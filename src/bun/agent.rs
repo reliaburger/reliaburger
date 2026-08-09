@@ -1407,6 +1407,10 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
         trust_domain: String,
     ) -> Self {
         let (deploy_ops_tx, deploy_ops_rx) = mpsc::channel(256);
+        // Capture the allocator's port range before it moves into the
+        // supervisor, so the perimeter firewall drops exactly the host ports
+        // Bun actually hands out (not a hardcoded 30000-31000 guess).
+        let host_port_range = port_allocator.range();
         Self {
             supervisor: WorkloadSupervisor::new(grill, port_allocator),
             command_rx,
@@ -1449,14 +1453,19 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
             )),
             ingress_configs: std::collections::HashMap::new(),
             #[cfg(target_os = "linux")]
-            perimeter_config: if crate::grill::rootless::is_rootless() {
-                crate::firewall::rules::PerimeterConfig::for_rootless()
-            } else {
-                crate::firewall::rules::PerimeterConfig::default()
+            perimeter_config: {
+                let mut cfg = if crate::grill::rootless::is_rootless() {
+                    crate::firewall::rules::PerimeterConfig::for_rootless()
+                } else {
+                    crate::firewall::rules::PerimeterConfig::default()
+                };
+                cfg.host_port_range = host_port_range;
+                cfg
             },
             #[cfg(not(target_os = "linux"))]
             perimeter_config: crate::firewall::rules::PerimeterConfig {
                 enabled: false,
+                host_port_range,
                 ..Default::default()
             },
             last_firewall_nodes: None,
@@ -4482,10 +4491,12 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
                 host_port,
                 healthy: instance.state == ContainerState::Running,
             };
-            let _ = self.service_map.add_backend(
+            if let Err(e) = self.service_map.add_backend(
                 &crate::onion::service_id::ServiceId::new(namespace, app_name),
                 backend,
-            );
+            ) {
+                eprintln!("onion: backend not registered for {namespace}/{app_name}: {e}");
+            }
         }
 
         self.finish_instance_networking(app_name, namespace).await;
@@ -4621,7 +4632,9 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
                         host_port,
                         healthy: true,
                     };
-                    let _ = self.service_map.add_backend(&service_id, backend);
+                    if let Err(e) = self.service_map.add_backend(&service_id, backend) {
+                        eprintln!("onion: backend not registered for {service_id:?}: {e}");
+                    }
                 }
             }
             self.rebuild_routing_table().await;
@@ -4699,7 +4712,9 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
                         host_port,
                         healthy: true,
                     };
-                    let _ = self.service_map.add_backend(&service_id, backend);
+                    if let Err(e) = self.service_map.add_backend(&service_id, backend) {
+                        eprintln!("onion: backend not registered for {service_id:?}: {e}");
+                    }
                 }
             }
         }
@@ -5811,7 +5826,9 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
                     host_port: port,
                     healthy: true,
                 };
-                let _ = self.service_map.add_backend(&service_id, backend);
+                if let Err(e) = self.service_map.add_backend(&service_id, backend) {
+                    eprintln!("onion: backend not registered for {service_id:?}: {e}");
+                }
             }
             // Egress was applied before `start` above. Post-start networking
             // only refreshes the service and namespace-firewall maps.
@@ -6928,7 +6945,9 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
             host_port,
             healthy: true,
         };
-        let _ = self.service_map.add_backend(&service_id, backend);
+        if let Err(e) = self.service_map.add_backend(&service_id, backend) {
+            eprintln!("onion: backend not registered for {service_id:?}: {e}");
+        }
         self.rebuild_routing_table().await;
     }
 
