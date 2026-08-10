@@ -15,6 +15,18 @@ use crate::meat::NodeId;
 use super::message::MembershipUpdate;
 use super::state::{self, NodeState};
 
+/// The live council voter set and leader, by gossip node name, derived from
+/// Raft metrics by the cluster runtime and fed into the gossip table so the
+/// `is_council`/`is_leader` flags reflect reality. Empty (the default) on a
+/// single-node/no-council process, where the flags stay `false`.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct CouncilRoles {
+    /// Node names that are current Raft voters.
+    pub council: std::collections::HashSet<NodeId>,
+    /// Node name of the current Raft leader, if any.
+    pub leader: Option<NodeId>,
+}
+
 /// Per-node resource summary piggybacked on gossip.
 /// Approximately 64 bytes serialised.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -239,6 +251,19 @@ impl MembershipTable {
     /// Get a mutable reference to a node's membership record.
     pub fn get_mut(&mut self, node_id: &NodeId) -> Option<&mut NodeMembership> {
         self.members.get_mut(node_id)
+    }
+
+    /// Overwrite every known member's `is_council`/`is_leader` flags from the
+    /// live, Raft-derived [`CouncilRoles`]. A member not in `roles.council` is
+    /// cleared, so a demoted voter stops advertising council membership. The
+    /// gossip node applies this each publish cycle from a watch fed by the
+    /// cluster runtime, so the flags — always `false` before this was wired —
+    /// reflect the real voter set and leader.
+    pub fn set_roles(&mut self, roles: &CouncilRoles) {
+        for (id, member) in self.members.iter_mut() {
+            member.is_council = roles.council.contains(id);
+            member.is_leader = roles.leader.as_ref() == Some(id);
+        }
     }
 
     /// All nodes currently considered alive.
@@ -634,6 +659,32 @@ mod tests {
         assert_eq!(council.len(), 2);
         assert!(council.contains(&NodeId::new("c1")));
         assert!(council.contains(&NodeId::new("c2")));
+    }
+
+    #[test]
+    fn set_roles_marks_current_voters_and_leader_and_clears_the_rest() {
+        let mut table = MembershipTable::new();
+        let t = now();
+        table.add_node(NodeId::new("c1"), addr(1), 1, BTreeMap::new(), t);
+        table.add_node(NodeId::new("c2"), addr(2), 1, BTreeMap::new(), t);
+        table.add_node(NodeId::new("w1"), addr(3), 1, BTreeMap::new(), t);
+
+        table.set_roles(&CouncilRoles {
+            council: std::collections::HashSet::from([NodeId::new("c1"), NodeId::new("c2")]),
+            leader: Some(NodeId::new("c1")),
+        });
+
+        assert_eq!(table.council_members().len(), 2);
+        assert_eq!(
+            table.leader().map(|m| m.node_id.clone()),
+            Some(NodeId::new("c1"))
+        );
+        assert!(!table.get(&NodeId::new("w1")).unwrap().is_council);
+
+        // A demotion (empty roles) clears every flag again.
+        table.set_roles(&CouncilRoles::default());
+        assert!(table.council_members().is_empty());
+        assert!(table.leader().is_none());
     }
 
     #[test]

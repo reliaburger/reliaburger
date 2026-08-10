@@ -239,6 +239,13 @@ pub async fn start(
     );
     let (leader_hint_tx, leader_hint_rx) = watch::channel::<Option<LeaderHint>>(None);
     node.set_leader_hint_watch(leader_hint_rx);
+    // Council roles (voter set + leader by name) derived from Raft metrics, so
+    // the gossip `is_council`/`is_leader` flags are correct. The receiver is
+    // wired in now (before the node spawns); the publisher below feeds the
+    // sender once metrics exist. Without it the flags stay `false`.
+    let (council_roles_tx, council_roles_rx) =
+        watch::channel(crate::mustard::membership::CouncilRoles::default());
+    node.set_council_roles_watch(council_roles_rx);
     // Disk-pressure resignation signal (12b.2 T3): the bun disk-pressure loop
     // publishes this node's own verdict, and gossip advertises it so the leader
     // learns which OTHER voters are pressured. Without a producer we advertise a
@@ -481,6 +488,13 @@ pub async fn start(
         supervision.clone(),
     );
 
+    // Keep the gossip council/leader flags in step with the Raft voter set.
+    spawn_council_roles_publisher(
+        raft_metrics_rx.clone(),
+        council_roles_tx,
+        supervision.clone(),
+    );
+
     // A maintainer keeps `council_rx` pointing at the current leader's
     // reporting address (the worker reports there) and `epoch_rx` at the
     // current leadership term (the aggregator scopes reports to it).
@@ -674,6 +688,50 @@ fn spawn_leader_hint_publisher(
             hint_tx.send_if_modified(|current| {
                 if *current != hint {
                     *current = hint;
+                    true
+                } else {
+                    false
+                }
+            });
+            tokio::select! {
+                _ = shutdown.cancelled() => break,
+                changed = metrics_rx.changed() => {
+                    if changed.is_err() {
+                        break;
+                    }
+                }
+            }
+        }
+    });
+}
+
+/// Publish the live council voter set and leader, by gossip node name, so the
+/// gossip membership table's `is_council`/`is_leader` flags reflect the Raft
+/// voter set and leader instead of the always-`false` defaults. Re-derives on
+/// every Raft metrics change, exactly like [`spawn_leader_hint_publisher`].
+fn spawn_council_roles_publisher(
+    mut metrics_rx: watch::Receiver<openraft::RaftMetrics<u64, CouncilNodeInfo>>,
+    roles_tx: watch::Sender<crate::mustard::membership::CouncilRoles>,
+    supervision: TaskSupervision,
+) {
+    let shutdown = supervision.shutdown.clone();
+    spawn_supervised("cluster:council-roles", supervision, async move {
+        loop {
+            let roles = {
+                let m = metrics_rx.borrow();
+                let membership = m.membership_config.membership();
+                let council: std::collections::HashSet<NodeId> = membership
+                    .voter_ids()
+                    .filter_map(|id| membership.get_node(&id).map(|n| NodeId::new(&n.name)))
+                    .collect();
+                let leader = m
+                    .current_leader
+                    .and_then(|id| membership.get_node(&id).map(|n| NodeId::new(&n.name)));
+                crate::mustard::membership::CouncilRoles { council, leader }
+            };
+            roles_tx.send_if_modified(|current| {
+                if *current != roles {
+                    *current = roles;
                     true
                 } else {
                     false

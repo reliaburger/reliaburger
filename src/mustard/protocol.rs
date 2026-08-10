@@ -86,6 +86,11 @@ pub struct MustardNode<T: MustardTransport> {
     /// outgoing extension so the leader learns this voter should resign.
     /// `None` until wired — then the bit is always `false`.
     disk_pressured_rx: Option<watch::Receiver<bool>>,
+    /// Live council voter set and leader by name, published by the cluster
+    /// runtime from Raft metrics. Applied to the membership table each publish
+    /// cycle so `is_council`/`is_leader` are correct. `None` on a single-node
+    /// process, where the flags stay `false`.
+    council_roles_rx: Option<watch::Receiver<super::membership::CouncilRoles>>,
     /// Directory accumulated from received extensions.
     directory: NodeDirectory,
     /// Optional watch channel publishing the directory on change.
@@ -119,6 +124,7 @@ impl<T: MustardTransport> MustardNode<T> {
             advertised_labels: BTreeMap::new(),
             leader_hint_rx: None,
             disk_pressured_rx: None,
+            council_roles_rx: None,
             directory: NodeDirectory::default(),
             directory_watch: None,
         }
@@ -172,6 +178,17 @@ impl<T: MustardTransport> MustardNode<T> {
     /// `disk_pressured` so the leader's reconciler can replace this voter.
     pub fn set_disk_pressured_watch(&mut self, rx: watch::Receiver<bool>) {
         self.disk_pressured_rx = Some(rx);
+    }
+
+    /// Wire the live council roles (voter set + leader by name) the cluster
+    /// runtime derives from Raft metrics. Applied to the membership table on
+    /// each publish so `is_council`/`is_leader` reflect reality. Without a
+    /// producer the flags stay `false`, the pre-wiring behaviour.
+    pub fn set_council_roles_watch(
+        &mut self,
+        rx: watch::Receiver<super::membership::CouncilRoles>,
+    ) {
+        self.council_roles_rx = Some(rx);
     }
 
     /// Set the directory watch channel, publishing endpoint and leader-hint
@@ -281,6 +298,13 @@ impl<T: MustardTransport> MustardNode<T> {
     /// transitions like Alive→Suspect — which keep the count constant until the
     /// reap — are published promptly to the council reconciler and `relish nodes`.
     fn publish_membership(&mut self) {
+        // Refresh council/leader flags from the latest Raft-derived roles before
+        // snapshotting. Clone the value out first so the watch borrow is released
+        // before taking `&mut self.membership` (different fields, but the borrow
+        // checker can't see that through method calls).
+        if let Some(roles) = self.council_roles_rx.as_ref().map(|rx| rx.borrow().clone()) {
+            self.membership.set_roles(&roles);
+        }
         let snapshot = self.membership.snapshot();
         let digest: Vec<(NodeId, NodeState, u64, bool, bool)> = snapshot
             .iter()
