@@ -24,9 +24,12 @@ pub struct PerimeterConfig {
     /// Whether the firewall is enabled. Defaults to `true` on Linux
     /// with root, `false` in rootless mode (nftables needs CAP_NET_ADMIN).
     pub enabled: bool,
-    /// Container host port range (dynamically allocated, default: 30000-31000).
-    /// External access to these ports is blocked — traffic reaches
-    /// containers via Wrapper on the ingress ports instead.
+    /// Container host port range. In production this is set from the node's
+    /// configured `[network] port_range` (the same range the port allocator
+    /// draws from), so the ports dropped for outsiders exactly match the host
+    /// ports Bun hands out. The default mirrors that config default. External
+    /// access to these ports is blocked — traffic reaches containers via
+    /// Wrapper on the ingress ports instead.
     pub host_port_range: (u16, u16),
     /// Cluster communication ports (gossip, Raft, reporting).
     /// Only accessible from cluster node IPs.
@@ -43,7 +46,7 @@ impl Default for PerimeterConfig {
     fn default() -> Self {
         Self {
             enabled: true,
-            host_port_range: (30000, 31000),
+            host_port_range: (10000, 60000),
             cluster_ports: vec![9443, 9444, 9445],
             admin_cidrs: Vec::new(),
             management_port: 9117,
@@ -397,7 +400,7 @@ mod tests {
         let nodes = ClusterNodes::new();
         let rules = generate(&config, &nodes);
 
-        assert!(rules.contains("tcp dport 30000-31000 drop"));
+        assert!(rules.contains("tcp dport 10000-60000 drop"));
     }
 
     #[test]
@@ -445,7 +448,7 @@ mod tests {
 
         // The accept rule must come before the drop rules
         let accept_pos = rules.find("10.0.1.1, 10.0.1.2 } accept").unwrap();
-        let drop_pos = rules.find("30000-31000 drop").unwrap();
+        let drop_pos = rules.find("10000-60000 drop").unwrap();
         assert!(accept_pos < drop_pos);
     }
 
@@ -483,13 +486,13 @@ mod tests {
         let rules = generate(&config, &nodes);
 
         assert!(rules.contains("tcp dport 40000-41000 drop"));
-        assert!(!rules.contains("30000"));
+        assert!(!rules.contains("10000-60000"));
     }
 
     #[test]
     fn default_config_values() {
         let config = default_config();
-        assert_eq!(config.host_port_range, (30000, 31000));
+        assert_eq!(config.host_port_range, (10000, 60000));
         assert_eq!(config.cluster_ports, vec![9443, 9444, 9445]);
         assert_eq!(config.management_port, 9117);
     }
@@ -555,7 +558,7 @@ mod tests {
         // leaves every drop rule void for v6 traffic.
         let ip6_start = rules.find("table ip6 reliaburger_fw {\n").unwrap();
         let ip6_rules = &rules[ip6_start..];
-        assert!(ip6_rules.contains("tcp dport 30000-31000 drop"));
+        assert!(ip6_rules.contains("tcp dport 10000-60000 drop"));
         assert!(ip6_rules.contains("tcp dport 9117 drop"));
         assert!(ip6_rules.contains("udp dport 9443 drop"));
     }

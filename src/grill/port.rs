@@ -48,6 +48,13 @@ impl PortAllocator {
         Self::new(range.start, range.end)
     }
 
+    /// The `(start, end)` port range this allocator draws from. The perimeter
+    /// firewall uses it so the ports it drops for outsiders exactly match the
+    /// host ports Bun actually allocates, rather than a hardcoded guess.
+    pub fn range(&self) -> (u16, u16) {
+        (self.range_start, self.range_end)
+    }
+
     /// Allocate a random available port from the range.
     pub async fn allocate(&self) -> Result<u16, PortError> {
         let mut allocated = self.allocated.lock().await;
@@ -132,6 +139,14 @@ mod tests {
         let alloc = PortAllocator::new(10000, 10010);
         let port = alloc.allocate().await.unwrap();
         assert!((10000..10010).contains(&port));
+    }
+
+    #[test]
+    fn range_reports_the_allocatable_bounds() {
+        // The perimeter firewall reads this to drop exactly the host ports the
+        // allocator hands out, so it must echo the configured range.
+        assert_eq!(PortAllocator::new(10000, 60000).range(), (10000, 60000));
+        assert_eq!(PortAllocator::new(40000, 41000).range(), (40000, 41000));
     }
 
     #[tokio::test]

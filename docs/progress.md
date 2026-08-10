@@ -1939,25 +1939,35 @@ Post-12b user-experience work (not a roadmap phase). Plan:
   to a bare-named repo; an unscoped token is unaffected. Runs in both single-node
   and clustered mode. Tests cover cross-namespace refusal, the bare-name bypass,
   and the unscoped pass-through.
-- [ ] **Firewall perimeter port range.** `src/firewall/rules.rs:45` hardcodes
-  `30000-31000` while the network default allocates `10000-60000`
-  (`src/config/node.rs:509`), so the perimeter can drop legitimately-allocated
-  host ports. Derive the perimeter range from the configured network range.
-- [ ] **`auto_rollback` default and wiring.** Default is `true` in code
-  (`src/meat/deploy_types.rs:57`) but `false` in the docs, and the wired rolling
-  path rolls back unconditionally without reading the flag (only the unwired
-  `meat` state machine consults it). Make the wired path honour the flag; align
-  the default; fix `deployments.md`.
-- [ ] **`live_council_voter()` always-false gate.** `is_council` is never set in
-  production, so the `relish council recover` guard (`src/bun/agent.rs:2391`)
-  keys on a field that's always false. Populate `is_council` from the live
-  council membership, or re-derive the guard from Raft state.
-- [ ] **Silent backend drop.** `TooManyBackends` is discarded by every caller via
-  `let _ =` (`src/onion/service_map.rs:134`); documented as a logged warning.
-  Log it (and surface a Mayo alert if one is warranted).
-- [ ] **Stale `upgrade/orchestrator.rs` module comment** describes a
-  leadership-transfer flow the code doesn't use. Rewrite the comment to match
-  the shipped ordering.
+- [x] **Firewall perimeter port range** — `BunAgent::with_cluster` now sets the
+  perimeter's `host_port_range` from the port allocator's actual range (new
+  `PortAllocator::range()`), so the ports dropped for outsiders exactly match the
+  host ports Bun hands out. The `PerimeterConfig` default was also aligned to the
+  network default (10000-60000) so the fallback isn't misleading. Tests updated.
+- [x] **Silent backend drop** — the five `let _ = self.service_map.add_backend(…)`
+  sites now log the (only) error, the per-service backend cap, instead of dropping
+  it silently; a backend that won't receive traffic is now visible in the log.
+- [x] **Stale `upgrade/orchestrator.rs` module comment** — rewrote the module doc
+  to match the shipped flow: the leader upgrades **in place last** (openraft 0.9
+  has no graceful leadership transfer), not the leadership hand-off the comment
+  described. The code (lines ~145-165) already documented the real behaviour.
+- [ ] **`auto_rollback` default and wiring** *(deferred to its own PR)* — the
+  wired rolling path (`src/bun/agent.rs`, the `if new_failed` block) always calls
+  `rollback_rolling_deploy` and never reads the flag; the code default is `true`
+  (the sensible one) while the docs say `false`. Honouring `auto_rollback = false`
+  means a real "halt" that keeps the healthy new + old instances and tears down
+  only the incomplete one (the data model already has `DeployResult::Halted`), which
+  needs a new command-loop op (DeployOp variant + forwarder + handler + impl) and a
+  wired MockGrill test in the critical deploy path. Too much for a cleanup bundle;
+  fix the default in `deployments.md` as part of that PR.
+- [ ] **`live_council_voter()` always-false gate** *(deferred — needs a decision)* —
+  deeper than a wiring fix: the gossip `is_council`/`is_leader` flags are **never
+  set in production at all**, so `MembershipTable::council_members()`,
+  `leader()` and `live_council_voter()` are all effectively dead (real
+  council/leader tracking lives in openraft/the cluster runtime, and
+  `live_council_voter` has no production caller). This is a wire-it-through-gossip
+  feature or a delete-the-dead-code cleanup, not a small correctness fix — decide
+  and do it in its own change.
 
 ### Section C — Carry-forward Phase 15 review defects
 
