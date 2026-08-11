@@ -1,16 +1,23 @@
 # The CI gate denies every RustSec warning that is not named here. Each
-# exception is owned by Phase 15a / M2 and expires on 18 August 2026; `make
-# audit` enforces that date before running cargo-audit. Reachability and
-# compensating controls are recorded in the Phase 15a follow-up plan.
+# remaining exception is an *unmaintained* informational advisory or a
+# lock-only dependency with no compiled path — none has a patched release to
+# upgrade to. `make audit` enforces the review date below before running
+# cargo-audit, so the list can't silently rot.
+#
+# Reviewed 11 August 2026 (Phase 16 Section G). Two former exceptions were
+# fixed by upgrades rather than re-ignored:
+#   - RUSTSEC-2026-0002 + RUSTSEC-2026-0253 (lru): ratatui 0.29 -> 0.30 pulls
+#     lru 0.18.2, which patches both. Removed.
+#   - RUSTSEC-2026-0190 (anyhow::Error::downcast_mut): anyhow 1.0.102 -> 1.0.104.
+#     Removed.
+# Next review: 18 November 2026.
 [advisories]
 ignore = [
-  "RUSTSEC-2024-0370", # proc-macro-error: build-time dependency through age
-  "RUSTSEC-2024-0436", # paste: build-time dependency through DataFusion/ratatui
-  "RUSTSEC-2025-0134", # rustls-pemfile: unmaintained, replacement migration pending
-  "RUSTSEC-2025-0141", # bincode 1: unmaintained, durable-format migration required
-  "RUSTSEC-2026-0002", # lru::IterMut: affected API is not called by ratatui 0.29
-  "RUSTSEC-2026-0190", # anyhow::Error::downcast_mut: affected API is not called
-  "RUSTSEC-2026-0235", # rkyv: inactive optional rust_decimal feature; no compiled path
+  "RUSTSEC-2024-0370", # proc-macro-error: unmaintained, no patched release; build-time only, reached through age
+  "RUSTSEC-2024-0436", # paste: unmaintained, no patched release; build-time proc-macro through DataFusion/ratatui
+  "RUSTSEC-2025-0134", # rustls-pemfile: unmaintained, no patched release; replacement migration pending
+  "RUSTSEC-2025-0141", # bincode 1: unmaintained, no patched release; durable-format migration required to move off
+  "RUSTSEC-2026-0235", # rkyv 0.7: patched in 0.8, but rust_decimal 1.x pins the 0.7 optional feature. `cargo tree -i rkyv` finds no active path — lock-only, never compiled
 ]
 
 [output]

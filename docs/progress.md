@@ -2101,11 +2101,18 @@ Post-12b user-experience work (not a roadmap phase). Plan:
 
 ### Section G — Time-boxed
 
-- [ ] **Advisory-exception review before 18 August 2026.** The exceptions in
-  `.cargo/audit.toml` (thrift, lru, anyhow, rkyv, plus the bincode/rustls-pemfile/
-  paste/proc-macro-error maintenance notices) fail closed after that date —
-  `make audit` starts failing on the 18th. Re-review each, extend or fix, and
-  bump the expiry. (Also follow-up plan G4.)
+- [x] **Advisory-exception review (done 11 Aug 2026, before the 18 Aug deadline)** —
+  re-reviewed every exception. Two were **fixed by upgrades**, not re-ignored:
+  `ratatui` 0.29 → 0.30 pulls `lru` 0.18.2, patching RUSTSEC-2026-0002 **and** the
+  newer RUSTSEC-2026-0253 (`LruCache::pop` UAF, which the review surfaced — the
+  audit was already failing on it); and `anyhow` 1.0.102 → 1.0.104 patches
+  RUSTSEC-2026-0190. Both removed from `.cargo/audit.toml`. The ratatui bump was a
+  one-line migration (`draw` now returns the backend error type) with unchanged TUI
+  snapshots. The five that remain (`bincode`, `rustls-pemfile`, `paste`,
+  `proc-macro-error` — all unmaintained, no patched release — and lock-only `rkyv`,
+  still no active compiled path) have no upgrade available; re-affirmed with the
+  same reachability rationale and a fresh **18 November 2026** re-review date
+  (`make audit` gate + `.cargo/audit.toml` bumped). Follow-up plan table updated.
 
 - [ ] **Close the Phase 16 gate** — rerun the doc-vs-code sweep after Sections
   A–F land and confirm no present-tense claim describes an unbuilt feature.

@@ -81,7 +81,11 @@ async fn event_loop<P: DataProvider, B: Backend>(
         tokio::select! {
             _ = tick.tick() => {
                 app.now_epoch = unix_now();
-                terminal.draw(|frame| views::render(frame, &app))?;
+                // ratatui 0.30 made `draw` return the backend's associated
+                // error type rather than `io::Error`; fold it back into one.
+                terminal
+                    .draw(|frame| views::render(frame, &app))
+                    .map_err(|e| std::io::Error::other(e.to_string()))?;
             }
             Some(message) = rx.recv() => app.update(message),
             Some(Ok(event)) = input.next() => match event {
