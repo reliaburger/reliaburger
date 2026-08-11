@@ -2,27 +2,27 @@
 
 ## 1. Overview
 
-Sesame is Reliaburger's built-in PKI, identity, and security layer. It provides the cryptographic foundation that every other subsystem depends on: mutual TLS between cluster nodes, workload identity certificates for every app and job, API authentication for human operators and CI systems, secret encryption at rest, Raft log encryption, and network-level firewalling.
+Sesame is Reliaburger's built-in PKI, identity, and security layer. It provides the cryptographic foundation that every other subsystem depends on: mutual TLS between cluster nodes, workload identity certificates for every app and job, API authentication for human operators and CI systems, secret encryption at rest, and network-level firewalling. Raft log encryption is designed and implemented as a module but is **not yet wired into the durable log** — see the status note in §5.6.
 
 Sesame is not a separate binary or sidecar. It is compiled into the single `reliaburger` binary and activated during `relish init`. Every security primitive -- certificate authorities, certificate signing, token management, secret encryption, firewall rule generation -- is handled by code paths within the existing node roles (council and worker).
 
 **Core responsibilities:**
 
 - **CA hierarchy.** A root CA and three intermediate CAs (Node, Workload, Ingress), each scoped to a single purpose.
-- **Node authentication.** Join tokens, mTLS certificate issuance, optional TPM attestation.
+- **Node authentication.** Join tokens and mTLS certificate issuance (shipped). TPM attestation is **planned — not yet implemented**: the `AttestationMode::Tpm` variant exists, but there is no TPM code or TPM crate behind it.
 - **Workload identity.** SPIFFE-compatible X.509 certificates and OIDC JWTs for every workload, issued via a CSR model, rotated automatically.
 - **API authentication.** Scoped tokens with roles, TTLs, and rate limits. Optional OIDC integration with external identity providers.
 - **Secret encryption.** Asymmetric age encryption for secrets checked into git. Namespace-scoped keypairs for multi-tenant isolation.
-- **Data at rest encryption.** AES-256-GCM encryption of the Raft log, with HKDF key derivation and optional TPM sealing.
+- **Data at rest encryption (planned — implemented but not yet wired).** AES-256-GCM encryption of the Raft log, with HKDF key derivation and optional TPM sealing. The crypto lives in `sesame::raft_encryption` (complete and tested) but has no call sites yet; the durable log currently writes plaintext. TPM sealing is not implemented at all.
 - **Network security.** nftables perimeter firewall, eBPF inter-app firewall, egress allowlists, namespace isolation -- all managed automatically by Bun.
 - **Certificate revocation.** CRL distribution for long-lived node certificates.
 
 **Design principles:**
 
 1. **Zero-configuration security (target).** A fresh cluster should have mTLS between all nodes, workload identity for all apps, namespace isolation, deny-by-default egress, and encrypted Raft logs. The current egress implementation is narrower: a declared `[app.NAME.egress]` allowlist is deny-by-default and fail-closed, but an app with no block still has unrestricted egress. A cluster-wide default policy remains planned.
-2. **Separation of privilege.** Worker nodes never hold CA private keys. They can only obtain certificates for workloads they are scheduled to run.
+2. **Separation of privilege (target — see the note below).** The intended model is that worker nodes never hold CA private keys and can only obtain certificates for workloads they are scheduled to run. **The current implementation does not yet enforce this key split:** every clustered node loads the same cluster master key and its bootstrap security state, from which it can locally unwrap the age private key, the intermediate CA private keys, and the OIDC signing key (see §3.2). A genuine council/worker key separation is planned, not shipped.
 3. **Data plane survives control plane failures.** Existing certificates, firewall rules, and secrets continue working during council outages. Grace period extensions prevent hard cliffs.
-4. **Short-lived credentials by default.** Workload certificates live 1 hour, rotated every 30 minutes. API tokens default to 90-day TTL. Short lifetimes reduce the blast radius of credential theft.
+4. **Short-lived credentials by default (workloads).** Workload certificates live 1 hour, rotated every 30 minutes — this is shipped. **API tokens are the exception:** `relish token create --ttl-days` is optional and has **no default**, so a token created without it **never expires**. A built-in 90-day default and a `token rotate` command are planned, not shipped (see §5.4). Short lifetimes reduce the blast radius of credential theft.
 
 ---
 
@@ -58,17 +58,26 @@ Root CA (offline after init, signs only intermediate CAs)
                        Lifetime: 5 years. Stored encrypted in Raft.
 ```
 
-The root CA private key is used **only** during `relish init` and `relish ca rotate --root`. After signing the three intermediates, the root private key is encrypted with the cluster's age public key, written to a sealed backup file on the admin's machine, and deleted from all cluster nodes. No cluster node holds the root CA private key during normal operation.
+The root CA private key is used **only** during `relish init` (and, once it ships, `relish ca rotate --root` — CA rotation is planned, see §5.8). After signing the three intermediates, the root private key is encrypted with the cluster's age public key, written to a sealed backup file on the admin's machine, and deleted from all cluster nodes. No cluster node holds the root CA private key during normal operation.
 
 All three intermediate CAs chain to the same root, so a single trust anchor (the root CA certificate) is sufficient for any verifier.
 
 ### 3.2 Key Distribution Model
 
+> **Implementation note (important).** The split drawn below is the *target*
+> model. It is **not** how the cluster currently boots. Today every clustered
+> node is started with the cluster master key (`load_master_key`) and the
+> bootstrap security state, which together let *any* node unwrap the age private
+> key, the intermediate CA private keys and the OIDC signing key locally. So the
+> "NO CA private keys / NO age private key / NO OIDC signing key" line in the
+> Worker Nodes box is aspirational — a real key split is planned work. The
+> diagram is retained to show the intended separation, not the shipped one.
+
 ```
 +-------------------------------------------------------------------+
 |                        Council Nodes                               |
 |                                                                    |
-|  Raft Log (encrypted at rest with AES-256-GCM)                    |
+|  Raft Log (at-rest AES-256-GCM planned; NOT wired — plaintext today) |
 |  +--------------------------------------------------------------+ |
 |  | Node CA private key (wrapped with HKDF-derived key)          | |
 |  | Workload CA private key (wrapped with HKDF-derived key)      | |
@@ -107,7 +116,9 @@ All three intermediate CAs chain to the same root, so a single trust anchor (the
 |  | OIDC JWT token                                                | |
 |  +--------------------------------------------------------------+ |
 |                                                                    |
-|  NO CA private keys. NO age private key. NO OIDC signing key.     |
+|  TARGET: NO CA private keys, age key, or OIDC signing key.        |
+|  CURRENT: holds the cluster master key + bootstrap state, so it    |
+|  can locally unwrap all of the above (key split not yet enforced). |
 +-------------------------------------------------------------------+
 ```
 
@@ -221,7 +232,9 @@ pub struct CertificateAuthority {
     /// The parent CA's serial (None for the root CA).
     pub issuer_serial: Option<SerialNumber>,
 
-    /// Generation counter, incremented on `relish ca rotate`.
+    /// Generation counter, intended to increment on `relish ca rotate`.
+    /// CA rotation is not implemented yet (§5.8), so this stays at its
+    /// initial value in practice.
     pub generation: u64,
 }
 
@@ -383,8 +396,10 @@ pub struct ApiToken {
     /// Optional scope restrictions.
     pub scope: TokenScope,
 
-    /// When the token expires. Default: 90 days from creation.
-    pub expires_at: SystemTime,
+    /// When the token expires. In the shipped store this is
+    /// `Option<SystemTime>`: `None` means the token never expires. There is
+    /// no default TTL applied at creation (§5.4) — the "90 days" is planned.
+    pub expires_at: Option<SystemTime>,
 
     /// When the token was created.
     pub created_at: SystemTime,
@@ -396,7 +411,8 @@ pub struct ApiToken {
     pub rate_limit_rps: u32,
 
     /// If this token is being rotated, the old token hash that is still
-    /// valid during the grace period.
+    /// valid during the grace period. (Planned — there is no `token rotate`
+    /// command or rotation-grace flow yet; see §5.4.)
     pub rotation_grace: Option<RotationGrace>,
 }
 
@@ -461,7 +477,7 @@ pub enum AgeKeyScope {
     /// Cluster-wide default keypair.
     ClusterWide,
 
-    /// Namespace-scoped keypair (opt-in via `secret_key = true`).
+    /// Namespace-scoped keypair (planned — no code creates one yet; see §5.5).
     Namespace(String),
 }
 ```
@@ -626,7 +642,8 @@ pub struct WorkloadJwtClaims {
     /// Subject: the workload's SPIFFE URI.
     pub sub: String,
 
-    /// Audience: always includes "spiffe://CLUSTER", plus any per-app audiences.
+    /// Audience. Today this is exactly `["spiffe://CLUSTER"]`; per-app
+    /// audiences are planned but not yet appended (§6.6).
     pub aud: Vec<String>,
 
     /// Expiration time (Unix timestamp).
@@ -645,6 +662,8 @@ pub struct WorkloadJwtClaims {
     #[serde(rename = "reliaburger.dev/cluster")]
     pub cluster: String,
 
+    /// The issuing node's id. NOTE: currently populated with the literal
+    /// string "local", not the real node id (planned fix).
     #[serde(rename = "reliaburger.dev/node")]
     pub node: String,
 
@@ -805,7 +824,7 @@ leader cannot create an orphan credential.
 2. The joining node presents the join token.
 3. The leader validates that the token exists, is not expired and has not already been consumed.
 4. One Raft entry atomically marks the token consumed and allocates the certificate serial. A retry or concurrent reuse is refused.
-5. If `node_attestation = "tpm"`: the joining node presents a TPM attestation quote. The leader verifies it against the pre-registered endorsement keys.
+5. If `node_attestation = "tpm"`: the joining node presents a TPM attestation quote, which the leader verifies against the pre-registered endorsement keys. **(Planned — not implemented. The `Tpm` attestation mode is a config/enum placeholder with no TPM code behind it; do not rely on it.)**
 6. If `node_attestation = "certificate"`: the joining node presents a client certificate. The leader verifies it against the configured external CA trust store.
 7. The leader signs the joining node's CSR with the Node CA. The node's private key never crosses the network.
 8. The signed certificate, the Node CA certificate and the root CA certificate are sent to the joining node.
@@ -829,7 +848,14 @@ Bun on each worker node maintains a rotation schedule for every running workload
 
 **Certificate contents.** The council rebuilds every certificate field server-side from the expected identity; the only input taken from the CSR is the public key. Extra SANs in a hostile CSR are never signed. Validity is an exact timestamped window (`now − 5 min` skew backdate to `now + 1 h`), not calendar dates.
 
-**OIDC JWT minting** happens at the same time as certificate issuance. The council member constructs the JWT with the workload's SPIFFE URI as the `sub` claim, the cluster's OIDC issuer as `iss`, default audience `spiffe://CLUSTER`, plus any per-app audiences from the `[app.NAME.identity]` config. The JWT is signed with the Ed25519 OIDC signing key and returned alongside the signed X.509 certificate.
+**OIDC JWT minting** happens at the same time as certificate issuance. The council member constructs the JWT with the workload's SPIFFE URI as the `sub` claim, the cluster's OIDC issuer as `iss`, and a single audience `spiffe://CLUSTER`. The JWT is signed with the Ed25519 OIDC signing key and returned alongside the signed X.509 certificate.
+
+> **Two claim details differ from the aspirational model.** (1) The `aud` claim
+> is exactly `["spiffe://<cluster>"]` today — **per-app audiences from
+> `[app.NAME.identity]` are not appended** (that is planned, §6.6). (2) The
+> `reliaburger.dev/node` claim is currently the **literal string `"local"`**,
+> not the issuing node's id — the CSR-signing path passes `"local"` as the node
+> identifier. Treat the per-app-audience and real-node-id stories as planned.
 
 ### 5.4 API Token Lifecycle
 
@@ -837,13 +863,20 @@ Bun on each worker node maintains a rotation schedule for every running workload
 
 ```bash
 $ relish token create --name ci-deploy --role deployer \
-    --apps "web,api" --namespaces "production" --ttl 90d
+    --apps "web,api" --namespaces "production" --ttl-days 90
 ```
 
 1. Generate a 256-bit cryptographically random token secret.
 2. Hash the secret with Argon2id (salt generated per-token).
-3. Store the hash, salt, role, scope, TTL, and rate limit in Raft.
+3. Store the hash, salt, role, scope, and expiry in Raft.
 4. Return the plaintext token to the user. It is never stored in plaintext.
+
+**Expiry is opt-in, with no default.** `--ttl-days` is optional; the stored
+`expires_at` is `Option<SystemTime>`, and when it is `None` the token **never
+expires**. Authentication only rejects a token once a *set* expiry has passed.
+A built-in default TTL (the "90 days" the config sketch mentions) is planned but
+not applied today, so a token created without `--ttl-days` is effectively
+permanent until explicitly revoked.
 
 **Bootstrap boundary (shipped):** An empty user-token store leaves protected
 API routes open long enough to create the first cluster token. Bun contains
@@ -854,10 +887,14 @@ the same explicit token store in standalone and clustered modes, so standalone
 can't bypass the listener check by omitting council state. The check runs before
 runtime, storage or observability startup in standalone mode.
 
-**Rotation:**
+**Rotation (planned — not implemented):**
+
+> There is no `relish token rotate` command. The `TokenAction` CLI enum exposes
+> only `create`, `list`, and `revoke`, and there is no rotation-grace machinery
+> wired to a rotate flow. The design below (dual-accept grace window) is planned.
 
 ```bash
-$ relish token rotate ci-deploy
+$ relish token rotate ci-deploy    # planned
 ```
 
 1. Generate a new token secret and hash.
@@ -865,7 +902,7 @@ $ relish token rotate ci-deploy
 3. During the grace period, both old and new tokens are accepted.
 4. After the grace period, the old hash is deleted.
 
-**Expiry:** Expired tokens are automatically revoked. A background sweep on the council leader checks for expired tokens every hour and removes them from Raft state.
+**Expiry:** A token with a set `expires_at` is rejected at authentication time once that time has passed (a `401 token expired`). A token with no expiry is never rejected on age grounds. Revocation is explicit via `relish token revoke`. A background sweep that proactively deletes expired tokens from Raft state is planned; today expiry is enforced at check time, not by a sweep.
 
 **Rate limiting:** Each API request checks the token's `rate_limit_rps`. A token-keyed sliding window counter (in-memory on the API-serving node) tracks request counts. Exceeding the limit returns HTTP 429 with a `Retry-After` header.
 
@@ -878,7 +915,7 @@ $ relish secret encrypt --pubkey age1qy8m5kz... "my-secret-value"
 ENC[AGE:YWdlLWVuY3J5cHRpb24...]
 ```
 
-> **Status:** `relish secret pubkey` and `relish secret encrypt` are implemented. `relish secret rotate` requires SecurityState in Raft (same dependency as token list/revoke) and is deferred.
+> **Status:** `relish secret pubkey`, `relish secret encrypt` and `relish secret rotate` (start and `--finalize`) are all implemented. Rotation drives `RaftRequest::RotateSecretKey` / `FinalizeSecretRotation` through the council state machine. It currently rotates the **cluster-wide** age key only; per-namespace key rotation is planned (see the namespace-scoped keys note below).
 
 The `relish` CLI uses the age public key to encrypt. No cluster access required. The ciphertext is embedded in the TOML app configuration and checked into git.
 
@@ -891,7 +928,7 @@ The `relish` CLI uses the age public key to encrypt. No cluster access required.
 5. Bun injects the plaintext as an environment variable. It is never written to disk.
 6. A decryption audit event is logged: which secret, which app, which node, timestamp.
 
-**Namespace-scoped keys:** When `secret_key = true` is set for a namespace, `relish init` (or `relish namespace create`) generates a separate age keypair for that namespace. The private key is stored in Raft, wrapped with HKDF. Bun on nodes running workloads in that namespace can request decryption only for secrets encrypted with that namespace's key. Compromise of one namespace's key does not expose other namespaces' secrets.
+**Namespace-scoped keys (planned — not yet generated):** The intended design is that setting `secret_key = true` for a namespace makes `relish init` (or `relish namespace create`) generate a separate age keypair for it, stored in Raft wrapped with HKDF, so compromise of one namespace's key does not expose another's. **This is not shipped:** there is no `secret_key` config field, and no code path generates a namespace-scoped age keypair — the cluster runs on a single cluster-wide age key. The decryption and re-seal paths already *prefer* a namespace key when one exists and fall back to the cluster-wide key, so the consuming side is ready; only the key-creation side is missing.
 
 **Key rotation (`relish secret rotate`):**
 
@@ -903,7 +940,17 @@ The `relish` CLI uses the age public key to encrypt. No cluster access required.
 
 ### 5.6 Raft Log Encryption
 
-On each council node:
+> **Status: planned — implemented but not yet wired.** The encryption routines
+> (HKDF derivation, AES-256-GCM entry seal/open) exist in
+> `sesame::raft_encryption` and are unit-tested, but nothing calls them:
+> `council::durable_log` currently serialises entries as plaintext (JSON for
+> `RaftRequest`, bincode for votes/log-ids). The steps below describe the
+> intended design, not current behaviour. The additional HKDF *wrapping* of
+> sensitive keys **inside** the log (age key, CA keys) — step 5 — is real and
+> does ship; it is the outer whole-log encryption that is not yet active. TPM
+> sealing (step 2) is not implemented.
+
+On each council node (intended design):
 
 1. At startup, derive the AES-256-GCM encryption key via HKDF:
    - **Input keying material:** the node's certificate private key (DER bytes).
@@ -927,7 +974,15 @@ On each council node:
 
 ### 5.8 CA Rotation
 
-**Intermediate CA rotation (`relish ca rotate`):**
+> **Status: planned — not yet implemented.** There is no `relish ca` command
+> family (no `ca rotate`, `ca rotate --root`, or generation bump). CA rotation,
+> the dual-signing transition, and root cross-signing below are design, not
+> shipped code. (Certificate *revocation* via the CRL — §5.7,
+> `RaftRequest::RevokeCertificate` — is separate and does ship.) The
+> `CertificateAuthority.generation` counter exists but is never incremented,
+> because nothing rotates a CA yet.
+
+**Intermediate CA rotation (`relish ca rotate`) — planned:**
 
 1. Generate a new intermediate CA keypair (for whichever CA is being rotated, or all three).
 2. Sign the new intermediate with the root CA. (The root CA private key is needed only for this step; it is decrypted from the sealed backup provided by the operator.)
@@ -1018,6 +1073,10 @@ external_ca_path = ""
 ### 6.3 API Tokens
 
 ```toml
+# PLANNED — this [security.tokens] block is not parsed today. Token TTL is
+# set per-token via `relish token create --ttl-days` and defaults to no expiry
+# when omitted (§5.4); there is no cluster-wide default TTL, no configurable
+# default rate limit, and no token-rotation grace period (no `token rotate`).
 [security.tokens]
 # Default TTL for new tokens. Default: 90 days.
 default_ttl = "90d"
@@ -1033,8 +1092,13 @@ rotation_grace_period = "24h"
 
 ```toml
 # Namespace-scoped secret keys (opt-in per namespace).
+# PLANNED — not parsed or acted on today. There is no `secret_key` config
+# field, and nothing generates a per-namespace age keypair (§5.5): init and
+# join create a single cluster-wide age key. The decrypt/seal paths already
+# look up a namespace key and fall back to the cluster-wide one, so the
+# lookup side is ready, but no namespace key is ever created.
 [namespace.team-payments]
-secret_key = true    # generate a separate age keypair for this namespace
+secret_key = true    # generate a separate age keypair for this namespace (planned)
 ```
 
 ### 6.5 Network Security
@@ -1061,8 +1125,11 @@ allow = [
 ]
 
 # Per-app inbound firewall (eBPF layer).
+# Each entry is a string: a bare "app" (same namespace as the target) or
+# "namespace/app" for a cross-namespace source. (The AppRef struct in §4.7 is
+# the internal representation; the config format is these strings.)
 [app.payment-service.firewall]
-allow_from = ["api", "admin"]
+allow_from = ["api", "admin", "team-web/frontend"]
 ```
 
 ### 6.6 OIDC Configuration
@@ -1074,6 +1141,8 @@ allow_from = ["api", "admin"]
 issuer = "https://reliaburger.prod.example.com"
 
 # Per-app audience configuration.
+# PLANNED — not yet emitted into JWTs. Minted tokens currently carry only
+# aud = ["spiffe://<cluster>"]; these extra audiences are not appended (§5.3).
 [app.api.identity]
 audiences = ["sts.amazonaws.com"]
 
@@ -1121,10 +1190,10 @@ council_size = 3
 
 **Response:**
 
-1. Immediately run `relish ca rotate` for the compromised CA.
-2. Revoke all certificates issued by the compromised CA.
+1. Immediately run `relish ca rotate` for the compromised CA. **(Planned — CA rotation is not implemented yet, §5.8. Until it ships, the practical response is CRL-revoking affected certificates and, in the worst case, re-bootstrapping the PKI.)**
+2. Revoke all certificates issued by the compromised CA (via the CRL, §5.7).
 3. The dual-signing period ensures existing legitimate certificates continue working during the transition.
-4. Investigate how the key was exfiltrated. Council nodes should have restricted access, TPM sealing, and encrypted Raft logs.
+4. Investigate how the key was exfiltrated. Council nodes should have restricted access; TPM sealing and at-rest Raft log encryption are planned hardening (§5.6), not yet active.
 
 **Root CA compromise:** If the sealed root CA backup is stolen, the attacker can sign new intermediate CAs. This requires a full PKI re-bootstrap: `relish init` on a new cluster and migrating workloads.
 
@@ -1157,6 +1226,10 @@ council_size = 3
 
 ### 7.5 Raft Log Encryption Key Loss
 
+> **Applies only once §5.6 ships.** At-rest Raft log encryption and TPM sealing
+> are not wired today (the log is plaintext), so this failure mode is about the
+> planned design, not current behaviour.
+
 **Scenario:** A council node's disk is moved to different hardware, breaking TPM sealing.
 
 **Impact:** The Raft log cannot be decrypted on the new hardware. The node cannot start.
@@ -1180,27 +1253,36 @@ council_size = 3
 The threat model assumes:
 
 - **Trusted:** The operator who runs `relish init` and has access to the sealed root CA backup.
-- **Semi-trusted:** Council nodes. They hold sensitive key material but are hardened (minimal attack surface, TPM sealing, encrypted Raft logs).
+- **Semi-trusted:** Council nodes. They hold sensitive key material. The intended hardening (minimal attack surface, TPM sealing, encrypted Raft logs) is only partly shipped: TPM sealing and at-rest Raft log encryption are planned, not active (§5.6). Today's protection for keys in the log is the per-key HKDF wrapping, not whole-log encryption.
 - **Untrusted:** Worker nodes. They may be compromised. The system is designed so that a compromised worker node has limited blast radius.
 - **Untrusted:** Network between nodes. All inter-node communication is mTLS-authenticated and encrypted.
 - **Untrusted:** External network. Declared app allowlists are default-deny; apps without an egress block remain unrestricted until the planned cluster default lands. nftables perimeter rules and Wrapper-only ingress cover inbound traffic.
 
 ### 8.2 Compromised Worker Node
 
-**What the attacker gains:**
+> **Current blast radius is larger than the target model.** Because every
+> clustered node loads the cluster master key and bootstrap security state
+> (§3.2), a compromised clustered node can locally unwrap the age private key,
+> the intermediate CA private keys and the OIDC signing key. The mitigations
+> below describe the *intended* worker/council split, which is planned work; a
+> node compromise today should be treated closer to a council compromise (§8.3)
+> until the key split ships.
+
+**What the attacker gains (today):**
 
 - The node's own node certificate and private key (can impersonate this specific node).
 - Workload certificates for workloads currently running on this node (1-hour lifetime).
 - Plaintext secret values for workloads running on this node (in-memory only, not on disk).
 - The ability to send CSRs for workloads scheduled on this node.
+- The cluster master key and bootstrap state, and therefore the ability to unwrap the age private key, the CA private keys and the OIDC signing key.
 
-**What the attacker cannot do:**
+**What the target model intends the attacker cannot do (not all enforced today):**
 
-- Obtain certificates for workloads on other nodes (CSR validation checks Meat's scheduling state).
-- Forge certificates for arbitrary workloads (no CA private keys on worker nodes).
-- Decrypt secrets for workloads in other namespaces (namespace-scoped keys, decryption happens on council).
-- Access the age private key, CA private keys, or OIDC signing key (stored only on council nodes).
-- Modify the Raft log or cluster state (requires council consensus).
+- Obtain certificates for workloads on other nodes (CSR validation checks Meat's scheduling state — this *is* enforced).
+- Forge certificates for arbitrary workloads — **not yet guaranteed:** CA private keys are currently derivable on every node.
+- Decrypt secrets for other namespaces — **not yet guaranteed:** there is a single cluster-wide age key today (§5.5), and it is derivable on every node.
+- Access the age private key, CA private keys, or OIDC signing key — **not yet guaranteed** (see the note above).
+- Modify the Raft log or cluster state (requires council consensus — this *is* enforced).
 - Bypass nftables perimeter rules on other nodes.
 
 **Response:**
@@ -1227,7 +1309,7 @@ The threat model assumes:
 **Response:**
 
 1. Isolate the compromised council node immediately.
-2. Rotate all intermediate CAs: `relish ca rotate`.
+2. Rotate all intermediate CAs: `relish ca rotate`. **(Planned — not implemented, §5.8.)**
 3. Rotate the age keypair: `relish secret rotate`.
 4. Rotate the OIDC signing keypair (re-minting all JWTs).
 5. Rotate all API tokens.
@@ -1237,8 +1319,8 @@ The threat model assumes:
 **Prevention:**
 
 - Council nodes should have the smallest possible attack surface.
-- TPM sealing ensures key material cannot be extracted even with disk access.
-- Encrypted Raft logs protect against offline forensic access.
+- TPM sealing would ensure key material cannot be extracted even with disk access (planned — not implemented).
+- Encrypted Raft logs would protect against offline forensic access (planned — the encryption module exists but is not wired; the log is plaintext today, §5.6). Per-key HKDF wrapping does protect the age/CA keys stored inside the log.
 - Council nodes should be on a restricted management network.
 
 ### 8.4 Join Token Theft
@@ -1275,7 +1357,7 @@ See Section 7.3. The short TTL (15 minutes), single-use property, and optional T
 
 **Scenario:** A JWT token intended for one service is intercepted and replayed against a different service.
 
-**Mitigation:** Every JWT includes a default audience of `spiffe://CLUSTER_NAME`. The verifying service must check that it is the intended audience in the `aud` claim. For cloud IAM federation, per-app audiences (e.g., `sts.amazonaws.com`) are explicitly configured, and the cloud provider validates the audience before issuing temporary credentials.
+**Mitigation:** Every JWT includes the audience `spiffe://CLUSTER_NAME`. The verifying service must check that it is the intended audience in the `aud` claim. Per-app audiences for cloud IAM federation (e.g., `sts.amazonaws.com` configured via `[app.NAME.identity]`) are **planned but not yet emitted** — today the `aud` claim carries only `spiffe://CLUSTER_NAME`, so cloud-provider audience federation does not work until that ships (§6.6).
 
 ---
 

@@ -1,23 +1,25 @@
 # Ketchup: Log Collection System
 
 **Component:** Ketchup (Log Collector)
-**Status:** Design Draft
+**Status:** Design (this document reconciled against the shipped code)
 **Whitepaper Reference:** Section 15
 
 ---
 
 ## 1. Overview
 
-Ketchup is Reliaburger's built-in log collection subsystem. It automatically captures stdout and stderr from every managed container and process workload on a node, stores the output in structured append-only files organised per-app per-day, and provides querying, export, and retention management without any external dependencies.
+Ketchup is Reliaburger's built-in log collection subsystem. It captures the output of every managed container and process workload on a node, stores it as flat Parquet files, and provides querying, export, and retention management without any external dependencies.
 
-Ketchup runs as a module within the Bun agent on every node. There is no separate log collection daemon, no sidecar container, and no central log aggregation server. Each node is responsible for capturing, indexing, compressing, and serving the logs produced by workloads running on that node. Cross-node queries are coordinated by the leader using the same fan-out pattern employed by Mayo for metrics: the query is dispatched only to nodes running the target app, and results are merged before being returned to the caller.
+Ketchup runs as a module within the Bun agent on every node. There is no separate log collection daemon, no sidecar container, and no central log aggregation server. Each node captures and serves the logs produced by workloads running on it. Non-follow cross-node queries are coordinated by the leader using the same fan-out pattern Mayo uses for metrics -- dispatched to the nodes running the target app, then merge-sorted -- **but log *follow* (`-f`) is local-node only** (see §3.7). Transport is HTTP throughout; there is no gRPC.
+
+The storage engine is **Parquet + DataFusion SQL**, mirroring `MayoStore` exactly. This document has been reconciled against the code: the per-app binary log-record format, the sparse memory-mapped `.idx` index, per-day file rotation, the `.log`/`.log.zst` compression lifecycle, regex grep, RFC3339 time ranges, the `--instance` and dot-path `--json-field` filters, and the log-permission model are all **planned -- not yet implemented** and flagged as such below.
 
 The design goals for Ketchup are:
 
-- **Zero configuration by default.** Log capture is automatic for every workload. No log agent configuration, no log format specification, no output plugin selection.
-- **Sub-millisecond per-app overhead.** At the design target of 500 apps per node, Ketchup must not become a bottleneck. Append-only writes with memory-mapped indexes keep per-line overhead in the low-microsecond range.
-- **Structured query support.** When an application emits JSON-formatted log lines, Ketchup auto-detects this and enables field-level queries (e.g., `--json-field level=error`) without requiring the application to declare its log format.
-- **Built-in retention and export.** Raw logs are retained for 7 days, compressed archives for 30 days. Long-term retention is handled by scheduled export to external destinations (S3, GCS, or any HTTP endpoint) in `jsonl.gz` format.
+- **Zero configuration by default.** Log capture is automatic for every workload.
+- **Low per-app overhead.** Lines are forwarded over a channel into an in-memory buffer and flushed to Parquet; the archive read path uses Parquet row-group statistics and bloom filters (on `app`/`namespace`) to skip irrelevant groups.
+- **SQL query support.** Logs are queryable with DataFusion SQL over the `logs` table. Substring search (`--grep`) is a SQL `LIKE '%…%'` match. Structured JSON field querying (`--json-field`) is a **planned** convenience layered on top (today it is a client-side single-key match, §5.3).
+- **Built-in retention and export.** Logs are retained for `retention_days` (default 7) and pruned oldest-first. Export ships the ZSTD-compressed Parquet files as-is (not `jsonl.gz`) to an `object_store` destination (local path, `file://`, `s3://`, `gs://`).
 
 ---
 
@@ -45,134 +47,81 @@ None. Ketchup has no external dependencies for core functionality. Export destin
 ```
 Container/Process workload
     │
-    ├─ stdout ──┐
-    │            ├──→ Grill/Bun pipe ──→ Ketchup capture task
-    └─ stderr ──┘                              │
-                                               ├─ Parse timestamp (or assign wall clock)
-                                               ├─ Detect JSON structure (first N lines)
-                                               ├─ Wrap in LogEntry envelope
-                                               ├─ Append to current day's log file
-                                               └─ Update in-memory index
+    └─ stdout ──→ runtime line stream ──→ agent forwarder task
+                                               │  (builds a LogRecord;
+                                               │   stream is ALWAYS Stdout)
+                                               ▼
+                                          mpsc channel
+                                               ▼
+                                       LogStore.append()  ──flush──▶
+                                       logs_NNNNNN.parquet
 ```
 
-Each container or process workload has a dedicated Tokio task that reads from the stdout and stderr file descriptors. The task performs line-splitting (on `\n` boundaries), wraps each line in a `LogEntry` envelope with metadata, and appends it to the current day's log file for that app on that node.
+Bun's agent (`src/bun/agent.rs`) spawns a forwarder task per instance that receives complete lines from the runtime, wraps each in a `LogRecord { app, namespace, stream, line }`, and sends it over an `mpsc` channel to the shared `LogStore`. `LogStore::append` stamps the wall-clock second and pushes the line into an in-memory buffer; a periodic flush turns the buffer into a Parquet file (§3.2).
 
-The capture task is spawned when Bun starts a workload (or reconnects to a running workload after a Bun restart). It is cancelled when the workload stops. Backpressure is handled by the OS pipe buffer: if Ketchup cannot keep up with a workload's log output, the pipe buffer fills, and the workload's write to stdout/stderr blocks. This is the correct behaviour -- a workload that produces logs faster than the disk can absorb them should be throttled, not silently drop logs.
+**stderr is never distinguished from stdout.** The forwarder always sets `stream: LogStream::Stdout` -- there is no separate stderr capture path, and the Apple Container runtime nulls stderr entirely. Every stored line therefore carries `stream = "stdout"`. The `LogStream::Stderr` variant exists in the type and round-trips through the schema, but nothing writes it. **A true separate-stderr capture story is planned -- not yet implemented.**
+
+The capture task is spawned when Bun starts a workload and cancelled when it stops. Backpressure flows through the bounded channel and the runtime's own pipe buffering.
 
 ### 3.2 On-Disk File Layout
 
+**Status of the per-app/per-day `.log`/`.idx`/`.log.zst` layout below: planned -- not yet implemented.** There is no per-app directory, no per-day file, no separate index file, and no `.log`/`.log.zst` lifecycle. What ships is a single flat directory of Parquet files, mirroring `MayoStore`:
+
 ```
-/var/lib/reliaburger/logs/
-├── web/
-│   ├── 2026-02-10.log          # Today's active log file (append-only)
-│   ├── 2026-02-10.idx          # Memory-mapped timestamp index
-│   ├── 2026-02-09.log          # Yesterday (still raw, within retention_days)
-│   ├── 2026-02-09.idx
-│   ├── 2026-02-03.log.zst      # Older file, compressed with zstd
-│   ├── 2026-02-03.idx          # Index is NOT compressed (small, needed for queries)
-│   └── ...
-├── api/
-│   ├── 2026-02-10.log
-│   ├── 2026-02-10.idx
-│   └── ...
-├── payment-service/
-│   └── ...
-└── _events/                    # Cluster events (scheduling, health, deploys)
-    ├── 2026-02-10.log
-    ├── 2026-02-10.idx
-    └── ...
+<storage.logs>/                    # default /var/lib/reliaburger/logs
+├── logs_000000.parquet
+├── logs_000001.parquet
+├── logs_000002.parquet
+└── ...
 ```
 
-**Naming convention:** `<app_name>/<YYYY-MM-DD>.log` and `<app_name>/<YYYY-MM-DD>.idx`. Compressed files add the `.zst` suffix to the log file only. Index files are never compressed because they are small (fixed-size records) and must be random-access readable for time-range queries.
+Each file is one flush of the in-memory buffer. File names come from a counter seeded one past the highest existing `logs_NNNNNN.parquet`, so a restart resumes numbering instead of clobbering. Files are written with ZSTD column compression and small (8192-row) row groups, plus bloom filters on the `app` and `namespace` columns so archive reads can skip row groups that hold no matching rows.
 
-**Day boundary rotation:** At midnight UTC, the capture task closes the current day's file handle and opens a new one. In-flight lines are guaranteed to land in the file matching the timestamp in their `LogEntry` envelope, not the file-open time. If a line arrives at 23:59:59.999 but is processed at 00:00:00.001, it goes into the previous day's file based on its captured timestamp.
+Every file carries the schema:
+
+| Column | Arrow type | Meaning |
+|--------|-----------|---------|
+| `timestamp` | `UInt64` | seconds since Unix epoch |
+| `app` | `Utf8` | app name |
+| `namespace` | `Utf8` | namespace |
+| `stream` | `Utf8` | always `"stdout"` today (see §3.1) |
+| `line` | `Utf8` | the captured line |
+
+**Day-boundary rotation at midnight UTC: planned -- not yet implemented.** Files roll over on flush, not on a calendar boundary; a line lands in whichever flush is current.
 
 ### 3.3 Log File Format
 
-Each `.log` file is a sequence of length-prefixed binary records. This is not a plain text file -- it is a structured append-only format that supports efficient seeking without parsing every line.
-
-```
-┌─────────────────────────────────────────────────────┐
-│ Record:                                             │
-│   [4 bytes]  record_length (u32 little-endian)      │
-│   [8 bytes]  timestamp_nanos (u64 LE, Unix epoch)   │
-│   [1 byte]   stream (0x01 = stdout, 0x02 = stderr)  │
-│   [2 bytes]  instance_id (u16 LE)                   │
-│   [1 byte]   flags (bit 0: is_json)                 │
-│   [N bytes]  line (UTF-8, no trailing newline)      │
-├─────────────────────────────────────────────────────┤
-│ Record:                                             │
-│   ...                                               │
-└─────────────────────────────────────────────────────┘
-```
-
-The `record_length` field covers everything after itself (timestamp + stream + instance_id + flags + line). This allows a reader to skip records without parsing their contents, which is critical for fast seeking.
+**Status: planned -- not yet implemented.** There is no length-prefixed binary record format, no `record_length`/`stream`/`instance_id`/`flags` framing. Lines are stored as Parquet rows (§3.2). Efficient seeking comes from Parquet row-group statistics and predicate pushdown, not a bespoke binary layout.
 
 ### 3.4 Timestamp Index
 
-Each `.idx` file is a flat array of fixed-size index entries, memory-mapped for O(1) random access:
-
-```
-┌─────────────────────────────────────────────────┐
-│ Index Entry (16 bytes):                         │
-│   [8 bytes]  timestamp_nanos (u64 LE)           │
-│   [8 bytes]  file_offset (u64 LE)               │
-├─────────────────────────────────────────────────┤
-│ Index Entry:                                    │
-│   ...                                           │
-└─────────────────────────────────────────────────┘
-```
-
-One index entry is written every 4 KB of log data (configurable via `INDEX_INTERVAL`). This provides a sparse byte-offset index: to find logs at a given timestamp, binary search the index to find the nearest preceding entry, then scan forward from that file offset. With a 4 KB interval, the index for a 100 MB log file has ~25,000 entries (25K * 16 bytes = 400 KB), which fits comfortably in memory. Binary search finds any timestamp in ~15 comparisons, then at most 4 KB of log data needs sequential scanning.
-
-Index entries are always sorted by timestamp (log records are appended in timestamp order because each capture task processes lines sequentially per-workload, and the index is append-only).
+**Status: planned -- not yet implemented.** There is no `.idx` file, no fixed-size `IndexEntry`, no memory-mapped sparse index, and no `INDEX_INTERVAL`. Time-range queries are `WHERE timestamp BETWEEN …` predicates DataFusion pushes down to Parquet row groups.
 
 ### 3.5 JSON Auto-Detection
 
-When a capture task starts (or when Bun reconnects to a running workload), Ketchup examines the first 20 lines from stdout. If all 20 lines are valid JSON objects (parse successfully with `serde_json`), the `is_json` flag is set on all subsequent records for that stream. This flag is sticky per-stream per-workload-lifecycle: once set, it persists until the workload restarts. If a workload emits a mix of JSON and non-JSON lines, the flag is not set, and structured queries fall back to text matching.
-
-The detection window of 20 lines is a tradeoff: large enough to avoid false positives from a single JSON-formatted startup banner, small enough to complete detection quickly. The detection result is logged as a Ketchup-internal event: `ketchup: JSON detection for app=web instance=web-3 stream=stdout result=true`.
+**Status: planned -- not yet implemented.** Ketchup does not sample the first N lines, does not parse them with `serde_json`, and stores no `is_json` flag. `--json-field` is a client-side filter applied to whatever lines come back (§5.3); the store treats every line as opaque text.
 
 ### 3.6 Compression Pipeline
 
-A background Tokio task runs once per hour (configurable) and compresses log files that are older than `retention_days` but younger than `compressed_retention_days`. Compression uses `zstd` at level 3 (the default, which provides a good balance of speed and ratio for log data). The compression pipeline:
-
-1. Identify `.log` files with date stamps older than `retention_days` that do not yet have a `.log.zst` counterpart.
-2. Open the `.log` file read-only.
-3. Compress to a temporary file `<date>.log.zst.tmp` using streaming zstd compression.
-4. `fsync` the temporary file.
-5. Rename `<date>.log.zst.tmp` to `<date>.log.zst` (atomic on POSIX).
-6. Delete the original `.log` file.
-
-The `.idx` file is retained uncompressed. For queries against compressed files, Ketchup decompresses the relevant portion of the `.zst` file on-the-fly using zstd's seekable frame format -- the file is compressed in 256 KB frames, allowing random access to any frame without decompressing the entire file.
+**Status of the hourly `.log`→`.log.zst` seekable-frame pipeline: planned -- not yet implemented.** Compression is not a separate lifecycle stage. Parquet files are written ZSTD-compressed at flush time, per row group, so they are already both compressed and randomly accessible. There is no `compression_level`/`compression_frame_size` knob and no `.tmp`→rename dance.
 
 ### 3.7 Cross-Node Query Architecture
 
 ```
-relish logs web --since 1h --grep "ERROR"
+relish logs web --since 1h --grep "ERROR"          (one-shot, no -f)
     │
     ▼
-Leader receives query
+/v1/logs/query/{app}/{namespace}  on the receiving node
     │
-    ├─ Lookup: which nodes run app "web"?
-    │   (from Meat placement state: node-01, node-02, node-03)
-    │
-    ├─ Fan out LogQuery to node-01, node-02, node-03 in parallel
-    │
-    ▼
-Each node's Ketchup:
-    ├─ Open index for today's file
-    ├─ Binary search for --since timestamp
-    ├─ Scan forward, applying --grep filter
-    ├─ Stream matching LogEntry records back to leader
-    │
-    ▼
-Leader:
-    ├─ Merge-sort results by timestamp (from all nodes)
-    └─ Stream to client (relish CLI or Brioche UI)
+    ├─ Lookup nodes running "web" (council placement state)
+    ├─ Fan out GET /v1/logs/entries/{app}/{namespace} to each (HTTP, not gRPC)
+    ├─ Each node runs LogStore::query locally (DataFusion SQL over Parquet)
+    └─ Merge-sort the returned LogEntry lists by timestamp
 ```
 
-For `relish logs web` with no time range (tail mode), the leader opens a streaming connection to all nodes running the app. Each node's Ketchup tails its active log file and pushes new entries as they are written. The leader merge-sorts the streams by timestamp and forwards to the client. This provides a unified real-time log view across all instances, similar to `stern` in the Kubernetes ecosystem but without requiring a separate tool.
+Non-follow queries fan out over HTTP (`fan_out_query` in `src/ketchup/query.rs`) to the nodes running the app and merge-sort the results by timestamp.
+
+**Follow (`-f`) is local-node only.** `relish logs web -f` opens `GET /v1/logs/{app}/{namespace}?follow=true`, which streams (SSE, or WebSocket via `ws_logs_handler`) new lines from **that node's** agent only, via the `FollowLogs` agent command. There is no cross-node merge of live streams -- the "leader opens a stream to all nodes and merge-sorts" behaviour is **planned -- not yet implemented**. Cross-node aggregation exists only for the non-follow query path.
 
 ---
 
@@ -180,229 +129,62 @@ For `relish logs web` with no time range (tail mode), the leader opens a streami
 
 ### 4.1 Core Types
 
+These are the shipped types (`src/ketchup/types.rs`). Note what is **absent** versus earlier drafts: a `LogEntry` has no `node`, `instance`, or `is_json` field, and `LogStream` is a plain enum, not a `#[repr(u8)]` value used in a binary record.
+
 ```rust
-use std::path::PathBuf;
-use std::time::Duration;
+/// Which output stream a line came from. In practice only Stdout is ever
+/// written (see §3.1); Stderr exists but is never produced.
+pub enum LogStream { Stdout, Stderr }
 
-/// A single log line captured from a workload's stdout or stderr.
-#[derive(Debug, Clone)]
-pub struct LogEntry {
-    /// Nanosecond-precision Unix timestamp of when the line was captured.
-    pub timestamp_nanos: u64,
-    /// The app this log line belongs to (e.g., "web", "api").
+/// A captured line, tagged with its source, before it enters the store.
+pub struct LogRecord {
     pub app: String,
-    /// The specific instance within the app (e.g., "web-3").
-    pub instance: String,
-    /// The node where this log line was captured.
-    pub node: String,
-    /// Which output stream this line came from.
-    pub stream: LogStream,
-    /// The raw log line content (UTF-8, no trailing newline).
+    pub namespace: String,
+    pub stream: LogStream,   // always Stdout in practice
     pub line: String,
-    /// Whether this line was detected as valid JSON.
-    pub is_json: bool,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[repr(u8)]
-pub enum LogStream {
-    Stdout = 0x01,
-    Stderr = 0x02,
-}
-
-/// A single entry in the sparse timestamp index.
-/// Fixed-size (16 bytes) for memory-mapped random access.
-#[derive(Debug, Clone, Copy)]
-#[repr(C, packed)]
-pub struct IndexEntry {
-    /// Nanosecond-precision Unix timestamp.
-    pub timestamp_nanos: u64,
-    /// Byte offset into the corresponding .log file.
-    pub file_offset: u64,
-}
-
-/// Represents a memory-mapped index file for fast timestamp lookups.
-pub struct LogIndex {
-    /// Memory-mapped view of the .idx file.
-    mmap: memmap2::Mmap,
-    /// Number of entries in the index.
-    entry_count: usize,
-    /// Path to the index file (for error reporting).
-    path: PathBuf,
-}
-
-impl LogIndex {
-    /// Binary search for the index entry whose timestamp is <= the target.
-    /// Returns the file offset to start scanning from.
-    pub fn lookup(&self, timestamp_nanos: u64) -> Option<u64> {
-        // Binary search over the fixed-size entries in the mmap.
-        // Each entry is 16 bytes: 8 bytes timestamp + 8 bytes offset.
-        let entries = self.as_slice();
-        let pos = entries.partition_point(|e| e.timestamp_nanos <= timestamp_nanos);
-        if pos == 0 {
-            return Some(0); // Before all indexed entries; start from beginning.
-        }
-        Some(entries[pos - 1].file_offset)
-    }
-
-    fn as_slice(&self) -> &[IndexEntry] {
-        // Safety: IndexEntry is repr(C, packed), 16 bytes, no padding.
-        unsafe {
-            std::slice::from_raw_parts(
-                self.mmap.as_ptr() as *const IndexEntry,
-                self.entry_count,
-            )
-        }
-    }
+/// A single log entry as returned by a query.
+pub struct LogEntry {
+    pub timestamp: u64,      // seconds since Unix epoch (not nanos)
+    pub stream: LogStream,
+    pub line: String,
 }
 ```
+
+There is no `IndexEntry`, no `LogIndex`, and no `memmap2` -- the sparse memory-mapped index is **planned -- not yet implemented** (§3.4).
 
 ### 4.2 Query Types
 
 ```rust
-/// A log query received from the CLI, API, or Brioche UI.
-#[derive(Debug, Clone)]
+/// Parameters for a log query (src/ketchup/types.rs).
 pub struct LogQuery {
-    /// Target app name (required).
     pub app: String,
-    /// Optional instance filter (e.g., "web-3").
-    pub instance: Option<String>,
-    /// Optional node filter.
-    pub node: Option<String>,
-    /// Stream filter (stdout, stderr, or both).
-    pub stream: Option<LogStream>,
-    /// Start of the time range. None means "from the beginning of retained logs."
-    pub since: Option<u64>,
-    /// End of the time range. None means "up to now" (or "follow" if tailing).
-    pub until: Option<u64>,
-    /// Text substring or regex pattern to match against the log line.
-    pub grep: Option<GrepFilter>,
-    /// Structured JSON field query (e.g., level=error).
-    pub json_field: Option<Vec<JsonFieldFilter>>,
-    /// Maximum number of lines to return. None means unlimited (streaming).
-    pub limit: Option<usize>,
-    /// Whether to follow (tail -f mode): keep the connection open and stream
-    /// new lines as they are written.
-    pub follow: bool,
-}
-
-#[derive(Debug, Clone)]
-pub struct GrepFilter {
-    /// The pattern string.
-    pub pattern: String,
-    /// Compiled regex (compiled once at query parse time).
-    pub regex: regex::Regex,
-    /// Case-insensitive flag.
-    pub case_insensitive: bool,
-}
-
-#[derive(Debug, Clone)]
-pub struct JsonFieldFilter {
-    /// Dot-separated JSON field path (e.g., "level" or "request.method").
-    pub field_path: String,
-    /// Expected value (string comparison after JSON extraction).
-    pub value: String,
+    pub namespace: String,
+    pub start: Option<u64>,             // inclusive, seconds since epoch
+    pub end: Option<u64>,               // inclusive, seconds since epoch
+    pub grep: Option<String>,           // SUBSTRING match, not regex
+    pub json_field: Option<(String, String)>,  // single (key, value)
+    pub tail: Option<usize>,            // last N lines
 }
 ```
+
+The differences from earlier drafts are load-bearing:
+
+- **`grep` is a plain substring**, applied as SQL `line LIKE '%…%'`. There is no `GrepFilter`, no compiled `regex::Regex`, and no case-insensitive `--grep-i` (the `regex` crate is not a dependency here). **Regex grep: planned -- not yet implemented.**
+- **`json_field` is a single `(key, value)` pair**, matched **client-side** against the top-level key only. Multiple ANDed filters and dot-path traversal (`request.method`) are **planned -- not yet implemented**.
+- There is **no `instance` filter**, **no `node` filter**, **no `stream` filter**, and **no `until`/`end`-as-follow** field. `--instance` does not exist. **`--until`: planned -- not yet implemented** (the CLI has `--since` only).
+- Follow is not a field on `LogQuery`; it is a separate agent command (§3.7).
 
 ### 4.3 Export and Retention Configuration
 
-```rust
-/// Configuration for log export to an external destination.
-#[derive(Debug, Clone, Deserialize)]
-pub struct LogExportConfig {
-    /// Destination URI (e.g., "s3://my-bucket/logs/", "gs://my-bucket/logs/",
-    /// "https://logs.example.com/ingest").
-    pub destination: String,
-    /// Output format. Currently only "jsonl.gz" is supported.
-    pub format: ExportFormat,
-    /// How often to run the export (e.g., "1h", "6h", "24h").
-    pub interval: Duration,
-    /// Optional: only export logs for specific apps. None means all apps.
-    pub apps: Option<Vec<String>>,
-    /// Optional: include or exclude specific fields in the export.
-    pub fields: Option<ExportFieldSelection>,
-}
+The shipped log config is small (`LogsSection` in `src/config/node.rs`): `retention_days` (default 7), `export_path` (optional), `export_interval_secs` (default 3600), `max_storage_mb` (default 0 = unlimited). See §6.
 
-#[derive(Debug, Clone, Deserialize)]
-pub enum ExportFormat {
-    /// Newline-delimited JSON, gzip-compressed. Each line is a full LogEntry
-    /// serialised as JSON.
-    #[serde(rename = "jsonl.gz")]
-    JsonlGz,
-}
-
-#[derive(Debug, Clone, Deserialize)]
-pub struct ExportFieldSelection {
-    /// Fields to include. If set, only these fields appear in the export.
-    pub include: Option<Vec<String>>,
-    /// Fields to exclude. Applied after include.
-    pub exclude: Option<Vec<String>>,
-}
-
-/// Retention policy for logs on a node.
-#[derive(Debug, Clone, Deserialize)]
-pub struct RetentionPolicy {
-    /// Number of days to keep raw (uncompressed) log files. Default: 7.
-    pub retention_days: u32,
-    /// Number of days to keep compressed log files. Default: 30.
-    /// After this period, compressed files are deleted.
-    pub compressed_retention_days: u32,
-    /// Maximum total storage for logs on this node. When exceeded,
-    /// the oldest compressed files are evicted first, then the oldest raw files.
-    pub max_storage: ByteSize,
-}
-
-/// Parsed byte size (e.g., "20Gi" -> 21474836480 bytes).
-#[derive(Debug, Clone, Deserialize)]
-pub struct ByteSize(pub u64);
-```
+**Status of the richer config below: planned -- not yet implemented.** There is no `LogExportConfig` struct, no `ExportFormat` (the export format is Parquet-as-is, **not** `jsonl.gz`), no `apps`/`fields` include/exclude selection, no `compressed_retention_days`, and no `ByteSize` string parser (`max_storage_mb` is a plain integer of megabytes). Export ships the ZSTD-Parquet files unchanged so an exported archive is queryable with the same DataFusion path as local logs.
 
 ### 4.4 Internal Capture State
 
-```rust
-/// Per-workload capture state maintained by the Ketchup module inside Bun.
-pub struct CaptureHandle {
-    /// The app this capture belongs to.
-    pub app: String,
-    /// The instance name (e.g., "web-3").
-    pub instance: String,
-    /// Instance ID (u16, used in the binary log record for compact encoding).
-    pub instance_id: u16,
-    /// Handle to the Tokio task reading stdout.
-    pub stdout_task: tokio::task::JoinHandle<()>,
-    /// Handle to the Tokio task reading stderr.
-    pub stderr_task: tokio::task::JoinHandle<()>,
-    /// Whether JSON auto-detection has completed for stdout.
-    pub stdout_json_detected: bool,
-    /// Whether JSON auto-detection has completed for stderr.
-    pub stderr_json_detected: bool,
-    /// Cancellation token for graceful shutdown.
-    pub cancel: tokio_util::sync::CancellationToken,
-}
-
-/// Writer state for a single app's log file on a single day.
-pub struct DayLogWriter {
-    /// The app name.
-    pub app: String,
-    /// The date this writer covers (YYYY-MM-DD).
-    pub date: chrono::NaiveDate,
-    /// File handle for the .log file, opened in append mode.
-    pub log_file: tokio::fs::File,
-    /// File handle for the .idx file, opened in append mode.
-    pub idx_file: tokio::fs::File,
-    /// Byte offset at last index entry.
-    pub last_index_offset: u64,
-    /// The index interval in bytes (write an index entry every N bytes).
-    pub index_interval: u64,
-    /// Current byte offset in the log file (tracked in-memory to avoid seeks).
-    pub current_offset: u64,
-    /// Mapping from instance name to instance_id for this day.
-    pub instance_ids: HashMap<String, u16>,
-    /// Next available instance_id.
-    pub next_instance_id: u16,
-}
-```
+**Status: planned -- not yet implemented.** There is no `CaptureHandle` with separate `stdout_task`/`stderr_task`/`*_json_detected` fields, and no `DayLogWriter` (no per-day file, no `.idx`, no `instance_id` mapping, no `chrono::NaiveDate`). The shipped capture is a per-instance forwarder task feeding a shared `LogStore` over an `mpsc` channel (§3.1); the store buffers in memory and flushes to Parquet (§3.2).
 
 ---
 
@@ -410,69 +192,52 @@ pub struct DayLogWriter {
 
 ### 5.1 Log Capture
 
-**Container workloads:** When Grill starts a container, it returns the stdout and stderr file descriptors (Unix pipes). Bun passes these to Ketchup, which spawns two Tokio tasks (one per stream) via `tokio::io::BufReader::new(AsyncFd::new(fd))`. Each task reads lines using `AsyncBufReadExt::read_line()`, wraps them in a `LogEntry`, and sends them to the `DayLogWriter` for the current day via an `mpsc` channel.
+Bun's agent (`src/bun/agent.rs`) receives complete lines from the runtime's stdout stream, builds a `LogRecord { app, namespace, stream: Stdout, line }`, and forwards it over an `mpsc` channel to the shared `LogStore`. Container and process workloads use the same path.
 
-**Process workloads:** Bun spawns the process with `tokio::process::Command` using `stdout(Stdio::piped())` and `stderr(Stdio::piped())`. The resulting `ChildStdout` and `ChildStderr` handles are passed to Ketchup in the same way as container file descriptors.
+As noted in §3.1, only stdout is captured: the forwarder always tags `LogStream::Stdout`, and the Apple Container runtime nulls stderr. **Separate stderr capture is planned -- not yet implemented.**
 
-**Reconnection after Bun restart:** When Bun restarts (e.g., during a self-upgrade), it queries the container runtime to discover running containers and reconnects to their stdout/stderr streams. Ketchup resumes capture from the current position in the stream. Log lines emitted while Bun was restarting are buffered in the OS pipe (default 64 KB on Linux). If the pipe buffer overflows (workload blocked on write), the lines are still not lost -- they are delivered when the capture task resumes. There is a gap in timestamps corresponding to the Bun restart duration, but no log lines are dropped.
+The `AsyncFd`/two-tasks-per-stream/`DayLogWriter` mechanics from earlier drafts, and the pipe-buffer reconnection guarantees around a Bun restart, describe the planned design, not the shipped forwarder.
 
 ### 5.2 Structured JSON Detection
 
-The detection algorithm per-stream per-workload:
-
-```
-1. Collect the first 20 lines from the stream into a detection buffer.
-2. For each line, attempt serde_json::from_str::<serde_json::Value>(&line).
-3. If all 20 lines parse as JSON objects (Value::Object), set is_json = true.
-4. If any line fails to parse, or parses as a non-object type, set is_json = false.
-5. Flush the detection buffer to the log file (with the determined is_json flag).
-6. For all subsequent lines, use the determined is_json flag without re-checking.
-```
-
-The detection buffer introduces a maximum latency of 20 lines before the first log output appears for a newly started workload. For workloads that emit fewer than 20 lines and then go quiet, a timeout of 5 seconds triggers early detection with whatever lines are available (if all N < 20 lines are JSON objects, `is_json = true`; if N = 0, `is_json = false`).
+**Status: planned -- not yet implemented.** There is no first-20-lines sampling, no `is_json` flag, and no per-stream detection buffer. The store keeps every line as opaque text; `--json-field` is a client-side match applied at query time (§5.3).
 
 ### 5.3 Querying
 
-All query operations are initiated via `relish logs` (CLI), the Brioche UI, or the HTTP API.
+Query operations are initiated via `relish logs` (CLI), the Brioche UI, or the HTTP API. The CLI flags that exist are `--tail`, `-f/--follow`, `--grep`, `--since`, and `--json-field` (`src/relish/commands.rs`).
 
-**Tail (default mode):**
+**One-shot fetch (default mode):**
 ```bash
 relish logs web
 ```
-Opens a streaming follow connection. The leader fans the query to all nodes running `web`. Each node tails its active log file using `inotify` (Linux) to detect new writes and streams new entries. The leader merge-sorts by timestamp and streams to the client. The client displays lines as they arrive, prefixed with instance name and stream indicator.
+Without `-f`, this is a **one-shot fetch**, not a tail/follow. It returns the (optionally `--tail`-limited) current logs and exits. It first tries the cross-node query endpoint (`/v1/logs/query/...`), which fans out over HTTP to the nodes running the app and merge-sorts by timestamp (§3.7).
 
-**Time range query:**
+**Follow:**
+```bash
+relish logs web -f
+```
+`-f` streams new lines from the **local node only** (§3.7). It is not a cluster-wide merged tail.
+
+**Time range:**
 ```bash
 relish logs web --since 1h
-relish logs web --since "2026-02-10T14:00:00Z" --until "2026-02-10T15:00:00Z"
+relish logs web --since 1739196000        # raw epoch seconds
 ```
-Each node uses the `LogIndex::lookup()` to binary-search the index for the start timestamp, then scans forward to the end timestamp. For queries spanning multiple days, Ketchup opens the relevant day files in sequence. For compressed files, Ketchup uses zstd seekable decompression to jump to the correct frame.
+`--since` accepts **raw epoch seconds or a duration** (e.g. `1h`, `30m`); it is parsed by `parse_since` into a start timestamp. **RFC3339 timestamps and `--until` are not supported** -- an `--until` flag does not exist. (RFC3339 parsing and an end bound: planned -- not yet implemented.)
 
 **Text search (grep):**
 ```bash
-relish logs web --grep "ERROR"
-relish logs web --grep "user_id=abc.*timeout" --since 24h
+relish logs web --grep ERROR
 ```
-The `--grep` pattern is compiled to a `regex::Regex` at query time and applied to each log line during the scan. The regex is applied after the time-range filter (index lookup first, then scan + filter). Case-insensitive matching is available via `--grep-i`.
+`--grep` is a **substring** match. Server-side it becomes `line LIKE '%ERROR%'`; the client also re-checks the substring. It is **not** a regex, and there is **no `--grep-i`** case-insensitive variant.
 
-**Structured JSON field queries:**
+**Structured JSON field query:**
 ```bash
 relish logs web --json-field level=error
-relish logs web --json-field "request.status=500" --json-field "request.method=POST"
 ```
-For lines where `is_json = true`, the line is parsed with `serde_json` and the specified field path is extracted using dot-notation traversal. The extracted value is compared as a string. Multiple `--json-field` filters are ANDed. Lines where `is_json = false` are skipped (not matched) when a `--json-field` filter is active.
+A single `key=value` filter, applied **client-side**: each returned line is parsed as JSON and the **top-level** `key` compared as a string. Multiple `--json-field` flags and dot-path traversal (`request.method=POST`) are **planned -- not yet implemented**.
 
-**Instance filter:**
-```bash
-relish logs web --instance web-3
-```
-Filters records by the `instance_id` field in the binary record. The instance name-to-ID mapping is stored in the `DayLogWriter` and reconstructed from the log file header on query (the first occurrence of each instance_id in the file establishes the mapping).
-
-**Combined filters:**
-```bash
-relish logs web --instance web-3 --since 1h --grep "ERROR" --json-field level=error
-```
-Filters are applied in order of cheapness: time range (index lookup) -> instance_id (field comparison) -> is_json flag check -> JSON field extraction -> grep regex. This minimizes the number of lines that require expensive operations.
+**Instance filter:** **Status: planned -- not yet implemented.** There is no `--instance` flag; logs are not tagged with an instance id.
 
 ### 5.4 Log Export
 
@@ -502,106 +267,52 @@ s3://my-bucket/logs/<node>/logs_NNNNNN.parquet
 
 ### 5.5 Retention Management
 
-A background task runs once per hour and enforces the retention policy:
+Retention is the same Parquet-file model as Mayo (`src/bun/disk_pressure.rs`, `check_and_relieve`), keyed on `retention_days` and `max_storage_mb`:
 
-1. **Delete expired compressed files:** Any `.log.zst` file with a date older than `compressed_retention_days` ago is deleted, along with its `.idx` file.
-2. **Compress aging raw files:** Any `.log` file with a date older than `retention_days` ago (but within `compressed_retention_days`) is compressed to `.log.zst` and the original is deleted.
-3. **Enforce max_storage:** If the total size of all files under `/var/lib/reliaburger/logs/` exceeds `max_storage`, the oldest compressed files are evicted first (oldest date first, across all apps). If compressed files are exhausted and storage is still over the limit, the oldest raw files are evicted. Active (today's) files are never evicted.
+1. If `export_path` is set, un-exported Parquet files are shipped to the destination first; only files whose exact bytes are recorded in the export checkpoint become eligible for deletion.
+2. Files are pruned **oldest-first by mtime** when past `retention_days` or when total size exceeds `max_storage_mb` (0 = unlimited, so only the retention cutoff applies).
 
-Eviction events are logged as cluster events visible in `relish events --type log-retention`.
+**Status of the compression lifecycle: planned -- not yet implemented.** There is no `.log`→`.log.zst` compression step (Parquet is already ZSTD-compressed at write time), no separate `compressed_retention_days`, no per-app byte counter, no `log.storage_exhausted` alert, and no `relish events --type log-retention` stream. Pruning deletes whole Parquet files.
 
 ### 5.6 Cross-Node Log Aggregation
 
-The `relish logs` command provides a unified view across all nodes. The aggregation flow:
+For **non-follow** queries, `/v1/logs/query/{app}/{namespace}` looks up which nodes run the app (council placement state), fans the query out over **HTTP** to each node's `/v1/logs/entries/...`, and merge-sorts the returned `LogEntry` lists by `timestamp` (`fan_out_query` in `src/ketchup/query.rs`). Transport is HTTP; there is no gRPC and no newline-delimited streaming protocol.
 
-1. The CLI sends a `LogQuery` to the cluster leader via the HTTP API.
-2. The leader looks up which nodes run the target app (from the Raft-stored placement state).
-3. The leader opens concurrent HTTP streams to each relevant node's Ketchup endpoint.
-4. Each node's Ketchup executes the query locally and streams matching `LogEntry` records.
-5. The leader performs a k-way merge sort on the incoming streams, ordered by `timestamp_nanos`.
-6. Merged entries are streamed back to the CLI (or Brioche UI) as newline-delimited JSON over the HTTP response.
-
-For follow/tail mode, the streams remain open and new entries are pushed as they arrive. The merge maintains a small buffer (100ms window) to handle clock skew between nodes before emitting entries to the client.
+**Follow across all nodes is planned -- not yet implemented.** `-f` streams from the local node only (§3.7). The k-way live merge with a 100ms clock-skew window belongs to the planned design.
 
 ---
 
 ## 6. Configuration
 
-All configuration is in the node's TOML config file under the `[logs]` section.
+All log configuration lives under the `[logs]` section (`LogsSection` in `src/config/node.rs`). It has just four keys; unknown keys are rejected (`deny_unknown_fields`), so a config that still sets the planned keys below gets a clear error naming the field.
 
 ```toml
-# ── Logs (Ketchup) ─────────────────────────────────
 [logs]
-# Number of days to keep raw (uncompressed) log files.
-# After this period, files are compressed with zstd.
-# Default: 7
+# Days to retain log Parquet files before pruning. Default: 7.
 retention_days = 7
 
-# Number of days to keep compressed log files.
-# After this period, compressed files are deleted.
-# Default: 30
-compressed_retention_days = 30
+# Optional export destination for Parquet log files. When set, un-exported
+# files are periodically shipped here via object_store. Accepts a local path,
+# a file:// URL, or an object-store URL (s3://…, gs://…). Default: unset.
+# export_path = "s3://bucket/logs/"
 
-# Maximum total disk space for log storage on this node.
-# When exceeded, oldest files are evicted (compressed first, then raw).
-# Default: "20Gi"
-max_storage = "20Gi"
+# How often to export (seconds). Default: 3600 (1 hour).
+export_interval_secs = 3600
 
-# Sparse index interval in bytes: one index entry per N bytes of log data.
-# Lower values = faster time-range lookups, larger index files.
-# Default: 4096 (4 KB)
-index_interval = 4096
-
-# Zstd compression level for archived log files (1-22).
-# Level 3 is the default, offering good compression ratio with fast speed.
-# Default: 3
-compression_level = 3
-
-# Zstd seekable frame size in bytes. Larger frames = better compression ratio,
-# smaller frames = faster random access into compressed files.
-# Default: 262144 (256 KB)
-compression_frame_size = 262144
-
-# How often to run the compression and retention cleanup task.
-# Default: "1h"
-maintenance_interval = "1h"
-
-# ── Log Export (optional) ──────────────────────────
-[logs.export]
-# Destination URI for log export.
-# Supported schemes: s3://, gs://, https://
-# No default (export is disabled if not set).
-destination = "s3://my-bucket/logs/"
-
-# Export file format. Currently only "jsonl.gz" is supported.
-# Default: "jsonl.gz"
-format = "jsonl.gz"
-
-# How often to run the export.
-# Default: "1h"
-interval = "1h"
-
-# Optional: only export logs for these apps.
-# Default: all apps.
-# apps = ["web", "api"]
-
-# ── Per-App Overrides (in the app definition) ──────
-# [app.noisy-worker]
-# image = "worker:latest"
-# logs.retention_days = 3          # Override: keep raw logs for only 3 days
-# logs.max_line_length = 4096      # Truncate lines longer than 4 KB
-# logs.suppress_stderr = false     # Default: capture both streams
+# Maximum local log Parquet storage (MB). 0 = unlimited (the default).
+# When exceeded, exported files are pruned oldest-first.
+max_storage_mb = 0
 ```
+
+**Status: planned -- not yet implemented (none of these keys exist).** `compressed_retention_days`, `index_interval`, `compression_level`, `compression_frame_size`, `maintenance_interval`, the `[logs.export]` sub-table with `format = "jsonl.gz"`/`apps`/`fields`, and per-app overrides (`[app.*]` `logs.retention_days`/`logs.max_line_length`/`logs.suppress_stderr`). `max_storage` is not a byte-size string; it is the integer `max_storage_mb`. Export format is Parquet, not `jsonl.gz`.
 
 ### Configuration Defaults and Rationale
 
 | Parameter | Default | Rationale |
 |-----------|---------|-----------|
-| `retention_days` | 7 | Covers a typical on-call rotation. Most debugging happens within hours, but a week of raw logs enables post-incident review. |
-| `compressed_retention_days` | 30 | Compressed logs are ~10x smaller; a month of history is cheap to store. |
-| `max_storage` | 20 Gi | Prevents runaway log growth from consuming disk needed by the container runtime and application volumes. |
-| `index_interval` | 4096 | At 4 KB per index entry, the index for a 100 MB file is ~400 KB (~0.4%). A time-range query requires binary search (~15 comparisons) then at most 4 KB of sequential scan. |
-| `compression_level` | 3 | Zstd level 3 compresses log data at ~400 MB/s with a typical ratio of 5-10x. Higher levels offer diminishing returns for log data. |
+| `retention_days` | 7 | Covers a typical on-call rotation; a week of logs enables post-incident review. |
+| `export_interval_secs` | 3600 | Hourly export keeps the object-store archive current without excessive churn. |
+| `max_storage_mb` | 0 (unlimited) | Off by default; set it to cap local log growth, at which point exported files are pruned oldest-first. |
 
 ---
 
@@ -609,48 +320,29 @@ interval = "1h"
 
 ### 7.1 Storage Exhaustion
 
-**Trigger:** Log output exceeds `max_storage` or the underlying filesystem fills up.
+**Trigger:** local log Parquet exceeds `max_storage_mb`, or `retention_days` elapses.
 
-**Detection:** The retention task checks total log storage every maintenance interval. Additionally, Ketchup monitors `write()` return values on every log append -- an `ENOSPC` error triggers immediate eviction.
+**Response (`src/bun/disk_pressure.rs`):** if `export_path` is set, un-exported files are shipped first (and only checkpoint-recorded files become deletable); then files are pruned oldest-first by mtime while past retention or over the size cap. With `max_storage_mb = 0` only the retention cutoff prunes.
 
-**Response:**
-
-1. Emergency eviction: delete the oldest compressed files across all apps until storage drops below 90% of `max_storage`.
-2. If still over limit after all compressed files are deleted, delete the oldest raw files (except today's active files).
-3. If today's active files alone exceed `max_storage`, emit a `critical` alert (`log.storage_exhausted`) and begin dropping log lines from the highest-volume app (tracked by a per-app byte counter). Dropped lines are counted but not stored; the count is visible in `relish events`.
-4. The `disk.filling` alert from Mayo also fires independently, alerting the operator to the underlying disk pressure.
-
-**Invariant:** Ketchup never causes a node to become unhealthy due to disk exhaustion. Log data is the lowest-priority data on the node (below container images, application volumes, metrics, and Raft state).
+The emergency per-app line-dropping, the `log.storage_exhausted` alert, and the `relish events` drop counter from earlier drafts are **planned -- not yet implemented**. There is no `ENOSPC`-triggered eviction path; pruning runs on the periodic pressure check.
 
 ### 7.2 Container Restart During Capture
 
-**Trigger:** A container is killed (OOM, health check failure, deploy) while the capture task is reading its stdout/stderr.
+When a workload stops, its forwarder task ends; a new one is spawned when a new instance starts. **Partial-line flushing with an `is_truncated` marker is planned -- not yet implemented** -- there is no truncation flag on a stored line (the record has no `flags` field).
 
-**Response:** The capture task's `read_line()` call returns `Ok(0)` (EOF) or `Err(BrokenPipe)`. The task logs the termination reason (if available from Grill), flushes any partial line in its buffer (with a `[truncated]` marker if the line lacks a trailing newline), and exits. When the new container instance starts, a new capture task is spawned.
+### 7.3 Corrupt Parquet File
 
-**Partial line handling:** If the container is killed mid-line (no `\n` before EOF), the partial content is flushed as a complete record with an `is_truncated` flag. This prevents silent data loss for the last line of output before a crash -- which is often the most important line for debugging.
+**Trigger:** power loss or a crash mid-flush leaves a truncated or garbage `.parquet` file.
 
-### 7.3 Corrupt Index
-
-**Trigger:** Power loss or kernel panic during an index write leaves a truncated or corrupt `.idx` file.
-
-**Detection:** On startup (or when opening an index for a query), Ketchup validates that the file size is a multiple of 16 bytes (the `IndexEntry` size). If not, the file is truncated to the nearest valid boundary. Additionally, the last entry's `file_offset` is validated against the actual `.log` file size.
-
-**Recovery:** If the index is corrupt beyond simple truncation (e.g., entries are not monotonically increasing in timestamp), Ketchup rebuilds the index by scanning the `.log` file from the beginning. This is O(N) in the number of records but only happens on corruption, not on normal startup. A rebuild event is logged.
-
-**Prevention:** Index entries are written with a single `write()` syscall (16 bytes, well within the atomic write guarantee for regular files on Linux). Combined with the append-only nature of the file, corruption requires a kernel-level failure, not an application bug.
+**Response:** on query the log store registers the Parquet directory as a DataFusion `ListingTable`; an unreadable file surfaces as a read/plan error for that scan. (Mayo's metrics store skips corrupt files per-file with a log; the corresponding per-file skip on the log read path is a reasonable follow-up.) There is no `.idx` file, so the "corrupt index / rebuild by scanning" story does not apply -- that whole mechanism is **planned -- not yet implemented** along with the index itself (§3.4).
 
 ### 7.4 Clock Skew
 
-**Trigger:** The system clock jumps backward (NTP correction, VM migration).
-
-**Response:** Ketchup uses monotonic timestamps for ordering within a single capture session and wall-clock timestamps for the `LogEntry` envelope. If the wall clock jumps backward, the index may contain non-monotonic entries for a brief period. The query engine handles this gracefully: the binary search finds an approximate position, and the forward scan skips entries outside the requested range. Cross-node merge sort tolerates clock skew via the 100ms buffering window.
+Timestamps are wall-clock seconds stamped at `append`. A backward clock jump can make stored timestamps non-monotonic; queries are ordinary `ORDER BY timestamp` SQL, which tolerates that. The monotonic-session-clock and 100ms cross-node merge window from earlier drafts are **planned -- not yet implemented**.
 
 ### 7.5 High-Volume Log Flood
 
-**Trigger:** A workload emits log lines at a rate that exceeds the disk write bandwidth.
-
-**Response:** OS pipe backpressure throttles the workload's stdout/stderr writes. This is intentional -- a workload that logs faster than the system can handle should be slowed down, not allowed to silently drop logs. If the operator prefers to drop logs rather than slow the workload, a future `logs.drop_policy = "tail"` option could allow Ketchup to discard lines from its read buffer when write throughput is insufficient (see Open Questions).
+Backpressure flows through the bounded `mpsc` channel from the forwarder into the store, and through the runtime's own buffering upstream of that. A `logs.drop_policy` knob is **planned -- not yet implemented** (see Open Questions).
 
 ---
 
@@ -658,37 +350,29 @@ interval = "1h"
 
 ### 8.1 Log Access Control
 
-Log access is governed by Reliaburger's existing permission model (Sesame). The relevant permissions:
+**What ships:** the log routes require an authenticated token (`AnyToken` in `src/bun/authz.rs`). The per-app routes (`/v1/logs/{app}/{namespace}`, `/v1/logs/entries/...`, `/v1/logs/query/...`, and the follow/WebSocket variants) additionally enforce **tenant scope** via `authorize_scoped` before serving -- a scoped token can only read logs for its own namespace/app, and the scope check for a follow socket runs *before* the upgrade. The raw-SQL endpoint `/v1/logs/sql` reads across every tenant, so it deliberately **refuses scoped tokens** (it takes no app to scope by) and caps results (`MAX_LOG_SQL_ROWS`, a 256 MiB working-memory limit, read-only `SELECT`/`WITH` only).
 
-| Permission | Scope | Grants |
-|------------|-------|--------|
-| `logs:read` | Per-app or cluster-wide | Read log lines for the specified app(s). |
-| `logs:export` | Cluster-wide | Configure and trigger log export. |
-| `logs:admin` | Cluster-wide | Modify retention policies, delete log files. |
+**Status of the `logs:read`/`logs:export`/`logs:admin` permission model, the `viewer` role's line-limit, and per-permission scoping: planned -- not yet implemented.** There are no `logs:*` permissions; access is the `AnyToken` + tenant-scope model above.
 
-By default, the `admin` role has all log permissions. The `developer` role has `logs:read` for apps in their namespace. The `viewer` role has `logs:read` with a configurable line limit (default: last 1000 lines) to prevent bulk exfiltration via the query API.
-
-**API enforcement:** Every `LogQuery` arriving at a node's Ketchup endpoint carries the authenticated identity of the requester (from the mTLS certificate or API token). Ketchup verifies that the requester has `logs:read` permission for the target app before executing the query. Cross-node fan-out queries carry the original requester's identity, not the leader's identity, so permission checks are enforced at the data source.
+Cross-node fan-out carries a service token between nodes; a per-request "original requester identity forwarded to the data source" model is **planned -- not yet implemented**.
 
 ### 8.2 Sensitive Data in Logs
 
 Ketchup does **not** perform automatic redaction of sensitive data in log lines. This is a deliberate design choice: automatic redaction is unreliable (false positives corrupt debugging data, false negatives provide a false sense of security) and should be the responsibility of the application.
 
-However, Ketchup provides two mechanisms for operators who need log data controls:
+Both operator-facing data controls below are **planned -- not yet implemented**: there is no `[logs.export]` `fields.exclude` field filtering (export ships whole Parquet files unchanged), and there is no built-in log-scrubbing Job.
 
-1. **Export field filtering:** The `[logs.export]` config supports `fields.exclude` to strip specific JSON fields before export. This allows operators to export logs to external systems without including fields like `user.email` or `request.headers.authorisation`.
-
-2. **Log scrubbing jobs:** Operators can define a Job that runs periodically and scrubs specific patterns from log files on disk. This is a power-user feature and is not recommended for most deployments (it modifies append-only files, which invalidates indexes and requires a rebuild).
-
-**Recommendation in documentation:** Applications should avoid logging secrets, tokens, passwords, and PII. Ketchup treats log lines as opaque data and stores them as-is.
+**Recommendation:** Applications should avoid logging secrets, tokens, passwords, and PII. Ketchup treats log lines as opaque data and stores them as-is.
 
 ### 8.3 Log File Permissions
 
-On-disk log files are owned by the Bun process user (typically `reliaburger` or `root`) with mode `0640`. The group is set to a configurable `log_group` (default: same as the Bun process group). Containers cannot access log files directly -- they are outside the container's mount namespace. Access is only available via the Ketchup query API (which enforces permissions) or direct host filesystem access (which requires host-level privileges).
+Log Parquet files are written by the Bun process user under `storage.logs` and are not on any container's mount namespace, so a workload cannot read them directly -- access is via the query API (token + tenant scope, §8.1) or host-level filesystem access. **The explicit `0640` mode and configurable `log_group` are planned -- not yet implemented**; files get the process's default creation mode.
 
 ---
 
 ## 9. Performance
+
+**Reconciliation note:** the figures below were derived for the planned binary-record + memory-mapped-index design. They do not describe the shipped store, which buffers `LogRecord`s over a bounded `mpsc` channel and flushes them to ZSTD-Parquet; there is no `DayLogWriter`, no `writev` of binary records, no 16-byte record overhead, no `.idx` binary search, no `mmap`, and no `regex`-crate grep (grep is Parquet `LIKE`). Read the subsections as targets for the planned design, not measurements of what ships.
 
 ### 9.1 Write Throughput
 
@@ -730,6 +414,8 @@ The dominant memory cost is the `mpsc` channel buffers. If memory pressure is a 
 ---
 
 ## 10. Testing Strategy
+
+**Reconciliation note:** the tables below list tests for the planned binary-format/index/JSON-detection/regex design and do not match the current suite. The shipped tests instead cover the Parquet `LogStore` (append/flush/reopen without clobbering, query by app + time range + substring grep + tail, distinct-app listing, SQL-injection escaping, bounded raw-SQL), the exported-Parquet query path (`remote_query`), and the `LogEntry`/`LogQueryResult` JSON round-trips. Read what follows as the target matrix for the planned features.
 
 ### 10.1 Unit Tests
 
@@ -866,7 +552,9 @@ Some applications (e.g., HTTP access logs for high-traffic APIs) produce million
 
 ### 13.3 Real-Time Log Streaming Protocol
 
-The current design uses HTTP/2 streaming for cross-node log fan-out (the leader opens a stream to each node and merge-sorts the results). This works for the `relish logs --follow` use case but has limitations:
+**Reconciliation note:** today `--follow` is local-node only (§3.7) -- there is no cross-node live merge. What ships for non-follow queries is an HTTP fan-out that runs each node's SQL query and merge-sorts the returned lists. The paragraph below describes the planned cross-node streaming design, not current behaviour.
+
+The planned design uses streaming for cross-node log fan-out (the leader opens a stream to each node and merge-sorts the results). This targets the `relish logs --follow` use case but has limitations:
 
 1. **Latency:** HTTP/2 framing adds overhead. A dedicated binary protocol over the existing inter-node mTLS connections could reduce tail latency for real-time streaming.
 

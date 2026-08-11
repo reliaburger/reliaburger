@@ -16,7 +16,7 @@ Meat is the single decision-maker for "what runs where." Every App placement, Jo
 
 - **Bin-packing first.** Meat uses a bin-packing algorithm as its primary placement strategy, maximising node utilisation before spreading to new nodes. This reduces the number of active nodes under low load and improves cache locality for images already present on a node.
 
-- **Dedicated CPU budget.** When the cluster exceeds 1,000 nodes, Meat's async task is pinned to a specific CPU core on the leader node, ensuring that API serving, Brioche UI, metrics queries, and other leader responsibilities cannot starve the scheduling loop.
+- **Dedicated CPU budget (planned — not yet implemented).** The intent is that when the cluster exceeds 1,000 nodes, Meat's async task is pinned to a specific CPU core on the leader node, ensuring that API serving, Brioche UI, metrics queries, and other leader responsibilities cannot starve the scheduling loop. No CPU-core pinning exists in the code today; the scheduling loop is an ordinary tokio task sharing the runtime.
 
 - **Learning period before scheduling.** After a leader election, Meat enters a learning period (collecting StateReports from nodes) and does not make scheduling decisions until it has a sufficiently complete view of the cluster (95% of nodes reported or 15-second timeout). This prevents incorrect placements based on stale or incomplete state.
 
@@ -107,9 +107,9 @@ Meat uses a four-phase placement pipeline for App scheduling:
 
 - **Bin-packing score (weight 50):** Prefer nodes with the least remaining allocatable resources after placing this workload. This maximizes density.
 - **Preferred label score (weight 20):** Nodes matching `preferred` labels receive a bonus.
-- **Image locality score (weight 15):** Nodes that already have the required image layers cached in Pickle score higher. *Currently a placeholder (returns 0) — wiring to the Pickle ManifestCatalog layer_locations is a follow-up task.*
-- **Spread score (weight 10):** Penalize nodes that already run other replicas of the same App. This provides failure-domain diversity.
-- **Node stability score (weight 5):** Prefer nodes with longer uptime and no recent restarts. *Currently a placeholder (returns 50) — wiring to actual node uptime tracking is a follow-up task.*
+- **Image locality score (weight 15):** Nodes that already have the required image cached score higher (full marks if the image is present, zero otherwise).
+- **Spread score (weight 60):** Penalize nodes that already run other replicas of the same App. This provides failure-domain diversity. The weight deliberately exceeds bin-packing's 50, so a spread-clean node always outscores a fuller node running the same app.
+- **Node stability score (weight 5):** Prefer nodes with longer uptime, scaled from the node's reported uptime (full marks at 24h).
 
 **Phase 3: Select.** Pick the highest-scoring node. Ties are broken by node ID (deterministic). For multi-replica placements, Meat runs the pipeline iteratively, updating the cluster state cache after each placement to reflect the newly committed resources.
 
@@ -420,8 +420,15 @@ pub enum NodeStatus {
 
 ### Scheduling Decisions
 
+The shipped `SchedulingDecision` (in `meat::types`) is deliberately minimal: it
+carries the app being scheduled and one `Placement` (node + reserved resources)
+per replica. The richer shape below — a per-decision `decision_id`, a
+`spec_version`, an allocated port, and a timestamp — is **planned — not yet
+implemented**; those fields back the replay-protection design in Section 8.4,
+which the current struct cannot enforce.
+
 ```rust
-/// A placement decision for a single App replica.
+/// A placement decision for a single App replica. (Planned shape.)
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct SchedulingDecision {
     pub decision_id: u64,
@@ -594,7 +601,7 @@ When an App spec with `replicas = 3` is submitted:
 1. Meat validates the spec (schema, permissions, namespace quota).
 2. For each replica (0..3), Meat runs the four-phase placement pipeline:
    - **Filter:** Eliminate nodes that lack resources, do not match `required` labels, or are not ready.
-   - **Score:** Rank candidates using the weighted scoring model (bin-packing 50%, preferred labels 20%, image locality 15%, spread 10%, stability 5%).
+   - **Score:** Rank candidates using the weighted scoring model (bin-packing 50, preferred labels 20, image locality 15, spread 60, stability 5).
    - **Select:** Pick the highest-scoring node.
    - **Commit:** Reserve resources on the selected node in the cluster state cache, then commit the `SchedulingDecision` to the Raft log.
 3. After all replicas are committed, the decisions are disseminated to target Bun agents.
@@ -946,6 +953,16 @@ The `default` namespace has no quotas unless explicitly configured, which is app
 
 ## 6. Configuration
 
+> **Status: planned — not yet implemented.** The `[scheduler]` (and
+> `[defaults.app.deploy]`) configuration namespace described in this section does
+> not exist yet. The scheduler's behaviour is currently baked into constants:
+> the reconcile tick is a hardcoded 2 seconds, the scoring weights are `const`s
+> in `meat::score` (bin-pack 50, preferred 20, image 15, spread 60, stability 5),
+> and there is no runtime knob to change any of them. Treat the tables below as
+> the intended configuration surface, not as keys you can set today. (The
+> per-node reconstruction knobs under `[reconstruction]` — e.g.
+> `learning_period_timeout_secs` — do exist; the `scheduler.*` keys do not.)
+
 All scheduler-related configuration is set in the cluster-level configuration (applied via `relish apply` or Lettuce) unless otherwise noted.
 
 ### Scheduler Core
@@ -1075,7 +1092,7 @@ If `auto_rollback = true` and the health check of the in-progress step was pendi
 
 1. For each failed node's App instances, Meat attempts to reschedule to surviving nodes.
 2. If surviving capacity is insufficient, some replicas remain unscheduled. An alert fires immediately.
-3. Meat prioritizes rescheduling by workload criticality: Apps with fewer remaining healthy replicas are rescheduled first.
+3. Rescheduling currently processes apps in a deterministic order (alphabetical by app id), not by remaining healthy replicas. Priority ordering by criticality — rescheduling the apps with the fewest remaining healthy replicas first — is **planned, not yet implemented**.
 4. Batch jobs on failed nodes are re-allocated as described in 7.1.
 
 ---
@@ -1120,8 +1137,8 @@ If `auto_rollback = true` and the health check of the in-progress step was pendi
 
 **Mitigation:**
 
-- Each `SchedulingDecision` includes a monotonically increasing `decision_id` and a `spec_version`. Bun agents reject decisions with a `decision_id` lower than or equal to the last one they processed for a given App.
-- Decisions are also committed to the Raft log, which has its own monotonic term and index. Replay of old Raft entries is prevented by the Raft protocol itself.
+- **Planned — not yet implemented:** giving each `SchedulingDecision` a monotonically increasing `decision_id` and a `spec_version`, so Bun agents can reject decisions with a `decision_id` lower than or equal to the last one they processed for a given App. The shipped `SchedulingDecision` carries neither field yet, so this per-decision replay check does not exist today.
+- Decisions are committed to the Raft log, which has its own monotonic term and index. Replay of old Raft entries is prevented by the Raft protocol itself — this is the protection that is actually in force.
 
 ---
 
@@ -1176,7 +1193,7 @@ Meat's scheduling loop is designed to consume < 15% of a single core at sustaine
 
 - Each scheduling decision involves: one Filter pass (~50us), one Score pass (~20us), one Select (~1us), one Raft commit (~200us for the leader's local append; replication is async for scheduling decisions that are not App deploys).
 - Total: ~270us per decision. At 1,150 decisions/sec = ~310ms of CPU per second = 31% of one core.
-- With core pinning at > 1,000 nodes, this is isolated from other Bun tasks.
+- With core pinning at > 1,000 nodes, this would be isolated from other Bun tasks (core pinning is planned, not yet implemented — see Section 1).
 
 In practice, the batch model means most scheduling decisions are batch allocations (one per node per batch, not one per instance), so the actual decision rate for 100M jobs/day is closer to 50-200 allocation decisions per second, well within budget.
 
@@ -1374,7 +1391,7 @@ V1 supports whole-device GPU allocation only (`gpu = 1`, `gpu = 2`). Fractional 
 
 ### 13.4 Spread Strategy as First-Class Alternative
 
-Currently, bin-packing is the primary strategy and spread is a scoring component. Some workloads (latency-sensitive services) benefit from a spread-first strategy that distributes replicas across as many nodes as possible, even if this reduces density. Should Meat support a per-App `strategy = "spread"` that inverts the scoring weights? **Current decision: under consideration. The current spread scoring weight (10/100) provides mild anti-affinity; a dedicated spread mode would set it to 50+ and reduce bin-packing weight.**
+Currently, bin-packing is the primary strategy and spread is a scoring component. Some workloads (latency-sensitive services) benefit from a spread-first strategy that distributes replicas across as many nodes as possible, even if this reduces density. Should Meat support a per-App `strategy = "spread"` that inverts the scoring weights? **Current decision: under consideration. The current spread weight (60) already exceeds bin-packing's 50, so a spread-clean node wins by default; a dedicated spread mode would go further and also reduce bin-packing weight.**
 
 ### 13.5 Topology-Aware Scheduling
 

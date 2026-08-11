@@ -28,7 +28,7 @@ Lettuce isn't a separate daemon, sidecar, or CRD controller. It's a module withi
 |-----------|----------------|-------|
 | **Bun** | Host process. Lettuce runs as a module inside the Bun binary on the elected GitOps coordinator (a council member). | Shares the Bun process lifecycle, mTLS identity, and signal handling. |
 | **Raft (Council)** | Stores sync state, coordinator election, and desired state replication. Lettuce reads current desired state from Raft to compute diffs and forwards applies to the leader. | Coordinator election is a Raft-replicated state machine entry, not a separate protocol. |
-| **Sesame** | Provides the mTLS certificate used for git-over-HTTPS client authentication (if configured) and verifies GPG/SSH commit signatures against the cluster's trusted key set. | Lettuce calls into Sesame's signature verification API rather than implementing its own PGP/SSH parsing. |
+| **Sesame** | Provides the mTLS identity Bun uses cluster-wide. | Commit-signature verification is **not** delegated to Sesame: Lettuce shells out to `git verify-commit` (which handles both GPG and SSH), then checks the reported key fingerprint against the trusted set. There is no PGP/SSH parsing in Rust. |
 | **Meat** | Scheduler. After Lettuce applies a changed app spec to Raft, Meat handles scheduling decisions (replica placement, rolling deploys). | Lettuce doesn't schedule directly; it writes desired state and Meat reacts. |
 | **Brioche** | Web UI. Displays sync status, last applied commit, pending change preview, and sync history. | Brioche reads Lettuce state from the Raft-replicated `SyncState` struct. |
 | **Mustard** | Gossip protocol. Used to detect coordinator node health. If the coordinator's gossip heartbeat stops, the council elects a replacement. | Lettuce doesn't use Mustard directly; the council handles coordinator failover. |
@@ -77,7 +77,7 @@ The core of Lettuce is a continuous sync loop running on the coordinator:
 
 1. **Trigger.** Either the poll timer fires (every `poll_interval`, default 30s) or a validated webhook arrives.
 2. **Git fetch.** Lettuce performs `git fetch origin <branch>` on the local bare clone. If the remote HEAD hasn't changed since the last sync, the loop short-circuits.
-3. **Commit signature verification.** If `require_signed_commits` is enabled globally, or if the incoming commit modifies any `script` field (auto-enforcement per Section 17), the commit signature is verified against `trusted_signing_keys`. Unsigned or untrusted commits are rejected and an alert fires via the event system.
+3. **Commit signature verification.** If `require_signed_commits` is enabled globally, or if the incoming commit modifies any `script` field (auto-enforcement per Section 17), the commit signature is verified against `trusted_signing_keys`. Unsigned or untrusted commits are rejected and the reason is recorded in `SyncState.last_error`. (A dedicated alert on rejection is **planned — not yet implemented**; today the rejection surfaces through sync state, not the alerting subsystem.)
 4. **TOML parse.** All `.toml` files under the configured `path` are parsed into the internal `DesiredState` representation. Parse errors are non-fatal per file -- a single malformed file doesn't block sync of other files, but the malformed file is flagged as an error in sync status.
 5. **Diff computation.** The parsed desired state is compared field-by-field against the current desired state stored in Raft. The `replicas` field is compared independently (see Section 5.6).
 6. **Selective apply.** Only changed resources are written to Raft via the leader. Unchanged resources are skipped entirely.
@@ -158,9 +158,10 @@ pub struct GitOpsConfig {
     /// are considered. Default: "/" (repository root).
     pub path: String,
 
-    /// How often to poll the remote for changes. Default: 30s.
-    /// Set to 0 to disable polling (webhook-only mode).
-    pub poll_interval: Duration,
+    /// How often to poll the remote for changes, in whole seconds. Default: 30.
+    /// The TOML key is the integer `poll_interval_secs` (not a duration string);
+    /// a `poll_interval()` helper converts it to a `Duration`.
+    pub poll_interval_secs: u64,
 
     /// If true, all commits must be signed by a key in `trusted_signing_keys`.
     /// Even if false, commits that modify `script` fields are always verified.
@@ -224,6 +225,9 @@ pub struct SyncState {
     pub last_diff_summary: Option<DiffSummary>,
 
     /// History of recent syncs (ring buffer, default 100 entries).
+    /// **Planned — not yet populated.** The field exists on `SyncState`, but the
+    /// sync runner never appends to it, so it is always empty in practice. The
+    /// sync-history view in Brioche therefore has no data to show yet.
     pub history: VecDeque<SyncHistoryEntry>,
 
     /// The node ID of the current GitOps coordinator.
@@ -269,7 +273,7 @@ pub enum SyncResult {
 ### 4.3 CommitInfo
 
 ```rust
-/// Metadata about a git commit, extracted from libgit2.
+/// Metadata about a git commit, parsed from `git log`/`git show` output.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct CommitInfo {
     /// Full 40-character hex SHA of the commit.
@@ -511,7 +515,7 @@ The default sync mode. A tokio timer fires every `poll_interval` (default 30 sec
 **Procedure:**
 
 1. Timer fires. Lettuce acquires the sync lock (a local mutex -- only one sync runs at a time on the coordinator).
-2. `git fetch origin <branch>` via `git2::Remote::fetch()`. Credentials are loaded from the configured SSH key path or HTTPS credentials (see Section 8).
+2. `git fetch origin <branch>` by shelling out to the system `git` binary (`std::process::Command`, not a `libgit2` binding). Credentials are loaded from the configured SSH key path or HTTPS credentials (see Section 8).
 3. Compare `FETCH_HEAD` against `last_applied_commit.sha` in `SyncState`. If they match, release lock and return (no-op sync).
 4. If they differ, proceed to commit verification, parse, diff, and apply (Steps 3-7 of Section 3.1).
 5. Update `SyncState` in Raft with the result.
@@ -519,11 +523,11 @@ The default sync mode. A tokio timer fires every `poll_interval` (default 30 sec
 
 **Back-off on failure:** If git fetch fails (network error, auth failure), Lettuce applies exponential back-off: 30s, 60s, 120s, 240s, capped at `poll_interval * 8`. The back-off resets on a successful fetch. During back-off, incoming webhooks still trigger immediate sync attempts.
 
-**Jitter:** To avoid thundering-herd effects in multi-cluster setups where many clusters point at the same repo, Lettuce adds random jitter of +/- 10% to the poll interval.
+**Jitter (planned — not yet implemented):** To avoid thundering-herd effects in multi-cluster setups where many clusters point at the same repo, Lettuce could add random jitter of +/- 10% to the poll interval. The current poll timer fires at a fixed interval with no jitter.
 
 ### 5.2 Webhook-Triggered Sync
 
-For instant deploys on push. The webhook endpoint is served on the cluster API port (the same port used by `relish` CLI and Brioche), behind TLS (required -- plaintext webhook endpoints are rejected at config validation time).
+For instant deploys on push. The webhook endpoint is served on the cluster API port (the same port used by `relish` CLI and Brioche). The authentication that actually protects the endpoint is the HMAC signature over the request body (below), not TLS: Lettuce does not reject a plaintext listener at config-validation time. Running the API port behind TLS is recommended so the provider's signature header isn't sniffable, but it is not enforced.
 
 **Endpoint:** `POST /v1/gitops/webhook`
 
@@ -570,16 +574,21 @@ Two modes of enforcement:
 
 **Verification procedure:**
 
-1. Extract the commit's signature using `git2::Commit::header_field_bytes("gpgsig")`.
-2. Determine signature type (GPG or SSH) from the signature armor header.
-3. For GPG signatures: parse with `sequoia-openpgp`, extract the signing key fingerprint, and check against `SigningKeySet.gpg_fingerprints`.
-4. For SSH signatures: parse the SSH signature format, extract the key fingerprint in `SHA256:<base64>` format, and check against `SigningKeySet.ssh_fingerprints`.
+Verification shells out to `git verify-commit` rather than parsing signatures in
+Rust — there is no `sequoia-openpgp` or SSH-signature crate in the dependency
+tree. `git` performs the cryptographic check against its configured keyring, and
+Lettuce interprets the result:
+
+1. Run `git verify-commit <sha>` and inspect its exit status and output.
+2. `git` determines the signature type (GPG or SSH) and validates it against the keyring.
+3. For GPG signatures: the signing key fingerprint reported by `git` is checked against `SigningKeySet.gpg_fingerprints`.
+4. For SSH signatures: the key fingerprint in `SHA256:<base64>` format is checked against `SigningKeySet.ssh_fingerprints`.
 5. If the signature is valid and the key is trusted, set `SignatureStatus::Verified`.
 6. If the signature is valid but the key isn't trusted, set `SignatureStatus::UntrustedKey` and reject.
 7. If the signature is invalid, set `SignatureStatus::InvalidSignature` and reject.
 8. If there's no signature and verification is required, set `SignatureStatus::Unsigned` and reject.
 
-**On rejection:** An event is emitted to the Ketchup event log with severity `warning`, including the commit SHA, author, and reason for rejection. The `SyncState.last_error` field is updated. Brioche displays a banner on the GitOps dashboard. If configured, an alert fires via the alerting subsystem.
+**On rejection:** The `SyncState.last_error` field is updated with the commit SHA, author, and reason for rejection, and the sync is recorded as failed. Emitting a Ketchup event and firing an alert via the alerting subsystem on rejection are **planned — not yet implemented**; the rejection is visible through sync state (and any Brioche view of it), not through the event log or alerts.
 
 ### 5.4 Diff Computation
 
@@ -635,7 +644,16 @@ This is critical to prevent Lettuce from fighting the autoscaler during traffic 
 
 ### 5.7 Coordinator Failover
 
-See Section 3.2. Summary of the failover timeline:
+> **Status: planned — not yet implemented.** See the status note in Section 3.2.
+> The sync loop is leader-driven: the Raft leader runs the sync and applies the
+> diff, and the elected coordinator (`select_coordinator`) is recorded in
+> `SyncState.coordinator_node_id` for display only — it does not drive syncing.
+> The `CoordinatorElectionReason::Failover` path exists only in tests. The
+> Raft-heartbeat-driven coordinator handoff and the timeline below are the target
+> model, not current behaviour; in practice a failover follows ordinary Raft
+> leader election.
+
+See Section 3.2. Summary of the (planned) failover timeline:
 
 | Time | Event |
 |------|-------|
@@ -682,9 +700,9 @@ branch = "main"
 # Only files under this path are parsed. Supports trailing slash.
 path = "production/"
 
-# Poll interval. Default: "30s". Minimum: "5s". Maximum: "1h".
-# Set to "0s" to disable polling entirely (webhook-only mode).
-poll_interval = "30s"
+# Poll interval, in whole seconds. Default: 30.
+# Set to 0 to disable polling entirely (webhook-only mode).
+poll_interval_secs = 30
 
 # Require all commits to be signed. Default: false.
 # Even when false, commits modifying `script` fields are always verified.
@@ -735,7 +753,7 @@ The coordinator loads credentials from its local `node.toml`. On failover, the n
 
 - `repo` is a valid git URL (SSH or HTTPS).
 - `branch` is non-empty.
-- `poll_interval` parses as a duration and is within bounds.
+- `poll_interval_secs` is a non-negative integer within bounds.
 - `webhook_secret` is at least 32 characters (if present).
 - `trusted_signing_keys` is non-empty if `require_signed_commits` is true.
 - `webhook_rate_limit` is between 1 and 1000.
@@ -769,7 +787,7 @@ The coordinator loads credentials from its local `node.toml`. On failover, the n
 
 **Cause:** Unsigned commit when `require_signed_commits` is true, or unsigned commit modifying `script` fields. Commit signed by an untrusted key. Corrupt signature.
 
-**Behaviour:** The entire commit is rejected. No changes are applied (even for files that don't contain scripts). `SyncState.last_error` records the reason. An alert fires.
+**Behaviour:** The entire commit is rejected. No changes are applied (even for files that don't contain scripts). `SyncState.last_error` records the reason. (Firing an alert on this is planned, not yet implemented — see Section 5.3.)
 
 **Impact:** The cluster remains on the last successfully applied commit. The rejected commit is retried on the next sync cycle (in case the operator adds the key to `trusted_signing_keys` in the meantime).
 
@@ -779,7 +797,7 @@ The coordinator loads credentials from its local `node.toml`. On failover, the n
 
 **Cause:** Node crash, hardware failure, network partition isolating the coordinator from the council.
 
-**Behaviour:** The council detects the failure via Raft heartbeat timeout (approximately 1.5 seconds). The leader elects a new coordinator. The new coordinator clones the repo (if needed) and resumes syncing.
+**Behaviour (target design — see the Section 3.2 and 5.7 status notes):** the council would detect the failure via Raft heartbeat timeout (approximately 1.5 seconds), the leader would elect a new coordinator, and the new coordinator would clone the repo (if needed) and resume syncing. Today, because syncing is leader-driven, a coordinator node failing is only consequential if it was also the Raft leader, in which case ordinary Raft leader election restores syncing.
 
 **Impact:** Sync gap of approximately 5 seconds (failover) plus up to `poll_interval` for the next poll. In webhook mode, the gap is just the failover time because the next webhook triggers immediate sync. Applications continue running unaffected.
 
@@ -853,9 +871,14 @@ The multi-layered defense against arbitrary code execution via git:
 4. **Audit logging.** The SHA-256 hash of every deployed script is logged in the event history. `relish history` shows which script content was deployed and by which commit.
 5. **Lint warnings.** `relish lint` flags scripts containing suspicious patterns: `eval`, `base64 -d`, `curl | sh`, `wget | bash`, `python -c`, and downloads from unknown URLs.
 
-### 8.5 TLS Requirement for Webhooks
+### 8.5 TLS for Webhooks
 
-The webhook endpoint requires TLS. Lettuce refuses to start the webhook listener on a plaintext port. This prevents credential sniffing (the webhook secret is transmitted in HTTP headers, so TLS is mandatory for confidentiality).
+TLS is **recommended but not enforced**. The endpoint's real authentication is
+the HMAC-SHA256 signature over the request body — the webhook secret is never
+sent in a header, only a signature derived from it, so a passive sniffer cannot
+recover the secret. Lettuce does **not** refuse to start on a plaintext port
+(mandatory-TLS enforcement is planned, not implemented). Terminating TLS in
+front of the API port is still advisable for defence in depth.
 
 ---
 

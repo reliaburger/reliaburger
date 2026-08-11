@@ -10,16 +10,21 @@
 
 Brioche is Reliaburger's built-in web dashboard, compiled directly into the Bun binary and served from every node in the cluster. It replaces the common Grafana + custom-dashboard pattern by providing purpose-built views for the operations that matter most: cluster health, application status, deployment history, ingress routing, GitOps sync state, and alerting.
 
-Because Brioche is embedded in Bun via Rust's `include_bytes!` / `rust-embed` mechanism, there is nothing to install, no sidecar to deploy, and no separate process to manage. Visiting any node's API port in a browser renders the full dashboard. The UI is a single-page application that makes API calls to the same Bun HTTP server; those calls follow Reliaburger's standard read/write routing (reads go to the nearest council member, writes are forwarded to the leader via Raft).
+Because Brioche is embedded in Bun via Rust's `include_bytes!` / `rust-embed` mechanism, there is nothing to install, no sidecar to deploy, and no separate process to manage. Visiting any node's API port in a browser renders the full dashboard. The shipped UI is **server-rendered HTML with HTMX**, not a client-side single-page application: each page is a full HTML document produced in Rust, and small `hx-get` regions poll `/ui/fragment/*` endpoints for updates. Those requests follow Reliaburger's standard read/write routing (reads go to the nearest council member, writes are forwarded to the leader via Raft).
 
 **Core dashboard pages:**
 
-- **Cluster overview** -- total resource usage, node health map, recent deploys, active alerts
-- **App detail** -- CPU/memory charts, request rate, error rate, instance status, streaming logs, deploy history, environment variables, current image
-- **Node detail** -- resource utilisation, running apps, disk usage, GPU status
+Three pages ship today, plus a login page:
+
+- **Cluster overview** (route `/`) -- total resource usage, node health map, app list, active alerts (rendered as a dashboard fragment)
+- **App detail** (route `/ui/app/{app}/{namespace}`) -- CPU/memory charts, instance status, deploy history, environment variables, current image
+- **Node detail** (route `/ui/node/{name}`) -- resource utilisation, running apps, disk usage, GPU status
+
+The following pages are **planned — not yet implemented** as standalone views:
+
 - **Ingress overview** -- request volume, latency distribution, error rates by route, TLS certificate status
 - **GitOps status** -- sync state, last applied commit, diff preview, sync history
-- **Alert dashboard** -- active alerts, alert history, suppression status
+- **Alert dashboard** -- active alerts, alert history, suppression status (alerts currently appear only as a fragment on the cluster overview, not as a dedicated page)
 - **Jobs view** -- running/completed/failed jobs, batch queue depth, execution duration
 
 Brioche shares the same API surface as the Relish CLI and TUI. Everything visible in Brioche is also available via `relish` commands and vice versa. The dashboard is strictly a presentation layer -- it has no exclusive data sources or side channels.
@@ -60,64 +65,59 @@ use rust_embed::Embed;
 struct BriocheAssets;
 ```
 
-At startup, Bun registers a route handler that serves these embedded assets. The handler sets appropriate `Content-Type` headers, `Cache-Control` directives (assets are content-hashed for cache-busting), and compression (`Content-Encoding: gzip` for text assets pre-compressed at build time).
+At startup, Bun registers explicit page routes (each returning a full
+server-rendered HTML document) plus a static-asset handler mounted at
+`/ui/static/{*path}` for the CSS, JS, and font files. There is **no SPA
+`index.html` fallback**: unknown paths 404, and unauthenticated HTML navigations
+redirect to `/ui/login`. The static handler sets the appropriate `Content-Type`
+and `Cache-Control` headers.
 
 ```rust
-// In Bun's HTTP server initialisation (axum router)
+// In Bun's HTTP server initialisation (axum router), simplified.
 let app = Router::new()
     .nest("/v1", api_routes())
-    .fallback(brioche_handler);
-
-async fn brioche_handler(uri: axum::http::Uri) -> impl IntoResponse {
-    let path = uri.path().trim_start_matches('/');
-    // Serve index.html for SPA client-side routing
-    let path = if path.is_empty() || !path.contains('.') {
-        "ui/index.html"
-    } else {
-        &format!("ui/{}", path)
-    };
-
-    match BriocheAssets::get(path) {
-        Some(content) => {
-            let mime = mime_guess::from_path(path).first_or_octet_stream();
-            (
-                StatusCode::OK,
-                [
-                    (header::CONTENT_TYPE, mime.as_ref()),
-                    (header::CACHE_CONTROL, cache_control_for(path)),
-                    (header::CONTENT_SECURITY_POLICY, CSP_HEADER),
-                ],
-                content.data,
-            )
-                .into_response()
-        }
-        None => (StatusCode::NOT_FOUND, "not found").into_response(),
-    }
-}
+    // Page routes: each handler renders a complete HTML page in Rust.
+    .route("/", get(dashboard_handler))
+    .route("/ui/app/{app}/{namespace}", get(app_detail_handler))
+    .route("/ui/node/{name}", get(node_detail_handler))
+    .route("/ui/login", get(login_handler))
+    // HTMX polling fragments.
+    .route("/ui/fragment/apps", get(fragment_apps_handler))
+    .route("/ui/fragment/nodes", get(fragment_nodes_handler))
+    .route("/ui/fragment/alerts", get(fragment_alerts_handler))
+    // Embedded static assets.
+    .route("/ui/static/{*path}", get(static_asset_handler));
 ```
 
-### 3.2 SPA Routing
+### 3.2 Page Routing
 
-Brioche is a single-page application. All navigation occurs client-side. Any request to a path that does not match a static asset or an `/api/` prefix returns `index.html`, allowing the SPA router to handle the URL. This means bookmarking `https://node-03:9117/apps/web` works -- the server returns `index.html`, and the client-side router renders the app detail view for `web`.
+Brioche is **not** a single-page application. Navigation is ordinary server-side
+routing: each URL maps to a Rust handler that renders a complete HTML page.
+Bookmarking `https://node-03:9117/ui/app/web/default` works because the server
+renders that page directly (not because a client-side router intercepts it).
+Within a page, HTMX swaps small fragments in place via `/ui/fragment/*` polling.
 
-URL structure:
+**Routes that ship today:**
 
 ```
-/                           → Cluster overview
-/apps                       → App list
-/apps/:name                 → App detail
-/apps/:name/logs            → App streaming logs
-/apps/:name/deploys         → App deploy history
-/nodes                      → Node list
-/nodes/:name                → Node detail
-/ingress                    → Ingress overview
-/ingress/:host              → Ingress route detail
-/gitops                     → GitOps status
-/alerts                     → Alert dashboard
-/jobs                       → Jobs view
-/jobs/:id                   → Job detail
-/settings                   → Cluster settings (admin only)
+/                              → Cluster overview (dashboard)
+/ui/app/{app}/{namespace}      → App detail
+/ui/app/{app}/{namespace}/env  → App environment fragment
+/ui/node/{name}                → Node detail
+/ui/login                      → Login page
+/ui/session   (POST)           → Exchange a token for a session cookie
+/ui/logout    (POST)           → Clear the session cookie
+/ui/fragment/apps              → App-list fragment (HTMX poll)
+/ui/fragment/nodes             → Node-list fragment (HTMX poll)
+/ui/fragment/alerts            → Active-alerts fragment (HTMX poll)
+/ui/fragment/app/{app}/{namespace}/instances → Instance table fragment
+/ui/static/{*path}             → Embedded CSS/JS/font assets
 ```
+
+**Planned — not yet implemented:** dedicated `/ui/ingress`, `/ui/gitops`,
+`/ui/alerts`, `/ui/jobs`, and `/ui/settings` pages, and per-resource detail
+routes (ingress route detail, job detail). App logs and deploy history render
+inside the app-detail page rather than at their own routes.
 
 ### 3.3 Request Routing
 
@@ -180,7 +180,7 @@ struct ClusterOverviewPage {
 {% extends "layout.html" %}
 {% block content %}
 <div id="cluster-overview"
-     hx-get="/v1/ui/cluster-overview"
+     hx-get="/ui/fragment/nodes"
      hx-trigger="every 5s"
      hx-swap="innerHTML">
 
@@ -225,7 +225,7 @@ struct ClusterOverviewPage {
   </section>
 
   <section class="active-alerts"
-           hx-get="/v1/ui/alerts-summary"
+           hx-get="/ui/fragment/alerts"
            hx-trigger="every 3s"
            hx-swap="innerHTML">
     {% for alert in alerts %}
@@ -946,13 +946,18 @@ The default landing page. Provides a single-glance view of cluster health.
 
 **Data sources:**
 
-| Section | API Endpoint | Refresh |
-|---------|-------------|---------|
-| Resource summary | `GET /v1/cluster/summary` | 5s (HTMX poll) |
-| Node health map | `GET /v1/nodes?fields=name,status` | 5s (HTMX poll) |
-| Recent deploys | `GET /v1/deploys?limit=10&sort=desc` | 10s (HTMX poll) |
-| Active alerts | `GET /v1/alerts?state=firing` | 3s (HTMX poll) |
-| Event stream | `SSE /v1/events/stream` | Real-time |
+The dashboard page renders these regions server-side, then refreshes them with
+HTMX polls against `/ui/fragment/*` endpoints (which return HTML fragments, not
+JSON). Underlying cluster data is read through the `/v1` API.
+
+| Section | HTMX fragment endpoint | Refresh |
+|---------|------------------------|---------|
+| App list | `GET /ui/fragment/apps` | 5s (HTMX poll) |
+| Node health map | `GET /ui/fragment/nodes` | 5s (HTMX poll) |
+| Active alerts | `GET /ui/fragment/alerts` | 3s (HTMX poll) |
+| Instance table (app detail) | `GET /ui/fragment/app/{app}/{namespace}/instances` | 5s (HTMX poll) |
+
+Recent-deploys and event-stream feeds are part of the planned dashboard build-out (see Section 3.2).
 
 **Node health map behaviour:** Each node is rendered as a coloured tile. Colour indicates status: green for healthy, yellow for degraded, red for unreachable, blue for draining. A star icon marks the leader. Clicking a tile navigates to the node detail page. At large cluster sizes (>100 nodes), the map switches to a compact grid with tooltip details on hover.
 
@@ -1050,6 +1055,9 @@ Accessed via `/nodes/:name`.
 
 ### 5.4 Ingress Overview Page
 
+> **Status: planned — not yet implemented.** No ingress page ships today; the
+> layout below is the target design.
+
 Accessed via `/ingress`.
 
 **Layout:**
@@ -1082,6 +1090,10 @@ Clicking a route row opens a detail view with per-route time-series charts and t
 
 ### 5.5 GitOps Status Page
 
+> **Status: planned — not yet implemented.** No GitOps page ships today. Lettuce
+> maintains sync state, but there is no dedicated Brioche view for it yet; the
+> layout below is the target design.
+
 Accessed via `/gitops`.
 
 **Layout:**
@@ -1111,6 +1123,11 @@ Accessed via `/gitops`.
    Each row expands to show the full diff of what was applied/rejected.
 
 ### 5.6 Alert Dashboard
+
+> **Status: planned — not yet implemented.** There is no dedicated alerts page.
+> Active alerts render only as a fragment on the cluster overview
+> (`/ui/fragment/alerts`); alert history, suppression status, and the
+> configuration summary below are the target design.
 
 Accessed via `/alerts`.
 
@@ -1142,6 +1159,9 @@ Accessed via `/alerts`.
    - Notification destinations (webhook URLs, partially masked).
 
 ### 5.7 Jobs View
+
+> **Status: planned — not yet implemented.** No jobs page ships today; the layout
+> below is the target design.
 
 Accessed via `/jobs`.
 
@@ -1200,20 +1220,24 @@ Brioche uses the same API token authentication as the Relish CLI (Section 11 of 
 
 **Login flow:**
 
-1. User navigates to any node's Brioche URL.
-2. Brioche renders a login page requesting an API token.
-3. The user enters their token (generated via `relish token create` or the Brioche UI itself if already authenticated).
-4. The token is sent to `POST /v1/auth/validate`.
-5. On success, the token is stored in an `HttpOnly`, `Secure`, `SameSite=Strict` cookie with the name `rb_session`.
-6. Subsequent API requests from the browser include the cookie automatically.
+1. User navigates to any node's Brioche URL. An unauthenticated HTML navigation is redirected to `/ui/login`.
+2. Brioche renders the login page (`GET /ui/login`) with a token form.
+3. The user enters their token (generated via `relish token create`).
+4. The form POSTs the token to `/ui/session`.
+5. On success, the token is stored in an `HttpOnly`, `Secure`, `SameSite=Strict` cookie with the name `rb_session`, and the user is redirected to the dashboard.
+6. Subsequent requests from the browser include the cookie automatically.
+7. `POST /ui/logout` clears the cookie.
 
 **Token-in-cookie details:**
 
 - The cookie contains the API token encrypted with a per-node session key (derived from the node's identity via HKDF). This prevents cookie theft from being directly useful on a different node, though the cluster's shared token validation means a stolen raw token works anywhere.
 - Cookie expiry matches the token's TTL. When the token expires, the cookie is invalidated and the user is redirected to the login page.
-- Logout (`POST /v1/auth/logout`) clears the cookie.
+- Logout (`POST /ui/logout`) clears the cookie.
 
-**OIDC flow (when configured):**
+**OIDC flow (planned — not yet implemented):**
+
+Brioche has no OIDC integration today; login is API-token-only. The provider
+redirect flow below is the target design:
 
 1. User navigates to Brioche.
 2. Brioche redirects to the OIDC provider's authorisation endpoint.

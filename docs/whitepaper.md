@@ -107,7 +107,7 @@ Reliaburger is designed to meet the following quantitative targets. These engine
 | State reconstruction time (cold start, full cluster) | < 30 seconds |
 | Time from bare metal to first deploy | < 5 minutes |
 | Cold start (new node joins and accepts work) | < 60 seconds |
-| Image distribution to N redundancy peers (default N=2) | < 30 seconds per layer after push |
+| Image distribution to N total copies (default 2: the pusher plus one peer) | < 30 seconds per layer (replicated asynchronously by the leader's heal loop) |
 | GPU scheduling | First-class resource, whole-device allocation |
 | Minimum kernel version | Linux 5.7+ (for eBPF CO-RE, BTF, and BPF_LINK support) |
 | cgroup version | v2 (required for eBPF service discovery and resource isolation) |
@@ -263,7 +263,9 @@ DATABASE_URL = "ENC[AGE:YWdlLWVuY3J5cHRpb24...]"
 NODE_ENV = "production"
 ```
 
-Namespace-scoped keypairs are available for multi-tenant clusters where blast radius matters. `relish secret rotate` handles key rotation with graceful transition periods.
+`relish secret rotate` handles key rotation of the cluster-wide keypair with graceful transition periods (both old and new ciphertexts decrypt during the overlap).
+
+**Status: namespace-scoped keypairs are partially implemented.** The seal and decrypt paths already prefer a namespace's own key when one exists, but the current binary only ever generates the single cluster-wide keypair at init. Per-namespace key generation for multi-tenant blast-radius isolation is planned.
 
 > For encryption implementation details, see [design/security-sesame.md](design/security-sesame.md).
 
@@ -571,9 +573,11 @@ Root CA (offline after init, signs only intermediate CAs)
 └── Ingress CA      — signs certificates for tls = "cluster" ingress routes
 ```
 
-A compromise of any single intermediate CA doesn't affect the others. Reliaburger deletes the root CA private key from all cluster nodes after signing the intermediates; it exists only in a sealed backup. Intermediate CAs are issued with a 5-year lifetime. Rotation requires the sealed root CA backup, performed via `relish ca rotate`. `relish ca status` warns when intermediates are within 90 days of expiry.
+A compromise of any single intermediate CA doesn't affect the others. Reliaburger deletes the root CA private key from all cluster nodes after signing the intermediates; it exists only in a sealed backup. Intermediate CAs are issued with a 5-year lifetime.
 
-**Node authentication:** Nodes join via short-lived join tokens (default 15 minutes, single-use) that embed a SHA-256 fingerprint of the cluster's root CA certificate, allowing the joining node to verify the cluster's identity before transmitting credentials. On successful join, the node receives a certificate signed by the Node CA. All subsequent communication is mTLS. Optional TPM attestation provides hardware-based identity verification.
+**Status: intermediate CA rotation and the `relish ca` command family (`ca status`, `ca rotate`, `ca revoke`) are planned — not yet implemented in the current binary.** The vision is rotation from the sealed root CA backup with a 90-day expiry warning.
+
+**Node authentication:** Nodes join via short-lived join tokens (default 15 minutes, single-use) that embed a SHA-256 fingerprint of the cluster's root CA certificate, allowing the joining node to verify the cluster's identity before transmitting credentials. On successful join, the node receives a certificate signed by the Node CA. All subsequent communication is mTLS. TPM-based hardware attestation is **planned — not yet implemented** (the binary links no TPM library).
 
 ### 11.2 Workload Identity
 
@@ -592,7 +596,7 @@ Three layers of built-in firewall:
 2. **Namespace isolation** (eBPF): cross-namespace traffic blocked by default
 3. **Per-app firewall** (eBPF `allow_from`): fine-grained ingress control within a namespace
 
-**Egress is deny-all by default.** Apps that need external access must declare an `egress` block, preventing data exfiltration from compromised containers.
+**Egress is unrestricted by default.** An app with no `egress` block can reach any external destination. Declaring an `egress` block flips that app to deny-by-default: only the listed destinations are permitted, and everything else is blocked. Use it to contain data exfiltration from compromised containers.
 
 ```toml
 [app.api.egress]
@@ -601,11 +605,11 @@ allow = ["api.stripe.com:443", "hooks.slack.com:443"]
 
 ### 11.4 Data at Rest
 
-Reliaburger encrypts Raft log data with AES-256-GCM. The encryption key is derived via HKDF from the node's identity and sealed to the TPM when available. Certificate revocation uses a CRL distributed via the reporting tree.
+Reliaburger encrypts Raft log data with AES-256-GCM. The encryption key is derived via HKDF from the node's identity. (Sealing that key to a TPM is planned, not yet implemented.) Certificate revocation uses a CRL distributed via the reporting tree.
 
 ### 11.5 Audit Logging
 
-Reliaburger logs all modifying API operations with identity, source IP, and timestamp. Audit logs are stored via Ketchup and queryable via `relish history`.
+Today, fault-injection operations emit a structured audit event attributed to the authenticated credential (not a client-supplied name), held in an in-memory bounded event history. **Status: comprehensive audit logging is planned — not yet implemented.** The full vision (an entry for every modifying API operation, with identity, source IP and timestamp, persisted via Ketchup and queryable from the CLI) is not what the current binary does: there is no source-IP capture, no Ketchup-backed audit store, and the events cover only fault injection.
 
 > For the full PKI model, API authentication, secret encryption, and threat model, see [design/security-sesame.md](design/security-sesame.md).
 
@@ -613,11 +617,11 @@ Reliaburger logs all modifying API operations with identity, source IP, and time
 
 ## 12. Built-In Image Registry (Pickle)
 
-Pickle is a distributed OCI-compatible registry built into every node. When you push an image (via standard `docker push`), Pickle stores it locally, synchronously replicates it to N peer nodes (default N=2) for durability, then makes it available for P2P distribution across the cluster. In clusters with fewer than N+1 nodes, Pickle replicates to all available peers and warns that the full durability target isn't met. Different layers can be downloaded from different nodes in parallel, similar to BitTorrent.
+Pickle is a distributed OCI-compatible registry built into every node. When you push an image (via standard `docker push`), Pickle commits it locally and returns immediately with an `oci-replication: pending` header. Replication to peers runs afterwards, driven by a leader-only heal loop (roughly every 60 seconds) that works towards a redundancy target (default 2 total copies: the pusher plus one peer). Once distributed, layers can be downloaded from different nodes in parallel, similar to BitTorrent. In clusters too small to meet the target, the heal loop warns that full redundancy can't be reached.
 
 Key properties:
 
-- **Synchronous replication.** A successful push guarantees the image survives any single node failure.
+- **Asynchronous, eventually-replicated.** A push succeeds as soon as the local commit lands. Durability across nodes follows shortly after via the heal loop, so an image pushed and then immediately lost with its origin node before the heal tick runs is not guaranteed to survive. Push latency is decoupled from replication.
 - **P2P distribution.** Image fan-out scales with cluster size, not against it.
 - **Pull-through cache.** External registry images (Docker Hub, GHCR) are cached on first use.
 - **Image signing.** Keyless signing via workload identity, cosign-compatible.
@@ -712,37 +716,37 @@ Relish is the CLI and interactive terminal UI for Reliaburger. Running `relish` 
 | `relish compile <path>` | Resolve config to final form | (none — Helm template + kustomize build) |
 | `relish lint <path>` | Validate config files | `kubectl --dry-run=client` (barely) |
 | `relish fmt <path>` | Format and sort TOML files | (none) |
-| `relish plan <path>` | Preview changes before apply | `terraform plan` (K8s has nothing equivalent) |
-| `relish diff <path>` | Detect cluster drift | `kubectl diff` (limited) |
+| `relish plan <path>` *(planned)* | Preview changes before apply | `terraform plan` (K8s has nothing equivalent) |
+| `relish diff <a> <b>` | Structural diff between two configs (not live cluster drift) | `kubectl diff` (limited) |
 | `relish apply <path>` | Apply configuration | `kubectl apply` |
-| `relish deploy <app> <image>` | Quick image update | `kubectl set image` |
-| `relish events` | Streaming event log | `kubectl get events` (1h expiry) |
+| `relish deploy <path>` | Trigger a rolling deploy from a config file | `kubectl set image` |
+| `relish events` *(planned)* | Streaming event log | `kubectl get events` (1h expiry) |
 | `relish logs <app>` | Stream/search logs | `kubectl logs` + `stern` |
 | `relish trace <app> --to <app>` | Connectivity diagnosis | (none — manual iptables/DNS debugging) |
 | `relish inspect <resource>` | Deep resource inspection | `kubectl describe` |
-| `relish top` | Live resource usage | `kubectl top` (requires metrics-server) |
+| `relish top` | Workload state, PID and restart counts (not live CPU/memory) | `kubectl top` (requires metrics-server) |
 | `relish wtf` | Automated health check | (none — requires runbooks + Prometheus alerts) |
-| `relish exec` | Container/host shell | `kubectl exec` + `kubectl debug` |
-| `relish exec --debug` | Debug container (separate identity) | `kubectl debug` |
+| `relish exec` | Run a command inside a running container | `kubectl exec` |
+| `relish exec --debug` *(planned)* | Debug container (separate identity) | `kubectl debug` |
 | `relish resolve <name>` | Query eBPF service map | `kubectl get endpoints` + `nslookup` |
-| `relish firewall <app>` | Show effective firewall rules | `kubectl get networkpolicy` + CNI tools |
-| `relish history <app>` | Full audit trail | (none — requires external audit logging) |
+| `relish firewall <app>` *(planned)* | Show effective firewall rules | `kubectl get networkpolicy` + CNI tools |
+| `relish history <app>` | Deploy history for an app | `kubectl rollout history` |
 | `relish rollback <app>` | One-command rollback | `kubectl rollout undo` |
-| `relish scale <app> <n>` | Set replica count | `kubectl scale` |
+| `relish scale <app> <n>` *(planned)* | Set replica count | `kubectl scale` |
 | `relish secret encrypt` | Encrypt a secret value | (none — requires Sealed Secrets) |
 | `relish fault <type> <app>` | Inject a fault | (none — requires Chaos Mesh / Litmus) |
 | `relish test` | Run integration test suite | (none) |
 | `relish bench` | Run performance benchmarks | (none) |
 | `relish upgrade start` | Rolling cluster upgrade | `kubeadm upgrade` (multi-step) |
-| `relish ca status` | Show CA hierarchy and expiry | (none) |
-| `relish ca rotate` | Rotate intermediate CA certificates | (none — manual process) |
-| `relish ca revoke` | Revoke a compromised certificate | (none — manual process) |
+| `relish ca status` *(planned)* | Show CA hierarchy and expiry | (none) |
+| `relish ca rotate` *(planned)* | Rotate intermediate CA certificates | (none — manual process) |
+| `relish ca revoke` *(planned)* | Revoke a compromised certificate | (none — manual process) |
 | `relish init` | Bootstrap a new cluster | `kubeadm init` |
 | `relish join` | Join a node to the cluster | `kubeadm join` |
-| `relish drain <node>` | Safely evacuate a node | `kubectl drain` |
+| `relish drain <node>` *(planned)* | Safely evacuate a node | `kubectl drain` |
 | `relish council recover` | Restore a lost council from a sealed backup | `etcdctl snapshot restore` |
 | `relish secret rotate` | Rotate encryption keys | (none — requires Sealed Secrets re-encrypt) |
-| `relish volume snapshot` | Snapshot a local volume | (none — requires CSI snapshotter) |
+| `relish snapshot create <app>` | Snapshot an app's local volumes | (none — requires CSI snapshotter) |
 | `relish import -f <k8s-yaml>` | Convert K8s manifests to Reliaburger TOML | (none) |
 | `relish export --format kubernetes` | Generate K8s manifests from config | (none) |
 
@@ -752,9 +756,14 @@ Relish is the CLI and interactive terminal UI for Reliaburger. Running `relish` 
 
 ## 17. Process Workloads (Non-Container)
 
-Reliaburger provides a middle ground between full container workloads and unmanaged system processes: **run a binary from the host's filesystem inside the same isolation primitives as a container app.** Process workloads get a cgroup (CPU, memory, GPU limits), a network namespace (Onion eBPF service discovery and firewall rules), a PID namespace, and Ketchup log capture, but they run a binary already on the host rather than one from a container image.
+Reliaburger provides a middle ground between full container workloads and unmanaged system processes: **run a binary from the host's filesystem under the same scheduling, health checks, metrics, and log capture as a container app.** Process Apps use `exec` instead of `image`; process Jobs use `exec` or `script` for inline shell scripts.
 
-Process Apps use `exec` instead of `image`; process Jobs use `exec` or `script` for inline shell scripts. Both receive the same scheduling, health checks, metrics, and service discovery as container workloads. Reliaburger enforces security via a required binary allowlist in `node.toml`, a dedicated unprivileged user (`burger`), a restrictive seccomp profile, and a restricted mount namespace. Inline scripts applied via Lettuce automatically require signed commits. When applied directly via `relish apply`, TOML files containing `script` fields require `host-exec` permission, and the binary must be in the node's allowlist.
+What the current binary actually enforces is a policy layer, not a sandbox:
+
+- **Deny-by-default binary allowlist** (`[process_workloads] allowed_binaries` in `node.toml`). An empty or absent allowlist refuses every `exec`/`script` workload, so host execution is off on any node the operator hasn't explicitly opened up. Inline `script` workloads run through `/bin/sh`, which must itself be allowlisted.
+- **Signed-commit gating.** Inline scripts applied via Lettuce require signed commits (Section 14). When applied directly via `relish apply`, TOML files containing `script` fields require `host-exec` permission.
+
+Beyond that, the process is spawned in its own process group and its stdout/stderr are captured, but it runs directly on the host. **Status: kernel-level isolation is planned — not yet implemented.** The design target (a dedicated unprivileged `burger` user, a seccomp profile, cgroup resource limits, and network/PID/mount namespaces so process workloads sit inside the same primitives as containers) is not what the binary does today: there is no seccomp profile, no `burger` user, no `unshare`/namespace creation, and no cgroup limits on process workloads. Mount-namespace isolation is explicitly *refused* rather than silently skipped: a host workload that requests `mount_isolation` is rejected with an error until the feature lands.
 
 > For the full isolation model, security controls, and when-to-use-what guidance, see [design/agent-bun.md](design/agent-bun.md).
 
@@ -828,6 +837,8 @@ Reliaburger verifies binary integrity via dual signatures: an embedded signing k
 
 ## 21. Multi-Cluster (Franchise)
 
+> **Status: planned — not yet implemented in the current binary.** Nothing in this section runs today. Franchise is a forward-looking design: there is no WAN gossip ring, no `relish franchise` command, no cross-cluster service discovery, and no franchise dashboard. In fact the binary actively refuses the one hook that exists in the config schema — an app that declares `egress.allow_franchise` is rejected at startup rather than run with the rule silently unenforced. The rest of this section describes the intended design, kept here so the vision is on record.
+
 Reliaburger clusters are independent by design. Each has its own Raft consensus, its own CA hierarchy, and its own lifecycle. Franchise extends this model to give you visibility and connectivity across multiple clusters without coupling them.
 
 Each cluster is a **franchise location**: independently operated, sharing standards and visibility. Peering is a single command:
@@ -889,7 +900,7 @@ The following features are intentionally excluded from Reliaburger v1. Each is a
 | Windows node support | Linux only in v1. |
 | IPv6 | The current networking model (virtual IPs, eBPF hooks) is IPv4-only. IPv6 support is planned for v2. |
 | Pod affinity / anti-affinity | Replaced by simple placement hints via node labels. |
-| Pod Disruption Budgets | Reliaburger's drain logic respects the same constraints as rolling deploys: it never drains a node if doing so would reduce any app below `replicas - max_unavailable` healthy instances. `relish drain` checks all affected apps before proceeding. |
+| Pod Disruption Budgets | Reliaburger's intended drain logic respects the same constraints as rolling deploys: it never drains a node if doing so would reduce any app below `replicas - max_unavailable` healthy instances, checking all affected apps before proceeding. (The `relish drain` command itself is planned — see Section 16.) |
 | Sidecars | Some use cases genuinely require co-located processes sharing a network namespace (authentication proxies, log forwarders, protocol adapters). In v1, init containers cover per-instance startup tasks and separate Apps with service discovery cover most runtime co-location needs, though at the cost of a network hop. A `sidecar` field on the App spec (co-located containers sharing the parent's network namespace and lifecycle) is planned for v2. |
 | Distributed tracing backend | Applications export traces to external collectors (Jaeger, Tempo, Datadog) using standard OpenTelemetry SDKs. Workload identity (Section 11.2) provides authentication to external tracing services. No single tracing backend fits all teams, so including one would violate the "batteries-included means the default works" principle. |
 
@@ -937,7 +948,7 @@ This is an explicit design goal: Reliaburger should never be a dead end, regardl
 | **GitOps** | Separate (ArgoCD/Flux) | Separate | Separate | N/A | **Built-in (Lettuce)** |
 | **Image registry** | Separate (Harbor etc.) | Separate | Separate | Docker Hub | **Built-in (Pickle)** |
 | **Service discovery** | CoreDNS + kube-proxy | Same as K8s | Built-in (since 1.3) or Consul | Docker DNS | **Built-in (Onion eBPF, near-zero overhead)** |
-| **Network security** | NetworkPolicy (CNI-dependent) | Same | Consul Connect | None | **Built-in eBPF + nftables (namespace isolation + per-app rules + deny-all egress default)** |
+| **Network security** | NetworkPolicy (CNI-dependent) | Same | Consul Connect | None | **Built-in eBPF + nftables (namespace isolation + per-app rules + opt-in egress allowlists)** |
 | **Image builds** | Separate (Tekton, Jenkins, external CI) | Same | Separate | `docker build` | **Built-in (build jobs → Pickle)** |
 | **Terminal UI** | None (k9s is third-party) | Same | None | None | **Built-in (relish TUI)** |
 | **Change planning** | `kubectl diff` (limited) | Same | Built-in (`nomad job plan`) | None | **Built-in (relish plan)** |
@@ -956,13 +967,13 @@ This is an explicit design goal: Reliaburger should never be a dead end, regardl
 | **GPU scheduling** | Via device plugin (separate install) | Via device plugin | Yes (device plugins) | No | **Built-in (NVIDIA auto-detect via `nvidia-smi`)** |
 | **Secret management** | Built-in (basic) or External (Vault, Sealed Secrets) | Same as K8s | Vault integration | Docker secrets | **Encrypted-in-git (built-in)** |
 | **Workload identity** | Separate (SPIRE, cert-manager) | Same | Consul Connect | None | **Built-in (SPIFFE-compatible, auto-rotated)** |
-| **Non-container jobs** | No | No | Yes (exec driver) | No | **Yes (cgroup + namespace isolated)** |
-| **Non-container apps** | No | No | Yes (exec/raw_exec drivers) | No | **Yes (cgroup + namespace isolated)** |
+| **Non-container jobs** | No | No | Yes (exec driver) | No | **Yes (allowlisted host exec; sandboxing planned)** |
+| **Non-container apps** | No | No | Yes (exec/raw_exec drivers) | No | **Yes (allowlisted host exec; sandboxing planned)** |
 | **Scheduling constraints** | nodeSelector, affinity/anti-affinity, taints/tolerations | Same | constraints, affinities | N/A | **Node labels with required/preferred (AND logic)** |
 | **Daemon mode** | DaemonSet (separate resource type) | Same | system scheduler | N/A | **replicas = "*" (same App resource)** |
 | **Job throughput** | Low (per-job API calls) | Low (same) | Medium | N/A | **100M+ per day** |
 | **Leader recovery** | Automatic within quorum; backup for quorum loss | Same | Automatic within quorum; backup for quorum loss | N/A | **Auto-reconstructs from nodes (survives total council loss)** |
-| **Multi-cluster** | Separate (Karmada / Cilium ClusterMesh / many CRDs) | Same | WAN gossip + API forwarding (Consul for service discovery) | N/A | **Built-in (Franchise — WAN gossip + Wrapper ingress, one command to peer)** |
+| **Multi-cluster** | Separate (Karmada / Cilium ClusterMesh / many CRDs) | Same | WAN gossip + API forwarding (Consul for service discovery) | N/A | **Planned (Franchise — WAN gossip + Wrapper ingress; not yet implemented, see §21)** |
 | **K8s migration** | N/A | N/A | N/A | N/A | **Built-in (relish import/export with migration reports)** |
 | **License** | Apache 2.0 | Apache 2.0 | MPL 2.0 (reverted from BSL 1.1) | Apache 2.0 | **Apache 2.0** |
 
@@ -1014,11 +1025,11 @@ No. The new leader enters a learning period where it accepts StateReports from n
 
 ### Q6: Aren't exec (non-container) jobs a massive security risk?
 
-They would be, without constraints. Process workloads are locked down by default: they require an explicit `admin` or `host-exec` Permission grant, run as a dedicated unprivileged user (`burger`), have a restrictive seccomp profile, a restricted mount namespace, and cgroup resource limits. On top of that, you must configure an explicit binary allowlist in `node.toml`. An empty or absent allowlist refuses every `exec`/`script` workload, so host execution is disabled on any node the operator hasn't explicitly opened up. This deny-by-default posture ensures that no host binary can execute without explicit operator approval. The security posture is closer to a cron job running under a locked-down service account than to unrestricted shell access.
+They would be, without constraints. The constraint that ships today is a policy gate, not a kernel sandbox. Process workloads require an explicit `admin` or `host-exec` Permission grant, and you must configure an explicit binary allowlist in `node.toml`. An empty or absent allowlist refuses every `exec`/`script` workload, so host execution is disabled on any node the operator hasn't explicitly opened up. Inline scripts additionally require signed commits when applied via GitOps. This deny-by-default posture ensures no host binary can execute without explicit operator approval. What's *not* here yet (planned, see Section 17): a dedicated unprivileged `burger` user, a seccomp profile, cgroup limits, and network/PID/mount namespaces. So treat a process workload as a binary the operator has explicitly whitelisted running on the host, not as a locked-down sandboxed process — for anything hostile, keep it in a container.
 
 ### Q7: How does Pickle ensure image durability?
 
-The push is synchronous by default. The client receives a success response only after the image has been replicated to N peer nodes (default N=2). A successful push guarantees that the image survives the failure of any single node. For typical application images (50-200MB), replication adds 2-5 seconds to the push. If you prefer faster pushes at the cost of durability, you can configure `[images] push_sync = false`, but the default prioritizes safety over speed.
+Durability is eventual, not guaranteed at push time. A push commits the image locally and returns immediately with an `oci-replication: pending` header, so the client never mistakes acceptance for full redundancy. A leader-only heal loop (running roughly every 60 seconds) then replicates layers towards a redundancy target of 2 total copies by default: the node that received the push plus one peer. There is no synchronous mode and no `push_sync` config key. This keeps push latency low and independent of cluster size, at the cost of a short window after a push where the image exists on only one node. In clusters too small to reach the target, the heal loop records that full redundancy can't be met rather than silently claiming success.
 
 ### Q8: Can a single leader actually schedule 100M+ jobs per day while doing everything else?
 
@@ -1053,6 +1064,8 @@ Reliaburger runs on any number of nodes. A single-node cluster works for develop
 An idle Bun node (zero application workloads) consumes approximately 80-120 MB of resident memory and negligible CPU. This covers the Bun agent, Mustard gossip, eBPF maps (Onion), Pickle registry, Mayo metrics store, Ketchup log collector, and the Wrapper ingress proxy. On council members, Raft consensus adds approximately 20-40 MB depending on the size of the desired-state log. The Brioche web UI is compiled into every node and adds approximately 10 MB when actively serving. All components share a single process (the Bun binary), avoiding the per-process overhead of separate daemons. A 2-CPU, 4 GB node has ample headroom for application workloads after the base overhead.
 
 ### Q16: How does Franchise compare to Kubernetes multi-cluster tools?
+
+Franchise is planned, not yet implemented (see Section 21). This comparison sets out the intended design against the alternatives.
 
 | | K8s + Karmada | K8s + Cilium ClusterMesh | Nomad Federation | **Reliaburger Franchise** |
 |---|---|---|---|---|

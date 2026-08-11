@@ -27,8 +27,12 @@ relish logs-search ./archive "SELECT count(*) FROM logs WHERE line LIKE '%error%
 
 System, per-app and Prometheus-endpoint metrics are collected on every node:
 
+The TUI and the web dashboard (Brioche) chart live CPU and memory. The CLI
+`relish top` is a one-shot workload table (app, namespace, state, PID,
+restarts) — it does not show live CPU/memory:
+
 ```sh
-relish top                       # live CPU/memory per app
+relish top                       # workload table, not a live resource meter
 ```
 
 Alert rules evaluate in the agent; `[[alerts.destinations]]` webhooks (with

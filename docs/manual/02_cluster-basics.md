@@ -26,7 +26,8 @@ relish --ca-cert cluster/identity/root-ca.crt status
 Join tokens are single-use and short-lived, separate from API tokens:
 
 ```sh
-relish --ca-cert cluster/identity/root-ca.crt join-token create --ttl 15m
+relish --ca-cert cluster/identity/root-ca.crt \
+  join-token create --node-id node-02 --ttl 15m
 ```
 
 On the new node, enrol an identity, point `[cluster].join` at an existing

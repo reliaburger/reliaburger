@@ -58,4 +58,5 @@ relish apply examples/phase-1/container-nginx.toml
 
 - Deploy and manage an app: `deploy-an-app`
 - Form a real cluster: `cluster-basics`
+- Diagnose a broken cluster (`wtf`, `trace`, `bench`): `diagnostics`
 - Press `/` in this manual to search; `q` quits.
