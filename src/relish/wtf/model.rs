@@ -15,6 +15,20 @@ pub enum Evidence<T> {
         /// The value returned by the source.
         value: T,
     },
+    /// A complete, error-free observation which nonetheless carries an
+    /// inherent, documented limitation.
+    ///
+    /// This is not a collection failure. The source answered fully; the caveat
+    /// records a structural fact about the data, such as a bounded, non-durable
+    /// history. It diagnoses exactly like `Available` but surfaces the caveat.
+    AvailableWithCaveat {
+        /// Unix timestamp, in seconds, when the source was read.
+        observed_at: u64,
+        /// The value returned by the source.
+        value: T,
+        /// The inherent limitation on the observation.
+        caveat: String,
+    },
     /// Usable observations whose inventory or freshness is incomplete.
     Degraded {
         /// Unix timestamp, in seconds, when the source was read.
@@ -42,20 +56,46 @@ impl<T> Evidence<T> {
         Self::Available { observed_at, value }
     }
 
+    /// Construct an available observation carrying an inherent limitation.
+    pub fn available_with_caveat(observed_at: u64, value: T, caveat: impl Into<String>) -> Self {
+        Self::AvailableWithCaveat {
+            observed_at,
+            value,
+            caveat: caveat.into(),
+        }
+    }
+
     /// Return the observed value, when one exists.
     pub fn value(&self) -> Option<&T> {
         match self {
-            Self::Available { value, .. } | Self::Degraded { value, .. } => Some(value),
+            Self::Available { value, .. }
+            | Self::AvailableWithCaveat { value, .. }
+            | Self::Degraded { value, .. } => Some(value),
             Self::Unavailable { .. } | Self::Unsupported { .. } => None,
         }
     }
 
+    /// The reason a source could not reach an honest verdict, when it is one.
+    ///
+    /// An inherent caveat is not such a reason: a caveated source answered
+    /// fully, so this returns `None` and the caveat surfaces separately.
     pub(crate) fn unknown_reason(&self) -> Option<&str> {
         match self {
-            Self::Available { .. } => None,
+            Self::Available { .. } | Self::AvailableWithCaveat { .. } => None,
             Self::Degraded { reason, .. }
             | Self::Unavailable { reason }
             | Self::Unsupported { reason } => Some(reason),
+        }
+    }
+
+    /// The inherent limitation on an otherwise-complete observation.
+    pub(crate) fn caveat(&self) -> Option<&str> {
+        match self {
+            Self::AvailableWithCaveat { caveat, .. } => Some(caveat),
+            Self::Available { .. }
+            | Self::Degraded { .. }
+            | Self::Unavailable { .. }
+            | Self::Unsupported { .. } => None,
         }
     }
 }

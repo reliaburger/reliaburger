@@ -73,19 +73,9 @@ impl<T> EvidenceBuilder<T> {
         self.errors.push(reason.into());
     }
 
-    fn finish(mut self, observed_at: u64, limitation: Option<&str>) -> Evidence<Vec<T>> {
-        let inherently_degraded = limitation.is_some();
-        if let Some(limitation) = limitation {
-            self.errors.push(limitation.to_string());
-        }
+    fn finish(self, observed_at: u64) -> Evidence<Vec<T>> {
         if self.errors.is_empty() {
             Evidence::available(observed_at, self.values)
-        } else if inherently_degraded {
-            Evidence::Degraded {
-                observed_at,
-                value: self.values,
-                reason: self.errors.join("; "),
-            }
         } else if self.values.is_empty() && self.unsupported == self.errors.len() {
             Evidence::Unsupported {
                 reason: self.errors.join("; "),
@@ -101,6 +91,18 @@ impl<T> EvidenceBuilder<T> {
                 reason: self.errors.join("; "),
             }
         }
+    }
+
+    /// Finish an evidence set that carries an inherent, non-error limitation.
+    ///
+    /// A clean collection becomes `AvailableWithCaveat`, so the caveat surfaces
+    /// without forcing a `Degraded` verdict. A genuine collection error still
+    /// wins: the caveat is dropped and the real failure is reported.
+    fn finish_with_caveat(self, observed_at: u64, caveat: &str) -> Evidence<Vec<T>> {
+        if self.errors.is_empty() {
+            return Evidence::available_with_caveat(observed_at, self.values, caveat);
+        }
+        self.finish(observed_at)
     }
 }
 
@@ -480,9 +482,9 @@ fn collect_restarts(
             Err(error) => builder.unavailable(format!("node {}: {error}", node.node_id)),
         }
     }
-    builder.finish(
+    builder.finish_with_caveat(
         observed_at,
-        Some("restart history is held in node-local, bounded, non-durable event rings"),
+        "restart history is held in node-local, bounded, non-durable event rings",
     )
 }
 
@@ -529,9 +531,9 @@ fn collect_deploys(
             Err(error) => builder.unavailable(format!("node {}: {error}", node.node_id)),
         }
     }
-    builder.finish(
+    builder.finish_with_caveat(
         observed_at,
-        Some("terminal deploy history is bounded and process-local; operation targets do not yet carry image versions"),
+        "terminal deploy history is bounded and process-local; operation targets do not yet carry image versions",
     )
 }
 
@@ -616,7 +618,7 @@ fn collect_faults(
             Err(error) => builder.unavailable(format!("node {}: {error}", node.node_id)),
         }
     }
-    builder.finish(observed_at, None)
+    builder.finish(observed_at)
 }
 
 fn collect_alerts(
@@ -659,7 +661,7 @@ fn collect_alerts(
             Err(error) => builder.unavailable(format!("node {}: {error}", node.node_id)),
         }
     }
-    builder.finish(observed_at, None)
+    builder.finish(observed_at)
 }
 
 fn collect_local_diagnostics(collected: &[NodeCollection], observed_at: u64) -> LocalEvidenceSet {
@@ -711,9 +713,9 @@ fn collect_local_diagnostics(collected: &[NodeCollection], observed_at: u64) -> 
     }
     coalesce_disk_filesystems(&mut disks.values);
     LocalEvidenceSet {
-        disks: disks.finish(observed_at, None),
-        cpu_throttling: cpu.finish(observed_at, None),
-        certificates: certificates.finish(observed_at, None),
+        disks: disks.finish(observed_at),
+        cpu_throttling: cpu.finish(observed_at),
+        certificates: certificates.finish(observed_at),
     }
 }
 
@@ -801,7 +803,7 @@ fn collect_registry(
             }
         }
     }
-    builder.finish(observed_at, None)
+    builder.finish(observed_at)
 }
 
 async fn collect_logs(
@@ -863,7 +865,7 @@ async fn collect_logs(
             Err(error) => builder.unavailable(format!("{app}/{namespace}: {error}")),
         }
     }
-    builder.finish(observed_at, None)
+    builder.finish(observed_at)
 }
 
 fn append_logs(
@@ -1037,6 +1039,43 @@ mod tests {
             0.5
         );
         assert!(matches!(evidence.certificates, Evidence::Degraded { .. }));
+    }
+
+    #[test]
+    fn clean_restart_collection_is_a_caveat_not_a_degrade() {
+        let collected = vec![NodeCollection {
+            node_id: "node-1".to_string(),
+            reachable: true,
+            diagnostics: Err("unused".to_string()),
+            events: Ok(Vec::new()),
+            deploys: Err("unused".to_string()),
+            alerts: Err("unused".to_string()),
+            faults: Err("unused".to_string()),
+        }];
+
+        let evidence = collect_restarts(&collected, 10);
+
+        assert!(matches!(evidence, Evidence::AvailableWithCaveat { .. }));
+        assert!(evidence.unknown_reason().is_none());
+        assert!(evidence.caveat().is_some());
+    }
+
+    #[test]
+    fn failed_restart_collection_stays_unknown() {
+        let collected = vec![NodeCollection {
+            node_id: "node-1".to_string(),
+            reachable: false,
+            diagnostics: Err("unused".to_string()),
+            events: Err("event ring unreachable".to_string()),
+            deploys: Err("unused".to_string()),
+            alerts: Err("unused".to_string()),
+            faults: Err("unused".to_string()),
+        }];
+
+        let evidence = collect_restarts(&collected, 10);
+
+        assert!(evidence.caveat().is_none());
+        assert!(evidence.unknown_reason().is_some());
     }
 
     #[test]

@@ -551,6 +551,7 @@ async fn context_transfer_copies_the_blob_to_the_builder_registry() {
         &format!("127.0.0.1:{builder_port}"),
         &digest,
         256 * 1024 * 1024,
+        None,
     )
     .await
     .expect("transfer should succeed");
@@ -568,6 +569,7 @@ async fn context_transfer_copies_the_blob_to_the_builder_registry() {
         &format!("127.0.0.1:{builder_port}"),
         &digest,
         256 * 1024 * 1024,
+        None,
     )
     .await
     .expect("repeat transfer should succeed");
@@ -581,6 +583,7 @@ async fn context_transfer_copies_the_blob_to_the_builder_registry() {
         &format!("127.0.0.1:{builder_port}"),
         missing,
         256 * 1024 * 1024,
+        None,
     )
     .await
     .unwrap_err();

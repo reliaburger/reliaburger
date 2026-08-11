@@ -92,7 +92,7 @@ impl FaultRegistry {
     pub fn clear_workload_faults(&mut self) -> Vec<FaultRule> {
         let mut removed = Vec::new();
         self.faults.retain(|fault| {
-            if fault.fault_type.is_node_operation() {
+            if fault.fault_type.requires_admin_reversal() {
                 true
             } else {
                 removed.push(fault.clone());
@@ -102,11 +102,15 @@ impl FaultRegistry {
         removed
     }
 
-    /// Remove all faults targeting a specific service. Returns removed rules.
+    /// Remove all workload faults targeting a specific service. Returns removed
+    /// rules. Admin-class faults (node operations, node pressure) are left
+    /// alone even when their `target_service` matches — most carry an empty
+    /// `target_service`, so an empty `service` argument would otherwise match
+    /// every one and let a Deployer reverse them.
     pub fn clear_by_service(&mut self, service: &str) -> Vec<FaultRule> {
         let mut removed = Vec::new();
         self.faults.retain(|f| {
-            if f.target_service == service {
+            if f.target_service == service && !f.fault_type.requires_admin_reversal() {
                 removed.push(f.clone());
                 false
             } else {
@@ -328,6 +332,46 @@ mod tests {
         let removed = reg.clear_by_service("postgres");
         assert!(removed.is_empty());
         assert_eq!(reg.len(), 1);
+    }
+
+    /// C3: a Deployer-authorised clear must not reverse Admin-class node faults.
+    /// NodePressure is the trap — it is not an `is_node_operation`, so before
+    /// the fix a blanket workload clear removed it, and an empty `?service=`
+    /// matched every node fault's empty `target_service`.
+    #[test]
+    fn deployer_clears_leave_node_kill_and_pressure_alone() {
+        let mut reg = FaultRegistry::new();
+        reg.insert(&delay_request("redis", 60)); // an ordinary workload fault
+
+        let mut kill = delay_request("", 60);
+        kill.fault_type = FaultType::NodeKill {
+            kill_containers: false,
+        };
+        kill.target_node = Some("node-a".to_string());
+        reg.insert(&kill);
+
+        let mut pressure = delay_request("", 60);
+        pressure.fault_type = FaultType::NodePressure {
+            cpu_percentage: 5,
+            memory_percentage: 0,
+        };
+        pressure.target_node = Some("node-a".to_string());
+        reg.insert(&pressure);
+
+        // Blanket workload clear removes only the workload fault.
+        let removed = reg.clear_workload_faults();
+        assert_eq!(removed.len(), 1);
+        assert_eq!(reg.len(), 2);
+        assert!(
+            reg.iter().all(|f| f.fault_type.requires_admin_reversal()),
+            "NodeKill and NodePressure must both survive a workload clear"
+        );
+
+        // An empty `?service=` matches every node fault's empty target_service
+        // but must remove none of them.
+        let removed = reg.clear_by_service("");
+        assert!(removed.is_empty());
+        assert_eq!(reg.len(), 2);
     }
 
     #[test]

@@ -600,6 +600,11 @@ pub fn find_peer_builders(
 /// registry has never heard of them. Transferring the blob at
 /// delegation time closes that gap without inventing request-supplied
 /// registry endpoints: both addresses derive from config + membership.
+///
+/// `bearer` is the internal service token: on a routable cluster the registry
+/// authorises both the local read and the builder-side write by that token, so
+/// it rides on every request here (B1).
+#[allow(clippy::too_many_arguments)]
 pub async fn transfer_context_to_builder(
     client: &reqwest::Client,
     registry_scheme: &str,
@@ -607,14 +612,20 @@ pub async fn transfer_context_to_builder(
     builder_registry_address: &str,
     digest: &str,
     max_bytes: u64,
+    bearer: Option<&str>,
 ) -> Result<(), String> {
+    let with_bearer = |req: reqwest::RequestBuilder| match bearer {
+        Some(token) => req.bearer_auth(token),
+        None => req,
+    };
+
     // Skip the copy if the builder already holds the blob.
     let peer_blob_url = crate::pickle::build::context_download_url_at(
         registry_scheme,
         builder_registry_address,
         digest,
     );
-    if let Ok(response) = client.head(&peer_blob_url).send().await
+    if let Ok(response) = with_bearer(client.head(&peer_blob_url)).send().await
         && response.status().is_success()
     {
         return Ok(());
@@ -622,8 +633,7 @@ pub async fn transfer_context_to_builder(
 
     let local_url =
         crate::pickle::build::context_download_url(registry_scheme, local_registry_port, digest);
-    let response = client
-        .get(&local_url)
+    let response = with_bearer(client.get(&local_url))
         .send()
         .await
         .map_err(|e| format!("local registry unreachable: {e}"))?;
@@ -641,9 +651,7 @@ pub async fn transfer_context_to_builder(
         builder_registry_address,
         digest,
     );
-    let response = client
-        .post(&upload_url)
-        .body(body)
+    let response = with_bearer(client.post(&upload_url).body(body))
         .send()
         .await
         .map_err(|e| format!("builder registry unreachable: {e}"))?;
@@ -652,6 +660,100 @@ pub async fn transfer_context_to_builder(
             "builder registry refused the context blob: {}",
             response.status()
         ));
+    }
+    Ok(())
+}
+
+/// Upload a buildah-exported OCI image layout to the local registry, presenting
+/// `bearer` (the internal service token) as the write credential (B1).
+///
+/// `buildah push` cannot authenticate against Pickle — Pickle takes the
+/// service token as a *bearer* and buildah only offers HTTP Basic `--creds`,
+/// which Pickle never accepts and never challenges for. So the push writes a
+/// local OCI layout and this function uploads it: every blob under
+/// `blobs/sha256/` goes up as a monolithic blob (covering the config, the
+/// layers, and — for a multi-platform build — the sub-manifests), then the top
+/// manifest named by `index.json` is `PUT` under `tag`. Pickle's manifest
+/// validation then finds every referenced blob already present.
+async fn upload_oci_layout(
+    client: &reqwest::Client,
+    scheme: &str,
+    port: u16,
+    repository: &str,
+    tag: &str,
+    oci_dir: &std::path::Path,
+    bearer: Option<&str>,
+) -> Result<(), String> {
+    let with_bearer = |req: reqwest::RequestBuilder| match bearer {
+        Some(token) => req.bearer_auth(token),
+        None => req,
+    };
+
+    let index_bytes = tokio::fs::read(oci_dir.join("index.json"))
+        .await
+        .map_err(|e| format!("reading oci layout index.json: {e}"))?;
+    let top = crate::pickle::build::parse_oci_index(&index_bytes).map_err(|e| e.to_string())?;
+
+    // Upload every blob in the layout. Configs, layers and any sub-manifests
+    // all live here as content-addressed files named by their hex digest.
+    let blobs_dir = oci_dir.join("blobs").join("sha256");
+    let mut entries = tokio::fs::read_dir(&blobs_dir)
+        .await
+        .map_err(|e| format!("reading oci layout blobs: {e}"))?;
+    while let Some(entry) = entries
+        .next_entry()
+        .await
+        .map_err(|e| format!("reading oci layout blobs: {e}"))?
+    {
+        if !entry
+            .file_type()
+            .await
+            .map(|t| t.is_file())
+            .unwrap_or(false)
+        {
+            continue;
+        }
+        let path = entry.path();
+        let Some(hex) = path.file_name().and_then(|n| n.to_str()) else {
+            continue;
+        };
+        let digest = format!("sha256:{hex}");
+        let body = tokio::fs::read(&path)
+            .await
+            .map_err(|e| format!("reading blob {digest}: {e}"))?;
+        let url = crate::pickle::build::oci_blob_upload_url(scheme, port, repository, &digest);
+        let response = with_bearer(client.post(&url).body(body))
+            .send()
+            .await
+            .map_err(|e| format!("blob {digest} upload failed: {e}"))?;
+        if !response.status().is_success() {
+            return Err(format!(
+                "registry refused blob {digest}: {}",
+                response.status()
+            ));
+        }
+    }
+
+    // PUT the top manifest under the tag: this records the catalogue entry and
+    // pins every referenced blob. The bytes must be exactly what buildah wrote
+    // (the digest must match), so they come straight from the blob file.
+    let top_hex = top.digest.strip_prefix("sha256:").unwrap_or(&top.digest);
+    let manifest_bytes = tokio::fs::read(blobs_dir.join(top_hex))
+        .await
+        .map_err(|e| format!("reading top manifest {}: {e}", top.digest))?;
+    let url = crate::pickle::build::oci_manifest_put_url(scheme, port, repository, tag);
+    let mut request = client.put(&url).body(manifest_bytes);
+    if let Some(media_type) = &top.media_type {
+        request = request.header("content-type", media_type);
+    }
+    let response = with_bearer(request)
+        .send()
+        .await
+        .map_err(|e| format!("manifest put failed: {e}"))?;
+    if !response.status().is_success() {
+        let status = response.status();
+        let body = response.text().await.unwrap_or_default();
+        return Err(format!("registry refused the manifest ({status}): {body}"));
     }
     Ok(())
 }
@@ -850,6 +952,20 @@ async fn run_build_inner(
     let state = &ctx.api;
     let timeout = std::time::Duration::from_secs(state.build_timeout_secs);
 
+    // A unique, self-cleaning build directory. `ScopedDir::drop` removes
+    // it on every exit path below, so no failure leaves a stray context.
+    let base = std::env::temp_dir().join("reliaburger-build");
+    let build_dir = ScopedDir::new(&base, build_id)
+        .map_err(|e| format!("failed to create build directory: {e}"))?;
+    // The tar lands beside the context, not inside it, so `context.tar`
+    // never becomes part of the build.
+    let tar_path = build_dir.path().join("context.tar");
+    let ctx_dir = build_dir.path().join("ctx");
+    // buildah exports the built image here as an OCI image layout; the runner
+    // then uploads it to the local registry with the service-token bearer,
+    // because buildah cannot authenticate a `docker://` push itself (B1).
+    let oci_dir = build_dir.path().join("oci");
+
     // The registry destination is the node's own config, never the
     // request (JOB2): a caller cannot point this privileged process at
     // an arbitrary localhost service.
@@ -860,16 +976,14 @@ async fn run_build_inner(
         state.registry_scheme == "https",
     )
     .map_err(|e| format!("invalid build spec: {e}"))?;
-
-    // A unique, self-cleaning build directory. `ScopedDir::drop` removes
-    // it on every exit path below, so no failure leaves a stray context.
-    let base = std::env::temp_dir().join("reliaburger-build");
-    let build_dir = ScopedDir::new(&base, build_id)
-        .map_err(|e| format!("failed to create build directory: {e}"))?;
-    // The tar lands beside the context, not inside it, so `context.tar`
-    // never becomes part of the build.
-    let tar_path = build_dir.path().join("context.tar");
-    let ctx_dir = build_dir.path().join("ctx");
+    // The clustered push does not go over `docker://` (buildah cannot present
+    // the service-token bearer Pickle requires): buildah exports the image to
+    // a local OCI layout and the runner uploads it below (B1).
+    let oci_push_cmd = crate::pickle::build::buildah_push_to_oci_args(
+        &job.local_tag,
+        &oci_dir.to_string_lossy(),
+        &job.destination.tag,
+    );
 
     // Stream the context blob to disk with a hard byte cap (no whole-body
     // buffer), then extract through the hardened unpacker (bounds
@@ -882,7 +996,14 @@ async fn run_build_inner(
     );
     // The cluster client, not a bare `reqwest::get`: over TLS the registry
     // presents a cluster-CA certificate that a default client won't trust.
-    let response = match state.cluster_http.client().get(&context_url).send().await {
+    // The service-token bearer is required too — on a routable cluster the
+    // registry bind is the wildcard (not loopback), so `require_read_auth`
+    // is on and even this localhost read needs a principal (B1).
+    let mut context_request = state.cluster_http.client().get(&context_url);
+    if let Some(token) = &state.service_token {
+        context_request = context_request.bearer_auth(token);
+    }
+    let response = match context_request.send().await {
         Ok(response) if response.status().is_success() => response,
         _ => {
             return Err(format!(
@@ -924,10 +1045,12 @@ async fn run_build_inner(
         Err(e) => return Err(format!("context extraction task failed: {e}")),
     }
 
-    // Build, then push. The push targets the local registry, so the
-    // image lands in Pickle through the standard handlers (real
-    // holders, catalog persistence, Raft propose — all for free).
-    for (label, cmd) in [("build", &job.build_cmd), ("push", &job.push_cmd)] {
+    // Build, then export. The `push` step writes an OCI image layout to the
+    // local `oci_dir`; the upload that follows lands it in Pickle through the
+    // standard handlers (real holders, catalog persistence, Raft propose — all
+    // for free), authenticated with the service-token bearer that buildah
+    // could not present itself (B1).
+    for (label, cmd) in [("build", &job.build_cmd), ("push", &oci_push_cmd)] {
         let (program, args) = match cmd.split_first() {
             Some(pair) => pair,
             None => continue,
@@ -950,6 +1073,20 @@ async fn run_build_inner(
             }
         }
     }
+
+    // Upload the exported OCI layout to the local registry, presenting the
+    // service-token bearer. Pickle authorises registry writes by that bearer,
+    // which `buildah push` has no way to send (B1).
+    upload_oci_layout(
+        state.cluster_http.client(),
+        state.registry_scheme,
+        state.registry_port,
+        &job.destination.name,
+        &job.destination.tag,
+        &oci_dir,
+        state.service_token.as_deref(),
+    )
+    .await?;
 
     // Sign the pushed manifest so it deploys under require_signatures.
     // With the policy set, signing is part of success (JOB7); without
@@ -1143,6 +1280,7 @@ pub async fn build_submit_handler(
             &candidate.registry_address,
             &request.context_digest,
             state.max_context_bytes,
+            state.service_token.as_deref(),
         )
         .await
         {

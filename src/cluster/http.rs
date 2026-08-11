@@ -17,6 +17,12 @@ use reqwest::Client;
 pub struct ClusterHttp {
     scheme: &'static str,
     client: Client,
+    /// The internal service token, presented as `Authorization: Bearer` on
+    /// requests that go through [`Self::get`]. `None` when the node has no
+    /// master key (single-node / keyless). Route authorisation on the peer
+    /// still checks it; without it a routable Pickle read or a self-upgrade
+    /// binary fetch 401s (B2).
+    bearer: Option<String>,
 }
 
 impl ClusterHttp {
@@ -25,6 +31,7 @@ impl ClusterHttp {
         Self {
             scheme: "http",
             client: Client::new(),
+            bearer: None,
         }
     }
 
@@ -33,12 +40,37 @@ impl ClusterHttp {
         Self {
             scheme: "https",
             client,
+            bearer: None,
         }
+    }
+
+    /// Attach the internal service token as a default bearer for
+    /// [`Self::get`]. Builder-style so callers that don't need it (the common
+    /// case) stay unchanged.
+    pub fn with_bearer(mut self, bearer: Option<String>) -> Self {
+        self.bearer = bearer;
+        self
+    }
+
+    /// The service-token bearer, if one was attached.
+    pub fn bearer(&self) -> Option<&str> {
+        self.bearer.as_deref()
     }
 
     /// The shared reqwest client.
     pub fn client(&self) -> &Client {
         &self.client
+    }
+
+    /// A `GET` to `url` carrying the attached bearer (if any). Callers that
+    /// build their own requests can read [`Self::bearer`] and apply it
+    /// themselves; this is the convenience path for a plain authenticated GET.
+    pub fn get(&self, url: &str) -> reqwest::RequestBuilder {
+        let request = self.client.get(url);
+        match &self.bearer {
+            Some(token) => request.bearer_auth(token),
+            None => request,
+        }
     }
 
     /// The URL scheme, `http` or `https`.
@@ -88,6 +120,48 @@ mod tests {
         assert_eq!(
             h.url("node-2:9117", "/v1/placements/n2"),
             "https://node-2:9117/v1/placements/n2"
+        );
+    }
+
+    #[test]
+    fn without_a_bearer_none_is_reported() {
+        assert!(ClusterHttp::plaintext().bearer().is_none());
+    }
+
+    #[test]
+    fn with_bearer_attaches_the_token() {
+        let h = ClusterHttp::plaintext().with_bearer(Some("rbrg_service".to_string()));
+        assert_eq!(h.bearer(), Some("rbrg_service"));
+    }
+
+    /// B2: a `get` built from a bearer-carrying `ClusterHttp` sends the
+    /// `Authorization: Bearer` header, so a routable Pickle read (self-upgrade
+    /// binary fetch) authenticates instead of 401ing. Driven through a raw TCP
+    /// capture server so we observe the wire request.
+    #[tokio::test]
+    async fn get_sends_the_bearer_on_the_wire() {
+        use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let capture = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut buf = vec![0u8; 4096];
+            let n = socket.read(&mut buf).await.unwrap();
+            let request = String::from_utf8_lossy(&buf[..n]).to_string();
+            let _ = socket
+                .write_all(b"HTTP/1.1 404 Not Found\r\ncontent-length: 0\r\n\r\n")
+                .await;
+            request
+        });
+
+        let http = ClusterHttp::plaintext().with_bearer(Some("rbrg_service".to_string()));
+        let _ = http.get(&format!("http://{addr}/v2/blobs")).send().await;
+
+        let request = capture.await.unwrap().to_lowercase();
+        assert!(
+            request.contains("authorization: bearer rbrg_service"),
+            "request did not carry the bearer:\n{request}"
         );
     }
 }

@@ -14,6 +14,7 @@ use crate::testkit::TestContext;
 use crate::testkit::chaos::ChaosGuard;
 use crate::testkit::context::PINNED_TEST_WORKLOAD_IMAGE;
 use crate::testkit::deadline::Deadline;
+use crate::testkit::probe;
 use crate::testkit::safety::OperationPermission;
 
 use super::report::BenchMetric;
@@ -48,7 +49,7 @@ impl SuiteKind {
         match self {
             Self::DeploySpeed => "deploy_speed",
             Self::SchedulerThroughput => "scheduler_throughput",
-            Self::DiscoveryLatency => "discovery_latency_p99",
+            Self::DiscoveryLatency => "discovery_exec_roundtrip_p99",
             Self::NetworkThroughput => "network_throughput",
             Self::ReconstructionTime => "reconstruction_time",
             Self::ImageDistribution => "image_distribution",
@@ -343,7 +344,8 @@ async fn discovery_latency(context: &SuiteContext) -> Result<BenchMetric, String
     test.wait_running_cluster(source, 1).await?;
     let source_client = client_hosting(&test, source).await?;
     let requests = if context.options.quick { 50 } else { 200 };
-    let command = discovery_command(target, &context.namespace);
+    let fqdn = format!("{target}.{}.internal", context.namespace);
+    let command = discovery_command(&fqdn);
     let mut samples = Vec::with_capacity(requests);
     for _ in 0..requests {
         let start = Instant::now();
@@ -351,15 +353,24 @@ async fn discovery_latency(context: &SuiteContext) -> Result<BenchMetric, String
             .exec(source, &context.namespace, &command)
             .await
             .map_err(|error| format!("workload DNS query failed: {error}"))?;
-        if !output.contains("Address") && !output.contains("address") {
+        let probe = probe::parse_probe(&output)
+            .ok_or_else(|| format!("workload DNS probe emitted no status marker: {output:?}"))?;
+        if probe.status != 0 {
             return Err(format!(
-                "workload DNS query returned no address: {output:?}"
+                "workload DNS query for {fqdn} exited with status {}: {:?}",
+                probe.status, probe.lines
+            ));
+        }
+        if !probe::dns_answer_resolved(&probe.lines, &fqdn) {
+            return Err(format!(
+                "workload DNS query did not resolve {fqdn}: {:?}",
+                probe.lines
             ));
         }
         samples.push(start.elapsed().as_secs_f64() * 1_000.0);
     }
     metric(
-        "discovery_latency_p99",
+        "discovery_exec_roundtrip_p99",
         nearest_rank(&samples, 99)
             .ok_or_else(|| "discovery suite produced no samples".to_string())?,
         "ms",
@@ -403,14 +414,27 @@ async fn network_throughput(context: &SuiteContext) -> Result<BenchMetric, Strin
     test.wait_running_cluster(target, 1).await?;
     test.wait_running_cluster(source, 1).await?;
     let source_client = client_hosting(&test, source).await?;
-    let command = network_command(target, &context.namespace, port);
+    let url = format!(
+        "http://{target}.{}.internal:{port}/payload.bin",
+        context.namespace
+    );
+    let command = network_command(&url);
     let mut samples = Vec::with_capacity(sample_count);
     for _ in 0..sample_count {
         let start = Instant::now();
-        source_client
+        let output = source_client
             .exec(source, &context.namespace, &command)
             .await
             .map_err(|error| format!("service data-plane fetch failed: {error}"))?;
+        let probe = probe::parse_probe(&output).ok_or_else(|| {
+            format!("service data-plane probe emitted no status marker: {output:?}")
+        })?;
+        if probe.status != 0 {
+            return Err(format!(
+                "service data-plane fetch of {url} exited with status {}: {:?}",
+                probe.status, probe.lines
+            ));
+        }
         samples.push(payload_mib as f64 / start.elapsed().as_secs_f64().max(f64::MIN_POSITIVE));
     }
     metric(
@@ -681,21 +705,12 @@ fn finite_sorted(samples: &[f64]) -> Option<Vec<f64>> {
     Some(sorted)
 }
 
-fn discovery_command(service: &str, namespace: &str) -> Vec<String> {
-    vec![
-        "nslookup".to_string(),
-        format!("{service}.{namespace}.internal"),
-    ]
+fn discovery_command(fqdn: &str) -> Vec<String> {
+    probe::wrap_probe("nslookup \"$1\" 2>&1", &[fqdn])
 }
 
-fn network_command(service: &str, namespace: &str, port: u16) -> Vec<String> {
-    vec![
-        "wget".to_string(),
-        "-q".to_string(),
-        "-O".to_string(),
-        "/dev/null".to_string(),
-        format!("http://{service}.{namespace}.internal:{port}/payload.bin"),
-    ]
+fn network_command(url: &str) -> Vec<String> {
+    probe::wrap_probe("wget -q -O /dev/null \"$1\" 2>&1", &[url])
 }
 
 #[cfg(test)]
@@ -718,20 +733,21 @@ mod tests {
     }
 
     #[test]
-    fn discovery_and_network_commands_use_the_workload_dns_path() {
+    fn discovery_and_network_commands_wrap_the_probe_with_a_status_marker() {
+        let discovery = discovery_command("redis.rbtest-bench-01.internal");
+        assert_eq!(discovery[0], "sh");
+        assert_eq!(discovery[1], "-c");
+        assert!(discovery[2].contains("nslookup"));
+        assert!(discovery[2].contains("__RB_BENCH_PROBE_STATUS__=%s"));
+        assert_eq!(discovery.last().unwrap(), "redis.rbtest-bench-01.internal");
+
+        let network = network_command("http://payload.rbtest-bench-01.internal:8080/payload.bin");
+        assert_eq!(network[0], "sh");
+        assert!(network[2].contains("wget -q -O /dev/null"));
+        assert!(network[2].contains("__RB_BENCH_PROBE_STATUS__=%s"));
         assert_eq!(
-            discovery_command("redis", "rbtest-bench-01"),
-            ["nslookup", "redis.rbtest-bench-01.internal"]
-        );
-        assert_eq!(
-            network_command("payload", "rbtest-bench-01", 8080),
-            [
-                "wget",
-                "-q",
-                "-O",
-                "/dev/null",
-                "http://payload.rbtest-bench-01.internal:8080/payload.bin",
-            ]
+            network.last().unwrap(),
+            "http://payload.rbtest-bench-01.internal:8080/payload.bin"
         );
     }
 

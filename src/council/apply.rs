@@ -61,15 +61,61 @@ pub fn config_to_desired_writes(config: &Config) -> Vec<RaftRequest> {
     writes
 }
 
+/// A leased apply declared a kind that has no lease-owned lifecycle.
+///
+/// Only apps and namespaces can be attached to a lease and reaped when it
+/// ends. Jobs, builds and permissions have no owning record, so a leased
+/// config that declares one is rejected rather than silently dropped — the
+/// alternative let a leased test believe it had deployed a job that the
+/// cluster never created and cleanup could never account for.
+#[derive(Debug, thiserror::Error)]
+pub enum LeasedConfigError {
+    /// The config declared a kind other than an app or a namespace.
+    #[error(
+        "leased apply cannot declare {kind} {name:?}: only apps and namespaces are lease-owned"
+    )]
+    UnsupportedKind {
+        /// The offending declarative kind (`job`, `build`, `permission`).
+        kind: &'static str,
+        /// The name of the first offending declaration, for a precise error.
+        name: String,
+    },
+}
+
 /// Convert apps and their namespace declaration into ownership-checked writes.
 ///
 /// Each entry atomically inserts the desired object and its lease resource.
 /// A client crash can therefore leave both or neither, never an unowned object.
+///
+/// Mirrors the "every declarative kind is accounted for" invariant of
+/// [`config_to_desired_writes`]: this path owns only apps and namespaces, so
+/// any other kind is a hard error instead of a silent drop.
 pub fn config_to_leased_writes(
     config: &Config,
     lease_id: &str,
     observed_at_unix_ms: u64,
-) -> Vec<RaftRequest> {
+) -> Result<Vec<RaftRequest>, LeasedConfigError> {
+    // Reject any kind this path cannot own before emitting a single write, so a
+    // half-understood config never lands as a partial, unowned deployment.
+    if let Some(name) = config.permission.keys().next() {
+        return Err(LeasedConfigError::UnsupportedKind {
+            kind: "permission",
+            name: name.clone(),
+        });
+    }
+    if let Some(name) = config.job.keys().next() {
+        return Err(LeasedConfigError::UnsupportedKind {
+            kind: "job",
+            name: name.clone(),
+        });
+    }
+    if let Some(name) = config.build.keys().next() {
+        return Err(LeasedConfigError::UnsupportedKind {
+            kind: "build",
+            name: name.clone(),
+        });
+    }
+
     let mut writes = Vec::new();
     for (name, spec) in &config.namespace {
         writes.push(RaftRequest::TestLeaseNamespaceSpec {
@@ -88,7 +134,7 @@ pub fn config_to_leased_writes(
             spec: Box::new(spec.clone()),
         });
     }
-    writes
+    Ok(writes)
 }
 
 #[cfg(test)]
@@ -143,7 +189,7 @@ mod tests {
             namespace = "rbtest-run1"
         "#,
         );
-        let writes = config_to_leased_writes(&config, "run1", 42);
+        let writes = config_to_leased_writes(&config, "run1", 42).unwrap();
         assert_eq!(writes.len(), 3);
         assert!(matches!(
             &writes[0],
@@ -162,6 +208,49 @@ mod tests {
                 ..
             } if lease_id == "run1"
         )));
+    }
+
+    #[test]
+    fn leased_writes_reject_a_non_owned_kind() {
+        // A leased apply owns only apps and namespaces. A job, build or
+        // permission has no owning record, so cleanup could never reap it —
+        // reject the whole config rather than silently dropping the kind and
+        // letting the test believe it deployed something the cluster never did.
+        for (toml, kind) in [
+            (
+                r#"
+                [app.web]
+                image = "web:v1"
+                namespace = "rbtest-run1"
+
+                [job.migrate]
+                image = "migrate:v1"
+                "#,
+                "job",
+            ),
+            (
+                r#"
+                [build.img]
+                context = "."
+                destination = "pickle://img:v1"
+                "#,
+                "build",
+            ),
+            (
+                r#"
+                [permission.deployer]
+                actions = ["deploy"]
+                "#,
+                "permission",
+            ),
+        ] {
+            let config = parse(toml);
+            let error = config_to_leased_writes(&config, "run1", 42).unwrap_err();
+            assert!(
+                matches!(&error, LeasedConfigError::UnsupportedKind { kind: k, .. } if *k == kind),
+                "expected an {kind} rejection, got: {error}"
+            );
+        }
     }
 
     #[test]
