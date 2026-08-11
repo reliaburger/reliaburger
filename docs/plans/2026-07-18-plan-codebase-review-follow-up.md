@@ -85,6 +85,24 @@ The remaining `lru`, `thrift` and lock-only `rkyv` alerts therefore stay
 visible. They are not being called fixed. The acceptance decision is narrowly
 about known API reachability and trusted input, with a forced re-review date.
 
+**Re-review, 11 August 2026 (Phase 16 Section G).** The forced re-review fired.
+Two exceptions were *fixed by upgrades*, not re-ignored:
+
+- **`lru` RUSTSEC-2026-0002, and the newer RUSTSEC-2026-0253** (`LruCache::pop`
+  use-after-free, which had appeared in the database since the last review):
+  bumping `ratatui` 0.29 → 0.30 pulls `lru` 0.18.2, patched for both. The
+  migration was a single call-site change (`draw` now returns the backend's
+  associated error type); the TUI snapshot tests are unchanged.
+- **`anyhow` RUSTSEC-2026-0190**: upgraded 1.0.102 → 1.0.104 (patched in
+  1.0.103).
+
+Both were removed from `.cargo/audit.toml`. The five that remain — `bincode`,
+`rustls-pemfile`, `paste`, `proc-macro-error` (all unmaintained, no patched
+release) and lock-only `rkyv` (`cargo tree -i rkyv` still prints no active
+path) — have no upgrade available, so they carry forward with the same
+reachability rationale and a new **18 November 2026** re-review date (enforced by
+`make audit` and recorded in `.cargo/audit.toml`).
+
 **Verification:** `make audit`, `cargo fmt --all -- --check` and portable
 all-target clippy pass. `make test` runs 2,633 tests (all pass; 39 separately
 skipped), while `make test-no-default` runs 2,615 (all pass; 39 skipped).

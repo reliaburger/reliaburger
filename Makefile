@@ -63,9 +63,9 @@ lint: ## Run clippy for every target and feature with warnings as errors
 	$(CARGO) clippy --all-targets --all-features -- -D warnings
 
 audit: ## Fail on new RustSec findings or an expired advisory exception
-	@today=$$(date -u +%Y%m%d); expiry=20260818; \
+	@today=$$(date -u +%Y%m%d); expiry=20261118; \
 	if [ "$$today" -gt "$$expiry" ]; then \
-		echo "dependency advisory exceptions expired on 2026-08-18; review .cargo/audit.toml" >&2; \
+		echo "dependency advisory exceptions expired on 2026-11-18; review .cargo/audit.toml" >&2; \
 		exit 1; \
 	fi
 	$(CARGO) audit
