@@ -31,7 +31,7 @@ When an App's image changes (via `git push` through Lettuce or `relish deploy` v
 
 Because host ports are dynamically allocated, old and new versions coexist on the same node without conflict during the transition. There's never a moment when traffic has nowhere to go.
 
-If any new instance fails its health check, the deploy either halts (default) or actively reverts all already-upgraded instances (when `auto_rollback = true`). The system maintains a per-app deploy history accessible via `relish history`, the Brioche UI, and structured Ketchup log events.
+If any new instance fails its health check, the deploy actively reverts all already-upgraded instances (the default) or, when `auto_rollback = false`, halts and leaves the mixed old/new state for the operator to resolve. The system maintains a per-app deploy history accessible via `relish history`, the Brioche UI, and structured Ketchup log events.
 
 Dependency ordering via `run_before` ensures that prerequisite jobs (e.g., database migrations) run to completion before the app's rolling deploy begins. Autoscaling adjusts replica counts at runtime based on CPU or memory metrics, interacting correctly with the GitOps `replicas` field via runtime overrides stored in Raft.
 
@@ -463,7 +463,7 @@ pub struct DeployConfig {
     /// Default: 60s.
     pub health_timeout: Duration,
     /// Whether to actively revert on health check failure (true) or just halt (false).
-    /// Default: false.
+    /// Default: true.
     pub auto_rollback: bool,
 }
 
@@ -480,7 +480,7 @@ impl Default for DeployConfig {
             max_surge: 1,
             drain_timeout: Duration::from_secs(30),
             health_timeout: Duration::from_secs(60),
-            auto_rollback: false,
+            auto_rollback: true,
         }
     }
 }
@@ -648,7 +648,7 @@ async fn execute_rollout_step(step: &mut RolloutStep, config: &DeployConfig) -> 
 
 Two modes, determined by the `auto_rollback` config field:
 
-**Mode 1: Halt (default, `auto_rollback = false`)**
+**Mode 1: Halt (`auto_rollback = false`)**
 
 When a new instance fails its health check, the deploy halts immediately. The system state becomes a mix of old and new versions:
 
@@ -658,7 +658,7 @@ When a new instance fails its health check, the deploy halts immediately. The sy
 
 The operator can inspect the situation via `relish status`, which clearly shows the partial rollout state (e.g., "web: 1/3 instances on v2, 2/3 on v1, deploy halted"). The operator then decides whether to fix the issue and continue (`relish deploy --continue`) or manually roll back (`relish rollback web`).
 
-**Mode 2: Active Revert (`auto_rollback = true`)**
+**Mode 2: Active Revert (default, `auto_rollback = true`)**
 
 When a new instance fails its health check, the system automatically reverts all already-upgraded instances back to the previous version. The revert uses the same rolling mechanism (start old version, health check, swap routing, drain new version, stop new version) but in reverse. After revert completes, the entire app is back on the old version with no manual intervention required.
 
@@ -830,7 +830,7 @@ strategy = "rolling"        # "rolling" (default) or "blue-green"
 max_surge = 1               # max extra instances during rolling update (default: 1)
 drain_timeout = "30s"       # time to wait for in-flight connections to drain (default: 30s)
 health_timeout = "60s"      # time to wait for new instance health check (default: 60s)
-auto_rollback = true        # actively revert on failure (default: false = halt only)
+auto_rollback = false       # halt on failure instead of the default active revert
 
 # Per-app autoscale configuration (optional)
 [app.web.autoscale]
@@ -859,7 +859,7 @@ health_timeout = "60s"
 | `max_surge` | integer | `1` | Maximum extra instances during rolling update. Higher values trade resources for speed. |
 | `drain_timeout` | duration string | `"30s"` | How long to wait for in-flight connections to complete before force-stopping |
 | `health_timeout` | duration string | `"60s"` | How long to wait for a new instance's health check endpoint to return success |
-| `auto_rollback` | boolean | `false` | `false`: halt on failure (mixed versions, operator decides). `true`: actively revert all upgraded instances. |
+| `auto_rollback` | boolean | `true` | `true`: actively revert all upgraded instances on failure. `false`: halt and leave the mixed old/new state for the operator to decide. |
 | `autoscale.metric` | `"cpu"` or `"memory"` | (none) | Metric to scale on. Autoscaling is disabled if this section is absent. |
 | `autoscale.target` | integer (1-100) | (required if autoscale set) | Target utilisation percentage |
 | `autoscale.min` | integer | (required if autoscale set) | Minimum replica count |

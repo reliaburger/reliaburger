@@ -456,6 +456,19 @@ enum DeployOp {
         replica_count: u32,
         reply: oneshot::Sender<()>,
     },
+    /// Halt a failed rolling deploy without reverting (`auto_rollback = false`):
+    /// keep the healthy new + surviving old instances, tear down only the
+    /// incomplete one, record a `Halted` result.
+    HaltRollingDeploy {
+        app_name: String,
+        namespace: String,
+        spec: Box<AppSpec>,
+        new_ids: Vec<InstanceId>,
+        new_prepared: Vec<InstanceId>,
+        new_ports: std::collections::HashMap<InstanceId, Option<u16>>,
+        replica_count: u32,
+        reply: oneshot::Sender<()>,
+    },
     /// Retire the old instances and register the healthy new ones: service
     /// map, health config, backends, kernel networking, ingress, history.
     FinaliseRollingDeploy {
@@ -843,6 +856,33 @@ impl DeployOps {
     ) {
         self.call(
             |reply| DeployOp::RollbackRollingDeploy {
+                app_name: app_name.to_string(),
+                namespace: namespace.to_string(),
+                spec: Box::new(spec.clone()),
+                new_ids,
+                new_prepared,
+                new_ports,
+                replica_count,
+                reply,
+            },
+            (),
+        )
+        .await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn halt_rolling_deploy(
+        &self,
+        app_name: &str,
+        namespace: &str,
+        spec: &AppSpec,
+        new_ids: Vec<InstanceId>,
+        new_prepared: Vec<InstanceId>,
+        new_ports: std::collections::HashMap<InstanceId, Option<u16>>,
+        replica_count: u32,
+    ) {
+        self.call(
+            |reply| DeployOp::HaltRollingDeploy {
                 app_name: app_name.to_string(),
                 namespace: namespace.to_string(),
                 spec: Box::new(spec.clone()),
@@ -4585,6 +4625,55 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
         self.deploy_history.write().await.push(entry);
     }
 
+    /// Halt a failed rolling deploy without reverting (`auto_rollback = false`).
+    ///
+    /// Unlike [`rollback_rolling_deploy`], the healthy new instances that were
+    /// already published stay in service alongside the surviving old ones — the
+    /// operator inspects the mixed state and decides. Only the incomplete
+    /// instance (prepared but never made healthy, so not in `new_ids`) is torn
+    /// down, so a failed replacement can't leak its container, port or identity
+    /// dir.
+    #[allow(clippy::too_many_arguments)]
+    async fn halt_rolling_deploy(
+        &mut self,
+        app_name: &str,
+        namespace: &str,
+        spec: &AppSpec,
+        new_ids: &[InstanceId],
+        new_prepared: &[InstanceId],
+        new_ports: &std::collections::HashMap<InstanceId, Option<u16>>,
+        replica_count: u32,
+    ) {
+        for prepared in new_prepared {
+            if new_ids.contains(prepared) {
+                continue; // healthy and serving — leave it running
+            }
+            let _ = self.supervisor.grill().kill(prepared).await;
+            self.clear_egress(prepared).await;
+            if let Some(port) = new_ports.get(prepared).copied().flatten() {
+                let _ = self.supervisor.port_allocator.release(port).await;
+            }
+            self.cleanup_instance_identity(prepared);
+        }
+        let entry = crate::meat::deploy_types::DeployHistoryEntry {
+            id: crate::meat::deploy_types::DeployId(
+                SystemTime::now()
+                    .duration_since(SystemTime::UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_secs(),
+            ),
+            app_id: crate::meat::types::AppId::new(app_name, namespace),
+            image: spec.image.clone().unwrap_or_default(),
+            result: crate::meat::deploy_types::DeployResult::Halted,
+            created_at: SystemTime::now(),
+            completed_at: SystemTime::now(),
+            steps_completed: new_ids.len(),
+            steps_total: replica_count as usize,
+            spec: Some(Box::new(spec.clone())),
+        };
+        self.deploy_history.write().await.push(entry);
+    }
+
     /// Retire the old instances and register the healthy new ones after a
     /// rolling redeploy: kill old, rebuild the service map and health config,
     /// register backends, finish kernel networking, store ingress, record it.
@@ -7292,6 +7381,28 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
                 .await;
                 let _ = reply.send(());
             }
+            DeployOp::HaltRollingDeploy {
+                app_name,
+                namespace,
+                spec,
+                new_ids,
+                new_prepared,
+                new_ports,
+                replica_count,
+                reply,
+            } => {
+                self.halt_rolling_deploy(
+                    &app_name,
+                    &namespace,
+                    &spec,
+                    &new_ids,
+                    &new_prepared,
+                    &new_ports,
+                    replica_count,
+                )
+                .await;
+                let _ = reply.send(());
+            }
             DeployOp::FinaliseRollingDeploy {
                 app_name,
                 namespace,
@@ -8056,22 +8167,49 @@ impl<G: Grill + Clone + 'static> DeployWorker<G> {
         }
 
         if new_failed {
-            self.ops
-                .rollback_rolling_deploy(
-                    app_name,
-                    namespace,
-                    spec,
-                    new_ids,
-                    new_prepared,
-                    new_ports,
-                    replica_count,
-                )
-                .await;
-            let _ = events
-                .send(ApplyEvent::Error {
-                    message: "rolled back — old instances preserved".to_string(),
-                })
-                .await;
+            if deploy_config.auto_rollback {
+                self.ops
+                    .rollback_rolling_deploy(
+                        app_name,
+                        namespace,
+                        spec,
+                        new_ids,
+                        new_prepared,
+                        new_ports,
+                        replica_count,
+                    )
+                    .await;
+                let _ = events
+                    .send(ApplyEvent::Error {
+                        message: "rolled back — old instances preserved".to_string(),
+                    })
+                    .await;
+            } else {
+                // auto_rollback = false: halt without reverting. Keep the
+                // healthy new instances and the surviving old ones in place for
+                // the operator to inspect; tear down only the incomplete one.
+                let new_live = new_ids.len();
+                let old_live = existing.len().saturating_sub(retired);
+                self.ops
+                    .halt_rolling_deploy(
+                        app_name,
+                        namespace,
+                        spec,
+                        new_ids,
+                        new_prepared,
+                        new_ports,
+                        replica_count,
+                    )
+                    .await;
+                let _ = events
+                    .send(ApplyEvent::Error {
+                        message: format!(
+                            "deploy halted (auto_rollback = false): {new_live} new and \
+                             {old_live} old instance(s) left running for inspection"
+                        ),
+                    })
+                    .await;
+            }
             return std::ops::ControlFlow::Break(());
         }
 
@@ -9729,6 +9867,80 @@ mod tests {
             identity_dir_names(volumes.path()),
             expected,
             "exactly the live instances' dirs survive the redeploy"
+        );
+
+        shutdown.cancel();
+        agent_handle.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn rolling_redeploy_halts_without_reverting_when_auto_rollback_is_false() {
+        let (mut agent, tx, shutdown, grill) = test_agent_with_grill();
+        let history = agent.deploy_history_handle();
+        let agent_handle = tokio::spawn(async move {
+            agent.run().await;
+        });
+
+        fn halt_config() -> Config {
+            Config::parse(
+                r#"
+                [app.web]
+                image = "myapp:v1"
+                port = 8080
+
+                [app.web.deploy]
+                auto_rollback = false
+                health_timeout = "1s"
+            "#,
+            )
+            .unwrap()
+        }
+
+        // First deploy: web-0 comes up healthy (MockGrill defaults to Running).
+        expect_complete(&send_deploy(&tx, halt_config()).await);
+
+        // The next rolling redeploy's new instance (generation 1) never becomes
+        // healthy, so the rollout fails after the 1s health wait.
+        let new_id = crate::grill::InstanceIdentity::canary("default", "web", 1, 0).instance_id();
+        grill.set_state(&new_id, crate::grill::state::ContainerState::Failed);
+
+        let events = send_deploy(&tx, halt_config()).await;
+        match events.last().expect("no events received") {
+            ApplyEvent::Error { message } => {
+                assert!(
+                    message.contains("halted"),
+                    "expected a halt, got: {message}"
+                );
+                assert!(
+                    !message.contains("rolled back"),
+                    "must not revert: {message}"
+                );
+            }
+            other => panic!("expected an Error (halt) event, got {other:?}"),
+        }
+
+        // Halt keeps the old instance and tears down only the failed new one.
+        let (resp_tx, resp_rx) = oneshot::channel();
+        tx.send(AgentCommand::Status { response: resp_tx })
+            .await
+            .unwrap();
+        let ids: Vec<String> = resp_rx.await.unwrap().into_iter().map(|s| s.id).collect();
+        assert!(
+            ids.iter().any(|id| id == "default__web-0"),
+            "the old instance survives a halt, got {ids:?}"
+        );
+        assert!(
+            !ids.iter().any(|id| id.contains("web-g1")),
+            "the failed new instance was torn down, got {ids:?}"
+        );
+
+        // The deploy is recorded as Halted, not RolledBack.
+        let hist = history.read().await;
+        assert!(
+            hist.iter()
+                .any(|e| e.result == crate::meat::deploy_types::DeployResult::Halted),
+            "a Halted deploy-history entry was recorded, got {:?}",
+            hist.iter().map(|e| &e.result).collect::<Vec<_>>()
         );
 
         shutdown.cancel();

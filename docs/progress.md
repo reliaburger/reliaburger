@@ -1951,23 +1951,28 @@ Post-12b user-experience work (not a roadmap phase). Plan:
   to match the shipped flow: the leader upgrades **in place last** (openraft 0.9
   has no graceful leadership transfer), not the leadership hand-off the comment
   described. The code (lines ~145-165) already documented the real behaviour.
-- [ ] **`auto_rollback` default and wiring** *(deferred to its own PR)* — the
-  wired rolling path (`src/bun/agent.rs`, the `if new_failed` block) always calls
-  `rollback_rolling_deploy` and never reads the flag; the code default is `true`
-  (the sensible one) while the docs say `false`. Honouring `auto_rollback = false`
-  means a real "halt" that keeps the healthy new + old instances and tears down
-  only the incomplete one (the data model already has `DeployResult::Halted`), which
-  needs a new command-loop op (DeployOp variant + forwarder + handler + impl) and a
-  wired MockGrill test in the critical deploy path. Too much for a cleanup bundle;
-  fix the default in `deployments.md` as part of that PR.
-- [ ] **`live_council_voter()` always-false gate** *(deferred — needs a decision)* —
-  deeper than a wiring fix: the gossip `is_council`/`is_leader` flags are **never
-  set in production at all**, so `MembershipTable::council_members()`,
-  `leader()` and `live_council_voter()` are all effectively dead (real
-  council/leader tracking lives in openraft/the cluster runtime, and
-  `live_council_voter` has no production caller). This is a wire-it-through-gossip
-  feature or a delete-the-dead-code cleanup, not a small correctness fix — decide
-  and do it in its own change.
+- [x] **`auto_rollback` default and wiring** — the wired rolling path now honours
+  the flag. On a failed rollout the `if new_failed` block branches: `auto_rollback
+  = true` (default, unchanged behaviour) reverts; `auto_rollback = false` calls the
+  new `halt_rolling_deploy` op (DeployOp variant + forwarder + loop handler + impl)
+  which keeps the healthy new + surviving old instances, tears down only the
+  incomplete one, and records `DeployResult::Halted`. `deployments.md` corrected to
+  say the default is `true` (active revert). A wired MockGrill test induces a
+  failed generation-1 instance under `auto_rollback = false` and asserts the halt,
+  the old instance's survival, and the Halted history entry.
+- [x] **`live_council_voter()` / gossip `is_council`** — wired. The cluster runtime
+  now derives the live voter set + leader by name from Raft metrics
+  (`spawn_council_roles_publisher`, mirroring `spawn_leader_hint_publisher`) and
+  feeds it through a `watch<CouncilRoles>` into the gossip node, which applies
+  `MembershipTable::set_roles` each publish cycle — so `is_council`/`is_leader`,
+  `council_members()`, `leader()` and `live_council_voter()` return real data
+  instead of always-`false`. **Scope note (from a codebase sweep):** the audit's
+  framing was imprecise — `relish council recover`'s live-voter guard already uses
+  the metrics-correct HTTP node list (`commands.rs`), not the gossip flag, so this
+  is honest-flags / defense-in-depth, not a live-bug fix. `live_council_voter` and
+  `council_recover` were deliberately **not** re-pointed at each other (that would
+  regress the guard's `dead`/`left` state check). Unit-tested via `set_roles`;
+  end-to-end exercised by the gated cluster suite.
 
 ### Section C — Carry-forward Phase 15 review defects
 
