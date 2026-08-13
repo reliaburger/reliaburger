@@ -11,6 +11,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use tokio::sync::{Mutex, mpsc};
+use tokio_util::sync::CancellationToken;
 
 /// A drain tracker shared between the live Wrapper proxy and Bun's deploy
 /// path.
@@ -46,6 +47,23 @@ impl SharedDrains {
     /// True while `instance_id` is still draining.
     pub async fn is_draining(&self, instance_id: &str) -> bool {
         self.0.lock().await.is_draining(instance_id)
+    }
+
+    /// True once `instance_id`'s drain deadline has passed but it is still
+    /// tracked — the window in which its connections are being force-torn-down
+    /// and any new request must be rejected with 503.
+    pub async fn is_terminating(&self, instance_id: &str) -> bool {
+        self.0.lock().await.is_terminating(instance_id)
+    }
+
+    /// The termination signal for `instance_id`, if it is draining.
+    ///
+    /// An in-flight request to a draining backend clones this token and races
+    /// it against its own work: when the drain deadline forces completion the
+    /// token is cancelled, so the request stops streaming and the connection
+    /// closes rather than running on against a container about to be killed.
+    pub async fn terminate_token(&self, instance_id: &str) -> Option<CancellationToken> {
+        self.0.lock().await.terminate_token(instance_id)
     }
 
     /// Record a request arriving at a draining backend.
@@ -131,6 +149,10 @@ struct DrainEntry {
     active_connections: u32,
     /// Number of WebSocket connections (subset of active_connections).
     websocket_connections: u32,
+    /// Fires when the drain finishes (deadline reached or all connections
+    /// gone). In-flight requests watch it so a deadline-forced completion
+    /// actively tears their connection down instead of leaving it running.
+    terminate: CancellationToken,
 }
 
 impl DrainTracker {
@@ -156,9 +178,26 @@ impl DrainTracker {
                 deadline: Instant::now() + cmd.timeout,
                 active_connections: 0,
                 websocket_connections: 0,
+                terminate: CancellationToken::new(),
             },
         );
         true
+    }
+
+    /// Whether `instance_id` is draining and its deadline has already passed.
+    ///
+    /// This is the "terminating" state: the backend is about to be killed, so
+    /// the proxy rejects any *new* request routed to it with 503 rather than
+    /// piling more load onto a container on its way out.
+    pub fn is_terminating(&self, instance_id: &str) -> bool {
+        self.draining
+            .get(instance_id)
+            .is_some_and(|entry| Instant::now() >= entry.deadline)
+    }
+
+    /// The termination token for `instance_id`, if it is draining.
+    pub fn terminate_token(&self, instance_id: &str) -> Option<CancellationToken> {
+        self.draining.get(instance_id).map(|e| e.terminate.clone())
     }
 
     /// Record that a new connection was routed to a draining backend.
@@ -218,6 +257,13 @@ impl DrainTracker {
             // live WebSocket splice, not just HTTP requests (ING4).
             let idle = entry.active_connections == 0 && entry.websocket_connections == 0;
             if idle || now >= entry.deadline {
+                // Signal termination on the way out. When the deadline forced
+                // this (connections still open), the fire actively tears those
+                // connections down; when it was already idle, nothing is
+                // watching and the cancel is a harmless no-op. Either way we
+                // never fire before the deadline while requests are in flight,
+                // so a live request is never killed early.
+                entry.terminate.cancel();
                 completed.push(id.clone());
                 let _ = self
                     .complete_tx
@@ -376,6 +422,55 @@ mod tests {
         tracker.decrement_websocket("web-0");
         let completed = tracker.check_completions().await;
         assert_eq!(completed, vec!["web-0"]);
+    }
+
+    #[tokio::test]
+    async fn expired_drain_signals_termination() {
+        // ING/§5.5: when the deadline forces a drain to complete while a
+        // connection is still open, the terminate token fires so the live
+        // proxy tears that connection down instead of leaving it running.
+        let (tx, _rx) = mpsc::channel(16);
+        let mut tracker = DrainTracker::new(tx);
+
+        tracker.start_drain(&drain_cmd("web", "web-0", 0));
+        tracker.increment_connections("web-0");
+        let token = tracker.terminate_token("web-0").unwrap();
+        assert!(!token.is_cancelled(), "token fired before the deadline");
+
+        tokio::time::sleep(Duration::from_millis(1)).await;
+        let completed = tracker.check_completions().await;
+        assert_eq!(completed, vec!["web-0"]);
+        assert!(
+            token.is_cancelled(),
+            "terminate token did not fire on a deadline-forced completion"
+        );
+    }
+
+    #[tokio::test]
+    async fn drain_within_window_is_not_terminating() {
+        // A backend still inside its drain window is draining but not yet
+        // terminating, so the proxy keeps counting racing requests rather than
+        // rejecting them with 503.
+        let (tx, _rx) = mpsc::channel(16);
+        let mut tracker = DrainTracker::new(tx);
+
+        tracker.start_drain(&drain_cmd("web", "web-0", 30));
+        assert!(tracker.is_draining("web-0"));
+        assert!(!tracker.is_terminating("web-0"));
+    }
+
+    #[tokio::test]
+    async fn expired_drain_is_terminating_before_the_sweep() {
+        // Once the deadline passes, the backend is "terminating" even before
+        // the next `check_completions` sweep removes it — that is the window in
+        // which a new request must get 503.
+        let (tx, _rx) = mpsc::channel(16);
+        let mut tracker = DrainTracker::new(tx);
+
+        tracker.start_drain(&drain_cmd("web", "web-0", 0));
+        tokio::time::sleep(Duration::from_millis(1)).await;
+        assert!(tracker.is_draining("web-0"));
+        assert!(tracker.is_terminating("web-0"));
     }
 
     #[tokio::test]

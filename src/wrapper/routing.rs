@@ -10,7 +10,12 @@
 /// namespaced key to look each one up.
 use std::collections::HashMap;
 use std::net::SocketAddr;
+use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::Duration;
+
+use tokio::sync::RwLock;
+use tokio_util::sync::CancellationToken;
 
 use crate::config::app::IngressSpec;
 use crate::onion::service_id::ServiceId;
@@ -26,8 +31,15 @@ pub struct Backend {
     pub instance_id: String,
     /// Real address to proxy to.
     pub addr: SocketAddr,
-    /// Whether this backend is healthy.
+    /// Whether this backend is healthy per the cluster service map (passive
+    /// health from the reporting tree).
     pub healthy: bool,
+    /// Whether Wrapper's own active L7 probes consider this backend reachable
+    /// from *this* node. Starts `true` on rebuild (trust the service map) and
+    /// is flipped by the probe loop. A backend is only routable when both this
+    /// and [`healthy`](Self::healthy) hold, so an instance that is healthy
+    /// cluster-wide but unreachable locally is skipped.
+    pub locally_healthy: bool,
 }
 
 /// A route for a specific path prefix within a host.
@@ -69,11 +81,21 @@ pub struct RouteKey {
 }
 
 impl PathRoute {
-    /// Select the next healthy backend via round-robin.
+    /// Whether a backend is routable: healthy per the service map *and* passing
+    /// Wrapper's own active probes.
+    fn is_routable(b: &Backend) -> bool {
+        b.healthy && b.locally_healthy
+    }
+
+    /// Select the next routable backend via round-robin.
     ///
-    /// Returns `None` if no healthy backends are available.
+    /// Returns `None` if no routable backends are available.
     pub fn select_backend(&self) -> Option<&Backend> {
-        let healthy: Vec<&Backend> = self.backends.iter().filter(|b| b.healthy).collect();
+        let healthy: Vec<&Backend> = self
+            .backends
+            .iter()
+            .filter(|b| Self::is_routable(b))
+            .collect();
         if healthy.is_empty() {
             return None;
         }
@@ -82,9 +104,39 @@ impl PathRoute {
         Some(healthy[idx])
     }
 
-    /// Number of healthy backends.
+    /// Select up to `max` distinct routable backends for one request, in
+    /// round-robin order.
+    ///
+    /// The first entry is the primary; the rest are failover candidates the
+    /// proxy tries in order if the primary's connection fails. Returns fewer
+    /// than `max` when the pool is smaller, and an empty vector when nothing is
+    /// routable. Each backend appears at most once, so a failover always moves
+    /// to a *different* instance rather than retrying the one that just failed.
+    pub fn select_backends(&self, max: usize) -> Vec<(String, SocketAddr)> {
+        let healthy: Vec<&Backend> = self
+            .backends
+            .iter()
+            .filter(|b| Self::is_routable(b))
+            .collect();
+        if healthy.is_empty() || max == 0 {
+            return Vec::new();
+        }
+        let start = self.rr_counter.fetch_add(1, Ordering::Relaxed) as usize;
+        let n = healthy.len();
+        (0..n.min(max))
+            .map(|offset| {
+                let b = healthy[(start + offset) % n];
+                (b.instance_id.clone(), b.addr)
+            })
+            .collect()
+    }
+
+    /// Number of routable backends (service-map healthy and locally probed OK).
     pub fn healthy_count(&self) -> usize {
-        self.backends.iter().filter(|b| b.healthy).count()
+        self.backends
+            .iter()
+            .filter(|b| Self::is_routable(b))
+            .count()
     }
 
     /// Whether `path` falls under this route's prefix on a segment boundary.
@@ -237,6 +289,43 @@ impl RoutingTable {
     pub fn route_count(&self) -> usize {
         self.routes.values().map(|r| r.len()).sum()
     }
+
+    /// Distinct `(instance_id, addr)` targets across every route.
+    ///
+    /// The active probe loop reads this to know which backends to probe.
+    /// Deduplicated by instance ID, so a backend that appears on several routes
+    /// is probed once.
+    pub fn backend_targets(&self) -> Vec<(String, SocketAddr)> {
+        let mut seen = std::collections::HashSet::new();
+        let mut targets = Vec::new();
+        for routes in self.routes.values() {
+            for route in routes {
+                for backend in &route.backends {
+                    if seen.insert(backend.instance_id.clone()) {
+                        targets.push((backend.instance_id.clone(), backend.addr));
+                    }
+                }
+            }
+        }
+        targets
+    }
+
+    /// Set the active-probe health flag for every backend with `instance_id`.
+    ///
+    /// The probe loop calls this when an instance flips routable state. A
+    /// locally-unhealthy backend is then skipped by [`PathRoute::select_backend`]
+    /// even though the service map still lists it as healthy.
+    pub fn set_local_health(&mut self, instance_id: &str, locally_healthy: bool) {
+        for routes in self.routes.values_mut() {
+            for route in routes {
+                for backend in &mut route.backends {
+                    if backend.instance_id == instance_id {
+                        backend.locally_healthy = locally_healthy;
+                    }
+                }
+            }
+        }
+    }
 }
 
 impl Default for RoutingTable {
@@ -317,6 +406,9 @@ fn build_path_route(
             instance_id: b.instance_id.clone(),
             addr: SocketAddr::new(b.node_ip.into(), b.host_port),
             healthy: b.healthy,
+            // Trust the service map on a fresh rebuild; the active probe loop
+            // re-evaluates local reachability from here.
+            locally_healthy: true,
         })
         .collect();
 
@@ -362,6 +454,184 @@ fn build_rate_limit(
             .ok_or_else(|| "rate_limit_rps too large to derive a default burst".to_string())?,
     };
     Ok(Some(RateLimitConfig { rps, burst }))
+}
+
+/// Configuration for Wrapper's active L7 health probes.
+#[derive(Debug, Clone)]
+pub struct HealthProbeConfig {
+    /// How often to probe every backend.
+    pub interval: Duration,
+    /// Per-probe timeout.
+    pub timeout: Duration,
+    /// HTTP path to GET when probing.
+    pub path: String,
+    /// Consecutive failures before a backend is marked locally unhealthy.
+    pub threshold_unhealthy: u32,
+    /// Consecutive successes before a locally-unhealthy backend recovers.
+    pub threshold_healthy: u32,
+}
+
+impl Default for HealthProbeConfig {
+    fn default() -> Self {
+        Self {
+            interval: Duration::from_secs(5),
+            timeout: Duration::from_secs(2),
+            path: "/".to_string(),
+            // Mirror the app health-check thresholds (`bun::health`): three
+            // consecutive failures mark a backend down. Recovery takes two
+            // successes rather than one, so a single lucky probe doesn't flap a
+            // struggling backend straight back into rotation.
+            threshold_unhealthy: 3,
+            threshold_healthy: 2,
+        }
+    }
+}
+
+/// Per-instance consecutive probe counters and the current routable verdict.
+#[derive(Debug, Clone)]
+struct ProbeCounters {
+    consecutive_healthy: u32,
+    consecutive_unhealthy: u32,
+    locally_healthy: bool,
+}
+
+impl ProbeCounters {
+    fn new() -> Self {
+        // A backend enters the tracker trusted (the service map already vouches
+        // for it); probes only ever *demote* it from here.
+        Self {
+            consecutive_healthy: 0,
+            consecutive_unhealthy: 0,
+            locally_healthy: true,
+        }
+    }
+}
+
+/// Tracks consecutive active-probe results per backend and decides when a
+/// backend flips between locally healthy and unhealthy.
+///
+/// This is the pure decision half of active probing — no I/O — so the
+/// threshold logic is unit-testable without a network. It mirrors the
+/// hysteresis in `bun::health`: N failures to go down, M successes to come
+/// back, so a single flaky probe doesn't toggle a backend in or out.
+#[derive(Debug)]
+pub struct ProbeTracker {
+    threshold_unhealthy: u32,
+    threshold_healthy: u32,
+    states: HashMap<String, ProbeCounters>,
+}
+
+impl ProbeTracker {
+    /// Create a tracker with the given hysteresis thresholds.
+    pub fn new(threshold_unhealthy: u32, threshold_healthy: u32) -> Self {
+        Self {
+            threshold_unhealthy: threshold_unhealthy.max(1),
+            threshold_healthy: threshold_healthy.max(1),
+            states: HashMap::new(),
+        }
+    }
+
+    /// Record one probe result for `instance_id`.
+    ///
+    /// Returns `Some(true)` when the backend just recovered to locally healthy,
+    /// `Some(false)` when it just went locally unhealthy, and `None` when the
+    /// routable verdict is unchanged. The caller applies a returned verdict to
+    /// the routing table.
+    pub fn record(&mut self, instance_id: &str, success: bool) -> Option<bool> {
+        let counters = self
+            .states
+            .entry(instance_id.to_string())
+            .or_insert_with(ProbeCounters::new);
+
+        if success {
+            counters.consecutive_healthy = counters.consecutive_healthy.saturating_add(1);
+            counters.consecutive_unhealthy = 0;
+            if !counters.locally_healthy && counters.consecutive_healthy >= self.threshold_healthy {
+                counters.locally_healthy = true;
+                return Some(true);
+            }
+        } else {
+            counters.consecutive_unhealthy = counters.consecutive_unhealthy.saturating_add(1);
+            counters.consecutive_healthy = 0;
+            if counters.locally_healthy
+                && counters.consecutive_unhealthy >= self.threshold_unhealthy
+            {
+                counters.locally_healthy = false;
+                return Some(false);
+            }
+        }
+        None
+    }
+
+    /// Drop tracker state for instances no longer present in `live`.
+    ///
+    /// Called each sweep so a retired instance's counters don't leak; a new
+    /// instance that reuses the ID starts fresh (trusted) rather than
+    /// inheriting a stale unhealthy verdict.
+    fn retain_only(&mut self, live: &std::collections::HashSet<String>) {
+        self.states.retain(|id, _| live.contains(id));
+    }
+}
+
+/// Probe one backend once. Success means it answered with a non-5xx status.
+///
+/// A connection failure, timeout, or 5xx all count as a failed probe: from
+/// this node's point of view the backend can't serve a request right now.
+async fn probe_backend_once(
+    client: &reqwest::Client,
+    addr: SocketAddr,
+    path: &str,
+    timeout: Duration,
+) -> bool {
+    let url = format!("http://{addr}{path}");
+    match tokio::time::timeout(timeout, client.get(&url).send()).await {
+        Ok(Ok(resp)) => !resp.status().is_server_error(),
+        _ => false,
+    }
+}
+
+/// Run Wrapper's active L7 health-probe loop until `shutdown` fires.
+///
+/// Every `config.interval` it probes each backend in the routing table and
+/// feeds the result to a [`ProbeTracker`]. When an instance flips routable
+/// state, it updates the routing table so [`PathRoute::select_backend`] starts
+/// (or stops) skipping it. This catches backends that are healthy cluster-wide
+/// but unreachable from this node — a signal the passive service map can't see.
+pub async fn run_health_probes(
+    routing_table: Arc<RwLock<RoutingTable>>,
+    config: HealthProbeConfig,
+    shutdown: CancellationToken,
+) {
+    let client = match reqwest::Client::builder().timeout(config.timeout).build() {
+        Ok(c) => c,
+        // Without a client we can't probe; passive service-map health still
+        // governs routing, so simply stand down rather than crash the proxy.
+        Err(_) => return,
+    };
+    let mut tracker = ProbeTracker::new(config.threshold_unhealthy, config.threshold_healthy);
+
+    loop {
+        tokio::select! {
+            _ = shutdown.cancelled() => return,
+            _ = tokio::time::sleep(config.interval) => {}
+        }
+
+        let targets = routing_table.read().await.backend_targets();
+        let live: std::collections::HashSet<String> =
+            targets.iter().map(|(id, _)| id.clone()).collect();
+
+        for (instance_id, addr) in &targets {
+            let ok = probe_backend_once(&client, *addr, &config.path, config.timeout).await;
+            if let Some(now_healthy) = tracker.record(instance_id, ok) {
+                routing_table
+                    .write()
+                    .await
+                    .set_local_health(instance_id, now_healthy);
+            }
+        }
+
+        tracker.retain_only(&live);
+    }
 }
 
 #[cfg(test)]
@@ -957,5 +1227,84 @@ mod tests {
             assert_eq!(table.lookup("h.com", "/abc/x").unwrap().app_name, "bbb");
             assert_eq!(table.lookup("h.com", "/xyz/x").unwrap().app_name, "aaa");
         }
+    }
+
+    #[test]
+    fn locally_unhealthy_backend_is_skipped_by_selection() {
+        // A backend that is healthy per the service map but has failed
+        // Wrapper's active probes must not be selected: the router honours the
+        // local verdict on top of the passive one.
+        let (map, configs) = setup_map_and_configs();
+        let mut table = RoutingTable::new();
+        table.rebuild(&map, &configs).unwrap();
+
+        // Both backends start routable.
+        assert_eq!(table.lookup("myapp.com", "/").unwrap().healthy_count(), 2);
+
+        // Probes mark web-1 locally unhealthy.
+        table.set_local_health("web-1", false);
+
+        let route = table.lookup("myapp.com", "/").unwrap();
+        assert_eq!(route.healthy_count(), 1);
+        for _ in 0..10 {
+            assert_eq!(route.select_backend().unwrap().instance_id, "web-0");
+        }
+
+        // A recovery flips it back.
+        table.set_local_health("web-1", true);
+        assert_eq!(table.lookup("myapp.com", "/").unwrap().healthy_count(), 2);
+    }
+
+    #[test]
+    fn select_backends_returns_distinct_failover_candidates() {
+        let (map, configs) = setup_map_and_configs();
+        let mut table = RoutingTable::new();
+        table.rebuild(&map, &configs).unwrap();
+        let route = table.lookup("myapp.com", "/").unwrap();
+
+        // Two healthy backends, so a request gets a primary plus one distinct
+        // failover candidate — never the same instance twice.
+        let picks = route.select_backends(3);
+        assert_eq!(picks.len(), 2);
+        assert_ne!(picks[0].0, picks[1].0);
+
+        // Zero max yields nothing.
+        assert!(route.select_backends(0).is_empty());
+    }
+
+    #[test]
+    fn probe_tracker_marks_unhealthy_after_three_failures() {
+        // Mirrors bun::health: the third consecutive failure flips the verdict,
+        // and not before.
+        let mut tracker = ProbeTracker::new(3, 2);
+        assert_eq!(tracker.record("web-0", false), None);
+        assert_eq!(tracker.record("web-0", false), None);
+        assert_eq!(tracker.record("web-0", false), Some(false));
+    }
+
+    #[test]
+    fn probe_tracker_recovers_after_two_successes() {
+        let mut tracker = ProbeTracker::new(3, 2);
+        // Drive it unhealthy first.
+        tracker.record("web-0", false);
+        tracker.record("web-0", false);
+        assert_eq!(tracker.record("web-0", false), Some(false));
+
+        // One success is not enough to recover; the second flips it back.
+        assert_eq!(tracker.record("web-0", true), None);
+        assert_eq!(tracker.record("web-0", true), Some(true));
+    }
+
+    #[test]
+    fn probe_tracker_resets_streak_on_alternating_results() {
+        // A single success in the middle of a failure streak resets the count,
+        // so alternating results never trip the threshold.
+        let mut tracker = ProbeTracker::new(3, 2);
+        assert_eq!(tracker.record("web-0", false), None);
+        assert_eq!(tracker.record("web-0", false), None);
+        assert_eq!(tracker.record("web-0", true), None); // resets unhealthy streak
+        assert_eq!(tracker.record("web-0", false), None);
+        assert_eq!(tracker.record("web-0", false), None);
+        assert_eq!(tracker.record("web-0", false), Some(false));
     }
 }

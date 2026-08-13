@@ -138,13 +138,17 @@ pub fn build_tls_config(
     // Ensure the ring crypto provider is installed (idempotent)
     let _ = rustls::crypto::ring::default_provider().install_default();
 
-    let config = ServerConfig::builder()
+    let mut config = ServerConfig::builder()
         .with_no_client_auth()
         .with_single_cert(certs, key)
         .map_err(|e| TlsError::ConfigFailed(e.to_string()))?;
 
     // rustls 0.23 defaults to TLS 1.2+ (no 1.0/1.1 support at all),
     // so no additional version filtering is needed.
+
+    // Advertise HTTP/2 then HTTP/1.1 (E); hyper's auto builder serves whichever
+    // ALPN the client negotiates.
+    config.alpn_protocols = crate::wrapper::types::alpn_protocols();
 
     Ok(Arc::new(config))
 }
@@ -158,9 +162,10 @@ pub fn build_tls_config_with_resolver(
     resolver: Arc<dyn rustls::server::ResolvesServerCert>,
 ) -> Result<Arc<ServerConfig>, TlsError> {
     let _ = rustls::crypto::ring::default_provider().install_default();
-    let config = ServerConfig::builder()
+    let mut config = ServerConfig::builder()
         .with_no_client_auth()
         .with_cert_resolver(resolver);
+    config.alpn_protocols = crate::wrapper::types::alpn_protocols();
     Ok(Arc::new(config))
 }
 

@@ -65,6 +65,20 @@ impl TlsMode {
     }
 }
 
+/// The ALPN protocols the ingress advertises, most-preferred first.
+///
+/// Returned as the wire-format identifiers rustls expects: `h2` for HTTP/2
+/// and `http/1.1` for HTTP/1.1. Advertising both lets an HTTP/2 client
+/// negotiate `h2` over TLS while an HTTP/1.1 client still connects.
+///
+/// This lives here (not in `tls.rs`) so the TLS config builder can set
+/// `ServerConfig::alpn_protocols = wrapper::types::alpn_protocols()` in a
+/// single line without the two modules depending on each other. `hyper`'s
+/// auto server then speaks whichever protocol was negotiated.
+pub fn alpn_protocols() -> Vec<Vec<u8>> {
+    vec![b"h2".to_vec(), b"http/1.1".to_vec()]
+}
+
 /// An unsupported or unimplemented TLS mode was requested in the config.
 #[derive(Debug, thiserror::Error, PartialEq, Eq)]
 pub enum TlsModeError {
@@ -145,4 +159,26 @@ pub struct RouteInfo {
     pub healthy_backends: usize,
     pub total_backends: usize,
     pub websocket: bool,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn alpn_advertises_h2_then_http1_in_preference_order() {
+        let alpn = alpn_protocols();
+        // h2 must come first so an HTTP/2-capable client negotiates it, with
+        // http/1.1 as the fallback for older clients.
+        assert_eq!(alpn, vec![b"h2".to_vec(), b"http/1.1".to_vec()]);
+    }
+
+    #[test]
+    fn tls_mode_parse_and_requires_tls() {
+        assert_eq!(TlsMode::parse(None).unwrap(), TlsMode::Disabled);
+        assert!(!TlsMode::parse(Some("none")).unwrap().requires_tls());
+        assert!(TlsMode::parse(Some("cluster")).unwrap().requires_tls());
+        assert!(TlsMode::parse(Some("explicit")).unwrap().requires_tls());
+        assert!(TlsMode::parse(Some("acme")).is_err());
+    }
 }
