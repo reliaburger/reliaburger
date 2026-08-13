@@ -22,6 +22,7 @@ use openraft::{Entry, LogId, RaftLogReader, StorageError, StorageIOError, Vote};
 use redb::{Database, ReadableTable, TableDefinition};
 
 use super::types::TypeConfig;
+use crate::sesame::raft_encryption::{self, EncryptedEntry};
 
 /// Log entries: index → `bincode(Entry)`.
 const ENTRIES: TableDefinition<u64, &[u8]> = TableDefinition::new("raft_log_entries");
@@ -32,6 +33,17 @@ const VOTE_KEY: &str = "vote";
 const COMMITTED_KEY: &str = "committed";
 const PURGED_KEY: &str = "last_purged";
 
+/// First byte of an encrypted log value.
+///
+/// Plaintext values are `serde_json::to_vec(&Entry)`, which always begins
+/// with `{` (0x7B); this marker is a byte a JSON entry can never start with,
+/// so a stored value is encrypted iff its first byte equals this marker. That
+/// one-byte test is what lets a plaintext log written before encryption (or on
+/// a keyless cluster) keep loading transparently after a key is introduced —
+/// the backward/forward compatibility the durable log's replay path depends on
+/// (an unreadable log must not be mistaken for a fresh one, CP3).
+const ENCRYPTED_MARKER: u8 = 0x01;
+
 /// Durable Raft log + vote storage backed by redb.
 ///
 /// `Clone` shares the underlying `Arc<Database>`, so the log reader (used by
@@ -39,6 +51,14 @@ const PURGED_KEY: &str = "last_purged";
 #[derive(Clone)]
 pub struct DurableLogStore {
     db: Arc<Database>,
+    /// Input key material for at-rest log encryption, or `None` for a keyless
+    /// (dev / pre-security) cluster that stores entries as plaintext JSON.
+    ///
+    /// When present this is the cluster master key (`wrapping_ikm`); it is fed
+    /// as HKDF IKM to [`raft_encryption::encrypt_entry`] /
+    /// [`raft_encryption::decrypt_entry`], each of which calls
+    /// `derive_log_encryption_key` internally with a fresh per-entry salt.
+    key: Option<Vec<u8>>,
 }
 
 /// Map any error into an openraft read-logs storage error.
@@ -61,8 +81,29 @@ fn decode_entry(bytes: &[u8]) -> Result<Entry<TypeConfig>, StorageError<u64>> {
 }
 
 impl DurableLogStore {
-    /// Open (or create) a durable log store at `path`.
+    /// Open (or create) a plaintext durable log store at `path`.
+    ///
+    /// Equivalent to [`open_with_key`](Self::open_with_key) with no key: entries
+    /// are stored as plaintext JSON, exactly as before at-rest encryption
+    /// existed.
     pub fn open(path: impl AsRef<Path>) -> Result<Self, redb::Error> {
+        Self::open_with_key(path, None)
+    }
+
+    /// Open (or create) a durable log store at `path`, optionally encrypting
+    /// entries at rest.
+    ///
+    /// When `key` is `Some`, each entry's value is encrypted (AES-256-GCM,
+    /// per-entry salt+nonce) before being written and decrypted on read. When
+    /// it is `None`, entries are stored as plaintext JSON. Either way a value
+    /// written by an earlier run — plaintext or encrypted — still loads: the
+    /// read path detects the on-disk format per value, so introducing (or, with
+    /// the same key, retaining) encryption never breaks the existing
+    /// open/replay path.
+    pub fn open_with_key(
+        path: impl AsRef<Path>,
+        key: Option<Vec<u8>>,
+    ) -> Result<Self, redb::Error> {
         let db = Database::create(path)?;
         // Materialise the tables so reads on a fresh store don't error.
         let wtx = db.begin_write()?;
@@ -71,7 +112,60 @@ impl DurableLogStore {
             wtx.open_table(META)?;
         }
         wtx.commit()?;
-        Ok(Self { db: Arc::new(db) })
+        Ok(Self {
+            db: Arc::new(db),
+            key,
+        })
+    }
+
+    /// Encode an entry into the bytes stored in redb.
+    ///
+    /// Plaintext JSON when keyless; when a key is present, the JSON is
+    /// encrypted and the `EncryptedEntry` is bincoded behind a one-byte marker
+    /// so the read path can tell the two formats apart.
+    fn encode_value(&self, entry: &Entry<TypeConfig>) -> Result<Vec<u8>, StorageError<u64>> {
+        // JSON, not bincode: log entries carry `RaftRequest`, whose `AppSpec`
+        // uses config types (`Replicas`, `ResourceRange`) with `deserialize_any`
+        // for TOML ergonomics. bincode is not self-describing and cannot drive
+        // `deserialize_any`, so it corrupts on read-back. The snapshot already
+        // uses JSON for the same reason. Votes/log-ids stay bincode — they're
+        // plain openraft numeric types.
+        let json = serde_json::to_vec(entry).map_err(write_err)?;
+        match &self.key {
+            None => Ok(json),
+            Some(ikm) => {
+                let encrypted = raft_encryption::encrypt_entry(&json, ikm).map_err(write_err)?;
+                // bincode is safe here: `EncryptedEntry` is plain byte
+                // vectors/arrays, no `deserialize_any`.
+                let body = bincode::serialize(&encrypted).map_err(write_err)?;
+                let mut out = Vec::with_capacity(body.len() + 1);
+                out.push(ENCRYPTED_MARKER);
+                out.extend_from_slice(&body);
+                Ok(out)
+            }
+        }
+    }
+
+    /// Decode an entry from the bytes stored in redb, transparently handling
+    /// both plaintext and encrypted values.
+    ///
+    /// An encrypted value (marker byte) requires the key that wrote it; a
+    /// plaintext value is decoded directly regardless of whether a key is now
+    /// configured. Refusing to decode an encrypted value with no key available
+    /// surfaces as a read error rather than silently losing log entries.
+    fn decode_value(&self, bytes: &[u8]) -> Result<Entry<TypeConfig>, StorageError<u64>> {
+        if bytes.first() == Some(&ENCRYPTED_MARKER) {
+            let encrypted: EncryptedEntry = bincode::deserialize(&bytes[1..]).map_err(read_err)?;
+            let ikm = self.key.as_ref().ok_or_else(|| {
+                read_err(std::io::Error::other(
+                    "encrypted raft log entry but no encryption key available",
+                ))
+            })?;
+            let json = raft_encryption::decrypt_entry(&encrypted, ikm).map_err(read_err)?;
+            decode_entry(&json)
+        } else {
+            decode_entry(bytes)
+        }
     }
 
     /// Whether the store has never been written to (no vote and no log).
@@ -139,7 +233,7 @@ impl DurableLogStore {
         let rtx = self.db.begin_read().map_err(read_err)?;
         let t = rtx.open_table(ENTRIES).map_err(read_err)?;
         match t.get(index).map_err(read_err)? {
-            Some(v) => Ok(Some(decode_entry(v.value())?)),
+            Some(v) => Ok(Some(self.decode_value(v.value())?)),
             None => Ok(None),
         }
     }
@@ -157,7 +251,7 @@ impl DurableLogStore {
         let mut out = Vec::new();
         for row in t.range::<u64>(bounds).map_err(read_err)? {
             let (_, v) = row.map_err(read_err)?;
-            out.push(decode_entry(v.value())?);
+            out.push(self.decode_value(v.value())?);
         }
         Ok(out)
     }
@@ -172,14 +266,7 @@ impl DurableLogStore {
         {
             let mut t = wtx.open_table(ENTRIES).map_err(write_err)?;
             for entry in entries {
-                // JSON, not bincode: log entries carry `RaftRequest`, whose
-                // `AppSpec` uses config types (`Replicas`, `ResourceRange`)
-                // with `deserialize_any` for TOML ergonomics. bincode is not
-                // self-describing and cannot drive `deserialize_any`, so it
-                // corrupts on read-back. The snapshot already uses JSON for
-                // the same reason. Votes/log-ids stay bincode — they're
-                // plain openraft numeric types.
-                let bytes = serde_json::to_vec(&entry).map_err(write_err)?;
+                let bytes = self.encode_value(&entry)?;
                 t.insert(entry.log_id.index, bytes.as_slice())
                     .map_err(write_err)?;
             }
@@ -443,5 +530,112 @@ mod tests {
                 .index,
             2
         );
+    }
+
+    /// Stand-in for the cluster master key (`wrapping_ikm`). HKDF accepts any
+    /// IKM length, so a plain byte string is fine.
+    fn test_key() -> Vec<u8> {
+        b"cluster-master-key-for-raft-log-tests".to_vec()
+    }
+
+    /// Read the exact bytes stored under `index`, to assert the on-disk format.
+    fn raw_entry_bytes(store: &DurableLogStore, index: u64) -> Vec<u8> {
+        let rtx = store.db.begin_read().unwrap();
+        let t = rtx.open_table(ENTRIES).unwrap();
+        t.get(index).unwrap().unwrap().value().to_vec()
+    }
+
+    #[tokio::test]
+    async fn encrypted_log_round_trips_append_and_read() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("store.redb");
+        let key = test_key();
+
+        let mut store = DurableLogStore::open_with_key(&path, Some(key.clone())).unwrap();
+        store.write_entries(vec![entry(1, 1), entry(2, 2)]).unwrap();
+
+        // On disk it is ciphertext behind the marker, not the plaintext JSON.
+        let raw = raw_entry_bytes(&store, 1);
+        assert_eq!(raw.first(), Some(&ENCRYPTED_MARKER));
+        let plaintext = serde_json::to_vec(&entry(1, 1)).unwrap();
+        assert!(
+            raft_encryption::is_encrypted(&raw, &plaintext),
+            "stored value must not contain the plaintext entry"
+        );
+
+        let mut reader = store.get_log_reader().await;
+        let entries = reader.try_get_log_entries(1..3).await.unwrap();
+        assert_eq!(entries.len(), 2);
+        assert_eq!(entries[0].log_id.index, 1);
+        assert_eq!(entries[1].log_id.index, 2);
+
+        // Survives a reopen with the same key. The reader holds a clone of the
+        // db Arc, so it must be dropped too before redb releases the file.
+        drop(reader);
+        drop(store);
+        let mut store = DurableLogStore::open_with_key(&path, Some(key)).unwrap();
+        let mut reader = store.get_log_reader().await;
+        assert_eq!(reader.try_get_log_entries(1..3).await.unwrap().len(), 2);
+    }
+
+    #[tokio::test]
+    async fn plaintext_log_round_trips_without_a_key() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("store.redb");
+
+        let mut store = DurableLogStore::open_with_key(&path, None).unwrap();
+        store.write_entries(vec![entry(1, 1)]).unwrap();
+
+        // Keyless: the value is plaintext JSON (starts with `{`), never the marker.
+        let raw = raw_entry_bytes(&store, 1);
+        assert_eq!(raw.first(), Some(&b'{'));
+
+        let mut reader = store.get_log_reader().await;
+        assert_eq!(reader.try_get_log_entries(1..2).await.unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn key_store_reads_previously_plaintext_entries() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("store.redb");
+
+        // First run: keyless, so the entry is written as plaintext.
+        {
+            let store = DurableLogStore::open(&path).unwrap();
+            store.write_entries(vec![entry(1, 1)]).unwrap();
+        }
+
+        // Second run: the SAME store reopened with a key. The pre-existing
+        // plaintext entry must still load, and new entries are encrypted.
+        let mut store = DurableLogStore::open_with_key(&path, Some(test_key())).unwrap();
+        store.write_entries(vec![entry(2, 2)]).unwrap();
+
+        assert_eq!(raw_entry_bytes(&store, 1).first(), Some(&b'{'));
+        assert_eq!(raw_entry_bytes(&store, 2).first(), Some(&ENCRYPTED_MARKER));
+
+        let mut reader = store.get_log_reader().await;
+        let entries = reader.try_get_log_entries(1..3).await.unwrap();
+        assert_eq!(entries.len(), 2);
+        assert_eq!(entries[0].log_id.index, 1);
+        assert_eq!(entries[1].log_id.index, 2);
+    }
+
+    #[tokio::test]
+    async fn encrypted_entry_without_key_errors_rather_than_vanishing() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("store.redb");
+
+        {
+            let store = DurableLogStore::open_with_key(&path, Some(test_key())).unwrap();
+            store.write_entries(vec![entry(1, 1)]).unwrap();
+        }
+
+        // Reopen with no key: the encrypted entry cannot be decoded. It must
+        // surface as an error, never as a silently empty log — dropping
+        // committed entries is the exact split-brain hazard the durable log
+        // guards against (CP3).
+        let mut store = DurableLogStore::open(&path).unwrap();
+        let mut reader = store.get_log_reader().await;
+        assert!(reader.try_get_log_entries(1..2).await.is_err());
     }
 }

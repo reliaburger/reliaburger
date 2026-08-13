@@ -130,8 +130,15 @@ pub struct ClusterParams {
 /// snapshot must cover everything the log has purged. Returns the log store,
 /// whether the durable store is genuinely fresh (drives the bootstrap
 /// guard), and the loaded state machine.
+///
+/// `log_encryption_key` is the cluster master key (`wrapping_ikm`); when
+/// present the Raft log is encrypted at rest with it. `None` keeps the log
+/// plaintext (keyless / dev clusters). A log written under one mode still
+/// opens under the other — the store detects each value's format on read — so
+/// this never turns a populated store into a "fresh" one (CP3).
 pub async fn open_raft_storage(
     raft_dir: &std::path::Path,
+    log_encryption_key: Option<Vec<u8>>,
 ) -> std::io::Result<(
     crate::council::durable_log::DurableLogStore,
     bool,
@@ -139,8 +146,9 @@ pub async fn open_raft_storage(
 )> {
     std::fs::create_dir_all(raft_dir)?;
     let log_path = raft_dir.join("log.redb");
-    let log_store = crate::council::durable_log::DurableLogStore::open(&log_path)
-        .map_err(|e| std::io::Error::other(format!("raft log store open failed: {e}")))?;
+    let log_store =
+        crate::council::durable_log::DurableLogStore::open_with_key(&log_path, log_encryption_key)
+            .map_err(|e| std::io::Error::other(format!("raft log store open failed: {e}")))?;
     let store_fresh = log_store.is_fresh().map_err(|e| {
         std::io::Error::other(format!(
             "raft log store at {} is unreadable, refusing to treat it as fresh: {e}",
@@ -278,7 +286,11 @@ pub async fn start(
     // remembers its vote/log across restarts (Raft safety) instead of forming a
     // fresh cluster. `store_fresh` drives the bootstrap guard below.
     let raft_dir = params.data_dir.join("raft");
-    let (log_store, store_fresh, state_machine) = open_raft_storage(&raft_dir).await?;
+    // Encrypt the Raft log at rest with the cluster master key when one is
+    // available; keyless clusters keep writing plaintext.
+    let log_encryption_key = params.wrapping_ikm.map(|k| k.to_vec());
+    let (log_store, store_fresh, state_machine) =
+        open_raft_storage(&raft_dir, log_encryption_key).await?;
 
     // Build the shared CRL handle (seeded from the bootstrap security state
     // if present) and, when this node has an identity, the mTLS acceptor and

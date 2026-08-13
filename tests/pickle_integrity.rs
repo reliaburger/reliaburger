@@ -537,7 +537,7 @@ async fn a_peer_committed_manifest_is_visible_through_the_authoritative_catalogu
     let network = InMemoryRaftNetworkFactory::new(1, raft_router.clone());
     let raft_dir = tempfile::tempdir().unwrap();
     let (log_store, _fresh, state_machine) =
-        reliaburger::cluster::runtime::open_raft_storage(raft_dir.path())
+        reliaburger::cluster::runtime::open_raft_storage(raft_dir.path(), None)
             .await
             .unwrap();
     let council = CouncilNode::new(
