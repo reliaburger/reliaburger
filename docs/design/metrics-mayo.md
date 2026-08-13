@@ -1,24 +1,24 @@
-# Mayo: Embedded Metrics and Time-Series Database
+# Mayo: Embedded Metrics Store
 
-**Component:** Mayo (Metrics TSDB + Built-In Alerts)
+**Component:** Mayo (Metrics store + Built-In Alerts)
 **Binary:** Embedded in Bun (the single-node agent)
-**Status:** Design
+**Status:** Design (this document reconciled against the shipped code)
 **Whitepaper Reference:** Section 15
 
 ---
 
 ## 1. Overview
 
-Mayo is Reliaburger's embedded, per-node time-series database (TSDB). It provides a complete metrics pipeline -- collection, storage, querying, dashboarding, and alerting -- with zero configuration required. Every Bun instance runs a Mayo TSDB that:
+Mayo is Reliaburger's embedded, per-node metrics store. It provides a metrics pipeline -- collection, storage, querying, and alerting -- with zero configuration required. Every Bun instance runs a Mayo store that:
 
-- **Auto-collects** infrastructure metrics (CPU, memory, network, disk, GPU) for every app and the node itself.
-- **Scrapes Prometheus-format metrics** from application `/metrics` endpoints, auto-detected at startup.
-- **Stores data locally** in a 3-tier retention scheme (full-resolution, downsampled, archived) requiring approximately 50-100MB/day per busy node.
-- **Participates in hierarchical aggregation** via council members, enabling cluster-wide queries at 10,000 nodes without scatter-gathering every node.
-- **Exposes a Prometheus-compatible remote-read API** so teams can federate data into external Prometheus/Thanos/Cortex/Grafana stacks.
-- **Evaluates built-in and custom alert rules** using a PromQL-compatible expression subset, with webhook-based notification and per-app suppression/tuning.
+- **Auto-collects** node infrastructure metrics (CPU, memory, disk, network) and per-process metrics (CPU, memory) for every running instance.
+- **Stores data locally** as flat Parquet files (`metrics_NNNNNN.parquet`), queried with **DataFusion SQL**, and prunes them by a single `retention_days` window.
+- **Pushes 1-minute rollups** to its council parent over the reporting transport, so a council member can serve a partial cluster view.
+- **Evaluates built-in threshold alert rules** (metric, operator, threshold, duration), with webhook, Slack, and PagerDuty notification.
 
-The result is that operators get Prometheus + Thanos + Alertmanager functionality out of the box, embedded in the single Bun binary, with no external dependencies, no central database, and no configuration for the common case.
+The result is a batteries-included metrics store embedded in the single Bun binary, with no external database and no configuration for the common case.
+
+A note on this document: the storage engine is **Parquet + DataFusion SQL**, not a custom Gorilla/ULID TSDB, and the query language is **SQL**, not PromQL. Several capabilities the original design imagined -- Prometheus scraping, remote-read federation, tiered downsampling, cross-council query fan-out, ingress metrics -- have code paths or config keys but are **not wired into a running system**. Each is flagged below with **Status: planned -- not yet implemented.**
 
 ---
 
@@ -28,22 +28,22 @@ The result is that operators get Prometheus + Thanos + Alertmanager functionalit
 
 | Component | Relationship |
 |-----------|-------------|
-| **Bun** (node agent) | Host process. Bun's container runtime (Grill) provides cgroup stats for auto-collected metrics. Bun's Prometheus scraper feeds application metrics into the local Mayo TSDB. Bun drives Mayo's lifecycle (init, retention, shutdown). |
-| **Council** (Raft consensus group) | Council members act as the hierarchical aggregation tier. Each council member receives pre-aggregated rollups from its assigned subset of cluster nodes. Cluster-wide queries fan out to council aggregators (3-7 nodes) rather than every node. |
-| **Brioche** (web UI) | Queries Mayo over the internal HTTP API for dashboard rendering. Brioche displays cluster overview, app detail, node detail, and ingress dashboards -- all sourced from Mayo data. Alert state is also surfaced through Brioche. |
-| **Relish** (CLI) | `relish metrics`, `relish alerts`, and `relish top` query Mayo. The CLI can target a single node's TSDB or fan out through the leader for cross-node queries. |
-| **Mustard** (gossip) | Provides cluster membership and node identity, used by Mayo to determine which nodes are alive for query fan-out and which council member a node reports rollups to. |
-| **Meat** (scheduler) | Provides the app-to-node placement map so the leader knows which nodes to fan out to for single-app queries. |
-| **Wrapper** (ingress proxy) | Emits per-route ingress metrics (request count, latency percentiles, error rates) that Mayo collects. |
+| **Bun** (node agent) | Host process. Bun's collection loop samples node and per-process metrics (via the `sysinfo` crate) into the local Mayo store, drives the periodic flush to Parquet, runs the alert evaluation loop, and drives retention/disk-pressure pruning. |
+| **Council** (Raft consensus group) | Each worker node pushes a 1-minute `NodeRollup` to its assigned council parent over the reporting transport. The council member stores rollups in a separate rollup store, served at `/v1/metrics/rollup` and `/v1/metrics/cluster`. **Cross-council query fan-out and merge is planned -- not yet implemented** (see §3.3). |
+| **Brioche** (web UI) | Queries Mayo over the internal HTTP API (`/v1/metrics*`) for dashboard rendering. |
+| **Relish** (CLI) | `relish` queries the per-app metrics endpoint over HTTP. |
+| **Mustard** (gossip) | Provides cluster membership and node identity, used to determine which council parent a node reports rollups to. |
+| **Meat** (scheduler) | Provides the app-to-node placement map. Using it to fan single-app queries out to the nodes running the app is **planned** (the app endpoint currently reads only the local store). |
+| **Wrapper** (ingress proxy) | **Status: planned -- not yet implemented.** Per-route ingress metrics (`ingress_requests_total` and friends) are described below but are never emitted. |
 
 ### External Interfaces
 
-| Interface | Direction | Description |
-|-----------|-----------|-------------|
-| Prometheus remote-read API | Inbound | External Prometheus/Thanos/Cortex instances can query Mayo data via the standard `remote_read` protocol. |
-| Prometheus scrape endpoint | Inbound | External Prometheus instances can scrape `/metrics` on each node to pull Mayo-collected data. |
-| Application `/metrics` | Outbound (node-local) | Bun scrapes each app instance's Prometheus exposition endpoint. |
-| Webhook notifications | Outbound | Alert notifications dispatched to Slack, PagerDuty, or arbitrary HTTP endpoints. |
+| Interface | Direction | Status |
+|-----------|-----------|--------|
+| Webhook notifications | Outbound | **Shipped.** Alert notifications dispatched to generic HTTP, Slack, or PagerDuty destinations. |
+| Prometheus remote-read API | Inbound | **Status: planned -- not yet implemented.** There is no `remote_read` endpoint. |
+| Prometheus scrape endpoint (`/metrics` exposition) | Inbound | **Status: planned -- not yet implemented.** Mayo does not expose its data in Prometheus exposition format. |
+| Application `/metrics` scraping | Outbound (node-local) | **Status: planned -- not yet implemented.** A scraper (`src/mayo/scrape.rs`) exists and parses Prometheus text, but nothing calls it. |
 
 ---
 
@@ -55,86 +55,58 @@ Each node stores its own metrics locally. There is no central metrics database. 
 
 - Metrics storage scales linearly with cluster size.
 - There is no single bottleneck or point of failure for metrics.
-- A node failure loses only that node's local historical data (rollups on council aggregators provide cluster-level continuity).
+- A node failure loses only that node's local historical data (the 1-minute rollups its council parent holds provide a coarse cluster-level view).
 - No inter-node replication of raw metric data is required.
 
 ```
 ┌──────────────────────────────────────────────────────────────────┐
 │  Node (Bun)                                                      │
 │                                                                  │
-│  ┌──────────────┐    ┌──────────────┐    ┌───────────────────┐  │
-│  │ Auto-Collect  │    │ Prom Scraper │    │ Wrapper Ingress   │  │
-│  │ (cgroups,     │    │ (/metrics    │    │ (request count,   │  │
-│  │  /proc, GPU)  │    │  endpoints)  │    │  latency, errors) │  │
-│  └──────┬───────┘    └──────┬───────┘    └────────┬──────────┘  │
-│         │                   │                     │              │
-│         └───────────────────┼─────────────────────┘              │
-│                             ▼                                    │
-│                   ┌─────────────────┐                            │
-│                   │   Mayo TSDB     │                            │
-│                   │                 │                            │
-│                   │  ┌───────────┐  │                            │
-│                   │  │ Full Tier │  │  10s intervals, 24h        │
-│                   │  ├───────────┤  │                            │
-│                   │  │ Downsamp. │  │  1min aggregates, 7d       │
-│                   │  ├───────────┤  │                            │
-│                   │  │ Archived  │  │  1h aggregates, 90d        │
-│                   │  └───────────┘  │                            │
-│                   └────────┬────────┘                            │
-│                            │                                     │
-│              ┌─────────────┼────────────┐                        │
-│              ▼             ▼            ▼                         │
-│     Local queries   Rollup push   Remote-read API                │
-│     (Brioche/CLI)   to council    (ext. Prometheus)              │
-│                     aggregator                                   │
+│  ┌──────────────────────────┐                                    │
+│  │ Collection loop (sysinfo)│  node CPU/mem/disk/net,            │
+│  │  every collection_interval│  per-process CPU/mem               │
+│  └────────────┬─────────────┘                                    │
+│               ▼                                                  │
+│       ┌────────────────────────────────┐                         │
+│       │        Mayo store              │                         │
+│       │  in-memory buffer ─flush─▶      │                         │
+│       │  metrics_NNNNNN.parquet files   │                         │
+│       │  queried via DataFusion SQL     │                         │
+│       │  (buffer ∪ on-disk Parquet)     │                         │
+│       └───────────────┬────────────────┘                         │
+│                       │                                          │
+│           ┌───────────┼─────────────┐                            │
+│           ▼           ▼             ▼                            │
+│   Local SQL query  Rollup push   Retention prune                 │
+│   (/v1/metrics*)   to council    (retention_days;               │
+│                    parent        disk-pressure)                  │
 └──────────────────────────────────────────────────────────────────┘
 ```
 
-### 3.2 Three-Tier Retention
+Inserts land in an in-memory buffer. On flush the buffer becomes an Arrow `RecordBatch`, is written to a new `metrics_NNNNNN.parquet` file, and dropped from memory. Queries register the on-disk Parquet directory plus the unflushed buffer as a DataFusion `metrics` table (columns `timestamp UInt64`, `metric_name Utf8`, `labels Utf8` (a JSON object), `value Float64`) and run SQL over the union. A corrupt or truncated Parquet file is skipped with a log rather than failing the whole query.
 
-Data is stored at three resolution tiers with configurable retention:
+### 3.2 Retention
 
-| Tier | Resolution | Default Retention | Purpose |
-|------|-----------|-------------------|---------|
-| **Full** | 10-second intervals | 24 hours | High-resolution debugging, recent incident investigation |
-| **Downsampled** | 1-minute aggregates (min, max, sum, count, avg) | 7 days | Week-over-week comparisons, capacity trends |
-| **Archived** | 1-hour aggregates (min, max, sum, count, avg) | 90 days | Long-term trends, quarterly reviews |
+**Status of the original three-tier design (10s full / 1-min downsampled / 1-hour archived, 24h/7d/90d): planned -- not yet implemented.** There is no downsampler, no archiver, and no tiered storage. What ships is a single flat retention window.
 
-Tier transitions are performed by a background compaction task on each node. The downsampler runs every minute, aggregating the previous minute's full-resolution samples. The archiver runs every hour, aggregating the previous hour's downsampled data. Both tasks operate on immutable, closed time windows to avoid consistency issues.
+Retention is a single `retention_days` value (default **7**). Two paths prune Parquet files:
 
-### 3.3 Hierarchical Aggregation via Council Members
+- `MayoStore::prune(before)` deletes any file whose **newest datapoint** is older than the cutoff. The newest timestamp is read from the file's Parquet row-group statistics, not the file's mtime, so a touched/copied file with old data is still pruned and a file with recent data is kept regardless of mtime.
+- The disk-pressure task (`src/bun/disk_pressure.rs`) prunes oldest-first by file **mtime** when either `retention_days` has elapsed or `max_storage_mb` is exceeded (see §7.1). When an export destination is configured it exports a file before pruning it.
 
-Cluster-wide queries use a hierarchical aggregation model designed to scale to 10,000 nodes. Each council member acts as an aggregator for a subset of cluster nodes (~1,400-2,000 nodes per council member in a 10,000-node cluster with a 5-7 member council).
+### 3.3 Rollup Push to Council Members
 
-```
-Cluster-wide query path:
-  Brioche UI → Leader → Council aggregators (5 nodes)
-                         ↑ each holds rollups from ~2,000 nodes
-                         → merged result in <500ms
+**What ships:** each worker node runs a rollup worker (`src/mayo/rollup_worker.rs`) that, every `rollup_interval_secs` (default 60), generates a `NodeRollup` -- 1-minute (min, max, sum, count) aggregates of the local metrics -- and sends it to its assigned council parent over the reporting transport (bincode-framed messages, `ReportingMessage::MetricsRollup`, not gRPC). The council member stores received rollups in a separate rollup store, exposed at `/v1/metrics/rollup` (this member's own data) and `/v1/metrics/cluster`.
 
-Single-app query path:
-  Brioche UI → Leader → Nodes running that app (3-10 nodes)
-                         → merged result in <50ms
-```
+**What is planned -- not yet implemented:**
 
-**Rollup push:** Each node periodically (every 60 seconds) pushes pre-aggregated rollups -- 1-minute summaries of top-level metrics (per-app CPU, memory, network; per-node totals) -- to its assigned council aggregator. The assignment is deterministic based on consistent hashing of the node ID against council member IDs, and rebalances automatically when council membership changes.
-
-**Council aggregator storage:** Council members store received rollups in a separate Mayo instance (or logically separated partition) with their own retention policy (default: 24 hours of 1-minute rollups, 30 days of 1-hour rollups). This data is used exclusively for cluster-wide queries.
-
-**Query fan-out for single-app queries:** The leader (or any council member handling the query) consults the Meat placement map to determine which nodes are running the target app, then fans the query out only to those nodes (typically 3-10). Each node evaluates the query against its local Mayo TSDB and returns results. The querying node merges the partial results.
-
-**Query fan-out for cluster-wide queries:** The querying node fans out to all council aggregators (3-7 nodes), each of which evaluates the query against its aggregated rollup data and returns results. The querying node merges the partial results. This bounds fan-out to the council size regardless of cluster size.
+- **Cross-council query fan-out and merge.** `src/mayo/query_fanout.rs` contains `fan_out_cluster_query`/`fan_out_app_query` and the merge functions, but nothing calls them. `/v1/metrics/cluster` returns only the handling council member's *local* rollup data; it does not fan out to the other council members or merge their partial sums. So a "cluster-wide" query today reflects one council member's subset, not the whole cluster.
+- **Single-app query fan-out via the Meat placement map.** `/v1/metrics/app/{app}/{namespace}` filters the *local* store by the `namespace/app` label. It does not consult placement or query the other nodes running the app.
+- **`rollup_retention_hours`.** The config key exists and defaults to 24, but nothing reads it -- rollup stores are not pruned on a separate schedule.
 
 ### 3.4 Prometheus-Compatible Remote-Read API
 
-Each node exposes a Prometheus-compatible remote-read API endpoint at `/v1/read`. External Prometheus instances can configure Mayo as a `remote_read` target to federate data out for teams that prefer their existing Prometheus + Grafana stack. The API supports:
-
-- The standard Prometheus remote-read protobuf protocol.
-- Label matchers (`=`, `!=`, `=~`, `!~`).
-- Time range selection.
-- Streaming chunked responses for large result sets.
-
-Additionally, each node exposes its collected metrics via a standard `/metrics` endpoint in Prometheus exposition format, allowing external Prometheus instances to scrape Mayo directly.
+**Status: planned -- not yet implemented.** There is no `/v1/read` remote-read endpoint and no `/metrics` Prometheus-exposition endpoint. Mayo's data is reachable only through the `/v1/metrics*` JSON endpoints (see §5.7). External-Prometheus federation is future work.
 
 ---
 
@@ -142,290 +114,127 @@ Additionally, each node exposes its collected metrics via a standard `/metrics` 
 
 ### 4.1 Core Metric Types
 
+These are the types the shipped collector, store, and alert engine use (`src/mayo/types.rs`).
+
 ```rust
 use std::collections::BTreeMap;
-use std::time::{Duration, SystemTime};
 
-/// A unique metric identity, combining name and label set.
-/// Labels are sorted by key for deterministic hashing and comparison.
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
-pub struct MetricDescriptor {
-    /// Metric name, e.g. "cpu_usage_seconds_total", "http_requests_total"
-    pub name: String,
-    /// Sorted label key-value pairs. Always includes at minimum:
-    /// - "node" (originating node ID)
-    /// - "app" (app name, if app-scoped)
-    /// - "instance" (app instance ID, if instance-scoped)
+/// A metric name (e.g. `node_cpu_usage_percent`).
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub struct MetricName(pub String);
+
+/// A metric key: name + a set of labels.
+///
+/// Labels live in a `BTreeMap` so the same metric with the same labels
+/// always produces the same key regardless of insertion order. On storage
+/// the labels are serialised to a JSON string (the `labels` Parquet column).
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub struct MetricKey {
+    pub name: MetricName,
     pub labels: BTreeMap<String, String>,
-    /// Metric type for exposition and query semantics
-    pub metric_type: MetricType,
-    /// Human-readable description (from HELP line in Prometheus exposition)
-    pub help: Option<String>,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub enum MetricType {
-    Counter,
-    Gauge,
-    Histogram,
-    Summary,
-    Untyped,
-}
-
-/// A single data point: timestamp + float64 value.
-/// Timestamps are milliseconds since Unix epoch.
-#[derive(Debug, Clone, Copy)]
+/// A single metric data point.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 pub struct Sample {
-    pub timestamp_ms: i64,
+    /// Seconds since Unix epoch (not milliseconds).
+    pub timestamp: u64,
     pub value: f64,
 }
 
-/// A time series is a metric descriptor plus an ordered sequence of samples.
-/// In memory, samples are stored in a compressed chunk (see ChunkEncoding).
-/// The descriptor is interned via MetricId to avoid repeated allocation.
-#[derive(Debug)]
-pub struct TimeSeries {
-    pub id: MetricId,
-    pub descriptor: MetricDescriptor,
-    pub samples: Vec<Sample>,
+/// The kind of metric. Note: only Gauge and Counter exist -- there are no
+/// Histogram/Summary/Untyped kinds, because Mayo does not parse Prometheus
+/// exposition into a running store.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum MetricKind {
+    Gauge,
+    Counter,
 }
-
-/// Compact numeric identifier for a metric descriptor within a single
-/// Mayo TSDB instance. Assigned at ingestion time, used for all internal
-/// lookups. The mapping (MetricId <-> MetricDescriptor) is stored in the
-/// label index.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub struct MetricId(pub u64);
 ```
 
-### 4.2 Retention Tiers and Downsampled Aggregates
+There is deliberately no `MetricDescriptor`, `TimeSeries`, `MetricId`, or interned label index: DataFusion plans over the Parquet columns directly, so Mayo carries no posting-list index of its own.
+
+### 4.2 Rollup Types
+
+The rollup worker and council rollup store use these (`src/mayo/rollup.rs`). One `NodeRollup` is generated per node per push interval and pushed to the council parent.
 
 ```rust
-/// Defines a single retention tier's parameters.
-#[derive(Debug, Clone)]
-pub struct RetentionTier {
-    pub name: TierName,
-    /// Resolution of data in this tier
-    pub resolution: Duration,
-    /// How long data is kept before deletion
-    pub retention: Duration,
-    /// Compression algorithm for on-disk blocks
-    pub compression: Compression,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum TierName {
-    Full,
-    Downsampled,
-    Archived,
-}
-
-#[derive(Debug, Clone, Copy)]
-pub enum Compression {
-    /// No compression (used for the in-memory head chunk)
-    None,
-    /// Gorilla-style XOR encoding for timestamps and values (full tier on-disk)
-    Gorilla,
-    /// Zstd compression over Gorilla-encoded blocks (downsampled + archived tiers)
-    GorillaPlusZstd { level: i32 },
-}
-
-/// An aggregated data point produced by the downsampler or archiver.
-/// Captures the statistical summary of all raw samples within the
-/// aggregation window.
-#[derive(Debug, Clone, Copy)]
-pub struct AggregationRollup {
-    /// Start of the aggregation window (inclusive)
-    pub window_start_ms: i64,
-    /// End of the aggregation window (exclusive)
-    pub window_end_ms: i64,
-    /// Minimum sample value in the window
+/// Min/max/sum/count aggregate of one metric series over the push window.
+pub struct RollupAggregate {
     pub min: f64,
-    /// Maximum sample value in the window
     pub max: f64,
-    /// Sum of all sample values (for computing averages)
     pub sum: f64,
-    /// Number of samples aggregated
-    pub count: u32,
-    /// For counters: total increase over the window (handles resets)
-    pub counter_increase: Option<f64>,
+    pub count: u64,
 }
 
-/// Pre-aggregated rollup pushed from worker nodes to council aggregators.
-/// One of these is generated per metric per node per push interval (60s).
-#[derive(Debug, Clone)]
-pub struct NodeRollup {
-    /// Node that produced this rollup
-    pub node_id: String,
-    /// Timestamp of rollup generation
-    pub timestamp_ms: i64,
-    /// Per-metric aggregation summaries for the last push interval
-    pub metrics: Vec<RollupEntry>,
-}
+/// One (metric, labels, aggregate) entry within a NodeRollup.
+pub struct RollupEntry { /* metric name, labels, RollupAggregate */ }
 
-#[derive(Debug, Clone)]
-pub struct RollupEntry {
-    pub descriptor: MetricDescriptor,
-    pub rollup: AggregationRollup,
-}
+/// A node's 1-minute rollup, pushed to its council parent.
+pub struct NodeRollup { /* node id, timestamp (secs), Vec<RollupEntry> */ }
 ```
+
+**Status of tiered aggregates: planned -- not yet implemented.** There is no `RetentionTier`, `TierName`, `Compression` (Gorilla/zstd) enum, `AggregationRollup.counter_increase`, downsampler, or archiver. Rollups are a single 1-minute summary pushed to the council, not an on-disk downsampling tier.
 
 ### 4.3 Alert Data Structures
 
+Alert rules are **threshold rules**, not PromQL expressions (`src/mayo/alert.rs`).
+
 ```rust
-/// A single alert rule definition. Can be a built-in default or custom.
-#[derive(Debug, Clone)]
+/// A threshold alert rule.
 pub struct AlertRule {
-    /// Unique name, e.g. "cpu.throttled", "api.error_rate_high"
     pub name: String,
-    /// PromQL-compatible expression that evaluates to a boolean or instant vector.
-    /// When the expression returns a non-empty result set (or a scalar > 0),
-    /// the alert is considered firing.
-    pub expr: String,
-    /// Duration the expression must continuously evaluate to true before
-    /// the alert transitions from Pending to Firing.
+    /// The metric name to check (matched against the latest value per name).
+    pub metric_name: String,
+    pub threshold: f64,
+    pub operator: AlertOperator,   // GreaterThan | LessThan
+    /// How long the breach must hold before firing.
     pub for_duration: Duration,
-    /// Alert severity level
-    pub severity: AlertSeverity,
-    /// Human-readable message template. Supports label interpolation:
-    /// "{{ $labels.app }} CPU throttled at {{ $value }}%"
-    pub message: String,
-    /// Whether this is a built-in default alert (can be suppressed per-app)
-    pub is_builtin: bool,
-    /// Per-app overrides: suppression or threshold tuning
-    pub app_overrides: BTreeMap<String, AlertOverride>,
+    pub severity: AlertSeverity,   // Warning | Critical  (no Info)
+    pub description: String,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum AlertSeverity {
-    Info,
-    Warning,
-    Critical,
-}
+pub enum AlertOperator { GreaterThan, LessThan }
+pub enum AlertSeverity { Warning, Critical }
 
-/// Per-app override for a built-in alert rule.
-#[derive(Debug, Clone)]
-pub enum AlertOverride {
-    /// Completely suppress this alert for the app
-    Suppressed,
-    /// Override the threshold value. The meaning depends on the alert:
-    /// for memory.low, this overrides the percentage threshold.
-    Tuned { threshold: f64 },
-}
-
-/// Runtime state of an alert rule evaluation.
-#[derive(Debug)]
-pub struct AlertState {
-    pub rule: AlertRule,
-    pub status: AlertStatus,
-    /// When the expression first started evaluating to true (for `for` duration)
-    pub pending_since: Option<SystemTime>,
-    /// When the alert transitioned to Firing
-    pub firing_since: Option<SystemTime>,
-    /// Labels from the expression result (identifies the specific app/node)
-    pub active_labels: BTreeMap<String, String>,
-    /// Last evaluation timestamp
-    pub last_eval: SystemTime,
-    /// Last evaluation error, if any
-    pub last_error: Option<String>,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum AlertStatus {
-    /// Expression is not true; alert is inactive
+/// State machine per rule: Inactive → Pending → Firing.
+pub enum AlertState {
     Inactive,
-    /// Expression is true but `for` duration has not elapsed
-    Pending,
-    /// Expression has been true for >= `for` duration; notifications sent
-    Firing,
-}
-
-/// Configuration for an alert notification destination.
-#[derive(Debug, Clone)]
-pub struct AlertNotificationDestination {
-    pub destination_type: NotificationType,
-    pub url: String,
-    /// Which severities to send to this destination
-    pub severity_filter: Vec<AlertSeverity>,
-    /// Optional shared secret for HMAC signing of webhook payloads
-    pub secret: Option<String>,
-}
-
-#[derive(Debug, Clone, Copy)]
-pub enum NotificationType {
-    Webhook,
+    Pending { since: SystemTime },
+    Firing { since: SystemTime },
 }
 ```
+
+A rule fires when the latest value for `metric_name` breaches `threshold` under `operator` continuously for `for_duration`. Evaluation is three-way, not two-way: a *missing* metric is not treated as "recovered" -- a firing alert whose telemetry goes stale stays firing (only a genuine in-range reading resolves it), and a pending alert whose data vanishes drops back to inactive.
+
+**Status: planned -- not yet implemented:** expression (PromQL) rules with `expr`; the `Info` severity; per-app suppression/tuning (`AlertOverride`, `is_builtin`, `app_overrides`); and the `!=`/`>=`/`<=`/`==` operators (only strict `>` and `<` exist).
+
+Notification destinations are plain config structs (`AlertDestination` in `src/config/node.rs`): `dest_type` (`"webhook"` | `"slack"` | `"pagerduty"`), `url`, an optional `severity` filter list, and an optional HMAC `secret`.
 
 ### 4.4 On-Disk Format
 
-Mayo's on-disk format is inspired by Prometheus TSDB's block-based design but simplified for the embedded use case.
+**Status of the block/WAL/Gorilla/ULID design below: planned -- not yet implemented.** There is no WAL, no memory-mapped head chunk, no ULID blocks, no posting-list index, no Gorilla encoding, and no `downsampled/`/`archived/` directories.
+
+What actually lands on disk is a flat directory of self-describing Parquet files:
 
 ```
-<mayo_data_dir>/
-├── head/                          # In-memory + WAL for current data
-│   ├── wal/                       # Write-ahead log for crash recovery
-│   │   ├── 000001                 # WAL segment (append-only, 128MB max)
-│   │   ├── 000002
-│   │   └── ...
-│   └── chunks_head/               # Memory-mapped chunks for recent data
-│       ├── 000001
-│       └── ...
-├── blocks/                        # Immutable, compacted blocks
-│   ├── 01HQXYZ.../               # Block ID (ULID)
-│   │   ├── meta.json             # Block metadata (time range, stats)
-│   │   ├── index                 # Label index (posting lists, label pairs)
-│   │   ├── chunks/               # Time-series data chunks
-│   │   │   ├── 000001            # Gorilla-encoded chunk file
-│   │   │   └── ...
-│   │   └── tombstones            # Deletion markers (for retention pruning)
-│   └── ...
-├── downsampled/                   # 1-minute aggregate blocks
-│   ├── 01HQXYZ.../
-│   │   ├── meta.json
-│   │   ├── index
-│   │   └── chunks/
-│   │       └── ...
-│   └── ...
-├── archived/                      # 1-hour aggregate blocks
-│   ├── 01HQXYZ.../
-│   │   ├── meta.json
-│   │   ├── index
-│   │   └── chunks/               # Zstd-compressed chunks
-│   │       └── ...
-│   └── ...
-└── lock                           # Process-level file lock
+<storage.metrics>/                 # default /var/lib/reliaburger/metrics
+├── metrics_000000.parquet
+├── metrics_000001.parquet
+├── metrics_000002.parquet
+└── ...
 ```
 
-**Block structure:** Each block covers a fixed time window (2 hours for full-resolution, 24 hours for downsampled, 7 days for archived). Blocks are immutable once written. The `meta.json` file contains:
+Each file is one flush of the in-memory buffer, written with Arrow's `ArrowWriter`. Every file carries the same schema:
 
-```rust
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct BlockMeta {
-    /// Unique block identifier (ULID, lexicographically sortable by time)
-    pub ulid: String,
-    /// Minimum timestamp (inclusive) of any sample in the block
-    pub min_time_ms: i64,
-    /// Maximum timestamp (exclusive) of any sample in the block
-    pub max_time_ms: i64,
-    /// Retention tier
-    pub tier: TierName,
-    /// Number of distinct time series in this block
-    pub num_series: u64,
-    /// Total number of samples (or rollups) in this block
-    pub num_samples: u64,
-    /// Block size on disk in bytes
-    pub size_bytes: u64,
-    /// Compaction level (0 = first write, increments on merges)
-    pub compaction_level: u32,
-    /// Compression format used for chunks in this block
-    pub compression: Compression,
-}
-```
+| Column | Arrow type | Meaning |
+|--------|-----------|---------|
+| `timestamp` | `UInt64` | seconds since Unix epoch |
+| `metric_name` | `Utf8` | e.g. `node_cpu_usage_percent` |
+| `labels` | `Utf8` | the label `BTreeMap` serialised as a JSON object |
+| `value` | `Float64` | the sample value |
 
-**Chunk encoding:** Samples within a chunk use Gorilla-style encoding (Facebook's "Gorilla: A Fast, Scalable, In-Memory Time Series Database" paper). Timestamps are delta-of-delta encoded; values are XOR-encoded. This achieves approximately 1.37 bytes per sample for typical infrastructure metrics (compared to 16 bytes raw). Downsampled and archived tiers additionally wrap chunks in zstd compression (level 3 default) for further 2-3x reduction.
-
-**Index structure:** The label index uses posting lists (sorted lists of MetricId for each label value) with intersection/union operations for multi-label lookups. This mirrors the Prometheus TSDB index design. The index is memory-mapped at query time for fast access without loading entirely into RAM.
+File names come from a counter seeded one past the highest existing `metrics_NNNNNN.parquet`, so a restart resumes numbering instead of clobbering a previous run. Parquet's own column compression is the only compression applied -- there is no zstd wrapper managed by Mayo. Retention deletes whole files (§3.2); there is no sample-level tombstoning.
 
 ---
 
@@ -433,366 +242,190 @@ pub struct BlockMeta {
 
 ### 5.1 Auto-Collection
 
-Bun's metrics collector gathers infrastructure metrics at the configured collection interval (default: 10 seconds) without any user configuration.
+Bun's collection loop samples metrics at `collection_interval_secs` (default 10) via the cross-platform `sysinfo` crate (`src/mayo/collector.rs`). It works on Linux and macOS without cgroup/`/proc`-specific code. Every sample carries whatever labels the collector attaches; there is no automatic `node`/`instance` label injection.
 
-**Per-app metrics** (collected via cgroup stats from the Grill container runtime):
+**Per-node metrics** (9 gauges, no labels):
 
-| Metric | Source | Type |
-|--------|--------|------|
-| `app_cpu_usage_seconds_total` | `cpuacct.usage` cgroup | Counter |
-| `app_cpu_throttled_seconds_total` | `cpu.stat` (throttled_time) | Counter |
-| `app_memory_usage_bytes` | `memory.current` cgroup | Gauge |
-| `app_memory_limit_bytes` | `memory.max` cgroup | Gauge |
-| `app_oom_kills_total` | `memory.events` (oom_kill) | Counter |
-| `app_network_receive_bytes_total` | `/proc/[pid]/net/dev` | Counter |
-| `app_network_transmit_bytes_total` | `/proc/[pid]/net/dev` | Counter |
-| `app_restarts_total` | Bun restart tracker | Counter |
-| `app_gpu_utilization_percent` | `nvidia-smi` | Gauge |
-| `app_gpu_vram_usage_bytes` | `nvidia-smi` | Gauge |
+| Metric | Source |
+|--------|--------|
+| `node_cpu_usage_percent` | `sysinfo` global CPU usage |
+| `node_memory_used_bytes` | `sysinfo` used memory |
+| `node_memory_total_bytes` | `sysinfo` total memory |
+| `node_disk_used_bytes` | sum over all disks |
+| `node_disk_total_bytes` | sum over all disks |
+| `node_network_rx_bytes` | sum over all interfaces |
+| `node_network_tx_bytes` | sum over all interfaces |
+| `node_network_rx_packets` | sum over all interfaces |
+| `node_network_tx_packets` | sum over all interfaces |
 
-GPU metrics are only collected for apps with a GPU allocation. Apps without GPU allocation do not incur any GPU metric collection overhead.
+Note: `node_memory_usage_percent` and `node_disk_usage_percent` (which the built-in alerts reference) are **not stored** -- they are derived on the fly at alert-evaluation time from the `used`/`total` pairs within one label set (see §5.6).
 
-**Per-node metrics** (collected from `/proc`, `/sys`, and device interfaces):
+**Per-process metrics** (2 per running instance that has a PID):
 
-| Metric | Source | Type |
-|--------|--------|------|
-| `node_cpu_usage_percent` | `/proc/stat` | Gauge |
-| `node_memory_total_bytes` | `/proc/meminfo` | Gauge |
-| `node_memory_available_bytes` | `/proc/meminfo` | Gauge |
-| `node_disk_usage_bytes{mount=...}` | `statvfs` per mount | Gauge |
-| `node_disk_total_bytes{mount=...}` | `statvfs` per mount | Gauge |
-| `node_network_receive_bytes_total{device=...}` | `/proc/net/dev` | Counter |
-| `node_network_transmit_bytes_total{device=...}` | `/proc/net/dev` | Counter |
-| `node_running_apps` | Bun app tracker | Gauge |
-| `node_gpu_utilization_percent{device=...}` | `nvidia-smi` | Gauge |
-| `node_gpu_temperature_celsius{device=...}` | `nvidia-smi` | Gauge |
+| Metric | Source | Labels |
+|--------|--------|--------|
+| `process_cpu_percent` | `sysinfo` process CPU | `app` = `"{namespace}/{app}"`, `pid` |
+| `process_memory_bytes` | `sysinfo` process RSS | `app` = `"{namespace}/{app}"`, `pid` |
 
-**Per-ingress-route metrics** (emitted by the Wrapper ingress proxy):
+Instances without a PID are skipped. There are no counters here, no restart/OOM/throttle metrics, and no cgroup-derived limits.
 
-| Metric | Source | Type |
-|--------|--------|------|
-| `ingress_requests_total{route=..., status_code=...}` | Wrapper | Counter |
-| `ingress_request_duration_seconds{route=..., quantile=...}` | Wrapper | Summary |
-| `ingress_http_errors_total{route=..., class="4xx"\|"5xx"}` | Wrapper | Counter |
+**GPU metrics: none.** There is no `nvidia-smi` collection; no `*_gpu_*` metric is emitted.
 
-All auto-collected metrics carry default labels: `node` (node ID), `app` (app name), `instance` (instance ID). Ingress metrics additionally carry `route` and `status_code` labels.
+**Per-ingress-route metrics (`ingress_requests_total`, `ingress_request_duration_seconds`, `ingress_http_errors_total`): Status: planned -- not yet implemented.** The Wrapper proxy never emits these.
 
 ### 5.2 Prometheus Scraping
 
-Metrics scraping is enabled **by default** for every app that declares a `port`. No configuration is required for the standard case.
+**Status: planned -- not yet implemented.**
 
-**Discovery and probing flow:**
-
-1. When Bun starts an app instance (or on Bun startup for existing instances), the scraper sends an HTTP GET to `http://127.0.0.1:{app_host_port}/metrics`.
-2. If the response is HTTP 200 with `Content-Type: text/plain` and contains valid Prometheus exposition format markers (`# HELP` / `# TYPE` lines), scraping is enabled for that instance at the configured interval (default: 30 seconds).
-3. If the endpoint returns a non-2xx status, is not present (connection refused / 404), or returns a body that does not parse as Prometheus exposition format, scraping is **silently disabled** for that instance. No error is logged; no configuration is required.
-4. Apps without a `port` declaration are never probed.
-
-**Configurable overrides:**
-
-```toml
-# Default behaviour (implicit, no config needed):
-# metrics = "/metrics"
-# metrics_interval = "30s"
-
-# Override the path and/or interval:
-[app.api]
-image = "myapp:v1.4.2"
-port = 8080
-metrics = "/prom/metrics"       # non-standard path
-metrics_interval = "10s"        # faster scrape for this app
-
-# Disable scraping explicitly:
-[app.static-assets]
-image = "nginx:alpine"
-port = 80
-metrics = false
-```
-
-**Scrape lifecycle:**
-
-- Scraping is re-probed on app restart (the endpoint may have appeared or disappeared).
-- If a scrape times out (default: 5 seconds, configurable), that scrape is skipped and the next attempt proceeds at the normal interval. Three consecutive timeouts log a warning-level message.
-- Scraped metrics are merged into the same Mayo TSDB as auto-collected metrics. They are distinguishable by the absence of the `__auto__` internal label.
-- Metric names from application scrapes are stored as-is (no prefixing). Label collisions with auto-collected metrics are avoided because auto-collected metrics use the `app_`, `node_`, and `ingress_` prefixes.
+`src/mayo/scrape.rs` provides `parse_prometheus_text` (parsing `# HELP`/`# TYPE` and metric lines via the `prometheus-parse` crate) and `scrape_endpoint` (an HTTP GET with a 5s timeout). Both are unit-tested but **nothing calls them** -- there is no scrape scheduler, no per-app `metrics`/`metrics_interval` config key, no auto-detection of `/metrics` endpoints, and no probing lifecycle. The whole scraping story below is aspirational.
 
 ### 5.3 Downsampling
 
-A background compaction task runs on each node to produce lower-resolution tiers.
+**Status: planned -- not yet implemented.** There is no downsampler and no archiver. Data is stored once as flat Parquet and pruned by age (§3.2). The two-stage full→downsampled→archived compaction described in earlier drafts does not exist.
 
-**Full -> Downsampled (every 60 seconds):**
+### 5.4 Rollup Push to the Council
 
-1. Wait until the current minute boundary passes (e.g., at 14:32:00, process the window 14:31:00-14:32:00).
-2. For every active time series, read all full-resolution samples in the closed window.
-3. Compute the `AggregationRollup` (min, max, sum, count; and `counter_increase` for counters).
-4. Append the rollup to the downsampled tier.
-5. The full-resolution data is retained until its retention expires (24 hours); downsampling does not delete it.
+Every `rollup_interval_secs` (default 60) the rollup worker (`src/mayo/rollup_worker.rs`) reads the local Mayo store, generates a `NodeRollup` of 1-minute (min, max, sum, count) aggregates, and sends it to its council parent as a `ReportingMessage::MetricsRollup` over the reporting transport (bincode-framed, **not** gRPC or a bespoke TCP call). On the first push after a parent change it can include an extended (backfill) window.
 
-**Downsampled -> Archived (every 60 minutes):**
-
-1. Same pattern: at the top of each hour, process the previous hour's downsampled rollups.
-2. Aggregate the 60 one-minute rollups into a single one-hour rollup.
-3. Append to the archived tier.
-
-**Retention pruning:** A background task runs every 15 minutes and deletes blocks whose `max_time_ms` is older than the tier's retention period. Deletion is block-level (entire blocks are removed), not sample-level, so pruning is O(number of blocks) not O(number of samples).
-
-### 5.4 Hierarchical Aggregation
-
-**Node-to-council rollup push:**
-
-Every 60 seconds, each node generates a `NodeRollup` containing 1-minute aggregation summaries for a curated set of top-level metrics:
-
-- Per-app: CPU usage, memory usage, network bytes, restart count
-- Per-node: total CPU, memory, disk, network, running app count
-- Per-ingress-route: request count, error count, p50/p95/p99 latency
-
-The node pushes this rollup to its assigned council aggregator via an internal bincode-over-TCP call. The assignment is `hash(node_id) % len(council_members)`, recomputed when council membership changes (Mustard gossip propagates council membership).
-
-**Council aggregator processing:**
-
-The council aggregator stores received `NodeRollup` entries in a separate rollup store. When a cluster-wide query arrives, the aggregator evaluates the query against its local rollup data. For aggregation functions (sum, avg, max), the aggregator can compute partial results from the rollups without needing raw data.
-
-**Aggregator reassignment on council membership change:**
-
-When a council member joins or leaves, nodes recompute their aggregator assignment. The new aggregator will have no historical rollups for its newly assigned nodes. To handle this gracefully:
-
-1. Nodes include their previous 5 minutes of rollups in the first push to a new aggregator.
-2. The query layer treats a gap in aggregator rollup data as "data unavailable" and annotates the response, rather than returning zeros.
+The council member stores received rollups in a rollup store and serves them at `/v1/metrics/rollup` and `/v1/metrics/cluster`. Aggregator reassignment backfill and the "data unavailable" gap annotation described in earlier drafts are **planned -- not yet implemented**; today a reassignment simply starts a fresh rollup history on the new parent.
 
 ### 5.5 Query Fan-Out
 
-**Single-app query** (e.g., "show CPU for app.web"):
+**Status: planned -- not yet implemented.** The fan-out helpers in `src/mayo/query_fanout.rs` (`fan_out_app_query`, `fan_out_cluster_query`, and the merge functions) have no callers. In the shipped code:
 
-1. Query arrives at any council member or the leader.
-2. The query handler looks up the Meat placement map to find which nodes are running `app.web` (e.g., nodes 3, 7, 11).
-3. Query is fanned out in parallel to those 3 nodes.
-4. Each node evaluates the PromQL expression against its local Mayo TSDB.
-5. Results are merged (series concatenation, deduplication by labels+timestamp).
-6. Merged result returned to the caller.
+- `/v1/metrics/app/{app}/{namespace}` filters the **local** store by the `namespace/app` label -- it does not consult the Meat placement map or query other nodes.
+- `/v1/metrics/cluster` returns the handling council member's **local** rollup data -- it does not fan out to the other council members or merge partial sums.
 
-**Cluster-wide query** (e.g., "top 10 apps by CPU" or "total cluster memory usage"):
-
-1. Query arrives at any council member or the leader.
-2. Query is fanned out in parallel to all council aggregators (3-7 nodes).
-3. Each aggregator evaluates the query against its rollup data.
-4. Results are merged and the top-N / aggregation is computed on the merged set.
-5. Merged result returned to the caller.
-
-**Query timeout:** Default 10 seconds. If a node does not respond within the timeout, its results are omitted and the response includes a warning annotation listing the unresponsive nodes.
+So neither the single-app path nor the cluster-wide path fans out today. The query timeout, top-N merge, and unresponsive-node annotations belong to the planned design.
 
 ### 5.6 Alert Evaluation
 
-Alert rules are evaluated on the leader node (or, for per-app alerts, on each node locally for its own apps). The evaluation loop runs every 15 seconds (configurable).
+The alert loop runs when `metrics.alerts_enabled` is set (default true), every `alerts.evaluation_interval_secs` (default **30**, not 15). Each tick, `gather_latest_values` reads the last 120 seconds of metrics, keeps the newest reading per `(metric_name, labels)` series, drops any reading older than a 90-second freshness bound, derives the memory/disk usage percentages *within* a label set, then collapses to one value per metric name (freshest series wins, deterministic tie-break). The evaluator (`src/mayo/alert.rs`) applies each rule to that value.
 
-**Built-in default alerts (active out of the box):**
+**Built-in alert rules (5, always active, node-scoped):**
 
-| Alert | Condition | Default Threshold | Severity |
-|-------|-----------|-------------------|----------|
-| `cpu.throttled` | App is consistently CPU-throttled | > 25% of CPU time throttled for 5 minutes | warning |
-| `cpu.idle` | App is using far less CPU than allocated | < 10% of allocated CPU for 1 hour | info |
-| `oom.kill` | Container killed due to insufficient memory | Any OOM kill event | critical |
-| `memory.low` | App is approaching its memory limit | > 85% of memory limit for 5 minutes | warning |
-| `disk.filling` | Node filesystem is running out of space | > 80% used (warning), > 90% used (critical) | warning / critical |
+| Name | Metric | Condition | Duration | Severity |
+|------|--------|-----------|----------|----------|
+| `cpu_throttle` | `node_cpu_usage_percent` | `> 90` | 5 min | Critical |
+| `oom_risk` | `node_memory_usage_percent` | `> 85` | 2 min | Critical |
+| `memory_high` | `node_memory_usage_percent` | `> 70` | 10 min | Warning |
+| `disk_high` | `node_disk_usage_percent` | `> 80` | 5 min | Warning |
+| `cpu_idle` | `node_cpu_usage_percent` | `< 5` | 30 min | Warning |
 
-These fire automatically for every app and every node with no configuration required.
+These are node-level rules against `node_*` metrics, not per-app rules. The state machine is `Inactive → Pending → Firing`, with the stale-telemetry handling described in §4.3.
 
-**Custom alert evaluation:**
-
-Custom alert expressions use a PromQL-compatible subset. The evaluation loop:
-
-1. Parse the expression into an AST (done once at rule load, cached).
-2. Evaluate the expression against the local Mayo TSDB (or, for cluster-scoped alerts, via the query fan-out path).
-3. If the expression returns a non-empty instant vector (or a scalar > 0), the alert enters `Pending` state and records `pending_since`.
-4. If the expression continues to evaluate to true for the `for` duration, the alert transitions to `Firing` and notifications are dispatched.
-5. If the expression evaluates to false at any point during the `for` window, the alert resets to `Inactive`.
-
-**PromQL-compatible subset supported:**
-
-- Instant vector selectors: `metric_name{label="value"}`
-- Range vector selectors: `metric_name{label="value"}[5m]`
-- Aggregation operators: `sum`, `avg`, `min`, `max`, `count`, `topk`, `bottomk`
-- Aggregation clauses: `by`, `without`
-- Functions: `rate()`, `irate()`, `increase()`, `delta()`, `deriv()`, `abs()`, `ceil()`, `floor()`, `round()`, `clamp()`, `clamp_min()`, `clamp_max()`, `histogram_quantile()`
-- Binary operators: `+`, `-`, `*`, `/`, `%`, `^`, `==`, `!=`, `>`, `<`, `>=`, `<=`
-- Logical operators: `and`, `or`, `unless`
-- Label matchers: `=`, `!=`, `=~`, `!~`
+**Custom / PromQL alert expressions: Status: planned -- not yet implemented.** There is no expression parser and no PromQL subset. Rules are the fixed threshold shape only; there is no `[[alert]]` TOML block, no `expr`, no range selectors, functions, or label matchers.
 
 ### 5.7 Alert Notification
 
-When an alert transitions to `Firing`, notifications are dispatched to configured destinations.
+When a rule transitions to `Firing` (or resolves), the webhook dispatcher (`src/mayo/webhook.rs`) builds a **provider-specific** body per destination and POSTs it. The endpoints Mayo itself exposes are the `/v1/metrics*` and `/v1/alerts` JSON endpoints; alert *delivery* is an outbound HTTP POST to the operator's destination.
 
-**Webhook payload format:**
+**Generic (`dest_type = "webhook"`) payload:**
 
 ```json
 {
   "version": "1",
   "alert": {
-    "name": "cpu.throttled",
-    "severity": "warning",
+    "name": "cpu_throttle",
+    "severity": "critical",
     "status": "firing",
-    "message": "app.web CPU throttled at 32% for 5 minutes",
-    "labels": {
-      "app": "web",
-      "node": "node-07",
-      "instance": "web-3"
-    },
-    "value": 0.32,
-    "started_at": "2026-02-16T14:30:15Z",
-    "fired_at": "2026-02-16T14:35:15Z"
+    "message": "CPU usage above 90% for 5 minutes",
+    "value": 95.3,
+    "fired_at": 1700000000
   },
   "cluster": "prod",
-  "timestamp": "2026-02-16T14:35:15Z"
+  "timestamp": 1700000300
 }
 ```
 
-A corresponding `resolved` payload is sent when the alert transitions from `Firing` to `Inactive`.
+Note the real shape: `severity`/`status` are lowercase strings; `value` is the numeric metric value; `fired_at` and the top-level `timestamp` are **integer Unix seconds**, not RFC3339. There is **no** `labels` object and **no** `started_at` field. A resolve reuses the same schema with `status: "resolved"` and `fired_at: null`.
 
-**Configuration:**
+**Slack (`dest_type = "slack"`)** gets a `{ "attachments": [ ... ] }` body with a coloured bar (`danger` firing-critical, `warning` firing-warning, `good` resolved). **PagerDuty (`dest_type = "pagerduty"`)** gets an Events API v2 event (`routing_key` from `secret`, `event_action` `trigger`/`resolve`, a `dedup_key`, and a `payload` object on trigger). Posting one generic shape to all three would be silently dropped by Slack and PagerDuty, so each destination type is serialised to its own contract.
 
-```toml
-# Simple single-destination:
-[alerts.notify]
-webhook = "https://hooks.slack.com/services/T.../B.../xxx"
+**Signing:** when a destination has a `secret`, the body is signed HMAC-SHA256 and the digest is sent as `X-Mayo-Signature-256: sha256=<hex>`. For PagerDuty the `secret` doubles as the routing key.
 
-# Multiple destinations with severity filtering:
-[[alerts.notify.destinations]]
-type = "webhook"
-url = "https://hooks.slack.com/services/T.../B.../xxx"
-severity = ["critical", "warning"]
+**Retry policy:** failed deliveries are retried 3 times with backoff (1s, 5s, 25s); after that the delivery is dropped with a log. There is no `mayo_alert_notification_failed_total` counter. Failure logs redact the URL to scheme+host so a Slack webhook path (which carries the secret) is never written to disk.
 
-[[alerts.notify.destinations]]
-type = "webhook"
-url = "https://events.pagerduty.com/v2/enqueue"
-severity = ["critical"]
-```
-
-**Retry policy:** Failed webhook deliveries are retried 3 times with exponential backoff (1s, 5s, 25s). After 3 failures, the notification is dropped and a `mayo_alert_notification_failed_total` metric is incremented.
+**HTTPS enforcement / `--allow-insecure-webhooks`: Status: planned -- not yet implemented.** HTTP webhook URLs are accepted; there is no scheme validation and no insecure-override flag.
 
 ### 5.8 Alert Suppression and Tuning Per-App
 
-Built-in default alerts can be suppressed or tuned on a per-app basis:
-
-```toml
-[app.batch-worker]
-image = "worker:latest"
-cpu = "100m-2000m"
-
-[app.batch-worker.alerts]
-cpu.idle = false                        # suppress idle alerts (intentionally bursty)
-memory.low = { threshold = 95 }         # this app is expected to use most of its RAM
-```
-
-When `cpu.idle = false`, the alert evaluation loop skips the `cpu.idle` rule for all instances of `app.batch-worker`. When a threshold override is provided, the built-in expression is rewritten with the overridden value before evaluation.
-
-Custom alerts (defined via `[[alert]]`) cannot be suppressed per-app via this mechanism -- they are cluster-wide rules. To scope a custom alert to specific apps, use label matchers in the expression (e.g., `{app="web"}`).
+**Status: planned -- not yet implemented.** There is no per-app alert config (`[app.*.alerts]`), no suppression, and no threshold tuning. The five built-in rules are node-scoped and fixed; an operator cannot currently silence or retune them per app.
 
 ---
 
 ## 6. Configuration
 
-All Mayo configuration is optional. The system operates with sensible defaults out of the box.
+All configuration is optional. The system operates with sensible defaults out of the box. The section is `[metrics]` (not `[mayo]`), with a separate `[alerts]` section; keys are integer `*_secs`/`*_days`/`*_mb`/`*_hours` values (there is no duration-string or byte-size parser here). Unknown keys are rejected (`deny_unknown_fields`).
 
-### 6.1 Collection Configuration
+### 6.1 Metrics Configuration (`[metrics]`)
 
 ```toml
-[mayo]
-# How often auto-collected metrics are sampled (default: 10s)
-collection_interval = "10s"
+[metrics]
+# How often to collect node + process metrics (seconds). Default: 10.
+collection_interval_secs = 10
 
-# Maximum disk space Mayo may use on this node (default: auto, 5% of disk)
-max_storage = "2Gi"
+# Days to retain metric Parquet files before pruning. Default: 7.
+retention_days = 7
 
-# Retention tier configuration
-[mayo.retention]
-full = "24h"           # Full-resolution (10s intervals)
-downsampled = "7d"     # 1-minute aggregates
-archived = "90d"       # 1-hour aggregates
+# How often to scrape Prometheus /metrics endpoints (seconds). Default: 30.
+# NOTE: scraping is not wired (see §5.2); this key is currently inert.
+scrape_interval_secs = 30
 
-# Downsampled tier resolution (default: 1m, minimum: 30s)
-downsample_resolution = "1m"
-# Archived tier resolution (default: 1h, minimum: 15m)
-archive_resolution = "1h"
+# Enable the built-in threshold alert loop. Default: true.
+alerts_enabled = true
+
+# Object-store URL for metric persistence. Empty = local filesystem.
+# e.g. "s3://bucket/prefix". Default: "".
+object_store_url = ""
+
+# How often to push rollups to the council parent (seconds). Default: 60.
+rollup_interval_secs = 60
+
+# Intended rollup retention on council members (hours). Default: 24.
+# NOTE: nothing reads this yet (see §3.3) — planned, currently inert.
+rollup_retention_hours = 24
+
+# Maximum local metrics Parquet storage (MB). 0 = unlimited (the default).
+# When exceeded, exported files are pruned oldest-first (see §7.1).
+max_storage_mb = 0
+
+# Optional export destination for metrics Parquet files
+# (local path, file://, s3://, gs://). Default: unset.
+# export_path = "s3://bucket/metrics"
 ```
 
 ### 6.2 Scraping Configuration
 
-```toml
-# Per-app overrides (in the main cluster.toml / app definition)
-[app.my-api]
-image = "myapp:v2"
-port = 8080
-metrics = "/prom/metrics"       # Override path (default: "/metrics")
-metrics_interval = "10s"        # Override interval (default: "30s")
+**Status: planned -- not yet implemented.** There is no scrape config. The `scrape_interval_secs` key above parses but drives nothing; there is no per-app `metrics`/`metrics_interval`, no `[metrics.scrape]` block, and no `max_samples_per_scrape` limit.
 
-# Disable scraping for a specific app:
-[app.static-assets]
-port = 80
-metrics = false
-
-# Global scrape settings (in mayo config)
-[mayo.scrape]
-default_interval = "30s"        # Default scrape interval for all apps
-timeout = "5s"                  # Per-scrape timeout
-max_samples_per_scrape = 10000  # Safety limit per scrape target
-```
-
-### 6.3 Alert Configuration
+### 6.3 Alert Configuration (`[alerts]`)
 
 ```toml
-# Notification destinations
-[alerts.notify]
-webhook = "https://hooks.slack.com/services/T.../B.../xxx"
+[alerts]
+# How often to evaluate the built-in rules (seconds). Default: 30.
+# Rejected if zero (would panic tokio's interval timer at startup).
+evaluation_interval_secs = 30
 
-# Or multiple destinations:
-[[alerts.notify.destinations]]
-type = "webhook"
-url = "https://hooks.slack.com/services/T.../B.../xxx"
-severity = ["critical", "warning"]
+# Webhook / Slack / PagerDuty destinations. Repeatable.
+[[alerts.destinations]]
+type = "slack"                                   # "webhook" | "slack" | "pagerduty"
+url = "https://hooks.slack.com/services/T/B/xxx"
+severity = ["critical", "warning"]               # empty = all severities
+# secret = "…"                                   # optional; HMAC key, or PagerDuty routing key
 
-[[alerts.notify.destinations]]
-type = "webhook"
+[[alerts.destinations]]
+type = "pagerduty"
 url = "https://events.pagerduty.com/v2/enqueue"
 severity = ["critical"]
-
-# Alert evaluation interval (default: 15s)
-[alerts]
-eval_interval = "15s"
-
-# Custom alert rules:
-[[alert]]
-name = "api.error_rate_high"
-expr = "rate(http_requests_total{status=~'5..'}[5m]) / rate(http_requests_total[5m]) > 0.05"
-for = "3m"
-severity = "critical"
-message = "API error rate above 5% for 3 minutes"
-
-[[alert]]
-name = "queue.depth"
-expr = "job_queue_depth > 10000"
-for = "10m"
-severity = "warning"
-message = "Job queue depth exceeds 10,000"
-
-# Per-app alert suppression/tuning (in the app definition):
-[app.batch-worker.alerts]
-cpu.idle = false
-memory.low = { threshold = 95 }
+secret = "your-pagerduty-routing-key"
 ```
+
+**Custom rules (`[[alert]]` with `expr`/`for`/`message`) and per-app suppression (`[app.*.alerts]`): Status: planned -- not yet implemented.** The five built-in threshold rules are fixed; there is no way to add, retune, or suppress rules from config today.
 
 ### 6.4 Aggregation Configuration
 
-```toml
-[mayo.aggregation]
-# How often nodes push rollups to council aggregators (default: 60s)
-push_interval = "60s"
-
-# Rollup retention on council aggregators
-rollup_retention_1m = "24h"     # 1-minute rollups
-rollup_retention_1h = "30d"     # 1-hour rollups
-
-# Max rollup payload size (safety limit)
-max_rollup_size_bytes = 1048576  # 1MB
-```
+The push interval is `metrics.rollup_interval_secs` (§6.1). The consistent-hash assignment knob, per-tier rollup retention, and `max_rollup_size_bytes` from earlier drafts do **not** exist; `rollup_retention_hours` is currently inert (§3.3).
 
 ---
 
@@ -800,69 +433,38 @@ max_rollup_size_bytes = 1048576  # 1MB
 
 ### 7.1 Storage Exhaustion
 
-**Trigger:** The Mayo data directory reaches the `max_storage` limit (default: 5% of disk, or explicit `max_storage` value).
+**Trigger:** local metrics Parquet exceeds `max_storage_mb`, or `retention_days` elapses.
 
-**Behaviour:**
+**Behaviour (`src/bun/disk_pressure.rs`):**
 
-1. Mayo stops ingesting new samples and logs a warning.
-2. Emergency retention pruning runs immediately: the oldest full-resolution block is deleted, then the oldest downsampled block, working backward until 10% headroom is recovered.
-3. If pruning cannot free sufficient space (e.g., only archived data remains and it is within minimum retention), Mayo enters degraded mode: it continues collecting samples in a small in-memory ring buffer (last 5 minutes) but does not persist to disk.
-4. The `disk.filling` built-in alert fires (independent of Mayo storage -- it monitors the entire filesystem).
-5. A dedicated `mayo_storage_exhausted` alert fires with severity `critical`.
+1. If `export_path` is set, un-exported Parquet files are shipped to the destination first (via `object_store`), and only files whose exact bytes are recorded in the export checkpoint become eligible for deletion.
+2. Files are then pruned **oldest-first by mtime** when either they are past `retention_days` or total size exceeds `max_storage_mb`. With `max_storage_mb = 0` (the default) only the retention cutoff prunes.
+3. Ingestion is never blocked; there is no in-memory ring-buffer degraded mode and no dedicated `mayo_storage_exhausted` alert.
 
-**Recovery:** Once disk space is freed (by operator intervention, external log cleanup, or the passage of time allowing retention pruning to reclaim more blocks), Mayo resumes normal disk writes. The in-memory ring buffer is flushed to disk. There will be a gap in persisted data for the degraded period, visible in queries as missing data points.
+**Recovery:** pruning is idempotent and runs each pressure check; once usage is back under the threshold nothing is deleted.
 
 ### 7.2 Aggregator Council Member Failure
 
-**Trigger:** A council member acting as a rollup aggregator crashes or becomes unreachable.
-
-**Behaviour:**
-
-1. Nodes assigned to the failed aggregator detect the failure via Mustard gossip (membership change) or via rollup push failure (connection refused / timeout).
-2. Nodes recompute their aggregator assignment based on the updated council membership. They begin pushing rollups to their new aggregator.
-3. The new aggregator has no historical rollups for the reassigned nodes. A coverage gap exists for the reassignment period (typically <60 seconds if gossip propagation is fast).
-4. Nodes include their previous 5 minutes of rollups in the first push to the new aggregator to minimise the gap.
-5. Cluster-wide queries during the gap period return partial data with a warning annotation.
-
-**Recovery:** When the failed council member recovers and rejoins the council, some nodes are reassigned back. The same 5-minute backfill applies.
+The rollup worker keeps pushing to the last known parent and follows parent reassignment as membership changes. **The graceful-handoff details from earlier drafts -- consistent-hash reassignment, a 5-minute backfill on the new parent, and per-query gap annotations -- are Status: planned -- not yet implemented.** Today a reassignment simply starts fresh rollup history on the new parent.
 
 ### 7.3 Stale Rollups
 
-**Trigger:** A node is alive but its rollup push to the council aggregator fails silently (e.g., network partition to the aggregator but not to the rest of the cluster), or the node's clock is significantly skewed.
-
-**Behaviour:**
-
-1. The council aggregator tracks the last-seen rollup timestamp per node.
-2. If no rollup is received from a node for 3 push intervals (3 minutes default), the aggregator marks that node's data as `stale`.
-3. Stale node data is excluded from cluster-wide query results (rather than returning outdated numbers), and a warning annotation is included in the response.
-4. The aggregator emits a `mayo_aggregator_stale_node` metric with the node ID as a label.
-
-**Recovery:** When rollups resume (network heals, node restarts), the stale marker is cleared and the node's data is included in subsequent queries.
+**Status: planned -- not yet implemented.** The council rollup store does not track a per-node last-seen timestamp, does not mark nodes `stale`, does not exclude stale data from responses, and emits no `mayo_aggregator_stale_node` metric.
 
 ### 7.4 Scrape Target Timeout
 
-**Trigger:** An application's `/metrics` endpoint becomes slow or unresponsive.
-
-**Behaviour:**
-
-1. If a scrape exceeds the timeout (default: 5 seconds), the scrape is aborted and no samples are ingested for that interval.
-2. After 3 consecutive timeouts, a warning is logged: `"app.web instance web-3: metrics scrape timeout (3 consecutive, disabling for 5m)"`.
-3. Scraping for that instance is backed off for 5 minutes, then retried.
-4. A `mayo_scrape_timeout_total{app, instance}` counter is incremented.
-
-**Recovery:** If the next probe after backoff succeeds, normal scraping resumes at the configured interval.
+**Status: planned -- not yet implemented.** There is no scraper in the running system (§5.2), so no scrape-timeout handling, backoff, or `mayo_scrape_timeout_total` counter exists.
 
 ### 7.5 Node Failure (Data Loss)
 
-**Trigger:** A node crashes permanently, losing its local Mayo data.
+**Trigger:** A node crashes permanently, losing its local Mayo Parquet files.
 
 **Behaviour:**
 
-- All historical full-resolution data for that node is lost. This is an accepted trade-off of the per-node storage architecture.
-- Council aggregators retain rollup data for the failed node (1-minute rollups for 24 hours, 1-hour rollups for 30 days), so cluster-wide dashboards continue to reflect the node's contribution.
-- If apps from the failed node are rescheduled to other nodes, they begin generating new metrics on those nodes. There is a gap in per-app history spanning the failure + reschedule period.
+- All that node's local metric history is lost. This is an accepted trade-off of per-node storage.
+- Its council parent retains the last rollups it received (a coarse 1-minute view), but because cluster-wide query fan-out is not wired (§5.5), that history is only visible through the parent that happens to hold it.
 
-**Mitigation for teams requiring full durability:** Use the Prometheus remote-read API to federate data into an external Thanos/Cortex cluster with replicated storage.
+**Mitigation for teams requiring durability:** set `export_path` so Parquet files are shipped to object storage before pruning. Remote-read federation into external Prometheus/Thanos is **planned -- not yet implemented**.
 
 ---
 
@@ -870,20 +472,22 @@ max_rollup_size_bytes = 1048576  # 1MB
 
 ### 8.1 Metrics Access Control
 
-- **Internal API (Brioche, Relish, inter-node queries):** Secured via mutual TLS using the Sesame PKI. All inter-node calls (query fan-out over HTTP, rollup push over TCP) use mTLS with certificates issued by the cluster CA. Only nodes with valid cluster certificates can query or push metrics.
-- **Prometheus remote-read API:** Protected by the same mTLS requirement by default. For external Prometheus instances, operators must provide the cluster CA certificate and a client certificate (issued via `relish cert issue --for prometheus`). Alternatively, operators can enable token-based authentication for the remote-read endpoint.
-- **Per-namespace isolation (future):** The query API enforces namespace-scoped access when the caller is authenticated as a namespace-scoped identity (e.g., a workload identity token from app.web in namespace `team-a` can only query metrics for apps in `team-a`). Cluster-wide queries require a cluster-scoped identity.
-- **Metric label scrubbing:** Application-scraped metrics are stored as-is. Mayo does not inject or strip labels from application metrics. Operators concerned about label cardinality explosion (a common Prometheus anti-pattern) can configure `max_samples_per_scrape` to limit ingest.
+- **Internal API:** the `/v1/metrics*` and `/v1/alerts` routes require an authenticated token (`AnyToken` in `src/bun/authz.rs`); inter-node transports are secured by the Sesame PKI where mTLS is enabled.
+- **Per-namespace isolation:** `/v1/metrics/app/{app}/{namespace}` enforces tenant scope via `authorize_scoped`, and every path/name segment that reaches SQL is escaped (single quotes doubled), so a scoped token cannot read another tenant's metrics and a crafted `?name=` cannot break out of the string literal. This is **shipped**, not future.
+- **Prometheus remote-read auth: Status: planned -- not yet implemented** (there is no remote-read endpoint, §3.4).
+- **`max_samples_per_scrape` / label scrubbing:** planned -- not yet implemented (no scraper, §5.2).
 
 ### 8.2 Alert Webhook Authentication
 
-- **HMAC signing:** When an `AlertNotificationDestination` has a `secret` configured, the webhook payload is signed with HMAC-SHA256. The signature is included in the `X-Mayo-Signature-256` HTTP header. The receiving service can verify authenticity by computing HMAC-SHA256 over the raw request body with the shared secret.
-- **TLS enforcement:** Webhook URLs must use HTTPS. HTTP URLs are rejected at configuration validation time with a clear error message. An `--allow-insecure-webhooks` flag exists for development/testing only.
-- **Secret storage:** Webhook secrets are stored encrypted in the Raft state (using the same encryption as Reliaburger secrets, Section 11). They are decrypted in memory only on the node evaluating alerts.
+- **HMAC signing (shipped):** when a destination has a `secret`, the body is signed HMAC-SHA256 and sent as `X-Mayo-Signature-256: sha256=<hex>`. For a PagerDuty destination the `secret` is the routing key.
+- **TLS enforcement / `--allow-insecure-webhooks`: Status: planned -- not yet implemented.** HTTP webhook URLs are accepted; there is no scheme validation and no insecure-override flag. (Failure logs do redact the URL to scheme+host so a secret-bearing Slack path is not written to disk.)
+- **Secret storage:** webhook secrets are read from the node's `[alerts.destinations]` config, held in memory by the dispatcher. They are **not** stored encrypted in Raft state.
 
 ---
 
 ## 9. Performance
+
+**Reconciliation note:** the numbers in this section were derived for the planned Gorilla-encoded, tiered, scraping TSDB. The shipped store writes plain Parquet (Parquet's own column compression, no Gorilla), stores only the node + per-process metrics of §5.1 (no scraped, ingress, downsampled, or archived series), and has no remote-read or scrape path. Treat the tables below as design *targets* for the planned system, not measurements of what ships.
 
 ### 9.1 Storage Footprint
 
@@ -931,6 +535,8 @@ The whitepaper specifies **50-100MB/day per busy node** as the expected range, a
 ---
 
 ## 10. Testing Strategy
+
+**Reconciliation note:** the subsections below describe tests for the planned system (tier transitions, aggregation accuracy, Prometheus/PromQL compatibility, scraping). The shipped tests instead cover: Parquet flush/reopen/prune (by data timestamp, not mtime), SQL-injection escaping, concurrent query-during-flush, corrupt-file skipping, the collector's metric names and labelling, the alert state machine (including stale-telemetry handling), and per-provider webhook serialisation. Read what follows as the target test matrix for the planned features, not the current suite.
 
 ### 10.1 Retention Tier Transitions
 
@@ -1039,8 +645,8 @@ The whitepaper specifies **50-100MB/day per busy node** as the expected range, a
 
 | Decision | Prior art approach | Mayo approach | Rationale |
 |----------|--------------------|---------------|-----------|
-| Data model | Prometheus labels+samples (universal) | Same | Industry standard; PromQL ecosystem compatibility |
-| Query language | PromQL (Prometheus), InfluxQL (InfluxDB) | PromQL subset | Existing operator knowledge transfer; ecosystem compatibility |
+| Data model | Prometheus labels+samples (universal) | name + label map + f64 sample, stored as Parquet columns | Simple, columnar, queryable with a standard engine |
+| Query language | PromQL (Prometheus), InfluxQL (InfluxDB) | **DataFusion SQL** (not PromQL) | Reuse a mature embedded SQL engine over Parquet; no PromQL parser to build or maintain |
 | Storage topology | Central server (Prometheus), sharded cluster (Cortex/VM) | Per-node, no central DB | Eliminates operational complexity; scales linearly; no SPOF |
 | Cluster-wide queries | Scatter-gather all instances (Thanos), query sharded cluster (Cortex) | Hierarchical aggregation via council | Bounds fan-out at O(council_size) not O(cluster_size) |
 | Deployment | Separate infrastructure (all) | Embedded in Bun binary | Zero operational overhead; batteries-included philosophy |
@@ -1058,20 +664,20 @@ The whitepaper specifies **50-100MB/day per busy node** as the expected range, a
 | `object_store` | Block storage abstraction | Reads and writes Parquet blocks behind a single interface over a local path, `file://`, `s3://`, or `gs://`. |
 | `prometheus-parse` | Prometheus exposition parsing | Parses `text/plain` `/metrics` scrape responses (with `# HELP`, `# TYPE`, and metric lines) into samples. |
 | `bincode` | Rollup serialisation | Encodes `NodeRollup` payloads pushed node-to-council over TCP. |
-| `hyper` | HTTP server | Serves the Prometheus remote-read API and the `/metrics` scrape endpoint, and handles inter-node query fan-out over HTTP. |
+| `axum`/`hyper` | HTTP server | Serves the `/v1/metrics*` and `/v1/alerts` JSON endpoints. (No remote-read or `/metrics` exposition endpoint -- planned.) |
+| `sysinfo` | Node + process metrics | Cross-platform CPU/memory/disk/network sampling; works on Linux and macOS without cgroup/`/proc` code. |
 | `tokio` | Async runtime | Drives the scrape scheduler, query fan-out, rollup push, and compaction background tasks. Already used by Bun. |
 | `reqwest` | HTTP client | Scrapes application `/metrics` endpoints and delivers webhook notifications. |
 
 ### 12.2 Build Considerations
 
-All dependencies are compiled into the single Bun binary. There are no runtime dependencies on external libraries. The choice between `sled` (pure Rust) and `rocksdb` (C++ via FFI) affects the build:
-
-- **`sled`:** Pure Rust, simpler cross-compilation, smaller binary delta (~2MB). Less mature for heavy write workloads.
-- **`rocksdb`:** Battle-tested, excellent write throughput, but requires C++ toolchain for cross-compilation and adds ~5MB to the binary.
+All dependencies are compiled into the single Bun binary. There are no runtime dependencies on external libraries. The `sled`-vs-`rocksdb` label-index question is **moot**: there is no custom label index. DataFusion plans directly over the Parquet columns, and `object_store` abstracts local/`file://`/`s3://`/`gs://` storage behind one interface.
 
 ---
 
 ## 13. Open Questions
+
+**Reconciliation note:** several questions below assume the planned Prometheus/PromQL/Gorilla design and are moot for what ships. There is no PromQL implementation (§13.1) -- the query language is DataFusion SQL and alerts are threshold rules; the remote-read/federation questions (§13.2) presuppose an endpoint that does not exist (§3.4); and the `sled`/`rocksdb` index-backend question (§13.4) is moot because there is no custom label index. They are retained as design history.
 
 ### 13.1 PromQL Completeness Level
 

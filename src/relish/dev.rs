@@ -1,7 +1,8 @@
 /// Dev cluster management via Lima VMs.
 ///
-/// Spins up real Ubuntu VMs with rootless runc, gossip networking,
-/// and Raft consensus. The Reliaburger equivalent of `minikube start`.
+/// Spins up real Ubuntu VMs running `bun` rootful under `sudo` (runc needs
+/// root for namespaces/netns), with gossip networking and Raft consensus.
+/// The Reliaburger equivalent of `minikube start`.
 use std::path::PathBuf;
 
 use serde::{Deserialize, Serialize};

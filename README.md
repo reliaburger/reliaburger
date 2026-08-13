@@ -99,10 +99,10 @@ systems along the way, aimed at programmers coming from C, Python or Go:
 
 ## What's inside
 
-Twelve burger-named subsystems in one binary — Grill (runtimes), Mustard
+Thirteen burger-named subsystems in one binary — Grill (runtimes), Mustard
 (gossip), Council (Raft), Meat (scheduler), Onion (discovery/DNS/eBPF),
 Wrapper (ingress), Sesame (security), Pickle (registry), Mayo (metrics),
-Ketchup (logs), Smoker (chaos), Brioche (dashboard). The component tour and
+Ketchup (logs), Lettuce (GitOps), Smoker (chaos), Brioche (dashboard). The component tour and
 repo layout live in the manual (`relish manual`, "Under the hood") and the
 [design docs](docs/design/).
 

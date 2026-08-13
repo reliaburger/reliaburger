@@ -758,6 +758,38 @@ impl StateMachineInner {
                         reason: "lease cleanup has not started".to_string(),
                     });
                 }
+                // Defence in depth against the cleanup-snapshot race: never
+                // destroy the ownership record while a resource it owns still
+                // exists. A driver that snapshotted the lease before an app
+                // attached would otherwise finish here, orphaning that app with
+                // no record left to reap it. Refusing keeps the record durable
+                // so the next cleanup attempt re-reads and deletes it first.
+                let resources: Vec<crate::testkit::lease::LeasedResource> =
+                    lease.resources.iter().cloned().collect();
+                let remaining: Vec<String> = resources
+                    .iter()
+                    .filter_map(|resource| match resource {
+                        crate::testkit::lease::LeasedResource::App { app_id }
+                            if self.state.apps.contains_key(app_id) =>
+                        {
+                            Some(app_id.to_string())
+                        }
+                        crate::testkit::lease::LeasedResource::Namespace { name }
+                            if self.state.namespaces.contains_key(name) =>
+                        {
+                            Some(name.clone())
+                        }
+                        _ => None,
+                    })
+                    .collect();
+                if !remaining.is_empty() {
+                    return Some(CouncilResponse::Refused {
+                        reason: format!(
+                            "lease still owns live resources, refusing to finish cleanup: {}",
+                            remaining.join(", ")
+                        ),
+                    });
+                }
                 self.state.test_leases.remove(lease_id);
             }
             RaftRequest::TestLeaseCleanupFailed { lease_id, reason } => {
@@ -3455,6 +3487,114 @@ mod tests {
         .await
         .unwrap();
         assert!(sm.desired_state().await.test_leases.is_empty());
+    }
+
+    /// The cleanup-snapshot race made executable. A cleanup driver snapshots
+    /// the lease's resources, but an app can attach in the window before
+    /// `TestLeaseBeginCleanup` commits. Re-reading desired state after
+    /// BeginCleanup must show that app as owned, and `TestLeaseFinishCleanup`
+    /// must refuse to destroy the record while the app still exists — otherwise
+    /// the app leaks with no record left to reap it.
+    #[tokio::test]
+    async fn finish_cleanup_refuses_while_a_raced_app_still_exists() {
+        let mut sm = CouncilStateMachine::new();
+        // A driver would snapshot this lease's (empty) resource set here.
+        sm.apply(vec![normal_entry(
+            1,
+            1,
+            RaftRequest::TestLeaseCreate(test_lease("run1", 100)),
+        )])
+        .await
+        .unwrap();
+
+        // Race: an app attaches to the lease after that snapshot but before
+        // cleanup begins. The lease is still Active, so the write is accepted.
+        let app_id = AppId::new("web", "rbtest-run1");
+        sm.apply(vec![normal_entry(
+            1,
+            2,
+            RaftRequest::TestLeaseAppSpec {
+                lease_id: "run1".to_string(),
+                observed_at_unix_ms: 20,
+                app_id: app_id.clone(),
+                spec: Box::new(default_spec()),
+            },
+        )])
+        .await
+        .unwrap();
+
+        // Cleanup begins; BeginCleanup commits and freezes the resource set.
+        sm.apply(vec![normal_entry(
+            1,
+            3,
+            RaftRequest::TestLeaseBeginCleanup {
+                lease_id: "run1".to_string(),
+            },
+        )])
+        .await
+        .unwrap();
+
+        // Re-reading desired state after BeginCleanup shows the raced app as
+        // owned — this is the fresh view `cleanup_cluster_lease` now iterates.
+        let state = sm.desired_state().await;
+        assert!(state.test_leases["run1"].resources.contains(
+            &crate::testkit::lease::LeasedResource::App {
+                app_id: app_id.clone(),
+            }
+        ));
+        assert!(state.apps.contains_key(&app_id));
+
+        // Defence in depth: finishing while the app still exists is refused,
+        // and the ownership record survives so the next attempt can retry.
+        let responses = sm
+            .apply(vec![normal_entry(
+                1,
+                4,
+                RaftRequest::TestLeaseFinishCleanup {
+                    lease_id: "run1".to_string(),
+                },
+            )])
+            .await
+            .unwrap();
+        assert!(
+            matches!(responses[0], CouncilResponse::Refused { .. }),
+            "got: {:?}",
+            responses[0]
+        );
+        assert!(
+            sm.desired_state().await.test_leases.contains_key("run1"),
+            "a refused finish must leave the ownership record durable"
+        );
+
+        // Resumed cleanup deletes the app (as the re-read set instructs), and
+        // only then does FinishCleanup succeed and drop the record.
+        sm.apply(vec![normal_entry(
+            1,
+            5,
+            RaftRequest::AppDelete {
+                app_id: app_id.clone(),
+            },
+        )])
+        .await
+        .unwrap();
+        let responses = sm
+            .apply(vec![normal_entry(
+                1,
+                6,
+                RaftRequest::TestLeaseFinishCleanup {
+                    lease_id: "run1".to_string(),
+                },
+            )])
+            .await
+            .unwrap();
+        assert!(
+            matches!(responses[0], CouncilResponse::Applied { .. }),
+            "got: {:?}",
+            responses[0]
+        );
+        let state = sm.desired_state().await;
+        assert!(state.test_leases.is_empty());
+        assert!(!state.apps.contains_key(&app_id));
     }
 
     /// The 12b.2 compatibility rule made executable: a snapshot written

@@ -157,6 +157,16 @@ impl UpgradeManager {
         self
     }
 
+    /// Attach the internal service token as the bearer for binary fetches (B2).
+    ///
+    /// A Pickle binary fetch on a routable cluster requires a principal
+    /// (`require_read_auth`); without the token every self-upgrade download
+    /// 401s. Only `bun` has the token, so it sets this after deriving it.
+    pub fn with_bearer(mut self, bearer: Option<String>) -> Self {
+        self.cluster_http = self.cluster_http.with_bearer(bearer);
+        self
+    }
+
     /// The version this process is running.
     pub fn running_version(&self) -> &BinaryVersion {
         &self.running_version
@@ -570,16 +580,15 @@ impl UpgradeManager {
                         directive.binary_sha256
                     ),
                 );
-                let response = self
-                    .cluster_http
-                    .client()
-                    .get(&url)
-                    .send()
-                    .await
-                    .map_err(|e| UpgradeError::FetchFailed {
+                // `get` carries the internal service token as a bearer: on a
+                // routable cluster the registry sets `require_read_auth`, so a
+                // bearer-less binary fetch 401s (B2).
+                let response = self.cluster_http.get(&url).send().await.map_err(|e| {
+                    UpgradeError::FetchFailed {
                         url: url.clone(),
                         reason: e.to_string(),
-                    })?;
+                    }
+                })?;
                 if !response.status().is_success() {
                     return Err(UpgradeError::FetchFailed {
                         url,
@@ -1174,6 +1183,53 @@ mod tests {
             }
             other => panic!("expected a fetch failure, got {other:?}"),
         }
+    }
+
+    /// B2: a Pickle binary fetch presents the internal service token as a
+    /// bearer, so it authenticates against a routable registry
+    /// (`require_read_auth`) instead of 401ing. Driven through a raw TCP
+    /// capture server that records the request line and headers.
+    #[tokio::test]
+    async fn a_pickle_binary_fetch_carries_the_service_token_bearer() {
+        use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let capture = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut buf = vec![0u8; 8192];
+            let n = socket.read(&mut buf).await.unwrap();
+            let request = String::from_utf8_lossy(&buf[..n]).to_string();
+            let _ = socket
+                .write_all(b"HTTP/1.1 404 Not Found\r\ncontent-length: 0\r\n\r\n")
+                .await;
+            request
+        });
+
+        let fixture = fixture();
+        let manager = fixture
+            .manager
+            .with_bearer(Some("rbrg_service".to_string()));
+        let directive = UpgradeDirective {
+            upgrade_id: "u1".to_string(),
+            target_version: v("0.2.0"),
+            binary_sha256: "abc123".to_string(),
+            embedded_signature: String::new(),
+            external_signature: None,
+            source: BinarySource::Pickle {
+                registry_address: addr.to_string(),
+            },
+            network_provenance: true,
+        };
+
+        // The 404 makes the fetch fail, but the request has already been sent.
+        let _ = manager.fetch_binary(&directive).await;
+
+        let request = capture.await.unwrap().to_lowercase();
+        assert!(
+            request.contains("authorization: bearer rbrg_service"),
+            "binary fetch did not carry the service-token bearer:\n{request}"
+        );
     }
 
     #[test]

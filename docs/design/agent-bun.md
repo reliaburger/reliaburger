@@ -14,7 +14,7 @@ Bun is the per-node agent that runs on every node in a Reliaburger cluster. It i
 Bun's responsibilities on every node:
 
 - **Container management (Grill):** Start, stop, health-check, and monitor OCI containers via the Grill abstraction layer. Grill drives the runtimes directly (runc on Linux, Apple Container on macOS, and a `process` mode with no runtime at all); it does not shell through containerd.
-- **Process workload management:** Start, stop, health-check, and isolate non-container workloads (host binaries and inline scripts) using Linux namespaces and cgroups.
+- **Process workload management:** Start, stop, and health-check non-container workloads (host binaries and inline scripts), gated by a deny-by-default binary allowlist. (The namespace/cgroup isolation stack for these host processes is planned; see §5.2.)
 - **Port allocation:** Allocate ephemeral host ports from a configurable range (default 10000-60000) and map them to container-internal ports.
 - **eBPF service discovery (Onion):** Load and maintain the Onion eBPF programs and kernel maps for socket-level service discovery and firewall enforcement.
 - **Log collection (Ketchup):** Capture stdout/stderr from all workloads and feed them into the structured log pipeline.
@@ -45,7 +45,7 @@ Grill is Bun's container runtime interface -- the abstraction layer between Bun'
 
 4. **Sub-millisecond per-app overhead.** At the design goal of 500 apps per node, Bun must have sub-millisecond per-app overhead. This drives the choice of Rust (no GC pauses), eBPF (kernel-space interception, not userspace proxying), and direct cgroup/namespace manipulation (no shim processes per container).
 
-5. **Deny-by-default security.** Process workloads require an explicit binary allowlist in `node.toml`. Capabilities are restricted. Seccomp profiles block dangerous syscalls. The `burger` unprivileged user is used for all workloads.
+5. **Deny-by-default security.** Process workloads require an explicit binary allowlist in `node.toml`: an `Exec` binary runs only if its absolute path is listed, a `Script` runs only if its interpreter (`/bin/sh`) is listed, and an empty or absent allowlist refuses every host workload. This admission gate — allowlist plus honest refusal — is the enforcement that ships today. The deeper isolation stack (Linux namespaces, seccomp, capability restriction, a dedicated `burger` unprivileged user) is **planned — not yet implemented**; see the status note in §5.2. Where isolation a node cannot provide is requested (e.g. mount isolation on a non-Linux host), the deploy is refused rather than run unprotected.
 
 ### 1.1 runc rootfs ownership
 
@@ -195,7 +195,7 @@ HealthChecker (periodic per workload)
 
 ### 3.3 Key Abstractions
 
-**Grill** abstracts the container runtime. It communicates with containerd over a Unix socket using the containerd gRPC API. Grill is responsible for:
+**Grill** abstracts the container runtime. It drives the runtime backend directly through its command-line interface — `runc run`/`runc state`/`runc exec` on Linux, the `container` CLI on macOS, and a `process` backend that spawns a host binary with no OCI runtime at all. There is no containerd daemon and no gRPC socket. Grill is responsible for:
 
 - Translating `AppSpec` into OCI container configurations
 - Creating and configuring network namespaces with port mappings
@@ -204,14 +204,14 @@ HealthChecker (periodic per workload)
 - Attaching to container stdio streams for log capture
 - Reconnecting to running containers after Bun restart
 
-**ProcessManager** handles non-container workloads. It uses direct Linux syscalls (`clone()`, `unshare()`, `mount()`, `pivot_root()`) to create isolated execution environments without a container image. ProcessManager is responsible for:
+**ProcessManager** handles non-container workloads. Today (the `process` Grill backend, `src/grill/process.rs`) it validates the binary against the allowlist and then spawns the host process directly (`std::process::Command`), in its own process group, with the spec's environment and stdout/stderr captured for Ketchup. Writing inline scripts to temporary files and marking them executable is real. The namespace/seccomp/user-drop machinery below is the **planned** design, not current behaviour:
 
-- Validating binaries against the allowlist in `node.toml`
-- Creating restricted mount namespaces (allow-listed paths only)
-- Writing inline scripts to temporary files and marking them executable
-- Spawning processes with PID, network, UTS, and mount namespace isolation
-- Applying the same cgroup limits and seccomp profiles as containers
-- Running processes as the `burger` unprivileged user
+- Validating binaries against the allowlist in `node.toml` *(shipped)*
+- Writing inline scripts to temporary files and marking them executable *(shipped)*
+- Creating restricted mount namespaces (allow-listed paths only) *(planned)*
+- Spawning processes with PID, network, UTS, and mount namespace isolation *(planned)*
+- Applying the same cgroup limits and seccomp profiles as containers *(planned)*
+- Running processes as the `burger` unprivileged user *(planned)*
 
 **WorkloadSupervisor** is the unified control plane for both container and process workloads. It does not care whether a workload is a container or a process -- it manages the lifecycle state machine, health checking, restart policies, event emission, and service map updates identically for both types.
 
@@ -818,7 +818,7 @@ pub struct UpgradeConfig {
 
 ### 4.6 Wire Protocols
 
-**Bun <-> containerd:** gRPC over Unix socket (`/run/containerd/containerd.sock`). Uses the containerd v1 API (`containerd.services.containers.v1`, `containerd.services.tasks.v1`, etc.).
+**Bun <-> container runtime:** no daemon and no gRPC. Grill spawns the runtime CLI directly — `runc run`/`runc state`/`runc kill`/`runc delete` against an OCI bundle on Linux, and the Apple `container` CLI on macOS. The `process` backend spawns the host binary itself. State survives Bun restarts because runc's own on-disk state and the Apple VM outlive the agent; Grill re-adopts them on startup.
 
 **Bun <-> reporting tree parent:** bincode-framed messages over an mTLS TCP connection. Messages include:
 
@@ -928,7 +928,7 @@ before their Phase 15 cases can use this contract.
 2. Transition state to `Pending`.
 3. **Prepare image:** Check Pickle local cache. If missing, fetch from Pickle peers (content-addressed, mTLS). If not in any Pickle node, pull from the external registry configured in `node.toml`. Transition to `Preparing`.
 4. **Allocate port:** Request a host port from PortAllocator. The allocator picks a random available port from the configured range (default 10000-60000) and marks it as in-use.
-5. **Create cgroup:** CgroupMgr creates a cgroup v2 hierarchy: `/sys/fs/cgroup/reliaburger/{namespace}/{app_name}/{instance}/`. Set `cpu.max` (from `cpu.limit`), `cpu.weight` (from `cpu.request`), `memory.max` (from `memory.limit`), `memory.high` (from `memory.request` -- enables graceful pressure before OOM). For GPU workloads, configure device allow-lists via the cgroup `devices` controller.
+5. **Create cgroup:** CgroupMgr creates a cgroup v2 hierarchy: `/sys/fs/cgroup/reliaburger/{namespace}/{app_name}/{instance}/`. The OCI spec carries the hard limits only — `cpu.max` (from `cpu.limit`) and `memory.max` (from `memory.limit`). The request-derived soft controls `cpu.weight` and `memory.high` are computed but not yet written to the spec (see §5.4). GPU device allow-listing via the cgroup `devices` controller is a follow-up (see §5.4 GPU note).
 6. **Prepare network namespace:** Create a new network namespace. Configure the veth pair and port mapping (host port -> container internal port). Attach Onion eBPF programs to the namespace's sockets.
 7. **Decrypt secrets:** For any `EnvValue::Encrypted` in the env map, decrypt using the cluster's age private key in memory. Plaintext is never written to disk.
 8. **Prepare workload identity:** Generate a keypair, send CSR to the nearest council member, receive the signed X.509 certificate. Write cert, key, CA chain, and JWT to a tmpfs mount.
@@ -960,6 +960,8 @@ before their Phase 15 cases can use this contract.
 7. Compare the discovered state against the expected state from the reporting tree and reconcile (start missing workloads, stop unexpected ones).
 
 ### 5.2 Process Workload Lifecycle
+
+> **Status: the isolation stack (steps 7-12) is planned — not yet implemented.** What ships today is the admission gate in step 3 (deny-by-default binary allowlist plus honest refusal of isolation a node can't provide) followed by a direct host `spawn` of the binary, in its own process group, with the spec's environment and stdout/stderr captured (`src/grill/process.rs`). The mount/PID/network/UTS namespaces, the seccomp profile, and dropping to the `burger` user (steps 7-12 below) describe the target design; a process workload currently runs as an ordinary child of the Bun process. Treat steps 7-12 as the roadmap, not a description of the running binary.
 
 **Start a process workload:**
 
@@ -1070,24 +1072,23 @@ Bun uses cgroup v2 exclusively. The cgroup hierarchy is:
   {namespace}/
     {app_name}/
       {instance}/
-        cpu.max          = "{limit_us} {period_us}"
-        cpu.weight       = {weight}    // derived from request
-        memory.max       = {limit_bytes}
-        memory.high      = {request_bytes}  // soft limit, triggers reclaim
-        io.max           = {blkio_limits}   // for fault injection disk-io throttle
+        cpu.max          = "{limit_us} {period_us}"   // from cpu.limit
+        memory.max       = {limit_bytes}              // from memory.limit
+        io.max           = {blkio_limits}             // for fault injection disk-io throttle
         cgroup.procs     = {pid}
 ```
 
 **CPU accounting:**
 
-- `cpu.max` is set from the `cpu.limit` field. For "500m" (500 millicores), this becomes `50000 100000` (50ms of CPU time per 100ms period).
-- `cpu.weight` is derived from `cpu.request` relative to the node's total allocatable CPU. This provides proportional sharing when the node is contended.
+- `cpu.max` is set from the `cpu.limit` field. For "500m" (500 millicores), this becomes `50000 100000` (50ms of CPU time per 100ms period). This is what the generated OCI spec carries (`OciCpuResources { quota, period }` in `src/grill/oci.rs`).
 
 **Memory accounting:**
 
-- `memory.max` is the hard limit. When exceeded, the OOM killer activates. This maps to `memory.limit`.
-- `memory.high` is set to `memory.request`. When exceeded, the kernel applies memory pressure (reclaims pages, slows allocations) without killing the process. This provides graceful degradation.
-- OOM kills are detected by Bun via `memory.events` inotify. When an OOM event is detected, Bun logs it as a structured event with the full cgroup memory state, emits it to the reporting tree, and increments the restart counter.
+- `memory.max` is the hard limit. When exceeded, the OOM killer activates. This maps to `memory.limit`. It is the only memory field written to the OCI spec (`OciMemoryResources { limit }`).
+
+> **Requests (`cpu.weight` / `memory.high`) — planned, not yet enforced.** Grill *computes* a `cpu.weight` from `cpu.request` and a `memory.high` from `memory.request` (`cgroup_params` / `cpu_weight_from_millicores` in `src/grill/cgroup.rs`), but the OCI resources struct only carries the hard limits above, so those request-derived soft controls are not currently written to any container's cgroup. Proportional CPU sharing under contention and graceful memory-pressure reclaim before OOM are the intended behaviour once the request fields are plumbed into the spec; today only the limits shape enforcement.
+
+> **OOM detection via `memory.events` inotify — planned, not yet implemented.** There is no inotify watch on `memory.events` today, so an OOM kill is observed only through the workload's exit and the ordinary restart path, not as a distinct structured OOM event with the cgroup's memory state.
 
 **GPU device isolation:**
 
@@ -1374,11 +1375,11 @@ join = ["10.0.1.5:9443"]
 
 **What happens:** A workload exceeds its `memory.max` cgroup limit and the kernel's OOM killer terminates it.
 
-**Detection:** Bun monitors `memory.events` via inotify on the cgroup. The `oom_kill` counter increment is detected within milliseconds.
+**Detection:** the workload process is killed by the kernel; Bun observes the exit through the ordinary supervision path. A dedicated `memory.events` inotify watch that would surface the `oom_kill` increment as a distinct event is **planned — not yet implemented** (see §5.4).
 
 **Impact:** The workload process is killed immediately. The workload transitions to `Stopped`, then restarts per the restart policy with exponential backoff.
 
-**Recovery:** Automatic restart with backoff. The OOM event is logged with full memory state (current usage, limit, peak). `relish wtf` reports recent OOM kills.
+**Recovery:** Automatic restart with backoff. Once the `memory.events` watch lands, the OOM event will be logged with full memory state (current usage, limit, peak) and surfaced via `relish wtf`; today an OOM kill looks like any other unexpected exit.
 
 ---
 
@@ -1388,7 +1389,7 @@ join = ["10.0.1.5:9443"]
 
 | Surface | Risk | Mitigation |
 |---------|------|------------|
-| **Process workloads access host binaries** | Larger attack surface than containers (host filesystem access) | Binary allowlist in `node.toml` (deny-by-default), restricted mount namespace, seccomp profile, `burger` unprivileged user |
+| **Process workloads access host binaries** | Larger attack surface than containers (host filesystem access) | **Shipped:** binary allowlist in `node.toml` (deny-by-default) plus admission refusal of isolation a node can't honour. **Planned (not yet implemented):** restricted mount namespace, seccomp profile, `burger` unprivileged user — a process workload currently runs as an ordinary child of the Bun process with no namespace, seccomp, or user isolation |
 | **Self-upgrade replaces the Bun binary** | A compromised upgrade could replace the orchestrator | Dual-signature verification (embedded key set + external key), no auto-update, admin role required, binary verified twice (leader + each node) |
 | **Secret decryption in Bun's memory** | Bun process memory contains plaintext secrets | Secrets are decrypted in memory only, never written to disk. `mlock()` the decryption buffer to prevent swapping. Zero the buffer after injection. |
 | **eBPF programs run in kernel space** | A malicious eBPF program could compromise the kernel | eBPF programs are compiled into the Bun binary (not loaded from external files). The kernel's BPF verifier rejects unsafe programs. |
@@ -1398,6 +1399,8 @@ join = ["10.0.1.5:9443"]
 | **Inline script execution** | Arbitrary code execution via git push | Lettuce enforces `require_signed_commits` for any config containing `script` fields. Scripts must be signed by a trusted key. |
 
 ### 8.2 Trust Boundaries
+
+> **Note: the "Process workloads" boundary below is the planned target, not the current state.** Process workloads today run as ordinary children of the Bun process without the PID/network/mount/UTS namespaces, seccomp filter, restricted filesystem view, or `burger` user shown in that box. The container-workload boundary is real; the process-workload isolation is the roadmap described in §5.2.
 
 ```
 ┌─────────────────────────────────────────────────────┐
@@ -1445,6 +1448,8 @@ join = ["10.0.1.5:9443"]
 
 ### 8.3 Restricted Capabilities
 
+> **Status: planned — not yet implemented.** The capability model below describes the target isolation for process workloads. Today a process workload is a plain host `spawn` with no capability filtering, so this section is design intent, not current enforcement.
+
 The following capabilities are explicitly NOT available to process workloads:
 
 - `NET_ADMIN`: Cannot modify network configuration. Prevents interference with the cluster's networking layer.
@@ -1455,6 +1460,8 @@ Available capabilities (require `admin` role, logged as security events):
 - `SYS_PTRACE`, `DAC_OVERRIDE`, `CHOWN`, `SETUID`, `SETGID`
 
 ### 8.4 Seccomp Profile
+
+> **Status: planned — not yet implemented for process workloads.** No seccomp profile is applied to a host-spawned process workload today. The profile below is the intended default once the isolation stack lands.
 
 The default seccomp profile blocks the following syscall families (identical for container and process workloads):
 

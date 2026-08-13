@@ -633,7 +633,18 @@ pub async fn cleanup_cluster_lease(
         }
         return Err(error);
     }
-    for resource in &lease.resources {
+    // Re-read after BeginCleanup commits. The `before` snapshot was taken
+    // ahead of that write, so a resource attached in the window between the
+    // snapshot and the commit is missing from it. BeginCleanup moves the lease
+    // to `Cleaning`, which blocks any further attach, so this fresh view is the
+    // final, authoritative owned set. Iterating the stale snapshot instead
+    // would leak the raced resource forever.
+    let after = council.desired_state().await;
+    let resources = match after.test_leases.get(lease_id) {
+        Some(lease) => lease.resources.clone(),
+        None => return Ok(()),
+    };
+    for resource in &resources {
         match resource {
             LeasedResource::App { app_id } => {
                 if let Err(error) = write_cluster_lease_request(

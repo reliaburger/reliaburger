@@ -106,6 +106,12 @@ pub struct NodePressureController {
     available: bool,
     #[cfg(target_os = "linux")]
     active: std::collections::HashMap<FaultId, NodePressureHandle>,
+    /// Cgroup directories whose helper was killed but whose (now-empty)
+    /// directory failed to remove — retried on each health tick. Freeing the
+    /// `active` slot regardless of this is what stops a transient removal
+    /// failure from wedging every future pressure fault.
+    #[cfg(target_os = "linux")]
+    pending_cleanup: Vec<PathBuf>,
 }
 
 #[cfg(target_os = "linux")]
@@ -293,13 +299,47 @@ impl NodePressureController {
             let _ = handle.child.kill().await;
             let _ =
                 tokio::time::timeout(std::time::Duration::from_secs(2), handle.child.wait()).await;
-            if let Err(error) = remove_fault_cgroup(&handle.cgroup) {
-                self.active.insert(id, handle);
+            // The helper is dead and the active slot is already freed, so a
+            // transient directory-removal failure can never wedge future
+            // pressure faults. Queue the empty directory for `retry_pending_cleanup`
+            // rather than re-inserting into `active` (the old bug).
+            if let Err(error) = remove_fault_cgroup_async(handle.cgroup.clone()).await {
+                self.pending_cleanup.push(handle.cgroup);
                 return Err(error);
             }
             Ok(())
         }
     }
+
+    /// Re-attempt removal of any cgroup directory that lingered after its helper
+    /// was killed (a transient busy/permission error during `clear` or expiry).
+    /// Invoked on each health tick; a directory that still won't remove stays
+    /// queued for the next tick. No-op off Linux.
+    pub async fn retry_pending_cleanup(&mut self) {
+        #[cfg(target_os = "linux")]
+        {
+            if self.pending_cleanup.is_empty() {
+                return;
+            }
+            let mut still_pending = Vec::new();
+            for cgroup in std::mem::take(&mut self.pending_cleanup) {
+                if remove_fault_cgroup_async(cgroup.clone()).await.is_err() {
+                    still_pending.push(cgroup);
+                }
+            }
+            self.pending_cleanup = still_pending;
+        }
+    }
+}
+
+/// Remove a fault cgroup off the async runtime. The removal polls the kernel
+/// with short sleeps, so running it inline would block a tokio worker; keep it
+/// on the blocking pool.
+#[cfg(target_os = "linux")]
+async fn remove_fault_cgroup_async(cgroup: PathBuf) -> Result<(), String> {
+    tokio::task::spawn_blocking(move || remove_fault_cgroup(&cgroup))
+        .await
+        .map_err(|e| format!("cgroup cleanup task panicked: {e}"))?
 }
 
 #[cfg(target_os = "linux")]
@@ -555,6 +595,23 @@ pub fn run_helper(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// C4: a queued cleanup that now succeeds (here, an already-absent
+    /// directory) is drained, freeing the controller — so a transient removal
+    /// failure never permanently blocks new pressure faults.
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn retry_pending_cleanup_drains_removable_directories() {
+        let mut controller = NodePressureController::default();
+        controller.pending_cleanup.push(std::path::PathBuf::from(
+            "/sys/fs/cgroup/reliaburger-chaos/nonexistent-retry-test",
+        ));
+        controller.retry_pending_cleanup().await;
+        assert!(
+            controller.pending_cleanup.is_empty(),
+            "an absent directory removes cleanly and leaves the queue empty"
+        );
+    }
 
     #[test]
     fn request_needs_work_and_stays_under_both_server_ceilings() {

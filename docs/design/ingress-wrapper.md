@@ -99,21 +99,21 @@ The routing table is an in-memory data structure mapping `(host, path_prefix)` p
 2. Look up the host in a `HashMap<String, Vec<PathRoute>>`. This is an exact match (no wildcard host matching in v1).
 3. Within the matched host, iterate `PathRoute` entries sorted by path length descending (longest prefix match). The first matching prefix wins.
 4. The matched `PathRoute` contains a `BackendPool` with a list of healthy backend addresses.
-5. Select a backend using weighted round-robin (default) or least-connections.
+5. Select a backend using **unweighted round-robin** — the only strategy implemented today (`PathRoute::select_backend`). Weighted round-robin, least-connections, and consistent-hash are planned (see §4).
 
 **Routing table updates:**
 
-Bun writes service map changes as they arrive from the reporting tree. Wrapper subscribes to a `tokio::sync::watch` channel that Bun publishes to whenever the routing-relevant subset of the service map changes. On each notification, Wrapper rebuilds the affected `BackendPool` entries. The rebuild is O(routes) and takes microseconds for typical clusters (hundreds of routes). During rebuild, the old routing table continues serving requests. The swap is atomic (Arc swap).
+Bun writes service map changes as they arrive from the reporting tree. Wrapper subscribes to a `tokio::sync::watch` channel that Bun publishes to whenever the routing-relevant subset of the service map changes. On each notification, Wrapper rebuilds the affected `BackendPool` entries. The rebuild is O(routes) and takes microseconds for typical clusters (hundreds of routes). The routing table is held behind an `Arc<tokio::sync::RwLock<RoutingTable>>` (`src/wrapper/proxy.rs`), not a lock-free arc-swap: readers take a read lock on the request path and the rebuild takes the write lock to publish the new table.
 
 ### 3.3 Backend Health Tracking
 
-Wrapper integrates two sources of health information:
+Wrapper's health information comes from one source today:
 
-1. **Passive health (from reporting tree):** The service map already excludes instances that have failed their application-level health checks. Wrapper inherits this by reading the service map.
+1. **Passive health (from reporting tree):** The service map already excludes instances that have failed their application-level health checks. Wrapper inherits this by reading the service map. This is the health signal that ships.
 
-2. **Active health (Wrapper-local):** Wrapper performs its own lightweight L7 health probes to backends every 5 seconds (configurable). This catches cases where an instance is technically "healthy" from the app perspective but unreachable from this specific node (e.g., network partition, firewall rule, host port conflict). An active probe failure marks the backend as locally unhealthy in the `BackendPool` without affecting the cluster-wide service map.
+2. **Active health (Wrapper-local) — planned, not yet implemented.** The design calls for Wrapper to run its own lightweight L7 probes to backends every few seconds to catch instances that are "healthy" cluster-wide but unreachable from this specific node. There is **no active-probe code in `src/wrapper/` today**; the `Backend.locally_healthy` flag is populated from the service map on rebuild, not from a Wrapper probe loop. The `[ingress] health_probe_*` keys and the `HealthProbeConfig` struct describe this planned behaviour.
 
-Wrapper only routes to a backend if it's healthy in both the service map (passive) AND the local active probe (active). When all backends in a pool are unhealthy, Wrapper returns `502 Bad Gateway`.
+When all backends in a pool are unhealthy (per the passive service-map signal), Wrapper returns `502 Bad Gateway`. Upstream **retry/failover of a single request** is likewise not implemented: `do_proxy` selects one backend once and returns `502` on send failure without re-selecting.
 
 ### 3.4 TLS Certificate Management
 
@@ -196,7 +196,7 @@ Step 4: After drain completes (or timeout expires), Bun stops v1
 
 Drain coordination is event-driven: Bun publishes a `DrainBackend { app, instance_id, deadline }` event on an internal channel. Wrapper moves the backend from the `active` set to the `draining` set. New requests are never routed to draining backends. When the last in-flight connection to the draining backend closes (or the drain timeout expires), Wrapper publishes a `DrainComplete { app, instance_id }` acknowledgment, and Bun proceeds to stop the old instance.
 
-If the drain timeout expires with connections still active, Wrapper forcibly closes the remaining connections by sending a TCP RST. This is a last resort; the 30-second default timeout is generous for most HTTP request/response cycles.
+> **Forced termination on timeout is planned — not yet implemented.** When the drain deadline expires today, `DrainTracker::check_completions` (`src/wrapper/draining.rs`) simply signals `DrainComplete` and **stops tracking** the backend; it does **not** actively terminate still-live connections. The TCP RST described here (and the WebSocket Close 1001 / mid-stream 503 in §5.5) is the target protocol. A `build_close_frame` helper exists but is currently reached only by tests, never sent on the live drain path. So an expired drain frees the backend for Bun to stop, but any lingering client connections are torn down by the backend going away, not by Wrapper.
 
 ---
 
@@ -208,9 +208,10 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime};
 use tokio::sync::watch;
-use arc_swap::ArcSwap;
+use tokio::sync::RwLock;
 
-/// Top-level routing table. Swapped atomically via ArcSwap.
+/// Top-level routing table. Held behind `Arc<RwLock<RoutingTable>>` and
+/// replaced under the write lock on rebuild (not a lock-free arc-swap).
 pub struct RoutingTable {
     /// Host → list of path routes, sorted by path length descending.
     pub routes: HashMap<String, Vec<PathRoute>>,
@@ -248,13 +249,17 @@ pub struct BackendPool {
     pub rr_counter: std::sync::atomic::AtomicU64,
 }
 
+// NOTE: only unweighted `RoundRobin` is implemented today. The shipped enum
+// (`src/wrapper/types.rs`) has just `RoundRobin` and `LeastConnections`, and
+// `select_backend` never consults `lb_strategy` — it always does unweighted
+// round-robin. Weighting, `LeastConnections`, and `ConsistentHash` are planned.
 #[derive(Clone, Copy)]
 pub enum LoadBalanceStrategy {
-    /// Weighted round-robin (default). Weights derived from instance resource allocation.
+    /// Unweighted round-robin. The only strategy actually used.
     RoundRobin,
-    /// Route to the backend with the fewest active connections.
+    /// Planned: route to the backend with the fewest active connections.
     LeastConnections,
-    /// Consistent hashing on a request attribute (e.g., client IP, header value).
+    /// Planned: consistent hashing on a request attribute (e.g., client IP).
     ConsistentHash,
 }
 
@@ -272,7 +277,8 @@ pub struct Backend {
     pub last_health_probe: Option<Instant>,
     /// Number of currently active connections to this backend.
     pub active_connections: std::sync::atomic::AtomicU32,
-    /// Weight for weighted round-robin (default: 1).
+    /// Weight for weighted round-robin (planned; not consulted today —
+    /// backend selection is unweighted round-robin).
     pub weight: u16,
 }
 
@@ -383,7 +389,8 @@ pub enum HeaderRule {
     Remove { name: String },
 }
 
-/// Active health probe configuration.
+/// Active health probe configuration. PLANNED — Wrapper runs no active
+/// probe loop today (see §3.3); this type describes the intended design.
 pub struct HealthProbeConfig {
     /// Interval between probes.
     pub interval: Duration,
@@ -415,9 +422,10 @@ pub struct WrapperConfig {
     pub drain_timeout: Duration,
     /// Global default rate limit (applied to routes without explicit config).
     pub default_rate_limit: Option<RateLimitConfig>,
-    /// Active health probe configuration.
+    /// Active health probe configuration. PLANNED — no probe loop exists yet.
     pub health_probe: HealthProbeConfig,
-    /// Minimum TLS version (default: TLS 1.2).
+    /// PLANNED — not a real config field today. The TLS minimum is rustls's
+    /// default (1.2+); there is no `min_tls_version` key.
     pub min_tls_version: TlsVersion,
 }
 
@@ -443,7 +451,7 @@ Every inbound HTTPS request follows this path:
     - A cluster leaf is minted/served only for a configured ingress host;
       an unknown SNI (or none) is served the self-signed default, which a
       hostname-validating client rejects
-3.  HTTP/1.1 or HTTP/2 request parsed (via hyper)
+3.  HTTP/1.1 or HTTP/2 request parsed (via hyper's auto builder). NOTE: Wrapper's rustls config does not set `alpn_protocols`, so it does **not** advertise `h2` over TLS — HTTP/2-over-TLS/ALPN negotiation is planned, not shipped. (hyper's auto builder can still speak h2 on cleartext prior-knowledge.)
 4.  Host header extracted (falls back to SNI hostname)
 5.  Routing table lookup:
     a. Exact match on Host → Vec<PathRoute>
@@ -456,9 +464,9 @@ Every inbound HTTPS request follows this path:
 7.  Backend selection from BackendPool:
     a. Filter to locally_healthy == true
     b. If pool empty: respond 502 Bad Gateway
-    c. Select backend per lb_strategy (default: weighted round-robin)
+    c. Select backend by unweighted round-robin (the only strategy implemented; lb_strategy is not consulted)
 8.  Proxy the request:
-    a. Add X-Forwarded-For, X-Forwarded-Proto, X-Real-IP headers
+    a. Add X-Forwarded-For and X-Forwarded-Proto headers (the only headers Wrapper injects today). X-Real-IP and X-Request-ID are planned, not yet added.
     b. Forward the request to backend_addr
     c. Stream the response back to the client
 9.  Connection accounting:
@@ -532,11 +540,13 @@ Bun (deploy coordinator)                  Wrapper
 **Drain timeout behaviour:**
 
 - Default: 30 seconds (configurable per app via `drain_timeout` in the deploy config).
-- When the timeout expires with connections still active:
-  1. WebSocket connections: Wrapper sends a WebSocket Close frame (opcode 0x08) with status 1001 (Going Away), then waits 5 seconds for the close handshake, then RSTs.
-  2. HTTP connections: Wrapper sends a 503 response if the request is mid-stream, then RSTs.
-  3. Idle keep-alive connections: RST immediately.
 - The drain timeout is a per-deploy-step timeout, not a global timeout. Each instance being replaced gets its own full drain window.
+
+> **The forced-termination protocol below is planned — not yet implemented.** Today, when the timeout expires the Wrapper stops tracking the draining backend and signals `DrainComplete` (see §3.5); it does not itself send any of the following to live clients. This is the target design:
+>
+> 1. WebSocket connections: send a WebSocket Close frame (opcode 0x08) with status 1001 (Going Away), wait 5 seconds for the close handshake, then RST.
+> 2. HTTP connections: send a 503 response if the request is mid-stream, then RST.
+> 3. Idle keep-alive connections: RST immediately.
 
 **Coordination with rolling deploys:**
 
@@ -544,7 +554,7 @@ The rolling deploy process (Section 13) proceeds one instance at a time (configu
 
 ### 5.6 WebSocket Upgrade Handling
 
-> **Status:** Deferred to Phase 9 (User Experience). The `websocket` config flag is parsed but the proxy currently handles HTTP only. The upgrade handshake and bidirectional byte-level proxying described below are not yet implemented.
+> **Status: shipped and tested.** WebSocket upgrade proxying is fully implemented in `src/wrapper/websocket.rs` (`handle_websocket_upgrade`), wired into the request path in `src/wrapper/proxy.rs`, and covered end-to-end by `tests/ingress.rs` (`ingress_proxies_websocket_handshake_and_bytes`, which drives a real client through the proxy to a raw WebSocket backend and asserts the `101` / `Sec-WebSocket-Accept` relay and byte echo). The `websocket` route flag gates it.
 
 When Wrapper receives a request with `Connection: Upgrade` and `Upgrade: websocket` headers:
 
@@ -623,7 +633,7 @@ Backend instance starts/stops/fails health check on some node
   → Bun publishes a notification on the watch channel
   → Wrapper receives the notification
   → Wrapper rebuilds affected BackendPool entries
-  → New routing table is swapped in via ArcSwap
+  → New routing table is swapped in under the RwLock write lock
 ```
 
 End-to-end latency for a routing table update: typically 1-3 seconds, dominated by the reporting tree aggregation interval. During this window, Wrapper may still route to a backend that has just become unhealthy. The active health probe (5-second interval) provides a secondary safety net.
@@ -663,21 +673,17 @@ drain_timeout = "30s"
 # rate_limit_rps = 1000
 # rate_limit_burst = 2000
 
-# Minimum TLS version. Default: "1.2".
-# Set to "1.3" to disable TLS 1.2.
-min_tls_version = "1.2"
-
-# Active health probe interval. Default: "5s".
-health_probe_interval = "5s"
-
-# Active health probe timeout. Default: "2s".
-health_probe_timeout = "2s"
-
-# Consecutive probe failures before marking backend unhealthy. Default: 3.
-health_threshold_unhealthy = 3
-
-# Consecutive probe successes before marking backend healthy. Default: 2.
-health_threshold_healthy = 2
+# NOTE: the keys below are PLANNED, not parsed today.
+#   - `min_tls_version` does not exist as a config key. The TLS minimum is
+#     not configurable; rustls 0.23's default (TLS 1.2+) applies, so 1.0/1.1
+#     are rejected, but there is no key to force 1.3-only.
+#   - the `health_probe_*` keys configure the planned Wrapper-local active
+#     health probe (see §3.3), which is not implemented yet.
+# min_tls_version = "1.2"
+# health_probe_interval = "5s"
+# health_probe_timeout = "2s"
+# health_threshold_unhealthy = 3
+# health_threshold_healthy = 2
 ```
 
 ### 6.2 App-Level Configuration (app spec TOML)
@@ -721,13 +727,13 @@ Wrapper validates ingress configuration at deploy time:
 | Failure | Detection | Impact | Recovery |
 |---|---|---|---|
 | **Unsupported TLS mode** | Routing-table rebuild parses `auto`, `acme`, or an unknown value | The new routing table is rejected; the previous table remains active. | Choose `cluster`, `explicit`, or a plain-HTTP alias. |
-| **Backend pool empty** | All backends removed from service map or all fail active health probes | Route returns 502 Bad Gateway for all requests. | Automatic: backends re-appear when health checks pass or new instances are scheduled. Wrapper re-adds them within seconds. |
+| **Backend pool empty** | All backends removed from the service map (there is no Wrapper-local active probe today) | Route returns 502 Bad Gateway for all requests. | Automatic: backends re-appear when the service map marks them healthy or new instances are scheduled. Wrapper re-adds them within seconds. |
 | **Certificate expiry** | Currently detected by clients, not by Wrapper | Clients reject the connection. | Restart before a cluster-issued leaf expires, or rotate the configured operator files and restart. Automatic detection, telemetry and hot rotation are required follow-up work. |
-| **Slow draining** | In-flight connections exceed `drain_timeout` | Deploy step is delayed up to `drain_timeout`. After timeout, remaining connections are forcibly closed (TCP RST). | Increase `drain_timeout` if the app has legitimately long-running requests. For WebSocket apps, set a higher timeout or implement reconnection logic in the client. |
+| **Slow draining** | In-flight connections exceed `drain_timeout` | Deploy step is delayed up to `drain_timeout`. On expiry Wrapper stops tracking the backend and signals `DrainComplete`; it does not itself RST live connections today (forced termination is planned, §5.5). | Increase `drain_timeout` if the app has legitimately long-running requests. For WebSocket apps, set a higher timeout or implement reconnection logic in the client. |
 | **Ingress CA resolver unavailable at startup** | Bun can't reconstruct the Ingress CA material and logs a warning | The HTTPS listener uses its self-signed development certificate; `cluster` doesn't meet its production trust contract on that node. | Restore council/wrapping material before enabling ingress, or configure an explicit certificate pair. A future capability gate should reject placement on such a node. |
 | **Port 80/443 already in use** | `bind()` returns `EADDRINUSE` | Wrapper cannot start. Bun logs the error and retries every 30 seconds. | Operator must free the ports or reconfigure Wrapper to use alternative ports. |
 | **rustls handshake failure** | Client sends unsupported TLS version or cipher suite | Connection dropped during handshake | Client-side fix (upgrade TLS version). Wrapper logs the failure at debug level to avoid log flooding. |
-| **Upstream connection refused** | Backend process crashed between health probe and request routing | Individual request fails with 502. Wrapper marks backend as locally unhealthy after `threshold_unhealthy` consecutive failures. | Automatic: backend removed from pool. Next request goes to a healthy backend. Bun's container supervision restarts the crashed process. |
+| **Upstream connection refused** | Backend process crashed between service-map update and request routing | The individual request fails with 502 immediately — Wrapper does not retry against another backend (single-shot selection). | Automatic: the backend is dropped from the pool when the service map marks it unhealthy; subsequent requests pick a healthy backend. Bun's container supervision restarts the crashed process. Per-request retry/failover is planned. |
 
 ---
 
@@ -737,7 +743,7 @@ Wrapper validates ingress configuration at deploy time:
 
 Wrapper uses `rustls` (a memory-safe TLS implementation) with the following defaults:
 
-- **Minimum TLS version:** TLS 1.2 (configurable to TLS 1.3 only via `min_tls_version = "1.3"`).
+- **Minimum TLS version:** TLS 1.2. This is rustls 0.23's default, not a configurable setting — there is no `min_tls_version` key today (that is planned). TLS 1.0/1.1 are rejected, but forcing TLS 1.3-only is not currently possible via config.
 - **TLS 1.3 cipher suites (preferred):**
   - `TLS_AES_256_GCM_SHA384`
   - `TLS_AES_128_GCM_SHA256`
@@ -775,10 +781,13 @@ For production deployments facing DDoS risk, operators should place a dedicated 
 
 ### 8.4 Header Security
 
-Wrapper adds the following headers to proxied requests:
+Wrapper adds the following headers to proxied requests today (`forwarded_headers` in `src/wrapper/proxy.rs`):
 
 - `X-Forwarded-For`: Client IP appended to any existing chain.
 - `X-Forwarded-Proto`: `https`.
+
+Planned, not yet added:
+
 - `X-Real-IP`: Client's direct IP address.
 - `X-Request-ID`: Unique request identifier (UUID v4) if not already present.
 
@@ -825,7 +834,7 @@ For most deployments, keep-alive connections amortize the handshake cost. The ha
 
 ### 9.4 Routing Table Rebuild Cost
 
-Routing table rebuilds (triggered by service map changes) are O(n) where n is the number of ingress routes. For a cluster with 500 routes, the rebuild takes ~50 microseconds. The ArcSwap ensures that in-flight requests are never blocked by a rebuild.
+Routing table rebuilds (triggered by service map changes) are O(n) where n is the number of ingress routes. For a cluster with 500 routes, the rebuild takes ~50 microseconds. The table is swapped under a `tokio::sync::RwLock` write lock; the rebuild is computed off to the side and the lock is held only for the brief pointer swap, so request-path readers are not meaningfully blocked.
 
 ---
 
@@ -855,7 +864,7 @@ Routing table rebuilds (triggered by service map changes) are O(n) where n is th
 | Longest path prefix match | Routes `/api` and `/api/v2` both exist. Request to `/api/v2/users` matches `/api/v2`, not `/api`. |
 | Root path match | Route with `path = "/"` matches `/anything`. |
 | Backend round-robin | Send N requests. Verify backends are selected in round-robin order. |
-| Backend least-connections | Configure `lb_strategy = LeastConnections`. Send concurrent requests. Verify backends are selected by lowest active connection count. |
+| Backend least-connections *(planned)* | Once `LeastConnections` is implemented: configure it, send concurrent requests, verify selection by lowest active connection count. Not testable today — only unweighted round-robin exists. |
 | Empty backend pool → 502 | Remove all backends from a route. Verify 502 response. |
 | Routing table update | Add a new backend to the service map. Verify it starts receiving requests within 5 seconds. |
 | Concurrent routing table swap | Send a continuous stream of requests while triggering a routing table rebuild. Verify no requests are dropped or return errors. |
@@ -867,7 +876,7 @@ Routing table rebuilds (triggered by service map changes) are O(n) where n is th
 | Graceful drain completes | Start a slow request (5-second response time). Initiate drain. Verify the slow request completes. Verify DrainComplete is signaled after the response finishes. |
 | Drain timeout forces RST | Start a request that never completes (blocked server). Initiate drain with 2-second timeout. Verify the connection is RST after 2 seconds. Verify DrainComplete is signaled. |
 | No new requests to draining backend | Initiate drain on a backend. Send 100 new requests. Verify zero requests reach the draining backend. |
-| WebSocket drain sends Close frame | Establish a WebSocket connection. Initiate drain. Verify the client receives a Close frame with status 1001 before disconnect. |
+| WebSocket drain sends Close frame *(planned)* | Depends on the forced-termination drain protocol (§5.5), which is not implemented — today an expired drain just stops tracking the backend and does not send a Close 1001. |
 | Rolling deploy end-to-end | Deploy a new version of an app with 3 replicas. Send continuous traffic during the deploy. Verify zero failed requests (5xx responses). Verify all instances are eventually replaced. |
 
 ### 10.4 Rate Limiting

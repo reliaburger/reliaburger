@@ -656,7 +656,7 @@ When a new instance fails its health check, the deploy halts immediately. The sy
 - Instances that haven't yet been rolled remain on the old version.
 - The failed instance is stopped (it never entered the routing pool).
 
-The operator can inspect the situation via `relish status`, which clearly shows the partial rollout state (e.g., "web: 1/3 instances on v2, 2/3 on v1, deploy halted"). The operator then decides whether to fix the issue and continue (`relish deploy --continue`) or manually roll back (`relish rollback web`).
+The operator can inspect the situation via `relish status`, which clearly shows the partial rollout state (e.g., "web: 1/3 instances on v2, 2/3 on v1, deploy halted"). The operator then decides whether to fix the issue and continue or manually roll back. (The `relish deploy --continue` resume flow and a dedicated `relish rollback` command are **planned — not yet implemented**; rollback today is a fresh deploy of the previous spec version.)
 
 **Mode 2: Active Revert (default, `auto_rollback = true`)**
 
@@ -713,9 +713,16 @@ web deploys:
   #1  2026-02-01 10:00  (initial deploy)   completed in 45s    (alice@myorg via relish deploy)
 ```
 
-Rollback to any previous version is a single command (`relish rollback web --to v1.4.1`) or a single click in Brioche. The rollback uses the same rolling deploy mechanism, creating a new deploy history entry with `initiated_by: Rollback`.
+Rollback re-deploys a previous spec version through the same rolling mechanism, creating a new deploy history entry with `initiated_by: Rollback`. A single `relish rollback web --to v1.4.1` command that targets a named version, and one-click rollback in Brioche, are **planned — not yet implemented**.
 
 ### 5.4 Dependency Ordering (`run_before`)
+
+> **Status: planned — not yet implemented.** The `run_before` field is parsed
+> and lint-checked, but nothing in the shipped deploy path consumes it. There is
+> no pre-deploy job gating today: a deploy that references a `run_before` job
+> rolls the app immediately without waiting for the job. The `RunningPreDeps`
+> phase, the `DependencyGraph`, and the topological ordering below describe the
+> target design.
 
 Jobs can declare dependencies on Apps using the `run_before` field:
 
@@ -753,6 +760,14 @@ For WebSocket connections, the drain timeout applies equally. Long-lived WebSock
 For internal service-to-service traffic (via Onion), the eBPF service map entry is removed atomically. New `connect()` calls immediately stop targeting the instance. Existing established TCP connections are unaffected by the map removal (they are kernel-level connections that persist independently of the BPF map).
 
 ### 5.6 Blue-Green Deploy
+
+> **Status: planned — not yet implemented.** The blue-green orchestrator
+> (`meat::blue_green::execute_blue_green` and the `DeployState` machine in
+> `meat::orchestrator`) exists as library code with no production caller. The
+> wired agent path never branches on `strategy`, so a config that sets
+> `strategy = "blue-green"` is accepted and parsed, then **silently runs a
+> rolling deploy** — you don't get an atomic cutover today. The design below is
+> the target.
 
 Blue-green deployment starts an entirely new set of instances (the "green" set) alongside the existing set (the "blue" set), verifies health on all green instances, then switches all traffic at once:
 
@@ -821,7 +836,7 @@ This prevents Lettuce from fighting the autoscaler during traffic spikes, even w
 
 ## 6. Configuration
 
-All deploy configuration lives under the `[app.<name>.deploy]` TOML section. Defaults can be set at the cluster level via `[defaults.app.deploy]`.
+All deploy configuration lives under the `[app.<name>.deploy]` TOML section. Defaults are set per-directory in a `_defaults.toml` file, merged into each app by `relish compile`. There is no cluster-level `[defaults.app.deploy]` section — the block shown below is planned, not implemented.
 
 ```toml
 # Per-app deploy configuration
@@ -840,10 +855,15 @@ min = 2                     # minimum replicas
 max = 10                    # maximum replicas
 ```
 
-**Cluster-wide defaults:**
+**Cluster-wide defaults (planned — not yet implemented):**
+
+The intent is a defaults section in the cluster config so every app inherits the
+same deploy policy. Today the only defaulting mechanism is the per-directory
+`_defaults.toml` merged by `relish compile`; the `[defaults.app.deploy]` section
+below is not read by anything yet.
 
 ```toml
-# In the defaults section of the cluster config
+# Planned. Not currently parsed.
 [defaults.app.deploy]
 strategy = "rolling"
 auto_rollback = true        # default to active revert for all apps

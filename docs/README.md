@@ -381,41 +381,60 @@ Commands:
 | `logs <name>` | Show captured stdout/stderr for an app |
 | `logs <name> --tail N` | Show only the last N lines |
 | `logs <name> --follow` / `-f` | Stream new log lines as they appear |
-| `inspect <name>` | Detailed info about an app |
+| `logs-export --dest <dir>` | Export Parquet log files to a directory |
+| `logs-search <dir> <sql>` | Run SQL over an exported Parquet log archive |
+| `inspect <name>` | Detailed info about an app (bare app name) |
+| `wtf [--app <app>] [--watch]` | Correlated cluster-health diagnosis (exit 0 OK / 1 criticals / 2 warnings-only) |
+| `trace <src> --to <dst>` | Probe DNS, service-map, firewall and TCP from a workload (exit 0/1/2) |
 | `exec <app> <cmd...>` | Execute a command inside a running instance |
 | `stop <app>` | Stop all instances of an app |
 | `init [dir]` | Generate PKI and an mTLS-required starter config (`--development-plaintext` is an explicit local-only exception) |
 | `nodes` | List cluster nodes and their gossip state |
 | `council` | Show council (Raft) composition and status |
+| `council recover --data-dir <dir>` | Recover a cluster after total council loss (read `--help` first) |
 | `join --token <token> --node-id <id> <api-addr>` | Enrol a node identity with an existing cluster member |
 | `join-token create --node-id <id> --ttl 15m` | Mint one Admin-authorised, single-use token that enrols exactly that node id |
 | `chaos <action>` | Run chaos testing scenarios (council-partition, worker-isolation, status, heal) |
 | `test [--profile <profile>]` | Run the 39-case live-cluster catalogue; full profiles fail on required skips, unknown evidence or unconfirmed cleanup |
+| `bench [--quick] [--compare <file>]` | Run reproducible data-plane benchmarks (`--disruptive`/`--capacity` need `--yes`) |
 | `resolve <name>` | Resolve a service name to its VIP and backends |
 | `routes` | Show ingress routing table |
-| `top` | Show live resource usage (CPU, memory) for all apps |
+| `top` | Print a workload table (app, namespace, state, PID, restarts); it does not show live CPU/memory |
 | `deploy <path>` | Trigger a rolling deploy for an app |
 | `history <app>` | Show deploy history for an app |
 | `rollback <app>` | Rollback an app to the previous version |
 | `lint <path>` | Validate a config file without deploying |
+| `compile <path>` | Merge and resolve configs into one TOML document |
+| `diff <path-a> [path-b]` | Structural diff between two configs (local; not cluster drift) |
+| `fmt <path>` | Format a TOML config in place (`--check` to verify only) |
 | `images` | List images in the local Pickle registry |
 | `build <path>` | Build OCI images from `[build.*]` sections and push to Pickle (async: submits, then polls; `--timeout` bounds the wait) |
 | `batch <path>` | Submit `[job.*]` sections as a high-throughput batch across the cluster |
 | `batch-status <id>` | Show a submitted batch's progress (`--wait --timeout` polls to a terminal state) |
 | `sign <image>` | Sign an image in the Pickle registry and attach the signature |
+| `import -f <file>` | Convert Kubernetes YAML to Reliaburger TOML (`kubernetes` build feature; `-f` repeatable, `--strict`) |
+| `export -f <file>` | Convert Reliaburger TOML to Kubernetes YAML (`kubernetes` build feature) |
 | `snapshot create <app>` | Snapshot an app's managed volumes (Btrfs-backed; `--volume` for one, `--name` to label) |
 | `snapshot list <app>` | List an app's snapshots, newest first |
 | `snapshot restore <app> <name>` | Restore a snapshot over the live volume (stop the app first) |
 | `snapshot delete <app> <name>` | Delete a snapshot |
 | `secret pubkey [dir]` | Print the cluster's age public key |
 | `secret encrypt --pubkey <key> <value>` | Encrypt a value for use in app configs |
+| `secret rotate [--finalize]` | Start (or finalise) secret encryption-key rotation |
+| `token create --name <name>` | Create an API token (`--role`, `--apps`, `--namespaces`, `--ttl-days`) |
+| `token list` | List all API tokens |
+| `token revoke <name>` | Revoke an API token by name |
 | `fault delay <target> <delay>` | Reserved contract; currently refused until the TC packet path ships |
 | `fault drop <target> <pct> --acknowledge` | Fail a percentage of connections (ECONNREFUSED) |
 | `fault dns <target> nxdomain --acknowledge` | Return NXDOMAIN for DNS resolution |
 | `fault partition <target> [--from <app>] --acknowledge` | Block connect() from one source app (or all callers) to a service; requires Linux eBPF |
 | `fault bandwidth <target> <rate>` | Reserved contract; currently refused until the TC packet path ships |
+| `fault cpu <target> <pct> --acknowledge` | Consume CPU in a service's cgroup |
+| `fault memory <target> <pct\|oom> --acknowledge` | Push memory toward the limit (`oom` is refused) |
+| `fault disk-io <target> <rate> [--write-only] --acknowledge` | Throttle disk I/O for a service |
 | `fault kill <target> --acknowledge` | Kill instances of a service (SIGKILL) |
 | `fault pause <target> --acknowledge` | Freeze instances of a service (SIGSTOP) |
+| `fault resume <target> --acknowledge` | Unfreeze (SIGCONT) previously paused instances |
 | `fault node-drain <node> --acknowledge` | Withdraw a node from scheduling for a bounded duration |
 | `fault node-kill <node> --acknowledge` | Quiesce a node's cluster transports for a bounded duration |
 | `fault node-pressure <node> --cpu 80% --memory 90% --acknowledge` | Consume server-bounded Linux node capacity in an owned cgroup |
@@ -423,12 +442,15 @@ Commands:
 | `fault clear [id]` | Clear workload faults (or a specific workload fault by ID) |
 | `fault clear <id> --node <node>` | Reverse a node fault on its owning node |
 | `fault scenario <file> --acknowledge` | Run a scripted chaos scenario from a TOML file |
-| `dev create` | Create a local dev cluster (Lima VMs with rootless runc) |
+| `dev create` | Create a local dev cluster (Lima VMs; each node runs `bun` rootful under `sudo` for runc/netns) |
 | `dev status` | Show dev cluster status |
 | `dev shell <node>` | Open a shell on a dev cluster node |
 | `dev stop` | Stop a dev cluster (VMs stay on disk) |
 | `dev start` | Start a stopped dev cluster |
 | `dev destroy` | Destroy a dev cluster (delete all VMs) |
+| `dev test [filter]` | Run Linux-gated tests in the persistent build VM (`--recreate` to rebuild it) |
+| `dev disk` | Show disk usage in the test VM |
+| `dev clean` | Clean cargo build artefacts in the test VM |
 | `dev keygen --out <dir>` | Generate an Ed25519 release signing keypair |
 | `dev sign-binary --key <key> <binary>` | Sign a binary, producing a detached `.sig` envelope |
 | `upgrade check` | Check the release metadata for available updates |
@@ -536,16 +558,30 @@ cargo run --bin relish -- exec web echo hello
 # Stop an app
 cargo run --bin relish -- stop web
 
-# Scaffold a new project
+# Generate cluster PKI, identity and a starter config
 cargo run --bin relish -- init myproject
 ```
 
-`apply --dry-run` shows what would happen without contacting an agent:
+`init` generates a cluster's CA hierarchy, age keypair, first-node identity,
+master key and an mTLS-required `reliaburger.toml` (plus a sample `app.toml`)
+in the target directory — it does not merely scaffold an empty project.
+
+`apply --dry-run` prints the `ApplyPlan` without contacting an agent (always
+exits 0). For `examples/phase-1/proc-minimal-app.toml`:
 
 ```
-app "web" (proc-grill:image-ignored)
-  1 replica, port 8080
-  health: GET /healthz every 10s
+Relish apply plan:
+
+  + app.web
+      image     proc-grill:image-ignored
+      replicas  1
+      port      8080
+      health    /healthz
+
+  + app.worker
+      image     proc-grill:image-ignored
+      replicas  1
+Plan: 2 to create, 0 to update, 0 to destroy.
 
 (dry run — nothing deployed)
 ```

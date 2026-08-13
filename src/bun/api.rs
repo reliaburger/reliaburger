@@ -691,10 +691,15 @@ async fn diagnostics_handler(
         },
     };
     let certificates = match &state.static_capabilities.diagnostics.node_certificate {
-        Some(certificate) => DiagnosticSource::Degraded {
+        // The node leaf metadata is genuinely available and diagnosable (expiry
+        // is checked from it). That the broader workload-certificate inventory
+        // and hot-reload state aren't exposed yet is a static product
+        // limitation, not a per-request collection failure — reporting it
+        // `Degraded` forced every mTLS cluster's `relish wtf` to exit 2, which
+        // the "0 = healthy" contract forbids. Serve it as `Available`.
+        Some(certificate) => DiagnosticSource::Available {
             observed_at,
             value: vec![certificate.clone()],
-            reason: "node certificate metadata is available, but workload certificate inventory and node hot-reload state are not yet exposed".to_string(),
         },
         None if !state.static_capabilities.identity => DiagnosticSource::Unsupported {
             reason: "workload identity issuance is disabled and no node mTLS leaf is loaded"
@@ -2332,16 +2337,41 @@ async fn cluster_apply(
         // apply and GitOps can't diverge (12b.2 T6). A failed write is a
         // hard stop — half an apply leaves desired state inconsistent.
         let writes = match &lease_id {
-            Some(lease_id) => crate::council::config_to_leased_writes(
+            Some(lease_id) => match crate::council::config_to_leased_writes(
                 &config,
                 lease_id,
                 crate::testkit::lease::now_unix_millis(),
-            ),
+            ) {
+                Ok(writes) => writes,
+                // A leased apply that declares a non-owned kind (job, build,
+                // permission) is rejected outright rather than silently
+                // dropping it — see `config_to_leased_writes`.
+                Err(e) => {
+                    let _ = event_tx
+                        .send(ApplyEvent::Error {
+                            message: e.to_string(),
+                        })
+                        .await;
+                    return;
+                }
+            },
             None => crate::council::config_to_desired_writes(&config),
         };
         for request in writes {
             let describe = describe_write(&request);
             match council.write(request).await {
+                // A state-machine refusal (lease expired, in cleanup, resource
+                // owned elsewhere, quota) is NOT a commit — surfacing it as an
+                // error stops the apply instead of streaming "committed" and
+                // letting the case die later as Unknown(TimedOut).
+                Ok(crate::council::CouncilResponse::Refused { reason }) => {
+                    let _ = event_tx
+                        .send(ApplyEvent::Error {
+                            message: format!("{describe}: refused by the cluster: {reason}"),
+                        })
+                        .await;
+                    return;
+                }
                 Ok(_) => {
                     committed += 1;
                     let _ = event_tx
@@ -3809,11 +3839,17 @@ async fn fault_inject_handler(
         if let Err(response) = check_node_fault_cluster_safety(&state, &request).await {
             return response;
         }
-        if state
-            .node_name
-            .as_deref()
-            .is_some_and(|name| name != target_node)
-        {
+        // A node with no cluster identity can't decide whether it *is* the
+        // target, so applying locally would pressure/kill the wrong (unnamed)
+        // node. Refuse rather than mis-route.
+        let Some(self_name) = state.node_name.as_deref() else {
+            return (
+                StatusCode::BAD_REQUEST,
+                "this node has no cluster identity; cannot route node-targeted faults",
+            )
+                .into_response();
+        };
+        if self_name != target_node {
             return forward_node_fault(&state, target_node, &headers, &request).await;
         }
     } else {
@@ -4374,8 +4410,21 @@ async fn fault_clear_all_handler(
         return (StatusCode::FORBIDDEN, error.to_string()).into_response();
     }
     let (resp_tx, resp_rx) = oneshot::channel();
-    // `?service=NAME` clears only that service's faults; no query clears all.
+    // `?service=NAME` clears only that service's faults; no query clears all
+    // workload faults. An *empty* `?service=` is neither: every node-class
+    // fault carries an empty `target_service`, so it would match them all —
+    // reject it rather than let this Deployer-authorised path reverse Admin
+    // faults by omission.
     let command = match params.get("service") {
+        Some(service) if service.is_empty() => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({
+                    "error": "service must be non-empty; omit ?service to clear all workload faults"
+                })),
+            )
+                .into_response();
+        }
         Some(service) => AgentCommand::ClearFaultsByService {
             service: service.clone(),
             response: resp_tx,

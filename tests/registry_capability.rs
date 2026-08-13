@@ -7,11 +7,18 @@ use reliaburger::pickle::capability::{
 use reliaburger::pickle::types::ManifestCatalog;
 
 #[test]
-fn clustered_default_derives_the_advertised_address() {
+fn clustered_loopback_default_binds_the_unspecified_address() {
+    // A loopback *default* on a routable cluster binds the unspecified address
+    // of the advertise family, not the advertised IP — so localhost (the build
+    // pipeline's push target and the node's own reads) keeps a listener while
+    // peers still reach the routable address. `peer_reachable` stays true.
     let advertised = IpAddr::V4(Ipv4Addr::new(10, 20, 30, 40));
     let plan = plan_registry_bind("127.0.0.1", 5050, Some(advertised)).unwrap();
 
-    assert_eq!(plan.listen_addr, SocketAddr::new(advertised, 5050));
+    assert_eq!(
+        plan.listen_addr,
+        SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), 5050)
+    );
     assert!(plan.peer_reachable);
 }
 

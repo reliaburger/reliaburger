@@ -282,8 +282,10 @@ fn check_crashloops(inputs: &WtfInputs, report: &mut WtfReport) {
     if !found {
         report.ok.push(WtfOk {
             id: "crashloops".to_string(),
-            description: "no applications have three timestamped restarts in 15 minutes"
-                .to_string(),
+            description: with_caveat(
+                "no applications have three timestamped restarts in 15 minutes",
+                inputs.applications.restarts.caveat(),
+            ),
         });
     }
 }
@@ -456,7 +458,10 @@ fn check_deploys(inputs: &WtfInputs, report: &mut WtfReport) {
     if !found {
         report.ok.push(WtfOk {
             id: "deploys".to_string(),
-            description: "no deploy has been active for more than 15 minutes".to_string(),
+            description: with_caveat(
+                "no deploy has been active for more than 15 minutes",
+                inputs.applications.deploys.caveat(),
+            ),
         });
     }
 }
@@ -720,6 +725,17 @@ fn app_matches(scope: Option<&str>, app: &str) -> bool {
 
 fn app_resource(app: &str, namespace: &str) -> String {
     format!("app.{app}/{namespace}")
+}
+
+/// Append an inherent evidence caveat to an OK description.
+///
+/// A caveat is not a failure, so it never becomes an unknown; it rides along
+/// with the successful check it qualifies.
+fn with_caveat(description: &str, caveat: Option<&str>) -> String {
+    match caveat {
+        Some(caveat) => format!("{description} (caveat: {caveat})"),
+        None => description.to_string(),
+    }
 }
 
 #[cfg(test)]
@@ -1124,6 +1140,50 @@ mod tests {
         let error = serde_json::from_value::<WtfReport>(value).unwrap_err();
 
         assert!(error.to_string().contains("unknown field"));
+    }
+
+    #[test]
+    fn inherent_collector_limitations_are_caveats_not_unknowns() {
+        let mut inputs = healthy_inputs();
+        // The restart and deploy collectors only ever observe bounded,
+        // process-local history. That is an inherent limitation, not a
+        // collection failure, so it must not force a non-zero exit.
+        inputs.applications.restarts =
+            Evidence::available_with_caveat(NOW, Vec::new(), "restart history is bounded");
+        inputs.applications.deploys =
+            Evidence::available_with_caveat(NOW, Vec::new(), "deploy history is bounded");
+
+        let report = diagnose(&inputs);
+
+        // A healthy cluster whose only "Degraded" came from these collectors now
+        // diagnoses clean: nothing critical, no warnings, and crucially no
+        // unknowns, so `relish wtf` would exit 0.
+        assert!(report.critical.is_empty());
+        assert!(report.warnings.is_empty());
+        assert!(report.unknown.is_empty());
+        // The caveat still surfaces, attached to the passing check.
+        let crashloops = report.ok.iter().find(|ok| ok.id == "crashloops").unwrap();
+        assert!(
+            crashloops
+                .description
+                .contains("restart history is bounded")
+        );
+        let deploys = report.ok.iter().find(|ok| ok.id == "deploys").unwrap();
+        assert!(deploys.description.contains("deploy history is bounded"));
+    }
+
+    #[test]
+    fn genuine_collection_errors_remain_unknown() {
+        let mut inputs = healthy_inputs();
+        // A real collection failure (not an inherent caveat) must still block a
+        // clean verdict and become an unknown.
+        inputs.applications.restarts = Evidence::Unavailable {
+            reason: "every node event ring was unreachable".to_string(),
+        };
+
+        let report = diagnose(&inputs);
+
+        assert!(report.unknown.iter().any(|item| item.source == "restarts"));
     }
 
     fn restart(timestamp: u64) -> RestartObservation {

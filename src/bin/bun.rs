@@ -967,6 +967,24 @@ async fn run_agent(cli: Cli) -> anyhow::Result<()> {
         .map(reliaburger::sesame::token::derive_service_token)
         .transpose()?;
 
+    // A clustered node with no master key cannot mint a service token, so its
+    // registry writes and cross-node replication silently 401 forever. Warn
+    // loudly rather than let the operator discover it only when a build or a
+    // heal quietly fails (B3).
+    if cli.cluster && service_token.is_none() {
+        eprintln!(
+            "bun: WARNING: clustered node started without [security] master_key_path. \
+             Registry writes (rbrg build), cross-node image replication and self-upgrade \
+             binary fetches authenticate with the internal service token derived from that \
+             key — without it they will fail with 401. Set [security] master_key_path on \
+             every node in the cluster."
+        );
+    }
+
+    // Present the service token as the bearer on self-upgrade binary fetches:
+    // on a routable cluster the registry requires a principal for reads (B2).
+    let upgrade_manager = upgrade_manager.map(|m| m.with_bearer(service_token.clone()));
+
     // Gossip membership watch for the upgrade orchestrator's live-voter
     // quorum check (UPG1). Captured out of `orchestration` before the
     // refresher task consumes its copy, so it outlives that block.
@@ -1980,14 +1998,25 @@ async fn run_agent(cli: Cli) -> anyhow::Result<()> {
     let pickle_listener = tokio::net::TcpListener::bind(registry_bind.listen_addr).await?;
     registry_bind.listen_addr = pickle_listener.local_addr()?;
     let registry_addr = registry_bind.listen_addr;
-    println!(
-        "bun: Pickle registry listening on {registry_addr} ({})",
-        if registry_over_tls {
-            "TLS, authenticated writes"
+    // Describe the listener honestly (B3). A clustered listener authenticates
+    // writes (service token or a Deployer bearer) and, on a routable bind,
+    // reads too — regardless of TLS. Only the literal loopback standalone
+    // listener is genuinely open.
+    let transport = if registry_over_tls {
+        "TLS"
+    } else {
+        "plaintext"
+    };
+    let auth = if registry_cluster_advertise.is_some() {
+        if registry_bind.listen_addr.ip().is_loopback() {
+            "authenticated writes"
         } else {
-            "plaintext, unauthenticated"
+            "authenticated writes and reads"
         }
-    );
+    } else {
+        "unauthenticated (loopback only)"
+    };
+    println!("bun: Pickle registry listening on {registry_addr} ({transport}, {auth})");
 
     if registry_cluster_advertise.is_some()
         && registry_addr.ip().to_string() != config.images.registry_bind

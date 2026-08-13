@@ -36,6 +36,12 @@ pub struct BuildahJob {
     /// The buildah bud command and arguments.
     pub build_cmd: Vec<String>,
     /// The buildah push command and arguments.
+    ///
+    /// Kept for display and for the delegated single-node path. The clustered
+    /// runner does NOT run this: a `docker://` push cannot authenticate against
+    /// Pickle (see [`buildah_push_to_oci_args`] and B1). It exports an OCI
+    /// layout and uploads it through the bearer-carrying registry client
+    /// instead.
     pub push_cmd: Vec<String>,
     /// Destination image reference.
     pub destination: PickleDestination,
@@ -161,6 +167,12 @@ pub fn digest_of(data: &[u8]) -> String {
 /// node downloads this blob, extracts it, and runs buildah.
 /// `registry_over_tls` decides whether the push verifies the registry's
 /// certificate (O2).
+///
+/// The `push_cmd` here targets `docker://`, which the clustered runner no
+/// longer uses (it cannot authenticate — B1); the runner exports an OCI layout
+/// via [`buildah_push_to_oci_args`] and uploads it with the service-token
+/// bearer instead. This command is retained for `relish`'s display and the
+/// standalone/loopback case.
 pub fn execute_build(
     spec: &BuildSpec,
     context_digest: &str,
@@ -241,6 +253,27 @@ fn buildah_push_args(local_tag: &str, tls_verify: bool) -> Vec<String> {
     ]
 }
 
+/// Generate a `buildah push` that exports the built image to a *local* OCI
+/// image layout directory (`oci:{dir}:{tag}`) instead of pushing to a
+/// `docker://` registry (B1).
+///
+/// Pickle authorises registry writes with the internal service token presented
+/// as a *bearer*; `buildah push` can only offer `--creds` (HTTP Basic), which
+/// Pickle does not accept and never challenges for — so a clustered `docker://`
+/// push simply 401s. The clustered runner uses this command to write a local
+/// layout, then uploads it to the registry through the bearer-carrying client.
+/// A local layout export needs no TLS and no credentials.
+pub fn buildah_push_to_oci_args(local_tag: &str, oci_layout_dir: &str, tag: &str) -> Vec<String> {
+    vec![
+        "buildah".to_string(),
+        "push".to_string(),
+        "--storage-driver".to_string(),
+        "vfs".to_string(),
+        local_tag.to_string(),
+        format!("oci:{oci_layout_dir}:{tag}"),
+    ]
+}
+
 /// Build the URL to download a context blob from Pickle.
 ///
 /// The build node fetches this before running buildah. `scheme` is the
@@ -277,6 +310,84 @@ pub fn context_upload_url(scheme: &str, pickle_port: u16, digest: &str) -> Strin
 /// address derives from cluster membership, never from request data.
 pub fn context_upload_url_at(scheme: &str, address: &str, digest: &str) -> String {
     format!("{scheme}://{address}/v2/_buildcontext/blobs/uploads/?digest={digest}")
+}
+
+// ---------------------------------------------------------------------------
+// OCI image-layout upload (B1)
+//
+// A clustered `buildah push` to `docker://` cannot authenticate — Pickle
+// authorises writes by the internal service token as a *bearer*, and buildah
+// only offers `--creds` (HTTP Basic), which Pickle never accepts and never
+// challenges for. So the runner exports the image to a local OCI layout and
+// uploads it to the local registry through the bearer-carrying registry
+// client. These helpers build the registry URLs and read the layout's index.
+// ---------------------------------------------------------------------------
+
+/// The monolithic-blob upload URL for the local registry: a single `POST`
+/// with the blob body and its `digest` query stores a content-addressed blob.
+pub fn oci_blob_upload_url(
+    scheme: &str,
+    pickle_port: u16,
+    repository: &str,
+    digest: &str,
+) -> String {
+    format!("{scheme}://localhost:{pickle_port}/v2/{repository}/blobs/uploads/?digest={digest}")
+}
+
+/// The manifest `PUT` URL for the local registry. `reference` is a tag or a
+/// `sha256:` digest.
+pub fn oci_manifest_put_url(
+    scheme: &str,
+    pickle_port: u16,
+    repository: &str,
+    reference: &str,
+) -> String {
+    format!("{scheme}://localhost:{pickle_port}/v2/{repository}/manifests/{reference}")
+}
+
+/// The top image (or image index) an OCI layout's `index.json` points at.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OciLayoutTop {
+    /// Digest of the top manifest, e.g. `sha256:…`.
+    pub digest: String,
+    /// Its media type, used as the `Content-Type` on the manifest `PUT`.
+    pub media_type: Option<String>,
+}
+
+/// Parse an OCI layout `index.json`, returning the single top-level manifest
+/// descriptor buildah wrote for the pushed tag.
+///
+/// A layout exported for one tag carries exactly one top manifest — either an
+/// image manifest (single platform) or an image index (multi-platform). All
+/// blobs it transitively references live under `blobs/sha256/`, so the caller
+/// uploads every blob first and then `PUT`s this manifest by tag; Pickle's
+/// manifest validation then finds each referenced blob (config, layers, or
+/// sub-manifests) already present.
+pub fn parse_oci_index(index_json: &[u8]) -> Result<OciLayoutTop, BuildError> {
+    #[derive(serde::Deserialize)]
+    struct Descriptor {
+        digest: String,
+        #[serde(rename = "mediaType")]
+        media_type: Option<String>,
+    }
+    #[derive(serde::Deserialize)]
+    struct Index {
+        manifests: Vec<Descriptor>,
+    }
+    let index: Index = serde_json::from_slice(index_json).map_err(|e| BuildError::PushFailed {
+        reason: format!("oci layout index.json is not valid json: {e}"),
+    })?;
+    let top = index
+        .manifests
+        .into_iter()
+        .next()
+        .ok_or_else(|| BuildError::PushFailed {
+            reason: "oci layout index.json lists no manifests".to_string(),
+        })?;
+    Ok(OciLayoutTop {
+        digest: top.digest,
+        media_type: top.media_type,
+    })
 }
 
 /// The namespace and image name a `pickle://` destination targets.
@@ -698,6 +809,18 @@ mod tests {
         assert!(!job.push_cmd.contains(&"--tls-verify=false".to_string()));
     }
 
+    /// B1: the clustered runner exports the image to a local OCI layout dir
+    /// (`oci:{dir}:{tag}`) instead of a `docker://` push, because buildah
+    /// cannot present the service-token bearer that Pickle requires for writes.
+    #[test]
+    fn buildah_push_to_oci_exports_a_local_layout() {
+        let cmd = buildah_push_to_oci_args("localhost:5000/myapp:v3", "/build/oci", "v3");
+        assert!(cmd.contains(&"localhost:5000/myapp:v3".to_string()));
+        assert!(cmd.contains(&"oci:/build/oci:v3".to_string()));
+        assert!(!cmd.iter().any(|a| a.starts_with("docker://")));
+        assert!(!cmd.iter().any(|a| a.starts_with("--tls-verify")));
+    }
+
     // --- context URLs ---
 
     #[test]
@@ -739,6 +862,52 @@ mod tests {
             context_upload_url_at("https", "10.0.1.5:5050", "sha256:abc")
                 .starts_with("https://10.0.1.5:5050/")
         );
+    }
+
+    // --- OCI layout upload (B1) ---
+
+    #[test]
+    fn oci_upload_urls_target_the_local_registry() {
+        assert_eq!(
+            oci_blob_upload_url("http", 5050, "team-a/api", "sha256:abc"),
+            "http://localhost:5050/v2/team-a/api/blobs/uploads/?digest=sha256:abc"
+        );
+        assert_eq!(
+            oci_manifest_put_url("https", 5050, "myapp", "v1"),
+            "https://localhost:5050/v2/myapp/manifests/v1"
+        );
+    }
+
+    #[test]
+    fn parse_oci_index_reads_the_top_manifest() {
+        let index = br#"{
+            "schemaVersion": 2,
+            "manifests": [
+                {
+                    "mediaType": "application/vnd.oci.image.index.v1+json",
+                    "digest": "sha256:1111111111111111111111111111111111111111111111111111111111111111",
+                    "size": 42
+                }
+            ]
+        }"#;
+        let top = parse_oci_index(index).unwrap();
+        assert_eq!(
+            top.digest,
+            "sha256:1111111111111111111111111111111111111111111111111111111111111111"
+        );
+        assert_eq!(
+            top.media_type.as_deref(),
+            Some("application/vnd.oci.image.index.v1+json")
+        );
+    }
+
+    #[test]
+    fn parse_oci_index_rejects_an_empty_layout() {
+        let index = br#"{ "schemaVersion": 2, "manifests": [] }"#;
+        assert!(matches!(
+            parse_oci_index(index),
+            Err(BuildError::PushFailed { .. })
+        ));
     }
 
     // --- namespace scoping ---

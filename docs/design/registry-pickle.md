@@ -8,11 +8,11 @@
 
 ## 1. Overview
 
-Pickle is Reliaburger's built-in, distributed, OCI-compatible container image registry. Rather than requiring an external registry service (Docker Hub, Harbor, ECR), Pickle embeds image storage directly into every cluster node. Every node has a local image store on disk. When an image is pushed to any node, Pickle stores it locally, immediately replicates it to N peer nodes for redundancy, and makes it available for peer-to-peer distribution across the cluster.
+Pickle is Reliaburger's built-in, distributed, OCI-compatible container image registry. Rather than requiring an external registry service (Docker Hub, Harbor, ECR), Pickle embeds image storage directly into every cluster node. Every node has a local image store on disk. When an image is pushed to any node, Pickle stores it locally, commits the manifest to Raft, and makes it available for peer-to-peer distribution across the cluster. A background heal loop replicates layers to peer nodes over time until the configured redundancy is met.
 
 Core capabilities:
 
-- **Synchronous replication on push.** A successful `docker push` guarantees the image survives the failure of any single node. The push doesn't return success until the image has been replicated to N peers (default N=2).
+- **Asynchronous, eventual replication.** A push stores the blobs locally, commits the manifest to Raft, and returns `201 Created` with an `oci-replication: pending` header. It does **not** block on replication. A leader-only heal loop (running roughly every 60s) then copies layers to peer nodes until the configured `redundancy` is met. `redundancy` counts the pushing node itself, so the default of 2 means two total copies — the pusher plus one peer. A freshly pushed image is therefore not guaranteed to survive the immediate loss of the pushing node until the heal loop has run at least once.
 - **P2P layer distribution.** OCI images are composed of content-addressed layers. Pickle downloads different layers from different peer nodes simultaneously (BitTorrent-like fan-out), bounding load on any single node and decreasing total deployment time as cluster size increases.
 - **Pull-through cache.** For images from external registries (Docker Hub, GHCR, ECR), Pickle acts as a transparent pull-through cache. The first node to need an external image pulls it from upstream; every subsequent node pulls from the peer cache.
 - **OCI Distribution API.** Any OCI-compatible tool works: `docker push`, `crane push`, `buildah push`, etc.
@@ -47,7 +47,7 @@ or turn an impossible target into a green skip.
 | **Bun** (node agent) | Runs the Pickle image store on each node. Manages local layer storage, executes garbage collection, tracks under-replicated images, handles replication to peers, and mounts the scoped Unix socket for build jobs. |
 | **Raft** (council consensus) | Stores image manifests (the metadata describing which layers compose an image) for consistency. The Raft state machine is the authoritative source for manifest data, tag-to-digest mappings, and the peer location map (which nodes hold which layers). |
 | **Mustard** (gossip protocol) | Provides cluster membership and peer discovery. Pickle uses Mustard to discover which nodes are alive and their network addresses, enabling peer selection for replication and parallel downloads. Mustard also disseminates node resource summaries that inform peer selection (e.g., least-loaded node). |
-| **Sesame** (security / mTLS / identity) | Provides the mTLS certificates for secure inter-node layer transfers, the workload identity JWTs used for keyless image signing, and the OIDC issuer infrastructure for Sigstore-compatible verification. |
+| **Sesame** (security / mTLS / identity) | Provides the mTLS certificates for secure inter-node layer transfers and the Workload CA that mints the persistent per-namespace build-signer identity used for keyless image signing (an X.509 leaf, not a JWT). Verification chains the signature back to the cluster root CA. |
 | **Meat** (scheduler) | Consumes image availability from Raft state to make scheduling decisions. Meat considers an image schedulable once its manifest exists in Raft with sufficient replication. Meat refuses to schedule unsigned images when `require_signatures = true`. |
 
 ---
@@ -59,24 +59,27 @@ or turn an impossible target into a green skip.
 Every node maintains a local content-addressed store on disk under a configurable root directory (governed by `[images] max_storage`). The store contains:
 
 - **Layers** (blobs): stored by their content digest (SHA-256), deduplicated across all images on the node.
-- **Manifests**: cached locally for fast resolution, but the authoritative copy lives in Raft.
-- **Tags**: local index mapping `repository:tag` to a manifest digest, kept in sync with Raft state.
+- **Manifests**: stored as ordinary content-addressed blobs (they are just more bytes under `blobs/sha256/`). The authoritative catalogue — which digest a `repository:tag` resolves to, and which nodes hold each layer — lives in Raft.
+- **Tags**: mirrored into a local `pickle-catalog.json` file (under the node's data directory), kept in sync with the Raft catalogue.
 
 ```
-/var/lib/reliaburger/pickle/
+<images root, e.g. /var/lib/reliaburger/images>/
   blobs/
     sha256/
-      aabbccdd.../data          # layer blob (gzip-compressed tar)
-      eeff0011.../data          # config blob
-  manifests/
-    myapp/
-      v1.4.2                    # symlink or file containing manifest digest
-      sha256:abc123.../manifest.json
-  tmp/
-    upload-<uuid>/              # in-progress uploads (atomic rename on completion)
+      aabbccdd.../data          # layer, config, or manifest blob
+      eeff0011.../data
+  <tmp upload dir>/             # in-progress uploads (atomic rename on completion)
+
+<data dir>/
+  pickle-catalog.json           # local mirror of the Raft manifest/tag catalogue
 ```
 
+The blob store shares its on-disk layout with the local image store (`grill::image::ImageStore`), so cached and pushed blobs interoperate. There is no separate `manifests/` symlink tree and no embedded key-value database in the Pickle store itself; the local catalogue is the single JSON file above, and Raft is authoritative.
+
 ### 3.2 Push Flow
+
+Push is a local, synchronous commit followed by asynchronous replication. The
+receiving node never blocks on peers.
 
 ```
 Client (docker push / crane push / build job)
@@ -85,50 +88,49 @@ Client (docker push / crane push / build job)
 [1] OCI Distribution API endpoint on receiving node (Bun HTTP server)
     │
     ├── Receive layer blobs via chunked upload
-    │   └── Stream to /tmp/upload-<uuid>/, verify SHA-256 on completion
-    │       └── Atomic rename to /blobs/sha256/<digest>/data
+    │   └── Stream to tmp upload dir, verify SHA-256 on completion
+    │       └── Atomic rename to blobs/sha256/<digest>/data
     │
     ├── Receive manifest
     │   └── Validate manifest references (all layers present locally)
     │
     ▼
-[2] Store locally on disk
+[2] Store manifest blob locally on disk
     │
     ▼
-[3] Replicate to N peer nodes (default N=2)
+[3] Commit manifest to Raft
     │
-    ├── Select peers for diversity:
-    │   - Different racks / zones / failure domains (from node labels)
-    │   - Prefer least-loaded peers (from Mustard resource summaries)
-    │   - Avoid peers that already hold the layers
-    │
-    ├── For each peer:
-    │   └── Stream layers over mTLS (Sesame node certificates)
-    │       └── Peer verifies SHA-256 on receipt, stores locally
-    │
-    ├── Wait for all N peers to acknowledge (synchronous)
-    │   ├── Timeout: configurable, default 30s
-    │   └── If timeout or insufficient peers: return error to client
-    │
-    ▼
-[4] Commit manifest to Raft
-    │
-    ├── Propose ManifestCommit { repository, tag, digest, layers, holders }
-    │   └── holders = [receiving_node, peer_1, peer_2, ...]
+    ├── Propose the catalogue entry (repository, tag, digest, layers,
+    │   initial holder = receiving node)
     │
     ├── Raft commits → manifest is now the authoritative record
     │
     ▼
-[5] Return success to client
+[4] Return to client
     │
-    ├── Node reports to its council aggregator via the hierarchical
-    │   reporting tree: "myapp:v1.4.2 available, layers [...], held by [...]"
+    ├── 201 Created + `oci-replication: pending` (Raft committed), or
+    │   202 Accepted + `oci-replication: raft-uncommitted` (stored and
+    │   persisted locally, but the Raft proposal did not commit)
     │
     ▼
-[6] Meat considers the image schedulable
+[5] Meat considers the image schedulable once the manifest exists in Raft
+    │
+    ▼
+[6] Leader-only heal loop (≈ every 60s) later replicates layers to peers
+    │
+    ├── For each under-replicated manifest (rarest first, capped per tick):
+    │   └── Pull any layers the leader lacks, then stream layers to peers
+    │       that lack them, over the registry's HTTP transport (TLS when
+    │       cluster TLS is configured); peers verify SHA-256 on receipt.
+    │
+    └── Update the Raft layer-location map as holders change, until every
+        layer meets the configured redundancy.
 ```
 
-When `push_sync = false`, step [3] returns immediately after local storage (step [2]) and replication proceeds in the background. The client gets a faster response but loses the single-node-failure durability guarantee until background replication completes.
+Replication is never on the push critical path. There is no synchronous
+replicate-then-commit mode and no configurable per-push durability toggle; the
+heal loop is the sole replication driver. `redundancy` includes the pushing
+node, so `redundancy = 2` targets one peer copy in addition to the pusher.
 
 ### 3.3 Pull Flow
 
@@ -378,11 +380,13 @@ pub struct ImageSignature {
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub enum SigningMethod {
-    /// Keyless signing using workload identity OIDC token.
-    /// The SPIFFE identity of the build job serves as the signing credential.
+    /// Keyless signing using the build node's persistent build-signer
+    /// identity (a Workload-CA leaf, `spiffe://…/job/build-signer`).
+    /// `issuer`/`identity` are descriptive labels recorded on the
+    /// signature, not a live OIDC issuance path.
     Keyless {
-        issuer: String,           // cluster OIDC issuer URL
-        identity: String,         // e.g. "spiffe://prod/ns/default/job/build-api"
+        issuer: String,           // descriptive label
+        identity: String,         // e.g. "spiffe://prod/ns/default/job/build-signer"
     },
     /// External key-based signing (cosign with a pre-registered public key).
     ExternalKey {
@@ -392,7 +396,9 @@ pub enum SigningMethod {
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub enum VerificationMaterial {
-    /// Fulcio certificate chain (for keyless).
+    /// Certificate chain for keyless signatures: the build-signer leaf
+    /// plus the cluster's Workload CA, verified back to the cluster root
+    /// CA (no Fulcio involved).
     CertificateChain(Vec<Vec<u8>>),
     /// Public key bytes (for external key signing).
     PublicKey(Vec<u8>),
@@ -407,8 +413,9 @@ pub struct ExternalRegistry {
     /// Username for authentication (optional for public registries).
     pub username: Option<String>,
 
-    /// Reference to a cluster secret containing the password/token.
-    /// Decrypted by Bun at runtime (see Section 5.3).
+    /// Name of an environment variable holding the password/token.
+    /// Resolved once at startup, not an age-encrypted cluster secret
+    /// (see Section 8.3). Unset means anonymous access.
     pub password_secret: Option<String>,
 }
 
@@ -493,36 +500,29 @@ pub enum PickleRaftCommand {
 
 ### 4.3 On-Disk Layout
 
+The layout below reflects what Bun actually writes. Blobs (layers, config
+blobs, and manifests alike) live under the images root; the tag/manifest index
+is a single JSON file in the data directory, mirroring the authoritative Raft
+catalogue. There is no on-disk `manifests/` symlink tree and no embedded KV
+database in the Pickle store.
+
 ```
-/var/lib/reliaburger/pickle/
-├── blobs/
-│   └── sha256/
-│       ├── <digest_hex>/
-│       │   ├── data              # the blob content (gzip tar for layers)
-│       │   ├── size              # file containing size in bytes (for fast stat)
-│       │   └── refcount          # local reference count (number of manifests referencing)
-│       └── .../
-├── manifests/
-│   └── <repository>/
-│       ├── tags/
-│       │   ├── v1.4.2 → sha256:<digest>   # tag-to-digest symlink
-│       │   └── latest → sha256:<digest>
-│       └── digests/
-│           └── sha256:<digest>/
-│               └── manifest.json           # cached manifest (source of truth is Raft)
-├── tmp/
-│   └── upload-<uuid>/                     # in-progress uploads
-│       ├── data                            # partial blob data
-│       └── meta.json                       # upload session metadata
-├── cache/
-│   └── external/                           # pull-through cache entries
-│       └── docker.io/
-│           └── library/
-│               └── redis/
-│                   └── 7-alpine/
-│                       └── manifest.json
-└── pickle.db                               # embedded KV store (redb) for indices
+<images root>/                       # e.g. /var/lib/reliaburger/images
+└── blobs/
+    └── sha256/
+        ├── <digest_hex>/
+        │   └── data                 # blob content: layer, config, or manifest bytes
+        └── .../
+
+<tmp upload dir>/                     # in-progress chunked uploads (atomic rename on completion)
+
+<data dir>/
+└── pickle-catalog.json              # local mirror of the Raft manifest/tag catalogue
 ```
+
+Pull-through cache entries are not a separate on-disk namespace: an upstream
+image is committed like any other push, under a `cache/<host>/<repo>`
+repository name in the same blob store and catalogue.
 
 ---
 
@@ -543,37 +543,33 @@ Pickle implements the OCI Distribution Spec push flow:
    - Returns `201 Created` with `Docker-Content-Digest` header.
 
 4. **Push manifest.** Client calls `PUT /v2/<name>/manifests/<reference>` with the manifest JSON. Bun:
-   - Validates the manifest (schema version, media type, all referenced layers exist locally).
-   - Initiates replication (step 5).
+   - Validates the manifest (media type, all referenced layers exist locally).
+   - Stores the manifest blob locally.
 
-5. **Synchronous replication.** For each of N selected peers:
-   - Open HTTP stream over mTLS to peer's Pickle replication endpoint.
-   - Send layers the peer doesn't already hold (deduplicate by querying peer's blob inventory).
-   - Peer stores layers, verifies digests, and sends acknowledgement.
-   - If any peer is unreachable, select an alternate peer. If Pickle can't meet the redundancy target within the timeout (default 30s), it returns an error to the client.
+5. **Raft commit.** Propose the catalogue entry (manifest, tag, initial holder = receiving node) to the Raft state machine.
 
-6. **Raft commit.** Propose `ManifestCommit` to the Raft state machine with the manifest, tag, initial holders. Wait for commit confirmation.
+6. **Return to client.** `201 Created` with `oci-replication: pending` when the Raft proposal committed, or `202 Accepted` with `oci-replication: raft-uncommitted` when it did not. The receiving node never waits on peers.
 
-7. **Return success.** `201 Created` to the client.
+7. **Background replication.** The leader-only heal loop later replicates layers to peers until the configured redundancy is met (see §3.2). This is not part of the push response.
 
 ```
-Sequence (synchronous push, redundancy=2):
+Sequence (push, redundancy=2):
 
-Client          Node A (receiver)       Node B (peer)       Node C (peer)       Raft
-  │                  │                      │                    │                │
-  ├─POST uploads/───►│                      │                    │                │
-  │◄──upload UUID────┤                      │                    │                │
-  ├─PATCH chunks────►│                      │                    │                │
-  ├─PUT  digest─────►│                      │                    │                │
-  │                  ├──stream layers──────►│                    │                │
-  │                  ├──stream layers───────────────────────────►│                │
-  │                  │                      │                    │                │
-  │                  │◄─────ack─────────────┤                    │                │
-  │                  │◄─────ack──────────────────────────────────┤                │
-  │                  │                      │                    │                │
-  │                  ├──ManifestCommit──────────────────────────────────────────►│
-  │                  │◄─────────────────────────────────────────────────commit───┤
-  │◄──201 Created────┤                      │                    │                │
+Client          Node A (receiver)                         Raft
+  │                  │                                       │
+  ├─POST uploads/───►│                                       │
+  │◄──upload UUID────┤                                       │
+  ├─PATCH chunks────►│                                       │
+  ├─PUT  digest─────►│                                       │
+  ├─PUT  manifest───►│                                       │
+  │                  ├──commit catalogue entry──────────────►│
+  │                  │◄──────────────────────────────commit──┤
+  │◄─201, oci-replication: pending─┤                         │
+
+Later, independently:
+
+Leader heal loop (≈60s)  ──stream missing layers──►  peer nodes
+                         ──update layer-location map──►  Raft
 ```
 
 ### 5.2 OCI Pull
@@ -647,10 +643,9 @@ Time T2: Nodes [6, 7, 8, 10, 11, 12] pull from any of the 6 holders
 When an image reference includes a registry hostname (e.g., `docker.io/redis:7-alpine`), Pickle operates as a pull-through cache:
 
 1. **First request.** Bun checks the local store and the cluster peer location map. On a cluster-wide miss:
-   - Authenticate to the external registry using credentials from `[images] external_registries` (the `password_secret` references a cluster secret decrypted by Bun at runtime).
+   - Authenticate to the external registry using credentials from `[images] external_registries` (the `password_secret` names an environment variable resolved once at startup — see §8.3).
    - Pull the manifest and layers from the upstream registry.
-   - Store locally and replicate to N peers (same as a regular push).
-   - Commit manifest to Raft.
+   - Store locally and commit the manifest to Raft (same as a regular push); the heal loop replicates to peers afterwards.
 
 2. **Subsequent requests.** Other nodes resolve the image from Raft state and pull layers from peers. The upstream registry is never contacted again until the cached manifest expires or is explicitly refreshed.
 
@@ -744,24 +739,25 @@ When a build job with `build = true` pushes an image, the signing flow is:
 
 [2] Bun intercepts the push completion.
 
-[3] Bun requests a workload identity JWT from the council
-    (via the CSR flow described in Section 12.1).
-    Identity: spiffe://cluster/ns/<namespace>/job/<job-name>
+[3] The node uses a persistent, per-namespace build-signer identity
+    (`spiffe://<cluster>/ns/<namespace>/job/build-signer`), a leaf
+    certificate the council mints once from the cluster's Workload CA
+    and Bun caches — not a fresh ephemeral CSR per build.
 
-[4] Bun uses the JWT as an OIDC token to obtain a short-lived
-    signing certificate from the cluster's built-in Fulcio-compatible
-    certificate authority (part of Sesame).
+[4] Bun signs the image manifest digest with the build-signer's
+    ECDSA P-256 private key (cosign-compatible signature format).
 
-[5] Bun signs the image manifest digest with the ephemeral private key.
+[5] The signature plus the certificate chain (build-signer leaf +
+    Workload CA) are attached to the manifest in the Raft catalogue via
+    the AttachSignature command. Signatures are stored in the catalogue,
+    not as OCI referrer artifacts.
 
-[6] The signature + certificate chain are attached to the manifest
-    in Raft via AttachSignature command.
-
-[7] The ephemeral private key is discarded. The certificate chain
-    provides the verification path back to the cluster's OIDC issuer.
+[6] Verification checks the signature against the digest and validates
+    the certificate chain back to the cluster's root CA (and against the
+    CRL, so a revoked signer fails closed).
 ```
 
-No separate signing key management is needed. The workload identity that Reliaburger already provides serves as the signing credential.
+There is no Fulcio-style ephemeral-key/OIDC exchange and no external signing key to manage: the build-signer is tied to the cluster's own Workload CA, so the trust policy accepts it by construction. Because the identity is persistent, `issuer` and `identity` on the signature are descriptive labels, not a live OIDC issuance path.
 
 **External key signing:**
 
@@ -771,12 +767,13 @@ For images pushed from external CI systems:
 [1] Developer signs the image with their own cosign key:
     cosign sign --key <private-key> mycluster:5000/myapp:v1.4.2
 
-[2] Pickle receives the signature as an OCI artifact alongside the image.
+[2] The signature is recorded against the manifest in the Raft
+    catalogue (not stored as a separate OCI referrer artifact).
 
-[3] On schedule, Meat verifies the signature against public keys
-    registered in cluster configuration:
+[3] On schedule, Meat verifies the signature against the ECDSA P-256
+    public keys registered in cluster configuration (base64-encoded):
     [images.trust_policy]
-    keys = ["cosign-key:abc123..."]
+    keys = ["<base64 ECDSA P-256 public key>"]
 
 [4] If verification succeeds, the image is schedulable.
 ```
@@ -800,7 +797,12 @@ Replicas:    3/3 nodes
 
 ### 5.7 Proactive Distribution
 
-Nodes can optionally pre-pull images that appear in cluster registry announcements, even before being scheduled to run them:
+> **Status: planned — not yet implemented.** The `pre_pull` config key and the
+> pre-pull loop below are a design sketch. No proactive pre-pull runs today;
+> nodes fetch an image's layers when the scheduler places a workload that needs
+> them (§3.3). The following is the intended shape, not shipped code.
+
+Nodes could optionally pre-pull images that appear in cluster registry announcements, even before being scheduled to run them:
 
 ```rust
 /// Pre-pull handler: listens for new manifest commits in Raft
@@ -876,46 +878,36 @@ All Pickle configuration lives in the `[images]` section of `node.toml`:
 # When exceeded, GC runs more aggressively (evicting beyond retain policy).
 max_storage = "50Gi"
 
-# Number of peer nodes to replicate pushed images to (synchronous).
-# A successful push guarantees the image is held by (1 + redundancy) nodes.
-# Default: 2
+# Target number of layer copies across the cluster, INCLUDING the pushing
+# node. The leader-only heal loop replicates toward this target in the
+# background; push itself does not wait. Default 2 = pusher + one peer.
 redundancy = 2
-
-# Number of most recent tags per repository to retain during GC.
-# Older tags are candidates for collection after gc_retain_days.
-# Default: 10
-gc_retain_tags = 10
 
 # Number of days to retain unreferenced images before GC eligibility.
 # Images referenced by running deployments are never collected regardless.
-# Default: 30
-gc_retain_days = 30
+# Default: 7
+gc_retain_days = 7
 
-# Enable proactive pre-pulling of newly pushed images.
-# When true, this node fetches new images as they appear in Raft,
-# even before being scheduled to run them.
-# Default: true
-pre_pull = true
-
-# Whether pushes wait for replication to complete before returning success.
-# true  = synchronous push (default, guarantees durability)
-# false = return success after local storage, replicate in background
-# Default: true
-push_sync = true
-
-# External registries for pull-through caching.
-# Pickle authenticates to these registries when pulling external images.
-# password_secret references a cluster secret (Section 5.3) decrypted by Bun.
+# External registries for pull-through caching (see the pull_through flag).
+# Pickle authenticates to these when pulling external images. password_secret
+# names an environment variable resolved once at startup (Section 8.3), NOT an
+# age-encrypted cluster secret. Unset means anonymous access.
 external_registries = [
-  { host = "ghcr.io", username = "bot", password_secret = "ghcr-token" },
-  { host = "docker.io", username = "myorg", password_secret = "dockerhub-token" },
+  { host = "ghcr.io", username = "bot", password_secret = "GHCR_TOKEN" },
+  { host = "docker.io", username = "myorg", password_secret = "DOCKERHUB_TOKEN" },
 ]
 
-# Require all images to be signed before Meat will schedule them.
-# Unsigned images are accepted into Pickle but remain unschedulable.
-# Default: false
+# Image trust policy. Require all Pickle-hosted images to be signed before
+# Meat will schedule them. Unsigned images are accepted into Pickle but
+# remain unschedulable. Default: false.
+[images.trust_policy]
 require_signatures = false
 ```
+
+> **Not shipped as config keys:** the `push_sync` toggle does not exist — there
+> is no synchronous-push mode to switch off (§3.2). `gc_retain_tags`
+> (retain-N-tags-per-repo) and `pre_pull` (§5.7 proactive distribution) are
+> **planned — not yet implemented**, and are not parsed today.
 
 **Corresponding Rust config struct:**
 
@@ -925,66 +917,51 @@ pub struct PickleConfig {
     /// Maximum blob store size on this node.
     pub max_storage: ByteSize,
 
-    /// Number of peers to replicate to on push.
+    /// Target layer copies across the cluster, including the pusher.
     #[serde(default = "default_redundancy")]
     pub redundancy: u32,
-
-    /// GC: retain this many recent tags per repository.
-    #[serde(default = "default_gc_retain_tags")]
-    pub gc_retain_tags: u32,
 
     /// GC: retain unreferenced images for this many days.
     #[serde(default = "default_gc_retain_days")]
     pub gc_retain_days: u32,
 
-    /// Pre-pull newly pushed images proactively.
-    #[serde(default = "default_true")]
-    pub pre_pull: bool,
-
-    /// Synchronous push (wait for replication before returning success).
-    #[serde(default = "default_true")]
-    pub push_sync: bool,
-
     /// External registries for pull-through caching.
     #[serde(default)]
     pub external_registries: Vec<ExternalRegistry>,
 
-    /// Require image signatures for scheduling.
+    /// Image trust policy (signature requirements) — nested under
+    /// `[images.trust_policy]`.
     #[serde(default)]
-    pub require_signatures: bool,
+    pub trust_policy: TrustPolicySection,
+    // Note: the shipped `ImagesSection` also carries registry_port,
+    // registry_bind, p2p_concurrency, pull_through, cache_recheck_secs,
+    // build_timeout_secs, and max_context_bytes. There is no push_sync,
+    // pre_pull, or gc_retain_tags field.
 }
 
 fn default_redundancy() -> u32 { 2 }
-fn default_gc_retain_tags() -> u32 { 10 }
-fn default_gc_retain_days() -> u32 { 30 }
-fn default_true() -> bool { true }
+fn default_gc_retain_days() -> u32 { 7 }
 ```
 
 ---
 
 ## 7. Failure Modes
 
-### 7.1 Replication Failure During Push
+### 7.1 Peers Unreachable at Push Time
 
-**Scenario:** A push arrives at Node A, which stores the layers locally but can't reach enough peers to meet the redundancy target within the timeout (default 30s).
+**Scenario:** A push arrives at Node A, which stores the layers locally and commits the manifest, but no peers are currently reachable to replicate to.
 
-**Behaviour:** The push returns an error to the client. The image is stored locally on Node A but isn't committed to Raft (no manifest entry, no tag). The client must retry.
+**Behaviour:** The push still succeeds — replication is not on the push path. Node A stores the blobs, commits the manifest to Raft, and returns `201 Created` with `oci-replication: pending`. The image is immediately schedulable but under-replicated (only Node A holds the layers). If the Raft proposal itself fails on a council member, the response is `202 Accepted` with `oci-replication: raft-uncommitted` instead.
 
-**Recovery:** Bun on Node A tracks the locally-stored-but-uncommitted layers. On the next successful replication attempt (either a client retry or Bun's background replication sweep), the layers are available locally and don't need to be re-uploaded. If no retry occurs within a configurable cleanup period (default 24h), the orphaned layers are removed.
-
-**Mitigation for `push_sync = false`:** When async push is configured, the push returns success after local storage. Background replication failures are tracked and surfaced:
-
-- `relish status` shows the under-replicated image count.
-- Bun retries replication to new peers as nodes become available.
-- An alert fires if an image remains under-replicated for more than 1 hour.
+**Recovery:** The leader-only heal loop (§3.2, ≈ every 60s) replicates the layers to peers once any are reachable, until `redundancy` is met. Capability and status reporting expose the under-replicated layer count so operators can see that replication is still pending.
 
 ### 7.2 Under-Replicated Images
 
-**Scenario:** A node holding one of the N replicas goes down permanently (e.g., hardware failure). The image's replica count drops below the desired redundancy.
+**Scenario:** A node holding one of the copies goes down permanently (e.g., hardware failure). The image's replica count drops below the desired redundancy.
 
-**Behaviour:** The Raft state machine updates the peer location map when a node is removed from the cluster (detected via Mustard gossip failure detection). The image's `ReplicationState` transitions to `UnderReplicated`.
+**Behaviour:** The Raft layer-location map updates as holders change. The image is now under-replicated but remains schedulable from surviving holders.
 
-**Recovery:** Bun on the remaining holder nodes detects under-replicated images during its periodic replication audit (default every 5 minutes). It selects new peer targets and replicates the missing layers to restore the desired redundancy. The replication audit prioritizes images with the fewest remaining copies.
+**Recovery:** The leader-only heal loop detects manifests below `redundancy`, pulls any layers the leader lacks, and replicates them onward to peers that lack them (rarest first, capped per tick), restoring the desired redundancy over successive ticks.
 
 ### 7.3 Node Holding Sole Copy Goes Down
 
@@ -1026,18 +1003,27 @@ Build jobs are granted write access to Pickle only through a Unix socket mounted
 When `require_signatures = true`:
 
 - **Unsigned images are accepted but unschedulable.** Pushes never fail due to missing signatures, which avoids breaking CI pipelines. However, Meat refuses to schedule unsigned images. This creates a clear separation: the registry accepts all valid OCI images; the scheduler enforces trust policy.
-- **Keyless signing eliminates key management.** Build jobs sign automatically using their workload identity JWT. No signing keys to rotate, distribute, or protect.
+- **Keyless signing eliminates key management.** Build nodes sign automatically with the cluster's persistent per-namespace build-signer identity (a Workload-CA leaf). No operator-provisioned signing keys to rotate, distribute, or protect.
 - **External signatures use cosign-compatible verification.** Teams pushing from external CI register their public keys in the cluster configuration. Pickle verifies signatures against these keys using the standard cosign verification flow.
 - **Signature verification is cached.** Once a manifest's signature is verified and recorded in Raft, subsequent scheduling decisions don't re-verify. The signature status is part of the `ManifestMetadata`.
 
 ### 8.3 Pull-Through Cache Credential Handling
 
-Credentials for external registries are stored as cluster secrets (Section 5.3), encrypted at rest in Raft with the cluster's age key. Bun decrypts them at runtime when needed for pull-through cache authentication. Credentials are:
+Credentials for external registries come from the node's startup environment,
+not from the cluster secret machinery. `password_secret` on an
+`[[images.external_registries]]` entry names an **environment variable** whose
+value Bun reads **once, at startup**, into memory. Registry credentials are
+needed before the age/secret subsystem is up, and env-injected credentials are
+the registry-auth convention, so this is a deliberate exception rather than the
+age-encrypted-in-Raft path used for app secrets. An unset variable falls back to
+anonymous access for that host. Credentials are:
 
-- **Never written to disk in plaintext.** They exist only in memory during the authentication flow.
+- **Never checked into git as `ENC[AGE:...]` values.** They are not encrypted in Raft with the cluster age key; they live only in the node's environment and in Bun's memory.
 - **Never exposed to workload containers.** The pull-through cache operates at the Bun agent level, not inside any container.
 - **Scoped per registry.** Each external registry entry specifies credentials only for that host. A credential for `ghcr.io` can't be used to authenticate to `docker.io`.
-- **Rotatable via cluster secret updates.** Updating the cluster secret referenced by `password_secret` takes effect on the next pull-through cache authentication attempt without restarting Bun.
+- **Not hot-rotatable.** Because the value is resolved once at startup, changing it requires restarting Bun. There is no runtime re-read.
+
+> **Status: partially implemented.** The env-var credential path above is what ships today. Sourcing pull-through credentials from age-encrypted cluster secrets, with rotation that takes effect without a restart, remains planned.
 
 ### 8.4 Inter-Node Layer Transfer
 
@@ -1049,16 +1035,18 @@ All layer transfers between nodes occur over the cluster's mTLS connections (Ses
 
 ### 9.1 Push Latency
 
-For the default configuration (`push_sync = true`, `redundancy = 2`):
+Because replication is off the push path, push latency is the time to receive
+and store the blobs locally plus the Raft manifest commit. It does **not**
+include peer replication (which the heal loop does afterwards).
 
 | Image size | Expected push latency | Notes |
 |-----------|----------------------|-------|
-| 5 MB (small app layer) | < 1s | Dominated by Raft commit latency |
-| 50 MB (typical app) | 2-3s | Layer transfer is the bottleneck |
-| 200 MB (large app with deps) | 3-5s | Parallel replication to 2 peers |
-| 1 GB+ (ML model, large base) | 10-30s | Bounded by network bandwidth |
+| 5 MB (small app layer) | < 1s | Local store + Raft commit |
+| 50 MB (typical app) | ~1s | Upload/store bandwidth to the receiving node |
+| 200 MB (large app with deps) | 1-2s | Upload/store bandwidth |
+| 1 GB+ (ML model, large base) | seconds | Bounded by client→node upload bandwidth |
 
-Push latency is dominated by layer transfer time. Layers are streamed to peers in parallel (both peers receive data concurrently, not sequentially). The Raft commit for the manifest is small (< 10KB) and adds negligible latency (typically < 50ms).
+Push latency is dominated by the client→receiving-node upload and local disk write. The Raft commit for the manifest is small (< 10KB) and adds negligible latency (typically < 50ms). Replicating to peers happens later, on the heal loop, and does not count against the push.
 
 ### 9.2 Fan-Out Speed
 
@@ -1111,33 +1099,32 @@ Test: push image, pull from different node
 ### 10.2 Replication Verification
 
 ```
-Test: image replicates to N peers within 30s
-  - Push image to Node A with redundancy=2.
-  - Verify layers appear on exactly 2 additional nodes.
-  - Verify Raft peer location map reflects all 3 holders.
-  Expected: 2-8s
+Test: push returns immediately with oci-replication: pending
+  - Push image to Node A (redundancy=2).
+  - Verify 201 Created with header oci-replication: pending.
+  - Verify the manifest is in the Raft catalogue and schedulable at once,
+    with Node A as the only initial holder.
 
-Test: replication failure returns error
-  - Configure redundancy=2, take 2 of 3 nodes offline.
-  - Push image to remaining node.
-  - Verify push returns error (insufficient peers).
-  - Bring nodes back online, retry push.
-  - Verify push succeeds.
-  Expected: 30s (timeout) + 2-5s (retry)
+Test: heal loop reaches redundancy in the background
+  - Push image to Node A with redundancy=2.
+  - Run heal ticks (leader-only, ≈60s in production; driven directly in tests).
+  - Verify layers appear on one additional node (2 total copies = pusher + 1).
+  - Verify the Raft layer-location map reflects both holders.
+
+Test: peers unreachable at push time does not fail the push
+  - redundancy=2, take the other nodes offline.
+  - Push image to the remaining node.
+  - Verify push still succeeds (201, oci-replication: pending); the image is
+    under-replicated but committed and schedulable.
+  - Bring nodes back online, run heal ticks.
+  - Verify redundancy is restored.
 
 Test: under-replicated image auto-heals
-  - Push image with redundancy=2 (holders: A, B, C).
-  - Remove Node C from cluster.
-  - Wait for replication audit (default 5 min, shortened in tests).
-  - Verify a new node (D) now holds the layers.
-  - Verify Raft peer location map updated.
-  Expected: <30s with shortened audit interval
-
-Test: push_sync=false returns immediately
-  - Configure push_sync = false.
-  - Push image, measure time (should be < 1s for small image).
-  - Wait for background replication.
-  - Verify replication completed asynchronously.
+  - Push image with redundancy=2 (holders: A, B).
+  - Remove a holder from the cluster.
+  - Run heal ticks.
+  - Verify a surviving/new node now holds the layers and the Raft
+    layer-location map is updated.
 ```
 
 ### 10.3 GC Safety
@@ -1287,7 +1274,7 @@ Pickle implements the OCI Distribution Specification for API compatibility. Any 
 | `tokio` | Async runtime | All Pickle I/O (disk, network, replication) is async. tokio provides the task scheduler, timers, and I/O primitives. |
 | `ring` or `sha2` | SHA-256 hashing for content addressing | Every blob is verified by its SHA-256 digest. `ring` for performance-critical paths; `sha2` as a pure-Rust fallback. |
 | `rustls` | TLS implementation for mTLS connections | Used by `hyper` (HTTPS) and `reqwest` for Sesame certificate-based authentication. |
-| `redb` | Embedded key-value store for local indices | Tag-to-digest mappings, blob reference counts, upload session state. Must be crash-safe (atomic writes). |
+| `serde_json` (local catalogue) | Local mirror of the manifest/tag catalogue | The shipped Pickle store keeps its tag-to-digest index in a single `pickle-catalog.json` file mirroring the authoritative Raft catalogue; it does **not** embed a key-value database (redb) of its own. Blobs are plain files under `blobs/sha256/`. |
 | `serde` + `serde_json` | Serialisation for manifests and Raft commands | OCI manifests are JSON. Raft commands are serialised for consensus. |
 | `flate2` | Compression for layer blobs | OCI layers are typically gzip-compressed tars. |
 | `tempfile` | Temporary file handling for upload sessions | Atomic file creation in the `tmp/` upload directory. |
@@ -1308,7 +1295,7 @@ Compliance is verified by running the [OCI Distribution Spec conformance tests](
 
 ### 13.1 Large Image Handling
 
-Very large images (multi-gigabyte ML models, monolithic base images) stress the synchronous push model. With `redundancy = 2`, a 5GB image push could take several minutes. Options under consideration:
+Very large images (multi-gigabyte ML models, monolithic base images) stress replication: the heal loop must copy a 5GB image's layers to a peer before redundancy is met, and the whole image is under-replicated until it does. (Push itself stays fast, since it does not wait on replication.) Options under consideration:
 
 - **Streaming replication:** Begin replicating layers to peers as they are received (before the full image upload is complete), overlapping client upload with peer replication.
 - **Tiered redundancy:** Allow per-image or per-repository redundancy overrides. Large ML model images might use `redundancy = 1` to trade durability for push speed.

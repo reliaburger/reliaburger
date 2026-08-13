@@ -157,6 +157,16 @@ impl FaultType {
         )
     }
 
+    /// Whether reversing this fault needs an Admin-only operation grant, so a
+    /// general Deployer clear (`clear_workload_faults` / `clear_by_service`)
+    /// must leave it alone. Node operations need `alter_node_state`; node
+    /// pressure needs `saturate_capacity` — both Admin-class, unlike workload
+    /// faults. `NodePressure` is deliberately *not* an `is_node_operation`, so
+    /// it must be named explicitly or a blanket clear would reverse it.
+    pub fn requires_admin_reversal(&self) -> bool {
+        self.is_node_operation() || matches!(self, Self::NodePressure { .. })
+    }
+
     /// Whether the fault must be routed to a named node.
     pub fn is_node_targeted(&self) -> bool {
         matches!(

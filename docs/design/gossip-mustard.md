@@ -114,8 +114,8 @@ Each PING/ACK message piggybacks a bounded number of membership updates (new joi
 
 1. **Membership events** -- node join, node suspect, node dead, node alive (refutation)
 2. **Leader identity** -- which node is the current Raft leader (broadcast by leader, propagated by all)
-3. **Resource summaries** -- per-node CPU/memory/GPU capacity and utilisation (~128 bytes per node)
-4. **Recovery candidate blob** -- encrypted list of pre-seeded recovery candidates (~256 bytes, updated infrequently)
+3. **Resource summaries** *(planned — not carried today)* -- per-node CPU/memory/GPU capacity and utilisation. The `ResourceSummary` type exists, but **gossip does not carry it**: no PING/ACK payload piggybacks resources, and `NodeMembership.resources` is always `None` for remote peers (`src/mustard/membership.rs`). This category is design intent, not current wire content.
+4. **Recovery candidate blob** *(planned, see §5.5)* -- encrypted list of pre-seeded recovery candidates
 5. **Council membership** -- which nodes are currently in the Raft council
 
 ### 3.3 Raft Integration
@@ -143,7 +143,7 @@ Raft is **not** used for:
 The leader selects council members from the general node pool. Selection criteria, in priority order:
 
 1. **Stability.** Node must have been in the cluster for at least `council.min_node_age` (default 10 minutes). This prevents a freshly joined node from immediately becoming a council member before it has proven reliable.
-2. **Resource availability.** Node must not be critically overloaded (CPU < 90%, memory < 85%). Council duties add modest overhead; an overloaded node would be a poor council member.
+2. **Resource availability** *(criterion present in code, but a no-op in production).* The selector filters on CPU < 90% / memory < 85%, but because per-node resources are never gossiped (`NodeMembership.resources` is always `None` for remote peers), the filter treats every node as eligible — an unreported node passes. This criterion only bites once resource gossip is implemented; today it rejects no one.
 3. **Zone diversity.** If node labels include zone or region information, the leader maximizes geographic distribution among council members. A council where all members are in the same rack defeats the purpose of redundancy.
 4. **Random tiebreaker.** Among otherwise-equal candidates, selection is random (seeded by the leader's node ID + current term for reproducibility).
 
@@ -181,7 +181,9 @@ Council returns to target size
 
 ### 3.5 Hierarchical Reporting Tree
 
-The reporting tree assigns each non-council node to a specific council member as its parent. The assignment is deterministic: `parent = council_members[hash(node_id) % council_size]`. This distributes the reporting load evenly.
+> **Status: the shipped topology is a flat star to the leader, not the two-level tree below.** What runs today (`src/cluster/runtime.rs`) has **every worker report directly to the leader**. The runtime's `spawn_leader_target_maintainer` pushes a *single-element* council list containing only the leader, and each `ReportWorker` runs the same `assign_parent(worker_id, council)` helper over that one-element list — so the hash always resolves to the leader. The two-level consistent-hash tree (workers → council member → leader) is deliberate MVP scaffolding that exists in the code (`src/reporting/assignment.rs`, `src/reporting/aggregator.rs`) but is **not wired into the running topology**. The fan-in arithmetic and diagram below describe that **planned** two-level design.
+
+In the planned tree, each non-council node is assigned to a specific council member as its parent, deterministically: `parent = council_members[hash(node_id) % council_size]`, distributing the reporting load evenly.
 
 ```
                     ┌────────────┐
@@ -198,9 +200,9 @@ The reporting tree assigns each non-council node to a specific council member as
         ...          ...          ...
 ```
 
-With a council of 5 and 10,000 total nodes, each council member aggregates reports from ~2,000 worker nodes. Workers send full StateReports at the reporting interval (default 5 seconds). Council members aggregate and forward summaries to the leader.
+Under that planned design, with a council of 7 and 10,000 total nodes each council member would aggregate reports from ~1,400 worker nodes. **Today, with the flat star, the leader receives all ~10,000 StateReports itself** — which is exactly why the two-level tree is the documented next step for large clusters. Workers send full StateReports at the reporting interval (default 5 seconds).
 
-When a council member departs, its assigned workers detect the lost connection and re-hash to the remaining council members. The new parent receives a full StateReport from each reassigned worker on the next reporting cycle.
+When (in the planned tree) a council member departs, its assigned workers re-hash to the remaining council members and the new parent receives a full StateReport on the next cycle. In the flat star there is only ever one parent — the leader — so a leader change simply re-points every worker at the new leader.
 
 ---
 
@@ -287,7 +289,9 @@ struct NodeMembership {
     first_seen: Instant,
     /// Last time we received a direct or indirect ACK from this node.
     last_ack: Instant,
-    /// Resource summary, updated via gossip piggyback.
+    /// Resource summary. Planned to be updated via gossip piggyback, but
+    /// gossip does not carry resources today, so this is always `None` for
+    /// remote peers.
     resources: Option<ResourceSummary>,
     /// Node labels (zone, region, etc.), set at join time.
     labels: BTreeMap<String, String>,
@@ -511,8 +515,7 @@ struct EncryptedRecoveryCandidateList {
 
 | Layer | Transport | Encoding | Max Message Size |
 |-------|-----------|----------|------------------|
-| Mustard gossip (PING/ACK/PING-REQ) | UDP | bincode (serde) | 1400 bytes (avoids IP fragmentation) |
-| Mustard protocol metadata (joins, full state sync) | TCP | bincode | 64 KiB |
+| Mustard gossip (PING/ACK/PING-REQ, including join via seed PING) | UDP | bincode (serde) | 1400 bytes (avoids IP fragmentation) |
 | Raft (AppendEntries, RequestVote) | TCP + mTLS | bincode | Unbounded (log entries can contain app specs) |
 | Reporting tree (StateReports) | TCP + mTLS | bincode | 1 MiB (bounded by max events per report) |
 
@@ -526,31 +529,40 @@ All TCP connections use mTLS via Sesame's Node CA certificates.
 
 **Node join:**
 
+Two separate things are called "join", and they are not the same step.
+
+*Identity enrolment* (`relish join`) is a one-shot HTTP call, not a gossip seed. The operator runs `relish join --token <token> <api-address>` where the address is an existing member's **HTTPS API** endpoint (e.g. `https://10.0.1.5:9117`). `relish` POSTs to `{addr}/v1/cluster/join` (TOFU-pinned by CA fingerprint), Sesame issues the node its mTLS identity, and `relish` writes the cert/key to the identity directory. No gossip and no membership exchange happen here — it only mints credentials.
+
+*Gossip membership* is UDP SWIM, seeded from `[cluster] join` in `node.toml`:
+
 ```
-1. New node N starts Bun with `relish join --token <token> <seed-addr>`
-2. N completes mTLS handshake with the seed node (receives Node CA cert)
-3. N sends a Mustard JOIN message to the seed node (TCP)
-4. Seed node responds with full membership list (TCP)
-5. N initializes its local membership table
-6. N begins the SWIM protocol period loop:
-   - Each period: pick a random node, PING it
+1. N's Bun reads its gossip seed addresses from [cluster] join
+   (e.g. "10.0.1.5:9443").
+2. N sends an (empty) SWIM PING over UDP to each seed. The reply
+   registers the seed's real NodeId and piggybacks membership updates.
+   There is NO TCP JOIN message and NO full-membership state dump.
+3. N runs the SWIM protocol period loop:
+   - Each period: pick a random node, PING it (UDP)
    - Piggyback own ALIVE state on all messages
-   - Within O(log N) periods, all nodes learn about N
-7. N begins sending StateReports to its assigned council member
-8. Leader adds N to the scheduling pool once N's first StateReport arrives
+   - Within O(log N) periods, all nodes learn about N via piggyback
+4. N begins reporting its runtime state up the reporting tree.
+5. Leader adds N to the scheduling pool once N's first StateReport arrives.
 ```
 
 **Node departure (graceful):**
 
+Leave is **immediate**. There is no `LEAVING` state, no drain-wait, and no `relish drain` command. The SWIM state machine has four states only — `Alive`, `Suspect`, `Dead`, `Left` — with no intermediate draining state.
+
 ```
-1. Bun receives SIGTERM or `relish drain` command
-2. Bun marks itself as LEAVING in gossip (piggybacked on next PING/ACK)
-3. Bun stops accepting new work
-4. Bun waits for in-flight requests to drain (configurable timeout)
-5. Bun sends LEFT state via gossip
-6. Other nodes mark N as LEFT and remove from scheduling pool
-7. Leader reschedules N's apps to other nodes
+1. Bun receives SIGTERM.
+2. Bun sets its own gossip state to Left and enqueues that update.
+3. Bun sends a best-effort burst of PINGs to spread the Left state.
+   It does NOT wait for acknowledgement.
+4. Other nodes that receive the update mark N as Left and drop it from
+   the scheduling pool; the leader reschedules N's apps.
 ```
+
+(The only "drain" in the codebase is `FaultAction::NodeDrain`, a Smoker fault-injection action that *simulates* a graceful departure for testing — not a production drain workflow.)
 
 **Node failure detection (SWIM protocol):**
 
@@ -691,8 +703,11 @@ fn select_council_candidates(
             && !current_council.contains(&n.node_id)
             // Must have been in the cluster long enough
             && n.first_seen.elapsed() >= config.min_node_age
-            // Must not be overloaded
-            && n.resources.as_ref().map_or(false, |r| {
+            // Must not be overloaded. NOTE: unreported == eligible.
+            // Because gossip never carries resources, `resources` is always
+            // None in production and this check passes for every node
+            // (`is_none_or` in the real `src/council/selection.rs`).
+            && n.resources.as_ref().is_none_or(|r| {
                 r.cpu_used_millicores < (r.cpu_capacity_millicores * 9 / 10)
                 && r.memory_used_mb < (r.memory_capacity_mb * 85 / 100)
             })
@@ -914,111 +929,70 @@ Remove member flow:
 
 ## 6. Configuration
 
-All configuration lives in the cluster's TOML configuration, modifiable via `relish config set` or the Brioche UI.
+There are **no `[mustard]` or `[raft]` TOML sections**. The SWIM and Raft protocol timings shown historically here (gossip interval, probe/suspicion timeouts, heartbeat and election timeouts, batch/snapshot sizes) are **compile-time constants**, not tunable config. What *is* configurable lives under `[cluster]` in `node.toml`, and it is essentially the three ports:
 
 ```toml
-[mustard]
-# SWIM protocol period: how often each node probes one random peer.
-# Lower = faster detection, higher network overhead.
-gossip_interval = "500ms"
+[cluster]
+# Cluster identity; must match on every node.
+name = "default"
 
-# How long to wait for a direct PING ACK before trying indirect probing.
-probe_timeout = "200ms"
+# Seed members to contact at startup (gossip seed addresses).
+join = ["10.0.1.5:9443"]
 
-# Number of indirect probe targets when direct probe fails.
-indirect_probe_count = 3
+# Mustard SWIM gossip (UDP). Default: 9443.
+gossip_port = 9443
 
-# How long a node stays in SUSPECT before transitioning to DEAD.
-suspicion_timeout = "5s"
+# Raft council consensus RPCs (TCP + mTLS). Default: 9444.
+raft_port = 9444
 
-# How long to keep DEAD nodes in the membership table before purging.
-cleanup_timeout = "60s"
+# Reporting-tree state reports (TCP + mTLS). Default: 9445.
+reporting_port = 9445
+```
 
-# Maximum gossip message size (UDP datagram).
-max_message_size = 1400
+(The old `7946`/`7947` gossip/raft ports never shipped; the real defaults are `9443`/`9444`/`9445`. The node HTTP API is a separate port, `9117`.)
 
-# Maximum piggybacked membership updates per message.
-max_piggyback_updates = 8
+The council sizing constants below are compile-time defaults in `CouncilSelectionConfig` (`src/council/selection.rs`), shown here for reference — they are **not** a `[council]` TOML section:
 
-# Port for Mustard gossip (UDP + TCP).
-port = 7946
-
-[raft]
-# Heartbeat interval from leader to followers.
-heartbeat_interval = "150ms"
-
-# Minimum election timeout (randomized between min and max).
-election_timeout_min = "1000ms"
-
-# Maximum election timeout.
-election_timeout_max = "2000ms"
-
-# Enable Raft pre-vote extension to prevent disruptive elections.
-pre_vote = true
-
-# Maximum entries per AppendEntries RPC.
-max_append_entries_batch = 64
-
-# Snapshot interval (number of log entries before compaction).
-snapshot_interval = 10000
-
-# Port for Raft communication (TCP + mTLS).
-port = 7947
-
-[council]
-# Target number of council members (must be odd for clean majorities).
-target_size = 5
-
+```text
 # Minimum council size (below this, the cluster enters degraded mode).
-min_size = 3
+min_council_size = 3
 
-# Maximum council size.
-max_size = 7
+# Maximum / steady-state target council size. The runtime passes
+# max_council_size as the selection target, so the council grows to 7,
+# not 5. There is no separate "target_size = 5".
+max_council_size = 7
 
 # Minimum time a node must be alive before it can join the council.
 min_node_age = "10m"
 
-# Maximum CPU utilisation for council eligibility (percent).
-max_cpu_for_eligibility = 90
+# Resource-eligibility thresholds (see the note below): these constants
+# exist but never fire in production, because per-node resources are not
+# gossiped, so every node passes the filter.
+max_cpu_usage_fraction = 0.90
+max_memory_usage_fraction = 0.85
+```
 
-# Maximum memory utilisation for council eligibility (percent).
-max_memory_for_eligibility = 85
+The reporting-tree and reconstruction timings are likewise compile-time constants (again, not TOML sections):
 
-[reporting_tree]
-# How often worker nodes send StateReports to their council member.
-report_interval = "5s"
-
-# Maximum events per StateReport.
+```text
+# reporting tree
+report_interval = "5s"          # how often a worker sends a StateReport
 max_events_per_report = 100
-
-# Timeout for considering a worker's report stale.
 stale_report_timeout = "30s"
 
-[reconstruction]
-# Percentage of nodes that must report before the learning period ends.
+# state reconstruction (learning period)
 report_threshold_percent = 95
-
-# Maximum duration of the learning period.
 learning_period_timeout = "15s"
-
-# Extended timeout for clusters > 5000 nodes.
-large_cluster_timeout = "30s"
-
-# Threshold above which large_cluster_timeout is used.
+large_cluster_timeout = "30s"   # clusters > 5000 nodes
 large_cluster_node_count = 5000
+```
 
-[recovery]
-# Number of pre-seeded recovery candidates.
-candidate_count = 10
+The recovery parameters below belong to the **proposed** pre-seeded catastrophic-recovery design (see §5.5); they document the target design, not shipped tunables:
 
-# Timeout before recovery candidates activate (no leader heartbeat).
-catastrophic_timeout = "30s"
-
-# Per-priority-rank delay before a candidate assumes leadership.
-# Candidate with priority 0 waits 0s, priority 1 waits this value, etc.
-priority_step_delay = "2s"
-
-# How often the leader refreshes the recovery candidate list.
+```text
+candidate_count = 10            # pre-seeded recovery candidates
+catastrophic_timeout = "30s"    # no-leader-heartbeat trigger
+priority_step_delay = "2s"      # per-priority-rank activation delay
 candidate_refresh_interval = "5m"
 ```
 
@@ -1077,7 +1051,7 @@ UDP is unreliable. Mustard handles this through redundancy:
 - Each membership update is piggybacked on multiple messages (a dissemination count of `ceil(log(N))` ensures each update is sent enough times for probabilistic reliability).
 - Indirect probing (PING-REQ) provides a second path when direct probes fail.
 - The suspicion subprotocol prevents premature failure declarations from transient loss.
-- Full state sync (TCP) occurs periodically between random pairs of nodes as a consistency backstop.
+- *(Planned)* A periodic TCP full-state sync between random node pairs as a consistency backstop. This is not implemented today; convergence relies on UDP piggyback and indirect probing alone.
 
 At 10,000 nodes with 0.1% UDP packet loss, the expected convergence time increases by less than one additional protocol period (~500ms).
 
@@ -1138,15 +1112,19 @@ All reporting tree connections use mTLS via Sesame's Node CA. A council member v
 | Medium | 100-1,000 | < 5 seconds | Council members aggregating reports. |
 | Large | 1,000-10,000 | < 15 seconds | Reporting tree fan-in at council members. Each council member receives ~2,000 reports concurrently. |
 
-At 10,000 nodes with a council of 5, each council member receives ~2,000 StateReports. Each StateReport is ~1-10 KB (depends on running apps). Total ingest per council member: ~2-20 MB over 15 seconds, well within network and processing capacity.
+> **Planned topology.** The fan-in figures in this row and the table below assume the two-level tree of §3.5, which is not the shipped topology. Today the leader is the single parent, so it receives every StateReport directly (see the flat-star note in §3.5); these per-council-member numbers apply only once the tree is wired in.
+
+In the planned two-level tree at 10,000 nodes with a council of 7, each council member would receive ~1,400 StateReports. Each StateReport is ~1-10 KB (depends on running apps). Today, on the flat star, the leader absorbs all ~10,000 reports itself.
 
 ### 9.4 Reporting Tree Overhead
+
+> **Planned topology (two-level tree, §3.5).** In the shipped flat star the "per-council-member" row does not apply — the leader receives every report.
 
 | Metric | Value |
 |--------|-------|
 | Per-worker bandwidth (sending) | ~2 KB every 5 seconds = ~400 B/s |
-| Per-council-member bandwidth (receiving, 2000 workers) | ~800 KB/s |
-| Leader aggregation bandwidth | ~4 MB/s (5 council members forwarding summaries) |
+| Per-council-member bandwidth (receiving, ~1,400 workers) *(planned tree)* | ~560 KB/s |
+| Leader aggregation bandwidth *(planned tree)* | council members forwarding summaries |
 | Report processing latency | < 1ms per report (deserialisation + state update) |
 
 ---

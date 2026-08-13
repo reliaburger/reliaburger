@@ -4032,6 +4032,10 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
         if expired_dns {
             self.publish_dns_faults();
         }
+        // Retry any node-pressure cgroup whose directory lingered after its
+        // helper was killed, so a transient removal failure doesn't leave the
+        // controller permanently refusing new pressure faults.
+        self.node_pressure.retry_pending_cleanup().await;
     }
 
     /// The network-byte-order VIP + port for a fault's target service, if

@@ -25,7 +25,7 @@ Onion also enforces namespace isolation and per-app firewall rules at the `conne
 
 ### Kernel
 
-- **Linux kernel 5.7+** (mandatory). The shipped connect-rewrite program uses the `BPF_CGROUP_INET4_CONNECT` hook, available since kernel 5.7. (The `BPF_CGROUP_UDP4_SENDMSG`/`RECVMSG` hooks belonged to the abandoned in-kernel DNS program, §3; DNS now runs in userspace and needs no BPF hook.) Bun checks the kernel version at startup and refuses to start on older kernels with a clear error message and exit code 1.
+- **Linux kernel 5.7+** (mandatory). The shipped connect-rewrite program uses the `BPF_CGROUP_INET4_CONNECT` hook, available since kernel 5.7. The loader (`src/onion/ebpf/loader.rs`) also attaches three more programs — `connect6`, `sendmsg4`, and `sendmsg6` — as **egress-firewall enforcement** for IPv6 and unconnected UDP. These are best-effort: `connect4` is mandatory (its failure aborts the load), while the other three log and continue on attach failure and expose their state via `connect6_attached()` / `sendmsg4_attached()` / `sendmsg6_attached()`. Note that VIP rewrite (the service-discovery half) is IPv4/TCP-`connect()` only; the v6 and sendmsg hooks enforce policy, they do not do VIP load-balancing. (The `RECVMSG` response-injection hook belonged to the abandoned in-kernel DNS program, §3; DNS now runs in userspace and needs no BPF hook.) Bun checks the kernel version at startup and refuses to start on older kernels with a clear error message and exit code 1.
 - **BPF Type Format (BTF)** enabled in the kernel (`CONFIG_DEBUG_INFO_BTF=y`). Required for CO-RE (Compile Once, Run Everywhere) portability of eBPF programs across kernel versions. Most distribution kernels since Ubuntu 20.10, Fedora 33, and Debian 12 ship with BTF enabled.
 - **cgroup v2** mounted at `/sys/fs/cgroup`. Required for cgroup-scoped eBPF program attachment and for identifying the source application by cgroup ID in the firewall path.
 - **Rootful runc for transparent DNS.** Rootless runc, ProcessGrill and Apple Container don't yet install a supervised workload resolver. Bun refuses `[dns] enabled = true` with those runtimes before adoption or workload creation.
@@ -684,25 +684,18 @@ Because Reliaburger does not use an overlay network, containers have direct outb
 
 Onion's configuration is part of the node-level and cluster-level TOML configuration.
 
-### Cluster-level (`cluster.toml`)
+### Cluster-level
 
-```toml
-[service_discovery]
-# VIP CIDR range. Default: "127.128.0.0/16"
-# Can be expanded to "127.128.0.0/10" for very large clusters (~4M VIPs).
-vip_range = "127.128.0.0/16"
+There is **no `[service_discovery]` config section**. Onion's core sizing is fixed at compile time, not exposed as TOML. The values below are the constants as built today:
 
-# Maximum number of backends per service in the BPF map.
-# Default: 32. Increase for services with very high replica counts.
-max_backends_per_service = 32
+| Constant | Value | Where |
+|----------|-------|-------|
+| VIP range | `127.128.0.0/16` (`VIP_PREFIX 0x7F800000` / `VIP_MASK 0xFFFF0000`) | `ebpf/onion_common.h`, `src/onion/vip.rs` |
+| Backends per service | `MAX_BACKENDS = 32` | BPF `backend_value` struct |
+| Services (map max entries) | `65534` (matches the /16) | BPF map definition |
+| Firewall map max entries | `262144` | BPF map definition |
 
-# BPF map max entries for dns_map and backend_map.
-# Default: 65534 (matches /16 VIP range).
-max_services = 65534
-
-# Firewall map max entries. Default: 262144.
-max_firewall_entries = 262144
-```
+Expanding the VIP range or the backend cap means changing the constant and recompiling (and, for the range, a rolling restart) — it is **not** a live cluster-config change today. A `[service_discovery]` section that would make these runtime-tunable is a possible future addition, not current behaviour.
 
 ### Node-level (`node.toml`)
 
@@ -842,7 +835,7 @@ allow_from = ["production/api"]   # allow the api app from the production namesp
 When Bun processes this configuration, it writes a `firewall_map` entry:
 
 ```
-key:   { src_cgroup_id: <cgroup of api@production>, dst_app_id: <payment-service id> }
+key:   { src_cgroup_id: <cgroup of production/api>, dst_app_id: <payment-service id> }
 value: { action: 1 }   // ALLOW
 ```
 
@@ -1069,14 +1062,14 @@ The current design focuses on TCP (`connect()` interception). For UDP services:
 - **Connected UDP sockets** (`connect()` + `send()`) are handled by the same `onion_connect` hook.
 - **Unconnected UDP sockets** (`sendto()` / `sendmsg()` with a destination address) require the `BPF_CGROUP_UDP4_SENDMSG` hook (already used for DNS interception). The same program must also handle service discovery for non-DNS UDP traffic to VIPs.
 - **Question:** Should Onion intercept `sendmsg()` calls to VIP addresses on non-53 ports and rewrite the destination to a real backend? This would cover unconnected UDP sockets (e.g., statsd, syslog, game servers). The eBPF sendmsg hook supports this, but the recvmsg path (receiving responses from the rewritten backend) requires additional tracking to map response packets back to the original VIP.
-- **Current position:** TCP is the priority. Connected UDP sockets work automatically via `connect()`. Unconnected UDP to VIPs is deferred until a concrete use case requires it.
+- **Current position:** the `sendmsg4`/`sendmsg6` hooks **are** loaded and attached today, but only for **egress-firewall enforcement** — they do not rewrite unconnected UDP to a backend VIP. TCP `connect()` remains the priority for service discovery; connected UDP sockets work automatically via the `connect()` rewrite. Unconnected-UDP-to-VIP *load-balancing* is the deferred piece, not the hook itself.
 
 ### 13.2 IPv6 Support
 
-The current design uses IPv4 only (127.128.0.0/16 VIP range, `BPF_CGROUP_INET4_CONNECT`).
+IPv6 is split: the **firewall/egress** hooks (`connect6`, `sendmsg6`) ship and are attached by the loader today, but **VIP service discovery** (the `127.128.0.0/16` rewrite) is IPv4-only, riding `BPF_CGROUP_INET4_CONNECT`.
 
-- **Question:** When is IPv6 support needed? IPv6-only container environments would require a parallel set of eBPF programs (`BPF_CGROUP_INET6_CONNECT`, `BPF_CGROUP_UDP6_SENDMSG`) and a VIP range within the IPv6 loopback space (`::1/128` is a single address; an alternative like `fd00::/8` ULA range could be used).
-- **Current position:** IPv4 service discovery covers the vast majority of use cases. Host-to-host communication can use IPv6 independently. IPv6 Onion support is deferred.
+- **Question:** When is IPv6 *service discovery* needed? An IPv6 VIP data plane would require rewrite logic in the already-attached `connect6` program and a VIP range within the IPv6 loopback/ULA space (`::1/128` is a single address; an alternative like `fd00::/8` could be used).
+- **Current position:** IPv6 egress-policy enforcement is shipped; IPv6 VIP load-balancing is deferred. IPv4 service discovery covers the vast majority of use cases, and host-to-host communication can use IPv6 independently.
 
 ### 13.3 BPF Map Size Limits
 
