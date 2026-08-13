@@ -1212,6 +1212,11 @@ async fn run_agent(cli: Cli) -> anyhow::Result<()> {
         let drains = agent.drains_handle();
         let wrapper_config = config.ingress.to_wrapper_config();
         let ingress_shutdown = shutdown.clone();
+        // Active L7 health probes (E): probe each backend off-band and flip its
+        // local-health verdict, so ingress fails away from a backend that's up
+        // per the service map but not actually answering.
+        let probe_routing = routing_table.clone();
+        let probe_shutdown = shutdown.clone();
         // Wire the cluster Ingress CA into TLS so `tls = "cluster"` routes are
         // served a cluster-signed cert per SNI (M8), not a self-signed
         // `localhost` cert. Available only in cluster mode (a council + the
@@ -1246,6 +1251,11 @@ async fn run_agent(cli: Cli) -> anyhow::Result<()> {
                 }
             },
         );
+        tokio::spawn(reliaburger::wrapper::routing::run_health_probes(
+            probe_routing,
+            reliaburger::wrapper::routing::HealthProbeConfig::default(),
+            probe_shutdown,
+        ));
     }
 
     let agent_handle = reliaburger::bun::readiness::spawn_owned(
@@ -1344,6 +1354,25 @@ async fn run_agent(cli: Cli) -> anyhow::Result<()> {
                         samples.extend(collector.collect_instance_metrics(&instances));
                     }
 
+                    // Ingress metrics (E): fold the wrapper's process-global
+                    // request counters into the same time series.
+                    let ingress =
+                        reliaburger::wrapper::metrics::global_ingress_metrics().snapshot();
+                    for (name, value) in [
+                        ("ingress_requests_total", ingress.total),
+                        ("ingress_requests_in_flight", ingress.in_flight),
+                        ("ingress_responses_1xx", ingress.status_1xx),
+                        ("ingress_responses_2xx", ingress.status_2xx),
+                        ("ingress_responses_3xx", ingress.status_3xx),
+                        ("ingress_responses_4xx", ingress.status_4xx),
+                        ("ingress_responses_5xx", ingress.status_5xx),
+                    ] {
+                        samples.push(reliaburger::mayo::collector::CollectedMetric {
+                            key: reliaburger::mayo::types::MetricKey::simple(name),
+                            value: value as f64,
+                        });
+                    }
+
                     {
                         let mut store = collection_mayo.write().await;
                         for m in &samples {
@@ -1365,6 +1394,31 @@ async fn run_agent(cli: Cli) -> anyhow::Result<()> {
             }
         }
     });
+
+    // Spawn Prometheus scrape task (E). Only when targets are configured —
+    // an empty list means scraping is disabled and no loop is spawned.
+    if !config.metrics.scrape_targets.is_empty() {
+        let scrape_mayo = Arc::clone(&mayo_store);
+        let scrape_interval = config.metrics.scrape_interval_secs.max(1);
+        let scrape_shutdown = shutdown.clone();
+        let scrape_targets: Vec<(String, String)> = config
+            .metrics
+            .scrape_targets
+            .iter()
+            .map(|t| (t.job.clone(), t.url.clone()))
+            .collect();
+        tokio::spawn(async move {
+            let mut tick = tokio::time::interval(std::time::Duration::from_secs(scrape_interval));
+            loop {
+                tokio::select! {
+                    _ = scrape_shutdown.cancelled() => break,
+                    _ = tick.tick() => {
+                        reliaburger::mayo::scrape::scrape_once(&scrape_mayo, &scrape_targets).await;
+                    }
+                }
+            }
+        });
+    }
 
     // Spawn log store flush task (every 60s)
     let log_flush_store = Arc::clone(&log_store);
@@ -1447,6 +1501,10 @@ async fn run_agent(cli: Cli) -> anyhow::Result<()> {
             .clone()
             .unwrap_or_else(|| "local".to_string());
         let dp_pressured_tx = disk_pressured_tx.clone();
+        // Rollup retention (E): expire aggregated rollups older than the
+        // configured window. Only present in cluster mode; 0 hours = keep all.
+        let dp_rollup_store = api_rollup_store.clone();
+        let rollup_retention_hours = config.metrics.rollup_retention_hours;
         tokio::spawn(async move {
             use reliaburger::bun::disk_pressure::{
                 DiskPressureResignation, ResignationVerdict, check_and_relieve, dir_parquet_size,
@@ -1510,6 +1568,27 @@ async fn run_agent(cli: Cli) -> anyhow::Result<()> {
                                 metrics_result.files_pruned, metrics_result.bytes_reclaimed
                             );
                             mayo_checkpoint.save(&mayo_checkpoint_path).ok();
+                        }
+
+                        // Rollup retention (E): drop aggregated rollups older
+                        // than the configured window (0 hours keeps all).
+                        if let Some(rollup) = &dp_rollup_store
+                            && rollup_retention_hours > 0
+                        {
+                            let retention = std::time::Duration::from_secs(
+                                rollup_retention_hours as u64 * 3600,
+                            );
+                            match rollup
+                                .read()
+                                .await
+                                .prune_expired(std::time::SystemTime::now(), retention)
+                            {
+                                Ok(pruned) if pruned > 0 => {
+                                    println!("bun: pruned {pruned} expired rollup(s)");
+                                }
+                                Ok(_) => {}
+                                Err(e) => eprintln!("bun: rollup prune error: {e}"),
+                            }
                         }
 
                         // Council resignation (12b.2 T3): if either store stays

@@ -31,7 +31,7 @@ use crate::ketchup::log_store::LogStore;
 use crate::ketchup::query::fan_out_query;
 use crate::ketchup::types::{LogEntry, LogQuery, LogQueryResult, LogQueryWarning};
 use crate::mayo::alert::AlertEvaluator;
-use crate::mayo::rollup::{MetricsQueryResult, MetricsQueryRow, QueryWarning};
+use crate::mayo::rollup::{MetricsQuery, MetricsQueryResult, MetricsQueryRow, QueryWarning};
 use crate::mayo::rollup_store::RollupStore;
 use crate::mayo::store::MayoStore;
 use crate::meat::deploy_types::DeployHistoryEntry;
@@ -321,6 +321,7 @@ pub fn router_with_upgrade(
         .route("/", get(dashboard_handler))
         .route("/ui/app/{app}/{namespace}", get(app_detail_handler))
         .route("/ui/node/{name}", get(node_detail_handler))
+        .route("/ui/gitops", get(gitops_handler))
         .route("/ui/fragment/apps", get(fragment_apps_handler))
         .route("/ui/fragment/nodes", get(fragment_nodes_handler))
         .route("/ui/fragment/alerts", get(fragment_alerts_handler))
@@ -4598,6 +4599,11 @@ struct MetricsQueryParams {
     name: Option<String>,
     start: Option<u64>,
     end: Option<u64>,
+    /// Restrict to one app's samples, matched against the `app` label
+    /// (`namespace/app`). Set by the single-app cross-node fan-out so each
+    /// node answers with only that app's local data; absent for node-wide
+    /// dashboard queries.
+    app: Option<String>,
 }
 
 /// `GET /v1/metrics?name=X&start=S&end=E` — query time-series data.
@@ -4616,6 +4622,46 @@ async fn metrics_query_handler(
     // overflows (debug-build panic) computing the cardinality of a
     // full-domain unsigned range like `timestamp <= u64::MAX`.
     let end = params.end.unwrap_or(i64::MAX as u64).min(i64::MAX as u64);
+
+    // When an `app` filter is present this is a leaf of the single-app
+    // cross-node fan-out: answer with only that app's local samples. Every
+    // caller-supplied string reaches the SQL literal, so escape each (OBS1).
+    if let Some(app) = &params.app {
+        let app_filter = crate::mayo::store::escape_sql_literal(app);
+        let sql = if name == "*" {
+            format!(
+                "SELECT timestamp, metric_name, labels, value FROM metrics \
+                 WHERE labels LIKE '%\"{app_filter}\"%' \
+                 AND timestamp >= {start} AND timestamp <= {end} \
+                 ORDER BY timestamp LIMIT 10000"
+            )
+        } else {
+            let name = crate::mayo::store::escape_sql_literal(name);
+            format!(
+                "SELECT timestamp, metric_name, labels, value FROM metrics \
+                 WHERE metric_name = '{name}' \
+                 AND labels LIKE '%\"{app_filter}\"%' \
+                 AND timestamp >= {start} AND timestamp <= {end} \
+                 ORDER BY timestamp LIMIT 10000"
+            )
+        };
+        return match store.query_sql(&sql).await {
+            Ok(results) => {
+                let data: Vec<serde_json::Value> = results
+                    .iter()
+                    .map(|(ts, name, labels, val)| {
+                        serde_json::json!({"timestamp": ts, "metric_name": name, "labels": labels, "value": val})
+                    })
+                    .collect();
+                Json(data).into_response()
+            }
+            Err(e) => (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({"error": e.to_string()})),
+            )
+                .into_response(),
+        };
+    }
 
     if name == "*" {
         let sql = format!(
@@ -4911,6 +4957,20 @@ async fn node_detail_handler(State(state): State<ApiState>, Path(name): Path<Str
     html_response(render_node_detail(&data))
 }
 
+/// `GET /ui/gitops` — Lettuce GitOps status page: current sync phase,
+/// coordinator, last applied commit, and recent sync history (E).
+async fn gitops_handler(State(state): State<ApiState>) -> Response {
+    let sync = match &state.council {
+        Some(council) => council
+            .desired_state()
+            .await
+            .gitops_sync_state
+            .unwrap_or_default(),
+        None => crate::lettuce::types::SyncState::default(),
+    };
+    html_response(crate::brioche::gitops::render_gitops(&sync))
+}
+
 /// `GET /ui/fragment/apps` — apps table HTML fragment for HTMX swap.
 async fn fragment_apps_handler(State(state): State<ApiState>) -> Response {
     let statuses = gather_statuses(&state).await;
@@ -5120,15 +5180,77 @@ async fn metrics_rollup_handler(
     }
 }
 
+/// Resolve the base URLs of every council aggregator (Raft voter) from the
+/// live gossip membership.
+///
+/// Each aggregator holds only its assigned workers' rollups, so a cluster-wide
+/// query must reach all of them and sum the partial aggregates. Returns `None`
+/// when this node has no council or no membership table (the standalone case),
+/// or when no voter can be mapped to a live member — the caller then reads its
+/// own local rollup store instead. This node's own URL is included when it is a
+/// voter, so a single-node council fans out to just itself.
+async fn resolve_council_urls(state: &ApiState) -> Option<Vec<String>> {
+    let council = state.council.as_ref()?;
+    let membership = state.membership.as_ref()?;
+    let metrics = council.metrics().borrow().clone();
+    let voters: std::collections::BTreeSet<_> =
+        metrics.membership_config.membership().voter_ids().collect();
+    if voters.is_empty() {
+        return None;
+    }
+    let members = membership.read().await;
+    let urls: Vec<String> = members
+        .iter()
+        .filter(|member| {
+            voters.contains(&crate::cluster::identity::raft_id_from_name(
+                &member.node_id.0,
+            ))
+        })
+        .map(|member| state.cluster_http.url(&member.address.to_string(), ""))
+        .collect();
+    if urls.is_empty() { None } else { Some(urls) }
+}
+
 /// `GET /v1/metrics/cluster?name=X&start=S&end=E` — cluster-wide query.
 ///
 /// Fans out to all council aggregators' `/v1/metrics/rollup` endpoints,
-/// merges results, and returns the combined data with any warnings
-/// about unresponsive aggregators.
+/// merges results (summing partial aggregates), and returns the combined data
+/// with any warnings about unresponsive aggregators. Falls back to reading the
+/// local rollup store when there is no council to fan out to (single-node).
 async fn metrics_cluster_handler(
     State(state): State<ApiState>,
     Query(params): Query<MetricsQueryParams>,
 ) -> Response {
+    let start = params.start.unwrap_or(0);
+    // Clamped below u64::MAX: DataFusion 45's interval analysis
+    // overflows (debug-build panic) computing the cardinality of a
+    // full-domain unsigned range like `timestamp <= u64::MAX`.
+    let end = params.end.unwrap_or(i64::MAX as u64).min(i64::MAX as u64);
+
+    // Cluster path: fan out to every council aggregator's local rollup store
+    // and sum. Reading only this member's store (as this endpoint used to)
+    // undercounts, because each aggregator holds a different slice of workers.
+    if let Some(urls) = resolve_council_urls(&state).await {
+        let query = MetricsQuery {
+            metric_name: params.name.clone(),
+            start,
+            end,
+            app: None,
+        };
+        let timeout = std::time::Duration::from_secs(10);
+        let result = crate::mayo::query_fanout::fan_out_cluster_query(
+            &query,
+            &urls,
+            state.cluster_http.client(),
+            timeout,
+            state.service_token.as_deref(),
+        )
+        .await;
+        return Json(result).into_response();
+    }
+
+    // Single-node / no-council fallback: read the local rollup store directly,
+    // which is equivalent to fanning out to just ourselves.
     let Some(rollup_store) = &state.rollup_store else {
         return Json(MetricsQueryResult {
             data: vec![],
@@ -5139,14 +5261,7 @@ async fn metrics_cluster_handler(
         .into_response();
     };
 
-    // Query local rollup store directly (this council member's data)
     let store = rollup_store.read().await;
-    let start = params.start.unwrap_or(0);
-    // Clamped below u64::MAX: DataFusion 45's interval analysis
-    // overflows (debug-build panic) computing the cardinality of a
-    // full-domain unsigned range like `timestamp <= u64::MAX`.
-    let end = params.end.unwrap_or(i64::MAX as u64).min(i64::MAX as u64);
-
     let result = match &params.name {
         Some(name) => store.query_cluster_metric(name, start, end).await,
         None => {
@@ -5188,9 +5303,11 @@ async fn metrics_cluster_handler(
 
 /// `GET /v1/metrics/app/{app}/{namespace}?name=X&start=S&end=E` — single-app query.
 ///
-/// Queries the local metrics store filtered by the specified app. In a
-/// full cluster deployment, this would fan out to nodes running the app
-/// using the Meat placement map.
+/// When the placement map is visible (council + membership), fans out to the
+/// nodes running the app, hitting each one's app-filtered `/v1/metrics` leaf
+/// and merge-sorting the per-instance rows. Falls back to the local metrics
+/// store otherwise (single-node, or no placement info) — which is the same as
+/// fanning out to just this node.
 async fn metrics_app_handler(
     auth: Option<axum::Extension<crate::sesame::auth::AuthContext>>,
     State(state): State<ApiState>,
@@ -5200,6 +5317,55 @@ async fn metrics_app_handler(
     if let Err(resp) = crate::sesame::auth::authorize_scoped(auth.as_deref(), &app, &namespace) {
         return resp;
     }
+    let start = params.start.unwrap_or(0);
+    // Clamped below u64::MAX: DataFusion 45's interval analysis
+    // overflows (debug-build panic) computing the cardinality of a
+    // full-domain unsigned range like `timestamp <= u64::MAX`.
+    let end = params.end.unwrap_or(i64::MAX as u64).min(i64::MAX as u64);
+
+    // Cross-node fan-out: each node keeps only its own instances' samples, so
+    // reading just this node's store misses instances scheduled elsewhere.
+    if let (Some(council), Some(membership)) = (&state.council, &state.membership) {
+        use crate::meat::types::AppId;
+        let desired = council.desired_state().await;
+        let app_id = AppId::new(&app, &namespace);
+        let node_ids: Vec<crate::meat::NodeId> = desired
+            .scheduling
+            .get(&app_id)
+            .map(|placements| placements.iter().map(|p| p.node_id.clone()).collect())
+            .unwrap_or_default();
+
+        if !node_ids.is_empty() {
+            let members = membership.read().await;
+            let urls: Vec<String> = node_ids
+                .iter()
+                .filter_map(|id| members.iter().find(|m| m.node_id == *id))
+                .map(|m| state.cluster_http.url(&m.address.to_string(), ""))
+                .collect();
+            drop(members);
+
+            if !urls.is_empty() {
+                let query = MetricsQuery {
+                    metric_name: params.name.clone(),
+                    start,
+                    end,
+                    // The leaf filters on the `app` label, stored as `namespace/app`.
+                    app: Some(format!("{namespace}/{app}")),
+                };
+                let timeout = std::time::Duration::from_secs(10);
+                let result = crate::mayo::query_fanout::fan_out_app_query(
+                    &query,
+                    &urls,
+                    state.cluster_http.client(),
+                    timeout,
+                    state.service_token.as_deref(),
+                )
+                .await;
+                return Json(result).into_response();
+            }
+        }
+    }
+
     let Some(mayo) = &state.mayo else {
         return Json(MetricsQueryResult {
             data: vec![],
@@ -5209,11 +5375,6 @@ async fn metrics_app_handler(
     };
 
     let store = mayo.read().await;
-    let start = params.start.unwrap_or(0);
-    // Clamped below u64::MAX: DataFusion 45's interval analysis
-    // overflows (debug-build panic) computing the cardinality of a
-    // full-domain unsigned range like `timestamp <= u64::MAX`.
-    let end = params.end.unwrap_or(i64::MAX as u64).min(i64::MAX as u64);
 
     // Filter by app label in the local store. Both the app/namespace path
     // segments and the caller-supplied `name` reach the SQL literal, so escape

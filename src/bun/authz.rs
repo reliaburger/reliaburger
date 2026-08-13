@@ -105,6 +105,7 @@ pub const ROUTE_MATRIX: &[Route] = &[
     route(Get, "/", AnyToken),
     route(Get, "/ui/app/{app}/{namespace}", AnyToken),
     route(Get, "/ui/node/{name}", AnyToken),
+    route(Get, "/ui/gitops", AnyToken),
     route(Get, "/ui/fragment/apps", AnyToken),
     route(Get, "/ui/fragment/nodes", AnyToken),
     route(Get, "/ui/fragment/alerts", AnyToken),
