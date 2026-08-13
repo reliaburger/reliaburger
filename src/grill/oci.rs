@@ -4,13 +4,15 @@
 /// We define our own types rather than importing the full OCI spec
 /// crate, because we only need a subset and want control over the
 /// serialisation and derives.
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
 use crate::config::app::AppSpec;
 use crate::config::job::JobSpec;
-use crate::config::types::EnvValue;
+use crate::config::types::{EnvValue, ResourceRange};
+use crate::grill::cgroup;
 
 /// A simplified OCI runtime specification.
 ///
@@ -111,12 +113,34 @@ pub struct OciNamespace {
 }
 
 /// Resource limits for the container.
+///
+/// The `cpu`/`memory` blocks carry the *hard* limits (quota and OOM
+/// ceiling). Resource *requests* have no dedicated field in the classic
+/// OCI schema, so they ride in `unified` — see that field's doc comment.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct OciResources {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub cpu: Option<OciCpuResources>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub memory: Option<OciMemoryResources>,
+    /// cgroup v2 native controller keys, written verbatim by runc into
+    /// the workload's cgroup. We use it for the resource *requests* that
+    /// the classic `cpu`/`memory` blocks can't express:
+    ///
+    /// - `cpu.weight` (1-10000): proportional CPU share under contention,
+    ///   derived from the CPU request. Passing it here avoids runc's
+    ///   lossy `cpu.shares` (2-262144) -> weight conversion, since our
+    ///   value is already in the v2 range.
+    /// - `memory.high` (bytes): the soft limit. The kernel throttles and
+    ///   reclaims a workload that crosses it, before the hard
+    ///   `memory.max` triggers an OOM kill. There is no classic OCI field
+    ///   for it (`memory.reservation` maps to `memory.low`, a protection
+    ///   floor with the opposite meaning).
+    ///
+    /// `BTreeMap` keeps serialisation deterministic; empty maps are
+    /// omitted so specs without requests are unchanged.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub unified: BTreeMap<String, String>,
 }
 
 /// CPU resource limits.
@@ -455,17 +479,48 @@ pub fn standard_mounts() -> Vec<OciMount> {
 }
 
 fn build_resources(spec: &AppSpec) -> Option<OciResources> {
-    let cpu = spec.cpu.as_ref().map(|range| OciCpuResources {
-        quota: (range.limit * 100_000 / 1000) as i64,
-        period: 100_000,
+    build_resources_from_ranges(spec.cpu.as_ref(), spec.memory.as_ref())
+}
+
+/// Build the OCI resource block from CPU and memory ranges.
+///
+/// Hard limits go into the `cpu`/`memory` blocks; requests go into the
+/// `unified` map as `cpu.weight` and `memory.high`. A request is only
+/// emitted when it is actually declared (`request > 0`) — an app that
+/// sets only a limit (e.g. `cpu = "0-1000m"`) gets the ceiling without a
+/// weight or soft limit forced on it.
+fn build_resources_from_ranges(
+    cpu: Option<&ResourceRange>,
+    memory: Option<&ResourceRange>,
+) -> Option<OciResources> {
+    let mut unified = BTreeMap::new();
+
+    let cpu_res = cpu.map(|range| {
+        if range.request > 0 {
+            let weight = cgroup::cpu_weight_from_millicores(range.request);
+            unified.insert("cpu.weight".to_string(), weight.to_string());
+        }
+        OciCpuResources {
+            quota: (range.limit * 100_000 / 1000) as i64,
+            period: 100_000,
+        }
     });
 
-    let memory = spec.memory.as_ref().map(|range| OciMemoryResources {
-        limit: range.limit as i64,
+    let memory_res = memory.map(|range| {
+        if range.request > 0 {
+            unified.insert("memory.high".to_string(), range.request.to_string());
+        }
+        OciMemoryResources {
+            limit: range.limit as i64,
+        }
     });
 
-    if cpu.is_some() || memory.is_some() {
-        Some(OciResources { cpu, memory })
+    if cpu_res.is_some() || memory_res.is_some() {
+        Some(OciResources {
+            cpu: cpu_res,
+            memory: memory_res,
+            unified,
+        })
     } else {
         None
     }
@@ -502,18 +557,7 @@ pub fn generate_job_oci_spec(
         spec.command.clone().unwrap_or_default()
     };
 
-    let cpu = spec.cpu.as_ref().map(|range| OciCpuResources {
-        quota: (range.limit * 100_000 / 1000) as i64,
-        period: 100_000,
-    });
-    let memory = spec.memory.as_ref().map(|range| OciMemoryResources {
-        limit: range.limit as i64,
-    });
-    let resources = if cpu.is_some() || memory.is_some() {
-        Some(OciResources { cpu, memory })
-    } else {
-        None
-    };
+    let resources = build_resources_from_ranges(spec.cpu.as_ref(), spec.memory.as_ref());
 
     OciSpec {
         root: OciRoot {
@@ -854,6 +898,116 @@ mod tests {
         let resources = oci.linux.resources.unwrap();
         let memory = resources.memory.unwrap();
         assert_eq!(memory.limit, 512 * 1024 * 1024);
+    }
+
+    #[test]
+    fn cpu_request_produces_weight_in_unified() {
+        let spec: AppSpec = toml::from_str(
+            r#"
+            image = "test:v1"
+            cpu = "500m-1000m"
+            "#,
+        )
+        .unwrap();
+        let oci = generate_oci_spec(
+            "web",
+            "default",
+            &spec,
+            "web-0",
+            None,
+            "/cgroup/path",
+            None,
+            None,
+        );
+
+        let resources = oci.linux.resources.unwrap();
+        // Hard limit unchanged: 1000m = a full CPU.
+        assert_eq!(resources.cpu.unwrap().quota, 100_000);
+        // Request of 500m maps to weight 50 (500 / 10), in the v2 range.
+        assert_eq!(resources.unified.get("cpu.weight"), Some(&"50".to_string()));
+    }
+
+    #[test]
+    fn memory_request_produces_high_in_unified() {
+        let spec: AppSpec = toml::from_str(
+            r#"
+            image = "test:v1"
+            memory = "128Mi-512Mi"
+            "#,
+        )
+        .unwrap();
+        let oci = generate_oci_spec(
+            "web",
+            "default",
+            &spec,
+            "web-0",
+            None,
+            "/cgroup/path",
+            None,
+            None,
+        );
+
+        let resources = oci.linux.resources.unwrap();
+        // Hard ceiling stays the limit; the request becomes the soft limit.
+        assert_eq!(resources.memory.unwrap().limit, 512 * 1024 * 1024);
+        assert_eq!(
+            resources.unified.get("memory.high"),
+            Some(&(128 * 1024 * 1024).to_string())
+        );
+    }
+
+    #[test]
+    fn limit_only_does_not_force_weight_or_soft_limit() {
+        // A leading `0-` request means "cap it here, but request nothing".
+        let spec: AppSpec = toml::from_str(
+            r#"
+            image = "test:v1"
+            cpu = "0-1000m"
+            memory = "0-512Mi"
+            "#,
+        )
+        .unwrap();
+        let oci = generate_oci_spec(
+            "web",
+            "default",
+            &spec,
+            "web-0",
+            None,
+            "/cgroup/path",
+            None,
+            None,
+        );
+
+        let resources = oci.linux.resources.unwrap();
+        // Hard limits still applied…
+        assert_eq!(resources.cpu.unwrap().quota, 100_000);
+        assert_eq!(resources.memory.unwrap().limit, 512 * 1024 * 1024);
+        // …but no request-derived enforcement is forced on the workload.
+        assert!(resources.unified.is_empty());
+    }
+
+    #[test]
+    fn unified_map_omitted_from_json_when_empty() {
+        let spec: AppSpec = toml::from_str(
+            r#"
+            image = "test:v1"
+            cpu = "0-1000m"
+            "#,
+        )
+        .unwrap();
+        let oci = generate_oci_spec(
+            "web",
+            "default",
+            &spec,
+            "web-0",
+            None,
+            "/cgroup/path",
+            None,
+            None,
+        );
+
+        let json = serde_json::to_string(&oci).unwrap();
+        assert!(!json.contains("unified"));
     }
 
     #[test]
