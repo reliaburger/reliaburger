@@ -263,7 +263,7 @@ pub enum WorkloadSource {
 /// Deploy strategy configuration for an App.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct DeployStrategy {
-    /// Deployment strategy type. Currently only "rolling" is supported.
+    /// Deployment strategy type: `rolling` (default) or `blue-green`.
     pub strategy: DeployStrategyType,
     /// Maximum number of extra instances during a rolling update.
     pub max_surge: u32,
@@ -997,7 +997,7 @@ All scheduler-related configuration is set in the cluster-level configuration (a
 
 | Knob | Default | Description |
 |------|---------|-------------|
-| `defaults.app.deploy.strategy` | `"rolling"` | Deploy strategy. Currently only `rolling` is supported. |
+| `defaults.app.deploy.strategy` | `"rolling"` | Deploy strategy: `rolling` or `blue-green`. |
 | `defaults.app.deploy.max_surge` | `1` | Default max extra instances during rolling deploy. |
 | `defaults.app.deploy.drain_timeout` | `"30s"` | Default drain timeout for connection draining. |
 | `defaults.app.deploy.health_timeout` | `"60s"` | Default timeout for health checks on new instances. |

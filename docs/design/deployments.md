@@ -717,12 +717,13 @@ Rollback re-deploys a previous spec version through the same rolling mechanism, 
 
 ### 5.4 Dependency Ordering (`run_before`)
 
-> **Status: planned — not yet implemented.** The `run_before` field is parsed
-> and lint-checked, but nothing in the shipped deploy path consumes it. There is
-> no pre-deploy job gating today: a deploy that references a `run_before` job
-> rolls the app immediately without waiting for the job. The `RunningPreDeps`
-> phase, the `DependencyGraph`, and the topological ordering below describe the
-> target design.
+> **Status: implemented.** Before an app deploys, the agent runs every job whose
+> `run_before` names that app to completion, gating on a clean (exit 0) finish
+> and aborting the deploy if a prerequisite fails or times out. A gating job runs
+> exactly once and is skipped in the regular jobs loop. The multi-stage
+> `DependencyGraph` and topological cycle detection below remain the target for a
+> future iteration; today's gating covers the job→app case (the common migration
+> ordering).
 
 Jobs can declare dependencies on Apps using the `run_before` field:
 
@@ -761,13 +762,12 @@ For internal service-to-service traffic (via Onion), the eBPF service map entry 
 
 ### 5.6 Blue-Green Deploy
 
-> **Status: planned — not yet implemented.** The blue-green orchestrator
-> (`meat::blue_green::execute_blue_green` and the `DeployState` machine in
-> `meat::orchestrator`) exists as library code with no production caller. The
-> wired agent path never branches on `strategy`, so a config that sets
-> `strategy = "blue-green"` is accepted and parsed, then **silently runs a
-> rolling deploy** — you don't get an atomic cutover today. The design below is
-> the target.
+> **Status: implemented.** A config that sets `strategy = "blue-green"` now
+> dispatches to the agent's `blue_green_redeploy`: the whole green fleet comes up
+> and health-checks while blue keeps serving, then an atomic routing swap retires
+> blue. A green failure tears green down and leaves blue untouched (or halts for
+> inspection when `auto_rollback = false`). The `meat::blue_green` library state
+> machine remains as a standalone, separately-tested model of the same sequence.
 
 Blue-green deployment starts an entirely new set of instances (the "green" set) alongside the existing set (the "blue" set), verifies health on all green instances, then switches all traffic at once:
 

@@ -18,7 +18,7 @@ Mayo is Reliaburger's embedded, per-node metrics store. It provides a metrics pi
 
 The result is a batteries-included metrics store embedded in the single Bun binary, with no external database and no configuration for the common case.
 
-A note on this document: the storage engine is **Parquet + DataFusion SQL**, not a custom Gorilla/ULID TSDB, and the query language is **SQL**, not PromQL. Several capabilities the original design imagined -- Prometheus scraping, remote-read federation, tiered downsampling, cross-council query fan-out, ingress metrics -- have code paths or config keys but are **not wired into a running system**. Each is flagged below with **Status: planned -- not yet implemented.**
+A note on this document: the storage engine is **Parquet + DataFusion SQL**, not a custom Gorilla/ULID TSDB, and the query language is **SQL**, not PromQL. Several capabilities are now wired: outbound Prometheus scraping of `[[metrics.scrape_targets]]`, cross-council query fan-out and merge, ingress request/response counters, and rollup retention pruning. Others the original design imagined -- remote-read federation, tiered downsampling, PromQL alert expressions, per-app alert tuning -- remain **not wired into a running system** and are each flagged below with **Status: planned -- not yet implemented.**
 
 ---
 
@@ -29,12 +29,12 @@ A note on this document: the storage engine is **Parquet + DataFusion SQL**, not
 | Component | Relationship |
 |-----------|-------------|
 | **Bun** (node agent) | Host process. Bun's collection loop samples node and per-process metrics (via the `sysinfo` crate) into the local Mayo store, drives the periodic flush to Parquet, runs the alert evaluation loop, and drives retention/disk-pressure pruning. |
-| **Council** (Raft consensus group) | Each worker node pushes a 1-minute `NodeRollup` to its assigned council parent over the reporting transport. The council member stores rollups in a separate rollup store, served at `/v1/metrics/rollup` and `/v1/metrics/cluster`. **Cross-council query fan-out and merge is planned -- not yet implemented** (see §3.3). |
+| **Council** (Raft consensus group) | Each worker node pushes a 1-minute `NodeRollup` to its assigned council parent over the reporting transport. The council member stores rollups in a separate rollup store, served at `/v1/metrics/rollup` and `/v1/metrics/cluster`. **Cross-council query fan-out and merge is implemented**: `/v1/metrics/cluster` and `/v1/metrics/app` fan out across council voters and sum the results (see §3.3). |
 | **Brioche** (web UI) | Queries Mayo over the internal HTTP API (`/v1/metrics*`) for dashboard rendering. |
 | **Relish** (CLI) | `relish` queries the per-app metrics endpoint over HTTP. |
 | **Mustard** (gossip) | Provides cluster membership and node identity, used to determine which council parent a node reports rollups to. |
-| **Meat** (scheduler) | Provides the app-to-node placement map. Using it to fan single-app queries out to the nodes running the app is **planned** (the app endpoint currently reads only the local store). |
-| **Wrapper** (ingress proxy) | **Status: planned -- not yet implemented.** Per-route ingress metrics (`ingress_requests_total` and friends) are described below but are never emitted. |
+| **Meat** (scheduler) | Provides the app-to-node placement map. The `/v1/metrics/app` endpoint uses it to fan single-app queries out to the nodes running the app and sum the results. |
+| **Wrapper** (ingress proxy) | **Implemented.** The proxy maintains a process-global `IngressMetrics` counter (total, per-status-class, in-flight); Bun's collection loop folds `global_ingress_metrics().snapshot()` into the time series as `ingress_requests_total`, `ingress_responses_Nxx`, and `ingress_requests_in_flight`. Per-route duration histograms remain future work. |
 
 ### External Interfaces
 
@@ -43,7 +43,7 @@ A note on this document: the storage engine is **Parquet + DataFusion SQL**, not
 | Webhook notifications | Outbound | **Shipped.** Alert notifications dispatched to generic HTTP, Slack, or PagerDuty destinations. |
 | Prometheus remote-read API | Inbound | **Status: planned -- not yet implemented.** There is no `remote_read` endpoint. |
 | Prometheus scrape endpoint (`/metrics` exposition) | Inbound | **Status: planned -- not yet implemented.** Mayo does not expose its data in Prometheus exposition format. |
-| Application `/metrics` scraping | Outbound (node-local) | **Status: planned -- not yet implemented.** A scraper (`src/mayo/scrape.rs`) exists and parses Prometheus text, but nothing calls it. |
+| Application `/metrics` scraping | Outbound (node-local) | **Implemented.** When `[[metrics.scrape_targets]]` is non-empty, Bun spawns a loop that scrapes each target's `/metrics` every `scrape_interval_secs`, parses the Prometheus text (`src/mayo/scrape.rs`), and ingests the samples tagged with the target's `job`. An empty target list means no loop is spawned. |
 
 ---
 
@@ -102,7 +102,7 @@ Retention is a single `retention_days` value (default **7**). Two paths prune Pa
 
 - **Cross-council query fan-out and merge.** `src/mayo/query_fanout.rs` contains `fan_out_cluster_query`/`fan_out_app_query` and the merge functions, but nothing calls them. `/v1/metrics/cluster` returns only the handling council member's *local* rollup data; it does not fan out to the other council members or merge their partial sums. So a "cluster-wide" query today reflects one council member's subset, not the whole cluster.
 - **Single-app query fan-out via the Meat placement map.** `/v1/metrics/app/{app}/{namespace}` filters the *local* store by the `namespace/app` label. It does not consult placement or query the other nodes running the app.
-- **`rollup_retention_hours`.** The config key exists and defaults to 24, but nothing reads it -- rollup stores are not pruned on a separate schedule.
+- **`rollup_retention_hours`.** Defaults to 24. Bun's disk-pressure loop calls `RollupStore::prune_expired` each tick to drop rollups older than this window (0 keeps all).
 
 ### 3.4 Prometheus-Compatible Remote-Read API
 
@@ -271,13 +271,13 @@ Instances without a PID are skipped. There are no counters here, no restart/OOM/
 
 **GPU metrics: none.** There is no `nvidia-smi` collection; no `*_gpu_*` metric is emitted.
 
-**Per-ingress-route metrics (`ingress_requests_total`, `ingress_request_duration_seconds`, `ingress_http_errors_total`): Status: planned -- not yet implemented.** The Wrapper proxy never emits these.
+**Ingress metrics: implemented (counters), planned (durations).** The Wrapper proxy maintains a process-global `IngressMetrics` and Bun's collection loop emits `ingress_requests_total`, `ingress_responses_1xx`..`5xx`, and `ingress_requests_in_flight`. Per-route breakdowns and `ingress_request_duration_seconds` histograms remain **planned -- not yet implemented**.
 
 ### 5.2 Prometheus Scraping
 
-**Status: planned -- not yet implemented.**
+**Status: implemented (explicit targets); per-app auto-scrape planned.**
 
-`src/mayo/scrape.rs` provides `parse_prometheus_text` (parsing `# HELP`/`# TYPE` and metric lines via the `prometheus-parse` crate) and `scrape_endpoint` (an HTTP GET with a 5s timeout). Both are unit-tested but **nothing calls them** -- there is no scrape scheduler, no per-app `metrics`/`metrics_interval` config key, no auto-detection of `/metrics` endpoints, and no probing lifecycle. The whole scraping story below is aspirational.
+`src/mayo/scrape.rs` provides `parse_prometheus_text`, `scrape_endpoint` (an HTTP GET with a 5s timeout), and `scrape_once`, which Bun's scrape loop calls every `scrape_interval_secs` over the `[[metrics.scrape_targets]]` list -- each target's samples are ingested tagged with its `job`. A target that fails contributes nothing rather than failing the sweep, and an empty target list spawns no loop. Still **planned -- not yet implemented**: per-app `metrics`/`metrics_interval` config, auto-detection of `/metrics` endpoints, `max_samples_per_scrape`, and a scrape-timeout counter.
 
 ### 5.3 Downsampling
 
@@ -291,10 +291,10 @@ The council member stores received rollups in a rollup store and serves them at 
 
 ### 5.5 Query Fan-Out
 
-**Status: planned -- not yet implemented.** The fan-out helpers in `src/mayo/query_fanout.rs` (`fan_out_app_query`, `fan_out_cluster_query`, and the merge functions) have no callers. In the shipped code:
+**Status: implemented.** The fan-out helpers in `src/mayo/query_fanout.rs` (`fan_out_app_query`, `fan_out_cluster_query`, and the merge functions) are now wired into the handlers:
 
-- `/v1/metrics/app/{app}/{namespace}` filters the **local** store by the `namespace/app` label -- it does not consult the Meat placement map or query other nodes.
-- `/v1/metrics/cluster` returns the handling council member's **local** rollup data -- it does not fan out to the other council members or merge partial sums.
+- `/v1/metrics/app/{app}/{namespace}` resolves the app's nodes from the Meat placement map and fans the query out to each, merging the results (falling back to the local store when there's no placement).
+- `/v1/metrics/cluster` enumerates the Raft voters, maps each to its live membership address, and sums each member's `/v1/metrics/rollup` (falling back to local rollup data on a single node / no council).
 
 So neither the single-app path nor the cluster-wide path fans out today. The query timeout, top-N merge, and unresponsive-node annotations belong to the planned design.
 
@@ -397,7 +397,7 @@ max_storage_mb = 0
 
 ### 6.2 Scraping Configuration
 
-**Status: planned -- not yet implemented.** There is no scrape config. The `scrape_interval_secs` key above parses but drives nothing; there is no per-app `metrics`/`metrics_interval`, no `[metrics.scrape]` block, and no `max_samples_per_scrape` limit.
+**Status: partially implemented.** `scrape_interval_secs` now drives the scrape loop and `[[metrics.scrape_targets]]` declares the endpoints (see §5.2). Still absent: per-app `metrics`/`metrics_interval`, a `[metrics.scrape]` block, and a `max_samples_per_scrape` limit.
 
 ### 6.3 Alert Configuration (`[alerts]`)
 
@@ -425,7 +425,7 @@ secret = "your-pagerduty-routing-key"
 
 ### 6.4 Aggregation Configuration
 
-The push interval is `metrics.rollup_interval_secs` (§6.1). The consistent-hash assignment knob, per-tier rollup retention, and `max_rollup_size_bytes` from earlier drafts do **not** exist; `rollup_retention_hours` is currently inert (§3.3).
+The push interval is `metrics.rollup_interval_secs` (§6.1). The consistent-hash assignment knob, per-tier rollup retention, and `max_rollup_size_bytes` from earlier drafts do **not** exist; `rollup_retention_hours` now prunes the rollup store on the disk-pressure tick (§3.3).
 
 ---
 

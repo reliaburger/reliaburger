@@ -99,14 +99,15 @@ The GitOps coordinator is a council member role, elected via a Raft-replicated s
 - The replacement coordinator reads the last `SyncState` from Raft (which includes the last applied commit hash and the local bare clone path) and resumes the sync loop from where the previous coordinator left off.
 - The replacement coordinator must `git clone` the repository fresh if it doesn't already have a local clone. During this window (typically a few seconds), sync is paused but not lost -- the next poll after clone completion catches up.
 
-**Implementation status (12b.5).** The sync loop is currently **leader-driven**: only the
-Raft leader can write desired state, so the leader runs the sync and applies the diff. The
-coordinator election (`select_coordinator`) is wired and the elected coordinator is recorded
-in `SyncState.coordinator_node_id` for the UI, but it *complements* the leader rather than
-replacing it — the separate coordinator-driven loop with Raft-heartbeat failover above is the
-target model, not yet the implemented one. A reused local clone is verified against the
-configured remote URL and branch and re-cloned on drift, so a stale clone left by a leadership
-change never syncs the wrong repository.
+**Implementation status.** The sync loop is **leader-driven**, and the coordinator is now
+defined as the Raft leader: only the leader can write desired state, so only it can apply a
+sync, and `coordinator_for_leader` records the leader in `SyncState.coordinator_node_id`,
+tagging a change of leader as a `Failover`. Failover therefore rides Raft leader election —
+a handover naturally resumes syncing on the new leader — rather than running a separate
+coordinator election (the old `select_coordinator`, which named a non-leader that never
+actually synced, is no longer called). A reused local clone is verified against the configured
+remote URL and branch and re-cloned on drift, so a stale clone left by a leadership change
+never syncs the wrong repository.
 
 ### 3.3 TOML Parsing Pipeline
 
@@ -224,10 +225,12 @@ pub struct SyncState {
     /// Summary of the last applied diff.
     pub last_diff_summary: Option<DiffSummary>,
 
-    /// History of recent syncs (ring buffer, default 100 entries).
-    /// **Planned — not yet populated.** The field exists on `SyncState`, but the
-    /// sync runner never appends to it, so it is always empty in practice. The
-    /// sync-history view in Brioche therefore has no data to show yet.
+    /// History of recent syncs (ring buffer, bounded at 100 entries).
+    /// Populated on every recorded sync: `record_success` / `record_failure`
+    /// append a `SyncHistoryEntry` (commit, timestamp, duration, result, diff
+    /// summary) and evict the oldest past the cap. Commit-less failures (repo
+    /// access, a panic) record `last_error` but no history row, since there's no
+    /// commit to attribute them to.
     pub history: VecDeque<SyncHistoryEntry>,
 
     /// The node ID of the current GitOps coordinator.
@@ -644,14 +647,13 @@ This is critical to prevent Lettuce from fighting the autoscaler during traffic 
 
 ### 5.7 Coordinator Failover
 
-> **Status: planned — not yet implemented.** See the status note in Section 3.2.
-> The sync loop is leader-driven: the Raft leader runs the sync and applies the
-> diff, and the elected coordinator (`select_coordinator`) is recorded in
-> `SyncState.coordinator_node_id` for display only — it does not drive syncing.
-> The `CoordinatorElectionReason::Failover` path exists only in tests. The
-> Raft-heartbeat-driven coordinator handoff and the timeline below are the target
-> model, not current behaviour; in practice a failover follows ordinary Raft
-> leader election.
+> **Status: implemented (as leader handover).** See Section 3.2. The coordinator
+> is the Raft leader: `coordinator_for_leader` records it in
+> `SyncState.coordinator_node_id` on every recorded sync and tags a change of
+> leader `Failover`. So a failover *is* an ordinary Raft leader election — the
+> new leader resumes syncing and stamps itself coordinator on its first recorded
+> sync. The separate Raft-heartbeat coordinator election of earlier drafts is not
+> used; the timeline below describes the equivalent leader-handover flow.
 
 See Section 3.2. Summary of the (planned) failover timeline:
 

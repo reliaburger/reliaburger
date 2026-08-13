@@ -2051,31 +2051,50 @@ present-tense claims were corrected, and unbuilt features are marked
 - [x] **Stale "deferred" markers flipped to shipped** — ingress WebSocket, `secret
   rotate`, onion IPv6/sendmsg egress hooks.
 
-### Section E — Wire it, or mark it: library-only features
+### Section E — Wire the library-only features
 
-Decision: these are all substantial unbuilt features (wiring any of them —
-Raft-log encryption into the durable log, a cron scheduler, blue-green dispatch,
-run_before gating, Prometheus scraping, GitOps failover, the ingress drain
-protocol) is real feature work far beyond a documentation-honesty PR. Every one
-is now **marked planned** in its design doc (done as part of Section D), so
-nothing reads as shipped that isn't. Wiring each remains available as its own
-future change.
+Every one of these had working, tested code with no production caller — Section D
+honestly marked them "planned". Section E **wires all eight** so the docs'
+original claims become true, and flips those "planned" markers back to
+present-tense. Delivered in one PR, the bulk fanned out across parallel agents on
+disjoint file clusters and integrated behind a single build + `make ci` (3216
+tests) + cluster suite (22/22).
 
-- [x] **Raft log encryption** — marked planned (implemented but unwired) in
-  security-sesame.md §11.4 / §7.5.
-- [x] **cgroup resource requests** — agent-bun.md §5 corrected to limits-only;
-  `cpu.weight`/`memory.high` marked planned.
-- [x] **Cron / scheduled jobs** — marked planned (whitepaper §5.2/§Q8, deployments).
-- [x] **Blue-green deploy** — marked planned in deployments.md/scheduler-meat.md
-  (config currently falls back to rolling).
-- [x] **`run_before` dependency ordering** — marked planned in deployments.md.
+- [x] **Raft log encryption** — `sesame::raft_encryption` (AES-256-GCM) now
+  encrypts the durable Raft log at rest whenever a cluster master key is present.
+  `DurableLogStore::open_with_key` encrypts entry values on write and detects a
+  per-entry marker on read, so plaintext and encrypted logs interoperate: a
+  keyless node stays plaintext, and an encrypted entry opened without the key
+  errors rather than reading as an empty (fresh) log (CP3-safe).
+- [x] **cgroup resource requests** — `build_resources` / `generate_job_oci_spec`
+  emit `cpu.weight` and `memory.high` into the OCI `linux.resources.unified` map
+  from a workload's request range; limit-only specs stay byte-identical.
+- [x] **Cron / scheduled jobs** — a `schedule = "0 3 * * *"` job is parsed by the
+  new dependency-free `meat::cron` (five-field crontab, Vixie DOM/DOW rule) and
+  fired by the bun event loop on its UTC minute, once per match. Scheduled jobs
+  no longer run at deploy time.
+- [x] **Blue-green deploy** — `strategy = "blue-green"` dispatches to a real
+  `blue_green_redeploy`: the whole green fleet comes up and health-checks while
+  blue keeps serving, then an atomic routing swap (via `finalise_rolling_deploy`)
+  retires blue. A green failure tears green down and leaves blue untouched.
+- [x] **`run_before` dependency ordering** — a job's `run_before = ["app.x"]`
+  now runs it to completion (clean exit gated, bounded by a timeout) before
+  app x deploys; a prerequisite failure aborts the deploy.
 - [x] **Prometheus scraping + fan-out + rollup retention + ingress metrics** —
-  marked planned in metrics-mayo.md.
-- [x] **GitOps coordinator failover + sync history + Brioche GitOps view** —
-  marked planned in gitops-lettuce.md / ui-brioche.md.
-- [x] **Ingress health probes / retry / headers / ALPN-HTTP2 / drain-termination** —
-  marked planned in ingress-wrapper.md (WebSocket flipped to shipped). The
-  drain-termination protocol wiring remains a tracked future item.
+  bun spawns a scrape loop over `[[metrics.scrape_targets]]`, the metrics query
+  handlers fan out across council members, the disk-pressure loop prunes rollups
+  past `rollup_retention_hours`, and the collector folds the wrapper's ingress
+  request counters into the time series.
+- [x] **GitOps coordinator failover + sync history + Brioche GitOps view** — the
+  coordinator now tracks the Raft leader (failover rides election), each sync
+  records a bounded history entry (commit, duration, result), and `/ui/gitops`
+  renders phase / coordinator / last-applied-commit / history.
+- [x] **Ingress health probes / retry / headers / ALPN-HTTP2 / drain** — a
+  background L7 probe loop flips each backend's local-health verdict, the proxy
+  fails over on connect errors (never replaying a sent request), sets
+  `X-Real-IP` / `X-Request-ID`, negotiates HTTP/2 via ALPN, and force-terminates
+  draining backends past their deadline. WebSocket parity for the header and
+  drain-termination paths remains a tracked follow-up (`websocket.rs`).
 
 ### Section F — User-facing doc fixes (manual + READMEs)
 
