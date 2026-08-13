@@ -34,6 +34,7 @@ pub(crate) fn render_nav() -> &'static str {
     r#"<nav>
 <span class="brand">Reliaburger</span>
 <a href="/">Dashboard</a>
+<a href="/ui/gitops">GitOps</a>
 </nav>
 "#
 }
