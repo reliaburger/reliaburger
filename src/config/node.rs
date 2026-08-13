@@ -721,6 +721,13 @@ pub struct MetricsSection {
     pub retention_days: u32,
     /// How often to scrape Prometheus /metrics endpoints (seconds).
     pub scrape_interval_secs: u64,
+    /// Prometheus `/metrics` endpoints to scrape on `scrape_interval_secs`.
+    ///
+    /// Empty (the default) disables scraping entirely — there is no per-app
+    /// scrape opt-in on the app spec, so operators declare targets here. Each
+    /// target's `job` becomes the `app` label on its samples, so per-app
+    /// dashboards and `/v1/metrics/app/...` queries can filter on it.
+    pub scrape_targets: Vec<ScrapeTarget>,
     /// Enable built-in alert evaluation.
     pub alerts_enabled: bool,
     /// Object store URL for metric persistence. Empty = local filesystem.
@@ -743,6 +750,7 @@ impl Default for MetricsSection {
             collection_interval_secs: 10,
             retention_days: 7,
             scrape_interval_secs: 30,
+            scrape_targets: Vec::new(),
             alerts_enabled: true,
             object_store_url: String::new(),
             rollup_interval_secs: 60,
@@ -751,6 +759,17 @@ impl Default for MetricsSection {
             export_path: None,
         }
     }
+}
+
+/// A single Prometheus `/metrics` endpoint to scrape (`[[metrics.scrape_targets]]`).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ScrapeTarget {
+    /// Label recorded as the `app` on every sample from this target, so the
+    /// per-app dashboards and queries can filter on it (e.g. `default/web`).
+    pub job: String,
+    /// Full URL of the endpoint, e.g. `http://127.0.0.1:9100/metrics`.
+    pub url: String,
 }
 
 /// Log collection configuration (Ketchup).
@@ -1116,6 +1135,36 @@ mod tests {
         assert_eq!(nc.metrics.retention_days, 30);
         assert_eq!(nc.metrics.object_store_url, "s3://my-bucket/metrics");
         assert!(!nc.metrics.alerts_enabled);
+    }
+
+    #[test]
+    fn scrape_targets_default_empty() {
+        let nc = NodeConfig::parse("").unwrap();
+        assert!(nc.metrics.scrape_targets.is_empty());
+    }
+
+    #[test]
+    fn scrape_targets_parse() {
+        let toml_str = r#"
+            [metrics]
+            scrape_interval_secs = 15
+
+            [[metrics.scrape_targets]]
+            job = "default/web"
+            url = "http://127.0.0.1:9100/metrics"
+
+            [[metrics.scrape_targets]]
+            job = "default/api"
+            url = "http://127.0.0.1:9200/metrics"
+        "#;
+        let nc = NodeConfig::parse(toml_str).unwrap();
+        assert_eq!(nc.metrics.scrape_interval_secs, 15);
+        assert_eq!(nc.metrics.scrape_targets.len(), 2);
+        assert_eq!(nc.metrics.scrape_targets[0].job, "default/web");
+        assert_eq!(
+            nc.metrics.scrape_targets[0].url,
+            "http://127.0.0.1:9100/metrics"
+        );
     }
 
     #[test]

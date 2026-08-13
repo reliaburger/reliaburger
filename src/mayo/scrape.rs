@@ -77,9 +77,110 @@ pub async fn scrape_endpoint(url: &str) -> Vec<CollectedMetric> {
     parse_prometheus_text(&body)
 }
 
+/// Tag parsed samples with a target's `job` (as the `app` label) and ingest
+/// them into the shared Mayo store. Returns how many samples were ingested.
+///
+/// Split out from [`scrape_once`] so the parse-and-ingest path is unit-testable
+/// without a live HTTP endpoint. The `app` label is what the per-app dashboards
+/// and `/v1/metrics/app/...` queries filter on, so a scraped target shows up
+/// alongside the process metrics the collector produces for the same app.
+pub async fn ingest_samples(
+    store: &tokio::sync::RwLock<super::store::MayoStore>,
+    metrics: Vec<CollectedMetric>,
+    job: &str,
+) -> usize {
+    if metrics.is_empty() {
+        return 0;
+    }
+    let mut guard = store.write().await;
+    let mut ingested = 0;
+    for mut metric in metrics {
+        // The target's own labels stay; `app` lets per-app views find it.
+        metric.key.labels.insert("app".to_string(), job.to_string());
+        guard.insert_now(&metric.key, metric.value);
+        ingested += 1;
+    }
+    ingested
+}
+
+/// Scrape every configured Prometheus target once and ingest the results.
+///
+/// This is the entry point a periodic scrape loop calls on each tick. Targets
+/// are scraped in turn; a target that fails (connection refused, timeout, bad
+/// body) contributes nothing rather than failing the whole sweep, since not
+/// every declared endpoint is guaranteed up. Returns the total number of
+/// samples ingested across all targets.
+///
+/// # Integrator hook
+///
+/// There is no scrape loop yet — the natural home is `src/bin/bun.rs`, next to
+/// the metrics collection loop that already owns the `mayo_store` handle. The
+/// integrator should spawn a task that ticks every
+/// `config.metrics.scrape_interval_secs` and calls
+/// `scrape_once(&mayo_store, &targets)`, where `targets` is built from
+/// `config.metrics.scrape_targets` (`(job, url)` pairs). An empty target list
+/// means the loop need not be spawned at all.
+pub async fn scrape_once(
+    store: &tokio::sync::RwLock<super::store::MayoStore>,
+    targets: &[(String, String)],
+) -> usize {
+    let mut ingested = 0;
+    for (job, url) in targets {
+        let metrics = scrape_endpoint(url).await;
+        ingested += ingest_samples(store, metrics, job).await;
+    }
+    ingested
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn ingest_samples_parses_and_ingests_with_app_label() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = tokio::sync::RwLock::new(super::super::store::MayoStore::new(
+            dir.path().to_path_buf(),
+        ));
+
+        let body = "\
+# TYPE http_requests_total counter
+http_requests_total{method=\"GET\"} 5
+http_requests_total{method=\"POST\"} 2
+";
+        let metrics = parse_prometheus_text(body);
+        let ingested = ingest_samples(&store, metrics, "default/web").await;
+        assert_eq!(ingested, 2);
+
+        let guard = store.read().await;
+        assert_eq!(guard.buffer_len(), 2);
+        drop(guard);
+
+        // The `app` label the per-app views filter on is present.
+        let store = store.into_inner();
+        let rows = store
+            .query_sql(
+                "SELECT timestamp, metric_name, labels, value FROM metrics \
+                 WHERE labels LIKE '%default/web%'",
+            )
+            .await
+            .unwrap();
+        assert_eq!(rows.len(), 2);
+        assert!(
+            rows.iter()
+                .all(|(_, name, _, _)| name == "http_requests_total")
+        );
+    }
+
+    #[tokio::test]
+    async fn ingest_samples_empty_is_noop() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = tokio::sync::RwLock::new(super::super::store::MayoStore::new(
+            dir.path().to_path_buf(),
+        ));
+        assert_eq!(ingest_samples(&store, Vec::new(), "job").await, 0);
+        assert_eq!(store.read().await.buffer_len(), 0);
+    }
 
     #[test]
     fn parse_simple_gauge() {
