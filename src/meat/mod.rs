@@ -8,6 +8,7 @@ pub mod batch;
 pub mod batch_tracker;
 pub mod blue_green;
 pub mod cluster_state;
+pub mod cron;
 pub mod deploy_types;
 pub mod filter;
 pub mod orchestrator;
