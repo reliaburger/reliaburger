@@ -125,22 +125,21 @@ pub struct SyncState {
     pub last_diff_summary: Option<DiffSummary>,
     /// History of recent syncs (ring buffer, max 100).
     ///
-    /// **Never written by the runner (O20).** The sync loop maintains the
-    /// scalar fields above — `last_applied_commit`, `phase`,
-    /// `consecutive_failures`, `last_error` — and leaves this empty, so
-    /// anything reading it sees "no syncs have happened" no matter how many
-    /// have. Populating it is a small piece of work in
-    /// [`crate::lettuce::runner`]; it's recorded here rather than in a review
-    /// document so the next reader of this struct doesn't trust it.
+    /// The runner appends one entry per completed sync — every success and
+    /// every commit-bearing failure — and drops the oldest once the ring is
+    /// full (`runner::push_history`). Repo-access and panic failures never
+    /// reach a commit, so they update the scalar `last_error` above without an
+    /// entry here. Brioche's GitOps page renders this as the sync timeline.
     pub history: VecDeque<SyncHistoryEntry>,
     /// Node ID of the current GitOps coordinator.
     ///
-    /// **Informational only (O20).** The runner sets this from
-    /// `elect_coordinator`, but leadership is what actually gates syncing —
-    /// the loop is spawned leader-only and re-checks Raft leadership each
-    /// tick. Nothing reads this field to decide whether to sync, so a stale
-    /// or wrong value can't cause two nodes to sync at once. It exists for
-    /// operator visibility, not exclusion.
+    /// The coordinator **is** the Raft leader — the only node that can apply a
+    /// sync, since only the leader writes desired state. The runner stamps the
+    /// leader's name here on each recorded sync (`runner::record_coordinator`),
+    /// so this reflects the node actually driving syncs, and a leadership
+    /// handover shows up as a `CoordinatorElectionReason::Failover`. Failover
+    /// therefore rides on Raft leader election rather than a separate protocol;
+    /// the field is honest visibility, not an exclusion mechanism.
     pub coordinator_node_id: Option<String>,
 }
 

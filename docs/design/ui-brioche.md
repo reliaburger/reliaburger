@@ -20,10 +20,9 @@ Three pages ship today, plus a login page:
 - **App detail** (route `/ui/app/{app}/{namespace}`) -- CPU/memory charts, instance status, deploy history, environment variables, current image
 - **Node detail** (route `/ui/node/{name}`) -- resource utilisation, running apps, disk usage, GPU status
 
-The following pages are **planned — not yet implemented** as standalone views:
+The **GitOps status** page (`/ui/gitops`) now ships (§5.5). The following pages remain **planned — not yet implemented** as standalone views:
 
 - **Ingress overview** -- request volume, latency distribution, error rates by route, TLS certificate status
-- **GitOps status** -- sync state, last applied commit, diff preview, sync history
 - **Alert dashboard** -- active alerts, alert history, suppression status (alerts currently appear only as a fragment on the cluster overview, not as a dedicated page)
 - **Jobs view** -- running/completed/failed jobs, batch queue depth, execution duration
 
@@ -114,10 +113,10 @@ Within a page, HTMX swaps small fragments in place via `/ui/fragment/*` polling.
 /ui/static/{*path}             → Embedded CSS/JS/font assets
 ```
 
-**Planned — not yet implemented:** dedicated `/ui/ingress`, `/ui/gitops`,
-`/ui/alerts`, `/ui/jobs`, and `/ui/settings` pages, and per-resource detail
-routes (ingress route detail, job detail). App logs and deploy history render
-inside the app-detail page rather than at their own routes.
+`/ui/gitops` now ships (§5.5). Still **planned — not yet implemented:** dedicated
+`/ui/ingress`, `/ui/alerts`, `/ui/jobs`, and `/ui/settings` pages, and
+per-resource detail routes (ingress route detail, job detail). App logs and
+deploy history render inside the app-detail page rather than at their own routes.
 
 ### 3.3 Request Routing
 
@@ -1090,9 +1089,12 @@ Clicking a route row opens a detail view with per-route time-series charts and t
 
 ### 5.5 GitOps Status Page
 
-> **Status: planned — not yet implemented.** No GitOps page ships today. Lettuce
-> maintains sync state, but there is no dedicated Brioche view for it yet; the
-> layout below is the target design.
+> **Status: implemented.** `GET /ui/gitops` (`brioche::gitops::render_gitops`)
+> renders Lettuce's sync state: current phase, coordinator, failure count, last
+> error, the last-applied commit (short SHA, message, author, signature, applied
+> time), and a newest-first sync-history table. It reads
+> `council.desired_state().gitops_sync_state`, and a GitOps link sits in the
+> shared nav.
 
 Accessed via `/gitops`.
 

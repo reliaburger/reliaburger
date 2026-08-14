@@ -940,15 +940,16 @@ The `relish` CLI uses the age public key to encrypt. No cluster access required.
 
 ### 5.6 Raft Log Encryption
 
-> **Status: planned — implemented but not yet wired.** The encryption routines
-> (HKDF derivation, AES-256-GCM entry seal/open) exist in
-> `sesame::raft_encryption` and are unit-tested, but nothing calls them:
-> `council::durable_log` currently serialises entries as plaintext (JSON for
-> `RaftRequest`, bincode for votes/log-ids). The steps below describe the
-> intended design, not current behaviour. The additional HKDF *wrapping* of
-> sensitive keys **inside** the log (age key, CA keys) — step 5 — is real and
-> does ship; it is the outer whole-log encryption that is not yet active. TPM
-> sealing (step 2) is not implemented.
+> **Status: implemented (with a cluster master key).** `council::durable_log`
+> now routes entry values through `sesame::raft_encryption` (HKDF derivation,
+> AES-256-GCM seal/open) whenever `open_with_key` is given a cluster master key.
+> Encrypted entries carry a one-byte marker and a per-entry salt+nonce; a
+> plaintext entry (leading `{`) still decodes, so plaintext and encrypted logs
+> interoperate and a keyless/dev cluster stays plaintext. An encrypted entry
+> opened without the key errors rather than reading as empty (CP3-safe). Vote and
+> log-id metadata remain plaintext bincode (not app data). The HKDF *wrapping* of
+> sensitive keys inside the log (step 5) ships as before. TPM sealing (step 2) is
+> still not implemented.
 
 On each council node (intended design):
 

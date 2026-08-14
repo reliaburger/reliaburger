@@ -19,7 +19,13 @@ use crate::council::types::{DesiredState, RaftRequest};
 use super::diff::{ChangePayload, ResourceChange};
 use super::git::GitRepo;
 use super::sync::{SyncOutcome, execute_sync};
-use super::types::{GitOpsConfig, SyncPhase, SyncResult};
+use super::types::{
+    CommitInfo, CoordinatorElection, CoordinatorElectionReason, GitOpsConfig, SyncHistoryEntry,
+    SyncPhase, SyncResult, SyncState,
+};
+
+/// How many past syncs `SyncState.history` retains (oldest dropped first).
+const MAX_SYNC_HISTORY: usize = 100;
 
 /// Spawn the leader-only GitOps sync loop.
 ///
@@ -72,9 +78,12 @@ pub fn spawn_gitops_sync(
                 .and_then(|s| s.last_applied_commit.as_ref())
                 .map(|c| c.sha.clone());
 
-            // Git operations shell out — keep them off the runtime.
+            // Git operations shell out — keep them off the runtime. Time the
+            // whole cycle so each history entry and `last_sync_duration_ms`
+            // reflect how long the sync actually took.
             let config_clone = config.clone();
             let repo_dir_clone = repo_dir.clone();
+            let started = std::time::Instant::now();
             let outcome = tokio::task::spawn_blocking(move || {
                 let repo = GitRepo::clone_or_open(
                     &config_clone.repo,
@@ -92,18 +101,33 @@ pub fn spawn_gitops_sync(
                 ))
             })
             .await;
+            let duration_ms = started.elapsed().as_millis() as u64;
 
             let outcome = match outcome {
                 Ok(Ok(outcome)) => outcome,
                 Ok(Err(e)) => {
                     consecutive_failures = consecutive_failures.saturating_add(1);
-                    record_failure(&council, &desired, &format!("repo access failed: {e}")).await;
+                    record_failure(
+                        &council,
+                        &desired,
+                        &format!("repo access failed: {e}"),
+                        None,
+                        duration_ms,
+                    )
+                    .await;
                     backoff(poll, consecutive_failures, &shutdown).await;
                     continue;
                 }
                 Err(e) => {
                     consecutive_failures = consecutive_failures.saturating_add(1);
-                    record_failure(&council, &desired, &format!("sync task panicked: {e}")).await;
+                    record_failure(
+                        &council,
+                        &desired,
+                        &format!("sync task panicked: {e}"),
+                        None,
+                        duration_ms,
+                    )
+                    .await;
                     backoff(poll, consecutive_failures, &shutdown).await;
                     continue;
                 }
@@ -114,7 +138,14 @@ pub fn spawn_gitops_sync(
                 SyncResult::Skipped { .. } => continue,
                 SyncResult::Failure { error } => {
                     consecutive_failures = consecutive_failures.saturating_add(1);
-                    record_failure(&council, &desired, error).await;
+                    record_failure(
+                        &council,
+                        &desired,
+                        error,
+                        outcome.commit.as_ref(),
+                        duration_ms,
+                    )
+                    .await;
                     backoff(poll, consecutive_failures, &shutdown).await;
                     continue;
                 }
@@ -152,6 +183,8 @@ pub fn spawn_gitops_sync(
                             "apply of {sha} failed at {unapplied}; commit not advanced, \
                              will retry"
                         ),
+                        outcome.commit.as_ref(),
+                        duration_ms,
                     )
                     .await;
                     backoff(poll, consecutive_failures, &shutdown).await;
@@ -163,7 +196,7 @@ pub fn spawn_gitops_sync(
             // commit (D12) plus the elected coordinator, then clear the
             // durable error.
             consecutive_failures = 0;
-            record_success(&council, &desired, &outcome).await;
+            record_success(&council, &desired, &outcome, duration_ms).await;
 
             if applied > 0 {
                 println!(
@@ -197,17 +230,47 @@ async fn backoff(poll: Duration, consecutive_failures: u32, shutdown: &Cancellat
 /// Before this, a failed sync only hit stderr, so relish and the UI
 /// couldn't tell a broken sync from a quiet one. Now the last error,
 /// failure count and attempt time land in Raft.
-async fn record_failure(council: &CouncilNode, desired: &DesiredState, error: &str) {
+async fn record_failure(
+    council: &CouncilNode,
+    desired: &DesiredState,
+    error: &str,
+    commit: Option<&CommitInfo>,
+    duration_ms: u64,
+) {
     // Redact any credential embedded in a URL before the error is echoed or
     // written to Raft `last_error` (M27) — defence in depth on top of the
     // source-level redaction in `git::redact_git_output`.
     let error = super::git::redact_url_credentials(error);
     eprintln!("gitops: sync failed: {error}");
+    let now = now_millis();
     let mut sync_state = desired.gitops_sync_state.clone().unwrap_or_default();
     sync_state.phase = SyncPhase::Error;
     sync_state.last_error = Some(error.clone());
     sync_state.consecutive_failures = sync_state.consecutive_failures.saturating_add(1);
-    sync_state.last_attempt_at = Some(now_millis());
+    sync_state.last_attempt_at = Some(now);
+    sync_state.last_sync_duration_ms = duration_ms;
+
+    // A history entry is per-commit: repo-access and panic failures never
+    // reached a commit, so there is nothing to attribute the failure to and
+    // we record only the scalar error above. A commit-bearing failure (a bad
+    // signature, a parse/validation error, a half-applied set) does get an
+    // entry so the run shows up in the UI's timeline.
+    if let Some(commit) = commit {
+        push_history(
+            &mut sync_state,
+            SyncHistoryEntry {
+                commit: commit.clone(),
+                timestamp: now,
+                duration_ms,
+                result: SyncResult::Failure {
+                    error: error.clone(),
+                },
+                diff_summary: None,
+            },
+        );
+    }
+
+    record_coordinator(council, &mut sync_state).await;
     if let Err(e) = council
         .write(RaftRequest::GitOpsSyncUpdate(Box::new(sync_state)))
         .await
@@ -217,26 +280,40 @@ async fn record_failure(council: &CouncilNode, desired: &DesiredState, error: &s
 }
 
 /// Record a clean sync in `SyncState`: advance the applied commit, clear
-/// the error, reset the failure count and stamp the elected coordinator.
-async fn record_success(council: &CouncilNode, desired: &DesiredState, outcome: &SyncOutcome) {
+/// the error, reset the failure count, append a history entry and stamp the
+/// coordinator.
+async fn record_success(
+    council: &CouncilNode,
+    desired: &DesiredState,
+    outcome: &SyncOutcome,
+    duration_ms: u64,
+) {
     let Some(commit) = &outcome.commit else {
         return;
     };
+    let now = now_millis();
     let mut sync_state = desired.gitops_sync_state.clone().unwrap_or_default();
     sync_state.last_applied_commit = Some(commit.clone());
     sync_state.last_fetched_commit = Some(commit.clone());
     sync_state.phase = SyncPhase::Idle;
     sync_state.last_error = None;
     sync_state.consecutive_failures = 0;
-    sync_state.last_sync_at = Some(now_millis());
-    sync_state.last_attempt_at = Some(now_millis());
+    sync_state.last_sync_at = Some(now);
+    sync_state.last_attempt_at = Some(now);
+    sync_state.last_sync_duration_ms = duration_ms;
     sync_state.last_diff_summary = outcome.diff_summary.clone();
     sync_state.file_errors = outcome.file_errors.clone();
-    // Elect the GitOps coordinator from the current council so relish/the
-    // UI can show who runs syncs. The leader still drives the sync (only
-    // it can write to Raft), so the coordinator *complements* leadership
-    // rather than replacing it — see chapter 7.
-    sync_state.coordinator_node_id = elect_coordinator(council).await;
+    push_history(
+        &mut sync_state,
+        SyncHistoryEntry {
+            commit: commit.clone(),
+            timestamp: now,
+            duration_ms,
+            result: outcome.result.clone(),
+            diff_summary: outcome.diff_summary.clone(),
+        },
+    );
+    record_coordinator(council, &mut sync_state).await;
     if let Err(e) = council
         .write(RaftRequest::GitOpsSyncUpdate(Box::new(sync_state)))
         .await
@@ -245,11 +322,44 @@ async fn record_success(council: &CouncilNode, desired: &DesiredState, outcome: 
     }
 }
 
-/// Elect the GitOps coordinator from the current council membership.
+/// Append a sync to `history`, dropping the oldest once it exceeds
+/// [`MAX_SYNC_HISTORY`]. A `VecDeque` gives O(1) push/pop at both ends, so the
+/// ring stays bounded without ever reallocating the whole buffer.
+fn push_history(sync_state: &mut SyncState, entry: SyncHistoryEntry) {
+    sync_state.history.push_back(entry);
+    while sync_state.history.len() > MAX_SYNC_HISTORY {
+        sync_state.history.pop_front();
+    }
+}
+
+/// Stamp the current GitOps coordinator into `sync_state`, honestly.
 ///
-/// Prefers a non-leader member to spread load; falls back to the leader
-/// on a single-node cluster. Returns `None` if membership is unknown.
-async fn elect_coordinator(council: &CouncilNode) -> Option<String> {
+/// The coordinator is the Raft leader — the only node that can apply a sync
+/// (see [`super::sync::coordinator_for_leader`]). We compare against the
+/// previously-recorded coordinator so a leadership handover is logged as a
+/// failover rather than silently swapping the name.
+async fn record_coordinator(council: &CouncilNode, sync_state: &mut SyncState) {
+    let previous = sync_state.coordinator_node_id.clone();
+    if let Some(election) = current_coordinator(council, previous.as_deref()).await {
+        if election.reason == CoordinatorElectionReason::Failover {
+            println!(
+                "gitops: coordinator failover — {} now drives syncs (was {})",
+                election.node_id,
+                previous.as_deref().unwrap_or("?")
+            );
+        }
+        sync_state.coordinator_node_id = Some(election.node_id);
+    }
+}
+
+/// The current GitOps coordinator, derived from Raft leadership.
+///
+/// Returns `None` when leadership is unknown (no metrics yet). Otherwise the
+/// leader's node name, tagged `Initial` or `Failover` relative to `previous`.
+async fn current_coordinator(
+    council: &CouncilNode,
+    previous: Option<&str>,
+) -> Option<CoordinatorElection> {
     let metrics = council.metrics().borrow().clone();
     let leader_id = metrics.current_leader?;
     let membership = metrics.membership_config.membership().clone();
@@ -257,16 +367,11 @@ async fn elect_coordinator(council: &CouncilNode) -> Option<String> {
         .nodes()
         .find(|(id, _)| **id == leader_id)
         .map(|(_, info)| info.name.clone())?;
-    let members: Vec<String> = membership
-        .nodes()
-        .map(|(_, info)| info.name.clone())
-        .collect();
-    super::coordinator::select_coordinator(
-        &members,
+    Some(super::sync::coordinator_for_leader(
         &leader_name,
-        super::types::CoordinatorElectionReason::Initial,
-    )
-    .map(|election| election.node_id)
+        previous,
+        now_millis(),
+    ))
 }
 
 /// Current Unix time in milliseconds.
@@ -376,7 +481,57 @@ fn change_id(change: &ResourceChange) -> &str {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::lettuce::types::{DiffSummary, SignatureStatus};
     use crate::meat::types::AppId;
+
+    fn sample_commit(sha: &str) -> CommitInfo {
+        CommitInfo {
+            sha: sha.to_string(),
+            message: "test commit".to_string(),
+            author: "dev".to_string(),
+            timestamp: 1700000000000,
+            signature: SignatureStatus::NotChecked,
+        }
+    }
+
+    fn sample_entry(sha: &str) -> SyncHistoryEntry {
+        SyncHistoryEntry {
+            commit: sample_commit(sha),
+            timestamp: 1700000000000,
+            duration_ms: 5,
+            result: SyncResult::Success,
+            diff_summary: Some(DiffSummary {
+                added: 1,
+                modified: 0,
+                removed: 0,
+            }),
+        }
+    }
+
+    #[test]
+    fn push_history_appends_in_order() {
+        let mut state = SyncState::default();
+        push_history(&mut state, sample_entry("aaa"));
+        push_history(&mut state, sample_entry("bbb"));
+        assert_eq!(state.history.len(), 2);
+        assert_eq!(state.history.front().unwrap().commit.sha, "aaa");
+        assert_eq!(state.history.back().unwrap().commit.sha, "bbb");
+    }
+
+    #[test]
+    fn push_history_is_bounded_and_drops_the_oldest() {
+        let mut state = SyncState::default();
+        for i in 0..(MAX_SYNC_HISTORY + 50) {
+            push_history(&mut state, sample_entry(&format!("c{i}")));
+        }
+        assert_eq!(state.history.len(), MAX_SYNC_HISTORY);
+        // The oldest 50 were evicted; the window now starts at c50.
+        assert_eq!(state.history.front().unwrap().commit.sha, "c50");
+        assert_eq!(
+            state.history.back().unwrap().commit.sha,
+            format!("c{}", MAX_SYNC_HISTORY + 49)
+        );
+    }
 
     #[test]
     fn app_removal_parses_the_full_namespaced_identity() {

@@ -8,7 +8,7 @@
 use std::collections::HashSet;
 use std::path::PathBuf;
 use std::sync::Arc;
-use std::time::SystemTime;
+use std::time::{Duration, SystemTime};
 
 use datafusion::arrow::array::{Array, Float64Array, StringArray, UInt32Array, UInt64Array};
 use datafusion::arrow::datatypes::{DataType, Field, Schema};
@@ -587,6 +587,26 @@ impl RollupStore {
         }
         Ok(deleted)
     }
+
+    /// Prune rollups older than `retention`, measured back from `now`.
+    ///
+    /// A thin convenience over [`prune`](Self::prune) for the periodic
+    /// maintenance tick: it turns the operator-facing `[metrics]
+    /// rollup_retention_hours` (a `Duration`) into the absolute cutoff
+    /// timestamp `prune` expects. A zero `retention` keeps everything —
+    /// matching the "0 means unlimited" convention the other storage limits
+    /// use — so an unconfigured council never deletes rollups by surprise.
+    pub fn prune_expired(&self, now: SystemTime, retention: Duration) -> Result<usize, MayoError> {
+        if retention.is_zero() {
+            return Ok(0);
+        }
+        let now_secs = now
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+        let before = now_secs.saturating_sub(retention.as_secs());
+        self.prune(before)
+    }
 }
 
 /// A cluster-wide aggregate row with full statistics.
@@ -1038,6 +1058,37 @@ mod tests {
         store.ingest(&make_rollup("n2", 1000, "cpu", 20.0));
         store.flush().await.unwrap();
         assert_eq!(store.prune(0).unwrap(), 0);
+    }
+
+    #[tokio::test]
+    async fn prune_expired_drops_rollups_past_retention() {
+        // A rollup written with an old window timestamp is dropped once its age
+        // exceeds the retention, while a fresh one survives.
+        let (mut store, _dir) = test_store();
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+
+        // One window two hours old, flushed to its own file.
+        store.ingest(&make_rollup("n1", now - 7200, "cpu", 10.0));
+        store.flush().await.unwrap();
+
+        // Retaining one hour must delete the two-hour-old file.
+        let deleted = store
+            .prune_expired(std::time::SystemTime::now(), Duration::from_secs(3600))
+            .unwrap();
+        assert_eq!(deleted, 1);
+
+        // A zero retention keeps everything, even stale data.
+        store.ingest(&make_rollup("n2", now - 7200, "cpu", 20.0));
+        store.flush().await.unwrap();
+        assert_eq!(
+            store
+                .prune_expired(std::time::SystemTime::now(), Duration::ZERO)
+                .unwrap(),
+            0
+        );
     }
 
     #[test]

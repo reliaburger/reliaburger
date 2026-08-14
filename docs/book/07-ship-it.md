@@ -150,7 +150,19 @@ There was a leak here worth calling out. Rollback reverts the steps that *comple
 
 Jobs can declare `run_before = ["app.web"]`, meaning they must complete before the rolling phase begins. Database migrations are the classic example: you want `migrate` to finish before `web` gets the new code.
 
-The orchestrator runs all pre-deploy jobs first. If any fail, the deploy fails immediately. No instances are modified. Clean.
+The orchestrator models this as a `RunningPreDeps` phase. If any pre-deploy job fails, the deploy fails immediately and no instances are modified.
+
+## From the model to the wired path
+
+Here's a honesty note that's easy to skip past. Everything above — `DeployOrchestrator`, the `DeployDriver` trait, `execute_blue_green`, the exhaustive rollback tests — is a *model* of the deploy state machine. It's driven in tests by `MockDriver`, and it's where we work out the tricky transitions in microseconds. But it is not the code that runs on a node. The path that actually deploys your app lives in the Bun agent: `rolling_redeploy`, `blue_green_redeploy`, and an inline `run_before` gate, each calling the supervisor and the container runtime directly.
+
+Why two versions of the same logic? Look back at the `DeployDriver` trait — every method is a plain `fn`, synchronous. The agent is `async` top to bottom: starting a container, waiting on a health probe, draining connections are all `.await` points. A synchronous trait can't `.await`, and bridging the two (blocking on a runtime handle inside an async task) is exactly the kind of thing that deadlocks under load. So the wired path is hand-rolled against the async supervisor, and the synchronous orchestrator stays as the model we test against. That's the honest state of it — the same trade-off you'll hit any time a clean synchronous abstraction meets an async runtime.
+
+So what's actually wired:
+
+- **`run_before`** — before an app deploys, the agent runs every job naming it in `run_before` to completion, polling the runtime until the job exits and gating on a clean exit code. A failure aborts the deploy; a gating job runs exactly once and is skipped in the regular jobs loop.
+- **Blue-green** — `strategy = "blue-green"` dispatches to `blue_green_redeploy`, which brings the whole green fleet up and health-checks it while blue keeps serving, then swaps routing over and retires blue in one move. A green failure leaves blue untouched.
+- **Scheduled jobs** — a job with a `schedule = "0 3 * * *"` doesn't run at deploy time at all. It's parsed by a small dependency-free cron matcher (`meat::cron`) and fired by the agent's one-second event-loop tick when its UTC minute matches, at most once per minute.
 
 ## Raft persistence
 

@@ -338,6 +338,34 @@ pub fn backoff_delay(base_interval: Duration, consecutive_failures: u32) -> Dura
     base_interval * multiplier
 }
 
+/// Decide the GitOps coordinator when `leader` is the node driving syncs.
+///
+/// The coordinator **is** the Raft leader. Only the leader can write desired
+/// state, so only it can apply a sync; the sync loop is leader-gated for
+/// exactly that reason. Making the coordinator anything other than the leader
+/// would name a node that never actually runs a sync — which is what the old
+/// "pick a non-leader" selection did, and why the field read as fiction.
+///
+/// Failover therefore rides on Raft leader election: when a new node wins
+/// leadership its loop takes over and records itself here. The returned reason
+/// distinguishes the first election (`Initial`) from a handover (`Failover`)
+/// so operators can see the coordinator move.
+pub fn coordinator_for_leader(
+    leader: &str,
+    previous: Option<&str>,
+    now_ms: u64,
+) -> CoordinatorElection {
+    let reason = match previous {
+        Some(prev) if prev != leader => CoordinatorElectionReason::Failover,
+        _ => CoordinatorElectionReason::Initial,
+    };
+    CoordinatorElection {
+        node_id: leader.to_string(),
+        reason,
+        timestamp: now_ms,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -587,6 +615,28 @@ mod tests {
             outcome.changes.is_empty(),
             "a validation failure must emit no changes"
         );
+    }
+
+    #[test]
+    fn coordinator_is_the_leader_and_first_election_is_initial() {
+        // No previous coordinator: the leader takes the role fresh.
+        let election = coordinator_for_leader("node-01", None, 1000);
+        assert_eq!(election.node_id, "node-01");
+        assert_eq!(election.reason, CoordinatorElectionReason::Initial);
+
+        // Same leader as before: still Initial (no handover happened).
+        let unchanged = coordinator_for_leader("node-01", Some("node-01"), 1000);
+        assert_eq!(unchanged.reason, CoordinatorElectionReason::Initial);
+    }
+
+    #[test]
+    fn coordinator_change_records_a_failover() {
+        // Leadership moved from node-01 to node-02; the new leader records the
+        // handover so operators see the coordinator move.
+        let election = coordinator_for_leader("node-02", Some("node-01"), 2000);
+        assert_eq!(election.node_id, "node-02");
+        assert_eq!(election.reason, CoordinatorElectionReason::Failover);
+        assert_eq!(election.timestamp, 2000);
     }
 
     #[test]

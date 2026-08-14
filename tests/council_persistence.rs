@@ -36,7 +36,7 @@ fn node_info() -> CouncilNodeInfo {
 /// some config, snapshot, and purge the compacted log prefix. Everything is
 /// dropped before returning so the redb files can be reopened.
 async fn run_and_compact(raft_dir: &Path) {
-    let (log_store, store_fresh, state_machine) = open_raft_storage(raft_dir).await.unwrap();
+    let (log_store, store_fresh, state_machine) = open_raft_storage(raft_dir, None).await.unwrap();
     assert!(store_fresh, "a brand new store must read as fresh");
 
     let router = InMemoryRaftRouter::new();
@@ -136,7 +136,8 @@ async fn compacted_snapshot_restores_state_across_restart() {
     let raft_dir = dir.path().join("raft");
     run_and_compact(&raft_dir).await;
 
-    let (_log_store, store_fresh, state_machine) = open_raft_storage(&raft_dir).await.unwrap();
+    let (_log_store, store_fresh, state_machine) =
+        open_raft_storage(&raft_dir, None).await.unwrap();
     assert!(!store_fresh, "a restarted store must not read as fresh");
     let state = state_machine.desired_state().await;
     for i in 0..5 {
@@ -157,7 +158,7 @@ async fn compacted_then_corrupted_snapshot_refuses_restart() {
     run_and_compact(&raft_dir).await;
     flip_stored_byte(&raft_dir.join("snapshot.redb"), SNAP_DATA_KEY);
 
-    let err = match open_raft_storage(&raft_dir).await {
+    let err = match open_raft_storage(&raft_dir, None).await {
         Ok(_) => panic!("a corrupt snapshot after compaction must refuse startup"),
         Err(e) => e,
     };
@@ -176,7 +177,7 @@ async fn compacted_then_missing_snapshot_refuses_restart() {
     run_and_compact(&raft_dir).await;
     delete_stored_snapshot(&raft_dir.join("snapshot.redb"));
 
-    let err = match open_raft_storage(&raft_dir).await {
+    let err = match open_raft_storage(&raft_dir, None).await {
         Ok(_) => panic!("a missing snapshot after compaction must refuse startup"),
         Err(e) => e,
     };

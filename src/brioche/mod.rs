@@ -9,6 +9,7 @@ pub mod app_detail;
 pub mod assets;
 pub mod dashboard;
 pub mod fragments;
+pub mod gitops;
 pub mod login;
 pub mod node_detail;
 pub mod types;

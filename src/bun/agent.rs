@@ -34,6 +34,25 @@ use super::supervisor::{WorkloadInstance, WorkloadSupervisor};
 /// init wait so a hung init can't wedge the agent event loop indefinitely.
 const INIT_TIMEOUT_SECS: u64 = 300;
 
+/// Maximum time a `run_before` prerequisite job may run before the gated
+/// deploy is aborted. Migrations are the classic case; a hung one must not
+/// wedge the deploy forever.
+const RUN_BEFORE_TIMEOUT_SECS: u64 = 600;
+
+/// A job registered to run on a cron schedule rather than at deploy time.
+///
+/// `last_fired_minute` is the epoch-minute stamp of the most recent firing. The
+/// cron tick runs every second but a schedule matches to minute resolution, so
+/// we only fire when the stamp changes — otherwise a `* * * * *` job would fire
+/// sixty times a minute.
+struct ScheduledJob {
+    name: String,
+    namespace: String,
+    schedule: crate::meat::cron::CronSchedule,
+    spec: JobSpec,
+    last_fired_minute: Option<i64>,
+}
+
 /// How many event-loop ticks (~1s each) between attempts to provision an
 /// identity for a running instance that has none — frequent enough to heal
 /// promptly, infrequent enough not to hammer an unreachable council.
@@ -1299,6 +1318,9 @@ pub struct BunAgent<G: Grill> {
     /// A wall-clock generation collided when two redeploys landed in the
     /// same second; this never repeats within a process.
     next_deploy_gen: u64,
+    /// Jobs carrying a `schedule`, registered on apply and fired by the cron
+    /// tick. Keyed by (name, namespace) so a re-apply replaces the entry.
+    scheduled_jobs: std::collections::HashMap<(String, String), ScheduledJob>,
     /// Sink for container log lines. When set, each started instance spawns a
     /// forwarder that streams its output here (drained into the LogStore).
     log_tx: Option<mpsc::Sender<crate::ketchup::types::LogRecord>>,
@@ -1422,6 +1444,7 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
             netns_paths: std::collections::HashMap::new(),
             deployed_specs: std::collections::HashMap::new(),
             next_deploy_gen: 1,
+            scheduled_jobs: std::collections::HashMap::new(),
             log_tx: None,
             events: None,
             capacity_cpu_millicores: 0,
@@ -1514,6 +1537,7 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
             netns_paths: std::collections::HashMap::new(),
             deployed_specs: std::collections::HashMap::new(),
             next_deploy_gen: 1,
+            scheduled_jobs: std::collections::HashMap::new(),
             log_tx: None,
             events: None,
             capacity_cpu_millicores: 0,
@@ -2256,6 +2280,7 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
                     }
                     self.run_health_checks().await;
                     self.check_jobs().await;
+                    self.fire_due_jobs().await;
                     self.check_apps().await;
                     self.drive_pending_restarts().await;
                     self.expire_faults().await;
@@ -2583,6 +2608,10 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
                     let _ = events.send(ApplyEvent::Error { message }).await;
                     return;
                 }
+                // Register any cron-scheduled jobs so the event loop fires them
+                // on their schedule rather than at deploy time (E).
+                self.register_scheduled_jobs(&config);
+
                 // Forward deploy events to the caller, mirroring errors into the
                 // event store. The deploy itself runs on its own task so a slow
                 // pull or a rolling health wait can't wedge this loop
@@ -5601,6 +5630,108 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
         }
     }
 
+    /// Register (or refresh) the cron-scheduled jobs from an applied config.
+    ///
+    /// A job with a `schedule` is not run at deploy time; it's parked here and
+    /// fired by [`fire_due_jobs`](Self::fire_due_jobs) when its cron matches.
+    /// Re-applying an unchanged schedule preserves its last-fired stamp so the
+    /// same minute doesn't fire twice; a parse failure is logged and skipped.
+    fn register_scheduled_jobs(&mut self, config: &Config) {
+        for (name, spec) in &config.job {
+            let Some(expression) = spec.schedule.as_deref() else {
+                continue;
+            };
+            let namespace = spec
+                .namespace
+                .clone()
+                .unwrap_or_else(|| "default".to_string());
+            match crate::meat::cron::CronSchedule::parse(expression) {
+                Ok(schedule) => {
+                    let key = (name.clone(), namespace.clone());
+                    let last_fired_minute = self
+                        .scheduled_jobs
+                        .get(&key)
+                        .filter(|existing| existing.schedule == schedule)
+                        .and_then(|existing| existing.last_fired_minute);
+                    self.scheduled_jobs.insert(
+                        key,
+                        ScheduledJob {
+                            name: name.clone(),
+                            namespace,
+                            schedule,
+                            spec: spec.clone(),
+                            last_fired_minute,
+                        },
+                    );
+                }
+                Err(error) => {
+                    eprintln!("cron: job {name} has invalid schedule {expression:?}: {error}");
+                }
+            }
+        }
+    }
+
+    /// Fire every scheduled job whose cron matches the current UTC minute.
+    ///
+    /// Called on the 1s event-loop tick, but a schedule only resolves to the
+    /// minute, so each job fires at most once per matching minute (guarded by
+    /// its epoch-minute stamp). Firing reuses the normal job deploy path with
+    /// the `schedule` cleared, so the job actually runs this time.
+    async fn fire_due_jobs(&mut self) {
+        if self.scheduled_jobs.is_empty() {
+            return;
+        }
+        let now = time::OffsetDateTime::now_utc();
+        let minute_stamp = now.unix_timestamp().div_euclid(60);
+
+        let mut due: Vec<(String, String, JobSpec)> = Vec::new();
+        for job in self.scheduled_jobs.values_mut() {
+            if job.last_fired_minute == Some(minute_stamp) {
+                continue;
+            }
+            if job.schedule.matches(now) {
+                job.last_fired_minute = Some(minute_stamp);
+                let mut spec = job.spec.clone();
+                spec.schedule = None;
+                due.push((job.name.clone(), job.namespace.clone(), spec));
+            }
+        }
+
+        for (name, namespace, spec) in due {
+            self.record_event(
+                crate::bun::events::EventKind::Deploy,
+                crate::bun::events::EventSeverity::Info,
+                Some(name.clone()),
+                Some(namespace.clone()),
+                format!("firing scheduled job {namespace}/{name}"),
+            )
+            .await;
+
+            let mut config = Config::default();
+            config.job.insert(name, spec);
+            self.spawn_scheduled_job_deploy(config);
+        }
+    }
+
+    /// Spawn a one-off deploy of a cron-fired job on its own task, draining the
+    /// event stream. Mirrors the worker construction in the deploy command path.
+    fn spawn_scheduled_job_deploy(&self, config: Config) {
+        let (events_tx, mut events_rx) = mpsc::channel::<ApplyEvent>(64);
+        tokio::spawn(async move { while events_rx.recv().await.is_some() {} });
+
+        let worker = DeployWorker {
+            grill: self.supervisor.grill().clone(),
+            port_allocator: self.supervisor.port_allocator(),
+            ops: DeployOps {
+                tx: self.deploy_ops_tx.clone(),
+            },
+            operation: None,
+        };
+        tokio::spawn(async move {
+            worker.run_deploy(config, events_tx).await;
+        });
+    }
+
     /// Monitor running job instances for process exit.
     ///
     /// For each running job, polls the runtime to see if the process has
@@ -7521,6 +7652,9 @@ impl<G: Grill + Clone + 'static> DeployWorker<G> {
     async fn run_deploy(self, config: Config, events: mpsc::Sender<ApplyEvent>) {
         let now = Instant::now();
         let mut all_ids: Vec<String> = Vec::new();
+        // Jobs already run as `run_before` prerequisites, so the regular jobs
+        // loop below doesn't run them a second time.
+        let mut ran_prereqs: std::collections::HashSet<String> = std::collections::HashSet::new();
         let deployed_apps: Vec<(String, String)> = config
             .app
             .iter()
@@ -7548,6 +7682,39 @@ impl<G: Grill + Clone + 'static> DeployWorker<G> {
 
         for (app_name, spec) in &config.app {
             let namespace = spec.namespace.as_deref().unwrap_or("default");
+
+            // run_before (E): jobs declaring `run_before = ["app.<name>"]` must
+            // run to completion before this app's deploy begins — migrations are
+            // the classic case. A prerequisite failure aborts the whole deploy.
+            let target = format!("app.{app_name}");
+            for (job_name, job_spec) in &config.job {
+                // Cron-scheduled jobs fire on their schedule, never as a
+                // deploy-time prerequisite.
+                if ran_prereqs.contains(job_name)
+                    || job_spec.schedule.is_some()
+                    || !job_spec.run_before.contains(&target)
+                {
+                    continue;
+                }
+                let job_ns = job_spec.namespace.as_deref().unwrap_or("default");
+                let _ = events
+                    .send(ApplyEvent::Progress {
+                        message: format!(
+                            "running prerequisite job {job_name} before app {app_name}"
+                        ),
+                    })
+                    .await;
+                if let Err(e) = self.run_prerequisite_job(job_name, job_ns, job_spec).await {
+                    let _ = events
+                        .send(ApplyEvent::Error {
+                            message: e.to_string(),
+                        })
+                        .await;
+                    return;
+                }
+                ran_prereqs.insert(job_name.clone());
+            }
+
             if let Some(operation) = &self.operation {
                 operation
                     .advance(
@@ -7587,11 +7754,26 @@ impl<G: Grill + Clone + 'static> DeployWorker<G> {
             let existing = self.ops.list_existing_active(app_name, namespace).await;
 
             if !existing.is_empty() {
-                if self
-                    .rolling_redeploy(app_name, namespace, spec, existing, &events, now)
-                    .await
-                    .is_break()
-                {
+                // Dispatch on deploy strategy (E): blue-green stands up the
+                // whole new fleet before swapping; rolling replaces one at a
+                // time. Everything else about the deploy is identical.
+                let strategy = spec
+                    .deploy
+                    .as_ref()
+                    .map(crate::meat::deploy_types::DeployConfig::from_spec)
+                    .unwrap_or_default()
+                    .strategy;
+                let outcome = match strategy {
+                    crate::meat::deploy_types::DeployStrategy::BlueGreen => {
+                        self.blue_green_redeploy(app_name, namespace, spec, existing, &events, now)
+                            .await
+                    }
+                    crate::meat::deploy_types::DeployStrategy::Rolling => {
+                        self.rolling_redeploy(app_name, namespace, spec, existing, &events, now)
+                            .await
+                    }
+                };
+                if outcome.is_break() {
                     return;
                 }
                 all_ids.extend(
@@ -7710,6 +7892,11 @@ impl<G: Grill + Clone + 'static> DeployWorker<G> {
         }
 
         for (job_name, spec) in &config.job {
+            // Already run to completion as a run_before prerequisite above, or a
+            // cron-scheduled job that fires on its schedule rather than now.
+            if ran_prereqs.contains(job_name) || spec.schedule.is_some() {
+                continue;
+            }
             let namespace = spec.namespace.as_deref().unwrap_or("default");
             if let Some(operation) = &self.operation {
                 operation
@@ -7908,6 +8095,57 @@ impl<G: Grill + Clone + 'static> DeployWorker<G> {
         self.ops
             .finish_job_instance(instance_id, job_name, namespace, oci_spec)
             .await
+    }
+
+    /// Run a `run_before` prerequisite job to completion for dependency
+    /// ordering. Deploys the job, then polls the runtime until every instance
+    /// exits. Returns `Ok(())` only when all instances exit cleanly (code 0);
+    /// a non-zero exit or a timeout is an error that aborts the gated deploy.
+    async fn run_prerequisite_job(
+        &self,
+        job_name: &str,
+        namespace: &str,
+        spec: &JobSpec,
+    ) -> Result<(), BunError> {
+        let ids = self
+            .ops
+            .supervisor_deploy_job(job_name, namespace, spec)
+            .await?;
+        for id in &ids {
+            self.drive_job(id, job_name, namespace, spec).await?;
+
+            let deadline =
+                std::time::Instant::now() + std::time::Duration::from_secs(RUN_BEFORE_TIMEOUT_SECS);
+            loop {
+                tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+                let state = self.grill.state(id).await?;
+                if state == ContainerState::Stopped {
+                    let exit_code = self.grill.exit_code(id).await;
+                    if exit_code == Some(0) {
+                        break;
+                    }
+                    return Err(BunError::DeployFailed {
+                        app_name: job_name.to_string(),
+                        reason: format!(
+                            "run_before job exited with {}",
+                            exit_code
+                                .map(|c| c.to_string())
+                                .unwrap_or_else(|| "unknown status".to_string())
+                        ),
+                    });
+                }
+                if std::time::Instant::now() >= deadline {
+                    let _ = self.grill.kill(id).await;
+                    return Err(BunError::DeployFailed {
+                        app_name: job_name.to_string(),
+                        reason: format!(
+                            "run_before job timed out after {RUN_BEFORE_TIMEOUT_SECS}s"
+                        ),
+                    });
+                }
+            }
+        }
+        Ok(())
     }
 
     /// Rolling redeploy: start generation-tagged new instances, health check
@@ -8236,6 +8474,252 @@ impl<G: Grill + Clone + 'static> DeployWorker<G> {
                 namespace,
                 spec,
                 outstanding,
+                new_ids.clone(),
+                new_ports,
+                new_ips,
+                new_specs,
+                now,
+            )
+            .await;
+
+        for new_id in &new_ids {
+            let _ = events
+                .send(ApplyEvent::InstanceCreated {
+                    id: new_id.0.clone(),
+                    app: app_name.to_string(),
+                })
+                .await;
+        }
+
+        std::ops::ControlFlow::Continue(())
+    }
+
+    /// Blue-green redeploy: start the whole new ("green") fleet in parallel to
+    /// the old ("blue") one, health check every green instance, and only then
+    /// swap routing over and retire all of blue at once. Blue keeps serving the
+    /// entire time green is coming up, so a failure anywhere in green tears the
+    /// green fleet down and leaves blue untouched. Returns `Break` when the
+    /// caller must stop the whole deploy.
+    async fn blue_green_redeploy(
+        &self,
+        app_name: &str,
+        namespace: &str,
+        spec: &AppSpec,
+        existing: Vec<InstanceId>,
+        events: &mpsc::Sender<ApplyEvent>,
+        now: Instant,
+    ) -> std::ops::ControlFlow<()> {
+        let _ = events
+            .send(ApplyEvent::Progress {
+                message: format!(
+                    "blue-green redeploy {app_name} ({} blue instance(s))",
+                    existing.len()
+                ),
+            })
+            .await;
+
+        let deploy_config = spec
+            .deploy
+            .as_ref()
+            .map(crate::meat::deploy_types::DeployConfig::from_spec)
+            .unwrap_or_default();
+        let deploy_gen = self.ops.next_deploy_gen().await;
+        let replica_count = match spec.replicas {
+            crate::config::types::Replicas::Fixed(n) => n,
+            crate::config::types::Replicas::DaemonSet => 1,
+        };
+
+        let mut new_ids: Vec<InstanceId> = Vec::new();
+        let mut new_ports: std::collections::HashMap<InstanceId, Option<u16>> =
+            std::collections::HashMap::new();
+        let mut new_specs: std::collections::HashMap<InstanceId, crate::grill::oci::OciSpec> =
+            std::collections::HashMap::new();
+        let mut new_ips: std::collections::HashMap<InstanceId, Option<std::net::Ipv4Addr>> =
+            std::collections::HashMap::new();
+        let mut new_prepared: Vec<InstanceId> = Vec::new();
+        let mut new_failed = false;
+
+        // Start and health check the entire green fleet before touching blue.
+        // Unlike the rolling planner, nothing retires here and nothing is
+        // published to routing yet: green comes up dark, alongside blue.
+        for i in 0..replica_count {
+            let new_id = crate::grill::InstanceIdentity::canary(namespace, app_name, deploy_gen, i)
+                .instance_id();
+            let _ = events
+                .send(ApplyEvent::Progress {
+                    message: format!("starting green instance {}", new_id.0),
+                })
+                .await;
+
+            let host_port = if spec.port.is_some() {
+                match self.port_allocator.allocate().await {
+                    Ok(p) => Some(p),
+                    Err(e) => {
+                        let _ = events
+                            .send(ApplyEvent::Error {
+                                message: format!("port allocation failed: {e}"),
+                            })
+                            .await;
+                        new_failed = true;
+                        break;
+                    }
+                }
+            } else {
+                None
+            };
+
+            new_prepared.push(new_id.clone());
+            let oci_spec = match self
+                .ops
+                .prepare_rolling_instance(&new_id, app_name, namespace, spec, host_port, i)
+                .await
+            {
+                Ok(oci_spec) => oci_spec,
+                Err(e) => {
+                    let _ = events
+                        .send(ApplyEvent::Error {
+                            message: e.to_string(),
+                        })
+                        .await;
+                    new_failed = true;
+                    break;
+                }
+            };
+            let cgroup_path = crate::grill::cgroup::cgroup_path(namespace, app_name, i);
+
+            if let Err(e) = self.grill.create(&new_id, &oci_spec).await {
+                let _ = events
+                    .send(ApplyEvent::Error {
+                        message: format!("failed to create {}: {e}", new_id.0),
+                    })
+                    .await;
+                new_failed = true;
+                break;
+            }
+            if let Err(e) = self
+                .ops
+                .apply_egress_pre_start(&new_id, app_name, spec, &cgroup_path)
+                .await
+            {
+                let _ = events
+                    .send(ApplyEvent::Error {
+                        message: format!("failed to program egress for {}: {e}", new_id.0),
+                    })
+                    .await;
+                let _ = self.grill.stop(&new_id).await;
+                new_failed = true;
+                break;
+            }
+            if let Err(e) = self.grill.start(&new_id).await {
+                let _ = events
+                    .send(ApplyEvent::Error {
+                        message: format!("failed to start {}: {e}", new_id.0),
+                    })
+                    .await;
+                self.ops.clear_egress(&new_id).await;
+                new_failed = true;
+                break;
+            }
+            self.ops
+                .register_rolling_instance(&new_id, app_name, namespace)
+                .await;
+
+            let container_ip = self.grill.container_ip(&new_id).await;
+
+            let wait = effective_health_wait(&deploy_config);
+            let deadline = std::time::Instant::now() + wait;
+            let mut probe = self.grill.state(&new_id).await;
+            while std::time::Instant::now() < deadline
+                && !matches!(probe, Ok(crate::grill::state::ContainerState::Running))
+            {
+                tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+                probe = self.grill.state(&new_id).await;
+            }
+            match probe {
+                Ok(crate::grill::state::ContainerState::Running) => {
+                    let _ = events
+                        .send(ApplyEvent::Progress {
+                            message: format!("{} healthy ✓", new_id.0),
+                        })
+                        .await;
+                    self.ops
+                        .provision_identity(app_name, namespace, &new_id, false)
+                        .await;
+                }
+                other => {
+                    let message = match other {
+                        Ok(state) => {
+                            format!("{} not healthy (state: {state}), rolling back", new_id.0)
+                        }
+                        Err(_) => format!("{} state unknown, rolling back", new_id.0),
+                    };
+                    let _ = events.send(ApplyEvent::Error { message }).await;
+                    let _ = self.grill.kill(&new_id).await;
+                    self.ops.clear_egress(&new_id).await;
+                    new_failed = true;
+                    break;
+                }
+            }
+
+            new_ports.insert(new_id.clone(), host_port);
+            new_specs.insert(new_id.clone(), oci_spec);
+            new_ips.insert(new_id.clone(), container_ip);
+            new_ids.push(new_id);
+        }
+
+        if new_failed {
+            // Green never took over routing, so blue is still live regardless of
+            // auto_rollback. Rollback tears green down; halt leaves it up for
+            // inspection. Either way blue keeps serving.
+            if deploy_config.auto_rollback {
+                self.ops
+                    .rollback_rolling_deploy(
+                        app_name,
+                        namespace,
+                        spec,
+                        new_ids,
+                        new_prepared,
+                        new_ports,
+                        replica_count,
+                    )
+                    .await;
+                let _ = events
+                    .send(ApplyEvent::Error {
+                        message: "rolled back — blue fleet preserved".to_string(),
+                    })
+                    .await;
+            } else {
+                self.ops
+                    .halt_rolling_deploy(
+                        app_name,
+                        namespace,
+                        spec,
+                        new_ids,
+                        new_prepared,
+                        new_ports,
+                        replica_count,
+                    )
+                    .await;
+                let _ = events
+                    .send(ApplyEvent::Error {
+                        message: "deploy halted (auto_rollback = false): green fleet left running \
+                                  for inspection"
+                            .to_string(),
+                    })
+                    .await;
+            }
+            return std::ops::ControlFlow::Break(());
+        }
+
+        // The whole green fleet is healthy. Swap: `finalise_rolling_deploy`
+        // publishes every green backend, rebuilds routing, then drains and
+        // retires all of blue. This is the atomic cut-over.
+        self.ops
+            .finalise_rolling_deploy(
+                app_name,
+                namespace,
+                spec,
+                existing,
                 new_ids.clone(),
                 new_ports,
                 new_ips,
@@ -9958,6 +10442,167 @@ mod tests {
             command = ["echo", "done"]
         "#;
         Config::parse(toml_str).unwrap()
+    }
+
+    fn run_before_config() -> Config {
+        Config::parse(
+            r#"
+            [app.web]
+            image = "myapp:v1"
+            port = 8080
+
+            [job.migrate]
+            image = "myapp:v1"
+            command = ["echo", "migrating"]
+            run_before = ["app.web"]
+        "#,
+        )
+        .unwrap()
+    }
+
+    async fn drain_deploy(agent: &mut BunAgent<MockGrill>, config: Config) -> Vec<ApplyEvent> {
+        let (ev_tx, mut ev_rx) = mpsc::channel(256);
+        agent.deploy(config, &ev_tx).await;
+        drop(ev_tx);
+        let mut events = Vec::new();
+        while let Some(e) = ev_rx.recv().await {
+            events.push(e);
+        }
+        events
+    }
+
+    #[tokio::test]
+    async fn run_before_runs_the_job_to_completion_before_the_app() {
+        let (mut agent, _tx, _shutdown, grill) = test_agent_with_grill();
+
+        // The prerequisite job exits cleanly, so the gate lets the app through.
+        let job_id = InstanceId("default__migrate-0".to_string());
+        grill.set_state(&job_id, ContainerState::Stopped);
+        grill.set_exit_code(&job_id, Some(0));
+
+        let events = drain_deploy(&mut agent, run_before_config()).await;
+        expect_complete(&events);
+
+        let calls = grill.calls();
+        let migrate_at = calls
+            .iter()
+            .position(|(op, id)| op == "create" && id.0.contains("migrate"))
+            .expect("prerequisite job was never created");
+        let web_at = calls
+            .iter()
+            .position(|(op, id)| op == "create" && id.0.contains("web"))
+            .expect("app was never created");
+        assert!(
+            migrate_at < web_at,
+            "the run_before job must be created before the app: {calls:?}"
+        );
+
+        let migrate_creates = calls
+            .iter()
+            .filter(|(op, id)| op == "create" && id.0.contains("migrate"))
+            .count();
+        assert_eq!(
+            migrate_creates, 1,
+            "the run_before job must not also run in the regular jobs loop: {calls:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn run_before_failure_aborts_the_deploy() {
+        let (mut agent, _tx, _shutdown, grill) = test_agent_with_grill();
+
+        // The prerequisite job exits non-zero, so the whole deploy is aborted.
+        let job_id = InstanceId("default__migrate-0".to_string());
+        grill.set_state(&job_id, ContainerState::Stopped);
+        grill.set_exit_code(&job_id, Some(1));
+
+        let events = drain_deploy(&mut agent, run_before_config()).await;
+        match events.last().expect("no events received") {
+            ApplyEvent::Error { message } => assert!(
+                message.contains("migrate"),
+                "expected a prerequisite failure, got: {message}"
+            ),
+            other => panic!("expected an Error event, got {other:?}"),
+        }
+
+        let calls = grill.calls();
+        assert!(
+            !calls
+                .iter()
+                .any(|(op, id)| op == "create" && id.0.contains("web")),
+            "the app must not deploy once a prerequisite fails: {calls:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn scheduled_job_is_not_run_at_deploy_time() {
+        let (mut agent, _tx, _shutdown, grill) = test_agent_with_grill();
+        let config = Config::parse(
+            r#"
+            [job.nightly]
+            image = "myapp:v1"
+            command = ["echo", "hi"]
+            schedule = "0 3 * * *"
+        "#,
+        )
+        .unwrap();
+
+        let events = drain_deploy(&mut agent, config).await;
+        let (created, _) = expect_complete(&events);
+        assert_eq!(created, 0, "a scheduled job must not run at deploy time");
+        assert!(
+            !grill.calls().iter().any(|(op, _)| op == "create"),
+            "no container should be created for a scheduled job at deploy time"
+        );
+    }
+
+    #[tokio::test]
+    async fn blue_green_redeploy_swaps_to_the_green_fleet() {
+        let (mut agent, tx, shutdown, _grill) = test_agent_with_grill();
+        let agent_handle = tokio::spawn(async move {
+            agent.run().await;
+        });
+
+        fn bg_config() -> Config {
+            Config::parse(
+                r#"
+                [app.web]
+                image = "myapp:v1"
+                port = 8080
+
+                [app.web.deploy]
+                strategy = "blue-green"
+                health_timeout = "1s"
+            "#,
+            )
+            .unwrap()
+        }
+
+        // First deploy: no existing instances, so the fresh path brings up the
+        // blue fleet (web-0). MockGrill defaults every container to Running.
+        expect_complete(&send_deploy(&tx, bg_config()).await);
+
+        // Redeploy: existing instances present, so the strategy dispatch routes
+        // to blue-green — the green fleet (generation 1) comes up and swaps.
+        expect_complete(&send_deploy(&tx, bg_config()).await);
+
+        let (resp_tx, resp_rx) = oneshot::channel();
+        tx.send(AgentCommand::Status { response: resp_tx })
+            .await
+            .unwrap();
+        let ids: Vec<String> = resp_rx.await.unwrap().into_iter().map(|s| s.id).collect();
+        assert_eq!(
+            ids.len(),
+            1,
+            "exactly one green instance is live, got {ids:?}"
+        );
+        assert!(
+            !ids.iter().any(|id| id == "default__web-0"),
+            "the blue instance must be retired after the swap, got {ids:?}"
+        );
+
+        shutdown.cancel();
+        agent_handle.await.unwrap();
     }
 
     fn mixed_config() -> Config {

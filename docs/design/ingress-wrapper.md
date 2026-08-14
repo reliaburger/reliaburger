@@ -111,9 +111,9 @@ Wrapper's health information comes from one source today:
 
 1. **Passive health (from reporting tree):** The service map already excludes instances that have failed their application-level health checks. Wrapper inherits this by reading the service map. This is the health signal that ships.
 
-2. **Active health (Wrapper-local) — planned, not yet implemented.** The design calls for Wrapper to run its own lightweight L7 probes to backends every few seconds to catch instances that are "healthy" cluster-wide but unreachable from this specific node. There is **no active-probe code in `src/wrapper/` today**; the `Backend.locally_healthy` flag is populated from the service map on rebuild, not from a Wrapper probe loop. The `[ingress] health_probe_*` keys and the `HealthProbeConfig` struct describe this planned behaviour.
+2. **Active health (Wrapper-local) — implemented.** A background probe loop (`run_health_probes`) runs its own lightweight L7 probes against each backend to catch instances that are "healthy" cluster-wide but unreachable from this specific node. A `ProbeTracker` applies hysteresis (three consecutive failures mark a backend locally unhealthy; two successes recover it), flipping `Backend.locally_healthy`, which `select_backend` then honours on top of the passive service-map signal.
 
-When all backends in a pool are unhealthy (per the passive service-map signal), Wrapper returns `502 Bad Gateway`. Upstream **retry/failover of a single request** is likewise not implemented: `do_proxy` selects one backend once and returns `502` on send failure without re-selecting.
+When all backends in a pool are unhealthy (per either signal), Wrapper returns `502 Bad Gateway`. Upstream **retry/failover of a single request** is now implemented for connect failures: `do_proxy` selects a primary plus up to two distinct candidates and retries on `reqwest::Error::is_connect()` (a connection that never established, so replay is side-effect-free). A 5xx is a completed send and is returned as-is, never replayed.
 
 ### 3.4 TLS Certificate Management
 
@@ -196,7 +196,16 @@ Step 4: After drain completes (or timeout expires), Bun stops v1
 
 Drain coordination is event-driven: Bun publishes a `DrainBackend { app, instance_id, deadline }` event on an internal channel. Wrapper moves the backend from the `active` set to the `draining` set. New requests are never routed to draining backends. When the last in-flight connection to the draining backend closes (or the drain timeout expires), Wrapper publishes a `DrainComplete { app, instance_id }` acknowledgment, and Bun proceeds to stop the old instance.
 
-> **Forced termination on timeout is planned — not yet implemented.** When the drain deadline expires today, `DrainTracker::check_completions` (`src/wrapper/draining.rs`) simply signals `DrainComplete` and **stops tracking** the backend; it does **not** actively terminate still-live connections. The TCP RST described here (and the WebSocket Close 1001 / mid-stream 503 in §5.5) is the target protocol. A `build_close_frame` helper exists but is currently reached only by tests, never sent on the live drain path. So an expired drain frees the backend for Bun to stop, but any lingering client connections are torn down by the backend going away, not by Wrapper.
+> **Forced termination on timeout is implemented for HTTP.** Each drain entry
+> carries a `terminate` cancellation token. Once a backend is past its deadline
+> with connections still open, a new request whose primary backend is
+> draining-and-terminating gets an immediate `503`, and an in-flight response
+> stream watches the token and stops mid-stream (closing the connection) if the
+> deadline fires. A backend still inside its drain window keeps the clean
+> count-and-forward behaviour. **WebSocket parity remains a follow-up:** the WS
+> splice holds an opaque drain guard and does not yet watch the token, so the
+> Close-1001-on-deadline (`websocket_close_frame`) is not sent on the live WS
+> path.
 
 ---
 
@@ -542,11 +551,16 @@ Bun (deploy coordinator)                  Wrapper
 - Default: 30 seconds (configurable per app via `drain_timeout` in the deploy config).
 - The drain timeout is a per-deploy-step timeout, not a global timeout. Each instance being replaced gets its own full drain window.
 
-> **The forced-termination protocol below is planned — not yet implemented.** Today, when the timeout expires the Wrapper stops tracking the draining backend and signals `DrainComplete` (see §3.5); it does not itself send any of the following to live clients. This is the target design:
+> **Forced termination on timeout is implemented for HTTP; WebSocket parity is a
+> follow-up.** When the deadline expires with connections still open, Wrapper now
+> fires the drain entry's `terminate` token. Of the protocol below, HTTP items 2
+> and 3 ship (a new request to a terminating backend gets `503`; an in-flight
+> response stops mid-stream, closing the connection). Item 1 — the WebSocket
+> Close 1001 handshake — is not yet sent on the live WS splice path.
 >
-> 1. WebSocket connections: send a WebSocket Close frame (opcode 0x08) with status 1001 (Going Away), wait 5 seconds for the close handshake, then RST.
-> 2. HTTP connections: send a 503 response if the request is mid-stream, then RST.
-> 3. Idle keep-alive connections: RST immediately.
+> 1. WebSocket connections: send a WebSocket Close frame (opcode 0x08) with status 1001 (Going Away), wait 5 seconds for the close handshake, then RST. *(follow-up)*
+> 2. HTTP connections: send a 503 response if the request is mid-stream, then close.
+> 3. Idle keep-alive connections: closed once the backend goes away.
 
 **Coordination with rolling deploys:**
 
