@@ -2130,5 +2130,28 @@ tests) + cluster suite (22/22).
   same reachability rationale and a fresh **18 November 2026** re-review date
   (`make audit` gate + `.cargo/audit.toml` bumped). Follow-up plan table updated.
 
-- [ ] **Close the Phase 16 gate** — rerun the doc-vs-code sweep after Sections
-  A–F land and confirm no present-tense claim describes an unbuilt feature.
+- [x] **Close the Phase 16 gate** — ran the full doc-vs-code sweep (whitepaper,
+  all design docs, manual, book, READMEs) after every section landed. Six
+  parallel auditors cross-checked present-tense claims against the code; 18 were
+  confirmed and fixed. The manual and both READMEs were clean.
+  - **whitepaper** (5): `build_push_to`→`destination`; `relish export --format
+    kubernetes`→`export -f`; removed the fictional live-cluster `import`
+    flags/`--dry-run`; `relish plan`→`apply --dry-run`; `relish volume
+    snapshot`→`snapshot create`.
+  - **chaos-smoker** (3): CPU stress and memory pressure described a burn-loop /
+    `mlock` mechanism; the code caps `cpu.max` and lowers `memory.high` (the burn
+    loop is node-level pressure only). §3.2 diagram + §5.2.1 rewritten.
+  - **ui-brioche** (6): PromQL/`/v1/metrics/query?expr=`→name-parameterised
+    `/v1/metrics`; Ketchup "index"→SQL over Parquet; WS log route + cross-node
+    multiplex corrected to local-only real routes; cookie HKDF-encryption→opaque
+    session id; CSRF section marked planned (only `SameSite=Strict` ships).
+  - **ingress-wrapper** (2) + **book ch.09** (1): WS Close-1001 drain-termination
+    is built but not sent on the live splice — reworded to a follow-up; corrected
+    the `tokio-tungstenite` "used by Wrapper" claim (Wrapper hand-rolls it).
+  - **discovery-onion** (1): `[ebpf] host_port_range` isn't a real key →
+    `[network] port_range`.
+  - **metrics-mayo** (bonus, understatements the Section E pass missed): flipped
+    the remaining "scraping inert / fan-out not wired / rollup retention inert"
+    notes that now denied shipped features.
+
+**Phase 16 is complete** — every section (A–G) plus the closing gate is done.
