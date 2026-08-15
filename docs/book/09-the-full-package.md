@@ -339,7 +339,7 @@ pub fn is_websocket_upgrade(req: &Request<Body>) -> bool {
 
 WebSocket connections are long-lived. When a backend is being drained (during a rolling or blue-green deploy), HTTP connections finish naturally within the drain timeout. WebSocket connections don't finish on their own -- they stay open indefinitely.
 
-The solution: send a WebSocket Close frame (opcode 0x08, status code 1001 "Going Away") to the client, wait 5 seconds for the close handshake, then RST the TCP connection. The Close frame is just 4 bytes:
+The intended solution: send a WebSocket Close frame (opcode 0x08, status code 1001 "Going Away") to the client, wait for the close handshake, then close the TCP connection. The Close frame is just 4 bytes, hand-built with no WebSocket library:
 
 ```rust
 pub fn build_close_frame(status: u16) -> Vec<u8> {
@@ -352,7 +352,7 @@ pub fn build_close_frame(status: u16) -> Vec<u8> {
 }
 ```
 
-No need for a full WebSocket library. Four bytes, hand-built. Well-behaved WebSocket clients see the 1001, close their end of the connection, and reconnect to a healthy backend. Misbehaving clients get RST'd after the timeout.
+Here's the honest state of it: `build_close_frame` exists and is unit-tested, but it is **not yet sent on the live drain path**. Today a draining backend's WebSockets are held open as tracked in-flight connections, and at the drain deadline they're torn down via a cancellation token rather than a graceful 1001 handshake. Wiring the frame into the splice -- write it into the client half, wait a grace period, then close -- is a tracked follow-up. (The HTTP side of drain-termination *is* wired: past the deadline a new request to a terminating backend gets a 503 and an in-flight response stops mid-stream.)
 
 ## Lettuce: the GitOps engine
 
@@ -647,7 +647,7 @@ There's a general principle in here that keeps recurring in this project: an inc
 
 **`toml_edit` was overkill for formatting.** We initially used `toml_edit` to preserve comments during formatting. It works, but the comment-preserving reserialisation introduced subtle ordering bugs that were painful to debug. We switched to a simpler approach: parse with `toml`, reserialise with canonical section ordering, accept that comments are lost. For machine-generated configs (which is what `relish compile` produces, and what Lettuce processes), comment loss is irrelevant. For hand-edited configs, `relish lint` validates without reformatting.
 
-**WebSocket is 95% detection, 5% proxying.** We spent most of the time on header detection edge cases (case-insensitive matching, multi-value Connection headers, routes that don't opt in). The actual proxying -- connect to backend, forward upgrade, bidirectional copy -- is straightforward. The Close frame for draining is 4 bytes of hand-built binary. No WebSocket library needed.
+**WebSocket is 95% detection, 5% proxying.** We spent most of the time on header detection edge cases (case-insensitive matching, multi-value Connection headers, routes that don't opt in). The actual proxying -- connect to backend, forward upgrade, bidirectional copy -- is straightforward. The drain Close frame is 4 bytes of hand-built binary (built and tested, though not yet sent on the live drain path -- see above). No WebSocket library needed.
 
 **Coordinator election should be boring.** Our first design for Lettuce's coordinator election had scoring heuristics: CPU load, memory availability, network latency to the git remote. We replaced it with "first non-leader alphabetically." It's deterministic, requires no measurement, and produces the same result on every node without communication. The scoring approach might produce slightly better placement, but the added complexity wasn't worth it for a role that does one git fetch every 30 seconds.
 

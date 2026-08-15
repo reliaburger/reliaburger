@@ -296,7 +296,7 @@ The council member stores received rollups in a rollup store and serves them at 
 - `/v1/metrics/app/{app}/{namespace}` resolves the app's nodes from the Meat placement map and fans the query out to each, merging the results (falling back to the local store when there's no placement).
 - `/v1/metrics/cluster` enumerates the Raft voters, maps each to its live membership address, and sums each member's `/v1/metrics/rollup` (falling back to local rollup data on a single node / no council).
 
-So neither the single-app path nor the cluster-wide path fans out today. The query timeout, top-N merge, and unresponsive-node annotations belong to the planned design.
+Both the single-app path (`/v1/metrics/app`, via the Meat placement map) and the cluster-wide path (`/v1/metrics/cluster`, across council voters) now fan out and merge. The query timeout, top-N merge, and unresponsive-node annotations remain part of the planned design.
 
 ### 5.6 Alert Evaluation
 
@@ -369,7 +369,7 @@ collection_interval_secs = 10
 retention_days = 7
 
 # How often to scrape Prometheus /metrics endpoints (seconds). Default: 30.
-# NOTE: scraping is not wired (see §5.2); this key is currently inert.
+# Drives the scrape loop over [[metrics.scrape_targets]] (see §5.2).
 scrape_interval_secs = 30
 
 # Enable the built-in threshold alert loop. Default: true.
@@ -383,7 +383,7 @@ object_store_url = ""
 rollup_interval_secs = 60
 
 # Intended rollup retention on council members (hours). Default: 24.
-# NOTE: nothing reads this yet (see §3.3) — planned, currently inert.
+# Prunes rollups past this age on the disk-pressure tick (see §3.3).
 rollup_retention_hours = 24
 
 # Maximum local metrics Parquet storage (MB). 0 = unlimited (the default).
@@ -453,7 +453,7 @@ The rollup worker keeps pushing to the last known parent and follows parent reas
 
 ### 7.4 Scrape Target Timeout
 
-**Status: planned -- not yet implemented.** There is no scraper in the running system (§5.2), so no scrape-timeout handling, backoff, or `mayo_scrape_timeout_total` counter exists.
+**Status: partially implemented.** The scrape loop (§5.2) is best-effort — a target that fails to respond contributes nothing that tick — but there is no dedicated scrape-timeout backoff or `mayo_scrape_timeout_total` counter yet.
 
 ### 7.5 Node Failure (Data Loss)
 
@@ -462,7 +462,7 @@ The rollup worker keeps pushing to the last known parent and follows parent reas
 **Behaviour:**
 
 - All that node's local metric history is lost. This is an accepted trade-off of per-node storage.
-- Its council parent retains the last rollups it received (a coarse 1-minute view), but because cluster-wide query fan-out is not wired (§5.5), that history is only visible through the parent that happens to hold it.
+- Its council parent retains the last rollups it received (a coarse 1-minute view); the cluster-wide query fan-out (§5.5) now sums each council member's rollups, so that history is reachable through any voter, not only the parent that happens to hold it.
 
 **Mitigation for teams requiring durability:** set `export_path` so Parquet files are shipped to object storage before pruning. Remote-read federation into external Prometheus/Thanos is **planned -- not yet implemented**.
 
@@ -475,7 +475,7 @@ The rollup worker keeps pushing to the last known parent and follows parent reas
 - **Internal API:** the `/v1/metrics*` and `/v1/alerts` routes require an authenticated token (`AnyToken` in `src/bun/authz.rs`); inter-node transports are secured by the Sesame PKI where mTLS is enabled.
 - **Per-namespace isolation:** `/v1/metrics/app/{app}/{namespace}` enforces tenant scope via `authorize_scoped`, and every path/name segment that reaches SQL is escaped (single quotes doubled), so a scoped token cannot read another tenant's metrics and a crafted `?name=` cannot break out of the string literal. This is **shipped**, not future.
 - **Prometheus remote-read auth: Status: planned -- not yet implemented** (there is no remote-read endpoint, §3.4).
-- **`max_samples_per_scrape` / label scrubbing:** planned -- not yet implemented (no scraper, §5.2).
+- **`max_samples_per_scrape` / label scrubbing:** planned -- not yet implemented. The scrape loop (§5.2) ingests every sample a target returns; there is no per-scrape sample cap or label scrubbing yet.
 
 ### 8.2 Alert Webhook Authentication
 
@@ -487,7 +487,7 @@ The rollup worker keeps pushing to the last known parent and follows parent reas
 
 ## 9. Performance
 
-**Reconciliation note:** the numbers in this section were derived for the planned Gorilla-encoded, tiered, scraping TSDB. The shipped store writes plain Parquet (Parquet's own column compression, no Gorilla), stores only the node + per-process metrics of §5.1 (no scraped, ingress, downsampled, or archived series), and has no remote-read or scrape path. Treat the tables below as design *targets* for the planned system, not measurements of what ships.
+**Reconciliation note:** the numbers in this section were derived for the planned Gorilla-encoded, tiered TSDB. The shipped store writes plain Parquet (Parquet's own column compression, no Gorilla) and holds the node + per-process metrics of §5.1 plus scraped and ingress series (no downsampled or archived tiers), with a scrape path but no remote-read endpoint. Treat the tables below as design *targets* for the planned system, not measurements of what ships.
 
 ### 9.1 Storage Footprint
 

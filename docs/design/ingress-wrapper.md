@@ -577,7 +577,7 @@ When Wrapper receives a request with `Connection: Upgrade` and `Upgrade: websock
 3. Wrapper forwards the upgrade request to the backend.
 4. If the backend responds with `101 Switching Protocols`, Wrapper enters bidirectional byte-level proxying (no HTTP framing).
 5. The connection is tracked as `is_websocket: true` in the connection tracker.
-6. WebSocket connections are long-lived. During connection draining, they receive the Close frame treatment described above.
+6. WebSocket connections are long-lived. The Close-1001 drain treatment described above is a follow-up: `websocket_close_frame` exists and is unit-tested, but is not yet sent on the live WS splice — today a draining backend's WebSockets are torn down at the drain deadline via a cancellation token (see §5.5).
 
 Wrapper doesn't inspect or modify WebSocket frames. It operates as a transparent TCP proxy after the upgrade handshake.
 
@@ -975,7 +975,7 @@ All dependencies are Rust crates compiled into the single `reliaburger` binary.
 | [`rustls`](https://crates.io/crates/rustls) | 0.23.x | TLS implementation | Memory-safe TLS. No OpenSSL dependency. Supports TLS 1.2 and 1.3. SNI-based certificate selection via `ResolvesServerCert`. Session tickets for TLS 1.3 PSK resumption. |
 | [`tokio`](https://crates.io/crates/tokio) | 1.x | Async runtime | Multi-threaded runtime with work-stealing scheduler. Provides `TcpListener`, `TcpStream`, timers, channels, and task spawning. Already used throughout the Bun agent. |
 | [`instant-acme`](https://crates.io/crates/instant-acme) *(candidate, not currently a dependency)* | To decide | Deferred ACME protocol client | Reassess when automatic public certificates enter the roadmap; library choice follows the issuer and challenge design. |
-| [`tokio-tungstenite`](https://crates.io/crates/tokio-tungstenite) | 0.24.x | WebSocket protocol implementation | Used for WebSocket upgrade detection and Close frame generation during connection draining. After the upgrade handshake, Wrapper uses raw TCP proxying for performance. |
+| [`tokio-tungstenite`](https://crates.io/crates/tokio-tungstenite) | 0.24.x | WebSocket protocol implementation | Used by the API/CLI clients (`bun/api.rs`, `relish`). Wrapper itself does *not* use it: it detects upgrades by hand on raw headers (`is_websocket_upgrade`) and, after the handshake, proxies at the raw TCP level. |
 | [`rcgen`](https://crates.io/crates/rcgen) | 0.13.x | X.509 certificate generation | Used for the development certificate and cluster-CA leaf certificates. |
 | [`webpki`](https://crates.io/crates/webpki) *(candidate, not currently a direct dependency)* | To decide | Deferred certificate validation | Reassess with ACME and explicit-certificate validation work. |
 | [`rustls-pemfile`](https://crates.io/crates/rustls-pemfile) | 2.x | PEM file parsing | Used to load certificates from disk cache and from operator-provided manual certificate files. |

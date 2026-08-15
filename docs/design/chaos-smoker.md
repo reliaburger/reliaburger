@@ -184,17 +184,17 @@ Resource faults operate entirely in userspace through Bun's existing cgroup and 
 |    -> eBPF program picks up new rule on next connect()        |
 |                                                               |
 |  Resource fault manager:                                      |
-|    -> CPU stress: spawns burn loop in target app's cgroup     |
-|    -> Memory pressure: allocates + mlocks pages in cgroup     |
+|    -> CPU stress: caps target app's cgroup cpu.max quota      |
+|    -> Memory pressure: lowers target cgroup's memory.high     |
 |    -> Disk I/O throttle: writes blkio cgroup limits           |
 |    -> Process faults: sends signals to container PID          |
 |                                                               |
 +---------------------------------------------------------------+
 ```
 
-**CPU stress.** Bun spawns a lightweight burn process (a tight arithmetic loop compiled into the Bun binary itself) inside the target container's CPU cgroup. The burn process consumes the specified percentage of the cgroup's CPU quota. Because it runs inside the same cgroup, it competes with the application for CPU time exactly as a real noisy-neighbour workload would. The application sees increased scheduling latency, higher tail latencies, and reduced throughput.
+**CPU stress.** Bun caps the target container's `cpu.max` quota so the workload keeps only `100 - percentage` of its CPU entitlement (`cpu_stress_quota` in `src/smoker/resource.rs`). Capping the target's own quota — rather than burning cycles in a competing process — means the throttling is precise, lands on the workload rather than on Bun, and is lifted cleanly by restoring the saved `cpu.max` on clear or expiry. The application sees increased scheduling latency, higher tail latencies, and reduced throughput.
 
-**Memory pressure.** Bun spawns a process inside the target container's memory cgroup that allocates and `mlock()`s pages, pushing the container toward its memory limit. The amount is calculated from the configured percentage and the container's memory limit. At 90%, the application has only 10% headroom. This triggers the same kernel memory pressure signals (PSI, memory.high events) as real contention.
+**Memory pressure.** Bun lowers the target container's `memory.high` soft limit to a fraction of its hard `memory.max` (`apply_memory_pressure` in `src/smoker/resource.rs`), so the kernel throttles and reclaims the workload as it crosses the soft limit. At 90%, the application has only 10% headroom before reclaim. This triggers the same kernel memory-pressure signals (PSI, `memory.high` events) as real contention, and the saved `memory.high` is restored on clear or expiry.
 
 **Disk I/O throttle.** Bun writes to the `blkio` cgroup controller for the target container, setting read/write bandwidth limits using `blkio.throttle.read_bps_device` and `blkio.throttle.write_bps_device`. This is the kernel's native I/O throttling mechanism.
 
@@ -913,46 +913,33 @@ int smoker_bandwidth_tc(struct __sk_buff *skb) {
 
 Resource faults do not use eBPF. They use the same cgroup and process control mechanisms that Bun already employs for container management.
 
-#### 5.2.1 CPU Burn Loop
+#### 5.2.1 CPU Stress via `cpu.max`
 
-Bun spawns a lightweight burn process inside the target container's CPU cgroup. The burn process is a tight arithmetic loop compiled directly into the Bun binary. Because it runs inside the same cgroup, it competes with the application for CPU time exactly as a real noisy-neighbour workload would.
+Bun caps the target container's `cpu.max` quota rather than spawning a competing
+burn loop. `cpu_stress_quota(percentage, cores)` (`src/smoker/resource.rs`)
+computes a `cpu.max` string that leaves the workload only `100 - percentage` of
+its `cores`-core entitlement; `apply_cpu_stress` writes it to the target cgroup
+after `read_cpu_max` saves the original, and clear/expiry restores the saved
+value.
+
+Capping the target's own quota is more precise than a burn process and doesn't
+starve Bun. An earlier design spun burn threads in Bun's own cgroup; those
+competed for whatever CPU the Bun process could get — starving Bun rather than
+the workload, and impossible to lift cleanly before the deadline. (The
+node-level CPU pressure fault still uses a real burn loop, because there the
+intent is to load the *host*, not throttle one container.)
 
 ```rust
-/// CPU burn loop, spawned inside target cgroup.
-/// `target_percent` is 0-100: how much of the cgroup CPU quota to consume.
-/// `cores` optionally limits stress to N cores (default: all).
-fn cpu_burn_loop(target_percent: u8, cores: Option<u32>) {
-    // Pin to the target cgroup's CPU set
-    // If `cores` is specified, only stress that many cores
-    let core_count = cores.unwrap_or_else(|| num_cpus_in_cgroup());
-
-    for core_idx in 0..core_count {
-        std::thread::spawn(move || {
-            pin_to_cpu(core_idx);
-            loop {
-                // Burn for target_percent of each 10ms window
-                let burn_duration = Duration::from_micros(
-                    (100 * target_percent as u64)  // 10ms * percent / 100
-                );
-                let sleep_duration = Duration::from_micros(
-                    10_000 - (100 * target_percent as u64)
-                );
-
-                let start = Instant::now();
-                // Tight arithmetic loop (not optimizable away)
-                let mut acc: u64 = 0xdeadbeef;
-                while start.elapsed() < burn_duration {
-                    acc = acc.wrapping_mul(6364136223846793005)
-                             .wrapping_add(1);
-                    std::hint::black_box(acc);
-                }
-
-                if sleep_duration > Duration::ZERO {
-                    std::thread::sleep(sleep_duration);
-                }
-            }
-        });
-    }
+/// Compute the `cpu.max` quota string that leaves a workload
+/// `100 - percentage` of `cores` cores, written verbatim to the
+/// target cgroup's `cpu.max`. (src/smoker/resource.rs)
+pub fn cpu_stress_quota(percentage: u8, cores: u32) -> String {
+    let remaining = 100u64.saturating_sub(percentage as u64).max(1);
+    let quota_us = remaining
+        .saturating_mul(CPU_PERIOD_US)
+        .saturating_mul(cores.max(1) as u64)
+        / 100;
+    format!("{quota_us} {CPU_PERIOD_US}")
 }
 ```
 

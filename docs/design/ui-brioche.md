@@ -37,8 +37,8 @@ Brioche depends on the following Reliaburger subsystems:
 | Dependency | Role | Interaction |
 |------------|------|-------------|
 | **Bun** | HTTP server; hosts Brioche's static assets and API endpoints | Brioche's compiled assets are served by Bun's built-in HTTP listener on the API port (default `9117`) |
-| **Mayo** | Metrics queries (CPU, memory, disk, GPU, request rate, error rate, custom metrics) | Brioche issues PromQL-compatible queries against the local Mayo TSDB via internal API; cross-node queries fan out through council aggregators |
-| **Ketchup** | Log queries and streaming | Brioche opens a streaming connection (WebSocket or SSE) for live log tailing; historical queries hit Ketchup's structured log index |
+| **Mayo** | Metrics queries (CPU, memory, disk, GPU, request rate, error rate, custom metrics) | Brioche issues name-parameterised queries against `/v1/metrics` on the local Mayo store (DataFusion SQL under the hood, not PromQL); the cluster/app endpoints fan out across council members |
+| **Ketchup** | Log queries and streaming | Brioche opens a streaming connection (WebSocket or SSE) for live log tailing (local node only); historical queries run DataFusion SQL over Ketchup's Parquet log store (no separate index) |
 | **Cluster API** | State queries (apps, nodes, jobs, deploy history, configuration, alert state) | Standard Bun API endpoints; reads are served by any council member from local Raft state |
 | **Wrapper** | Ingress routing info (route table, TLS cert status, per-route metrics) | Brioche queries Wrapper's routing table and certificate metadata via internal API |
 | **Lettuce** | GitOps sync status (sync state, last commit, diff preview, sync history) | Brioche queries Lettuce's sync state via the cluster API; the GitOps coordinator (a council member) serves this data |
@@ -137,8 +137,8 @@ Brioche runs on every node, but the data it displays comes from the cluster API.
 - **Static asset requests** (`/`, `/apps`, CSS, JS, fonts): Served directly from the embedded assets on the local node. No network hop.
 - **API read requests** (`GET /v1/*`): The local Bun forwards to the nearest council member if the local node is not a council member. Council members serve from local Raft state.
 - **API write requests** (`POST /v1/*`, `PUT`, `DELETE`): Forwarded to the current leader, which commits via Raft before responding.
-- **Metrics queries** (`GET /v1/metrics/query`): Routed to the leader (or council aggregator), which fans out to relevant nodes and merges results.
-- **Log streaming** (`WS /v1/logs/:app/stream`): The council member multiplexes log streams from the nodes running the requested app.
+- **Metrics queries** (`GET /v1/metrics/cluster`, `GET /v1/metrics/app/{app}/{namespace}`): fan out across council members and merge results. The per-name `GET /v1/metrics` reads the local store.
+- **Log streaming** (`GET /v1/logs/{app}/{namespace}?follow=true`, `WS /v1/ws/logs/{app}/{namespace}`): streams from the receiving node's local agent only. Cross-node merge of live follow is not implemented.
 
 ### 3.4 Frontend Technology
 
@@ -975,7 +975,7 @@ Accessed via `/apps/:name`. The primary operational view for understanding a sin
    - Error rate (5xx/sec from Wrapper metrics)
    - Time range selector: 15m, 1h, 6h, 24h, 7d, 30d, custom
 
-   Charts are initialised via a JSON config block rendered into the page, and uPlot fetches data from `/v1/metrics/query?expr=...&range=...`. The chart refresh interval is 10 seconds for the active time range.
+   Charts are initialised via a JSON config block rendered into the page, and uPlot fetches data from `/v1/metrics?name=<metric>` (optionally `&app=&namespace=`). The chart refresh interval is 10 seconds for the active time range.
 
 3. **Instance Table:**
 
@@ -1226,14 +1226,14 @@ Brioche uses the same API token authentication as the Relish CLI (Section 11 of 
 2. Brioche renders the login page (`GET /ui/login`) with a token form.
 3. The user enters their token (generated via `relish token create`).
 4. The form POSTs the token to `/ui/session`.
-5. On success, the token is stored in an `HttpOnly`, `Secure`, `SameSite=Strict` cookie with the name `rb_session`, and the user is redirected to the dashboard.
+5. On success, an opaque server-side session id is stored in an `HttpOnly`, `SameSite=Strict` cookie named `rb_session`, and the user is redirected to the dashboard.
 6. Subsequent requests from the browser include the cookie automatically.
 7. `POST /ui/logout` clears the cookie.
 
-**Token-in-cookie details:**
+**Session-cookie details:**
 
-- The cookie contains the API token encrypted with a per-node session key (derived from the node's identity via HKDF). This prevents cookie theft from being directly useful on a different node, though the cluster's shared token validation means a stolen raw token works anywhere.
-- Cookie expiry matches the token's TTL. When the token expires, the cookie is invalidated and the user is redirected to the login page.
+- The cookie carries a random session id that maps, server-side, to the API token held in memory — the token itself is never placed in the cookie, so there is no per-node HKDF encryption to reason about. (Adding the `Secure` attribute, so the cookie is only sent over HTTPS, is a hardening follow-up; it is not set today.)
+- The session is dropped when it expires or on logout, and the user is redirected to the login page.
 - Logout (`POST /ui/logout`) clears the cookie.
 
 **OIDC flow (planned — not yet implemented):**
@@ -1364,9 +1364,16 @@ Brioche reuses the cluster's API token system. There are no separate credentials
 
 ### 8.2 CSRF Protection
 
-All state-mutating API endpoints (POST, PUT, DELETE) require a CSRF token in addition to the session cookie.
+> **Status: planned — not yet implemented.** There is no CSRF-token middleware
+> in the code today (`rg -i csrf src/` finds only certificate-signing-request
+> helpers, unrelated). The current cross-site defence is the `SameSite=Strict`
+> session cookie (§8.1), which stops a third-party origin from riding the
+> browser's session on a state-mutating request. The token-header scheme below
+> is the target design, not current behaviour.
 
-**Implementation:**
+The target design: all state-mutating API endpoints (POST, PUT, DELETE) require a CSRF token in addition to the session cookie.
+
+**Planned implementation:**
 
 - On login, the server generates a random CSRF token (256-bit, base64-encoded) and returns it in the response body (not in a cookie).
 - The Brioche SPA stores the CSRF token in a JavaScript variable (memory only, not localStorage).

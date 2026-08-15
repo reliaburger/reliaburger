@@ -249,7 +249,7 @@ schedule = "0 3 * * *"
 
 **High-throughput batch scheduling:** At 100M jobs/day, Meat allocates job batches to nodes rather than scheduling individual jobs. Nodes execute and report completions asynchronously. The Raft log records only batch-level decisions. The bin-packing allocator ships; the full delegated dispatch-and-completion pipeline is a Phase 12 deliverable (see [design/scheduler-meat.md](design/scheduler-meat.md) §5.2). On-demand and scheduled Jobs run today.
 
-**Build jobs:** Jobs can build container images and push them to the Pickle registry via the `pickle://` scheme. Build jobs require a `build_push_to` field that scopes registry access. Lettuce injects `${GIT_SHA}` for tag synchronisation.
+**Build jobs:** Jobs can build container images and push them to the Pickle registry via the `pickle://` scheme. Build jobs require a `destination` field (a `pickle://` reference) that scopes registry access. Lettuce injects `${GIT_SHA}` for tag synchronisation.
 
 > For batch scheduling and build job details, see [design/scheduler-meat.md](design/scheduler-meat.md) and [design/registry-pickle.md](design/registry-pickle.md).
 
@@ -748,7 +748,7 @@ Relish is the CLI and interactive terminal UI for Reliaburger. Running `relish` 
 | `relish secret rotate` | Rotate encryption keys | (none — requires Sealed Secrets re-encrypt) |
 | `relish snapshot create <app>` | Snapshot an app's local volumes | (none — requires CSI snapshotter) |
 | `relish import -f <k8s-yaml>` | Convert K8s manifests to Reliaburger TOML | (none) |
-| `relish export --format kubernetes` | Generate K8s manifests from config | (none) |
+| `relish export -f <file>` | Generate K8s manifests from a Reliaburger config | (none) |
 
 > For TUI mockups, command details, and debug container behaviour, see [design/cli-relish.md](design/cli-relish.md).
 
@@ -911,20 +911,17 @@ Reliaburger provides bidirectional Kubernetes migration tooling. Neither directi
 **Importing from Kubernetes** (`relish import`) converts Kubernetes YAML into Reliaburger TOML. The importer correlates related resources automatically: a Deployment + Service + Ingress + HPA that Kubernetes treats as four separate objects becomes a single `[app.*]` block in TOML. It uses the same matching logic Kubernetes itself uses (label selectors, backend references, and scale target refs) to group resources. Every import produces a migration report with three sections: what was converted directly, what was approximated (review recommended), and what was dropped (no Reliaburger equivalent) with guidance on alternatives.
 
 ```bash
-# From files
-relish import -f deployment.yaml -f service.yaml --output-dir ./reliaburger/
+# From files (repeat -f for multiple manifests)
+relish import -f deployment.yaml -f service.yaml
 
-# From a live cluster
-relish import --from-cluster --kubeconfig ~/.kube/config --namespace myapp
-
-# Dry run (migration report only)
-kubectl get all -o yaml | relish import -f - --dry-run
+# Fail on any conversion warning (CI gate)
+relish import -f deployment.yaml --strict
 ```
 
 **Exporting to Kubernetes** (`relish export`) generates standard Kubernetes manifests from Reliaburger configuration. Each `[app.*]` produces a Deployment + Service, plus Ingress and HPA if the app defines ingress and autoscale blocks. Each `[job.*]` produces a Job or CronJob. Features with no Kubernetes equivalent (auto-rollback, Smoker fault rules, process workloads) are noted in the export report.
 
 ```bash
-relish export --format kubernetes -f myapp.toml > k8s-manifests.yaml
+relish export -f myapp.toml > k8s-manifests.yaml
 ```
 
 This is an explicit design goal: Reliaburger should never be a dead end, regardless of which direction you're moving.
@@ -951,7 +948,7 @@ This is an explicit design goal: Reliaburger should never be a dead end, regardl
 | **Network security** | NetworkPolicy (CNI-dependent) | Same | Consul Connect | None | **Built-in eBPF + nftables (namespace isolation + per-app rules + opt-in egress allowlists)** |
 | **Image builds** | Separate (Tekton, Jenkins, external CI) | Same | Separate | `docker build` | **Built-in (build jobs → Pickle)** |
 | **Terminal UI** | None (k9s is third-party) | Same | None | None | **Built-in (relish TUI)** |
-| **Change planning** | `kubectl diff` (limited) | Same | Built-in (`nomad job plan`) | None | **Built-in (relish plan)** |
+| **Change planning** | `kubectl diff` (limited) | Same | Built-in (`nomad job plan`) | None | **Built-in (`relish apply --dry-run`)** |
 | **Connectivity debugging** | Manual (iptables, DNS, endpoints) | Same | Manual | N/A | **Built-in (relish trace)** |
 | **Health diagnosis** | Manual (requires runbooks) | Same | Manual | N/A | **Built-in (relish wtf)** |
 | **Fault injection** | Separate (Chaos Mesh / Litmus) | Same | Separate (Gremlin) | N/A | **Built-in (Smoker, eBPF-native)** |
@@ -1037,7 +1034,7 @@ The leader doesn't schedule individual jobs. For batch workloads, Meat allocates
 
 ### Q9: Local-only volumes with no distributed storage. How do teams not lose data?
 
-Three layers of mitigation. First, Reliaburger recommends managed databases for critical data (the pattern most production teams already follow). Second, apps that manage their own replication (CockroachDB, Cassandra) work naturally with local volumes. Third, Reliaburger includes built-in volume snapshots: `relish volume snapshot` creates an instant copy-on-write snapshot on the local filesystem, and a configurable upload job (a regular container with its own credentials) ships the snapshot to S3/GCS on a schedule (see Section 5.5 for details). Local snapshots provide fast rollback from application-level corruption; the upload job provides off-node durability. This covers the common case of "don't lose my Redis cache" without the complexity of a distributed storage layer.
+Three layers of mitigation. First, Reliaburger recommends managed databases for critical data (the pattern most production teams already follow). Second, apps that manage their own replication (CockroachDB, Cassandra) work naturally with local volumes. Third, Reliaburger includes built-in volume snapshots: `relish snapshot create <app>` creates an instant copy-on-write snapshot on the local filesystem, and a configurable upload job (a regular container with its own credentials) ships the snapshot to S3/GCS on a schedule (see Section 5.5 for details). Local snapshots provide fast rollback from application-level corruption; the upload job provides off-node durability. This covers the common case of "don't lose my Redis cache" without the complexity of a distributed storage layer.
 
 ### Q10: Will TOML configuration get unwieldy at 50+ apps?
 

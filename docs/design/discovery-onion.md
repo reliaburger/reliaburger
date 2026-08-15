@@ -708,11 +708,16 @@ program_dir = "/var/lib/reliaburger/ebpf/"
 # Cgroup v2 mount point for eBPF program attachment.
 # Default: "/sys/fs/cgroup"
 cgroup_path = "/sys/fs/cgroup"
+```
 
-# Port range for dynamic host port allocation (used by Bun, referenced
-# by Onion for backend map entries).
-# Default: "10000-60000"
-host_port_range = "10000-60000"
+The host port range Onion references for backend map entries is not an
+`[ebpf]` key — it comes from the port allocator, configured under
+`[network]`:
+
+```toml
+[network]
+# Dynamic host port allocation range (default: start = 10000, end = 60000).
+port_range = { start = 10000, end = 60000 }
 ```
 
 ### eBPF Program Files
