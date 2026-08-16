@@ -2155,3 +2155,417 @@ tests) + cluster suite (22/22).
     notes that now denied shipped features.
 
 **Phase 16 is complete** — every section (A–G) plus the closing gate is done.
+
+---
+
+## TODO: Codebase Audit Backlog (16 Aug 2026)
+
+Findings from a full-tree audit (six parallel auditors over all 24 modules, ~169k
+lines). Every item was verified by reading the surrounding code, not just grep hits.
+Severity reflects blast radius, not effort. `[x]` = fixed; unchecked = open. Group
+the fixes into a staged plan the way earlier review tiers did; several cluster in a
+handful of files (`bun/api.rs` authz, `mayo`/`ketchup` durability, agent-loop
+blocking calls).
+
+> **Scope caveat:** the eBPF/Apple/runc code paths were read but not all run — treat
+> platform-specific findings as "read-confirmed", not "reproduced". The areas skimmed
+> in the first pass (`src/relish/` command handlers + `wtf` + `k8s_export`/`k8s_import`,
+> and all of `src/testkit/`) were re-audited line-by-line on 16 Aug 2026 — see the
+> **Deep re-audit** subsection at the end of this backlog.
+
+### Critical — security & authorisation
+
+- [ ] **Scoped token widens to cluster-wide via `/ui/session`** — `src/bun/api.rs:3269`
+  `ui_session_handler` exchanges *any* valid token (including an app/namespace-scoped
+  one) for a session cookie whose `AuthContext` is built by `readonly_session_context`
+  (`src/sesame/auth.rs:313`) with `scoped_apps: None, scoped_namespaces: None`, and
+  `None` means "allow everything" in `authorize_scoped` — it even passes
+  `require_unscoped`. A tenant-scoped holder can POST its token to `/ui/session` then
+  read every tenant's `/ui/app/{app}/{ns}`, `/v1/logs/{app}/{ns}`, `/v1/metrics/app/…`,
+  and the whole-cluster `/v1/logs/sql` that explicitly refuses scoped bearer tokens (C3).
+- [ ] **A token literally named `__system` bypasses scope confinement** —
+  `src/sesame/auth.rs:46-48` documents `__system` as reserved and "never stored", but
+  nothing enforces it: `create_token` (`src/sesame/token.rs:44-79`) and the handler
+  (`src/bun/api.rs:5938-5999`) accept any name, and authorisation matches
+  `ctx.token_name == SYSTEM_PRINCIPAL`, so a real token named `__system` passes
+  `require_system` (auth.rs:450-459) and skips `authorize_scoped`/`require_unscoped`.
+- [ ] **Fault injection ignores scope** — `src/bun/api.rs:3795` `fault_inject_handler`
+  never calls `authorize_scoped` on `target_service` (and `FaultRequest` in
+  `src/smoker/types.rs:465` carries no namespace), so a Deployer scoped to one namespace
+  can kill/latency/error-inject any tenant's service; same in `fault_clear_all_handler`'s
+  `?service=` path (`api.rs:4388`). The C3 test misses it because `/v1/fault` has no
+  `{app}` path segment. Related: `src/bun/agent.rs:3747-3800,4074-4080` matches fault
+  targets by `app_name` only (no namespace), so "web" hits every namespace's "web".
+- [ ] **Metrics/events endpoints serve every tenant to any token** —
+  `src/bun/api.rs:4610` `metrics_query_handler` (plus `/v1/metrics/keys|rollup|cluster`
+  and `/v1/events`) take no `auth` parameter, contradicting the C3 doctrine that
+  `logs_sql_handler` applies via `require_unscoped` (api.rs:5069). A scoped token reads
+  all tenants' per-app metrics and audit events.
+- [ ] **`relish join` leaks the join token before the fingerprint pin is checked** —
+  `src/relish/commands.rs:619-626` + `src/sesame/join.rs:206-232` use
+  `danger_accept_invalid_certs(true)` and send the one-time token + CSR *before* the
+  `--ca-fingerprint` check runs on the response, so a MITM can capture and replay the
+  still-unconsumed token even when a fingerprint was pinned.
+- [ ] **Rollup reports skip identity binding (metrics poisoning)** —
+  `src/reporting/aggregator.rs:179-183` `MetricsRollup` is the only report type that
+  skips the C6 `report_identity_ok` check, so under mTLS node X can submit a `NodeRollup`
+  claiming node_id Y, poisoning Y's cluster metrics and pre-claiming Y's `(node, window)`
+  dedup keys so Y's genuine rollups drop as duplicates (`rollup_store.rs:168`).
+- [ ] **`[permission]` section is enforced nowhere** — `src/council/state_machine.rs:581`
+  permission specs are parsed, validated, GitOps-synced, and committed to Raft, but
+  nothing reads `state.permissions` to authorise anything (authz is purely token scopes).
+  `whitepaper.md:764`'s "`script` fields require `host-exec` permission" is false — gating
+  is the node-level `[process_workloads]` allowlist (`supervisor.rs:256`). Decide: enforce,
+  or document stored-but-unenforced and fix the docs + `src/config/permission.rs:1`.
+- [ ] **Constrained JWT verifier is unwired** — `src/sesame/oidc.rs:172-240`
+  `verify_jwt_with_constraints` + `JwtConstraints` (the PKI10-hardened alg/kid/iss/aud/iat
+  checks) has zero call sites; the only JWT verification anywhere is the weak `verify_jwt`,
+  inside a `#[cfg(test)]` block (`src/council/node.rs:1288`).
+
+### High — correctness / availability
+
+- [ ] **Whole-cluster node config validation is dead** — `src/config/validate.rs:328`
+  `NodeConfig::validate()` is never called; `run_agent` (`src/bin/bun.rs:546-565`) runs
+  only five section validators. So absolute-storage-path checks, inverted `port_range`,
+  `retain_versions == 0`, `max_boot_attempts == 0`, the testing policy, unparseable
+  `reserved_cpu`/`reserved_memory` (which then falls into `unwrap_or(0)` at bun.rs:361,
+  over-reporting capacity), and the "dns without ebpf is a VIP black hole" rejection all
+  never run.
+- [ ] **Identity rotation wedges the agent loop** — `src/bun/agent.rs:6584-6588`
+  `check_identity_rotation` makes `mpsc::channel(1)` whose receiver (`_dummy_rx`) is never
+  read, then loops `provision_identity` (one send per call); the second send blocks
+  forever, permanently wedging the agent event loop when 2+ instances need rotation.
+- [ ] **`relish exec` with a long command stalls the whole agent** —
+  `src/bun/agent.rs:2765-2772` `AgentCommand::Exec` runs `grill.exec()` inline on the
+  command loop with no timeout, so `relish exec app -- sleep 3600` stalls health checks,
+  restarts, and all commands (`Trace` was explicitly moved off-loop with an 8 s timeout
+  for exactly this).
+- [ ] **Cluster-join seeds silently dropped → node bootstraps a new cluster** —
+  `src/bin/bun.rs:121-126` parses `cluster.join` with
+  `.filter_map(|s| s.parse::<SocketAddr>().ok())`, so any unparseable entry (including a
+  natural `hostname:port`) is dropped; if all fail, `seeds` is empty and the node silently
+  forms a brand-new cluster instead of joining.
+- [ ] **Zero-valued intervals panic at startup** — `src/bin/bun.rs:1328,1460`
+  `[metrics] collection_interval_secs = 0` or `[logs] export_interval_secs = 0` is fed
+  straight into `tokio::time::interval`, which panics on a zero period (alerts fixed this
+  class under OBS4; scrape is guarded `.max(1)` at bun.rs:1402; `rollup_interval_secs` at
+  bun.rs:185 has the same exposure).
+- [ ] **Council rollups are never persisted** — `src/mayo/rollup_store.rs:252`
+  `RollupStore::flush()` has only test call sites, so cluster rollups live only in the
+  in-memory buffer: a restart loses all rollup history (despite flush's doc),
+  `hydrate_seen_windows` always finds an empty dir, `MAX_BUFFER_ROWS` silently drops the
+  oldest data at 1M rows, and the "Rollup retention (E)" `prune_expired` tick
+  (`bin/bun.rs:1584`) prunes Parquet files that never exist.
+- [ ] **Metrics retention prunes by mtime, not data timestamp** — `src/mayo/store.rs:588`
+  `MayoStore::prune` (the O12 fix keying retention on the data's own max timestamp) has no
+  callers; the binary prunes the metrics dir by mtime via `check_and_relieve`
+  (`bun/disk_pressure.rs:122`, wired at `bin/bun.rs:1556`), reinstating the
+  touch/copy/clock-skew hazard O12 fixed.
+- [ ] **`object_store_url` is dead config the book advertises as working** —
+  `src/config/node.rs:735` `[metrics] object_store_url` is parsed/defaulted/round-trip-tested
+  but read by zero code, yet `docs/book/06-watching-everything.md:52`,
+  `docs/design/metrics-mayo.md:380`, and checked `progress.md:167` all claim it redirects
+  metric persistence to S3. Wire it into MayoStore or delete it and fix the three docs.
+- [ ] **Namespace firewall keys rules by bare app name** — `src/sesame/firewall.rs:60-139`
+  `resolve_firewall_rules`/`resolve_cgroup_namespace_entries` key cgroup IDs by bare app
+  name (`src/bun/agent.rs:1867-1880` builds `HashMap<String /*app*/, Vec<u64>>` from
+  `i.app_name` alone), so same-named apps in different namespaces collide — an `allow_from`
+  rule leaks to every namespace's app of that name, and map insert order decides which
+  namespace a cgroup lands under. Routing/service-map already fixed the identical collision
+  (D3/codex-M1, `wrapper/routing.rs:6-10`).
+
+### Medium — data-plane bugs, blocking calls, unwired subsystems
+
+- [ ] **Btrfs snapshot restore is destructive on failure** — `src/grill/snapshot.rs:245-247`
+  `SnapshotManager::restore` deletes the live subvolume first, then creates the writable
+  snapshot; if the second `btrfs` call fails the live volume is gone with no rollback.
+- [ ] **Rootless/runc port-mapping failures reported as "started"** —
+  `src/grill/netns.rs:391-395` rootless `add_port_mapping` returns `Ok` before
+  `run_tcp_proxy` binds (line 594, spawned task), so a taken host port yields a
+  "successfully started" container whose port silently doesn't listen (error only
+  `eprintln!`'d; `accept?` at 600 also kills the proxy loop on any transient error). Same
+  shape root-mode: `src/grill/runc.rs:336-347` DNAT failure is only logged, supervisor
+  reports Running with a dead port.
+- [ ] **Blob cache accepts truncated blobs after a crash** — `src/grill/image.rs:400,427`
+  cache validity is `blob_path.exists()` and blobs are written non-atomically to the final
+  path; a crash mid-write leaves a truncated blob treated as a valid cache hit forever
+  (digest verified only on first download). Lines 408-415 also buffer the whole layer in
+  memory.
+- [ ] **Secret decrypt failure starts the container anyway** — `src/grill/oci.rs:284-295`
+  injects `{key}=DECRYPT_ERROR:{e}` (or raw ciphertext when no decryptor is present) into
+  the workload env and starts it, silently running with a broken secret.
+- [ ] **New deploys go live before their health check runs** —
+  `src/bun/agent.rs:8343-8362,8629-8662` the rolling/blue-green health wait polls only
+  `grill.state == Running` yet publishes the backend `healthy: true` (7166-7171); the
+  configured HTTP health check isn't registered for new instances until
+  `finalise_rolling_deploy` (4778-4813), so a version that starts but fails its probe still
+  replaces healthy old instances.
+- [ ] **Parquet flushes are unfsynced and Mayo drops samples on a failed write** —
+  `src/mayo/store.rs:62-76`, `src/ketchup/log_store.rs:294-303`: no `sync_all`/temp+rename/
+  dir fsync despite explicit durability claims (contrast pickle REG5). And
+  `src/mayo/store.rs:244-257` `take_flush_batch` clears the buffer + bumps the counter
+  *before* the write, so a failed write permanently discards the drained samples
+  (LogStore/RollupStore clear only after success).
+- [ ] **Blocking work on the agent event loop / runtime worker** (project rule: no blocking
+  in async):
+  - `src/bun/agent.rs:2890-2919,1731` + `src/bun/snapshot_worker.rs:93-137` — snapshot
+    create/restore/delete run sync `btrfs` subprocess + `std::fs` walks on the loop
+    (btrfs.rs's own doc says "call from `spawn_blocking`").
+  - `src/bun/agent.rs:7580-7586` — `DeployOp::RetireOldInstance` runs `wait_drained` +
+    `stop_and_wait_for_exit` (100 ms polls up to drain+10 s, per instance, sequentially) on
+    the loop, contradicting the DeployOp "fast `&mut self` steps only" doc.
+  - `src/ketchup/log_store.rs:284-309` — `LogStore::flush()` does sync Parquet encode +
+    ZSTD + `std::fs` on the runtime while holding the write lock (`bin/bun.rs:1432-1435`),
+    starving all log appends/queries; only Mayo got the OBS5/M3 `spawn_blocking` treatment.
+  - `src/council/durable_log.rs:261-277` (+ `save_vote`/`truncate`/`purge`,
+    `state_machine.rs:109-123`) — every openraft async storage method does a synchronous
+    redb `begin_write()`/`commit()` (fsync) on a runtime worker, uncommented.
+  - `src/pickle/api.rs:461` — `blob_get` calls sync `read_blob` (`std::fs::read`) and
+    buffers the whole blob (up to 512 MiB) per GET on a runtime worker.
+  - Argon2id inline: `src/bun/api.rs:5980,3282` `create_token`/`authenticate` hash/verify
+    on the async handler without `spawn_blocking`.
+  - `src/sesame/identity.rs:281-299,312-321` — `mount`/`umount` via blocking
+    `std::process::Command::status()` from async agent paths.
+- [ ] **LogStore buffer is unbounded** — `src/ketchup/log_store.rs:194-199` has no cap, so
+  a persistently failing flush (disk full — logged every 60 s) grows the buffer without
+  bound; RollupStore got `MAX_BUFFER_ROWS` for exactly this, LogStore didn't.
+- [ ] **Rollup backfill double-counts or drops on aggregator reassignment** —
+  `src/mayo/rollup_generator.rs:44-85` + `query_fanout.rs:34-52` stamp the 5-minute backfill
+  as one aggregate at `aligned_end - 300` (a key a normal 1-minute window already used):
+  reassignment *back* drops the whole backfill as a duplicate; reassignment to a fresh
+  aggregator makes `merge_cluster_results` sum the 5-min row with overlapping 1-min rows
+  (cross-aggregator, invisible to OBS2 dedup). Failed rollup pushes are also lost silently
+  (`rollup_worker.rs:126-140`: `Err(_) => return` no log, `let _ =` send, backfill flag
+  cleared before the send; nodes over `MAX_REPORT_SIZE` 1 MiB lose metrics permanently).
+- [ ] **Placement reconciler orphans instances on a failed stop** —
+  `src/cluster/orchestrate.rs:847-857` fires `AgentCommand::Stop` with the response oneshot
+  dropped and unconditionally does `applied.remove(...)` even if the send/stop failed, so no
+  later tick retries — asymmetric with the deploy path, which waits for terminal `Complete`.
+- [ ] **SWIM dissemination can drop failure notifications** —
+  `src/mustard/dissemination.rs:127-154` `compact()` keeps the first-drained entry at equal
+  incarnation, but `BinaryHeap::drain()` yields arbitrary order, so a `Dead`/`Suspect`
+  update can be discarded for an `Alive` — inverting the SWIM precedence `resolve_conflict`
+  enforces everywhere else. Also `src/mustard/protocol.rs:801-836` `wait_for_relay_ack`
+  applies piggybacked updates but skips the self-refutation logic (`handle_message:580-588`),
+  so a Suspect-about-self during a relay wait is never refuted.
+- [ ] **Non-deterministic Raft apply** — `src/council/state_machine.rs:512`
+  `RevokeCertificate` sets `crl.updated_at = SystemTime::now()` inside `apply_request`, so
+  replicas diverge on that field (the comment eight lines up explains why wall-clock in
+  apply is forbidden; the pruning beside it correctly uses in-log `revoked_at`).
+- [ ] **Upgrade start/rollback races and trusts client-supplied node identity** —
+  `src/bun/api.rs:1685` `upgrade_start_handler` is check-then-write over a last-writer-wins
+  `UpgradeUpdate`, so two concurrent starts (or a start racing rollback at 1897) both pass
+  the guard and the second clobbers the first plan mid-flight; and `api.rs:1865`
+  `upgrade_cluster_rollback_handler` copies client-supplied `node_id`/`address`/`role`
+  verbatim into the replicated plan, bypassing the UPG2 validation `upgrade_start_handler`
+  applies.
+- [ ] **`GET /ui/node/{name}` ignores the requested node** — `src/bun/api.rs:4931`
+  `node_detail_handler` renders the *local* agent's instances with hardcoded
+  `state: "alive"`, so clicking node B in a cluster shows node A's workloads labelled B.
+- [ ] **Ingress certs are unrevocable (hardcoded serial)** — `src/wrapper/tls.rs:70-74`
+  every ingress cert (including per-SNI resolver-minted certs) uses `SerialNumber(1)`, so
+  they're indistinguishable by serial and unrevocable via the serial-keyed CRL. (Known
+  deferral — comment admits it, but track it.)
+- [ ] **WebSocket ingress has no connect/handshake timeout and ignores drain** —
+  `src/wrapper/websocket.rs:69,162-180` has no timeout on `TcpStream::connect`/handshake/
+  `read_http_head`, so a backend that accepts TCP but never responds pins the handler,
+  permit, and drain guard forever; and `src/wrapper/proxy.rs:489,503-514` drops the drain
+  `terminate` token on the WS path, so the drain deadline never tears a WS splice down and
+  no 1001 close frame is sent (the `websocket_close_frame` builder at
+  `draining.rs:237-239` is unwired).
+- [ ] **`upgrade_cluster_rollback`/`manager` swallow failures that disable rollback** —
+  `src/upgrade/orchestrator.rs:757` discards a failed Raft `UpgradeUpdate` write with no
+  log; `src/upgrade/manager.rs:313-314` swallows a failed symlink-restore after `execv`
+  fails while archiving the marker anyway, so a restart execs the broken binary with no
+  boot-check marker to trigger rollback.
+- [ ] **Unwired parallel deploy engine** — `src/meat/orchestrator.rs` `DeployOrchestrator`,
+  the `DeployDriver` trait, and `src/meat/blue_green.rs` `execute_blue_green` (~800 tested
+  lines) have zero call sites outside their files; the agent implements rolling and
+  blue-green independently (`bun/agent.rs:7767`). Same for the replicated deploy state:
+  `RaftRequest::DeployUpdate`/`DeployComplete` (`council/types.rs`, applied at
+  `state_machine.rs:239-270`) are never written in production, so `DesiredState.active_deploys`
+  / `deploy_history` stay empty forever. Decide: wire, or delete and stop maintaining two
+  deploy implementations that can silently diverge.
+- [ ] **Superseded coordinator module still shipped** — `src/lettuce/coordinator.rs`
+  `select_coordinator` ("prefer non-leader" election) is test-only dead code; production uses
+  `coordinator_for_leader` (`sync.rs:353`), and the module doc still describes the opposite
+  behaviour. Delete the module + fix the doc.
+- [ ] **GitOps auto-enforce admits unverified commits** — `src/lettuce/sync.rs:139-142`
+  the script-modifying-commit gate admits `SignatureStatus::NotChecked`, so with no trusted
+  keys (default when `require_signed_commits = false`) the "modifies script but not signed"
+  protection is a no-op — the exact "verification never ran" case the rationale at
+  sync.rs:50-53 calls unsafe to admit.
+- [ ] **Smoker BPF cleanup is a no-op** — `src/smoker/bpf_maps.rs:97-114`
+  `cleanup_all_fault_maps` prints and does nothing (`let _ = map_ref;`) despite its
+  hot-restart "safety net" doc, and has zero callers; stale fault-map state can survive a
+  restart.
+- [ ] **Argon2/reqwest/GC swallowed failures** —
+  `src/bin/bun.rs:2253-2256` GC treats a dead agent task's failed `ActiveImages` send as
+  "no active images" (`unwrap_or_default()`) and collects everything; `bin/bun.rs:2425-2443`
+  final-flush comment claims the feeding tasks are joined but the log-drain (1309) and
+  metrics (1326) tasks are bare spawns not in the `join!`, so buffered records can be
+  appended after the final flush and lost; `bin/bun.rs:1636-1637` swallows a
+  `create_dir_all` error and uses `config.storage.data` directly rather than the computed
+  `data_base` fallback.
+- [ ] **Dead / mislabelled config keys** — beyond `object_store_url` and `[permission]`
+  above: `[upgrades] release_url` (`node.rs:316`) claims to feed `relish upgrade check` but
+  nothing reads it (relish uses its own `--url`); `upgrades.gossip_rejoin_secs` (`node.rs:324`)
+  parsed but never read (TODO(Phase 14) at bun.rs:1698); `[reporting_tree] max_events_per_report`
+  (`node.rs:535`) plumbed into ClusterParams but no consumer/cap code; `[images] max_storage`
+  parsed `unwrap_or(0)` where 0 = unlimited so a typo disables the cap.
+- [ ] **Config error messages name fields that don't exist** —
+  `src/config/node.rs:592-606` `ReconstructionSection::validate` reports against
+  `coverage_percent`/`timeout_secs` but the real TOML keys are `report_threshold_percent`/
+  `learning_period_timeout_secs`; `node.rs:352` doc says node name defaults to hostname but
+  it's `node-{gossip_port}`; `node.rs:503` doc says `advertise_address` is auto-detected but
+  bun silently falls back to `127.0.0.1` (which then passes
+  `enforce_cluster_transport_security`).
+- [ ] **`--output json|yaml` ignored by most relish subcommands** — `src/bin/relish.rs:16-18`
+  the global format flag is threaded only into apply/nodes/council/test/bench/wtf/trace;
+  `status`/`top`/`images`/`deploy`/`history` ignore it, so `relish --output json status`
+  prints human output with exit 0.
+
+### Low — hygiene, minor bugs, stale docs
+
+- [ ] **TUI log buffer not cleared on target switch** — `src/relish/tui/state.rs:159`
+  opening app B's logs after A interleaves A's buffered lines with B's; and
+  `src/relish/tui/views/logs.rs:41` hard-codes `.take(32)` regardless of terminal height.
+- [ ] **Stale TODO / doc drift** — `src/meat/filter.rs:41` `TODO(wiring)` is stale
+  (`apply_upgrade_cordon` *is* wired via `orchestrate.rs:172`, `bin/bun.rs:1001`), delete it;
+  `src/meat/score.rs:3-8` doc claims a "0–130 scale, Spread (40)" but constants give
+  `WEIGHT_SPREAD = 60`, max 150; `src/mayo/scrape.rs:114-122` "there is no scrape loop yet"
+  is stale (loop at bin/bun.rs:1400-1416); `src/meat/quota.rs:204-207` and
+  `src/mustard/dissemination.rs:180-189` carry stale/left-in editing notes;
+  `docs/roadmap.md:686` Phase 15 "Tests (write first)" names 7 integration tests that live
+  only as in-module unit tests, and roadmap.md has no Phase 16 section at all.
+- [ ] **Swallowed errors worth surfacing** — `src/cluster/runtime.rs:421`
+  `let _ = council.initialize(members)` swallows a fresh-cluster bootstrap failure with no
+  log; `src/bun/api.rs:5695` `gitops_webhook_handler` returns 202 "sync triggered" even when
+  the sync loop's receiver is gone; `src/bun/disk_pressure.rs:75-81` discards
+  `export_logs` errors with no logging.
+- [ ] **Fresh reqwest client per health probe** — `src/bun/probe.rs:21` builds a new
+  `reqwest::Client` (new connection pool) per probe and maps a client-*build* failure to
+  `HealthStatus::ConnectionRefused`, misattributing a local config error to the workload.
+- [ ] **Panics reachable from production entry points** — `src/bin/bun.rs:696,1280,1978`
+  `.expect("failed to create … directory")` on `create_dir_all` (the fallback at 583 maps
+  into anyhow correctly); `src/bun/testapp.rs:130-131` `TcpListener::bind().await.unwrap()`
+  panics `bun testapp` when the port is taken; `src/bin/bun.rs:1918-1921`
+  `build().unwrap_or_default()` where `Default` calls `Client::new()` which panics on the
+  same TLS-init failure (and drops the 10 s timeout).
+- [ ] **Unwired library-only helpers** (delete or wire): `src/wrapper/proxy.rs:343`
+  `run_proxy`; `src/onion/dns.rs:364-375` `run_dns_responder`; `src/sesame/identity.rs:543-551`
+  `extend_grace_period` (so `RotationState::GracePeriod` and the documented 4-hour grace
+  extension are unreachable; failed rotation marches to `Expired` with an `eprintln`);
+  `src/sesame/secret.rs:197-221` `unseal_with_age` (the sealed root-CA backup `relish init`
+  writes has no restore path); `src/meat/autoscaler.rs:278-316` `run_autoscale_loop` (still
+  contains the DEP8 bug the wired path fixed); `src/pickle/pull.rs:193`
+  `image_available_locally`; `src/relish/client.rs:707` `renew_test_lease`; various
+  smoker helpers (`resource.rs:230`, `types.rs:285`, `registry.rs:155,188`).
+- [ ] **Dead wire/config fields** — `src/mustard/message.rs:171` `lamport` is stamped and
+  shipped "for causal ordering" but never read (conflict resolution is incarnation-only);
+  `src/wrapper/types.rs:136-142` `LoadBalanceStrategy::LeastConnections` is populated but
+  `select_backend` is unconditionally round-robin; `src/wrapper/types.rs:99`
+  `worker_threads` is mapped but never read; `MembershipSnapshot.resources` / `cached_images`
+  are unpopulated for remote peers, so council resource-eligibility (`selection.rs:113-120`)
+  and image-locality scoring (`score.rs:103-111`) are inert in production.
+- [ ] **Minor correctness** — `src/bun/authz.rs:392` `matrix_covers_every_mounted_route`
+  compares paths only, not methods (a new method on a listed path bypasses the matrix);
+  `src/bun/api.rs:4757` `statuses_to_dashboard_apps` sets `instances_desired = count` where
+  count *is* the running count, so under-replication can never render; `src/grill/port.rs:76-88`
+  `allocate()` gives up after 1000 random probes with no deterministic fallback scan;
+  `src/sesame/ca.rs:573-614` uses a hand-rolled "approximate" epoch→Y/M/D conversion for
+  cert validity; `src/mayo/store.rs:606-608` + `rollup_store.rs:582-584` count a file pruned
+  even when `remove_file` fails; `src/ketchup/export.rs:44-49` `exported_files` only grows.
+- [ ] **Known planned boundaries (not defects, keep honest)** — no PromQL (raw SQL /
+  fixed-shape endpoints), no remote-read protocol, a single rollup tier (no tiered
+  downsampling), WS 1001 drain-termination built but not sent on the live splice, and the
+  Apple grill `create` (`src/grill/apple.rs:216-255`) not translating `spec.mounts`/
+  `port_mapping` so volumes/config files silently don't mount on macOS.
+
+### Deep re-audit of the previously-skimmed areas (16 Aug 2026)
+
+Four agents line-audited what the first pass only skimmed: the `relish` command
+handlers, the `wtf` diagnostics, `k8s_export`/`k8s_import`, and the whole `testkit`
+tree (treated as production code — it ships as the `relish test`/`bench` runner).
+
+Headline: the runner's **safety gate and lease/deadline arithmetic are genuinely
+sound** (fail-closed authorise path, no expiry gap/overlap, atomic lease persistence),
+the **`wtf` diagnosis rules and all bench math are correct**, and no path turns a
+broken test run green by accident (deferrals report `Unknown`, which fails a full
+profile). The real defects are a Kubernetes-conversion path that silently drops fields,
+and a handful of test cases whose assertions are too loose to catch the bug they name.
+
+**Medium — Kubernetes export/import silently loses data:**
+
+- [ ] **Exported Ingress has no namespace** — `src/relish/k8s_export.rs:308-313` omits
+  `namespace` from the Ingress `ObjectMeta` (every other kind sets it), so a namespaced
+  app's Ingress lands in `default` and can't reach its Service — the M28 class the
+  surrounding comments claim to have fixed.
+- [ ] **Export drops quotas and Job resources without a report entry** —
+  `src/relish/k8s_export.rs:522-538` `export_namespace` ignores its `_ns` arg and emits
+  only a `Namespace` (every quota field dropped) despite the module doc promising a
+  `ResourceQuota`; `k8s_export.rs:444-449` `export_job` maps only image+command, silently
+  discarding `env`/`memory`/`cpu`. Both skip the `dropped`/`unsupported` report the app
+  exporter uses. Also `k8s_export.rs:356-360` emits a DaemonSet-app HPA whose
+  `scaleTargetRef` is hardcoded `kind: Deployment` (pointing at nothing), and
+  `k8s_export.rs:369,557` can emit a `Utilization` HPA with no `averageUtilization`.
+- [ ] **Import correlates HPAs by the wrong name and drops uncorrelated resources** —
+  `src/relish/k8s_import.rs:324-327` matches `hpas.get(name)` on the HPA's own metadata
+  name against the deployment name (the comment says "by scaleTargetRef name"), so a
+  conventionally-named `api-hpa`→`api` never correlates and its autoscaling is lost; any
+  Ingress/HPA that fails to correlate is dropped with no warning (`k8s_import.rs:248-393`),
+  unlike ConfigMaps/Secrets which are reported.
+- [ ] **Import drops fields on non-Deployment workloads** —
+  `src/relish/k8s_import.rs:584-619` `daemonset_to_app`/`statefulset_to_app` keep only
+  image/namespace/replicas/port, silently dropping command/env/resources/probes/
+  initContainers/nodeSelector (whereas `deployment_to_app` imports and warns on all of
+  them); `k8s_import.rs:791-829` Job/CronJob import loses env/limits/namespace;
+  `k8s_import.rs:503-512` reads resources from `limits` only (a requests-only Deployment
+  imports with no cpu/memory); `k8s_import.rs:707-747` `apply_ingress` keeps only the
+  first rule's first path.
+
+**Medium — relish command handlers:**
+
+- [ ] **`relish logs-export` doc describes an agent interaction that doesn't exist** —
+  `src/relish/commands.rs:204-234` the doc claims it "triggers an immediate export from
+  the running Bun agent's LogStore" and "falls back to direct file copy if the agent is
+  unreachable," but the body never contacts the agent — it unconditionally reads hardcoded
+  local Parquet paths. Fix the doc or build the agent path.
+- [ ] **`plan.rs` current-state diff is unreachable** — `src/relish/plan.rs:80`
+  `generate_plan`'s `Update`/`Destroy`/`Unchanged` diffing and the `CurrentResource` type
+  are never exercised: every caller (`apply`, `deploy`) passes `current = None`, so
+  `apply --dry-run` always shows everything as a create, contradicting the module doc.
+
+**Medium — test cases with assertions too loose to catch the named bug (false-green risk):**
+
+- [ ] **Scope/quota cases accept any error as success** —
+  `src/testkit/cases/workload_identity.rs:82` (`Err(_) => Ok(())`) and
+  `src/testkit/cases/scheduling.rs:94` treat *any* failure of the second/scoped apply as
+  proof the enforcement works, so a network blip or 5xx passes the case; neither inspects
+  the rejection reason. `src/testkit/cases/scheduling.rs:72` reads a node whose `status()`
+  errored as "not hosting the misplaced replica" (`unwrap_or(false)`) and never positively
+  asserts placement, so a real placement violation can pass.
+
+**Low — hygiene and minor bugs from the deep pass:**
+
+- [ ] **relish client/CLI robustness** — `src/relish/client.rs:367-376` `health()` returns
+  `Ok(())` without checking HTTP status (any server on the port reads as "agent alive");
+  `client.rs:305` `build().expect(...)` panics the CLI on a reqwest/TLS init failure;
+  `client.rs:440` decodes SSE with per-chunk `from_utf8_lossy`, corrupting multibyte
+  sequences split across chunk boundaries; `commands.rs:246` exports to CWD when the
+  destination isn't valid UTF-8 (`unwrap_or(".")`); `commands.rs:169` `parse_since` does an
+  unchecked `amount * multiplier`; `commands.rs:1125-1132` a doc comment is misplaced onto
+  `secret_rotate` so `images()` has none; `wtf/diagnose.rs:681` the certs-OK message says
+  "valid for at least 14 days" but counts auto-rotating sub-14-day leaves as OK.
+- [ ] **Test-harness robustness** — `src/testkit/cases/deployments.rs:32` maps a failed
+  `cluster_instances` to `running = 0` (spurious "dropped to 0 backends" flake);
+  `deployments.rs:89` `deploy_history_records_each_version` only checks non-empty + ≥1
+  Completed, never that each version is recorded; `ingress.rs:73` (+2 siblings) do a
+  single-shot HTTP check with no polling (spurious false-red); `context.rs:351`
+  cluster-wait helpers aren't wrapped in `deadline.run(...)` like their sibling (degrades
+  the timeout diagnostic); `context.rs:441-508` the `teardown` "second lock" doc overstates
+  (the guarantee is server-side lease validation, not the client-side guard);
+  `context.rs:376-386` `registry_base` mishandles bracketed IPv6; `context.rs:120`
+  `wait_running` is dead harness surface; and note the workload-fault handlers
+  (`src/bun/api.rs:4243-4246,3858-3861`) default to `Admin` when `auth` is `None` while
+  node faults reject `None` — only reachable with auth fully disabled, but asymmetric.
