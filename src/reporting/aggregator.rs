@@ -176,8 +176,15 @@ impl<T: ReportingTransport> ReportAggregator<T> {
                         Some((_, _, ReportingMessage::Ack { .. })) => {
                             // Workers don't send Acks to the aggregator
                         }
-                        Some((_, _, ReportingMessage::MetricsRollup(rollup))) => {
-                            if let Some(ref store) = self.rollup_store {
+                        Some((_, peer, ReportingMessage::MetricsRollup(rollup))) => {
+                            // C6: a rollup may only claim the node id the peer's
+                            // cert authenticates. Otherwise, under mTLS, node X
+                            // could submit a NodeRollup{node_id: Y}, poisoning Y's
+                            // cluster metrics and pre-claiming Y's (node, window)
+                            // dedup keys so Y's genuine rollups drop as duplicates.
+                            if Self::report_identity_ok(&peer, &rollup.node_id)
+                                && let Some(ref store) = self.rollup_store
+                            {
                                 store.write().await.ingest(&rollup);
                             }
                         }

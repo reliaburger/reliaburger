@@ -17,17 +17,33 @@ use std::time::{Duration, SystemTime};
 use ring::rand::{SecureRandom, SystemRandom};
 use tokio::sync::RwLock;
 
+use super::types::TokenScope;
+
 /// The cookie name carrying the session id.
 pub const SESSION_COOKIE: &str = "rb_session";
 
 /// How long a session stays valid after creation.
 const SESSION_TTL: Duration = Duration::from_secs(12 * 3600);
 
+/// The identity a live session resolves to: the originating token's name plus
+/// the app/namespace scope it was confined to. The scope travels with the
+/// session so a tenant-scoped token cannot widen to cluster-wide reads by
+/// exchanging itself for a cookie (the C3 gap).
+#[derive(Debug, Clone)]
+pub struct SessionIdentity {
+    /// The token name the session was created from.
+    pub token_name: String,
+    /// The originating token's scope, carried onto the session context.
+    pub scope: TokenScope,
+}
+
 /// One active browser session.
 #[derive(Debug, Clone)]
 struct Session {
     /// The token name the session was created from (for audit only).
     token_name: String,
+    /// The scope the originating token was confined to.
+    scope: TokenScope,
     /// When the session expires.
     expires_at: SystemTime,
 }
@@ -44,11 +60,12 @@ impl SessionStore {
         Self::default()
     }
 
-    /// Create a new session for `token_name` and return its opaque id.
+    /// Create a new session for `token_name` with the originating token's
+    /// `scope`, and return its opaque id.
     ///
     /// The id is 256 bits of randomness, hex-encoded. Creating a session
     /// opportunistically sweeps expired ones.
-    pub async fn create(&self, token_name: &str) -> String {
+    pub async fn create(&self, token_name: &str, scope: TokenScope) -> String {
         let mut bytes = [0u8; 32];
         // The system RNG only fails if the OS entropy source is unavailable,
         // which on a running node it is not.
@@ -64,20 +81,26 @@ impl SessionStore {
             id.clone(),
             Session {
                 token_name: token_name.to_string(),
+                scope,
                 expires_at: now + SESSION_TTL,
             },
         );
         id
     }
 
-    /// Return the token name if `id` names a live session, else `None`.
+    /// Return the session identity if `id` names a live session, else `None`.
     /// An expired session is removed as a side effect.
-    pub async fn validate(&self, id: &str) -> Option<String> {
+    pub async fn validate(&self, id: &str) -> Option<SessionIdentity> {
         // Fast path: a read lock covers the common valid case.
         {
             let guard = self.inner.read().await;
             match guard.get(id) {
-                Some(s) if s.expires_at > SystemTime::now() => return Some(s.token_name.clone()),
+                Some(s) if s.expires_at > SystemTime::now() => {
+                    return Some(SessionIdentity {
+                        token_name: s.token_name.clone(),
+                        scope: s.scope.clone(),
+                    });
+                }
                 Some(_) => {} // expired — fall through to remove it
                 None => return None,
             }
@@ -110,8 +133,22 @@ mod tests {
     #[tokio::test]
     async fn create_then_validate_returns_the_token_name() {
         let store = SessionStore::new();
-        let id = store.create("ci").await;
-        assert_eq!(store.validate(&id).await.as_deref(), Some("ci"));
+        let id = store.create("ci", TokenScope::default()).await;
+        let identity = store.validate(&id).await.expect("session should be live");
+        assert_eq!(identity.token_name, "ci");
+    }
+
+    #[tokio::test]
+    async fn validate_carries_the_originating_token_scope() {
+        let store = SessionStore::new();
+        let scope = TokenScope {
+            apps: Some(vec!["web".to_string()]),
+            namespaces: Some(vec!["team-a".to_string()]),
+        };
+        let id = store.create("scoped", scope.clone()).await;
+        let identity = store.validate(&id).await.expect("session should be live");
+        assert_eq!(identity.scope.apps, scope.apps);
+        assert_eq!(identity.scope.namespaces, scope.namespaces);
     }
 
     #[tokio::test]
@@ -123,7 +160,7 @@ mod tests {
     #[tokio::test]
     async fn a_removed_session_no_longer_validates() {
         let store = SessionStore::new();
-        let id = store.create("ci").await;
+        let id = store.create("ci", TokenScope::default()).await;
         store.remove(&id).await;
         assert!(store.validate(&id).await.is_none());
     }

@@ -2584,11 +2584,17 @@ struct EventsQuery {
 
 /// Return recent events from the bounded in-memory store.
 async fn events_handler(
+    auth: Option<axum::Extension<crate::sesame::auth::AuthContext>>,
     State(state): State<ApiState>,
     Query(query): Query<EventsQuery>,
-) -> impl IntoResponse {
+) -> Response {
+    // Audit events span every app and namespace, so a scoped token is refused
+    // (C3) just as it is for the cluster-wide metrics and logs endpoints.
+    if let Err(resp) = crate::sesame::auth::require_unscoped(auth.as_deref()) {
+        return resp;
+    }
     let Some(events) = &state.events else {
-        return Json(serde_json::json!({"events": []}));
+        return Json(serde_json::json!({"events": []})).into_response();
     };
     let store = events.read().await;
     Json(serde_json::json!({
@@ -2598,6 +2604,7 @@ async fn events_handler(
             query.severity,
         )
     }))
+    .into_response()
 }
 
 /// Upgrade an authenticated request to the live event stream.
@@ -3271,21 +3278,36 @@ async fn ui_session_handler(
     axum::Form(form): axum::Form<SessionForm>,
 ) -> Response {
     let tokens = auth.tokens.read().await;
-    // Accept the internal service token or any valid user token.
-    let name = if auth
+    // Accept the internal service token or any valid user token. The session
+    // inherits the presented token's scope (C3), so a tenant-scoped token
+    // cannot widen to cluster-wide reads by exchanging itself for a cookie.
+    let identity = if auth
         .service_token
         .as_deref()
         .is_some_and(|s| crate::sesame::auth::tokens_equal(&form.token, s))
     {
-        Some(crate::sesame::auth::SYSTEM_PRINCIPAL.to_string())
+        // The operator presented the real service token; the session is
+        // unconfined (but still read-only), matching the service principal.
+        Some((
+            crate::sesame::auth::SYSTEM_PRINCIPAL.to_string(),
+            crate::sesame::types::TokenScope::default(),
+        ))
     } else {
         crate::sesame::auth::authenticate(&form.token, &tokens)
             .ok()
-            .map(|ctx| ctx.token_name)
+            .map(|ctx| {
+                (
+                    ctx.token_name,
+                    crate::sesame::types::TokenScope {
+                        apps: ctx.scoped_apps,
+                        namespaces: ctx.scoped_namespaces,
+                    },
+                )
+            })
     };
     drop(tokens);
 
-    let Some(name) = name else {
+    let Some((name, scope)) = identity else {
         return (
             StatusCode::UNAUTHORIZED,
             axum::response::Html(crate::brioche::login::render_login(Some(
@@ -3295,7 +3317,7 @@ async fn ui_session_handler(
             .into_response();
     };
 
-    let id = auth.sessions.create(&name).await;
+    let id = auth.sessions.create(&name, scope).await;
     let cookie = format!(
         "{}={id}; HttpOnly; SameSite=Strict; Path=/; Max-Age=43200",
         crate::sesame::session::SESSION_COOKIE
@@ -4607,10 +4629,18 @@ struct MetricsQueryParams {
 }
 
 /// `GET /v1/metrics?name=X&start=S&end=E` — query time-series data.
+///
+/// Reads across every app and namespace on the node, so a scoped token is
+/// refused (C3) and pointed at `/v1/metrics/app/{app}/{namespace}`, which can
+/// filter. The cross-node fan-out presents the service token, which passes.
 async fn metrics_query_handler(
+    auth: Option<axum::Extension<crate::sesame::auth::AuthContext>>,
     State(state): State<ApiState>,
     Query(params): Query<MetricsQueryParams>,
 ) -> Response {
+    if let Err(resp) = crate::sesame::auth::require_unscoped(auth.as_deref()) {
+        return resp;
+    }
     let Some(mayo) = &state.mayo else {
         return Json(serde_json::json!({"error": "metrics not enabled"})).into_response();
     };
@@ -4706,7 +4736,13 @@ async fn metrics_query_handler(
 }
 
 /// `GET /v1/metrics/summary` — latest value for each metric.
-async fn metrics_summary_handler(State(state): State<ApiState>) -> Response {
+async fn metrics_summary_handler(
+    auth: Option<axum::Extension<crate::sesame::auth::AuthContext>>,
+    State(state): State<ApiState>,
+) -> Response {
+    if let Err(resp) = crate::sesame::auth::require_unscoped(auth.as_deref()) {
+        return resp;
+    }
     let Some(mayo) = &state.mayo else {
         return Json(serde_json::json!([])).into_response();
     };
@@ -5110,7 +5146,13 @@ async fn alerts_handler(State(state): State<ApiState>) -> impl IntoResponse {
 }
 
 /// `GET /v1/metrics/keys` — list all distinct metric names.
-async fn metrics_keys_handler(State(state): State<ApiState>) -> Response {
+async fn metrics_keys_handler(
+    auth: Option<axum::Extension<crate::sesame::auth::AuthContext>>,
+    State(state): State<ApiState>,
+) -> Response {
+    if let Err(resp) = crate::sesame::auth::require_unscoped(auth.as_deref()) {
+        return resp;
+    }
     let Some(mayo) = &state.mayo else {
         return Json(serde_json::json!({"keys": []})).into_response();
     };
@@ -5131,9 +5173,13 @@ async fn metrics_keys_handler(State(state): State<ApiState>) -> Response {
 /// Internal endpoint used by cluster-wide query fan-out. Each council
 /// member evaluates this against its own rollup data.
 async fn metrics_rollup_handler(
+    auth: Option<axum::Extension<crate::sesame::auth::AuthContext>>,
     State(state): State<ApiState>,
     Query(params): Query<MetricsQueryParams>,
 ) -> Response {
+    if let Err(resp) = crate::sesame::auth::require_unscoped(auth.as_deref()) {
+        return resp;
+    }
     let Some(rollup_store) = &state.rollup_store else {
         return Json(Vec::<MetricsQueryRow>::new()).into_response();
     };
@@ -5218,9 +5264,13 @@ async fn resolve_council_urls(state: &ApiState) -> Option<Vec<String>> {
 /// with any warnings about unresponsive aggregators. Falls back to reading the
 /// local rollup store when there is no council to fan out to (single-node).
 async fn metrics_cluster_handler(
+    auth: Option<axum::Extension<crate::sesame::auth::AuthContext>>,
     State(state): State<ApiState>,
     Query(params): Query<MetricsQueryParams>,
 ) -> Response {
+    if let Err(resp) = crate::sesame::auth::require_unscoped(auth.as_deref()) {
+        return resp;
+    }
     let start = params.start.unwrap_or(0);
     // Clamped below u64::MAX: DataFusion 45's interval analysis
     // overflows (debug-build panic) computing the cardinality of a
@@ -5945,6 +5995,18 @@ async fn token_create_handler(
                 .into_response();
         }
     };
+
+    // The internal service principal name is reserved: a user token minted with
+    // it would match `SYSTEM_PRINCIPAL` and bypass scope confinement (AUTH4).
+    if req.name == crate::sesame::auth::SYSTEM_PRINCIPAL {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({
+                "error": format!("token name {:?} is reserved", req.name)
+            })),
+        )
+            .into_response();
+    }
 
     let role = match req.role.as_str() {
         "admin" => crate::sesame::types::ApiRole::Admin,
@@ -8374,6 +8436,38 @@ mod tests {
         let status = get_status(app, "/v1/logs/sql?q=SELECT%20*%20FROM%20logs", Some(&tok)).await;
         assert_ne!(status, StatusCode::FORBIDDEN);
         shutdown.cancel();
+    }
+
+    /// The cluster-wide metrics and events endpoints read across every app and
+    /// namespace, so — like `/v1/logs/sql` — a scoped token is refused (C3)
+    /// rather than served every tenant's data.
+    #[tokio::test]
+    async fn scoped_token_is_refused_cluster_wide_metrics_and_events() {
+        for path in [
+            "/v1/metrics?name=node_cpu_usage_percent",
+            "/v1/metrics/summary",
+            "/v1/metrics/keys",
+            "/v1/metrics/rollup",
+            "/v1/metrics/cluster",
+            "/v1/events",
+        ] {
+            let (app, shutdown, tok) = setup_scoped_to_namespace("team-a").await;
+            let status = get_status(app, path, Some(&tok)).await;
+            assert_eq!(status, StatusCode::FORBIDDEN, "scoped token allowed on {path}");
+            shutdown.cancel();
+        }
+    }
+
+    /// …while an unscoped token still reaches them.
+    #[tokio::test]
+    async fn unscoped_token_still_reads_cluster_wide_metrics_and_events() {
+        for path in ["/v1/metrics/keys", "/v1/events"] {
+            let (app, shutdown, tok) =
+                setup_with_role("metrics-unscoped", crate::sesame::types::ApiRole::ReadOnly).await;
+            let status = get_status(app, path, Some(&tok)).await;
+            assert_ne!(status, StatusCode::FORBIDDEN, "unscoped token refused on {path}");
+            shutdown.cancel();
+        }
     }
 
     /// Two apps of the same name in different namespaces have coexisted since

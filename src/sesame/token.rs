@@ -27,6 +27,8 @@ pub enum TokenError {
     InsufficientRole { required: String },
     #[error("token scope does not allow this operation")]
     OutOfScope,
+    #[error("token name {0:?} is reserved for the internal service principal")]
+    ReservedName(String),
 }
 
 /// The result of creating a new API token.
@@ -47,6 +49,13 @@ pub fn create_token(
     scope: TokenScope,
     expires_at: Option<SystemTime>,
 ) -> Result<CreatedToken, TokenError> {
+    // The service principal name is not a real user token; a user token minted
+    // with this name would match `SYSTEM_PRINCIPAL` in the auth layer and
+    // bypass every scope/role confinement. Refuse it at the source.
+    if name == super::auth::SYSTEM_PRINCIPAL {
+        return Err(TokenError::ReservedName(name.to_string()));
+    }
+
     let rng = SystemRandom::new();
     let mut token_bytes = [0u8; 32];
     rng.fill(&mut token_bytes)
@@ -207,6 +216,17 @@ mod tests {
                 .unwrap()
                 .starts_with("rbrg_")
         );
+    }
+
+    #[test]
+    fn create_token_rejects_the_reserved_system_name() {
+        let result = create_token(
+            super::super::auth::SYSTEM_PRINCIPAL,
+            ApiRole::Admin,
+            TokenScope::default(),
+            None,
+        );
+        assert!(matches!(result, Err(TokenError::ReservedName(_))));
     }
 
     #[test]

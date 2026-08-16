@@ -123,6 +123,16 @@ pub fn authenticate(
         }
     };
 
+    // Defence in depth (AUTH4): the system principal is a side-channel
+    // credential the middleware accepts directly (see `auth_middleware`), never
+    // a stored user token. If a token named `__system` ever reaches the store —
+    // through a future write path that skips `create_token`'s guard — it must
+    // still not authenticate *as* the system principal, or it would clear
+    // `require_system` and skip `authorize_scoped`/`require_unscoped`.
+    if stored.name == SYSTEM_PRINCIPAL {
+        return Err((StatusCode::UNAUTHORIZED, "invalid token".to_string()));
+    }
+
     Ok(AuthContext {
         token_name: stored.name.clone(),
         principal_id: token_principal_id(stored),
@@ -292,11 +302,11 @@ pub async fn auth_middleware(
         .and_then(super::session::session_id_from_cookie_header)
         .map(str::to_string);
     if let Some(id) = session_id
-        && let Some(token_name) = state.sessions.validate(&id).await
+        && let Some(identity) = state.sessions.validate(&id).await
     {
         request
             .extensions_mut()
-            .insert(readonly_session_context(&token_name));
+            .insert(readonly_session_context(&identity));
         return next.run(request).await;
     }
 
@@ -310,13 +320,17 @@ pub async fn auth_middleware(
 
 /// The `AuthContext` for a browser session: always read-only, so a request
 /// riding a stolen or forged cookie can read the dashboard but never mutate.
-fn readonly_session_context(token_name: &str) -> AuthContext {
+///
+/// The originating token's **scope** is preserved (C3): a token confined to one
+/// app/namespace stays confined when it rides a session cookie, so exchanging
+/// it at `/ui/session` cannot widen it to cluster-wide reads.
+fn readonly_session_context(identity: &super::session::SessionIdentity) -> AuthContext {
     AuthContext {
-        token_name: token_name.to_string(),
-        principal_id: format!("session:{token_name}"),
+        token_name: identity.token_name.clone(),
+        principal_id: format!("session:{}", identity.token_name),
         role: ApiRole::ReadOnly,
-        scoped_apps: None,
-        scoped_namespaces: None,
+        scoped_apps: identity.scope.apps.clone(),
+        scoped_namespaces: identity.scope.namespaces.clone(),
     }
 }
 
@@ -796,13 +810,50 @@ mod tests {
         let store = new_token_store();
         store.write().await.push(user.token);
         let state = AuthState::new(store, Some("rbrg_service".to_string()));
-        let id = state.sessions.create("u").await;
+        let id = state.sessions.create("u", TokenScope::default()).await;
 
         let cookie = format!("rb_session={id}");
         let status = respond(guarded_router(state), &[("cookie", &cookie)])
             .await
             .status();
         assert_eq!(status, StatusCode::OK);
+    }
+
+    #[test]
+    fn a_stored_token_named_system_never_authenticates() {
+        // Defence in depth (AUTH4): even if a token named `__system` reaches the
+        // store through some future write path that skips `create_token`'s
+        // guard, it must not authenticate as the system principal.
+        let created = create_token("legit", ApiRole::Admin, TokenScope::default(), None).unwrap();
+        let mut smuggled = created.token.clone();
+        smuggled.name = SYSTEM_PRINCIPAL.to_string();
+        let result = authenticate(&created.plaintext, &[smuggled]);
+        assert!(result.is_err(), "a stored __system token authenticated");
+    }
+
+    #[test]
+    fn a_session_context_inherits_the_token_scope() {
+        // A tenant-scoped token that exchanges itself for a session cookie must
+        // stay confined — its session context carries the same scope (C3).
+        let identity = super::super::session::SessionIdentity {
+            token_name: "scoped".to_string(),
+            scope: TokenScope {
+                apps: Some(vec!["web".to_string()]),
+                namespaces: Some(vec!["team-a".to_string()]),
+            },
+        };
+        let ctx = readonly_session_context(&identity);
+        assert_eq!(ctx.role, ApiRole::ReadOnly);
+        assert_eq!(ctx.scoped_apps.as_deref(), Some(&["web".to_string()][..]));
+        assert_eq!(
+            ctx.scoped_namespaces.as_deref(),
+            Some(&["team-a".to_string()][..])
+        );
+        // The scoped session is refused by the cluster-wide endpoints it must
+        // not reach, and confined on the per-app ones.
+        assert!(require_unscoped(Some(&ctx)).is_err());
+        assert!(authorize_scoped(Some(&ctx), "web", "team-a").is_ok());
+        assert!(authorize_scoped(Some(&ctx), "web", "team-b").is_err());
     }
 
     #[tokio::test]
