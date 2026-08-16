@@ -202,6 +202,7 @@ pub fn router(
         crate::bun::capabilities::StaticCapabilities::default(),
         super::readiness::ReadinessTracker::new(),
         None,
+        None,
     )
 }
 
@@ -240,6 +241,7 @@ pub fn router_with_upgrade(
     static_capabilities: crate::bun::capabilities::StaticCapabilities,
     readiness: super::readiness::ReadinessTracker,
     local_test_leases: Option<crate::testkit::lease::LocalLeaseStore>,
+    jwt_verifier: Option<crate::sesame::auth::WorkloadJwtVerifier>,
 ) -> Router {
     let state = ApiState {
         cmd_tx,
@@ -281,10 +283,13 @@ pub fn router_with_upgrade(
         build_signers: Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new())),
     };
 
-    let auth_state = crate::sesame::auth::AuthState::new(
+    let mut auth_state = crate::sesame::auth::AuthState::new(
         token_store.unwrap_or_else(crate::sesame::auth::new_token_store),
         service_token,
     );
+    if let Some(verifier) = jwt_verifier {
+        auth_state = auth_state.with_jwt_verifier(verifier);
+    }
 
     // Public routes need no token: liveness, static assets, the JWKS
     // endpoint (public keys are meant to be readable), and the join endpoint
@@ -6737,6 +6742,7 @@ mod tests {
             static_capabilities,
             readiness,
             local_test_leases,
+        None,
         );
         (app, shutdown)
     }
@@ -8393,6 +8399,7 @@ mod tests {
             statics,
             crate::bun::readiness::ReadinessTracker::new(),
             None,
+        None,
         );
         (app, shutdown, mayo_dir)
     }
@@ -9563,6 +9570,7 @@ mod tests {
             crate::bun::capabilities::StaticCapabilities::default(),
             crate::bun::readiness::ReadinessTracker::new(),
             None,
+        None,
         );
         (app, webhook_rx, shutdown)
     }
@@ -9827,6 +9835,7 @@ mod tests {
             crate::bun::capabilities::StaticCapabilities::default(),
             crate::bun::readiness::ReadinessTracker::new(),
             None,
+        None,
         );
         let status = post_webhook(&app, br#"{}"#, &[]).await;
         assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);

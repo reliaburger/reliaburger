@@ -137,6 +137,7 @@ impl Harness {
             reliaburger::bun::capabilities::StaticCapabilities::default(),
             reliaburger::bun::readiness::ReadinessTracker::new(),
             None,
+        None,
         );
         let server_shutdown = shutdown.clone();
         let server_task = tokio::spawn(async move {

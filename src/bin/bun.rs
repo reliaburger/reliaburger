@@ -1838,6 +1838,22 @@ async fn run_agent(cli: Cli) -> anyhow::Result<()> {
         test_policy: config.testing.clone(),
     };
 
+    // Enable workload-JWT bearer authentication when the cluster has an OIDC
+    // signing config (PKI10): a workload presenting a cluster-minted identity
+    // token authenticates to the API as itself, confined read-only to its own
+    // app/namespace. Absent an OIDC config (single-node / pre-init) this stays
+    // `None` and the token/session paths are unchanged.
+    let jwt_verifier = match &api_council {
+        Some(council) => council
+            .security_state()
+            .await
+            .oidc_signing_config
+            .map(|oidc| {
+                reliaburger::sesame::auth::WorkloadJwtVerifier::new(oidc, &config.cluster.name)
+            }),
+        None => None,
+    };
+
     let app = api::router_with_upgrade(
         cmd_tx,
         Some(Arc::clone(&mayo_store)),
@@ -1870,6 +1886,7 @@ async fn run_agent(cli: Cli) -> anyhow::Result<()> {
         static_capabilities,
         readiness.clone(),
         Some(local_test_leases),
+        jwt_verifier,
     );
     let server_shutdown = shutdown.clone();
     // Serve the API over TLS when this node has an mTLS identity; the listener

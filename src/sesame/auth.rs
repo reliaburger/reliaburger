@@ -47,6 +47,36 @@ pub fn new_token_store() -> TokenStore {
 /// token). Not a real user token; never stored in `SecurityState`.
 pub const SYSTEM_PRINCIPAL: &str = "__system";
 
+/// Verifies workload-identity JWTs presented as bearer tokens (PKI10).
+///
+/// The cluster mints these for its workloads (SPIFFE-style, signed with the
+/// OIDC key); this is the consumer that lets a workload authenticate to the API
+/// as itself. Verification is the constrained path — algorithm, key id, issuer,
+/// audience, and `iat` are all checked — so a token minted for another cluster
+/// or purpose is refused.
+#[derive(Clone)]
+pub struct WorkloadJwtVerifier {
+    config: Arc<super::types::OidcSigningConfig>,
+    constraints: super::oidc::JwtConstraints,
+}
+
+impl WorkloadJwtVerifier {
+    /// Build a verifier from the cluster's OIDC config and trust-domain name.
+    pub fn new(config: super::types::OidcSigningConfig, cluster_name: &str) -> Self {
+        let constraints = super::oidc::JwtConstraints::for_config(&config, cluster_name);
+        Self {
+            config: Arc::new(config),
+            constraints,
+        }
+    }
+
+    /// Return the verified claims if `token` is a valid workload JWT for this
+    /// cluster, else `None`.
+    pub fn verify(&self, token: &str) -> Option<super::types::WorkloadJwtClaims> {
+        super::oidc::verify_jwt_with_constraints(token, &self.config, &self.constraints).ok()
+    }
+}
+
 /// State shared with the auth middleware: the live user-token store plus the
 /// optional side-channel service token (see [`super::token::derive_service_token`]).
 #[derive(Clone)]
@@ -59,6 +89,9 @@ pub struct AuthState {
     /// Browser sessions, exchanged for a token at `POST /ui/session`. A valid
     /// session cookie authenticates a request as a read-only principal.
     pub sessions: super::session::SessionStore,
+    /// Verifier for workload-identity JWT bearers. `None` disables JWT auth
+    /// (single-node / pre-OIDC), leaving the token and session paths unchanged.
+    pub jwt_verifier: Option<Arc<WorkloadJwtVerifier>>,
 }
 
 impl AuthState {
@@ -68,7 +101,14 @@ impl AuthState {
             tokens,
             service_token,
             sessions: super::session::SessionStore::new(),
+            jwt_verifier: None,
         }
+    }
+
+    /// Attach a workload-JWT verifier, enabling JWT bearer authentication.
+    pub fn with_jwt_verifier(mut self, verifier: WorkloadJwtVerifier) -> Self {
+        self.jwt_verifier = Some(Arc::new(verifier));
+        self
     }
 }
 
@@ -284,6 +324,19 @@ pub async fn auth_middleware(
     }
 
     if let Some(bearer_token) = bearer {
+        // A workload-identity JWT (three dot-separated parts) authenticates the
+        // presenting workload as itself, confined read-only to its own
+        // app/namespace. Tried before the Argon2 token path because a JWT can
+        // never match an `rbrg_` hash, and skipped when no verifier is set.
+        if let Some(verifier) = &state.jwt_verifier
+            && looks_like_jwt(bearer_token)
+            && let Some(claims) = verifier.verify(bearer_token)
+        {
+            request
+                .extensions_mut()
+                .insert(workload_context(&claims));
+            return next.run(request).await;
+        }
         return match authenticate_off_lock(bearer_token, tokens).await {
             Ok(ctx) => {
                 request.extensions_mut().insert(ctx);
@@ -331,6 +384,28 @@ fn readonly_session_context(identity: &super::session::SessionIdentity) -> AuthC
         role: ApiRole::ReadOnly,
         scoped_apps: identity.scope.apps.clone(),
         scoped_namespaces: identity.scope.namespaces.clone(),
+    }
+}
+
+/// Cheap shape check: does the bearer look like a compact JWS (three
+/// non-empty dot-separated segments)? Used only to route a bearer to the JWT
+/// verifier instead of the Argon2 token path; the real check is the signature.
+fn looks_like_jwt(candidate: &str) -> bool {
+    let mut parts = candidate.split('.');
+    let ok = matches!((parts.next(), parts.next(), parts.next()), (Some(a), Some(b), Some(c)) if !a.is_empty() && !b.is_empty() && !c.is_empty());
+    ok && parts.next().is_none()
+}
+
+/// The `AuthContext` for a verified workload-identity JWT: read-only and
+/// confined to the workload's own app and namespace, so a workload can read its
+/// own resources through the API but never mutate or reach another tenant's.
+fn workload_context(claims: &super::types::WorkloadJwtClaims) -> AuthContext {
+    AuthContext {
+        token_name: format!("workload:{}/{}", claims.namespace, claims.app),
+        principal_id: claims.sub.clone(),
+        role: ApiRole::ReadOnly,
+        scoped_apps: Some(vec![claims.app.clone()]),
+        scoped_namespaces: Some(vec![claims.namespace.clone()]),
     }
 }
 
@@ -875,6 +950,69 @@ mod tests {
         smuggled.name = SYSTEM_PRINCIPAL.to_string();
         let result = authenticate(&created.plaintext, &[smuggled]);
         assert!(result.is_err(), "a stored __system token authenticated");
+    }
+
+    fn mint_test_workload_jwt(
+        app: &str,
+        namespace: &str,
+    ) -> (String, super::super::types::OidcSigningConfig) {
+        let ikm = b"test-oidc-wrapping-material-32b!".to_vec();
+        let config =
+            super::super::oidc::generate_oidc_keypair("https://test.reliaburger.dev", &ikm).unwrap();
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        let claims = super::super::types::WorkloadJwtClaims {
+            iss: "https://test.reliaburger.dev".to_string(),
+            sub: format!("spiffe://test/ns/{namespace}/app/{app}"),
+            aud: vec!["spiffe://test".to_string()],
+            exp: now + 3600,
+            iat: now,
+            namespace: namespace.to_string(),
+            app: app.to_string(),
+            cluster: "test".to_string(),
+            node: "node-01".to_string(),
+            instance: format!("{app}-g1-0"),
+        };
+        let jwt = super::super::oidc::mint_jwt(&claims, &config, &ikm).unwrap();
+        (jwt, config)
+    }
+
+    #[test]
+    fn a_workload_jwt_verifies_to_a_scoped_read_only_context() {
+        let (jwt, config) = mint_test_workload_jwt("api", "team-a");
+        let verifier = WorkloadJwtVerifier::new(config, "test");
+
+        let claims = verifier.verify(&jwt).expect("valid workload JWT should verify");
+        let ctx = workload_context(&claims);
+        assert_eq!(ctx.role, ApiRole::ReadOnly);
+        assert_eq!(ctx.scoped_apps.as_deref(), Some(&["api".to_string()][..]));
+        assert_eq!(
+            ctx.scoped_namespaces.as_deref(),
+            Some(&["team-a".to_string()][..])
+        );
+        // Confined to its own app/namespace, refused on the cluster-wide path.
+        assert!(authorize_scoped(Some(&ctx), "api", "team-a").is_ok());
+        assert!(authorize_scoped(Some(&ctx), "api", "team-b").is_err());
+        assert!(require_unscoped(Some(&ctx)).is_err());
+    }
+
+    #[test]
+    fn a_workload_jwt_for_another_cluster_is_rejected() {
+        let (jwt, config) = mint_test_workload_jwt("api", "team-a");
+        // A verifier for a different trust domain expects a different audience.
+        let verifier = WorkloadJwtVerifier::new(config, "other-cluster");
+        assert!(verifier.verify(&jwt).is_none());
+    }
+
+    #[test]
+    fn looks_like_jwt_distinguishes_jwts_from_bearer_tokens() {
+        assert!(looks_like_jwt("aaa.bbb.ccc"));
+        assert!(!looks_like_jwt("rbrg_deadbeef"));
+        assert!(!looks_like_jwt("aaa.bbb"));
+        assert!(!looks_like_jwt("aaa..ccc"));
+        assert!(!looks_like_jwt("aaa.bbb.ccc.ddd"));
     }
 
     #[test]
