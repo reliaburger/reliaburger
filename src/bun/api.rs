@@ -6742,7 +6742,7 @@ mod tests {
             static_capabilities,
             readiness,
             local_test_leases,
-        None,
+            None,
         );
         (app, shutdown)
     }
@@ -8399,7 +8399,7 @@ mod tests {
             statics,
             crate::bun::readiness::ReadinessTracker::new(),
             None,
-        None,
+            None,
         );
         (app, shutdown, mayo_dir)
     }
@@ -8613,7 +8613,10 @@ mod tests {
         let (status, body) = post_authenticated(app, "/v1/fault", &tok, &body, None).await;
         assert_eq!(status, StatusCode::FORBIDDEN);
         let text = String::from_utf8_lossy(&body);
-        assert!(text.contains("scope"), "expected a scope refusal, got: {text}");
+        assert!(
+            text.contains("scope"),
+            "expected a scope refusal, got: {text}"
+        );
         shutdown.cancel();
     }
 
@@ -8632,7 +8635,11 @@ mod tests {
         ] {
             let (app, shutdown, tok) = setup_scoped_to_namespace("team-a").await;
             let status = get_status(app, path, Some(&tok)).await;
-            assert_eq!(status, StatusCode::FORBIDDEN, "scoped token allowed on {path}");
+            assert_eq!(
+                status,
+                StatusCode::FORBIDDEN,
+                "scoped token allowed on {path}"
+            );
             shutdown.cancel();
         }
     }
@@ -8644,7 +8651,11 @@ mod tests {
             let (app, shutdown, tok) =
                 setup_with_role("metrics-unscoped", crate::sesame::types::ApiRole::ReadOnly).await;
             let status = get_status(app, path, Some(&tok)).await;
-            assert_ne!(status, StatusCode::FORBIDDEN, "unscoped token refused on {path}");
+            assert_ne!(
+                status,
+                StatusCode::FORBIDDEN,
+                "unscoped token refused on {path}"
+            );
             shutdown.cancel();
         }
     }
@@ -9570,7 +9581,7 @@ mod tests {
             crate::bun::capabilities::StaticCapabilities::default(),
             crate::bun::readiness::ReadinessTracker::new(),
             None,
-        None,
+            None,
         );
         (app, webhook_rx, shutdown)
     }
@@ -9835,7 +9846,7 @@ mod tests {
             crate::bun::capabilities::StaticCapabilities::default(),
             crate::bun::readiness::ReadinessTracker::new(),
             None,
-        None,
+            None,
         );
         let status = post_webhook(&app, br#"{}"#, &[]).await;
         assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);

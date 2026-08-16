@@ -255,7 +255,7 @@ async fn start_node_with_auth(
             static_capabilities,
             readiness,
             None,
-        None,
+            None,
         )
     } else {
         api::router(

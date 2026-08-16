@@ -97,7 +97,7 @@ impl TestHarness {
             static_capabilities,
             reliaburger::bun::readiness::ReadinessTracker::new(),
             None,
-        None,
+            None,
         );
         let server_shutdown = shutdown.clone();
 

@@ -332,9 +332,7 @@ pub async fn auth_middleware(
             && looks_like_jwt(bearer_token)
             && let Some(claims) = verifier.verify(bearer_token)
         {
-            request
-                .extensions_mut()
-                .insert(workload_context(&claims));
+            request.extensions_mut().insert(workload_context(&claims));
             return next.run(request).await;
         }
         return match authenticate_off_lock(bearer_token, tokens).await {
@@ -958,7 +956,8 @@ mod tests {
     ) -> (String, super::super::types::OidcSigningConfig) {
         let ikm = b"test-oidc-wrapping-material-32b!".to_vec();
         let config =
-            super::super::oidc::generate_oidc_keypair("https://test.reliaburger.dev", &ikm).unwrap();
+            super::super::oidc::generate_oidc_keypair("https://test.reliaburger.dev", &ikm)
+                .unwrap();
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap()
@@ -984,7 +983,9 @@ mod tests {
         let (jwt, config) = mint_test_workload_jwt("api", "team-a");
         let verifier = WorkloadJwtVerifier::new(config, "test");
 
-        let claims = verifier.verify(&jwt).expect("valid workload JWT should verify");
+        let claims = verifier
+            .verify(&jwt)
+            .expect("valid workload JWT should verify");
         let ctx = workload_context(&claims);
         assert_eq!(ctx.role, ApiRole::ReadOnly);
         assert_eq!(ctx.scoped_apps.as_deref(), Some(&["api".to_string()][..]));
@@ -1029,8 +1030,14 @@ mod tests {
 
         // No spec for this principal → governed by role/scope alone (allow).
         assert!(
-            authorize_permission(Some(&ctx), PermissionAction::Deploy, "web", "prod", &permissions)
-                .is_ok()
+            authorize_permission(
+                Some(&ctx),
+                PermissionAction::Deploy,
+                "web",
+                "prod",
+                &permissions
+            )
+            .is_ok()
         );
 
         // A spec that grants deploy on web/prod but nothing else.
@@ -1043,17 +1050,35 @@ mod tests {
             },
         );
         assert!(
-            authorize_permission(Some(&ctx), PermissionAction::Deploy, "web", "prod", &permissions)
-                .is_ok()
+            authorize_permission(
+                Some(&ctx),
+                PermissionAction::Deploy,
+                "web",
+                "prod",
+                &permissions
+            )
+            .is_ok()
         );
         // Wrong action / app / namespace are refused.
         assert!(
-            authorize_permission(Some(&ctx), PermissionAction::Exec, "web", "prod", &permissions)
-                .is_err()
+            authorize_permission(
+                Some(&ctx),
+                PermissionAction::Exec,
+                "web",
+                "prod",
+                &permissions
+            )
+            .is_err()
         );
         assert!(
-            authorize_permission(Some(&ctx), PermissionAction::Deploy, "api", "prod", &permissions)
-                .is_err()
+            authorize_permission(
+                Some(&ctx),
+                PermissionAction::Deploy,
+                "api",
+                "prod",
+                &permissions
+            )
+            .is_err()
         );
 
         // Pre-init (None) and the system principal are never gated.
