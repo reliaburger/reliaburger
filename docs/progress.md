@@ -2175,7 +2175,13 @@ blocking calls).
 
 ### Critical — security & authorisation
 
-- [ ] **Scoped token widens to cluster-wide via `/ui/session`** — `src/bun/api.rs:3269`
+> **All eight landed (16 Aug 2026, branch `phase16-critical-security`)** as a
+> single PR of six commits, one per fix. CI green: `cargo fmt`, `clippy -D
+> warnings`, portable nextest (3257 passed), doctests, `--no-default-features`,
+> plus gated `test-slow` (4) and `test-cluster` (22, incl. chaos fault
+> injection and placement/join). Every fix carries unit tests.
+
+- [x] **Scoped token widens to cluster-wide via `/ui/session`** — `src/bun/api.rs:3269`
   `ui_session_handler` exchanges *any* valid token (including an app/namespace-scoped
   one) for a session cookie whose `AuthContext` is built by `readonly_session_context`
   (`src/sesame/auth.rs:313`) with `scoped_apps: None, scoped_namespaces: None`, and
@@ -2183,41 +2189,41 @@ blocking calls).
   `require_unscoped`. A tenant-scoped holder can POST its token to `/ui/session` then
   read every tenant's `/ui/app/{app}/{ns}`, `/v1/logs/{app}/{ns}`, `/v1/metrics/app/…`,
   and the whole-cluster `/v1/logs/sql` that explicitly refuses scoped bearer tokens (C3).
-- [ ] **A token literally named `__system` bypasses scope confinement** —
+- [x] **A token literally named `__system` bypasses scope confinement** —
   `src/sesame/auth.rs:46-48` documents `__system` as reserved and "never stored", but
   nothing enforces it: `create_token` (`src/sesame/token.rs:44-79`) and the handler
   (`src/bun/api.rs:5938-5999`) accept any name, and authorisation matches
   `ctx.token_name == SYSTEM_PRINCIPAL`, so a real token named `__system` passes
   `require_system` (auth.rs:450-459) and skips `authorize_scoped`/`require_unscoped`.
-- [ ] **Fault injection ignores scope** — `src/bun/api.rs:3795` `fault_inject_handler`
+- [x] **Fault injection ignores scope** — `src/bun/api.rs:3795` `fault_inject_handler`
   never calls `authorize_scoped` on `target_service` (and `FaultRequest` in
   `src/smoker/types.rs:465` carries no namespace), so a Deployer scoped to one namespace
   can kill/latency/error-inject any tenant's service; same in `fault_clear_all_handler`'s
   `?service=` path (`api.rs:4388`). The C3 test misses it because `/v1/fault` has no
   `{app}` path segment. Related: `src/bun/agent.rs:3747-3800,4074-4080` matches fault
   targets by `app_name` only (no namespace), so "web" hits every namespace's "web".
-- [ ] **Metrics/events endpoints serve every tenant to any token** —
+- [x] **Metrics/events endpoints serve every tenant to any token** —
   `src/bun/api.rs:4610` `metrics_query_handler` (plus `/v1/metrics/keys|rollup|cluster`
   and `/v1/events`) take no `auth` parameter, contradicting the C3 doctrine that
   `logs_sql_handler` applies via `require_unscoped` (api.rs:5069). A scoped token reads
   all tenants' per-app metrics and audit events.
-- [ ] **`relish join` leaks the join token before the fingerprint pin is checked** —
+- [x] **`relish join` leaks the join token before the fingerprint pin is checked** —
   `src/relish/commands.rs:619-626` + `src/sesame/join.rs:206-232` use
   `danger_accept_invalid_certs(true)` and send the one-time token + CSR *before* the
   `--ca-fingerprint` check runs on the response, so a MITM can capture and replay the
   still-unconsumed token even when a fingerprint was pinned.
-- [ ] **Rollup reports skip identity binding (metrics poisoning)** —
+- [x] **Rollup reports skip identity binding (metrics poisoning)** —
   `src/reporting/aggregator.rs:179-183` `MetricsRollup` is the only report type that
   skips the C6 `report_identity_ok` check, so under mTLS node X can submit a `NodeRollup`
   claiming node_id Y, poisoning Y's cluster metrics and pre-claiming Y's `(node, window)`
   dedup keys so Y's genuine rollups drop as duplicates (`rollup_store.rs:168`).
-- [ ] **`[permission]` section is enforced nowhere** — `src/council/state_machine.rs:581`
+- [x] **`[permission]` section is enforced nowhere** — `src/council/state_machine.rs:581`
   permission specs are parsed, validated, GitOps-synced, and committed to Raft, but
   nothing reads `state.permissions` to authorise anything (authz is purely token scopes).
   `whitepaper.md:764`'s "`script` fields require `host-exec` permission" is false — gating
   is the node-level `[process_workloads]` allowlist (`supervisor.rs:256`). Decide: enforce,
   or document stored-but-unenforced and fix the docs + `src/config/permission.rs:1`.
-- [ ] **Constrained JWT verifier is unwired** — `src/sesame/oidc.rs:172-240`
+- [x] **Constrained JWT verifier is unwired** — `src/sesame/oidc.rs:172-240`
   `verify_jwt_with_constraints` + `JwtConstraints` (the PKI10-hardened alg/kid/iss/aud/iat
   checks) has zero call sites; the only JWT verification anywhere is the weak `verify_jwt`,
   inside a `#[cfg(test)]` block (`src/council/node.rs:1288`).

@@ -438,8 +438,10 @@ Commands:
 | `fault node-drain <node> --acknowledge` | Withdraw a node from scheduling for a bounded duration |
 | `fault node-kill <node> --acknowledge` | Quiesce a node's cluster transports for a bounded duration |
 | `fault node-pressure <node> --cpu 80% --memory 90% --acknowledge` | Consume server-bounded Linux node capacity in an owned cgroup |
+| `fault kill <target> --namespace <ns> --acknowledge` | Confine a workload fault to one tenant (defaults to `default`; a scoped token must name a namespace it may touch) |
 | `fault list` | List all active faults |
 | `fault clear [id]` | Clear workload faults (or a specific workload fault by ID) |
+| `fault clear <service> --namespace <ns>` | Clear a service's faults in one namespace (omit `--namespace` to clear every namespace; needs an unscoped token) |
 | `fault clear <id> --node <node>` | Reverse a node fault on its owning node |
 | `fault scenario <file> --acknowledge` | Run a scripted chaos scenario from a TOML file |
 | `dev create` | Create a local dev cluster (Lima VMs; each node runs `bun` rootful under `sudo` for runc/netns) |
