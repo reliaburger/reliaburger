@@ -1982,6 +1982,26 @@ async fn cluster_elect_handler(
     }
 }
 
+/// Enforce a principal's `[permission]` spec for a per-app action.
+///
+/// Reads the replicated permission map from the council (empty when there is no
+/// council, e.g. single-node mode, where permissions cannot be configured) and
+/// defers to [`crate::sesame::auth::authorize_permission`]. Call it after the
+/// role and scope checks in a gated handler.
+async fn enforce_permission(
+    state: &ApiState,
+    auth: Option<&crate::sesame::auth::AuthContext>,
+    action: crate::config::PermissionAction,
+    app: &str,
+    namespace: &str,
+) -> Result<(), Response> {
+    let permissions = match &state.council {
+        Some(council) => council.desired_state().await.permissions,
+        None => std::collections::BTreeMap::new(),
+    };
+    crate::sesame::auth::authorize_permission(auth, action, app, namespace, &permissions)
+}
+
 /// Deploy workloads, streaming progress via SSE.
 ///
 /// Returns a Server-Sent Events stream. Each event's `data` field
@@ -2133,11 +2153,38 @@ async fn apply_handler(
 
     // AUTH1: a scoped token may only deploy apps its scope covers. Check
     // every app in the manifest, so one out-of-scope app rejects the whole
-    // apply rather than being silently dropped.
+    // apply rather than being silently dropped. A principal's `[permission]`
+    // spec (when it has one) must also grant `deploy` on each app — and
+    // `host-exec` for any app that runs an inline `script` (a host process),
+    // which is the capability the whitepaper ties to script workloads.
+    let permissions = match &state.council {
+        Some(council) => council.desired_state().await.permissions,
+        None => std::collections::BTreeMap::new(),
+    };
     for (app_name, spec) in &config.app {
         let namespace = spec.namespace.as_deref().unwrap_or("default");
         if let Err(resp) =
             crate::sesame::auth::authorize_scoped(auth.as_deref(), app_name, namespace)
+        {
+            return resp;
+        }
+        if let Err(resp) = crate::sesame::auth::authorize_permission(
+            auth.as_deref(),
+            crate::config::PermissionAction::Deploy,
+            app_name,
+            namespace,
+            &permissions,
+        ) {
+            return resp;
+        }
+        if spec.script.is_some()
+            && let Err(resp) = crate::sesame::auth::authorize_permission(
+                auth.as_deref(),
+                crate::config::PermissionAction::HostExec,
+                app_name,
+                namespace,
+                &permissions,
+            )
         {
             return resp;
         }
@@ -2716,6 +2763,17 @@ async fn stop_handler(
     if let Err(resp) = crate::sesame::auth::authorize_scoped(auth.as_deref(), &app, &namespace) {
         return resp;
     }
+    if let Err(resp) = enforce_permission(
+        &state,
+        auth.as_deref(),
+        crate::config::PermissionAction::Scale,
+        &app,
+        &namespace,
+    )
+    .await
+    {
+        return resp;
+    }
 
     if let Some(council) = state.council.clone() {
         return cluster_stop(state, council, app, namespace).await;
@@ -3170,6 +3228,17 @@ async fn exec_handler(
         return resp;
     }
     if let Err(resp) = crate::sesame::auth::authorize_scoped(auth.as_deref(), &app, &namespace) {
+        return resp;
+    }
+    if let Err(resp) = enforce_permission(
+        &state,
+        auth.as_deref(),
+        crate::config::PermissionAction::Exec,
+        &app,
+        &namespace,
+    )
+    .await
+    {
         return resp;
     }
     let (resp_tx, resp_rx) = oneshot::channel();

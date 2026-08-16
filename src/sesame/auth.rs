@@ -421,6 +421,52 @@ pub fn authorize_scoped(
     }
 }
 
+/// Enforce a principal's `[permission]` spec on a specific action + target.
+///
+/// Permissions are an **additional** allow-list keyed by token name, layered on
+/// top of the role and scope checks — they can restrict a principal to named
+/// actions/apps/namespaces but never grant beyond its role. The rules:
+///
+/// - A pre-init request (`None`) or the system principal passes untouched.
+/// - A principal with **no** spec is governed by role + scope alone, so
+///   permissions are opt-in: defining none preserves today's behaviour.
+/// - A principal **with** a spec must have it grant `(action, app, namespace)`,
+///   or the request is refused with 403.
+///
+/// Call it *after* the role and scope checks in a gated handler, passing the
+/// replicated permission map (`DesiredState.permissions`).
+#[allow(clippy::result_large_err)]
+pub fn authorize_permission(
+    ctx: Option<&AuthContext>,
+    action: crate::config::PermissionAction,
+    app: &str,
+    namespace: &str,
+    permissions: &std::collections::BTreeMap<String, crate::config::PermissionSpec>,
+) -> Result<(), Response> {
+    let Some(ctx) = ctx else {
+        return Ok(());
+    };
+    if ctx.token_name == SYSTEM_PRINCIPAL {
+        return Ok(());
+    }
+    let Some(spec) = permissions.get(&ctx.token_name) else {
+        return Ok(());
+    };
+    if spec.allows(action, app, namespace) {
+        Ok(())
+    } else {
+        Err((
+            StatusCode::FORBIDDEN,
+            format!(
+                "permission for {:?} does not grant {} on {app} in namespace {namespace}",
+                ctx.token_name,
+                action.as_str()
+            ),
+        )
+            .into_response())
+    }
+}
+
 /// Require a token whose scope covers the **whole cluster**.
 ///
 /// Some endpoints take no app or namespace to check a scope against —
@@ -829,6 +875,64 @@ mod tests {
         smuggled.name = SYSTEM_PRINCIPAL.to_string();
         let result = authenticate(&created.plaintext, &[smuggled]);
         assert!(result.is_err(), "a stored __system token authenticated");
+    }
+
+    #[test]
+    fn authorize_permission_enforces_specs_only_for_principals_that_have_one() {
+        use crate::config::{PermissionAction, PermissionSpec};
+        let ctx = AuthContext {
+            token_name: "ci".to_string(),
+            principal_id: "token:ci".to_string(),
+            role: ApiRole::Deployer,
+            scoped_apps: None,
+            scoped_namespaces: None,
+        };
+        let mut permissions = std::collections::BTreeMap::new();
+
+        // No spec for this principal → governed by role/scope alone (allow).
+        assert!(
+            authorize_permission(Some(&ctx), PermissionAction::Deploy, "web", "prod", &permissions)
+                .is_ok()
+        );
+
+        // A spec that grants deploy on web/prod but nothing else.
+        permissions.insert(
+            "ci".to_string(),
+            PermissionSpec {
+                actions: vec!["deploy".to_string()],
+                apps: vec!["web".to_string()],
+                namespaces: Some(vec!["prod".to_string()]),
+            },
+        );
+        assert!(
+            authorize_permission(Some(&ctx), PermissionAction::Deploy, "web", "prod", &permissions)
+                .is_ok()
+        );
+        // Wrong action / app / namespace are refused.
+        assert!(
+            authorize_permission(Some(&ctx), PermissionAction::Exec, "web", "prod", &permissions)
+                .is_err()
+        );
+        assert!(
+            authorize_permission(Some(&ctx), PermissionAction::Deploy, "api", "prod", &permissions)
+                .is_err()
+        );
+
+        // Pre-init (None) and the system principal are never gated.
+        assert!(
+            authorize_permission(None, PermissionAction::Exec, "web", "prod", &permissions).is_ok()
+        );
+        let system = system_context();
+        assert!(
+            authorize_permission(
+                Some(&system),
+                PermissionAction::Exec,
+                "web",
+                "prod",
+                &permissions
+            )
+            .is_ok()
+        );
     }
 
     #[test]
