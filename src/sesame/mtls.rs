@@ -424,6 +424,37 @@ pub fn build_cluster_http_client(
     build_cluster_http_client_with_bearer(identity, crl, None)
 }
 
+/// Build an HTTPS client that authenticates the **server** against a pinned CA
+/// pair, presenting no client certificate.
+///
+/// Used by `relish join` for the second leg of the join handshake: once the
+/// joiner has fetched and fingerprint-verified the cluster's CA certificates,
+/// it sends its one-time token only over a connection proven to chain to that
+/// CA. A man-in-the-middle without the cluster's key cannot present such a
+/// chain, so the token never reaches an impostor. Hostname verification is
+/// skipped (the same as node-to-node calls — members are dialled by IP), and an
+/// empty CRL is used because a joiner has no revocation list yet.
+pub fn build_ca_pinned_client(
+    node_ca_der: Vec<u8>,
+    root_ca_der: Vec<u8>,
+) -> Result<reqwest::Client, MtlsError> {
+    let _ = rustls::crypto::ring::default_provider().install_default();
+    let verifier = Arc::new(PinnedChainServerVerifier::new(
+        node_ca_der,
+        root_ca_der,
+        CrlHandle::new(Crl::default()),
+    ));
+    let tls = ClientConfig::builder()
+        .dangerous()
+        .with_custom_certificate_verifier(verifier)
+        .with_no_client_auth();
+    reqwest::Client::builder()
+        .use_preconfigured_tls(tls)
+        .timeout(std::time::Duration::from_secs(30))
+        .build()
+        .map_err(|e| MtlsError::ConfigFailed(format!("ca-pinned client: {e}")))
+}
+
 /// Like [`build_cluster_http_client`], but attaches `bearer` as a default
 /// `Authorization: Bearer` header on every request.
 ///

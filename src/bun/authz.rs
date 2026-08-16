@@ -98,6 +98,7 @@ pub const ROUTE_MATRIX: &[Route] = &[
     route(Get, "/v1/identity/jwks", Public),
     route(Get, "/ui/static/{*path}", Public),
     route(Post, "/v1/cluster/join", Public),
+    route(Get, "/v1/cluster/ca", Public),
     route(Get, "/ui/login", Public),
     route(Post, "/ui/session", Public),
     route(Post, "/ui/logout", Public),

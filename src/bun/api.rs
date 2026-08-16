@@ -296,6 +296,7 @@ pub fn router_with_upgrade(
         .route("/v1/identity/jwks", get(identity_jwks_handler))
         .route("/ui/static/{*path}", get(static_asset_handler))
         .route("/v1/cluster/join", post(join_handler))
+        .route("/v1/cluster/ca", get(cluster_ca_handler))
         // The GitOps webhook is public: real providers (GitHub, GitLab)
         // send `X-Hub-Signature-256`/`X-Gitlab-Token`, never a Reliaburger
         // bearer token, so it can't sit behind the bearer-auth middleware.
@@ -3366,6 +3367,40 @@ struct JoinRequest {
 /// Public route: the join token is the credential. The joiner sends a CSR and
 /// keeps its private key (PKI4); we sign the CSR and return the leaf plus CA
 /// chain the joiner persists as its identity.
+/// `GET /v1/cluster/ca` — the cluster's public CA certificates.
+///
+/// A joiner fetches these *before* sending its one-time join token so it can
+/// verify the cluster's identity against a pinned `--ca-fingerprint` and then
+/// transmit the token only over a connection proven to chain to this CA. CA
+/// certificates are public material, so the endpoint needs no authentication.
+async fn cluster_ca_handler(State(state): State<ApiState>) -> Response {
+    use base64::Engine as _;
+    let Some(ref council) = state.council else {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(serde_json::json!({ "error": "no council available" })),
+        )
+            .into_response();
+    };
+    let security = council.security_state().await;
+    let (Some(node_ca), Some(root_ca)) = (
+        security.get_ca(crate::sesame::types::CaRole::Node),
+        security.get_ca(crate::sesame::types::CaRole::Root),
+    ) else {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(serde_json::json!({ "error": "cluster CA not initialised" })),
+        )
+            .into_response();
+    };
+    let encoder = base64::engine::general_purpose::STANDARD;
+    Json(serde_json::json!({
+        "node_ca_b64": encoder.encode(&node_ca.certificate_der),
+        "root_ca_b64": encoder.encode(&root_ca.certificate_der),
+    }))
+    .into_response()
+}
+
 async fn join_handler(State(state): State<ApiState>, Json(body): Json<JoinRequest>) -> Response {
     use base64::Engine as _;
     let csr_der = match base64::engine::general_purpose::STANDARD.decode(&body.csr_b64) {
