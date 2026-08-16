@@ -3876,6 +3876,23 @@ async fn fault_inject_handler(
             return forward_node_fault(&state, target_node, &headers, &request).await;
         }
     } else {
+        // Workload fault: normalise the namespace (apps default to `default`)
+        // and enforce the caller's token scope against it, so a Deployer scoped
+        // to one namespace cannot inject a fault into another tenant's
+        // same-named service (AUTH1 for faults). The normalised namespace is
+        // written back so the agent targets only the intended tenant.
+        let namespace = request
+            .namespace
+            .clone()
+            .unwrap_or_else(|| "default".to_string());
+        request.namespace = Some(namespace.clone());
+        if let Err(response) = crate::sesame::auth::authorize_scoped(
+            auth.as_deref(),
+            &request.target_service,
+            &namespace,
+        ) {
+            return response;
+        }
         let (principal, role) = auth
             .as_deref()
             .map(|auth| (auth.principal_id.as_str(), auth.role))
@@ -4448,9 +4465,35 @@ async fn fault_clear_all_handler(
             )
                 .into_response();
         }
-        Some(service) => AgentCommand::ClearFaultsByService {
-            service: service.clone(),
-            response: resp_tx,
+        Some(service) => match params.get("namespace") {
+            // Confined clear: scope-check the named namespace, so a Deployer
+            // scoped to one tenant cannot reverse another tenant's same-named
+            // service faults (AUTH1).
+            Some(namespace) => {
+                if let Err(response) =
+                    crate::sesame::auth::authorize_scoped(auth.as_deref(), service, namespace)
+                {
+                    return response;
+                }
+                AgentCommand::ClearFaultsByService {
+                    service: service.clone(),
+                    namespace: Some(namespace.clone()),
+                    response: resp_tx,
+                }
+            }
+            // Cross-namespace clear: reversing a service's faults in every
+            // namespace is a cluster-wide action, so a scoped token is refused
+            // and told to name a namespace it may touch (C3, as for reads).
+            None => {
+                if let Err(response) = crate::sesame::auth::require_unscoped(auth.as_deref()) {
+                    return response;
+                }
+                AgentCommand::ClearFaultsByService {
+                    service: service.clone(),
+                    namespace: None,
+                    response: resp_tx,
+                }
+            }
         },
         None => AgentCommand::ClearAllFaults { response: resp_tx },
     };
@@ -6801,6 +6844,7 @@ mod tests {
         serde_json::to_string(&crate::smoker::types::FaultRequest {
             fault_type: crate::smoker::types::FaultType::DnsNxdomain,
             target_service: "web".to_string(),
+            namespace: None,
             target_instance: None,
             target_node: None,
             duration: std::time::Duration::from_secs(30),
@@ -6828,6 +6872,7 @@ mod tests {
                 kill_containers: false,
             },
             target_service: String::new(),
+            namespace: None,
             target_instance: None,
             target_node: Some("node-a".to_string()),
             duration: std::time::Duration::from_secs(30),
@@ -6847,6 +6892,7 @@ mod tests {
                 memory_percentage: 90,
             },
             target_service: String::new(),
+            namespace: None,
             target_instance: None,
             target_node: Some("node-a".to_string()),
             duration: std::time::Duration::from_secs(30),
@@ -8435,6 +8481,28 @@ mod tests {
             setup_with_role("sql-unscoped", crate::sesame::types::ApiRole::Admin).await;
         let status = get_status(app, "/v1/logs/sql?q=SELECT%20*%20FROM%20logs", Some(&tok)).await;
         assert_ne!(status, StatusCode::FORBIDDEN);
+        shutdown.cancel();
+    }
+
+    /// AUTH1 for faults: a Deployer scoped to one namespace clears the role
+    /// gate but is refused injecting a fault into another tenant's same-named
+    /// service, before the safety policy is even consulted. `/v1/fault` carries
+    /// no `{app}` path segment, so the route-matrix scope test can't cover it.
+    #[tokio::test]
+    async fn scoped_token_is_refused_faulting_another_namespace() {
+        let (app, shutdown, tok) = setup_scoped_to_namespace("team-a").await;
+        let body = serde_json::json!({
+            "fault_type": { "type": "Pause" },
+            "target_service": "web",
+            "namespace": "team-b",
+            "duration": { "secs": 1, "nanos": 0 },
+            "injected_by": "",
+        })
+        .to_string();
+        let (status, body) = post_authenticated(app, "/v1/fault", &tok, &body, None).await;
+        assert_eq!(status, StatusCode::FORBIDDEN);
+        let text = String::from_utf8_lossy(&body);
+        assert!(text.contains("scope"), "expected a scope refusal, got: {text}");
         shutdown.cancel();
     }
 

@@ -154,6 +154,9 @@ pub fn step_to_fault_request(
     Ok(FaultRequest {
         fault_type,
         target_service: step.target.clone(),
+        // Scenario files target a service by bare name across namespaces
+        // (legacy match); a namespace-qualified scenario is future work.
+        namespace: None,
         target_instance: None,
         target_node: None,
         duration,

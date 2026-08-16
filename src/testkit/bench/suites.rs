@@ -479,6 +479,7 @@ async fn reconstruction_time(context: &SuiteContext) -> Result<BenchMetric, Stri
             kill_containers: false,
         },
         target_service: String::new(),
+        namespace: None,
         target_instance: None,
         target_node: Some(leader.clone()),
         duration: context.timeout.saturating_add(Duration::from_secs(30)),

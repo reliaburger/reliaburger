@@ -961,6 +961,11 @@ enum FaultAction {
     Clear {
         /// Fault id or service name to clear (omit to clear all).
         target: Option<String>,
+        /// Namespace of the service to clear. Omit to clear the service in
+        /// every namespace (needs an unscoped token); name a namespace to
+        /// clear only that tenant's faults.
+        #[arg(long, requires = "target")]
+        namespace: Option<String>,
         /// Node which owns a node-level fault id.
         #[arg(long, requires = "target")]
         node: Option<String>,
@@ -1267,11 +1272,17 @@ async fn main() -> ExitCode {
             FaultAction::List => reliaburger::relish::fault::list().await,
             FaultAction::Clear {
                 target,
+                namespace,
                 node,
                 acknowledge,
             } => {
-                reliaburger::relish::fault::clear(target.clone(), node.as_deref(), *acknowledge)
-                    .await
+                reliaburger::relish::fault::clear(
+                    target.clone(),
+                    namespace.as_deref(),
+                    node.as_deref(),
+                    *acknowledge,
+                )
+                .await
             }
             FaultAction::Scenario {
                 path,

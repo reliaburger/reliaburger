@@ -118,6 +118,10 @@ fn get_duration(d: &Option<String>) -> Result<Duration, RelishError> {
 /// in the CLI; now they reach the wire.
 #[derive(clap::Args, Clone, Debug, Default)]
 pub struct FaultTargeting {
+    /// Namespace of the target service. Defaults to `default` on the server;
+    /// a namespace-scoped token must name a namespace it is allowed to touch.
+    #[arg(long)]
+    pub namespace: Option<String>,
     /// Scope the fault to a single instance id instead of every instance.
     #[arg(long)]
     pub instance: Option<String>,
@@ -146,6 +150,7 @@ fn make_request(
     FaultRequest {
         fault_type,
         target_service,
+        namespace: targeting.namespace.clone(),
         target_instance: targeting.instance.clone(),
         target_node: targeting.node.clone(),
         duration,
@@ -481,6 +486,7 @@ pub async fn list() -> Result<(), RelishError> {
 /// caller for the registry's `clear_by_service`). No argument clears all.
 pub async fn clear(
     target: Option<String>,
+    namespace: Option<&str>,
     node: Option<&str>,
     acknowledged: bool,
 ) -> Result<(), RelishError> {
@@ -495,7 +501,7 @@ pub async fn clear(
                     body: "--node can only be used when clearing a numeric fault id".to_string(),
                 });
             }
-            Err(_) => client.clear_faults_by_service(&arg).await?,
+            Err(_) => client.clear_faults_by_service(&arg, namespace).await?,
         },
     };
     println!("{msg}");
@@ -660,6 +666,7 @@ mod tests {
     #[test]
     fn make_request_carries_instance_node_and_reason() {
         let targeting = FaultTargeting {
+            namespace: Some("team-a".into()),
             instance: Some("redis-1".into()),
             node: Some("node-2".into()),
             reason: Some("game day".into()),

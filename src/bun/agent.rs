@@ -286,9 +286,12 @@ pub enum AgentCommand {
     ClearAllFaults {
         response: oneshot::Sender<Result<String, BunError>>,
     },
-    /// Clear every active fault targeting a given service.
+    /// Clear every active fault targeting a given service. `namespace`
+    /// confines the clear to one tenant (`None` clears the service in every
+    /// namespace, for legacy/admin callers).
     ClearFaultsByService {
         service: String,
+        namespace: Option<String>,
         response: oneshot::Sender<Result<String, BunError>>,
     },
     /// List all active faults.
@@ -2813,6 +2816,7 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
                 let request = crate::smoker::types::FaultRequest {
                     fault_type: crate::smoker::types::FaultType::CouncilPartition,
                     target_service: peers.join(","),
+                    namespace: None,
                     target_instance: None,
                     target_node: None,
                     duration: std::time::Duration::from_secs(duration_secs),
@@ -3038,8 +3042,14 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
                 let msg = format!("cleared {} fault(s)", removed.len());
                 let _ = response.send(Ok(msg));
             }
-            AgentCommand::ClearFaultsByService { service, response } => {
-                let removed = self.fault_registry.clear_by_service(&service);
+            AgentCommand::ClearFaultsByService {
+                service,
+                namespace,
+                response,
+            } => {
+                let removed = self
+                    .fault_registry
+                    .clear_by_service(&service, namespace.as_deref());
                 for rule in &removed {
                     self.delete_fault_bpf_entry(rule).await;
                     self.reverse_fault(rule).await;
@@ -3395,7 +3405,13 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
             .supervisor
             .list_instances()
             .iter()
-            .filter(|i| i.app_name == request.target_service)
+            .filter(|i| {
+                i.app_name == request.target_service
+                    && request
+                        .namespace
+                        .as_deref()
+                        .is_none_or(|ns| ns == i.namespace)
+            })
             .count() as u32;
 
         // Node-level faults already active. We count NodeKill/NodeDrain/
@@ -3751,6 +3767,7 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
             .iter()
             .filter(|i| {
                 i.app_name == rule.target_service
+                    && rule.matches_namespace(&i.namespace)
                     && rule.target_instance.as_ref().is_none_or(|t| &i.id.0 == t)
             })
             .map(|i| i.id.clone())
@@ -3787,6 +3804,7 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
             .iter()
             .filter(|i| {
                 i.app_name == rule.target_service
+                    && rule.matches_namespace(&i.namespace)
                     && rule.target_instance.as_ref().is_none_or(|t| &i.id.0 == t)
             })
             .map(|i| {
@@ -4071,12 +4089,16 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
     /// it is registered. VIP is deterministic from the app name; the port
     /// comes from the service entry. Connect/bandwidth fault keys need both.
     #[cfg(all(feature = "ebpf", target_os = "linux"))]
-    fn fault_vip_port(&self, target_service: &str) -> Option<(u32, u16)> {
-        // Smoker targets a service by bare name; match the first entry in
-        // any namespace (PR 2 adds a namespace-qualified fault target).
-        self.service_map
-            .resolve_by_name(target_service)
-            .map(|e| (e.vip.to_network_byte_order(), e.port.to_be()))
+    fn fault_vip_port(&self, rule: &crate::smoker::types::FaultRule) -> Option<(u32, u16)> {
+        // A namespace-qualified fault resolves the exact service identity, so a
+        // network fault on `web` in `team-a` never picks up `team-b`'s `web`
+        // VIP. A legacy fault with no namespace falls back to the first entry
+        // in any namespace.
+        let entry = match rule.namespace.as_deref() {
+            Some(namespace) => self.service_map.resolve(namespace, &rule.target_service),
+            None => self.service_map.resolve_by_name(&rule.target_service),
+        }?;
+        Some((entry.vip.to_network_byte_order(), entry.port.to_be()))
     }
 
     /// Resolve every running instance of a partition's source app to the
@@ -4154,7 +4176,7 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
             _ => vec![0],
         };
         let (vip, port) = self
-            .fault_vip_port(&rule.target_service)
+            .fault_vip_port(rule)
             .ok_or_else(|| format!("no service VIP exists for {}", rule.target_service))?;
         let Some(handle) = self.onion_ebpf.as_ref() else {
             return Err("the eBPF data path is not loaded on this node".to_string());
@@ -4254,7 +4276,7 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
 
         // Compatibility fallback for a rule created before exact key
         // ownership was recorded.
-        if let Some((vip, port)) = self.fault_vip_port(&rule.target_service)
+        if let Some((vip, port)) = self.fault_vip_port(rule)
             && matches!(rule.fault_type, FaultType::Drop { .. })
             && let Err(error) =
                 bpf_maps::delete_connect_fault(&mut ebpf.bpf, &connect_fault_key(vip, port))
@@ -11595,6 +11617,7 @@ mod tests {
             .insert(&crate::smoker::types::FaultRequest {
                 fault_type,
                 target_service: String::new(),
+                namespace: None,
                 target_instance: None,
                 target_node: Some("node-a".to_string()),
                 duration,
@@ -11874,6 +11897,7 @@ mod tests {
         let request = crate::smoker::types::FaultRequest {
             fault_type: crate::smoker::types::FaultType::Kill { count: 0 },
             target_service: "web".into(),
+            namespace: None,
             target_instance: None,
             target_node: None,
             duration: std::time::Duration::from_secs(30),

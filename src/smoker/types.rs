@@ -350,6 +350,11 @@ pub struct FaultRule {
     pub fault_type: FaultType,
     /// Target service name (e.g. "redis", "api", "payment-service").
     pub target_service: String,
+    /// Namespace of the target service, when the fault is namespace-qualified.
+    /// `None` keeps the legacy behaviour of matching the service in every
+    /// namespace; the workload-fault API always sets it (defaulting to
+    /// `default`) so injected faults hit only the intended tenant.
+    pub namespace: Option<String>,
     /// Optional: target a specific instance by name (e.g. "redis-1").
     pub target_instance: Option<String>,
     /// Optional: restrict fault to a specific node.
@@ -393,6 +398,7 @@ impl FaultRule {
             id,
             fault_type,
             target_service,
+            namespace: None,
             target_instance: None,
             target_node: None,
             activated_at_ns: now_ns,
@@ -402,6 +408,18 @@ impl FaultRule {
             reason: None,
             reversal: FaultReversal::None,
         }
+    }
+
+    /// Whether an instance in `namespace` is in scope for this fault.
+    ///
+    /// A namespace-qualified fault (the API path) matches only its own
+    /// namespace, so a fault on `web` in `team-a` never touches `team-b`'s
+    /// `web`. A legacy fault with no namespace (`None`) matches any namespace,
+    /// preserving the historical behaviour for internal/test callers.
+    pub fn matches_namespace(&self, namespace: &str) -> bool {
+        self.namespace
+            .as_deref()
+            .is_none_or(|target| target == namespace)
     }
 
     /// How long until this fault expires (zero if already expired).
@@ -467,6 +485,12 @@ pub struct FaultRequest {
     pub fault_type: FaultType,
     /// Target service name.
     pub target_service: String,
+    /// Namespace of the target service. `None` on node-targeted faults (which
+    /// have no service) and on legacy callers; the workload-fault API defaults
+    /// it to `default` and enforces the caller's token scope against it, so a
+    /// scoped Deployer cannot fault another tenant's same-named service.
+    #[serde(default)]
+    pub namespace: Option<String>,
     /// Optional: target a specific instance.
     pub target_instance: Option<String>,
     /// Optional: restrict to a specific node.
@@ -668,6 +692,24 @@ mod tests {
     #[test]
     fn fault_id_display() {
         assert_eq!(FaultId(42).to_string(), "fault-42");
+    }
+
+    #[test]
+    fn matches_namespace_confines_qualified_faults_but_not_legacy_ones() {
+        let mut rule = FaultRule::new(
+            FaultId(1),
+            FaultType::Pause,
+            "web".to_string(),
+            Duration::from_secs(1),
+            "tester".to_string(),
+        );
+        // No namespace = legacy behaviour: matches every namespace.
+        assert!(rule.matches_namespace("team-a"));
+        assert!(rule.matches_namespace("team-b"));
+        // Qualified = matches only its own namespace.
+        rule.namespace = Some("team-a".to_string());
+        assert!(rule.matches_namespace("team-a"));
+        assert!(!rule.matches_namespace("team-b"));
     }
 
     #[test]
@@ -991,6 +1033,7 @@ mod tests {
                 jitter_ns: 0,
             },
             target_service: "redis".into(),
+            namespace: None,
             target_instance: Some("redis-1".into()),
             target_node: None,
             duration: Duration::from_secs(300),

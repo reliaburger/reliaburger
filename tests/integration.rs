@@ -871,6 +871,7 @@ async fn kill_fault_actually_kills_the_instance() {
     let fault = FaultRequest {
         fault_type: FaultType::Kill { count: 1 },
         target_service: "victim".into(),
+        namespace: None,
         target_instance: None,
         target_node: None,
         duration: Duration::from_secs(5),
@@ -932,6 +933,7 @@ async fn network_fault_without_ebpf_is_rejected_not_faked() {
             jitter_ns: 0,
         },
         target_service: "svc".into(),
+        namespace: None,
         target_instance: None,
         target_node: None,
         duration: Duration::from_secs(5),
