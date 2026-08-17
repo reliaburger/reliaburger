@@ -30,6 +30,11 @@ use super::BunError;
 use super::probe::probe_health;
 use super::supervisor::{WorkloadInstance, WorkloadSupervisor};
 
+/// Deadline for an `exec` run off the command loop (H3). Bounds an orphaned
+/// task if the caller disconnects; the exec no longer blocks the loop, so this
+/// is generous — it only stops a truly runaway command from lingering forever.
+const EXEC_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(300);
+
 /// Maximum time an init container may run before the deploy fails. Bounds the
 /// init wait so a hung init can't wedge the agent event loop indefinitely.
 const INIT_TIMEOUT_SECS: u64 = 300;
@@ -1864,22 +1869,24 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
             return;
         };
 
-        // cgroup id(s) per app, from currently-running instances. Collect the
-        // (app, id) pairs first so the `list_instances` borrow is released
-        // before the async `pid` lookups.
-        let pairs: Vec<(String, InstanceId)> = self
+        // cgroup id(s) per (namespace, app), from currently-running instances.
+        // Keying by the namespace-qualified identity — not the bare app name —
+        // is what stops same-named apps in different namespaces from sharing a
+        // firewall rule or a namespace mapping (H9). Collect the pairs first so
+        // the `list_instances` borrow is released before the async `pid` lookups.
+        let pairs: Vec<((String, String), InstanceId)> = self
             .supervisor
             .list_instances()
             .into_iter()
-            .map(|i| (i.app_name.clone(), i.id.clone()))
+            .map(|i| ((i.namespace.clone(), i.app_name.clone()), i.id.clone()))
             .collect();
-        let mut cgroup_ids: std::collections::HashMap<String, Vec<u64>> =
+        let mut cgroup_ids: std::collections::HashMap<(String, String), Vec<u64>> =
             std::collections::HashMap::new();
-        for (app, id) in pairs {
+        for (key, id) in pairs {
             if let Some(pid) = self.supervisor.grill().pid(&id).await
                 && let Some(cg) = crate::sesame::egress::cgroup_id_of_pid(pid)
             {
-                cgroup_ids.entry(app).or_default().push(cg);
+                cgroup_ids.entry(key).or_default().push(cg);
             }
         }
 
@@ -2771,8 +2778,33 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
                 command,
                 response,
             } => {
-                let result = self.exec_app(&app_name, &namespace, &command).await;
-                let _ = response.send(result);
+                // Resolve the target instance on the loop (cheap), then run the
+                // exec off-loop under a deadline (H3). Running it inline let a
+                // long command (`relish exec app -- sleep 3600`) stall health
+                // checks, restarts and every other command — the exact reason
+                // Trace was moved off the loop.
+                match self.resolve_running_instance(&app_name, &namespace) {
+                    Ok(instance_id) => {
+                        let grill = self.supervisor.grill().clone();
+                        tokio::spawn(async move {
+                            let result = match tokio::time::timeout(
+                                EXEC_TIMEOUT,
+                                grill.exec(&instance_id, &command),
+                            )
+                            .await
+                            {
+                                Ok(inner) => inner.map_err(BunError::from),
+                                Err(_) => Err(BunError::ExecTimeout {
+                                    seconds: EXEC_TIMEOUT.as_secs(),
+                                }),
+                            };
+                            let _ = response.send(result);
+                        });
+                    }
+                    Err(error) => {
+                        let _ = response.send(Err(error));
+                    }
+                }
             }
             AgentCommand::Trace {
                 request,
@@ -6607,8 +6639,15 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
             }
         }
 
-        // Re-provision identities that need rotation
-        let (dummy_tx, _dummy_rx) = mpsc::channel(1);
+        // Re-provision identities that need rotation. `provision_identity` emits
+        // best-effort progress events, but a background rotation tick has no SSE
+        // consumer for them. The old code held a capacity-1 receiver it never
+        // read, so the *second* send inside the *first* provision blocked the
+        // agent loop forever (H2). Drop the receiver instead: each `send` now
+        // fails fast (channel closed) and is swallowed, while the actual
+        // CSR-signing and file writes proceed unchanged.
+        let (dummy_tx, dummy_rx) = mpsc::channel(1);
+        drop(dummy_rx);
         for (id, app, ns, is_job) in needs_rotation {
             self.provision_identity(&app, &ns, &id, is_job, &dummy_tx)
                 .await;
@@ -6753,14 +6792,15 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
     /// Finds the first running instance of the app in the given namespace
     /// and delegates to `grill.exec()`. In Phase 1 (ProcessGrill), this
     /// just spawns the command directly. Phase 3+ will add namespace entry.
-    async fn exec_app(
+    /// Resolve the id of a running instance of `app_name` in `namespace`, or
+    /// `AppNotFound`. Cheap and synchronous, so it runs on the command loop
+    /// before the actual exec is spawned off it (H3).
+    fn resolve_running_instance(
         &self,
         app_name: &str,
         namespace: &str,
-        command: &[String],
-    ) -> Result<String, BunError> {
-        let instance_id = self
-            .supervisor
+    ) -> Result<InstanceId, BunError> {
+        self.supervisor
             .list_instances()
             .into_iter()
             .find(|i| {
@@ -6772,10 +6812,7 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
             .ok_or_else(|| BunError::AppNotFound {
                 app_name: app_name.to_string(),
                 namespace: namespace.to_string(),
-            })?;
-
-        let output = self.supervisor.grill().exec(&instance_id, command).await?;
-        Ok(output)
+            })
     }
 
     /// Capture the immutable state needed by a connectivity trace. The slow

@@ -14,8 +14,82 @@ use datafusion::arrow::record_batch::RecordBatch;
 use datafusion::datasource::MemTable;
 use datafusion::parquet::arrow::ArrowWriter;
 use datafusion::prelude::*;
+use object_store::{ObjectStore, ObjectStoreExt};
 
 use super::types::{MayoError, MetricKey, Sample};
+
+/// Where a [`MayoStore`] reads and writes Parquet.
+///
+/// `Local` is the default single-node case: a filesystem directory. `Remote`
+/// (H8) backs the store with an `object_store` bucket named by
+/// `[metrics] object_store_url` (`s3://…`, `gs://…`, or `file://…`), so metrics
+/// survive node loss and the same DataFusion queries run over the bucket.
+#[derive(Clone)]
+enum Backend {
+    Local,
+    Remote {
+        store: Arc<dyn ObjectStore>,
+        /// Path *inside* the store where `metrics_*.parquet` files live.
+        prefix: object_store::path::Path,
+    },
+}
+
+/// Parse a `[metrics] object_store_url` into an object store and key prefix.
+/// A bare path or `file://…` maps to the local filesystem; `s3://…`/`gs://…`
+/// map to their cloud backends (credentials from each backend's standard
+/// environment variables). Mirrors Ketchup's log export.
+fn parse_object_store(
+    destination: &str,
+) -> Result<(Arc<dyn ObjectStore>, object_store::path::Path), MayoError> {
+    let url = if destination.contains("://") {
+        url::Url::parse(destination)
+            .map_err(|e| MayoError::ObjectStore(format!("invalid object_store_url: {e}")))?
+    } else {
+        let absolute = std::path::absolute(destination).map_err(MayoError::Io)?;
+        url::Url::from_file_path(&absolute)
+            .map_err(|_| MayoError::ObjectStore("could not build file:// url".to_string()))?
+    };
+    let (store, prefix) = object_store::parse_url(&url)
+        .map_err(|e| MayoError::ObjectStore(format!("unsupported object_store_url: {e}")))?;
+    Ok((Arc::from(store), prefix))
+}
+
+/// Seed the flush counter for a remote backend by listing existing
+/// `metrics_NNNNNN.parquet` objects under `prefix` and returning one past the
+/// highest — so a restart resumes numbering instead of clobbering data.
+async fn next_remote_flush_counter(
+    store: &Arc<dyn ObjectStore>,
+    prefix: &object_store::path::Path,
+) -> Result<u64, MayoError> {
+    use futures_util::StreamExt;
+    let mut listing = store.list(Some(prefix));
+    let mut max_seen: Option<u64> = None;
+    while let Some(item) = listing.next().await {
+        let meta = item.map_err(|e| MayoError::ObjectStore(e.to_string()))?;
+        let name = meta.location.filename().unwrap_or("");
+        if let Some(rest) = name.strip_prefix("metrics_")
+            && let Some(digits) = rest.strip_suffix(".parquet")
+            && let Ok(n) = digits.parse::<u64>()
+        {
+            max_seen = Some(max_seen.map_or(n, |m| m.max(n)));
+        }
+    }
+    Ok(max_seen.map_or(0, |m| m + 1))
+}
+
+/// Serialise a RecordBatch to in-memory Parquet bytes (for object-store PUT).
+fn batch_to_parquet_bytes(batch: &RecordBatch) -> Result<Vec<u8>, MayoError> {
+    let mut buffer = Vec::new();
+    let mut writer = ArrowWriter::try_new(&mut buffer, batch.schema(), None)
+        .map_err(|e| MayoError::Arrow(e.to_string()))?;
+    writer
+        .write(batch)
+        .map_err(|e| MayoError::Arrow(e.to_string()))?;
+    writer
+        .close()
+        .map_err(|e| MayoError::Arrow(e.to_string()))?;
+    Ok(buffer)
+}
 
 /// Escape a value for safe interpolation into a single-quoted SQL string
 /// literal (M1). DataFusion follows standard SQL: a `'` inside a literal is
@@ -78,9 +152,21 @@ pub(crate) fn write_batch_parquet(
 /// A drained buffer ready to be written to Parquet, decoupled from the store so
 /// the caller can release its lock before the (blocking) write (OBS5/M3).
 pub struct PendingFlush {
-    data_dir: PathBuf,
-    path: PathBuf,
     batch: RecordBatch,
+    target: FlushTarget,
+}
+
+/// Where a [`PendingFlush`] is written — a local Parquet file or an
+/// object-store key (H8).
+enum FlushTarget {
+    Local {
+        data_dir: PathBuf,
+        path: PathBuf,
+    },
+    Remote {
+        store: Arc<dyn ObjectStore>,
+        key: object_store::path::Path,
+    },
 }
 
 /// Flush a shared store without holding its lock across the (blocking) write.
@@ -109,17 +195,27 @@ pub async fn flush_off_lock(
 /// Persist a [`PendingFlush`] to disk on the blocking pool. Runs with no lock
 /// held, so concurrent queries proceed while the write is in flight.
 pub async fn write_pending_flush(pending: PendingFlush) -> Result<(), MayoError> {
-    let PendingFlush {
-        data_dir,
-        path,
-        batch,
-    } = pending;
-    tokio::task::spawn_blocking(move || {
-        std::fs::create_dir_all(&data_dir).map_err(MayoError::Io)?;
-        write_batch_parquet(&path, &batch)
-    })
-    .await
-    .map_err(|e| MayoError::Io(std::io::Error::other(e.to_string())))?
+    let PendingFlush { batch, target } = pending;
+    match target {
+        FlushTarget::Local { data_dir, path } => tokio::task::spawn_blocking(move || {
+            std::fs::create_dir_all(&data_dir).map_err(MayoError::Io)?;
+            write_batch_parquet(&path, &batch)
+        })
+        .await
+        .map_err(|e| MayoError::Io(std::io::Error::other(e.to_string())))?,
+        FlushTarget::Remote { store, key } => {
+            // Encode off the runtime (Arrow's writer is blocking), then PUT the
+            // bytes to the object store.
+            let bytes = tokio::task::spawn_blocking(move || batch_to_parquet_bytes(&batch))
+                .await
+                .map_err(|e| MayoError::Io(std::io::Error::other(e.to_string())))??;
+            store
+                .put(&key, object_store::PutPayload::from(bytes))
+                .await
+                .map_err(|e| MayoError::ObjectStore(e.to_string()))?;
+            Ok(())
+        }
+    }
 }
 
 /// Whether `data_dir` contains at least one `.parquet` file.
@@ -151,15 +247,18 @@ struct BufferedSample {
 pub struct MayoStore {
     /// In-memory buffer of unflushed samples.
     buffer: Vec<BufferedSample>,
-    /// Directory for Parquet files.
+    /// Local directory for Parquet files (also the checkpoint dir under a
+    /// remote backend, which otherwise ignores it).
     data_dir: PathBuf,
+    /// Storage backend: a local directory or an object store (H8).
+    backend: Backend,
     /// Counter for unique Parquet file names. Seeded past any existing files
     /// so a restart never clobbers a previous run's data.
     flush_counter: u64,
 }
 
 impl MayoStore {
-    /// Open (or create) a store writing Parquet to `data_dir`.
+    /// Open (or create) a store writing Parquet to a local `data_dir`.
     ///
     /// Existing `metrics_NNNNNN.parquet` files are left in place and remain
     /// queryable; the flush counter resumes past the highest one so restarts
@@ -169,11 +268,34 @@ impl MayoStore {
         Self {
             buffer: Vec::new(),
             data_dir,
+            backend: Backend::Local,
             flush_counter,
         }
     }
 
-    /// The directory where Parquet files are stored.
+    /// Open a store, backing it with an object store when `object_store_url` is
+    /// set (H8) or a local `data_dir` otherwise. For the remote backend the
+    /// flush counter is seeded by listing existing `metrics_*.parquet` objects,
+    /// so a restart resumes numbering instead of clobbering prior data.
+    pub async fn open(
+        data_dir: PathBuf,
+        object_store_url: Option<&str>,
+    ) -> Result<Self, MayoError> {
+        let Some(url) = object_store_url.filter(|u| !u.is_empty()) else {
+            return Ok(Self::new(data_dir));
+        };
+        let (store, prefix) = parse_object_store(url)?;
+        let flush_counter = next_remote_flush_counter(&store, &prefix).await?;
+        Ok(Self {
+            buffer: Vec::new(),
+            data_dir,
+            backend: Backend::Remote { store, prefix },
+            flush_counter,
+        })
+    }
+
+    /// The local directory where Parquet files are stored (the configured
+    /// metrics dir; unused for storage under a remote backend).
     pub fn data_dir(&self) -> &std::path::Path {
         &self.data_dir
     }
@@ -246,14 +368,19 @@ impl MayoStore {
             return Ok(None);
         };
         let filename = format!("metrics_{:06}.parquet", self.flush_counter);
-        let path = self.data_dir.join(filename);
         self.buffer.clear();
         self.flush_counter += 1;
-        Ok(Some(PendingFlush {
-            data_dir: self.data_dir.clone(),
-            path,
-            batch,
-        }))
+        let target = match &self.backend {
+            Backend::Local => FlushTarget::Local {
+                data_dir: self.data_dir.clone(),
+                path: self.data_dir.join(&filename),
+            },
+            Backend::Remote { store, prefix, .. } => FlushTarget::Remote {
+                store: Arc::clone(store),
+                key: prefix.clone().join(filename.as_str()),
+            },
+        };
+        Ok(Some(PendingFlush { batch, target }))
     }
 
     /// Build a DataFusion session exposing a `metrics` table over all data:
@@ -299,6 +426,9 @@ impl MayoStore {
     /// with a log instead of failing the whole query (OBS5): a single bad flush
     /// must not make every unrelated read error out.
     async fn read_disk_batches(&self, ctx: &SessionContext) -> Result<Vec<RecordBatch>, MayoError> {
+        if let Backend::Remote { .. } = &self.backend {
+            return self.read_remote_batches(ctx).await;
+        }
         if !dir_has_parquet(&self.data_dir) {
             return Ok(Vec::new());
         }
@@ -345,6 +475,68 @@ impl MayoStore {
                     }
                 }
                 Err(_) => eprintln!("mayo: skipping corrupt metrics file {file}"),
+            }
+        }
+        Ok(normalised)
+    }
+
+    /// Read all `metrics_*.parquet` objects from the remote backend into
+    /// RecordBatches, normalised to the canonical schema (H8).
+    ///
+    /// Bytes are fetched with `object_store` and parsed with DataFusion's
+    /// in-memory Parquet reader, so we never register the object store on the
+    /// DataFusion runtime — that would clash with the different `object_store`
+    /// version DataFusion links. A corrupt object is skipped with a log, like
+    /// the local path, so one bad flush can't fail every query.
+    async fn read_remote_batches(
+        &self,
+        _ctx: &SessionContext,
+    ) -> Result<Vec<RecordBatch>, MayoError> {
+        use datafusion::parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
+        use futures_util::StreamExt;
+
+        let Backend::Remote { store, prefix, .. } = &self.backend else {
+            return Ok(Vec::new());
+        };
+
+        let mut keys = Vec::new();
+        let mut listing = store.list(Some(prefix));
+        while let Some(item) = listing.next().await {
+            let meta = item.map_err(|e| MayoError::ObjectStore(e.to_string()))?;
+            let name = meta.location.filename().unwrap_or("");
+            if name.starts_with("metrics_") && name.ends_with(".parquet") {
+                keys.push(meta.location);
+            }
+        }
+
+        let schema = Arc::new(metrics_schema());
+        let mut normalised = Vec::new();
+        for key in keys {
+            let bytes = match store.get(&key).await {
+                Ok(result) => result
+                    .bytes()
+                    .await
+                    .map_err(|e| MayoError::ObjectStore(e.to_string()))?,
+                Err(_) => continue, // deleted between list and get; skip
+            };
+            let builder = match ParquetRecordBatchReaderBuilder::try_new(bytes) {
+                Ok(builder) => builder,
+                Err(e) => {
+                    eprintln!("mayo: skipping unreadable remote metrics object {key}: {e}");
+                    continue;
+                }
+            };
+            let reader = builder
+                .build()
+                .map_err(|e| MayoError::Arrow(e.to_string()))?;
+            for batch in reader {
+                match batch {
+                    Ok(b) => match RecordBatch::try_new(schema.clone(), b.columns().to_vec()) {
+                        Ok(nb) => normalised.push(nb),
+                        Err(e) => eprintln!("mayo: skipping malformed remote metrics batch: {e}"),
+                    },
+                    Err(e) => eprintln!("mayo: error reading remote metrics batch: {e}"),
+                }
             }
         }
         Ok(normalised)
@@ -586,6 +778,12 @@ impl MayoStore {
     /// file whose max timestamp can't be read falls back to mtime so a
     /// malformed file is still eligible for pruning.
     pub fn prune(&self, before: u64) -> Result<usize, MayoError> {
+        // Remote backends leave retention to the bucket's own lifecycle policy
+        // (the idiomatic way to expire object-store data), so node-side pruning
+        // is a no-op there (H8).
+        if let Backend::Remote { .. } = &self.backend {
+            return Ok(0);
+        }
         let mut deleted = 0;
         if let Ok(entries) = std::fs::read_dir(&self.data_dir) {
             for entry in entries.flatten() {
@@ -649,6 +847,42 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let store = MayoStore::new(dir.path().to_path_buf());
         (store, dir)
+    }
+
+    /// H8: with an object-store backend (exercised here via a `file://` temp
+    /// dir — object_store's LocalFileSystem — so no real cloud is needed),
+    /// flushed metrics land in the store and the same queries read them back,
+    /// including across a "restart" that re-opens the store and resumes the
+    /// flush counter from what's already there.
+    #[tokio::test]
+    async fn object_store_backend_round_trips_and_survives_restart() {
+        let dir = tempfile::tempdir().unwrap();
+        let url = url::Url::from_file_path(dir.path()).unwrap().to_string();
+
+        let mut store = MayoStore::open(dir.path().to_path_buf(), Some(&url))
+            .await
+            .unwrap();
+        let key = MetricKey::simple("node_cpu");
+        store.insert(&key, Sample::at(1000, 10.0));
+        store.insert(&key, Sample::at(1001, 20.0));
+        store.flush().await.unwrap();
+
+        let rows = store.query("node_cpu", 0, 2000).await.unwrap();
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0].3, 10.0);
+
+        // Re-open (restart): the store lists existing objects, so a fresh flush
+        // doesn't clobber the first file, and both are queryable.
+        let mut restarted = MayoStore::open(dir.path().to_path_buf(), Some(&url))
+            .await
+            .unwrap();
+        restarted.insert(&key, Sample::at(1002, 30.0));
+        restarted.flush().await.unwrap();
+        let rows = restarted.query("node_cpu", 0, 2000).await.unwrap();
+        assert_eq!(rows.len(), 3, "restart must not clobber earlier objects");
+
+        // Prune is a no-op for a remote backend (bucket lifecycle owns retention).
+        assert_eq!(restarted.prune(u64::MAX).unwrap(), 0);
     }
 
     #[tokio::test]

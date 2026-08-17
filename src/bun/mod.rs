@@ -54,6 +54,10 @@ pub enum BunError {
     #[error("app {app_name:?} not found in namespace {namespace:?}")]
     AppNotFound { app_name: String, namespace: String },
 
+    /// An `exec` did not finish within its deadline.
+    #[error("exec timed out after {seconds}s")]
+    ExecTimeout { seconds: u64 },
+
     /// A health check was configured but the app has no port to probe.
     #[error("app {app_name:?} has a health check but no port")]
     NoPortForHealthCheck { app_name: String },
