@@ -581,6 +581,7 @@ async fn agent_drop_fault_refuses_vip_with_eperm() {
             request: FaultRequest {
                 fault_type: FaultType::Drop { probability: 100 },
                 target_service: "faulty".into(),
+                namespace: None,
                 target_instance: None,
                 target_node: None,
                 duration: Duration::from_secs(30),
