@@ -1342,17 +1342,23 @@ async fn run_agent(cli: Cli) -> anyhow::Result<()> {
     );
     let log_store = Arc::new(RwLock::new(log_store_inner));
 
+    // Tasks that feed the metric/log buffers. They must stop before the final
+    // shutdown flush, or a last record can be appended *after* the flush and
+    // lost (M22) — the join set above doesn't cover them, so we abort them
+    // explicitly just before flushing.
+    let mut feeder_handles: Vec<tokio::task::JoinHandle<()>> = Vec::new();
+
     // Drain container log lines from the agent into the LogStore.
     {
         let drain_store = Arc::clone(&log_store);
-        tokio::spawn(async move {
+        feeder_handles.push(tokio::spawn(async move {
             while let Some(rec) = log_rx.recv().await {
                 drain_store
                     .write()
                     .await
                     .append(&rec.app, &rec.namespace, rec.stream, &rec.line);
             }
-        });
+        }));
     }
 
     println!("bun: observability enabled (metrics + logs + alerts)");
@@ -1363,7 +1369,7 @@ async fn run_agent(cli: Cli) -> anyhow::Result<()> {
     let collection_interval = config.metrics.collection_interval_secs.max(1);
     let collection_shutdown = shutdown.clone();
     let collection_cmd_tx = cmd_tx.clone();
-    tokio::spawn(async move {
+    feeder_handles.push(tokio::spawn(async move {
         let mut collector = SystemCollector::new();
         let mut tick = tokio::time::interval(std::time::Duration::from_secs(collection_interval));
         let mut flush_counter = 0u64;
@@ -1433,7 +1439,7 @@ async fn run_agent(cli: Cli) -> anyhow::Result<()> {
                 }
             }
         }
-    });
+    }));
 
     // Spawn Prometheus scrape task (E). Only when targets are configured —
     // an empty list means scraping is disabled and no loop is spawned.
@@ -1738,8 +1744,11 @@ async fn run_agent(cli: Cli) -> anyhow::Result<()> {
     // L10: the catalog used to be `default()` on every boot — image
     // metadata evaporated on restart. Load the persisted copy; a
     // corrupt file aborts startup rather than silently orphaning blobs.
-    let _ = std::fs::create_dir_all(&config.storage.data);
-    let catalog_path = config.storage.data.join("pickle-catalog.json");
+    // Persist the catalog under `data_base` — the resolved writable base — not
+    // `config.storage.data` directly (M22). When storage.data is unwritable the
+    // node falls back to a user data dir; writing the catalog to the raw
+    // storage.data would then fail every GC/manifest persist at runtime.
+    let catalog_path = data_base.join("pickle-catalog.json");
     let loaded_catalog = ManifestCatalog::load_from(&catalog_path)
         .map_err(|e| anyhow::anyhow!("failed to load pickle catalog: {e}"))?;
     if !loaded_catalog.manifests.is_empty() {
@@ -2370,12 +2379,28 @@ async fn run_agent(cli: Cli) -> anyhow::Result<()> {
                     _ = ticker.tick() => {}
                 }
 
-                // Actively deployed images are never collected.
+                // Actively deployed images are never collected. If the agent
+                // can't tell us which images are active (its task died, or the
+                // reply was dropped), skip this sweep entirely (M22): treating
+                // the failure as "no images are active" — the old
+                // `unwrap_or_default()` — would collect every layer of every
+                // running workload.
                 let (tx, rx) = tokio::sync::oneshot::channel();
-                let _ = gc_cmd_tx
+                if gc_cmd_tx
                     .send(reliaburger::bun::agent::AgentCommand::ActiveImages { response: tx })
-                    .await;
-                let active = rx.await.unwrap_or_default();
+                    .await
+                    .is_err()
+                {
+                    eprintln!("bun: GC skipped — agent unavailable to report active images");
+                    continue;
+                }
+                let active = match rx.await {
+                    Ok(active) => active,
+                    Err(_) => {
+                        eprintln!("bun: GC skipped — active-image query dropped");
+                        continue;
+                    }
+                };
 
                 // Phase 1: nominate (fs walk off the runtime).
                 let catalog_snapshot = gc_catalog.read().await.clone();
@@ -2554,9 +2579,15 @@ async fn run_agent(cli: Cli) -> anyhow::Result<()> {
 
     // OBS7: the flush loops break on cancellation and drop whatever they'd
     // buffered since their last tick. Force one final flush of both stores so
-    // the last minute of metrics and logs is durable, not lost on a clean
-    // stop. The tasks that fed these buffers are joined above, so nothing is
-    // still appending.
+    // the last minute of metrics and logs is durable, not lost on a clean stop.
+    //
+    // First stop the tasks that feed those buffers (M22): the join set above
+    // doesn't cover the log-drain and metrics-collection tasks, so without this
+    // one of them could append a record *after* the final flush and lose it.
+    // Abort (rather than await) so a wedged feeder can't hang shutdown.
+    for handle in &feeder_handles {
+        handle.abort();
+    }
     if let Err(e) = reliaburger::mayo::store::flush_off_lock(&mayo_store).await {
         eprintln!("bun: final metrics flush error: {e}");
     }
