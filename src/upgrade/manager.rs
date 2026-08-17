@@ -309,9 +309,19 @@ impl UpgradeManager {
 
         let error = self.exec_current_symlink();
 
-        // Exec failed (missing binary, ENOEXEC...): put everything back.
-        let _ = self.store.activate(&marker.previous_version);
-        let _ = UpgradeMarker::archive_stale(&self.marker_path);
+        // Exec failed (missing binary, ENOEXEC...): put the previous version
+        // back. Only archive the marker if that restore succeeded — otherwise
+        // the current symlink still points at the broken target, so we must
+        // keep the marker so the next boot's check triggers a revert rather
+        // than exec the broken binary again with no marker (M17).
+        if let Err(restore_err) = self.store.activate(&marker.previous_version) {
+            eprintln!(
+                "bun: CRITICAL: failed to restore the previous version after a failed exec \
+                 ({restore_err}); leaving the upgrade marker in place so the next boot reverts"
+            );
+        } else {
+            let _ = UpgradeMarker::archive_stale(&self.marker_path);
+        }
         let _ = self.append_history(&UpgradeHistoryEntry {
             upgrade_id: marker.upgrade_id.clone(),
             from_version: marker.previous_version.clone(),

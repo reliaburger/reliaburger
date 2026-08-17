@@ -136,15 +136,21 @@ pub fn execute_sync(
                 let status =
                     verify::verify_commit(repo.path(), &commit, &config.trusted_signing_keys);
                 commit.signature = status.clone();
-                if !matches!(
-                    status,
-                    SignatureStatus::Verified | SignatureStatus::NotChecked
-                ) {
+                // Only a *verified* signature admits a script-modifying commit
+                // (M20). Admitting `NotChecked` — which means verification never
+                // ran because no trusted keys are configured — made this gate a
+                // no-op on the common default, exactly the "verification never
+                // ran" case the fail-closed rationale above calls unsafe. So a
+                // script change through GitOps now requires configured trusted
+                // keys and a valid signature.
+                if !matches!(status, SignatureStatus::Verified) {
                     return SyncOutcome {
                         commit: Some(commit.clone()),
                         result: SyncResult::Failure {
                             error: format!(
-                                "commit {} modifies script field but is not signed",
+                                "commit {} modifies a script field but has no verified \
+                                 signature (status: {status:?}); configure \
+                                 [gitops] trusted_signing_keys and sign the commit",
                                 commit.sha
                             ),
                         },

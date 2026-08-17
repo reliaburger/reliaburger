@@ -754,11 +754,16 @@ pub async fn run_orchestrator(
             if let ClusterUpgradePhase::Paused { reason } = &next.phase {
                 eprintln!("bun: cluster upgrade {} paused: {reason}", next.upgrade_id);
             }
-            let _ = council
+            if let Err(e) = council
                 .write(RaftRequest::UpgradeUpdate {
                     state: Box::new(next),
                 })
-                .await;
+                .await
+            {
+                // A lost phase-transition write (e.g. a node newly marked
+                // Failed) was invisible to operators; surface it (M17).
+                eprintln!("bun: cluster upgrade phase update failed to commit: {e}");
+            }
         }
     }
 }

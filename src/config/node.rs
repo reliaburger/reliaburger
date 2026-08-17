@@ -349,7 +349,7 @@ impl Default for UpgradeSection {
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct NodeSection {
-    /// Node name. Defaults to hostname if omitted.
+    /// Node name. Defaults to `node-<gossip_port>` if omitted.
     pub name: Option<String>,
     /// Arbitrary key-value labels for placement constraints.
     pub labels: BTreeMap<String, String>,
@@ -499,7 +499,8 @@ impl Default for ResourcesSection {
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct NetworkSection {
-    /// IP address advertised to the cluster. Auto-detected if omitted.
+    /// IP address advertised to the cluster. Falls back to `127.0.0.1` if
+    /// omitted or unparseable (single-node / loopback default).
     pub advertise_address: Option<String>,
     /// Ephemeral port range for container port mapping.
     pub port_range: PortRange,
@@ -591,12 +592,15 @@ impl ReconstructionSection {
         };
         if self.report_threshold_percent == 0 || self.report_threshold_percent > 100 {
             return Err(bad(
-                "coverage_percent",
+                "report_threshold_percent",
                 "must be between 1 and 100 inclusive",
             ));
         }
         if self.learning_period_timeout_secs == 0 {
-            return Err(bad("timeout_secs", "must be greater than zero"));
+            return Err(bad(
+                "learning_period_timeout_secs",
+                "must be greater than zero",
+            ));
         }
         if self.large_cluster_timeout_secs == 0 {
             return Err(bad(
