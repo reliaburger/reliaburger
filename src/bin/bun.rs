@@ -1471,6 +1471,69 @@ async fn run_agent(cli: Cli) -> anyhow::Result<()> {
         }
     });
 
+    // Spawn rollup store flush task (H6). The aggregator only ingests cluster
+    // rollups into memory; without this a restart loses all rollup history, the
+    // 1M-row buffer cap silently drops the oldest data, and the rollup-retention
+    // prune finds no Parquet to act on. Flush periodically and once more on a
+    // graceful shutdown so the last window survives.
+    if let Some(rollup_store) = api_rollup_store.clone() {
+        let rollup_flush_shutdown = shutdown.clone();
+        tokio::spawn(async move {
+            let mut tick = tokio::time::interval(std::time::Duration::from_secs(60));
+            tick.tick().await; // skip the immediate first tick
+            loop {
+                tokio::select! {
+                    _ = rollup_flush_shutdown.cancelled() => {
+                        if let Err(e) = rollup_store.write().await.flush().await {
+                            eprintln!("bun: final rollup flush error: {e}");
+                        }
+                        break;
+                    }
+                    _ = tick.tick() => {
+                        if let Err(e) = rollup_store.write().await.flush().await {
+                            eprintln!("bun: rollup flush error: {e}");
+                        }
+                    }
+                }
+            }
+        });
+    }
+
+    // Metrics retention (H7). Prune Parquet whose newest datapoint is older
+    // than the configured window, keyed on the data's own timestamp (O12) — not
+    // the file mtime the disk-pressure path uses, which a touch/copy or clock
+    // skew can push forward and so silently drop in-range data. Disk-pressure
+    // relief (`check_and_relieve`) stays separate for emergency reclamation.
+    if config.metrics.retention_days > 0 {
+        let retention_mayo = Arc::clone(&mayo_store);
+        let retention_days = config.metrics.retention_days;
+        let retention_shutdown = shutdown.clone();
+        tokio::spawn(async move {
+            let mut tick = tokio::time::interval(std::time::Duration::from_secs(3600));
+            tick.tick().await; // skip the immediate first tick
+            loop {
+                tokio::select! {
+                    _ = retention_shutdown.cancelled() => break,
+                    _ = tick.tick() => {
+                        let now_secs = std::time::SystemTime::now()
+                            .duration_since(std::time::UNIX_EPOCH)
+                            .unwrap_or_default()
+                            .as_secs();
+                        let before = now_secs.saturating_sub(u64::from(retention_days) * 86_400);
+                        let store = retention_mayo.read().await;
+                        match store.prune(before) {
+                            Ok(n) if n > 0 => println!(
+                                "bun: metrics retention pruned {n} file(s) older than {retention_days}d"
+                            ),
+                            Ok(_) => {}
+                            Err(e) => eprintln!("bun: metrics retention prune error: {e}"),
+                        }
+                    }
+                }
+            }
+        });
+    }
+
     // Spawn log export task (if configured)
     if let Some(ref export_path) = config.logs.export_path {
         let export_store = Arc::clone(&log_store);
