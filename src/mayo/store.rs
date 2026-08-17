@@ -129,23 +129,38 @@ pub(crate) fn next_flush_counter(data_dir: &std::path::Path, prefix: &str) -> u6
     max_seen.map_or(0, |m| m + 1)
 }
 
-/// Write a single RecordBatch to a Parquet file at `path`.
+/// Write a single RecordBatch to a Parquet file at `path`, durably (M6).
 ///
+/// Writes to a `.tmp` sibling, fsyncs it, atomically renames it into place, and
+/// fsyncs the directory — so a crash mid-write can't leave a torn file that a
+/// later query treats as valid, and a flush that returned Ok is really on disk.
 /// Synchronous (Arrow's writer is blocking), so callers run it on
 /// `spawn_blocking` to keep the async runtime free (OBS5/M3).
 pub(crate) fn write_batch_parquet(
     path: &std::path::Path,
     batch: &RecordBatch,
 ) -> Result<(), MayoError> {
-    let file = std::fs::File::create(path).map_err(MayoError::Io)?;
+    let tmp = path.with_extension("parquet.tmp");
+    let file = std::fs::File::create(&tmp).map_err(MayoError::Io)?;
     let mut writer = ArrowWriter::try_new(file, batch.schema(), None)
         .map_err(|e| MayoError::Arrow(e.to_string()))?;
     writer
         .write(batch)
         .map_err(|e| MayoError::Arrow(e.to_string()))?;
-    writer
-        .close()
+    // `into_inner` flushes and hands back the File so we can fsync the bytes
+    // before the rename publishes them.
+    let file = writer
+        .into_inner()
         .map_err(|e| MayoError::Arrow(e.to_string()))?;
+    file.sync_all().map_err(MayoError::Io)?;
+    std::fs::rename(&tmp, path).map_err(MayoError::Io)?;
+    if let Some(dir) = path.parent() {
+        // A dir fsync makes the rename itself durable. Best-effort: not every
+        // filesystem supports it, and the file bytes are already synced.
+        if let Ok(dir_file) = std::fs::File::open(dir) {
+            let _ = dir_file.sync_all();
+        }
+    }
     Ok(())
 }
 
@@ -185,8 +200,18 @@ pub async fn flush_off_lock(
     };
     match pending {
         Some(p) => {
-            write_pending_flush(p).await?;
-            Ok(true)
+            // Keep a cheap (Arc-backed) handle on the drained samples so a
+            // failed write can put them back rather than lose them (M6): the
+            // buffer was already cleared under the lock, so nothing else holds
+            // them.
+            let batch = p.batch.clone();
+            match write_pending_flush(p).await {
+                Ok(()) => Ok(true),
+                Err(e) => {
+                    store.write().await.reabsorb_batch(&batch);
+                    Err(e)
+                }
+            }
         }
         None => Ok(false),
     }
@@ -356,7 +381,36 @@ impl MayoStore {
         let Some(pending) = self.take_flush_batch()? else {
             return Ok(());
         };
-        write_pending_flush(pending).await
+        let batch = pending.batch.clone();
+        if let Err(e) = write_pending_flush(pending).await {
+            // A failed write must not discard the drained samples (M6).
+            self.reabsorb_batch(&batch);
+            return Err(e);
+        }
+        Ok(())
+    }
+
+    /// Put a drained flush batch back into the buffer after a failed write, so
+    /// the samples are retried on the next flush instead of lost (M6). Rows are
+    /// appended; ordering doesn't matter (queries sort by timestamp).
+    pub(crate) fn reabsorb_batch(&mut self, batch: &RecordBatch) {
+        let (Some(timestamps), Some(names), Some(labels), Some(values)) = (
+            batch.column(0).as_any().downcast_ref::<UInt64Array>(),
+            batch.column(1).as_any().downcast_ref::<StringArray>(),
+            batch.column(2).as_any().downcast_ref::<StringArray>(),
+            batch.column(3).as_any().downcast_ref::<Float64Array>(),
+        ) else {
+            eprintln!("mayo: could not re-buffer a failed flush batch (schema mismatch)");
+            return;
+        };
+        for i in 0..batch.num_rows() {
+            self.buffer.push(BufferedSample {
+                timestamp: timestamps.value(i),
+                metric_name: names.value(i).to_string(),
+                labels_json: labels.value(i).to_string(),
+                value: values.value(i),
+            });
+        }
     }
 
     /// Drain the buffer into a self-contained [`PendingFlush`] the caller writes
@@ -883,6 +937,25 @@ mod tests {
 
         // Prune is a no-op for a remote backend (bucket lifecycle owns retention).
         assert_eq!(restarted.prune(u64::MAX).unwrap(), 0);
+    }
+
+    #[tokio::test]
+    async fn reabsorb_batch_restores_drained_samples() {
+        // M6: a failed write must not lose the drained samples. take_flush_batch
+        // clears the buffer; reabsorb_batch puts the rows back so the next flush
+        // retries them.
+        let (mut store, _dir) = test_store();
+        let key = MetricKey::simple("cpu");
+        store.insert(&key, Sample::at(1, 1.0));
+        store.insert(&key, Sample::at(2, 2.0));
+        let pending = store.take_flush_batch().unwrap().unwrap();
+        assert_eq!(store.buffer_len(), 0, "take_flush_batch drains the buffer");
+        store.reabsorb_batch(&pending.batch);
+        assert_eq!(store.buffer_len(), 2, "the samples are back for a retry");
+        // And they still flush and query correctly afterwards.
+        store.flush().await.unwrap();
+        let rows = store.query("cpu", 0, 10).await.unwrap();
+        assert_eq!(rows.len(), 2);
     }
 
     #[tokio::test]
