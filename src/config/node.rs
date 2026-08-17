@@ -312,7 +312,9 @@ pub struct UpgradeSection {
     pub external_signing_key: Option<String>,
     /// Number of previous binary versions to retain on disk for rollback.
     pub retain_versions: u32,
-    /// Release metadata endpoint URL for `relish upgrade check`.
+    /// Default release-metadata endpoint. Reserved: `relish upgrade check`
+    /// currently takes its own `--url` (defaulting to a compiled-in constant)
+    /// and does not read this node-config value.
     pub release_url: String,
     /// Directory holding the versioned binaries and the entry symlink.
     /// Defaults to the directory of the resolved current executable.
@@ -321,6 +323,8 @@ pub struct UpgradeSection {
     /// swap counts as verified.
     pub boot_grace_secs: u64,
     /// Seconds the new binary has to rejoin gossip (cluster mode only).
+    /// Reserved: parsed but not yet enforced (TODO Phase 14 — the cluster-mode
+    /// upgrade-verify path does not yet require a gossip rejoin).
     pub gossip_rejoin_secs: u64,
     /// Boot attempts on the new version before automatic revert.
     pub max_boot_attempts: u32,
@@ -532,7 +536,9 @@ impl Default for PortRange {
 pub struct ReportingTreeSection {
     /// How often worker nodes send StateReports (seconds).
     pub report_interval_secs: u64,
-    /// Maximum events in a single report's event log.
+    /// Maximum events in a single report's event log. Reserved: plumbed into
+    /// ClusterParams but not yet enforced — the worker does not currently
+    /// truncate a report's event log to this cap.
     pub max_events_per_report: usize,
     /// Time after which a report is considered stale (seconds).
     pub stale_report_timeout_secs: u64,

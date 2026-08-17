@@ -5117,11 +5117,33 @@ async fn app_detail_handler(
 
 /// `GET /ui/node/{name}` — node detail page.
 async fn node_detail_handler(State(state): State<ApiState>, Path(name): Path<String>) -> Response {
-    let statuses = gather_statuses(&state).await;
+    // M14: the old handler ignored `name` entirely — it rendered *this* node's
+    // instances with a hard-coded `state: "alive"`, so clicking node B showed
+    // node A's workloads labelled as B. Only this node knows its own running
+    // instances, so show the instance list only when the request is for this
+    // node; for any other node show its presence in gossip but no (misattributed)
+    // workloads. Cross-node instance detail would need a fan-out and is left as a
+    // follow-up.
+    let is_self = state.node_name.as_deref() == Some(name.as_str());
+    let in_membership = match &state.membership {
+        Some(m) => m.read().await.iter().any(|info| info.node_id.0 == name),
+        None => false,
+    };
+    let node_state = if is_self || in_membership {
+        "alive"
+    } else {
+        "unknown"
+    }
+    .to_string();
+    let statuses = if is_self {
+        gather_statuses(&state).await
+    } else {
+        Vec::new()
+    };
 
     let data = NodeDetailData {
         name,
-        state: "alive".to_string(),
+        state: node_state,
         app_count: statuses.len(),
         apps: statuses,
         charts: vec![
