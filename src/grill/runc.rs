@@ -339,7 +339,7 @@ impl RuncGrill {
                             netns::add_port_mapping(&network, pm.host_port, pm.container_port)
                                 .await
                                 .map_err(|e| GrillError::StartFailed {
-                                    instance: instance.0.clone(),
+                                    instance: instance.clone(),
                                     reason: format!(
                                         "port mapping {}->{} failed: {e}",
                                         pm.host_port, pm.container_port
