@@ -2293,12 +2293,11 @@ blocking calls).
 
 > **Most landed (17 Aug 2026, branch `phase16-medium-dataplane`, PR #162).**
 > Nineteen items fixed with tests; the deletions removed ~800 lines of unwired
-> deploy engine + the superseded coordinator. **Six remain open** as deeper /
+> deploy engine + the superseded coordinator. **Five remain open** as deeper /
 > larger follow-ups, still unchecked below: new-deploys-live-before-health-check
 > (M5), blocking-work-on-async-loop (M7, several sub-items), the rollup
 > backfill-window dedup redesign (the silent-lost-push half is fixed), the
-> upgrade start/rollback race + client-node-identity (M13), ingress cert serials
-> (M15), and `--output` coverage across relish subcommands (M25).
+> upgrade start/rollback race + client-node-identity (M13), and `--output` coverage across relish subcommands (M25).
 
 - [x] **Btrfs snapshot restore is destructive on failure** — `src/grill/snapshot.rs:245-247`
   `SnapshotManager::restore` deletes the live subvolume first, then creates the writable
@@ -2386,7 +2385,7 @@ blocking calls).
 - [x] **`GET /ui/node/{name}` ignores the requested node** — `src/bun/api.rs:4931`
   `node_detail_handler` renders the *local* agent's instances with hardcoded
   `state: "alive"`, so clicking node B in a cluster shows node A's workloads labelled B.
-- [ ] **Ingress certs are unrevocable (hardcoded serial)** — `src/wrapper/tls.rs:70-74`
+- [x] **Ingress certs are unrevocable (hardcoded serial)** — `src/wrapper/tls.rs:70-74`
   every ingress cert (including per-SNI resolver-minted certs) uses `SerialNumber(1)`, so
   they're indistinguishable by serial and unrevocable via the serial-keyed CRL. (Known
   deferral — comment admits it, but track it.)
