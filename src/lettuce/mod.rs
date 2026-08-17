@@ -9,7 +9,6 @@
 /// coordinator. If the coordinator fails, another council member
 /// assumes the role within seconds, inheriting the last sync state
 /// from Raft.
-pub mod coordinator;
 pub mod diff;
 pub mod git;
 pub mod runner;
