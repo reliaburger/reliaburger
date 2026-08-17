@@ -4430,7 +4430,7 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
         volumes_dir: Option<&std::path::Path>,
         netns_path: Option<&str>,
         identities: Vec<age::x25519::Identity>,
-    ) -> crate::grill::oci::OciSpec {
+    ) -> Result<crate::grill::oci::OciSpec, BunError> {
         // Try each live generation's identity until one decrypts the value, so
         // a secret encrypted under any still-present key is readable across a
         // rotation window (PKI8).
@@ -4448,6 +4448,8 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
                 Err(last_err)
             }) as crate::grill::oci::SecretDecryptor)
         };
+        // A decryption failure fails the deploy closed (M4): the container must
+        // not start with a broken secret injected as `DECRYPT_ERROR:...`.
         crate::grill::oci::generate_oci_spec_with_decryptor(
             app_name,
             namespace,
@@ -4459,6 +4461,10 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
             netns_path,
             decryptor.as_ref(),
         )
+        .map_err(|reason| BunError::DeployFailed {
+            app_name: app_name.to_string(),
+            reason,
+        })
     }
 
     /// Program a freshly-started instance's kernel networking: mirror its
@@ -4569,7 +4575,7 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
             Some(&self.volumes_dir),
             netns_path.as_deref(),
             identities,
-        );
+        )?;
 
         Ok(PreparedInstance {
             oci_spec,
@@ -4661,7 +4667,7 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
             eprintln!("bun: warning: {e}");
         }
         let cgroup_path = crate::grill::cgroup::cgroup_path(namespace, app_name, index);
-        Ok(Self::oci_spec_with_secrets(
+        Self::oci_spec_with_secrets(
             app_name,
             namespace,
             spec,
@@ -4671,7 +4677,7 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
             Some(&self.volumes_dir),
             None,
             identities,
-        ))
+        )
     }
 
     /// Roll a failed rolling redeploy back: kill and clean up the new

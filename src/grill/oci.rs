@@ -183,6 +183,9 @@ pub fn generate_oci_spec(
         netns_path,
         None,
     )
+    // Infallible with no decryptor: encrypted values are passed through, so the
+    // env build never hits a decryption failure.
+    .expect("env build without a decryptor cannot fail")
 }
 
 /// Generate an OCI runtime spec, decrypting `ENC[AGE:...]` env values with the
@@ -203,8 +206,8 @@ pub fn generate_oci_spec_with_decryptor(
     volumes_dir: Option<&Path>,
     netns_path: Option<&str>,
     decryptor: Option<&SecretDecryptor>,
-) -> OciSpec {
-    let env = build_env_with_decryptor(spec, decryptor);
+) -> Result<OciSpec, String> {
+    let env = build_env_with_decryptor(spec, decryptor)?;
     let args = build_args(app_name, spec);
     let mounts = build_mounts(
         spec,
@@ -219,7 +222,7 @@ pub fn generate_oci_spec_with_decryptor(
 
     let resources = build_resources(spec);
 
-    OciSpec {
+    Ok(OciSpec {
         root: OciRoot {
             // Process workloads (exec/script) use the host root filesystem.
             // Container workloads use the image reference (Apple Container)
@@ -258,7 +261,7 @@ pub fn generate_oci_spec_with_decryptor(
             host_port: hp,
             container_port: cp,
         }),
-    }
+    })
 }
 
 /// A callback for decrypting `ENC[AGE:...]` values.
@@ -270,31 +273,33 @@ pub type SecretDecryptor = Box<dyn Fn(&str) -> Result<String, String>>;
 
 /// Build env vars with optional secret decryption.
 ///
-/// When a `SecretDecryptor` is provided, `ENC[AGE:...]` values are
-/// decrypted before injection. Without a decryptor, they're passed
-/// through as literal strings (pre-Phase 4 behaviour).
+/// When a `SecretDecryptor` is provided, `ENC[AGE:...]` values are decrypted
+/// before injection. A decryption **failure** is an error (M4): the container
+/// must not start with a broken secret — the old code injected
+/// `KEY=DECRYPT_ERROR:...` and ran anyway. Without a decryptor the values are
+/// passed through as literal strings (pre-Phase 4 behaviour); the caller is
+/// responsible for refusing to start a workload whose secrets it can't decrypt.
 pub fn build_env_with_decryptor(
     spec: &AppSpec,
     decryptor: Option<&SecretDecryptor>,
-) -> Vec<String> {
+) -> Result<Vec<String>, String> {
     let mut env = Vec::new();
     for (key, value) in &spec.env {
         match value {
             EnvValue::Plain(v) => env.push(format!("{key}={v}")),
             EnvValue::Encrypted(v) => {
                 if let Some(decrypt) = decryptor {
-                    match decrypt(v) {
-                        Ok(plaintext) => env.push(format!("{key}={plaintext}")),
-                        Err(e) => env.push(format!("{key}=DECRYPT_ERROR:{e}")),
-                    }
+                    let plaintext =
+                        decrypt(v).map_err(|e| format!("failed to decrypt secret {key:?}: {e}"))?;
+                    env.push(format!("{key}={plaintext}"));
                 } else {
-                    // No decryptor available — pass through as-is
+                    // No decryptor available — pass through as-is.
                     env.push(format!("{key}={v}"));
                 }
             }
         }
     }
-    env
+    Ok(env)
 }
 
 /// Build the process arguments from an app spec.
@@ -839,7 +844,8 @@ mod tests {
             None,
             None,
             Some(&decryptor),
-        );
+        )
+        .unwrap();
 
         assert!(oci.process.env.contains(&"SECRET=plaintext".to_string()));
         assert!(oci.process.env.contains(&"PLAIN=visible".to_string()));
@@ -1455,14 +1461,16 @@ mod tests {
         .unwrap();
 
         let decryptor: SecretDecryptor = Box::new(|_encrypted| Ok("decrypted-value".to_string()));
-        let env = build_env_with_decryptor(&spec, Some(&decryptor));
+        let env = build_env_with_decryptor(&spec, Some(&decryptor)).unwrap();
 
         assert!(env.contains(&"PLAIN=hello".to_string()));
         assert!(env.contains(&"SECRET=decrypted-value".to_string()));
     }
 
     #[test]
-    fn build_env_with_decryptor_handles_error() {
+    fn build_env_with_decryptor_fails_closed_on_error() {
+        // M4: a decryption failure is an error, so the caller blocks the start
+        // — it no longer injects `SECRET=DECRYPT_ERROR:...` and runs anyway.
         let spec: AppSpec = toml::from_str(
             r#"
             image = "test:v1"
@@ -1473,9 +1481,10 @@ mod tests {
         .unwrap();
 
         let decryptor: SecretDecryptor = Box::new(|_encrypted| Err("key not found".to_string()));
-        let env = build_env_with_decryptor(&spec, Some(&decryptor));
-
-        assert!(env[0].starts_with("SECRET=DECRYPT_ERROR:"));
+        let result = build_env_with_decryptor(&spec, Some(&decryptor));
+        let err = result.unwrap_err();
+        assert!(err.contains("SECRET"), "{err}");
+        assert!(err.contains("key not found"), "{err}");
     }
 
     #[test]
@@ -1489,7 +1498,7 @@ mod tests {
         )
         .unwrap();
 
-        let env = build_env_with_decryptor(&spec, None);
+        let env = build_env_with_decryptor(&spec, None).unwrap();
         assert!(env.contains(&"SECRET=ENC[AGE:abc123]".to_string()));
     }
 }
