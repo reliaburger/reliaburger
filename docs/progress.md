@@ -2230,49 +2230,58 @@ blocking calls).
 
 ### High — correctness / availability
 
-- [ ] **Whole-cluster node config validation is dead** — `src/config/validate.rs:328`
+> **All nine landed (17 Aug 2026, branch `phase16-high-correctness`)** as a
+> single PR. Highlights: `NodeConfig::validate()` now runs at startup; the
+> identity-rotation deadlock and inline `relish exec` stall are fixed; join
+> seeds resolve `hostname:port` and refuse to silently bootstrap; zero intervals
+> can't panic; council rollups are persisted and metrics prune by data
+> timestamp; the firewall keys by `(namespace, app)`; and `object_store_url`
+> now really backs metrics with S3/GCS/local object storage. Every fix carries
+> tests.
+
+- [x] **Whole-cluster node config validation is dead** — `src/config/validate.rs:328`
   `NodeConfig::validate()` is never called; `run_agent` (`src/bin/bun.rs:546-565`) runs
   only five section validators. So absolute-storage-path checks, inverted `port_range`,
   `retain_versions == 0`, `max_boot_attempts == 0`, the testing policy, unparseable
   `reserved_cpu`/`reserved_memory` (which then falls into `unwrap_or(0)` at bun.rs:361,
   over-reporting capacity), and the "dns without ebpf is a VIP black hole" rejection all
   never run.
-- [ ] **Identity rotation wedges the agent loop** — `src/bun/agent.rs:6584-6588`
+- [x] **Identity rotation wedges the agent loop** — `src/bun/agent.rs:6584-6588`
   `check_identity_rotation` makes `mpsc::channel(1)` whose receiver (`_dummy_rx`) is never
   read, then loops `provision_identity` (one send per call); the second send blocks
   forever, permanently wedging the agent event loop when 2+ instances need rotation.
-- [ ] **`relish exec` with a long command stalls the whole agent** —
+- [x] **`relish exec` with a long command stalls the whole agent** —
   `src/bun/agent.rs:2765-2772` `AgentCommand::Exec` runs `grill.exec()` inline on the
   command loop with no timeout, so `relish exec app -- sleep 3600` stalls health checks,
   restarts, and all commands (`Trace` was explicitly moved off-loop with an 8 s timeout
   for exactly this).
-- [ ] **Cluster-join seeds silently dropped → node bootstraps a new cluster** —
+- [x] **Cluster-join seeds silently dropped → node bootstraps a new cluster** —
   `src/bin/bun.rs:121-126` parses `cluster.join` with
   `.filter_map(|s| s.parse::<SocketAddr>().ok())`, so any unparseable entry (including a
   natural `hostname:port`) is dropped; if all fail, `seeds` is empty and the node silently
   forms a brand-new cluster instead of joining.
-- [ ] **Zero-valued intervals panic at startup** — `src/bin/bun.rs:1328,1460`
+- [x] **Zero-valued intervals panic at startup** — `src/bin/bun.rs:1328,1460`
   `[metrics] collection_interval_secs = 0` or `[logs] export_interval_secs = 0` is fed
   straight into `tokio::time::interval`, which panics on a zero period (alerts fixed this
   class under OBS4; scrape is guarded `.max(1)` at bun.rs:1402; `rollup_interval_secs` at
   bun.rs:185 has the same exposure).
-- [ ] **Council rollups are never persisted** — `src/mayo/rollup_store.rs:252`
+- [x] **Council rollups are never persisted** — `src/mayo/rollup_store.rs:252`
   `RollupStore::flush()` has only test call sites, so cluster rollups live only in the
   in-memory buffer: a restart loses all rollup history (despite flush's doc),
   `hydrate_seen_windows` always finds an empty dir, `MAX_BUFFER_ROWS` silently drops the
   oldest data at 1M rows, and the "Rollup retention (E)" `prune_expired` tick
   (`bin/bun.rs:1584`) prunes Parquet files that never exist.
-- [ ] **Metrics retention prunes by mtime, not data timestamp** — `src/mayo/store.rs:588`
+- [x] **Metrics retention prunes by mtime, not data timestamp** — `src/mayo/store.rs:588`
   `MayoStore::prune` (the O12 fix keying retention on the data's own max timestamp) has no
   callers; the binary prunes the metrics dir by mtime via `check_and_relieve`
   (`bun/disk_pressure.rs:122`, wired at `bin/bun.rs:1556`), reinstating the
   touch/copy/clock-skew hazard O12 fixed.
-- [ ] **`object_store_url` is dead config the book advertises as working** —
+- [x] **`object_store_url` is dead config the book advertises as working** —
   `src/config/node.rs:735` `[metrics] object_store_url` is parsed/defaulted/round-trip-tested
   but read by zero code, yet `docs/book/06-watching-everything.md:52`,
   `docs/design/metrics-mayo.md:380`, and checked `progress.md:167` all claim it redirects
   metric persistence to S3. Wire it into MayoStore or delete it and fix the three docs.
-- [ ] **Namespace firewall keys rules by bare app name** — `src/sesame/firewall.rs:60-139`
+- [x] **Namespace firewall keys rules by bare app name** — `src/sesame/firewall.rs:60-139`
   `resolve_firewall_rules`/`resolve_cgroup_namespace_entries` key cgroup IDs by bare app
   name (`src/bun/agent.rs:1867-1880` builds `HashMap<String /*app*/, Vec<u64>>` from
   `i.app_name` alone), so same-named apps in different namespaces collide — an `allow_from`
