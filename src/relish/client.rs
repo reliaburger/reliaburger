@@ -1337,8 +1337,18 @@ impl BunClient {
     }
 
     /// Clear every active fault targeting `service`.
-    pub async fn clear_faults_by_service(&self, service: &str) -> Result<String, RelishError> {
-        let url = format!("{}/v1/fault?service={}", self.base_url, service);
+    pub async fn clear_faults_by_service(
+        &self,
+        service: &str,
+        namespace: Option<&str>,
+    ) -> Result<String, RelishError> {
+        let url = match namespace {
+            Some(namespace) => format!(
+                "{}/v1/fault?service={}&namespace={}",
+                self.base_url, service, namespace
+            ),
+            None => format!("{}/v1/fault?service={}", self.base_url, service),
+        };
         let response = self
             .client
             .delete(&url)

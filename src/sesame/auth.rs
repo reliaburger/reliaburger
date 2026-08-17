@@ -47,6 +47,36 @@ pub fn new_token_store() -> TokenStore {
 /// token). Not a real user token; never stored in `SecurityState`.
 pub const SYSTEM_PRINCIPAL: &str = "__system";
 
+/// Verifies workload-identity JWTs presented as bearer tokens (PKI10).
+///
+/// The cluster mints these for its workloads (SPIFFE-style, signed with the
+/// OIDC key); this is the consumer that lets a workload authenticate to the API
+/// as itself. Verification is the constrained path — algorithm, key id, issuer,
+/// audience, and `iat` are all checked — so a token minted for another cluster
+/// or purpose is refused.
+#[derive(Clone)]
+pub struct WorkloadJwtVerifier {
+    config: Arc<super::types::OidcSigningConfig>,
+    constraints: super::oidc::JwtConstraints,
+}
+
+impl WorkloadJwtVerifier {
+    /// Build a verifier from the cluster's OIDC config and trust-domain name.
+    pub fn new(config: super::types::OidcSigningConfig, cluster_name: &str) -> Self {
+        let constraints = super::oidc::JwtConstraints::for_config(&config, cluster_name);
+        Self {
+            config: Arc::new(config),
+            constraints,
+        }
+    }
+
+    /// Return the verified claims if `token` is a valid workload JWT for this
+    /// cluster, else `None`.
+    pub fn verify(&self, token: &str) -> Option<super::types::WorkloadJwtClaims> {
+        super::oidc::verify_jwt_with_constraints(token, &self.config, &self.constraints).ok()
+    }
+}
+
 /// State shared with the auth middleware: the live user-token store plus the
 /// optional side-channel service token (see [`super::token::derive_service_token`]).
 #[derive(Clone)]
@@ -59,6 +89,9 @@ pub struct AuthState {
     /// Browser sessions, exchanged for a token at `POST /ui/session`. A valid
     /// session cookie authenticates a request as a read-only principal.
     pub sessions: super::session::SessionStore,
+    /// Verifier for workload-identity JWT bearers. `None` disables JWT auth
+    /// (single-node / pre-OIDC), leaving the token and session paths unchanged.
+    pub jwt_verifier: Option<Arc<WorkloadJwtVerifier>>,
 }
 
 impl AuthState {
@@ -68,7 +101,14 @@ impl AuthState {
             tokens,
             service_token,
             sessions: super::session::SessionStore::new(),
+            jwt_verifier: None,
         }
+    }
+
+    /// Attach a workload-JWT verifier, enabling JWT bearer authentication.
+    pub fn with_jwt_verifier(mut self, verifier: WorkloadJwtVerifier) -> Self {
+        self.jwt_verifier = Some(Arc::new(verifier));
+        self
     }
 }
 
@@ -122,6 +162,16 @@ pub fn authenticate(
             return Err((StatusCode::UNAUTHORIZED, "invalid token".to_string()));
         }
     };
+
+    // Defence in depth (AUTH4): the system principal is a side-channel
+    // credential the middleware accepts directly (see `auth_middleware`), never
+    // a stored user token. If a token named `__system` ever reaches the store —
+    // through a future write path that skips `create_token`'s guard — it must
+    // still not authenticate *as* the system principal, or it would clear
+    // `require_system` and skip `authorize_scoped`/`require_unscoped`.
+    if stored.name == SYSTEM_PRINCIPAL {
+        return Err((StatusCode::UNAUTHORIZED, "invalid token".to_string()));
+    }
 
     Ok(AuthContext {
         token_name: stored.name.clone(),
@@ -274,6 +324,17 @@ pub async fn auth_middleware(
     }
 
     if let Some(bearer_token) = bearer {
+        // A workload-identity JWT (three dot-separated parts) authenticates the
+        // presenting workload as itself, confined read-only to its own
+        // app/namespace. Tried before the Argon2 token path because a JWT can
+        // never match an `rbrg_` hash, and skipped when no verifier is set.
+        if let Some(verifier) = &state.jwt_verifier
+            && looks_like_jwt(bearer_token)
+            && let Some(claims) = verifier.verify(bearer_token)
+        {
+            request.extensions_mut().insert(workload_context(&claims));
+            return next.run(request).await;
+        }
         return match authenticate_off_lock(bearer_token, tokens).await {
             Ok(ctx) => {
                 request.extensions_mut().insert(ctx);
@@ -292,11 +353,11 @@ pub async fn auth_middleware(
         .and_then(super::session::session_id_from_cookie_header)
         .map(str::to_string);
     if let Some(id) = session_id
-        && let Some(token_name) = state.sessions.validate(&id).await
+        && let Some(identity) = state.sessions.validate(&id).await
     {
         request
             .extensions_mut()
-            .insert(readonly_session_context(&token_name));
+            .insert(readonly_session_context(&identity));
         return next.run(request).await;
     }
 
@@ -310,13 +371,39 @@ pub async fn auth_middleware(
 
 /// The `AuthContext` for a browser session: always read-only, so a request
 /// riding a stolen or forged cookie can read the dashboard but never mutate.
-fn readonly_session_context(token_name: &str) -> AuthContext {
+///
+/// The originating token's **scope** is preserved (C3): a token confined to one
+/// app/namespace stays confined when it rides a session cookie, so exchanging
+/// it at `/ui/session` cannot widen it to cluster-wide reads.
+fn readonly_session_context(identity: &super::session::SessionIdentity) -> AuthContext {
     AuthContext {
-        token_name: token_name.to_string(),
-        principal_id: format!("session:{token_name}"),
+        token_name: identity.token_name.clone(),
+        principal_id: format!("session:{}", identity.token_name),
         role: ApiRole::ReadOnly,
-        scoped_apps: None,
-        scoped_namespaces: None,
+        scoped_apps: identity.scope.apps.clone(),
+        scoped_namespaces: identity.scope.namespaces.clone(),
+    }
+}
+
+/// Cheap shape check: does the bearer look like a compact JWS (three
+/// non-empty dot-separated segments)? Used only to route a bearer to the JWT
+/// verifier instead of the Argon2 token path; the real check is the signature.
+fn looks_like_jwt(candidate: &str) -> bool {
+    let mut parts = candidate.split('.');
+    let ok = matches!((parts.next(), parts.next(), parts.next()), (Some(a), Some(b), Some(c)) if !a.is_empty() && !b.is_empty() && !c.is_empty());
+    ok && parts.next().is_none()
+}
+
+/// The `AuthContext` for a verified workload-identity JWT: read-only and
+/// confined to the workload's own app and namespace, so a workload can read its
+/// own resources through the API but never mutate or reach another tenant's.
+fn workload_context(claims: &super::types::WorkloadJwtClaims) -> AuthContext {
+    AuthContext {
+        token_name: format!("workload:{}/{}", claims.namespace, claims.app),
+        principal_id: claims.sub.clone(),
+        role: ApiRole::ReadOnly,
+        scoped_apps: Some(vec![claims.app.clone()]),
+        scoped_namespaces: Some(vec![claims.namespace.clone()]),
     }
 }
 
@@ -402,6 +489,52 @@ pub fn authorize_scoped(
         Err((
             StatusCode::FORBIDDEN,
             format!("token scope does not allow {app} in namespace {namespace}"),
+        )
+            .into_response())
+    }
+}
+
+/// Enforce a principal's `[permission]` spec on a specific action + target.
+///
+/// Permissions are an **additional** allow-list keyed by token name, layered on
+/// top of the role and scope checks — they can restrict a principal to named
+/// actions/apps/namespaces but never grant beyond its role. The rules:
+///
+/// - A pre-init request (`None`) or the system principal passes untouched.
+/// - A principal with **no** spec is governed by role + scope alone, so
+///   permissions are opt-in: defining none preserves today's behaviour.
+/// - A principal **with** a spec must have it grant `(action, app, namespace)`,
+///   or the request is refused with 403.
+///
+/// Call it *after* the role and scope checks in a gated handler, passing the
+/// replicated permission map (`DesiredState.permissions`).
+#[allow(clippy::result_large_err)]
+pub fn authorize_permission(
+    ctx: Option<&AuthContext>,
+    action: crate::config::PermissionAction,
+    app: &str,
+    namespace: &str,
+    permissions: &std::collections::BTreeMap<String, crate::config::PermissionSpec>,
+) -> Result<(), Response> {
+    let Some(ctx) = ctx else {
+        return Ok(());
+    };
+    if ctx.token_name == SYSTEM_PRINCIPAL {
+        return Ok(());
+    }
+    let Some(spec) = permissions.get(&ctx.token_name) else {
+        return Ok(());
+    };
+    if spec.allows(action, app, namespace) {
+        Ok(())
+    } else {
+        Err((
+            StatusCode::FORBIDDEN,
+            format!(
+                "permission for {:?} does not grant {} on {app} in namespace {namespace}",
+                ctx.token_name,
+                action.as_str()
+            ),
         )
             .into_response())
     }
@@ -796,13 +929,198 @@ mod tests {
         let store = new_token_store();
         store.write().await.push(user.token);
         let state = AuthState::new(store, Some("rbrg_service".to_string()));
-        let id = state.sessions.create("u").await;
+        let id = state.sessions.create("u", TokenScope::default()).await;
 
         let cookie = format!("rb_session={id}");
         let status = respond(guarded_router(state), &[("cookie", &cookie)])
             .await
             .status();
         assert_eq!(status, StatusCode::OK);
+    }
+
+    #[test]
+    fn a_stored_token_named_system_never_authenticates() {
+        // Defence in depth (AUTH4): even if a token named `__system` reaches the
+        // store through some future write path that skips `create_token`'s
+        // guard, it must not authenticate as the system principal.
+        let created = create_token("legit", ApiRole::Admin, TokenScope::default(), None).unwrap();
+        let mut smuggled = created.token.clone();
+        smuggled.name = SYSTEM_PRINCIPAL.to_string();
+        let result = authenticate(&created.plaintext, &[smuggled]);
+        assert!(result.is_err(), "a stored __system token authenticated");
+    }
+
+    fn mint_test_workload_jwt(
+        app: &str,
+        namespace: &str,
+    ) -> (String, super::super::types::OidcSigningConfig) {
+        let ikm = b"test-oidc-wrapping-material-32b!".to_vec();
+        let config =
+            super::super::oidc::generate_oidc_keypair("https://test.reliaburger.dev", &ikm)
+                .unwrap();
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        let claims = super::super::types::WorkloadJwtClaims {
+            iss: "https://test.reliaburger.dev".to_string(),
+            sub: format!("spiffe://test/ns/{namespace}/app/{app}"),
+            aud: vec!["spiffe://test".to_string()],
+            exp: now + 3600,
+            iat: now,
+            namespace: namespace.to_string(),
+            app: app.to_string(),
+            cluster: "test".to_string(),
+            node: "node-01".to_string(),
+            instance: format!("{app}-g1-0"),
+        };
+        let jwt = super::super::oidc::mint_jwt(&claims, &config, &ikm).unwrap();
+        (jwt, config)
+    }
+
+    #[test]
+    fn a_workload_jwt_verifies_to_a_scoped_read_only_context() {
+        let (jwt, config) = mint_test_workload_jwt("api", "team-a");
+        let verifier = WorkloadJwtVerifier::new(config, "test");
+
+        let claims = verifier
+            .verify(&jwt)
+            .expect("valid workload JWT should verify");
+        let ctx = workload_context(&claims);
+        assert_eq!(ctx.role, ApiRole::ReadOnly);
+        assert_eq!(ctx.scoped_apps.as_deref(), Some(&["api".to_string()][..]));
+        assert_eq!(
+            ctx.scoped_namespaces.as_deref(),
+            Some(&["team-a".to_string()][..])
+        );
+        // Confined to its own app/namespace, refused on the cluster-wide path.
+        assert!(authorize_scoped(Some(&ctx), "api", "team-a").is_ok());
+        assert!(authorize_scoped(Some(&ctx), "api", "team-b").is_err());
+        assert!(require_unscoped(Some(&ctx)).is_err());
+    }
+
+    #[test]
+    fn a_workload_jwt_for_another_cluster_is_rejected() {
+        let (jwt, config) = mint_test_workload_jwt("api", "team-a");
+        // A verifier for a different trust domain expects a different audience.
+        let verifier = WorkloadJwtVerifier::new(config, "other-cluster");
+        assert!(verifier.verify(&jwt).is_none());
+    }
+
+    #[test]
+    fn looks_like_jwt_distinguishes_jwts_from_bearer_tokens() {
+        assert!(looks_like_jwt("aaa.bbb.ccc"));
+        assert!(!looks_like_jwt("rbrg_deadbeef"));
+        assert!(!looks_like_jwt("aaa.bbb"));
+        assert!(!looks_like_jwt("aaa..ccc"));
+        assert!(!looks_like_jwt("aaa.bbb.ccc.ddd"));
+    }
+
+    #[test]
+    fn authorize_permission_enforces_specs_only_for_principals_that_have_one() {
+        use crate::config::{PermissionAction, PermissionSpec};
+        let ctx = AuthContext {
+            token_name: "ci".to_string(),
+            principal_id: "token:ci".to_string(),
+            role: ApiRole::Deployer,
+            scoped_apps: None,
+            scoped_namespaces: None,
+        };
+        let mut permissions = std::collections::BTreeMap::new();
+
+        // No spec for this principal → governed by role/scope alone (allow).
+        assert!(
+            authorize_permission(
+                Some(&ctx),
+                PermissionAction::Deploy,
+                "web",
+                "prod",
+                &permissions
+            )
+            .is_ok()
+        );
+
+        // A spec that grants deploy on web/prod but nothing else.
+        permissions.insert(
+            "ci".to_string(),
+            PermissionSpec {
+                actions: vec!["deploy".to_string()],
+                apps: vec!["web".to_string()],
+                namespaces: Some(vec!["prod".to_string()]),
+            },
+        );
+        assert!(
+            authorize_permission(
+                Some(&ctx),
+                PermissionAction::Deploy,
+                "web",
+                "prod",
+                &permissions
+            )
+            .is_ok()
+        );
+        // Wrong action / app / namespace are refused.
+        assert!(
+            authorize_permission(
+                Some(&ctx),
+                PermissionAction::Exec,
+                "web",
+                "prod",
+                &permissions
+            )
+            .is_err()
+        );
+        assert!(
+            authorize_permission(
+                Some(&ctx),
+                PermissionAction::Deploy,
+                "api",
+                "prod",
+                &permissions
+            )
+            .is_err()
+        );
+
+        // Pre-init (None) and the system principal are never gated.
+        assert!(
+            authorize_permission(None, PermissionAction::Exec, "web", "prod", &permissions).is_ok()
+        );
+        let system = system_context();
+        assert!(
+            authorize_permission(
+                Some(&system),
+                PermissionAction::Exec,
+                "web",
+                "prod",
+                &permissions
+            )
+            .is_ok()
+        );
+    }
+
+    #[test]
+    fn a_session_context_inherits_the_token_scope() {
+        // A tenant-scoped token that exchanges itself for a session cookie must
+        // stay confined — its session context carries the same scope (C3).
+        let identity = super::super::session::SessionIdentity {
+            token_name: "scoped".to_string(),
+            scope: TokenScope {
+                apps: Some(vec!["web".to_string()]),
+                namespaces: Some(vec!["team-a".to_string()]),
+            },
+        };
+        let ctx = readonly_session_context(&identity);
+        assert_eq!(ctx.role, ApiRole::ReadOnly);
+        assert_eq!(ctx.scoped_apps.as_deref(), Some(&["web".to_string()][..]));
+        assert_eq!(
+            ctx.scoped_namespaces.as_deref(),
+            Some(&["team-a".to_string()][..])
+        );
+        // The scoped session is refused by the cluster-wide endpoints it must
+        // not reach, and confined on the per-app ones.
+        assert!(require_unscoped(Some(&ctx)).is_err());
+        assert!(authorize_scoped(Some(&ctx), "web", "team-a").is_ok());
+        assert!(authorize_scoped(Some(&ctx), "web", "team-b").is_err());
     }
 
     #[tokio::test]

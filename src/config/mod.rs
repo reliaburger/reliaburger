@@ -27,7 +27,7 @@ pub use error::ConfigError;
 pub use job::JobSpec;
 pub use namespace::NamespaceSpec;
 pub use node::NodeConfig;
-pub use permission::PermissionSpec;
+pub use permission::{PermissionAction, PermissionSpec};
 pub use types::{ConfigFileSpec, EnvValue, Replicas, ResourceRange, VolumeSpec};
 
 /// Top-level workload configuration.

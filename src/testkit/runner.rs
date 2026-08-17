@@ -1032,6 +1032,7 @@ mod tests {
                     kill_containers: false,
                 },
                 target_service: String::new(),
+                namespace: None,
                 target_instance: None,
                 target_node: Some("node-a".to_string()),
                 duration: Duration::from_secs(30),

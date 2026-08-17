@@ -178,14 +178,71 @@ impl JoinBundle {
     }
 }
 
+/// The cluster's public CA certificates, fetched from `GET /v1/cluster/ca`
+/// before the joiner reveals its token.
+#[derive(Debug, Clone, serde::Deserialize)]
+pub struct CaCertificates {
+    /// Base64 DER Node CA certificate.
+    pub node_ca_b64: String,
+    /// Base64 DER Root CA certificate.
+    pub root_ca_b64: String,
+}
+
+impl CaCertificates {
+    /// Decode the Node and Root CA DER bytes.
+    pub fn decode(&self) -> Result<(Vec<u8>, Vec<u8>), JoinClientError> {
+        let node_ca = BASE64
+            .decode(&self.node_ca_b64)
+            .map_err(|e| JoinClientError::Malformed(format!("node_ca: {e}")))?;
+        let root_ca = BASE64
+            .decode(&self.root_ca_b64)
+            .map_err(|e| JoinClientError::Malformed(format!("root_ca: {e}")))?;
+        Ok((node_ca, root_ca))
+    }
+
+    /// The `sha256:` fingerprint of the root CA.
+    pub fn root_ca_fingerprint(&self) -> Result<String, JoinClientError> {
+        let (_, root_ca) = self.decode()?;
+        Ok(super::identity_store::root_ca_fingerprint(&root_ca))
+    }
+}
+
+/// Fetch the cluster's public CA certificates from a member.
+///
+/// This is the first leg of the join: it runs over a trust-on-first-use
+/// connection (the joiner has no CA yet), but it reveals **no secret** — CA
+/// certificates are public. The joiner verifies the returned root CA against a
+/// pinned fingerprint before proceeding, so a man-in-the-middle that swaps in
+/// its own CA is caught here, before the token is ever sent.
+pub async fn fetch_ca(
+    client: &reqwest::Client,
+    ca_url: &str,
+) -> Result<CaCertificates, JoinClientError> {
+    let response = client
+        .get(ca_url)
+        .send()
+        .await
+        .map_err(|e| JoinClientError::Transport(e.to_string()))?;
+    if !response.status().is_success() {
+        let status = response.status();
+        let body = response.text().await.unwrap_or_default();
+        return Err(JoinClientError::Rejected(format!("{status}: {body}")));
+    }
+    response
+        .json()
+        .await
+        .map_err(|e| JoinClientError::Malformed(e.to_string()))
+}
+
 /// Request a certificate from an existing cluster member and return the
 /// identity to persist.
 ///
 /// `member_url` is the member's join endpoint, e.g.
-/// `https://10.0.1.5:9117/v1/cluster/join`. The connection is trust-on-
-/// first-use: a joiner has no CA yet, so the returned root CA fingerprint
-/// is the anchor to verify out of band. If `expected_fingerprint` is set,
-/// a mismatch is refused before the identity is ever written to disk.
+/// `https://10.0.1.5:9117/v1/cluster/join`. `client` should already pin the
+/// cluster CA (see [`fetch_ca`] and `mtls::build_ca_pinned_client`), so the
+/// token travels only over a verified connection. If `expected_fingerprint` is
+/// set, the returned bundle's root CA is re-checked against it as defence in
+/// depth before the identity is ever written to disk.
 pub async fn request_join(
     client: &reqwest::Client,
     member_url: &str,
@@ -523,6 +580,26 @@ mod tests {
         let bundle = JoinBundle::from_result(&result);
         let expected = crate::sesame::identity_store::root_ca_fingerprint(&result.root_ca_der);
         assert_eq!(bundle.root_ca_fingerprint().unwrap(), expected);
+    }
+
+    #[test]
+    fn fetched_ca_certificates_decode_and_fingerprint_the_root() {
+        // PKI: the joiner verifies the CA fetched over TOFU against the pinned
+        // fingerprint *before* sending its token, so the decode + fingerprint
+        // of the CA-fetch payload must agree with the authoritative root CA.
+        let (state, token, master_secret) = setup_with_known_key();
+        let (result, _key) =
+            issue(&state, &token, "node-02", SerialNumber(7), &master_secret).unwrap();
+
+        let ca = CaCertificates {
+            node_ca_b64: BASE64.encode(&result.node_ca_der),
+            root_ca_b64: BASE64.encode(&result.root_ca_der),
+        };
+        let (node_ca, root_ca) = ca.decode().unwrap();
+        assert_eq!(node_ca, result.node_ca_der);
+        assert_eq!(root_ca, result.root_ca_der);
+        let expected = crate::sesame::identity_store::root_ca_fingerprint(&result.root_ca_der);
+        assert_eq!(ca.root_ca_fingerprint().unwrap(), expected);
     }
 
     #[test]

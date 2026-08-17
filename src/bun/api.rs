@@ -202,6 +202,7 @@ pub fn router(
         crate::bun::capabilities::StaticCapabilities::default(),
         super::readiness::ReadinessTracker::new(),
         None,
+        None,
     )
 }
 
@@ -240,6 +241,7 @@ pub fn router_with_upgrade(
     static_capabilities: crate::bun::capabilities::StaticCapabilities,
     readiness: super::readiness::ReadinessTracker,
     local_test_leases: Option<crate::testkit::lease::LocalLeaseStore>,
+    jwt_verifier: Option<crate::sesame::auth::WorkloadJwtVerifier>,
 ) -> Router {
     let state = ApiState {
         cmd_tx,
@@ -281,10 +283,13 @@ pub fn router_with_upgrade(
         build_signers: Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new())),
     };
 
-    let auth_state = crate::sesame::auth::AuthState::new(
+    let mut auth_state = crate::sesame::auth::AuthState::new(
         token_store.unwrap_or_else(crate::sesame::auth::new_token_store),
         service_token,
     );
+    if let Some(verifier) = jwt_verifier {
+        auth_state = auth_state.with_jwt_verifier(verifier);
+    }
 
     // Public routes need no token: liveness, static assets, the JWKS
     // endpoint (public keys are meant to be readable), and the join endpoint
@@ -296,6 +301,7 @@ pub fn router_with_upgrade(
         .route("/v1/identity/jwks", get(identity_jwks_handler))
         .route("/ui/static/{*path}", get(static_asset_handler))
         .route("/v1/cluster/join", post(join_handler))
+        .route("/v1/cluster/ca", get(cluster_ca_handler))
         // The GitOps webhook is public: real providers (GitHub, GitLab)
         // send `X-Hub-Signature-256`/`X-Gitlab-Token`, never a Reliaburger
         // bearer token, so it can't sit behind the bearer-auth middleware.
@@ -1981,6 +1987,26 @@ async fn cluster_elect_handler(
     }
 }
 
+/// Enforce a principal's `[permission]` spec for a per-app action.
+///
+/// Reads the replicated permission map from the council (empty when there is no
+/// council, e.g. single-node mode, where permissions cannot be configured) and
+/// defers to [`crate::sesame::auth::authorize_permission`]. Call it after the
+/// role and scope checks in a gated handler.
+async fn enforce_permission(
+    state: &ApiState,
+    auth: Option<&crate::sesame::auth::AuthContext>,
+    action: crate::config::PermissionAction,
+    app: &str,
+    namespace: &str,
+) -> Result<(), Response> {
+    let permissions = match &state.council {
+        Some(council) => council.desired_state().await.permissions,
+        None => std::collections::BTreeMap::new(),
+    };
+    crate::sesame::auth::authorize_permission(auth, action, app, namespace, &permissions)
+}
+
 /// Deploy workloads, streaming progress via SSE.
 ///
 /// Returns a Server-Sent Events stream. Each event's `data` field
@@ -2132,11 +2158,38 @@ async fn apply_handler(
 
     // AUTH1: a scoped token may only deploy apps its scope covers. Check
     // every app in the manifest, so one out-of-scope app rejects the whole
-    // apply rather than being silently dropped.
+    // apply rather than being silently dropped. A principal's `[permission]`
+    // spec (when it has one) must also grant `deploy` on each app — and
+    // `host-exec` for any app that runs an inline `script` (a host process),
+    // which is the capability the whitepaper ties to script workloads.
+    let permissions = match &state.council {
+        Some(council) => council.desired_state().await.permissions,
+        None => std::collections::BTreeMap::new(),
+    };
     for (app_name, spec) in &config.app {
         let namespace = spec.namespace.as_deref().unwrap_or("default");
         if let Err(resp) =
             crate::sesame::auth::authorize_scoped(auth.as_deref(), app_name, namespace)
+        {
+            return resp;
+        }
+        if let Err(resp) = crate::sesame::auth::authorize_permission(
+            auth.as_deref(),
+            crate::config::PermissionAction::Deploy,
+            app_name,
+            namespace,
+            &permissions,
+        ) {
+            return resp;
+        }
+        if spec.script.is_some()
+            && let Err(resp) = crate::sesame::auth::authorize_permission(
+                auth.as_deref(),
+                crate::config::PermissionAction::HostExec,
+                app_name,
+                namespace,
+                &permissions,
+            )
         {
             return resp;
         }
@@ -2584,11 +2637,17 @@ struct EventsQuery {
 
 /// Return recent events from the bounded in-memory store.
 async fn events_handler(
+    auth: Option<axum::Extension<crate::sesame::auth::AuthContext>>,
     State(state): State<ApiState>,
     Query(query): Query<EventsQuery>,
-) -> impl IntoResponse {
+) -> Response {
+    // Audit events span every app and namespace, so a scoped token is refused
+    // (C3) just as it is for the cluster-wide metrics and logs endpoints.
+    if let Err(resp) = crate::sesame::auth::require_unscoped(auth.as_deref()) {
+        return resp;
+    }
     let Some(events) = &state.events else {
-        return Json(serde_json::json!({"events": []}));
+        return Json(serde_json::json!({"events": []})).into_response();
     };
     let store = events.read().await;
     Json(serde_json::json!({
@@ -2598,6 +2657,7 @@ async fn events_handler(
             query.severity,
         )
     }))
+    .into_response()
 }
 
 /// Upgrade an authenticated request to the live event stream.
@@ -2706,6 +2766,17 @@ async fn stop_handler(
         return resp;
     }
     if let Err(resp) = crate::sesame::auth::authorize_scoped(auth.as_deref(), &app, &namespace) {
+        return resp;
+    }
+    if let Err(resp) = enforce_permission(
+        &state,
+        auth.as_deref(),
+        crate::config::PermissionAction::Scale,
+        &app,
+        &namespace,
+    )
+    .await
+    {
         return resp;
     }
 
@@ -3164,6 +3235,17 @@ async fn exec_handler(
     if let Err(resp) = crate::sesame::auth::authorize_scoped(auth.as_deref(), &app, &namespace) {
         return resp;
     }
+    if let Err(resp) = enforce_permission(
+        &state,
+        auth.as_deref(),
+        crate::config::PermissionAction::Exec,
+        &app,
+        &namespace,
+    )
+    .await
+    {
+        return resp;
+    }
     let (resp_tx, resp_rx) = oneshot::channel();
     if state
         .cmd_tx
@@ -3271,21 +3353,36 @@ async fn ui_session_handler(
     axum::Form(form): axum::Form<SessionForm>,
 ) -> Response {
     let tokens = auth.tokens.read().await;
-    // Accept the internal service token or any valid user token.
-    let name = if auth
+    // Accept the internal service token or any valid user token. The session
+    // inherits the presented token's scope (C3), so a tenant-scoped token
+    // cannot widen to cluster-wide reads by exchanging itself for a cookie.
+    let identity = if auth
         .service_token
         .as_deref()
         .is_some_and(|s| crate::sesame::auth::tokens_equal(&form.token, s))
     {
-        Some(crate::sesame::auth::SYSTEM_PRINCIPAL.to_string())
+        // The operator presented the real service token; the session is
+        // unconfined (but still read-only), matching the service principal.
+        Some((
+            crate::sesame::auth::SYSTEM_PRINCIPAL.to_string(),
+            crate::sesame::types::TokenScope::default(),
+        ))
     } else {
         crate::sesame::auth::authenticate(&form.token, &tokens)
             .ok()
-            .map(|ctx| ctx.token_name)
+            .map(|ctx| {
+                (
+                    ctx.token_name,
+                    crate::sesame::types::TokenScope {
+                        apps: ctx.scoped_apps,
+                        namespaces: ctx.scoped_namespaces,
+                    },
+                )
+            })
     };
     drop(tokens);
 
-    let Some(name) = name else {
+    let Some((name, scope)) = identity else {
         return (
             StatusCode::UNAUTHORIZED,
             axum::response::Html(crate::brioche::login::render_login(Some(
@@ -3295,7 +3392,7 @@ async fn ui_session_handler(
             .into_response();
     };
 
-    let id = auth.sessions.create(&name).await;
+    let id = auth.sessions.create(&name, scope).await;
     let cookie = format!(
         "{}={id}; HttpOnly; SameSite=Strict; Path=/; Max-Age=43200",
         crate::sesame::session::SESSION_COOKIE
@@ -3344,6 +3441,40 @@ struct JoinRequest {
 /// Public route: the join token is the credential. The joiner sends a CSR and
 /// keeps its private key (PKI4); we sign the CSR and return the leaf plus CA
 /// chain the joiner persists as its identity.
+/// `GET /v1/cluster/ca` — the cluster's public CA certificates.
+///
+/// A joiner fetches these *before* sending its one-time join token so it can
+/// verify the cluster's identity against a pinned `--ca-fingerprint` and then
+/// transmit the token only over a connection proven to chain to this CA. CA
+/// certificates are public material, so the endpoint needs no authentication.
+async fn cluster_ca_handler(State(state): State<ApiState>) -> Response {
+    use base64::Engine as _;
+    let Some(ref council) = state.council else {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(serde_json::json!({ "error": "no council available" })),
+        )
+            .into_response();
+    };
+    let security = council.security_state().await;
+    let (Some(node_ca), Some(root_ca)) = (
+        security.get_ca(crate::sesame::types::CaRole::Node),
+        security.get_ca(crate::sesame::types::CaRole::Root),
+    ) else {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(serde_json::json!({ "error": "cluster CA not initialised" })),
+        )
+            .into_response();
+    };
+    let encoder = base64::engine::general_purpose::STANDARD;
+    Json(serde_json::json!({
+        "node_ca_b64": encoder.encode(&node_ca.certificate_der),
+        "root_ca_b64": encoder.encode(&root_ca.certificate_der),
+    }))
+    .into_response()
+}
+
 async fn join_handler(State(state): State<ApiState>, Json(body): Json<JoinRequest>) -> Response {
     use base64::Engine as _;
     let csr_der = match base64::engine::general_purpose::STANDARD.decode(&body.csr_b64) {
@@ -3854,6 +3985,23 @@ async fn fault_inject_handler(
             return forward_node_fault(&state, target_node, &headers, &request).await;
         }
     } else {
+        // Workload fault: normalise the namespace (apps default to `default`)
+        // and enforce the caller's token scope against it, so a Deployer scoped
+        // to one namespace cannot inject a fault into another tenant's
+        // same-named service (AUTH1 for faults). The normalised namespace is
+        // written back so the agent targets only the intended tenant.
+        let namespace = request
+            .namespace
+            .clone()
+            .unwrap_or_else(|| "default".to_string());
+        request.namespace = Some(namespace.clone());
+        if let Err(response) = crate::sesame::auth::authorize_scoped(
+            auth.as_deref(),
+            &request.target_service,
+            &namespace,
+        ) {
+            return response;
+        }
         let (principal, role) = auth
             .as_deref()
             .map(|auth| (auth.principal_id.as_str(), auth.role))
@@ -4426,9 +4574,35 @@ async fn fault_clear_all_handler(
             )
                 .into_response();
         }
-        Some(service) => AgentCommand::ClearFaultsByService {
-            service: service.clone(),
-            response: resp_tx,
+        Some(service) => match params.get("namespace") {
+            // Confined clear: scope-check the named namespace, so a Deployer
+            // scoped to one tenant cannot reverse another tenant's same-named
+            // service faults (AUTH1).
+            Some(namespace) => {
+                if let Err(response) =
+                    crate::sesame::auth::authorize_scoped(auth.as_deref(), service, namespace)
+                {
+                    return response;
+                }
+                AgentCommand::ClearFaultsByService {
+                    service: service.clone(),
+                    namespace: Some(namespace.clone()),
+                    response: resp_tx,
+                }
+            }
+            // Cross-namespace clear: reversing a service's faults in every
+            // namespace is a cluster-wide action, so a scoped token is refused
+            // and told to name a namespace it may touch (C3, as for reads).
+            None => {
+                if let Err(response) = crate::sesame::auth::require_unscoped(auth.as_deref()) {
+                    return response;
+                }
+                AgentCommand::ClearFaultsByService {
+                    service: service.clone(),
+                    namespace: None,
+                    response: resp_tx,
+                }
+            }
         },
         None => AgentCommand::ClearAllFaults { response: resp_tx },
     };
@@ -4607,10 +4781,18 @@ struct MetricsQueryParams {
 }
 
 /// `GET /v1/metrics?name=X&start=S&end=E` — query time-series data.
+///
+/// Reads across every app and namespace on the node, so a scoped token is
+/// refused (C3) and pointed at `/v1/metrics/app/{app}/{namespace}`, which can
+/// filter. The cross-node fan-out presents the service token, which passes.
 async fn metrics_query_handler(
+    auth: Option<axum::Extension<crate::sesame::auth::AuthContext>>,
     State(state): State<ApiState>,
     Query(params): Query<MetricsQueryParams>,
 ) -> Response {
+    if let Err(resp) = crate::sesame::auth::require_unscoped(auth.as_deref()) {
+        return resp;
+    }
     let Some(mayo) = &state.mayo else {
         return Json(serde_json::json!({"error": "metrics not enabled"})).into_response();
     };
@@ -4706,7 +4888,13 @@ async fn metrics_query_handler(
 }
 
 /// `GET /v1/metrics/summary` — latest value for each metric.
-async fn metrics_summary_handler(State(state): State<ApiState>) -> Response {
+async fn metrics_summary_handler(
+    auth: Option<axum::Extension<crate::sesame::auth::AuthContext>>,
+    State(state): State<ApiState>,
+) -> Response {
+    if let Err(resp) = crate::sesame::auth::require_unscoped(auth.as_deref()) {
+        return resp;
+    }
     let Some(mayo) = &state.mayo else {
         return Json(serde_json::json!([])).into_response();
     };
@@ -5110,7 +5298,13 @@ async fn alerts_handler(State(state): State<ApiState>) -> impl IntoResponse {
 }
 
 /// `GET /v1/metrics/keys` — list all distinct metric names.
-async fn metrics_keys_handler(State(state): State<ApiState>) -> Response {
+async fn metrics_keys_handler(
+    auth: Option<axum::Extension<crate::sesame::auth::AuthContext>>,
+    State(state): State<ApiState>,
+) -> Response {
+    if let Err(resp) = crate::sesame::auth::require_unscoped(auth.as_deref()) {
+        return resp;
+    }
     let Some(mayo) = &state.mayo else {
         return Json(serde_json::json!({"keys": []})).into_response();
     };
@@ -5131,9 +5325,13 @@ async fn metrics_keys_handler(State(state): State<ApiState>) -> Response {
 /// Internal endpoint used by cluster-wide query fan-out. Each council
 /// member evaluates this against its own rollup data.
 async fn metrics_rollup_handler(
+    auth: Option<axum::Extension<crate::sesame::auth::AuthContext>>,
     State(state): State<ApiState>,
     Query(params): Query<MetricsQueryParams>,
 ) -> Response {
+    if let Err(resp) = crate::sesame::auth::require_unscoped(auth.as_deref()) {
+        return resp;
+    }
     let Some(rollup_store) = &state.rollup_store else {
         return Json(Vec::<MetricsQueryRow>::new()).into_response();
     };
@@ -5218,9 +5416,13 @@ async fn resolve_council_urls(state: &ApiState) -> Option<Vec<String>> {
 /// with any warnings about unresponsive aggregators. Falls back to reading the
 /// local rollup store when there is no council to fan out to (single-node).
 async fn metrics_cluster_handler(
+    auth: Option<axum::Extension<crate::sesame::auth::AuthContext>>,
     State(state): State<ApiState>,
     Query(params): Query<MetricsQueryParams>,
 ) -> Response {
+    if let Err(resp) = crate::sesame::auth::require_unscoped(auth.as_deref()) {
+        return resp;
+    }
     let start = params.start.unwrap_or(0);
     // Clamped below u64::MAX: DataFusion 45's interval analysis
     // overflows (debug-build panic) computing the cardinality of a
@@ -5946,6 +6148,18 @@ async fn token_create_handler(
         }
     };
 
+    // The internal service principal name is reserved: a user token minted with
+    // it would match `SYSTEM_PRINCIPAL` and bypass scope confinement (AUTH4).
+    if req.name == crate::sesame::auth::SYSTEM_PRINCIPAL {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({
+                "error": format!("token name {:?} is reserved", req.name)
+            })),
+        )
+            .into_response();
+    }
+
     let role = match req.role.as_str() {
         "admin" => crate::sesame::types::ApiRole::Admin,
         "deployer" => crate::sesame::types::ApiRole::Deployer,
@@ -6528,6 +6742,7 @@ mod tests {
             static_capabilities,
             readiness,
             local_test_leases,
+            None,
         );
         (app, shutdown)
     }
@@ -6739,6 +6954,7 @@ mod tests {
         serde_json::to_string(&crate::smoker::types::FaultRequest {
             fault_type: crate::smoker::types::FaultType::DnsNxdomain,
             target_service: "web".to_string(),
+            namespace: None,
             target_instance: None,
             target_node: None,
             duration: std::time::Duration::from_secs(30),
@@ -6766,6 +6982,7 @@ mod tests {
                 kill_containers: false,
             },
             target_service: String::new(),
+            namespace: None,
             target_instance: None,
             target_node: Some("node-a".to_string()),
             duration: std::time::Duration::from_secs(30),
@@ -6785,6 +7002,7 @@ mod tests {
                 memory_percentage: 90,
             },
             target_service: String::new(),
+            namespace: None,
             target_instance: None,
             target_node: Some("node-a".to_string()),
             duration: std::time::Duration::from_secs(30),
@@ -8181,6 +8399,7 @@ mod tests {
             statics,
             crate::bun::readiness::ReadinessTracker::new(),
             None,
+            None,
         );
         (app, shutdown, mayo_dir)
     }
@@ -8374,6 +8593,71 @@ mod tests {
         let status = get_status(app, "/v1/logs/sql?q=SELECT%20*%20FROM%20logs", Some(&tok)).await;
         assert_ne!(status, StatusCode::FORBIDDEN);
         shutdown.cancel();
+    }
+
+    /// AUTH1 for faults: a Deployer scoped to one namespace clears the role
+    /// gate but is refused injecting a fault into another tenant's same-named
+    /// service, before the safety policy is even consulted. `/v1/fault` carries
+    /// no `{app}` path segment, so the route-matrix scope test can't cover it.
+    #[tokio::test]
+    async fn scoped_token_is_refused_faulting_another_namespace() {
+        let (app, shutdown, tok) = setup_scoped_to_namespace("team-a").await;
+        let body = serde_json::json!({
+            "fault_type": { "type": "Pause" },
+            "target_service": "web",
+            "namespace": "team-b",
+            "duration": { "secs": 1, "nanos": 0 },
+            "injected_by": "",
+        })
+        .to_string();
+        let (status, body) = post_authenticated(app, "/v1/fault", &tok, &body, None).await;
+        assert_eq!(status, StatusCode::FORBIDDEN);
+        let text = String::from_utf8_lossy(&body);
+        assert!(
+            text.contains("scope"),
+            "expected a scope refusal, got: {text}"
+        );
+        shutdown.cancel();
+    }
+
+    /// The cluster-wide metrics and events endpoints read across every app and
+    /// namespace, so — like `/v1/logs/sql` — a scoped token is refused (C3)
+    /// rather than served every tenant's data.
+    #[tokio::test]
+    async fn scoped_token_is_refused_cluster_wide_metrics_and_events() {
+        for path in [
+            "/v1/metrics?name=node_cpu_usage_percent",
+            "/v1/metrics/summary",
+            "/v1/metrics/keys",
+            "/v1/metrics/rollup",
+            "/v1/metrics/cluster",
+            "/v1/events",
+        ] {
+            let (app, shutdown, tok) = setup_scoped_to_namespace("team-a").await;
+            let status = get_status(app, path, Some(&tok)).await;
+            assert_eq!(
+                status,
+                StatusCode::FORBIDDEN,
+                "scoped token allowed on {path}"
+            );
+            shutdown.cancel();
+        }
+    }
+
+    /// …while an unscoped token still reaches them.
+    #[tokio::test]
+    async fn unscoped_token_still_reads_cluster_wide_metrics_and_events() {
+        for path in ["/v1/metrics/keys", "/v1/events"] {
+            let (app, shutdown, tok) =
+                setup_with_role("metrics-unscoped", crate::sesame::types::ApiRole::ReadOnly).await;
+            let status = get_status(app, path, Some(&tok)).await;
+            assert_ne!(
+                status,
+                StatusCode::FORBIDDEN,
+                "unscoped token refused on {path}"
+            );
+            shutdown.cancel();
+        }
     }
 
     /// Two apps of the same name in different namespaces have coexisted since
@@ -9297,6 +9581,7 @@ mod tests {
             crate::bun::capabilities::StaticCapabilities::default(),
             crate::bun::readiness::ReadinessTracker::new(),
             None,
+            None,
         );
         (app, webhook_rx, shutdown)
     }
@@ -9560,6 +9845,7 @@ mod tests {
             false,
             crate::bun::capabilities::StaticCapabilities::default(),
             crate::bun::readiness::ReadinessTracker::new(),
+            None,
             None,
         );
         let status = post_webhook(&app, br#"{}"#, &[]).await;

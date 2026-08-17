@@ -255,6 +255,7 @@ async fn start_node_with_auth(
             static_capabilities,
             readiness,
             None,
+            None,
         )
     } else {
         api::router(
@@ -1010,6 +1011,7 @@ async fn authenticated_node_kill_fails_and_restores_a_real_cluster_member() {
             kill_containers: false,
         },
         target_service: String::new(),
+        namespace: None,
         target_instance: None,
         target_node: Some(target.name.clone()),
         duration: Duration::from_secs(60),

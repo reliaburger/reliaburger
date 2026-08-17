@@ -44,6 +44,7 @@ impl FaultRegistry {
             request.duration,
             request.injected_by.clone(),
         );
+        rule.namespace = request.namespace.clone();
         rule.target_instance = request.target_instance.clone();
         rule.target_node = request.target_node.clone();
         rule.reason = request.reason.clone();
@@ -107,10 +108,18 @@ impl FaultRegistry {
     /// alone even when their `target_service` matches — most carry an empty
     /// `target_service`, so an empty `service` argument would otherwise match
     /// every one and let a Deployer reverse them.
-    pub fn clear_by_service(&mut self, service: &str) -> Vec<FaultRule> {
+    ///
+    /// When `namespace` is `Some`, only faults in that namespace are cleared,
+    /// so a Deployer scoped to one tenant cannot reverse another tenant's
+    /// same-named service faults. `None` clears the service in every namespace.
+    pub fn clear_by_service(&mut self, service: &str, namespace: Option<&str>) -> Vec<FaultRule> {
         let mut removed = Vec::new();
         self.faults.retain(|f| {
-            if f.target_service == service && !f.fault_type.requires_admin_reversal() {
+            let namespace_matches = namespace.is_none_or(|ns| f.matches_namespace(ns));
+            if f.target_service == service
+                && namespace_matches
+                && !f.fault_type.requires_admin_reversal()
+            {
                 removed.push(f.clone());
                 false
             } else {
@@ -213,6 +222,7 @@ mod tests {
                 jitter_ns: 0,
             },
             target_service: service.into(),
+            namespace: None,
             target_instance: None,
             target_node: None,
             duration: Duration::from_secs(duration_secs),
@@ -228,6 +238,7 @@ mod tests {
         FaultRequest {
             fault_type: FaultType::Kill { count: 1 },
             target_service: service.into(),
+            namespace: None,
             target_instance: None,
             target_node: None,
             duration: Duration::from_secs(30),
@@ -319,7 +330,7 @@ mod tests {
         reg.insert(&kill_request("redis"));
         reg.insert(&delay_request("api", 60));
 
-        let removed = reg.clear_by_service("redis");
+        let removed = reg.clear_by_service("redis", None);
         assert_eq!(removed.len(), 2);
         assert_eq!(reg.len(), 1);
         assert_eq!(reg.iter().next().unwrap().target_service, "api");
@@ -329,9 +340,33 @@ mod tests {
     fn clear_by_service_no_match() {
         let mut reg = FaultRegistry::new();
         reg.insert(&delay_request("redis", 60));
-        let removed = reg.clear_by_service("postgres");
+        let removed = reg.clear_by_service("postgres", None);
         assert!(removed.is_empty());
         assert_eq!(reg.len(), 1);
+    }
+
+    /// AUTH1 for faults: a namespace-qualified clear must touch only its own
+    /// tenant, leaving the same-named service in another namespace alone.
+    #[test]
+    fn clear_by_service_is_confined_to_the_named_namespace() {
+        let mut reg = FaultRegistry::new();
+        let mut a = delay_request("web", 60);
+        a.namespace = Some("team-a".to_string());
+        let mut b = delay_request("web", 60);
+        b.namespace = Some("team-b".to_string());
+        reg.insert(&a);
+        reg.insert(&b);
+
+        let removed = reg.clear_by_service("web", Some("team-a"));
+        assert_eq!(removed.len(), 1);
+        assert_eq!(reg.len(), 1);
+        let survivor = reg.iter().next().unwrap();
+        assert_eq!(survivor.namespace.as_deref(), Some("team-b"));
+
+        // A namespace-less clear still reaches every namespace (legacy/admin).
+        let removed = reg.clear_by_service("web", None);
+        assert_eq!(removed.len(), 1);
+        assert_eq!(reg.len(), 0);
     }
 
     /// C3: a Deployer-authorised clear must not reverse Admin-class node faults.
@@ -369,7 +404,7 @@ mod tests {
 
         // An empty `?service=` matches every node fault's empty target_service
         // but must remove none of them.
-        let removed = reg.clear_by_service("");
+        let removed = reg.clear_by_service("", None);
         assert!(removed.is_empty());
         assert_eq!(reg.len(), 2);
     }

@@ -71,6 +71,7 @@ fn node_request(
     FaultRequest {
         fault_type,
         target_service: String::new(),
+        namespace: None,
         target_instance: None,
         target_node: Some(target.to_string()),
         duration: fault_duration(context.timeout),
