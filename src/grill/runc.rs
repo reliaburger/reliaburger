@@ -329,22 +329,26 @@ impl RuncGrill {
                         }
                     }
 
-                    // Publish the app's port: host_port on the node
-                    // DNATs (root: map element) or proxies (rootless)
-                    // to the container. Failure is logged, not fatal —
-                    // matching the network-setup stance above.
+                    // Publish the app's port: host_port on the node DNATs
+                    // (root: map element) or proxies (rootless) to the
+                    // container. A failure here is fatal (M2): a container whose
+                    // published port never listens must not be reported Running,
+                    // so fail the prepare instead of just logging.
                     if let Some(pm) = &spec.port_mapping {
-                        match netns::add_port_mapping(&network, pm.host_port, pm.container_port)
+                        let handle =
+                            netns::add_port_mapping(&network, pm.host_port, pm.container_port)
+                                .await
+                                .map_err(|e| GrillError::StartFailed {
+                                    instance: instance.0.clone(),
+                                    reason: format!(
+                                        "port mapping {}->{} failed: {e}",
+                                        pm.host_port, pm.container_port
+                                    ),
+                                })?;
+                        self.port_handles
+                            .lock()
                             .await
-                        {
-                            Ok(handle) => {
-                                self.port_handles
-                                    .lock()
-                                    .await
-                                    .insert(instance.clone(), handle);
-                            }
-                            Err(e) => eprintln!("warning: port mapping failed for {instance}: {e}"),
-                        }
+                            .insert(instance.clone(), handle);
                     }
 
                     self.networks.lock().await.insert(instance.clone(), network);

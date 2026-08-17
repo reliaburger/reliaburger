@@ -384,12 +384,25 @@ pub async fn add_port_mapping(
     let shutdown = CancellationToken::new();
 
     if network.rootless {
-        // Rootless: spawn a TCP proxy
+        // Rootless: a userspace TCP proxy. Bind the listener *here* (M2), before
+        // returning Ok, so a taken host port surfaces as an error instead of a
+        // "successfully started" container whose published port never listens.
+        // The old code spawned the proxy and returned Ok immediately; the bind
+        // happened later in the task and its failure was only eprintln'd.
         let container_ip = network.container_ip;
         let token = shutdown.clone();
 
+        let listener = tokio::net::TcpListener::bind(("0.0.0.0", host_port))
+            .await
+            .map_err(|e| NetnsError::PortMappingFailed {
+                instance: "tcp-proxy".to_string(),
+                host_port,
+                container_port,
+                reason: e.to_string(),
+            })?;
+
         tokio::spawn(async move {
-            if let Err(e) = run_tcp_proxy(host_port, container_ip, container_port, token).await {
+            if let Err(e) = run_tcp_proxy(listener, container_ip, container_port, token).await {
                 eprintln!("tcp proxy error for port {host_port}: {e}");
             }
         });
@@ -586,18 +599,24 @@ async fn list_chain(chain: &str) -> Result<String, String> {
 /// `container_ip:container_port`. Runs until the cancellation token
 /// is triggered.
 async fn run_tcp_proxy(
-    host_port: u16,
+    listener: tokio::net::TcpListener,
     container_ip: Ipv4Addr,
     container_port: u16,
     shutdown: CancellationToken,
 ) -> Result<(), std::io::Error> {
-    let listener = tokio::net::TcpListener::bind(("0.0.0.0", host_port)).await?;
-
     loop {
         tokio::select! {
             _ = shutdown.cancelled() => break,
             accept = listener.accept() => {
-                let (client, _addr) = accept?;
+                // A transient accept error (e.g. EMFILE) must not tear the
+                // whole proxy down and silently stop publishing the port (M2).
+                let (client, _addr) = match accept {
+                    Ok(pair) => pair,
+                    Err(e) => {
+                        eprintln!("tcp proxy accept error: {e}");
+                        continue;
+                    }
+                };
                 let target_addr = std::net::SocketAddr::new(
                     std::net::IpAddr::V4(container_ip),
                     container_port,
