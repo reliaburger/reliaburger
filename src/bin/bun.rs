@@ -118,12 +118,7 @@ fn cluster_params_from_config(
         .unwrap_or(IpAddr::V4(Ipv4Addr::LOCALHOST));
     let gossip_addr = SocketAddr::new(ip, config.cluster.gossip_port);
 
-    let seeds: Vec<SocketAddr> = config
-        .cluster
-        .join
-        .iter()
-        .filter_map(|s| s.parse::<SocketAddr>().ok())
-        .collect();
+    let seeds = resolve_join_seeds(&config.cluster.join)?;
 
     let node_name = config
         .node
@@ -182,7 +177,8 @@ fn cluster_params_from_config(
         // The MayoStore doesn't exist yet when params are built; the
         // caller sets it before starting the runtime.
         mayo: None,
-        rollup_interval: std::time::Duration::from_secs(config.metrics.rollup_interval_secs),
+        // Clamp to ≥1s: a zero period makes `tokio::time::interval` panic (OBS4).
+        rollup_interval: std::time::Duration::from_secs(config.metrics.rollup_interval_secs.max(1)),
         identity,
         backup: config.cluster.backup.clone(),
         labels: config.node.labels.clone(),
@@ -499,6 +495,35 @@ fn main() -> anyhow::Result<()> {
     runtime.block_on(run_agent(cli))
 }
 
+/// Resolve the configured `cluster.join` seeds to socket addresses.
+///
+/// Each entry is resolved with `tokio::net::lookup_host`, so both IP literals
+/// (`10.0.1.5:9100`) and `hostname:port` forms work — the old code parsed only
+/// `SocketAddr`, so a hostname seed was silently dropped. If seeds were
+/// configured but none resolved, this errors rather than letting the node fall
+/// back to bootstrapping a brand-new cluster (H4): a typo or transient DNS
+/// failure must fail loudly, not quietly split-brain.
+fn resolve_join_seeds(join: &[String]) -> anyhow::Result<Vec<std::net::SocketAddr>> {
+    use std::net::ToSocketAddrs;
+    let mut seeds = Vec::new();
+    for entry in join {
+        match entry.to_socket_addrs() {
+            Ok(addrs) => seeds.extend(addrs),
+            Err(error) => {
+                eprintln!("warning: cluster.join seed {entry:?} did not resolve: {error}");
+            }
+        }
+    }
+    if !join.is_empty() && seeds.is_empty() {
+        anyhow::bail!(
+            "cluster.join lists {} seed(s) but none resolved to an address; \
+             refusing to bootstrap a new cluster — check the addresses and DNS",
+            join.len()
+        );
+    }
+    Ok(seeds)
+}
+
 async fn run_agent(cli: Cli) -> anyhow::Result<()> {
     // `bun testapp` never becomes an agent — it's the workload, not the
     // orchestrator. Handle it before any node config is touched.
@@ -562,6 +587,13 @@ async fn run_agent(cli: Cli) -> anyhow::Result<()> {
         .map_err(|e| anyhow::anyhow!("invalid config: {e}"))?;
     config
         .ingress
+        .validate()
+        .map_err(|e| anyhow::anyhow!("invalid config: {e}"))?;
+    // Whole-config validation (H1): absolute storage paths, a sane port range,
+    // upgrade retention/boot budgets, reserved-resource parsing, the
+    // dns-without-ebpf black hole, and zero-valued metric/log intervals. These
+    // checks existed but were never run, so a bad value failed opaquely later.
+    config
         .validate()
         .map_err(|e| anyhow::anyhow!("invalid config: {e}"))?;
 
@@ -1320,7 +1352,8 @@ async fn run_agent(cli: Cli) -> anyhow::Result<()> {
 
     // Spawn metrics collection task
     let collection_mayo = Arc::clone(&mayo_store);
-    let collection_interval = config.metrics.collection_interval_secs;
+    // Clamp to ≥1s: a zero period makes `tokio::time::interval` panic (OBS4).
+    let collection_interval = config.metrics.collection_interval_secs.max(1);
     let collection_shutdown = shutdown.clone();
     let collection_cmd_tx = cmd_tx.clone();
     tokio::spawn(async move {
@@ -1443,7 +1476,9 @@ async fn run_agent(cli: Cli) -> anyhow::Result<()> {
         let export_store = Arc::clone(&log_store);
         let export_shutdown = shutdown.clone();
         let export_dest = export_path.clone();
-        let export_interval = std::time::Duration::from_secs(config.logs.export_interval_secs);
+        // Clamp to ≥1s: a zero period makes `tokio::time::interval` panic (OBS4).
+        let export_interval =
+            std::time::Duration::from_secs(config.logs.export_interval_secs.max(1));
         let node_id = config
             .node
             .name
@@ -2697,6 +2732,27 @@ fn configure_workload_dns(
 mod tests {
     use super::*;
     use std::collections::BTreeMap;
+
+    #[test]
+    fn resolve_join_seeds_handles_empty_and_ip_literals() {
+        // No seeds → no error, empty list (the node bootstraps a new cluster).
+        assert!(resolve_join_seeds(&[]).unwrap().is_empty());
+        // An IP literal resolves without touching DNS.
+        let seeds = resolve_join_seeds(&["127.0.0.1:9100".to_string()]).unwrap();
+        assert_eq!(seeds.len(), 1);
+        assert_eq!(
+            seeds[0],
+            "127.0.0.1:9100".parse::<std::net::SocketAddr>().unwrap()
+        );
+    }
+
+    #[test]
+    fn resolve_join_seeds_errors_when_configured_seeds_all_fail() {
+        // A seed with no port can't resolve; configured-but-unresolvable seeds
+        // must fail loudly rather than silently bootstrap a new cluster (H4).
+        let result = resolve_join_seeds(&["missing-port-entry".to_string()]);
+        assert!(result.is_err(), "expected an error, got {result:?}");
+    }
 
     #[test]
     fn process_runtime_refuses_dns_before_workload_creation() {

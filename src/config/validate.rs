@@ -434,6 +434,30 @@ impl NodeConfig {
             }
         })?;
 
+        // Periodic intervals feed `tokio::time::interval`, which panics on a
+        // zero period (OBS4). The runtime also clamps these defensively, but
+        // reject zero here so the operator gets a clear error rather than a
+        // silent 1-second fallback.
+        for (field, value) in [
+            (
+                "metrics.collection_interval_secs",
+                self.metrics.collection_interval_secs,
+            ),
+            (
+                "metrics.rollup_interval_secs",
+                self.metrics.rollup_interval_secs,
+            ),
+            ("logs.export_interval_secs", self.logs.export_interval_secs),
+        ] {
+            if value == 0 {
+                return Err(ConfigError::Validation {
+                    field: field.to_string(),
+                    context: "node config".to_string(),
+                    reason: "must be greater than zero".to_string(),
+                });
+            }
+        }
+
         Ok(())
     }
 }
@@ -453,6 +477,38 @@ mod tests {
 
     fn minimal_app() -> AppSpec {
         toml::from_str(r#"image = "test:v1""#).unwrap()
+    }
+
+    #[test]
+    fn node_config_defaults_are_valid() {
+        // H1: the whole-config validator now runs at startup, so the shipped
+        // defaults must pass it (absolute paths, sane ranges, non-zero
+        // intervals, dns-off-by-default so the dns/ebpf rail is inert).
+        crate::config::NodeConfig::default().validate().unwrap();
+    }
+
+    #[test]
+    fn node_config_rejects_a_zero_metric_interval() {
+        let mut node = crate::config::NodeConfig::default();
+        node.metrics.collection_interval_secs = 0;
+        let err = node.validate().unwrap_err();
+        assert!(
+            matches!(err, ConfigError::Validation { ref field, .. }
+                if field == "metrics.collection_interval_secs"),
+            "expected a collection-interval validation error, got {err:?}"
+        );
+    }
+
+    #[test]
+    fn node_config_rejects_dns_without_ebpf() {
+        let mut node = crate::config::NodeConfig::default();
+        node.dns.enabled = true;
+        node.ebpf.enabled = false;
+        let err = node.validate().unwrap_err();
+        assert!(
+            matches!(err, ConfigError::Validation { ref field, .. } if field == "dns.enabled"),
+            "expected a dns/ebpf validation error, got {err:?}"
+        );
     }
 
     #[test]
