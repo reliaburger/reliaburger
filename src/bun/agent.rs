@@ -4095,10 +4095,12 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
         // VIP. A legacy fault with no namespace falls back to the first entry
         // in any namespace.
         let entry = match rule.namespace.as_deref() {
-            Some(namespace) => self.service_map.resolve(&crate::onion::service_id::ServiceId::new(
-                namespace,
-                rule.target_service.as_str(),
-            )),
+            Some(namespace) => self
+                .service_map
+                .resolve(&crate::onion::service_id::ServiceId::new(
+                    namespace,
+                    rule.target_service.as_str(),
+                )),
             None => self.service_map.resolve_by_name(&rule.target_service),
         }?;
         Some((entry.vip.to_network_byte_order(), entry.port.to_be()))
