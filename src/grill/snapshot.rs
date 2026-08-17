@@ -230,8 +230,13 @@ impl SnapshotManager {
         Ok(snapshots)
     }
 
-    /// Restore a snapshot over its live volume: delete the live
-    /// subvolume, then take a writable snapshot of the read-only one.
+    /// Restore a snapshot over its live volume.
+    ///
+    /// Non-destructive on failure (M1): the new writable subvolume is built
+    /// *alongside* the live one first, then swapped in by atomic subvolume
+    /// rename — so a failed `btrfs snapshot` never leaves the app with no volume
+    /// at all (the old code deleted the live subvolume before creating the
+    /// replacement, so a failure there was unrecoverable).
     ///
     /// The caller must have verified the app has no running instances —
     /// restoring under a live workload corrupts both copies' semantics.
@@ -242,9 +247,42 @@ impl SnapshotManager {
             .snapshot_dir(namespace, app, &meta.volume_path)
             .join(&meta.name);
 
-        btrfs::run_btrfs(&subvolume_delete_args(&live)).map_err(SnapshotError::Btrfs)?;
-        btrfs::run_btrfs(&snapshot_create_args(&snapshot_path, &live, false))
+        let with_suffix = |suffix: &str| -> std::path::PathBuf {
+            let mut path = live.clone();
+            let name = live
+                .file_name()
+                .map(|n| n.to_string_lossy().into_owned())
+                .unwrap_or_default();
+            path.set_file_name(format!("{name}{suffix}"));
+            path
+        };
+        let staged = with_suffix(".restore-staged");
+        let old = with_suffix(".restore-old");
+
+        // Clean up any leftovers from a previously interrupted restore.
+        let _ = btrfs::run_btrfs(&subvolume_delete_args(&staged));
+        let _ = btrfs::run_btrfs(&subvolume_delete_args(&old));
+
+        // 1. Build the replacement next to the live volume. On failure the live
+        //    subvolume is untouched.
+        btrfs::run_btrfs(&snapshot_create_args(&snapshot_path, &staged, false))
             .map_err(SnapshotError::Btrfs)?;
+
+        // 2. Swap by atomic renames (same btrfs filesystem): move the live
+        //    volume aside, then the staged one into place. If the second rename
+        //    fails, put the original back so the app keeps a working volume.
+        if let Err(e) = std::fs::rename(&live, &old) {
+            let _ = btrfs::run_btrfs(&subvolume_delete_args(&staged));
+            return Err(SnapshotError::Btrfs(e.to_string()));
+        }
+        if let Err(e) = std::fs::rename(&staged, &live) {
+            let _ = std::fs::rename(&old, &live);
+            let _ = btrfs::run_btrfs(&subvolume_delete_args(&staged));
+            return Err(SnapshotError::Btrfs(e.to_string()));
+        }
+
+        // 3. Drop the old volume (best-effort — the restore already succeeded).
+        let _ = btrfs::run_btrfs(&subvolume_delete_args(&old));
         Ok(())
     }
 
