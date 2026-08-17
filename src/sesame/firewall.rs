@@ -59,7 +59,7 @@ pub struct LiveFirewallState {
 ///   allowed. Names can be cross-namespace using `namespace/app` format.
 pub fn resolve_firewall_rules(
     services: &[ServiceEntry],
-    cgroup_ids: &HashMap<String, Vec<u64>>,
+    cgroup_ids: &HashMap<(String, String), Vec<u64>>,
 ) -> Vec<ResolvedFirewallRule> {
     let mut rules = Vec::new();
 
@@ -72,7 +72,8 @@ pub fn resolve_firewall_rules(
                 for other in services {
                     if other.namespace == service.namespace
                         && other.app_name != service.app_name
-                        && let Some(cgroups) = cgroup_ids.get(&other.app_name)
+                        && let Some(cgroups) =
+                            cgroup_ids.get(&(other.namespace.clone(), other.app_name.clone()))
                     {
                         for &cg in cgroups {
                             rules.push(ResolvedFirewallRule {
@@ -101,7 +102,8 @@ pub fn resolve_firewall_rules(
                         .find(|s| s.app_name == target_app && s.namespace == target_ns);
 
                     if matching_app.is_some()
-                        && let Some(cgroups) = cgroup_ids.get(target_app)
+                        && let Some(cgroups) =
+                            cgroup_ids.get(&(target_ns.to_string(), target_app.to_string()))
                     {
                         for &cg in cgroups {
                             rules.push(ResolvedFirewallRule {
@@ -122,11 +124,13 @@ pub fn resolve_firewall_rules(
 /// Resolve cgroup-to-namespace mappings for all running instances.
 pub fn resolve_cgroup_namespace_entries(
     services: &[ServiceEntry],
-    cgroup_ids: &HashMap<String, Vec<u64>>,
+    cgroup_ids: &HashMap<(String, String), Vec<u64>>,
 ) -> Vec<CgroupNamespaceEntry> {
     let mut entries = Vec::new();
     for service in services {
-        if let Some(cgroups) = cgroup_ids.get(&service.app_name) {
+        if let Some(cgroups) =
+            cgroup_ids.get(&(service.namespace.clone(), service.app_name.clone()))
+        {
             for &cg in cgroups {
                 entries.push(CgroupNamespaceEntry {
                     cgroup_id: cg,
@@ -324,6 +328,11 @@ mod tests {
     use crate::onion::vip::VirtualIP;
     use std::net::Ipv4Addr;
 
+    /// Build a `(namespace, app)`-keyed cgroup-id map entry.
+    fn cg(namespace: &str, app: &str, ids: Vec<u64>) -> ((String, String), Vec<u64>) {
+        ((namespace.to_string(), app.to_string()), ids)
+    }
+
     fn make_service(
         name: &str,
         namespace: &str,
@@ -354,9 +363,9 @@ mod tests {
             make_service("api", "default", 1, 100, None),
             make_service("redis", "default", 2, 100, None),
         ];
-        let cgroups: HashMap<String, Vec<u64>> = [
-            ("api".to_string(), vec![1001]),
-            ("redis".to_string(), vec![1002]),
+        let cgroups: HashMap<(String, String), Vec<u64>> = [
+            cg("default", "api", vec![1001]),
+            cg("default", "redis", vec![1002]),
         ]
         .into();
 
@@ -372,9 +381,9 @@ mod tests {
             make_service("api", "frontend", 1, 100, None),
             make_service("db", "backend", 2, 200, None),
         ];
-        let cgroups: HashMap<String, Vec<u64>> = [
-            ("api".to_string(), vec![1001]),
-            ("db".to_string(), vec![1002]),
+        let cgroups: HashMap<(String, String), Vec<u64>> = [
+            cg("frontend", "api", vec![1001]),
+            cg("backend", "db", vec![1002]),
         ]
         .into();
 
@@ -395,9 +404,9 @@ mod tests {
                 Some(vec!["frontend/api".to_string()]),
             ),
         ];
-        let cgroups: HashMap<String, Vec<u64>> = [
-            ("api".to_string(), vec![1001]),
-            ("db".to_string(), vec![1002]),
+        let cgroups: HashMap<(String, String), Vec<u64>> = [
+            cg("frontend", "api", vec![1001]),
+            cg("backend", "db", vec![1002]),
         ]
         .into();
 
@@ -415,9 +424,9 @@ mod tests {
             make_service("api", "default", 1, 100, None),
             make_service("redis", "default", 2, 100, None),
         ];
-        let cgroups: HashMap<String, Vec<u64>> = [
-            ("api".to_string(), vec![1001, 1002]),
-            ("redis".to_string(), vec![2001]),
+        let cgroups: HashMap<(String, String), Vec<u64>> = [
+            cg("default", "api", vec![1001, 1002]),
+            cg("default", "redis", vec![2001]),
         ]
         .into();
 
@@ -425,6 +434,41 @@ mod tests {
         assert_eq!(entries.len(), 3);
         // All should map to namespace_id 100
         assert!(entries.iter().all(|e| e.namespace_id == 100));
+    }
+
+    #[test]
+    fn same_named_apps_in_different_namespaces_do_not_collide() {
+        // H9: `web` runs in both `team-a` and `team-b`. Keying cgroup ids by
+        // bare app name conflated them — an `allow_from` rule for one, and the
+        // namespace mapping, leaked to the other. With `(namespace, app)` keys
+        // each `web` only ever sees its own cgroup.
+        let services = vec![
+            make_service("web", "team-a", 1, 100, None),
+            make_service("client", "team-a", 2, 100, Some(vec!["web".to_string()])),
+            make_service("web", "team-b", 3, 200, None),
+        ];
+        let cgroups: HashMap<(String, String), Vec<u64>> = [
+            cg("team-a", "web", vec![1001]),
+            cg("team-a", "client", vec![1002]),
+            cg("team-b", "web", vec![9001]),
+        ]
+        .into();
+
+        // client (team-a) allows web: only team-a's web cgroup 1001, never
+        // team-b's web cgroup 9001.
+        let rules = resolve_firewall_rules(&services, &cgroups);
+        let client_id = 2;
+        let sources: Vec<u64> = rules
+            .iter()
+            .filter(|r| r.dst_app_id == client_id)
+            .map(|r| r.src_cgroup_id)
+            .collect();
+        assert_eq!(sources, vec![1001], "team-b's web must not be allowed");
+
+        // Namespace mapping: team-b's web maps to namespace 200, not 100.
+        let entries = resolve_cgroup_namespace_entries(&services, &cgroups);
+        let team_b_web = entries.iter().find(|e| e.cgroup_id == 9001).unwrap();
+        assert_eq!(team_b_web.namespace_id, 200);
     }
 
     #[test]

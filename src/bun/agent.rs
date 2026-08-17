@@ -1869,22 +1869,24 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
             return;
         };
 
-        // cgroup id(s) per app, from currently-running instances. Collect the
-        // (app, id) pairs first so the `list_instances` borrow is released
-        // before the async `pid` lookups.
-        let pairs: Vec<(String, InstanceId)> = self
+        // cgroup id(s) per (namespace, app), from currently-running instances.
+        // Keying by the namespace-qualified identity — not the bare app name —
+        // is what stops same-named apps in different namespaces from sharing a
+        // firewall rule or a namespace mapping (H9). Collect the pairs first so
+        // the `list_instances` borrow is released before the async `pid` lookups.
+        let pairs: Vec<((String, String), InstanceId)> = self
             .supervisor
             .list_instances()
             .into_iter()
-            .map(|i| (i.app_name.clone(), i.id.clone()))
+            .map(|i| ((i.namespace.clone(), i.app_name.clone()), i.id.clone()))
             .collect();
-        let mut cgroup_ids: std::collections::HashMap<String, Vec<u64>> =
+        let mut cgroup_ids: std::collections::HashMap<(String, String), Vec<u64>> =
             std::collections::HashMap::new();
-        for (app, id) in pairs {
+        for (key, id) in pairs {
             if let Some(pid) = self.supervisor.grill().pid(&id).await
                 && let Some(cg) = crate::sesame::egress::cgroup_id_of_pid(pid)
             {
-                cgroup_ids.entry(app).or_default().push(cg);
+                cgroup_ids.entry(key).or_default().push(cg);
             }
         }
 
