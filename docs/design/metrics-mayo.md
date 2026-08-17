@@ -376,7 +376,10 @@ scrape_interval_secs = 30
 alerts_enabled = true
 
 # Object-store URL for metric persistence. Empty = local filesystem.
-# e.g. "s3://bucket/prefix". Default: "".
+# e.g. "s3://bucket/prefix" or "gs://bucket/prefix". Default: "".
+# When set, flushed Parquet is written to (and queried from) the bucket, so
+# metrics survive node loss. Retention is then the bucket's own lifecycle
+# policy — the node-side `retention_days` prune applies only to local storage.
 object_store_url = ""
 
 # How often to push rollups to the council parent (seconds). Default: 60.

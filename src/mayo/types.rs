@@ -126,6 +126,8 @@ pub enum MayoError {
     DataFusion(String),
     #[error("io error: {0}")]
     Io(#[from] std::io::Error),
+    #[error("object store error: {0}")]
+    ObjectStore(String),
 }
 
 #[cfg(test)]

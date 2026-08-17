@@ -728,7 +728,14 @@ async fn run_agent(cli: Cli) -> anyhow::Result<()> {
         std::fs::create_dir_all(&fallback).expect("failed to create metrics directory");
         fallback
     };
-    let mayo_store = Arc::new(RwLock::new(MayoStore::new(metrics_dir)));
+    // With `[metrics] object_store_url` set, metrics are persisted to and
+    // queried from an object store (s3://, gs://, file://) so they survive node
+    // loss (H8); otherwise Parquet stays in the local metrics dir.
+    let mayo_store = Arc::new(RwLock::new(
+        MayoStore::open(metrics_dir, Some(config.metrics.object_store_url.as_str()))
+            .await
+            .map_err(|e| anyhow::anyhow!("failed to open metrics store: {e}"))?,
+    ));
 
     // Create the agent (extract deploy history handle before spawning).
     // In cluster mode, start the cluster runtime (gossip, …) and build the
