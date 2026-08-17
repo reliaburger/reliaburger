@@ -477,8 +477,18 @@ impl StateMachineInner {
             }
             RaftRequest::Noop => {}
             RaftRequest::UpgradeUpdate { state } => {
-                // Last-writer-wins: only the leader's orchestrator writes,
-                // and it always writes the full state.
+                // Reject starting a *different* upgrade while one is active
+                // (M13). The start/rollback handlers check `active_upgrade`
+                // then write, which is racy — two concurrent starts both passed
+                // the is_some() guard and the second clobbered the first plan
+                // mid-flight. Serialised Raft apply is the right place to
+                // enforce it; a phase update to the active upgrade (same id)
+                // still applies.
+                if let Some(active) = &self.state.active_upgrade
+                    && active.upgrade_id != state.upgrade_id
+                {
+                    return None;
+                }
                 self.state.active_upgrade = Some(*state.clone());
             }
             RaftRequest::UpgradeClear { upgrade_id } => {
@@ -2734,6 +2744,25 @@ mod tests {
 
         assert_eq!(inner.state.active_upgrade, Some(advanced));
         assert!(inner.state.upgrade_history.is_empty());
+    }
+
+    #[test]
+    fn upgrade_update_ignores_a_concurrent_different_start() {
+        // M13: a second start with a *different* upgrade id while one is active
+        // must not clobber the first plan (the racy check-then-write let two
+        // concurrent starts through). A same-id update still applies.
+        let mut inner = StateMachineInner::default();
+        inner.apply_request(&RaftRequest::UpgradeUpdate {
+            state: Box::new(upgrade_state("up-1")),
+        });
+        inner.apply_request(&RaftRequest::UpgradeUpdate {
+            state: Box::new(upgrade_state("up-2")),
+        });
+        assert_eq!(
+            inner.state.active_upgrade.as_ref().unwrap().upgrade_id,
+            "up-1",
+            "a concurrent different-id start must not replace the active upgrade"
+        );
     }
 
     #[test]

@@ -1908,6 +1908,37 @@ async fn upgrade_cluster_rollback_handler(
             .into_response();
     }
 
+    // Validate each rollback node's identity against the authoritative gossip /
+    // Raft view, exactly as upgrade_start does (M13/UPG2). The old rollback path
+    // copied client-supplied node_id/address/role straight into the replicated
+    // plan, so a caller could point the orchestrator at spoofed addresses or
+    // roles that UPG2 exists to reject.
+    let authoritative = match build_authoritative_view(&state, council).await {
+        Ok(view) => view,
+        Err(resp) => return resp,
+    };
+    let requested: Vec<crate::upgrade::plan::RequestedNode> = request
+        .nodes
+        .iter()
+        .map(|node| crate::upgrade::plan::RequestedNode {
+            node_id: node.node_id.clone(),
+            address: node.address.clone(),
+            role: node.role,
+        })
+        .collect();
+    let derived_nodes = match crate::upgrade::plan::derive_upgrade_nodes(&requested, |id| {
+        authoritative.get(id).cloned()
+    }) {
+        Ok(nodes) => nodes,
+        Err(e) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({ "error": e.to_string() })),
+            )
+                .into_response();
+        }
+    };
+
     let upgrade_id = format!(
         "rollback-{}-{}",
         request.target_version,
@@ -1926,18 +1957,7 @@ async fn upgrade_cluster_rollback_handler(
         direction: crate::upgrade::types::UpgradeDirection::Rollback,
         phase: crate::upgrade::types::ClusterUpgradePhase::Preparing,
         registry_address: String::new(),
-        nodes: request
-            .nodes
-            .into_iter()
-            .map(|node| crate::upgrade::types::NodeUpgradeRecord {
-                node_id: node.node_id,
-                address: node.address,
-                role: node.role,
-                from_version: None,
-                phase: crate::upgrade::types::NodeUpgradePhase::Pending,
-                since: None,
-            })
-            .collect(),
+        nodes: derived_nodes,
     };
 
     match council

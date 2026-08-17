@@ -2293,11 +2293,10 @@ blocking calls).
 
 > **Most landed (17 Aug 2026, branch `phase16-medium-dataplane`, PR #162).**
 > Nineteen items fixed with tests; the deletions removed ~800 lines of unwired
-> deploy engine + the superseded coordinator. **Five remain open** as deeper /
+> deploy engine + the superseded coordinator. **Four remain open** as deeper /
 > larger follow-ups, still unchecked below: new-deploys-live-before-health-check
 > (M5), blocking-work-on-async-loop (M7, several sub-items), the rollup
-> backfill-window dedup redesign (the silent-lost-push half is fixed), the
-> upgrade start/rollback race + client-node-identity (M13), and `--output` coverage across relish subcommands (M25).
+> backfill-window dedup redesign (the silent-lost-push half is fixed), and `--output` coverage across relish subcommands (M25).
 
 - [x] **Btrfs snapshot restore is destructive on failure** — `src/grill/snapshot.rs:245-247`
   `SnapshotManager::restore` deletes the live subvolume first, then creates the writable
@@ -2375,7 +2374,7 @@ blocking calls).
   `RevokeCertificate` sets `crl.updated_at = SystemTime::now()` inside `apply_request`, so
   replicas diverge on that field (the comment eight lines up explains why wall-clock in
   apply is forbidden; the pruning beside it correctly uses in-log `revoked_at`).
-- [ ] **Upgrade start/rollback races and trusts client-supplied node identity** —
+- [x] **Upgrade start/rollback races and trusts client-supplied node identity** —
   `src/bun/api.rs:1685` `upgrade_start_handler` is check-then-write over a last-writer-wins
   `UpgradeUpdate`, so two concurrent starts (or a start racing rollback at 1897) both pass
   the guard and the second clobbers the first plan mid-flight; and `api.rs:1865`
