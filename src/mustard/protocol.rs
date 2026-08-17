@@ -823,6 +823,20 @@ impl<T: MustardTransport> MustardNode<T> {
                     }
                     for update in message.payload.updates() {
                         self.membership.apply_update(update, now);
+                        // Refute a Suspect/Dead/Left claimed about *us* here too
+                        // (M11): this relay-wait applies piggybacked updates but
+                        // used to skip the refutation `handle_message` does, so a
+                        // false Suspect/Dead about this node arriving during a
+                        // relay probe was never refuted and could stick until the
+                        // reap timeout.
+                        let refutable = match update.state {
+                            NodeState::Suspect | NodeState::Dead => true,
+                            NodeState::Left => !self.left,
+                            NodeState::Alive => false,
+                        };
+                        if update.node_id == self.node_id && refutable {
+                            self.refute(update.incarnation);
+                        }
                     }
 
                     if is_ack_from_target {

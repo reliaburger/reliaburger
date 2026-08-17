@@ -469,7 +469,11 @@ impl StateMachineInner {
                     .entries
                     .retain(|e| e.expires_at.is_none_or(|expiry| expiry > logical_now));
                 self.state.security_state.crl.version += 1;
-                self.state.security_state.crl.updated_at = std::time::SystemTime::now();
+                // Deterministic like the prune above (M12): a `SystemTime::now()`
+                // here makes every replica store a different `updated_at`, so
+                // the replicated state machines diverge on that field. Use the
+                // in-log `revoked_at` so all replicas agree.
+                self.state.security_state.crl.updated_at = logical_now;
             }
             RaftRequest::Noop => {}
             RaftRequest::UpgradeUpdate { state } => {
@@ -3587,5 +3591,24 @@ mod tests {
 
         assert_eq!(apply_all(), apply_all());
         assert_eq!(apply_all(), vec![2]);
+    }
+
+    /// M12: `crl.updated_at` must come from the in-log `revoked_at`, not
+    /// `SystemTime::now()`, or replicas store different values and the
+    /// replicated state machines diverge on that field.
+    #[test]
+    fn crl_updated_at_is_the_in_log_timestamp() {
+        use crate::sesame::types::{CaRole, CrlEntry, SerialNumber};
+
+        let revoked_at = std::time::SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(1234);
+        let mut inner = StateMachineInner::default();
+        inner.apply_request(&RaftRequest::RevokeCertificate(CrlEntry {
+            serial: SerialNumber(1),
+            issuer: CaRole::Node,
+            revoked_at,
+            reason: "one".to_string(),
+            expires_at: None,
+        }));
+        assert_eq!(inner.state.security_state.crl.updated_at, revoked_at);
     }
 }

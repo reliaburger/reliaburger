@@ -74,6 +74,22 @@ const MIN_COMPACT_THRESHOLD: usize = 1024;
 /// discard real updates is an incident, not routine housekeeping.
 const HARD_CAP: usize = 65_536;
 
+/// Whether `queued` should replace `existing` when coalescing the same node's
+/// updates: a strictly higher incarnation, or the same incarnation with a
+/// strictly higher-priority state (Dead/Left/Suspect over Alive). This mirrors
+/// [`crate::mustard::state::resolve_conflict`]'s precedence.
+fn queued_supersedes(queued: &QueuedUpdate, existing: &QueuedUpdate) -> bool {
+    use std::cmp::Ordering;
+    match queued.update.incarnation.cmp(&existing.update.incarnation) {
+        Ordering::Greater => true,
+        Ordering::Less => false,
+        Ordering::Equal => {
+            queued.update.state.dissemination_priority()
+                > existing.update.state.dissemination_priority()
+        }
+    }
+}
+
 /// The dissemination queue that selects updates to piggyback on messages.
 pub struct DisseminationQueue {
     queue: BinaryHeap<QueuedUpdate>,
@@ -132,7 +148,15 @@ impl DisseminationQueue {
             HashMap::with_capacity(drained.len());
         for queued in drained {
             match newest.get(&queued.update.node_id) {
-                Some(existing) if existing.update.incarnation >= queued.update.incarnation => {}
+                // Keep the surviving update per SWIM precedence: a higher
+                // incarnation always wins, and at an *equal* incarnation the
+                // higher-priority state does (Dead/Left/Suspect over Alive).
+                // `BinaryHeap::drain()` yields arbitrary order, so the old
+                // `existing.incarnation >= queued.incarnation` kept whichever
+                // was drained first — silently dropping a Dead/Suspect in
+                // favour of an Alive at equal incarnation (inverting
+                // `resolve_conflict`, so a failure notification vanished).
+                Some(existing) if !queued_supersedes(&queued, existing) => {}
                 _ => {
                     newest.insert(queued.update.node_id.clone(), queued);
                 }
@@ -242,6 +266,37 @@ mod tests {
             incarnation: 1,
             lamport: 0,
         }
+    }
+
+    fn queued(node: &str, state: NodeState, incarnation: u64) -> QueuedUpdate {
+        let mut u = update(node, state);
+        u.incarnation = incarnation;
+        QueuedUpdate {
+            update: u,
+            remaining_broadcasts: 3,
+        }
+    }
+
+    // -- coalescing precedence (M11) ------------------------------------------
+
+    #[test]
+    fn coalescing_keeps_the_failure_state_at_equal_incarnation() {
+        // A Dead and an Alive for the same node at the same incarnation must
+        // resolve to Dead — the old compaction kept whichever the arbitrary
+        // heap-drain yielded first, silently dropping the failure notification.
+        let dead = queued("n1", NodeState::Dead, 5);
+        let alive = queued("n1", NodeState::Alive, 5);
+        assert!(queued_supersedes(&dead, &alive));
+        assert!(!queued_supersedes(&alive, &dead));
+    }
+
+    #[test]
+    fn coalescing_prefers_the_higher_incarnation() {
+        // A higher incarnation always wins, even an Alive over a Dead.
+        let fresh_alive = queued("n1", NodeState::Alive, 9);
+        let stale_dead = queued("n1", NodeState::Dead, 5);
+        assert!(queued_supersedes(&fresh_alive, &stale_dead));
+        assert!(!queued_supersedes(&stale_dead, &fresh_alive));
     }
 
     // -- broadcast_count ------------------------------------------------------
