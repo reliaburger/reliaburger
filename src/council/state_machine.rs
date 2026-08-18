@@ -126,6 +126,8 @@ fn persist_snapshot(db: &Database, data: &[u8], index: u64) -> Result<(), redb::
 /// Persist a snapshot on the blocking pool (M7). `persist_snapshot` commits to
 /// redb, which fsyncs — running it inline on an async openraft method blocked a
 /// tokio runtime worker on disk I/O. A panic in the task maps to a write error.
+// `StorageError<u64>` is large but dictated by openraft; boxing it buys nothing.
+#[allow(clippy::result_large_err)]
 async fn persist_snapshot_blocking(
     db: Arc<Database>,
     data: Vec<u8>,
