@@ -284,6 +284,22 @@ impl DurableLogStore {
     }
 }
 
+/// Run a blocking redb closure on the blocking pool (M7).
+///
+/// Every redb `commit()` fsyncs, so running these inline on an openraft async
+/// storage method blocked a tokio runtime worker on disk I/O. `spawn_blocking`
+/// moves that off the async workers; a panic in the task maps to a write error.
+async fn run_blocking<T, F>(f: F) -> Result<T, StorageError<u64>>
+where
+    F: FnOnce() -> Result<T, StorageError<u64>> + Send + 'static,
+    T: Send + 'static,
+{
+    match tokio::task::spawn_blocking(f).await {
+        Ok(result) => result,
+        Err(join_err) => Err(write_err(join_err)),
+    }
+}
+
 /// Copy a `Bound<&u64>` into an owned `Bound<u64>`.
 fn copy_bound(b: Bound<&u64>) -> Bound<u64> {
     match b {
@@ -340,7 +356,8 @@ impl RaftLogStorage<TypeConfig> for DurableLogStore {
 
     async fn save_vote(&mut self, vote: &Vote<u64>) -> Result<(), StorageError<u64>> {
         let bytes = bincode::serialize(vote).map_err(write_err)?;
-        self.put_meta(VOTE_KEY, &bytes)
+        let store = self.clone();
+        run_blocking(move || store.put_meta(VOTE_KEY, &bytes)).await
     }
 
     async fn read_vote(&mut self) -> Result<Option<Vote<u64>>, StorageError<u64>> {
@@ -351,12 +368,13 @@ impl RaftLogStorage<TypeConfig> for DurableLogStore {
         &mut self,
         committed: Option<LogId<u64>>,
     ) -> Result<(), StorageError<u64>> {
+        let store = self.clone();
         match committed {
             Some(log_id) => {
                 let bytes = bincode::serialize(&log_id).map_err(write_err)?;
-                self.put_meta(COMMITTED_KEY, &bytes)
+                run_blocking(move || store.put_meta(COMMITTED_KEY, &bytes)).await
             }
-            None => self.del_meta(COMMITTED_KEY),
+            None => run_blocking(move || store.del_meta(COMMITTED_KEY)).await,
         }
     }
 
@@ -377,52 +395,64 @@ impl RaftLogStorage<TypeConfig> for DurableLogStore {
         I::IntoIter: Send,
     {
         // Entries are on disk and fsynced once write_entries returns; only then
-        // do we signal openraft that the write completed.
-        self.write_entries(entries)?;
+        // do we signal openraft that the write completed. The fsync runs on the
+        // blocking pool (M7), and we await it before the callback so the
+        // durability ordering openraft relies on is preserved.
+        let entries: Vec<Entry<TypeConfig>> = entries.into_iter().collect();
+        let store = self.clone();
+        run_blocking(move || store.write_entries(entries)).await?;
         callback.log_io_completed(Ok(()));
         Ok(())
     }
 
     async fn truncate(&mut self, log_id: LogId<u64>) -> Result<(), StorageError<u64>> {
-        let wtx = self.db.begin_write().map_err(write_err)?;
-        {
-            let mut t = wtx.open_table(ENTRIES).map_err(write_err)?;
-            // Remove everything from log_id.index onward. A row read error
-            // propagates: silently skipping a key would leave a stale entry
-            // that a later election could resurrect.
-            let mut keys = Vec::new();
-            for row in t.range::<u64>(log_id.index..).map_err(write_err)? {
-                let (k, _) = row.map_err(write_err)?;
-                keys.push(k.value());
+        let store = self.clone();
+        run_blocking(move || {
+            let wtx = store.db.begin_write().map_err(write_err)?;
+            {
+                let mut t = wtx.open_table(ENTRIES).map_err(write_err)?;
+                // Remove everything from log_id.index onward. A row read error
+                // propagates: silently skipping a key would leave a stale entry
+                // that a later election could resurrect.
+                let mut keys = Vec::new();
+                for row in t.range::<u64>(log_id.index..).map_err(write_err)? {
+                    let (k, _) = row.map_err(write_err)?;
+                    keys.push(k.value());
+                }
+                for k in keys {
+                    t.remove(k).map_err(write_err)?;
+                }
             }
-            for k in keys {
-                t.remove(k).map_err(write_err)?;
-            }
-        }
-        wtx.commit().map_err(write_err)?;
-        Ok(())
+            wtx.commit().map_err(write_err)?;
+            Ok(())
+        })
+        .await
     }
 
     async fn purge(&mut self, log_id: LogId<u64>) -> Result<(), StorageError<u64>> {
         let bytes = bincode::serialize(&log_id).map_err(write_err)?;
-        let wtx = self.db.begin_write().map_err(write_err)?;
-        {
-            let mut meta = wtx.open_table(META).map_err(write_err)?;
-            meta.insert(PURGED_KEY, bytes.as_slice())
-                .map_err(write_err)?;
-            let mut t = wtx.open_table(ENTRIES).map_err(write_err)?;
-            // Same as truncate: propagate row errors instead of skipping keys.
-            let mut keys = Vec::new();
-            for row in t.range::<u64>(..=log_id.index).map_err(write_err)? {
-                let (k, _) = row.map_err(write_err)?;
-                keys.push(k.value());
+        let store = self.clone();
+        run_blocking(move || {
+            let wtx = store.db.begin_write().map_err(write_err)?;
+            {
+                let mut meta = wtx.open_table(META).map_err(write_err)?;
+                meta.insert(PURGED_KEY, bytes.as_slice())
+                    .map_err(write_err)?;
+                let mut t = wtx.open_table(ENTRIES).map_err(write_err)?;
+                // Same as truncate: propagate row errors instead of skipping keys.
+                let mut keys = Vec::new();
+                for row in t.range::<u64>(..=log_id.index).map_err(write_err)? {
+                    let (k, _) = row.map_err(write_err)?;
+                    keys.push(k.value());
+                }
+                for k in keys {
+                    t.remove(k).map_err(write_err)?;
+                }
             }
-            for k in keys {
-                t.remove(k).map_err(write_err)?;
-            }
-        }
-        wtx.commit().map_err(write_err)?;
-        Ok(())
+            wtx.commit().map_err(write_err)?;
+            Ok(())
+        })
+        .await
     }
 }
 

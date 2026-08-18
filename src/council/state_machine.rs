@@ -123,6 +123,21 @@ fn persist_snapshot(db: &Database, data: &[u8], index: u64) -> Result<(), redb::
     Ok(())
 }
 
+/// Persist a snapshot on the blocking pool (M7). `persist_snapshot` commits to
+/// redb, which fsyncs — running it inline on an async openraft method blocked a
+/// tokio runtime worker on disk I/O. A panic in the task maps to a write error.
+async fn persist_snapshot_blocking(
+    db: Arc<Database>,
+    data: Vec<u8>,
+    index: u64,
+) -> Result<(), StorageError<u64>> {
+    match tokio::task::spawn_blocking(move || persist_snapshot(&db, &data, index)).await {
+        Ok(Ok(())) => Ok(()),
+        Ok(Err(e)) => Err(StorageError::from(StorageIOError::write_state_machine(&e))),
+        Err(e) => Err(StorageError::from(StorageIOError::write_state_machine(&e))),
+    }
+}
+
 /// SHA-256 of the snapshot payload bytes.
 fn snapshot_checksum(data: &[u8]) -> [u8; 32] {
     let mut hasher = Sha256::new();
@@ -1157,17 +1172,20 @@ impl RaftStateMachine<TypeConfig> for CouncilStateMachine {
         let new_state: DesiredState = serde_json::from_slice(&data)
             .map_err(|e| StorageError::from(StorageIOError::read_state_machine(&e)))?;
 
-        let mut guard = self.inner.write().await;
-        guard.state = new_state;
-        guard.state.last_applied_log = meta.last_log_id;
-        guard.state.last_membership = meta.last_membership.clone();
-        guard.snapshot_index += 1;
-        guard.snapshot_data = Some(data.clone());
+        let (db, index) = {
+            let mut guard = self.inner.write().await;
+            guard.state = new_state;
+            guard.state.last_applied_log = meta.last_log_id;
+            guard.state.last_membership = meta.last_membership.clone();
+            guard.snapshot_index += 1;
+            guard.snapshot_data = Some(data.clone());
+            (guard.db.clone(), guard.snapshot_index)
+        };
 
-        // Persist the installed snapshot so it survives a restart too.
-        if let Some(db) = &guard.db {
-            persist_snapshot(db, &data, guard.snapshot_index)
-                .map_err(|e| StorageError::from(StorageIOError::write_state_machine(&e)))?;
+        // Persist the installed snapshot so it survives a restart too, off the
+        // async runtime (M7): the lock is released before the fsync.
+        if let Some(db) = db {
+            persist_snapshot_blocking(db, data, index).await?;
         }
         Ok(())
     }
@@ -1205,25 +1223,31 @@ pub struct MemSnapshotBuilder {
 
 impl RaftSnapshotBuilder<TypeConfig> for MemSnapshotBuilder {
     async fn build_snapshot(&mut self) -> Result<Snapshot<TypeConfig>, StorageError<u64>> {
-        let mut guard = self.inner.write().await;
+        let (data, index, db, last_log_id, last_membership) = {
+            let mut guard = self.inner.write().await;
+            let data = serde_json::to_vec(&guard.state)
+                .map_err(|e| StorageError::from(StorageIOError::read_state_machine(&e)))?;
+            guard.snapshot_index += 1;
+            guard.snapshot_data = Some(data.clone());
+            (
+                data,
+                guard.snapshot_index,
+                guard.db.clone(),
+                guard.state.last_applied_log,
+                guard.state.last_membership.clone(),
+            )
+        };
 
-        let data = serde_json::to_vec(&guard.state)
-            .map_err(|e| StorageError::from(StorageIOError::read_state_machine(&e)))?;
-
-        guard.snapshot_index += 1;
-        let snapshot_id = format!("mem-{}", guard.snapshot_index);
-        guard.snapshot_data = Some(data.clone());
-
-        // Persist so applied state survives a restart.
-        if let Some(db) = &guard.db {
-            persist_snapshot(db, &data, guard.snapshot_index)
-                .map_err(|e| StorageError::from(StorageIOError::write_state_machine(&e)))?;
+        // Persist so applied state survives a restart, off the async runtime
+        // (M7): the lock is released before the fsync.
+        if let Some(db) = db {
+            persist_snapshot_blocking(db, data.clone(), index).await?;
         }
 
         let meta = SnapshotMeta {
-            last_log_id: guard.state.last_applied_log,
-            last_membership: guard.state.last_membership.clone(),
-            snapshot_id,
+            last_log_id,
+            last_membership,
+            snapshot_id: format!("mem-{index}"),
         };
 
         Ok(Snapshot {
