@@ -3372,7 +3372,6 @@ async fn ui_session_handler(
     State(auth): State<crate::sesame::auth::AuthState>,
     axum::Form(form): axum::Form<SessionForm>,
 ) -> Response {
-    let tokens = auth.tokens.read().await;
     // Accept the internal service token or any valid user token. The session
     // inherits the presented token's scope (C3), so a tenant-scoped token
     // cannot widen to cluster-wide reads by exchanging itself for a cookie.
@@ -3388,19 +3387,27 @@ async fn ui_session_handler(
             crate::sesame::types::TokenScope::default(),
         ))
     } else {
-        crate::sesame::auth::authenticate(&form.token, &tokens)
-            .ok()
-            .map(|ctx| {
-                (
-                    ctx.token_name,
-                    crate::sesame::types::TokenScope {
-                        apps: ctx.scoped_apps,
-                        namespaces: ctx.scoped_namespaces,
-                    },
-                )
-            })
+        // Snapshot the tokens under the lock, then run the Argon2id verify on
+        // the blocking pool (M7) so the deliberately-slow hashing doesn't stall
+        // the async runtime worker.
+        let tokens = auth.tokens.read().await.clone();
+        let candidate = form.token.clone();
+        tokio::task::spawn_blocking(move || {
+            crate::sesame::auth::authenticate(&candidate, &tokens)
+                .ok()
+                .map(|ctx| {
+                    (
+                        ctx.token_name,
+                        crate::sesame::types::TokenScope {
+                            apps: ctx.scoped_apps,
+                            namespaces: ctx.scoped_namespaces,
+                        },
+                    )
+                })
+        })
+        .await
+        .unwrap_or(None)
     };
-    drop(tokens);
 
     let Some((name, scope)) = identity else {
         return (
@@ -6233,12 +6240,26 @@ async fn token_create_handler(
         .ttl_days
         .map(|d| std::time::SystemTime::now() + std::time::Duration::from_secs(d * 86400));
 
-    let created = match crate::sesame::token::create_token(&req.name, role, scope, expires_at) {
-        Ok(c) => c,
-        Err(e) => {
+    // Argon2id hashing is deliberately slow + memory-hungry (M7): run it on the
+    // blocking pool so it doesn't stall the async runtime worker.
+    let name = req.name.clone();
+    let created = match tokio::task::spawn_blocking(move || {
+        crate::sesame::token::create_token(&name, role, scope, expires_at)
+    })
+    .await
+    {
+        Ok(Ok(c)) => c,
+        Ok(Err(e)) => {
             return (
                 StatusCode::INTERNAL_SERVER_ERROR,
                 Json(serde_json::json!({ "error": e.to_string() })),
+            )
+                .into_response();
+        }
+        Err(_) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({ "error": "token hashing task failed" })),
             )
                 .into_response();
         }

@@ -1475,8 +1475,12 @@ async fn run_agent(cli: Cli) -> anyhow::Result<()> {
             tokio::select! {
                 _ = log_flush_shutdown.cancelled() => break,
                 _ = tick.tick() => {
-                    let mut store = log_flush_store.write().await;
-                    if let Err(e) = store.flush().await {
+                    // Drain under the lock, write off it (M7): the sync Parquet
+                    // encode + fsync no longer runs while the write lock is held,
+                    // so log appends and queries aren't starved during a flush.
+                    if let Err(e) =
+                        reliaburger::ketchup::log_store::flush_shared(&log_flush_store).await
+                    {
                         eprintln!("bun: log flush error: {e}");
                     }
                 }

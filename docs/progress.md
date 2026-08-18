@@ -2328,7 +2328,7 @@ blocking calls).
   `src/mayo/store.rs:244-257` `take_flush_batch` clears the buffer + bumps the counter
   *before* the write, so a failed write permanently discards the drained samples
   (LogStore/RollupStore clear only after success).
-- [ ] **Blocking work on the agent event loop / runtime worker** (project rule: no blocking
+- [~] **Blocking work on the agent event loop / runtime worker**  _(partial: Argon2id token create+verify, pickle blob_get read, and LogStore flush now run off-lock/off-runtime; snapshot btrfs, DeployOp::RetireOldInstance polling, and the openraft redb commits remain)_ (project rule: no blocking
   in async):
   - `src/bun/agent.rs:2890-2919,1731` + `src/bun/snapshot_worker.rs:93-137` — snapshot
     create/restore/delete run sync `btrfs` subprocess + `std::fs` walks on the loop
