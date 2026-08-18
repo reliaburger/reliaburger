@@ -85,6 +85,38 @@ fn new_shared_drains() -> crate::wrapper::draining::SharedDrains {
     ))
 }
 
+/// Drain then stop a single instance using cloneable handles, so the wait can
+/// run on a spawned deploy task instead of the command loop (M7). Mirrors
+/// `retire_with_drain` + `stop_and_wait_for_exit` for one instance: start the
+/// drain, let in-flight requests finish (up to `drain_timeout`), then
+/// stop-and-wait-for-exit, killing if it overruns the grace.
+async fn drain_and_stop_instance<G: Grill>(
+    drains: &crate::wrapper::draining::SharedDrains,
+    grill: &G,
+    id: &InstanceId,
+    drain_timeout: std::time::Duration,
+) {
+    let cmd = crate::wrapper::draining::DrainCommand {
+        app_name: String::new(),
+        instance_id: id.0.clone(),
+        timeout: drain_timeout,
+    };
+    drains.start_drain(&cmd).await;
+    drains.wait_drained(&id.0).await;
+
+    let _ = grill.stop(id).await;
+    let deadline = Instant::now() + drain_timeout;
+    while Instant::now() < deadline {
+        if matches!(grill.state(id).await, Ok(ContainerState::Stopped)) {
+            return;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    }
+    if !matches!(grill.state(id).await, Ok(ContainerState::Stopped)) {
+        let _ = grill.kill(id).await;
+    }
+}
+
 /// The address to probe an instance's health check at.
 ///
 /// A container with its own IP (runc/apple per-container netns) is probed at
@@ -524,14 +556,13 @@ enum DeployOp {
         has_port: bool,
         reply: oneshot::Sender<()>,
     },
-    /// Drain, stop and forget one old instance (M7).
-    ///
-    /// Also split out of `FinaliseRollingDeploy`, so retirement can be
-    /// interleaved with replacement one instance at a time instead of
-    /// happening all at once at the end.
-    RetireOldInstance {
+    /// Finish retiring one old instance: the fast `&mut self` bookkeeping
+    /// (lift egress, clean identity, drop the record + supervisor entry) after
+    /// the deploy worker has already drained and stopped it off the command
+    /// loop (M7). The drain/stop wait used to run here on the loop, stalling
+    /// every command for its duration per retired instance.
+    FinishRetire {
         old_id: InstanceId,
-        drain_timeout: std::time::Duration,
         reply: oneshot::Sender<()>,
     },
     /// Append an entry to the deploy history.
@@ -980,11 +1011,12 @@ impl DeployOps {
         .await
     }
 
-    async fn retire_old_instance(&self, old_id: &InstanceId, drain_timeout: std::time::Duration) {
+    /// Bookkeeping-only op sent after the worker has already drained+stopped
+    /// the instance off the loop (M7).
+    async fn finish_retire(&self, old_id: &InstanceId) {
         self.call(
-            |reply| DeployOp::RetireOldInstance {
+            |reply| DeployOp::FinishRetire {
                 old_id: old_id.clone(),
-                drain_timeout,
                 reply,
             },
             (),
@@ -1709,8 +1741,11 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
     /// Snapshot one volume of an app — or, with `volume: None`, every
     /// provisioned volume (discovered from sidecars, so this works for
     /// stopped apps too). Multi-volume snapshots share one timestamp.
+    /// Create volume snapshots. Free of `&self` (takes `volumes_dir`) so it can
+    /// run on `spawn_blocking` — btrfs subprocess + fs walks must not run on the
+    /// agent command loop (M7).
     fn snapshot_create(
-        &self,
+        volumes_dir: &std::path::Path,
         namespace: &str,
         app_name: &str,
         volume: Option<String>,
@@ -1719,7 +1754,7 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
         let volumes = match volume {
             Some(v) => vec![v],
             None => {
-                let found = crate::grill::volume::VolumeManager::new(&self.volumes_dir)
+                let found = crate::grill::volume::VolumeManager::new(volumes_dir)
                     .provisioned_volumes(namespace, app_name);
                 if found.is_empty() {
                     return Err(crate::grill::snapshot::SnapshotError::NoVolumes {
@@ -1732,40 +1767,13 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
             }
         };
 
-        let manager = crate::grill::snapshot::SnapshotManager::new(&self.volumes_dir);
+        let manager = crate::grill::snapshot::SnapshotManager::new(volumes_dir);
         let now = std::time::SystemTime::now();
         let mut metas = Vec::with_capacity(volumes.len());
         for volume_path in &volumes {
             metas.push(manager.create(namespace, app_name, volume_path, name.as_deref(), now)?);
         }
         Ok(metas)
-    }
-
-    /// Restore a snapshot — refused while the app has instances that
-    /// aren't terminal, because swapping a subvolume under a live
-    /// workload corrupts both the workload's view and the data.
-    fn snapshot_restore(
-        &self,
-        namespace: &str,
-        app_name: &str,
-        name: &str,
-    ) -> Result<(), BunError> {
-        let running = self.supervisor.list_instances().into_iter().any(|i| {
-            i.app_name == app_name
-                && i.namespace == namespace
-                && !matches!(i.state, ContainerState::Stopped | ContainerState::Failed)
-        });
-        if running {
-            return Err(crate::grill::snapshot::SnapshotError::AppRunning {
-                namespace: namespace.to_string(),
-                app: app_name.to_string(),
-            }
-            .into());
-        }
-
-        crate::grill::snapshot::SnapshotManager::new(&self.volumes_dir)
-            .restore(namespace, app_name, name)
-            .map_err(BunError::from)
     }
 
     /// Enable or disable the perimeter firewall. In-process multi-node tests
@@ -2684,6 +2692,7 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
                     ops: DeployOps {
                         tx: self.deploy_ops_tx.clone(),
                     },
+                    drains: self.drains.clone(),
                     operation: Some(operation),
                 };
                 tokio::spawn(async move {
@@ -2923,15 +2932,25 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
                 name,
                 response,
             } => {
-                let _ = response.send(self.snapshot_create(&namespace, &app_name, volume, name));
+                // btrfs subprocess + fs walks off the command loop (M7).
+                let volumes_dir = self.volumes_dir.clone();
+                tokio::task::spawn_blocking(move || {
+                    let result =
+                        Self::snapshot_create(&volumes_dir, &namespace, &app_name, volume, name);
+                    let _ = response.send(result);
+                });
             }
             AgentCommand::SnapshotList {
                 namespace,
                 app_name,
                 response,
             } => {
-                let manager = crate::grill::snapshot::SnapshotManager::new(&self.volumes_dir);
-                let _ = response.send(manager.list(&namespace, &app_name).map_err(BunError::from));
+                let volumes_dir = self.volumes_dir.clone();
+                tokio::task::spawn_blocking(move || {
+                    let manager = crate::grill::snapshot::SnapshotManager::new(&volumes_dir);
+                    let _ =
+                        response.send(manager.list(&namespace, &app_name).map_err(BunError::from));
+                });
             }
             AgentCommand::SnapshotRestore {
                 namespace,
@@ -2939,7 +2958,28 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
                 name,
                 response,
             } => {
-                let _ = response.send(self.snapshot_restore(&namespace, &app_name, &name));
+                // The running-instance check needs supervisor state, so it stays
+                // on the loop; the btrfs restore itself runs off it (M7).
+                let running = self.supervisor.list_instances().into_iter().any(|i| {
+                    i.app_name == app_name
+                        && i.namespace == namespace
+                        && !matches!(i.state, ContainerState::Stopped | ContainerState::Failed)
+                });
+                if running {
+                    let _ = response.send(Err(crate::grill::snapshot::SnapshotError::AppRunning {
+                        namespace: namespace.clone(),
+                        app: app_name.clone(),
+                    }
+                    .into()));
+                } else {
+                    let volumes_dir = self.volumes_dir.clone();
+                    tokio::task::spawn_blocking(move || {
+                        let result = crate::grill::snapshot::SnapshotManager::new(&volumes_dir)
+                            .restore(&namespace, &app_name, &name)
+                            .map_err(BunError::from);
+                        let _ = response.send(result);
+                    });
+                }
             }
             AgentCommand::SnapshotDelete {
                 namespace,
@@ -2947,12 +2987,15 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
                 name,
                 response,
             } => {
-                let manager = crate::grill::snapshot::SnapshotManager::new(&self.volumes_dir);
-                let _ = response.send(
-                    manager
-                        .delete(&namespace, &app_name, &name)
-                        .map_err(BunError::from),
-                );
+                let volumes_dir = self.volumes_dir.clone();
+                tokio::task::spawn_blocking(move || {
+                    let manager = crate::grill::snapshot::SnapshotManager::new(&volumes_dir);
+                    let _ = response.send(
+                        manager
+                            .delete(&namespace, &app_name, &name)
+                            .map_err(BunError::from),
+                    );
+                });
             }
             AgentCommand::InjectFault {
                 mut request,
@@ -5790,6 +5833,7 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
             ops: DeployOps {
                 tx: self.deploy_ops_tx.clone(),
             },
+            drains: self.drains.clone(),
             operation: None,
         };
         tokio::spawn(async move {
@@ -7247,16 +7291,12 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
 
     /// Drain, stop and forget one old instance (M7).
     ///
-    /// The per-instance half of what `finalise_rolling_deploy` used to do to
-    /// every old instance at once. Interleaving it with replacement is what
-    /// gives `max_surge` and `max_unavailable` their meaning.
-    async fn retire_one_old_instance(
-        &mut self,
-        old_id: &InstanceId,
-        drain_timeout: std::time::Duration,
-    ) {
-        self.retire_with_drain(std::slice::from_ref(old_id), drain_timeout)
-            .await;
+    /// The fast `&mut self` bookkeeping half of retiring one old instance: the
+    /// worker has already drained and stopped it off the command loop (M7), so
+    /// this only lifts egress, cleans identity, and drops the record and
+    /// supervisor entry. Interleaving it with replacement is what gives
+    /// `max_surge` and `max_unavailable` their meaning.
+    async fn finish_retire_bookkeeping(&mut self, old_id: &InstanceId) {
         // NET6: lift the retiring instance's egress enforcement.
         self.clear_egress(old_id).await;
         self.cleanup_instance_identity(old_id);
@@ -7647,12 +7687,8 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
                 .await;
                 let _ = reply.send(());
             }
-            DeployOp::RetireOldInstance {
-                old_id,
-                drain_timeout,
-                reply,
-            } => {
-                self.retire_one_old_instance(&old_id, drain_timeout).await;
+            DeployOp::FinishRetire { old_id, reply } => {
+                self.finish_retire_bookkeeping(&old_id).await;
                 let _ = reply.send(());
             }
             DeployOp::PushDeployHistory { entry, reply } => {
@@ -7713,6 +7749,10 @@ struct DeployWorker<G: Grill> {
     grill: G,
     port_allocator: PortAllocator,
     ops: DeployOps,
+    /// Shared drain tracker, so the worker can drain-and-stop a retiring
+    /// instance off the command loop (M7) rather than sending the whole wait
+    /// to the loop as an op.
+    drains: crate::wrapper::draining::SharedDrains,
     operation: Option<crate::bun::deploy_operations::DeployOperationHandle>,
 }
 
@@ -8310,9 +8350,17 @@ impl<G: Grill + Clone + 'static> DeployWorker<G> {
                             message: format!("stopping old instance {}", old_id.0),
                         })
                         .await;
-                    self.ops
-                        .retire_old_instance(&old_id, deploy_config.drain_timeout)
-                        .await;
+                    // Drain and stop the old instance on this spawned deploy
+                    // task (M7), then send only the fast bookkeeping to the
+                    // command loop — the wait no longer stalls every command.
+                    drain_and_stop_instance(
+                        &self.drains,
+                        &self.grill,
+                        &old_id,
+                        deploy_config.drain_timeout,
+                    )
+                    .await;
+                    self.ops.finish_retire(&old_id).await;
                     retired += 1;
                     continue;
                 }
@@ -9253,6 +9301,7 @@ mod tests {
                 ops: DeployOps {
                     tx: self.deploy_ops_tx.clone(),
                 },
+                drains: self.drains.clone(),
                 operation: None,
             };
             let events = events.clone();

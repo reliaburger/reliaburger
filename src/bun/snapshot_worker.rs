@@ -85,48 +85,81 @@ pub async fn snapshot_tick(
     uploader: Option<&SnapshotUploader>,
     now: SystemTime,
 ) -> TickReport {
-    let mut report = TickReport::default();
-    let volumes = VolumeManager::new(volumes_dir);
-    let snapshots = SnapshotManager::new(volumes_dir);
+    // The create/list/prune work is synchronous btrfs subprocess + fs walks;
+    // run it off the runtime (M7) rather than on the caller's async task. Only
+    // the object-store upload (phase 2b) stays async, so we hand the survivors
+    // back for it. A panic in the task degrades to a reported error.
+    let dir = volumes_dir.to_path_buf();
+    let has_uploader = uploader.is_some();
+    #[allow(clippy::type_complexity)]
+    let (mut report, to_upload): (TickReport, Vec<(String, String, SnapshotMeta)>) =
+        tokio::task::spawn_blocking(move || {
+            let mut report = TickReport::default();
+            let volumes = VolumeManager::new(&dir);
+            let snapshots = SnapshotManager::new(&dir);
 
-    // Phase 1: snapshot every provisioned volume of every app.
-    for (namespace, app) in volumes.provisioned_apps() {
-        for volume_path in volumes.provisioned_volumes(&namespace, &app) {
-            match snapshots.create(&namespace, &app, &volume_path, None, now) {
-                Ok(_) => report.created += 1,
-                Err(e) => report
-                    .errors
-                    .push(format!("snapshot {namespace}/{app}{volume_path}: {e}")),
+            // Phase 1: snapshot every provisioned volume of every app.
+            for (namespace, app) in volumes.provisioned_apps() {
+                for volume_path in volumes.provisioned_volumes(&namespace, &app) {
+                    match snapshots.create(&namespace, &app, &volume_path, None, now) {
+                        Ok(_) => report.created += 1,
+                        Err(e) => report
+                            .errors
+                            .push(format!("snapshot {namespace}/{app}{volume_path}: {e}")),
+                    }
+                }
             }
-        }
-    }
 
-    // Phase 2: prune and upload — driven by what's on disk under
-    // .snapshots, so snapshots of deleted apps still age out and ship.
-    for (namespace, app) in snapshots.apps() {
-        let metas = match snapshots.list(&namespace, &app) {
-            Ok(metas) => metas,
-            Err(e) => {
-                report.errors.push(format!("list {namespace}/{app}: {e}"));
-                continue;
+            // Phase 2a: prune, and collect the survivors that still need
+            // uploading — driven by what's on disk under .snapshots, so
+            // snapshots of deleted apps still age out and ship.
+            let mut to_upload: Vec<(String, String, SnapshotMeta)> = Vec::new();
+            for (namespace, app) in snapshots.apps() {
+                let metas = match snapshots.list(&namespace, &app) {
+                    Ok(metas) => metas,
+                    Err(e) => {
+                        report.errors.push(format!("list {namespace}/{app}: {e}"));
+                        continue;
+                    }
+                };
+
+                for doomed in prune_plan(&metas, retain) {
+                    match snapshots.delete(&namespace, &app, &doomed.name) {
+                        Ok(()) => report.pruned += 1,
+                        Err(e) => report
+                            .errors
+                            .push(format!("prune {namespace}/{app}/{}: {e}", doomed.name)),
+                    }
+                }
+
+                if !has_uploader {
+                    continue;
+                }
+                let survivors = match snapshots.list(&namespace, &app) {
+                    Ok(metas) => metas,
+                    Err(_) => continue, // listed above; already reported
+                };
+                for meta in survivors.into_iter().filter(|m| !m.uploaded) {
+                    to_upload.push((namespace.clone(), app.clone(), meta));
+                }
             }
-        };
 
-        for doomed in prune_plan(&metas, retain) {
-            match snapshots.delete(&namespace, &app, &doomed.name) {
-                Ok(()) => report.pruned += 1,
-                Err(e) => report
-                    .errors
-                    .push(format!("prune {namespace}/{app}/{}: {e}", doomed.name)),
-            }
-        }
+            (report, to_upload)
+        })
+        .await
+        .unwrap_or_else(|_| {
+            let mut report = TickReport::default();
+            report
+                .errors
+                .push("snapshot tick task panicked".to_string());
+            (report, Vec::new())
+        });
 
-        let Some(uploader) = uploader else { continue };
-        let survivors = match snapshots.list(&namespace, &app) {
-            Ok(metas) => metas,
-            Err(_) => continue, // listed above; already reported
-        };
-        for meta in survivors.into_iter().filter(|m| !m.uploaded) {
+    // Phase 2b: upload survivors. `upload_snapshot` does its own spawn_blocking
+    // for the tar/gzip and awaits the object-store put, so this stays async.
+    if let Some(uploader) = uploader {
+        let snapshots = SnapshotManager::new(volumes_dir);
+        for (namespace, app, meta) in to_upload {
             match upload_snapshot(&snapshots, uploader, &meta).await {
                 Ok(()) => report.uploaded += 1,
                 Err(e) => report
