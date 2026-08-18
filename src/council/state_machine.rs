@@ -477,15 +477,24 @@ impl StateMachineInner {
             }
             RaftRequest::Noop => {}
             RaftRequest::UpgradeUpdate { state } => {
-                // Reject starting a *different* upgrade while one is active
-                // (M13). The start/rollback handlers check `active_upgrade`
-                // then write, which is racy — two concurrent starts both passed
-                // the is_some() guard and the second clobbered the first plan
-                // mid-flight. Serialised Raft apply is the right place to
-                // enforce it; a phase update to the active upgrade (same id)
-                // still applies.
+                // Reject starting a *different* upgrade while one is actively in
+                // progress (M13). The start/rollback handlers check
+                // `active_upgrade` then write, which is racy — two concurrent
+                // starts both passed the is_some() guard and the second
+                // clobbered the first plan mid-flight. Serialised Raft apply is
+                // the right place to enforce it.
+                //
+                // A resume legitimately renames the run to a fresh id and
+                // replaces a *Paused* upgrade, so only a different-id write
+                // against a non-paused active upgrade is the race to block; a
+                // same-id phase update, or a resume of a paused run, still
+                // applies.
                 if let Some(active) = &self.state.active_upgrade
                     && active.upgrade_id != state.upgrade_id
+                    && !matches!(
+                        active.phase,
+                        crate::upgrade::types::ClusterUpgradePhase::Paused { .. }
+                    )
                 {
                     return None;
                 }
@@ -2762,6 +2771,31 @@ mod tests {
             inner.state.active_upgrade.as_ref().unwrap().upgrade_id,
             "up-1",
             "a concurrent different-id start must not replace the active upgrade"
+        );
+    }
+
+    #[test]
+    fn upgrade_update_allows_a_resume_of_a_paused_run() {
+        // M13 regression guard: `upgrade resume` renames the run to a fresh id
+        // and replaces the *paused* active upgrade. That must apply — the race
+        // guard only blocks a different-id start against a *non-paused* active
+        // upgrade, not a resume.
+        let mut inner = StateMachineInner::default();
+        let mut paused = upgrade_state("up-1");
+        paused.phase = crate::upgrade::types::ClusterUpgradePhase::Paused {
+            reason: "worker reverted".to_string(),
+        };
+        inner.apply_request(&RaftRequest::UpgradeUpdate {
+            state: Box::new(paused),
+        });
+        // Resume: a fresh id, non-paused phase.
+        inner.apply_request(&RaftRequest::UpgradeUpdate {
+            state: Box::new(upgrade_state("up-1-resume")),
+        });
+        assert_eq!(
+            inner.state.active_upgrade.as_ref().unwrap().upgrade_id,
+            "up-1-resume",
+            "a resume of a paused run must replace the active upgrade"
         );
     }
 
