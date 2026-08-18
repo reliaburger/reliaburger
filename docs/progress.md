@@ -2293,7 +2293,7 @@ blocking calls).
 
 > **Most landed (17 Aug 2026, branch `phase16-medium-dataplane`, PR #162).**
 > Nineteen items fixed with tests; the deletions removed ~800 lines of unwired
-> deploy engine + the superseded coordinator. **Four remain open** as deeper /
+> deploy engine + the superseded coordinator. **Three remain open** as deeper /
 > larger follow-ups, still unchecked below: new-deploys-live-before-health-check
 > (M5), blocking-work-on-async-loop (M7, several sub-items), the rollup
 > backfill-window dedup redesign (the silent-lost-push half is fixed), and `--output` coverage across relish subcommands (M25).
@@ -2442,7 +2442,7 @@ blocking calls).
   it's `node-{gossip_port}`; `node.rs:503` doc says `advertise_address` is auto-detected but
   bun silently falls back to `127.0.0.1` (which then passes
   `enforce_cluster_transport_security`).
-- [ ] **`--output json|yaml` ignored by most relish subcommands** — `src/bin/relish.rs:16-18`
+- [x] **`--output json|yaml` ignored by most relish subcommands** — `src/bin/relish.rs:16-18`
   the global format flag is threaded only into apply/nodes/council/test/bench/wtf/trace;
   `status`/`top`/`images`/`deploy`/`history` ignore it, so `relish --output json status`
   prints human output with exit 0.

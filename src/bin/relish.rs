@@ -1010,7 +1010,7 @@ async fn main() -> ExitCode {
     let result = match command {
         Command::Tui => reliaburger::relish::tui::run().await,
         Command::Apply { ref path, dry_run } => commands::apply(path, cli.output, dry_run).await,
-        Command::Status => commands::status().await,
+        Command::Status => commands::status(cli.output).await,
         Command::Logs {
             ref name,
             tail,
@@ -1039,7 +1039,7 @@ async fn main() -> ExitCode {
             ref source,
             ref sql,
         } => commands::logs_search(source, sql).await,
-        Command::Top => commands::top().await,
+        Command::Top => commands::top(cli.output).await,
         Command::Exec {
             ref app,
             ref command,
@@ -1291,11 +1291,11 @@ async fn main() -> ExitCode {
                 acknowledge,
             } => reliaburger::relish::fault::scenario(path, *dry_run, *speed, *acknowledge).await,
         },
-        Command::Deploy { ref path, dry_run } => commands::deploy(path, dry_run).await,
+        Command::Deploy { ref path, dry_run } => commands::deploy(path, cli.output, dry_run).await,
         Command::History {
             ref app,
             ref namespace,
-        } => commands::history(app, namespace).await,
+        } => commands::history(app, namespace, cli.output).await,
         Command::Rollback {
             ref app,
             ref namespace,
@@ -1311,7 +1311,7 @@ async fn main() -> ExitCode {
         Command::Import { ref files, strict } => commands::import_k8s(files, strict),
         #[cfg(feature = "kubernetes")]
         Command::Export { ref file } => commands::export_k8s(file),
-        Command::Images => commands::images().await,
+        Command::Images => commands::images(cli.output).await,
         Command::Build {
             ref path,
             registry_port,
