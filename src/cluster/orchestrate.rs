@@ -845,16 +845,38 @@ pub fn spawn_placement_reconciler(
                 .cloned()
                 .collect();
             for (name, namespace) in removed {
-                let (response_tx, _response_rx) = tokio::sync::oneshot::channel();
-                let _ = cmd_tx
+                let (response_tx, response_rx) = tokio::sync::oneshot::channel();
+                if cmd_tx
                     .send(AgentCommand::Stop {
                         app_name: name.clone(),
                         namespace: namespace.clone(),
                         response: response_tx,
                     })
-                    .await;
-                applied.remove(&(name, namespace));
-                changed = true;
+                    .await
+                    .is_err()
+                {
+                    // Agent gone; leave the key in `applied` so a later tick
+                    // retries the stop rather than orphaning the instance (DEP3).
+                    continue;
+                }
+                // Only forget the instance once the stop actually succeeded.
+                // Removing it unconditionally (as before) meant a failed or
+                // dropped stop was never retried — the instance kept running
+                // while the reconciler believed it was gone.
+                match response_rx.await {
+                    Ok(Ok(())) => {
+                        applied.remove(&(name, namespace));
+                        changed = true;
+                    }
+                    Ok(Err(e)) => {
+                        eprintln!(
+                            "orchestrator: stop of {name}/{namespace} failed, will retry: {e}"
+                        );
+                    }
+                    Err(_) => {
+                        eprintln!("orchestrator: stop of {name}/{namespace} dropped, will retry");
+                    }
+                }
             }
 
             // Persist the durable checkpoint whenever the applied set moved,

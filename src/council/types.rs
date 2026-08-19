@@ -14,7 +14,6 @@ use openraft::storage::LogState;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
 use crate::config::app::AppSpec;
-use crate::meat::deploy_types::{DeployHistoryEntry, DeployState};
 use crate::meat::types::{AppId, Placement, SchedulingDecision};
 use crate::pickle::types::{
     AttachSignature, DeleteTag, GcReport, ManifestCatalog, ManifestCommit, UpdateLayerLocations,
@@ -111,16 +110,6 @@ pub enum RaftRequest {
     GcReport(GcReport),
     /// Delete a tag from the Pickle manifest catalog.
     DeleteTag(DeleteTag),
-    /// Start or update a deploy operation.
-    DeployUpdate {
-        app_id: AppId,
-        state: Box<DeployState>,
-    },
-    /// Record a completed deploy in history.
-    DeployComplete {
-        app_id: AppId,
-        entry: DeployHistoryEntry,
-    },
     /// Set an autoscale replica override for an app.
     AutoscaleOverride {
         app_id: AppId,
@@ -322,12 +311,6 @@ pub struct DesiredState {
     /// Pickle image registry manifest catalog.
     #[serde(default)]
     pub manifest_catalog: ManifestCatalog,
-    /// Active deploys (one per app at most).
-    #[serde(default)]
-    pub active_deploys: Vec<(String, DeployState)>,
-    /// Deploy history (last 50 per app).
-    #[serde(default)]
-    pub deploy_history: Vec<(String, Vec<DeployHistoryEntry>)>,
     /// Autoscale replica overrides (runtime adjustments above/below baseline).
     #[serde(default)]
     pub autoscale_overrides: Vec<(String, u32)>,

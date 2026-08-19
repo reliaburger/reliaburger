@@ -125,19 +125,33 @@ impl<T: ReportingTransport> RollupWorker<T> {
         let store = self.mayo.read().await;
         let rollup = match self.generator.generate(&store, now, extended).await {
             Ok(r) => r,
-            Err(_) => return,
+            Err(e) => {
+                // A failed generation used to vanish silently; the stateless
+                // generator only rolls up the previous minute, so a swallowed
+                // error is a permanent gap. Log it and retry next tick (M9).
+                eprintln!("mayo: rollup generation failed, skipping this tick: {e}");
+                return;
+            }
         };
         drop(store);
 
-        // Clear the extended flag after a successful generation
-        if extended {
-            self.send_extended = false;
-        }
-
-        let _ = self
+        match self
             .transport
             .send(parent, &ReportingMessage::MetricsRollup(rollup))
-            .await;
+            .await
+        {
+            Ok(()) => {
+                // Only drop the backfill request once it has actually been
+                // sent (M9). Clearing it before the send meant a failed
+                // post-reassignment push lost the 5-minute backfill for good.
+                if extended {
+                    self.send_extended = false;
+                }
+            }
+            Err(e) => {
+                eprintln!("mayo: rollup push to parent failed, will retry next tick: {e}");
+            }
+        }
     }
 }
 

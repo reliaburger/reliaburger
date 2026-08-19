@@ -123,6 +123,23 @@ fn persist_snapshot(db: &Database, data: &[u8], index: u64) -> Result<(), redb::
     Ok(())
 }
 
+/// Persist a snapshot on the blocking pool (M7). `persist_snapshot` commits to
+/// redb, which fsyncs — running it inline on an async openraft method blocked a
+/// tokio runtime worker on disk I/O. A panic in the task maps to a write error.
+// `StorageError<u64>` is large but dictated by openraft; boxing it buys nothing.
+#[allow(clippy::result_large_err)]
+async fn persist_snapshot_blocking(
+    db: Arc<Database>,
+    data: Vec<u8>,
+    index: u64,
+) -> Result<(), StorageError<u64>> {
+    match tokio::task::spawn_blocking(move || persist_snapshot(&db, &data, index)).await {
+        Ok(Ok(())) => Ok(()),
+        Ok(Err(e)) => Err(StorageError::from(StorageIOError::write_state_machine(&e))),
+        Err(e) => Err(StorageError::from(StorageIOError::write_state_machine(&e))),
+    }
+}
+
 /// SHA-256 of the snapshot payload bytes.
 fn snapshot_checksum(data: &[u8]) -> [u8; 32] {
     let mut hasher = Sha256::new();
@@ -196,14 +213,6 @@ impl StateMachineInner {
                 // from its own spec, not a ghost override (DEP8).
                 let key = app_id.to_string();
                 self.state.autoscale_overrides.retain(|(k, _)| k != &key);
-                // An in-flight deploy for a deleted app has nothing left to
-                // deploy, and its history describes an app that no longer
-                // exists. Both are keyed on the same `app_id` string as the
-                // override above, and both were left behind — the deploy state
-                // grew for the lifetime of the cluster and a recreated app
-                // inherited the dead one's history (O20).
-                self.state.active_deploys.retain(|(k, _)| k != &key);
-                self.state.deploy_history.retain(|(k, _)| k != &key);
                 let prefix = format!("{app_id}/");
                 self.state
                     .security_state
@@ -235,38 +244,6 @@ impl StateMachineInner {
             }
             RaftRequest::DeleteTag(delete) => {
                 self.state.manifest_catalog.apply_delete_tag(delete);
-            }
-            RaftRequest::DeployUpdate { app_id, state } => {
-                let key = app_id.to_string();
-                if let Some((_, existing)) = self
-                    .state
-                    .active_deploys
-                    .iter_mut()
-                    .find(|(k, _)| k == &key)
-                {
-                    *existing = *state.clone();
-                } else {
-                    self.state.active_deploys.push((key, *state.clone()));
-                }
-            }
-            RaftRequest::DeployComplete { app_id, entry } => {
-                let key = app_id.to_string();
-                // Remove from active
-                self.state.active_deploys.retain(|(k, _)| k != &key);
-                // Add to history (cap at 50 per app)
-                if let Some((_, history)) = self
-                    .state
-                    .deploy_history
-                    .iter_mut()
-                    .find(|(k, _)| k == &key)
-                {
-                    history.push(entry.clone());
-                    if history.len() > 50 {
-                        history.remove(0);
-                    }
-                } else {
-                    self.state.deploy_history.push((key, vec![entry.clone()]));
-                }
             }
             RaftRequest::AutoscaleOverride {
                 app_id,
@@ -509,12 +486,35 @@ impl StateMachineInner {
                     .entries
                     .retain(|e| e.expires_at.is_none_or(|expiry| expiry > logical_now));
                 self.state.security_state.crl.version += 1;
-                self.state.security_state.crl.updated_at = std::time::SystemTime::now();
+                // Deterministic like the prune above (M12): a `SystemTime::now()`
+                // here makes every replica store a different `updated_at`, so
+                // the replicated state machines diverge on that field. Use the
+                // in-log `revoked_at` so all replicas agree.
+                self.state.security_state.crl.updated_at = logical_now;
             }
             RaftRequest::Noop => {}
             RaftRequest::UpgradeUpdate { state } => {
-                // Last-writer-wins: only the leader's orchestrator writes,
-                // and it always writes the full state.
+                // Reject starting a *different* upgrade while one is actively in
+                // progress (M13). The start/rollback handlers check
+                // `active_upgrade` then write, which is racy — two concurrent
+                // starts both passed the is_some() guard and the second
+                // clobbered the first plan mid-flight. Serialised Raft apply is
+                // the right place to enforce it.
+                //
+                // A resume legitimately renames the run to a fresh id and
+                // replaces a *Paused* upgrade, so only a different-id write
+                // against a non-paused active upgrade is the race to block; a
+                // same-id phase update, or a resume of a paused run, still
+                // applies.
+                if let Some(active) = &self.state.active_upgrade
+                    && active.upgrade_id != state.upgrade_id
+                    && !matches!(
+                        active.phase,
+                        crate::upgrade::types::ClusterUpgradePhase::Paused { .. }
+                    )
+                {
+                    return None;
+                }
                 self.state.active_upgrade = Some(*state.clone());
             }
             RaftRequest::UpgradeClear { upgrade_id } => {
@@ -1174,17 +1174,20 @@ impl RaftStateMachine<TypeConfig> for CouncilStateMachine {
         let new_state: DesiredState = serde_json::from_slice(&data)
             .map_err(|e| StorageError::from(StorageIOError::read_state_machine(&e)))?;
 
-        let mut guard = self.inner.write().await;
-        guard.state = new_state;
-        guard.state.last_applied_log = meta.last_log_id;
-        guard.state.last_membership = meta.last_membership.clone();
-        guard.snapshot_index += 1;
-        guard.snapshot_data = Some(data.clone());
+        let (db, index) = {
+            let mut guard = self.inner.write().await;
+            guard.state = new_state;
+            guard.state.last_applied_log = meta.last_log_id;
+            guard.state.last_membership = meta.last_membership.clone();
+            guard.snapshot_index += 1;
+            guard.snapshot_data = Some(data.clone());
+            (guard.db.clone(), guard.snapshot_index)
+        };
 
-        // Persist the installed snapshot so it survives a restart too.
-        if let Some(db) = &guard.db {
-            persist_snapshot(db, &data, guard.snapshot_index)
-                .map_err(|e| StorageError::from(StorageIOError::write_state_machine(&e)))?;
+        // Persist the installed snapshot so it survives a restart too, off the
+        // async runtime (M7): the lock is released before the fsync.
+        if let Some(db) = db {
+            persist_snapshot_blocking(db, data, index).await?;
         }
         Ok(())
     }
@@ -1222,25 +1225,31 @@ pub struct MemSnapshotBuilder {
 
 impl RaftSnapshotBuilder<TypeConfig> for MemSnapshotBuilder {
     async fn build_snapshot(&mut self) -> Result<Snapshot<TypeConfig>, StorageError<u64>> {
-        let mut guard = self.inner.write().await;
+        let (data, index, db, last_log_id, last_membership) = {
+            let mut guard = self.inner.write().await;
+            let data = serde_json::to_vec(&guard.state)
+                .map_err(|e| StorageError::from(StorageIOError::read_state_machine(&e)))?;
+            guard.snapshot_index += 1;
+            guard.snapshot_data = Some(data.clone());
+            (
+                data,
+                guard.snapshot_index,
+                guard.db.clone(),
+                guard.state.last_applied_log,
+                guard.state.last_membership.clone(),
+            )
+        };
 
-        let data = serde_json::to_vec(&guard.state)
-            .map_err(|e| StorageError::from(StorageIOError::read_state_machine(&e)))?;
-
-        guard.snapshot_index += 1;
-        let snapshot_id = format!("mem-{}", guard.snapshot_index);
-        guard.snapshot_data = Some(data.clone());
-
-        // Persist so applied state survives a restart.
-        if let Some(db) = &guard.db {
-            persist_snapshot(db, &data, guard.snapshot_index)
-                .map_err(|e| StorageError::from(StorageIOError::write_state_machine(&e)))?;
+        // Persist so applied state survives a restart, off the async runtime
+        // (M7): the lock is released before the fsync.
+        if let Some(db) = db {
+            persist_snapshot_blocking(db, data.clone(), index).await?;
         }
 
         let meta = SnapshotMeta {
-            last_log_id: guard.state.last_applied_log,
-            last_membership: guard.state.last_membership.clone(),
-            snapshot_id,
+            last_log_id,
+            last_membership,
+            snapshot_id: format!("mem-{index}"),
         };
 
         Ok(Snapshot {
@@ -2186,127 +2195,6 @@ mod tests {
         );
     }
 
-    // -- Deploy state machine tests ------------------------------------------
-
-    fn test_deploy_state() -> crate::meat::deploy_types::DeployState {
-        use crate::meat::deploy_types::*;
-        DeployState::new(
-            DeployId(1),
-            DeployRequest {
-                app_id: AppId::new("web", "prod"),
-                new_image: "myapp:v2".to_string(),
-                previous_image: Some("myapp:v1".to_string()),
-                config: DeployConfig::default(),
-                pre_deploy_jobs: Vec::new(),
-            },
-        )
-    }
-
-    fn test_deploy_history_entry() -> crate::meat::deploy_types::DeployHistoryEntry {
-        use crate::meat::deploy_types::*;
-        DeployHistoryEntry {
-            id: DeployId(1),
-            app_id: AppId::new("web", "prod"),
-            image: "myapp:v2".to_string(),
-            result: DeployResult::Completed,
-            created_at: std::time::SystemTime::UNIX_EPOCH,
-            completed_at: std::time::SystemTime::UNIX_EPOCH,
-            steps_completed: 3,
-            steps_total: 3,
-            spec: None,
-        }
-    }
-
-    #[tokio::test]
-    async fn apply_deploy_update_stores_active_deploy() {
-        let mut sm = CouncilStateMachine::new();
-        let deploy = test_deploy_state();
-        let entry = normal_entry(
-            1,
-            1,
-            RaftRequest::DeployUpdate {
-                app_id: AppId::new("web", "prod"),
-                state: Box::new(deploy),
-            },
-        );
-        sm.apply(vec![entry]).await.unwrap();
-
-        let state = sm.desired_state().await;
-        assert_eq!(state.active_deploys.len(), 1);
-    }
-
-    #[tokio::test]
-    async fn apply_deploy_complete_moves_to_history() {
-        let mut sm = CouncilStateMachine::new();
-
-        // First: start a deploy
-        let deploy = test_deploy_state();
-        sm.apply(vec![normal_entry(
-            1,
-            1,
-            RaftRequest::DeployUpdate {
-                app_id: AppId::new("web", "prod"),
-                state: Box::new(deploy),
-            },
-        )])
-        .await
-        .unwrap();
-
-        // Then: complete it
-        let entry = test_deploy_history_entry();
-        sm.apply(vec![normal_entry(
-            1,
-            2,
-            RaftRequest::DeployComplete {
-                app_id: AppId::new("web", "prod"),
-                entry,
-            },
-        )])
-        .await
-        .unwrap();
-
-        let state = sm.desired_state().await;
-        assert!(state.active_deploys.is_empty());
-        assert_eq!(state.deploy_history.len(), 1);
-        assert_eq!(state.deploy_history[0].1.len(), 1);
-    }
-
-    #[tokio::test]
-    async fn deploy_history_capped_at_50() {
-        let mut sm = CouncilStateMachine::new();
-
-        for i in 0..55 {
-            let mut entry = test_deploy_history_entry();
-            entry.id = crate::meat::deploy_types::DeployId(i);
-            sm.apply(vec![normal_entry(
-                1,
-                i + 1,
-                RaftRequest::DeployComplete {
-                    app_id: AppId::new("web", "prod"),
-                    entry,
-                },
-            )])
-            .await
-            .unwrap();
-        }
-
-        let state = sm.desired_state().await;
-        let history = &state.deploy_history[0].1;
-        assert_eq!(history.len(), 50);
-    }
-
-    #[tokio::test]
-    async fn deploy_raft_serde_round_trip() {
-        let deploy = test_deploy_state();
-        let req = RaftRequest::DeployUpdate {
-            app_id: AppId::new("web", "prod"),
-            state: Box::new(deploy),
-        };
-        let json = serde_json::to_string(&req).unwrap();
-        let decoded: RaftRequest = serde_json::from_str(&json).unwrap();
-        assert_eq!(req, decoded);
-    }
-
     // --- SecurityState Raft tests ---
 
     #[test]
@@ -2891,6 +2779,50 @@ mod tests {
 
         assert_eq!(inner.state.active_upgrade, Some(advanced));
         assert!(inner.state.upgrade_history.is_empty());
+    }
+
+    #[test]
+    fn upgrade_update_ignores_a_concurrent_different_start() {
+        // M13: a second start with a *different* upgrade id while one is active
+        // must not clobber the first plan (the racy check-then-write let two
+        // concurrent starts through). A same-id update still applies.
+        let mut inner = StateMachineInner::default();
+        inner.apply_request(&RaftRequest::UpgradeUpdate {
+            state: Box::new(upgrade_state("up-1")),
+        });
+        inner.apply_request(&RaftRequest::UpgradeUpdate {
+            state: Box::new(upgrade_state("up-2")),
+        });
+        assert_eq!(
+            inner.state.active_upgrade.as_ref().unwrap().upgrade_id,
+            "up-1",
+            "a concurrent different-id start must not replace the active upgrade"
+        );
+    }
+
+    #[test]
+    fn upgrade_update_allows_a_resume_of_a_paused_run() {
+        // M13 regression guard: `upgrade resume` renames the run to a fresh id
+        // and replaces the *paused* active upgrade. That must apply — the race
+        // guard only blocks a different-id start against a *non-paused* active
+        // upgrade, not a resume.
+        let mut inner = StateMachineInner::default();
+        let mut paused = upgrade_state("up-1");
+        paused.phase = crate::upgrade::types::ClusterUpgradePhase::Paused {
+            reason: "worker reverted".to_string(),
+        };
+        inner.apply_request(&RaftRequest::UpgradeUpdate {
+            state: Box::new(paused),
+        });
+        // Resume: a fresh id, non-paused phase.
+        inner.apply_request(&RaftRequest::UpgradeUpdate {
+            state: Box::new(upgrade_state("up-1-resume")),
+        });
+        assert_eq!(
+            inner.state.active_upgrade.as_ref().unwrap().upgrade_id,
+            "up-1-resume",
+            "a resume of a paused run must replace the active upgrade"
+        );
     }
 
     #[test]
@@ -3658,79 +3590,6 @@ mod tests {
         assert!(state.test_leases.is_empty());
     }
 
-    /// O20: `AppDelete` cleared apps, scheduling, autoscale overrides and
-    /// secret seals but left the deploy state behind, so the Raft state grew
-    /// for the lifetime of the cluster and an app recreated under the same
-    /// name inherited the dead one's history.
-    #[test]
-    fn deleting_an_app_clears_its_deploy_state() {
-        use crate::meat::deploy_types::{DeployHistoryEntry, DeployId, DeployResult, DeployState};
-        use crate::meat::types::AppId;
-
-        let app_id = AppId {
-            name: "web".to_string(),
-            namespace: "default".to_string(),
-        };
-        let other = AppId {
-            name: "api".to_string(),
-            namespace: "default".to_string(),
-        };
-        let request = |id: &AppId, image: &str| crate::meat::deploy_types::DeployRequest {
-            app_id: id.clone(),
-            new_image: image.to_string(),
-            previous_image: None,
-            config: Default::default(),
-            pre_deploy_jobs: Vec::new(),
-        };
-        let entry = |id: &AppId| DeployHistoryEntry {
-            id: DeployId(1),
-            app_id: id.clone(),
-            image: "web:v1".to_string(),
-            result: DeployResult::Completed,
-            created_at: std::time::SystemTime::UNIX_EPOCH,
-            completed_at: std::time::SystemTime::UNIX_EPOCH,
-            steps_completed: 1,
-            steps_total: 1,
-            spec: None,
-        };
-
-        let mut inner = StateMachineInner::default();
-        for id in [&app_id, &other] {
-            inner.apply_request(&RaftRequest::DeployUpdate {
-                app_id: id.clone(),
-                state: Box::new(DeployState::new(DeployId(1), request(id, "web:v1"))),
-            });
-            inner.apply_request(&RaftRequest::DeployComplete {
-                app_id: id.clone(),
-                entry: entry(id),
-            });
-            // Re-open an active deploy so both maps have an entry to clear.
-            inner.apply_request(&RaftRequest::DeployUpdate {
-                app_id: id.clone(),
-                state: Box::new(DeployState::new(DeployId(2), request(id, "web:v2"))),
-            });
-        }
-        assert_eq!(inner.state.active_deploys.len(), 2);
-        assert_eq!(inner.state.deploy_history.len(), 2);
-
-        inner.apply_request(&RaftRequest::AppDelete {
-            app_id: app_id.clone(),
-        });
-
-        let key = app_id.to_string();
-        assert!(
-            !inner.state.active_deploys.iter().any(|(k, _)| k == &key),
-            "a deleted app left an active deploy behind"
-        );
-        assert!(
-            !inner.state.deploy_history.iter().any(|(k, _)| k == &key),
-            "a deleted app left its deploy history behind"
-        );
-        // The other app is untouched — deletion is scoped, not a sweep.
-        assert_eq!(inner.state.active_deploys.len(), 1);
-        assert_eq!(inner.state.deploy_history.len(), 1);
-    }
-
     /// O5: the CRL is replicated in every snapshot and scanned on every TLS
     /// handshake, and nothing ever removed an entry. An expired certificate
     /// fails validation with or without one, so those entries are pure
@@ -3821,5 +3680,24 @@ mod tests {
 
         assert_eq!(apply_all(), apply_all());
         assert_eq!(apply_all(), vec![2]);
+    }
+
+    /// M12: `crl.updated_at` must come from the in-log `revoked_at`, not
+    /// `SystemTime::now()`, or replicas store different values and the
+    /// replicated state machines diverge on that field.
+    #[test]
+    fn crl_updated_at_is_the_in_log_timestamp() {
+        use crate::sesame::types::{CaRole, CrlEntry, SerialNumber};
+
+        let revoked_at = std::time::SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(1234);
+        let mut inner = StateMachineInner::default();
+        inner.apply_request(&RaftRequest::RevokeCertificate(CrlEntry {
+            serial: SerialNumber(1),
+            issuer: CaRole::Node,
+            revoked_at,
+            reason: "one".to_string(),
+            expires_at: None,
+        }));
+        assert_eq!(inner.state.security_state.crl.updated_at, revoked_at);
     }
 }

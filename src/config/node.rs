@@ -312,7 +312,9 @@ pub struct UpgradeSection {
     pub external_signing_key: Option<String>,
     /// Number of previous binary versions to retain on disk for rollback.
     pub retain_versions: u32,
-    /// Release metadata endpoint URL for `relish upgrade check`.
+    /// Default release-metadata endpoint. Reserved: `relish upgrade check`
+    /// currently takes its own `--url` (defaulting to a compiled-in constant)
+    /// and does not read this node-config value.
     pub release_url: String,
     /// Directory holding the versioned binaries and the entry symlink.
     /// Defaults to the directory of the resolved current executable.
@@ -321,6 +323,8 @@ pub struct UpgradeSection {
     /// swap counts as verified.
     pub boot_grace_secs: u64,
     /// Seconds the new binary has to rejoin gossip (cluster mode only).
+    /// Reserved: parsed but not yet enforced (TODO Phase 14 — the cluster-mode
+    /// upgrade-verify path does not yet require a gossip rejoin).
     pub gossip_rejoin_secs: u64,
     /// Boot attempts on the new version before automatic revert.
     pub max_boot_attempts: u32,
@@ -349,7 +353,7 @@ impl Default for UpgradeSection {
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct NodeSection {
-    /// Node name. Defaults to hostname if omitted.
+    /// Node name. Defaults to `node-<gossip_port>` if omitted.
     pub name: Option<String>,
     /// Arbitrary key-value labels for placement constraints.
     pub labels: BTreeMap<String, String>,
@@ -499,7 +503,8 @@ impl Default for ResourcesSection {
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct NetworkSection {
-    /// IP address advertised to the cluster. Auto-detected if omitted.
+    /// IP address advertised to the cluster. Falls back to `127.0.0.1` if
+    /// omitted or unparseable (single-node / loopback default).
     pub advertise_address: Option<String>,
     /// Ephemeral port range for container port mapping.
     pub port_range: PortRange,
@@ -531,7 +536,9 @@ impl Default for PortRange {
 pub struct ReportingTreeSection {
     /// How often worker nodes send StateReports (seconds).
     pub report_interval_secs: u64,
-    /// Maximum events in a single report's event log.
+    /// Maximum events in a single report's event log. Reserved: plumbed into
+    /// ClusterParams but not yet enforced — the worker does not currently
+    /// truncate a report's event log to this cap.
     pub max_events_per_report: usize,
     /// Time after which a report is considered stale (seconds).
     pub stale_report_timeout_secs: u64,
@@ -591,12 +598,15 @@ impl ReconstructionSection {
         };
         if self.report_threshold_percent == 0 || self.report_threshold_percent > 100 {
             return Err(bad(
-                "coverage_percent",
+                "report_threshold_percent",
                 "must be between 1 and 100 inclusive",
             ));
         }
         if self.learning_period_timeout_secs == 0 {
-            return Err(bad("timeout_secs", "must be greater than zero"));
+            return Err(bad(
+                "learning_period_timeout_secs",
+                "must be greater than zero",
+            ));
         }
         if self.large_cluster_timeout_secs == 0 {
             return Err(bad(

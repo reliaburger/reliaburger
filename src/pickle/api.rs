@@ -458,8 +458,14 @@ async fn blob_get(state: &PickleState, _name: &str, digest_str: &str) -> Respons
         return StatusCode::BAD_REQUEST.into_response();
     };
 
-    match state.store.read_blob(&digest) {
-        Ok(data) => {
+    // read_blob is a synchronous `std::fs::read` of the whole blob (up to the
+    // request ceiling). Run it on the blocking pool (M7) so a large GET doesn't
+    // stall an async runtime worker while the file is read.
+    let store = Arc::clone(&state.store);
+    let read_digest = digest.clone();
+    let read = tokio::task::spawn_blocking(move || store.read_blob(&read_digest)).await;
+    match read {
+        Ok(Ok(data)) => {
             let mut headers = HeaderMap::new();
             headers.insert(
                 "content-length",
@@ -477,7 +483,8 @@ async fn blob_get(state: &PickleState, _name: &str, digest_str: &str) -> Respons
             );
             (StatusCode::OK, headers, data).into_response()
         }
-        Err(_) => StatusCode::NOT_FOUND.into_response(),
+        Ok(Err(_)) => StatusCode::NOT_FOUND.into_response(),
+        Err(_) => StatusCode::INTERNAL_SERVER_ERROR.into_response(),
     }
 }
 

@@ -84,6 +84,14 @@ fn batches_to_json(batches: &[RecordBatch]) -> Vec<serde_json::Value> {
 /// monolithic block.
 const LOG_ROW_GROUP_SIZE: usize = 8192;
 
+/// Hard ceiling on unflushed log entries (M8). If flushing keeps failing (e.g.
+/// disk full — logged every 60s by the flush task) the buffer would otherwise
+/// grow without bound while containers keep logging, eventually OOM-ing the
+/// node. At the cap the oldest entries are dropped: shedding the tail of the
+/// log backlog is the lesser evil compared with killing the whole node.
+/// RollupStore bounds itself the same way.
+const MAX_BUFFER_ROWS: usize = 1_000_000;
+
 /// Parquet writer properties for flushed log files.
 ///
 /// Two optimisations, both of which only matter for the *archive* read
@@ -160,20 +168,70 @@ fn dir_has_parquet(data_dir: &std::path::Path) -> bool {
         .unwrap_or(false)
 }
 
-/// Flush a shared log store, returning whether anything was written.
+/// A drained log buffer ready to be written to Parquet, decoupled from the
+/// store so the caller can release its lock before the (blocking) write (M7).
+pub struct LogPendingFlush {
+    data_dir: std::path::PathBuf,
+    path: std::path::PathBuf,
+    batch: RecordBatch,
+}
+
+/// Persist a [`LogPendingFlush`] on the blocking pool, with no lock held so
+/// concurrent appends/queries proceed while the write is in flight (M7).
+/// Durable write (M6): temp file, fsync, atomic rename, dir fsync.
+pub async fn write_log_pending(pending: LogPendingFlush) -> Result<(), KetchupError> {
+    let LogPendingFlush {
+        data_dir,
+        path,
+        batch,
+    } = pending;
+    tokio::task::spawn_blocking(move || -> Result<(), KetchupError> {
+        std::fs::create_dir_all(&data_dir)?;
+        let tmp = path.with_extension("parquet.tmp");
+        let file = std::fs::File::create(&tmp)?;
+        let mut writer =
+            ArrowWriter::try_new(file, Arc::new(log_schema()), Some(log_writer_properties()))
+                .map_err(|e| KetchupError::Io(std::io::Error::other(e.to_string())))?;
+        writer
+            .write(&batch)
+            .map_err(|e| KetchupError::Io(std::io::Error::other(e.to_string())))?;
+        let file = writer
+            .into_inner()
+            .map_err(|e| KetchupError::Io(std::io::Error::other(e.to_string())))?;
+        file.sync_all()?;
+        std::fs::rename(&tmp, &path)?;
+        if let Some(dir) = path.parent()
+            && let Ok(dir_file) = std::fs::File::open(dir)
+        {
+            let _ = dir_file.sync_all();
+        }
+        Ok(())
+    })
+    .await
+    .map_err(|e| KetchupError::Io(std::io::Error::other(e.to_string())))?
+}
+
+/// Flush a shared log store without holding its write lock across the (blocking)
+/// encode + write (M7). Drains under a brief lock, releases it, then writes on
+/// the blocking pool. Returns `true` if a file was written.
 ///
 /// Extracted from the `bun` shutdown path (OBS7) so the "flush the shared
 /// buffer on stop" step is unit-tested here instead of living only in the
-/// binary. Returns `true` if the buffer held entries that were flushed.
+/// binary.
 pub async fn flush_shared(
     store: &std::sync::Arc<tokio::sync::RwLock<LogStore>>,
 ) -> Result<bool, KetchupError> {
-    let mut guard = store.write().await;
-    if guard.buffer_len() == 0 {
-        return Ok(false);
+    let pending = {
+        let mut guard = store.write().await;
+        guard.take_flush_batch()?
+    };
+    match pending {
+        Some(p) => {
+            write_log_pending(p).await?;
+            Ok(true)
+        }
+        None => Ok(false),
     }
-    guard.flush().await?;
-    Ok(true)
 }
 
 /// A buffered log entry waiting to be flushed.
@@ -246,6 +304,12 @@ impl LogStore {
             stream: stream_str.to_string(),
             line: line.to_string(),
         });
+        // Bound memory if flushing is failing (M8): drop the oldest entries
+        // rather than let a stuck flush grow the buffer until the node OOMs.
+        if self.buffer.len() > MAX_BUFFER_ROWS {
+            let overflow = self.buffer.len() - MAX_BUFFER_ROWS;
+            self.buffer.drain(0..overflow);
+        }
     }
 
     /// Number of unflushed entries.
@@ -280,33 +344,36 @@ impl LogStore {
         Ok(Some(batch))
     }
 
-    /// Flush the buffer to Parquet.
-    pub async fn flush(&mut self) -> Result<(), KetchupError> {
-        let batch = self.buffer_to_batch()?;
-        let Some(batch) = batch else {
-            return Ok(());
+    /// Drain the buffer into a self-contained [`LogPendingFlush`] the caller
+    /// writes later, outside any lock (M7). Bumps the flush counter and clears
+    /// the buffer immediately, so the file name is reserved before the (slow)
+    /// write. Returns `None` when there's nothing to flush.
+    pub fn take_flush_batch(&mut self) -> Result<Option<LogPendingFlush>, KetchupError> {
+        let Some(batch) = self.buffer_to_batch()? else {
+            return Ok(None);
         };
-
-        std::fs::create_dir_all(&self.data_dir)?;
         let filename = format!("logs_{:06}.parquet", self.flush_counter);
         let path = self.data_dir.join(filename);
-
-        let file = std::fs::File::create(&path)?;
-        let mut writer =
-            ArrowWriter::try_new(file, Arc::new(log_schema()), Some(log_writer_properties()))
-                .map_err(|e| KetchupError::Io(std::io::Error::other(e.to_string())))?;
-        writer
-            .write(&batch)
-            .map_err(|e| KetchupError::Io(std::io::Error::other(e.to_string())))?;
-        writer
-            .close()
-            .map_err(|e| KetchupError::Io(std::io::Error::other(e.to_string())))?;
-
-        // Durable on disk now; drop from memory. Queries read it back from the
-        // Parquet directory (see `session`).
         self.buffer.clear();
         self.flush_counter += 1;
-        Ok(())
+        Ok(Some(LogPendingFlush {
+            data_dir: self.data_dir.clone(),
+            path,
+            batch,
+        }))
+    }
+
+    /// Flush the buffer to Parquet.
+    ///
+    /// Convenience keeping the whole operation under `&mut self`; the encode +
+    /// write runs on the blocking pool (M7). Callers holding a shared lock
+    /// across readers should prefer [`take_flush_batch`](Self::take_flush_batch)
+    /// + [`write_log_pending`] so the lock is released during the I/O.
+    pub async fn flush(&mut self) -> Result<(), KetchupError> {
+        let Some(pending) = self.take_flush_batch()? else {
+            return Ok(());
+        };
+        write_log_pending(pending).await
     }
 
     /// Build a DataFusion session exposing a `logs` table over the on-disk

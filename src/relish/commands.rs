@@ -69,29 +69,42 @@ async fn apply_with_client(
 }
 
 /// Show cluster and app status.
-pub async fn status() -> Result<(), RelishError> {
-    status_with_client(&BunClient::default_local()).await
+pub async fn status(output: OutputFormat) -> Result<(), RelishError> {
+    status_with_client(output, &BunClient::default_local()).await
 }
 
-async fn status_with_client(client: &BunClient) -> Result<(), RelishError> {
+async fn status_with_client(output: OutputFormat, client: &BunClient) -> Result<(), RelishError> {
     let statuses = client.status().await?;
 
-    if statuses.is_empty() {
-        println!("no workloads running");
-    } else {
-        println!(
-            "{:<20} {:<15} {:<12} {:<10} {:<10} {:<6}",
-            "INSTANCE", "APP", "NAMESPACE", "STATE", "PID", "RESTARTS"
-        );
-        for s in &statuses {
-            let pid = s
-                .pid
-                .map(|p| p.to_string())
-                .unwrap_or_else(|| "-".to_string());
-            println!(
-                "{:<20} {:<15} {:<12} {:<10} {:<10} {:<6}",
-                s.id, s.app_name, s.namespace, s.state, pid, s.restart_count
-            );
+    match output {
+        OutputFormat::Human => {
+            if statuses.is_empty() {
+                println!("no workloads running");
+            } else {
+                println!(
+                    "{:<20} {:<15} {:<12} {:<10} {:<10} {:<6}",
+                    "INSTANCE", "APP", "NAMESPACE", "STATE", "PID", "RESTARTS"
+                );
+                for s in &statuses {
+                    let pid = s
+                        .pid
+                        .map(|p| p.to_string())
+                        .unwrap_or_else(|| "-".to_string());
+                    println!(
+                        "{:<20} {:<15} {:<12} {:<10} {:<10} {:<6}",
+                        s.id, s.app_name, s.namespace, s.state, pid, s.restart_count
+                    );
+                }
+            }
+        }
+        OutputFormat::Json => {
+            let json =
+                serde_json::to_string_pretty(&statuses).map_err(RelishError::SerialiseJson)?;
+            println!("{json}");
+        }
+        OutputFormat::Yaml => {
+            let yaml = serde_yaml::to_string(&statuses).map_err(RelishError::SerialiseYaml)?;
+            print!("{yaml}");
         }
     }
 
@@ -871,15 +884,17 @@ async fn routes_with_client(client: &BunClient) -> Result<(), RelishError> {
 /// (if the app already exists, the agent performs a rolling update).
 /// With `--dry-run`, prints the plan and exits 0 without deploying;
 /// otherwise an unreachable agent is an error (X5).
-pub async fn deploy(path: &Path, dry_run: bool) -> Result<(), RelishError> {
+pub async fn deploy(path: &Path, output: OutputFormat, dry_run: bool) -> Result<(), RelishError> {
     let config = Config::from_file(path)?;
     config.validate()?;
 
     if dry_run {
         let plan = generate_plan(&config, None);
-        let formatted = format_output(&plan, super::OutputFormat::Human)?;
+        let formatted = format_output(&plan, output)?;
         println!("{formatted}");
-        println!("\n(dry run — nothing deployed)");
+        if matches!(output, OutputFormat::Human) {
+            println!("\n(dry run — nothing deployed)");
+        }
         return Ok(());
     }
 
@@ -887,11 +902,23 @@ pub async fn deploy(path: &Path, dry_run: bool) -> Result<(), RelishError> {
     match client.health().await {
         Ok(()) => {
             let result = client.apply(&config).await?;
-            println!(
-                "deploy started: {} instance(s): {}",
-                result.created,
-                result.instances.join(", ")
-            );
+            match output {
+                OutputFormat::Human => println!(
+                    "deploy started: {} instance(s): {}",
+                    result.created,
+                    result.instances.join(", ")
+                ),
+                OutputFormat::Json => {
+                    let json = serde_json::to_string_pretty(&result)
+                        .map_err(RelishError::SerialiseJson)?;
+                    println!("{json}");
+                }
+                OutputFormat::Yaml => {
+                    let yaml =
+                        serde_yaml::to_string(&result).map_err(RelishError::SerialiseYaml)?;
+                    print!("{yaml}");
+                }
+            }
             Ok(())
         }
         Err(_) => {
@@ -906,7 +933,7 @@ pub async fn deploy(path: &Path, dry_run: bool) -> Result<(), RelishError> {
 }
 
 /// Show deploy history for an app in a namespace.
-pub async fn history(app: &str, namespace: &str) -> Result<(), RelishError> {
+pub async fn history(app: &str, namespace: &str, output: OutputFormat) -> Result<(), RelishError> {
     let client = BunClient::default_local();
     // Authenticated + CA-trusting request (M21): the previous bare
     // `reqwest::get` carried no bearer/CA, so it 401'd against a secured agent
@@ -914,22 +941,35 @@ pub async fn history(app: &str, namespace: &str) -> Result<(), RelishError> {
     // client and propagates the failure.
     let entries = client.deploy_history(app, namespace).await?;
 
-    if entries.is_empty() {
-        println!("no deploy history for {app} in namespace {namespace}");
-    } else {
-        println!(
-            "{:<8} {:<20} {:<12} {:<6} {:<6}",
-            "ID", "IMAGE", "RESULT", "DONE", "TOTAL"
-        );
-        for e in &entries {
-            println!(
-                "{:<8} {:<20} {:<12} {:<6} {:<6}",
-                e["id"].as_u64().unwrap_or(0),
-                e["image"].as_str().unwrap_or("-"),
-                e["result"].as_str().unwrap_or("-"),
-                e["steps_completed"].as_u64().unwrap_or(0),
-                e["steps_total"].as_u64().unwrap_or(0),
-            );
+    match output {
+        OutputFormat::Human => {
+            if entries.is_empty() {
+                println!("no deploy history for {app} in namespace {namespace}");
+            } else {
+                println!(
+                    "{:<8} {:<20} {:<12} {:<6} {:<6}",
+                    "ID", "IMAGE", "RESULT", "DONE", "TOTAL"
+                );
+                for e in &entries {
+                    println!(
+                        "{:<8} {:<20} {:<12} {:<6} {:<6}",
+                        e["id"].as_u64().unwrap_or(0),
+                        e["image"].as_str().unwrap_or("-"),
+                        e["result"].as_str().unwrap_or("-"),
+                        e["steps_completed"].as_u64().unwrap_or(0),
+                        e["steps_total"].as_u64().unwrap_or(0),
+                    );
+                }
+            }
+        }
+        OutputFormat::Json => {
+            let json =
+                serde_json::to_string_pretty(&entries).map_err(RelishError::SerialiseJson)?;
+            println!("{json}");
+        }
+        OutputFormat::Yaml => {
+            let yaml = serde_yaml::to_string(&entries).map_err(RelishError::SerialiseYaml)?;
+            print!("{yaml}");
         }
     }
 
@@ -1131,28 +1171,40 @@ pub fn export_k8s(file: &Path) -> Result<(), RelishError> {
 /// Named `top` by analogy, but it does not (yet) report live CPU/memory usage;
 /// the title and help say what it actually shows rather than promising resource
 /// figures it doesn't print (O19).
-pub async fn top() -> Result<(), RelishError> {
+pub async fn top(output: OutputFormat) -> Result<(), RelishError> {
     let client = BunClient::default_local();
     let statuses = client.status().await?;
 
-    if statuses.is_empty() {
-        println!("no workloads running");
-        return Ok(());
-    }
-
-    println!(
-        "{:<20} {:<12} {:<10} {:<10} {:<10}",
-        "APP", "NAMESPACE", "STATE", "PID", "RESTARTS"
-    );
-    for s in &statuses {
-        let pid = s
-            .pid
-            .map(|p| p.to_string())
-            .unwrap_or_else(|| "-".to_string());
-        println!(
-            "{:<20} {:<12} {:<10} {:<10} {:<10}",
-            s.app_name, s.namespace, s.state, pid, s.restart_count
-        );
+    match output {
+        OutputFormat::Human => {
+            if statuses.is_empty() {
+                println!("no workloads running");
+                return Ok(());
+            }
+            println!(
+                "{:<20} {:<12} {:<10} {:<10} {:<10}",
+                "APP", "NAMESPACE", "STATE", "PID", "RESTARTS"
+            );
+            for s in &statuses {
+                let pid = s
+                    .pid
+                    .map(|p| p.to_string())
+                    .unwrap_or_else(|| "-".to_string());
+                println!(
+                    "{:<20} {:<12} {:<10} {:<10} {:<10}",
+                    s.app_name, s.namespace, s.state, pid, s.restart_count
+                );
+            }
+        }
+        OutputFormat::Json => {
+            let json =
+                serde_json::to_string_pretty(&statuses).map_err(RelishError::SerialiseJson)?;
+            println!("{json}");
+        }
+        OutputFormat::Yaml => {
+            let yaml = serde_yaml::to_string(&statuses).map_err(RelishError::SerialiseYaml)?;
+            print!("{yaml}");
+        }
     }
 
     Ok(())
@@ -1175,9 +1227,22 @@ pub async fn sign(image: &str) -> Result<(), RelishError> {
     Ok(())
 }
 
-pub async fn images() -> Result<(), RelishError> {
+pub async fn images(output: OutputFormat) -> Result<(), RelishError> {
     let client = BunClient::default_local();
     let result = client.images().await?;
+    if let OutputFormat::Json | OutputFormat::Yaml = output {
+        let text = match output {
+            OutputFormat::Json => {
+                serde_json::to_string_pretty(&result).map_err(RelishError::SerialiseJson)?
+            }
+            _ => serde_yaml::to_string(&result).map_err(RelishError::SerialiseYaml)?,
+        };
+        print!("{text}");
+        if matches!(output, OutputFormat::Json) {
+            println!();
+        }
+        return Ok(());
+    }
     let images = result["images"].as_array();
     match images {
         Some(imgs) if imgs.is_empty() => {
@@ -1915,7 +1980,9 @@ mod tests {
 
     #[tokio::test]
     async fn status_returns_agent_unreachable() {
-        let err = status_with_client(&bogus_client()).await.unwrap_err();
+        let err = status_with_client(OutputFormat::Human, &bogus_client())
+            .await
+            .unwrap_err();
         assert!(matches!(err, RelishError::AgentUnreachable), "got: {err:?}");
     }
 

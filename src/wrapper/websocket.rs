@@ -18,6 +18,11 @@ use tokio::net::TcpStream;
 /// Cap on the backend's handshake response head we buffer before giving up.
 const MAX_HANDSHAKE_HEAD: usize = 16 * 1024;
 
+/// Deadline for the backend WebSocket handshake (connect + request + response
+/// head). Bounds a backend that accepts TCP but never completes the handshake,
+/// so it can't pin the handler, its permit, and the drain guard forever (M16).
+const WS_HANDSHAKE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+
 /// Check whether a request is a WebSocket upgrade.
 ///
 /// A valid WebSocket upgrade has both `Connection: Upgrade` (or
@@ -65,26 +70,28 @@ pub async fn handle_websocket_upgrade(
     // It resolves to the raw client stream once our 101 is written.
     let client_upgrade = hyper::upgrade::on(&mut req);
 
-    // Connect to the backend and relay the handshake as raw HTTP/1.1.
-    let mut backend_stream = match TcpStream::connect(backend).await {
-        Ok(s) => s,
-        Err(_) => return StatusCode::BAD_GATEWAY.into_response(),
-    };
+    // Bound the whole backend handshake (connect + request write + response
+    // head) with a deadline (M16): a backend that accepts the TCP connection
+    // but never completes the WebSocket handshake would otherwise pin this
+    // handler, its connection permit, and the drain guard indefinitely — the
+    // 30s reqwest timeout only covers the non-WS path.
     let upgrade_request = build_upgrade_request(&req, backend, remote, over_tls);
-    if backend_stream
-        .write_all(upgrade_request.as_bytes())
-        .await
-        .is_err()
-    {
-        return StatusCode::BAD_GATEWAY.into_response();
-    }
-
-    // Read the backend's handshake response head (up to the blank line).
-    // `leftover` is any payload the backend sent past the head — it must be
-    // forwarded to the client before the bidirectional splice begins.
-    let (head, leftover) = match read_http_head(&mut backend_stream).await {
-        Some(pair) => pair,
-        None => return StatusCode::BAD_GATEWAY.into_response(),
+    let handshake_result = tokio::time::timeout(WS_HANDSHAKE_TIMEOUT, async {
+        let mut backend_stream = TcpStream::connect(backend).await.ok()?;
+        backend_stream
+            .write_all(upgrade_request.as_bytes())
+            .await
+            .ok()?;
+        // `leftover` is any payload the backend sent past the head — it must be
+        // forwarded to the client before the bidirectional splice begins.
+        let (head, leftover) = read_http_head(&mut backend_stream).await?;
+        Some((backend_stream, head, leftover))
+    })
+    .await;
+    let (mut backend_stream, head, leftover) = match handshake_result {
+        Ok(Some(triple)) => triple,
+        // Timed out, or connect/write/read failed.
+        _ => return StatusCode::BAD_GATEWAY.into_response(),
     };
 
     let Some(handshake) = parse_handshake(&head) else {

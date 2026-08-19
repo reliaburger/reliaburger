@@ -93,22 +93,27 @@ mod inner {
 
     /// Delete all entries from all fault BPF maps.
     ///
-    /// Called on Bun startup to ensure a clean state after a crash.
+    /// Called on Bun startup so a hot restart (which reuses pinned maps rather
+    /// than reloading the program) doesn't inherit a departed run's stale fault
+    /// rules (M21). Best-effort: iterate each map's keys and remove them; a map
+    /// that isn't present is simply skipped.
     pub fn cleanup_all_fault_maps(bpf: &mut aya::Ebpf) {
-        // Best-effort cleanup — log warnings but don't fail startup.
-        for map_name in &["fault_connect_map", "fault_bw_map"] {
-            if let Some(map_ref) = bpf.map_mut(map_name) {
-                // We can't easily iterate and delete from a generic map
-                // without knowing the key type. For startup cleanup, the
-                // simplest approach is to note that BPF maps are cleared
-                // when the eBPF program is reloaded. Since Bun reloads
-                // the eBPF program on startup, the maps start empty.
-                //
-                // This function exists as a safety net for the case where
-                // Bun restarts without reloading the eBPF program (e.g.
-                // hot restart). In that case, we'd need to iterate.
-                let _ = map_ref; // Acknowledge the handle
-                eprintln!("smoker: startup cleanup — {map_name} will be cleared on eBPF reload");
+        if let Some(map_ref) = bpf.map_mut("fault_connect_map")
+            && let Ok(mut map) =
+                HashMap::<_, BpfConnectFaultKey, BpfConnectFaultValue>::try_from(map_ref)
+        {
+            let keys: Vec<_> = map.keys().filter_map(|k| k.ok()).collect();
+            for key in keys {
+                let _ = map.remove(&key);
+            }
+        }
+        if let Some(map_ref) = bpf.map_mut("fault_bw_map")
+            && let Ok(mut map) =
+                HashMap::<_, BpfBandwidthFaultKey, BpfBandwidthFaultValue>::try_from(map_ref)
+        {
+            let keys: Vec<_> = map.keys().filter_map(|k| k.ok()).collect();
+            for key in keys {
+                let _ = map.remove(&key);
             }
         }
     }

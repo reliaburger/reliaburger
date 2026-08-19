@@ -100,6 +100,11 @@ impl OnionEbpf {
             });
         }
 
+        // Clear any stale fault-map entries a departed run left behind (M21):
+        // on a hot restart the pinned maps can survive, so a fault a previous
+        // process installed would otherwise still be active.
+        crate::smoker::bpf_maps::cleanup_all_fault_maps(&mut bpf);
+
         let cgroup_fd =
             std::fs::File::open(cgroup_path).map_err(|e| OnionError::EbpfLoadFailed {
                 reason: format!("failed to open cgroup {}: {e}", cgroup_path.display()),

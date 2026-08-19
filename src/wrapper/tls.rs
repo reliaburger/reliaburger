@@ -8,9 +8,21 @@
 /// TLS 1.0 and 1.1 are rejected. Only 1.2 and 1.3 are accepted.
 use std::path::Path;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use rustls::ServerConfig;
 use rustls::pki_types::{CertificateDer, PrivateKeyDer};
+
+/// Process-local monotonic serial source for ingress certificates (M15).
+///
+/// Ingress certs are minted per-SNI and short-lived, so threading the cluster's
+/// Raft serial allocator (a consensus write per cert) is impractical. This at
+/// least gives every ingress cert a *distinct* serial — the old code stamped
+/// every one `SerialNumber(1)`, so they were indistinguishable and could never
+/// be told apart in a CRL. Seeded high so it can't collide with the CA's
+/// centrally-allocated (low, sequential) serials. Central CRL-revocation of an
+/// individual ingress leaf remains future work.
+static INGRESS_SERIAL: AtomicU64 = AtomicU64::new(1 << 62);
 
 /// Errors from TLS operations.
 #[derive(Debug, thiserror::Error)]
@@ -67,11 +79,11 @@ pub fn issue_ingress_cert(
         .ok_or_else(|| TlsError::CertGenFailed("no ingress hostname supplied".to_string()))?;
 
     // The cert is a TLS server, so it carries the ServerAuth extended key
-    // usage. `SerialNumber(1)` is a placeholder; a real deployment threads
-    // the CA's serial allocator through here.
+    // usage. Each ingress cert gets a distinct serial (M15) — see INGRESS_SERIAL.
+    let serial = INGRESS_SERIAL.fetch_add(1, Ordering::Relaxed);
     let (cert_der, key_der, _serial) = crate::sesame::ca::issue_end_entity_cert(
         &common_name,
-        crate::sesame::types::SerialNumber(1),
+        crate::sesame::types::SerialNumber(serial),
         lifetime,
         hostnames,
         &[rcgen::ExtendedKeyUsagePurpose::ServerAuth],

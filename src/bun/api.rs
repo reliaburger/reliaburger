@@ -1908,6 +1908,37 @@ async fn upgrade_cluster_rollback_handler(
             .into_response();
     }
 
+    // Validate each rollback node's identity against the authoritative gossip /
+    // Raft view, exactly as upgrade_start does (M13/UPG2). The old rollback path
+    // copied client-supplied node_id/address/role straight into the replicated
+    // plan, so a caller could point the orchestrator at spoofed addresses or
+    // roles that UPG2 exists to reject.
+    let authoritative = match build_authoritative_view(&state, council).await {
+        Ok(view) => view,
+        Err(resp) => return resp,
+    };
+    let requested: Vec<crate::upgrade::plan::RequestedNode> = request
+        .nodes
+        .iter()
+        .map(|node| crate::upgrade::plan::RequestedNode {
+            node_id: node.node_id.clone(),
+            address: node.address.clone(),
+            role: node.role,
+        })
+        .collect();
+    let derived_nodes = match crate::upgrade::plan::derive_upgrade_nodes(&requested, |id| {
+        authoritative.get(id).cloned()
+    }) {
+        Ok(nodes) => nodes,
+        Err(e) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({ "error": e.to_string() })),
+            )
+                .into_response();
+        }
+    };
+
     let upgrade_id = format!(
         "rollback-{}-{}",
         request.target_version,
@@ -1926,18 +1957,7 @@ async fn upgrade_cluster_rollback_handler(
         direction: crate::upgrade::types::UpgradeDirection::Rollback,
         phase: crate::upgrade::types::ClusterUpgradePhase::Preparing,
         registry_address: String::new(),
-        nodes: request
-            .nodes
-            .into_iter()
-            .map(|node| crate::upgrade::types::NodeUpgradeRecord {
-                node_id: node.node_id,
-                address: node.address,
-                role: node.role,
-                from_version: None,
-                phase: crate::upgrade::types::NodeUpgradePhase::Pending,
-                since: None,
-            })
-            .collect(),
+        nodes: derived_nodes,
     };
 
     match council
@@ -3352,7 +3372,6 @@ async fn ui_session_handler(
     State(auth): State<crate::sesame::auth::AuthState>,
     axum::Form(form): axum::Form<SessionForm>,
 ) -> Response {
-    let tokens = auth.tokens.read().await;
     // Accept the internal service token or any valid user token. The session
     // inherits the presented token's scope (C3), so a tenant-scoped token
     // cannot widen to cluster-wide reads by exchanging itself for a cookie.
@@ -3368,19 +3387,27 @@ async fn ui_session_handler(
             crate::sesame::types::TokenScope::default(),
         ))
     } else {
-        crate::sesame::auth::authenticate(&form.token, &tokens)
-            .ok()
-            .map(|ctx| {
-                (
-                    ctx.token_name,
-                    crate::sesame::types::TokenScope {
-                        apps: ctx.scoped_apps,
-                        namespaces: ctx.scoped_namespaces,
-                    },
-                )
-            })
+        // Snapshot the tokens under the lock, then run the Argon2id verify on
+        // the blocking pool (M7) so the deliberately-slow hashing doesn't stall
+        // the async runtime worker.
+        let tokens = auth.tokens.read().await.clone();
+        let candidate = form.token.clone();
+        tokio::task::spawn_blocking(move || {
+            crate::sesame::auth::authenticate(&candidate, &tokens)
+                .ok()
+                .map(|ctx| {
+                    (
+                        ctx.token_name,
+                        crate::sesame::types::TokenScope {
+                            apps: ctx.scoped_apps,
+                            namespaces: ctx.scoped_namespaces,
+                        },
+                    )
+                })
+        })
+        .await
+        .unwrap_or(None)
     };
-    drop(tokens);
 
     let Some((name, scope)) = identity else {
         return (
@@ -5117,11 +5144,33 @@ async fn app_detail_handler(
 
 /// `GET /ui/node/{name}` — node detail page.
 async fn node_detail_handler(State(state): State<ApiState>, Path(name): Path<String>) -> Response {
-    let statuses = gather_statuses(&state).await;
+    // M14: the old handler ignored `name` entirely — it rendered *this* node's
+    // instances with a hard-coded `state: "alive"`, so clicking node B showed
+    // node A's workloads labelled as B. Only this node knows its own running
+    // instances, so show the instance list only when the request is for this
+    // node; for any other node show its presence in gossip but no (misattributed)
+    // workloads. Cross-node instance detail would need a fan-out and is left as a
+    // follow-up.
+    let is_self = state.node_name.as_deref() == Some(name.as_str());
+    let in_membership = match &state.membership {
+        Some(m) => m.read().await.iter().any(|info| info.node_id.0 == name),
+        None => false,
+    };
+    let node_state = if is_self || in_membership {
+        "alive"
+    } else {
+        "unknown"
+    }
+    .to_string();
+    let statuses = if is_self {
+        gather_statuses(&state).await
+    } else {
+        Vec::new()
+    };
 
     let data = NodeDetailData {
         name,
-        state: "alive".to_string(),
+        state: node_state,
         app_count: statuses.len(),
         apps: statuses,
         charts: vec![
@@ -6191,12 +6240,26 @@ async fn token_create_handler(
         .ttl_days
         .map(|d| std::time::SystemTime::now() + std::time::Duration::from_secs(d * 86400));
 
-    let created = match crate::sesame::token::create_token(&req.name, role, scope, expires_at) {
-        Ok(c) => c,
-        Err(e) => {
+    // Argon2id hashing is deliberately slow + memory-hungry (M7): run it on the
+    // blocking pool so it doesn't stall the async runtime worker.
+    let name = req.name.clone();
+    let created = match tokio::task::spawn_blocking(move || {
+        crate::sesame::token::create_token(&name, role, scope, expires_at)
+    })
+    .await
+    {
+        Ok(Ok(c)) => c,
+        Ok(Err(e)) => {
             return (
                 StatusCode::INTERNAL_SERVER_ERROR,
                 Json(serde_json::json!({ "error": e.to_string() })),
+            )
+                .into_response();
+        }
+        Err(_) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({ "error": "token hashing task failed" })),
             )
                 .into_response();
         }

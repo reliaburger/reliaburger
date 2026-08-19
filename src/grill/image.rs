@@ -424,7 +424,14 @@ impl ImageStore {
                 });
             }
 
-            tokio::fs::write(&blob_path, &blob_data).await?;
+            // Write atomically (temp + rename) so a crash mid-write can't leave
+            // a truncated blob at the final path that a later pull treats as a
+            // valid cache hit (M3) — the `exists()` check above never
+            // re-verifies a cached file. The digest was verified above, so a
+            // completed rename only ever publishes a good blob.
+            let tmp = blob_path.with_extension("tmp");
+            tokio::fs::write(&tmp, &blob_data).await?;
+            tokio::fs::rename(&tmp, &blob_path).await?;
         }
 
         // Unpack layers into an immutable content-addressed generation

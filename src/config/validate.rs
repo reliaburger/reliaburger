@@ -434,6 +434,16 @@ impl NodeConfig {
             }
         })?;
 
+        // The registry storage cap must parse (M23): the binary reads it with
+        // `unwrap_or(0)`, and 0 means "unlimited", so a typo like "10GBB" would
+        // silently disable the cap. Fail here instead. `0` (explicit unlimited)
+        // parses fine.
+        parse_resource_value(&self.images.max_storage).map_err(|_| ConfigError::Validation {
+            field: "images.max_storage".to_string(),
+            context: "node config".to_string(),
+            reason: format!("invalid resource value {:?}", self.images.max_storage),
+        })?;
+
         // Periodic intervals feed `tokio::time::interval`, which panics on a
         // zero period (OBS4). The runtime also clamps these defensively, but
         // reject zero here so the operator gets a clear error rather than a
@@ -497,6 +507,20 @@ mod tests {
                 if field == "metrics.collection_interval_secs"),
             "expected a collection-interval validation error, got {err:?}"
         );
+    }
+
+    #[test]
+    fn node_config_rejects_an_unparseable_max_storage() {
+        let mut node = crate::config::NodeConfig::default();
+        node.images.max_storage = "10GBB".to_string();
+        let err = node.validate().unwrap_err();
+        assert!(
+            matches!(err, ConfigError::Validation { ref field, .. } if field == "images.max_storage"),
+            "expected a max_storage validation error, got {err:?}"
+        );
+        // Explicit "0" (unlimited) still validates.
+        node.images.max_storage = "0".to_string();
+        node.validate().unwrap();
     }
 
     #[test]

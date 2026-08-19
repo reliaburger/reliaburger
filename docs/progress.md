@@ -2291,22 +2291,32 @@ blocking calls).
 
 ### Medium — data-plane bugs, blocking calls, unwired subsystems
 
-- [ ] **Btrfs snapshot restore is destructive on failure** — `src/grill/snapshot.rs:245-247`
+> **Most landed (17–18 Aug 2026, branch `phase16-medium-dataplane`, PR #162).**
+> The deletions removed ~800 lines of unwired deploy engine + the superseded
+> coordinator; M7 moved Argon2id, pickle blob reads, LogStore flush, the openraft
+> redb commits, snapshot btrfs, and the per-step rolling-deploy retire drain off
+> the async runtime. **Two remain open** as deeper redesigns, still unchecked
+> below: new-deploys-live-before-health-check (M5) and the rollup backfill-window
+> dedup redesign (the silent-lost-push half is fixed). One bonus finding is left
+> for a focused change: `finalise_rolling_deploy`'s terminal *bulk* retire still
+> drains on the loop (the per-step retire the audit named is fixed).
+
+- [x] **Btrfs snapshot restore is destructive on failure** — `src/grill/snapshot.rs:245-247`
   `SnapshotManager::restore` deletes the live subvolume first, then creates the writable
   snapshot; if the second `btrfs` call fails the live volume is gone with no rollback.
-- [ ] **Rootless/runc port-mapping failures reported as "started"** —
+- [x] **Rootless/runc port-mapping failures reported as "started"** —
   `src/grill/netns.rs:391-395` rootless `add_port_mapping` returns `Ok` before
   `run_tcp_proxy` binds (line 594, spawned task), so a taken host port yields a
   "successfully started" container whose port silently doesn't listen (error only
   `eprintln!`'d; `accept?` at 600 also kills the proxy loop on any transient error). Same
   shape root-mode: `src/grill/runc.rs:336-347` DNAT failure is only logged, supervisor
   reports Running with a dead port.
-- [ ] **Blob cache accepts truncated blobs after a crash** — `src/grill/image.rs:400,427`
+- [x] **Blob cache accepts truncated blobs after a crash** — `src/grill/image.rs:400,427`
   cache validity is `blob_path.exists()` and blobs are written non-atomically to the final
   path; a crash mid-write leaves a truncated blob treated as a valid cache hit forever
   (digest verified only on first download). Lines 408-415 also buffer the whole layer in
   memory.
-- [ ] **Secret decrypt failure starts the container anyway** — `src/grill/oci.rs:284-295`
+- [x] **Secret decrypt failure starts the container anyway** — `src/grill/oci.rs:284-295`
   injects `{key}=DECRYPT_ERROR:{e}` (or raw ciphertext when no decryptor is present) into
   the workload env and starts it, silently running with a broken secret.
 - [ ] **New deploys go live before their health check runs** —
@@ -2315,13 +2325,13 @@ blocking calls).
   configured HTTP health check isn't registered for new instances until
   `finalise_rolling_deploy` (4778-4813), so a version that starts but fails its probe still
   replaces healthy old instances.
-- [ ] **Parquet flushes are unfsynced and Mayo drops samples on a failed write** —
+- [x] **Parquet flushes are unfsynced and Mayo drops samples on a failed write** —
   `src/mayo/store.rs:62-76`, `src/ketchup/log_store.rs:294-303`: no `sync_all`/temp+rename/
   dir fsync despite explicit durability claims (contrast pickle REG5). And
   `src/mayo/store.rs:244-257` `take_flush_batch` clears the buffer + bumps the counter
   *before* the write, so a failed write permanently discards the drained samples
   (LogStore/RollupStore clear only after success).
-- [ ] **Blocking work on the agent event loop / runtime worker** (project rule: no blocking
+- [x] **Blocking work on the agent event loop / runtime worker**  _(Argon2id token create+verify, pickle blob_get read, LogStore flush, the openraft redb commits, snapshot btrfs, and the per-step rolling-deploy retire drain all now run off-lock/off-runtime. Residual: `finalise_rolling_deploy`'s terminal bulk retire still drains on the loop — a focused follow-up.)_ (project rule: no blocking
   in async):
   - `src/bun/agent.rs:2890-2919,1731` + `src/bun/snapshot_worker.rs:93-137` — snapshot
     create/restore/delete run sync `btrfs` subprocess + `std::fs` walks on the loop
@@ -2341,7 +2351,7 @@ blocking calls).
     on the async handler without `spawn_blocking`.
   - `src/sesame/identity.rs:281-299,312-321` — `mount`/`umount` via blocking
     `std::process::Command::status()` from async agent paths.
-- [ ] **LogStore buffer is unbounded** — `src/ketchup/log_store.rs:194-199` has no cap, so
+- [x] **LogStore buffer is unbounded** — `src/ketchup/log_store.rs:194-199` has no cap, so
   a persistently failing flush (disk full — logged every 60 s) grows the buffer without
   bound; RollupStore got `MAX_BUFFER_ROWS` for exactly this, LogStore didn't.
 - [ ] **Rollup backfill double-counts or drops on aggregator reassignment** —
@@ -2352,48 +2362,48 @@ blocking calls).
   (cross-aggregator, invisible to OBS2 dedup). Failed rollup pushes are also lost silently
   (`rollup_worker.rs:126-140`: `Err(_) => return` no log, `let _ =` send, backfill flag
   cleared before the send; nodes over `MAX_REPORT_SIZE` 1 MiB lose metrics permanently).
-- [ ] **Placement reconciler orphans instances on a failed stop** —
+- [x] **Placement reconciler orphans instances on a failed stop** —
   `src/cluster/orchestrate.rs:847-857` fires `AgentCommand::Stop` with the response oneshot
   dropped and unconditionally does `applied.remove(...)` even if the send/stop failed, so no
   later tick retries — asymmetric with the deploy path, which waits for terminal `Complete`.
-- [ ] **SWIM dissemination can drop failure notifications** —
+- [x] **SWIM dissemination can drop failure notifications** —
   `src/mustard/dissemination.rs:127-154` `compact()` keeps the first-drained entry at equal
   incarnation, but `BinaryHeap::drain()` yields arbitrary order, so a `Dead`/`Suspect`
   update can be discarded for an `Alive` — inverting the SWIM precedence `resolve_conflict`
   enforces everywhere else. Also `src/mustard/protocol.rs:801-836` `wait_for_relay_ack`
   applies piggybacked updates but skips the self-refutation logic (`handle_message:580-588`),
   so a Suspect-about-self during a relay wait is never refuted.
-- [ ] **Non-deterministic Raft apply** — `src/council/state_machine.rs:512`
+- [x] **Non-deterministic Raft apply** — `src/council/state_machine.rs:512`
   `RevokeCertificate` sets `crl.updated_at = SystemTime::now()` inside `apply_request`, so
   replicas diverge on that field (the comment eight lines up explains why wall-clock in
   apply is forbidden; the pruning beside it correctly uses in-log `revoked_at`).
-- [ ] **Upgrade start/rollback races and trusts client-supplied node identity** —
+- [x] **Upgrade start/rollback races and trusts client-supplied node identity** —
   `src/bun/api.rs:1685` `upgrade_start_handler` is check-then-write over a last-writer-wins
   `UpgradeUpdate`, so two concurrent starts (or a start racing rollback at 1897) both pass
   the guard and the second clobbers the first plan mid-flight; and `api.rs:1865`
   `upgrade_cluster_rollback_handler` copies client-supplied `node_id`/`address`/`role`
   verbatim into the replicated plan, bypassing the UPG2 validation `upgrade_start_handler`
   applies.
-- [ ] **`GET /ui/node/{name}` ignores the requested node** — `src/bun/api.rs:4931`
+- [x] **`GET /ui/node/{name}` ignores the requested node** — `src/bun/api.rs:4931`
   `node_detail_handler` renders the *local* agent's instances with hardcoded
   `state: "alive"`, so clicking node B in a cluster shows node A's workloads labelled B.
-- [ ] **Ingress certs are unrevocable (hardcoded serial)** — `src/wrapper/tls.rs:70-74`
+- [x] **Ingress certs are unrevocable (hardcoded serial)** — `src/wrapper/tls.rs:70-74`
   every ingress cert (including per-SNI resolver-minted certs) uses `SerialNumber(1)`, so
   they're indistinguishable by serial and unrevocable via the serial-keyed CRL. (Known
   deferral — comment admits it, but track it.)
-- [ ] **WebSocket ingress has no connect/handshake timeout and ignores drain** —
+- [x] **WebSocket ingress has no connect/handshake timeout and ignores drain** —
   `src/wrapper/websocket.rs:69,162-180` has no timeout on `TcpStream::connect`/handshake/
   `read_http_head`, so a backend that accepts TCP but never responds pins the handler,
   permit, and drain guard forever; and `src/wrapper/proxy.rs:489,503-514` drops the drain
   `terminate` token on the WS path, so the drain deadline never tears a WS splice down and
   no 1001 close frame is sent (the `websocket_close_frame` builder at
   `draining.rs:237-239` is unwired).
-- [ ] **`upgrade_cluster_rollback`/`manager` swallow failures that disable rollback** —
+- [x] **`upgrade_cluster_rollback`/`manager` swallow failures that disable rollback** —
   `src/upgrade/orchestrator.rs:757` discards a failed Raft `UpgradeUpdate` write with no
   log; `src/upgrade/manager.rs:313-314` swallows a failed symlink-restore after `execv`
   fails while archiving the marker anyway, so a restart execs the broken binary with no
   boot-check marker to trigger rollback.
-- [ ] **Unwired parallel deploy engine** — `src/meat/orchestrator.rs` `DeployOrchestrator`,
+- [x] **Unwired parallel deploy engine** — `src/meat/orchestrator.rs` `DeployOrchestrator`,
   the `DeployDriver` trait, and `src/meat/blue_green.rs` `execute_blue_green` (~800 tested
   lines) have zero call sites outside their files; the agent implements rolling and
   blue-green independently (`bun/agent.rs:7767`). Same for the replicated deploy state:
@@ -2401,20 +2411,20 @@ blocking calls).
   `state_machine.rs:239-270`) are never written in production, so `DesiredState.active_deploys`
   / `deploy_history` stay empty forever. Decide: wire, or delete and stop maintaining two
   deploy implementations that can silently diverge.
-- [ ] **Superseded coordinator module still shipped** — `src/lettuce/coordinator.rs`
+- [x] **Superseded coordinator module still shipped** — `src/lettuce/coordinator.rs`
   `select_coordinator` ("prefer non-leader" election) is test-only dead code; production uses
   `coordinator_for_leader` (`sync.rs:353`), and the module doc still describes the opposite
   behaviour. Delete the module + fix the doc.
-- [ ] **GitOps auto-enforce admits unverified commits** — `src/lettuce/sync.rs:139-142`
+- [x] **GitOps auto-enforce admits unverified commits** — `src/lettuce/sync.rs:139-142`
   the script-modifying-commit gate admits `SignatureStatus::NotChecked`, so with no trusted
   keys (default when `require_signed_commits = false`) the "modifies script but not signed"
   protection is a no-op — the exact "verification never ran" case the rationale at
   sync.rs:50-53 calls unsafe to admit.
-- [ ] **Smoker BPF cleanup is a no-op** — `src/smoker/bpf_maps.rs:97-114`
+- [x] **Smoker BPF cleanup is a no-op** — `src/smoker/bpf_maps.rs:97-114`
   `cleanup_all_fault_maps` prints and does nothing (`let _ = map_ref;`) despite its
   hot-restart "safety net" doc, and has zero callers; stale fault-map state can survive a
   restart.
-- [ ] **Argon2/reqwest/GC swallowed failures** —
+- [x] **Argon2/reqwest/GC swallowed failures** —
   `src/bin/bun.rs:2253-2256` GC treats a dead agent task's failed `ActiveImages` send as
   "no active images" (`unwrap_or_default()`) and collects everything; `bin/bun.rs:2425-2443`
   final-flush comment claims the feeding tasks are joined but the log-drain (1309) and
@@ -2422,20 +2432,20 @@ blocking calls).
   appended after the final flush and lost; `bin/bun.rs:1636-1637` swallows a
   `create_dir_all` error and uses `config.storage.data` directly rather than the computed
   `data_base` fallback.
-- [ ] **Dead / mislabelled config keys** — beyond `object_store_url` and `[permission]`
+- [x] **Dead / mislabelled config keys** — beyond `object_store_url` and `[permission]`
   above: `[upgrades] release_url` (`node.rs:316`) claims to feed `relish upgrade check` but
   nothing reads it (relish uses its own `--url`); `upgrades.gossip_rejoin_secs` (`node.rs:324`)
   parsed but never read (TODO(Phase 14) at bun.rs:1698); `[reporting_tree] max_events_per_report`
   (`node.rs:535`) plumbed into ClusterParams but no consumer/cap code; `[images] max_storage`
   parsed `unwrap_or(0)` where 0 = unlimited so a typo disables the cap.
-- [ ] **Config error messages name fields that don't exist** —
+- [x] **Config error messages name fields that don't exist** —
   `src/config/node.rs:592-606` `ReconstructionSection::validate` reports against
   `coverage_percent`/`timeout_secs` but the real TOML keys are `report_threshold_percent`/
   `learning_period_timeout_secs`; `node.rs:352` doc says node name defaults to hostname but
   it's `node-{gossip_port}`; `node.rs:503` doc says `advertise_address` is auto-detected but
   bun silently falls back to `127.0.0.1` (which then passes
   `enforce_cluster_transport_security`).
-- [ ] **`--output json|yaml` ignored by most relish subcommands** — `src/bin/relish.rs:16-18`
+- [x] **`--output json|yaml` ignored by most relish subcommands** — `src/bin/relish.rs:16-18`
   the global format flag is threaded only into apply/nodes/council/test/bench/wtf/trace;
   `status`/`top`/`images`/`deploy`/`history` ignore it, so `relish --output json status`
   prints human output with exit 0.
