@@ -120,6 +120,92 @@ async fn drain_and_stop_instance<G: Grill>(
     }
 }
 
+/// Wait for a replacement instance to become healthy, on the deploy worker
+/// (M5): first for the runtime to report `Running`, then — when the app
+/// declares a health check — for the HTTP probe itself to pass
+/// `threshold_healthy` consecutive times.
+///
+/// The old wait stopped at `Running`, the runtime's "process alive" view. A
+/// version that started but failed its probe was announced healthy, published
+/// as a routable backend, and allowed to replace instances that were
+/// genuinely serving; its first real probe only ran after the deploy
+/// finalised. Apps without a health check keep the `Running`-only wait.
+///
+/// Probes use the same config as steady-state monitoring afterwards
+/// (`HealthCheckConfig::from_spec` on the spec's container port, probed at
+/// `probe_host`), honouring `initial_delay` and re-probing at `interval`
+/// capped to 500 ms — a deploy gate wants responsiveness, not the
+/// steady-state cadence — all bounded by the deploy's `health_timeout`
+/// deadline. Returns the failure message for the deploy's error event.
+async fn wait_instance_healthy<G: Grill>(
+    grill: &G,
+    id: &InstanceId,
+    spec: &AppSpec,
+    container_ip: Option<std::net::Ipv4Addr>,
+    wait: std::time::Duration,
+) -> Result<(), String> {
+    let deadline = std::time::Instant::now() + wait;
+    let mut state = grill.state(id).await;
+    while std::time::Instant::now() < deadline
+        && !matches!(state, Ok(crate::grill::state::ContainerState::Running))
+    {
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        state = grill.state(id).await;
+    }
+    match state {
+        Ok(crate::grill::state::ContainerState::Running) => {}
+        Ok(state) => {
+            return Err(format!(
+                "{} not healthy (state: {state}), rolling back",
+                id.0
+            ));
+        }
+        Err(_) => return Err(format!("{} state unknown, rolling back", id.0)),
+    }
+
+    let Some(config) = spec
+        .health
+        .as_ref()
+        .zip(spec.port)
+        .map(|(hs, port)| crate::bun::health::HealthCheckConfig::from_spec(hs, port))
+    else {
+        return Ok(());
+    };
+
+    let host = probe_host(container_ip);
+    let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+    tokio::time::sleep(config.initial_delay.min(remaining)).await;
+    let mut consecutive = 0u32;
+    let mut last_status;
+    // At least one probe runs even if `initial_delay` consumed the deadline,
+    // so a tight `health_timeout` degrades to a single-shot check rather than
+    // failing without ever asking the app.
+    loop {
+        last_status = crate::bun::probe::probe_health(&config, &host).await;
+        if last_status == crate::bun::health::HealthStatus::Healthy {
+            consecutive += 1;
+            if consecutive >= config.threshold_healthy {
+                return Ok(());
+            }
+        } else {
+            consecutive = 0;
+        }
+        if std::time::Instant::now() >= deadline {
+            return Err(format!(
+                "{} failed its health check ({last_status:?} at {}:{}{}), rolling back",
+                id.0, host, config.port, config.path
+            ));
+        }
+        tokio::time::sleep(
+            config
+                .interval
+                .min(deadline.saturating_duration_since(std::time::Instant::now()))
+                .min(std::time::Duration::from_millis(500)),
+        )
+        .await;
+    }
+}
+
 /// The address to probe an instance's health check at.
 ///
 /// A container with its own IP (runc/apple per-container netns) is probed at
@@ -7281,6 +7367,9 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
             instance_id: new_id.0.clone(),
             node_ip: container_ip.unwrap_or(std::net::Ipv4Addr::LOCALHOST),
             host_port,
+            // Verified, not assumed: the deploy worker gates on
+            // `wait_instance_healthy` — including the app's own HTTP probe
+            // when one is configured — before sending this op (M5).
             healthy: true,
         };
         if let Err(e) = self.service_map.add_backend(&service_id, backend) {
@@ -8431,22 +8520,16 @@ impl<G: Grill + Clone + 'static> DeployWorker<G> {
 
             let container_ip = self.grill.container_ip(&new_id).await;
 
-            // Health wait: poll until Running, off the command loop. This runs
-            // on a spawned per-deploy task, not the command loop, so the full
-            // configured `health_timeout` is honoured — the old `.min(5s)` cap
-            // silently failed a container that legitimately took longer than 5s
-            // to become healthy and rolled the deploy back (M7).
+            // Health wait, off the command loop (this runs on the spawned
+            // per-deploy task, so the full configured `health_timeout` is
+            // honoured — M7). Waits for Running, then for the app's own HTTP
+            // probe to pass (M5): a replacement is only announced healthy —
+            // and only published as a backend below — once it answers the
+            // health check the operator configured, not merely because its
+            // process came up.
             let wait = effective_health_wait(&deploy_config);
-            let deadline = std::time::Instant::now() + wait;
-            let mut probe = self.grill.state(&new_id).await;
-            while std::time::Instant::now() < deadline
-                && !matches!(probe, Ok(crate::grill::state::ContainerState::Running))
-            {
-                tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-                probe = self.grill.state(&new_id).await;
-            }
-            match probe {
-                Ok(crate::grill::state::ContainerState::Running) => {
+            match wait_instance_healthy(&self.grill, &new_id, spec, container_ip, wait).await {
+                Ok(()) => {
                     let _ = events
                         .send(ApplyEvent::Progress {
                             message: format!("{} healthy ✓", new_id.0),
@@ -8456,26 +8539,8 @@ impl<G: Grill + Clone + 'static> DeployWorker<G> {
                         .provision_identity(app_name, namespace, &new_id, false)
                         .await;
                 }
-                Ok(state) => {
-                    let _ = events
-                        .send(ApplyEvent::Error {
-                            message: format!(
-                                "{} not healthy (state: {state}), rolling back",
-                                new_id.0
-                            ),
-                        })
-                        .await;
-                    let _ = self.grill.kill(&new_id).await;
-                    self.ops.clear_egress(&new_id).await;
-                    new_failed = true;
-                    break;
-                }
-                Err(_) => {
-                    let _ = events
-                        .send(ApplyEvent::Error {
-                            message: format!("{} state unknown, rolling back", new_id.0),
-                        })
-                        .await;
+                Err(message) => {
+                    let _ = events.send(ApplyEvent::Error { message }).await;
                     let _ = self.grill.kill(&new_id).await;
                     self.ops.clear_egress(&new_id).await;
                     new_failed = true;
@@ -8730,17 +8795,13 @@ impl<G: Grill + Clone + 'static> DeployWorker<G> {
 
             let container_ip = self.grill.container_ip(&new_id).await;
 
+            // Same M5 gate as the rolling path: green only counts as healthy
+            // once its configured HTTP probe passes, not merely on Running —
+            // otherwise a green fleet that starts but can't serve replaces a
+            // blue fleet that can.
             let wait = effective_health_wait(&deploy_config);
-            let deadline = std::time::Instant::now() + wait;
-            let mut probe = self.grill.state(&new_id).await;
-            while std::time::Instant::now() < deadline
-                && !matches!(probe, Ok(crate::grill::state::ContainerState::Running))
-            {
-                tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-                probe = self.grill.state(&new_id).await;
-            }
-            match probe {
-                Ok(crate::grill::state::ContainerState::Running) => {
+            match wait_instance_healthy(&self.grill, &new_id, spec, container_ip, wait).await {
+                Ok(()) => {
                     let _ = events
                         .send(ApplyEvent::Progress {
                             message: format!("{} healthy ✓", new_id.0),
@@ -8750,13 +8811,7 @@ impl<G: Grill + Clone + 'static> DeployWorker<G> {
                         .provision_identity(app_name, namespace, &new_id, false)
                         .await;
                 }
-                other => {
-                    let message = match other {
-                        Ok(state) => {
-                            format!("{} not healthy (state: {state}), rolling back", new_id.0)
-                        }
-                        Err(_) => format!("{} state unknown, rolling back", new_id.0),
-                    };
+                Err(message) => {
                     let _ = events.send(ApplyEvent::Error { message }).await;
                     let _ = self.grill.kill(&new_id).await;
                     self.ops.clear_egress(&new_id).await;
@@ -9956,15 +10011,18 @@ mod tests {
 
     #[tokio::test]
     async fn redeploy_registers_backends_health_and_port() {
+        // The rolling gate (M5) probes the app's health endpoint before the
+        // redeploy may complete, so give it one that answers 200.
+        let port = spawn_health_responder(200).await;
         let (_tx, rx) = mpsc::channel(32);
         let shutdown = CancellationToken::new();
         let grill = crate::grill::process::ProcessGrill::new();
         let port_allocator = PortAllocator::new(30000, 31000);
         let mut agent = BunAgent::new(grill, port_allocator, rx, shutdown);
 
-        let config = Config::parse(
-            "[app.web]\nimage = \"proc-grill:ignored\"\ncommand = [\"sleep\", \"60\"]\nport = 8080\n\n[app.web.health]\npath = \"/healthz\"\n",
-        )
+        let config = Config::parse(&format!(
+            "[app.web]\nimage = \"proc-grill:ignored\"\ncommand = [\"sleep\", \"60\"]\nport = {port}\n\n[app.web.health]\npath = \"/healthz\"\n\n[app.web.deploy]\nhealth_timeout = \"5s\"\n",
+        ))
         .unwrap();
         let (ev_tx, mut ev_rx) = mpsc::channel(256);
 
@@ -10838,6 +10896,196 @@ mod tests {
                 .iter()
                 .any(|(op, i)| op == "stop" && i == &blue_id),
             "blue must be stopped after the drain"
+        );
+
+        shutdown.cancel();
+        agent_handle.await.unwrap();
+    }
+
+    /// A minimal HTTP responder that answers every connection with `status`,
+    /// standing in for the app's health endpoint. Returns the bound port.
+    /// MockGrill reports no container IP, so the deploy gate probes
+    /// `127.0.0.1:{spec.port}` — binding the responder there and pointing
+    /// `port` at it exercises the real `probe_health` path end to end.
+    async fn spawn_health_responder(status: u16) -> u16 {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        tokio::spawn(async move {
+            loop {
+                let Ok((mut socket, _)) = listener.accept().await else {
+                    return;
+                };
+                let mut buf = vec![0u8; 1024];
+                let _ = tokio::io::AsyncReadExt::read(&mut socket, &mut buf).await;
+                let response = format!("HTTP/1.1 {status} X\r\nContent-Length: 0\r\n\r\n");
+                let _ = tokio::io::AsyncWriteExt::write_all(&mut socket, response.as_bytes()).await;
+            }
+        });
+        port
+    }
+
+    fn no_health_config(port: u16) -> Config {
+        Config::parse(&format!(
+            r#"
+            [app.web]
+            image = "myapp:v1"
+            port = {port}
+        "#
+        ))
+        .unwrap()
+    }
+
+    fn health_gated_config(port: u16, strategy: &str) -> Config {
+        Config::parse(&format!(
+            r#"
+            [app.web]
+            image = "myapp:v2"
+            port = {port}
+
+            [app.web.health]
+            path = "/healthz"
+
+            [app.web.deploy]
+            strategy = "{strategy}"
+            health_timeout = "1s"
+        "#
+        ))
+        .unwrap()
+    }
+
+    /// M5: a replacement whose container runs but whose HTTP health check
+    /// fails must NOT replace the old instance — the deploy rolls back and
+    /// the old instance keeps serving. Before the gate, the rolling wait
+    /// only polled `grill.state == Running` (which MockGrill always
+    /// satisfies), so this exact scenario replaced a healthy v1 with a
+    /// broken v2.
+    #[tokio::test]
+    async fn rolling_redeploy_rolls_back_when_the_probe_fails() {
+        let port = spawn_health_responder(500).await;
+        let (mut agent, tx, shutdown, grill) = test_agent_with_grill();
+        let agent_handle = tokio::spawn(async move {
+            agent.run().await;
+        });
+
+        expect_complete(&send_deploy(&tx, no_health_config(port)).await);
+
+        let events = send_deploy(&tx, health_gated_config(port, "rolling")).await;
+        let error = events
+            .iter()
+            .find_map(|e| match e {
+                ApplyEvent::Error { message } => Some(message.clone()),
+                _ => None,
+            })
+            .expect("a probe-failing redeploy must produce an error event");
+        assert!(
+            error.contains("failed its health check"),
+            "error should name the failed probe, got: {error}"
+        );
+
+        let (resp_tx, resp_rx) = oneshot::channel();
+        tx.send(AgentCommand::Status { response: resp_tx })
+            .await
+            .unwrap();
+        let ids: Vec<String> = resp_rx.await.unwrap().into_iter().map(|s| s.id).collect();
+        assert_eq!(
+            ids,
+            vec!["default__web-0".to_string()],
+            "the old instance must keep serving after the rollback"
+        );
+        let old_id = InstanceId("default__web-0".to_string());
+        assert!(
+            !grill
+                .calls()
+                .iter()
+                .any(|(op, i)| (op == "stop" || op == "kill") && i == &old_id),
+            "the old instance must never be stopped when the replacement fails its probe"
+        );
+        let canary = crate::grill::InstanceIdentity::canary("default", "web", 1, 0).instance_id();
+        assert!(
+            grill
+                .calls()
+                .iter()
+                .any(|(op, i)| op == "kill" && i == &canary),
+            "the probe-failing replacement must be torn down"
+        );
+
+        shutdown.cancel();
+        agent_handle.await.unwrap();
+    }
+
+    /// The gate must not break healthy deploys: with the responder answering
+    /// 200, the rolling redeploy completes through the real probe path and
+    /// the replacement takes over.
+    #[tokio::test]
+    async fn rolling_redeploy_completes_when_the_probe_passes() {
+        let port = spawn_health_responder(200).await;
+        let (mut agent, tx, shutdown, grill) = test_agent_with_grill();
+        let agent_handle = tokio::spawn(async move {
+            agent.run().await;
+        });
+
+        expect_complete(&send_deploy(&tx, no_health_config(port)).await);
+        expect_complete(&send_deploy(&tx, health_gated_config(port, "rolling")).await);
+
+        let (resp_tx, resp_rx) = oneshot::channel();
+        tx.send(AgentCommand::Status { response: resp_tx })
+            .await
+            .unwrap();
+        let ids: Vec<String> = resp_rx.await.unwrap().into_iter().map(|s| s.id).collect();
+        let canary = crate::grill::InstanceIdentity::canary("default", "web", 1, 0).instance_id();
+        assert_eq!(
+            ids,
+            vec![canary.0.clone()],
+            "the probe-passing replacement must take over"
+        );
+        let old_id = InstanceId("default__web-0".to_string());
+        assert!(
+            grill
+                .calls()
+                .iter()
+                .any(|(op, i)| op == "stop" && i == &old_id),
+            "the old instance must be retired after the healthy replacement"
+        );
+
+        shutdown.cancel();
+        agent_handle.await.unwrap();
+    }
+
+    /// M5 on the blue-green path: a green fleet that starts but fails its
+    /// probe must leave blue serving untouched.
+    #[tokio::test]
+    async fn blue_green_rolls_back_when_green_fails_its_probe() {
+        let port = spawn_health_responder(500).await;
+        let (mut agent, tx, shutdown, grill) = test_agent_with_grill();
+        let agent_handle = tokio::spawn(async move {
+            agent.run().await;
+        });
+
+        expect_complete(&send_deploy(&tx, no_health_config(port)).await);
+
+        let events = send_deploy(&tx, health_gated_config(port, "blue-green")).await;
+        assert!(
+            matches!(events.last(), Some(ApplyEvent::Error { .. })),
+            "a probe-failing green fleet must fail the deploy, got: {events:?}"
+        );
+
+        let (resp_tx, resp_rx) = oneshot::channel();
+        tx.send(AgentCommand::Status { response: resp_tx })
+            .await
+            .unwrap();
+        let ids: Vec<String> = resp_rx.await.unwrap().into_iter().map(|s| s.id).collect();
+        assert_eq!(
+            ids,
+            vec!["default__web-0".to_string()],
+            "blue must keep serving when green fails its probe"
+        );
+        let old_id = InstanceId("default__web-0".to_string());
+        assert!(
+            !grill
+                .calls()
+                .iter()
+                .any(|(op, i)| (op == "stop" || op == "kill") && i == &old_id),
+            "blue must never be stopped when green fails its probe"
         );
 
         shutdown.cancel();

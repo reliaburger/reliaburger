@@ -2295,11 +2295,11 @@ blocking calls).
 > The deletions removed ~800 lines of unwired deploy engine + the superseded
 > coordinator; M7 moved Argon2id, pickle blob reads, LogStore flush, the openraft
 > redb commits, snapshot btrfs, and the per-step rolling-deploy retire drain off
-> the async runtime. The residuals branch closed the rollup backfill-window
-> redesign (per-minute emission) and the `finalise_rolling_deploy` bulk retire
-> (now drained on the deploy worker, with the blue-green cut-over split into
-> publish → drain → bookkeeping). **One remains open**, still unchecked below:
-> new-deploys-live-before-health-check (M5).
+> the async runtime. The residuals branch then closed the rest — the rollup
+> backfill-window redesign (per-minute emission), the `finalise_rolling_deploy`
+> bulk retire (drained on the deploy worker; blue-green cut-over split into
+> publish → drain → bookkeeping), and the M5 deploy health gate — **completing
+> the Medium tier**. Small tracked residuals live inside their items.
 
 - [x] **Btrfs snapshot restore is destructive on failure** — `src/grill/snapshot.rs:245-247`
   `SnapshotManager::restore` deletes the live subvolume first, then creates the writable
@@ -2319,12 +2319,18 @@ blocking calls).
 - [x] **Secret decrypt failure starts the container anyway** — `src/grill/oci.rs:284-295`
   injects `{key}=DECRYPT_ERROR:{e}` (or raw ciphertext when no decryptor is present) into
   the workload env and starts it, silently running with a broken secret.
-- [ ] **New deploys go live before their health check runs** —
-  `src/bun/agent.rs:8343-8362,8629-8662` the rolling/blue-green health wait polls only
-  `grill.state == Running` yet publishes the backend `healthy: true` (7166-7171); the
-  configured HTTP health check isn't registered for new instances until
-  `finalise_rolling_deploy` (4778-4813), so a version that starts but fails its probe still
-  replaces healthy old instances.
+- [x] **New deploys go live before their health check runs** — the deploy worker's
+  `wait_instance_healthy` now gates both rolling and blue-green replacements: after the
+  runtime reports Running, the app's configured HTTP probe must pass `threshold_healthy`
+  consecutive times (same `HealthCheckConfig` the steady-state tick uses, honouring
+  `initial_delay`, bounded by the deploy's `health_timeout`) before the instance is
+  announced healthy or published as a backend; failure takes the existing
+  rollback/halt paths, so the old instances keep serving. Apps without a health check
+  keep the Running-only wait. Regression tests drive the real `probe_health` against a
+  local responder (200 completes, 500 rolls back on both strategies). _Tracked residual:
+  `RegisterRollingInstance`'s `persist_instance_record` no-ops mid-deploy (the instance
+  isn't in the supervisor until finalise), so a crash mid-rollout loses the new
+  instances' on-disk records._
 - [x] **Parquet flushes are unfsynced and Mayo drops samples on a failed write** —
   `src/mayo/store.rs:62-76`, `src/ketchup/log_store.rs:294-303`: no `sync_all`/temp+rename/
   dir fsync despite explicit durability claims (contrast pickle REG5). And
