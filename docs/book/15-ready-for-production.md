@@ -329,6 +329,34 @@ cpu/memory limits on a rootless node that can't enforce them. In each case the o
 was to accept the work and quietly deliver less than asked. The new behaviour is a clear
 error. A refusal you can see beats a guarantee you can't.
 
+### `Err(_)` is not a locked door
+
+A later audit found the runner's own cases breaking exactly this rule. The namespace-scope
+case sent a write it expected to be refused and matched the outcome with `Err(_) => Ok(())`.
+Any error was proof of enforcement — a connection reset, a TLS failure, a 500 from a
+half-started agent. The test named a security property and would go green on a network blip.
+Worse: even asserting the status wasn't enough. The real refusal is a 403 whose body says
+`token scope does not allow …`, and a *role* failure is also a 403 — so the case now matches
+the message, not just the code. And a transport failure while probing an enforcement boundary
+is neither pass nor fail; it becomes `Unknown`, the runner's "no verdict" outcome, because
+"couldn't reach the door" says nothing about whether it was locked.
+
+The quota case had the more interesting disease: its premise was wrong. It expected the
+second `apply` to be rejected — and quota enforcement doesn't live there. Apply admits an app
+to desired state; the *scheduler* enforces quota, by declining to place the over-budget app.
+So on a healthy cluster the case's expected rejection never happens, and the only reason it
+ever passed was the same `Err(_)` sponge soaking up unrelated failures. The rewrite asserts
+the enforcement that actually exists: both applies succeed, and the scheduling evidence shows
+the second app pinned at zero scheduled replicas — re-checked after a settle window, because
+a *late* grant is precisely the bug. When a test can't say what mechanism it's testing, check
+whether the mechanism exists.
+
+The placement case rounds out the set: it swept per-node status errors into "not hosting"
+(`unwrap_or(false)`) and only ever asserted the *negative* — no wrong node hosts the replica.
+An unreachable node is the likeliest home of a misplaced replica, and a sweep that can't see
+it proves nothing. It now returns `Unknown` on any node it can't inspect and asserts the
+positive: the set of hosting nodes is exactly the labelled one.
+
 ## The gate that runs on real hardware
 
 A unit test is only as honest as its fixture. If you invent the shape of the world and then

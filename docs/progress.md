@@ -2527,6 +2527,12 @@ broken test run green by accident (deferrals report `Unknown`, which fails a ful
 profile). The real defects are a Kubernetes-conversion path that silently drops fields,
 and a handful of test cases whose assertions are too loose to catch the bug they name.
 
+> **All Medium items below landed (20 Aug 2026, branch `phase16-deep-audit-mediums`)**
+> as one PR: k8s export/import fidelity (incl. the `cpu: "1"` 1000× quantity
+> under-read), the logs-export agent endpoint, the wired dry-run diff (with the
+> Destroy→not-in-config honesty rename), and the testkit false-green rewrites. The
+> Low items remain tracked below.
+
 **Medium — Kubernetes export/import silently loses data:**
 
 - [x] **Exported Ingress has no namespace** — the Ingress `ObjectMeta` now carries the
@@ -2584,13 +2590,20 @@ and a handful of test cases whose assertions are too loose to catch the bug they
 
 **Medium — test cases with assertions too loose to catch the named bug (false-green risk):**
 
-- [ ] **Scope/quota cases accept any error as success** —
-  `src/testkit/cases/workload_identity.rs:82` (`Err(_) => Ok(())`) and
-  `src/testkit/cases/scheduling.rs:94` treat *any* failure of the second/scoped apply as
-  proof the enforcement works, so a network blip or 5xx passes the case; neither inspects
-  the rejection reason. `src/testkit/cases/scheduling.rs:72` reads a node whose `status()`
-  errored as "not hosting the misplaced replica" (`unwrap_or(false)`) and never positively
-  asserts placement, so a real placement violation can pass.
+- [x] **Scope/quota cases accept any error as success** — the scope case now passes only
+  on the AUTH1 refusal itself (`ApiError { 403 }` with "token scope does not allow" in
+  the body — status alone is insufficient, a role failure is also 403); transport errors
+  become `unknown`, other errors fail, and a `token_revoke` failure no longer clobbers a
+  genuine verdict. The quota case's premise was wrong — **quota is enforced at
+  scheduling time** (the placement pass skips and logs; no council refusal reason
+  exists), so the second apply *succeeds* — rewritten to assert the real observable:
+  quota-b stays at `scheduled_replicas == 0` (via `desired_apps` evidence, with a settle
+  re-check for late grants) while quota-a runs untouched; empty evidence → `unknown`.
+  The placement case treats a failed node `status()` as `unknown` instead of "not
+  hosting", and positively asserts the hosting set is exactly the labelled node. Bonus,
+  same class: `service_discovery`'s stopped-backend case accepted *any* resolve error as
+  "service gone" — now only a genuine 404 passes, transport errors at the deadline are
+  `unknown`.
 
 **Low — hygiene and minor bugs from the deep pass:**
 
