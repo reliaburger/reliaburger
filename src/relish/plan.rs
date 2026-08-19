@@ -1,8 +1,12 @@
 /// Apply plan generation.
 ///
 /// Takes a parsed `Config` and produces a plan showing what would be deployed.
-/// When current state is available, the plan diffs against it to show creates,
-/// updates, destroys, and unchanged resources.
+/// When current state is available (fetched from a live agent), the plan
+/// diffs against it: creates, updates, unchanged resources, and resources
+/// that are running but absent from this config. There is deliberately no
+/// "destroy" action — `relish apply` is additive; removal is `relish stop`
+/// (or a GitOps diff), so a plan claiming apply would destroy something
+/// would be a lie.
 use std::collections::BTreeSet;
 use std::fmt;
 
@@ -15,7 +19,9 @@ use crate::config::Config;
 pub enum PlanAction {
     Create,
     Update,
-    Destroy,
+    /// Running on the cluster but absent from this config. Apply leaves it
+    /// untouched; `relish stop` removes it.
+    NotInConfig,
     Unchanged,
 }
 
@@ -24,7 +30,7 @@ impl fmt::Display for PlanAction {
         match self {
             PlanAction::Create => write!(f, "+"),
             PlanAction::Update => write!(f, "~"),
-            PlanAction::Destroy => write!(f, "-"),
+            PlanAction::NotInConfig => write!(f, "*"),
             PlanAction::Unchanged => write!(f, " "),
         }
     }
@@ -35,7 +41,7 @@ impl Serialize for PlanAction {
         match self {
             PlanAction::Create => serializer.serialize_str("create"),
             PlanAction::Update => serializer.serialize_str("update"),
-            PlanAction::Destroy => serializer.serialize_str("destroy"),
+            PlanAction::NotInConfig => serializer.serialize_str("not_in_config"),
             PlanAction::Unchanged => serializer.serialize_str("unchanged"),
         }
     }
@@ -58,13 +64,16 @@ pub struct ApplyPlan {
     pub entries: Vec<PlanEntry>,
     pub to_create: usize,
     pub to_update: usize,
-    pub to_destroy: usize,
+    /// Resources running on the cluster but absent from this config —
+    /// informational; apply does not remove them.
+    pub not_in_config: usize,
     pub unchanged: usize,
 }
 
 /// Snapshot of a currently deployed resource for diffing.
 ///
-/// The `image` field is used to detect updates (image change).
+/// Fetched from a live agent (`GET /v1/apps`) by the dry-run path. The
+/// `image` field is used to detect updates (image change).
 #[derive(Debug, Clone)]
 pub struct CurrentResource {
     /// Resource identifier matching the plan format, e.g. "app.web".
@@ -202,13 +211,14 @@ pub fn generate_plan(config: &Config, current: Option<&[CurrentResource]>) -> Ap
         });
     }
 
-    // Resources in current state but not in desired config → Destroy
+    // Resources in current state but absent from this config. Apply is
+    // additive, so these are informational — not a promise of removal.
     if let Some(current_list) = current {
         for existing in current_list {
             if !desired_resources.contains(&existing.resource) {
                 entries.push(PlanEntry {
                     resource: existing.resource.clone(),
-                    action: PlanAction::Destroy,
+                    action: PlanAction::NotInConfig,
                     summary: Vec::new(),
                 });
             }
@@ -223,9 +233,9 @@ pub fn generate_plan(config: &Config, current: Option<&[CurrentResource]>) -> Ap
         .iter()
         .filter(|e| e.action == PlanAction::Update)
         .count();
-    let to_destroy = entries
+    let not_in_config = entries
         .iter()
-        .filter(|e| e.action == PlanAction::Destroy)
+        .filter(|e| e.action == PlanAction::NotInConfig)
         .count();
     let unchanged = entries
         .iter()
@@ -236,7 +246,7 @@ pub fn generate_plan(config: &Config, current: Option<&[CurrentResource]>) -> Ap
         entries,
         to_create,
         to_update,
-        to_destroy,
+        not_in_config,
         unchanged,
     }
 }
@@ -246,7 +256,7 @@ impl fmt::Display for ApplyPlan {
         if self.entries.is_empty() {
             writeln!(f, "Relish apply plan:")?;
             writeln!(f)?;
-            write!(f, "Plan: 0 to create, 0 to update, 0 to destroy.")?;
+            write!(f, "Plan: 0 to create, 0 to update, 0 unchanged.")?;
             return Ok(());
         }
 
@@ -266,9 +276,16 @@ impl fmt::Display for ApplyPlan {
 
         write!(
             f,
-            "Plan: {} to create, {} to update, {} to destroy.",
-            self.to_create, self.to_update, self.to_destroy
+            "Plan: {} to create, {} to update, {} unchanged.",
+            self.to_create, self.to_update, self.unchanged
         )?;
+        if self.not_in_config > 0 {
+            write!(
+                f,
+                "\n{} running resource(s) not in this config (apply leaves them; `relish stop` removes).",
+                self.not_in_config
+            )?;
+        }
         Ok(())
     }
 }
@@ -287,7 +304,7 @@ mod tests {
         assert!(plan.entries.is_empty());
         assert_eq!(plan.to_create, 0);
         assert_eq!(plan.to_update, 0);
-        assert_eq!(plan.to_destroy, 0);
+        assert_eq!(plan.not_in_config, 0);
         assert_eq!(plan.unchanged, 0);
     }
 
@@ -515,7 +532,7 @@ mod tests {
         let plan = generate_plan(&config, None);
         let output = plan.to_string();
         assert!(
-            output.contains("Plan: 2 to create, 0 to update, 0 to destroy."),
+            output.contains("Plan: 2 to create, 0 to update, 0 unchanged."),
             "got:\n{output}"
         );
     }
@@ -526,7 +543,7 @@ mod tests {
         let output = plan.to_string();
         assert!(output.contains("Relish apply plan:"), "got:\n{output}");
         assert!(
-            output.contains("Plan: 0 to create, 0 to update, 0 to destroy."),
+            output.contains("Plan: 0 to create, 0 to update, 0 unchanged."),
             "got:\n{output}"
         );
     }
@@ -602,7 +619,7 @@ mod tests {
     }
 
     #[test]
-    fn destroy_detected_when_app_removed() {
+    fn running_app_absent_from_config_is_reported_not_destroyed() {
         let config = parse_config(
             r#"
             [app.web]
@@ -620,17 +637,17 @@ mod tests {
             },
         ];
         let plan = generate_plan(&config, Some(&current));
-        let destroy = plan
+        let extra = plan
             .entries
             .iter()
-            .find(|e| e.action == PlanAction::Destroy);
-        assert!(destroy.is_some());
-        assert_eq!(destroy.unwrap().resource, "app.old-service");
-        assert_eq!(plan.to_destroy, 1);
+            .find(|e| e.action == PlanAction::NotInConfig);
+        assert!(extra.is_some());
+        assert_eq!(extra.unwrap().resource, "app.old-service");
+        assert_eq!(plan.not_in_config, 1);
     }
 
     #[test]
-    fn mixed_plan_with_create_update_destroy_unchanged() {
+    fn mixed_plan_with_create_update_absent_unchanged() {
         let config = parse_config(
             r#"
             [app.web]
@@ -659,7 +676,7 @@ mod tests {
 
         assert_eq!(plan.to_create, 1); // new-service
         assert_eq!(plan.to_update, 1); // web (v1→v2)
-        assert_eq!(plan.to_destroy, 1); // removed
+        assert_eq!(plan.not_in_config, 1); // removed
         assert_eq!(plan.unchanged, 1); // api
     }
 
@@ -681,7 +698,7 @@ mod tests {
     }
 
     #[test]
-    fn display_uses_minus_for_destroy() {
+    fn display_marks_not_in_config_and_never_claims_destroy() {
         let config = Config::default();
         let current = vec![CurrentResource {
             resource: "app.old".to_string(),
@@ -689,7 +706,13 @@ mod tests {
         }];
         let plan = generate_plan(&config, Some(&current));
         let output = plan.to_string();
-        assert!(output.contains("- app.old"), "got:\n{output}");
+        assert!(output.contains("* app.old"), "got:\n{output}");
+        // Apply is additive — the plan must not promise a removal.
+        assert!(!output.contains("destroy"), "got:\n{output}");
+        assert!(
+            output.contains("apply leaves them; `relish stop` removes"),
+            "got:\n{output}"
+        );
     }
 
     #[test]

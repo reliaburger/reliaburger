@@ -453,7 +453,9 @@ pub struct FieldChange {
 pub struct PlanSummary {
     pub to_create: u32,
     pub to_update: u32,
-    pub to_destroy: u32,
+    /// Running on the cluster but absent from this config. Informational:
+    /// apply is additive and never removes; `relish stop` does.
+    pub not_in_config: u32,
     pub unchanged: u32,
 }
 

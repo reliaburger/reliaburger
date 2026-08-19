@@ -37,10 +37,21 @@ async fn apply_with_client(
     config.validate()?;
 
     if dry_run {
-        let plan = generate_plan(&config, None);
+        // Diff against the live agent's current state when one answers, so
+        // updates and unchanged resources render as such instead of every
+        // resource claiming to be a create. No agent → the all-create plan.
+        let current = match client.health().await {
+            Ok(()) => client.current_resources().await.ok(),
+            Err(_) => None,
+        };
+        let plan = generate_plan(&config, current.as_deref());
         let formatted = format_output(&plan, output)?;
         println!("{formatted}");
-        println!("\n(dry run — nothing deployed)");
+        // Human-only trailer: appending it to --output json|yaml would
+        // corrupt the document (deploy already guarded this; apply didn't).
+        if matches!(output, OutputFormat::Human) {
+            println!("\n(dry run — nothing deployed)");
+        }
         return Ok(());
     }
 
@@ -915,8 +926,16 @@ pub async fn deploy(path: &Path, output: OutputFormat, dry_run: bool) -> Result<
     let config = Config::from_file(path)?;
     config.validate()?;
 
+    let client = BunClient::default_local();
+
     if dry_run {
-        let plan = generate_plan(&config, None);
+        // Same live diff as `apply --dry-run`: a reachable agent supplies
+        // current state so the plan shows updates, not universal creates.
+        let current = match client.health().await {
+            Ok(()) => client.current_resources().await.ok(),
+            Err(_) => None,
+        };
+        let plan = generate_plan(&config, current.as_deref());
         let formatted = format_output(&plan, output)?;
         println!("{formatted}");
         if matches!(output, OutputFormat::Human) {
@@ -925,7 +944,6 @@ pub async fn deploy(path: &Path, output: OutputFormat, dry_run: bool) -> Result<
         return Ok(());
     }
 
-    let client = BunClient::default_local();
     match client.health().await {
         Ok(()) => {
             let result = client.apply(&config).await?;

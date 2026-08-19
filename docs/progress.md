@@ -2571,10 +2571,16 @@ and a handful of test cases whose assertions are too loose to catch the bug they
   + the CLI calls it when `health()` answers and otherwise falls back to the direct local
   read — now in bun's own path preference order (the old code tried them reversed and
   ignored custom `[storage] logs`, which remains reachable only via the agent).
-- [ ] **`plan.rs` current-state diff is unreachable** — `src/relish/plan.rs:80`
-  `generate_plan`'s `Update`/`Destroy`/`Unchanged` diffing and the `CurrentResource` type
-  are never exercised: every caller (`apply`, `deploy`) passes `current = None`, so
-  `apply --dry-run` always shows everything as a create, contradicting the module doc.
+- [x] **`plan.rs` current-state diff is unreachable** — wired: `GET /v1/apps` serves the
+  currently deployed resources in plan format (council desired state merged over the local
+  agent's `deployed_specs`/jobs via the new `AgentCommand::CurrentResources`);
+  `apply`/`deploy --dry-run` fetch it whenever the agent answers `health()` and diff for
+  real (unreachable keeps the all-create plan). **Semantics correction:** apply is
+  additive (removal is `relish stop`/GitOps), so the plan's `Destroy` action was a lie —
+  renamed to `not_in_config`, rendered `*` with an "apply leaves them" note, and the
+  footer now reports unchanged counts. Also fixed: `apply --dry-run --output json`
+  appended the human "(dry run)" trailer, corrupting the JSON document. Round-trip test
+  drives endpoint → client → `generate_plan` against a live standalone agent.
 
 **Medium — test cases with assertions too loose to catch the named bug (false-green risk):**
 

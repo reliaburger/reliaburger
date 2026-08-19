@@ -338,6 +338,7 @@ pub fn router_with_upgrade(
         .route("/ui/app/{app}/{namespace}/env", get(app_env_handler))
         .route("/v1/apply", post(apply_handler))
         .route("/v1/status", get(status_handler))
+        .route("/v1/apps", get(current_apps_handler))
         .route("/v1/readiness", get(readiness_handler))
         .route("/v1/jobs", get(jobs_handler))
         .route("/v1/events", get(events_handler))
@@ -2605,6 +2606,53 @@ async fn placements_handler(
 }
 
 /// List all instances.
+/// `GET /v1/apps` — the currently deployed resources in the CLI plan's
+/// identifier format, for `relish apply --dry-run` diffing.
+///
+/// Cluster mode answers from the council's desired state (authoritative and
+/// cluster-wide: apps with images, declared namespaces and permissions),
+/// merged over the local agent's view (which contributes node-local jobs —
+/// jobs don't live in desired state). Standalone answers from the local
+/// agent alone.
+async fn current_apps_handler(State(state): State<ApiState>) -> Response {
+    // Plan-key → image; later inserts overwrite, so the council's
+    // authoritative entries land last.
+    let mut resources: std::collections::BTreeMap<String, Option<String>> =
+        std::collections::BTreeMap::new();
+
+    let (resp_tx, resp_rx) = oneshot::channel();
+    if state
+        .cmd_tx
+        .send(AgentCommand::CurrentResources { response: resp_tx })
+        .await
+        .is_ok()
+        && let Ok(local) = resp_rx.await
+    {
+        for entry in local {
+            resources.insert(entry.resource, entry.image);
+        }
+    }
+
+    if let Some(council) = &state.council {
+        let desired = council.desired_state().await;
+        for (app_id, spec) in &desired.apps {
+            resources.insert(format!("app.{}", app_id.name), spec.image.clone());
+        }
+        for name in desired.namespaces.keys() {
+            resources.insert(format!("namespace.{name}"), None);
+        }
+        for name in desired.permissions.keys() {
+            resources.insert(format!("permission.{name}"), None);
+        }
+    }
+
+    let rows: Vec<crate::bun::agent::CurrentResourceStatus> = resources
+        .into_iter()
+        .map(|(resource, image)| crate::bun::agent::CurrentResourceStatus { resource, image })
+        .collect();
+    Json(rows).into_response()
+}
+
 async fn status_handler(State(state): State<ApiState>) -> Response {
     let (resp_tx, resp_rx) = oneshot::channel();
     if state
@@ -6673,6 +6721,87 @@ mod tests {
             cmd_tx, None, None, None, None, None, None, None, None, None, None, None, 9117, None,
         );
         (app, shutdown)
+    }
+
+    /// `GET /v1/apps` → `BunClient::current_resources` → `generate_plan`:
+    /// the full dry-run diff chain against a live standalone agent. Before
+    /// the endpoint existed, every dry-run caller passed `current = None`,
+    /// so the tested Update/Unchanged diff in plan.rs was dead in production.
+    #[tokio::test]
+    async fn current_apps_feeds_the_dry_run_diff() {
+        let (cmd_tx, cmd_rx) = mpsc::channel(32);
+        let shutdown = CancellationToken::new();
+        let grill = MockGrill::new();
+        let port_allocator = PortAllocator::new(30000, 31000);
+        let mut agent = BunAgent::new(grill, port_allocator, cmd_rx, shutdown.clone());
+        tokio::spawn(async move {
+            agent.run().await;
+        });
+        let app = router(
+            cmd_tx.clone(),
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            9117,
+            None,
+        );
+
+        // Deploy one app through the agent, as apply would.
+        let config = crate::config::Config::parse("[app.web]\nimage = \"myapp:v1\"\n").unwrap();
+        let (ev_tx, mut ev_rx) = mpsc::channel(64);
+        cmd_tx
+            .send(AgentCommand::Deploy {
+                config,
+                events: ev_tx,
+            })
+            .await
+            .unwrap();
+        while ev_rx.recv().await.is_some() {}
+
+        // Serve the router for a real client round-trip.
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let serving = shutdown.clone();
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app)
+                .with_graceful_shutdown(async move { serving.cancelled().await })
+                .await
+                .unwrap();
+        });
+
+        let client = crate::relish::client::BunClient::new(&format!("http://{address}"));
+        let current = client.current_resources().await.unwrap();
+        assert!(
+            current
+                .iter()
+                .any(|r| r.resource == "app.web" && r.image.as_deref() == Some("myapp:v1")),
+            "deployed app missing from /v1/apps: {current:?}"
+        );
+
+        // Same image diffs Unchanged; a bumped image diffs Update; the
+        // running app absent from a config is reported, never "destroyed".
+        let same = crate::config::Config::parse("[app.web]\nimage = \"myapp:v1\"\n").unwrap();
+        let plan = crate::relish::plan::generate_plan(&same, Some(&current));
+        assert_eq!((plan.to_update, plan.unchanged), (0, 1), "{plan:?}");
+
+        let bumped = crate::config::Config::parse("[app.web]\nimage = \"myapp:v2\"\n").unwrap();
+        let plan = crate::relish::plan::generate_plan(&bumped, Some(&current));
+        assert_eq!((plan.to_create, plan.to_update), (0, 1), "{plan:?}");
+
+        let unrelated = crate::config::Config::parse("[app.other]\nimage = \"o:v1\"\n").unwrap();
+        let plan = crate::relish::plan::generate_plan(&unrelated, Some(&current));
+        assert_eq!(plan.not_in_config, 1, "{plan:?}");
+
+        shutdown.cancel();
+        let _ = server.await;
     }
 
     /// Build a router whose local `MayoStore` already holds `samples`

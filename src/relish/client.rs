@@ -658,6 +658,22 @@ impl BunClient {
         self.get_typed_json("/v1/diagnostics/apps").await
     }
 
+    /// Fetch the currently deployed resources in plan format
+    /// (`GET /v1/apps`), for `--dry-run` diffing.
+    pub async fn current_resources(
+        &self,
+    ) -> Result<Vec<crate::relish::plan::CurrentResource>, RelishError> {
+        let rows: Vec<crate::bun::agent::CurrentResourceStatus> =
+            self.get_typed_json("/v1/apps").await?;
+        Ok(rows
+            .into_iter()
+            .map(|row| crate::relish::plan::CurrentResource {
+                resource: row.resource,
+                image: row.image,
+            })
+            .collect())
+    }
+
     /// Trigger an immediate log export on the agent (`POST /v1/logs/export`).
     ///
     /// The destination is resolved agent-side — a path on the agent host,

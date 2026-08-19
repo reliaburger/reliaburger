@@ -264,6 +264,11 @@ pub enum AgentCommand {
     DesiredApps {
         response: oneshot::Sender<Vec<crate::bun::diagnostics::DesiredAppEvidence>>,
     },
+    /// Get the currently deployed resources in plan format ("app.{name}",
+    /// "job.{name}") with their images, for `relish --dry-run` diffing.
+    CurrentResources {
+        response: oneshot::Sender<Vec<CurrentResourceStatus>>,
+    },
     /// Get status of run-to-completion workload instances.
     JobStatus {
         response: oneshot::Sender<Vec<JobStatus>>,
@@ -1191,6 +1196,17 @@ pub struct ApplyResult {
     pub created: usize,
     /// Instance IDs that were created.
     pub instances: Vec<String>,
+}
+
+/// One currently deployed resource in the CLI plan's identifier format,
+/// served by `GET /v1/apps` for `relish apply --dry-run` diffing.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CurrentResourceStatus {
+    /// Plan-format identifier: "app.{name}", "job.{name}",
+    /// "namespace.{name}" or "permission.{name}".
+    pub resource: String,
+    /// Image currently deployed, when the resource kind has one.
+    pub image: Option<String>,
 }
 
 /// Status of a single workload instance.
@@ -2832,6 +2848,25 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
                     (&left.namespace, &left.app).cmp(&(&right.namespace, &right.app))
                 });
                 let _ = response.send(apps);
+            }
+            AgentCommand::CurrentResources { response } => {
+                let mut resources: Vec<CurrentResourceStatus> = self
+                    .deployed_specs
+                    .iter()
+                    .map(|((app, _namespace), spec)| CurrentResourceStatus {
+                        resource: format!("app.{app}"),
+                        image: spec.image.clone(),
+                    })
+                    .collect();
+                for job in self.get_job_status() {
+                    resources.push(CurrentResourceStatus {
+                        resource: format!("job.{}", job.name),
+                        image: Some(job.image),
+                    });
+                }
+                resources.sort_by(|a, b| a.resource.cmp(&b.resource));
+                resources.dedup_by(|a, b| a.resource == b.resource);
+                let _ = response.send(resources);
             }
             AgentCommand::JobStatus { response } => {
                 let statuses = self.get_job_status();
