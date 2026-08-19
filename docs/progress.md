@@ -2354,14 +2354,15 @@ blocking calls).
 - [x] **LogStore buffer is unbounded** — `src/ketchup/log_store.rs:194-199` has no cap, so
   a persistently failing flush (disk full — logged every 60 s) grows the buffer without
   bound; RollupStore got `MAX_BUFFER_ROWS` for exactly this, LogStore didn't.
-- [ ] **Rollup backfill double-counts or drops on aggregator reassignment** —
-  `src/mayo/rollup_generator.rs:44-85` + `query_fanout.rs:34-52` stamp the 5-minute backfill
-  as one aggregate at `aligned_end - 300` (a key a normal 1-minute window already used):
-  reassignment *back* drops the whole backfill as a duplicate; reassignment to a fresh
-  aggregator makes `merge_cluster_results` sum the 5-min row with overlapping 1-min rows
-  (cross-aggregator, invisible to OBS2 dedup). Failed rollup pushes are also lost silently
-  (`rollup_worker.rs:126-140`: `Err(_) => return` no log, `let _ =` send, backfill flag
-  cleared before the send; nodes over `MAX_REPORT_SIZE` 1 MiB lose metrics permanently).
+- [x] **Rollup backfill double-counts or drops on aggregator reassignment** — the
+  backfill is now emitted as per-minute `NodeRollup`s (`generate_backfill`), each stamped
+  at its own minute start, so the aggregator's `(node, timestamp)` dedup drops exactly the
+  minutes it already holds and keeps the rest; no wire change (bincode discriminants are
+  pinned), and the worker clears the backfill flag only after every send succeeds
+  (partial-failure re-sends are idempotent). The silent-lost-push half was fixed in the
+  main Medium PR. _Residuals: minutes held by **both** aggregators still overlap at query
+  merge (inherent to reassignment without handoff), and a node whose single rollup exceeds
+  `MAX_REPORT_SIZE` (1 MiB) still can't push — chunking is untracked work._
 - [x] **Placement reconciler orphans instances on a failed stop** —
   `src/cluster/orchestrate.rs:847-857` fires `AgentCommand::Stop` with the response oneshot
   dropped and unconditionally does `applied.remove(...)` even if the send/stop failed, so no

@@ -49,7 +49,10 @@ pub struct RollupEntry {
 }
 
 /// Pre-aggregated rollup pushed from a worker node to its council
-/// aggregator every 60 seconds.
+/// aggregator every 60 seconds. Every rollup — including the reassignment
+/// backfill, which is emitted as several of these — covers exactly one
+/// minute-aligned window, so the aggregator's `(node, timestamp)` dedup key
+/// is unambiguous (M9).
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct NodeRollup {
     /// Identity of the reporting node.

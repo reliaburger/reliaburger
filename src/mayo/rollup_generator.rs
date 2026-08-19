@@ -15,8 +15,8 @@ use super::types::MayoError;
 /// Default rollup window in seconds.
 pub const DEFAULT_ROLLUP_WINDOW_SECS: u64 = 60;
 
-/// Extended rollup window (5 minutes) for reassignment backfill.
-pub const EXTENDED_ROLLUP_WINDOW_SECS: u64 = 300;
+/// Total span (5 minutes) re-sent as per-minute rollups after reassignment.
+pub const BACKFILL_SPAN_SECS: u64 = 300;
 
 /// Generates `NodeRollup` entries from a local `MayoStore`.
 pub struct RollupGenerator {
@@ -29,11 +29,7 @@ impl RollupGenerator {
         Self { node_id }
     }
 
-    /// Generate a rollup from the local MayoStore.
-    ///
-    /// Queries the store for the window ending at `now`. When `extended` is
-    /// true, covers 5 minutes instead of 1 minute (used on first push to a new
-    /// aggregator after reassignment).
+    /// Generate the previous complete minute's rollup from the local MayoStore.
     ///
     /// The window start is aligned down to a multiple of
     /// `DEFAULT_ROLLUP_WINDOW_SECS` (OBS2). Without alignment two nodes ticking
@@ -41,24 +37,58 @@ impl RollupGenerator {
     /// the council can't tell one node's re-sent window from a genuinely new
     /// one and can't deduplicate. Aligned windows give every node the same
     /// `(node, window)` key for the same minute.
-    pub async fn generate(
-        &self,
-        store: &MayoStore,
-        now: u64,
-        extended: bool,
-    ) -> Result<NodeRollup, MayoError> {
-        let window = if extended {
-            EXTENDED_ROLLUP_WINDOW_SECS
-        } else {
-            DEFAULT_ROLLUP_WINDOW_SECS
-        };
+    pub async fn generate(&self, store: &MayoStore, now: u64) -> Result<NodeRollup, MayoError> {
         // Align the window end down to a minute boundary, then step back one
         // window. `now - (now % W)` is the start of the current minute; the
         // completed window we roll up is the one before it.
         let aligned_end = now - (now % DEFAULT_ROLLUP_WINDOW_SECS);
-        let start = aligned_end.saturating_sub(window);
+        let start = aligned_end.saturating_sub(DEFAULT_ROLLUP_WINDOW_SECS);
+        self.window_rollup(store, start, aligned_end).await
+    }
 
-        let aggregates = store.query_window_aggregates(start, aligned_end).await?;
+    /// Generate the reassignment backfill: the last `BACKFILL_SPAN_SECS` as
+    /// **per-minute** rollups, oldest first, empty minutes skipped.
+    ///
+    /// The backfill used to be one aggregate spanning the whole 5 minutes,
+    /// stamped at `aligned_end - 300` — always a minute boundary an ordinary
+    /// rollup had already used. The aggregator's `(node, timestamp)` dedup then
+    /// either dropped the entire backfill (reassignment back to a previous
+    /// parent) or a fresh parent's 5-minute row was summed with the old
+    /// parent's overlapping 1-minute rows at query merge — double counting.
+    /// Per-minute emission makes every row a genuine 60-second window, so the
+    /// dedup drops exactly the minutes the parent already holds and keeps the
+    /// rest. Minutes held by *both* parents still overlap at query merge;
+    /// that is inherent to aggregator reassignment without handoff.
+    pub async fn generate_backfill(
+        &self,
+        store: &MayoStore,
+        now: u64,
+    ) -> Result<Vec<NodeRollup>, MayoError> {
+        let aligned_end = now - (now % DEFAULT_ROLLUP_WINDOW_SECS);
+        let span_start = aligned_end.saturating_sub(BACKFILL_SPAN_SECS);
+
+        let mut rollups = Vec::new();
+        let mut start = span_start;
+        while start < aligned_end {
+            let rollup = self
+                .window_rollup(store, start, start + DEFAULT_ROLLUP_WINDOW_SECS)
+                .await?;
+            if !rollup.entries.is_empty() {
+                rollups.push(rollup);
+            }
+            start += DEFAULT_ROLLUP_WINDOW_SECS;
+        }
+        Ok(rollups)
+    }
+
+    /// Roll up one `[start, end)` window into a `NodeRollup` stamped at `start`.
+    async fn window_rollup(
+        &self,
+        store: &MayoStore,
+        start: u64,
+        end: u64,
+    ) -> Result<NodeRollup, MayoError> {
+        let aggregates = store.query_window_aggregates(start, end).await?;
 
         let entries = aggregates
             .into_iter()
@@ -113,7 +143,7 @@ mod tests {
         store.flush().await.unwrap();
 
         let generator = RollupGenerator::new(NodeId::new("node-1"));
-        let rollup = generator.generate(&store, 1080, false).await.unwrap();
+        let rollup = generator.generate(&store, 1080).await.unwrap();
 
         assert_eq!(rollup.node_id, NodeId::new("node-1"));
         // The window start is aligned to a minute boundary.
@@ -128,23 +158,60 @@ mod tests {
         assert_eq!(entry.aggregate.count, 3);
     }
 
+    /// The backfill covers the last 5 minutes as per-minute rollups, each
+    /// stamped at its own minute start — the same `(node, timestamp)` keys an
+    /// ordinary tick would have produced, so the aggregator's dedup works on
+    /// them minute by minute. The old single-blob backfill stamped everything
+    /// at one already-used minute key, which this test would have caught.
     #[tokio::test]
-    async fn extended_covers_five_minutes() {
+    async fn backfill_emits_per_minute_rollups_with_ordinary_stamps() {
         let (mut store, _dir) = test_store();
         let key = MetricKey::simple("mem");
-        // Spread samples across 5 minutes (300 seconds)
+        // now = 1000 aligns to 960; backfill span is [660, 960). Seed three
+        // distinct minutes inside it: [660, 720), [780, 840), [900, 960).
         store.insert(&key, Sample::at(700, 100.0));
         store.insert(&key, Sample::at(800, 200.0));
         store.insert(&key, Sample::at(900, 300.0));
         store.flush().await.unwrap();
 
         let generator = RollupGenerator::new(NodeId::new("node-1"));
-        let rollup = generator.generate(&store, 1000, true).await.unwrap();
+        let rollups = generator.generate_backfill(&store, 1000).await.unwrap();
 
-        // Extended window: 1000 - 300 = 700, so all 3 samples included
-        assert_eq!(rollup.entries.len(), 1);
-        assert_eq!(rollup.entries[0].aggregate.count, 3);
-        assert_eq!(rollup.entries[0].aggregate.sum, 600.0);
+        // Empty minutes ([720, 780) and [840, 900)) are skipped.
+        assert_eq!(rollups.len(), 3);
+        let stamps: Vec<u64> = rollups.iter().map(|r| r.timestamp).collect();
+        assert_eq!(stamps, vec![660, 780, 900]);
+        for (rollup, expected_sum) in rollups.iter().zip([100.0, 200.0, 300.0]) {
+            assert_eq!(rollup.entries.len(), 1);
+            assert_eq!(rollup.entries[0].aggregate.count, 1);
+            assert_eq!(rollup.entries[0].aggregate.sum, expected_sum);
+        }
+    }
+
+    /// A minute with samples in every sub-window backfills all five minutes,
+    /// and the newest backfilled minute is exactly the one `generate` would
+    /// produce — the backfill is a superset re-send, not a different shape.
+    #[tokio::test]
+    async fn backfill_newest_minute_matches_the_normal_rollup() {
+        let (mut store, _dir) = test_store();
+        let key = MetricKey::simple("cpu");
+        for minute_start in (660..960).step_by(60) {
+            store.insert(&key, Sample::at(minute_start + 30, 10.0));
+        }
+        store.flush().await.unwrap();
+
+        let generator = RollupGenerator::new(NodeId::new("node-1"));
+        let rollups = generator.generate_backfill(&store, 1000).await.unwrap();
+        let normal = generator.generate(&store, 1000).await.unwrap();
+
+        assert_eq!(rollups.len(), 5);
+        assert_eq!(
+            rollups.iter().map(|r| r.timestamp).collect::<Vec<_>>(),
+            vec![660, 720, 780, 840, 900]
+        );
+        let newest = rollups.last().unwrap();
+        assert_eq!(newest.timestamp, normal.timestamp);
+        assert_eq!(newest.entries, normal.entries);
     }
 
     #[tokio::test]
@@ -156,7 +223,7 @@ mod tests {
         store.flush().await.unwrap();
 
         let generator = RollupGenerator::new(NodeId::new("node-1"));
-        let rollup = generator.generate(&store, 1000, false).await.unwrap();
+        let rollup = generator.generate(&store, 1000).await.unwrap();
 
         assert_eq!(rollup.entries.len(), 1);
         assert_eq!(rollup.entries[0].aggregate.count, 1);
@@ -185,7 +252,7 @@ mod tests {
             // `now` lands anywhere inside minute [1080, 1140); the generator
             // must always roll up the completed previous minute [1020, 1080).
             let now = 1080 + phase;
-            let rollup = generator.generate(&store, now, false).await.unwrap();
+            let rollup = generator.generate(&store, now).await.unwrap();
 
             assert_eq!(
                 rollup.entries.len(),
@@ -202,7 +269,7 @@ mod tests {
         let (store, _dir) = test_store();
 
         let generator = RollupGenerator::new(NodeId::new("node-1"));
-        let rollup = generator.generate(&store, 1000, false).await.unwrap();
+        let rollup = generator.generate(&store, 1000).await.unwrap();
 
         assert!(rollup.entries.is_empty());
     }
@@ -216,7 +283,7 @@ mod tests {
         store.flush().await.unwrap();
 
         let generator = RollupGenerator::new(NodeId::new("node-1"));
-        let rollup = generator.generate(&store, 1000, false).await.unwrap();
+        let rollup = generator.generate(&store, 1000).await.unwrap();
 
         assert_eq!(rollup.entries.len(), 3);
         let names: Vec<&str> = rollup
@@ -240,7 +307,7 @@ mod tests {
         store.flush().await.unwrap();
 
         let generator = RollupGenerator::new(NodeId::new("node-1"));
-        let rollup = generator.generate(&store, 1000, false).await.unwrap();
+        let rollup = generator.generate(&store, 1000).await.unwrap();
 
         assert_eq!(rollup.entries.len(), 1);
         assert_eq!(rollup.entries[0].labels, labels);
@@ -269,7 +336,7 @@ mod tests {
         let mut rollups = Vec::new();
         for (store, _dir, node_name) in &stores {
             let generator = RollupGenerator::new(NodeId::new(node_name));
-            let rollup = generator.generate(store, 1000, false).await.unwrap();
+            let rollup = generator.generate(store, 1000).await.unwrap();
             rollups.push(rollup);
         }
 
