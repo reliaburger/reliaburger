@@ -572,7 +572,7 @@ A Kubernetes Deployment becomes an `AppSpec`. The mapping isn't one-to-one, but 
 - `nodeSelector` → `placement.required`
 - `initContainers` → `init`
 
-DaemonSets become `replicas = "*"`. StatefulSets produce a warning because Reliaburger doesn't have ordered startup or stable network IDs. Jobs and CronJobs map directly.
+DaemonSets become `replicas = "*"`. StatefulSets produce a warning because Reliaburger doesn't have ordered startup or stable network IDs. Jobs and CronJobs map directly. The whole mapping above runs through one shared `pod_spec_to_app` helper, whatever the workload kind — that wasn't always true, and the section below explains what it cost while it wasn't.
 
 Three of those rows have a history: `command`, `namespace`, and env values used to be silently dropped. A Deployment running `python -m worker.main` would import as an app running the image's default entrypoint. No error, no warning — the config just did something different from the original. Silent data loss during migration is the worst kind, because you only discover it when the workload misbehaves in production.
 
@@ -638,6 +638,20 @@ Not exported yet (a K8s equivalent exists):
 The distinction matters to the person reading it. "Unsupported" tells them to stop looking; "not exported yet" tells them a solution exists and they'll have to write it by hand today. Filing the second under the first is a small lie that costs someone an afternoon.
 
 There's a general principle in here that keeps recurring in this project: an incomplete tool that reports its gaps is trustworthy, and a tool that quietly does less than it claims isn't — regardless of which one has more features.
+
+#### The second pass: the bugs the first pass planted
+
+A later line-by-line audit of both converters found another crop, and they're instructive because most of them are *consistency* failures — one code path fixed, its sibling left behind.
+
+The export side first. The M28 pass added the namespace to every resource's metadata... except the Ingress, the one resource that referenced another by name. A namespaced app's Ingress landed in `default` and pointed at a Service that wasn't there. The job exporter kept only image and command, so a migration job's database credentials and memory limit vanished — the same env/resources mapping the app exporter had, sitting thirty lines up, unused. And the namespace exporter accepted a `NamespaceSpec` full of quota fields, ignored the argument entirely (`_ns`, the underscore quietly telling you it was never read), and emitted a bare Namespace while the module doc promised a ResourceQuota.
+
+Two smaller export bugs had sharper teeth. A DaemonSet app with `[autoscale]` produced an HPA whose `scaleTargetRef` said `kind: Deployment` — pointing at a resource that doesn't exist, because the HPA block sat outside the branch that knew which kind it had emitted. And the autoscale target parser accepted only `"70%"`, while config validation also accepts the fraction form `"0.7"` — which exported as `type: Utilization` with no `averageUtilization`, a manifest the API server rejects. Both are now report entries instead of broken YAML: a DaemonSet can't be scaled (no scale subresource), so the honest output is no HPA and a sentence saying why.
+
+The import side had the best bug of the batch. Kubernetes denominates CPU in *cores*: `cpu: "1"` means one core. Reliaburger denominates in millicores, and its own `ResourceRange` parser reads a bare integer as exactly that. Feed the K8s string to the Reliaburger parser — which is what the importer did — and `cpu: "1"` imports as one *millicore*. A thousand-fold under-read, and nothing said so, because the parse error path was `.ok()` and the values that did parse were silently wrong. The importer now has real K8s quantity parsers (cores to millicores, the full suffix zoo for memory), reads `requests` as well as `limits` (a requests-only Deployment — the common case — used to import with no resources at all), and warns on anything unparseable.
+
+The rest of the import crop was the same shape as the export's: DaemonSets and StatefulSets kept only four fields while Deployments kept fourteen, fixed by extracting the shared `pod_spec_to_app` helper rather than copying the logic twice more. The HPA lookup keyed on the HPA's *own* name, so the conventional `api-hpa` → `api` pairing never matched and autoscaling silently disappeared — the comment above the lookup said "correlate by scaleTargetRef name", which is what it should have done and now does. And an Ingress or HPA that correlated with nothing just vanished, while ConfigMaps and Secrets got report entries — the sweep now covers all four.
+
+Can you see the pattern? Almost none of these were hard to fix. They existed because the correct code was written once, for the most common kind, and the other kinds were stubbed "for now". If you take one habit from this section: when you fix a mapping for Deployments, grep for the sibling that handles DaemonSets before you close the ticket.
 
 ## Lessons learned
 

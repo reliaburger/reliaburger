@@ -2542,20 +2542,24 @@ and a handful of test cases whose assertions are too loose to catch the bug they
   metric with a report entry instead of emitting `Utilization` with no
   `averageUtilization`. Bonus: the CLI's export-report gate now also prints when only
   `dropped` entries exist.
-- [ ] **Import correlates HPAs by the wrong name and drops uncorrelated resources** —
-  `src/relish/k8s_import.rs:324-327` matches `hpas.get(name)` on the HPA's own metadata
-  name against the deployment name (the comment says "by scaleTargetRef name"), so a
-  conventionally-named `api-hpa`→`api` never correlates and its autoscaling is lost; any
-  Ingress/HPA that fails to correlate is dropped with no warning (`k8s_import.rs:248-393`),
-  unlike ConfigMaps/Secrets which are reported.
-- [ ] **Import drops fields on non-Deployment workloads** —
-  `src/relish/k8s_import.rs:584-619` `daemonset_to_app`/`statefulset_to_app` keep only
-  image/namespace/replicas/port, silently dropping command/env/resources/probes/
-  initContainers/nodeSelector (whereas `deployment_to_app` imports and warns on all of
-  them); `k8s_import.rs:791-829` Job/CronJob import loses env/limits/namespace;
-  `k8s_import.rs:503-512` reads resources from `limits` only (a requests-only Deployment
-  imports with no cpu/memory); `k8s_import.rs:707-747` `apply_ingress` keeps only the
-  first rule's first path.
+- [x] **Import correlates HPAs by the wrong name and drops uncorrelated resources** —
+  `find_hpa_for_workload` scans by `spec.scaleTargetRef` (name + kind, empty kind matches
+  any), so `api-hpa`→`api` correlates; StatefulSets now get Service/Ingress/HPA
+  correlation and DaemonSets get Ingress; a post-conversion sweep warns for every
+  Ingress/HPA no workload matched (mirroring the ConfigMap/Secret sweeps — warnings trip
+  `--strict`, which is honest, the data is lost).
+- [x] **Import drops fields on non-Deployment workloads** — a shared `pod_spec_to_app`
+  helper gives DaemonSets/StatefulSets everything Deployments already imported
+  (command+args, env with `valueFrom` warnings, resources, probes, initContainers,
+  nodeSelector), with warnings filed under `{kind}/{name}`; Job/CronJob share
+  `pod_to_jobspec` (env/resources/namespace/args survive; CronJob `suspend`/
+  `concurrencyPolicy` warned). Resources read **requests and limits** as real K8s
+  quantities via new `parse_k8s_cpu_millicores`/`parse_k8s_memory_bytes` — the old path
+  fed K8s strings to `ResourceRange::parse`, under-reading `cpu: "1"` 1000× (bare int =
+  millicores there) and silently dropping `"0.5"`/`"512M"`; unparseable quantities now
+  warn. `apply_ingress` warns per dropped rule/path, non-Prefix `pathType`,
+  `defaultBackend` and `ingressClassName`; the design-doc "path rules preserved" claim
+  fixed.
 
 **Medium — relish command handlers:**
 
