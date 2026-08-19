@@ -416,6 +416,7 @@ pub fn router_with_upgrade(
         )
         .route("/v1/alerts", get(alerts_handler))
         .route("/v1/logs/sql", get(logs_sql_handler))
+        .route("/v1/logs/export", post(logs_export_handler))
         .route("/v1/deploys/active", get(deploys_active_handler))
         .route("/v1/deploys/operations", get(deploys_operations_handler))
         .route("/v1/deploys/history/{app}", get(deploys_history_handler))
@@ -5336,6 +5337,86 @@ async fn logs_sql_handler(
     }
 }
 
+/// `POST /v1/logs/export` request body.
+#[derive(serde::Deserialize)]
+struct LogsExportRequest {
+    /// Where the Parquet files go — a path on the agent host, `file://`,
+    /// `s3://` or `gs://`. Resolved agent-side, with the agent's credentials.
+    destination: String,
+}
+
+/// `POST /v1/logs/export` — export this node's Parquet log store now.
+///
+/// Uses the Bun-owned export checkpoint (X8), so a manual export and the
+/// periodic export loop can't double-ship or skip each other's files. Both
+/// load/save the same checkpoint file non-atomically; that load/save window
+/// is a pre-existing exposure shared with the interval task and the
+/// disk-pressure sweep.
+async fn logs_export_handler(
+    auth: Option<axum::Extension<crate::sesame::auth::AuthContext>>,
+    State(state): State<ApiState>,
+    Json(request): Json<LogsExportRequest>,
+) -> Response {
+    // Admin: this writes files wherever the destination points, using the
+    // agent host's filesystem and object-store credentials.
+    if let Err(resp) =
+        crate::sesame::auth::authorize(auth.as_deref(), crate::sesame::types::ApiRole::Admin)
+    {
+        return resp;
+    }
+    let Some(log_store) = &state.log_store else {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(serde_json::json!({"error": "log store not enabled"})),
+        )
+            .into_response();
+    };
+    let data_dir = log_store.read().await.data_dir().to_path_buf();
+    let checkpoint_path = data_dir.join(crate::ketchup::export::CHECKPOINT_FILENAME);
+    let mut checkpoint = crate::ketchup::export::ExportCheckpoint::load(&checkpoint_path);
+    let node_id = state
+        .node_name
+        .clone()
+        .unwrap_or_else(|| "local".to_string());
+
+    match crate::ketchup::export::export_logs(
+        &data_dir,
+        &request.destination,
+        &node_id,
+        &mut checkpoint,
+    )
+    .await
+    {
+        Ok(result) => {
+            // The files landed; a failed checkpoint save only means a later
+            // export may re-ship them. Say so instead of pretending.
+            let checkpoint_saved = if result.files_exported > 0 {
+                match checkpoint.save(&checkpoint_path) {
+                    Ok(()) => true,
+                    Err(e) => {
+                        eprintln!("bun: log export checkpoint save failed: {e}");
+                        false
+                    }
+                }
+            } else {
+                true
+            };
+            Json(serde_json::json!({
+                "files_exported": result.files_exported,
+                "bytes_written": result.bytes_written,
+                "node_id": node_id,
+                "checkpoint_saved": checkpoint_saved,
+            }))
+            .into_response()
+        }
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({"error": e.to_string()})),
+        )
+            .into_response(),
+    }
+}
+
 /// `GET /v1/alerts` — list all alert statuses.
 async fn alerts_handler(State(state): State<ApiState>) -> impl IntoResponse {
     let Some(alerts) = &state.alerts else {
@@ -8656,6 +8737,120 @@ mod tests {
         let status = get_status(app, "/v1/logs/sql?q=SELECT%20*%20FROM%20logs", Some(&tok)).await;
         assert_ne!(status, StatusCode::FORBIDDEN);
         shutdown.cancel();
+    }
+
+    /// `/v1/logs/export` writes files with the agent's credentials wherever
+    /// the destination points — Deployer must not reach it.
+    #[tokio::test]
+    async fn logs_export_requires_admin() {
+        let (app, shutdown, tok) = setup_with_role(
+            "logs-export-deployer",
+            crate::sesame::types::ApiRole::Deployer,
+        )
+        .await;
+        let status = post_status(
+            app,
+            "/v1/logs/export",
+            &tok,
+            r#"{"destination":"/tmp/nowhere"}"#,
+        )
+        .await;
+        assert_eq!(status, StatusCode::FORBIDDEN);
+        shutdown.cancel();
+    }
+
+    /// An Admin token on a node with no log store gets an honest 503, not a
+    /// silent empty success.
+    #[tokio::test]
+    async fn logs_export_without_a_store_is_service_unavailable() {
+        let (app, shutdown, tok) =
+            setup_with_role("logs-export-nostore", crate::sesame::types::ApiRole::Admin).await;
+        let status = post_status(
+            app,
+            "/v1/logs/export",
+            &tok,
+            r#"{"destination":"/tmp/nowhere"}"#,
+        )
+        .await;
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+        shutdown.cancel();
+    }
+
+    /// The export endpoint ships the store's Parquet files to the requested
+    /// destination under the node's name and persists the Bun-owned export
+    /// checkpoint (X8), so a repeat export ships nothing new.
+    #[tokio::test]
+    async fn logs_export_ships_parquet_and_persists_the_checkpoint() {
+        let (cmd_tx, _cmd_rx) = mpsc::channel(32);
+        let store_dir = tempfile::tempdir().unwrap();
+        let mut store = crate::ketchup::log_store::LogStore::new(store_dir.path().to_path_buf());
+        store.append(
+            "web",
+            "default",
+            crate::ketchup::types::LogStream::Stdout,
+            "hello",
+        );
+        store.flush().await.unwrap();
+        let log_store = Some(Arc::new(RwLock::new(store)));
+
+        let app = router(
+            cmd_tx, None, log_store, None, None, None, None, None, None, None, None, None, 9117,
+            None,
+        );
+        let destination = tempfile::tempdir().unwrap();
+        let body = serde_json::json!({ "destination": destination.path() }).to_string();
+
+        let response = app
+            .clone()
+            .oneshot(
+                axum::http::Request::builder()
+                    .method("POST")
+                    .uri("/v1/logs/export")
+                    .header("content-type", "application/json")
+                    .body(Body::from(body.clone()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let bytes = axum::body::to_bytes(response.into_body(), 1024 * 1024)
+            .await
+            .unwrap();
+        let outcome: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(outcome["files_exported"], 1, "{outcome}");
+        assert_eq!(outcome["checkpoint_saved"], true, "{outcome}");
+
+        // The file landed under the node's subdirectory…
+        let node_dir = destination.path().join("local");
+        let shipped: Vec<_> = std::fs::read_dir(&node_dir)
+            .expect("node subdirectory must exist")
+            .flatten()
+            .collect();
+        assert_eq!(shipped.len(), 1, "one parquet file must be shipped");
+        // …and the checkpoint lives with the store, so a second export is a
+        // no-op instead of a double-ship.
+        assert!(
+            store_dir
+                .path()
+                .join(crate::ketchup::export::CHECKPOINT_FILENAME)
+                .exists()
+        );
+        let repeat = app
+            .oneshot(
+                axum::http::Request::builder()
+                    .method("POST")
+                    .uri("/v1/logs/export")
+                    .header("content-type", "application/json")
+                    .body(Body::from(body))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let bytes = axum::body::to_bytes(repeat.into_body(), 1024 * 1024)
+            .await
+            .unwrap();
+        let outcome: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(outcome["files_exported"], 0, "{outcome}");
     }
 
     /// AUTH1 for faults: a Deployer scoped to one namespace clears the role

@@ -2563,11 +2563,14 @@ and a handful of test cases whose assertions are too loose to catch the bug they
 
 **Medium — relish command handlers:**
 
-- [ ] **`relish logs-export` doc describes an agent interaction that doesn't exist** —
-  `src/relish/commands.rs:204-234` the doc claims it "triggers an immediate export from
-  the running Bun agent's LogStore" and "falls back to direct file copy if the agent is
-  unreachable," but the body never contacts the agent — it unconditionally reads hardcoded
-  local Parquet paths. Fix the doc or build the agent path.
+- [x] **`relish logs-export` doc describes an agent interaction that doesn't exist** —
+  built the agent path (the described design was better than the doc lie): Admin-only
+  `POST /v1/logs/export` runs `ketchup::export_logs` server-side against the store's real
+  directory with the Bun-owned checkpoint (destination `s3://`/`gs://`/path resolves
+  agent-side; a failed checkpoint save is reported, not swallowed); `BunClient::logs_export`
+  + the CLI calls it when `health()` answers and otherwise falls back to the direct local
+  read — now in bun's own path preference order (the old code tried them reversed and
+  ignored custom `[storage] logs`, which remains reachable only via the agent).
 - [ ] **`plan.rs` current-state diff is unreachable** — `src/relish/plan.rs:80`
   `generate_plan`'s `Update`/`Destroy`/`Unchanged` diffing and the `CurrentResource` type
   are never exercised: every caller (`apply`, `deploy`) passes `current = None`, so
