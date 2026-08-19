@@ -86,10 +86,13 @@ fn new_shared_drains() -> crate::wrapper::draining::SharedDrains {
 }
 
 /// Drain then stop a single instance using cloneable handles, so the wait can
-/// run on a spawned deploy task instead of the command loop (M7). Mirrors
-/// `retire_with_drain` + `stop_and_wait_for_exit` for one instance: start the
-/// drain, let in-flight requests finish (up to `drain_timeout`), then
-/// stop-and-wait-for-exit, killing if it overruns the grace.
+/// run on a spawned deploy task instead of the command loop (M7): start the
+/// drain (new traffic is routed away; the Wrapper proxy shares this drain
+/// tracker, so the wait reflects real in-flight HTTP/WebSocket traffic), let
+/// in-flight requests finish (up to `drain_timeout`), then stop and wait for
+/// exit, killing if it overruns the grace (DEP5). Every deploy retire — the
+/// per-step rolling retire, the rolling scale-down surplus, and the blue-green
+/// bulk cut-over — funnels through here on the worker.
 async fn drain_and_stop_instance<G: Grill>(
     drains: &crate::wrapper::draining::SharedDrains,
     grill: &G,
@@ -528,8 +531,10 @@ enum DeployOp {
         replica_count: u32,
         reply: oneshot::Sender<()>,
     },
-    /// Retire the old instances and register the healthy new ones: service
-    /// map, health config, backends, kernel networking, ingress, history.
+    /// Forget the already-stopped old instances and register the healthy new
+    /// ones: service map, health config, backends, kernel networking, ingress,
+    /// history. Bookkeeping only — the deploy worker drains and stops the old
+    /// instances off the command loop before sending this (M7).
     FinaliseRollingDeploy {
         app_name: String,
         namespace: String,
@@ -4815,9 +4820,13 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
         self.deploy_history.write().await.push(entry);
     }
 
-    /// Retire the old instances and register the healthy new ones after a
-    /// rolling redeploy: kill old, rebuild the service map and health config,
-    /// register backends, finish kernel networking, store ingress, record it.
+    /// Forget the old instances and register the healthy new ones after a
+    /// redeploy: rebuild the service map and health config, register backends,
+    /// finish kernel networking, store ingress, record history.
+    ///
+    /// Bookkeeping only (M7): the deploy worker has already drained and
+    /// stopped every instance in `existing` off the command loop via
+    /// `drain_and_stop_instance` — no waiting happens here.
     #[allow(clippy::too_many_arguments)]
     async fn finalise_rolling_deploy(
         &mut self,
@@ -4831,18 +4840,10 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
         mut new_specs: std::collections::HashMap<InstanceId, crate::grill::oci::OciSpec>,
         now: Instant,
     ) {
-        // DEP5: route new traffic to the fresh instances before we retire the
-        // old ones. We add the new backends to the service map alongside the
-        // old ones and rebuild the routing table, so the proxy starts picking
-        // the fresh instances. Then we drain the old instances (let in-flight
-        // requests finish, up to drain_timeout) and stop-and-wait-for-exit.
-        // Only after that do we tear their bookkeeping down.
-        let drain_timeout = spec
-            .deploy
-            .as_ref()
-            .map(crate::meat::deploy_types::DeployConfig::from_spec)
-            .unwrap_or_default()
-            .drain_timeout;
+        // DEP5: the worker routed traffic to the fresh instances (published
+        // backends) before draining and stopping the old ones, so by the time
+        // this op runs the cut-over has already happened. What's left is to
+        // tear the old bookkeeping down and install the new.
         let service_id = crate::onion::service_id::ServiceId::new(namespace, app_name);
         // M7: publishing backends and retiring old instances now happen
         // incrementally as the rollout steps, so by the time we get here both
@@ -4869,7 +4870,6 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
             }
             self.rebuild_routing_table().await;
         }
-        self.retire_with_drain(existing, drain_timeout).await;
 
         for old_id in existing {
             // NET6: lift the retiring instance's egress enforcement.
@@ -7307,28 +7307,6 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
         self.supervisor.retire_instance(old_id).await;
     }
 
-    /// Retire a set of old instances with connection draining (DEP5).
-    ///
-    /// New traffic is already routed away (the caller rebuilds the routing
-    /// table before this). For each instance we start a drain, let in-flight
-    /// requests finish (up to `drain_timeout`), then stop-and-wait-for-exit.
-    /// The Wrapper proxy shares this agent's drain tracker, so the wait
-    /// reflects real in-flight HTTP/WebSocket traffic.
-    async fn retire_with_drain(&self, ids: &[InstanceId], drain_timeout: std::time::Duration) {
-        for id in ids {
-            let cmd = crate::wrapper::draining::DrainCommand {
-                app_name: String::new(),
-                instance_id: id.0.clone(),
-                timeout: drain_timeout,
-            };
-            self.drains.start_drain(&cmd).await;
-        }
-        for id in ids {
-            self.drains.wait_drained(&id.0).await;
-            self.stop_and_wait_for_exit(id, drain_timeout).await;
-        }
-    }
-
     /// Gracefully stop all instances.
     async fn shutdown_all(&mut self) {
         // Reverse every owned fault before the process goes away. The
@@ -8576,7 +8554,8 @@ impl<G: Grill + Clone + 'static> DeployWorker<G> {
         // Anything the planner didn't reach (it stops once every replacement is
         // healthy, and a scale-down leaves surplus old instances) is retired
         // here. On a default rollout this is empty — the stop-progress lines
-        // were already emitted per step above.
+        // were already emitted per step above. The drain+stop wait runs on
+        // this spawned task (M7); finalise only does the fast bookkeeping.
         let outstanding: Vec<InstanceId> = existing[retired..].to_vec();
         for old_id in &outstanding {
             let _ = events
@@ -8584,6 +8563,13 @@ impl<G: Grill + Clone + 'static> DeployWorker<G> {
                     message: format!("stopping old instance {}", old_id.0),
                 })
                 .await;
+            drain_and_stop_instance(
+                &self.drains,
+                &self.grill,
+                old_id,
+                deploy_config.drain_timeout,
+            )
+            .await;
         }
 
         self.ops
@@ -8829,9 +8815,33 @@ impl<G: Grill + Clone + 'static> DeployWorker<G> {
             return std::ops::ControlFlow::Break(());
         }
 
-        // The whole green fleet is healthy. Swap: `finalise_rolling_deploy`
-        // publishes every green backend, rebuilds routing, then drains and
-        // retires all of blue. This is the atomic cut-over.
+        // The whole green fleet is healthy. Cut over: publish every green
+        // backend so routing picks them up while blue still serves, then
+        // drain and stop blue on this spawned task (M7 — the bulk drain used
+        // to run inside finalise on the command loop, freezing every agent
+        // command for up to fleet-size × drain_timeout), and finally send the
+        // fast bookkeeping to the loop.
+        for new_id in &new_ids {
+            self.ops
+                .publish_new_backend(
+                    app_name,
+                    namespace,
+                    new_id,
+                    new_ports.get(new_id).copied().flatten(),
+                    new_ips.get(new_id).copied().flatten(),
+                    spec.port.is_some(),
+                )
+                .await;
+        }
+        for old_id in &existing {
+            drain_and_stop_instance(
+                &self.drains,
+                &self.grill,
+                old_id,
+                deploy_config.drain_timeout,
+            )
+            .await;
+        }
         self.ops
             .finalise_rolling_deploy(
                 app_name,
@@ -10724,6 +10734,116 @@ mod tests {
         agent_handle.await.unwrap();
     }
 
+    /// M7 ordering guarantee: the blue-green cut-over publishes the green
+    /// backends *before* draining and stopping the blue fleet. An in-flight
+    /// request holds the blue drain open; while it does, the green backend
+    /// must already be routable and blue must still be unstopped — and the
+    /// whole wait runs on the deploy worker, so the command loop keeps
+    /// answering (asserted via a Status round-trip mid-drain).
+    #[tokio::test]
+    async fn blue_green_publishes_green_before_stopping_blue() {
+        let (agent, tx, shutdown, grill) = test_agent_with_grill();
+        let drains = agent.drains_handle();
+        let mut service_maps = agent.service_map_watch();
+        let mut agent = agent;
+        let agent_handle = tokio::spawn(async move {
+            agent.run().await;
+        });
+
+        fn bg_config() -> Config {
+            Config::parse(
+                r#"
+                [app.web]
+                image = "myapp:v1"
+                port = 8080
+
+                [app.web.deploy]
+                strategy = "blue-green"
+                health_timeout = "1s"
+            "#,
+            )
+            .unwrap()
+        }
+
+        expect_complete(&send_deploy(&tx, bg_config()).await);
+        let blue_id = InstanceId("default__web-0".to_string());
+
+        // Simulate the proxy holding an in-flight request on blue: pre-start
+        // its drain and bump the connection count. The worker's own
+        // `start_drain` is a no-op on an already-draining instance, so the
+        // cut-over blocks on this connection.
+        drains
+            .start_drain(&crate::wrapper::draining::DrainCommand {
+                app_name: "web".to_string(),
+                instance_id: blue_id.0.clone(),
+                timeout: std::time::Duration::from_secs(30),
+            })
+            .await;
+        drains.increment_connections(&blue_id.0).await;
+
+        let redeploy_tx = tx.clone();
+        let redeploy = tokio::spawn(async move { send_deploy(&redeploy_tx, bg_config()).await });
+
+        // Wait until the green backend is published (the service-map watch
+        // publishes on every rebuild).
+        let green_id = crate::grill::InstanceIdentity::canary("default", "web", 1, 0).instance_id();
+        let published = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            loop {
+                let map = service_maps.borrow_and_update().clone();
+                let has_green = map
+                    .resolve_by_name("web")
+                    .is_some_and(|e| e.backends.iter().any(|b| b.instance_id == green_id.0));
+                if has_green {
+                    return;
+                }
+                if service_maps.changed().await.is_err() {
+                    panic!("service map channel closed before green was published");
+                }
+            }
+        })
+        .await;
+        assert!(published.is_ok(), "green backend was never published");
+
+        // Green is routable, blue's drain is still held open: blue must not
+        // have been stopped or killed yet.
+        assert!(
+            !grill
+                .calls()
+                .iter()
+                .any(|(op, i)| (op == "stop" || op == "kill") && i == &blue_id),
+            "blue was stopped before its in-flight request drained"
+        );
+
+        // The wait runs on the deploy worker, not the command loop: the agent
+        // still answers commands mid-drain.
+        let (resp_tx, resp_rx) = oneshot::channel();
+        tx.send(AgentCommand::Status { response: resp_tx })
+            .await
+            .unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(2), resp_rx)
+            .await
+            .expect("command loop was blocked during the blue drain")
+            .unwrap();
+
+        // The request finishes; the cut-over completes and blue is stopped.
+        drains.decrement_connections(&blue_id.0).await;
+        let events = tokio::time::timeout(std::time::Duration::from_secs(5), redeploy)
+            .await
+            .expect("redeploy did not complete after the drain released")
+            .unwrap();
+        expect_complete(&events);
+        assert!(
+            grill
+                .calls()
+                .iter()
+                .any(|(op, i)| op == "stop" && i == &blue_id),
+            "blue must be stopped after the drain"
+        );
+
+        shutdown.cancel();
+        agent_handle.await.unwrap();
+    }
+
     fn mixed_config() -> Config {
         let toml_str = r#"
             [app.web]
@@ -11435,11 +11555,8 @@ mod tests {
         drains.increment_connections(&id.0).await;
 
         // Kick off the retire on a task; it must block on the drain.
-        let agent_ref = &agent;
-        let retire = agent_ref.retire_with_drain(
-            std::slice::from_ref(&id),
-            std::time::Duration::from_secs(30),
-        );
+        let retire =
+            drain_and_stop_instance(&drains, &grill, &id, std::time::Duration::from_secs(30));
         tokio::pin!(retire);
 
         // While the request is in flight, the retire has not killed anything.
@@ -11492,11 +11609,8 @@ mod tests {
         drains.increment_connections(&id.0).await;
         drains.increment_websocket(&id.0).await;
 
-        let agent_ref = &agent;
-        let retire = agent_ref.retire_with_drain(
-            std::slice::from_ref(&id),
-            std::time::Duration::from_secs(30),
-        );
+        let retire =
+            drain_and_stop_instance(&drains, &grill, &id, std::time::Duration::from_secs(30));
         tokio::pin!(retire);
 
         // The HTTP half of the splice completes, but the WebSocket is still

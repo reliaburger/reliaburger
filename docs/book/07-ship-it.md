@@ -387,18 +387,21 @@ let _drain_guard = match &state.drains {
 With the proxy reporting in-flight traffic, the agent's retire path can finally do the right thing:
 
 ```rust
-async fn retire_with_drain(&self, ids: &[InstanceId], drain_timeout: Duration) {
-    for id in ids {
-        self.drains.start_drain(&drain_command(id, drain_timeout)).await;
-    }
-    for id in ids {
-        self.drains.wait_drained(&id.0).await;
-        self.stop_and_wait_for_exit(id, drain_timeout).await;
-    }
+async fn drain_and_stop_instance<G: Grill>(
+    drains: &SharedDrains,
+    grill: &G,
+    id: &InstanceId,
+    drain_timeout: Duration,
+) {
+    drains.start_drain(&drain_command(id, drain_timeout)).await;
+    drains.wait_drained(&id.0).await;
+    // stop, poll until Stopped, kill if the grace elapses
 }
 ```
 
-Before this runs, the rolling finaliser registers the *new* backends and rebuilds the routing table. So by the time we start draining, the proxy is already sending new requests to the fresh instances. The old ones only have to wait out the requests they were already handling. `wait_drained` polls until the instance's in-flight count hits zero or its deadline passes — new traffic already goes elsewhere, so this is a countdown, not a losing battle.
+Before this runs, the deploy publishes the *new* backends and rebuilds the routing table. So by the time we start draining, the proxy is already sending new requests to the fresh instances. The old ones only have to wait out the requests they were already handling. `wait_drained` polls until the instance's in-flight count hits zero or its deadline passes — new traffic already goes elsewhere, so this is a countdown, not a losing battle.
+
+Notice what this function *takes*: a drain handle and a grill, both cloneable, and no `&self`. That's deliberate, and it's the second half of a lesson that took two rounds to learn. Our first version was a method on the agent, called from the finaliser — which runs on the agent's command loop. The command loop is the single owner of all agent state; while one command executes, every other command waits. A drain is a wait of up to `drain_timeout` *per instance*, and a blue-green cut-over retires the whole old fleet at once. Do that arithmetic on the loop and a routine redeploy of a three-replica app freezes health checks, status queries and cluster RPC for up to ninety seconds. The fix is a division of labour: the spawned deploy worker owns every wait (it calls this free function per instance), and the loop gets only fast bookkeeping messages — "this one's drained and stopped, forget it". The cut-over ordering is preserved by doing it in three steps: publish the green backends (fast, on the loop), drain and stop blue (slow, on the worker), then tear down the old bookkeeping (fast, on the loop). A test pins the ordering by holding a connection open on blue and asserting green is routable — and the agent still answers commands — mid-drain.
 
 This is where `max_unavailable` becomes real rather than aspirational. The rolling path brings a new replica up and healthy *before* it retires an old one, so the count of serving instances never dips below the target: while the old ones drain, the new ones are already taking traffic.
 

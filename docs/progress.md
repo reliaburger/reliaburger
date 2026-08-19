@@ -2295,11 +2295,11 @@ blocking calls).
 > The deletions removed ~800 lines of unwired deploy engine + the superseded
 > coordinator; M7 moved Argon2id, pickle blob reads, LogStore flush, the openraft
 > redb commits, snapshot btrfs, and the per-step rolling-deploy retire drain off
-> the async runtime. **Two remain open** as deeper redesigns, still unchecked
-> below: new-deploys-live-before-health-check (M5) and the rollup backfill-window
-> dedup redesign (the silent-lost-push half is fixed). One bonus finding is left
-> for a focused change: `finalise_rolling_deploy`'s terminal *bulk* retire still
-> drains on the loop (the per-step retire the audit named is fixed).
+> the async runtime. The residuals branch closed the rollup backfill-window
+> redesign (per-minute emission) and the `finalise_rolling_deploy` bulk retire
+> (now drained on the deploy worker, with the blue-green cut-over split into
+> publish → drain → bookkeeping). **One remains open**, still unchecked below:
+> new-deploys-live-before-health-check (M5).
 
 - [x] **Btrfs snapshot restore is destructive on failure** — `src/grill/snapshot.rs:245-247`
   `SnapshotManager::restore` deletes the live subvolume first, then creates the writable
@@ -2331,7 +2331,7 @@ blocking calls).
   `src/mayo/store.rs:244-257` `take_flush_batch` clears the buffer + bumps the counter
   *before* the write, so a failed write permanently discards the drained samples
   (LogStore/RollupStore clear only after success).
-- [x] **Blocking work on the agent event loop / runtime worker**  _(Argon2id token create+verify, pickle blob_get read, LogStore flush, the openraft redb commits, snapshot btrfs, and the per-step rolling-deploy retire drain all now run off-lock/off-runtime. Residual: `finalise_rolling_deploy`'s terminal bulk retire still drains on the loop — a focused follow-up.)_ (project rule: no blocking
+- [x] **Blocking work on the agent event loop / runtime worker**  _(Argon2id token create+verify, pickle blob_get read, LogStore flush, the openraft redb commits, snapshot btrfs, and every deploy retire drain — per-step, rolling scale-down surplus, and the blue-green bulk cut-over — now run off-lock/off-runtime; `retire_with_drain` is deleted and `finalise_rolling_deploy` is bookkeeping-only, with the blue-green ordering "publish green → drain blue → finalise" pinned by a test.)_ (project rule: no blocking
   in async):
   - `src/bun/agent.rs:2890-2919,1731` + `src/bun/snapshot_worker.rs:93-137` — snapshot
     create/restore/delete run sync `btrfs` subprocess + `std::fs` walks on the loop
