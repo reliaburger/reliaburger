@@ -1159,7 +1159,10 @@ pub fn export_k8s(file: &Path) -> Result<(), RelishError> {
 
     print!("{}", result.yaml);
 
-    if !result.report.resources_created.is_empty() || !result.report.unsupported.is_empty() {
+    if !result.report.resources_created.is_empty()
+        || !result.report.unsupported.is_empty()
+        || !result.report.dropped.is_empty()
+    {
         eprint!("{}", result.report);
     }
 

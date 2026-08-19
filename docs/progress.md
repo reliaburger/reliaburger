@@ -2529,18 +2529,19 @@ and a handful of test cases whose assertions are too loose to catch the bug they
 
 **Medium — Kubernetes export/import silently loses data:**
 
-- [ ] **Exported Ingress has no namespace** — `src/relish/k8s_export.rs:308-313` omits
-  `namespace` from the Ingress `ObjectMeta` (every other kind sets it), so a namespaced
-  app's Ingress lands in `default` and can't reach its Service — the M28 class the
-  surrounding comments claim to have fixed.
-- [ ] **Export drops quotas and Job resources without a report entry** —
-  `src/relish/k8s_export.rs:522-538` `export_namespace` ignores its `_ns` arg and emits
-  only a `Namespace` (every quota field dropped) despite the module doc promising a
-  `ResourceQuota`; `k8s_export.rs:444-449` `export_job` maps only image+command, silently
-  discarding `env`/`memory`/`cpu`. Both skip the `dropped`/`unsupported` report the app
-  exporter uses. Also `k8s_export.rs:356-360` emits a DaemonSet-app HPA whose
-  `scaleTargetRef` is hardcoded `kind: Deployment` (pointing at nothing), and
-  `k8s_export.rs:369,557` can emit a `Utilization` HPA with no `averageUtilization`.
+- [x] **Exported Ingress has no namespace** — the Ingress `ObjectMeta` now carries the
+  app's namespace like every other kind; the namespace regression test includes an
+  Ingress so this class can't silently return.
+- [x] **Export drops quotas and Job resources without a report entry** —
+  `export_namespace` emits a real `ResourceQuota` (`cpu`/`memory` → `limits.*`, `gpu` →
+  `requests.nvidia.com/gpu`; `max_apps`/`max_replicas` reported unsupported — K8s counts
+  objects per kind, not apps); `export_job` shares the app path's env/resources helpers
+  and reports `exec`/`script`; a DaemonSet app with `[autoscale]` gets an unsupported
+  entry instead of an HPA targeting a nonexistent Deployment; `parse_target_pct` accepts
+  the fraction form config validation accepts, and an unconvertible target omits the
+  metric with a report entry instead of emitting `Utilization` with no
+  `averageUtilization`. Bonus: the CLI's export-report gate now also prints when only
+  `dropped` entries exist.
 - [ ] **Import correlates HPAs by the wrong name and drops uncorrelated resources** —
   `src/relish/k8s_import.rs:324-327` matches `hpas.get(name)` on the HPA's own metadata
   name against the deployment name (the comment says "by scaleTargetRef name"), so a
