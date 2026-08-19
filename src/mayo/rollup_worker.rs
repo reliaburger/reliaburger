@@ -123,7 +123,22 @@ impl<T: ReportingTransport> RollupWorker<T> {
 
         let extended = self.send_extended;
         let store = self.mayo.read().await;
-        let rollup = match self.generator.generate(&store, now, extended).await {
+        // The backfill is per-minute rollups, not one 5-minute blob: a blob's
+        // single timestamp collided with an already-sent minute key, so the
+        // parent's dedup dropped or double-counted the whole thing (M9). The
+        // normal tick's minute is the backfill's newest sub-window, so the
+        // extended path replaces the ordinary rollup rather than adding to it.
+        let generated = if extended {
+            self.generator.generate_backfill(&store, now).await
+        } else {
+            self.generator
+                .generate(&store, now)
+                .await
+                .map(|rollup| vec![rollup])
+        };
+        drop(store);
+
+        let rollups = match generated {
             Ok(r) => r,
             Err(e) => {
                 // A failed generation used to vanish silently; the stateless
@@ -133,24 +148,25 @@ impl<T: ReportingTransport> RollupWorker<T> {
                 return;
             }
         };
-        drop(store);
 
-        match self
-            .transport
-            .send(parent, &ReportingMessage::MetricsRollup(rollup))
-            .await
-        {
-            Ok(()) => {
-                // Only drop the backfill request once it has actually been
-                // sent (M9). Clearing it before the send meant a failed
-                // post-reassignment push lost the 5-minute backfill for good.
-                if extended {
-                    self.send_extended = false;
-                }
-            }
-            Err(e) => {
+        let mut all_sent = true;
+        for rollup in rollups {
+            if let Err(e) = self
+                .transport
+                .send(parent, &ReportingMessage::MetricsRollup(rollup))
+                .await
+            {
                 eprintln!("mayo: rollup push to parent failed, will retry next tick: {e}");
+                all_sent = false;
+                break;
             }
+        }
+
+        // Only drop the backfill request once every minute has actually been
+        // sent (M9). A partial success re-sends some minutes next tick, which
+        // the parent's `(node, timestamp)` dedup makes idempotent.
+        if extended && all_sent {
+            self.send_extended = false;
         }
     }
 }
@@ -223,6 +239,101 @@ mod tests {
             shutdown.cancel();
             let _ = handle.await;
         }
+    }
+
+    /// After reassignment the backfill goes out as per-minute rollups stamped
+    /// exactly like ordinary ticks — the single 5-minute blob used to collide
+    /// with an already-sent minute key and get dropped or double-counted (M9).
+    /// Driven directly (no spawned task) so there is no timing to race.
+    #[tokio::test]
+    async fn backfill_sends_per_minute_rollups_and_clears_the_flag() {
+        let net = InMemoryReportingNetwork::new();
+        let worker_transport = net.register(addr(1)).await;
+        let council_transport = net.register(addr(2)).await;
+
+        let dir = tempfile::tempdir().unwrap();
+        let mayo = Arc::new(RwLock::new(MayoStore::new(dir.path().to_path_buf())));
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        {
+            // Three samples 60 s apart land in three distinct completed
+            // minutes, all inside the 5-minute backfill span.
+            let mut s = mayo.write().await;
+            for offset in [90, 150, 210] {
+                s.insert(&MetricKey::simple("cpu"), Sample::at(now - offset, 1.0));
+            }
+            s.flush().await.unwrap();
+        }
+
+        let council = vec![(NodeId::new("c1"), addr(2))];
+        let (_council_tx, council_rx) = watch::channel(council);
+        let mut worker = RollupWorker::new(
+            NodeId::new("w1"),
+            worker_transport,
+            mayo,
+            council_rx,
+            Duration::from_millis(100),
+            CancellationToken::new(),
+        );
+        worker.send_extended = true;
+
+        worker.push_rollup().await;
+        assert!(!worker.send_extended, "flag clears after a full send");
+
+        let mut stamps = Vec::new();
+        while let Some((_, _, msg)) = council_transport.try_recv() {
+            match msg {
+                ReportingMessage::MetricsRollup(r) => stamps.push(r.timestamp),
+                _ => panic!("expected MetricsRollup"),
+            }
+        }
+        assert_eq!(stamps.len(), 3, "one rollup per non-empty minute");
+        for stamp in &stamps {
+            assert_eq!(stamp % 60, 0, "backfill stamps are minute-aligned");
+        }
+        assert!(
+            stamps.windows(2).all(|pair| pair[0] < pair[1]),
+            "stamps are distinct and oldest-first: {stamps:?}"
+        );
+    }
+
+    /// A failed backfill send must keep the flag set so the next tick retries;
+    /// the parent's `(node, timestamp)` dedup makes any re-sent minutes
+    /// idempotent.
+    #[tokio::test]
+    async fn backfill_flag_survives_a_failed_send() {
+        let net = InMemoryReportingNetwork::new();
+        let worker_transport = net.register(addr(1)).await;
+        // addr(9) is never registered, so every send to it fails.
+
+        let dir = tempfile::tempdir().unwrap();
+        let mayo = Arc::new(RwLock::new(MayoStore::new(dir.path().to_path_buf())));
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        {
+            let mut s = mayo.write().await;
+            s.insert(&MetricKey::simple("cpu"), Sample::at(now - 90, 1.0));
+            s.flush().await.unwrap();
+        }
+
+        let council = vec![(NodeId::new("c1"), addr(9))];
+        let (_council_tx, council_rx) = watch::channel(council);
+        let mut worker = RollupWorker::new(
+            NodeId::new("w1"),
+            worker_transport,
+            mayo,
+            council_rx,
+            Duration::from_millis(100),
+            CancellationToken::new(),
+        );
+        worker.send_extended = true;
+
+        worker.push_rollup().await;
+        assert!(worker.send_extended, "flag survives a failed send");
     }
 
     #[tokio::test]

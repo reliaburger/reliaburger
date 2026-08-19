@@ -387,18 +387,21 @@ let _drain_guard = match &state.drains {
 With the proxy reporting in-flight traffic, the agent's retire path can finally do the right thing:
 
 ```rust
-async fn retire_with_drain(&self, ids: &[InstanceId], drain_timeout: Duration) {
-    for id in ids {
-        self.drains.start_drain(&drain_command(id, drain_timeout)).await;
-    }
-    for id in ids {
-        self.drains.wait_drained(&id.0).await;
-        self.stop_and_wait_for_exit(id, drain_timeout).await;
-    }
+async fn drain_and_stop_instance<G: Grill>(
+    drains: &SharedDrains,
+    grill: &G,
+    id: &InstanceId,
+    drain_timeout: Duration,
+) {
+    drains.start_drain(&drain_command(id, drain_timeout)).await;
+    drains.wait_drained(&id.0).await;
+    // stop, poll until Stopped, kill if the grace elapses
 }
 ```
 
-Before this runs, the rolling finaliser registers the *new* backends and rebuilds the routing table. So by the time we start draining, the proxy is already sending new requests to the fresh instances. The old ones only have to wait out the requests they were already handling. `wait_drained` polls until the instance's in-flight count hits zero or its deadline passes — new traffic already goes elsewhere, so this is a countdown, not a losing battle.
+Before this runs, the deploy publishes the *new* backends and rebuilds the routing table. So by the time we start draining, the proxy is already sending new requests to the fresh instances. The old ones only have to wait out the requests they were already handling. `wait_drained` polls until the instance's in-flight count hits zero or its deadline passes — new traffic already goes elsewhere, so this is a countdown, not a losing battle.
+
+Notice what this function *takes*: a drain handle and a grill, both cloneable, and no `&self`. That's deliberate, and it's the second half of a lesson that took two rounds to learn. Our first version was a method on the agent, called from the finaliser — which runs on the agent's command loop. The command loop is the single owner of all agent state; while one command executes, every other command waits. A drain is a wait of up to `drain_timeout` *per instance*, and a blue-green cut-over retires the whole old fleet at once. Do that arithmetic on the loop and a routine redeploy of a three-replica app freezes health checks, status queries and cluster RPC for up to ninety seconds. The fix is a division of labour: the spawned deploy worker owns every wait (it calls this free function per instance), and the loop gets only fast bookkeeping messages — "this one's drained and stopped, forget it". The cut-over ordering is preserved by doing it in three steps: publish the green backends (fast, on the loop), drain and stop blue (slow, on the worker), then tear down the old bookkeeping (fast, on the loop). A test pins the ordering by holding a connection open on blue and asserting green is routable — and the agent still answers commands — mid-drain.
 
 This is where `max_unavailable` becomes real rather than aspirational. The rolling path brings a new replica up and healthy *before* it retires an old one, so the count of serving instances never dips below the target: while the old ones drain, the new ones are already taking traffic.
 
@@ -443,6 +446,16 @@ The first is that `max_surge = 0` and `max_unavailable = 0` together are unsatis
 The second is a hazard the interleaving created. Retiring old instances *during* the rollout rather than all at the end means the command loop gets a turn between retirements — and a deliberately stopped instance still sitting in `supervisor.instances` looks exactly like a crashed one to the restart driver, which would helpfully bring it back. So retirement drops the instance from the supervisor in the same turn that stops it (`Supervisor::retire_instance`). Interleaving two loops that used to run one-after-the-other is a reliable way to discover which of your invariants were really just orderings.
 
 Testing this is where the pure planner pays off. The unit tests don't assert step sequences — that would pin the implementation — they replay a whole rollout and assert the *envelope*: peak total and minimum serving. A proptest then does the same for every combination of target, existing count and bounds that validation permits. And because a planner nothing calls is worse than no planner (this codebase has a long history of exactly that), there are agent-level tests that replay the grill's call log to count live containers: three replicas with `max_surge = 1` peak at four, and they peak at six against the old code.
+
+### "Healthy" has to mean the app answered
+
+One more audit finding, and it's the one that would have hurt most in production. The opening of this chapter promised "health-check each new instance before moving on". The live path's version of that promise was a poll on `grill.state == Running` — the *runtime's* view. The process came up, the container didn't crash, so: healthy, publish the backend, retire an old instance. At no point did anyone ask the app the question the operator configured: does `GET /healthz` return 200?
+
+Run the failure through. You ship a version with a broken database password. The process starts fine — it only discovers the bad credential when the health check's handler tries to connect. The old rolling path sees `Running`, announces "healthy ✓", routes traffic to it, and drains the instance that was actually serving. Repeat per replica, and a config typo has replaced your whole healthy fleet with instances that answer every request with a 500. The health check you configured does eventually run — after the deploy finalises, when the ordinary monitoring tick picks the instance up and marks it `Unhealthy` three probes later. The system notices; it just notices after the damage rather than instead of it.
+
+The reason the check couldn't run earlier is structural, and worth understanding. During a rollout, the replacement instance doesn't exist in the supervisor yet — it's the deploy worker's private business until the finaliser installs it. The steady-state health tick probes instances the supervisor knows about, so mid-deploy there is nothing for it to probe. Registering the instance earlier would have meant the restart driver and the deploy worker fighting over a half-created instance (we already met that hazard with retirement). The fix goes the other way: the deploy worker, which already owns every wait, gates itself. `wait_instance_healthy` waits for `Running`, then — when the app declares a health check — runs the same HTTP probe the monitoring tick uses (same config, same `initial_delay`, same thresholds) until it passes or the deploy's `health_timeout` expires. Only then is the backend published; on failure the existing rollback machinery takes over, and the old instances never stop serving. Apps without a health check keep the `Running`-only behaviour — we can't ask a question the operator didn't configure.
+
+The tests for this had a blind spot worth confessing. Every deploy test drove a `MockGrill` whose `state()` says `Running`, so "container runs" and "app answers" were indistinguishable by construction — the gate could not be tested against a fake that has no notion of HTTP. The regression tests bind a real TCP listener on a loopback port, point the app's health check at it, and run the genuine `probe_health` through the deploy: a responder that answers 500 must leave the old instance serving and the deploy rolled back; flip it to 200 and the rollout completes. When a bug survives because the test double can't express it, the fix needs a test the double isn't in.
 
 ### Stop must wait for the process to actually exit
 

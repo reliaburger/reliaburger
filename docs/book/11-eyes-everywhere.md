@@ -78,29 +78,17 @@ A typical node running 10 apps produces roughly 20-30 rollup entries per minute 
 The `RollupGenerator` sits on each node. Every 60 seconds, it queries the local `MayoStore` for the previous *complete* minute and rolls it up with a GROUP BY query:
 
 ```rust
-pub async fn generate(
-    &self,
-    store: &MayoStore,
-    now: u64,
-    extended: bool,
-) -> Result<NodeRollup, MayoError> {
-    let window = if extended {
-        EXTENDED_ROLLUP_WINDOW_SECS  // 300 seconds
-    } else {
-        DEFAULT_ROLLUP_WINDOW_SECS   // 60 seconds
-    };
+pub async fn generate(&self, store: &MayoStore, now: u64) -> Result<NodeRollup, MayoError> {
     // Align the window end down to a minute boundary, then step back one
     // window. `now - (now % 60)` is the start of the current minute; the
     // completed window we roll up is the one before it.
     let aligned_end = now - (now % DEFAULT_ROLLUP_WINDOW_SECS);
-    let start = aligned_end.saturating_sub(window);
-
-    let aggregates = store.query_window_aggregates(start, aligned_end).await?;
-    // ... map to RollupEntry structs
+    let start = aligned_end.saturating_sub(DEFAULT_ROLLUP_WINDOW_SECS);
+    self.window_rollup(store, start, aligned_end).await
 }
 ```
 
-The `extended` flag matters during reassignment. More on that shortly.
+There's a second entry point, `generate_backfill`, which produces the last five minutes as five separate one-minute rollups. It matters during reassignment. More on that shortly.
 
 Why align? Two nodes ticking a few seconds apart would otherwise stamp the same data with different `timestamp`s, and the council couldn't tell a re-sent window from a genuinely new one, so it couldn't deduplicate. Aligning to a minute boundary gives every node the same `(node, window)` key for the same minute.
 
@@ -164,7 +152,7 @@ That's it. One match arm. The existing transport handles framing, serialisation,
 
 On each node, a `RollupWorker` runs as a separate spawned task with its own 60-second interval. It's separate from the `ReportWorker` (which sends `StateReport` every 1-5 seconds) because the data source, interval, and message type are all different. Combining them in one event loop would just add complexity.
 
-The worker watches for council membership changes via a `watch` channel. When the assignment changes (because a council member joined or left), it sets a flag to send an extended rollup on the next tick, covering the previous 5 minutes instead of 1 minute. This backfills the new aggregator with enough historical data to answer queries immediately, rather than having a 5-minute gap.
+The worker watches for council membership changes via a `watch` channel. When the assignment changes (because a council member joined or left), it sets a flag to backfill on the next tick: instead of the usual single rollup, it sends the previous five minutes so the new aggregator can answer queries immediately, rather than having a 5-minute gap.
 
 ```rust
 fn update_parent(&mut self) {
@@ -177,6 +165,18 @@ fn update_parent(&mut self) {
     self.parent_address = new_parent;
 }
 ```
+
+### The backfill that keyed itself out of existence
+
+Our first backfill was one message: a single rollup covering the whole 300 seconds, stamped at `aligned_end - 300`. Compact, obvious, wrong. Can you see the problem? Every minute boundary is a multiple of 60, and so is 300 — so the backfill's timestamp was *always* a key some ordinary rollup had already claimed.
+
+That one stamp broke both directions of reassignment. Reassigned back to an aggregator you'd pushed to before? Its `(node, timestamp)` dedup saw a key it already held and dropped the entire backfill, including the four minutes it had genuinely never received. Reassigned to a fresh aggregator? It accepted the 5-minute blob happily, but the old aggregator still served its own 1-minute rows for the same span, and the cluster query merge summed both. The same minute counted twice, and a five-minute sum sat on a single timestamp where every consumer (the autoscaler included) expected one minute's worth.
+
+The fix wasn't cleverer dedup. It was making the data honest: `generate_backfill` emits five ordinary one-minute rollups, each stamped at its own minute start — exactly the keys the ordinary ticks would have used. Now dedup does the right thing with no new logic at all: an aggregator that already holds a minute drops that minute and keeps the rest. The worker clears its backfill flag only after every send succeeds; a partial failure re-sends some minutes next tick, and idempotent keys make the re-send free.
+
+We deliberately did *not* add a "window length" field to `NodeRollup`. The reporting messages cross the wire as bincode, where enum discriminants and struct layouts are pinned for rolling upgrades — an old node receiving a new field mid-upgrade would fail to decode the frame. Five sends of the unchanged type cost a few extra kilobytes once per reassignment and keep the wire format stable. When a schema is pinned, change the *usage*, not the shape.
+
+One honest caveat: if the old and new aggregators both hold the same minute, a cluster-wide query still sums it twice, because there's no handoff between aggregators — the old one is never told it lost a worker. That overlap lasts until retention prunes it, it's bounded to the reassignment window, and fixing it properly means aggregator handoff, which is a much bigger hammer than the bug deserves.
 
 ### Switching it on
 

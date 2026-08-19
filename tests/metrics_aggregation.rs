@@ -59,7 +59,7 @@ async fn five_node_cluster_hierarchical_aggregation() {
 
         // Generate rollup
         let generator = RollupGenerator::new(worker_id.clone());
-        let rollup = generator.generate(&store, now, false).await.unwrap();
+        let rollup = generator.generate(&store, now).await.unwrap();
 
         // Determine which council member this worker is assigned to
         let parent_id = assign_parent(worker_id, &council_ids).unwrap();
@@ -172,7 +172,7 @@ async fn partial_results_when_aggregator_down() {
         store.flush().await.unwrap();
 
         let generator = RollupGenerator::new(worker_id.clone());
-        let rollup = generator.generate(&store, now, false).await.unwrap();
+        let rollup = generator.generate(&store, now).await.unwrap();
 
         let parent_id = assign_parent(worker_id, &council_ids).unwrap();
         let parent_idx = council_ids.iter().position(|id| *id == parent_id).unwrap();
@@ -234,6 +234,124 @@ async fn partial_results_when_aggregator_down() {
     );
 }
 
+/// Aggregator reassignment backfill neither drops minutes nor collapses them
+/// onto one key (M9).
+///
+/// The backfill used to be a single 5-minute aggregate stamped at a minute key
+/// an ordinary rollup had already used. Reassignment *back* to a previous
+/// aggregator then dropped the whole backfill as a duplicate (losing the
+/// minutes that aggregator never saw), and a *fresh* aggregator served the
+/// 5-minute blob on one timestamp, which the merge summed with the old
+/// aggregator's overlapping 1-minute row. Per-minute backfill emission makes
+/// both cases behave: dedup drops exactly the already-held minutes, and every
+/// minute only one store holds merges to its true value.
+#[tokio::test]
+async fn backfill_after_reassignment_neither_drops_nor_double_counts() {
+    let worker_id = NodeId::new("w1");
+    // One sample of 1.0 in each of the five completed minutes [5700, 6000).
+    let dir = tempfile::tempdir().unwrap();
+    let mut store = MayoStore::new(dir.path().to_path_buf());
+    let key = MetricKey::simple("cpu_usage");
+    for minute in (5700..6000).step_by(60) {
+        store.insert(&key, Sample::at(minute + 30, 1.0));
+    }
+    store.flush().await.unwrap();
+    let generator = RollupGenerator::new(worker_id.clone());
+
+    // Ordinary ticks delivered minutes 5700 and 5760 to aggregator A before
+    // the reassignment.
+    let dir_a = tempfile::tempdir().unwrap();
+    let mut store_a = RollupStore::new(dir_a.path().to_path_buf());
+    for now in [5760u64, 5820] {
+        let rollup = generator.generate(&store, now).await.unwrap();
+        assert!(store_a.ingest(&rollup));
+    }
+
+    let backfill = generator.generate_backfill(&store, 6000).await.unwrap();
+    assert_eq!(backfill.len(), 5);
+
+    // --- Reassignment back to A: dedup keeps exactly the missing minutes ---
+    let mut ingested = Vec::new();
+    for rollup in &backfill {
+        ingested.push(store_a.ingest(rollup));
+    }
+    assert_eq!(
+        ingested,
+        vec![false, false, true, true, true],
+        "already-held minutes drop, missing minutes ingest"
+    );
+    store_a.flush().await.unwrap();
+    let rows_a = store_a
+        .query_cluster_metric("cpu_usage", 0, u64::MAX)
+        .await
+        .unwrap();
+    let mut minutes_a: Vec<(u64, f64)> = rows_a.iter().map(|(ts, _, _, v)| (*ts, *v)).collect();
+    minutes_a.sort_unstable_by_key(|(ts, _)| *ts);
+    assert_eq!(
+        minutes_a,
+        vec![
+            (5700, 1.0),
+            (5760, 1.0),
+            (5820, 1.0),
+            (5880, 1.0),
+            (5940, 1.0)
+        ],
+        "every minute exactly once — the blob backfill lost 5820-5940 here"
+    );
+
+    // --- Reassignment to a fresh aggregator B: no minute is missing and no
+    // minute B alone holds is inflated ---
+    let dir_b = tempfile::tempdir().unwrap();
+    let mut store_b = RollupStore::new(dir_b.path().to_path_buf());
+    for rollup in &backfill {
+        assert!(store_b.ingest(rollup));
+    }
+    store_b.flush().await.unwrap();
+    let to_rows = |rows: Vec<(u64, String, String, f64)>| {
+        rows.into_iter()
+            .map(|(ts, name, labels, val)| MetricsQueryRow {
+                timestamp: ts,
+                metric_name: name,
+                labels,
+                value: val,
+            })
+            .collect::<Vec<_>>()
+    };
+    // A as it stood before the reassignment-back above: minutes 5700, 5760.
+    let dir_a2 = tempfile::tempdir().unwrap();
+    let mut store_a2 = RollupStore::new(dir_a2.path().to_path_buf());
+    for now in [5760u64, 5820] {
+        let rollup = generator.generate(&store, now).await.unwrap();
+        store_a2.ingest(&rollup);
+    }
+    store_a2.flush().await.unwrap();
+    let merged = merge_cluster_results(vec![
+        to_rows(
+            store_a2
+                .query_cluster_metric("cpu_usage", 0, u64::MAX)
+                .await
+                .unwrap(),
+        ),
+        to_rows(
+            store_b
+                .query_cluster_metric("cpu_usage", 0, u64::MAX)
+                .await
+                .unwrap(),
+        ),
+    ]);
+    let by_minute: std::collections::BTreeMap<u64, f64> =
+        merged.iter().map(|r| (r.timestamp, r.value)).collect();
+    // The blob backfill served all five minutes on key 5700 (value 6.0 after
+    // the merge) and left 5820-5940 with no row at all. Per-minute emission
+    // keeps every minute present at its true value; only the two minutes both
+    // aggregators hold overlap (inherent to reassignment without handoff).
+    assert_eq!(by_minute[&5820], 1.0);
+    assert_eq!(by_minute[&5880], 1.0);
+    assert_eq!(by_minute[&5940], 1.0);
+    assert_eq!(by_minute[&5700], 2.0, "known cross-aggregator overlap");
+    assert_eq!(by_minute[&5760], 2.0, "known cross-aggregator overlap");
+}
+
 /// Multiple metrics with labels produce separate entries in the rollup.
 #[tokio::test]
 async fn multi_metric_aggregation_with_labels() {
@@ -256,7 +374,7 @@ async fn multi_metric_aggregation_with_labels() {
         store.flush().await.unwrap();
 
         let generator = RollupGenerator::new(NodeId::new(node_name));
-        let rollup = generator.generate(&store, now, false).await.unwrap();
+        let rollup = generator.generate(&store, now).await.unwrap();
         assert_eq!(rollup.entries.len(), 2, "should have cpu and mem entries");
     }
 }

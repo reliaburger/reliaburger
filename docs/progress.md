@@ -2295,11 +2295,11 @@ blocking calls).
 > The deletions removed ~800 lines of unwired deploy engine + the superseded
 > coordinator; M7 moved Argon2id, pickle blob reads, LogStore flush, the openraft
 > redb commits, snapshot btrfs, and the per-step rolling-deploy retire drain off
-> the async runtime. **Two remain open** as deeper redesigns, still unchecked
-> below: new-deploys-live-before-health-check (M5) and the rollup backfill-window
-> dedup redesign (the silent-lost-push half is fixed). One bonus finding is left
-> for a focused change: `finalise_rolling_deploy`'s terminal *bulk* retire still
-> drains on the loop (the per-step retire the audit named is fixed).
+> the async runtime. The residuals branch then closed the rest — the rollup
+> backfill-window redesign (per-minute emission), the `finalise_rolling_deploy`
+> bulk retire (drained on the deploy worker; blue-green cut-over split into
+> publish → drain → bookkeeping), and the M5 deploy health gate — **completing
+> the Medium tier**. Small tracked residuals live inside their items.
 
 - [x] **Btrfs snapshot restore is destructive on failure** — `src/grill/snapshot.rs:245-247`
   `SnapshotManager::restore` deletes the live subvolume first, then creates the writable
@@ -2319,19 +2319,25 @@ blocking calls).
 - [x] **Secret decrypt failure starts the container anyway** — `src/grill/oci.rs:284-295`
   injects `{key}=DECRYPT_ERROR:{e}` (or raw ciphertext when no decryptor is present) into
   the workload env and starts it, silently running with a broken secret.
-- [ ] **New deploys go live before their health check runs** —
-  `src/bun/agent.rs:8343-8362,8629-8662` the rolling/blue-green health wait polls only
-  `grill.state == Running` yet publishes the backend `healthy: true` (7166-7171); the
-  configured HTTP health check isn't registered for new instances until
-  `finalise_rolling_deploy` (4778-4813), so a version that starts but fails its probe still
-  replaces healthy old instances.
+- [x] **New deploys go live before their health check runs** — the deploy worker's
+  `wait_instance_healthy` now gates both rolling and blue-green replacements: after the
+  runtime reports Running, the app's configured HTTP probe must pass `threshold_healthy`
+  consecutive times (same `HealthCheckConfig` the steady-state tick uses, honouring
+  `initial_delay`, bounded by the deploy's `health_timeout`) before the instance is
+  announced healthy or published as a backend; failure takes the existing
+  rollback/halt paths, so the old instances keep serving. Apps without a health check
+  keep the Running-only wait. Regression tests drive the real `probe_health` against a
+  local responder (200 completes, 500 rolls back on both strategies). _Tracked residual:
+  `RegisterRollingInstance`'s `persist_instance_record` no-ops mid-deploy (the instance
+  isn't in the supervisor until finalise), so a crash mid-rollout loses the new
+  instances' on-disk records._
 - [x] **Parquet flushes are unfsynced and Mayo drops samples on a failed write** —
   `src/mayo/store.rs:62-76`, `src/ketchup/log_store.rs:294-303`: no `sync_all`/temp+rename/
   dir fsync despite explicit durability claims (contrast pickle REG5). And
   `src/mayo/store.rs:244-257` `take_flush_batch` clears the buffer + bumps the counter
   *before* the write, so a failed write permanently discards the drained samples
   (LogStore/RollupStore clear only after success).
-- [x] **Blocking work on the agent event loop / runtime worker**  _(Argon2id token create+verify, pickle blob_get read, LogStore flush, the openraft redb commits, snapshot btrfs, and the per-step rolling-deploy retire drain all now run off-lock/off-runtime. Residual: `finalise_rolling_deploy`'s terminal bulk retire still drains on the loop — a focused follow-up.)_ (project rule: no blocking
+- [x] **Blocking work on the agent event loop / runtime worker**  _(Argon2id token create+verify, pickle blob_get read, LogStore flush, the openraft redb commits, snapshot btrfs, and every deploy retire drain — per-step, rolling scale-down surplus, and the blue-green bulk cut-over — now run off-lock/off-runtime; `retire_with_drain` is deleted and `finalise_rolling_deploy` is bookkeeping-only, with the blue-green ordering "publish green → drain blue → finalise" pinned by a test.)_ (project rule: no blocking
   in async):
   - `src/bun/agent.rs:2890-2919,1731` + `src/bun/snapshot_worker.rs:93-137` — snapshot
     create/restore/delete run sync `btrfs` subprocess + `std::fs` walks on the loop
@@ -2354,14 +2360,15 @@ blocking calls).
 - [x] **LogStore buffer is unbounded** — `src/ketchup/log_store.rs:194-199` has no cap, so
   a persistently failing flush (disk full — logged every 60 s) grows the buffer without
   bound; RollupStore got `MAX_BUFFER_ROWS` for exactly this, LogStore didn't.
-- [ ] **Rollup backfill double-counts or drops on aggregator reassignment** —
-  `src/mayo/rollup_generator.rs:44-85` + `query_fanout.rs:34-52` stamp the 5-minute backfill
-  as one aggregate at `aligned_end - 300` (a key a normal 1-minute window already used):
-  reassignment *back* drops the whole backfill as a duplicate; reassignment to a fresh
-  aggregator makes `merge_cluster_results` sum the 5-min row with overlapping 1-min rows
-  (cross-aggregator, invisible to OBS2 dedup). Failed rollup pushes are also lost silently
-  (`rollup_worker.rs:126-140`: `Err(_) => return` no log, `let _ =` send, backfill flag
-  cleared before the send; nodes over `MAX_REPORT_SIZE` 1 MiB lose metrics permanently).
+- [x] **Rollup backfill double-counts or drops on aggregator reassignment** — the
+  backfill is now emitted as per-minute `NodeRollup`s (`generate_backfill`), each stamped
+  at its own minute start, so the aggregator's `(node, timestamp)` dedup drops exactly the
+  minutes it already holds and keeps the rest; no wire change (bincode discriminants are
+  pinned), and the worker clears the backfill flag only after every send succeeds
+  (partial-failure re-sends are idempotent). The silent-lost-push half was fixed in the
+  main Medium PR. _Residuals: minutes held by **both** aggregators still overlap at query
+  merge (inherent to reassignment without handoff), and a node whose single rollup exceeds
+  `MAX_REPORT_SIZE` (1 MiB) still can't push — chunking is untracked work._
 - [x] **Placement reconciler orphans instances on a failed stop** —
   `src/cluster/orchestrate.rs:847-857` fires `AgentCommand::Stop` with the response oneshot
   dropped and unconditionally does `applied.remove(...)` even if the send/stop failed, so no
