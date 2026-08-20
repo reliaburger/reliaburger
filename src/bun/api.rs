@@ -1382,6 +1382,9 @@ async fn find_test_lease(
     }
 }
 
+// `Response` is large but it IS the HTTP reply to send on failure —
+// boxing it would tax every call site for a value that lives one frame.
+#[allow(clippy::result_large_err)]
 async fn write_lease_request(
     council: &crate::council::CouncilNode,
     request: crate::council::RaftRequest,
@@ -1751,6 +1754,9 @@ async fn upgrade_start_handler(
 /// are `Council`, and everything else `Worker`. Gossip identifies nodes by
 /// name; the Raft voter set by `raft_id_from_name(name)`, so we bridge them
 /// with that same stable hash.
+// `Response` is large but it IS the HTTP reply to send on failure —
+// boxing it would tax every call site for a value that lives one frame.
+#[allow(clippy::result_large_err)]
 async fn build_authoritative_view(
     state: &ApiState,
     council: &Arc<crate::council::CouncilNode>,
@@ -2015,6 +2021,9 @@ async fn cluster_elect_handler(
 /// council, e.g. single-node mode, where permissions cannot be configured) and
 /// defers to [`crate::sesame::auth::authorize_permission`]. Call it after the
 /// role and scope checks in a gated handler.
+// `Response` is large but it IS the HTTP reply to send on failure —
+// boxing it would tax every call site for a value that lives one frame.
+#[allow(clippy::result_large_err)]
 async fn enforce_permission(
     state: &ApiState,
     auth: Option<&crate::sesame::auth::AuthContext>,
@@ -4226,6 +4235,9 @@ async fn record_fault_audit(state: &ApiState, audit: FaultAudit<'_>) {
 /// the replicated voter set minus live SWIM members, so a request reaching a
 /// different node cannot silently exceed quorum. The target agent repeats its
 /// local checks immediately before applying the effect.
+// `Response` is large but it IS the HTTP reply to send on failure —
+// boxing it would tax every call site for a value that lives one frame.
+#[allow(clippy::result_large_err)]
 async fn check_node_fault_cluster_safety(
     state: &ApiState,
     request: &crate::smoker::types::FaultRequest,
@@ -4327,6 +4339,9 @@ async fn forward_node_fault(
 }
 
 /// Resolve a live cluster member to one of its API URLs.
+// `Response` is large but it IS the HTTP reply to send on failure —
+// boxing it would tax every call site for a value that lives one frame.
+#[allow(clippy::result_large_err)]
 async fn target_node_api_url(
     state: &ApiState,
     target_node: &str,
@@ -5830,6 +5845,9 @@ async fn deploys_operations_handler(State(state): State<ApiState>) -> Response {
     }
 }
 
+// `Response` is large but it IS the HTTP reply to send on failure —
+// boxing it would tax every call site for a value that lives one frame.
+#[allow(clippy::result_large_err)]
 async fn deploy_operation_snapshot(
     state: &ApiState,
 ) -> Result<crate::bun::deploy_operations::DeployOperationSnapshot, Response> {

@@ -83,6 +83,9 @@ impl PickleState {
     /// Authorise a registry write (REG4). `Ok(())` means the request may
     /// proceed; `Err(response)` is the 401/403 to return. No auth
     /// configured means the gate is off (writes open).
+    // `Response` is large but it IS the HTTP reply to send on failure —
+    // boxing it would tax every call site for a value that lives one frame.
+    #[allow(clippy::result_large_err)]
     async fn authorise_write(&self, headers: &HeaderMap) -> Result<(), Response> {
         let Some(auth) = &self.auth else {
             return Ok(());
@@ -111,6 +114,9 @@ impl PickleState {
 
     /// Authorise a registry read (O1). A no-op unless the registry is bound
     /// somewhere a stranger could reach it.
+    // `Response` is large but it IS the HTTP reply to send on failure —
+    // boxing it would tax every call site for a value that lives one frame.
+    #[allow(clippy::result_large_err)]
     async fn authorise_read(&self, headers: &HeaderMap) -> Result<(), Response> {
         if !self.require_read_auth {
             return Ok(());
@@ -147,6 +153,9 @@ impl PickleState {
     /// Enforce the storage quota for admitting `incoming` bytes into
     /// `repository` (REG4). `Ok(())` when unlimited or within limits;
     /// `Err(response)` is the 413 to return.
+    // `Response` is large but it IS the HTTP reply to send on failure —
+    // boxing it would tax every call site for a value that lives one frame.
+    #[allow(clippy::result_large_err)]
     async fn enforce_quota(&self, repository: &str, incoming: u64) -> Result<(), Response> {
         if self.quota.is_unlimited() {
             return Ok(());
