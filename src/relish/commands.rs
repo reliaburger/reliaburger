@@ -37,10 +37,21 @@ async fn apply_with_client(
     config.validate()?;
 
     if dry_run {
-        let plan = generate_plan(&config, None);
+        // Diff against the live agent's current state when one answers, so
+        // updates and unchanged resources render as such instead of every
+        // resource claiming to be a create. No agent → the all-create plan.
+        let current = match client.health().await {
+            Ok(()) => client.current_resources().await.ok(),
+            Err(_) => None,
+        };
+        let plan = generate_plan(&config, current.as_deref());
         let formatted = format_output(&plan, output)?;
         println!("{formatted}");
-        println!("\n(dry run — nothing deployed)");
+        // Human-only trailer: appending it to --output json|yaml would
+        // corrupt the document (deploy already guarded this; apply didn't).
+        if matches!(output, OutputFormat::Human) {
+            println!("\n(dry run — nothing deployed)");
+        }
         return Ok(());
     }
 
@@ -214,36 +225,63 @@ async fn logs_with_client(
     Ok(())
 }
 
-/// Export Parquet log files to a destination directory.
+/// Export Parquet log files to a destination.
 ///
-/// Triggers an immediate export from the running Bun agent's LogStore
-/// to the specified destination. Falls back to direct file copy if the
-/// agent is unreachable.
+/// Asks the running Bun agent to export its LogStore (`POST
+/// /v1/logs/export`): the destination is resolved agent-side (a path on the
+/// agent host, `file://`, `s3://` or `gs://`) and the agent files the export
+/// under its own node name — `--node-id` only affects the local fallback.
+/// When no agent answers the health probe, falls back to reading the local
+/// Parquet store directly, preferring the agent's default
+/// `/var/lib/reliaburger/logs/parquet` and then the per-user data dir (the
+/// same order bun itself uses); a custom `[storage] logs` path is only
+/// reachable through the agent.
 pub async fn logs_export(dest: &Path, node_id: &str) -> Result<(), RelishError> {
-    // Try to find the local log store directory
-    let log_dir = dirs::data_local_dir()
+    let dest_str = dest.to_string_lossy();
+    let client = BunClient::default_local();
+    if client.health().await.is_ok() {
+        let outcome = client.logs_export(&dest_str).await?;
+        if outcome.files_exported == 0 {
+            println!("no new files to export");
+        } else {
+            println!(
+                "agent exported {} file(s) ({} bytes) to {}/{}",
+                outcome.files_exported, outcome.bytes_written, dest_str, outcome.node_id,
+            );
+            if !outcome.checkpoint_saved {
+                eprintln!(
+                    "warning: the agent could not persist its export checkpoint; \
+                     a later export may re-ship these files"
+                );
+            }
+        }
+        return Ok(());
+    }
+
+    // No agent: read the local store directly, in the agent's own path
+    // preference order (bin/bun.rs) — the old code tried them reversed, so a
+    // stock install with both dirs present exported the stale one.
+    let primary = std::path::PathBuf::from("/var/lib/reliaburger/logs/parquet");
+    let fallback = dirs::data_local_dir()
         .unwrap_or_else(|| std::path::PathBuf::from("/tmp/reliaburger"))
         .join("reliaburger")
         .join("logs")
         .join("parquet");
-
-    if !log_dir.exists() {
-        // Try the default config path
-        let alt_dir = std::path::PathBuf::from("/var/lib/reliaburger/logs/parquet");
-        if !alt_dir.exists() {
-            return Err(RelishError::ApiError {
-                status: 0,
-                body: format!(
-                    "no log store found at {} or {}",
-                    log_dir.display(),
-                    alt_dir.display()
-                ),
-            });
-        }
-        return logs_export_from(&alt_dir, dest, node_id).await;
-    }
-
-    logs_export_from(&log_dir, dest, node_id).await
+    let source = if primary.exists() {
+        primary
+    } else if fallback.exists() {
+        fallback
+    } else {
+        return Err(RelishError::ApiError {
+            status: 0,
+            body: format!(
+                "no agent reachable and no log store found at {} or {}",
+                primary.display(),
+                fallback.display()
+            ),
+        });
+    };
+    logs_export_from(&source, dest, node_id).await
 }
 
 async fn logs_export_from(source: &Path, dest: &Path, node_id: &str) -> Result<(), RelishError> {
@@ -888,8 +926,16 @@ pub async fn deploy(path: &Path, output: OutputFormat, dry_run: bool) -> Result<
     let config = Config::from_file(path)?;
     config.validate()?;
 
+    let client = BunClient::default_local();
+
     if dry_run {
-        let plan = generate_plan(&config, None);
+        // Same live diff as `apply --dry-run`: a reachable agent supplies
+        // current state so the plan shows updates, not universal creates.
+        let current = match client.health().await {
+            Ok(()) => client.current_resources().await.ok(),
+            Err(_) => None,
+        };
+        let plan = generate_plan(&config, current.as_deref());
         let formatted = format_output(&plan, output)?;
         println!("{formatted}");
         if matches!(output, OutputFormat::Human) {
@@ -898,7 +944,6 @@ pub async fn deploy(path: &Path, output: OutputFormat, dry_run: bool) -> Result<
         return Ok(());
     }
 
-    let client = BunClient::default_local();
     match client.health().await {
         Ok(()) => {
             let result = client.apply(&config).await?;
@@ -1159,7 +1204,10 @@ pub fn export_k8s(file: &Path) -> Result<(), RelishError> {
 
     print!("{}", result.yaml);
 
-    if !result.report.resources_created.is_empty() || !result.report.unsupported.is_empty() {
+    if !result.report.resources_created.is_empty()
+        || !result.report.unsupported.is_empty()
+        || !result.report.dropped.is_empty()
+    {
         eprint!("{}", result.report);
     }
 

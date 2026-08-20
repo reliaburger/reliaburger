@@ -4,7 +4,7 @@ use std::time::{Duration, Instant};
 
 use crate::bun::capabilities::Capability;
 use crate::testkit::TestContext;
-use crate::testkit::registry::TestCase;
+use crate::testkit::registry::{TestCase, unknown};
 use crate::testkit::report::TestGroup;
 use crate::testkit_case;
 
@@ -65,14 +65,27 @@ async fn stopped_instance_leaves_the_backend_list(ctx: TestContext) -> Result<()
 
     let deadline = Instant::now() + ctx.timeout;
     loop {
-        match ctx.client.resolve(app).await {
+        // The service vanishing from the catalogue entirely (404) is as good
+        // as zero backends. Any error used to count, so a transport blip
+        // passed this case while the backend was still routable — a blip is
+        // now no verdict at all.
+        let transport_error = match ctx.client.resolve(app).await {
             Ok(resolved) if resolved.healthy_backends == 0 => return Ok(()),
-            // A service that resolves to nothing at all is equally fine.
-            Err(_) => return Ok(()),
-            _ => {}
-        }
+            Err(crate::relish::RelishError::ApiError { status: 404, .. }) => return Ok(()),
+            Err(
+                error @ (crate::relish::RelishError::AgentUnreachable
+                | crate::relish::RelishError::RequestTimeout),
+            ) => Some(error.to_string()),
+            Err(error) => return Err(format!("resolve failed: {error}")),
+            _ => None,
+        };
         if Instant::now() >= deadline {
-            return Err("a stopped app still has healthy backends".to_string());
+            return match transport_error {
+                Some(error) => unknown(format!(
+                    "could not resolve {app} ({error}); backend removal unproven"
+                )),
+                None => Err("a stopped app still has healthy backends".to_string()),
+            };
         }
         tokio::time::sleep(Duration::from_millis(500)).await;
     }

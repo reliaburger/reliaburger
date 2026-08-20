@@ -453,7 +453,9 @@ pub struct FieldChange {
 pub struct PlanSummary {
     pub to_create: u32,
     pub to_update: u32,
-    pub to_destroy: u32,
+    /// Running on the cluster but absent from this config. Informational:
+    /// apply is additive and never removes; `relish stop` does.
+    pub not_in_config: u32,
     pub unchanged: u32,
 }
 
@@ -1419,14 +1421,14 @@ Each correlated group becomes one `[app.*]` block. Uncorrelated resources are co
 | StatefulSet | `[app.*]` with `volume` | **Warning**: ordering guarantees and stable network IDs lost |
 | Service (ClusterIP) | Merged into `[app.*]` `port` | Onion handles discovery automatically |
 | Service (NodePort/LoadBalancer) | **Warning** | Suggest Wrapper ingress instead |
-| Ingress | `[app.*.ingress]` | `host`, `tls`, path rules preserved |
-| HorizontalPodAutoscaler | `[app.*.autoscale]` | `min`, `max`, `metric`, `target` |
+| Ingress | `[app.*.ingress]` | First rule's host + first path only (Reliaburger is one host/path per app); extra rules/paths, non-Prefix `pathType`, `defaultBackend` and `ingressClassName` are **warned** |
+| HorizontalPodAutoscaler | `[app.*.autoscale]` | `min`, `max`, `metric`, `target`; correlated by `scaleTargetRef` |
 | ConfigMap (mounted) | `[[app.*.config_file]]` | Each mount → config_file entry |
 | ConfigMap (envFrom) | `[app.*.env]` | Flattened into env block |
 | Secret (envFrom) | `[app.*.env]` | Values become `"IMPORT:replace-with-encrypted-value"` |
 | Secret (mounted) | `[[app.*.config_file]]` | **Warning**: re-encrypt with `relish secret encrypt` |
-| Job | `[job.*]` | `command`, `image` |
-| CronJob | `[job.*]` with `schedule` | Cron expression preserved |
+| Job | `[job.*]` | `command`+`args`, `image`, `env`, resources, namespace |
+| CronJob | `[job.*]` with `schedule` | Cron expression preserved; `suspend`/`concurrencyPolicy` warned |
 | PersistentVolumeClaim | `volume = { path, size }` | **Warning** if StorageClass is not local |
 | Namespace | `[namespace.*]` | ResourceQuota fields → quota fields |
 | NetworkPolicy | **Warning** | Partial via `allow_from`; complex policies dropped |

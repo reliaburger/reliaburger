@@ -61,27 +61,51 @@ async fn schedule_respects_required_placement_label(ctx: TestContext) -> Result<
     ctx.apply(&spec).await?;
     ctx.wait_running_cluster(app, 1).await?;
 
-    // The one replica must be on the node that carries the label.
+    // The one replica must be on the labelled node — and only there. A node
+    // whose status read fails is unknown evidence, not "not hosting": the
+    // misplaced replica is likeliest to sit on exactly the node that errors,
+    // and the old `unwrap_or(false)` let a placement violation pass green.
+    let mut hosting: Vec<String> = Vec::new();
     for (node_id, client) in ctx.node_clients().await? {
-        let hosts = client
-            .status()
-            .await
-            .map(|s| {
-                s.iter()
+        match client.status().await {
+            Ok(statuses) => {
+                if statuses
+                    .iter()
                     .any(|i| i.app_name == app && i.namespace == ctx.namespace)
-            })
-            .unwrap_or(false);
-        if hosts && node_id != target_node {
-            return Err(format!(
-                "app pinned to {key}={value} ran on {node_id}, not the labelled node {target_node}"
-            ));
+                {
+                    hosting.push(node_id);
+                }
+            }
+            Err(error) => {
+                return unknown(format!(
+                    "could not inspect node {node_id}: {error}; placement unproven"
+                ));
+            }
         }
+    }
+    if hosting.is_empty() {
+        // wait_running_cluster saw it running, but no reachable node admits
+        // to hosting it — the fan-out missed a node; no verdict either way.
+        return unknown("the running replica was not visible on any reachable node");
+    }
+    if hosting != vec![target_node.clone()] {
+        return Err(format!(
+            "app pinned to {key}={value} must run only on the labelled node {target_node}, \
+             found on {hosting:?}"
+        ));
     }
     Ok(())
 }
 
-/// A namespace with `max_apps = 1` rejects a second app; the first is
-/// untouched.
+/// A namespace with `max_apps = 1` schedules only the first app; the second
+/// is admitted to desired state but never acquires a placement, and the
+/// first is untouched.
+///
+/// Quota is enforced at *scheduling* time — the leader's placement pass
+/// skips an over-quota app and logs — not at apply time; there is no council
+/// refusal reason for quota. The old case expected the second `apply` to
+/// error, a rejection that doesn't exist, and then accepted *any* error
+/// (including a network blip) as proof of enforcement.
 async fn schedule_rejects_app_exceeding_namespace_quota(ctx: TestContext) -> Result<(), String> {
     let quota = format!(
         "[namespace.\"{ns}\"]\nmax_apps = 1\n\n{app}",
@@ -91,12 +115,68 @@ async fn schedule_rejects_app_exceeding_namespace_quota(ctx: TestContext) -> Res
     ctx.apply(&quota).await?;
     ctx.wait_running_cluster("quota-a", 1).await?;
 
-    match ctx.apply(&ctx.testapp_spec("quota-b", "healthy", 1)).await {
-        Err(_) => {}
-        Ok(()) => return Err("a second app was accepted despite max_apps = 1".to_string()),
+    // Admission succeeds — apply only writes desired state.
+    ctx.apply(&ctx.testapp_spec("quota-b", "healthy", 1))
+        .await?;
+
+    // The scheduler must keep quota-b at zero scheduled replicas. Poll until
+    // the evidence covers both apps, failing the moment quota-b is granted.
+    let scheduled_replicas = |evidence: &[crate::bun::diagnostics::DesiredAppEvidence],
+                              name: &str| {
+        evidence
+            .iter()
+            .find(|e| e.app == name && e.namespace == ctx.namespace)
+            .map(|e| e.scheduled_replicas)
+    };
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+    loop {
+        let evidence = ctx
+            .client
+            .desired_apps()
+            .await
+            .map_err(|error| format!("could not read scheduling evidence: {error}"))?;
+        if evidence.is_empty() {
+            return unknown("no scheduling evidence available; quota enforcement unproven");
+        }
+        if let Some(granted) = scheduled_replicas(&evidence, "quota-b")
+            && granted > 0
+        {
+            return Err(format!(
+                "quota-b acquired {granted} scheduled replica(s) despite max_apps = 1"
+            ));
+        }
+        // Wait until quota-a is scheduled and quota-b is visible in desired
+        // state — then the scheduler has demonstrably considered both.
+        if scheduled_replicas(&evidence, "quota-a").is_some_and(|n| n >= 1)
+            && scheduled_replicas(&evidence, "quota-b").is_some()
+        {
+            break;
+        }
+        if std::time::Instant::now() >= deadline {
+            return unknown(
+                "scheduling evidence never covered both apps within 30s; \
+                 quota enforcement unproven",
+            );
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
     }
 
-    // The first app must be untouched by the rejected second.
+    // Hold a settle window: a *late* grant to quota-b is exactly the bug.
+    tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+    let evidence = ctx
+        .client
+        .desired_apps()
+        .await
+        .map_err(|error| format!("could not re-read scheduling evidence: {error}"))?;
+    if let Some(granted) = scheduled_replicas(&evidence, "quota-b")
+        && granted > 0
+    {
+        return Err(format!(
+            "quota-b was granted {granted} replica(s) after a settle window despite max_apps = 1"
+        ));
+    }
+
+    // The first app must be untouched by the unschedulable second.
     ctx.wait_running_cluster("quota-a", 1).await?;
     Ok(())
 }

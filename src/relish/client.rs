@@ -29,6 +29,20 @@ pub struct BunClient {
 /// `grep` and `start` are also sent server-side where the endpoint
 /// supports them; `json_field` is client-side only (there is no
 /// server-side equivalent).
+/// Outcome of an agent-side log export (`POST /v1/logs/export`).
+#[derive(Debug, Clone, serde::Deserialize)]
+pub struct LogsExportOutcome {
+    /// Files newly shipped to the destination.
+    pub files_exported: u64,
+    /// Total bytes written.
+    pub bytes_written: u64,
+    /// The node name the agent filed the export under.
+    pub node_id: String,
+    /// False when the files landed but the export checkpoint could not be
+    /// persisted — a later export may re-ship the same files.
+    pub checkpoint_saved: bool,
+}
+
 #[derive(Debug, Clone, Default)]
 pub struct LogOptions {
     pub tail: Option<usize>,
@@ -642,6 +656,38 @@ impl BunClient {
         &self,
     ) -> Result<Vec<crate::bun::diagnostics::DesiredAppEvidence>, RelishError> {
         self.get_typed_json("/v1/diagnostics/apps").await
+    }
+
+    /// Fetch the currently deployed resources in plan format
+    /// (`GET /v1/apps`), for `--dry-run` diffing.
+    pub async fn current_resources(
+        &self,
+    ) -> Result<Vec<crate::relish::plan::CurrentResource>, RelishError> {
+        let rows: Vec<crate::bun::agent::CurrentResourceStatus> =
+            self.get_typed_json("/v1/apps").await?;
+        Ok(rows
+            .into_iter()
+            .map(|row| crate::relish::plan::CurrentResource {
+                resource: row.resource,
+                image: row.image,
+            })
+            .collect())
+    }
+
+    /// Trigger an immediate log export on the agent (`POST /v1/logs/export`).
+    ///
+    /// The destination is resolved agent-side — a path on the agent host,
+    /// `file://`, `s3://` or `gs://` — and the agent names the subdirectory
+    /// after its own node name.
+    pub async fn logs_export(&self, destination: &str) -> Result<LogsExportOutcome, RelishError> {
+        let response = self
+            .client
+            .post(format!("{}/v1/logs/export", self.base_url))
+            .json(&serde_json::json!({ "destination": destination }))
+            .send()
+            .await
+            .map_err(classify_error)?;
+        parse_typed_response(response).await
     }
 
     /// Fetch structured, cluster-aware recent log entries for one application.

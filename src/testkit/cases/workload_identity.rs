@@ -78,19 +78,38 @@ async fn namespace_scoped_token_is_rejected_elsewhere(ctx: TestContext) -> Resul
     let config =
         Config::parse(&spec).map_err(|error| format!("probe spec does not parse: {error}"))?;
 
+    // Only the scope gate's own refusal proves enforcement: AUTH1 answers
+    // 403 with "token scope does not allow …". Any error used to count as a
+    // pass, so a network blip or a 500 silently green-lit the case; and 403
+    // alone is not enough — a role failure is also 403.
     let verdict = match scoped.apply(&config).await {
-        Err(_) => Ok(()),
+        Err(crate::relish::RelishError::ApiError { status: 403, body })
+            if body.contains("token scope does not allow") =>
+        {
+            Ok(())
+        }
+        Err(
+            error @ (crate::relish::RelishError::AgentUnreachable
+            | crate::relish::RelishError::RequestTimeout),
+        ) => unknown(format!(
+            "could not probe the scope boundary: {error}; enforcement unproven"
+        )),
+        Err(error) => Err(format!(
+            "expected the scope refusal (403 \"token scope does not allow\"), got: {error}"
+        )),
         Ok(_) => {
             // It was wrongly allowed — clean up the leak, then fail.
             let _ = ctx.client.stop("probe", &other_namespace).await;
             Err("a namespace-scoped token was allowed to write to another namespace".to_string())
         }
     };
-    ctx.client
-        .token_revoke(&token_name)
-        .await
-        .map_err(|error| format!("could not revoke scoped test token: {error}"))?;
-    verdict
+    // Revoke is cleanup: it must not overwrite a genuine verdict. Surface a
+    // revoke failure only when the case would otherwise pass.
+    let revoked = ctx.client.token_revoke(&token_name).await;
+    match (verdict, revoked) {
+        (Ok(()), Err(error)) => Err(format!("could not revoke scoped test token: {error}")),
+        (verdict, _) => verdict,
+    }
 }
 
 pub fn cases() -> Vec<TestCase> {

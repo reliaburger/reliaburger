@@ -2527,56 +2527,83 @@ broken test run green by accident (deferrals report `Unknown`, which fails a ful
 profile). The real defects are a Kubernetes-conversion path that silently drops fields,
 and a handful of test cases whose assertions are too loose to catch the bug they name.
 
+> **All Medium items below landed (20 Aug 2026, branch `phase16-deep-audit-mediums`)**
+> as one PR: k8s export/import fidelity (incl. the `cpu: "1"` 1000× quantity
+> under-read), the logs-export agent endpoint, the wired dry-run diff (with the
+> Destroy→not-in-config honesty rename), and the testkit false-green rewrites. The
+> Low items remain tracked below.
+
 **Medium — Kubernetes export/import silently loses data:**
 
-- [ ] **Exported Ingress has no namespace** — `src/relish/k8s_export.rs:308-313` omits
-  `namespace` from the Ingress `ObjectMeta` (every other kind sets it), so a namespaced
-  app's Ingress lands in `default` and can't reach its Service — the M28 class the
-  surrounding comments claim to have fixed.
-- [ ] **Export drops quotas and Job resources without a report entry** —
-  `src/relish/k8s_export.rs:522-538` `export_namespace` ignores its `_ns` arg and emits
-  only a `Namespace` (every quota field dropped) despite the module doc promising a
-  `ResourceQuota`; `k8s_export.rs:444-449` `export_job` maps only image+command, silently
-  discarding `env`/`memory`/`cpu`. Both skip the `dropped`/`unsupported` report the app
-  exporter uses. Also `k8s_export.rs:356-360` emits a DaemonSet-app HPA whose
-  `scaleTargetRef` is hardcoded `kind: Deployment` (pointing at nothing), and
-  `k8s_export.rs:369,557` can emit a `Utilization` HPA with no `averageUtilization`.
-- [ ] **Import correlates HPAs by the wrong name and drops uncorrelated resources** —
-  `src/relish/k8s_import.rs:324-327` matches `hpas.get(name)` on the HPA's own metadata
-  name against the deployment name (the comment says "by scaleTargetRef name"), so a
-  conventionally-named `api-hpa`→`api` never correlates and its autoscaling is lost; any
-  Ingress/HPA that fails to correlate is dropped with no warning (`k8s_import.rs:248-393`),
-  unlike ConfigMaps/Secrets which are reported.
-- [ ] **Import drops fields on non-Deployment workloads** —
-  `src/relish/k8s_import.rs:584-619` `daemonset_to_app`/`statefulset_to_app` keep only
-  image/namespace/replicas/port, silently dropping command/env/resources/probes/
-  initContainers/nodeSelector (whereas `deployment_to_app` imports and warns on all of
-  them); `k8s_import.rs:791-829` Job/CronJob import loses env/limits/namespace;
-  `k8s_import.rs:503-512` reads resources from `limits` only (a requests-only Deployment
-  imports with no cpu/memory); `k8s_import.rs:707-747` `apply_ingress` keeps only the
-  first rule's first path.
+- [x] **Exported Ingress has no namespace** — the Ingress `ObjectMeta` now carries the
+  app's namespace like every other kind; the namespace regression test includes an
+  Ingress so this class can't silently return.
+- [x] **Export drops quotas and Job resources without a report entry** —
+  `export_namespace` emits a real `ResourceQuota` (`cpu`/`memory` → `limits.*`, `gpu` →
+  `requests.nvidia.com/gpu`; `max_apps`/`max_replicas` reported unsupported — K8s counts
+  objects per kind, not apps); `export_job` shares the app path's env/resources helpers
+  and reports `exec`/`script`; a DaemonSet app with `[autoscale]` gets an unsupported
+  entry instead of an HPA targeting a nonexistent Deployment; `parse_target_pct` accepts
+  the fraction form config validation accepts, and an unconvertible target omits the
+  metric with a report entry instead of emitting `Utilization` with no
+  `averageUtilization`. Bonus: the CLI's export-report gate now also prints when only
+  `dropped` entries exist.
+- [x] **Import correlates HPAs by the wrong name and drops uncorrelated resources** —
+  `find_hpa_for_workload` scans by `spec.scaleTargetRef` (name + kind, empty kind matches
+  any), so `api-hpa`→`api` correlates; StatefulSets now get Service/Ingress/HPA
+  correlation and DaemonSets get Ingress; a post-conversion sweep warns for every
+  Ingress/HPA no workload matched (mirroring the ConfigMap/Secret sweeps — warnings trip
+  `--strict`, which is honest, the data is lost).
+- [x] **Import drops fields on non-Deployment workloads** — a shared `pod_spec_to_app`
+  helper gives DaemonSets/StatefulSets everything Deployments already imported
+  (command+args, env with `valueFrom` warnings, resources, probes, initContainers,
+  nodeSelector), with warnings filed under `{kind}/{name}`; Job/CronJob share
+  `pod_to_jobspec` (env/resources/namespace/args survive; CronJob `suspend`/
+  `concurrencyPolicy` warned). Resources read **requests and limits** as real K8s
+  quantities via new `parse_k8s_cpu_millicores`/`parse_k8s_memory_bytes` — the old path
+  fed K8s strings to `ResourceRange::parse`, under-reading `cpu: "1"` 1000× (bare int =
+  millicores there) and silently dropping `"0.5"`/`"512M"`; unparseable quantities now
+  warn. `apply_ingress` warns per dropped rule/path, non-Prefix `pathType`,
+  `defaultBackend` and `ingressClassName`; the design-doc "path rules preserved" claim
+  fixed.
 
 **Medium — relish command handlers:**
 
-- [ ] **`relish logs-export` doc describes an agent interaction that doesn't exist** —
-  `src/relish/commands.rs:204-234` the doc claims it "triggers an immediate export from
-  the running Bun agent's LogStore" and "falls back to direct file copy if the agent is
-  unreachable," but the body never contacts the agent — it unconditionally reads hardcoded
-  local Parquet paths. Fix the doc or build the agent path.
-- [ ] **`plan.rs` current-state diff is unreachable** — `src/relish/plan.rs:80`
-  `generate_plan`'s `Update`/`Destroy`/`Unchanged` diffing and the `CurrentResource` type
-  are never exercised: every caller (`apply`, `deploy`) passes `current = None`, so
-  `apply --dry-run` always shows everything as a create, contradicting the module doc.
+- [x] **`relish logs-export` doc describes an agent interaction that doesn't exist** —
+  built the agent path (the described design was better than the doc lie): Admin-only
+  `POST /v1/logs/export` runs `ketchup::export_logs` server-side against the store's real
+  directory with the Bun-owned checkpoint (destination `s3://`/`gs://`/path resolves
+  agent-side; a failed checkpoint save is reported, not swallowed); `BunClient::logs_export`
+  + the CLI calls it when `health()` answers and otherwise falls back to the direct local
+  read — now in bun's own path preference order (the old code tried them reversed and
+  ignored custom `[storage] logs`, which remains reachable only via the agent).
+- [x] **`plan.rs` current-state diff is unreachable** — wired: `GET /v1/apps` serves the
+  currently deployed resources in plan format (council desired state merged over the local
+  agent's `deployed_specs`/jobs via the new `AgentCommand::CurrentResources`);
+  `apply`/`deploy --dry-run` fetch it whenever the agent answers `health()` and diff for
+  real (unreachable keeps the all-create plan). **Semantics correction:** apply is
+  additive (removal is `relish stop`/GitOps), so the plan's `Destroy` action was a lie —
+  renamed to `not_in_config`, rendered `*` with an "apply leaves them" note, and the
+  footer now reports unchanged counts. Also fixed: `apply --dry-run --output json`
+  appended the human "(dry run)" trailer, corrupting the JSON document. Round-trip test
+  drives endpoint → client → `generate_plan` against a live standalone agent.
 
 **Medium — test cases with assertions too loose to catch the named bug (false-green risk):**
 
-- [ ] **Scope/quota cases accept any error as success** —
-  `src/testkit/cases/workload_identity.rs:82` (`Err(_) => Ok(())`) and
-  `src/testkit/cases/scheduling.rs:94` treat *any* failure of the second/scoped apply as
-  proof the enforcement works, so a network blip or 5xx passes the case; neither inspects
-  the rejection reason. `src/testkit/cases/scheduling.rs:72` reads a node whose `status()`
-  errored as "not hosting the misplaced replica" (`unwrap_or(false)`) and never positively
-  asserts placement, so a real placement violation can pass.
+- [x] **Scope/quota cases accept any error as success** — the scope case now passes only
+  on the AUTH1 refusal itself (`ApiError { 403 }` with "token scope does not allow" in
+  the body — status alone is insufficient, a role failure is also 403); transport errors
+  become `unknown`, other errors fail, and a `token_revoke` failure no longer clobbers a
+  genuine verdict. The quota case's premise was wrong — **quota is enforced at
+  scheduling time** (the placement pass skips and logs; no council refusal reason
+  exists), so the second apply *succeeds* — rewritten to assert the real observable:
+  quota-b stays at `scheduled_replicas == 0` (via `desired_apps` evidence, with a settle
+  re-check for late grants) while quota-a runs untouched; empty evidence → `unknown`.
+  The placement case treats a failed node `status()` as `unknown` instead of "not
+  hosting", and positively asserts the hosting set is exactly the labelled node. Bonus,
+  same class: `service_discovery`'s stopped-backend case accepted *any* resolve error as
+  "service gone" — now only a genuine 404 passes, transport errors at the deadline are
+  `unknown`.
 
 **Low — hygiene and minor bugs from the deep pass:**
 

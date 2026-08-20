@@ -17,8 +17,8 @@ use k8s_openapi::api::autoscaling::v2::{
 };
 use k8s_openapi::api::batch::v1::{CronJob, CronJobSpec, Job, JobSpec, JobTemplateSpec};
 use k8s_openapi::api::core::v1::{
-    Container, ContainerPort, EnvVar, Namespace, PodSpec, PodTemplateSpec, ResourceRequirements,
-    Service, ServicePort, ServiceSpec,
+    Container, ContainerPort, EnvVar, Namespace, PodSpec, PodTemplateSpec, ResourceQuota,
+    ResourceQuotaSpec, ResourceRequirements, Service, ServicePort, ServiceSpec,
 };
 use k8s_openapi::api::networking::v1::{
     HTTPIngressPath, HTTPIngressRuleValue, Ingress, IngressBackend, IngressRule,
@@ -147,58 +147,13 @@ fn export_app(
         }]);
     }
 
-    // Env vars
-    if !app.env.is_empty() {
-        container.env = Some(
-            app.env
-                .iter()
-                .map(|(k, v)| {
-                    let value = match v {
-                        crate::config::types::EnvValue::Plain(s) => s.clone(),
-                        crate::config::types::EnvValue::Encrypted(_) => {
-                            "ENCRYPTED_VALUE".to_string()
-                        }
-                    };
-                    EnvVar {
-                        name: k.clone(),
-                        value: Some(value),
-                        ..EnvVar::default()
-                    }
-                })
-                .collect(),
-        );
-    }
+    // Env vars — shared with the job path, which used to drop them (M28).
+    container.env = env_vars(&app.env);
 
     // M28: resource requests were dropped entirely, so an app with a 512Mi
     // memory limit exported as an unlimited pod — the scheduler saw a
     // different workload from the one that was configured.
-    // `ResourceRange` carries a request and a limit, which map exactly onto
-    // Kubernetes' two fields — so unlike most of this exporter the translation
-    // is lossless.
-    let quantity = |value: String| k8s_openapi::apimachinery::pkg::api::resource::Quantity(value);
-    let mut requests: BTreeMap<String, _> = BTreeMap::new();
-    let mut limits: BTreeMap<String, _> = BTreeMap::new();
-    if let Some(memory) = &app.memory {
-        requests.insert("memory".to_string(), quantity(memory.request.to_string()));
-        limits.insert("memory".to_string(), quantity(memory.limit.to_string()));
-    }
-    if let Some(cpu) = &app.cpu {
-        // Reliaburger stores CPU in millicores, which is also Kubernetes'
-        // `m` suffix, so the numbers carry across unchanged.
-        requests.insert("cpu".to_string(), quantity(format!("{}m", cpu.request)));
-        limits.insert("cpu".to_string(), quantity(format!("{}m", cpu.limit)));
-    }
-    if let Some(gpu) = app.gpu.filter(|count| *count > 0) {
-        requests.insert("nvidia.com/gpu".to_string(), quantity(gpu.to_string()));
-        limits.insert("nvidia.com/gpu".to_string(), quantity(gpu.to_string()));
-    }
-    if !limits.is_empty() {
-        container.resources = Some(ResourceRequirements {
-            limits: Some(limits),
-            requests: Some(requests),
-            ..ResourceRequirements::default()
-        });
-    }
+    container.resources = resource_requirements(app.memory.as_ref(), app.cpu.as_ref(), app.gpu);
 
     let pod_spec = PodSpec {
         containers: vec![container],
@@ -309,6 +264,10 @@ fn export_app(
         let ing = Ingress {
             metadata: ObjectMeta {
                 name: Some(format!("{name}-ingress")),
+                // M28: the Ingress was the one resource that omitted the
+                // namespace, so a namespaced app's Ingress landed in
+                // `default` where it could not reach its Service.
+                namespace: app_namespace.clone(),
                 ..ObjectMeta::default()
             },
             spec: Some(IngressSpec {
@@ -341,45 +300,69 @@ fn export_app(
             .push(format!("Ingress/{name}-ingress"));
     }
 
-    // HPA (if autoscale configured)
+    // HPA (if autoscale configured). A DaemonSet has no scale subresource, so
+    // an HPA cannot target it — the old code emitted one anyway, with a
+    // scaleTargetRef pointing at a Deployment that doesn't exist.
     if let Some(ref auto) = app.autoscale {
-        let hpa = HorizontalPodAutoscaler {
-            metadata: ObjectMeta {
-                name: Some(name.to_string()),
-                // M28: without this every exported resource lands in
-                // `default`, silently collapsing two namespaces' apps of the
-                // same name into one — the same class of bug as DEP1.
-                namespace: app_namespace.clone(),
-                ..ObjectMeta::default()
-            },
-            spec: Some(HorizontalPodAutoscalerSpec {
-                scale_target_ref: k8s_openapi::api::autoscaling::v2::CrossVersionObjectReference {
-                    api_version: Some("apps/v1".to_string()),
-                    kind: "Deployment".to_string(),
-                    name: name.to_string(),
-                },
-                min_replicas: Some(auto.min as i32),
-                max_replicas: auto.max as i32,
-                metrics: Some(vec![MetricSpec {
+        if app.replicas == Replicas::DaemonSet {
+            report.unsupported.push(format!(
+                "[app.{name}.autoscale] — a DaemonSet has no scale subresource, no HPA emitted"
+            ));
+        } else {
+            // A target that doesn't convert to a whole percentage must not
+            // become `type: Utilization` with no `averageUtilization` — the
+            // API server rejects that. Emit the HPA without the metric (the
+            // K8s default applies) and say so.
+            let average_utilization = parse_target_pct(&auto.target);
+            let metrics = average_utilization.map(|pct| {
+                vec![MetricSpec {
                     type_: "Resource".to_string(),
                     resource: Some(ResourceMetricSource {
                         name: auto.metric.clone(),
                         target: MetricTarget {
                             type_: "Utilization".to_string(),
-                            average_utilization: parse_target_pct(&auto.target),
+                            average_utilization: Some(pct),
                             ..MetricTarget::default()
                         },
                     }),
                     ..MetricSpec::default()
-                }]),
-                ..HorizontalPodAutoscalerSpec::default()
-            }),
-            ..HorizontalPodAutoscaler::default()
-        };
-        docs.push(to_yaml(&hpa)?);
-        report
-            .resources_created
-            .push(format!("HorizontalPodAutoscaler/{name}"));
+                }]
+            });
+            if metrics.is_none() {
+                report.unsupported.push(format!(
+                    "[app.{name}.autoscale] target {:?} — could not convert to a percentage; \
+                     HPA emitted without a metric (the K8s default applies)",
+                    auto.target
+                ));
+            }
+            let hpa = HorizontalPodAutoscaler {
+                metadata: ObjectMeta {
+                    name: Some(name.to_string()),
+                    // M28: without this every exported resource lands in
+                    // `default`, silently collapsing two namespaces' apps of
+                    // the same name into one — the same class of bug as DEP1.
+                    namespace: app_namespace.clone(),
+                    ..ObjectMeta::default()
+                },
+                spec: Some(HorizontalPodAutoscalerSpec {
+                    scale_target_ref:
+                        k8s_openapi::api::autoscaling::v2::CrossVersionObjectReference {
+                            api_version: Some("apps/v1".to_string()),
+                            kind: "Deployment".to_string(),
+                            name: name.to_string(),
+                        },
+                    min_replicas: Some(auto.min as i32),
+                    max_replicas: auto.max as i32,
+                    metrics,
+                    ..HorizontalPodAutoscalerSpec::default()
+                }),
+                ..HorizontalPodAutoscaler::default()
+            };
+            docs.push(to_yaml(&hpa)?);
+            report
+                .resources_created
+                .push(format!("HorizontalPodAutoscaler/{name}"));
+        }
     }
 
     // Report unsupported features
@@ -441,10 +424,15 @@ fn export_job(
     report: &mut ExportReport,
 ) -> Result<(), RelishError> {
     let app_namespace = job.namespace.clone();
+    // Env and resources go through the same helpers as the app path — the job
+    // exporter used to drop both, so a job with a memory limit and database
+    // credentials exported as an unlimited pod with no environment.
     let container = Container {
         name: name.to_string(),
         image: job.image.clone(),
         command: job.command.clone(),
+        env: env_vars(&job.env),
+        resources: resource_requirements(job.memory.as_ref(), job.cpu.as_ref(), None),
         ..Container::default()
     };
 
@@ -511,6 +499,11 @@ fn export_job(
             "[job.{name}] run_before — use Argo Workflows or init containers"
         ));
     }
+    if job.exec.is_some() || job.script.is_some() {
+        report.unsupported.push(format!(
+            "[job.{name}] exec/script process workloads — no K8s equivalent"
+        ));
+    }
 
     Ok(())
 }
@@ -521,7 +514,7 @@ fn export_job(
 
 fn export_namespace(
     name: &str,
-    _ns: &crate::config::NamespaceSpec,
+    ns_spec: &crate::config::NamespaceSpec,
     docs: &mut Vec<String>,
     report: &mut ExportReport,
 ) -> Result<(), RelishError> {
@@ -534,6 +527,56 @@ fn export_namespace(
     };
     docs.push(to_yaml(&ns)?);
     report.resources_created.push(format!("Namespace/{name}"));
+
+    // ResourceQuota for the budget fields (the module doc always promised
+    // one; until M28 every quota field was silently dropped). Reliaburger's
+    // TOML forms (`8000m`, `16Gi`, bare integers) are already valid K8s
+    // quantities, so they pass through verbatim.
+    let quantity = |value: String| k8s_openapi::apimachinery::pkg::api::resource::Quantity(value);
+    let mut hard: BTreeMap<String, _> = BTreeMap::new();
+    if let Some(ref cpu) = ns_spec.cpu {
+        hard.insert("limits.cpu".to_string(), quantity(cpu.clone()));
+    }
+    if let Some(ref memory) = ns_spec.memory {
+        hard.insert("limits.memory".to_string(), quantity(memory.clone()));
+    }
+    if let Some(gpu) = ns_spec.gpu {
+        hard.insert(
+            "requests.nvidia.com/gpu".to_string(),
+            quantity(gpu.to_string()),
+        );
+    }
+    if !hard.is_empty() {
+        let quota = ResourceQuota {
+            metadata: ObjectMeta {
+                name: Some(format!("{name}-quota")),
+                namespace: Some(name.to_string()),
+                ..ObjectMeta::default()
+            },
+            spec: Some(ResourceQuotaSpec {
+                hard: Some(hard),
+                ..ResourceQuotaSpec::default()
+            }),
+            ..ResourceQuota::default()
+        };
+        docs.push(to_yaml(&quota)?);
+        report
+            .resources_created
+            .push(format!("ResourceQuota/{name}-quota"));
+    }
+
+    // K8s ResourceQuota counts objects per API kind (`count/deployments.apps`),
+    // not "distinct apps", and has no total-replica cap at all.
+    if ns_spec.max_apps.is_some() {
+        report.unsupported.push(format!(
+            "[namespace.{name}] max_apps — K8s quotas count objects per kind, not apps"
+        ));
+    }
+    if ns_spec.max_replicas.is_some() {
+        report.unsupported.push(format!(
+            "[namespace.{name}] max_replicas — no K8s equivalent for a total-replica cap"
+        ));
+    }
     Ok(())
 }
 
@@ -554,11 +597,85 @@ fn to_yaml<T: serde::Serialize>(resource: &T) -> Result<String, RelishError> {
     serde_yaml::to_string(resource).map_err(|e| RelishError::FormatFailed(e.to_string()))
 }
 
+/// Map Reliaburger env vars to Kubernetes `EnvVar`s.
+///
+/// Encrypted values export as the placeholder `ENCRYPTED_VALUE` — the sealed
+/// ciphertext is useless outside the cluster that holds the key, and leaking
+/// it would be worse than a placeholder that fails loudly.
+fn env_vars(env: &BTreeMap<String, crate::config::types::EnvValue>) -> Option<Vec<EnvVar>> {
+    if env.is_empty() {
+        return None;
+    }
+    Some(
+        env.iter()
+            .map(|(k, v)| {
+                let value = match v {
+                    crate::config::types::EnvValue::Plain(s) => s.clone(),
+                    crate::config::types::EnvValue::Encrypted(_) => "ENCRYPTED_VALUE".to_string(),
+                };
+                EnvVar {
+                    name: k.clone(),
+                    value: Some(value),
+                    ..EnvVar::default()
+                }
+            })
+            .collect(),
+    )
+}
+
+/// Build Kubernetes resource requests/limits from Reliaburger's ranges.
+///
+/// `ResourceRange` carries a request and a limit, which map exactly onto
+/// Kubernetes' two fields — so unlike most of this exporter the translation
+/// is lossless. Reliaburger stores CPU in millicores, which is also
+/// Kubernetes' `m` suffix, so the numbers carry across unchanged.
+fn resource_requirements(
+    memory: Option<&crate::config::types::ResourceRange>,
+    cpu: Option<&crate::config::types::ResourceRange>,
+    gpu: Option<u32>,
+) -> Option<ResourceRequirements> {
+    let quantity = |value: String| k8s_openapi::apimachinery::pkg::api::resource::Quantity(value);
+    let mut requests: BTreeMap<String, _> = BTreeMap::new();
+    let mut limits: BTreeMap<String, _> = BTreeMap::new();
+    if let Some(memory) = memory {
+        requests.insert("memory".to_string(), quantity(memory.request.to_string()));
+        limits.insert("memory".to_string(), quantity(memory.limit.to_string()));
+    }
+    if let Some(cpu) = cpu {
+        requests.insert("cpu".to_string(), quantity(format!("{}m", cpu.request)));
+        limits.insert("cpu".to_string(), quantity(format!("{}m", cpu.limit)));
+    }
+    if let Some(gpu) = gpu.filter(|count| *count > 0) {
+        requests.insert("nvidia.com/gpu".to_string(), quantity(gpu.to_string()));
+        limits.insert("nvidia.com/gpu".to_string(), quantity(gpu.to_string()));
+    }
+    if limits.is_empty() {
+        return None;
+    }
+    Some(ResourceRequirements {
+        limits: Some(limits),
+        requests: Some(requests),
+        ..ResourceRequirements::default()
+    })
+}
+
+/// Parse an autoscale target into a whole percentage for the HPA's
+/// `averageUtilization`.
+///
+/// Accepts the same forms config validation does (`parse_percentage` in
+/// `meat::autoscaler`): `"70%"` and the raw fraction `"0.7"` both mean 70.
+/// Anything that doesn't land in 1-100 after conversion returns `None` — the
+/// caller reports it instead of emitting a `Utilization` metric with no
+/// `averageUtilization`, which the API server rejects.
 fn parse_target_pct(target: &str) -> Option<i32> {
-    target
-        .trim()
-        .strip_suffix('%')
-        .and_then(|s| s.parse::<i32>().ok())
+    let s = target.trim();
+    let fraction = if let Some(pct) = s.strip_suffix('%') {
+        pct.trim().parse::<f64>().ok().map(|v| v / 100.0)
+    } else {
+        s.parse::<f64>().ok()
+    }?;
+    let pct = (fraction * 100.0).round() as i32;
+    (1..=100).contains(&pct).then_some(pct)
 }
 
 // ---------------------------------------------------------------------------
@@ -707,20 +824,23 @@ mod tests {
     /// way out.
     #[test]
     fn export_carries_the_namespace_onto_every_resource() {
-        let config =
-            parse_config("[app.web]\nimage = \"web:v1\"\nport = 8080\nnamespace = \"team-a\"\n");
+        let config = parse_config(
+            "[app.web]\nimage = \"web:v1\"\nport = 8080\nnamespace = \"team-a\"\n\n\
+             [app.web.ingress]\nhost = \"web.example.com\"\n",
+        );
         let result = export_kubernetes(&config).unwrap();
         assert!(
             result.yaml.contains("namespace: team-a"),
             "no namespace in the exported YAML:\n{}",
             result.yaml
         );
-        // Both the Deployment and the Service must carry it, or the Service
-        // lands in `default` and never finds its pods.
+        // Deployment, Service AND Ingress must carry it — the Ingress was the
+        // one resource that didn't, so it landed in `default` where it could
+        // not reach its Service.
         assert_eq!(
             result.yaml.matches("namespace: team-a").count(),
-            2,
-            "expected the namespace on both Deployment and Service:\n{}",
+            3,
+            "expected the namespace on Deployment, Service and Ingress:\n{}",
             result.yaml
         );
     }
@@ -800,6 +920,182 @@ mod tests {
             result.report.dropped.is_empty(),
             "reported drops for an app that exports cleanly: {:?}",
             result.report.dropped
+        );
+    }
+
+    /// The module doc always promised "Namespaces produce Namespace and
+    /// ResourceQuota"; until this test every quota field was silently dropped.
+    #[test]
+    fn namespace_quota_fields_export_as_a_resource_quota() {
+        let config = parse_config(
+            r#"
+            [namespace.team-a]
+            cpu = "8000m"
+            memory = "16Gi"
+            gpu = 2
+            max_apps = 5
+            max_replicas = 20
+            "#,
+        );
+        let result = export_kubernetes(&config).unwrap();
+        assert!(
+            result.yaml.contains("kind: ResourceQuota"),
+            "no ResourceQuota emitted:\n{}",
+            result.yaml
+        );
+        assert!(result.yaml.contains("limits.cpu"), "{}", result.yaml);
+        assert!(result.yaml.contains("8000m"), "{}", result.yaml);
+        assert!(result.yaml.contains("limits.memory"), "{}", result.yaml);
+        assert!(result.yaml.contains("16Gi"), "{}", result.yaml);
+        assert!(
+            result.yaml.contains("requests.nvidia.com/gpu"),
+            "{}",
+            result.yaml
+        );
+        // The quota itself must live inside the namespace it constrains.
+        assert!(
+            result.yaml.contains("namespace: team-a"),
+            "the ResourceQuota must be namespaced:\n{}",
+            result.yaml
+        );
+        // The two caps K8s genuinely cannot express are said, not dropped.
+        assert!(
+            result
+                .report
+                .unsupported
+                .iter()
+                .any(|u| u.contains("max_apps")),
+            "{:?}",
+            result.report.unsupported
+        );
+        assert!(
+            result
+                .report
+                .unsupported
+                .iter()
+                .any(|u| u.contains("max_replicas")),
+            "{:?}",
+            result.report.unsupported
+        );
+    }
+
+    #[test]
+    fn namespace_without_quota_fields_emits_no_resource_quota() {
+        let config = parse_config("[namespace.team-b]\n");
+        let result = export_kubernetes(&config).unwrap();
+        assert!(result.yaml.contains("kind: Namespace"));
+        assert!(
+            !result.yaml.contains("kind: ResourceQuota"),
+            "an empty namespace must not emit a quota:\n{}",
+            result.yaml
+        );
+    }
+
+    /// The job exporter used to keep only image + command: a job with a memory
+    /// limit and database credentials exported as an unlimited pod with no
+    /// environment.
+    #[test]
+    fn job_export_carries_env_and_resources() {
+        let config = parse_config(
+            r#"
+            [job.migrate]
+            image = "migrate:v1"
+            command = ["npm", "run", "migrate"]
+            memory = "128Mi-256Mi"
+            cpu = "100m-200m"
+
+            [job.migrate.env]
+            DATABASE_URL = "postgres://db/main"
+            "#,
+        );
+        let result = export_kubernetes(&config).unwrap();
+        assert!(result.yaml.contains("DATABASE_URL"), "{}", result.yaml);
+        assert!(
+            result.yaml.contains("postgres://db/main"),
+            "{}",
+            result.yaml
+        );
+        // ResourceRange stores memory in bytes; 256Mi = 268435456 (a valid
+        // K8s quantity, matching what the app path exports).
+        assert!(result.yaml.contains("268435456"), "{}", result.yaml);
+        assert!(result.yaml.contains("200m"), "{}", result.yaml);
+    }
+
+    /// A DaemonSet has no scale subresource — the old export emitted an HPA
+    /// whose scaleTargetRef pointed at a Deployment that doesn't exist.
+    #[test]
+    fn daemonset_autoscale_reports_instead_of_emitting_an_hpa() {
+        let config = parse_config(
+            r#"
+            [app.monitor]
+            image = "monitor:v1"
+            replicas = "*"
+
+            [app.monitor.autoscale]
+            metric = "cpu"
+            target = "70%"
+            min = 1
+            max = 5
+            "#,
+        );
+        let result = export_kubernetes(&config).unwrap();
+        assert!(
+            !result.yaml.contains("kind: HorizontalPodAutoscaler"),
+            "an HPA cannot target a DaemonSet:\n{}",
+            result.yaml
+        );
+        assert!(
+            result
+                .report
+                .unsupported
+                .iter()
+                .any(|u| u.contains("scale subresource")),
+            "{:?}",
+            result.report.unsupported
+        );
+    }
+
+    /// Config validation accepts both "70%" and the raw fraction "0.7"
+    /// (`parse_percentage`); the exporter used to emit `type: Utilization`
+    /// with no `averageUtilization` for the fraction form, which the API
+    /// server rejects.
+    #[test]
+    fn autoscale_target_forms_both_export_average_utilization() {
+        for target in ["\"70%\"", "\"0.7\""] {
+            let config = parse_config(&format!(
+                "[app.web]\nimage = \"web:v1\"\nreplicas = 3\n\n\
+                 [app.web.autoscale]\nmetric = \"cpu\"\ntarget = {target}\nmin = 2\nmax = 10\n",
+            ));
+            let result = export_kubernetes(&config).unwrap();
+            assert!(
+                result.yaml.contains("averageUtilization: 70"),
+                "target {target} must export averageUtilization 70:\n{}",
+                result.yaml
+            );
+        }
+    }
+
+    #[test]
+    fn unparseable_autoscale_target_omits_the_metric_and_reports() {
+        let config = parse_config(
+            "[app.web]\nimage = \"web:v1\"\nreplicas = 3\n\n\
+             [app.web.autoscale]\nmetric = \"cpu\"\ntarget = \"banana\"\nmin = 2\nmax = 10\n",
+        );
+        let result = export_kubernetes(&config).unwrap();
+        assert!(result.yaml.contains("kind: HorizontalPodAutoscaler"));
+        assert!(
+            !result.yaml.contains("Utilization"),
+            "no metric may be emitted for an unconvertible target:\n{}",
+            result.yaml
+        );
+        assert!(
+            result
+                .report
+                .unsupported
+                .iter()
+                .any(|u| u.contains("could not convert")),
+            "{:?}",
+            result.report.unsupported
         );
     }
 }

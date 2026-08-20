@@ -1675,13 +1675,15 @@ pub fn generate_plan(config: &Config) -> ApplyPlan {
         to_create: entries.len(),
         entries,
         to_update: 0,
-        to_destroy: 0,
+        not_in_config: 0,
         unchanged: 0,
     }
 }
 ```
 
 Notice `if let Some(ref image) = app.image`. This is pattern matching with a reference — `ref` borrows the inner `String` instead of moving it out of the `Option`. In Rust, `match` and `if let` can destructure values, and `ref` says "I want to look at this, not take ownership of it." Without `ref`, the compiler would complain that you're trying to move `image` out of a borrowed `app`.
+
+A confession about this plan, added much later. The diffing half — `Update`, `Unchanged`, and the comparison against current state — sat fully written and fully unit-tested for a long time while every production caller passed `current = None`, because no agent endpoint existed to fetch current state from. So `apply --dry-run` showed every resource as a create, forever, and the tests happily verified logic that nothing could reach. The fix (a `GET /v1/apps` endpoint serving the deployed apps and their images, which the dry-run path queries whenever an agent answers) came with a naming correction: the plan used to have a `Destroy` action for resources running but absent from your config. But `relish apply` is additive — removal is `relish stop` — so "destroy" promised something apply would never do. Those entries are now labelled `not_in_config`, with a note telling you apply leaves them alone. A plan is a contract about what will happen; an action name that doesn't match the verb is a bug even when the code around it works.
 
 The function iterates `config.app`, which is a `BTreeMap<String, AppSpec>`. We chose `BTreeMap` over `HashMap` back in the config chapter for deterministic ordering — and here's the payoff. The plan entries come out in alphabetical order. Tests can assert on ordering without fragility. The YAML and JSON output is stable across runs. Small decision, compound benefit.
 

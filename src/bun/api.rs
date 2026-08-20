@@ -338,6 +338,7 @@ pub fn router_with_upgrade(
         .route("/ui/app/{app}/{namespace}/env", get(app_env_handler))
         .route("/v1/apply", post(apply_handler))
         .route("/v1/status", get(status_handler))
+        .route("/v1/apps", get(current_apps_handler))
         .route("/v1/readiness", get(readiness_handler))
         .route("/v1/jobs", get(jobs_handler))
         .route("/v1/events", get(events_handler))
@@ -416,6 +417,7 @@ pub fn router_with_upgrade(
         )
         .route("/v1/alerts", get(alerts_handler))
         .route("/v1/logs/sql", get(logs_sql_handler))
+        .route("/v1/logs/export", post(logs_export_handler))
         .route("/v1/deploys/active", get(deploys_active_handler))
         .route("/v1/deploys/operations", get(deploys_operations_handler))
         .route("/v1/deploys/history/{app}", get(deploys_history_handler))
@@ -1380,6 +1382,9 @@ async fn find_test_lease(
     }
 }
 
+// `Response` is large but it IS the HTTP reply to send on failure —
+// boxing it would tax every call site for a value that lives one frame.
+#[allow(clippy::result_large_err)]
 async fn write_lease_request(
     council: &crate::council::CouncilNode,
     request: crate::council::RaftRequest,
@@ -1749,6 +1754,9 @@ async fn upgrade_start_handler(
 /// are `Council`, and everything else `Worker`. Gossip identifies nodes by
 /// name; the Raft voter set by `raft_id_from_name(name)`, so we bridge them
 /// with that same stable hash.
+// `Response` is large but it IS the HTTP reply to send on failure —
+// boxing it would tax every call site for a value that lives one frame.
+#[allow(clippy::result_large_err)]
 async fn build_authoritative_view(
     state: &ApiState,
     council: &Arc<crate::council::CouncilNode>,
@@ -2013,6 +2021,9 @@ async fn cluster_elect_handler(
 /// council, e.g. single-node mode, where permissions cannot be configured) and
 /// defers to [`crate::sesame::auth::authorize_permission`]. Call it after the
 /// role and scope checks in a gated handler.
+// `Response` is large but it IS the HTTP reply to send on failure —
+// boxing it would tax every call site for a value that lives one frame.
+#[allow(clippy::result_large_err)]
 async fn enforce_permission(
     state: &ApiState,
     auth: Option<&crate::sesame::auth::AuthContext>,
@@ -2604,6 +2615,53 @@ async fn placements_handler(
 }
 
 /// List all instances.
+/// `GET /v1/apps` — the currently deployed resources in the CLI plan's
+/// identifier format, for `relish apply --dry-run` diffing.
+///
+/// Cluster mode answers from the council's desired state (authoritative and
+/// cluster-wide: apps with images, declared namespaces and permissions),
+/// merged over the local agent's view (which contributes node-local jobs —
+/// jobs don't live in desired state). Standalone answers from the local
+/// agent alone.
+async fn current_apps_handler(State(state): State<ApiState>) -> Response {
+    // Plan-key → image; later inserts overwrite, so the council's
+    // authoritative entries land last.
+    let mut resources: std::collections::BTreeMap<String, Option<String>> =
+        std::collections::BTreeMap::new();
+
+    let (resp_tx, resp_rx) = oneshot::channel();
+    if state
+        .cmd_tx
+        .send(AgentCommand::CurrentResources { response: resp_tx })
+        .await
+        .is_ok()
+        && let Ok(local) = resp_rx.await
+    {
+        for entry in local {
+            resources.insert(entry.resource, entry.image);
+        }
+    }
+
+    if let Some(council) = &state.council {
+        let desired = council.desired_state().await;
+        for (app_id, spec) in &desired.apps {
+            resources.insert(format!("app.{}", app_id.name), spec.image.clone());
+        }
+        for name in desired.namespaces.keys() {
+            resources.insert(format!("namespace.{name}"), None);
+        }
+        for name in desired.permissions.keys() {
+            resources.insert(format!("permission.{name}"), None);
+        }
+    }
+
+    let rows: Vec<crate::bun::agent::CurrentResourceStatus> = resources
+        .into_iter()
+        .map(|(resource, image)| crate::bun::agent::CurrentResourceStatus { resource, image })
+        .collect();
+    Json(rows).into_response()
+}
+
 async fn status_handler(State(state): State<ApiState>) -> Response {
     let (resp_tx, resp_rx) = oneshot::channel();
     if state
@@ -4177,6 +4235,9 @@ async fn record_fault_audit(state: &ApiState, audit: FaultAudit<'_>) {
 /// the replicated voter set minus live SWIM members, so a request reaching a
 /// different node cannot silently exceed quorum. The target agent repeats its
 /// local checks immediately before applying the effect.
+// `Response` is large but it IS the HTTP reply to send on failure —
+// boxing it would tax every call site for a value that lives one frame.
+#[allow(clippy::result_large_err)]
 async fn check_node_fault_cluster_safety(
     state: &ApiState,
     request: &crate::smoker::types::FaultRequest,
@@ -4278,6 +4339,9 @@ async fn forward_node_fault(
 }
 
 /// Resolve a live cluster member to one of its API URLs.
+// `Response` is large but it IS the HTTP reply to send on failure —
+// boxing it would tax every call site for a value that lives one frame.
+#[allow(clippy::result_large_err)]
 async fn target_node_api_url(
     state: &ApiState,
     target_node: &str,
@@ -5336,6 +5400,86 @@ async fn logs_sql_handler(
     }
 }
 
+/// `POST /v1/logs/export` request body.
+#[derive(serde::Deserialize)]
+struct LogsExportRequest {
+    /// Where the Parquet files go — a path on the agent host, `file://`,
+    /// `s3://` or `gs://`. Resolved agent-side, with the agent's credentials.
+    destination: String,
+}
+
+/// `POST /v1/logs/export` — export this node's Parquet log store now.
+///
+/// Uses the Bun-owned export checkpoint (X8), so a manual export and the
+/// periodic export loop can't double-ship or skip each other's files. Both
+/// load/save the same checkpoint file non-atomically; that load/save window
+/// is a pre-existing exposure shared with the interval task and the
+/// disk-pressure sweep.
+async fn logs_export_handler(
+    auth: Option<axum::Extension<crate::sesame::auth::AuthContext>>,
+    State(state): State<ApiState>,
+    Json(request): Json<LogsExportRequest>,
+) -> Response {
+    // Admin: this writes files wherever the destination points, using the
+    // agent host's filesystem and object-store credentials.
+    if let Err(resp) =
+        crate::sesame::auth::authorize(auth.as_deref(), crate::sesame::types::ApiRole::Admin)
+    {
+        return resp;
+    }
+    let Some(log_store) = &state.log_store else {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(serde_json::json!({"error": "log store not enabled"})),
+        )
+            .into_response();
+    };
+    let data_dir = log_store.read().await.data_dir().to_path_buf();
+    let checkpoint_path = data_dir.join(crate::ketchup::export::CHECKPOINT_FILENAME);
+    let mut checkpoint = crate::ketchup::export::ExportCheckpoint::load(&checkpoint_path);
+    let node_id = state
+        .node_name
+        .clone()
+        .unwrap_or_else(|| "local".to_string());
+
+    match crate::ketchup::export::export_logs(
+        &data_dir,
+        &request.destination,
+        &node_id,
+        &mut checkpoint,
+    )
+    .await
+    {
+        Ok(result) => {
+            // The files landed; a failed checkpoint save only means a later
+            // export may re-ship them. Say so instead of pretending.
+            let checkpoint_saved = if result.files_exported > 0 {
+                match checkpoint.save(&checkpoint_path) {
+                    Ok(()) => true,
+                    Err(e) => {
+                        eprintln!("bun: log export checkpoint save failed: {e}");
+                        false
+                    }
+                }
+            } else {
+                true
+            };
+            Json(serde_json::json!({
+                "files_exported": result.files_exported,
+                "bytes_written": result.bytes_written,
+                "node_id": node_id,
+                "checkpoint_saved": checkpoint_saved,
+            }))
+            .into_response()
+        }
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({"error": e.to_string()})),
+        )
+            .into_response(),
+    }
+}
+
 /// `GET /v1/alerts` — list all alert statuses.
 async fn alerts_handler(State(state): State<ApiState>) -> impl IntoResponse {
     let Some(alerts) = &state.alerts else {
@@ -5701,6 +5845,9 @@ async fn deploys_operations_handler(State(state): State<ApiState>) -> Response {
     }
 }
 
+// `Response` is large but it IS the HTTP reply to send on failure —
+// boxing it would tax every call site for a value that lives one frame.
+#[allow(clippy::result_large_err)]
 async fn deploy_operation_snapshot(
     state: &ApiState,
 ) -> Result<crate::bun::deploy_operations::DeployOperationSnapshot, Response> {
@@ -6592,6 +6739,87 @@ mod tests {
             cmd_tx, None, None, None, None, None, None, None, None, None, None, None, 9117, None,
         );
         (app, shutdown)
+    }
+
+    /// `GET /v1/apps` → `BunClient::current_resources` → `generate_plan`:
+    /// the full dry-run diff chain against a live standalone agent. Before
+    /// the endpoint existed, every dry-run caller passed `current = None`,
+    /// so the tested Update/Unchanged diff in plan.rs was dead in production.
+    #[tokio::test]
+    async fn current_apps_feeds_the_dry_run_diff() {
+        let (cmd_tx, cmd_rx) = mpsc::channel(32);
+        let shutdown = CancellationToken::new();
+        let grill = MockGrill::new();
+        let port_allocator = PortAllocator::new(30000, 31000);
+        let mut agent = BunAgent::new(grill, port_allocator, cmd_rx, shutdown.clone());
+        tokio::spawn(async move {
+            agent.run().await;
+        });
+        let app = router(
+            cmd_tx.clone(),
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            9117,
+            None,
+        );
+
+        // Deploy one app through the agent, as apply would.
+        let config = crate::config::Config::parse("[app.web]\nimage = \"myapp:v1\"\n").unwrap();
+        let (ev_tx, mut ev_rx) = mpsc::channel(64);
+        cmd_tx
+            .send(AgentCommand::Deploy {
+                config,
+                events: ev_tx,
+            })
+            .await
+            .unwrap();
+        while ev_rx.recv().await.is_some() {}
+
+        // Serve the router for a real client round-trip.
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let serving = shutdown.clone();
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app)
+                .with_graceful_shutdown(async move { serving.cancelled().await })
+                .await
+                .unwrap();
+        });
+
+        let client = crate::relish::client::BunClient::new(&format!("http://{address}"));
+        let current = client.current_resources().await.unwrap();
+        assert!(
+            current
+                .iter()
+                .any(|r| r.resource == "app.web" && r.image.as_deref() == Some("myapp:v1")),
+            "deployed app missing from /v1/apps: {current:?}"
+        );
+
+        // Same image diffs Unchanged; a bumped image diffs Update; the
+        // running app absent from a config is reported, never "destroyed".
+        let same = crate::config::Config::parse("[app.web]\nimage = \"myapp:v1\"\n").unwrap();
+        let plan = crate::relish::plan::generate_plan(&same, Some(&current));
+        assert_eq!((plan.to_update, plan.unchanged), (0, 1), "{plan:?}");
+
+        let bumped = crate::config::Config::parse("[app.web]\nimage = \"myapp:v2\"\n").unwrap();
+        let plan = crate::relish::plan::generate_plan(&bumped, Some(&current));
+        assert_eq!((plan.to_create, plan.to_update), (0, 1), "{plan:?}");
+
+        let unrelated = crate::config::Config::parse("[app.other]\nimage = \"o:v1\"\n").unwrap();
+        let plan = crate::relish::plan::generate_plan(&unrelated, Some(&current));
+        assert_eq!(plan.not_in_config, 1, "{plan:?}");
+
+        shutdown.cancel();
+        let _ = server.await;
     }
 
     /// Build a router whose local `MayoStore` already holds `samples`
@@ -8656,6 +8884,120 @@ mod tests {
         let status = get_status(app, "/v1/logs/sql?q=SELECT%20*%20FROM%20logs", Some(&tok)).await;
         assert_ne!(status, StatusCode::FORBIDDEN);
         shutdown.cancel();
+    }
+
+    /// `/v1/logs/export` writes files with the agent's credentials wherever
+    /// the destination points — Deployer must not reach it.
+    #[tokio::test]
+    async fn logs_export_requires_admin() {
+        let (app, shutdown, tok) = setup_with_role(
+            "logs-export-deployer",
+            crate::sesame::types::ApiRole::Deployer,
+        )
+        .await;
+        let status = post_status(
+            app,
+            "/v1/logs/export",
+            &tok,
+            r#"{"destination":"/tmp/nowhere"}"#,
+        )
+        .await;
+        assert_eq!(status, StatusCode::FORBIDDEN);
+        shutdown.cancel();
+    }
+
+    /// An Admin token on a node with no log store gets an honest 503, not a
+    /// silent empty success.
+    #[tokio::test]
+    async fn logs_export_without_a_store_is_service_unavailable() {
+        let (app, shutdown, tok) =
+            setup_with_role("logs-export-nostore", crate::sesame::types::ApiRole::Admin).await;
+        let status = post_status(
+            app,
+            "/v1/logs/export",
+            &tok,
+            r#"{"destination":"/tmp/nowhere"}"#,
+        )
+        .await;
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+        shutdown.cancel();
+    }
+
+    /// The export endpoint ships the store's Parquet files to the requested
+    /// destination under the node's name and persists the Bun-owned export
+    /// checkpoint (X8), so a repeat export ships nothing new.
+    #[tokio::test]
+    async fn logs_export_ships_parquet_and_persists_the_checkpoint() {
+        let (cmd_tx, _cmd_rx) = mpsc::channel(32);
+        let store_dir = tempfile::tempdir().unwrap();
+        let mut store = crate::ketchup::log_store::LogStore::new(store_dir.path().to_path_buf());
+        store.append(
+            "web",
+            "default",
+            crate::ketchup::types::LogStream::Stdout,
+            "hello",
+        );
+        store.flush().await.unwrap();
+        let log_store = Some(Arc::new(RwLock::new(store)));
+
+        let app = router(
+            cmd_tx, None, log_store, None, None, None, None, None, None, None, None, None, 9117,
+            None,
+        );
+        let destination = tempfile::tempdir().unwrap();
+        let body = serde_json::json!({ "destination": destination.path() }).to_string();
+
+        let response = app
+            .clone()
+            .oneshot(
+                axum::http::Request::builder()
+                    .method("POST")
+                    .uri("/v1/logs/export")
+                    .header("content-type", "application/json")
+                    .body(Body::from(body.clone()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let bytes = axum::body::to_bytes(response.into_body(), 1024 * 1024)
+            .await
+            .unwrap();
+        let outcome: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(outcome["files_exported"], 1, "{outcome}");
+        assert_eq!(outcome["checkpoint_saved"], true, "{outcome}");
+
+        // The file landed under the node's subdirectory…
+        let node_dir = destination.path().join("local");
+        let shipped: Vec<_> = std::fs::read_dir(&node_dir)
+            .expect("node subdirectory must exist")
+            .flatten()
+            .collect();
+        assert_eq!(shipped.len(), 1, "one parquet file must be shipped");
+        // …and the checkpoint lives with the store, so a second export is a
+        // no-op instead of a double-ship.
+        assert!(
+            store_dir
+                .path()
+                .join(crate::ketchup::export::CHECKPOINT_FILENAME)
+                .exists()
+        );
+        let repeat = app
+            .oneshot(
+                axum::http::Request::builder()
+                    .method("POST")
+                    .uri("/v1/logs/export")
+                    .header("content-type", "application/json")
+                    .body(Body::from(body))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let bytes = axum::body::to_bytes(repeat.into_body(), 1024 * 1024)
+            .await
+            .unwrap();
+        let outcome: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(outcome["files_exported"], 0, "{outcome}");
     }
 
     /// AUTH1 for faults: a Deployer scoped to one namespace clears the role
