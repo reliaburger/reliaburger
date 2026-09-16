@@ -1,0 +1,160 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="description" content="Reliaburger is a container orchestrator written in Rust. One node agent, one CLI, and the source, design decisions and book on GitHub.">
+  <meta name="theme-color" content="#181b19">
+  <title>Reliaburger — a container orchestrator in Rust</title>
+  <link rel="icon" type="image/svg+xml" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='4' fill='%23181b19'/%3E%3Ctext x='16' y='23' text-anchor='middle' font-family='monospace' font-weight='bold' font-size='23' fill='%23f49463'%3Er%3C/text%3E%3C/svg%3E">
+  <link rel="stylesheet" href="./style.css">
+</head>
+<body>
+  <a class="skip" href="#main">Skip to content</a>
+  <div class="page">
+    <header class="masthead">
+      <a class="wordmark" href="./" aria-label="Reliaburger home"><span class="mark" aria-hidden="true">r/</span>reliaburger</a>
+      <nav aria-label="Main navigation">
+        <a href="#start">Run it</a>
+        <a href="#docs">Read the docs</a>
+        <a href="https://github.com/reliaburger/reliaburger">GitHub <span aria-hidden="true">↗</span></a>
+      </nav>
+    </header>
+
+    <main id="main">
+      <section class="intro" aria-labelledby="title">
+        <div class="eyebrow">RUST · APACHE 2.0 · IN DEVELOPMENT</div>
+        <h1 id="title">Container orchestration.<br>One agent. One CLI.</h1>
+        <p class="lede">Reliaburger puts scheduling, service discovery, ingress, a registry,
+          secrets, logs and metrics in one node agent. Written in Rust. Driven by TOML.</p>
+        <div class="intro-links">
+          <a class="primary-link" href="https://github.com/reliaburger/reliaburger">Read the source <span aria-hidden="true">↗</span></a>
+          <a href="https://github.com/reliaburger/reliaburger/blob/main/docs/whitepaper.md">Read the whitepaper</a>
+        </div>
+      </section>
+
+      <aside class="status" aria-label="Release status">
+        <strong>Working towards 0.1.0</strong>
+        <p>The core is implemented. Packaging, the laptop installer and release acceptance
+          are next. The five-minute cluster is a goal, not an available install command.</p>
+        <a href="https://github.com/reliaburger/reliaburger/blob/main/docs/plans/2026-09-16-v0.1.0-release-plan.md">Release plan <span aria-hidden="true">↗</span></a>
+      </aside>
+
+      <section id="start" class="section start" aria-labelledby="start-title">
+        <div class="section-heading">
+          <span class="section-number" aria-hidden="true">01 /</span>
+          <h2 id="start-title">Run it from source</h2>
+        </div>
+        <div class="start-grid">
+          <div class="start-copy">
+            <p>Start with a local process. No container runtime required.</p>
+            <p>You’ll need Rust and the build tools for your platform. This example runs
+              <code>hello</code> under the built-in ProcessGrill runtime; it doesn’t create
+              an isolated container or a multi-node cluster.</p>
+            <p>For real OCI containers, use runc on Linux. Native Apple Container support
+              has limitations; the planned laptop quickstart uses Linux VMs.</p>
+            <a href="https://github.com/reliaburger/reliaburger/blob/main/docs/README.md">Build requirements &amp; runtime setup <span aria-hidden="true">↗</span></a>
+          </div>
+          <div class="terminal">
+            <div class="terminal-heading">LOCAL DEVELOPMENT <span>sh</span></div>
+            <pre><code><span class="comment"># Terminal 1 · build and start the agent</span>
+git clone https://github.com/reliaburger/reliaburger
+cd reliaburger
+cargo build --bins
+target/debug/bun --runtime process
+
+<span class="comment"># Terminal 2 · from the same checkout</span>
+target/debug/relish apply \
+  examples/phase-1/proc-first-run.toml
+target/debug/relish status
+target/debug/relish</code></pre>
+            <div class="terminal-footer">Web dashboard: <code>http://127.0.0.1:9117/</code></div>
+          </div>
+        </div>
+      </section>
+
+      <section id="docs" class="section" aria-labelledby="docs-title">
+        <div class="section-heading">
+          <span class="section-number" aria-hidden="true">02 /</span>
+          <h2 id="docs-title">Read before you deploy</h2>
+          <span class="section-note">Documentation lives with the code.</span>
+        </div>
+        <div class="reading-list">
+          <article class="reading-item">
+            <span class="filetype">START HERE</span>
+            <h3><a href="https://github.com/reliaburger/reliaburger/blob/main/docs/README.md">User documentation <span aria-hidden="true">↗</span></a></h3>
+            <p>Build requirements, runtimes, configuration, secure cluster setup and CLI commands.</p>
+          </article>
+          <article class="reading-item">
+            <span class="filetype">DESIGN &amp; INTENT</span>
+            <h3><a href="https://github.com/reliaburger/reliaburger/blob/main/docs/whitepaper.md">The whitepaper <span aria-hidden="true">↗</span></a></h3>
+            <p>The architecture, its trade-offs and the longer-term vision. Includes features still planned.</p>
+            <a class="secondary-link" href="https://github.com/reliaburger/reliaburger/actions/workflows/build.yml">PDF from build artefacts</a>
+          </article>
+          <article class="reading-item">
+            <span class="filetype">IMPLEMENTATION</span>
+            <h3><a href="https://github.com/reliaburger/reliaburger/tree/main/docs/design">Component design docs <span aria-hidden="true">↗</span></a></h3>
+            <p>Protocols, data structures, failure modes and decisions for each subsystem.</p>
+          </article>
+          <article class="reading-item">
+            <span class="filetype">WALKTHROUGH</span>
+            <h3><a href="https://github.com/reliaburger/reliaburger/tree/main/docs/book">Building Reliaburger <span aria-hidden="true">↗</span></a></h3>
+            <p>The companion book: build the orchestrator while learning Rust and distributed systems. For programmers coming from C, Python or Go.</p>
+          </article>
+          <article class="reading-item">
+            <span class="filetype">REFERENCE</span>
+            <h3><a href="https://github.com/reliaburger/reliaburger/tree/main/docs/manual">The manual &amp; examples <span aria-hidden="true">↗</span></a></h3>
+            <p>The manual is also embedded in <code>relish manual</code>. Browse the <a href="https://github.com/reliaburger/reliaburger/tree/main/examples">example configs</a> by phase and runtime.</p>
+          </article>
+          <article class="reading-item">
+            <span class="filetype">CURRENT STATE</span>
+            <h3><a href="https://github.com/reliaburger/reliaburger/blob/main/docs/progress.md">Progress &amp; release work <span aria-hidden="true">↗</span></a></h3>
+            <p>What’s implemented, what needs verification and what’s next. Read alongside the <a href="https://github.com/reliaburger/reliaburger/blob/main/docs/roadmap.md">roadmap</a>.</p>
+          </article>
+        </div>
+        <p class="pdf-note">For the PDF: open a successful build, download <code>reliaburger-pdfs</code>
+          under <strong>Artifacts</strong>, then open <code>reliaburger-whitepaper.pdf</code>.
+          GitHub sign-in is required. Artefacts expire; the Markdown version stays in the repository.</p>
+      </section>
+
+      <section class="section" aria-labelledby="internals-title">
+        <div class="section-heading">
+          <span class="section-number" aria-hidden="true">03 /</span>
+          <h2 id="internals-title">Follow a subsystem</h2>
+        </div>
+        <p class="section-intro"><code>bun</code> runs on each node. <code>relish</code> talks to its API.
+          The names are burger ingredients; the links are the design documents.</p>
+        <dl class="subsystems">
+          <div><dt><a href="https://github.com/reliaburger/reliaburger/blob/main/docs/design/agent-bun.md">Bun / Grill</a></dt><dd>Agent, container lifecycle, health checks</dd></div>
+          <div><dt><a href="https://github.com/reliaburger/reliaburger/blob/main/docs/design/gossip-mustard.md">Mustard / Council</a></dt><dd>SWIM membership, Raft consensus</dd></div>
+          <div><dt><a href="https://github.com/reliaburger/reliaburger/blob/main/docs/design/scheduler-meat.md">Meat</a></dt><dd>Placement, resources, scheduling</dd></div>
+          <div><dt><a href="https://github.com/reliaburger/reliaburger/blob/main/docs/design/discovery-onion.md">Onion</a></dt><dd>DNS, service discovery, eBPF</dd></div>
+          <div><dt><a href="https://github.com/reliaburger/reliaburger/blob/main/docs/design/ingress-wrapper.md">Wrapper</a></dt><dd>Ingress, TLS, connection draining</dd></div>
+          <div><dt><a href="https://github.com/reliaburger/reliaburger/blob/main/docs/design/security-sesame.md">Sesame</a></dt><dd>PKI, mTLS, secrets, authorisation</dd></div>
+          <div><dt><a href="https://github.com/reliaburger/reliaburger/blob/main/docs/design/registry-pickle.md">Pickle</a></dt><dd>OCI registry, image distribution</dd></div>
+          <div><dt><a href="https://github.com/reliaburger/reliaburger/blob/main/docs/design/metrics-mayo.md">Mayo</a> / <a href="https://github.com/reliaburger/reliaburger/blob/main/docs/design/logs-ketchup.md">Ketchup</a></dt><dd>Metrics, SQL queries, logs</dd></div>
+          <div><dt><a href="https://github.com/reliaburger/reliaburger/blob/main/docs/design/gitops-lettuce.md">Lettuce</a></dt><dd>GitOps, reconciliation</dd></div>
+          <div><dt><a href="https://github.com/reliaburger/reliaburger/blob/main/docs/design/deployments.md">Deployments</a></dt><dd>Rollouts, health gates, rollback</dd></div>
+          <div><dt><a href="https://github.com/reliaburger/reliaburger/blob/main/docs/design/chaos-smoker.md">Smoker</a></dt><dd>Fault injection, recovery testing</dd></div>
+          <div><dt><a href="https://github.com/reliaburger/reliaburger/blob/main/docs/design/cli-relish.md">Relish</a> / <a href="https://github.com/reliaburger/reliaburger/blob/main/docs/design/ui-brioche.md">Brioche</a></dt><dd>CLI, terminal UI, web dashboard</dd></div>
+        </dl>
+      </section>
+
+      <section class="section contributing" aria-labelledby="contribute-title">
+        <div>
+          <div class="eyebrow">CODE, TESTS, DOCUMENTATION</div>
+          <h2 id="contribute-title">Find something that doesn’t work?</h2>
+          <p>Open an issue with your OS, runtime, config and the steps to reproduce it.
+            Implementation changes come with tests and a chapter in the book.</p>
+        </div>
+        <a class="primary-link" href="https://github.com/reliaburger/reliaburger/issues">GitHub issues <span aria-hidden="true">↗</span></a>
+      </section>
+    </main>
+    <footer>
+      <span>Reliaburger · by Miko Pawlikowski</span>
+      <a href="https://github.com/reliaburger/reliaburger/blob/main/LICENSE">Apache 2.0</a>
+      <span class="footer-note">Plain HTML + CSS. No JavaScript.</span>
+    </footer>
+  </div>
+</body>
+</html>

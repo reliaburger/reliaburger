@@ -16,10 +16,8 @@ rolling self-upgrade of the orchestrator itself — ship compiled into one
 
 No sidecars. No add-on shopping list. No YAML archaeology. You get:
 
-- **A five-minute start.** `relish setup` takes a fresh machine to a
-  configured node: it detects or installs `bun` (signature-verified through
-  the same dual-signed pipeline the cluster uses to upgrade itself) and asks
-  a handful of questions.
+- **A built-in guide.** `relish manual` provides searchable documentation
+  and runnable examples without a repo checkout or internet connection.
 - **A cluster that heals itself.** SWIM gossip membership, a self-healing
   Raft council, automatic rescheduling, council disaster recovery, and
   rolling binary upgrades where workloads survive the swap.
@@ -108,49 +106,54 @@ repo layout live in the manual (`relish manual`, "Under the hood") and the
 
 ## Try it
 
+Use the source-based quick start above while we prepare the first release.
+From a checkout, you can run the portable tests and check the examples:
+
 ```sh
 make test                    # run the portable nextest suite
-make audit                   # reject new RustSec dependency findings
-relish test --profile development # run the 39-case live-cluster catalogue
-relish bench --quick --output json # benchmark real DNS and service data paths
-relish wtf                       # diagnose live cluster evidence (0/1/2 exit)
-relish trace web --to redis      # probe DNS and TCP from the web workload
+make audit                   # check dependency advisories
 make examples                # validate and dry-run every example config
-make observability-demo      # start bun, collect metrics, query APIs, show dashboard
-make pickle-test-macos       # push/pull a Docker image through the Pickle registry
 ```
 
-The Phase 15 runner and 39-case catalogue are live. Bun also exposes durable,
-server-owned app/namespace leases, and the runner now uses one for every case.
-Container cases use one digest-pinned BusyBox 1.37.0 OCI index, accepted through
-both runc and Apple Container. Authenticated, TTL-bounded node drain and node
-kill now exercise the real scheduler and cluster transports. Opt-in,
-server-bounded Linux node pressure runs outside Bun in an owned cgroup and
-cleans up on clear, expiry, graceful shutdown, parent death or restart. The
-service partition now has a root-only, source-cgroup eBPF effect proof and is
-separate from the Raft/gossip quorum operation; unsupported delay and bandwidth
-faults refuse instead of claiming success. `relish test --chaos` now runs five
-serial recovery scenarios with fresh destructive-capability evidence, exact
-fault ownership, and panic- and timeout-safe reversal. Missing node-failure,
-node-pressure, policy or three-node prerequisites refuse instead of becoming
-green skips. Workload injection is opt-in through the server-owned
-`inject_workload_faults` operation, needs explicit operator acknowledgement,
-and records structured audit events attributed to the authenticated
-credential. Reversal keeps the matching role and grant but doesn't require a
-destructive acknowledgement. `relish bench` now runs seven public-API suites
-under server-owned leases. Its DNS and throughput measurements originate
-inside a source workload, strict environment fingerprints prevent unlike
-comparisons, and hosted-runner changes stay informational. Started-suite
-timeouts and uncertain cleanup fail instead of becoming green skips.
-`relish wtf` now fans authenticated requests across the expected nodes, keeps
-unavailable and inherently incomplete evidence as `Unknown`, and correlates
-timestamped restarts with recent deploys and error logs. It returns 0 only when
-every selected check is observed and healthy, 1 for critical findings, and 2
-for warnings or unknown evidence. `relish trace` locates a running source
-instance, executes fixed DNS and TCP probes inside that workload, and compares
-the result with the live service map and, on supported Linux nodes, attached
-eBPF backend and firewall maps. Every step says whether its evidence was
-observed, inferred or unavailable; incomplete evidence returns exit status 2.
+With a running, configured cluster and `relish` on your PATH:
+
+```sh
+relish status
+relish wtf                   # diagnose the live cluster
+relish test --profile development
+```
+
+See the [diagnostics guide](docs/manual/07_diagnostics.md) for test prerequisites,
+profiles and interpreting results.
+
+## Getting to 0.1.0
+
+The core platform is implemented. We're preparing a release that takes a
+laptop to three healthy Linux nodes and a working sample app, with no Rust
+build or repo checkout. **Under five minutes is the target; the public
+installer and that timing guarantee aren't available yet.**
+
+The [0.1.0 release plan](docs/plans/2026-09-16-v0.1.0-release-plan.md)
+sets out the remaining work, in order:
+
+1. **Establish the release baseline.** Reconcile the older TODO lists,
+   define supported platforms and run the complete test matrix.
+2. **Finish correctness fixes.** Make readiness checks trustworthy, bound
+   registry upload memory and close the remaining consequential bugs.
+3. **Package and sign the release.** Publish Linux binaries, native macOS
+   CLI binaries, eBPF assets and matching release metadata.
+4. **Make laptop clusters reliable.** Use prebuilt assets and managed Linux
+   VMs, with secure enrolment, resumable setup and access from the host CLI
+   and browser.
+5. **Add the installer and first-run flow.** Install, start the cluster and
+   deploy a sample app, with clear progress, errors and cleanup commands.
+6. **Prove the downloadable release works.** Test clean installations,
+   restart and recovery, and measure the full three-node start with empty
+   caches before publishing the five-minute claim.
+
+Each step includes tests and updates to the documentation and book. Detailed
+acceptance gates and deferred features live in the release plan; implementation
+history remains in [progress.md](docs/progress.md).
 
 ## Licence
 
