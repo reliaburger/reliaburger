@@ -2,6 +2,12 @@
 
 Single source of truth for what's done and what's next. Check off an item only when it compiles, passes tests, and is committed. See [roadmap.md](roadmap.md) for full details on each phase.
 
+> **0.1.0 release planning (16 September 2026):** see the
+> [release-readiness review and laptop quickstart plan](plans/2026-09-16-v0.1.0-release-plan.md).
+> It separates current packaging/onboarding blockers from superseded audit findings,
+> proposes a supported release scope, and defines clean-install and real-cluster
+> acceptance gates. This is a proposed plan, not a completed release.
+
 > **Review note (July 2026):** a full verification pass ([2026-07-02-review-codebase.md](plans/2026-07-02-review-codebase.md))
 > found that many checked items are **library-only** — implemented and unit-tested, but never
 > wired into the `bun`/`relish` binaries. Those are tagged **`[lib-only]`** below with their
