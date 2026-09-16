@@ -128,6 +128,9 @@ profiles and interpreting results.
 
 ## Getting to 0.1.0
 
+Node startup now verifies the agent response, version and critical subsystem
+readiness before setup reports success. The installer remains in development.
+
 The core platform is implemented. We're preparing a release that takes a
 laptop to three healthy Linux nodes and a working sample app, with no Rust
 build or repo checkout. **Under five minutes is the target; the public

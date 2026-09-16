@@ -2183,3 +2183,35 @@ rootful runc and Apple Container profiles. The implementation sandbox used for
 this tranche couldn't launch a live Bun process, so the checked evidence is
 the pure contract, API/authentication tests and mock-runtime orchestration. We
 don't turn that platform limitation into a production claim.
+
+
+## Release checks: listening isn't ready
+
+Imagine running setup while an unrelated web server occupies port 9117. It
+returns a perfectly valid HTTP 404. Our original client treated any completed
+HTTP request as success, so setup congratulated you on your new node. There
+wasn't one.
+
+The liveness check now requires a successful HTTP status and Bun's JSON
+`{"status":"ok"}` response. It bounds the response body as well: a health check
+has no reason to download megabytes. This preserves the existing liveness
+protocol, but liveness still doesn't prove that the node can do useful work.
+
+The new `relish::readiness::wait_for_node` checks liveness, a parseable node
+version and authenticated subsystem readiness. An empty critical-subsystem
+list isn't enough, even if the response claims `ready = true`. Every critical
+subsystem must report `Ready`. Setup returns an error, including the log path,
+when those checks don't succeed.
+
+All requests and retry delays share one `tokio::time::Instant` deadline.
+`timeout_at(deadline, future)` polls the future until that absolute instant;
+when time runs out, dropping the future cancels that attempt. Creating a fresh
+30-second timeout for every request would let a multi-step operation take
+several minutes. One deadline means what it says.
+
+The tests run real HTTP listeners on ephemeral loopback ports. They reject
+404/500 responses, unrelated HTML, invalid version evidence and a live node
+whose subsystems are still starting. A deliberately hung handler proves the
+whole operation respects its deadline. This is a node-startup check; cluster
+quorum and a successful workload request still need their own acceptance
+checks before we call a laptop cluster ready.

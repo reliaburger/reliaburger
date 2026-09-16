@@ -2,6 +2,14 @@
 
 User guide for building and running Reliaburger. For the full architectural vision, see the [whitepaper](whitepaper.md). For current implementation status, see [progress.md](progress.md).
 
+## Release work
+
+The [0.1.0 plan](plans/2026-09-16-v0.1.0-release-plan.md) tracks packaging and
+the managed laptop cluster. `relish setup` now checks node version and critical
+subsystem readiness before reporting a successful start. A startup timeout
+returns an error with the log path; `--yes` still configures without starting a
+background node. The public installer remains in development.
+
 ## Prerequisites
 
 ### Rust toolchain

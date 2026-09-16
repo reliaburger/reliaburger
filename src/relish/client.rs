@@ -380,13 +380,50 @@ impl BunClient {
     /// doesn't respond quickly, the agent is effectively unreachable.
     pub async fn health(&self) -> Result<(), RelishError> {
         let url = format!("{}/v1/health", self.base_url);
-        self.client
+        let mut response = self
+            .client
             .get(&url)
             .timeout(std::time::Duration::from_secs(5))
             .send()
             .await
             .map_err(|_| RelishError::AgentUnreachable)?;
+        let status = response.status().as_u16();
+        if !response.status().is_success() {
+            return Err(RelishError::ApiError {
+                status,
+                body: "bun liveness check failed".to_string(),
+            });
+        }
+        // Keep an unrelated service's response from exhausting the CLI's memory.
+        let mut body = Vec::new();
+        while let Some(chunk) = response.chunk().await.map_err(classify_error)? {
+            if body.len().saturating_add(chunk.len()) > 4096 {
+                return Err(RelishError::ApiError {
+                    status,
+                    body: "invalid bun liveness response".to_string(),
+                });
+            }
+            body.extend_from_slice(&chunk);
+        }
+        let json: serde_json::Value =
+            serde_json::from_slice(&body).map_err(|_| RelishError::ApiError {
+                status,
+                body: "invalid bun liveness response".to_string(),
+            })?;
+        if json["status"] != "ok" {
+            return Err(RelishError::ApiError {
+                status,
+                body: "bun is not live".to_string(),
+            });
+        }
         Ok(())
+    }
+
+    /// Read authenticated critical-subsystem readiness; liveness alone is insufficient.
+    pub async fn readiness(
+        &self,
+    ) -> Result<crate::bun::readiness::NodeReadinessEvidence, RelishError> {
+        self.get_typed_json("/v1/readiness").await
     }
 
     /// Deploy workloads from a config, streaming progress to stderr.
@@ -1893,6 +1930,47 @@ mod tests {
     use super::*;
     use std::sync::{Arc, Mutex};
 
+    #[tokio::test]
+    async fn health_rejects_http_errors_and_unrelated_services() {
+        use axum::{Router, routing::get};
+        for (status, body) in [
+            (404, r#"{"status":"ok"}"#),
+            (500, r#"{"status":"ok"}"#),
+            (200, "welcome to another server"),
+            (200, r#"{"status":"starting"}"#),
+        ] {
+            let app =
+                Router::new().route(
+                    "/v1/health",
+                    get(move || async move {
+                        (axum::http::StatusCode::from_u16(status).unwrap(), body)
+                    }),
+                );
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let address = listener.local_addr().unwrap();
+            let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+            let client = BunClient::new_with_token(&format!("http://{address}"), None);
+            let result = client.health().await;
+            server.abort();
+            assert!(result.is_err(), "accepted HTTP {status}: {body}");
+        }
+    }
+
+    #[tokio::test]
+    async fn health_accepts_the_bun_liveness_response() {
+        let app = axum::Router::new().route(
+            "/v1/health",
+            axum::routing::get(|| async { axum::Json(serde_json::json!({"status": "ok"})) }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let client = BunClient::new_with_token(&format!("http://{address}"), None);
+        let result = client.health().await;
+        server.abort();
+        result.unwrap();
+    }
+
     /// PEM-encode a DER certificate for `reqwest::Certificate::from_pem`.
     fn pem_cert(der: &[u8]) -> Vec<u8> {
         pem::encode(&pem::Pem::new("CERTIFICATE", der.to_vec())).into_bytes()
@@ -1914,7 +1992,10 @@ mod tests {
             )
             .unwrap(),
         );
-        let router = Router::new().route("/v1/health", get(|| async { "ok" }));
+        let router = Router::new().route(
+            "/v1/health",
+            get(|| async { axum::Json(serde_json::json!({"status": "ok"})) }),
+        );
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         tokio::spawn(async move {
@@ -2030,7 +2111,7 @@ mod tests {
                         .get("authorization")
                         .and_then(|v| v.to_str().ok())
                         .map(String::from);
-                    "ok"
+                    axum::Json(serde_json::json!({"status": "ok"}))
                 }
             }),
         );

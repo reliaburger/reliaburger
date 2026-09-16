@@ -30,6 +30,7 @@ pub mod manual;
 pub mod output;
 pub mod plan;
 pub mod reader;
+pub mod readiness;
 pub mod setup;
 pub mod source;
 pub mod test_cmd;
