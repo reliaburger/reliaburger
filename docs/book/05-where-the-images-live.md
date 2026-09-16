@@ -534,3 +534,40 @@ cargo test --lib pickle       # the whole registry, in-process
 Reach for the gated commands only when you want to exercise real images or real runtimes. The full env-var table lives in `docs/README.md`.
 
 Phase 5 adds 72 tests, bringing the total to 867.
+
+## Release hardening: a push shouldn't need a layer's worth of RAM
+
+Push a 400 MiB layer to Pickle. Previously, the HTTP handler collected the
+request into memory before checking authentication, and completion read the
+upload file back into another allocation. Four clients could exhaust a small
+laptop VM without running a single container.
+
+The handler now authenticates before reading the body and writes each incoming
+chunk to the upload file before requesting the next one. That gives us
+backpressure: a slow disk slows the sender. Completion hashes the file with a
+64 KiB buffer on Tokio's blocking pool, syncs it, then renames it into the
+content-addressed store. The digest must match before the blob becomes visible.
+Manifests still need parsing in memory, so they have a separate 4 MiB limit.
+
+A semaphore allows four simultaneous write requests. A fifth receives HTTP 429
+with `Retry-After: 1`; it doesn't sit in a queue retaining its body. Each upload
+also owns a one-permit semaphore, so a PATCH can't change a file while a PUT
+verifies it. An `OwnedSemaphorePermit` holds its semaphore through an `Arc`
+(shared ownership), rather than borrowing the request's stack. Moving it into
+`spawn_blocking` keeps the upload locked even if the client disconnects while
+verification is running. Dropping the permit releases the lock automatically.
+The expiry sweep skips uploads with an active writer.
+
+Each request has a five-minute deadline and a 512 MiB byte limit. Failed body
+reads discard their partial upload; abandoned sessions remain subject to expiry.
+Both PATCH and PUT reject expired sessions and repository mismatches. These
+limits bound active request processing, not total temporary disk usage; storage
+quotas and the expiry sweep still matter.
+
+The regression test sends half a body, waits until those bytes reach the upload
+file, and only then sends the rest. An implementation that buffers until EOF
+cannot pass it. Other tests leave an unauthorised body unfinished, saturate the
+writer limit, and try to complete an expired session. This tests the behaviour
+clients depend on, without relying on process memory measurements. The separate
+release acceptance still needs to measure memory under real concurrent pushes
+in the laptop VM.
