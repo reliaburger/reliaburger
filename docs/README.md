@@ -969,3 +969,5 @@ the `finished` phase plus an explicit `completed`, `failed`, `cancelled` or
 `unknown` outcome. `unknown` means the worker ended without terminal evidence.
 It is not treated as a green deploy. Concurrent operations may target different
 apps, but Bun refuses a second operation for the same namespace/name.
+
+Release maintainers: see [the build, signing and publication procedure](releasing.md).

@@ -28,3 +28,6 @@ _book/
 /.quarto/
 **/*.quarto_ipynb
 *.pdf
+
+# Python release-tool bytecode
+__pycache__/

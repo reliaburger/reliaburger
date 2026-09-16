@@ -335,7 +335,7 @@ impl Default for UpgradeSection {
         Self {
             external_signing_key: None,
             retain_versions: 3,
-            release_url: "https://releases.reliaburger.dev/metadata.json".to_string(),
+            release_url: crate::upgrade::metadata::DEFAULT_RELEASE_URL.to_string(),
             binary_dir: None,
             boot_grace_secs: 30,
             gossip_rejoin_secs: 60,

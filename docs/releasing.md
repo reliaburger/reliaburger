@@ -1,0 +1,70 @@
+# Cutting a release
+
+The [0.1.0 plan](plans/2026-09-16-v0.1.0-release-plan.md) defines the acceptance
+gates. A green build alone doesn't qualify the laptop quickstart or its timing.
+No public 0.1.0 release has been published by this work.
+
+## What the workflow builds
+
+`.github/workflows/build.yml` builds the following native artefacts on pull
+requests, main and version tags:
+
+| File | Build host | Use |
+| --- | --- | --- |
+| `bun-linux-x86_64` | Ubuntu 22.04 x86_64 | Linux agent, embedded eBPF |
+| `bun-linux-aarch64` | Ubuntu 22.04 arm64 | Linux agent, embedded eBPF |
+| `relish-linux-x86_64` | Ubuntu 22.04 x86_64 | Linux CLI |
+| `relish-linux-aarch64` | Ubuntu 22.04 arm64 | Linux CLI |
+| `relish-macos-aarch64` | macOS 15 Apple silicon | Laptop CLI |
+| `relish-macos-x86_64` | macOS 15 Intel | CLI build; cold-install qualification still required |
+
+Native runners avoid depending on tools installed outside a cross-build
+container. Runner labels follow GitHub's
+[hosted runner reference](https://docs.github.com/en/actions/reference/runners/github-hosted-runners).
+The initial Linux build baseline is Ubuntu 22.04. Compatibility with older
+systems is not promised. macOS builds are not yet Developer ID signed or
+notarised; don't equate an Actions build with clean-host acceptance.
+
+## Signing identity
+
+Configure the Actions secret `RELIABURGER_RELEASE_KEY` with the base64 encoding
+of the existing Ed25519 PKCS#8 DER private key whose public key is listed in
+`src/upgrade/keys.rs`. Never commit that private key. This workflow does not
+rotate the project's identity or generate a replacement when the secret is
+missing.
+
+The packaging script derives the public key and checks it against the compiled
+trust list before signing. A missing key, wrong key, incomplete matrix or failed
+signing operation stops publication. Unit tests use fresh temporary keys and
+verify that a modified binary no longer passes signature verification.
+
+Each binary gets a schema-1 `.sig` envelope compatible with the existing
+upgrade verifier. `SHA256SUMS` supports download checks; it doesn't replace
+signature verification. Public release signatures establish project provenance.
+Operators using the dual-signature upgrade policy still need to approve binaries
+with their configured external key.
+
+## Metadata and publication
+
+The tag must equal `v` plus the version in `Cargo.toml`. After source CI, native
+builds, packaging tests and PDF generation pass, the tag workflow signs all six
+binaries and attaches them, their envelopes, checksums, metadata and PDFs to a
+GitHub release.
+
+- `metadata.json` selects **Bun** by platform, preserving the existing schema
+  and upgrade reader.
+- `cli-metadata.json` uses the same schema to select **Relish**. Keeping the
+  documents separate prevents an older agent from interpreting a CLI as an
+  upgrade candidate.
+- URLs inside each document point to that exact version's GitHub release.
+- Bun's default metadata URL is
+  `https://github.com/reliaburger/reliaburger/releases/latest/download/metadata.json`.
+
+The website and installer are separate static assets under `docs/website`,
+published by `static.yml`. GitHub Pages cannot select a different response for
+curl and a browser at `/`; the planned shell endpoint is `/install.sh`.
+
+Before tagging 0.1.0, complete the managed-cluster and clean-install gates in the
+release plan. Record timing from an empty cache, the actual artefact digests,
+host and guest versions, memory use, and the successful sample workload. Don't
+publish a five-minute claim from a source build or a warmed VM.
