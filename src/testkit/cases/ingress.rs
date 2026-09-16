@@ -39,6 +39,7 @@ async fn proxy_status(ctx: &TestContext, path: &str) -> Result<u16, String> {
     let response = ctx
         .client
         .http()
+        .map_err(|error| error.to_string())?
         .get(&url)
         .header("Host", INGRESS_HOST)
         .send()

@@ -496,7 +496,7 @@ async fn push_blob(
         crate::upgrade::BINARY_BLOB_REPO
     );
     let response = client
-        .http()
+        .http()?
         .post(&url)
         .body(bytes.to_vec())
         .send()

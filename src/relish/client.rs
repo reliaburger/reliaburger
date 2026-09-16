@@ -20,7 +20,7 @@ use super::RelishError;
 #[derive(Clone)]
 pub struct BunClient {
     base_url: String,
-    client: reqwest::Client,
+    client: Result<reqwest::Client, String>,
     token: Option<String>,
 }
 
@@ -265,58 +265,72 @@ impl BunClient {
     /// Create a client with an explicit token (or none). Used by tests; `new`
     /// resolves the token from the flag/env instead.
     pub fn new_with_token(base_url: &str, token: Option<&str>) -> Self {
-        let ca_pem = resolve_ca_cert().and_then(|ca_path| match std::fs::read(&ca_path) {
-            Ok(pem) => Some(pem),
-            Err(e) => {
-                eprintln!(
-                    "relish: warning — could not load --ca-cert {}: {e}",
-                    ca_path.display()
-                );
-                None
+        let ca_pem = match resolve_ca_cert().map(std::fs::read).transpose() {
+            Ok(pem) => pem,
+            Err(error) => {
+                return Self {
+                    base_url: base_url.trim_end_matches('/').to_string(),
+                    client: Err(format!("failed to read cluster CA: {error}")),
+                    token: token.map(str::to_string),
+                };
             }
-        });
+        };
         Self::build(base_url, token, ca_pem.as_deref())
     }
 
-    /// Build a client with an explicit cluster CA (PEM), if any.
-    ///
-    /// Split out from [`new_with_token`] so the TLS trust configuration can be
-    /// exercised without the process-global `--ca-cert` state.
+    /// Create a client pinned to an explicit cluster CA, validating configuration
+    /// before any request can send credentials.
+    pub fn new_with_ca(
+        base_url: &str,
+        token: Option<&str>,
+        ca_pem: &[u8],
+    ) -> Result<Self, RelishError> {
+        let client = Self::build(base_url, token, Some(ca_pem));
+        client.http()?;
+        Ok(client)
+    }
+
     fn build(base_url: &str, token: Option<&str>, ca_pem: Option<&[u8]>) -> Self {
-        let mut builder = reqwest::Client::builder().timeout(std::time::Duration::from_secs(300));
-        if let Some(t) = token {
-            let mut headers = reqwest::header::HeaderMap::new();
-            if let Ok(mut value) = reqwest::header::HeaderValue::from_str(&format!("Bearer {t}")) {
+        let client = (|| -> Result<reqwest::Client, String> {
+            let mut builder =
+                reqwest::Client::builder().timeout(std::time::Duration::from_secs(300));
+            if let Some(token) = token {
+                let mut headers = reqwest::header::HeaderMap::new();
+                let mut value = reqwest::header::HeaderValue::from_str(&format!("Bearer {token}"))
+                    .map_err(|_| "invalid bearer token header".to_string())?;
                 value.set_sensitive(true);
                 headers.insert(reqwest::header::AUTHORIZATION, value);
                 builder = builder.default_headers(headers);
             }
-        }
-        // Under mTLS the API cert is issued for the node id, not "127.0.0.1",
-        // so we trust the cluster CA and skip the hostname check. For that to
-        // be safe the cluster CA must be the *only* trust anchor: reqwest keeps
-        // the built-in webpki/system roots by default, so without disabling
-        // them any certificate chaining to a public CA would be accepted while
-        // the hostname check is off — a MITM could then present a valid public
-        // cert and harvest the bearer token. `tls_built_in_root_certs(false)`
-        // makes the pin real, mirroring the cluster HTTP client's empty root
-        // store (`sesame::mtls`).
-        if let Some(pem) = ca_pem {
-            match reqwest::Certificate::from_pem(pem) {
-                Ok(cert) => {
-                    builder = builder
-                        .tls_built_in_root_certs(false)
-                        .add_root_certificate(cert)
-                        .danger_accept_invalid_hostnames(true);
+            if let Some(pem) = ca_pem {
+                let certificates = rustls_pemfile::certs(&mut &pem[..])
+                    .collect::<Result<Vec<_>, _>>()
+                    .map_err(|error| format!("invalid cluster CA PEM: {error}"))?;
+                if certificates.is_empty() {
+                    return Err("cluster CA PEM contains no certificates".to_string());
                 }
-                Err(e) => {
-                    eprintln!("relish: warning — invalid --ca-cert PEM: {e}");
+                // Node certificates name the node, not its forwarded loopback
+                // endpoint. Disable hostname checks only with these trust anchors.
+                builder = builder
+                    .tls_built_in_root_certs(false)
+                    .danger_accept_invalid_hostnames(true);
+                let mut roots = rustls::RootCertStore::empty();
+                for certificate in certificates {
+                    roots
+                        .add(certificate.clone())
+                        .map_err(|error| format!("invalid cluster CA certificate: {error}"))?;
+                    let certificate = reqwest::Certificate::from_der(certificate.as_ref())
+                        .map_err(|error| format!("invalid cluster CA certificate: {error}"))?;
+                    builder = builder.add_root_certificate(certificate);
                 }
             }
-        }
+            builder
+                .build()
+                .map_err(|error| format!("failed to create HTTP client: {error}"))
+        })();
         Self {
             base_url: base_url.trim_end_matches('/').to_string(),
-            client: builder.build().expect("failed to create HTTP client"),
+            client,
             token: token.map(str::to_string),
         }
     }
@@ -355,8 +369,14 @@ impl BunClient {
     /// token and cluster-CA trust. Used for requests to an explicit URL that
     /// isn't relative to `base_url` — e.g. a Pickle registry `/v2` upload on a
     /// different port (M21) — so they, too, are authenticated and TLS-trusting.
-    pub fn http(&self) -> &reqwest::Client {
-        &self.client
+    /// Invalid client configuration returns an error before any request is sent.
+    pub fn http(&self) -> Result<&reqwest::Client, RelishError> {
+        self.client
+            .as_ref()
+            .map_err(|reason| RelishError::ApiError {
+                status: 0,
+                body: reason.clone(),
+            })
     }
 
     /// Create a client pointing at the default local agent. Uses HTTPS when a
@@ -381,7 +401,7 @@ impl BunClient {
     pub async fn health(&self) -> Result<(), RelishError> {
         let url = format!("{}/v1/health", self.base_url);
         let mut response = self
-            .client
+            .http()?
             .get(&url)
             .timeout(std::time::Duration::from_secs(5))
             .send()
@@ -466,7 +486,7 @@ impl BunClient {
             body: format!("failed to serialise config: {e}"),
         })?;
 
-        let mut request = self.client.post(&url).body(toml_str);
+        let mut request = self.http()?.post(&url).body(toml_str);
         if let Some(lease_id) = lease_id {
             request = request.header("x-reliaburger-test-lease", lease_id);
         }
@@ -560,7 +580,7 @@ impl BunClient {
     pub async fn rollback(&self, app: &str, namespace: &str) -> Result<(), RelishError> {
         let url = format!("{}/v1/rollback/{app}/{namespace}", self.base_url);
         let response = self
-            .client
+            .http()?
             .post(&url)
             .send()
             .await
@@ -602,7 +622,12 @@ impl BunClient {
     /// Get status of all instances.
     pub async fn status(&self) -> Result<Vec<InstanceStatus>, RelishError> {
         let url = format!("{}/v1/status", self.base_url);
-        let response = self.client.get(&url).send().await.map_err(classify_error)?;
+        let response = self
+            .http()?
+            .get(&url)
+            .send()
+            .await
+            .map_err(classify_error)?;
 
         let status = response.status().as_u16();
         if !response.status().is_success() {
@@ -681,7 +706,7 @@ impl BunClient {
         request: &crate::onion::trace::TraceRequest,
     ) -> Result<crate::onion::trace::TraceResult, RelishError> {
         let response = self
-            .client
+            .http()?
             .post(format!("{}/v1/trace", self.base_url))
             .json(request)
             .send()
@@ -720,7 +745,7 @@ impl BunClient {
     /// after its own node name.
     pub async fn logs_export(&self, destination: &str) -> Result<LogsExportOutcome, RelishError> {
         let response = self
-            .client
+            .http()?
             .post(format!("{}/v1/logs/export", self.base_url))
             .json(&serde_json::json!({ "destination": destination }))
             .send()
@@ -776,7 +801,7 @@ impl BunClient {
         namespace: Option<&str>,
     ) -> Result<crate::testkit::lease::TestLease, RelishError> {
         let response = self
-            .client
+            .http()?
             .post(format!("{}/v1/test/leases", self.base_url))
             .json(&serde_json::json!({
                 "ttl_seconds": ttl_seconds,
@@ -795,7 +820,7 @@ impl BunClient {
         ttl_seconds: u64,
     ) -> Result<crate::testkit::lease::TestLease, RelishError> {
         let response = self
-            .client
+            .http()?
             .post(format!("{}/v1/test/leases/{lease_id}/renew", self.base_url))
             .json(&serde_json::json!({ "ttl_seconds": ttl_seconds }))
             .send()
@@ -807,7 +832,7 @@ impl BunClient {
     /// Release a lease and wait for server-confirmed cleanup.
     pub async fn release_test_lease(&self, lease_id: &str) -> Result<(), RelishError> {
         let response = self
-            .client
+            .http()?
             .delete(format!("{}/v1/test/leases/{lease_id}", self.base_url))
             .send()
             .await
@@ -835,7 +860,7 @@ impl BunClient {
         path: &str,
     ) -> Result<T, RelishError> {
         let response = self
-            .client
+            .http()?
             .get(format!("{}{}", self.base_url, path))
             .send()
             .await
@@ -922,7 +947,7 @@ impl BunClient {
     pub async fn stop(&self, app: &str, namespace: &str) -> Result<(), RelishError> {
         let url = format!("{}/v1/stop/{}/{}", self.base_url, app, namespace);
         let response = self
-            .client
+            .http()?
             .post(&url)
             .send()
             .await
@@ -949,7 +974,7 @@ impl BunClient {
         let url = format!("{}/v1/snapshots/{}/{}", self.base_url, namespace, app);
         let body = serde_json::json!({ "volume": volume, "name": name });
         let response = self
-            .client
+            .http()?
             .post(&url)
             .json(&body)
             .send()
@@ -971,7 +996,12 @@ impl BunClient {
         namespace: &str,
     ) -> Result<serde_json::Value, RelishError> {
         let url = format!("{}/v1/snapshots/{}/{}", self.base_url, namespace, app);
-        let response = self.client.get(&url).send().await.map_err(classify_error)?;
+        let response = self
+            .http()?
+            .get(&url)
+            .send()
+            .await
+            .map_err(classify_error)?;
 
         let status = response.status().as_u16();
         if !response.status().is_success() {
@@ -994,7 +1024,7 @@ impl BunClient {
             self.base_url, namespace, app
         );
         let response = self
-            .client
+            .http()?
             .post(&url)
             .json(&serde_json::json!({ "name": name }))
             .send()
@@ -1021,7 +1051,7 @@ impl BunClient {
             self.base_url, namespace, app, name
         );
         let response = self
-            .client
+            .http()?
             .delete(&url)
             .send()
             .await
@@ -1058,7 +1088,7 @@ impl BunClient {
         let url = format!("{}/v1/logs/query/{}/{}", self.base_url, app, namespace);
 
         if let Ok(response) = self
-            .client
+            .http()?
             .get(&url)
             .query(&options.query_params())
             .send()
@@ -1115,7 +1145,7 @@ impl BunClient {
         let url = format!("{}/v1/logs/{}/{}", self.base_url, app, namespace);
 
         let response = self
-            .client
+            .http()?
             .get(&url)
             .query(&options.query_params())
             .send()
@@ -1150,7 +1180,7 @@ impl BunClient {
         params.push(("follow".to_string(), "true".to_string()));
 
         let response = self
-            .client
+            .http()?
             .get(&url)
             .query(&params)
             .send()
@@ -1206,7 +1236,7 @@ impl BunClient {
     ) -> Result<String, RelishError> {
         let url = format!("{}/v1/exec/{}/{}", self.base_url, app, namespace);
         let response = self
-            .client
+            .http()?
             .post(&url)
             .json(&serde_json::json!({ "command": command }))
             .send()
@@ -1230,7 +1260,12 @@ impl BunClient {
     /// Get cluster node membership.
     pub async fn nodes(&self) -> Result<Vec<NodeStatus>, RelishError> {
         let url = format!("{}/v1/cluster/nodes", self.base_url);
-        let response = self.client.get(&url).send().await.map_err(classify_error)?;
+        let response = self
+            .http()?
+            .get(&url)
+            .send()
+            .await
+            .map_err(classify_error)?;
 
         let status = response.status().as_u16();
         if !response.status().is_success() {
@@ -1249,7 +1284,12 @@ impl BunClient {
     /// Get council (Raft) status.
     pub async fn council(&self) -> Result<CouncilStatus, RelishError> {
         let url = format!("{}/v1/cluster/council", self.base_url);
-        let response = self.client.get(&url).send().await.map_err(classify_error)?;
+        let response = self
+            .http()?
+            .get(&url)
+            .send()
+            .await
+            .map_err(classify_error)?;
 
         let status = response.status().as_u16();
         if !response.status().is_success() {
@@ -1274,7 +1314,7 @@ impl BunClient {
     ) -> Result<crate::smoker::types::FaultSummary, RelishError> {
         let url = format!("{}/v1/chaos/partition", self.base_url);
         let response = self
-            .client
+            .http()?
             .post(&url)
             .json(&serde_json::json!({
                 "peers": peers,
@@ -1305,7 +1345,7 @@ impl BunClient {
     pub async fn heal_partition(&self) -> Result<String, RelishError> {
         let url = format!("{}/v1/chaos/heal", self.base_url);
         let response = self
-            .client
+            .http()?
             .post(&url)
             .send()
             .await
@@ -1327,7 +1367,12 @@ impl BunClient {
     /// Query chaos status.
     pub async fn chaos_status(&self) -> Result<ChaosState, RelishError> {
         let url = format!("{}/v1/chaos/status", self.base_url);
-        let response = self.client.get(&url).send().await.map_err(classify_error)?;
+        let response = self
+            .http()?
+            .get(&url)
+            .send()
+            .await
+            .map_err(classify_error)?;
 
         let status = response.status().as_u16();
         if !response.status().is_success() {
@@ -1349,7 +1394,7 @@ impl BunClient {
     ) -> Result<crate::smoker::types::FaultSummary, RelishError> {
         let url = format!("{}/v1/fault", self.base_url);
         let response = self
-            .client
+            .http()?
             .post(&url)
             .json(request)
             .send()
@@ -1376,7 +1421,7 @@ impl BunClient {
         acknowledged: bool,
     ) -> Result<String, RelishError> {
         let url = format!("{}/v1/fault/{id}", self.base_url);
-        let mut request = self.client.delete(&url);
+        let mut request = self.http()?.delete(&url);
         if let Some(node) = node {
             request = request.query(&[
                 ("node", node),
@@ -1402,7 +1447,7 @@ impl BunClient {
     pub async fn clear_all_faults(&self) -> Result<String, RelishError> {
         let url = format!("{}/v1/fault", self.base_url);
         let response = self
-            .client
+            .http()?
             .delete(&url)
             .send()
             .await
@@ -1435,7 +1480,7 @@ impl BunClient {
             None => format!("{}/v1/fault?service={}", self.base_url, service),
         };
         let response = self
-            .client
+            .http()?
             .delete(&url)
             .send()
             .await
@@ -1459,7 +1504,12 @@ impl BunClient {
         &self,
     ) -> Result<Vec<crate::smoker::types::FaultSummary>, RelishError> {
         let url = format!("{}/v1/fault", self.base_url);
-        let response = self.client.get(&url).send().await.map_err(classify_error)?;
+        let response = self
+            .http()?
+            .get(&url)
+            .send()
+            .await
+            .map_err(classify_error)?;
 
         let status = response.status().as_u16();
         if !response.status().is_success() {
@@ -1479,7 +1529,12 @@ impl BunClient {
         name: &str,
     ) -> Result<crate::onion::types::ResolveResponse, RelishError> {
         let url = format!("{}/v1/resolve/{name}", self.base_url);
-        let response = self.client.get(&url).send().await.map_err(classify_error)?;
+        let response = self
+            .http()?
+            .get(&url)
+            .send()
+            .await
+            .map_err(classify_error)?;
 
         let status = response.status().as_u16();
         if !response.status().is_success() {
@@ -1498,7 +1553,12 @@ impl BunClient {
         &self,
     ) -> Result<Vec<crate::onion::types::ResolveResponse>, RelishError> {
         let url = format!("{}/v1/resolve", self.base_url);
-        let response = self.client.get(&url).send().await.map_err(classify_error)?;
+        let response = self
+            .http()?
+            .get(&url)
+            .send()
+            .await
+            .map_err(classify_error)?;
 
         let status = response.status().as_u16();
         if !response.status().is_success() {
@@ -1515,7 +1575,12 @@ impl BunClient {
     /// List all ingress routes.
     pub async fn routes(&self) -> Result<Vec<crate::wrapper::types::RouteInfo>, RelishError> {
         let url = format!("{}/v1/routes", self.base_url);
-        let response = self.client.get(&url).send().await.map_err(classify_error)?;
+        let response = self
+            .http()?
+            .get(&url)
+            .send()
+            .await
+            .map_err(classify_error)?;
 
         let status = response.status().as_u16();
         if !response.status().is_success() {
@@ -1532,7 +1597,12 @@ impl BunClient {
     /// List images in the local Pickle registry.
     pub async fn images(&self) -> Result<serde_json::Value, RelishError> {
         let url = format!("{}/v1/images", self.base_url);
-        let response = self.client.get(&url).send().await.map_err(classify_error)?;
+        let response = self
+            .http()?
+            .get(&url)
+            .send()
+            .await
+            .map_err(classify_error)?;
 
         let status = response.status().as_u16();
         if !response.status().is_success() {
@@ -1559,7 +1629,7 @@ impl BunClient {
     ) -> Result<u64, RelishError> {
         let url = format!("{}/v1/build", self.base_url);
         let response = self
-            .client
+            .http()?
             .post(&url)
             .json(&serde_json::json!({
                 "name": name,
@@ -1591,7 +1661,12 @@ impl BunClient {
     /// Progress of a submitted build (`GET /v1/build/{id}`).
     pub async fn build_status(&self, build_id: u64) -> Result<serde_json::Value, RelishError> {
         let url = format!("{}/v1/build/{build_id}", self.base_url);
-        let response = self.client.get(&url).send().await.map_err(classify_error)?;
+        let response = self
+            .http()?
+            .get(&url)
+            .send()
+            .await
+            .map_err(classify_error)?;
 
         let status = response.status().as_u16();
         if !response.status().is_success() {
@@ -1604,7 +1679,12 @@ impl BunClient {
     /// List API tokens from SecurityState.
     pub async fn token_list(&self) -> Result<serde_json::Value, RelishError> {
         let url = format!("{}/v1/token/list", self.base_url);
-        let response = self.client.get(&url).send().await.map_err(classify_error)?;
+        let response = self
+            .http()?
+            .get(&url)
+            .send()
+            .await
+            .map_err(classify_error)?;
 
         let status = response.status().as_u16();
         if !response.status().is_success() {
@@ -1630,7 +1710,7 @@ impl BunClient {
     ) -> Result<String, RelishError> {
         let url = format!("{}/v1/token/create", self.base_url);
         let response = self
-            .client
+            .http()?
             .post(&url)
             .json(&serde_json::json!({
                 "name": name,
@@ -1666,7 +1746,7 @@ impl BunClient {
     pub async fn token_revoke(&self, name: &str) -> Result<String, RelishError> {
         let url = format!("{}/v1/token/revoke", self.base_url);
         let response = self
-            .client
+            .http()?
             .post(&url)
             .json(&serde_json::json!({ "name": name }))
             .send()
@@ -1698,7 +1778,7 @@ impl BunClient {
     ) -> Result<String, RelishError> {
         let url = format!("{}/v1/join-token/create", self.base_url);
         let response = self
-            .client
+            .http()?
             .post(&url)
             .json(&serde_json::json!({ "ttl_seconds": ttl_seconds, "node_id": node_id }))
             .send()
@@ -1728,7 +1808,7 @@ impl BunClient {
     pub async fn secret_rotate(&self, finalize: bool) -> Result<String, RelishError> {
         let url = format!("{}/v1/secret/rotate", self.base_url);
         let response = self
-            .client
+            .http()?
             .post(&url)
             .json(&serde_json::json!({ "finalize": finalize }))
             .send()
@@ -1755,7 +1835,7 @@ impl BunClient {
     pub async fn sign_image(&self, image: &str) -> Result<String, RelishError> {
         let url = format!("{}/v1/identity/sign", self.base_url);
         let response = self
-            .client
+            .http()?
             .post(&url)
             .json(&serde_json::json!({ "digest": image }))
             .send()
@@ -1796,7 +1876,7 @@ impl BunClient {
                 .collect::<Vec<_>>(),
         });
         let response = self
-            .client
+            .http()?
             .post(&url)
             .json(&payload)
             .send()
@@ -1818,7 +1898,12 @@ impl BunClient {
     /// Progress of a submitted batch (`GET /v1/batch/{id}`).
     pub async fn batch_status(&self, batch_id: u64) -> Result<serde_json::Value, RelishError> {
         let url = format!("{}/v1/batch/{batch_id}", self.base_url);
-        let response = self.client.get(&url).send().await.map_err(classify_error)?;
+        let response = self
+            .http()?
+            .get(&url)
+            .send()
+            .await
+            .map_err(classify_error)?;
 
         let status = response.status().as_u16();
         if !response.status().is_success() {
@@ -1893,7 +1978,12 @@ impl BunClient {
 
     async fn get_json(&self, path: &str) -> Result<serde_json::Value, RelishError> {
         let url = format!("{}{path}", self.base_url);
-        let response = self.client.get(&url).send().await.map_err(classify_error)?;
+        let response = self
+            .http()?
+            .get(&url)
+            .send()
+            .await
+            .map_err(classify_error)?;
         let status = response.status().as_u16();
         if !response.status().is_success() {
             let body = response.text().await.unwrap_or_default();
@@ -1908,7 +1998,7 @@ impl BunClient {
     async fn post_json(&self, path: &str, body: String) -> Result<serde_json::Value, RelishError> {
         let url = format!("{}{path}", self.base_url);
         let response = self
-            .client
+            .http()?
             .post(&url)
             .header(reqwest::header::CONTENT_TYPE, "application/json")
             .body(body)
@@ -1931,6 +2021,20 @@ impl BunClient {
 mod tests {
     use super::*;
     use std::sync::{Arc, Mutex};
+
+    #[test]
+    fn explicit_ca_constructor_refuses_invalid_trust_material() {
+        assert!(
+            BunClient::new_with_ca("https://127.0.0.1:9117", None, b"not a certificate").is_err()
+        );
+    }
+
+    #[tokio::test]
+    async fn malformed_bearer_is_an_error_instead_of_an_anonymous_request() {
+        let client = BunClient::new_with_token("http://127.0.0.1:9", Some("bad\nheader"));
+        let error = client.health().await.unwrap_err();
+        assert!(matches!(error, RelishError::ApiError { body, .. } if body.contains("bearer")));
+    }
 
     #[tokio::test]
     async fn deployment_errors_preserve_unicode_across_network_chunks() {

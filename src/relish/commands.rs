@@ -1481,7 +1481,7 @@ pub async fn build(
         let upload_url =
             crate::pickle::build::context_upload_url(client.scheme(), registry_port, &digest);
         let resp = client
-            .http()
+            .http()?
             .post(&upload_url)
             .body(tar_bytes)
             .send()

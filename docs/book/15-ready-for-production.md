@@ -2229,3 +2229,25 @@ and followed logs use this ordering. The regression test serves an error over
 HTTP with a deliberate pause inside the UTF-8 character, then checks the exact
 message returned by both public deployment methods. The old client failed it;
 the corrected client preserves the message.
+
+### A broken client configuration is an error, not a different configuration
+
+If a user supplies an unreadable CA file, continuing with public trust roots
+changes what the client trusts. If a bearer contains an invalid HTTP header
+character, dropping it turns an authenticated request into an anonymous one.
+Neither is the operation the user requested.
+
+The client now retains construction failures as a `Result` and returns them
+before making a request. Existing constructors keep their return type, but the
+HTTP accessor returns `Result<&Client, RelishError>`, so callers use `?` to
+propagate configuration errors. The new explicit-CA constructor validates at
+construction time for managed cluster setup. Tests reject invalid CA material
+and malformed bearer headers; the existing live TLS tests still verify that a
+cluster-pinned client refuses unrelated trust roots.
+
+The first hosted release build also caught two issues a local build hadn't:
+RustSec reported a newly patched Rustls advisory, and Ubuntu 22.04's compiler
+rejected a C label directly before a declaration in the eBPF source. We updated
+the locked dependencies and added the empty statement required by the older C
+rules. Release builds need their own gate because local source tests can't prove
+that every supported build environment produces a usable artefact.
