@@ -263,6 +263,7 @@ int onion_connect(struct bpf_sock_addr *ctx)
         }
     }
 no_fault:
+    ; /* C11 labels precede statements, not declarations. */
 
     /* Look up the backend list for this (VIP, port) */
     struct backend_key key = {
