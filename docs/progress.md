@@ -8,9 +8,23 @@ Single source of truth for what's done and what's next. Check off an item only w
 > proposes a supported release scope, and defines clean-install and real-cluster
 > acceptance gates. This is a proposed plan, not a completed release.
 
+## Current release checklist
+
+- [x] Commit the release scope and acceptance plan (`99e4ff9`).
+- [x] Validate setup liveness and bounded subsystem readiness (`6ee50a6`; 268 Relish tests).
+- [x] Stream registry uploads and bound writers (`1ea2b1a`; 228 registry tests, all-target Clippy).
+- [ ] Measure registry memory use under concurrent pushes in the laptop VM.
+- [ ] Package self-contained Linux agents and native laptop CLIs.
+- [ ] Publish verifiable release metadata and signed artefacts.
+- [ ] Implement secure, resumable managed laptop clusters and installer.
+- [ ] Close the remaining correctness findings listed in the release plan.
+- [ ] Qualify the downloaded candidate on clean hosts and record three-node timing.
+- [ ] Pass the real-cluster and final release acceptance gates.
+
 > **Review note (July 2026):** a full verification pass ([2026-07-02-review-codebase.md](plans/2026-07-02-review-codebase.md))
-> found that many checked items are **library-only** — implemented and unit-tested, but never
-> wired into the `bun`/`relish` binaries. Those are tagged **`[lib-only]`** below with their
+> found that many checked items were **library-only** — implemented and unit-tested, but never
+> wired into the `bun`/`relish` binaries at that review date. Later hardening sections supersede
+> many of these findings; use the release plan above for current blockers. Those are tagged **`[lib-only]`** below with their
 > finding ID (e.g. `L7`, `C5`). `[x]` still means "code exists + tests pass"; `[lib-only]` means
 > "not reachable from the running binary". Critical bugs in *wired* paths are tagged with their
 > ID too (e.g. `C4`). See the review doc for `file:line` and the staged fix plan.
