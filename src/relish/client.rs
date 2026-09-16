@@ -483,17 +483,17 @@ impl BunClient {
 
         // Read the SSE stream
         let mut stream = response.bytes_stream();
-        let mut buffer = String::new();
+        let mut buffer = Vec::new();
         let mut result = None;
 
         while let Some(chunk) = stream.next().await {
             let bytes = chunk.map_err(classify_error)?;
-            buffer.push_str(&String::from_utf8_lossy(&bytes));
+            buffer.extend_from_slice(&bytes);
 
-            // Process complete SSE events (separated by double newline)
-            while let Some(event_end) = buffer.find("\n\n") {
-                let event_text = buffer[..event_end].to_string();
-                buffer = buffer[event_end + 2..].to_string();
+            // Decode only complete frames: a UTF-8 character can span network chunks.
+            while let Some(event_end) = buffer.windows(2).position(|pair| pair == b"\n\n") {
+                let event_text = String::from_utf8_lossy(&buffer[..event_end]).into_owned();
+                buffer.drain(..event_end + 2);
 
                 if let Some(data) = event_text
                     .lines()
@@ -528,7 +528,9 @@ impl BunClient {
         }
 
         // Check for any remaining data in the buffer
-        if let Some(data) = buffer.lines().find_map(|line| line.strip_prefix("data:"))
+        if let Some(data) = String::from_utf8_lossy(&buffer)
+            .lines()
+            .find_map(|line| line.strip_prefix("data:"))
             && let Ok(event) = serde_json::from_str::<ApplyEvent>(data.trim())
         {
             match event {
@@ -571,13 +573,13 @@ impl BunClient {
         }
 
         let mut stream = response.bytes_stream();
-        let mut buffer = String::new();
+        let mut buffer = Vec::new();
         while let Some(chunk) = stream.next().await {
             let bytes = chunk.map_err(classify_error)?;
-            buffer.push_str(&String::from_utf8_lossy(&bytes));
-            while let Some(end) = buffer.find("\n\n") {
-                let event_text = buffer[..end].to_string();
-                buffer = buffer[end + 2..].to_string();
+            buffer.extend_from_slice(&bytes);
+            while let Some(end) = buffer.windows(2).position(|pair| pair == b"\n\n") {
+                let event_text = String::from_utf8_lossy(&buffer[..end]).into_owned();
+                buffer.drain(..end + 2);
                 if let Some(data) = event_text.lines().find_map(|l| l.strip_prefix("data:"))
                     && let Ok(event) = serde_json::from_str::<ApplyEvent>(data.trim())
                 {
@@ -1162,15 +1164,15 @@ impl BunClient {
         }
 
         let mut stream = response.bytes_stream();
-        let mut buffer = String::new();
+        let mut buffer = Vec::new();
 
         while let Some(chunk) = stream.next().await {
             let bytes = chunk.map_err(classify_error)?;
-            buffer.push_str(&String::from_utf8_lossy(&bytes));
+            buffer.extend_from_slice(&bytes);
 
-            while let Some(event_end) = buffer.find("\n\n") {
-                let event_text = buffer[..event_end].to_string();
-                buffer = buffer[event_end + 2..].to_string();
+            while let Some(event_end) = buffer.windows(2).position(|pair| pair == b"\n\n") {
+                let event_text = String::from_utf8_lossy(&buffer[..event_end]).into_owned();
+                buffer.drain(..event_end + 2);
 
                 for line in event_text.lines() {
                     if let Some(data) = line.strip_prefix("data:") {
@@ -1183,7 +1185,7 @@ impl BunClient {
             }
         }
 
-        for line in buffer.lines() {
+        for line in String::from_utf8_lossy(&buffer).lines() {
             if let Some(data) = line.strip_prefix("data:") {
                 let data = data.trim();
                 if options.matches(data) {
@@ -1929,6 +1931,47 @@ impl BunClient {
 mod tests {
     use super::*;
     use std::sync::{Arc, Mutex};
+
+    #[tokio::test]
+    async fn deployment_errors_preserve_unicode_across_network_chunks() {
+        use axum::{Router, routing::post};
+        let message = "cannot deploy café 🍔";
+        let event = format!(
+            "data: {}\n\n",
+            serde_json::to_string(&ApplyEvent::Error {
+                message: message.to_string(),
+            })
+            .unwrap()
+        );
+        let split = event.find('é').unwrap() + 1;
+        let chunks = vec![
+            event.as_bytes()[..split].to_vec(),
+            event.as_bytes()[split..].to_vec(),
+        ];
+        let handler = move || {
+            let chunks = chunks.clone();
+            async move {
+                let stream = futures_util::stream::iter(chunks).then(|chunk| async move {
+                    tokio::time::sleep(std::time::Duration::from_millis(30)).await;
+                    Ok::<_, std::io::Error>(chunk)
+                });
+                axum::body::Body::from_stream(stream)
+            }
+        };
+        let app = Router::new()
+            .route("/v1/apply", post(handler.clone()))
+            .route("/v1/rollback/web/default", post(handler));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let client = BunClient::new_with_token(&format!("http://{address}"), None);
+        let applied = client.apply(&Config::default()).await.unwrap_err();
+        let rolled_back = client.rollback("web", "default").await.unwrap_err();
+        server.abort();
+        for error in [applied, rolled_back] {
+            assert!(matches!(error, RelishError::ApiError { body, .. } if body == message));
+        }
+    }
 
     #[tokio::test]
     async fn health_rejects_http_errors_and_unrelated_services() {

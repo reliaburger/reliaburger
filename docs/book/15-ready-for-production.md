@@ -2215,3 +2215,17 @@ whose subsystems are still starting. A deliberately hung handler proves the
 whole operation respects its deadline. This is a node-startup check; cluster
 quorum and a successful workload request still need their own acceptance
 checks before we call a laptop cluster ready.
+
+### Text doesn't arrive one character at a time
+
+A deployment error containing `café` can arrive with the first byte of `é` at
+the end of one network chunk and its second byte in the next. Decoding each
+chunk separately replaces those bytes with invalid-character markers. The
+connection succeeded; the diagnostic was still wrong.
+
+Relish now retains a `Vec<u8>` (a growable byte vector) until an entire SSE event
+has arrived. Only then does it decode the text. Deployment progress, rollback
+and followed logs use this ordering. The regression test serves an error over
+HTTP with a deliberate pause inside the UTF-8 character, then checks the exact
+message returned by both public deployment methods. The old client failed it;
+the corrected client preserves the message.
