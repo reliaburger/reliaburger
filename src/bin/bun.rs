@@ -957,45 +957,34 @@ async fn run_agent(cli: Cli) -> anyhow::Result<()> {
     #[cfg_attr(not(all(feature = "ebpf", target_os = "linux")), allow(unused_mut))]
     let mut ebpf_loaded = false;
     if config.ebpf.enabled {
-        match config.ebpf.resolve_program_dir() {
-            Some(program_dir) => {
-                #[cfg(all(feature = "ebpf", target_os = "linux"))]
-                match reliaburger::onion::ebpf::loader::OnionEbpf::load(
-                    &program_dir,
-                    &config.ebpf.cgroup_path,
-                ) {
-                    Ok(ebpf) => {
-                        eprintln!(
-                            "bun: eBPF data path loaded from {} (attached={})",
-                            program_dir.display(),
-                            ebpf.is_attached()
-                        );
-                        ebpf_loaded = ebpf.is_attached();
-                        agent
-                            .set_onion_ebpf(Arc::new(tokio::sync::Mutex::new(ebpf)))
-                            .await;
-                    }
-                    Err(e) => {
-                        eprintln!(
-                            "bun: failed to load eBPF data path: {e}; continuing without enforcement"
-                        );
-                    }
-                }
-                #[cfg(not(all(feature = "ebpf", target_os = "linux")))]
-                {
-                    let _ = program_dir;
+        #[cfg(all(feature = "ebpf", target_os = "linux"))]
+        {
+            use reliaburger::onion::ebpf::loader::OnionEbpf;
+            let loaded = match config.ebpf.resolve_program_dir() {
+                Some(program_dir) => OnionEbpf::load(&program_dir, &config.ebpf.cgroup_path),
+                None => OnionEbpf::load_embedded(&config.ebpf.cgroup_path),
+            };
+            match loaded {
+                Ok(ebpf) => {
                     eprintln!(
-                        "bun: [ebpf] enabled but this binary was built without the `ebpf` feature; \
-                         network faults and egress allowlists are NOT enforced"
+                        "bun: eBPF data path loaded (attached={})",
+                        ebpf.is_attached()
                     );
+                    ebpf_loaded = ebpf.is_attached();
+                    agent
+                        .set_onion_ebpf(Arc::new(tokio::sync::Mutex::new(ebpf)))
+                        .await;
                 }
-            }
-            None => {
-                eprintln!(
-                    "bun: [ebpf] enabled but no program_dir set and no build-time objects; skipping"
-                );
+                Err(error) => eprintln!(
+                    "bun: failed to load eBPF data path: {error}; continuing without enforcement"
+                ),
             }
         }
+        #[cfg(not(all(feature = "ebpf", target_os = "linux")))]
+        eprintln!(
+            "bun: [ebpf] enabled but this binary lacks Linux eBPF support; \
+             network faults and egress allowlists are NOT enforced"
+        );
     }
 
     // Derive the internal service token from the shared master key, so bun's own

@@ -80,10 +80,27 @@ impl OnionEbpf {
             });
         }
 
-        let mut bpf = aya::Ebpf::load_file(&obj_path).map_err(|e| OnionError::EbpfLoadFailed {
+        let bpf = aya::Ebpf::load_file(&obj_path).map_err(|e| OnionError::EbpfLoadFailed {
             reason: format!("failed to load eBPF program: {e}"),
         })?;
 
+        Self::attach(bpf, cgroup_path)
+    }
+
+    /// Load the version-matched object embedded in this executable.
+    /// No build tree or installed `.bpf.o` files are needed at runtime.
+    #[cfg(feature = "ebpf")]
+    pub fn load_embedded(cgroup_path: &Path) -> Result<Self, OnionError> {
+        check_prerequisites()?;
+        let bytes = aya::include_bytes_aligned!(concat!(env!("OUT_DIR"), "/onion_connect.bpf.o"));
+        let bpf = aya::Ebpf::load(bytes).map_err(|error| OnionError::EbpfLoadFailed {
+            reason: format!("failed to load embedded eBPF program: {error}"),
+        })?;
+        Self::attach(bpf, cgroup_path)
+    }
+
+    #[cfg(feature = "ebpf")]
+    fn attach(mut bpf: aya::Ebpf, cgroup_path: &Path) -> Result<Self, OnionError> {
         // Validate the object in one place instead of panicking at first
         // map use later (NET8).
         let map_names: Vec<String> = bpf.maps().map(|(name, _)| name.to_string()).collect();
@@ -93,8 +110,7 @@ impl OnionEbpf {
         if !missing.is_empty() {
             return Err(OnionError::EbpfLoadFailed {
                 reason: format!(
-                    "loaded object {} is missing required maps/programs: {}",
-                    obj_path.display(),
+                    "loaded object is missing required maps/programs: {}",
                     missing.join(", ")
                 ),
             });

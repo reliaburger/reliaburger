@@ -167,8 +167,7 @@ impl DnsSection {
 pub struct EbpfSection {
     /// Load and attach the eBPF programs on this node at startup.
     pub enabled: bool,
-    /// Directory holding the compiled `.bpf.o` objects. When unset, the
-    /// build-time output directory is used.
+    /// Optional directory overriding the version-matched embedded `.bpf.o` object.
     pub program_dir: Option<PathBuf>,
     /// Root cgroup v2 path to attach the connect hook to.
     pub cgroup_path: PathBuf,
@@ -191,13 +190,10 @@ impl Default for EbpfSection {
 }
 
 impl EbpfSection {
-    /// Resolve the directory to load `.bpf.o` objects from: the explicit
-    /// config value, or the build-time output directory baked in by
-    /// `build.rs`. Returns `None` if neither is available.
+    /// Return the explicit object directory override. `None` selects the
+    /// version-matched object embedded in an eBPF-enabled Linux binary.
     pub fn resolve_program_dir(&self) -> Option<PathBuf> {
-        self.program_dir
-            .clone()
-            .or_else(|| option_env!("RELIABURGER_BPF_DIR").map(PathBuf::from))
+        self.program_dir.clone()
     }
 }
 
@@ -1022,7 +1018,7 @@ mod tests {
         )
         .unwrap();
         assert!(nc.ebpf.enabled);
-        // An explicit program_dir wins over the build-time default.
+        // An explicit program_dir overrides the embedded object.
         assert_eq!(
             nc.ebpf.resolve_program_dir(),
             Some(PathBuf::from("/opt/reliaburger/bpf"))

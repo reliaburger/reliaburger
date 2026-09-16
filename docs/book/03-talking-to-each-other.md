@@ -977,3 +977,30 @@ The rule for a forwarding header is: the proxy owns it. We strip whatever the cl
 Phase 3 adds 114 tests, bringing the total to 702. The new tests cover IP calculation (boundary cases, wrapping, max containers per node), service map operations (register, resolve, backend health, unregister), routing table lookups (longest prefix match, round-robin, case insensitivity), firewall rule generation (policy, ordering, SSH exclusion), the DNS responder (`.internal` resolution, upstream passthrough), and eBPF integration (BPF map ops, connect rewrite, backend failover).
 
 Most of these run under a plain `cargo test` on any machine. The privileged ones split by gate: `RELIABURGER_NETNS_TESTS=1` (network namespaces, needs root on Linux), `RELIABURGER_RUNC_TESTS=1` (runc containers), and `RELIABURGER_EBPF_TESTS=1` together with `--features ebpf` (the connect-rewrite tests, needs Linux and cgroup v2). On a Mac, `relish dev test` sets all three env vars and the feature flag inside the Lima VM, so one command runs the lot — no need to remember the matrix.
+
+## Release packaging: the eBPF object travels with Bun
+
+A local build can load `onion_connect.bpf.o` from Cargo's output directory.
+Copy that executable to another machine and the directory disappears. The old
+configuration default therefore worked for development but failed for a release
+that shipped only Bun.
+
+An eBPF-enabled Linux build now embeds the object in the executable with Aya's
+`include_bytes_aligned!` macro. Like Rust's `include_bytes!`, this reads a file at
+compile time and produces a reference to its bytes. Aya's variant also gives the
+bytes the alignment its ELF parser requires. `concat!` constructs the file name
+from Cargo's `OUT_DIR` environment variable during compilation. No path lookup
+happens when the installed binary starts.
+
+Both embedded and explicitly configured objects go through the same map and
+program validation and cgroup attachment code. An operator can still set
+`ebpf.program_dir` for a custom object. If that override fails, we report the
+failure; silently substituting another object would hide a configuration error.
+The existing capability checks continue to refuse workloads requiring enforcement
+when attachment fails.
+
+The build script checks Cargo's target OS, rather than the OS running the build
+script. Those differ when cross-compiling. An embedded-object integration test
+loads and attaches the object on a real Linux kernel without supplying an object
+directory. This belongs in the privileged eBPF suite; a macOS unit test can't
+prove that a Linux kernel accepts a program.

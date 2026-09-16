@@ -14,8 +14,8 @@ fn main() {
     }
     println!("cargo:rerun-if-env-changed=RELIABURGER_GIT_SHA");
 
-    // Only compile eBPF programs on Linux with the ebpf feature
-    if cfg!(target_os = "linux") && cfg!(feature = "ebpf") {
+    // Select the target OS: the build script itself runs on the host.
+    if std::env::var("CARGO_CFG_TARGET_OS").as_deref() == Ok("linux") && cfg!(feature = "ebpf") {
         compile_ebpf();
     }
 }
@@ -75,8 +75,7 @@ fn compile_ebpf() {
     println!("cargo:rerun-if-changed=ebpf/onion_common.h");
     println!("cargo:rerun-if-changed=ebpf/smoker_common.h");
 
-    // Bake the object directory into the binary so `[ebpf]` can default
-    // `program_dir` to where we just wrote the `.bpf.o` files — no
-    // install step needed for dev/Lima builds.
+    // Expose the build directory for development tooling. Runtime loading
+    // uses embedded bytes unless the operator explicitly overrides it.
     println!("cargo:rustc-env=RELIABURGER_BPF_DIR={out_dir}");
 }
