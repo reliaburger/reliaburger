@@ -51,7 +51,7 @@ remain separate. Older unchecked groups below point into this current ledger.
 - [ ] **C20** (P1) Deduplicate rollup ownership at query merge.
 - [ ] **C21** (P2) Bound and chunk reporting payloads.
 - [x] **C22** Compact receipts to current source generations only after a successful scan, in the existing locked durable transaction. The 32-generation retention/restart regression fails before the fix and preserves all archive rows after it; 12 archive integration, 12 exporter unit and 11 disk-pressure tests pass. Receipt count follows live source retention.
-- [ ] **C23** (P2) Distinguish expired certificates from renewal warnings.
+- [x] **C23** Treat encoded expiry as critical regardless of stale rotation labels; require positive healthy rotation evidence to suppress near-expiry warnings and describe short-lived validity accurately. Both diagnostic regressions fail before the fix; all 17 diagnosis tests pass.
 - [ ] **C24** (P2) Keep unknown council membership out of quorum arithmetic.
 - [ ] **C25** (P2) Identify diagnostic filesystems by identity.
 - [ ] **C26** (P2) Match diagnostic instance and VIP evidence exactly.

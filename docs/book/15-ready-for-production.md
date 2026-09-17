@@ -2439,3 +2439,14 @@ view might differ from disk. We retain that view for inspection but refuse furth
 mutations until the store is reopened. Returning an error and then overwriting
 possibly newer ownership would defeat the safety mechanism. Physical crash and
 filesystem sync-failure qualification remain part of the recovery acceptance gate.
+
+### Expiry outranks a rotation label
+
+A certificate whose encoded expiry has passed is critical, even if its last
+rotation observation still says `valid`. Diagnosis now checks that timestamp
+first. A healthy automatically rotating 90-second leaf is fine, but the OK text
+says it is currently valid with healthy rotation; it no longer promises fourteen
+days of remaining validity. Near-expiry leaves without positive healthy rotation
+evidence produce a warning. Consumers that cannot hot-rotate remain separately
+unknown. Tests cover the exact expiry boundary with both automatic-rotation
+settings and the short-lived healthy case.
