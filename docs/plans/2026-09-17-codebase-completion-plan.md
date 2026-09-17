@@ -280,6 +280,16 @@ The atomic counter starts at the same fixed value in every process. The earlier 
 
 **Completion test:** Mint under one CA from separate processes and after restart; no repeated serials. Specify revocation ownership and persistence rather than claiming the current counter solves it.
 
+**Completed on PR #167.** Each ingress issuance obtains an independent positive
+20-byte serial with 158 random bits from the operating system; randomness failure
+refuses issuance. This gives probabilistic cross-process uniqueness without a
+counter that can reset or a consensus call in the synchronous handshake. The
+certificate carries its identity and the resolver owns its cache. Individual
+ingress revocation remains unsupported; the 64-bit node CRL API does not own or
+truncate these serials. Four real processes sharing one CA reproduce the old
+collision and verify signed leaves after the repair. Ten ingress TLS tests,
+265 Sesame tests and strict Linux Clippy pass.
+
 ### C16 — Reject invalid certificate inputs without panicking
 
 **Priority:** P2. **Wave:** 3. **Book chapters:** 04.

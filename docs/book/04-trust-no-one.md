@@ -832,3 +832,36 @@ so a non-ASCII name could panic. It now collects conversions into a
 context to the caller. The common-name SAN follows the same rule instead of
 silently disappearing. Requesting a root CA through the intermediate-CA function
 also returns an input error. Regression tests exercise both former panic paths.
+
+### A process counter cannot identify certificates across nodes
+
+Restart two ingress nodes using the same CA. If each starts its certificate
+counter at the same number, their first leaves share an issuer and serial.
+An atomic increment only coordinates threads inside one process. It says
+nothing about another node, or tomorrow's restart.
+
+Ingress issuance now asks the operating system for twenty random bytes. It
+clears the sign bit and sets the next bit, leaving 158 random bits and a
+positive, non-zero value that always occupies twenty bytes. That also keeps
+these serials outside the eight-byte range of our Raft-issued node identities.
+[RFC 5280 section 4.1.2.2](https://www.rfc-editor.org/rfc/rfc5280#section-4.1.2.2)
+sets the positive-serial requirement and the twenty-octet ceiling.
+
+The expression `(serial[0] & 0x3f) | 0x40` uses bitwise AND to retain the six
+low bits and bitwise OR to set the next bit. `[0u8; 20]` creates a fixed-size
+array of twenty bytes. The random fill returns a `Result`; `?` propagates a
+failure instead of falling back to a timestamp or a repeatable counter.
+Uniqueness is probabilistic, based on independent cryptographic randomness.
+There is no persistent counter to roll back and no synchronous Raft request
+inside the TLS handshake. The signed certificate carries its serial; the
+resolver owns its cached key and discards that cache at restart.
+
+The regression starts separate processes with the same CA, including a restart
+and concurrent peers. It checks the actual signed certificates, their serial
+shape and the absence of duplicates. The old counter fails this test.
+
+This does not add ingress CRL distribution. Our cluster revocation API owns
+64-bit node identities; it must not truncate a longer ingress serial and claim
+to revoke it. Individual ingress-leaf revocation remains unsupported. Certificate
+renewal and hot reload are tracked separately under C14, and CA rotation remains
+an explicit future capability under F04.

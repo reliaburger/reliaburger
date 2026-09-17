@@ -191,9 +191,6 @@ pub fn node_id_from_spiffe_uri(uri: &str) -> Option<&str> {
     uri.strip_prefix("spiffe://reliaburger/node/")
 }
 
-/// Issue an end-entity certificate (e.g. node cert) signed by an intermediate CA.
-///
-/// Returns `(certificate_der, private_key_der, serial)`.
 /// Reconstruct a CA's signing keypair and issuer params from stored state.
 ///
 /// Unwraps the CA's private key with `wrapping_ikm` and rebuilds the rcgen
@@ -223,6 +220,9 @@ pub fn ca_signing_material(
     Ok((keypair, params))
 }
 
+/// Issue a leaf with a centrally allocated 64-bit serial.
+///
+/// Returns the certificate DER, private key DER and unchanged serial.
 pub fn issue_end_entity_cert(
     common_name: &str,
     serial: SerialNumber,
@@ -232,6 +232,56 @@ pub fn issue_end_entity_cert(
     ca_keypair: &KeyPair,
     ca_params: &CertificateParams,
 ) -> Result<(Vec<u8>, Vec<u8>, SerialNumber), CaError> {
+    let (certificate, key) = sign_end_entity_cert(
+        common_name,
+        RcgenSerial::from_slice(&serial.0.to_be_bytes()),
+        lifetime,
+        san_dns_names,
+        extended_key_usage,
+        ca_keypair,
+        ca_params,
+    )?;
+    Ok((certificate, key, serial))
+}
+
+/// Issue an ingress leaf with an independent positive 20-byte random serial.
+///
+/// Randomness failure refuses issuance. These serials are outside the node
+/// revocation API's 64-bit identity space; no truncation or counter is used.
+pub(crate) fn issue_ingress_leaf_cert(
+    common_name: &str,
+    lifetime: Duration,
+    san_dns_names: &[String],
+    ca_keypair: &KeyPair,
+    ca_params: &CertificateParams,
+) -> Result<(Vec<u8>, Vec<u8>), CaError> {
+    let mut serial = [0u8; 20];
+    SystemRandom::new().fill(&mut serial).map_err(|_| {
+        CaError::CertGenFailed("operating system randomness unavailable for ingress serial".into())
+    })?;
+    // RFC 5280 limits serials to 20 octets. Keep a positive, non-zero value
+    // with 158 random bits, disjoint from every centrally allocated u64.
+    serial[0] = (serial[0] & 0x3f) | 0x40;
+    sign_end_entity_cert(
+        common_name,
+        RcgenSerial::from_slice(&serial),
+        lifetime,
+        san_dns_names,
+        &[ExtendedKeyUsagePurpose::ServerAuth],
+        ca_keypair,
+        ca_params,
+    )
+}
+
+fn sign_end_entity_cert(
+    common_name: &str,
+    serial: RcgenSerial,
+    lifetime: Duration,
+    san_dns_names: &[String],
+    extended_key_usage: &[ExtendedKeyUsagePurpose],
+    ca_keypair: &KeyPair,
+    ca_params: &CertificateParams,
+) -> Result<(Vec<u8>, Vec<u8>), CaError> {
     let key_pair = KeyPair::generate_for(&rcgen::PKCS_ECDSA_P256_SHA256)
         .map_err(|e| CaError::KeyGenFailed(e.to_string()))?;
     let private_key_der = key_pair.serialize_der();
@@ -246,7 +296,7 @@ pub fn issue_end_entity_cert(
         KeyUsagePurpose::KeyEncipherment,
     ];
     params.extended_key_usages = extended_key_usage.to_vec();
-    params.serial_number = Some(RcgenSerial::from_slice(&serial.0.to_be_bytes()));
+    params.serial_number = Some(serial);
 
     let mut all_sans: Vec<rcgen::SanType> = san_dns_names
         .iter()
@@ -280,7 +330,7 @@ pub fn issue_end_entity_cert(
         .map_err(|e| CaError::SignFailed(e.to_string()))?;
     let certificate_der = certificate.der().to_vec();
 
-    Ok((certificate_der, private_key_der, serial))
+    Ok((certificate_der, private_key_der))
 }
 
 /// Issue a node certificate signed by the Node CA. Convenience wrapper

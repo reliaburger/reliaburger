@@ -8,21 +8,9 @@
 /// TLS 1.0 and 1.1 are rejected. Only 1.2 and 1.3 are accepted.
 use std::path::Path;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
 
 use rustls::ServerConfig;
 use rustls::pki_types::{CertificateDer, PrivateKeyDer};
-
-/// Process-local monotonic serial source for ingress certificates (M15).
-///
-/// Ingress certs are minted per-SNI and short-lived, so threading the cluster's
-/// Raft serial allocator (a consensus write per cert) is impractical. This at
-/// least gives every ingress cert a *distinct* serial — the old code stamped
-/// every one `SerialNumber(1)`, so they were indistinguishable and could never
-/// be told apart in a CRL. Seeded high so it can't collide with the CA's
-/// centrally-allocated (low, sequential) serials. Central CRL-revocation of an
-/// individual ingress leaf remains future work.
-static INGRESS_SERIAL: AtomicU64 = AtomicU64::new(1 << 62);
 
 /// Errors from TLS operations.
 #[derive(Debug, thiserror::Error)]
@@ -78,15 +66,10 @@ pub fn issue_ingress_cert(
         .cloned()
         .ok_or_else(|| TlsError::CertGenFailed("no ingress hostname supplied".to_string()))?;
 
-    // The cert is a TLS server, so it carries the ServerAuth extended key
-    // usage. Each ingress cert gets a distinct serial (M15) — see INGRESS_SERIAL.
-    let serial = INGRESS_SERIAL.fetch_add(1, Ordering::Relaxed);
-    let (cert_der, key_der, _serial) = crate::sesame::ca::issue_end_entity_cert(
+    let (cert_der, key_der) = crate::sesame::ca::issue_ingress_leaf_cert(
         &common_name,
-        crate::sesame::types::SerialNumber(serial),
         lifetime,
         hostnames,
-        &[rcgen::ExtendedKeyUsagePurpose::ServerAuth],
         ca_keypair,
         ca_params,
     )
@@ -363,6 +346,100 @@ mod tests {
         // The issued cert and key must yield a working rustls config.
         let config = build_tls_config(certs, key).unwrap();
         let _ = config; // built without error means it's servable
+    }
+
+    // Child entry point for the separate-process serial regression. No key
+    // material crosses stdout or process arguments.
+    #[test]
+    fn ingress_serial_child() {
+        use rcgen::{CertificateParams, KeyPair};
+        let Some(directory) = std::env::var_os("RELIABURGER_SERIAL_TEST_DIRECTORY") else {
+            return;
+        };
+        let directory = std::path::PathBuf::from(directory);
+        let certificate = CertificateDer::from(std::fs::read(directory.join("ca.der")).unwrap());
+        let params = CertificateParams::from_ca_cert_der(&certificate).unwrap();
+        let key =
+            PrivateKeyDer::try_from(std::fs::read(directory.join("ca.key")).unwrap()).unwrap();
+        let key = KeyPair::from_der_and_sign_algo(&key, &rcgen::PKCS_ECDSA_P256_SHA256).unwrap();
+        let (certificates, _) = issue_ingress_cert(
+            &["app.example.com".into()],
+            std::time::Duration::from_secs(3600),
+            &key,
+            &params,
+        )
+        .unwrap();
+        let destination = std::env::var_os("RELIABURGER_SERIAL_TEST_OUTPUT").unwrap();
+        std::fs::write(destination, &certificates[0]).unwrap();
+    }
+
+    #[tokio::test]
+    async fn ingress_serials_differ_across_nodes_and_restarts_under_one_issuer() {
+        use std::io::Write;
+        use std::os::unix::fs::OpenOptionsExt;
+        use x509_parser::prelude::FromDer;
+        let directory = tempfile::tempdir().unwrap();
+        let hierarchy =
+            crate::sesame::ca::generate_ca_hierarchy("serial-test", b"test-wrap-ikm").unwrap();
+        std::fs::write(
+            directory.path().join("ca.der"),
+            &hierarchy.ingress.ca.certificate_der,
+        )
+        .unwrap();
+        let mut key_file = std::fs::OpenOptions::new()
+            .create_new(true)
+            .write(true)
+            .mode(0o600)
+            .open(directory.path().join("ca.key"))
+            .unwrap();
+        key_file
+            .write_all(&hierarchy.ingress.private_key_der)
+            .unwrap();
+        drop(key_file);
+        async fn issue(directory: &Path, node: &str) -> Vec<u8> {
+            let destination = directory.join(node);
+            let mut child = tokio::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "wrapper::tls::tests::ingress_serial_child",
+                    "--nocapture",
+                ])
+                .env("RELIABURGER_SERIAL_TEST_DIRECTORY", directory)
+                .env("RELIABURGER_SERIAL_TEST_OUTPUT", &destination)
+                .kill_on_drop(true)
+                .spawn()
+                .unwrap();
+            let status = tokio::time::timeout(std::time::Duration::from_secs(60), child.wait())
+                .await
+                .unwrap()
+                .unwrap();
+            assert!(status.success());
+            std::fs::read(destination).unwrap()
+        }
+        let first = issue(directory.path(), "first.der").await;
+        let restarted = issue(directory.path(), "restarted.der").await;
+        let (peer_a, peer_b) = tokio::join!(
+            issue(directory.path(), "peer-a.der"),
+            issue(directory.path(), "peer-b.der")
+        );
+        let (_, ca) = x509_parser::certificate::X509Certificate::from_der(
+            &hierarchy.ingress.ca.certificate_der,
+        )
+        .unwrap();
+        let mut serials = std::collections::HashSet::new();
+        for der in [first, restarted, peer_a, peer_b] {
+            let (_, certificate) =
+                x509_parser::certificate::X509Certificate::from_der(&der).unwrap();
+            certificate.verify_signature(Some(ca.public_key())).unwrap();
+            assert!(
+                serials.insert(certificate.raw_serial().to_vec()),
+                "separate processes reused a certificate serial under the same CA"
+            );
+        }
+        for serial in serials {
+            assert_eq!(serial.len(), 20);
+            assert!((0x40..=0x7f).contains(&serial[0]));
+        }
     }
 
     #[test]
