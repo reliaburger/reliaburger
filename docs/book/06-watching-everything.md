@@ -465,3 +465,17 @@ replaces the caller's borrowed checkpoint; stale caller state never drives uploa
 Regressions exercise a held lock, stale snapshots, corrupt checkpoint data,
 agent exports and the offline CLI's non-zero error result. Actual power-loss and
 storage-device durability qualification remains part of the release recovery gate.
+
+### Report source failures
+
+A directory whose name ends in `.parquet` used to look like an empty successful
+export: the read failed and the loop continued. We now reject non-regular entries
+and invalid filenames, and propagate directory and file I/O errors with their
+source path. The only skipped read error is `NotFound`, because retention can
+remove an immutable file between enumeration and opening it.
+
+Directory enumeration and file reads use Tokio's asynchronous filesystem API.
+The directory regression runs on both supported host platforms. The invalid-byte
+filename regression is Linux-only: macOS APFS rejects that filename when creating
+the fixture, before our exporter can inspect it. That platform boundary belongs
+in the test definition rather than a silent successful early return.

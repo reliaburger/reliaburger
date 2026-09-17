@@ -184,6 +184,10 @@ reconciles the older TODOs, records remaining correctness gaps and separates
 release acceptance from deferred capabilities. The current checklist lives in
 [progress.md](docs/progress.md).
 
+Log exports now preserve content generations, scope receipts to the destination,
+and serialise durable checkpoint updates across agent and offline exports. Source
+and checkpoint errors stop the export and prevent disk-pressure pruning.
+
 ## Licence
 
 [Apache 2.0](LICENSE)

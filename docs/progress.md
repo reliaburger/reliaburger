@@ -32,7 +32,7 @@ remain separate. Older unchecked groups below point into this current ledger.
 - [x] **C01** Preserve every exported log generation with full content-hash object names. Five real Parquet export/query tests and ten exporter unit tests pass; the restart/name-reuse regression fails before the fix. Legacy archive objects remain untouched (migration duplicates documented in chapter 6).
 - [x] **C02** Scope export acknowledgements and pruning proof to the destination URL and node prefix. Seven archive integration tests, ten exporter unit tests and eleven disk-pressure tests pass, including changed destinations/prefixes after restart and failed-export preservation.
 - [x] **C03** Serialise all exporters with a cross-process lock, reload before export, and atomically persist a private checkpoint with file/directory sync before acknowledgement or pruning. Stale-state, busy-lock, corrupt-state, atomic-replacement and rename-failure regressions pass, plus API/offline CLI checks; physical crash/durability qualification remains V02.
-- [ ] **C04** (P1) Report non-transient export read failures.
+- [x] **C04** Report directory, entry and file-read failures with context; reject non-regular/invalid-name candidates and skip only concurrent NotFound reads. Eleven archive integration tests, twelve exporter unit tests and eleven pressure tests pass on macOS; the invalid-byte filename regression is explicitly Linux-only.
 - [ ] **C05** (P1) Persist new instances during rolling deployments.
 - [ ] **C06** (P1) Reserve node-fault capacity across the cluster.
 - [ ] **C07** (P1) Define and enforce mixed-version compatibility.

@@ -246,31 +246,60 @@ async fn export_logs_locked(
         checkpoint.scope = Some(scope);
     }
 
-    let entries = match std::fs::read_dir(source_dir) {
-        Ok(entries) => entries,
-        Err(_) => return Ok(ExportResult::default()),
-    };
-
-    // Collect candidate filenames first so the async put loop borrows nothing
-    // from the (non-Send) ReadDir iterator across an await point.
+    let mut entries = tokio::fs::read_dir(source_dir).await.map_err(|error| {
+        KetchupError::Io(std::io::Error::new(
+            error.kind(),
+            format!("list {}: {error}", source_dir.display()),
+        ))
+    })?;
     let mut candidates: Vec<String> = Vec::new();
-    for entry in entries.flatten() {
+    while let Some(entry) = entries.next_entry().await.map_err(|error| {
+        KetchupError::Io(std::io::Error::new(
+            error.kind(),
+            format!("read directory {}: {error}", source_dir.display()),
+        ))
+    })? {
         let path = entry.path();
-        if path.extension().is_none_or(|e| e != "parquet") {
+        if path
+            .extension()
+            .is_none_or(|extension| extension != "parquet")
+        {
             continue;
         }
-        if let Some(name) = path.file_name().and_then(|n| n.to_str()) {
-            candidates.push(name.to_string());
+        let kind = entry.file_type().await.map_err(|error| {
+            KetchupError::Io(std::io::Error::new(
+                error.kind(),
+                format!("inspect {}: {error}", path.display()),
+            ))
+        })?;
+        if !kind.is_file() {
+            return Err(KetchupError::Io(std::io::Error::other(format!(
+                "export source {} is not a regular file",
+                path.display()
+            ))));
         }
+        let name = entry.file_name().into_string().map_err(|name| {
+            KetchupError::Io(std::io::Error::other(format!(
+                "export filename is not UTF-8: {name:?}"
+            )))
+        })?;
+        candidates.push(name);
     }
     candidates.sort();
 
     let mut result = ExportResult::default();
     for filename in candidates {
         let source_path = source_dir.join(&filename);
-        let contents = match std::fs::read(&source_path) {
+        let contents = match tokio::fs::read(&source_path).await {
             Ok(bytes) => bytes,
-            Err(_) => continue, // pruned between listing and read; skip
+            // Retention may remove an immutable source between enumeration and read.
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(error) => {
+                return Err(KetchupError::Io(std::io::Error::new(
+                    error.kind(),
+                    format!("read export source {}: {error}", source_path.display()),
+                )));
+            }
         };
         let id = durable_id(&filename, &contents);
         if checkpoint.exported_files.contains(&id) {

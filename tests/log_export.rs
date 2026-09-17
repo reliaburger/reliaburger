@@ -387,3 +387,43 @@ async fn unreadable_checkpoint_preserves_sources_under_pressure() {
     assert_eq!(result.files_pruned, 0);
     assert!(file.exists());
 }
+
+#[tokio::test]
+async fn malformed_parquet_entries_are_errors_not_empty_exports() {
+    let source = tempfile::tempdir().unwrap();
+    let destination = tempfile::tempdir().unwrap();
+    std::fs::create_dir(source.path().join("logs_000000.parquet")).unwrap();
+    let mut checkpoint = ExportCheckpoint::default();
+    let error = export_logs(
+        source.path(),
+        destination.path().to_str().unwrap(),
+        "node-1",
+        &mut checkpoint,
+    )
+    .await
+    .unwrap_err();
+    assert!(error.to_string().contains("logs_000000.parquet"));
+    assert!(checkpoint.exported_files.is_empty());
+}
+
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn non_utf8_parquet_names_are_reported() {
+    use std::os::unix::ffi::OsStringExt;
+    let source = tempfile::tempdir().unwrap();
+    let destination = tempfile::tempdir().unwrap();
+    let filename = std::ffi::OsString::from_vec(b"logs_\xff.parquet".to_vec());
+    std::fs::write(source.path().join(filename), b"bytes").unwrap();
+    let mut checkpoint = ExportCheckpoint::default();
+    assert!(
+        export_logs(
+            source.path(),
+            destination.path().to_str().unwrap(),
+            "node-1",
+            &mut checkpoint
+        )
+        .await
+        .is_err()
+    );
+    assert!(checkpoint.exported_files.is_empty());
+}
