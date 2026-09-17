@@ -197,13 +197,8 @@ pub async fn collect(client: &BunClient, app: Option<&str>) -> Result<WtfInputs,
         bounded("service resolution", client.resolve_all()),
     );
 
-    let council = collect_council_evidence(
-        cluster_enabled,
-        membership.as_deref(),
-        &collected,
-        council_result,
-        collected_at,
-    );
+    let council =
+        collect_council_evidence(cluster_enabled, &collected, council_result, collected_at);
     let restarts = collect_restarts(&collected, collected_at);
     let deploys = collect_deploys(&collected, collected_at);
     let services = collect_services(desired_result, services_result, app, collected_at);
@@ -377,7 +372,6 @@ fn collect_node_evidence(
 
 fn collect_council_evidence(
     cluster_enabled: bool,
-    membership: Option<&[NodeStatus]>,
     collected: &[NodeCollection],
     council: Result<CouncilStatus, String>,
     observed_at: u64,
@@ -414,38 +408,13 @@ fn collect_council_evidence(
                 },
             )
         }
-        result => {
-            let Some(membership) = membership else {
-                return Evidence::Unavailable {
-                    reason: result
-                        .err()
-                        .unwrap_or_else(|| "council membership is empty".to_string()),
-                };
-            };
-            let members = membership
-                .iter()
-                .filter(|node| node.is_council)
-                .collect::<Vec<_>>();
-            let observation = CouncilObservation {
-                enabled: true,
-                member_count: members.len(),
-                reachable_members: members
-                    .iter()
-                    .filter(|node| health.get(node.node_id.as_str()).copied().unwrap_or(false))
-                    .count(),
-                leader: membership
-                    .iter()
-                    .find(|node| node.is_leader)
-                    .map(|node| node.node_id.clone()),
-            };
-            Evidence::Degraded {
-                observed_at,
-                value: observation,
-                reason: result
-                    .err()
-                    .unwrap_or_else(|| "leader council endpoint returned no members".to_string()),
-            }
-        }
+        result => Evidence::Unavailable {
+            // Gossip role flags can lag Raft membership changes. They cannot
+            // establish the voter denominator for a quorum diagnosis.
+            reason: result
+                .err()
+                .unwrap_or_else(|| "council endpoint returned no configured members".to_string()),
+        },
     }
 }
 
@@ -1085,10 +1054,75 @@ mod tests {
         assert!(!line_is_error("request completed"));
     }
 
+    #[tokio::test]
+    async fn missing_council_membership_never_invents_quorum_loss() {
+        use axum::{Json, Router, routing::get};
+        for (stale_council_flag, empty_answer) in [(false, false), (true, false), (true, true)] {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let address = listener.local_addr().unwrap();
+            let app = Router::new()
+                .route(
+                    "/v1/cluster/council",
+                    get(move || async move {
+                        (
+                            if empty_answer {
+                                axum::http::StatusCode::OK
+                            } else {
+                                axum::http::StatusCode::SERVICE_UNAVAILABLE
+                            },
+                            Json(CouncilStatus::default()),
+                        )
+                    }),
+                )
+                .route(
+                    "/v1/health",
+                    get(|| async { Json(serde_json::json!({"status":"ok"})) }),
+                )
+                .route(
+                    "/v1/cluster/nodes",
+                    get(move || async move {
+                        Json(vec![NodeStatus {
+                            node_id: "node-a".into(),
+                            address: address.to_string(),
+                            state: "alive".into(),
+                            incarnation: 0,
+                            is_council: stale_council_flag,
+                            is_leader: false,
+                            labels: BTreeMap::new(),
+                        }])
+                    }),
+                );
+            let server = tokio::spawn(async move {
+                axum::serve(listener, app).await.unwrap();
+            });
+            let inputs = collect(&BunClient::new(&format!("http://{address}")), None)
+                .await
+                .unwrap();
+            server.abort();
+            let _ = server.await;
+            assert!(
+                inputs.cluster.council.value().is_none(),
+                "gossip flags cannot establish configured voters"
+            );
+            let report = super::super::diagnose(&inputs);
+            assert!(
+                report
+                    .unknown
+                    .iter()
+                    .any(|finding| finding.source == "council")
+            );
+            assert!(
+                !report
+                    .critical
+                    .iter()
+                    .any(|finding| ["quorum-loss", "no-leader"].contains(&finding.id.as_str()))
+            );
+        }
+    }
+
     #[test]
     fn standalone_council_is_an_observed_non_requirement() {
-        let evidence =
-            collect_council_evidence(false, Some(&[]), &[], Ok(CouncilStatus::default()), 10);
+        let evidence = collect_council_evidence(false, &[], Ok(CouncilStatus::default()), 10);
         let council = evidence.value().unwrap();
 
         assert!(!council.enabled);

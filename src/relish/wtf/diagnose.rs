@@ -161,6 +161,16 @@ fn check_council(inputs: &WtfInputs, report: &mut WtfReport) {
         });
         return;
     }
+    if council.member_count == 0 || inputs.cluster.council.unknown_reason().is_some() {
+        if !report.unknown.iter().any(|item| item.source == "council") {
+            report.unknown.push(WtfUnknown {
+                source: "council".into(),
+                reason: "configured council membership is not known".into(),
+                affected_resource: "council".into(),
+            });
+        }
+        return;
+    }
     let mut healthy = true;
     if council.leader.is_none() {
         healthy = false;

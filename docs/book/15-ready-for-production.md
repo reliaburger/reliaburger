@@ -2450,3 +2450,14 @@ days of remaining validity. Near-expiry leaves without positive healthy rotation
 evidence produce a warning. Consumers that cannot hot-rotate remain separately
 unknown. Tests cover the exact expiry boundary with both automatic-rotation
 settings and the short-lived healthy case.
+
+### Unknown membership has no quorum denominator
+
+When the council endpoint fails, gossip can still report role flags. Those flags
+may describe an older Raft configuration. Using them as the configured voter set
+could turn an empty observation into “zero of zero members, quorum lost”, or
+report a false healthy majority. Council collection now records unavailable or
+empty membership as unknown and retains the source failure. Diagnosis also refuses
+quorum arithmetic for explicitly degraded or empty membership. A public HTTP
+collector regression covers missing membership, stale role flags and an empty
+council response; the existing observed failed-majority case remains critical.
