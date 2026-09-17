@@ -421,3 +421,21 @@ Surviving source files are therefore exported again under the new names. Existin
 legacy archive objects are left untouched; a mixed legacy/new archive can contain
 duplicate rows for that migration batch. We prefer that explicit migration
 limitation to deleting an old object whose provenance we cannot establish.
+
+### An acknowledgement belongs to one destination
+
+Exporting to archive A doesn't mean the same bytes exist in archive B. The
+checkpoint now includes a scope derived from the destination URL and node prefix.
+Changing either clears its acknowledgements. We store a hash of the scope rather
+than the URL itself, so a checkpoint doesn't copy credentials embedded in a URL.
+This hash identifies the export context; it is not an authentication mechanism.
+
+An old checkpoint without a scope is also untrusted for skipping uploads. The
+immutable names from the previous fix make repeated exports safe. Keeping one
+active scope is deliberately simple: switching back to an earlier destination
+may repeat writes, but it cannot mistake another archive's receipt for this one.
+
+The pruner checks the scope as well as the content identity. Our regression
+exports to a working destination, switches to an unwritable destination, then
+forces disk pressure. The source must survive. Another test changes both the
+destination and node prefix across checkpoint reloads and queries every archive.

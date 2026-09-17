@@ -30,7 +30,7 @@ remain separate. Older unchecked groups below point into this current ledger.
 ### Correctness and behavioural contracts
 
 - [x] **C01** Preserve every exported log generation with full content-hash object names. Five real Parquet export/query tests and ten exporter unit tests pass; the restart/name-reuse regression fails before the fix. Legacy archive objects remain untouched (migration duplicates documented in chapter 6).
-- [ ] **C02** (P1) Scope export acknowledgements to their destination.
+- [x] **C02** Scope export acknowledgements and pruning proof to the destination URL and node prefix. Seven archive integration tests, ten exporter unit tests and eleven disk-pressure tests pass, including changed destinations/prefixes after restart and failed-export preservation.
 - [ ] **C03** (P1) Make export checkpoints durable and serialised.
 - [ ] **C04** (P1) Report non-transient export read failures.
 - [ ] **C05** (P1) Persist new instances during rolling deployments.

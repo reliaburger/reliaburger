@@ -233,3 +233,72 @@ async fn reused_filename_preserves_both_generations_across_restart() {
         ["first generation", "second generation"]
     );
 }
+
+#[tokio::test]
+async fn changing_destination_or_node_prefix_exports_after_restart() {
+    let source = tempfile::tempdir().unwrap();
+    let first = tempfile::tempdir().unwrap();
+    let second = tempfile::tempdir().unwrap();
+    let checkpoint_path = source.path().join("checkpoint.json");
+    let mut store = LogStore::new(source.path().to_path_buf());
+    store.append_at(1, "web", "default", LogStream::Stdout, "preserve me");
+    store.flush().await.unwrap();
+    let mut checkpoint = ExportCheckpoint::default();
+    for (destination, node) in [
+        (first.path(), "node-1"),
+        (second.path(), "node-1"),
+        (second.path(), "node-2"),
+    ] {
+        let result = export_logs(
+            source.path(),
+            destination.to_str().unwrap(),
+            node,
+            &mut checkpoint,
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            result.files_exported, 1,
+            "a different archive needs its own acknowledgement"
+        );
+        checkpoint.save(&checkpoint_path).unwrap();
+        checkpoint = ExportCheckpoint::load(&checkpoint_path);
+        let entries = query_remote(
+            destination.join(node).to_str().unwrap(),
+            "SELECT timestamp, app, namespace, stream, line FROM logs",
+        )
+        .await
+        .unwrap();
+        assert_eq!(entries[0].line, "preserve me");
+    }
+}
+
+#[tokio::test]
+async fn acknowledgement_from_another_destination_does_not_allow_pruning() {
+    let source = tempfile::tempdir().unwrap();
+    let destination = tempfile::tempdir().unwrap();
+    let blocked = tempfile::NamedTempFile::new().unwrap();
+    let file = source.path().join("logs_000000.parquet");
+    std::fs::write(&file, b"preserve these bytes").unwrap();
+    let mut checkpoint = ExportCheckpoint::default();
+    export_logs(
+        source.path(),
+        destination.path().to_str().unwrap(),
+        "node-1",
+        &mut checkpoint,
+    )
+    .await
+    .unwrap();
+    let result = reliaburger::bun::disk_pressure::check_and_relieve(
+        source.path(),
+        Some(blocked.path().to_str().unwrap()),
+        "node-1",
+        &mut checkpoint,
+        1,
+        0,
+    )
+    .await;
+    assert!(result.export_error.is_some());
+    assert_eq!(result.files_pruned, 0);
+    assert!(file.exists());
+}

@@ -46,6 +46,9 @@ pub struct ExportCheckpoint {
     /// Durable ids (`{filename}@{hash}`) that have already been exported.
     #[serde(default)]
     pub exported_files: HashSet<String>,
+    /// Hash of the destination URL and node prefix these acknowledgements cover.
+    #[serde(default)]
+    pub scope: Option<String>,
 }
 
 impl ExportCheckpoint {
@@ -70,7 +73,12 @@ impl ExportCheckpoint {
     ///
     /// The disk-pressure pruner uses this so it only deletes a local file once
     /// that exact content has landed in the object store.
-    pub fn contains_file(&self, path: &Path) -> bool {
+    pub fn contains_file(&self, path: &Path, destination: &str, node_id: &str) -> bool {
+        if export_scope(destination, node_id).ok().as_ref() != self.scope.as_ref()
+            || self.scope.is_none()
+        {
+            return false;
+        }
         match file_durable_id(path) {
             Ok(id) => self.exported_files.contains(&id),
             Err(_) => false,
@@ -116,6 +124,24 @@ fn durable_id(filename: &str, contents: &[u8]) -> String {
 fn parse_destination(
     destination: &str,
 ) -> Result<(Box<dyn object_store::ObjectStore>, object_store::path::Path), KetchupError> {
+    let url = destination_url(destination)?;
+    object_store::parse_url(&url).map_err(|e| {
+        KetchupError::Io(std::io::Error::other(format!(
+            "unsupported destination: {e}"
+        )))
+    })
+}
+
+fn export_scope(destination: &str, node_id: &str) -> Result<String, KetchupError> {
+    let url = destination_url(destination)?;
+    let mut digest = Sha256::new();
+    digest.update(url.as_str().as_bytes());
+    digest.update([0]);
+    digest.update(node_id.as_bytes());
+    Ok(hex::encode(digest.finalize()))
+}
+
+fn destination_url(destination: &str) -> Result<url::Url, KetchupError> {
     // A bare filesystem path has no scheme; normalise it to a file:// URL so
     // `object_store::parse_url` picks the LocalFileSystem backend. Existing
     // configs and tests pass plain temp-dir paths, so this stays compatible.
@@ -130,11 +156,7 @@ fn parse_destination(
     }
     .map_err(|e| KetchupError::Io(std::io::Error::other(format!("invalid destination: {e}"))))?;
 
-    object_store::parse_url(&url).map_err(|e| {
-        KetchupError::Io(std::io::Error::other(format!(
-            "unsupported destination: {e}"
-        )))
-    })
+    Ok(url)
 }
 
 /// Export local Parquet log files to an object store.
@@ -151,6 +173,13 @@ pub async fn export_logs(
 ) -> Result<ExportResult, KetchupError> {
     let (store, prefix) = parse_destination(destination)?;
     let node_prefix = prefix.join(node_id);
+    let scope = export_scope(destination, node_id)?;
+    if checkpoint.scope.as_ref() != Some(&scope) {
+        // Legacy or differently scoped acknowledgements cannot justify skipping
+        // an upload or pruning its source. Immutable object names make retries safe.
+        checkpoint.exported_files.clear();
+        checkpoint.scope = Some(scope);
+    }
 
     let entries = match std::fs::read_dir(source_dir) {
         Ok(entries) => entries,
@@ -292,7 +321,10 @@ mod tests {
         std::fs::write(source.path().join("logs_000000.parquet"), b"data1").unwrap();
         std::fs::write(source.path().join("logs_000001.parquet"), b"data2").unwrap();
 
-        let mut checkpoint = ExportCheckpoint::default();
+        let mut checkpoint = ExportCheckpoint {
+            scope: Some(export_scope(dest.path().to_str().unwrap(), "node-1").unwrap()),
+            ..ExportCheckpoint::default()
+        };
         // Pre-record the durable id of the first file.
         checkpoint
             .exported_files
