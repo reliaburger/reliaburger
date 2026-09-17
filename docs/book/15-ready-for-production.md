@@ -2532,3 +2532,16 @@ Randomness makes accidental collisions negligible; it isn't ownership proof.
 The server still refuses a namespace with an active lease, including explicitly
 chosen fixed namespaces. Cleanup remains tied to the granted lease. Tests check
 concurrent IDs, DNS-label validity and the existing collision refusal.
+
+### A passing test can still leave a process behind
+
+Nextest can observe a test process exit successfully while a child still holds
+its output pipe open. That is a passing-but-leaky result, not proof of cleanup.
+Our `slow` status filter printed the aggregate leak count without the responsible
+case's name. Both default and CI profiles now use `status-level = "leak"`, so
+future occurrences retain that identity in the run log.
+
+The no-default suite reproduced one leak during this audit. Three reruns with
+detailed reporting did not reproduce it, so H08 remains open: we still need the
+case identity, an ownership fix and a focused regression. We haven't increased
+the leak timeout to make the warning disappear.

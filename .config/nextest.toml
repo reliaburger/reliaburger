@@ -4,14 +4,14 @@ dir = "target/nextest"
 [profile.default]
 retries = 0
 fail-fast = true
-status-level = "slow"
+status-level = "leak"
 final-status-level = "slow"
 slow-timeout = { period = "30s", terminate-after = 2 }
 
 [profile.ci]
 retries = 0
 fail-fast = false
-status-level = "slow"
+status-level = "leak"
 final-status-level = "slow"
 slow-timeout = { period = "30s", terminate-after = 2 }
 junit = { path = "junit.xml" }

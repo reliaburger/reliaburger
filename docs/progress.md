@@ -82,7 +82,7 @@ remain separate. Older unchecked groups below point into this current ledger.
 - [ ] **H05** (P3) Split modules along existing ownership boundaries.
 - [ ] **H06** (P3) Evaluate shared DNS and duration parsers.
 - [ ] **H07** (P3) Add useful public API doctests.
-- [ ] **H08** (P2) Identify and eliminate leaked test processes.
+- [ ] **H08** (P2) Identify and eliminate leaked test processes. The 3,373-test no-default run reproduced one passing-but-leaky test; three subsequent diagnostic reruns passed without a leak. Default/CI nextest output now retains per-test leak identity instead of hiding it under the slow filter. The offending case and ownership repair remain unresolved; no timeout was relaxed.
 - [ ] **H09** (P3) Complete node-pressure diagnostic hygiene.
 - [ ] **H10** (P3) Reuse one egress observation per health tick.
 - [x] **H11** Declare Rust 1.97, pin release/CI builds to 1.98.0 and add a locked minimum-compiler CI job for both feature configurations, including stacked PR triggers. Linux 1.97 checks every target/feature and passes 3,155 default plus 3,115 no-default library tests; macOS 1.98 passes 3,413 default plus 3,373 no-default portable tests. The no-default process leak remains H08. Build/rebuild policy and both READMEs are updated.
