@@ -150,8 +150,15 @@ enum Command {
     /// Join an existing cluster.
     Join {
         /// Join token issued by `relish init` or `relish join-token create`.
-        #[arg(long)]
-        token: String,
+        #[arg(
+            long,
+            required_unless_present = "token_file",
+            conflicts_with = "token_file"
+        )]
+        token: Option<String>,
+        /// Read the join token from a private file instead of command-line arguments.
+        #[arg(long, conflicts_with = "token")]
+        token_file: Option<PathBuf>,
         /// API address of an existing cluster member, e.g.
         /// `https://10.0.1.5:9117` (bare host:port assumes https).
         addr: String,
@@ -341,8 +348,33 @@ enum Command {
         /// Open with this search query pre-seeded (e.g. "ebpf").
         query: Option<String>,
     },
+    /// Manage a laptop cluster created by setup --quickstart.
+    Local {
+        #[arg(value_enum)]
+        action: LocalAction,
+        #[arg(long, default_value = "laptop")]
+        name: String,
+        /// Confirm permanent deletion of the owned VMs and their data.
+        #[arg(long)]
+        yes: bool,
+    },
     /// Guided setup: detect or install bun, then write a starter config.
     Setup {
+        /// Boot a secure managed Linux cluster and verify a sample container.
+        #[arg(long, conflicts_with_all = ["dir", "release_url", "binary_dir"])]
+        quickstart: bool,
+        #[arg(long, requires = "quickstart")]
+        name: Option<String>,
+        #[arg(long, requires = "quickstart")]
+        nodes: Option<usize>,
+        #[arg(long, requires = "quickstart")]
+        api_port: Option<u16>,
+        #[arg(long, requires = "quickstart")]
+        ingress_port: Option<u16>,
+        /// Use explicitly supplied Linux binaries for development before a release exists.
+        #[arg(long, requires = "quickstart")]
+        development_binaries: Option<PathBuf>,
+
         /// Accept the default answer to every question (non-interactive).
         #[arg(long)]
         yes: bool,
@@ -612,6 +644,14 @@ enum SecretAction {
         #[arg(long)]
         finalize: bool,
     },
+}
+
+#[derive(Debug, Clone, Copy, clap::ValueEnum)]
+enum LocalAction {
+    Status,
+    Start,
+    Stop,
+    Destroy,
 }
 
 #[derive(Subcommand)]
@@ -1080,18 +1120,31 @@ async fn main() -> ExitCode {
         },
         Command::Join {
             ref token,
+            ref token_file,
             ref addr,
             ref node_id,
             ref identity_dir,
             ref ca_fingerprint,
         } => {
-            commands::join(
-                token,
-                addr,
-                node_id,
-                identity_dir.as_deref(),
-                ca_fingerprint.as_deref(),
-            )
+            async {
+                let token = match (token, token_file) {
+                    (Some(token), None) => token.clone(),
+                    (None, Some(path)) => commands::read_join_token(path).await?,
+                    _ => {
+                        return Err(reliaburger::relish::RelishError::JoinFailed(
+                            "provide exactly one of --token and --token-file".into(),
+                        ));
+                    }
+                };
+                commands::join(
+                    &token,
+                    addr,
+                    node_id,
+                    identity_dir.as_deref(),
+                    ca_fingerprint.as_deref(),
+                )
+                .await
+            }
             .await
         }
         Command::Resolve { ref name } => commands::resolve(name).await,
@@ -1451,19 +1504,51 @@ async fn main() -> ExitCode {
             None => reliaburger::relish::manual::run().await,
         },
         Command::Source { query } => reliaburger::relish::source::run(query).await,
+        Command::Local { action, name, yes } => {
+            use reliaburger::relish::quickstart::lifecycle::{self, Action};
+            let action = match action {
+                LocalAction::Status => Action::Status,
+                LocalAction::Start => Action::Start,
+                LocalAction::Stop => Action::Stop,
+                LocalAction::Destroy => Action::Destroy,
+            };
+            lifecycle::run(action, &name, yes)
+                .await
+                .map_err(|error| reliaburger::relish::RelishError::InitFailed(format!("{error:#}")))
+        }
         Command::Setup {
+            quickstart,
+            name,
+            nodes,
+            api_port,
+            ingress_port,
+            development_binaries,
             yes,
             ref dir,
             ref release_url,
             ref binary_dir,
         } => {
-            reliaburger::relish::setup::run(reliaburger::relish::setup::SetupOptions {
-                yes,
-                dir: dir.clone(),
-                release_url: release_url.clone(),
-                binary_dir: binary_dir.clone(),
-            })
-            .await
+            if quickstart {
+                reliaburger::relish::quickstart::runner::run(
+                    reliaburger::relish::quickstart::runner::Options {
+                        name: name.unwrap_or_else(|| "laptop".into()),
+                        nodes: nodes.unwrap_or(3),
+                        api_port: api_port.unwrap_or(19117),
+                        ingress_port: ingress_port.unwrap_or(18080),
+                        development_binaries,
+                    },
+                )
+                .await
+                .map_err(|error| reliaburger::relish::RelishError::InitFailed(format!("{error:#}")))
+            } else {
+                reliaburger::relish::setup::run(reliaburger::relish::setup::SetupOptions {
+                    yes,
+                    dir: dir.clone(),
+                    release_url: release_url.clone(),
+                    binary_dir: binary_dir.clone(),
+                })
+                .await
+            }
         }
         Command::Test {
             filter,
@@ -2000,6 +2085,54 @@ mod tests {
     }
 
     #[test]
+    fn parse_managed_quickstart_and_explicit_destroy() {
+        assert!(parse(&["relish", "setup", "--quickstart", "--nodes", "3"]).is_ok());
+        assert!(parse(&["relish", "local", "status"]).is_ok());
+        assert!(parse(&["relish", "local", "destroy", "--name", "laptop", "--yes"]).is_ok());
+        assert!(parse(&["relish", "setup", "--nodes", "3"]).is_err());
+    }
+
+    #[test]
+    fn parse_join_token_file_and_reject_conflicting_credentials() {
+        assert!(
+            parse(&[
+                "relish",
+                "join",
+                "--token-file",
+                "/private/join.token",
+                "--node-id",
+                "node-02",
+                "https://10.0.1.5:9117"
+            ])
+            .is_ok()
+        );
+        assert!(
+            parse(&[
+                "relish",
+                "join",
+                "--token",
+                "secret",
+                "--token-file",
+                "/private/join.token",
+                "--node-id",
+                "node-02",
+                "https://10.0.1.5:9117"
+            ])
+            .is_err()
+        );
+        assert!(
+            parse(&[
+                "relish",
+                "join",
+                "--node-id",
+                "node-02",
+                "https://10.0.1.5:9117"
+            ])
+            .is_err()
+        );
+    }
+
+    #[test]
     fn parse_join_command() {
         let cli = parse(&[
             "relish",
@@ -2014,12 +2147,14 @@ mod tests {
         match cli.command {
             Command::Join {
                 token,
+                token_file,
                 addr,
                 node_id,
                 identity_dir,
                 ca_fingerprint,
             } => {
-                assert_eq!(token, "abc123");
+                assert_eq!(token.as_deref(), Some("abc123"));
+                assert!(token_file.is_none());
                 assert_eq!(addr, "https://10.0.1.5:9117");
                 assert_eq!(node_id, "node-02");
                 assert!(identity_dir.is_none());
@@ -2717,6 +2852,7 @@ mod tests {
                 ref dir,
                 ref release_url,
                 ref binary_dir,
+                ..
             } => {
                 assert!(!yes);
                 assert_eq!(dir.to_str(), Some("."));

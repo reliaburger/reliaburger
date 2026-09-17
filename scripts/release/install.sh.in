@@ -1,0 +1,43 @@
+#!/usr/bin/env bash
+# Generated for @VERSION@. Review this script before piping it to bash.
+# HTTPS authenticates this bootstrap; the embedded digest pins the first CLI.
+set -euo pipefail
+umask 077
+fail() { printf 'reliaburger: %s\n' "$*" >&2; exit 1; }
+command -v curl >/dev/null || fail 'curl is required'
+case "$(uname -s)-$(uname -m)" in
+  Darwin-arm64) platform=macos-aarch64; expected=@MACOS_AARCH64@ ;;
+  Darwin-x86_64) platform=macos-x86_64; expected=@MACOS_X86_64@ ;;
+  Linux-aarch64|Linux-arm64) platform=linux-aarch64; expected=@LINUX_AARCH64@ ;;
+  Linux-x86_64) platform=linux-x86_64; expected=@LINUX_X86_64@ ;;
+  *) fail 'supported CLI platforms are macOS and Linux on arm64 or x86_64' ;;
+esac
+if command -v sha256sum >/dev/null; then
+  checksum() { sha256sum "$1" | awk '{print $1}'; }
+elif command -v shasum >/dev/null; then
+  checksum() { shasum -a 256 "$1" | awk '{print $1}'; }
+else
+  fail 'sha256sum or shasum is required'
+fi
+: "${HOME:?HOME must be set}"
+bin_dir="$HOME/.reliaburger/bin"
+mkdir -p "$bin_dir"
+[ ! -d "$bin_dir/relish" ] || fail "$bin_dir/relish is a directory"
+staging=$(mktemp -d "$bin_dir/.install.XXXXXXXX")
+trap 'rm -rf "$staging"' EXIT
+trap 'exit 130' INT
+trap 'exit 143' TERM HUP
+url="https://github.com/@REPOSITORY@/releases/download/@VERSION@/relish-$platform"
+curl --fail --silent --show-error --location --proto '=https' --proto-redir '=https' \
+  --tlsv1.2 --connect-timeout 15 --max-time 180 --retry 2 "$url" -o "$staging/relish"
+[ "$(checksum "$staging/relish")" = "$expected" ] || fail 'CLI checksum mismatch; existing installation was not changed'
+chmod 755 "$staging/relish"
+mv -f "$staging/relish" "$bin_dir/relish"
+printf 'Installed Relish @VERSION@ in %s\n' "$bin_dir"
+printf 'Add this directory to PATH: %s\n' "$bin_dir"
+if [ "${1:-}" = --install-only ]; then
+  shift
+  [ "$#" -eq 0 ] || fail '--install-only takes no further arguments'
+  exit 0
+fi
+"$bin_dir/relish" setup --quickstart "$@"

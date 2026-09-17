@@ -123,13 +123,32 @@ relish wtf                   # diagnose the live cluster
 relish test --profile development
 ```
 
+The managed laptop flow is now available in the source and undergoing VM
+qualification. Once the signed release and website are published, the install
+path will be:
+
+```sh
+curl -fsSL https://reliaburger.com/install.sh | bash
+export PATH="$HOME/.reliaburger/bin:$PATH"
+relish nodes
+relish status
+# Open http://localhost:18080/
+relish local stop
+relish local start
+relish local destroy --yes   # permanently remove the cluster's VMs and data
+```
+
+See the [laptop quickstart](docs/quickstart.md) for prerequisites, single-node
+setup, retries and development qualification. The public release is still pending.
+
 See the [diagnostics guide](docs/manual/07_diagnostics.md) for test prerequisites,
 profiles and interpreting results.
 
 ## Getting to 0.1.0
 
 Node startup now verifies the agent response, version and critical subsystem
-readiness before setup reports success. The installer remains in development.
+readiness before setup reports success. Managed setup also checks the council
+and the sample app through ingress; end-to-end qualification is still in progress.
 
 The core platform is implemented. We're preparing a release that takes a
 laptop to three healthy Linux nodes and a working sample app, with no Rust

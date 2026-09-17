@@ -1,5 +1,9 @@
 # Reliaburger Documentation
 
+For managed Linux VMs on a laptop, see the [quickstart guide](quickstart.md).
+The source implementation is undergoing qualification; the signed public
+installer is pending release.
+
 User guide for building and running Reliaburger. For the full architectural vision, see the [whitepaper](whitepaper.md). For current implementation status, see [progress.md](progress.md).
 
 ## Release work

@@ -724,6 +724,38 @@ pub async fn join(
     Ok(())
 }
 
+/// Read a bounded, owner-only join credential without exposing it in process arguments.
+pub async fn read_join_token(path: &Path) -> Result<String, RelishError> {
+    use tokio::io::AsyncReadExt;
+    let file = tokio::fs::File::open(path).await?;
+    let metadata = file.metadata().await?;
+    if !metadata.is_file() || metadata.len() > 4096 {
+        return Err(RelishError::JoinFailed(
+            "invalid join token file size or type".into(),
+        ));
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        if metadata.permissions().mode() & 0o077 != 0 {
+            return Err(RelishError::JoinFailed(
+                "join token file must be owner-only (chmod 600)".into(),
+            ));
+        }
+    }
+    let mut token = String::new();
+    file.take(4097).read_to_string(&mut token).await?;
+    if token.len() > 4096
+        || token.trim().is_empty()
+        || token.trim().chars().any(char::is_whitespace)
+    {
+        return Err(RelishError::JoinFailed(
+            "invalid join token file contents".into(),
+        ));
+    }
+    Ok(token.trim().to_owned())
+}
+
 /// Normalise a member address into a base URL. A bare `host:port` assumes
 /// `https`; an explicit scheme is left untouched.
 fn normalise_member_base(addr: &str) -> String {
@@ -1859,6 +1891,26 @@ pub async fn snapshot_delete(app: &str, namespace: &str, name: &str) -> Result<(
 mod tests {
     use super::*;
     use std::io::Write as _;
+
+    #[tokio::test]
+    async fn join_token_file_rejects_exposed_empty_and_oversized_credentials() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("token");
+        crate::sesame::identity::atomic_write_mode(&path, b"one-time-token\n", Some(0o600))
+            .unwrap();
+        assert_eq!(read_join_token(&path).await.unwrap(), "one-time-token");
+        for invalid in [String::new(), "two tokens".into(), "x".repeat(4097)] {
+            std::fs::write(&path, invalid).unwrap();
+            assert!(read_join_token(&path).await.is_err());
+        }
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::write(&path, "secret").unwrap();
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
+            assert!(read_join_token(&path).await.is_err());
+        }
+    }
 
     /// Port 1 on localhost — nothing listens there, so connections
     /// are refused immediately without waiting for a timeout.

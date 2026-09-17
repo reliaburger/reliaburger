@@ -14,7 +14,7 @@ Single source of truth for what's done and what's next. Check off an item only w
 - [x] Validate setup liveness and bounded subsystem readiness (`6ee50a6`; 268 Relish tests).
 - [x] Stream registry uploads and bound writers (`1ea2b1a`; 228 registry tests, all-target Clippy).
 - [ ] Measure registry memory use under concurrent pushes in the laptop VM.
-- [ ] Package self-contained Linux agents and native laptop CLIs.
+- [x] Package self-contained Linux agents and native laptop CLIs (`c448f58`, `79b31b9`; all four hosted native builds pass).
 - [ ] Publish verifiable release metadata and signed artefacts.
 - [ ] Implement secure, resumable managed laptop clusters and installer.
 - [ ] Close the remaining correctness findings listed in the release plan.

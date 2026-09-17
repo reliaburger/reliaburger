@@ -130,6 +130,8 @@ jobs:
           pattern: binaries-*
           merge-multiple: true
           path: dist
+      - name: Mirror checksum-pinned Ubuntu guest images
+        run: python3 scripts/release/fetch_guest_images.py --directory dist
       - name: Sign complete matrix and generate release metadata
         env:
           RELIABURGER_RELEASE_KEY: ${{ secrets.RELIABURGER_RELEASE_KEY }}

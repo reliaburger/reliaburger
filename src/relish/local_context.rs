@@ -71,18 +71,7 @@ impl LocalContext {
             directory.mode(0o700);
         }
         directory.create(parent)?;
-        // Keep the lock inode in place: deleting it would let a concurrent
-        // writer lock a different inode for the same context path.
-        let mut options = std::fs::OpenOptions::new();
-        options.read(true).write(true).create(true).truncate(false);
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::OpenOptionsExt;
-            options.mode(0o600);
-        }
-        let lock = options.open(path.with_extension("lock"))?;
-        lock.try_lock()
-            .map_err(|error| RelishError::InitFailed(format!("local context is busy: {error}")))?;
+        let _lock = lock_context(path)?;
         if let Some(existing) = Self::load(path)?
             && existing.owner != self.owner
         {
@@ -92,6 +81,19 @@ impl LocalContext {
         }
         let bytes = serde_json::to_vec_pretty(self).map_err(RelishError::SerialiseJson)?;
         crate::sesame::identity::atomic_write_mode(path, &bytes, Some(0o600))?;
+        Ok(())
+    }
+
+    /// Remove the active credentials only when they belong to this operation.
+    pub fn remove_owned(path: &Path, owner: &str) -> Result<(), RelishError> {
+        let _lock = lock_context(path)?;
+        if Self::load(path)?.is_some_and(|context| context.owner == owner) {
+            std::fs::remove_file(path)?;
+            #[cfg(unix)]
+            if let Some(parent) = path.parent() {
+                std::fs::File::open(parent)?.sync_all()?;
+            }
+        }
         Ok(())
     }
 
@@ -135,18 +137,58 @@ impl LocalContext {
 
 /// The default managed context path, separate from user shell configuration.
 pub fn default_path() -> Result<PathBuf, RelishError> {
+    Ok(root_directory()?.join("context.json"))
+}
+
+fn lock_context(path: &Path) -> Result<std::fs::File, RelishError> {
+    // Keep the lock inode in place: deleting it would let a concurrent
+    // writer lock a different inode for the same context path.
+    let mut options = std::fs::OpenOptions::new();
+    options.read(true).write(true).create(true).truncate(false);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    let lock = options.open(path.with_extension("lock"))?;
+    lock.try_lock()
+        .map_err(|error| RelishError::InitFailed(format!("local context is busy: {error}")))?;
+    Ok(lock)
+}
+
+/// Managed local state root; an explicit override must be an absolute path.
+pub fn root_directory() -> Result<PathBuf, RelishError> {
+    if let Some(path) = std::env::var_os("RELIABURGER_HOME") {
+        let path = PathBuf::from(path);
+        if !path.is_absolute() {
+            return Err(RelishError::InitFailed(
+                "RELIABURGER_HOME must be absolute".into(),
+            ));
+        }
+        return Ok(path);
+    }
     dirs::home_dir()
-        .map(|home| home.join(".reliaburger/context.json"))
+        .map(|home| home.join(".reliaburger"))
         .ok_or_else(|| {
-            RelishError::InitFailed(
-                "cannot locate the home directory for the local context".to_string(),
-            )
+            RelishError::InitFailed("cannot locate the home directory for local state".into())
         })
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn removing_a_cluster_context_preserves_another_owner() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("context.json");
+        context(root.path(), "one").save(&path).unwrap();
+        LocalContext::remove_owned(&path, "two").unwrap();
+        assert!(path.exists());
+        LocalContext::remove_owned(&path, "one").unwrap();
+        assert!(!path.exists());
+        LocalContext::remove_owned(&path, "one").unwrap();
+    }
 
     fn context(root: &std::path::Path, owner: &str) -> LocalContext {
         LocalContext {

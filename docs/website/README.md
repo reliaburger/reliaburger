@@ -24,3 +24,9 @@ require GitHub sign-in and have limited retention.
 
 Update the release-status paragraph when the installer actually ships. The
 source quickstart intentionally matches `examples/phase-1/proc-first-run.toml`.
+
+`install.sh` is a small HTTPS bootstrap for the versioned release installer.
+It intentionally fails with a release-not-published message until v0.1.0 exists.
+The page labels this path as pending; remove that label only after published
+candidate qualification passes. The generated installer itself lives in the
+GitHub release, with native CLI checksums supplied by release packaging.

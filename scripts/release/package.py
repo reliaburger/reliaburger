@@ -87,6 +87,13 @@ def package_release(directory, version, repository, key, trusted_keys):
         temporary.replace(directory / name)
     (directory / "SHA256SUMS").write_text("".join(checksums))
 
+    template = Path(__file__).with_name("install.sh.in").read_text()
+    template = template.replace("@VERSION@", version).replace("@REPOSITORY@", repository)
+    for platform in PLATFORMS["relish"]:
+        marker = "@" + platform.upper().replace("-", "_") + "@"
+        template = template.replace(marker, sha256(directory / f"relish-{platform}"))
+    (directory / "install.sh").write_text(template)
+
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)

@@ -48,6 +48,29 @@ class ReleasePackageTests(unittest.TestCase):
         result = subprocess.run(["openssl", "pkeyutl", "-verify", "-rawin", "-keyform", "DER", "-inkey", str(self.key), "-in", str(path), "-sigfile", str(signature)], capture_output=True)
         self.assertNotEqual(result.returncode, 0)
 
+    def test_installer_pins_cli_hash_and_refuses_modified_download(self):
+        self.package()
+        installer = self.assets / "install.sh"
+        self.assertTrue(installer.is_file())
+        home = self.root / "home"
+        home.mkdir()
+        tools = self.root / "tools"
+        tools.mkdir()
+        (tools / "uname").write_text("#!/bin/sh\ncase \"$1\" in -s) echo Darwin;; -m) echo arm64;; esac\n")
+        (tools / "curl").write_text("#!/bin/sh\nwhile [ \"$#\" -gt 0 ]; do if [ \"$1\" = -o ]; then cp \"$FIXTURE\" \"$2\"; exit; fi; shift; done\nexit 1\n")
+        for tool in tools.iterdir():
+            tool.chmod(0o755)
+        import os
+        env = dict(os.environ, HOME=str(home), PATH=str(tools) + os.pathsep + os.environ["PATH"], FIXTURE=str(self.assets / "relish-macos-aarch64"))
+        result = subprocess.run(["bash", str(installer), "--install-only"], env=env, capture_output=True)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        installed = home / ".reliaburger/bin/relish"
+        original = installed.read_bytes()
+        (self.assets / "relish-macos-aarch64").write_bytes(b"tampered")
+        result = subprocess.run(["bash", str(installer), "--install-only"], env=env, capture_output=True)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertEqual(installed.read_bytes(), original)
+
     def test_untrusted_key_cannot_publish_metadata(self):
         self.trusted = ["ed25519:" + base64.b64encode(bytes(32)).decode()]
         with self.assertRaises(ValueError):

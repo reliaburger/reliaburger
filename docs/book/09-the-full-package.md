@@ -773,3 +773,71 @@ writes to Tokio's blocking pool. An `Arc<File>` keeps the operation lock alive
 until a write finishes, even if its awaiting task is cancelled. The tests cover
 exclusive writers, stable identity and names, changed parameters, invalid
 ownership, private bootstrap files and damaged bundles.
+
+### Download before you trust, verify before you replace
+
+The installer needs a guest image and prebuilt binaries. A partial download
+mustn't become tomorrow's cached executable. The downloader streams each body
+to a randomly named private file beside its destination, checks a running
+SHA-256 digest, flushes it, and renames it into place. A bad checksum leaves an
+existing file untouched. Cached files get checked again before reuse.
+
+Request deadlines include the response body. Size limits apply both to the
+advertised length and the bytes actually received, so chunked responses don't
+bypass them. Redirects must keep using HTTPS, and URLs can't contain credentials.
+Loopback HTTP is allowed only in test builds for the local fixture server.
+Release metadata has its own smaller limit and an explicit schema check.
+Checksum verification protects transfer integrity; the release signature remains
+a separate check before executing a downloaded Reliaburger binary.
+
+VM configuration disables host directory mounts and automatic port forwarding.
+Only the API ports and the first node's HTTP ingress get loopback forwards.
+Nodes use the shared guest network for authenticated cluster traffic, with a
+rootful runc runtime and embedded eBPF. The DNS listener binds that shared IP,
+leaving Ubuntu's loopback resolver alone. Systemd owns the agent process and
+its journal instead of a detached shell process with an uncertain lifetime.
+
+A join token can now come from `relish join --token-file`. It must be a small,
+nonempty, owner-only file. This lets provisioning copy the token into a private
+guest directory without exposing it in the host or guest process arguments.
+The existing `--token` option remains available for manual use. Clap enforces
+that you supply exactly one source; both routes use the same pinned-CA join.
+
+### Put the steps together
+
+`setup --quickstart` wraps the whole operation in one five-minute deadline.
+Each completed external step gets a durable checkpoint. VM boots run through
+`FuturesUnordered`, a collection of futures polled concurrently that yields
+results as they finish. A future is Rust's suspended asynchronous computation;
+putting several in this stream lets one VM boot while another waits for package
+installation. We persist each result before moving on. Dropping a timed-out
+Lima command kills its direct child; VMs already created remain recorded for
+resume or explicit cleanup.
+
+The first node receives the saved bootstrap identity. Subsequent nodes generate
+their own keys through the ordinary pinned-CA join protocol, using short-lived,
+node-bound tokens. The host never invents a second CA on a retry. Guest file
+replacement uses a staging file and rename, which also permits recovery when
+a previous attempt already started the executable being installed.
+
+API readiness alone isn't the finish line. We check the running binary version,
+all owned nodes, council membership and leader, then deploy a digest-pinned
+BusyBox HTTP server. The last probe goes through the host ingress port and
+checks the response body. Only then do we save the active host context and
+print success. This is the distinction between having started processes and
+having demonstrated a usable cluster. Real-VM qualification still has to prove
+these steps work together, and a published candidate with empty caches must
+meet the timing target before we advertise it.
+
+The release mirrors the dated Ubuntu images named in `guest-images.json`.
+Ubuntu can retire older dated downloads; keeping the verified bytes with the
+release preserves reproducibility. The native CLI embeds the same manifest.
+A developer can explicitly supply local Linux binaries for testing before a
+release exists, but that path prints a notice and cannot qualify the signed
+installer. `RELIABURGER_HOME` isolates its state from a normal installation.
+
+Lifecycle commands hold the operation lock and use only its saved VM names.
+Stopping preserves disks. Destroying requires `--yes`, removes the owned VMs,
+and removes the active context only if its owner matches. We preserve the lock
+file's inode: deleting it while holding the lock would let another process
+create a new file at the same path and acquire a different lock.

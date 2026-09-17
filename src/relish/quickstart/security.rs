@@ -28,6 +28,11 @@ impl Bootstrap {
     }
 }
 
+/// Validate existing bootstrap credentials without generating or changing them.
+pub fn existing(operation: &Operation) -> Result<Bootstrap, RelishError> {
+    load(operation, &operation.directory.join("security"))
+}
+
 /// Generate credentials once, or validate and reuse the complete existing bundle.
 /// Call this on the blocking pool before creating any VM.
 pub fn prepare(operation: &Operation) -> Result<Bootstrap, RelishError> {

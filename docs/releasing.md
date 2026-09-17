@@ -68,3 +68,24 @@ Before tagging 0.1.0, complete the managed-cluster and clean-install gates in th
 release plan. Record timing from an empty cache, the actual artefact digests,
 host and guest versions, memory use, and the successful sample workload. Don't
 publish a five-minute claim from a source build or a warmed VM.
+
+## Guest images and bootstrap installer
+
+The release job mirrors the two dated Ubuntu images in
+`scripts/release/guest-images.json`, verifying SHA-256 before publication. The
+CLI embeds that same manifest and verifies its downloaded image. Update the
+manifest deliberately when changing the guest baseline; don't introduce an
+unpinned `current` fallback.
+
+Packaging generates `install.sh` with the exact native CLI checksums. The
+static `docs/website/install.sh` fetches that versioned installer over HTTPS.
+The CLI then verifies the project signatures on its Linux binaries. HTTPS is
+the initial bootstrap trust boundary; the shell script doesn't claim to verify
+its own signature. Both scripts finish downloads before executing them and
+leave an existing CLI untouched on a checksum failure.
+
+See [quickstart.md](quickstart.md) for the managed workflow. Before publishing,
+run it from the signed candidate with empty caches, including three-node and
+single-node runs, interruption/resume, stop/start and destroy. A run using
+`--development-binaries` is useful integration evidence but doesn't replace
+this gate. The installer and five-minute promise remain pending until it passes.

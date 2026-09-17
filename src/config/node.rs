@@ -158,10 +158,9 @@ impl DnsSection {
 /// network faults, Sesame egress allowlists).
 ///
 /// Disabled by default: loading eBPF programs needs root, a 5.7+ kernel
-/// and cgroup v2, and it is Linux-only. `program_dir` defaults to the
-/// directory the build compiled the `.bpf.o` objects into (baked in at
-/// build time), so a dev/Lima build "just works" with `enabled = true`;
-/// a packaged install points it at the installed objects.
+/// and cgroup v2, and it is Linux-only. Builds with the `ebpf` feature embed
+/// the matching object, so packaged binaries need no build directory.
+/// `program_dir` explicitly overrides the embedded object for development.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct EbpfSection {
