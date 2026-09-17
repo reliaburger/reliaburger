@@ -512,3 +512,24 @@ Local rollup receipts prevent repeated ingestion by one aggregator. Cluster quer
 merging also retains the original worker/minute/series key, so reassignment to
 another aggregator cannot double-count overlapping history. Chapter 11 explains
 the owned-row endpoint and its persistence and HTTP regressions.
+
+
+### A worker does not need a listening socket
+
+During Linux upgrade qualification, one node could not bind its API. A reporting
+worker on another node had taken that port with an ephemeral listener. Why was
+it listening? The same transport type had been used for both ends of reporting,
+even though workers only send snapshots and rollups.
+
+`TcpReportingSender` implements the existing `ReportingTransport` trait with the
+same framing, TLS connector and node fault gate. Its receive method returns
+`None` immediately. It owns no listener or accept task. The aggregator keeps the
+full transport because it actually receives reports. This also removes two
+unused sockets and tasks from every node.
+
+The transport regression checks fault-gated delivery and the absence of an
+inbound stream. The integration test sends reports from two outbound-only
+workers to a real TCP aggregator. Upgrade tests also bound HTTP requests, so a
+socket that accepts connections without answering cannot hide the failure
+behind an unbounded read. These checks fix the observed listener collision;
+they do not establish that every upgrade failure has the same cause.

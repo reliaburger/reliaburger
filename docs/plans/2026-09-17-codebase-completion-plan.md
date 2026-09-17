@@ -37,7 +37,7 @@ F items are missing capabilities, not evidence of failures in supported behaviou
 [Audit evidence and reproducible probes](../qualification/2026-09-17-code-audit.md)
 record those distinctions and the hosted checks inspected.
 
-There are **72 tracked work packages**: 43 correctness/contract items, 12
+There are **73 tracked work packages**: 44 correctness/contract items, 12
 engineering follow-ups, 12 capability families and five acceptance/release gates.
 The correctness items include 19 P1 priorities; these are engineering priorities, not
 security severity ratings. A capability family can require several commits.
@@ -550,6 +550,19 @@ Evidence: `src/onion/dns.rs:DnsConfig::default_namespace`.
 Bare app.internal names use the node's configured default namespace, not the source workload's namespace.
 
 **Completion test:** Same-named apps in two namespaces resolve correctly from their own workloads, including TCP/UDP and qualified names; unknown source identity fails explicitly.
+
+### C44 — Remove unused reporting worker listeners
+
+**Priority:** P2. **Wave:** 3. **Book chapters:** 06, 14.
+
+Linux upgrade qualification found a reporting worker holding an ephemeral TCP
+listener on a port allocated to another node's API. Snapshot and rollup workers
+only send messages; neither consumes incoming connections.
+
+**Completion test:** Outbound-only workers deliver real TCP reports, respect the
+node fault gate and own no receive loop. Bound upgrade-harness HTTP requests and
+include the address in API bind errors. The separate intermittent cluster
+upgrade stall remains a release qualification blocker under V02.
 
 ## Engineering follow-ups
 

@@ -178,6 +178,44 @@ const MAX_REPORT_SIZE: usize = 1_048_576;
 /// stalled peer (partial length prefix, half-open TLS) must not hold the task.
 const REPORT_ACCEPT_DEADLINE: std::time::Duration = std::time::Duration::from_secs(10);
 
+/// Outbound-only reporting transport for worker snapshots and rollups.
+/// It owns no listening socket or accept task, so workers cannot occupy a
+/// service port while that service is restarting.
+pub struct TcpReportingSender {
+    connector: Option<tokio_rustls::TlsConnector>,
+    node_gate: crate::smoker::node_fault::NodeTransportGate,
+}
+
+impl TcpReportingSender {
+    /// Create a sender retaining the cluster's TLS identity and fault gate.
+    pub fn new(
+        connector: Option<tokio_rustls::TlsConnector>,
+        node_gate: crate::smoker::node_fault::NodeTransportGate,
+    ) -> Self {
+        Self {
+            connector,
+            node_gate,
+        }
+    }
+}
+
+impl ReportingTransport for TcpReportingSender {
+    async fn send(
+        &self,
+        target: SocketAddr,
+        message: &ReportingMessage,
+    ) -> Result<(), ReportingError> {
+        if self.node_gate.is_quiesced() {
+            return Ok(());
+        }
+        TcpReportingTransport::send_framed(target, message, self.connector.as_ref()).await
+    }
+
+    async fn recv(&self) -> Option<InboundReport> {
+        None
+    }
+}
+
 /// Real TCP transport for reporting tree messages.
 ///
 /// Uses length-prefixed framing: 4-byte big-endian length + bincode payload.
@@ -619,10 +657,11 @@ mod tests {
     async fn node_transport_gate_drops_and_then_restores_reports() {
         let shutdown = tokio_util::sync::CancellationToken::new();
         let gate = crate::smoker::node_fault::NodeTransportGate::new();
-        let t1 =
-            TcpReportingTransport::bind_with_node_gate(addr(0), shutdown.clone(), gate.clone())
-                .await
-                .unwrap();
+        let t1 = TcpReportingSender::new(None, gate.clone());
+        assert!(
+            t1.recv().await.is_none(),
+            "send-only workers have no inbound listener"
+        );
         let t2 = TcpReportingTransport::bind(addr(0), shutdown.clone())
             .await
             .unwrap();

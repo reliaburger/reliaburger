@@ -40,7 +40,7 @@ use crate::mustard::protocol::MustardNode;
 use crate::mustard::state::NodeState;
 use crate::mustard::transport::UdpMustardTransport;
 use crate::reporting::aggregator::{AggregatedState, ReportAggregator};
-use crate::reporting::transport::TcpReportingTransport;
+use crate::reporting::transport::{TcpReportingSender, TcpReportingTransport};
 use crate::reporting::worker::ReportWorker;
 
 /// How often the leader reconciles the council against gossip membership.
@@ -567,17 +567,9 @@ pub async fn start(
     );
 
     // Worker: snapshots this node's state (via the agent) and sends it to the
-    // leader. Binds an ephemeral port — it only sends; replies are ignored.
+    // leader. It has no listener: replies are not part of this protocol.
     let (snapshot_tx, snapshot_rx) = mpsc::channel(16);
-    let worker_transport = TcpReportingTransport::bind_tls_with_node_gate(
-        SocketAddr::new(params.gossip_addr.ip(), 0),
-        shutdown.clone(),
-        raft_acceptor.clone(),
-        raft_connector.clone(),
-        node_gate.clone(),
-    )
-    .await
-    .map_err(|e| std::io::Error::other(format!("reporting worker bind failed: {e}")))?;
+    let worker_transport = TcpReportingSender::new(raft_connector.clone(), node_gate.clone());
     let rollup_council_rx = council_rx.clone();
     let mut worker = ReportWorker::new(
         NodeId::new(&params.node_name),
@@ -594,15 +586,7 @@ pub async fn start(
     // Rollup worker: pushes this node's metric rollups to the leader,
     // where the aggregator ingests them into the rollup store.
     if let Some(mayo) = params.mayo.clone() {
-        let rollup_transport = TcpReportingTransport::bind_tls_with_node_gate(
-            SocketAddr::new(params.gossip_addr.ip(), 0),
-            shutdown.clone(),
-            raft_acceptor.clone(),
-            raft_connector.clone(),
-            node_gate.clone(),
-        )
-        .await
-        .map_err(|e| std::io::Error::other(format!("rollup worker bind failed: {e}")))?;
+        let rollup_transport = TcpReportingSender::new(raft_connector.clone(), node_gate.clone());
         let mut rollup_worker = crate::mayo::rollup_worker::RollupWorker::new(
             NodeId::new(&params.node_name),
             rollup_transport,

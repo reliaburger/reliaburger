@@ -1805,7 +1805,9 @@ async fn run_agent(cli: Cli) -> anyhow::Result<()> {
     if no_tokens {
         refuse_open_non_loopback_bind(&cli.listen)?;
     }
-    let listener = tokio::net::TcpListener::bind(&cli.listen).await?;
+    let listener = tokio::net::TcpListener::bind(&cli.listen)
+        .await
+        .with_context(|| format!("failed to bind Bun API on {}", cli.listen))?;
     println!("bun: API server listening on {}", cli.listen);
 
     // L10: the catalog used to be `default()` on every boot — image

@@ -244,7 +244,11 @@ retain_versions = 3
         let harness = Self {
             _root: root,
             nodes,
-            client: reqwest::Client::new(),
+            client: reqwest::Client::builder()
+                .connect_timeout(Duration::from_secs(2))
+                .timeout(Duration::from_secs(5))
+                .build()
+                .unwrap(),
             release_pkcs8,
             external_pkcs8,
             service_token,
