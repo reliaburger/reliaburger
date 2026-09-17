@@ -175,7 +175,29 @@ Record the commit and exact build in progress; update the owning book chapter.
 Do not change a verdict to “passed” merely because missing evidence is inconvenient.
 
 
-Documentation verification: all 71 plan IDs match unique unchecked entries in
+Documentation verification: all 72 plan IDs match unique unchecked entries in
 progress; all 136 relative Markdown links checked across the changed documents
 resolve to existing paths. `cargo fmt` and `git diff --check` pass. These checks
 validate the audit artefacts, not the unimplemented completion tests.
+
+
+## Dependency alert discovered during publication of this audit
+
+GitHub's push response reported an open moderate dependency vulnerability. A
+read-only query of [Dependabot alert #13](https://github.com/reliaburger/reliaburger/security/dependabot/13)
+returned `open`, package `thrift`, GHSA-2f9f-gq7v-9h6m / CVE-2026-43868,
+versions `< 0.23.0`, first patched version `0.23.0`. The alert was created and last
+updated on 24 July 2026. Its title is “Apache Thrift has a Memory Allocation with
+Excessive Size Value Vulnerability”.
+
+`cargo tree --locked --offline -i thrift` confirms an active compiled path:
+
+```text
+thrift 0.17.0 → parquet 54.3.1 → datafusion 45.0.0 → reliaburger
+```
+
+This does not prove the affected parser is reachable through a public Reliaburger
+endpoint. H12 retains that analysis and dependency remediation as a publication
+prerequisite. The recorded RustSec pass and five exceptions remain accurate;
+neither closes this separate GitHub advisory. No dependency was modified or
+alert dismissed during the documentation audit.

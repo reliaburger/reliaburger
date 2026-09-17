@@ -37,7 +37,7 @@ F items are missing capabilities, not evidence of failures in supported behaviou
 [Audit evidence and reproducible probes](../qualification/2026-09-17-code-audit.md)
 record those distinctions and the hosted checks inspected.
 
-There are **71 tracked work packages**: 43 correctness/contract items, 11
+There are **72 tracked work packages**: 43 correctness/contract items, 12
 engineering follow-ups, 12 capability families and five acceptance/release gates.
 The correctness items include 19 P1 priorities; these are engineering priorities, not
 security severity ratings. A capability family can require several commits.
@@ -74,7 +74,7 @@ candidate installs, the complete real catalogue and sustained recovery remain op
 | Deployments and upgrade | Rolling deployment records, adoption, coordinator quorum/rejoin checks | C05, C07, C37–C38; V02 |
 | CLI, TUI and dashboard | Diagnostics, catalogue commands, managed setup and cluster status | C17, C23–C33, C39, C41; F07, F11 |
 | Chaos and test ownership | Server grants, app/namespace leases, guarded cases | C06–C12, C29–C36; V01 |
-| Build, docs and distribution | Installer, signed-release tooling, static website and hosted build matrix | H01–H11; V03–V05 |
+| Build, docs and distribution | Installer, signed-release tooling, static website and hosted build matrix | H01–H12; V03–V05 |
 
 ## Implementation order and release boundary
 
@@ -94,7 +94,7 @@ quietly becoming prerequisites for the laptop release.
 4. **Make diagnostics and acceptance verdicts trustworthy.** C23–C36, C38, C41.
    Exact lease ownership and fixtures precede the complete catalogue; benchmark
    verdict fixes precede using comparisons as release evidence.
-5. **Finish engineering follow-ups.** H01–H11. Optional module/parser changes can
+5. **Finish engineering follow-ups.** H01–H12. Optional module/parser changes can
    be deliberately deferred with a recorded reason; they are not release blockers.
 6. **Implement declared missing capabilities in roadmap order.** F01–F12. Each
    family needs a separate supported contract. Future Windows/federation/TPM work
@@ -108,7 +108,7 @@ in a document is insufficient for a data-loss or unsafe-operation path. P2 items
 also need a release disposition: fixed, enforced unsupported boundary, or a
 specific documented limitation and follow-up. Do not treat optional H refactors
 or all F families as mandatory 0.1.0 work. Keep the original release gate open
-until those dispositions and V01–V04 evidence exist.
+until those dispositions, H12 dependency triage and V01–V04 evidence exist.
 
 For each fix, write a regression that demonstrates the intended behaviour, make
 it pass, and commit that fix separately. Do not combine independent fixes merely
@@ -662,6 +662,29 @@ Evidence: `Cargo.toml`; `.github/workflows/build.yml`; `docs/README.md`.
 The README promises Rust 1.85+, Cargo declares no rust-version and CI uses moving stable. The promised minimum and reproducible release baseline are unqualified.
 
 **Completion test:** Select a toolchain compatible with the locked dependency graph; test the declared minimum and pin release builds, updating documentation and upgrade/rebuild policy.
+
+### H12 — Resolve the active Thrift dependency alert
+
+**Priority:** P2. **Wave:** 5, before candidate publication. **Book chapters:** 05, 06, 15.
+
+Evidence: `Cargo.lock:thrift 0.17.0`; `cargo tree --locked --offline -i thrift`;
+[Dependabot alert #13](https://github.com/reliaburger/reliaburger/security/dependabot/13).
+
+GitHub reports GHSA-2f9f-gq7v-9h6m / CVE-2026-43868, “Apache Thrift has a Memory
+Allocation with Excessive Size Value Vulnerability”, as open, medium severity,
+affecting versions below 0.23.0. The current branch still compiles Thrift 0.17.0
+through Parquet 54.3.1 and DataFusion 45.0.0. This is separate from the five
+RustSec exceptions, and green `cargo audit` does not resolve it. The dependency
+path is confirmed; reachability of the affected parser from attacker-controlled
+input has not been established by this audit.
+
+**Completion test:** trace the affected allocation through the actual Parquet
+reader, identify input bounds and trust boundaries, and upgrade/remove the affected
+dependency or document a reviewed, evidence-backed disposition before publishing.
+Keep storage compatibility/query tests and a bounded malformed-input regression
+where the path is reachable. Reconcile GitHub and RustSec findings in CI rather
+than assuming one feed covers the other. Do not dismiss the alert solely because
+the other audit tool is green.
 
 ## Missing capabilities and longer-term scope
 

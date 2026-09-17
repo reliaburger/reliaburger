@@ -23,7 +23,7 @@ for every item below. IDs are scoped to that plan, not the older C1/M1 review ID
 The [audit record](qualification/2026-09-17-code-audit.md) separates local defect
 reproductions from inspected source and previous acceptance evidence.
 
-These are work packages, not 71 mandatory features for 0.1.0. Correctness fixes
+These are work packages, not 72 mandatory features for 0.1.0. Correctness fixes
 need explicit release dispositions; optional refactors and future capabilities
 remain separate. Older unchecked groups below point into this current ledger.
 
@@ -86,6 +86,8 @@ remain separate. Older unchecked groups below point into this current ledger.
 - [ ] **H09** (P3) Complete node-pressure diagnostic hygiene.
 - [ ] **H10** (P3) Reuse one egress observation per health tick.
 - [ ] **H11** (P2) Declare and test the actual Rust/toolchain baseline.
+
+- [ ] **H12** (P2) Resolve the active Thrift dependency alert and qualify its parsing path before publication.
 
 ### Missing capabilities and longer-term scope
 
