@@ -2882,3 +2882,23 @@ BusyBox's HTTP server as UID 123 and GID 456 with `/work` as its current directo
 and reads the file through a published host port. It then verifies process
 identity, working directory and the root mount's read-only flag from inside the
 container. Finally, it removes only that test's container.
+
+### Reuse the probe client and distinguish local errors
+
+A node may probe hundreds of containers every second. Constructing a new HTTP
+client for each probe repeatedly builds connection pools and TLS configuration.
+The probe module now keeps one client in `OnceLock`, a standard-library cell
+which initialises a value once and then shares immutable access. Reqwest handles
+the pool's internal synchronisation. Each request still has its own deadline;
+sharing a client doesn't give a slow workload extra time.
+
+Client construction can fail, so the cell contains a `Result`, not a client
+created with `unwrap()`. Malformed probe requests and client setup errors return
+`ProbeError`. They are local failures, distinct from a workload refusing a
+connection. The agent reports them and schedules another probe without changing
+that workload's failure counters. Deploy health gates return the error directly.
+
+These probes target local workloads, so they bypass shell proxy settings and
+don't follow redirects. A 302 isn't a successful health response. Tests exercise
+two requests over one HTTP connection, malformed targets, redirects, timeouts,
+and a healthy workload retaining its state after a local probe failure.

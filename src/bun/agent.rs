@@ -181,7 +181,9 @@ async fn wait_instance_healthy<G: Grill>(
     // so a tight `health_timeout` degrades to a single-shot check rather than
     // failing without ever asking the app.
     loop {
-        last_status = crate::bun::probe::probe_health(&config, &host).await;
+        last_status = crate::bun::probe::probe_health(&config, &host)
+            .await
+            .map_err(|error| format!("{}: {error}", id.0))?;
         if last_status == crate::bun::health::HealthStatus::Healthy {
             consecutive += 1;
             if consecutive >= config.threshold_healthy {
@@ -479,7 +481,7 @@ enum DeployOp {
     HealthProbeResult {
         instance_id: InstanceId,
         created_at: Instant,
-        status: super::health::HealthStatus,
+        status: Result<super::health::HealthStatus, super::probe::ProbeError>,
     },
     /// Enforce the image trust policy; returns the digest-pinned image, if any.
     EnforceImageSignature {
@@ -5835,7 +5837,7 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
         &mut self,
         instance_id: InstanceId,
         created_at: Instant,
-        status: super::health::HealthStatus,
+        status: Result<super::health::HealthStatus, super::probe::ProbeError>,
     ) {
         self.health_inflight.remove(&instance_id);
         let now = Instant::now();
@@ -5854,6 +5856,16 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
         {
             return;
         }
+        let status = match status {
+            Ok(status) => status,
+            Err(error) => {
+                eprintln!("bun: {}: {error}", instance_id.0);
+                self.supervisor
+                    .health_checker_mut()
+                    .schedule_next(instance_id, now);
+                return;
+            }
+        };
         let transition = self.supervisor.process_health_result(&instance_id, status);
 
         // Propagate health transitions to the service map, noting the
@@ -10356,6 +10368,44 @@ host = "remote.local"
                 .lookup("remote.local", "/")
                 .is_none()
         );
+    }
+
+    #[tokio::test]
+    async fn local_probe_failure_does_not_restart_a_healthy_workload() {
+        let (mut agent, _tx, _shutdown, _grill) = test_agent_with_grill();
+        let (events, _receiver) = mpsc::channel(64);
+        agent.deploy(config_with_health(), &events).await;
+        let instance = agent.supervisor.list_instances()[0];
+        let id = instance.id.clone();
+        let created_at = instance.created_at;
+        for _ in 0..3 {
+            agent
+                .complete_health_probe(
+                    id.clone(),
+                    created_at,
+                    Ok(super::super::health::HealthStatus::Healthy),
+                )
+                .await;
+        }
+        assert_eq!(
+            agent.supervisor.get_instance(&id).unwrap().state,
+            ContainerState::Running
+        );
+        for _ in 0..3 {
+            agent
+                .complete_health_probe(
+                    id.clone(),
+                    created_at,
+                    Err(super::super::probe::ProbeError::Client(
+                        "local TLS setup failed".into(),
+                    )),
+                )
+                .await;
+        }
+        let instance = agent.supervisor.get_instance(&id).unwrap();
+        assert_eq!(instance.state, ContainerState::Running);
+        assert_eq!(instance.health_counters.consecutive_unhealthy, 0);
+        assert_eq!(instance.restart_count, 0);
     }
 
     #[tokio::test]
