@@ -552,7 +552,7 @@ path = "/"
 }
 
 /// Assemble the first node's on-disk identity from the init result.
-fn node_identity_from_init(
+pub(super) fn node_identity_from_init(
     init_result: &crate::sesame::init::InitResult,
 ) -> Result<crate::sesame::identity_store::NodeIdentity, RelishError> {
     use crate::sesame::types::CaRole;

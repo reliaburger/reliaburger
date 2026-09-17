@@ -753,3 +753,23 @@ certificate name. Rustls performs the certificate and signature verification;
 we supply the trust anchors and policy. Live TLS tests prove both that the
 right CA works and that an unrelated CA fails. WebSocket connection setup also
 has a deadline, so a stalled handshake can't hang the TUI indefinitely.
+
+### Resume the operation, don't create a second cluster
+
+Quickstart records its ownership identifier and all VM names before it runs a
+VM command. A retry opens the same checkpoint under an exclusive file lock.
+Changing the requested version, node count or ports is an error; a retry isn't
+an implicit upgrade or resize. VM names include the ownership identifier, and
+state validation refuses unrelated names before lifecycle commands can use them.
+
+Bootstrap preparation follows the same rule. We generate the CA hierarchy,
+first node identity, master key and administrator token in a private staging
+directory, then rename the complete bundle into place. A retry validates that
+bundle and reuses it. A missing commit marker, mismatched CA or wrong master key
+is an error, never a reason to generate another identity for running VMs.
+
+Checkpoints use the durable writer described in Chapter 4. Async callers send
+writes to Tokio's blocking pool. An `Arc<File>` keeps the operation lock alive
+until a write finishes, even if its awaiting task is cancelled. The tests cover
+exclusive writers, stable identity and names, changed parameters, invalid
+ownership, private bootstrap files and damaged bundles.

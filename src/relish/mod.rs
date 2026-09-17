@@ -30,6 +30,7 @@ pub mod local_context;
 pub mod manual;
 pub mod output;
 pub mod plan;
+pub mod quickstart;
 pub mod reader;
 pub mod readiness;
 pub mod setup;
