@@ -47,7 +47,7 @@ remain separate. Older unchecked groups below point into this current ledger.
 - [x] **C16** Return contextual errors for invalid DNS/common-name SANs and a root role passed to intermediate issuance. Both former panic paths have failing-before regressions; all 16 CA tests pass.
 - [x] **C17** Reject overflowing relative durations with checked multiplication and parse units at UTF-8 boundaries. The overflow regression fails before the fix; all 34 CLI command tests pass, including multibyte invalid input.
 - [x] **C18** Scan candidates once from a random starting point, preserving concurrency and out-of-range adoption semantics. The nearly-full-pool regression fails before the fix; all 16 allocator tests pass.
-- [ ] **C19** (P2) Count only successful metric-file pruning.
+- [x] **C19** Count successful metric/rollup deletions only, expose removal and directory-enumeration errors with paths, and ignore concurrent NotFound without counting it. Both failing-removal regressions fail before the fix; all 171 Mayo tests pass.
 - [ ] **C20** (P1) Deduplicate rollup ownership at query merge.
 - [ ] **C21** (P2) Bound and chunk reporting payloads.
 - [ ] **C22** (P2) Bound export checkpoint growth safely.

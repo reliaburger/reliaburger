@@ -479,3 +479,15 @@ The directory regression runs on both supported host platforms. The invalid-byte
 filename regression is Linux-only: macOS APFS rejects that filename when creating
 the fixture, before our exporter can inspect it. That platform boundary belongs
 in the test definition rather than a silent successful early return.
+
+### Retention counts successful removals
+
+Metrics and rollup pruning previously ignored `remove_file` errors and incremented
+the deletion count anyway. A directory named `blocked.parquet` was enough to make
+both stores claim they had reclaimed a file that still existed. They now increment
+only after a successful removal and return filesystem failures with the affected
+path. A concurrent `NotFound` is harmless but does not count as our deletion;
+a not-yet-created store directory remains an empty store. Directory enumeration
+errors also reach the caller. A failed pass can have removed earlier files, so
+callers must treat its error as incomplete retention, not an all-or-nothing rollback.
+Both store regressions verify that the failed candidate's contents survive.
