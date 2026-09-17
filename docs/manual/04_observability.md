@@ -23,6 +23,11 @@ relish logs-export --dest ./archive
 relish logs-search ./archive "SELECT count(*) FROM logs WHERE line LIKE '%error%'"
 ```
 
+To export a local store directly, including a custom store while its agent is
+stopped, use `relish logs-export --source /path/to/parquet --dest ./archive`.
+If files copy but the checkpoint cannot be saved, the command exits non-zero
+and explains that a later export may repeat them.
+
 ## Metrics
 
 System, per-app and Prometheus-endpoint metrics are collected on every node:

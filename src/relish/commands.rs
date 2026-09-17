@@ -236,12 +236,22 @@ async fn logs_with_client(
 /// Parquet store directly, preferring the agent's default
 /// `/var/lib/reliaburger/logs/parquet` and then the per-user data dir (the
 /// same order bun itself uses); a custom `[storage] logs` path is only
-/// reachable through the agent.
-pub async fn logs_export(dest: &Path, node_id: &str) -> Result<(), RelishError> {
-    let dest_str = dest.to_string_lossy();
+/// reachable through the agent or an explicit `source` directory.
+pub async fn logs_export(
+    dest: &Path,
+    node_id: &str,
+    source: Option<&Path>,
+) -> Result<(), RelishError> {
+    let dest_str = dest.to_str().ok_or_else(|| RelishError::InvalidFlag {
+        flag: "--dest".into(),
+        reason: "destination must be valid UTF-8".into(),
+    })?;
+    if let Some(source) = source {
+        return logs_export_from(source, dest_str, node_id).await;
+    }
     let client = BunClient::default_local();
     if client.health().await.is_ok() {
-        let outcome = client.logs_export(&dest_str).await?;
+        let outcome = client.logs_export(dest_str).await?;
         if outcome.files_exported == 0 {
             println!("no new files to export");
         } else {
@@ -282,20 +292,28 @@ pub async fn logs_export(dest: &Path, node_id: &str) -> Result<(), RelishError> 
             ),
         });
     };
-    logs_export_from(&source, dest, node_id).await
+    logs_export_from(&source, dest_str, node_id).await
 }
 
-async fn logs_export_from(source: &Path, dest: &Path, node_id: &str) -> Result<(), RelishError> {
+async fn logs_export_from(source: &Path, dest_str: &str, node_id: &str) -> Result<(), RelishError> {
     use crate::ketchup::export::{CHECKPOINT_FILENAME, ExportCheckpoint, export_logs};
 
     // X8: share Bun's one authoritative checkpoint, not a competing Relish
     // copy. Whichever process exports last records into the same file, so a
     // manual `relish logs-export` and the agent's export loop can't
     // double-ship or skip each other's files.
+    let _entries = tokio::fs::read_dir(source)
+        .await
+        .map_err(|error| RelishError::ApiError {
+            status: 0,
+            body: format!(
+                "cannot read log export source {}: {error}",
+                source.display()
+            ),
+        })?;
     let checkpoint_path = source.join(CHECKPOINT_FILENAME);
     let mut checkpoint = ExportCheckpoint::load(&checkpoint_path);
 
-    let dest_str = dest.to_str().unwrap_or(".");
     match export_logs(source, dest_str, node_id, &mut checkpoint).await {
         Ok(result) => {
             if result.files_exported == 0 {

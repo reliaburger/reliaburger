@@ -90,6 +90,9 @@ enum Command {
     /// Export Parquet log files to a destination directory.
     #[command(name = "logs-export")]
     LogsExport {
+        /// Export this local Parquet directory without contacting an agent.
+        #[arg(long)]
+        source: Option<PathBuf>,
         /// Destination directory path.
         #[arg(long)]
         dest: PathBuf,
@@ -1084,9 +1087,10 @@ async fn main() -> ExitCode {
             .await
         }
         Command::LogsExport {
+            ref source,
             ref dest,
             ref node_id,
-        } => commands::logs_export(dest, node_id).await,
+        } => commands::logs_export(dest, node_id, source.as_deref()).await,
         Command::LogsSearch {
             ref source,
             ref sql,

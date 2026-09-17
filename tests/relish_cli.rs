@@ -86,3 +86,55 @@ fn endpoint_environment_rejects_remote_plaintext_before_dispatch() {
     assert!(output.stdout.is_empty());
     assert!(String::from_utf8_lossy(&output.stderr).contains("must use HTTPS"));
 }
+#[test]
+fn offline_log_export_persists_progress_between_runs() {
+    let dir = tempfile::tempdir().unwrap();
+    let source = dir.path().join("source");
+    std::fs::create_dir(&source).unwrap();
+    std::fs::write(source.join("logs.parquet"), b"exported bytes").unwrap();
+    for expected in ["exported 1 file(s)", "no new files to export"] {
+        let output = Command::new(env!("CARGO_BIN_EXE_relish"))
+            .args(["logs-export", "--source"])
+            .arg(&source)
+            .arg("--dest")
+            .arg(dir.path().join("dest"))
+            .env("RELIABURGER_HOME", dir.path().join("home"))
+            .output()
+            .unwrap();
+        assert!(output.status.success(), "{:?}", output);
+        assert!(String::from_utf8_lossy(&output.stdout).contains(expected));
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn offline_log_export_rejects_a_non_utf8_destination() {
+    use std::os::unix::ffi::OsStringExt;
+    let dir = tempfile::tempdir().unwrap();
+    let output = Command::new(env!("CARGO_BIN_EXE_relish"))
+        .args(["logs-export", "--source"])
+        .arg(dir.path())
+        .arg("--dest")
+        .arg(std::ffi::OsString::from_vec(vec![0xff]))
+        .env("RELIABURGER_HOME", dir.path().join("home"))
+        .output()
+        .unwrap();
+    assert!(!output.status.success());
+    assert!(output.stdout.is_empty());
+    assert!(String::from_utf8_lossy(&output.stderr).contains("UTF-8"));
+}
+
+#[test]
+fn offline_log_export_rejects_a_missing_source() {
+    let dir = tempfile::tempdir().unwrap();
+    let output = Command::new(env!("CARGO_BIN_EXE_relish"))
+        .args(["logs-export", "--source"])
+        .arg(dir.path().join("missing"))
+        .arg("--dest")
+        .arg(dir.path().join("dest"))
+        .env("RELIABURGER_HOME", dir.path().join("home"))
+        .output()
+        .unwrap();
+    assert!(!output.status.success());
+    assert!(output.stdout.is_empty());
+}
