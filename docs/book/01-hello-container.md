@@ -2921,3 +2921,14 @@ the string length. Invalid non-ASCII units therefore return an error too, rather
 than panicking while slicing a UTF-8 string. The regression covers overflowing
 minutes, hours and days as well as multibyte units; ordinary durations retain
 their existing saturating subtraction from the current epoch time.
+
+### Find the free port before declaring exhaustion
+
+If only one port is free in a large range, a thousand random guesses will usually
+miss it. That is not exhaustion. The allocator now chooses a random starting
+point and visits each candidate once, wrapping around the configured range.
+Its existing Tokio mutex covers the entire selection, so concurrent callers
+cannot receive the same reservation. Adopted ports outside the range still do
+not consume its capacity. A regression reserves 63,999 of 64,000 candidates and
+repeatedly allocates and releases the final free port; the concurrent allocation
+tests check uniqueness too.
