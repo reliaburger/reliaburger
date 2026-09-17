@@ -2287,3 +2287,30 @@ The regression runs the public catalogue case against a controlled HTTP server.
 One server deliberately records only the first version; another records both.
 The first must fail and the second must pass. This checks the test's verdict,
 not just the implementation it claims to test.
+
+Ingress acceptance needs a known answer. The container fixture now creates its
+own response file and uses absolute BusyBox commands; it no longer assumes the
+image has a `PATH` or `/etc/hostname`. The test polls until both status and body
+match, sharing the case deadline with deployment. Stopping an app removes the
+desired route, so that case expects 404 after convergence. A configured route
+with an unreachable backend still has its separate 502 integration test.
+
+The probe also needs a different HTTP client from the control plane. `BunClient`
+adds the cluster bearer to requests. Reusing it against ingress could send that
+credential to a workload. `TestContext::workload_http_client` carries no bearer,
+disables redirects and ambient proxies, and bounds requests. Its regression
+sends a request to a controlled server and checks that no Authorization header
+arrives, even when the context's API client has an administrator credential.
+
+The first live run passed its ingress request, then labelled the next two cases
+unknown. Their capability snapshot had expired while they waited in the queue.
+We already refreshed before chaos cases; ordinary queued cases now also refresh
+when required evidence is unknown or stale. A failed refresh remains unknown,
+not a pass or a skipped prerequisite. The capability request consumes the same
+case deadline as the lease and workload operations. A controlled-server test
+covers both ordinary and chaos cases starting with expired evidence.
+
+Each ingress case also gets a hostname derived from its own namespace. Sharing
+one hostname across concurrently deployed test apps lets one case accidentally
+route to another case's backend. Namespace isolation must extend to the ingress
+name, not just the app record.

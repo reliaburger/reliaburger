@@ -58,6 +58,19 @@ pub struct TestContext {
 }
 
 impl TestContext {
+    /// Build a bounded HTTP client for workloads, without cluster credentials.
+    ///
+    /// Workload requests must never use the authenticated Bun API client.
+    /// Redirects and ambient proxies are disabled to keep probes on their target.
+    pub fn workload_http_client(&self) -> Result<reqwest::Client, String> {
+        reqwest::Client::builder()
+            .no_proxy()
+            .redirect(reqwest::redirect::Policy::none())
+            .timeout(Duration::from_secs(3))
+            .build()
+            .map_err(|error| format!("could not create workload HTTP client: {error}"))
+    }
+
     /// Build a namespace name for case number `seq` of run `run_id`.
     pub fn namespace_for(run_id: &str, seq: usize) -> String {
         format!("{TEST_NAMESPACE_PREFIX}-{run_id}-{seq:02}")
@@ -224,7 +237,7 @@ impl TestContext {
         format!(
             "[app.{app}]\n\
              image = \"{PINNED_TEST_WORKLOAD_IMAGE}\"\n\
-             command = [\"sleep\", \"infinity\"]\n\
+             command = [\"/bin/busybox\", \"sleep\", \"infinity\"]\n\
              namespace = \"{ns}\"\n",
             ns = self.namespace,
         )
@@ -232,16 +245,16 @@ impl TestContext {
 
     /// A TOML spec for an HTTP container workload in this test's namespace.
     ///
-    /// Runs the pinned workload's `httpd` serving `/etc`, health-checked on
-    /// `/hostname` (which maps to `/etc/hostname`, always present). This is the
-    /// workload for ingress and firewall-target cases. Port derives from the
-    /// app name.
+    /// Creates a known response file and serves it with the pinned workload's
+    /// HTTP server. Neither the executable nor its content depends on image
+    /// defaults. This is the ingress/firewall fixture; its port derives from
+    /// the app name.
     pub fn container_http_spec(&self, app: &str, replicas: u32) -> String {
         let port = testapp_port(app);
         format!(
             "[app.{app}]\n\
              image = \"{PINNED_TEST_WORKLOAD_IMAGE}\"\n\
-             command = [\"httpd\", \"-f\", \"-p\", \"{port}\", \"-h\", \"/etc\"]\n\
+             command = [\"/bin/sh\", \"-c\", \"/bin/busybox mkdir -p /tmp/reliaburger-test-http; printf 'reliaburger-test' > /tmp/reliaburger-test-http/hostname; exec /bin/busybox httpd -f -p {port} -h /tmp/reliaburger-test-http\"]\n\
              port = {port}\n\
              replicas = {replicas}\n\
              namespace = \"{ns}\"\n\
@@ -714,6 +727,36 @@ mod tests {
         assert!(app.health.is_some(), "testapp_spec carries a health check");
     }
 
+    #[tokio::test]
+    async fn workload_requests_do_not_receive_the_cluster_bearer() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let app = axum::Router::new().route(
+            "/",
+            axum::routing::get(|headers: axum::http::HeaderMap| async move {
+                axum::Json(headers.contains_key(axum::http::header::AUTHORIZATION))
+            }),
+        );
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        let mut ctx = context("rbtest-http-00");
+        ctx.client =
+            BunClient::new_with_token(&format!("http://{address}"), Some("private-cluster-token"));
+        let leaked = ctx
+            .workload_http_client()
+            .unwrap()
+            .get(format!("http://{address}/"))
+            .send()
+            .await
+            .unwrap()
+            .json::<bool>()
+            .await
+            .unwrap();
+        server.abort();
+        assert!(!leaked, "workload requests must never carry the API bearer");
+    }
+
     #[test]
     fn container_specs_parse_and_land_in_the_test_namespace() {
         let ctx = context("rbtest-abc-00");
@@ -729,12 +772,17 @@ mod tests {
         assert!(digest.bytes().all(|byte| byte.is_ascii_hexdigit()));
         assert!(web.health.is_some());
         assert_eq!(web.port, Some(ctx.container_port("web")));
+        assert!(
+            std::path::Path::new(&web.command[0]).is_absolute(),
+            "container fixtures must not depend on an image-provided PATH"
+        );
 
         let idle = Config::parse(&ctx.container_idle_spec("box")).unwrap();
         let box_app = idle.app.get("box").expect("app box");
         assert_eq!(box_app.namespace.as_deref(), Some("rbtest-abc-00"));
         assert!(box_app.command.iter().any(|a| a == "sleep"));
         assert!(box_app.health.is_none());
+        assert!(std::path::Path::new(&box_app.command[0]).is_absolute());
     }
 
     #[test]
