@@ -44,7 +44,7 @@ remain separate. Older unchecked groups below point into this current ledger.
 - [x] **C13** Use one whole-second issuance instant and checked lifetime arithmetic for CA, node and general leaf certificates; derive stored CA validity from signing parameters. The 90-second certificate regression fails before the fix, and all CA unit tests pass.
 - [ ] **C14** (P1) Renew and hot-reload every served certificate class.
 - [ ] **C15** (P2) Make ingress serials unique across nodes and restarts.
-- [ ] **C16** (P2) Reject invalid certificate inputs without panicking.
+- [x] **C16** Return contextual errors for invalid DNS/common-name SANs and a root role passed to intermediate issuance. Both former panic paths have failing-before regressions; all 16 CA tests pass.
 - [ ] **C17** (P2) Reject overflowing CLI durations.
 - [ ] **C18** (P2) Find a free port before reporting exhaustion.
 - [ ] **C19** (P2) Count only successful metric-file pruning.

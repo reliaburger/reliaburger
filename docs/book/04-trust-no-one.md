@@ -822,3 +822,13 @@ We reject lifetimes that cannot produce a valid, positive window. Stored CA
 metadata comes from the same parameters used to sign the certificate. The
 regression decodes a real 90-second certificate and compares both the duration
 and the root CA's encoded timestamps with its stored metadata.
+
+### Bad certificate input is an error, not a panic
+
+A DNS subject alternative name must fit the certificate library's IA5 string
+representation. The public issuer previously called `unwrap()` on that conversion,
+so a non-ASCII name could panic. It now collects conversions into a
+`Result<Vec<_>, _>`: collection stops at the first invalid name and returns its
+context to the caller. The common-name SAN follows the same rule instead of
+silently disappearing. Requesting a root CA through the intermediate-CA function
+also returns an input error. Regression tests exercise both former panic paths.

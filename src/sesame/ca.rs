@@ -17,6 +17,8 @@ use super::types::{CaRole, CertificateAuthority, SerialNumber};
 /// Errors from CA operations.
 #[derive(Debug, thiserror::Error)]
 pub enum CaError {
+    #[error("invalid certificate input: {0}")]
+    InvalidInput(String),
     #[error("failed to generate keypair: {0}")]
     KeyGenFailed(String),
     #[error("failed to generate certificate: {0}")]
@@ -113,7 +115,11 @@ pub fn generate_intermediate_ca(
         CaRole::Node => "Node",
         CaRole::Workload => "Workload",
         CaRole::Ingress => "Ingress",
-        CaRole::Root => unreachable!("root CA is not an intermediate"),
+        CaRole::Root => {
+            return Err(CaError::InvalidInput(
+                "root CA is not an intermediate".into(),
+            ));
+        }
     };
 
     let mut params = CertificateParams::default();
@@ -244,12 +250,22 @@ pub fn issue_end_entity_cert(
 
     let mut all_sans: Vec<rcgen::SanType> = san_dns_names
         .iter()
-        .map(|name| rcgen::SanType::DnsName(name.clone().try_into().unwrap()))
-        .collect();
+        .map(|name| {
+            name.clone()
+                .try_into()
+                .map(rcgen::SanType::DnsName)
+                .map_err(|error| {
+                    CaError::InvalidInput(format!("invalid DNS SAN {name:?}: {error}"))
+                })
+        })
+        .collect::<Result<_, _>>()?;
     // Also add the CN as a SAN (modern TLS requires SAN)
-    if let Ok(ia5) = common_name.to_string().try_into() {
-        all_sans.push(rcgen::SanType::DnsName(ia5));
-    }
+    let common_san = common_name.to_string().try_into().map_err(|error| {
+        CaError::InvalidInput(format!(
+            "invalid common-name DNS SAN {common_name:?}: {error}"
+        ))
+    })?;
+    all_sans.push(rcgen::SanType::DnsName(common_san));
     params.subject_alt_names = all_sans;
 
     set_validity(&mut params, lifetime)?;
@@ -554,6 +570,40 @@ fn set_validity(params: &mut CertificateParams, lifetime: Duration) -> Result<()
 mod tests {
     use super::*;
     use std::time::SystemTime;
+
+    #[test]
+    fn invalid_certificate_names_return_errors() {
+        let root = generate_root_ca("test", SerialNumber(1)).unwrap();
+        assert!(
+            issue_end_entity_cert(
+                "api.test",
+                SerialNumber(2),
+                Duration::from_secs(90),
+                &["☃.test".to_string()],
+                &[],
+                &root.signing_keypair,
+                &root.certificate_params
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn root_role_is_refused_as_an_intermediate() {
+        let root = generate_root_ca("test", SerialNumber(1)).unwrap();
+        assert!(
+            generate_intermediate_ca(
+                CaRole::Root,
+                "test",
+                SerialNumber(2),
+                root.ca.serial,
+                &root.signing_keypair,
+                &root.certificate_params,
+                b"test"
+            )
+            .is_err()
+        );
+    }
 
     #[test]
     fn short_lived_certificates_retain_their_full_validity_window() {
