@@ -248,8 +248,12 @@ pub enum RaftRpc {
 /// old nodes, which resets them onto the new epoch.
 #[derive(Serialize, Deserialize)]
 pub struct RaftRpcEnvelope {
+    /// Protocol and state formats required before this RPC may reach Raft.
+    pub compatibility: crate::compatibility::Compatibility,
     /// The sending node's recovery epoch.
     pub sender_recovery_epoch: u64,
+    /// Versioned request field also makes development decoders refuse this frame.
+    #[serde(rename = "request")]
     pub rpc: RaftRpc,
 }
 
@@ -267,6 +271,7 @@ pub fn recovery_epochs_compatible(local_epoch: u64, sender_epoch: u64) -> bool {
 /// fence is unit-tested without constructing a `Raft` instance.
 fn decode_and_fence(payload: &[u8], local_epoch: u64) -> Option<RaftRpc> {
     let envelope = serde_json::from_slice::<RaftRpcEnvelope>(payload).ok()?;
+    envelope.compatibility.require_current().ok()?;
     if !recovery_epochs_compatible(local_epoch, envelope.sender_recovery_epoch) {
         eprintln!(
             "raft: dropping RPC from a peer at recovery epoch {} (local {local_epoch}); \
@@ -284,6 +289,12 @@ pub enum RaftRpcResponse {
     AppendEntries(AppendEntriesResponse<u64>),
     Vote(VoteResponse<u64>),
     InstallSnapshot(InstallSnapshotResponse<u64>),
+}
+
+#[derive(Serialize, Deserialize)]
+struct RaftResponseEnvelope {
+    compatibility: crate::compatibility::Compatibility,
+    response: RaftRpcResponse,
 }
 
 /// Read a length-prefixed frame from any byte stream (plain TCP or TLS).
@@ -505,7 +516,10 @@ async fn handle_raft_rpc<S: AsyncRead + AsyncWrite + Unpin>(
         },
     };
 
-    if let Ok(bytes) = serde_json::to_vec(&response) {
+    if let Ok(bytes) = serde_json::to_vec(&RaftResponseEnvelope {
+        compatibility: crate::compatibility::CURRENT,
+        response,
+    }) {
         let _ = write_frame(&mut stream, &bytes).await;
     }
 }
@@ -711,6 +725,7 @@ impl TcpRaftNetwork {
         // wrapped in a `RaftRpcEnvelope` stamped with this node's recovery epoch
         // (C5) so the accept side can fence off a different-epoch peer.
         let envelope = RaftRpcEnvelope {
+            compatibility: crate::compatibility::CURRENT,
             sender_recovery_epoch: self.recovery_epoch,
             rpc,
         };
@@ -750,8 +765,13 @@ impl TcpRaftNetwork {
             .await
             .ok_or_else(|| Unreachable::new(&RouterError("read response failed".into())))?;
 
-        serde_json::from_slice(&resp_payload)
-            .map_err(|e| Unreachable::new(&RouterError(format!("deserialize: {e}"))))
+        let envelope: RaftResponseEnvelope = serde_json::from_slice(&resp_payload)
+            .map_err(|e| Unreachable::new(&RouterError(format!("deserialize: {e}"))))?;
+        envelope
+            .compatibility
+            .require_current()
+            .map_err(|e| Unreachable::new(&RouterError(e.to_string())))?;
+        Ok(envelope.response)
     }
 }
 
@@ -953,6 +973,7 @@ mod tests {
     #[test]
     fn decode_and_fence_drops_a_different_epoch_rpc() {
         let envelope = RaftRpcEnvelope {
+            compatibility: crate::compatibility::CURRENT,
             sender_recovery_epoch: 0,
             rpc: RaftRpc::Vote(VoteRequest::new(
                 openraft::Vote::new(1, 7),
@@ -963,6 +984,11 @@ mod tests {
             )),
         };
         let payload = serde_json::to_vec(&envelope).unwrap();
+        for field in ["protocol", "state"] {
+            let mut wrong = serde_json::to_value(&envelope).unwrap();
+            wrong["compatibility"][field] = serde_json::json!(99);
+            assert!(decode_and_fence(&serde_json::to_vec(&wrong).unwrap(), 0).is_none());
+        }
 
         // A node that has recovered (local epoch 1) refuses the epoch-0 RPC.
         assert!(decode_and_fence(&payload, 1).is_none());
@@ -971,6 +997,15 @@ mod tests {
             decode_and_fence(&payload, 0),
             Some(RaftRpc::Vote(_))
         ));
+    }
+
+    #[test]
+    fn incompatible_or_missing_formats_are_refused_before_raft() {
+        let request = serde_json::json!({
+            "sender_recovery_epoch": 0,
+            "rpc": RaftRpc::Vote(VoteRequest::new(openraft::Vote::new(1, 7), None)),
+        });
+        assert!(decode_and_fence(&serde_json::to_vec(&request).unwrap(), 0).is_none());
     }
 
     #[test]

@@ -1448,6 +1448,7 @@ async fn version_handler(State(state): State<ApiState>) -> impl IntoResponse {
     match &state.upgrade {
         Some(manager) => Json(serde_json::json!({
             "version": manager.running_version().to_string(),
+            "compatibility": crate::compatibility::CURRENT,
             "upgrade_in_flight": manager.upgrade_in_flight(),
             // Ids this node attempted and reverted — the orchestrator
             // reads these to detect node-side reverts.
@@ -1455,6 +1456,7 @@ async fn version_handler(State(state): State<ApiState>) -> impl IntoResponse {
         })),
         None => Json(serde_json::json!({
             "version": crate::upgrade::version::compiled_version().to_string(),
+            "compatibility": crate::compatibility::CURRENT,
             "upgrade_in_flight": false,
             "failed_upgrade_ids": [],
         })),
@@ -3639,15 +3641,6 @@ async fn ui_logout_handler(
         .into_response()
 }
 
-/// Request body for cluster join: a one-time token, the joiner's node id, and
-/// the joiner's CSR (PKI4 — the joiner keeps its private key).
-#[derive(Deserialize)]
-struct JoinRequest {
-    token: String,
-    node_id: String,
-    csr_b64: String,
-}
-
 /// Issue a certificate bundle to a joining node (issuer side).
 ///
 /// Public route: the join token is the credential. The joiner sends a CSR and
@@ -3681,14 +3674,25 @@ async fn cluster_ca_handler(State(state): State<ApiState>) -> Response {
     };
     let encoder = base64::engine::general_purpose::STANDARD;
     Json(serde_json::json!({
+        "compatibility": crate::compatibility::CURRENT,
         "node_ca_b64": encoder.encode(&node_ca.certificate_der),
         "root_ca_b64": encoder.encode(&root_ca.certificate_der),
     }))
     .into_response()
 }
 
-async fn join_handler(State(state): State<ApiState>, Json(body): Json<JoinRequest>) -> Response {
+async fn join_handler(
+    State(state): State<ApiState>,
+    Json(body): Json<crate::sesame::join::JoinRequest>,
+) -> Response {
     use base64::Engine as _;
+    if let Err(error) = body.compatibility.require_current() {
+        return (
+            StatusCode::CONFLICT,
+            Json(serde_json::json!({ "error": error.to_string() })),
+        )
+            .into_response();
+    }
     let csr_der = match base64::engine::general_purpose::STANDARD.decode(&body.csr_b64) {
         Ok(der) => der,
         Err(e) => {
@@ -10000,7 +10004,7 @@ mod tests {
                     .uri("/v1/cluster/join")
                     .header("content-type", "application/json")
                     .body(Body::from(
-                        r#"{"token":"abc123","node_id":"node-02","csr_b64":""}"#,
+                        r#"{"compatibility":{"protocol":2,"state":2},"token":"abc123","node_id":"node-02","csr_b64":""}"#,
                     ))
                     .unwrap(),
             )
@@ -10009,6 +10013,18 @@ mod tests {
 
         // Without a council, join validation fails with a 400
         assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        shutdown.cancel();
+    }
+
+    #[tokio::test]
+    async fn incompatible_join_is_refused_before_csr_or_token_validation() {
+        let (app, shutdown) = test_setup();
+        let response = app.oneshot(axum::http::Request::builder()
+            .method("POST").uri("/v1/cluster/join")
+            .header("content-type", "application/json")
+            .body(Body::from(r#"{"compatibility":{"protocol":1,"state":1},"token":"unused","node_id":"old","csr_b64":"invalid!"}"#)).unwrap())
+            .await.unwrap();
+        assert_eq!(response.status(), StatusCode::CONFLICT);
         shutdown.cancel();
     }
 
@@ -10026,7 +10042,7 @@ mod tests {
                     .uri("/v1/cluster/join")
                     .header("content-type", "application/json")
                     .body(Body::from(
-                        r#"{"token":"whatever","node_id":"node-09","csr_b64":""}"#,
+                        r#"{"compatibility":{"protocol":2,"state":2},"token":"whatever","node_id":"node-09","csr_b64":""}"#,
                     ))
                     .unwrap(),
             )

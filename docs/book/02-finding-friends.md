@@ -2345,3 +2345,10 @@ three Linux nodes and passed sample HTTP in 241.75 seconds. We record the
 [conditions and exclusions](../qualification/2026-09-17-laptop.md): it used local
 development binaries, so downloading and verifying a signed release remains a
 separate acceptance gate. One passing measurement is evidence, not a guarantee.
+
+
+### The first supported compatibility boundary
+
+A development snapshot might deserialize successfully and still represent a different contract. Before 0.1.0 we therefore require fresh clusters. Startup stamps a fresh data directory with its state generation and refuses an existing unmarked directory. Snapshot loading no longer silently rewrites pre-envelope development state.
+
+A Raft request now carries protocol and state generations as well as its recovery epoch. All three checks run before dispatch to Raft. Responses carry the format contract too, so a new caller cannot mistake a development server's reply for an accepted negotiation. Gossip checks both generations before learning membership; reporting checks both generations before decoding its payload. Chapter 14 explains how the same contract gates binary replacement and rollback. Different product versions are supported only when they explicitly advertise equal formats.

@@ -30,11 +30,11 @@ use crate::sesame::crypto::{self, CryptoError};
 /// HKDF info string that scopes the backup-sealing key. Binding the derived
 /// key to this purpose prevents a sealed backup from being decrypted with, or
 /// mistaken for, any other key derived from the same master secret.
-const BACKUP_SEAL_INFO: &str = "reliaburger-council-backup-seal-v1";
+const BACKUP_SEAL_INFO: &str = "reliaburger-council-backup-seal-v2";
 
 /// Format version of the sealed-backup envelope. Bump when the on-disk shape
 /// changes so an older binary refuses a newer blob rather than mis-parsing it.
-const BACKUP_ENVELOPE_VERSION: u32 = 1;
+const BACKUP_ENVELOPE_VERSION: u32 = crate::compatibility::CURRENT.state;
 
 /// Configuration for the council backup loop (`[cluster.backup]`).
 ///
@@ -156,7 +156,12 @@ pub fn unseal_snapshot(
             supported: BACKUP_ENVELOPE_VERSION,
         });
     }
-    let wrapping_key = crypto::hkdf_derive_key(master_key, &sealed.hkdf_salt, &sealed.hkdf_info)?;
+    if sealed.hkdf_info != BACKUP_SEAL_INFO {
+        return Err(BackupError::Serialise(
+            "incompatible backup key context".into(),
+        ));
+    }
+    let wrapping_key = crypto::hkdf_derive_key(master_key, &sealed.hkdf_salt, BACKUP_SEAL_INFO)?;
     let plaintext = crypto::aes_256_gcm_decrypt(&wrapping_key, &sealed.ciphertext, &sealed.nonce)?;
     Ok(plaintext)
 }
@@ -403,6 +408,19 @@ mod tests {
             matches!(err, BackupError::UnsupportedVersion { found: 99, .. }),
             "got {err:?}"
         );
+    }
+
+    #[test]
+    fn development_backup_and_relabelled_key_context_are_refused() {
+        let mut sealed = seal_snapshot(&key(1), b"state", &BackupConfig::default()).unwrap();
+        sealed.version = 1;
+        assert!(matches!(
+            unseal_snapshot(&key(1), &sealed),
+            Err(BackupError::UnsupportedVersion { found: 1, .. })
+        ));
+        sealed.version = BACKUP_ENVELOPE_VERSION;
+        sealed.hkdf_info = "reliaburger-council-backup-seal-v1".into();
+        assert!(unseal_snapshot(&key(1), &sealed).is_err());
     }
 
     #[test]

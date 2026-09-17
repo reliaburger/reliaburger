@@ -512,6 +512,11 @@ impl<T: MustardTransport> MustardNode<T> {
 
     /// Handle an incoming gossip message.
     pub async fn handle_message(&mut self, from: SocketAddr, message: GossipMessage) {
+        if message.version != GossipMessage::VERSION
+            || message.state_format != crate::compatibility::CURRENT.state
+        {
+            return;
+        }
         let now = Instant::now();
 
         // Fold the directory extension in first — endpoint knowledge and the

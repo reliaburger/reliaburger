@@ -28,6 +28,10 @@ use reliaburger::pickle::types::ManifestCatalog;
 #[derive(Parser)]
 #[command(name = "bun", version, about = "Reliaburger node agent")]
 struct Cli {
+    /// Print supported protocol and state formats without opening runtime state.
+    #[arg(long)]
+    compatibility: bool,
+
     /// Path to node configuration file.
     #[arg(long)]
     config: Option<PathBuf>,
@@ -493,6 +497,13 @@ async fn run_testapp(
 
 fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
+    if cli.compatibility {
+        println!(
+            "{}",
+            serde_json::to_string(&reliaburger::compatibility::CURRENT)?
+        );
+        return Ok(());
+    }
 
     // The helper must not construct Tokio's multi-thread runtime: those
     // threads would join the pressure cgroup too and blur ownership. Handle
@@ -674,6 +685,13 @@ async fn run_agent(cli: Cli) -> anyhow::Result<()> {
             .map_err(|e| anyhow::anyhow!("failed to create data directory: {e}"))?;
         fallback
     };
+
+    let compatibility_directory = data_base.clone();
+    tokio::task::spawn_blocking(move || {
+        reliaburger::compatibility::ensure_state_compatible(&compatibility_directory)
+    })
+    .await
+    .context("state compatibility check failed")??;
 
     // Instance records + process log files ({data}/instances). Started
     // workloads are recorded here so a future bun process (crash restart or

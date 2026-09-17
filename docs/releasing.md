@@ -36,6 +36,23 @@ candidate and new checksums; never replace an existing release's binaries.
 The compiler pin does not promise identical bytes across different linkers or
 host operating systems.
 
+## Cluster compatibility
+
+0.1.0 requires fresh clusters. Preserve pre-release development data separately;
+startup and recovery refuse it rather than attempting an implicit migration.
+Do not copy a format stamp onto old data to bypass this check.
+
+`bun --compatibility` reports `{"protocol":2,"state":2}` without starting a node.
+`GET /v1/version` includes the same contract. Different product versions may
+roll or roll back only when both generations match exactly. The agent verifies
+the signed executable and checks this contract before staging it. Joins and
+cluster transports also enforce compatibility; absent evidence is a refusal.
+
+For a future incompatible wire or state change, bump the relevant generation
+and design migration separately. Leader-last upgrade ordering does not make an
+unknown Raft request safe during elections. Qualify the actual old/new binary
+pair before advertising it as supported.
+
 ## Signing identity
 
 Configure the Actions secret `RELIABURGER_RELEASE_KEY` with the base64 encoding

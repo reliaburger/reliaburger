@@ -314,6 +314,12 @@ async fn spawn_issuer(
         ikm,
     };
     let app = Router::new()
+        .route(
+            "/v1/version",
+            axum::routing::get(|| async {
+                Json(serde_json::json!({"compatibility": reliaburger::compatibility::CURRENT}))
+            }),
+        )
         .route("/v1/cluster/join", post(issue))
         .with_state(issuer);
 
@@ -390,4 +396,60 @@ async fn joiner_rejects_a_bad_join_token() {
     );
 
     server.abort();
+}
+
+#[tokio::test]
+async fn incompatible_member_never_receives_the_join_token() {
+    use axum::{
+        Json, Router,
+        routing::{get, post},
+    };
+    use std::sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering},
+    };
+    for version in [
+        serde_json::json!({"version":"development"}),
+        serde_json::json!({"compatibility":{"protocol":2,"state":99}}),
+    ] {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let observed = calls.clone();
+        let app = Router::new()
+            .route(
+                "/v1/version",
+                get(move || {
+                    let version = version.clone();
+                    async move { Json(version) }
+                }),
+            )
+            .route(
+                "/v1/cluster/join",
+                post(move || {
+                    let calls = calls.clone();
+                    async move {
+                        calls.fetch_add(1, Ordering::SeqCst);
+                        "unexpected"
+                    }
+                }),
+            );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}/v1/cluster/join", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        assert!(
+            join::request_join(
+                &reqwest::Client::new(),
+                &url,
+                "must-stay-local",
+                "new",
+                None
+            )
+            .await
+            .is_err()
+        );
+        assert_eq!(observed.load(Ordering::SeqCst), 0);
+        server.abort();
+        let _ = server.await;
+    }
 }

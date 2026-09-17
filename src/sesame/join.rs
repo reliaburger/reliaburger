@@ -78,6 +78,8 @@ pub struct JoinResult {
 /// compromised or eavesdropped join can never yield the joiner's key (PKI4).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct JoinRequest {
+    /// Required cluster protocol and state generations.
+    pub compatibility: crate::compatibility::Compatibility,
     /// The one-time join token, plaintext.
     pub token: String,
     /// The node id the joiner wants a certificate for.
@@ -94,6 +96,8 @@ pub struct JoinRequest {
 /// its identity from this bundle and the private key it kept locally.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct JoinBundle {
+    /// Required cluster protocol and state generations.
+    pub compatibility: crate::compatibility::Compatibility,
     /// The node id the certificate was issued for.
     pub node_id: String,
     /// The serial the Node CA assigned.
@@ -127,6 +131,7 @@ impl JoinBundle {
     /// Build a wire bundle from an issuer-side [`JoinResult`].
     pub fn from_result(result: &JoinResult) -> Self {
         Self {
+            compatibility: crate::compatibility::CURRENT,
             node_id: result.node_id.clone(),
             serial: result.serial.0,
             ca_generation: result.ca_generation,
@@ -143,6 +148,9 @@ impl JoinBundle {
     /// with the key from its own CSR. A `validate_chain` guard rejects a
     /// bundle whose leaf does not chain to the returned CA chain.
     pub fn into_identity(self, private_key_der: Vec<u8>) -> Result<NodeIdentity, JoinClientError> {
+        self.compatibility
+            .require_current()
+            .map_err(|e| JoinClientError::Rejected(e.to_string()))?;
         let decode = |field: &str, s: &str| {
             BASE64
                 .decode(s)
@@ -182,6 +190,8 @@ impl JoinBundle {
 /// before the joiner reveals its token.
 #[derive(Debug, Clone, serde::Deserialize)]
 pub struct CaCertificates {
+    /// Required cluster protocol and state generations.
+    pub compatibility: crate::compatibility::Compatibility,
     /// Base64 DER Node CA certificate.
     pub node_ca_b64: String,
     /// Base64 DER Root CA certificate.
@@ -191,6 +201,9 @@ pub struct CaCertificates {
 impl CaCertificates {
     /// Decode the Node and Root CA DER bytes.
     pub fn decode(&self) -> Result<(Vec<u8>, Vec<u8>), JoinClientError> {
+        self.compatibility
+            .require_current()
+            .map_err(|e| JoinClientError::Rejected(e.to_string()))?;
         let node_ca = BASE64
             .decode(&self.node_ca_b64)
             .map_err(|e| JoinClientError::Malformed(format!("node_ca: {e}")))?;
@@ -250,11 +263,39 @@ pub async fn request_join(
     node_id: &str,
     expected_fingerprint: Option<&str>,
 ) -> Result<NodeIdentity, JoinClientError> {
+    // Query the pinned member before sending the one-time credential. Old
+    // development servers ignore unknown JSON fields on a join request.
+    let mut version_url =
+        reqwest::Url::parse(member_url).map_err(|e| JoinClientError::Malformed(e.to_string()))?;
+    version_url.set_path("/v1/version");
+    version_url.set_query(None);
+    version_url.set_fragment(None);
+    #[derive(Deserialize)]
+    struct VersionResponse {
+        compatibility: crate::compatibility::Compatibility,
+    }
+    let version: VersionResponse = client
+        .get(version_url)
+        .timeout(Duration::from_secs(10))
+        .send()
+        .await
+        .map_err(|e| JoinClientError::Transport(e.to_string()))?
+        .error_for_status()
+        .map_err(|e| JoinClientError::Rejected(e.to_string()))?
+        .json()
+        .await
+        .map_err(|e| JoinClientError::Malformed(e.to_string()))?;
+    version
+        .compatibility
+        .require_current()
+        .map_err(|e| JoinClientError::Rejected(e.to_string()))?;
+
     // Generate our own keypair and CSR. The private key stays here (PKI4).
     let (csr_der, private_key_der) = ca::create_node_csr(node_id)
         .map_err(|e| JoinClientError::Malformed(format!("failed to build CSR: {e}")))?;
 
     let request = JoinRequest {
+        compatibility: crate::compatibility::CURRENT,
         token: token.to_string(),
         node_id: node_id.to_string(),
         csr_b64: BASE64.encode(&csr_der),
@@ -592,6 +633,7 @@ mod tests {
             issue(&state, &token, "node-02", SerialNumber(7), &master_secret).unwrap();
 
         let ca = CaCertificates {
+            compatibility: crate::compatibility::CURRENT,
             node_ca_b64: BASE64.encode(&result.node_ca_der),
             root_ca_b64: BASE64.encode(&result.root_ca_der),
         };

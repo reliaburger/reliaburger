@@ -5,6 +5,10 @@ use std::path::PathBuf;
 /// Errors from the self-upgrade subsystem.
 #[derive(Debug, thiserror::Error)]
 pub enum UpgradeError {
+    /// A verified candidate cannot safely use this cluster's wire or state formats.
+    #[error("incompatible binary: {0}")]
+    IncompatibleBinary(String),
+
     /// The input could not be parsed as a semantic version.
     #[error("invalid version {input:?}: {reason}")]
     InvalidVersion { input: String, reason: String },

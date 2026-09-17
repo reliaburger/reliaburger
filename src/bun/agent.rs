@@ -3523,7 +3523,7 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
         self.draining
             .store(true, std::sync::atomic::Ordering::Relaxed);
         let inventory = self.upgrade_inventory().await;
-        let prepared = match manager.prepare_rollback(version, inventory) {
+        let prepared = match manager.prepare_rollback(version, inventory).await {
             Ok(prepared) => prepared,
             Err(e) => {
                 self.draining

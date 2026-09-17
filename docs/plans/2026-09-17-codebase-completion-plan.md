@@ -191,6 +191,15 @@ Lease writes have no peer-schema negotiation/upgrade barrier, while old nodes la
 
 **Completion test:** A supported old/new pair upgrades with safe scheduling and decodable logs/snapshots; unsupported peers and new writes are refused before replication. Never infer healthy readiness from missing evidence.
 
+**Implementation:** the approved 0.1.0 policy requires fresh clusters, with exact
+protocol/state generation equality for later rolling upgrades. Generation 2 is
+explicit in cluster traffic, joins, durable state, snapshots and backups. A
+verified candidate must answer a bounded `--compatibility` query before staging;
+rollback checks retained binaries too. Development state is preserved and refused.
+The real Linux suite exercises different product versions with equal formats,
+including rollback and pause/resume after a deliberately broken replacement.
+
+
 ### C08 — Publish readiness after resources are acquired
 
 **Priority:** P1. **Wave:** 2. **Book chapters:** 01, 15.

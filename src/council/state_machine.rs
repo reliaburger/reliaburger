@@ -30,7 +30,7 @@ const SNAP_CHECKSUM_KEY: &str = "checksum";
 
 /// Snapshot format version this binary writes. Bump it when the persisted
 /// layout changes incompatibly; loading rejects versions it doesn't know.
-const SNAPSHOT_FORMAT_VERSION: u32 = 1;
+const SNAPSHOT_FORMAT_VERSION: u32 = crate::compatibility::CURRENT.state;
 
 /// Errors opening or validating the persisted snapshot store.
 ///
@@ -51,9 +51,7 @@ pub enum SnapshotStoreError {
     ChecksumMismatch { stored: String, computed: String },
     #[error("snapshot records format version {version} but no checksum")]
     MissingChecksum { version: u32 },
-    #[error(
-        "snapshot format version {found} is not supported (this binary supports up to {supported})"
-    )]
+    #[error("snapshot format version {found} is not supported (this binary requires {supported})")]
     UnsupportedVersion { found: u32, supported: u32 },
     #[error("snapshot version marker is malformed: expected 4 bytes, found {found}")]
     MalformedVersion { found: usize },
@@ -967,25 +965,33 @@ impl CouncilStateMachine {
     /// desired and security state.
     #[allow(clippy::result_large_err)]
     pub fn snapshot_present(db: &Database) -> Result<bool, SnapshotStoreError> {
-        // Materialise the table so the read doesn't error on a fresh store.
-        let wtx = db.begin_write()?;
-        {
-            wtx.open_table(SNAPSHOT)?;
-        }
-        wtx.commit()?;
         let rtx = db.begin_read()?;
-        let t = rtx.open_table(SNAPSHOT)?;
-        Ok(t.get(SNAP_DATA_KEY)?.is_some())
+        let table = match rtx.open_table(SNAPSHOT) {
+            Ok(table) => table,
+            Err(redb::TableError::TableDoesNotExist(_)) => return Ok(false),
+            Err(error) => return Err(error.into()),
+        };
+        Ok(table.get(SNAP_DATA_KEY)?.is_some())
     }
 
     #[allow(clippy::result_large_err)]
     pub fn with_store(db: Arc<Database>) -> Result<Self, SnapshotStoreError> {
-        // Materialise the table so reads on a fresh store don't error.
-        let wtx = db.begin_write()?;
-        {
-            wtx.open_table(SNAPSHOT)?;
+        // Only a genuinely empty store needs a write before validation.
+        let table_exists = {
+            let rtx = db.begin_read()?;
+            match rtx.open_table(SNAPSHOT) {
+                Ok(_) => true,
+                Err(redb::TableError::TableDoesNotExist(_)) => false,
+                Err(error) => return Err(error.into()),
+            }
+        };
+        if !table_exists {
+            let wtx = db.begin_write()?;
+            {
+                wtx.open_table(SNAPSHOT)?;
+            }
+            wtx.commit()?;
         }
-        wtx.commit()?;
 
         let mut inner = StateMachineInner::default();
         {
@@ -994,13 +1000,12 @@ impl CouncilStateMachine {
             if let Some(data) = t.get(SNAP_DATA_KEY)? {
                 let bytes = data.value().to_vec();
                 match read_snapshot_version(&t)? {
-                    // Legacy pre-envelope snapshot: no version, no checksum.
-                    // Load it as before; the next persist rewrites it in the
-                    // enveloped format (version + checksum, one transaction).
-                    None => eprintln!(
-                        "council: snapshot has no version/checksum envelope (pre-12b format); \
-                         loading as legacy, it will be rewritten on the next snapshot"
-                    ),
+                    None => {
+                        return Err(SnapshotStoreError::UnsupportedVersion {
+                            found: 0,
+                            supported: SNAPSHOT_FORMAT_VERSION,
+                        });
+                    }
                     Some(SNAPSHOT_FORMAT_VERSION) => verify_snapshot_checksum(&t, &bytes)?,
                     Some(found) => {
                         return Err(SnapshotStoreError::UnsupportedVersion {
@@ -1485,12 +1490,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn legacy_snapshot_without_envelope_still_loads_and_is_rewritten() {
-        // Fixture: a snapshot exactly as a pre-envelope binary wrote it —
-        // raw `DesiredState` JSON under "data" plus the counter under
-        // "index", no version or checksum keys. Existing dev clusters and
-        // the Lima rigs carry this format; it must keep loading (with a
-        // warning), and the next persist must upgrade it in place.
+    async fn legacy_snapshot_without_envelope_is_refused_and_preserved() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("legacy.redb");
         let app_id = AppId::new("web", "prod");
@@ -1517,21 +1517,15 @@ mod tests {
         }
 
         let db = std::sync::Arc::new(Database::create(&path).unwrap());
-        let mut sm = CouncilStateMachine::with_store(db.clone()).expect("legacy snapshot loads");
-        let state = sm.desired_state().await;
-        assert_eq!(
-            state.apps.get(&app_id).unwrap().image,
-            Some("legacy:v1".to_string())
-        );
-        assert_eq!(sm.snapshot_last_applied().await, Some(log_id(1, 3)));
-
-        // The next snapshot persist rewrites the store in the new format.
-        let mut builder = sm.get_snapshot_builder().await;
-        builder.build_snapshot().await.unwrap();
+        assert!(matches!(
+            CouncilStateMachine::with_store(db.clone()),
+            Err(SnapshotStoreError::UnsupportedVersion { found: 0, .. })
+        ));
         let rtx = db.begin_read().unwrap();
-        let t = rtx.open_table(SNAPSHOT).unwrap();
-        assert!(t.get(SNAP_VERSION_KEY).unwrap().is_some());
-        assert!(t.get(SNAP_CHECKSUM_KEY).unwrap().is_some());
+        let table = rtx.open_table(SNAPSHOT).unwrap();
+        assert_eq!(table.get(SNAP_DATA_KEY).unwrap().unwrap().value(), payload);
+        assert!(table.get(SNAP_VERSION_KEY).unwrap().is_none());
+        assert!(table.get(SNAP_CHECKSUM_KEY).unwrap().is_none());
     }
 
     #[tokio::test]
@@ -3549,12 +3543,9 @@ mod tests {
         assert!(reloaded.test_leases.is_empty());
     }
 
-    /// The same rule end to end through the persisted store: a legacy
-    /// pre-envelope snapshot without the tracker fields loads through
-    /// `with_store` (the #83 envelope loader), and the trackers start
-    /// from their defaults.
+    /// Missing tracker fields do not authorise migration of development state.
     #[tokio::test]
-    async fn pre_12b2_persisted_snapshot_loads_through_the_envelope_loader() {
+    async fn pre_12b2_persisted_snapshot_is_refused() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("pre12b2.redb");
         let app_id = AppId::new("web", "prod");
@@ -3582,12 +3573,10 @@ mod tests {
         }
 
         let db = std::sync::Arc::new(Database::create(&path).unwrap());
-        let sm = CouncilStateMachine::with_store(db).expect("pre-12b.2 snapshot loads");
-        let state = sm.desired_state().await;
-        assert!(state.apps.contains_key(&app_id));
-        assert_eq!(state.batch_state.next_batch_id, 1);
-        assert_eq!(state.build_state.next_build_id, 1);
-        assert!(state.test_leases.is_empty());
+        assert!(matches!(
+            CouncilStateMachine::with_store(db),
+            Err(SnapshotStoreError::UnsupportedVersion { found: 0, .. })
+        ));
     }
 
     /// O5: the CRL is replicated in every snapshot and scanned on every TLS

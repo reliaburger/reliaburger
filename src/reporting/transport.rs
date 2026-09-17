@@ -415,8 +415,7 @@ impl TcpReportingTransport {
             return;
         }
 
-        // Deserialise
-        if let Ok(msg) = bincode::deserialize::<ReportingMessage>(&payload) {
+        if let Ok(msg) = decode_report(&payload) {
             let _ = tx.send((peer, peer_node_id, msg)).await;
         }
     }
@@ -427,8 +426,8 @@ impl TcpReportingTransport {
         message: &ReportingMessage,
         connector: Option<&tokio_rustls::TlsConnector>,
     ) -> Result<(), ReportingError> {
-        let payload = bincode::serialize(message)
-            .map_err(|e| ReportingError::Serialisation(e.to_string()))?;
+        let payload =
+            encode_report(message).map_err(|e| ReportingError::Serialisation(e.to_string()))?;
         if payload.len() > MAX_REPORT_SIZE {
             return Err(ReportingError::ReportTooLarge {
                 size: payload.len(),
@@ -555,6 +554,36 @@ fn peer_node_id_from_tls(
 // Tests
 // ---------------------------------------------------------------------------
 
+// The fixed header is inspected before decoding any peer-controlled collections.
+// Development frames have no header and are refused without interpreting them.
+fn report_header() -> [u8; 12] {
+    let mut header = [0; 12];
+    header[..4].copy_from_slice(b"RBRP");
+    header[4..8].copy_from_slice(&crate::compatibility::CURRENT.protocol.to_be_bytes());
+    header[8..].copy_from_slice(&crate::compatibility::CURRENT.state.to_be_bytes());
+    header
+}
+
+fn encode_report(message: &ReportingMessage) -> Result<Vec<u8>, bincode::Error> {
+    let mut bytes = report_header().to_vec();
+    bincode::serialize_into(&mut bytes, message)?;
+    Ok(bytes)
+}
+
+fn decode_report(payload: &[u8]) -> Result<ReportingMessage, bincode::Error> {
+    use bincode::Options;
+    let body = payload.strip_prefix(&report_header()).ok_or_else(|| {
+        Box::new(bincode::ErrorKind::Custom(
+            "incompatible reporting formats".into(),
+        ))
+    })?;
+    bincode::DefaultOptions::new()
+        .with_fixint_encoding()
+        .with_limit(body.len() as u64)
+        .reject_trailing_bytes()
+        .deserialize(body)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -576,6 +605,33 @@ mod tests {
             resource_usage: ResourceUsage::default(),
             event_log: vec![],
         })
+    }
+
+    #[test]
+    fn reporting_rejects_either_format_mismatch_and_oversized_collection_claims() {
+        let valid = encode_report(&sample_msg("current")).unwrap();
+        assert!(decode_report(&valid).is_ok());
+        for offset in [7, 11] {
+            let mut wrong = valid.clone();
+            wrong[offset] = 99;
+            assert!(decode_report(&wrong).is_err());
+        }
+        // Report enum discriminant, then an impossible node-id string length.
+        let mut malicious = report_header().to_vec();
+        malicious.extend(0u32.to_le_bytes());
+        malicious.push(0); // has_buildah
+        malicious.extend(u64::MAX.to_le_bytes());
+        assert!(decode_report(&malicious).is_err());
+    }
+
+    #[tokio::test]
+    async fn legacy_reporting_frame_never_reaches_the_inbox() {
+        let payload = bincode::serialize(&sample_msg("legacy")).unwrap();
+        let mut frame = (payload.len() as u32).to_be_bytes().to_vec();
+        frame.extend(payload);
+        let (tx, mut rx) = mpsc::channel(1);
+        TcpReportingTransport::handle_connection(frame.as_slice(), addr(1234), None, tx).await;
+        assert!(rx.recv().await.is_none());
     }
 
     #[tokio::test]
