@@ -98,7 +98,8 @@ impl ClusterState {
             return Err(failed("invalid managed cluster state"));
         }
         for (index, node) in self.nodes.iter().enumerate() {
-            if node.name != vm_name(&self.spec.name, &self.id, index) {
+            let legacy_name = format!("rb-{}-{}-{}", self.spec.name, &self.id[..12], index + 1);
+            if node.name != vm_name(&self.id, index) && node.name != legacy_name {
                 return Err(failed(
                     "managed state contains a VM not owned by this operation",
                 ));
@@ -135,7 +136,7 @@ impl Operation {
             let id = format!("{:032x}", rand::random::<u128>());
             let nodes = (0..spec.nodes)
                 .map(|index| NodeState {
-                    name: vm_name(&spec.name, &id, index),
+                    name: vm_name(&id, index),
                     address: None,
                     phase: NodePhase::Planned,
                 })
@@ -199,8 +200,8 @@ fn save_state(directory: &Path, state: &ClusterState) -> Result<(), RelishError>
     Ok(())
 }
 
-fn vm_name(name: &str, id: &str, index: usize) -> String {
-    format!("rb-{name}-{}-{}", &id[..12], index + 1)
+fn vm_name(id: &str, index: usize) -> String {
+    format!("rb-{}-{}", &id[..12], index + 1)
 }
 
 fn validate_name(name: &str) -> Result<(), RelishError> {
@@ -277,6 +278,21 @@ fn failed(message: &str) -> RelishError {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn long_cluster_names_do_not_expand_vm_socket_paths() {
+        let root = tempfile::tempdir().unwrap();
+        let mut spec = spec();
+        spec.name = "a".repeat(32);
+        let operation = Operation::open(root.path(), &spec).unwrap();
+        assert!(
+            operation
+                .state
+                .nodes
+                .iter()
+                .all(|node| node.name.len() <= 20)
+        );
+    }
 
     fn spec() -> ClusterSpec {
         ClusterSpec {

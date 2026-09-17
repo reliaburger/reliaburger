@@ -28,7 +28,8 @@ Native macOS uses Apple's Virtualization.framework through Lima. Linux needs
 QEMU, KVM access and Lima's host prerequisites already installed. Allow at
 least 8 GiB of available memory and 15 GiB of free disk for the default cluster;
 image download time also depends on your connection. Guest package setup uses
-Ubuntu's repositories. No host directories are mounted into the VMs.
+Ubuntu's repositories. No host directories are mounted into the VMs. Managed Lima state lives under
+`~/.reliaburger/lima`, isolated from your normal Lima configuration.
 
 For a smaller single-node cluster:
 
@@ -80,7 +81,8 @@ context's credentials.
 For guest diagnostics, use the VM name printed by `relish local status`:
 
 ```sh
-~/.reliaburger/tools/lima-2.1.0/bin/limactl shell VM_NAME \
+LIMA_HOME="$HOME/.reliaburger/lima" \
+  ~/.reliaburger/tools/lima-2.1.0/bin/limactl shell VM_NAME \
   sudo journalctl -u reliaburger.service --no-pager -n 100
 ```
 

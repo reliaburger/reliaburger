@@ -22,18 +22,21 @@ pub fn vm_config(
         forwards.push(serde_json::json!({"guestPort":80,"hostPort":port,"hostIP":"127.0.0.1"}));
     }
     // Lima otherwise forwards every listening guest port automatically.
-    forwards.push(serde_json::json!({"guestPortRange":[1,65535],"ignore":true}));
+    forwards.push(serde_json::json!({
+        "guestPortRange":[1,65535], "guestIP":"0.0.0.0", "proto":"any", "ignore":true
+    }));
     let value = serde_json::json!({
         "vmType": if cfg!(target_os="macos") {"vz"} else {"qemu"},
         "arch":arch,
         "images":[{"location":image,"arch":arch}],
         "cpus":2,"memory":"2GiB","disk":"10GiB",
         "mounts":[],
+        "containerd":{"system":false,"user":false},
         "networks":[{"lima":"user-v2"}],
         "portForwards":forwards,
         "provision":[{"mode":"system","script": concat!(
             "#!/bin/bash\nset -eu\nexport DEBIAN_FRONTEND=noninteractive\n",
-            "apt-get update -qq\napt-get install -y -qq runc uidmap btrfs-progs iptables iproute2\n",
+            "apt-get update -qq\napt-get install -y -qq runc uidmap btrfs-progs nftables iptables iproute2\n",
             "install -d -m 700 /etc/reliaburger\n")
         }]
     });
@@ -46,6 +49,7 @@ pub fn node_config(
     name: &str,
     address: Ipv4Addr,
     seed: Option<Ipv4Addr>,
+    peers: &[Ipv4Addr],
 ) -> Result<String> {
     let mut config = NodeConfig::default();
     config.node.name = Some(name.to_owned());
@@ -54,6 +58,7 @@ pub fn node_config(
     config.cluster.join = seed.into_iter().map(|ip| format!("{ip}:9443")).collect();
     config.network.advertise_address = Some(address.to_string());
     config.security.require_mtls = true;
+    config.security.bootstrap_peers = peers.iter().copied().map(std::net::IpAddr::V4).collect();
     config.security.allow_insecure_cluster = false;
     config.security.identity_dir = Some("/etc/reliaburger/identity".into());
     config.security.master_key_path = Some("/etc/reliaburger/master.key".into());
@@ -79,12 +84,16 @@ mod tests {
         let yaml = vm_config("/private/cache/ubuntu.img", "aarch64", 19117, Some(18080)).unwrap();
         let value: serde_yaml::Value = serde_yaml::from_str(&yaml).unwrap();
         assert_eq!(value["mounts"].as_sequence().unwrap().len(), 0);
+        assert_eq!(value["containerd"]["user"], false);
+        assert_eq!(value["containerd"]["system"], false);
         let forwards = value["portForwards"].as_sequence().unwrap();
         assert_eq!(forwards.len(), 3);
         assert_eq!(forwards[0]["hostIP"], "127.0.0.1");
         assert_eq!(forwards[0]["hostPort"], 19117);
         assert_eq!(forwards[1]["hostPort"], 18080);
         assert_eq!(forwards[2]["ignore"], true);
+        assert_eq!(forwards[2]["proto"], "any");
+        assert_eq!(forwards[2]["guestIP"], "0.0.0.0");
         assert_eq!(value["networks"][0]["lima"], "user-v2");
     }
 
@@ -95,10 +104,15 @@ mod tests {
             "rb-laptop-123-1",
             "192.168.104.2".parse().unwrap(),
             None,
+            &["192.168.104.3".parse().unwrap()],
         )
         .unwrap();
         let node: crate::config::node::NodeConfig = toml::from_str(&first).unwrap();
         assert!(node.security.require_mtls);
+        assert_eq!(
+            node.security.bootstrap_peers,
+            vec!["192.168.104.3".parse::<std::net::IpAddr>().unwrap()]
+        );
         assert!(!node.security.allow_insecure_cluster);
         assert!(node.security.bootstrap_path.is_some());
         assert!(node.ebpf.enabled);
@@ -110,6 +124,7 @@ mod tests {
             "rb-laptop-123-2",
             "192.168.104.3".parse().unwrap(),
             Some("192.168.104.2".parse().unwrap()),
+            &["192.168.104.2".parse().unwrap()],
         )
         .unwrap();
         let node: crate::config::node::NodeConfig = toml::from_str(&peer).unwrap();

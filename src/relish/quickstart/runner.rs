@@ -44,12 +44,28 @@ pub async fn run(options: Options) -> Result<()> {
         ingress_port: options.ingress_port,
     };
     let operation_root = root.clone();
-    let (mut operation, bootstrap) = tokio::task::spawn_blocking(move || -> Result<_> {
-        let operation = Operation::open(&operation_root, &spec)?;
-        let bootstrap = security::prepare(&operation)?;
-        Ok((operation, bootstrap))
-    })
-    .await??;
+    let (mut operation, bootstrap, _setup_lock) =
+        tokio::task::spawn_blocking(move || -> Result<_> {
+            let operation = Operation::open(&operation_root, &spec)?;
+            let mut lock_options = std::fs::OpenOptions::new();
+            lock_options.read(true).write(true).create(true).truncate(false);
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::OpenOptionsExt;
+                lock_options.mode(0o600);
+            }
+            let setup_lock = lock_options.open(operation_root.join("setup.lock"))?;
+            setup_lock.try_lock().context("another managed setup is using this state directory")?;
+            if LocalContext::load(&operation_root.join("context.json"))?
+                .is_some_and(|context| context.owner != operation.state.id)
+            {
+                bail!("another cluster owns the active context; use a separate RELIABURGER_HOME for a second cluster");
+            }
+            let bootstrap = security::prepare(&operation)?;
+            Ok((operation, bootstrap, setup_lock))
+        })
+        .await??;
+    super::preflight::socket_paths(&root, operation.state.nodes.iter().map(|node| &node.name))?;
     let started = std::time::Instant::now();
     let result = tokio::time::timeout(
         Duration::from_secs(300),
@@ -99,6 +115,7 @@ async fn provision_cluster(
     let spec = operation.state.spec.clone();
     let cache = root.join("cache");
     tokio::fs::create_dir_all(&cache).await?;
+    super::preflight::host(root).await?;
     let downloader = Downloader::new(Duration::from_secs(180))?;
     println!("preparing verified Linux image and tooling");
     let binaries = async {
@@ -130,8 +147,19 @@ async fn provision_cluster(
     let (lima, image, (bun, relish)) =
         tokio::try_join!(artifacts::tooling(root, &downloader), image, binaries)?;
     println!("starting {} Linux VM(s)", spec.nodes);
+    let mut statuses = Vec::new();
+    for node in &operation.state.nodes {
+        statuses.push(lima.status(&node.name).await?);
+    }
+    let to_start = statuses
+        .iter()
+        .filter(|status| status.as_deref() != Some("Running"))
+        .count();
+    let to_create = statuses.iter().filter(|status| status.is_none()).count();
+    super::preflight::resources(to_start, to_create, root).await?;
     let mut boots = FuturesUnordered::new();
-    for (index, node) in operation.state.nodes.iter().enumerate() {
+    let nodes = operation.state.nodes.clone();
+    for (index, node) in nodes.iter().enumerate() {
         let lima = lima.clone();
         let node = node.clone();
         let config_path = operation.directory.join(format!("{}.yaml", node.name));
@@ -142,8 +170,16 @@ async fn provision_cluster(
             (index == 0).then_some(spec.ingress_port),
         )?;
         tokio::fs::write(&config_path, yaml).await?;
-        boots.push(async move {
-            match lima.status(&node.name).await?.as_deref() {
+        let status = statuses[index].clone();
+        let api_port = spec.api_port + index as u16;
+        let ingress_port = (index == 0).then_some(spec.ingress_port);
+        let boot = async move {
+            if status.as_deref() != Some("Running") {
+                let mut ports = vec![api_port];
+                ports.extend(ingress_port);
+                super::preflight::ports(&ports).await?;
+            }
+            match status.as_deref() {
                 None if node.phase != NodePhase::Planned => bail!(
                     "owned VM {} disappeared; refusing to create a replacement cluster implicitly",
                     node.name
@@ -163,26 +199,26 @@ async fn provision_cluster(
                 }
                 Some(status) => bail!("VM {} is in unexpected state {status}", node.name),
             }
+            lima.wait_for_guest(&node.name).await?;
             Ok::<_, anyhow::Error>((index, lima.address(&node.name).await?))
-        });
+        };
+        // Lima creates its shared SSH key on first boot. Initialise once before
+        // starting peers, otherwise concurrent ssh-keygen calls can overwrite it.
+        if index == 0 {
+            record_boot(operation, boot.await?).await?;
+        } else {
+            boots.push(boot);
+        }
     }
     while let Some(result) = boots.next().await {
-        let (index, address) = result?;
-        let node = &mut operation.state.nodes[index];
-        if node.address.is_some_and(|previous| previous != address)
-            && node.phase == NodePhase::Started
-        {
-            bail!(
-                "VM {} changed its shared address; refusing to resume with stale peer configuration",
-                node.name
-            );
-        }
-        node.address = Some(address);
-        if node.phase == NodePhase::Planned {
-            node.phase = NodePhase::Created;
-        }
-        operation.save_async().await?;
+        record_boot(operation, result?).await?;
     }
+    let peers: Vec<_> = operation
+        .state
+        .nodes
+        .iter()
+        .filter_map(|node| node.address)
+        .collect();
     let first_address = operation.state.nodes[0]
         .address
         .context("bootstrap VM has no address")?;
@@ -201,6 +237,7 @@ async fn provision_cluster(
                 &node.name,
                 node.address.context("VM has no address")?,
                 (index > 0).then_some(first_address),
+                &peers,
             )?;
             let config_path = operation.directory.join(format!("{}.toml", node.name));
             tokio::fs::write(&config_path, config).await?;
@@ -381,6 +418,26 @@ async fn provision_cluster(
     Ok(())
 }
 
+async fn record_boot(
+    operation: &mut Operation,
+    (index, address): (usize, std::net::Ipv4Addr),
+) -> Result<()> {
+    let node = &mut operation.state.nodes[index];
+    if node.address.is_some_and(|previous| previous != address) && node.phase == NodePhase::Started
+    {
+        bail!(
+            "VM {} changed its shared address; refusing to resume with stale peer configuration",
+            node.name
+        );
+    }
+    node.address = Some(address);
+    if node.phase == NodePhase::Planned {
+        node.phase = NodePhase::Created;
+    }
+    operation.save_async().await?;
+    Ok(())
+}
+
 fn quorum_ready(names: &[String], council: &CouncilStatus) -> bool {
     council
         .leader
@@ -392,7 +449,7 @@ fn quorum_ready(names: &[String], council: &CouncilStatus) -> bool {
             .all(|name| council.members.iter().any(|member| &member.name == name))
 }
 
-async fn wait_for_quorum(client: &BunClient, names: &[String]) -> Result<()> {
+pub(super) async fn wait_for_quorum(client: &BunClient, names: &[String]) -> Result<()> {
     tokio::time::timeout(Duration::from_secs(45), async {
         loop {
             if let (Ok(council), Ok(nodes)) = (client.council().await, client.nodes().await)

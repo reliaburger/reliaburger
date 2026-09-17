@@ -806,7 +806,9 @@ that you supply exactly one source; both routes use the same pinned-CA join.
 ### Put the steps together
 
 `setup --quickstart` wraps the whole operation in one five-minute deadline.
-Each completed external step gets a durable checkpoint. VM boots run through
+Each completed external step gets a durable checkpoint. The first VM boots
+alone: Lima creates its shared SSH identity during this step, and concurrent
+first boots race that initialisation. The remaining VM boots run through
 `FuturesUnordered`, a collection of futures polled concurrently that yields
 results as they finish. A future is Rust's suspended asynchronous computation;
 putting several in this stream lets one VM boot while another waits for package
@@ -841,3 +843,21 @@ Stopping preserves disks. Destroying requires `--yes`, removes the owned VMs,
 and removes the active context only if its owner matches. We preserve the lock
 file's inode: deleting it while holding the lock would let another process
 create a new file at the same path and acquire a different lock.
+
+
+### Keep the host predictable
+
+The managed Lima home lives inside `RELIABURGER_HOME`, so a user's global Lima
+configuration cannot add host mounts or change the network behind our back.
+A root-level setup lock protects the shared SSH identity and active context;
+the per-cluster lock still protects lifecycle operations. VM names use a short
+ownership identifier rather than the human-facing cluster name. Unix sockets
+have a fixed path-length limit, so we check the complete socket path before
+allocating anything and explain how to choose a shorter state directory.
+
+Preflight checks the VM driver, available memory and disk, and the ports needed
+by stopped or missing VMs. Already running VMs aren't charged twice. We wait
+for guest provisioning to finish even when Lima reports the VM as running;
+those are different milestones. The last forwarding rule excludes every other
+TCP and UDP port on every guest interface. Lima's automatic forwarding is
+helpful interactively, but it isn't part of this installation's contract.

@@ -40,7 +40,7 @@ pub async fn run(action: Action, name: &str, confirmed: bool) -> Result<()> {
     if !executable.exists() {
         bail!("managed Lima is missing; resume setup to reinstall it");
     }
-    let lima = Lima::new(executable, Duration::from_secs(120));
+    let lima = Lima::new(executable, Duration::from_secs(120)).with_home(root.join("lima"));
     for (index, node) in operation.state.nodes.iter().enumerate() {
         let status = lima.status(&node.name).await?;
         match action {
@@ -78,11 +78,13 @@ pub async fn run(action: Action, name: &str, confirmed: bool) -> Result<()> {
             Action::Stop => {
                 if status.as_deref() == Some("Running") {
                     lima.command(&["stop", &node.name]).await?;
+                    println!("stopped {}", node.name);
                 }
             }
             Action::Destroy => {
                 if status.is_some() {
                     lima.command(&["delete", "--force", &node.name]).await?;
+                    println!("removed {}", node.name);
                 }
             }
         }
@@ -96,6 +98,21 @@ pub async fn run(action: Action, name: &str, confirmed: bool) -> Result<()> {
             ))?;
             crate::relish::readiness::wait_for_node(&client, Duration::from_secs(45)).await?;
         }
+    }
+    if action == Action::Start {
+        let bootstrap = bootstrap.as_ref().context("cluster bootstrap is missing")?;
+        let client = bootstrap.client(&format!(
+            "https://127.0.0.1:{}",
+            operation.state.spec.api_port
+        ))?;
+        let names = operation
+            .state
+            .nodes
+            .iter()
+            .map(|node| node.name.clone())
+            .collect::<Vec<_>>();
+        super::runner::wait_for_quorum(&client, &names).await?;
+        println!("cluster quorum ready");
     }
     if action == Action::Destroy {
         tokio::task::spawn_blocking(move || -> Result<()> {

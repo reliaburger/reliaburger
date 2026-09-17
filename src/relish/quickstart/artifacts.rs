@@ -96,7 +96,7 @@ pub async fn tooling(root: &Path, downloader: &Downloader) -> Result<Lima> {
         tokio::fs::rename(staging.path(), &installed).await?;
         let _ = staging.keep();
     }
-    let lima = Lima::new(executable, Duration::from_secs(240));
+    let lima = Lima::new(executable, Duration::from_secs(240)).with_home(root.join("lima"));
     let version = lima.command(&["--version"]).await?;
     if !version.split_whitespace().any(|word| word == "2.1.0") {
         bail!("managed Lima installation has an unexpected version");
