@@ -7,7 +7,9 @@
 use std::collections::BTreeMap;
 use std::time::Duration;
 
-use super::rollup::{MetricsQuery, MetricsQueryResult, MetricsQueryRow, QueryWarning};
+use super::rollup::{
+    MetricsQuery, MetricsQueryResult, MetricsQueryRow, OwnedRollupRow, QueryWarning,
+};
 
 /// Merge metrics results from multiple sources, sorted by timestamp.
 ///
@@ -51,10 +53,49 @@ pub fn merge_cluster_results(mut sources: Vec<Vec<MetricsQueryRow>>) -> Vec<Metr
         .collect()
 }
 
+/// Deduplicate immutable worker/minute/series contributions before summing.
+/// Conflicting copies are omitted and marked unavailable rather than selected arbitrarily.
+pub fn merge_owned_rollups(sources: Vec<Vec<OwnedRollupRow>>) -> MetricsQueryResult {
+    let mut contributions: BTreeMap<(String, u64, String, String), Option<f64>> = BTreeMap::new();
+    for owned in sources.into_iter().flatten() {
+        let row = owned.row;
+        let key = (owned.node_id, row.timestamp, row.metric_name, row.labels);
+        contributions
+            .entry(key)
+            .and_modify(|value| {
+                if *value != Some(row.value) {
+                    *value = None;
+                }
+            })
+            .or_insert(Some(row.value));
+    }
+    let mut rows = Vec::new();
+    let mut warnings = Vec::new();
+    for ((node_id, timestamp, metric_name, labels), value) in contributions {
+        match value {
+            Some(value) => rows.push(MetricsQueryRow {
+                timestamp,
+                metric_name,
+                labels,
+                value,
+            }),
+            None => warnings.push(QueryWarning::DataUnavailable {
+                node_id,
+                from: timestamp,
+                to: timestamp,
+            }),
+        }
+    }
+    MetricsQueryResult {
+        data: merge_cluster_results(vec![rows]),
+        warnings,
+    }
+}
+
 /// Fan out a cluster-wide metrics query to all council aggregators.
 ///
 /// Each `council_url` should be a base URL like `http://10.0.1.5:9117`.
-/// The query is sent to `GET /v1/metrics/rollup` on each council member.
+/// The query is sent to `GET /v1/metrics/rollup/owned` on each council member.
 /// Results are merged by timestamp. Unresponsive nodes produce warnings.
 pub async fn fan_out_cluster_query(
     query: &MetricsQuery,
@@ -66,17 +107,16 @@ pub async fn fan_out_cluster_query(
     let (data_sources, warnings) = fan_out_to_urls(
         query,
         council_urls,
-        "/v1/metrics/rollup",
+        "/v1/metrics/rollup/owned",
         client,
         timeout,
         service_token,
     )
     .await;
 
-    MetricsQueryResult {
-        data: merge_cluster_results(data_sources),
-        warnings,
-    }
+    let mut result = merge_owned_rollups(data_sources);
+    result.warnings.extend(warnings);
+    result
 }
 
 /// Fan out a single-app metrics query to nodes running that app.
@@ -107,14 +147,14 @@ pub async fn fan_out_app_query(
 }
 
 /// Internal helper: fan out a query to a set of URLs, collect results.
-async fn fan_out_to_urls(
+async fn fan_out_to_urls<T: serde::de::DeserializeOwned + Send + 'static>(
     query: &MetricsQuery,
     urls: &[String],
     path: &str,
     client: &reqwest::Client,
     timeout: Duration,
     service_token: Option<&str>,
-) -> (Vec<Vec<MetricsQueryRow>>, Vec<QueryWarning>) {
+) -> (Vec<Vec<T>>, Vec<QueryWarning>) {
     let mut handles = Vec::new();
 
     for url in urls {
@@ -129,23 +169,27 @@ async fn fan_out_to_urls(
         let token = service_token.map(str::to_string);
 
         handles.push(tokio::spawn(async move {
-            let mut params = vec![format!("start={start}"), format!("end={end}")];
-            if let Some(ref name) = metric_name {
-                params.push(format!("name={name}"));
+            let mut params = vec![("start", start.to_string()), ("end", end.to_string())];
+            if let Some(name) = metric_name {
+                params.push(("name", name));
             }
-            if let Some(ref app) = app {
-                params.push(format!("app={app}"));
+            if let Some(app) = app {
+                params.push(("app", app));
             }
-            let req_url = format!("{endpoint}?{}", params.join("&"));
-
-            let request = crate::sesame::auth::bearer_get(&client, &req_url, token.as_deref());
-            let resp = tokio::time::timeout(timeout, request.send()).await;
-
-            match resp {
-                Ok(Ok(r)) if r.status().is_success() => {
-                    let rows = r.json::<Vec<MetricsQueryRow>>().await.unwrap_or_default();
-                    Ok(rows)
-                }
+            let request = crate::sesame::auth::bearer_get(&client, &endpoint, token.as_deref())
+                .query(&params);
+            // Cover response decoding too: a peer can send headers then stall its body.
+            let response = tokio::time::timeout(timeout, async {
+                request
+                    .send()
+                    .await?
+                    .error_for_status()?
+                    .json::<Vec<T>>()
+                    .await
+            })
+            .await;
+            match response {
+                Ok(Ok(rows)) => Ok(rows),
                 _ => Err(node_url),
             }
         }));
@@ -265,6 +309,119 @@ mod tests {
         assert_eq!(result[0].value, 10.0);
         assert_eq!(result[1].value, 20.0);
         assert_eq!(result[2].value, 30.0);
+    }
+
+    #[tokio::test]
+    async fn cluster_query_counts_reassigned_worker_history_once() {
+        use axum::{Json, Router, routing::get};
+        let mut servers = Vec::new();
+        let mut urls = Vec::new();
+        for node in ["worker-b", "worker-c"] {
+            let rows = serde_json::json!([
+                {"node_id":"worker-a", "timestamp":1000, "metric_name":"cpu", "labels":"{}", "value":10.0},
+                {"node_id":node, "timestamp":1000, "metric_name":"cpu", "labels":"{}", "value":20.0}
+            ]);
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            urls.push(format!("http://{}", listener.local_addr().unwrap()));
+            let handler = get(move || {
+                let rows = rows.clone();
+                async move { Json(rows) }
+            });
+            let app = Router::new()
+                .route("/v1/metrics/rollup", handler.clone())
+                .route("/v1/metrics/rollup/owned", handler);
+            servers.push(tokio::spawn(async move {
+                axum::serve(listener, app).await.unwrap();
+            }));
+        }
+        let query = MetricsQuery {
+            metric_name: Some("cpu".into()),
+            start: 0,
+            end: 2000,
+            app: None,
+        };
+        let result = fan_out_cluster_query(
+            &query,
+            &urls,
+            &reqwest::Client::new(),
+            Duration::from_secs(2),
+            None,
+        )
+        .await;
+        for server in servers {
+            server.abort();
+            let _ = server.await;
+        }
+        assert!(result.warnings.is_empty(), "{:?}", result.warnings);
+        assert_eq!(result.data.len(), 1);
+        assert_eq!(
+            result.data[0].value, 50.0,
+            "reassigned worker counted twice"
+        );
+    }
+
+    #[test]
+    fn conflicting_copies_are_unknown_and_other_series_remain_independent() {
+        let owned = |value| OwnedRollupRow {
+            node_id: "worker-a".into(),
+            row: row(1000, "cpu", "{}", value),
+        };
+        let independent = OwnedRollupRow {
+            node_id: "worker-a".into(),
+            row: row(1000, "cpu", r#"{"app":"web"}"#, 30.0),
+        };
+        let result = merge_owned_rollups(vec![
+            vec![owned(10.0), independent],
+            vec![owned(20.0), owned(10.0)],
+        ]);
+        assert_eq!(result.data.len(), 1);
+        assert_eq!(result.data[0].value, 30.0);
+        assert_eq!(
+            result.warnings,
+            vec![QueryWarning::DataUnavailable {
+                node_id: "worker-a".into(),
+                from: 1000,
+                to: 1000
+            }]
+        );
+    }
+
+    #[tokio::test]
+    async fn legacy_or_malformed_rollup_responses_remain_unknown() {
+        use axum::{Json, Router, routing::get};
+        for owned_endpoint in [false, true] {
+            let app = Router::new().route(
+                if owned_endpoint {
+                    "/v1/metrics/rollup/owned"
+                } else {
+                    "/v1/metrics/rollup"
+                },
+                get(|| async { Json(vec![row(1000, "cpu", "{}", 10.0)]) }),
+            );
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let url = format!("http://{}", listener.local_addr().unwrap());
+            let server = tokio::spawn(async move {
+                axum::serve(listener, app).await.unwrap();
+            });
+            let query = MetricsQuery {
+                metric_name: None,
+                start: 0,
+                end: 2000,
+                app: None,
+            };
+            let result = fan_out_cluster_query(
+                &query,
+                &[url],
+                &reqwest::Client::new(),
+                Duration::from_secs(1),
+                None,
+            )
+            .await;
+            server.abort();
+            let _ = server.await;
+            assert!(result.data.is_empty());
+            assert_eq!(result.warnings.len(), 1);
+        }
     }
 
     // --- merge_cluster_results tests ---

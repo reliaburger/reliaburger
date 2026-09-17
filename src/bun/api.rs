@@ -410,6 +410,10 @@ pub fn router_with_upgrade(
         .route("/v1/metrics/summary", get(metrics_summary_handler))
         .route("/v1/metrics/keys", get(metrics_keys_handler))
         .route("/v1/metrics/rollup", get(metrics_rollup_handler))
+        .route(
+            "/v1/metrics/rollup/owned",
+            get(metrics_owned_rollup_handler),
+        )
         .route("/v1/metrics/cluster", get(metrics_cluster_handler))
         .route(
             "/v1/metrics/app/{app}/{namespace}",
@@ -5725,6 +5729,41 @@ async fn metrics_rollup_handler(
     }
 }
 
+/// Return worker identity with each contribution so overlapping aggregators cannot double-count it.
+async fn metrics_owned_rollup_handler(
+    auth: Option<axum::Extension<crate::sesame::auth::AuthContext>>,
+    State(state): State<ApiState>,
+    Query(params): Query<MetricsQueryParams>,
+) -> Response {
+    if let Err(response) = crate::sesame::auth::require_unscoped(auth.as_deref()) {
+        return response;
+    }
+    let Some(store) = &state.rollup_store else {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            "no rollup store configured",
+        )
+            .into_response();
+    };
+    match store
+        .read()
+        .await
+        .query_owned_rows(
+            params.name.as_deref(),
+            params.start.unwrap_or(0),
+            params.end.unwrap_or(i64::MAX as u64),
+        )
+        .await
+    {
+        Ok(rows) => Json(rows).into_response(),
+        Err(error) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({"error":error.to_string()})),
+        )
+            .into_response(),
+    }
+}
+
 /// Resolve the base URLs of every council aggregator (Raft voter) from the
 /// live gossip membership.
 ///
@@ -5758,8 +5797,8 @@ async fn resolve_council_urls(state: &ApiState) -> Option<Vec<String>> {
 
 /// `GET /v1/metrics/cluster?name=X&start=S&end=E` — cluster-wide query.
 ///
-/// Fans out to all council aggregators' `/v1/metrics/rollup` endpoints,
-/// merges results (summing partial aggregates), and returns the combined data
+/// Fans out to all council aggregators' `/v1/metrics/rollup/owned` endpoints,
+/// deduplicates worker contributions before summing, and returns the combined data
 /// with any warnings about unresponsive aggregators. Falls back to reading the
 /// local rollup store when there is no council to fan out to (single-node).
 async fn metrics_cluster_handler(
@@ -5776,9 +5815,8 @@ async fn metrics_cluster_handler(
     // full-domain unsigned range like `timestamp <= u64::MAX`.
     let end = params.end.unwrap_or(i64::MAX as u64).min(i64::MAX as u64);
 
-    // Cluster path: fan out to every council aggregator's local rollup store
-    // and sum. Reading only this member's store (as this endpoint used to)
-    // undercounts, because each aggregator holds a different slice of workers.
+    // Retain worker identity until after deduplication: reassignment leaves
+    // overlapping history on old and new aggregators.
     if let Some(urls) = resolve_council_urls(&state).await {
         let query = MetricsQuery {
             metric_name: params.name.clone(),
@@ -5811,36 +5849,12 @@ async fn metrics_cluster_handler(
     };
 
     let store = rollup_store.read().await;
-    let result = match &params.name {
-        Some(name) => store.query_cluster_metric(name, start, end).await,
-        None => {
-            let sql = format!(
-                "SELECT timestamp, metric_name, labels, SUM(sum_val) as total_sum \
-                 FROM rollups \
-                 WHERE timestamp >= {start} AND timestamp <= {end} \
-                 GROUP BY timestamp, metric_name, labels \
-                 ORDER BY timestamp LIMIT 10000"
-            );
-            store.query_sql(&sql).await
-        }
-    };
-
+    let result = store
+        .query_owned_rows(params.name.as_deref(), start, end)
+        .await;
     match result {
         Ok(rows) => {
-            let data: Vec<MetricsQueryRow> = rows
-                .into_iter()
-                .map(|(ts, name, labels, val)| MetricsQueryRow {
-                    timestamp: ts,
-                    metric_name: name,
-                    labels,
-                    value: val,
-                })
-                .collect();
-            Json(MetricsQueryResult {
-                data,
-                warnings: vec![],
-            })
-            .into_response()
+            Json(crate::mayo::query_fanout::merge_owned_rollups(vec![rows])).into_response()
         }
         Err(e) => (
             StatusCode::INTERNAL_SERVER_ERROR,
@@ -9204,6 +9218,7 @@ mod tests {
             "/v1/metrics/summary",
             "/v1/metrics/keys",
             "/v1/metrics/rollup",
+            "/v1/metrics/rollup/owned",
             "/v1/metrics/cluster",
             "/v1/events",
         ] {

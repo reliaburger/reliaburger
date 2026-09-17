@@ -176,7 +176,11 @@ The fix wasn't cleverer dedup. It was making the data honest: `generate_backfill
 
 We deliberately did *not* add a "window length" field to `NodeRollup`. The reporting messages cross the wire as bincode, where enum discriminants and struct layouts are pinned for rolling upgrades — an old node receiving a new field mid-upgrade would fail to decode the frame. Five sends of the unchanged type cost a few extra kilobytes once per reassignment and keep the wire format stable. When a schema is pinned, change the *usage*, not the shape.
 
-One honest caveat: if the old and new aggregators both hold the same minute, a cluster-wide query still sums it twice, because there's no handoff between aggregators — the old one is never told it lost a worker. That overlap lasts until retention prunes it, it's bounded to the reassignment window, and fixing it properly means aggregator handoff, which is a much bigger hammer than the bug deserves.
+The query must also retain the worker's identity. Both aggregators can hold the
+same minute after reassignment, so the owned-rollup endpoint returns individual
+worker/minute/series contributions. The coordinator deduplicates those keys
+before summing across workers. We don't need to delete history from the old
+aggregator to make the answer correct.
 
 ### Switching it on
 
@@ -221,7 +225,12 @@ pub fn merge_metrics_results(mut sources: Vec<Vec<MetricsQueryRow>>) -> Vec<Metr
 }
 ```
 
-**Cluster-wide queries** fan out to the 3-7 council aggregators. Each returns a partial aggregate covering its subset of nodes. These must be *summed*, not deduplicated. If council member c1 reports `cpu_sum=30` (from workers w1 and w2) and c2 reports `cpu_sum=70` (from workers w3 and w4), the cluster total is 100, not 30 or 70.
+**Cluster-wide queries** fan out to the council aggregators. Each returns rows
+with the original worker identity. `merge_owned_rollups` removes duplicate
+worker/minute/metric/label keys, then passes the remaining contributions to the
+sum below. Different workers' values add together; copies of one worker's value
+do not. Conflicting copies produce an unavailable-data warning instead of an
+arbitrary choice.
 
 ```rust
 pub fn merge_cluster_results(mut sources: Vec<Vec<MetricsQueryRow>>) -> Vec<MetricsQueryRow> {
@@ -244,10 +253,11 @@ You might wonder why `merge_cluster_results` uses `BTreeMap` instead of `HashMap
 
 ## The API endpoints
 
-Three new endpoints expose the aggregation:
+These endpoints expose the aggregation:
 
-- `GET /v1/metrics/rollup` -- internal. Queried by other council members during fan-out. Returns raw rollup data from the local `RollupStore`.
-- `GET /v1/metrics/cluster` -- cluster-wide query. Fans out to all council aggregators, sums partial results.
+- `GET /v1/metrics/rollup` -- legacy local aggregate view.
+- `GET /v1/metrics/rollup/owned` -- internal fan-out endpoint retaining worker identity.
+- `GET /v1/metrics/cluster` -- cluster-wide query. Fans out to council aggregators, deduplicates ownership, then sums.
 - `GET /v1/metrics/app/{app}/{namespace}` -- single-app query. Queries local metrics filtered by app labels.
 
 The cluster endpoint returns a `MetricsQueryResult` with both data and warnings:
@@ -745,3 +755,23 @@ state, so an unscheduled replica remains visible. Environment values come from
 the replicated spec, with the existing encrypted-value masking; standalone
 agents answer through a bounded command request. Local deployment history also
 filters by namespace, because two tenants can use the same app name.
+
+### Keep identity until after the merge
+
+Summing first destroys the information needed to recognise an overlapping
+worker. `OwnedRollupRow` therefore wraps a query row with its originating node.
+The `#[serde(flatten)]` attribute places the wrapped row's fields beside
+`node_id` in JSON, while Rust keeps the nested types explicit. The ordered map
+uses `(node, minute, metric, labels)` as its key and `Option<f64>` as its value:
+`Some` holds the agreed contribution; `None` records conflicting copies.
+
+The owned endpoint is separate from the legacy aggregate endpoint. An older
+aggregator returns 404, producing a visible partial-result warning. Malformed
+responses also remain unknown, and the timeout covers both headers and body.
+Queries exceeding 10,000 contributions are refused with a narrower-range hint,
+so truncation cannot quietly reduce the sum.
+
+Tests reproduce 60 instead of 50 through HTTP fan-out, then prove 50 after the
+fix. Real Parquet stores retain overlapping history across reopening and retry;
+the merge still counts each contribution once. The existing backfill integration
+test now expects one for every minute, including the two both parents hold.

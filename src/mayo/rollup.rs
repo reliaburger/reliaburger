@@ -98,6 +98,16 @@ pub struct MetricsQueryResult {
     pub warnings: Vec<QueryWarning>,
 }
 
+/// One immutable worker/minute/series contribution, before cluster aggregation.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct OwnedRollupRow {
+    /// Worker that originally measured this contribution, not its aggregator.
+    pub node_id: String,
+    /// Measurement identity and sum for the window.
+    #[serde(flatten)]
+    pub row: MetricsQueryRow,
+}
+
 /// A single row in a metrics query result.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct MetricsQueryRow {

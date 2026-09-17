@@ -507,3 +507,8 @@ hash key again is safe. A 32-generation retention/restart regression keeps one
 receipt throughout, skips an immediate duplicate export, and queries all 32
 archived generations afterwards. Destination and pruning tests still apply to
 the smaller checkpoint.
+
+Local rollup receipts prevent repeated ingestion by one aggregator. Cluster query
+merging also retains the original worker/minute/series key, so reassignment to
+another aggregator cannot double-count overlapping history. Chapter 11 explains
+the owned-row endpoint and its persistence and HTTP regressions.

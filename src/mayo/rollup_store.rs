@@ -16,7 +16,7 @@ use datafusion::arrow::record_batch::RecordBatch;
 use datafusion::datasource::MemTable;
 use datafusion::prelude::*;
 
-use super::rollup::NodeRollup;
+use super::rollup::{MetricsQueryRow, NodeRollup, OwnedRollupRow};
 use super::store::{dir_has_parquet, next_flush_counter, write_batch_parquet};
 use super::types::MayoError;
 
@@ -413,6 +413,83 @@ impl RollupStore {
         Ok(results)
     }
 
+    /// Read worker contributions without losing the identity needed for reassignment deduplication.
+    /// Refuse oversized results rather than silently returning a truncated cluster sum.
+    pub async fn query_owned_rows(
+        &self,
+        metric_name: Option<&str>,
+        start: u64,
+        end: u64,
+    ) -> Result<Vec<OwnedRollupRow>, MayoError> {
+        let name_filter = metric_name
+            .map(|name| {
+                format!(
+                    " AND metric_name = '{}'",
+                    super::store::escape_sql_literal(name)
+                )
+            })
+            .unwrap_or_default();
+        let end = end.min(i64::MAX as u64);
+        let sql = format!(
+            "SELECT DISTINCT timestamp, node_id, metric_name, labels, sum_val FROM rollups WHERE timestamp >= {start} AND timestamp <= {end}{name_filter} ORDER BY timestamp, node_id, metric_name, labels LIMIT 10001"
+        );
+        let batches = self
+            .session()
+            .await?
+            .sql(&sql)
+            .await
+            .map_err(|error| MayoError::QueryFailed(error.to_string()))?
+            .collect()
+            .await
+            .map_err(|error| MayoError::QueryFailed(error.to_string()))?;
+        let mut rows = Vec::new();
+        for batch in batches {
+            let timestamps = batch
+                .column(0)
+                .as_any()
+                .downcast_ref::<UInt64Array>()
+                .ok_or_else(|| MayoError::Arrow("timestamp column type mismatch".into()))?;
+            let nodes = batch
+                .column(1)
+                .as_any()
+                .downcast_ref::<StringArray>()
+                .ok_or_else(|| MayoError::Arrow("node_id column type mismatch".into()))?;
+            let names = batch
+                .column(2)
+                .as_any()
+                .downcast_ref::<StringArray>()
+                .ok_or_else(|| MayoError::Arrow("metric_name column type mismatch".into()))?;
+            let labels = batch
+                .column(3)
+                .as_any()
+                .downcast_ref::<StringArray>()
+                .ok_or_else(|| MayoError::Arrow("labels column type mismatch".into()))?;
+            let values = batch
+                .column(4)
+                .as_any()
+                .downcast_ref::<Float64Array>()
+                .ok_or_else(|| MayoError::Arrow("value column type mismatch".into()))?;
+            for i in 0..batch.num_rows() {
+                rows.push(OwnedRollupRow {
+                    node_id: nodes.value(i).to_owned(),
+                    row: MetricsQueryRow {
+                        timestamp: timestamps.value(i),
+                        metric_name: names.value(i).to_owned(),
+                        labels: labels.value(i).to_owned(),
+                        value: values.value(i),
+                    },
+                });
+            }
+        }
+        if rows.len() > 10000 {
+            return Err(MayoError::QueryFailed(
+                "rollup query exceeds 10000 contributions; narrow the time range or metric filter"
+                    .into(),
+            ));
+        }
+        Ok(rows)
+    }
+
     /// Query cluster-wide aggregated metrics by name and time range.
     ///
     /// Returns (timestamp, metric_name, labels, sum) tuples aggregated
@@ -735,6 +812,58 @@ mod tests {
                 },
             }],
         }
+    }
+
+    #[tokio::test]
+    async fn oversized_owned_queries_refuse_instead_of_truncating_the_sum() {
+        let (mut store, _dir) = test_store();
+        for window in 0..=10000 {
+            store.ingest(&make_rollup("worker-a", window, "cpu", 1.0));
+        }
+        let error = store.query_owned_rows(None, 0, 10000).await.unwrap_err();
+        assert!(error.to_string().contains("narrow the time range"));
+        assert_eq!(
+            store
+                .query_owned_rows(Some("cpu"), 0, 9999)
+                .await
+                .unwrap()
+                .len(),
+            10000
+        );
+    }
+
+    #[tokio::test]
+    async fn reassigned_history_stays_unique_after_restart_and_retries() {
+        let mut sources = Vec::new();
+        for worker in ["worker-b", "worker-c"] {
+            let (mut store, dir) = test_store();
+            let common = make_rollup("worker-a", 1000, "cpu", 10.0);
+            store.ingest(&common);
+            store.ingest(&make_rollup(worker, 1000, "cpu", 20.0));
+            store.flush().await.unwrap();
+            drop(store);
+            let mut reopened = RollupStore::new(dir.path().to_path_buf());
+            // Even a retry before hydrating in-memory receipt state must not double-count.
+            reopened.ingest(&common);
+            reopened.flush().await.unwrap();
+            assert!(
+                reopened
+                    .query_owned_rows(Some("cpu' OR '1'='1"), 0, 2000)
+                    .await
+                    .unwrap()
+                    .is_empty()
+            );
+            let rows = reopened
+                .query_owned_rows(Some("cpu"), 0, 2000)
+                .await
+                .unwrap();
+            assert_eq!(rows.len(), 2);
+            sources.push(rows);
+        }
+        let result = crate::mayo::query_fanout::merge_owned_rollups(sources);
+        assert!(result.warnings.is_empty());
+        assert_eq!(result.data.len(), 1);
+        assert_eq!(result.data[0].value, 50.0);
     }
 
     #[tokio::test]

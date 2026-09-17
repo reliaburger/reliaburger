@@ -48,7 +48,7 @@ remain separate. Older unchecked groups below point into this current ledger.
 - [x] **C17** Reject overflowing relative durations with checked multiplication and parse units at UTF-8 boundaries. The overflow regression fails before the fix; all 34 CLI command tests pass, including multibyte invalid input.
 - [x] **C18** Scan candidates once from a random starting point, preserving concurrency and out-of-range adoption semantics. The nearly-full-pool regression fails before the fix; all 16 allocator tests pass.
 - [x] **C19** Count successful metric/rollup deletions only, expose removal and directory-enumeration errors with paths, and ignore concurrent NotFound without counting it. Both failing-removal regressions fail before the fix; all 171 Mayo tests pass.
-- [ ] **C20** (P1) Deduplicate rollup ownership at query merge.
+- [x] **C20** Retain worker/minute/series identity through an owned-rollup endpoint and deduplicate before summing; conflicting copies and legacy/malformed peers remain explicit unknown evidence. The HTTP double-count regression fails before the fix; Mayo, real Parquet restart/retry, four aggregation integration tests and endpoint scope/authority tests pass. Oversized queries refuse rather than silently truncate.
 - [ ] **C21** (P2) Bound and chunk reporting payloads.
 - [x] **C22** Compact receipts to current source generations only after a successful scan, in the existing locked durable transaction. The 32-generation retention/restart regression fails before the fix and preserves all archive rows after it; 12 archive integration, 12 exporter unit and 11 disk-pressure tests pass. Receipt count follows live source retention.
 - [x] **C23** Treat encoded expiry as critical regardless of stale rotation labels; require positive healthy rotation evidence to suppress near-expiry warnings and describe short-lived validity accurately. Both diagnostic regressions fail before the fix; all 17 diagnosis tests pass.
@@ -2500,9 +2500,9 @@ blocking calls).
   minutes it already holds and keeps the rest; no wire change (bincode discriminants are
   pinned), and the worker clears the backfill flag only after every send succeeds
   (partial-failure re-sends are idempotent). The silent-lost-push half was fixed in the
-  main Medium PR. _Residuals: minutes held by **both** aggregators still overlap at query
-  merge (inherent to reassignment without handoff), and a node whose single rollup exceeds
-  `MAX_REPORT_SIZE` (1 MiB) still can't push — chunking is untracked work._
+  main Medium PR. C20 now deduplicates worker/minute/series ownership across
+  aggregators at query merge. A single rollup exceeding `MAX_REPORT_SIZE` (1 MiB)
+  still cannot be pushed; bounded chunking is tracked as C21.
 - [x] **Placement reconciler orphans instances on a failed stop** —
   `src/cluster/orchestrate.rs:847-857` fires `AgentCommand::Stop` with the response oneshot
   dropped and unconditionally does `applied.remove(...)` even if the send/stop failed, so no
