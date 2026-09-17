@@ -2478,11 +2478,24 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
 
     /// Run the agent event loop until shutdown is requested.
     pub async fn run(&mut self) {
+        self.run_loop(None).await;
+    }
+
+    /// Run the agent, acknowledging readiness after initial capability collection.
+    pub async fn run_with_readiness(&mut self, ready: super::readiness::ReadySignal) {
+        self.run_loop(Some(ready)).await;
+    }
+
+    async fn run_loop(&mut self, ready: Option<super::readiness::ReadySignal>) {
         let mut health_interval = tokio::time::interval(std::time::Duration::from_secs(1));
 
         if let Some(readiness) = self.readiness.clone() {
             let (capabilities, _) = self.live_egress_report_state().await;
             readiness.set_capabilities(capabilities).await;
+        }
+
+        if let Some(ready) = ready {
+            ready.ready();
         }
 
         loop {

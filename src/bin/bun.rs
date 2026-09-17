@@ -1225,12 +1225,17 @@ async fn run_agent(cli: Cli) -> anyhow::Result<()> {
                 recovery_deadline: std::time::Duration::from_secs(30),
                 shutdown_deadline: std::time::Duration::from_secs(5),
             },
-            move |attempt_shutdown| {
+            move |attempt_shutdown, ready| {
                 let refresh_store = Arc::clone(&refresh_store);
                 let refresh_council = Arc::clone(&refresh_council);
                 let refresh_crl = refresh_crl.clone();
                 async move {
+                    refresh_token_store(&refresh_store, &refresh_council).await;
+                    if let Some(crl) = &refresh_crl {
+                        crl.update(refresh_council.security_state().await.crl);
+                    }
                     let mut ticker = tokio::time::interval(std::time::Duration::from_secs(5));
+                    ready.ready();
                     loop {
                         tokio::select! {
                             _ = attempt_shutdown.cancelled() => break,
@@ -1282,7 +1287,15 @@ async fn run_agent(cli: Cli) -> anyhow::Result<()> {
             true,
             readiness.clone(),
             dns_shutdown.clone(),
-            bound_dns.run(service_map_rx, dns_faults_rx, dns_shutdown.clone()),
+            {
+                let owner_shutdown = dns_shutdown.clone();
+                move |ready| async move {
+                    ready.ready();
+                    bound_dns
+                        .run(service_map_rx, dns_faults_rx, owner_shutdown)
+                        .await;
+                }
+            },
         );
         tokio::spawn(async move {
             let outcome = server.await;
@@ -1341,7 +1354,9 @@ async fn run_agent(cli: Cli) -> anyhow::Result<()> {
             true,
             readiness.clone(),
             shutdown.clone(),
-            async move {
+            move |ready| async move {
+                ready.ready();
+
                 if let Err(e) = bound.serve().await {
                     eprintln!("bun: ingress proxy exited with error: {e}");
                 }
@@ -1359,8 +1374,8 @@ async fn run_agent(cli: Cli) -> anyhow::Result<()> {
         true,
         readiness.clone(),
         shutdown.clone(),
-        async move {
-            agent.run().await;
+        move |ready| async move {
+            agent.run_with_readiness(ready).await;
         },
     );
 
@@ -2071,7 +2086,9 @@ async fn run_agent(cli: Cli) -> anyhow::Result<()> {
         true,
         readiness.clone(),
         shutdown.clone(),
-        async move {
+        move |ready| async move {
+            ready.ready();
+
             match api_acceptor {
                 Some(acceptor) => {
                     serve_api_over_tls(listener, acceptor, app, server_shutdown).await
@@ -2298,7 +2315,9 @@ async fn run_agent(cli: Cli) -> anyhow::Result<()> {
         false,
         readiness.clone(),
         shutdown.clone(),
-        async move {
+        move |ready| async move {
+            ready.ready();
+
             let mut ticker = tokio::time::interval(std::time::Duration::from_secs(5));
             loop {
                 tokio::select! {
@@ -2365,7 +2384,9 @@ async fn run_agent(cli: Cli) -> anyhow::Result<()> {
         true,
         readiness.clone(),
         shutdown.clone(),
-        async move {
+        move |ready| async move {
+            ready.ready();
+
             match pickle_acceptor {
                 Some(acceptor) => {
                     serve_api_over_tls(pickle_listener, acceptor, pickle_app, pickle_shutdown).await

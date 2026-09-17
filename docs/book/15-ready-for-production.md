@@ -2363,3 +2363,23 @@ catalogue. The [acceptance runbook](../plans/2026-07-06-plan-chaos.md) still nee
 its real-node execution record, including profiles, prerequisites, unknown results
 and proof that owned workloads and faults were removed. The laptop smoke run is
 valuable evidence for setup. It doesn't close that wider gate.
+
+### Readiness belongs to the resource owner
+
+Spawning a future doesn't mean its listener has bound or its initial state has
+loaded. A wrapper used to mark every owner ready before polling that future.
+We now pass each owner a `ReadySignal`. It consumes that signal only after it has
+acquired its resources. Until then the subsystem remains `Starting`.
+
+The signal contains a one-shot sender. Consuming it transfers the acknowledgement
+to the supervisor, which still watches the running task. A task that exits or
+panics loses readiness. A reconstructible owner gets a new channel on every
+attempt, so a delayed signal from the previous attempt cannot mark its successor
+ready. This is an ownership boundary, not a sleep long enough to hope startup
+has finished.
+
+Bun's listeners acknowledge their already-bound sockets from inside their owner
+futures. The agent waits until initial capability collection completes, and the
+security refresh worker loads its state before signalling. Regression tests hold
+an owner before readiness, fail a real bind, retain a stale attempt's signal and
+panic during startup. Each checks the externally visible readiness snapshot.

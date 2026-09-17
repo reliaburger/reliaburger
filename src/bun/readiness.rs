@@ -5,6 +5,7 @@ use std::future::Future;
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
+use futures_util::FutureExt;
 use serde::{Deserialize, Serialize};
 use tokio::sync::RwLock;
 use tokio::task::JoinHandle;
@@ -221,29 +222,63 @@ pub struct RestartBudget {
     pub shutdown_deadline: Duration,
 }
 
+/// One attempt's acknowledgement that its resources are acquired.
+///
+/// Consumed once; a late acknowledgement from a retired attempt cannot mark
+/// a replacement ready because each attempt has its own channel.
+#[derive(Debug)]
+pub struct ReadySignal(tokio::sync::oneshot::Sender<()>);
+
+impl ReadySignal {
+    /// Publish resource readiness. A retired owner's acknowledgement is ignored.
+    pub fn ready(self) {
+        let _ = self.0.send(());
+    }
+}
+
 /// Spawn a non-reconstructible owner and publish an unexpected exit as live
 /// degradation. The future itself must observe `shutdown` and release its
 /// resources; the wrapper never duplicates ownership by respawning it.
-pub fn spawn_owned<F>(
+pub fn spawn_owned<Factory, Task>(
     name: &'static str,
     critical: bool,
     evidence: ReadinessTracker,
     shutdown: CancellationToken,
-    task: F,
+    factory: Factory,
 ) -> JoinHandle<()>
 where
-    F: Future<Output = ()> + Send + 'static,
+    Factory: FnOnce(ReadySignal) -> Task + Send + 'static,
+    Task: Future<Output = ()> + Send + 'static,
 {
     tokio::spawn(async move {
         evidence.register(name, critical).await;
-        evidence.ready(name).await;
-        task.await;
+        let (ready_tx, mut ready_rx) = tokio::sync::oneshot::channel();
+        let task =
+            std::panic::AssertUnwindSafe(async move { factory(ReadySignal(ready_tx)).await })
+                .catch_unwind();
+        tokio::pin!(task);
+        let mut readiness_received = false;
+        let outcome = loop {
+            tokio::select! {
+                biased;
+                outcome = &mut task => break outcome,
+                ready = &mut ready_rx, if !readiness_received => {
+                    readiness_received = true;
+                    if ready.is_ok() && !shutdown.is_cancelled() {
+                        evidence.ready(name).await;
+                    }
+                }
+            }
+        };
         if shutdown.is_cancelled() {
             evidence.stopped(name, None).await;
         } else {
-            evidence
-                .degraded(name, "task exited unexpectedly before shutdown")
-                .await;
+            let error = if outcome.is_err() {
+                "task panicked before shutdown"
+            } else {
+                "task exited unexpectedly before shutdown"
+            };
+            evidence.degraded(name, error).await;
         }
     })
 }
@@ -259,7 +294,7 @@ pub fn spawn_reconstructible<Factory, Task>(
     factory: Factory,
 ) -> JoinHandle<()>
 where
-    Factory: Fn(CancellationToken) -> Task + Send + Sync + 'static,
+    Factory: Fn(CancellationToken, ReadySignal) -> Task + Send + Sync + 'static,
     Task: Future<Output = Result<(), String>> + Send + 'static,
 {
     tokio::spawn(async move {
@@ -267,28 +302,46 @@ where
         let mut recovery_started: Option<Instant> = None;
         let mut restarts_in_window = 0u32;
         loop {
-            evidence.ready(name).await;
             let attempt_started = Instant::now();
             let attempt_shutdown = shutdown.child_token();
-            let task = factory(attempt_shutdown.clone());
+            let (ready_tx, mut ready_rx) = tokio::sync::oneshot::channel();
+            let task = std::panic::AssertUnwindSafe(async {
+                factory(attempt_shutdown.clone(), ReadySignal(ready_tx)).await
+            })
+            .catch_unwind();
             tokio::pin!(task);
 
-            let failure = tokio::select! {
-                result = &mut task => match result {
-                    Ok(()) => "task exited unexpectedly before shutdown".to_string(),
-                    Err(error) => error,
-                },
-                _ = shutdown.cancelled() => {
-                    attempt_shutdown.cancel();
-                    if tokio::time::timeout(budget.shutdown_deadline, &mut task).await.is_err() {
-                        evidence.stopped(name, Some("shutdown deadline exceeded".to_string())).await;
-                    } else {
-                        evidence.stopped(name, None).await;
+            let mut readiness_received = false;
+            let failure = loop {
+                tokio::select! {
+                    biased;
+                    result = &mut task => break match result {
+                        Ok(Ok(())) => "task exited unexpectedly before shutdown".to_string(),
+                        Ok(Err(error)) => error,
+                        Err(_) => "task panicked before shutdown".to_string(),
+                    },
+                    _ = shutdown.cancelled() => {
+                        attempt_shutdown.cancel();
+                        if tokio::time::timeout(budget.shutdown_deadline, &mut task).await.is_err() {
+                            evidence.stopped(name, Some("shutdown deadline exceeded".to_string())).await;
+                        } else {
+                            evidence.stopped(name, None).await;
+                        }
+                        return;
                     }
-                    return;
+                    ready = &mut ready_rx, if !readiness_received => {
+                        readiness_received = true;
+                        if ready.is_ok() && !shutdown.is_cancelled() {
+                            evidence.ready(name).await;
+                        }
+                    }
                 }
             };
 
+            if shutdown.is_cancelled() {
+                evidence.stopped(name, None).await;
+                return;
+            }
             evidence.degraded(name, failure.clone()).await;
             // A task that stayed up for a full recovery window starts a new
             // incident; its historical restart_count remains visible, but an
@@ -410,12 +463,13 @@ mod tests {
                 recovery_deadline: Duration::from_secs(1),
                 shutdown_deadline: Duration::from_millis(50),
             },
-            move |_attempt_shutdown| {
+            move |_attempt_shutdown, ready| {
                 let run_attempts = Arc::clone(&run_attempts);
                 async move {
                     if run_attempts.fetch_add(1, Ordering::SeqCst) == 0 {
                         Err("transient failure".to_string())
                     } else {
+                        ready.ready();
                         std::future::pending::<Result<(), String>>().await
                     }
                 }
@@ -446,10 +500,140 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn an_owner_without_resource_readiness_stays_starting() {
+        let evidence = ReadinessTracker::new();
+        let shutdown = CancellationToken::new();
+        let owner_shutdown = shutdown.clone();
+        let (entered, observed) = tokio::sync::oneshot::channel();
+        let handle = spawn_owned(
+            "unbound",
+            true,
+            evidence.clone(),
+            shutdown.clone(),
+            move |_ready| async move {
+                let _ = entered.send(());
+                owner_shutdown.cancelled().await;
+            },
+        );
+        observed.await.unwrap();
+        let snapshot = evidence.snapshot().await;
+        shutdown.cancel();
+        handle.await.unwrap();
+        assert!(!snapshot.ready);
+        assert_eq!(snapshot.subsystems[0].state, SubsystemState::Starting);
+    }
+
+    #[tokio::test]
+    async fn a_retired_attempt_cannot_mark_its_replacement_ready() {
+        let evidence = ReadinessTracker::new();
+        let shutdown = CancellationToken::new();
+        let attempts = Arc::new(AtomicUsize::new(0));
+        let (signals, mut received) = tokio::sync::mpsc::unbounded_channel();
+        let handle = spawn_reconstructible(
+            "generation",
+            true,
+            evidence.clone(),
+            shutdown.clone(),
+            RestartBudget {
+                max_restarts: 1,
+                retry_delay: Duration::ZERO,
+                recovery_deadline: Duration::from_secs(5),
+                shutdown_deadline: Duration::from_millis(100),
+            },
+            move |stop, ready| {
+                let number = attempts.fetch_add(1, Ordering::SeqCst);
+                signals.send(ready).unwrap();
+                async move {
+                    if number == 0 {
+                        return Err("bind failed".to_string());
+                    }
+                    stop.cancelled().await;
+                    Ok(())
+                }
+            },
+        );
+        let stale = tokio::time::timeout(Duration::from_secs(2), received.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        let current = tokio::time::timeout(Duration::from_secs(2), received.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        stale.ready();
+        assert!(!evidence.snapshot().await.ready);
+        current.ready();
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while !evidence.snapshot().await.ready {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        shutdown.cancel();
+        handle.await.unwrap();
+        assert!(!evidence.snapshot().await.ready);
+    }
+
+    #[tokio::test]
+    async fn bind_failure_never_acknowledges_readiness() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let evidence = ReadinessTracker::new();
+        let handle = spawn_owned(
+            "listener",
+            true,
+            evidence.clone(),
+            CancellationToken::new(),
+            move |ready| async move {
+                if tokio::net::TcpListener::bind(address).await.is_ok() {
+                    ready.ready();
+                }
+            },
+        );
+        handle.await.unwrap();
+        let observed = evidence.snapshot().await;
+        assert!(!observed.ready);
+        assert_eq!(observed.subsystems[0].state, SubsystemState::Degraded);
+    }
+
+    #[tokio::test]
+    async fn owner_panic_is_live_degradation() {
+        let evidence = ReadinessTracker::new();
+        let handle = spawn_owned(
+            "panicking",
+            true,
+            evidence.clone(),
+            CancellationToken::new(),
+            |ready| async move {
+                ready.ready();
+                panic!("owner failed during startup");
+            },
+        );
+        handle.await.unwrap();
+        let observed = evidence.snapshot().await;
+        assert!(!observed.ready);
+        assert_eq!(observed.subsystems[0].state, SubsystemState::Degraded);
+        assert!(
+            observed.subsystems[0]
+                .last_error
+                .as_ref()
+                .unwrap()
+                .contains("panicked")
+        );
+    }
+
+    #[tokio::test]
     async fn non_reconstructible_exit_is_degraded_without_restart() {
         let evidence = ReadinessTracker::new();
         let shutdown = CancellationToken::new();
-        let handle = spawn_owned("socket owner", true, evidence.clone(), shutdown, async {});
+        let handle = spawn_owned(
+            "socket owner",
+            true,
+            evidence.clone(),
+            shutdown,
+            |_ready| async {},
+        );
         handle.await.unwrap();
 
         let snapshot = evidence.snapshot().await;

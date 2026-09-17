@@ -181,7 +181,7 @@ async fn start_node(index: usize, seeds: Vec<SocketAddr>, root: &CancellationTok
         true,
         readiness,
         shutdown.clone(),
-        async move { agent.run().await },
+        move |ready| async move { agent.run_with_readiness(ready).await },
     );
 
     // Leader scheduler with a fast learning period, so a fresh leader

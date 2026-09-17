@@ -36,7 +36,7 @@ remain separate. Older unchecked groups below point into this current ledger.
 - [x] **C05** Persist replacement launch details before health publication, including private durable records, rollback record/port cleanup and Apple launcher provenance. All 94 agent unit tests and ten record tests pass; regressions inspect records during rollout, adopt after restart and refuse failed record writes in both deployment strategies. Runtime crash-injection qualification remains V02.
 - [ ] **C06** (P1) Reserve node-fault capacity across the cluster.
 - [ ] **C07** (P1) Define and enforce mixed-version compatibility.
-- [ ] **C08** (P1) Publish readiness after resources are acquired.
+- [x] **C08** Publish readiness only after each owner explicitly acknowledges acquired resources; catch startup panics and fence signals by attempt. Eight readiness and 94 agent tests pass, all-target/all-feature Clippy passes, and the live three-node placement regression passes (20.89s).
 - [ ] **C09** (P1) Bound lease cleanup lock acquisition.
 - [ ] **C10** (P1) Record fault ownership before injection can be cancelled.
 - [ ] **C11** (P1) Persist standalone leases through directory-sync failures.

@@ -668,7 +668,18 @@ fn spawn_supervised(
     };
     match supervision.readiness {
         Some(evidence) => {
-            crate::bun::readiness::spawn_owned(name, true, evidence, supervision.shutdown, guarded);
+            crate::bun::readiness::spawn_owned(
+                name,
+                true,
+                evidence,
+                supervision.shutdown,
+                move |ready| async move {
+                    // Callers bind transports and construct channel owners before
+                    // passing their run loop to this supervisor.
+                    ready.ready();
+                    guarded.await;
+                },
+            );
         }
         None => {
             tokio::spawn(guarded);

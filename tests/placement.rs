@@ -139,7 +139,7 @@ async fn start_node_with_auth(
         true,
         readiness.clone(),
         shutdown.clone(),
-        async move { agent.run().await },
+        move |ready| async move { agent.run_with_readiness(ready).await },
     );
     let mut tasks = vec![agent_task];
 
