@@ -222,6 +222,31 @@ For rootless containers, we use `slirp4netns`, the same tool Podman uses. It imp
 
 The `--disable-host-loopback` flag is important: it prevents the container from reaching services on the host's loopback. Without it, a compromised container could probe the host's `localhost`-only services.
 
+#### One userspace network needs one process owner
+
+Starting networking twice for an instance used to overwrite its `slirp4netns`
+handle in a map. The previous helper kept running. Dropping a Tokio `Child`
+doesn't kill its process, and we deliberately need that behaviour during Bun
+replacement. A plain map insertion cannot distinguish a handoff from a leak.
+
+Replacement now holds the async ownership lock while retiring the old helper,
+waiting for exit and installing its successor. Adoption of the same PID and
+start time keeps the existing handle; conflicting metadata is refused. When a
+different surviving helper takes over, retirement preserves its API socket.
+Otherwise the old owner's cleanup could unlink the new owner's socket.
+
+Startup has a stricter lifetime. `PendingSlirp` owns an `Option<Child>` and its
+`Drop` implementation requests termination if the future is cancelled. `take()`
+moves the child out only after socket readiness and host forwarding succeed.
+The published handle can then survive an intentional Bun handoff. This is why
+we don't set `kill_on_drop` on every helper indiscriminately.
+
+Socket checks use asynchronous filesystem calls, and one two-second deadline
+bounds both readiness and the forwarding handshake. Regression tests cancel a
+real helper during startup, stall its forwarding response, replace a failed
+network and adopt the same surviving process repeatedly. They check process
+exit and socket ownership, not just the number of handles in the map.
+
 ### Apple Container: the easy case
 
 Apple Container runs each container in a lightweight VM with its own vmnet interface. The network isolation comes for free. We just need to discover the IP:

@@ -534,7 +534,7 @@ rejects that directory name before the CLI can inspect it.
 
 Evidence: `src/grill/runc.rs:start_rootless_network`; `adoption`; `src/grill/rootless.rs:setup_slirp4netns`.
 
-Map insertion discards a previous slirp handle without explicit shutdown; socket readiness polls synchronous exists on the async runtime.
+**Completed on PR #167.** Replacement and adoption share serialised ownership. Displaced helpers stop before replacement, repeated adoption retains the current owner, conflicting metadata fails explicitly, and retirement preserves a successor's socket. Startup-only ownership kills a helper on cancellation; async socket checks and forwarding share a two-second deadline. The cancellation regression fails against the original code. All 248 Linux runtime tests pass (12 explicit privileged gates remain), and strict Linux all-target/all-feature Clippy passes.
 
 **Completion test:** Repeated start/adopt under the same instance retires only the displaced owned proxy; asynchronous socket checks and timeout cleanup leave no orphan forwards.
 

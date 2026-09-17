@@ -217,16 +217,67 @@ impl RuncGrill {
         api_socket: &std::path::Path,
         port_mapping: Option<super::oci::PortMapping>,
     ) -> Result<(), GrillError> {
+        self.restore_rootless_network(instance, container_pid, api_socket, port_mapping, None)
+            .await
+    }
+
+    /// Serialise replacement and adoption so one instance has one network owner.
+    async fn restore_rootless_network(
+        &self,
+        instance: &InstanceId,
+        container_pid: u32,
+        api_socket: &std::path::Path,
+        port_mapping: Option<super::oci::PortMapping>,
+        recorded: Option<&super::records::RootlessNetworkRecord>,
+    ) -> Result<(), GrillError> {
+        let mut handles = self.slirp_handles.lock().await;
+        if let Some(record) = recorded.filter(|record| record.container_pid == container_pid)
+            && let Some(surviving) = super::rootless::Slirp4netnsHandle::adopt(record).await
+        {
+            if let Some(current) = handles
+                .get(instance)
+                .and_then(|handle| handle.adoption_record())
+                && current.owner_pid == record.owner_pid
+                && current.owner_pid_started_at == record.owner_pid_started_at
+            {
+                if &current != record {
+                    return Err(GrillError::StartFailed {
+                        instance: instance.clone(),
+                        reason: "rootless adoption record conflicts with the current owner".into(),
+                    });
+                }
+                // Keep an owned Child (and its reaping responsibility) on repeat adoption.
+                return Ok(());
+            }
+            if let Some(old) = handles.remove(instance) {
+                old.shutdown_preserving_socket(Some(&record.api_socket))
+                    .await
+                    .map_err(|error| GrillError::StartFailed {
+                        instance: instance.clone(),
+                        reason: format!("failed to retire rootless network owner: {error}"),
+                    })?;
+            }
+            handles.insert(instance.clone(), surviving);
+            return Ok(());
+        }
+        if let Some(old) = handles.remove(instance) {
+            old.shutdown()
+                .await
+                .map_err(|error| GrillError::StartFailed {
+                    instance: instance.clone(),
+                    reason: format!("failed to retire rootless network owner: {error}"),
+                })?;
+        }
+        if let Some(record) = recorded {
+            super::rootless::stop_recorded_owner(record);
+        }
         let handle = super::rootless::setup_slirp4netns(container_pid, api_socket, port_mapping)
             .await
             .map_err(|error| GrillError::StartFailed {
                 instance: instance.clone(),
                 reason: format!("failed to start rootless networking: {error}"),
             })?;
-        self.slirp_handles
-            .lock()
-            .await
-            .insert(instance.clone(), handle);
+        handles.insert(instance.clone(), handle);
         Ok(())
     }
 
@@ -237,8 +288,10 @@ impl RuncGrill {
     async fn cleanup(&self, instance: &InstanceId) {
         // slirp holds the container network namespace open. Stop it before
         // deleting runc state so teardown cannot leave an orphaned forward.
-        if let Some(handle) = self.slirp_handles.lock().await.remove(instance) {
-            handle.shutdown().await;
+        if let Some(handle) = self.slirp_handles.lock().await.remove(instance)
+            && let Err(error) = handle.shutdown().await
+        {
+            eprintln!("warning: rootless network teardown failed for {instance}: {error}");
         }
         let _ = self
             .runc_command(&["delete", "--force", &instance.0], instance)
@@ -801,37 +854,23 @@ impl super::Grill for RuncGrill {
                             .to_string(),
                 });
             };
-            let surviving = record
+            let api_socket = record
                 .rootless_network
                 .as_ref()
-                .filter(|network| network.container_pid == container_pid)
-                .and_then(super::rootless::Slirp4netnsHandle::adopt);
-            if let Some(handle) = surviving {
-                self.slirp_handles
-                    .lock()
-                    .await
-                    .insert(instance.clone(), handle);
-            } else {
-                if let Some(previous) = &record.rootless_network {
-                    super::rootless::stop_recorded_owner(previous);
-                }
-                let api_socket = record
-                    .rootless_network
-                    .as_ref()
-                    .map(|network| network.api_socket.clone())
-                    .unwrap_or_else(|| self.bundle_base.join(&instance.0).join("slirp4netns.sock"));
-                if let Err(error) = self
-                    .start_rootless_network(
-                        instance,
-                        container_pid,
-                        &api_socket,
-                        record.oci_spec.port_mapping,
-                    )
-                    .await
-                {
-                    self.cleanup(instance).await;
-                    return Err(error);
-                }
+                .map(|network| network.api_socket.clone())
+                .unwrap_or_else(|| self.bundle_base.join(&instance.0).join("slirp4netns.sock"));
+            if let Err(error) = self
+                .restore_rootless_network(
+                    instance,
+                    container_pid,
+                    &api_socket,
+                    record.oci_spec.port_mapping,
+                    record.rootless_network.as_ref(),
+                )
+                .await
+            {
+                self.cleanup(instance).await;
+                return Err(error);
             }
         } else if let Some(pm) = &record.oci_spec.port_mapping {
             // The root-mode map element survived in the kernel; rebuild only
@@ -1020,6 +1059,142 @@ mod tests {
         std::fs::write(&path, b"line one\nline two\n").unwrap();
         let second = read_from_offset(&path, offset).await.unwrap();
         assert_eq!(second, b"line two\n");
+    }
+
+    #[tokio::test]
+    async fn repeated_adoption_retires_only_the_displaced_owner() {
+        let tmp = tempfile::tempdir().unwrap();
+        let grill = RuncGrill::new(
+            tmp.path().join("bundles"),
+            ImageStore::new(tmp.path().join("images")),
+            true,
+            tmp.path().join("state"),
+        );
+        let id = InstanceId("adopt-rootless".into());
+        let socket = tmp.path().join("api.sock");
+        let _listener = tokio::net::UnixListener::bind(&socket).unwrap();
+        let mut old = tokio::process::Command::new("sleep")
+            .arg("60")
+            .kill_on_drop(true)
+            .spawn()
+            .unwrap();
+        let mut new = tokio::process::Command::new("sleep")
+            .arg("60")
+            .kill_on_drop(true)
+            .spawn()
+            .unwrap();
+        let record_for = |pid| super::super::records::RootlessNetworkRecord {
+            api_socket: socket.clone(),
+            owner_pid: pid,
+            owner_pid_started_at: super::super::records::process_start_time(pid).unwrap(),
+            container_pid: std::process::id(),
+            port_mapping: None,
+        };
+        let first = record_for(old.id().unwrap());
+        let second = record_for(new.id().unwrap());
+        for record in [&first, &second, &second] {
+            grill
+                .restore_rootless_network(&id, std::process::id(), &socket, None, Some(record))
+                .await
+                .unwrap();
+        }
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_secs(2), old.wait())
+                .await
+                .is_ok()
+        );
+        assert!(new.try_wait().unwrap().is_none());
+        assert!(
+            socket.exists(),
+            "retiring old owner unlinked the replacement socket"
+        );
+        assert_eq!(
+            grill.rootless_network_record(&id).await,
+            Some(second.clone())
+        );
+        let mut conflicting = second.clone();
+        conflicting.port_mapping = Some(super::super::oci::PortMapping {
+            host_port: 8080,
+            container_port: 80,
+        });
+        assert!(
+            grill
+                .restore_rootless_network(
+                    &id,
+                    std::process::id(),
+                    &socket,
+                    None,
+                    Some(&conflicting)
+                )
+                .await
+                .is_err()
+        );
+        assert!(new.try_wait().unwrap().is_none());
+        assert_eq!(grill.rootless_network_record(&id).await, Some(second));
+        grill
+            .slirp_handles
+            .lock()
+            .await
+            .remove(&id)
+            .unwrap()
+            .shutdown()
+            .await
+            .unwrap();
+        assert!(!socket.exists());
+    }
+
+    #[tokio::test]
+    async fn failed_replacement_stops_displaced_rootless_owner() {
+        let tmp = tempfile::tempdir().unwrap();
+        let grill = RuncGrill::new(
+            tmp.path().join("bundles"),
+            ImageStore::new(tmp.path().join("images")),
+            true,
+            tmp.path().join("state"),
+        );
+        let id = InstanceId("replace-rootless".into());
+        let socket = tmp.path().join("old.sock");
+        let _listener = tokio::net::UnixListener::bind(&socket).unwrap();
+        let mut old = tokio::process::Command::new("sleep")
+            .arg("60")
+            .kill_on_drop(true)
+            .spawn()
+            .unwrap();
+        let pid = old.id().unwrap();
+        let record = super::super::records::RootlessNetworkRecord {
+            api_socket: socket.clone(),
+            owner_pid: pid,
+            owner_pid_started_at: super::super::records::process_start_time(pid).unwrap(),
+            container_pid: std::process::id(),
+            port_mapping: None,
+        };
+        grill.slirp_handles.lock().await.insert(
+            id.clone(),
+            super::super::rootless::Slirp4netnsHandle::adopt(&record)
+                .await
+                .unwrap(),
+        );
+        let result = grill
+            .start_rootless_network(
+                &id,
+                std::process::id(),
+                &tmp.path().join("missing/next.sock"),
+                None,
+            )
+            .await;
+        assert!(result.is_err());
+        let stopped = tokio::time::timeout(std::time::Duration::from_secs(2), old.wait())
+            .await
+            .is_ok();
+        if !stopped {
+            let _ = old.kill().await;
+        }
+        assert!(
+            stopped,
+            "replacement discarded the old helper without stopping it"
+        );
+        assert!(!socket.exists());
+        assert!(grill.rootless_network_record(&id).await.is_none());
     }
 
     #[tokio::test]
