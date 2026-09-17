@@ -2314,3 +2314,52 @@ Each ingress case also gets a hostname derived from its own namespace. Sharing
 one hostname across concurrently deployed test apps lets one case accidentally
 route to another case's backend. Namespace isolation must extend to the ingress
 name, not just the app record.
+
+
+## Lessons learned: audit the evidence too
+
+Export a log file, replace it with new contents under the same name, then export
+again. Both commands report success. Where did the first archive go? The exporter
+used a content hash to notice the change, but used only the filename for its
+archive key. The second write replaced the first. Detecting a new generation and
+preserving that generation are two different requirements.
+
+The [September audit](../qualification/2026-09-17-code-audit.md) reproduced this
+with temporary files, without a running cluster. It also found that exporting to
+a second destination reused the first destination's checkpoint. A checkpoint
+must describe what was acknowledged, by whom and where. “We've seen these bytes”
+isn't enough evidence to delete their source.
+
+A passing test can establish the wrong thing. The audit's temporary certificate
+probe passed when issuance panicked on an invalid DNS name. That was useful for
+confirming a report, but it would be a terrible permanent regression test. The
+real regression must require an ordinary error and fail if issuance panics.
+The temporary probes were removed; their results and limitations remain in the
+audit record so the next implementation starts with a reproducible observation.
+
+The same distinction applies to our catalogue. Unknown means we didn't establish
+the result. A deliberately unsupported case needs an explicit profile contract;
+a required case without evidence must not become a green skip. Fresh capability
+evidence can expire while a case waits, and collecting an HTTP response doesn't
+prove that the intended workload answered it. Assert the outcome we actually
+care about, including the cleanup outcome.
+
+Fault ownership is part of that result. If cancellation arrives after a server
+accepts an injection but before the client records its ID, cleanup can't rely on
+an empty client list. Track the pending operation and reconcile it. Healing every
+fault on the node would remove someone else's experiment too. Exact ownership
+matters most when the happy path has already stopped running.
+
+Finally, a milestone checkbox needs a scope. The cluster upgrade coordinator
+already checks gossip rejoin; the replacement process's local boot-marker check
+still has a separate gap. Calling all upgrade verification either finished or
+missing hides useful information. We now keep completed milestones and explicit
+residual tasks side by side in [progress](../progress.md), with completion tests
+in the [new plan](../plans/2026-09-17-codebase-completion-plan.md).
+
+Portable tests and controlled servers let us force awkward orderings quickly.
+They don't establish that three independent Linux nodes survive the complete
+catalogue. The [acceptance runbook](../plans/2026-07-06-plan-chaos.md) still needs
+its real-node execution record, including profiles, prerequisites, unknown results
+and proof that owned workloads and faults were removed. The laptop smoke run is
+valuable evidence for setup. It doesn't close that wider gate.

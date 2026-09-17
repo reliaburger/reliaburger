@@ -1,5 +1,9 @@
 # Phase 15 follow-up plan — review of PR #151 (`codex/phase15-correctness-2026-07-28`)
 
+> Historical checklist. The [17 September completion plan](2026-09-17-codebase-completion-plan.md#reconciliation-with-the-earlier-plans)
+> reconciles every section with the current code and tracks the remaining work.
+> Do not interpret the unchecked boxes below as a current implementation count.
+
 Reviewed 6 August 2026 against `origin/main` (f7eb560). The branch is 27 commits,
 ~28k insertions across 147 files. This plan turns the review into PR-sized tasks,
 grouped in phases, with enough detail for direct implementation. Work through the

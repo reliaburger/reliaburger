@@ -2,6 +2,12 @@
 
 Single source of truth for what's done and what's next. Check off an item only when it compiles, passes tests, and is committed. See [roadmap.md](roadmap.md) for full details on each phase.
 
+**Audited 17 September 2026 against `fc11d25` (PR #165).** Done below means
+implemented and verified on the stacked release branch, not necessarily merged
+or published. Historical test counts describe their original checkpoints. An
+implemented subsystem can still have explicitly tracked defects or acceptance
+gates; those stay unchecked.
+
 > **0.1.0 release planning (16 September 2026):** see the
 > [release-readiness review and laptop quickstart plan](plans/2026-09-16-v0.1.0-release-plan.md).
 > It separates current packaging/onboarding blockers from superseded audit findings,
@@ -9,32 +15,126 @@ Single source of truth for what's done and what's next. Check off an item only w
 > acceptance gates. Implementation is in progress; signed-release and cold-install
 > qualification remain open.
 
+## Current completion backlog (17 September 2026)
+
+The [codebase completion plan](plans/2026-09-17-codebase-completion-plan.md)
+contains the evidence, priority, dependency order, completion test and book chapter
+for every item below. IDs are scoped to that plan, not the older C1/M1 review IDs.
+The [audit record](qualification/2026-09-17-code-audit.md) separates local defect
+reproductions from inspected source and previous acceptance evidence.
+
+These are work packages, not 72 mandatory features for 0.1.0. Correctness fixes
+need explicit release dispositions; optional refactors and future capabilities
+remain separate. Older unchecked groups below point into this current ledger.
+
+### Correctness and behavioural contracts
+
+- [ ] **C01** (P1) Preserve every exported log generation.
+- [ ] **C02** (P1) Scope export acknowledgements to their destination.
+- [ ] **C03** (P1) Make export checkpoints durable and serialised.
+- [ ] **C04** (P1) Report non-transient export read failures.
+- [ ] **C05** (P1) Persist new instances during rolling deployments.
+- [ ] **C06** (P1) Reserve node-fault capacity across the cluster.
+- [ ] **C07** (P1) Define and enforce mixed-version compatibility.
+- [ ] **C08** (P1) Publish readiness after resources are acquired.
+- [ ] **C09** (P1) Bound lease cleanup lock acquisition.
+- [ ] **C10** (P1) Record fault ownership before injection can be cancelled.
+- [ ] **C11** (P1) Persist standalone leases through directory-sync failures.
+- [ ] **C12** (P1) Sweep pressure leftovers even after disabling pressure.
+- [ ] **C13** (P1) Issue certificates with exact validity timestamps.
+- [ ] **C14** (P1) Renew and hot-reload every served certificate class.
+- [ ] **C15** (P2) Make ingress serials unique across nodes and restarts.
+- [ ] **C16** (P2) Reject invalid certificate inputs without panicking.
+- [ ] **C17** (P2) Reject overflowing CLI durations.
+- [ ] **C18** (P2) Find a free port before reporting exhaustion.
+- [ ] **C19** (P2) Count only successful metric-file pruning.
+- [ ] **C20** (P1) Deduplicate rollup ownership at query merge.
+- [ ] **C21** (P2) Bound and chunk reporting payloads.
+- [ ] **C22** (P2) Bound export checkpoint growth safely.
+- [ ] **C23** (P2) Distinguish expired certificates from renewal warnings.
+- [ ] **C24** (P2) Keep unknown council membership out of quorum arithmetic.
+- [ ] **C25** (P2) Identify diagnostic filesystems by identity.
+- [ ] **C26** (P2) Match diagnostic instance and VIP evidence exactly.
+- [ ] **C27** (P2) Preserve watch-mode failures and exit outcomes.
+- [ ] **C28** (P2) Make TUI status reflect the cluster.
+- [ ] **C29** (P1) Fail benchmark comparisons when required metrics vanish.
+- [ ] **C30** (P1) Replace unconditional unknown catalogue cases with real evidence.
+- [ ] **C31** (P2) Give concurrent test runs distinct namespaces.
+- [ ] **C32** (P2) Use typed case outcomes and validated runner configuration.
+- [ ] **C33** (P2) Discover actual registry and ingress test endpoints.
+- [ ] **C34** (P2) Define lease ownership for the remaining test resources.
+- [ ] **C35** (P2) Gate chaos capabilities per selected scenario.
+- [ ] **C36** (P1) Target and clean up the legacy chaos command precisely.
+- [ ] **C37** (P1) Require rejoin before committing the local upgrade marker.
+- [ ] **C38** (P2) Make blocked deployment replacement explicit.
+- [ ] **C39** (P2) Handle development CLI paths without unwraps.
+- [ ] **C40** (P2) Own replaced rootless proxy processes.
+- [ ] **C41** (P2) Return a non-zero managed-status result for unhealthy nodes.
+- [ ] **C42** (P2) Key alert state by labelled series.
+- [ ] **C43** (P2) Resolve short service names in the caller namespace.
+
+### Engineering follow-ups
+
+- [ ] **H01** (P2) Remove stale wiring claims and validate documentation.
+- [ ] **H02** (P3) Remove or deliberately expose unused helper entry points.
+- [ ] **H03** (P2) Resolve inert configuration and wire fields explicitly.
+- [ ] **H04** (P3) Use typed alert and scheduler error contracts.
+- [ ] **H05** (P3) Split modules along existing ownership boundaries.
+- [ ] **H06** (P3) Evaluate shared DNS and duration parsers.
+- [ ] **H07** (P3) Add useful public API doctests.
+- [ ] **H08** (P2) Identify and eliminate leaked test processes.
+- [ ] **H09** (P3) Complete node-pressure diagnostic hygiene.
+- [ ] **H10** (P3) Reuse one egress observation per health tick.
+- [ ] **H11** (P2) Declare and test the actual Rust/toolchain baseline.
+
+- [ ] **H12** (P2) Resolve the active Thrift dependency alert and qualify its parsing path before publication.
+
+### Missing capabilities and longer-term scope
+
+- [ ] **F01** (feature) Propagate GPU capacity and cached-image placement evidence.
+- [ ] **F02** (feature) Complete rootless and process-workload isolation.
+- [ ] **F03** (feature) Finish upstream image trust and worker key separation.
+- [ ] **F04** (feature) Add supported CA recovery and rotation operations.
+- [ ] **F05** (feature) Complete namespace-scoped identity and token lifecycle.
+- [ ] **F06** (feature) Complete the metrics/query and reporting architecture.
+- [ ] **F07** (feature) Finish cross-node views and log-stream capabilities.
+- [ ] **F08** (feature) Complete WebSocket ingress parity and certificate automation.
+- [ ] **F09** (feature) Implement packet-level delay/bandwidth faults if retained.
+- [ ] **F10** (feature) Provide explicit managed-volume retirement and runtime parity.
+- [ ] **F11** (feature) Finish supported Kubernetes translations.
+- [ ] **F12** (future) Keep the long-term vision explicitly separate.
+
+### Acceptance and release gates
+
+- [ ] **V01** (gate) Qualify the complete live three-node catalogue.
+- [ ] **V02** (gate) Qualify sustained TLS, storage and upgrade recovery.
+- [ ] **V03** (gate) Publish and install the exact signed candidate.
+- [ ] **V04** (gate) Measure repeated cold installs on the advertised host matrix.
+- [ ] **V05** (gate) Review dependency exceptions before their deadline.
+
 ## Current release checklist
 
 - [x] Commit the release scope and acceptance plan (`99e4ff9`).
 - [x] Validate setup liveness and bounded subsystem readiness (`6ee50a6`; 268 Relish tests).
 - [x] Stream registry uploads and bound writers (`1ea2b1a`; 228 registry tests, all-target Clippy).
-- [x] Measure registry memory under concurrent pushes (`5343072`; four 128 MiB uploads, 37.5 MiB RSS growth in a 2 GiB VM).
-- [x] Package self-contained Linux agents and native laptop CLIs (`c448f58`, `79b31b9`; all four hosted native builds pass).
+- [x] Measure registry memory under concurrent pushes (`3fcba4c`, `f1882be`, `598a893`, `b16d723`; four 128 MiB uploads, 37.5 MiB RSS growth in a 2 GiB VM).
+- [x] Package self-contained Linux agents and native laptop CLIs (`22e334a`, `e834832`, `ee4e945`, `d95e636`, `e346aec`; all four hosted native builds pass).
 - [ ] Publish verifiable release metadata and signed artefacts.
 - [x] Implement secure, resumable managed laptop clusters and installer (committed on `codex/v0.1.0-release`; three real Linux VMs passed setup, HTTP ingress and stop/start on 17 September).
 - [x] Fix registry/runtime cache compatibility, restart checkpoints and responsive health probing.
-- [x] Route ingress across nodes and report cluster-wide CLI status (`ea98c4b`, `81611a0`).
-- [x] Propagate storage/bootstrap errors, honour experimental Apple runtime settings, and audit HTTP methods (`6c5bd6f`, `95513ea`, `54f9ee7`).
-- [x] Report unavailable GitOps queues/export failures and show real dashboard replica counts (`baf73f2`, `592e285`).
-- [x] Connect the host browser through pinned TLS and show remote app instances (`5343072`; session tests, 48 rendering tests and three-node acceptance).
-- [x] Fix promoted first-run defects and record residual dispositions in the release plan (`e2fb093`, `a9feedd`; live ingress acceptance and offline export regressions).
-- [x] Record an empty-cache development-binary laptop run (`8ac0700`; three nodes and sample HTTP in 241.75s).
+- [x] Route ingress across nodes and report cluster-wide CLI status (`f5404f9`, `8072209`).
+- [x] Propagate storage/bootstrap errors, honour experimental Apple runtime settings, and audit HTTP methods (`a805575`, `3d302de`, `bbe9c9b`, `e5f4208`).
+- [x] Report unavailable GitOps queues/export failures and show real dashboard replica counts (`b7735ba`, `7acb36b`, `afee562`).
+- [x] Connect the host browser through pinned TLS and show remote app instances (`3fcba4c`, `f1882be`, `598a893`, `b16d723`; session tests, 48 rendering tests and three-node acceptance).
+- [x] Fix promoted first-run defects and record residual dispositions in the release plan (`01b9b00`, `3f97aea`, `6b3400f`, `df91a67`, `cfb483f`; live ingress acceptance and offline export regressions).
+- [x] Record an empty-cache development-binary laptop run (`38cc6b7`; three nodes and sample HTTP in 241.75s).
 - [ ] Qualify the downloaded candidate on clean hosts and record three-node timing.
 - [ ] Pass the real-cluster and final release acceptance gates.
 
-> **Review note (July 2026):** a full verification pass ([2026-07-02-review-codebase.md](plans/2026-07-02-review-codebase.md))
-> found that many checked items were **library-only** — implemented and unit-tested, but never
-> wired into the `bun`/`relish` binaries at that review date. Later hardening sections supersede
-> many of these findings; use the release plan above for current blockers. Those are tagged **`[lib-only]`** below with their
-> finding ID (e.g. `L7`, `C5`). `[x]` still means "code exists + tests pass"; `[lib-only]` means
-> "not reachable from the running binary". Critical bugs in *wired* paths are tagged with their
-> ID too (e.g. `C4`). See the review doc for `file:line` and the staged fix plan.
+> **Historical reviews:** the [July wiring review](plans/2026-07-02-review-codebase.md)
+> found components that existed only as libraries. Later hardening wired many of
+> them into the binaries. The dated findings remain useful history; superseded
+> inline warnings are not current blockers. Current residuals are tracked separately.
 
 > **Three reviews, three ID spaces.** Finding IDs are scoped to the review that raised them, and
 > all three reviews reuse `C1`/`M1`/`O1`. When you see a bare ID, check which section you're in:
@@ -48,10 +148,14 @@ Single source of truth for what's done and what's next. Check off an item only w
 
 ## Phase 1: Foundation
 
+The phase milestones below describe implemented components. Superseded July
+inline failure warnings have been removed; their findings and fixes remain in
+the later hardening sections and the dated review documents.
+
 - [x] Cargo workspace setup (binary `bun`, library `reliaburger`, test fixtures)
 - [x] TOML config parsing (App, Job, Secret, ConfigFile, Volume, Permission, Namespace)
 - [x] Grill container runtime interface (runc/Apple/process backends, driven directly — no containerd; OCI extraction, ports, cgroups)
-- [x] Bun agent core (process supervisor, health checks, restart logic, GPU detection) — **restart re-drive broken for apps on all runtimes (`H1`); ~~GPU detector is a stub~~ (12b.6: real `NvidiaGpuDetector`; `gpu_enabled` now effective, GPU-request refused when unbacked)**
+- [x] Bun agent core (process supervisor, health checks, restart logic, GPU detection)
 - [x] Relish CLI skeleton (`apply`, `status`, `logs`, `exec`, `inspect`)
 - [x] ProcessGrill (cross-platform process-based runtime)
 - [x] RuncGrill (Linux-only, calls runc CLI)
@@ -64,33 +168,33 @@ Single source of truth for what's done and what's next. Check off an item only w
 - [x] `command` field on AppSpec (run custom processes via ProcessGrill)
 - [x] TestApp standalone binary (`cargo run --bin testapp`)
 - [x] Job execution (deploy, run-to-completion, retry with backoff, failure)
-- [x] Init container execution (sequential run, failure prevents main start) — **no timeout: a non-exiting init wedges the agent (`H3`)**
-- [x] Restart re-drive (health check and job restarts re-start instances) — **`H1` only ProcessGrill jobs work; apps wedge in `Preparing`, old process leaks**
-- [x] Exit code tracking on Grill trait (ProcessGrill, MockGrill) — **`H13` runc/apple return `None`; successful jobs there get retried then Failed**
+- [x] Init container execution (sequential run, failure prevents main start)
+- [x] Restart re-drive (health check and job restarts re-start instances)
+- [x] Exit code tracking on Grill trait (ProcessGrill, MockGrill)
 - [x] Example configs (minimal-app, restarts, job-success, job-failure, init-container, volumes, multi-app, full-featured)
-- [x] OCI image pulling from Docker Hub (oci-distribution, content-addressed cache, layer unpacking with whiteouts) — **`C1` CRITICAL: whiteout path traversal deletes host files outside rootfs**
+- [x] OCI image pulling from Docker Hub (oci-distribution, content-addressed cache, layer unpacking with whiteouts)
 - [x] Rootless runc (user namespaces, UID/GID mapping, no-sudo read-only containers) — resource-requiring workloads fail admission because delegated cgroup enforcement is not implemented; the spec omits an undelegated cgroup path rather than failing every start. `slirp4netns` now owns the network namespace and published ports, with persisted ownership and recreation across Bun replacement (M5).
 - [x] Streaming apply progress via SSE (real-time deploy feedback instead of blocking response)
 - [x] HostPath-style volumes (dual-mode: explicit source for hostPath, managed for auto-provisioned storage) — ~~`M21` managed mode half-wired~~ **fixed in Phase 12 E0**: the agent creates managed volume dirs (and loop mounts) before the OCI spec's bind mounts reference them; `[storage] volumes` config wired; volumes never deleted on Stop (reconciler rebalances would destroy data)
 - [x] Relish init command (scaffold reliaburger.toml and app.toml from defaults)
-- [x] Log tailing (`--tail N`) and streaming (`--follow`/`-f`) — **`H3` `follow_logs` blocks the whole agent event loop; runc has no `logs`/`follow_logs` (empty)**
-- [x] Relish exec command (run commands in running instances) — **`H13` unimplemented on runc (always errors)**
+- [x] Log tailing (`--tail N`) and streaming (`--follow`/`-f`)
+- [x] Relish exec command (run commands in running instances)
 - [x] All Phase 1 tests green (321 tests)
 
 ## Phase 2: Cluster Formation
 
 - [x] Shared types: `NodeId`, `AppId`, `Resources`, `NodeCapacity`, `SchedulingDecision` (`src/meat/types.rs`)
-- [x] Mustard state machine: NodeState enum, incarnation conflicts, membership table, piggyback dissemination — **`H4`–`H7` SWIM bugs: wrong incarnation on suspect, no Dead refutation, suspicion timed from `last_ack`, watch fires on count only**
+- [x] Mustard state machine: NodeState enum, incarnation conflicts, membership table, piggyback dissemination
 - [x] Mustard transport and protocol: `MustardTransport` trait, SWIM probe cycle, gossip convergence tests
 - [x] Indirect probe (PING-REQ) ACK routing, proptest for conflict resolution, broadcast count lambda=3
 - [x] Dead node reap timer (cleanup_timeout=60s), graceful leave protocol (Left state broadcast on shutdown)
-- [x] Raft integration (openraft): storage, network, and state machine adapters; leader election and log replication — **`C3` CRITICAL: log/vote in-memory only → split-brain on restart**
-- [x] Council selection: stability/zone diversity scoring, deterministic tiebreak, size bounds 3–7 — **`[lib-only]` `L5` never called; runtime uses naive sort-by-id+truncate (can demote leader). Wire format carries no resources/labels, so scoring inputs are empty anyway**
-- [x] Reporting tree: `StateReport` to council member every 5s, consistent hash assignment, `watch` channel — **`L6` flat-star only; leader's aggregated view read by nothing; StateReport resource usage all zeroed**
-- [x] State reconstruction: learning period after leader election, 95% threshold or 15s timeout, diff/correction — **`[lib-only]` `L4` never invoked; no `Correction` consumer**
-- [x] Meat scheduler: Filter → Score → Select → Commit pipeline, bin-packing, labels, daemon mode, quotas — **`[lib-only]` `L1` nothing in the binary schedules onto a remote node (deploys are always local); `H8` all replicas land on one node; quotas never integrated**
-- [x] Scheduler image locality scoring — prefers nodes with cached images — **`[lib-only]` (part of `L1`)**
-- [x] Scheduler stability scoring — prefers nodes with longer uptime — **`[lib-only]` (part of `L1`)**
+- [x] Raft integration (openraft): storage, network, and state machine adapters; leader election and log replication
+- [x] Council selection: stability/zone diversity scoring, deterministic tiebreak, size bounds 3–7
+- [x] Reporting tree: `StateReport` to council member every 5s, consistent hash assignment, `watch` channel
+- [x] State reconstruction: learning period after leader election, 95% threshold or 15s timeout, diff/correction
+- [x] Meat scheduler: Filter → Score → Select → Commit pipeline, bin-packing, labels, daemon mode, quotas
+- [x] Scheduler image locality scoring — prefers nodes with cached images
+- [x] Scheduler stability scoring — prefers nodes with longer uptime
 - [x] Agent integration: wire cluster subsystems into `BunAgent`, extend config, cluster API endpoints
 - [x] CLI extensions: `relish nodes`, `relish council` (stub responses, full pipeline)
 - [x] CLI extensions: `relish join`
@@ -108,7 +212,7 @@ Phases 2–11 built the cluster subsystems but the `bun` binary always ran singl
 - [x] Perimeter firewall fixes (both blocked any multi-node cluster, not just dev): accept loopback before the port drops — local `relish` talks to `127.0.0.1:9117` and its SYN was being dropped, which looked like an API hang; and flush the table before re-applying — `nft -f` appends, so reconciling on every membership change stacked stale boot-time rules ahead of the fresh allow-members rule
 - [x] `relish nodes` shows real council membership + leader, derived from the Raft metrics (the gossip-level `is_council`/`is_leader` flags are never set by the runtime), falling back to gossip when Raft isn't wired
 - Canonical consistent-hash reporting tree (workers → council → leader, multi-level aggregation) — follow-up
-- Durable Raft log + `wrapping_ikm` loading — follow-up
+- [x] Durable Raft log and `wrapping_ikm` loading (Phase 12b consensus/PKI wiring; encrypted persistence in Phase 16).
 
 ## Phase 2.1: Dev Cluster
 
@@ -130,7 +234,7 @@ Phases 2–11 built the cluster subsystems but the `bun` binary always ran singl
   - [x] Userspace DNS responder for `.internal` queries (replaces infeasible in-kernel DNS synthesis) — ~~`[lib-only]` `L9` `run_dns_responder` never spawned~~ (now spawned from `src/bin/bun.rs` when `[dns]` is enabled, and containers get their `resolv.conf` nameserver pointed at it)
   - [x] `relish dev test` runs Linux + eBPF tests from macOS via Lima
   - [x] eBPF integration tests (load/attach, map read/write, connect rewrite, DNS responder)
-- [x] Wrapper ingress proxy (host/path routing, load balancing, draining, rate limiting) — **`[lib-only]` `L7` the proxy never runs: `run_proxy` has no caller, no listener is bound**
+- [x] Wrapper ingress proxy (host/path routing, load balancing, draining, rate limiting)
   - [x] Routing table (host/path → backend pool, longest prefix match, round-robin LB) — routing table itself is wired (answers `relish routes`)
   - [x] HTTP reverse proxy on dedicated tokio runtime (DDoS isolation, connection limit) — **`[lib-only]` `L7`; the "dedicated tokio runtime" does not exist**
   - [x] Per-client-IP token bucket rate limiting (429 + Retry-After) — **`[lib-only]` `L7` never instantiated**
@@ -152,13 +256,13 @@ Phases 2–11 built the cluster subsystems but the `bun` binary always ran singl
 > no signature/CRL verification.
 
 - [x] Sesame CA hierarchy (Root, Node, Workload, Ingress CAs — ECDSA P-256, HKDF key wrapping) — primitives real; `wrapping_ikm` hardcoded `None` at runtime so CA-key ops dead-end (`C5`)
-- [x] Node mTLS (join tokens, certificate issuance, mTLS config builders, gossip HMAC) — **`[lib-only]` `C5` builders never used; Raft RPC is plaintext; gossip HMAC never signed/verified**
+- [x] Node mTLS (join tokens, certificate issuance, mTLS config builders, gossip HMAC)
 - Workload identity — deferred to Phase 10
-- [x] API authentication (tokens, Argon2id hashing, roles: Admin/Deployer/ReadOnly, axum middleware) — **`[lib-only]` `C5` middleware never attached (and fails OPEN on empty token store)**
-- [x] Secret encryption (age keypairs, `ENC[AGE:...]` decryption at container startup, namespace-scoped keys) — **`C5` decryption never invoked: containers get the literal `ENC[AGE:...]`**
-- [x] eBPF firewall rules (`allow_from` resolution, cgroup-to-namespace mapping, BPF map wiring) — **`[lib-only]` no callers; nothing populates the BPF maps**
-- [x] Raft log encryption at rest (AES-256-GCM, HKDF from node cert private key) — **`[lib-only]` dead code; the log is in-memory so there is nothing at rest to encrypt (`C3`)**
-- [x] `relish init` generates full PKI + join token; `relish token create` — **`X2` `token create` is local-only (never persisted to Raft, can't be validated/listed); `X7` `secret pubkey` reads the wrong filename**
+- [x] API authentication (tokens, Argon2id hashing, roles: Admin/Deployer/ReadOnly, axum middleware)
+- [x] Secret encryption (age keypairs, `ENC[AGE:...]` decryption at container startup, namespace-scoped keys)
+- [x] eBPF firewall rules (`allow_from` resolution, cgroup-to-namespace mapping, BPF map wiring)
+- [x] Raft log encryption at rest (AES-256-GCM, HKDF from node cert private key)
+- [x] `relish init` generates full PKI + join token; `relish token create`
 - `relish token list/revoke` — moved to Phase 10 (requires SecurityState in Raft)
 - Join token validation in agent — moved to Phase 10 (requires SecurityState in Raft)
 - [x] `relish secret pubkey` and `relish secret encrypt` CLI commands
@@ -169,11 +273,11 @@ Phases 2–11 built the cluster subsystems but the `bun` binary always ran singl
 ## Phase 5: Storage & Registry
 
 - [x] Pickle types and Raft state extensions (Digest, ImageManifest, ManifestCatalog, Raft commands)
-- [x] Pickle blob store (content-addressed, upload sessions, digest verification, atomic rename) — **`C2` CRITICAL: `upload_id` path traversal (arbitrary file append/exfil) on the unauthenticated `0.0.0.0` registry**
+- [x] Pickle blob store (content-addressed, upload sessions, digest verification, atomic rename)
 - [x] OCI Distribution API (push/pull: blob upload POST/PATCH/PUT, manifest PUT/GET, tag list)
-- [x] Synchronous replication on push (peer selection, layer transfer via OCI API, mTLS) — **`[lib-only]` `L10` no callers; push stores locally with hardcoded holders; no mTLS**
-- [x] Peer pull (fetch missing layers from peers via Raft layer_locations) — **`[lib-only]` `L10` catalog is `default()` per boot, not Raft-replicated (metadata lost on restart)**
-- [x] Garbage collection (sole-copy protection, active reference safety, retention window, GcReport) — **`[lib-only]` `L10` `gc_sweep` never scheduled; `M2` TOCTOU can lose all copies**
+- [x] Synchronous replication on push (peer selection, layer transfer via OCI API, mTLS)
+- [x] Peer pull (fetch missing layers from peers via Raft layer_locations)
+- [x] Garbage collection (sole-copy protection, active reference safety, retention window, GcReport)
 - [x] Volume size enforcement (loop mount on Linux, soft warning on macOS)
 - [x] `relish images` CLI command, `[images]` config section
 - Pull-through cache (Phase 12), P2P downloads (Phase 12), image signing (Phase 10), volume snapshots (Phase 12)
@@ -182,13 +286,13 @@ Phases 2–11 built the cluster subsystems but the `bun` binary always ran singl
 
 ## Phase 6: Observability
 
-- [x] Mayo TSDB (Arrow RecordBatches + DataFusion SQL + Parquet persistence via object_store) — **`H9` Parquet write-only & clobbered on restart, never reloaded, in-memory batches unbounded; `M1` SQL injection via `name=` param breaks tenant isolation**
+- [x] Mayo TSDB (Arrow RecordBatches + DataFusion SQL + Parquet persistence via object_store)
 - [x] System metrics collector (CPU, memory, disk, network via sysinfo)
-- [x] Prometheus scraping (prometheus-parse crate, auto /metrics endpoint) — **`[lib-only]` `L11` `scrape_endpoint` never called**
+- [x] Prometheus scraping (prometheus-parse crate, auto /metrics endpoint)
 - [x] Metrics API (`/v1/metrics`, `/v1/metrics/summary`, `/v1/metrics/keys`)
 - [x] Alert evaluation (5 default rules, Inactive→Pending→Firing state machine)
-- [x] Ketchup log collection (append-only files, sparse timestamp index, JSON detection) — **`[lib-only]` `L12` `KetchupStore` created then dropped; sparse index written but never read; `H10` container stdout/stderr never reaches any log store**
-- [x] Ketchup queries (grep, tail, time range, JSON field filter) — **`M4` dedup only removes adjacent duplicates**
+- [x] Ketchup log collection (append-only files, sparse timestamp index, JSON detection)
+- [x] Ketchup queries (grep, tail, time range, JSON field filter)
 - [x] Brioche dashboard (server-rendered HTML, dark theme, auto-refresh)
 - [x] `relish top` command, `relish logs --grep/--since/--json-field`
 - [x] Config: `[metrics]` and `[logs]` sections with object_store_url
@@ -204,11 +308,11 @@ Phases 2–11 built the cluster subsystems but the `bun` binary always ran singl
 ## Phase 7: GitOps & Deployments
 
 - [x] Deploy state machine (9 phases: Pending → Rolling → Completed/RolledBack/Halted/Failed)
-- [x] Rolling deploy orchestrator (DeployDriver trait, per-step health-gated replacement) — **`[lib-only]` `L2` orchestrator/`DeployDriver` only in tests; the wired path is the agent's inline redeploy (`H2`/`H3` bugs)**
-- [x] Automatic rollback (revert upgraded instances on health failure) — **`M16` rollback leaks the failed step's new instance**
+- [x] Rolling deploy orchestrator (DeployDriver trait, per-step health-gated replacement)
+- [x] Automatic rollback (revert upgraded instances on health failure)
 - [x] Dependency ordering (`run_before` jobs complete before rolling)
 - [x] Deploy state models and history — the library-side `DeployState` Raft commands remain separate from the binary's desired-state reconciler. The real Bun path records every accepted worker with a stable operation ID, live phase/target and bounded 50-entry outcome history (M6); per-app rollback history records fresh and rolling deploys locally.
-- [x] CLI: `relish deploy`, `relish history`, `relish rollback`, `relish lint` — **`X3` `rollback` calls no endpoint (prints advice); `X5` dry-run fallback makes `apply`/`deploy` exit 0 when the agent is down**
+- [x] CLI: `relish deploy`, `relish history`, `relish rollback`, `relish lint`
 - [x] API: `/v1/deploys/active`, `/v1/deploys/operations`, `/v1/deploys/history/{app}` — active operations now come from the running worker path; operation history and per-app rollback history are explicit separate contracts.
 - [x] `make deploy-demo` for local testing
 - [x] Book chapter 7: "Ship It"
@@ -217,9 +321,9 @@ Phases 2–11 built the cluster subsystems but the `bun` binary always ran singl
 
 ## Phase 8: Advanced
 
-- [x] Smoker fault injection (safety rails, registry, process/network fault plumbing, scripted scenarios and chaos tests) — **post-Phase-12 audit: Kill/Pause/Resume and eBPF faults have live paths, but memory, disk, drain and node-kill can still report success without an effect; CPU stress targets Bun rather than the workload and cleanup is incomplete. Phase 12b owns the correction.**
-- [x] Network security (egress allowlists, eBPF enforcement in connect hook, namespace isolation) — **`[lib-only]` `L16` egress resolvers never called; supervisor sets `egress: None`**
-- [x] Process workloads (exec/script apps and jobs, binary allowlist, ProcessManager, OCI spec wiring, validation) — **`M23` allowlist + `mount_isolation` never enforced (`with_process_config` no callers)**
+- [x] Smoker fault injection (safety rails, registry, process/network fault plumbing, scripted scenarios and chaos tests)
+- [x] Network security (egress allowlists, eBPF enforcement in connect hook, namespace isolation)
+- [x] Process workloads (exec/script apps and jobs, binary allowlist, ProcessManager, OCI spec wiring, validation)
 - [x] High-throughput batch scheduling (greedy bin-packing `schedule_batch`, `BatchTracker`, 100K jobs in <1s)
 - [x] Build jobs (BuildSpec config, pickle:// destination parsing, namespace-scoped push, buildah command construction)
 - Live agent wiring for batch dispatch and build execution — deferred to Phase 12 (the `/v1/batch` and `/v1/build` endpoints return 501 until then)
@@ -227,39 +331,39 @@ Phases 2–11 built the cluster subsystems but the `bun` binary always ran singl
 
 ## Phase 9: User Experience
 
-- [x] Blue-green deploy strategy (parallel start, atomic routing swap, orchestrator dispatch) — **`[lib-only]` `L2` orchestrator never constructed outside tests; no production `DeployDriver`; `M16` swap error wedges non-terminal**
-- [x] Autoscaling (evaluation logic, hysteresis, cooldown, Mayo query_avg, async task runner, Raft persistence) — **`[lib-only]` `L3` `run_autoscale_loop` never spawned**
-- [x] Lettuce GitOps engine (sync loop, git ops, signature verification, diff engine, webhook endpoint, coordinator election, Raft integration, node config) — **`[lib-only]` `L13` nothing spawns the sync loop; webhook endpoint always 503; `[gitops]` config never read; `H12` trusted-key check always passes**
-- [x] Kubernetes migration (`relish import`, `relish export` via k8s-openapi, resource correlation, migration reports, optional `kubernetes` feature) — **`M17` import silently drops `command`/`args`, `env.valueFrom`, and namespace**
-- [x] `relish compile`, `relish diff`, `relish fmt` — **`H11` `relish fmt` corrupts nested-table configs (writes invalid TOML over the file)**
+- [x] Blue-green deploy strategy (parallel start, atomic routing swap, orchestrator dispatch)
+- [x] Autoscaling (evaluation logic, hysteresis, cooldown, Mayo query_avg, async task runner, Raft persistence)
+- [x] Lettuce GitOps engine (sync loop, git ops, signature verification, diff engine, webhook endpoint, coordinator election, Raft integration, node config)
+- [x] Kubernetes migration (`relish import`, `relish export` via k8s-openapi, resource correlation, migration reports, optional `kubernetes` feature)
+- [x] `relish compile`, `relish diff`, `relish fmt`
 - [x] WebSocket upgrade proxying in Wrapper ingress (detection, dispatch, close frame, draining) — ~~`[lib-only]` `L7` proxy never runs; handshake stub drops the backend stream~~ (12b.4: the Wrapper proxy runs the 101 upgrade and splices the backend stream; a live splice holds the drain open until it ends — `src/wrapper/proxy.rs`, `draining.rs`, ING2/ING4)
 - [x] Book chapter 9: "The Full Package"
 - [x] All Phase 9 tests green (1271 tests)
 
 ## Phase 10: Advanced Security
 
-- [x] Workload identity (SPIFFE certs, CSR, automatic rotation, OIDC JWTs) — **`L18` CSR path always fails at runtime (`wrapping_ikm: None`, empty SecurityState); rotation task re-CSRs through the same dead path; `M25` workload key world-readable**
-- [x] Image signing (keyless via workload identity, cosign-compatible) — **`[lib-only]` `L17` `verify_signature` never called; `require_signatures` never consulted; "signing after build push" not exercisable (build is 501)**
-- [x] SecurityState in Raft (prerequisite for the wiring items below) — **`L18` never populated at runtime; `bin/bun.rs` writes nothing; bootstrap file never loaded**
-- [x] Wire agent-to-council CSR flow during deploy — **`L18` reachable but always dead-ends at "no wrapping IKM available"**
-- [x] Wire automatic keyless signing after build job push — **not exercisable (build execution is 501)**
+- [x] Workload identity (SPIFFE certs, CSR, automatic rotation, OIDC JWTs)
+- [x] Cluster image signing and verification through workload identity; upstream-image trust policy remains a separate boundary.
+- [x] SecurityState in Raft (prerequisite for the wiring items below)
+- [x] Wire agent-to-council CSR flow during deploy
+- [x] Wire automatic keyless signing after build job push
 - [x] `relish sign` CLI command
-- [x] `/v1/identity/jwks` and `/v1/identity/sign` API endpoints — **`L18` always 503 (`ApiState.council` is `None`)**
-- [x] CRL distribution, egress DNS resolution — **`[lib-only]` `L17` CRL never enforced/served; egress never programmed**
+- [x] `/v1/identity/jwks` and `/v1/identity/sign` API endpoints
+- [x] CRL distribution, egress DNS resolution
 - TPM sealing — deferred to v2 (requires hardware)
-- [x] `relish token list/revoke` (SecurityState in Raft) — **`L18` always 503 (`ApiState.council` is `None`, even in `--cluster`)**
-- [x] Join token validation in agent (SecurityState in Raft) — **`L18` join dead-ends at "no wrapping IKM available"**
-- [x] `relish secret rotate` (dual-key transition window) — **`L18` endpoint always 503**
+- [x] `relish token list/revoke` (SecurityState in Raft)
+- [x] Join token validation in agent (SecurityState in Raft)
+- [x] `relish secret rotate` (dual-key transition window)
 - [x] Book chapter 10: "Locking It Down"
 - [x] All Phase 10 tests green (1448 tests)
 
 ## Phase 11: Advanced Observability
 
-- [x] Hierarchical metrics aggregation via council (cluster-wide queries) — **`[lib-only]` `L11` `RollupWorker` never spawned; aggregator gets `rollup_store: None`; `/v1/metrics/cluster` returns "no rollup store configured" forever**
-- [x] Full Brioche UI (app/node detail pages, HTMX auto-refresh, uPlot charts) — **partial: nodes table hardcoded empty, node detail hardcodes `alive` and lists all apps, per-app charts permanently empty (no per-process metrics collected)**
-- [x] Alert webhooks (Slack, PagerDuty, generic HTTP) — **`M19` generic payload only; Slack/PagerDuty formats never applied (would be rejected). Dispatch loop is wired.**
-- [x] Log export to S3/GCS (scheduled Parquet, `relish logs-search` for remote SQL) — **`M20` behaviour is still open: AWS/GCP `object_store` features are enabled, but `ketchup::export` still converts `s3://`/`gs://` to a `PathBuf` and calls `std::fs::copy`; `X8` `logs-export` also races the agent's checkpoint**
-- [x] Cross-node log queries via Raft (leader fan-out, merge-sort) — **`[lib-only]` production always takes the single-node path (`ApiState.council`/`membership` are `None`); direct HTTP, not "via Raft"; `M4` dedup flaw**
+- [x] Hierarchical metrics aggregation via council (cluster-wide queries)
+- [x] Brioche UI pages, HTMX refresh and uPlot charts; cluster app counts/details are wired. Remaining cross-node view and telemetry limits need separate acceptance.
+- [x] Alert webhooks (Slack, PagerDuty, generic HTTP)
+- [x] Log export to S3/GCS (scheduled Parquet, `relish logs-search` for remote SQL)
+- [x] Cross-node log queries over authenticated HTTP (leader fan-out, merge-sort)
 - [x] Book chapter 11: "Eyes Everywhere"
 - [x] All Phase 11 tests green (1595 tests)
 
@@ -1318,8 +1422,10 @@ Implementation plan: [docs/plans/2026-07-06-plan-tui.md](plans/2026-07-06-plan-t
 The Phase 14 deferred seams are closed in 12b.6: scheduler cordoning is wired
 against a live `ClusterStateCache`, quorum headroom counts live voters, node
 roles/addresses are derived server-side from gossip + Raft, and post-upgrade
-verification now requires gossip rejoin explicitly (see the "Self-upgrade
-convergence and adoption" theme under 12b.6).
+the cluster orchestrator requires observed gossip rejoin before marking a node
+Healthy (see the "Self-upgrade convergence and adoption" theme under 12b.6).
+The replacement process still commits its local boot marker after workload
+verification alone; its separate gossip-rejoin deadline remains unfinished.
 
 ## Phase 15: Testing, Benchmarking & Diagnostics
 
@@ -1327,9 +1433,10 @@ convergence and adoption" theme under 12b.6).
 > (20 numbered steps plus prerequisite tranches, test catalogue, data structures,
 > acceptance runbook).
 >
-> The harness half is done; the diagnostic commands are the largest block of genuinely
-> unbuilt feature work left in the project. Smoker's service-to-service `Partition` deferral
-> is closed below; Pickle push-side body streaming remains open.
+> The harness, diagnostic commands and registry upload streaming are implemented.
+> Four catalogue cases still return unknown unconditionally, and the complete
+> three-node acceptance run remains open. Implementation milestones below do not
+> certify that every diagnostic verdict or cleanup edge case is correct.
 
 - [x] Test harness audit and suite taxonomy: nextest local/CI profiles, JUnit, timeouts,
   zero retries, serial resources and no-tests-selected failures; portable, wall-clock,
@@ -1398,7 +1505,7 @@ convergence and adoption" theme under 12b.6).
   versus compiled-out tests, deterministic async tests, nextest, benchmarks and coverage
 - [x] Complete chapter 15 with the built-in diagnostics commands (`relish test`, `wtf`,
   `trace`), including safety, evidence provenance and acceptance limitations
-- [ ] All Phase 15 tests green
+- [ ] All Phase 15 tests green (current backlog: V01)
 
 ## Phase 15a: Current-State Hardening
 
@@ -1417,7 +1524,7 @@ convergence and adoption" theme under 12b.6).
 
 ### High-value / must fix
 
-- [x] Patch, assess and continuously detect known dependency advisories (H0) — all compatible fixes applied, including newer RustSec findings missed by GitHub; `make audit` denies new vulnerability/maintenance warnings in change and release CI plus a weekly scan. Named temporary exceptions fail closed after 18 August 2026; `thrift`, `lru` and lock-only, feature-inactive `rkyv` remain tracked risk, not claimed fixes.
+- [x] Patch, assess and continuously detect known dependency advisories (H0) — all compatible fixes applied, including newer RustSec findings missed by GitHub; `make audit` denies new vulnerability/maintenance warnings in change and release CI plus a weekly scan. The August review removed the patched `lru`/`anyhow` exceptions. Five named exceptions remain in `.cargo/audit.toml`, including lock-only `rkyv`; their next enforced review is 18 November 2026. September dependency updates and the current hosted audit pass.
 - [x] Contain the API authentication bootstrap window (H1 / SEC-1) — Bun now owns one token store in standalone and cluster modes; an empty store permits only IP-literal loopback. Five real-binary startup tests cover standalone/clustered bootstrap, and the 2,633-test portable suite passes.
 - [x] Fail closed when a declared egress policy can't be enforced (H2 / SEC-3) — four cgroup hooks plus per-workload enforcement are proven before start, live loss fences affected workloads, and independent expiring capability evidence keeps placement fail closed. Merged in PR #122.
 - [x] Make `.internal` DNS reachable, supervised and schedulable (H3 / NET-1) — rootful runc derives and mounts a veth-gateway resolver, Bun pre-binds supervised UDP/TCP with `IP_FREEBIND`, and independent rolling-safe readiness leases gate placement. A checked-in two-workload rootful-runc/netns acceptance test resolves `redis.internal`; it also forced fixes for colliding long veth names and destructive repeated rootfs extraction. Unsupported runtimes and addresses fail before creation. Portable default/no-default suites pass 2,661/2,643 tests (39 named skips in each).
@@ -1438,7 +1545,7 @@ convergence and adoption" theme under 12b.6).
   a three-member Raft test proves follower refusal and post-failover issuance.
   Portable 2,670/2,670, no-default 2,652/2,652, cluster 21/21, Clippy,
   doctests and the dependency audit pass.
-- [ ] Rerun the complete review matrix and close the high-value gate
+- [x] Rerun the source review matrix: all applicable hosted checks passed on `fc11d25`, including Linux/macOS portable suites, rootful/rootless Linux, cluster, upgrades, wall-clock acceptance, examples and dependency audit. Signed-candidate and full catalogue qualification remain separate open gates.
 
 ### Medium-value
 
@@ -1472,7 +1579,7 @@ convergence and adoption" theme under 12b.6).
   the unused ACME challenge prefix. The audit also records certificate renewal,
   hot reload and expiry evidence as Phase 15 prerequisites rather than claiming
   they already work.
-- [ ] Corrected Phase 15 prerequisites and catalogue (M8)
+- [x] Implement Phase 15 prerequisite infrastructure and catalogue commands (M8). Four case fixtures and the full-catalogue acceptance gate remain open.
   - [x] Result/evidence/profile contracts, inherited absolute deadlines,
     panic-safe runner ownership, verified cleanup reporting and typed
     server-owned `[testing]` safety policy. Unknown clusters fail protected;
@@ -1482,7 +1589,7 @@ convergence and adoption" theme under 12b.6).
     expiry. Authenticated cluster fan-out uses the service identity, one shared
     deadline and an explicit evidence/unknown result for every expected node.
     Reports include build/runtime/topology fingerprints and server policy
-  - [ ] Server resource leases and hermetic OCI workload
+  - [x] App/namespace resource leases and hermetic OCI workload. Wider resource ownership remains open; the shipped lease enum covers apps and namespaces.
     - [x] Durable, bounded app/namespace leases: authenticated
       creation/renewal/release; lease-only `rbtest-*` namespaces; standalone
       fsync persistence and Raft ownership; restart/leader-safe reapers;
@@ -1540,11 +1647,11 @@ convergence and adoption" theme under 12b.6).
 
 ### Optional
 
-- [ ] Ownership-based module splits (O1)
-- [ ] Library-backed DNS/duration parsing where compatibility tests justify it (O2)
-- [ ] Public API doctests (O3)
-- [ ] Production TC DNS fast-path evaluation if profiling justifies it (O4)
-- [ ] Mechanical shipped/planned/experimental/historical documentation markers (O5)
+- [ ] Ownership-based module splits (O1) (current backlog: H05)
+- [ ] Library-backed DNS/duration parsing where compatibility tests justify it (O2) (current backlog: H06)
+- [ ] Public API doctests (O3) (current backlog: H07)
+- [ ] Production TC DNS fast-path evaluation if profiling justifies it (O4) (current backlog: F09)
+- [x] Audit shipped/planned/experimental claims (O5, Phase 16 Sections D–G). Mechanical drift prevention and new findings remain ongoing work.
 
 ## Phase 15b: Code-Logic Review Hardening
 
@@ -1755,7 +1862,7 @@ work, not by `M1`.
   a distinct `CouncilPartition` variant and a real three-node quorum-rail test, so it can no
   longer borrow the service fault's safety semantics. Delay and bandwidth commands now
   refuse honestly until a TC packet hook exists; the connect hook cannot implement either.
-- [ ] `TODO(Phase 15)` — Pickle push-side request-body streaming (`MAX_REQUEST_BYTES`)
+- [x] Pickle push-side request-body streaming (`1ea2b1a`): bounded writers, streamed temporary files and digest verification; four concurrent 128 MiB live uploads used 37.5 MiB extra RSS in a 2 GiB VM.
 
 ### Open — Optional list
 
@@ -2486,10 +2593,8 @@ blocking calls).
 
 ### Low — hygiene, minor bugs, stale docs
 
-- [ ] **TUI log buffer not cleared on target switch** — `src/relish/tui/state.rs:159`
-  opening app B's logs after A interleaves A's buffered lines with B's; and
-  `src/relish/tui/views/logs.rs:41` hard-codes `.take(32)` regardless of terminal height.
-- [ ] **Stale TODO / doc drift** — `src/meat/filter.rs:41` `TODO(wiring)` is stale
+- [x] **TUI log switching and viewport sizing** — subscription generations reject late lines/errors; both log views use the actual terminal height (`90d7081`, `cfd6d81`; reducer and viewport regressions).
+- [ ] **Stale TODO / doc drift** (current backlog: H01) — `src/meat/filter.rs:41` `TODO(wiring)` is stale
   (`apply_upgrade_cordon` *is* wired via `orchestrate.rs:172`, `bin/bun.rs:1001`), delete it;
   `src/meat/score.rs:3-8` doc claims a "0–130 scale, Spread (40)" but constants give
   `WEIGHT_SPREAD = 60`, max 150; `src/mayo/scrape.rs:114-122` "there is no scrape loop yet"
@@ -2497,21 +2602,10 @@ blocking calls).
   `src/mustard/dissemination.rs:180-189` carry stale/left-in editing notes;
   `docs/roadmap.md:686` Phase 15 "Tests (write first)" names 7 integration tests that live
   only as in-module unit tests, and roadmap.md has no Phase 16 section at all.
-- [ ] **Swallowed errors worth surfacing** — `src/cluster/runtime.rs:421`
-  `let _ = council.initialize(members)` swallows a fresh-cluster bootstrap failure with no
-  log; `src/bun/api.rs:5695` `gitops_webhook_handler` returns 202 "sync triggered" even when
-  the sync loop's receiver is gone; `src/bun/disk_pressure.rs:75-81` discards
-  `export_logs` errors with no logging.
-- [ ] **Fresh reqwest client per health probe** — `src/bun/probe.rs:21` builds a new
-  `reqwest::Client` (new connection pool) per probe and maps a client-*build* failure to
-  `HealthStatus::ConnectionRefused`, misattributing a local config error to the workload.
-- [ ] **Panics reachable from production entry points** — `src/bin/bun.rs:696,1280,1978`
-  `.expect("failed to create … directory")` on `create_dir_all` (the fallback at 583 maps
-  into anyhow correctly); `src/bun/testapp.rs:130-131` `TcpListener::bind().await.unwrap()`
-  panics `bun testapp` when the port is taken; `src/bin/bun.rs:1918-1921`
-  `build().unwrap_or_default()` where `Default` calls `Client::new()` which panics on the
-  same TLS-init failure (and drops the 10 s timeout).
-- [ ] **Unwired library-only helpers** (delete or wire): `src/wrapper/proxy.rs:343`
+- [x] **Bootstrap, GitOps and disk-pressure export errors** — fresh council failures propagate, unavailable sync queues return 503 without consuming delivery IDs, and failed exports are logged (`3d302de`, `b7735ba`, `7acb36b`).
+- [x] **HTTP health-probe pooling and attribution** — pooled requests retain deadlines and distinguish local client errors from workload refusal (`3c78b09`).
+- [x] **The listed startup/testapp/client-construction panics** — storage errors propagate, occupied testapp ports return errors, and invalid client trust configuration fails explicitly (`a805575`, `d70699d`, `e346aec`). This is not a claim that all public panic paths are eliminated.
+- [ ] **Unwired library-only helpers** (current backlog: H02/F04) (delete or wire): `src/wrapper/proxy.rs:343`
   `run_proxy`; `src/onion/dns.rs:364-375` `run_dns_responder`; `src/sesame/identity.rs:543-551`
   `extend_grace_period` (so `RotationState::GracePeriod` and the documented 4-hour grace
   extension are unreachable; failed rotation marches to `Expired` with an `eprintln`);
@@ -2520,26 +2614,18 @@ blocking calls).
   contains the DEP8 bug the wired path fixed); `src/pickle/pull.rs:193`
   `image_available_locally`; `src/relish/client.rs:707` `renew_test_lease`; various
   smoker helpers (`resource.rs:230`, `types.rs:285`, `registry.rs:155,188`).
-- [ ] **Dead wire/config fields** — `src/mustard/message.rs:171` `lamport` is stamped and
+- [ ] **Dead wire/config fields** (current backlog: H03) — `src/mustard/message.rs:171` `lamport` is stamped and
   shipped "for causal ordering" but never read (conflict resolution is incarnation-only);
   `src/wrapper/types.rs:136-142` `LoadBalanceStrategy::LeastConnections` is populated but
   `select_backend` is unconditionally round-robin; `src/wrapper/types.rs:99`
   `worker_threads` is mapped but never read; `MembershipSnapshot.resources` / `cached_images`
   are unpopulated for remote peers, so council resource-eligibility (`selection.rs:113-120`)
   and image-locality scoring (`score.rs:103-111`) are inert in production.
-- [ ] **Minor correctness** — `src/bun/authz.rs:392` `matrix_covers_every_mounted_route`
-  compares paths only, not methods (a new method on a listed path bypasses the matrix);
-  `src/bun/api.rs:4757` `statuses_to_dashboard_apps` sets `instances_desired = count` where
-  count *is* the running count, so under-replication can never render; `src/grill/port.rs:76-88`
-  `allocate()` gives up after 1000 random probes with no deterministic fallback scan;
-  `src/sesame/ca.rs:573-614` uses a hand-rolled "approximate" epoch→Y/M/D conversion for
-  cert validity; `src/mayo/store.rs:606-608` + `rollup_store.rs:582-584` count a file pruned
-  even when `remove_file` fails; `src/ketchup/export.rs:44-49` `exported_files` only grows.
-- [ ] **Known planned boundaries (not defects, keep honest)** — no PromQL (raw SQL /
-  fixed-shape endpoints), no remote-read protocol, a single rollup tier (no tiered
-  downsampling), WS 1001 drain-termination built but not sent on the live splice, and the
-  Apple grill `create` (`src/grill/apple.rs:216-255`) not translating `spec.mounts`/
-  `port_mapping` so volumes/config files silently don't mount on macOS.
+- [x] **Authorisation matrix checks methods as well as paths** (`e5f4208`), and dashboard desired counts come from desired state (`afee562`, `f1882be`).
+- [ ] **Remaining minor-correctness group** (current backlog: C01–C04/C13/C18–C19/C22) — premature port exhaustion, hand-written certificate-date conversion, prune counts after failed deletion, and growing export checkpoint history remain. The September audit also identifies archive overwrite and destination-scope defects.
+- [x] **Native Apple mounts and publication** — bind/config mounts, process identity, working directory, read-only root and published ports are translated and live-tested (`bbe9c9b`). Broader runtime parity remains experimental.
+- [ ] **Planned capability boundaries** (current backlog: F06/F08) — PromQL, remote read, extra rollup tiers and live WebSocket drain-close remain unimplemented. Labelling them planned completed the documentation task, not these features.
+
 
 ### Deep re-audit of the previously-skimmed areas (16 Aug 2026)
 
@@ -2634,24 +2720,7 @@ and a handful of test cases whose assertions are too loose to catch the bug they
 
 **Low — hygiene and minor bugs from the deep pass:**
 
-- [ ] **relish client/CLI robustness** — `src/relish/client.rs:367-376` `health()` returns
-  `Ok(())` without checking HTTP status (any server on the port reads as "agent alive");
-  `client.rs:305` `build().expect(...)` panics the CLI on a reqwest/TLS init failure;
-  `client.rs:440` decodes SSE with per-chunk `from_utf8_lossy`, corrupting multibyte
-  sequences split across chunk boundaries; `commands.rs:246` exports to CWD when the
-  destination isn't valid UTF-8 (`unwrap_or(".")`); `commands.rs:169` `parse_since` does an
-  unchecked `amount * multiplier`; `commands.rs:1125-1132` a doc comment is misplaced onto
-  `secret_rotate` so `images()` has none; `wtf/diagnose.rs:681` the certs-OK message says
-  "valid for at least 14 days" but counts auto-rotating sub-14-day leaves as OK.
-- [ ] **Test-harness robustness** — `src/testkit/cases/deployments.rs:32` maps a failed
-  `cluster_instances` to `running = 0` (spurious "dropped to 0 backends" flake);
-  `deployments.rs:89` `deploy_history_records_each_version` only checks non-empty + ≥1
-  Completed, never that each version is recorded; `ingress.rs:73` (+2 siblings) do a
-  single-shot HTTP check with no polling (spurious false-red); `context.rs:351`
-  cluster-wait helpers aren't wrapped in `deadline.run(...)` like their sibling (degrades
-  the timeout diagnostic); `context.rs:441-508` the `teardown` "second lock" doc overstates
-  (the guarantee is server-side lease validation, not the client-side guard);
-  `context.rs:376-386` `registry_base` mishandles bracketed IPv6; `context.rs:120`
-  `wait_running` is dead harness surface; and note the workload-fault handlers
-  (`src/bun/api.rs:4243-4246,3858-3861`) default to `Admin` when `auth` is `None` while
-  node faults reject `None` — only reachable with auth fully disabled, but asymmetric.
+- [x] **Relish liveness, client configuration, streamed UTF-8 and offline export errors** — health validates the response; invalid trust settings return errors; split UTF-8 survives SSE framing; explicit offline export validates paths and reports checkpoint failures (`6ee50a6`, `e346aec`, `a057634`, `df91a67`, `cfb483f`).
+- [ ] **Remaining CLI robustness** (current backlog: C17/C23/C39/H01) — `parse_since` still multiplies unchecked (reproduced exit 101 for `18446744073709551615d`); development VM commands retain non-UTF-8 path unwraps; diagnostic certificate wording and misplaced API docs need correction.
+- [x] **Cluster collection, deadlines, deployment history and ingress acceptance** — incomplete collection fails, waits share the case deadline, history must contain both tested versions, and ingress polls exact responses using credential-free clients and isolated hosts (`c6163b8`, `265aa99`, `6b3400f`). Expired queued capabilities refresh (`3f97aea`); three live ingress cases passed.
+- [ ] **Remaining test-harness robustness** (current backlog: C29–C36/H01–H02) — registry URLs still split on `:` (breaking IPv6 and ignoring configured registry ports), teardown prose overstates client guarantees, unused helpers remain, and fully disabled-auth workload faults retain different semantics from node faults. Broader runner/lease/verdict defects are tracked in the completion plan.

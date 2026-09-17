@@ -179,6 +179,11 @@ Each step includes tests and updates to the documentation and book. Detailed
 acceptance gates and deferred features live in the release plan; implementation
 history remains in [progress.md](docs/progress.md).
 
+The [17 September codebase audit and completion plan](docs/plans/2026-09-17-codebase-completion-plan.md)
+reconciles the older TODOs, records remaining correctness gaps and separates
+release acceptance from deferred capabilities. The current checklist lives in
+[progress.md](docs/progress.md).
+
 ## Licence
 
 [Apache 2.0](LICENSE)

@@ -6,6 +6,11 @@ installer is pending release.
 
 User guide for building and running Reliaburger. For the full architectural vision, see the [whitepaper](whitepaper.md). For current implementation status, see [progress.md](progress.md).
 
+The [17 September codebase audit and completion plan](plans/2026-09-17-codebase-completion-plan.md)
+reconciles the older TODOs, records remaining correctness gaps and separates
+release acceptance from deferred capabilities. The current checklist lives in
+[progress.md](progress.md).
+
 ## Release work
 
 The [0.1.0 plan](plans/2026-09-16-v0.1.0-release-plan.md) tracks packaging and
