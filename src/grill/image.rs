@@ -266,7 +266,15 @@ impl ImageStore {
         for path in layer_paths {
             // The blob filename is the layer's sha256 hex — immutable
             // content identity. Hash the ordered set into one generation id.
-            let name = path.file_name().unwrap_or_default().to_string_lossy();
+            let digest_path = if path.file_name().is_some_and(|name| name == "data") {
+                path.parent().unwrap_or(path)
+            } else {
+                path.as_path()
+            };
+            let name = digest_path
+                .file_name()
+                .unwrap_or_default()
+                .to_string_lossy();
             hasher.update(name.as_bytes());
             hasher.update(b"\n");
         }
@@ -783,6 +791,19 @@ mod tests {
         assert_eq!(registry.read_blob(&legacy).unwrap(), b"old layer");
         assert_eq!(image.blob_path(legacy.as_str()), path);
         assert!(registry.list_blobs().unwrap().contains(&legacy));
+    }
+
+    #[test]
+    fn registry_layer_generations_use_digest_instead_of_the_data_filename() {
+        let store = ImageStore::new(PathBuf::from("/tmp/images"));
+        let root = Path::new("/rootfs/tag");
+        let first = store.rootfs_generation_path(root, &[PathBuf::from("/blobs/aaaa/data")]);
+        let second = store.rootfs_generation_path(root, &[PathBuf::from("/blobs/bbbb/data")]);
+        assert_ne!(first, second);
+        assert_eq!(
+            first,
+            store.rootfs_generation_path(root, &[PathBuf::from("/blobs/aaaa")])
+        );
     }
 
     #[test]
