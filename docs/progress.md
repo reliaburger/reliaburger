@@ -54,7 +54,7 @@ remain separate. Older unchecked groups below point into this current ledger.
 - [x] **C23** Treat encoded expiry as critical regardless of stale rotation labels; require positive healthy rotation evidence to suppress near-expiry warnings and describe short-lived validity accurately. Both diagnostic regressions fail before the fix; all 17 diagnosis tests pass.
 - [x] **C24** Require observed configured voters for quorum arithmetic; unavailable/empty council responses and degraded membership remain unknown instead of using stale gossip flags. The public collector regression fails before the fix; all 25 diagnostic collector/engine tests pass, including observed quorum loss.
 - [x] **C25** Report node-local Unix device identity without paths and coalesce only matching identities; preserve separate legacy observations and the busiest complete shared-device reading. The HTTP regression fails before the fix; all 26 diagnostic collector/engine and seven local diagnostic tests pass, including real sibling-path identity.
-- [ ] **C26** (P2) Match diagnostic instance and VIP evidence exactly.
+- [x] **C26** Track exact CPU sample identities and compare parsed DNS answer IPs, excluding resolver/name/target text. Both substring regressions fail before the fix; local diagnostics, agent trace and pure trace tests pass, including equivalent IPv6 addresses.
 - [ ] **C27** (P2) Preserve watch-mode failures and exit outcomes.
 - [ ] **C28** (P2) Make TUI status reflect the cluster.
 - [ ] **C29** (P1) Fail benchmark comparisons when required metrics vanish.

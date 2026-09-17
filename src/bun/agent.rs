@@ -9238,15 +9238,20 @@ fn trace_probe_step(
     use crate::onion::trace::{TraceEvidence, TraceStep, TraceVerdict};
     match probe {
         Ok(probe) => {
+            let expected_answer = expected_value.is_none_or(|expected| {
+                expected
+                    .parse::<std::net::IpAddr>()
+                    .is_ok_and(|address| probe.dns_answers().contains(&address))
+            });
             let mut details = vec![format!("fixed workload probe target: {target}")];
             details.extend(probe.lines);
             let verdict = if probe.status == 0 {
                 if let Some(expected) = expected_value
-                    && !details.iter().any(|line| line.contains(expected))
+                    && !expected_answer
                 {
                     TraceVerdict::Fail {
                         reason: format!(
-                            "probe succeeded but its answer did not contain expected value {expected}"
+                            "probe succeeded but its DNS answers did not include exact address {expected}"
                         ),
                     }
                 } else {
@@ -9443,6 +9448,65 @@ mod tests {
 
         shutdown.cancel();
         handle.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn trace_requires_an_exact_dns_answer_not_server_or_name_text() {
+        let (mut agent, tx, shutdown, grill) = test_agent_with_grill();
+        let handle = tokio::spawn(async move { agent.run().await });
+        expect_complete(
+            &send_deploy(
+                &tx,
+                Config::parse(
+                    r#"
+            [app.source]
+            image = "source:v1"
+            [app.destination]
+            image = "destination:v1"
+            port = 8080
+        "#,
+                )
+                .unwrap(),
+            )
+            .await,
+        );
+        let vip = crate::onion::vip::VirtualIP::from_qualified("default__destination");
+        let mut verdicts = Vec::new();
+        for answer in [
+            format!(
+                "Server: resolver\nAddress: {vip}#53\nName: destination.default.internal\nAddress: 127.0.0.1"
+            ),
+            format!("Name: {vip}.invalid\nAddress: {vip}0"),
+        ] {
+            grill.set_exec_outputs([
+                format!("{answer}\n__RB_TRACE_DNS_STATUS__=0\n"),
+                "__RB_TRACE_TCP_STATUS__=0\n".into(),
+            ]);
+            let (response, receiver) = oneshot::channel();
+            tx.send(AgentCommand::Trace {
+                request: crate::onion::trace::TraceRequest {
+                    source: "source".into(),
+                    source_namespace: "default".into(),
+                    destination: "destination".into(),
+                    destination_namespace: "default".into(),
+                    port: None,
+                },
+                internal_destination: true,
+                source_node: "node-a".into(),
+                response,
+            })
+            .await
+            .unwrap();
+            verdicts.push(receiver.await.unwrap().unwrap().steps[0].verdict.clone());
+        }
+        shutdown.cancel();
+        handle.await.unwrap();
+        assert!(
+            verdicts
+                .iter()
+                .all(|verdict| matches!(verdict, crate::onion::trace::TraceVerdict::Fail { .. })),
+            "{verdicts:?}"
+        );
     }
 
     #[tokio::test]

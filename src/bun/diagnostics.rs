@@ -4,7 +4,7 @@
 //! host filesystem paths. Collection can return degraded evidence alongside
 //! the facts it did observe, rather than hiding a partial failure.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::PathBuf;
 
 use serde::{Deserialize, Serialize};
@@ -406,7 +406,9 @@ pub(crate) fn cpu_throttle_window(
         .map(|sample| (sample.instance.clone(), sample))
         .collect::<BTreeMap<_, _>>();
     let mut values = Vec::new();
+    let mut observed_instances = BTreeSet::new();
     for sample in second {
+        observed_instances.insert(sample.instance.clone());
         let Some(previous) = first.get(&sample.instance) else {
             errors.push(format!(
                 "instance {} appeared during the CPU observation window",
@@ -432,16 +434,13 @@ pub(crate) fn cpu_throttle_window(
             window_seconds,
         });
     }
-    if first.len() != values.len() {
-        for instance in first.keys() {
-            if !values.iter().any(|sample| &sample.instance == instance)
-                && !errors.iter().any(|error| error.contains(instance))
-            {
-                errors.push(format!(
-                    "instance {instance} disappeared during the CPU observation window"
-                ));
-            }
-        }
+    for instance in first
+        .keys()
+        .filter(|instance| !observed_instances.contains(*instance))
+    {
+        errors.push(format!(
+            "instance {instance} disappeared during the CPU observation window"
+        ));
     }
     values.sort_by(|left, right| left.instance.cmp(&right.instance));
     finish_collection(values, errors, observed_at)
@@ -505,6 +504,28 @@ mod tests {
         assert_eq!(values.len(), 1);
         assert_eq!(values[0].throttled_seconds_delta, 1.25);
         assert_eq!(values[0].window_seconds, 2);
+    }
+
+    #[test]
+    fn one_instance_prefix_cannot_hide_another_missing_cpu_sample() {
+        let first = DiagnosticSource::Available {
+            observed_at: 10,
+            value: vec![cpu_total("api-1", 500), cpu_total("api-10", 500)],
+        };
+        let second = DiagnosticSource::Available {
+            observed_at: 11,
+            value: vec![cpu_total("api-10", 1)],
+        };
+        let result = cpu_throttle_window(first, second, 1, 11);
+        let DiagnosticSource::Unavailable { reason } = result else {
+            panic!("missing samples must be unavailable")
+        };
+        assert!(reason.contains("instance api-1 disappeared"), "{reason}");
+        assert!(
+            reason.contains("counter reset for instance api-10"),
+            "{reason}"
+        );
+        assert!(!reason.contains("instance api-10 disappeared"), "{reason}");
     }
 
     #[test]

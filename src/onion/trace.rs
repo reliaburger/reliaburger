@@ -93,6 +93,42 @@ pub struct ProbeOutput {
     pub lines: Vec<String>,
 }
 
+impl ProbeOutput {
+    /// Extract exact IP addresses from nslookup's answer section. Resolver
+    /// addresses and names containing address text are not answers.
+    pub fn dns_answers(&self) -> Vec<std::net::IpAddr> {
+        let mut in_answer = false;
+        let mut addresses = Vec::new();
+        for line in &self.lines {
+            let line = line.trim();
+            if line.starts_with("Name:") {
+                in_answer = true;
+                continue;
+            }
+            if !in_answer {
+                continue;
+            }
+            let Some((label, values)) = line.split_once(':') else {
+                continue;
+            };
+            let address_label = label == "Address"
+                || label == "Addresses"
+                || label
+                    .strip_prefix("Address ")
+                    .is_some_and(|index| index.parse::<u32>().is_ok());
+            if address_label {
+                addresses.extend(values.split_whitespace().filter_map(|value| {
+                    value
+                        .trim_matches(['[', ']', ','])
+                        .parse::<std::net::IpAddr>()
+                        .ok()
+                }));
+            }
+        }
+        addresses
+    }
+}
+
 /// Parse the private exit marker emitted by the fixed workload probe.
 pub fn parse_probe_output(output: &str, marker: &str) -> Option<ProbeOutput> {
     const MAX_DETAIL_LINES: usize = 16;
@@ -204,6 +240,19 @@ mod tests {
             ]),
             TraceVerdict::Fail { .. }
         ));
+    }
+
+    #[test]
+    fn dns_answers_parse_exact_ipv4_and_ipv6_values_only() {
+        let probe = parse_probe_output("Server: resolver\nAddress: 10.0.0.1#53\nName: 10.0.0.1.invalid\nAddress 1: 10.0.0.10 name\nAddress 2: 2001:0db8:0:0:0:0:0:1\nAddress: [2001:db8::2]\nSTATUS=0", "STATUS").unwrap();
+        assert_eq!(
+            probe.dns_answers(),
+            [
+                "10.0.0.10".parse::<std::net::IpAddr>().unwrap(),
+                "2001:db8::1".parse().unwrap(),
+                "2001:db8::2".parse().unwrap()
+            ]
+        );
     }
 
     #[test]

@@ -2476,3 +2476,18 @@ covers identical-size distinct devices, missing identities and two changing
 readings of one device. A real filesystem test also confirms that sibling storage
 paths report the same device identity. The optional wire field is backward-readable
 by the new client; older strict diagnostic clients may report unknown until updated.
+
+### Match observations as identities, not substrings
+
+A counter-reset error for `api-10` must not hide the disappearance of `api-1`.
+The CPU observation window now tracks the exact instances seen in its second
+sample, independently of human-readable errors. Reset and missing-instance
+messages can therefore coexist without one suppressing the other.
+
+Trace had the same category of mistake: it searched every output line (including
+its own target description) for the expected VIP text. A resolver address or a
+hostname containing that text could pass. We now parse addresses from nslookup's
+answer section and compare `IpAddr` values. This rejects longer textual matches
+and recognises equivalent IPv6 spellings. The agent regression supplies successful
+probe output with misleading resolver/name text and verifies that DNS still fails;
+the existing correct-answer trace remains successful.
