@@ -198,7 +198,12 @@ async fn run_one(
     let started_at = now_rfc3339();
     let deadline_at = rfc3339_after(timeout);
     let required = profile_requires_case(profile, case.requires);
-    let refresh_capabilities = case.group == TestGroup::Chaos;
+    let deadline = Deadline::after(timeout).expect("CLI rejects a zero timeout");
+    let refresh_capabilities = case.group == TestGroup::Chaos
+        || case
+            .requires
+            .iter()
+            .any(|capability| capabilities.state(*capability) == CapabilityState::Unknown);
     let refreshed;
     let capabilities = if refresh_capabilities {
         match tokio::time::timeout(timeout.min(Duration::from_secs(5)), client.capabilities()).await
@@ -218,7 +223,7 @@ async fn run_one(
                     outcome: TestOutcome::Unknown {
                         kind: UnknownKind::CollectorFailed,
                         reason: format!(
-                            "could not refresh capability evidence before destructive case: {error}"
+                            "could not refresh capability evidence before case: {error}"
                         ),
                     },
                     duration_ms: start.elapsed().as_millis() as u64,
@@ -300,7 +305,6 @@ async fn run_one(
         };
     }
 
-    let deadline = Deadline::after(timeout).expect("CLI rejects a zero timeout");
     let (namespace, lease_id) = match lease_ownership {
         LeaseOwnership::Required => {
             let lifetime = timeout.saturating_add(TEARDOWN_TIMEOUT);
@@ -652,14 +656,14 @@ mod tests {
         assert!(matches!(
             report.results[0].outcome,
             TestOutcome::Unknown {
-                kind: UnknownKind::MissingEvidence,
+                kind: UnknownKind::CollectorFailed,
                 ..
             }
         ));
     }
 
     #[tokio::test]
-    async fn chaos_case_refreshes_capabilities_after_entering_the_serial_queue() {
+    async fn queued_cases_refresh_expired_capabilities() {
         static CHAOS_BODY_RAN: AtomicBool = AtomicBool::new(false);
 
         async fn body(ctx: TestContext) -> Result<(), String> {
@@ -691,16 +695,23 @@ mod tests {
         let mut stale = full_capabilities();
         stale.expires_at_unix_ms = 0;
         let report = run(
-            vec![chaos_case(
-                "fresh_destructive_evidence",
-                &[Capability::Ebpf],
-                testkit_case!(body),
-            )],
+            vec![
+                chaos_case(
+                    "fresh_destructive_evidence",
+                    &[Capability::Ebpf],
+                    testkit_case!(body),
+                ),
+                case(
+                    "fresh_ordinary_evidence",
+                    &[Capability::Ebpf],
+                    testkit_case!(body),
+                ),
+            ],
             config(BunClient::new_with_token(&address, None), stale, 1),
         )
         .await;
 
-        assert_eq!(report.passed, 1, "{:?}", report.results);
+        assert_eq!(report.passed, 2, "{:?}", report.results);
         assert!(CHAOS_BODY_RAN.load(Ordering::SeqCst));
     }
 
