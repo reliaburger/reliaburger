@@ -302,11 +302,13 @@ impl ImageStore {
 
     /// Path to the unpacked rootfs for an image reference.
     pub fn rootfs_path(&self, image_ref: &ImageReference) -> PathBuf {
+        // A colon separates overlayfs lower layers. Digest pins and registry
+        // ports contain it, so encode it before this path reaches a mount.
         self.store_root
             .join("rootfs")
-            .join(&image_ref.registry)
+            .join(image_ref.registry.replace(':', "%3A"))
             .join(&image_ref.repository)
-            .join(&image_ref.tag)
+            .join(image_ref.tag.replace(':', "%3A"))
     }
 
     /// Path to the cached manifest for an image reference.
@@ -804,6 +806,18 @@ mod tests {
             first,
             store.rootfs_generation_path(root, &[PathBuf::from("/blobs/aaaa")])
         );
+    }
+
+    #[test]
+    fn digest_pinned_rootfs_paths_are_safe_for_overlayfs() {
+        let store = ImageStore::new(PathBuf::from("/var/lib/reliaburger/images"));
+        let reference =
+            ImageReference::parse(&format!("localhost:5000/demo@sha256:{}", "a".repeat(64)))
+                .unwrap();
+        let path = store.rootfs_path(&reference);
+        assert!(!path.to_string_lossy().contains(':'));
+        assert!(path.to_string_lossy().contains("localhost%3A5000"));
+        assert!(path.to_string_lossy().contains("sha256%3A"));
     }
 
     #[test]
