@@ -798,6 +798,7 @@ mod tests {
                 }),
                 faults: available(Vec::new()),
                 disks: available(vec![DiskObservation {
+                    filesystem_id: None,
                     node_id: "node-1".to_string(),
                     storage_domains: vec!["images".to_string()],
                     used_bytes: 20,
@@ -1107,6 +1108,7 @@ mod tests {
             message: "latency budget exhausted".to_string(),
         }]);
         inputs.cluster.disks = available(vec![DiskObservation {
+            filesystem_id: None,
             node_id: "node-1".to_string(),
             storage_domains: vec!["logs".to_string()],
             used_bytes: 96,

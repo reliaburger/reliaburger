@@ -2461,3 +2461,18 @@ empty membership as unknown and retains the source failure. Diagnosis also refus
 quorum arithmetic for explicitly degraded or empty membership. A public HTTP
 collector regression covers missing membership, stale role flags and an empty
 council response; the existing observed failed-majority case remains critical.
+
+### Filesystem identity is not its capacity
+
+Two filesystems can both report 50 bytes used out of 100. That does not make them
+one filesystem. Diagnostics now attach a node-local device identity from Unix
+filesystem metadata, without exposing host paths. The collector groups storage
+domains only when that identity matches. Older reporters or unsupported systems
+omit it; those observations remain separate rather than being guessed together.
+
+If readings for one device change during collection, we retain the busiest
+complete reading and combine the domain names. A public HTTP collector regression
+covers identical-size distinct devices, missing identities and two changing
+readings of one device. A real filesystem test also confirms that sibling storage
+paths report the same device identity. The optional wire field is backward-readable
+by the new client; older strict diagnostic clients may report unknown until updated.

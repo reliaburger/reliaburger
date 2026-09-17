@@ -650,6 +650,7 @@ fn collect_local_diagnostics(collected: &[NodeCollection], observed_at: u64) -> 
         };
         append_diagnostic_source(&snapshot.disks, &node.node_id, &mut disks, |disk| {
             DiskObservation {
+                filesystem_id: disk.filesystem_id.clone(),
                 node_id: node.node_id.clone(),
                 storage_domains: vec![disk.storage_domain.clone()],
                 used_bytes: disk.used_bytes,
@@ -689,15 +690,27 @@ fn collect_local_diagnostics(collected: &[NodeCollection], observed_at: u64) -> 
 }
 
 fn coalesce_disk_filesystems(disks: &mut Vec<DiskObservation>) {
-    let mut grouped = BTreeMap::<(String, u64, u64), DiskObservation>::new();
+    let mut grouped = BTreeMap::<(String, String), DiskObservation>::new();
     for disk in std::mem::take(disks) {
-        let key = (disk.node_id.clone(), disk.used_bytes, disk.total_bytes);
+        let Some(identity) = disk.filesystem_id.as_ref().filter(|id| !id.is_empty()) else {
+            // Matching capacities do not prove two observations share a device.
+            disks.push(disk);
+            continue;
+        };
+        let key = (disk.node_id.clone(), identity.clone());
         grouped
             .entry(key)
             .and_modify(|existing| {
                 existing
                     .storage_domains
-                    .extend(disk.storage_domains.clone())
+                    .extend(disk.storage_domains.clone());
+                // Readings can change during collection. Preserve the busiest
+                // observed reading as a whole, rather than mixing its counters.
+                if disk.used_percent > existing.used_percent {
+                    existing.used_bytes = disk.used_bytes;
+                    existing.total_bytes = disk.total_bytes;
+                    existing.used_percent = disk.used_percent;
+                }
             })
             .or_insert(disk);
     }
@@ -706,6 +719,9 @@ fn coalesce_disk_filesystems(disks: &mut Vec<DiskObservation>) {
         disk.storage_domains.dedup();
     }
     disks.extend(grouped.into_values());
+    disks.sort_by(|left, right| {
+        (&left.node_id, &left.storage_domains).cmp(&(&right.node_id, &right.storage_domains))
+    });
 }
 
 fn append_diagnostic_source<T, U, F>(
@@ -946,12 +962,14 @@ mod tests {
                 observed_at: 10,
                 value: vec![
                     DiskUsageEvidence {
+                        filesystem_id: Some("device:a".into()),
                         storage_domain: "images".to_string(),
                         used_bytes: 95,
                         total_bytes: 100,
                         used_percent: 95.0,
                     },
                     DiskUsageEvidence {
+                        filesystem_id: Some("device:a".into()),
                         storage_domain: "logs".to_string(),
                         used_bytes: 95,
                         total_bytes: 100,
@@ -1052,6 +1070,63 @@ mod tests {
         assert!(line_is_error(r#"{"level":"ERROR","message":"boom"}"#));
         assert!(line_is_error("ERROR connection refused"));
         assert!(!line_is_error("request completed"));
+    }
+
+    #[tokio::test]
+    async fn disk_collection_groups_by_identity_not_matching_capacity() {
+        use axum::{Json, Router, routing::get};
+        for (identities, usages, expected_count) in [
+            ([None, None], [50, 50], 2),
+            ([Some("device-a"), Some("device-b")], [50, 50], 2),
+            ([Some("device-a"), Some("device-a")], [50, 60], 1),
+        ] {
+            let mut disks = Vec::new();
+            for (index, domain) in ["images", "logs"].into_iter().enumerate() {
+                let mut disk = serde_json::json!({"storage_domain":domain, "used_bytes":usages[index], "total_bytes":100, "used_percent":usages[index] as f64});
+                if let Some(identity) = identities[index] {
+                    disk["filesystem_id"] = identity.into();
+                }
+                disks.push(disk);
+            }
+            let snapshot = serde_json::json!({
+                "schema_version":1, "node_id":"node-a", "observed_at":10,
+                "disks":{"state":"available","observed_at":10,"value":disks},
+                "cpu_throttling":{"state":"unsupported","reason":"fixture"},
+                "certificates":{"state":"unsupported","reason":"fixture"},
+            });
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let address = listener.local_addr().unwrap();
+            let app = Router::new()
+                .route(
+                    "/v1/health",
+                    get(|| async { Json(serde_json::json!({"status":"ok"})) }),
+                )
+                .route(
+                    "/v1/cluster/nodes",
+                    get(|| async { Json(Vec::<NodeStatus>::new()) }),
+                )
+                .route(
+                    "/v1/diagnostics",
+                    get(move || {
+                        let snapshot = snapshot.clone();
+                        async move { Json(snapshot) }
+                    }),
+                );
+            let server = tokio::spawn(async move {
+                axum::serve(listener, app).await.unwrap();
+            });
+            let inputs = collect(&BunClient::new(&format!("http://{address}")), None)
+                .await
+                .unwrap();
+            server.abort();
+            let _ = server.await;
+            let disks = inputs.cluster.disks.value().expect("disk evidence");
+            assert_eq!(disks.len(), expected_count);
+            if expected_count == 1 {
+                assert_eq!(disks[0].storage_domains, ["images", "logs"]);
+                assert_eq!(disks[0].used_percent, 60.0);
+            }
+        }
     }
 
     #[tokio::test]

@@ -93,6 +93,9 @@ pub struct DiagnosticStaticEvidence {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct DiskUsageEvidence {
+    /// Node-local filesystem identity. Absent on older or unsupported reporters.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub filesystem_id: Option<String>,
     /// Stable domain such as `images`, `logs` or `volumes`.
     pub storage_domain: String,
     /// Bytes used on the filesystem containing that domain.
@@ -233,6 +236,7 @@ pub fn collect_disk_usage(
         .list()
         .iter()
         .map(|disk| MountCapacity {
+            filesystem_id: filesystem_identity(disk.mount_point()),
             mount: disk.mount_point().to_path_buf(),
             total_bytes: disk.total_space(),
             available_bytes: disk.available_space(),
@@ -241,8 +245,22 @@ pub fn collect_disk_usage(
     disk_usage_from_mounts(storage_paths, &mounts, observed_at)
 }
 
+#[cfg(unix)]
+fn filesystem_identity(mount: &std::path::Path) -> Option<String> {
+    use std::os::unix::fs::MetadataExt;
+    std::fs::metadata(mount)
+        .ok()
+        .map(|metadata| format!("device:{:x}", metadata.dev()))
+}
+
+#[cfg(not(unix))]
+fn filesystem_identity(_mount: &std::path::Path) -> Option<String> {
+    None
+}
+
 #[derive(Debug, Clone)]
 struct MountCapacity {
+    filesystem_id: Option<String>,
     mount: PathBuf,
     total_bytes: u64,
     available_bytes: u64,
@@ -281,6 +299,7 @@ fn disk_usage_from_mounts(
         }
         let used_bytes = mount.total_bytes - mount.available_bytes;
         values.push(DiskUsageEvidence {
+            filesystem_id: mount.filesystem_id.clone(),
             storage_domain: storage.domain.clone(),
             used_bytes,
             total_bytes: mount.total_bytes,
@@ -506,6 +525,36 @@ mod tests {
         );
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn real_storage_paths_share_their_device_identity() {
+        use std::os::unix::fs::MetadataExt;
+        let directory = tempfile::tempdir().unwrap();
+        let nested = directory.path().join("logs");
+        std::fs::create_dir(&nested).unwrap();
+        let expected = format!("device:{:x}", std::fs::metadata(&nested).unwrap().dev());
+        let evidence = collect_disk_usage(
+            &[
+                DiagnosticStoragePath {
+                    domain: "data".into(),
+                    path: directory.path().canonicalize().unwrap(),
+                },
+                DiagnosticStoragePath {
+                    domain: "logs".into(),
+                    path: nested.canonicalize().unwrap(),
+                },
+            ],
+            10,
+        );
+        let disks = evidence.value().unwrap();
+        assert_eq!(disks.len(), 2);
+        assert!(
+            disks
+                .iter()
+                .all(|disk| disk.filesystem_id.as_deref() == Some(expected.as_str()))
+        );
+    }
+
     #[test]
     fn disk_capacity_is_attributed_to_longest_matching_mount() {
         let paths = vec![
@@ -520,11 +569,13 @@ mod tests {
         ];
         let mounts = vec![
             MountCapacity {
+                filesystem_id: None,
                 mount: PathBuf::from("/"),
                 total_bytes: 1000,
                 available_bytes: 500,
             },
             MountCapacity {
+                filesystem_id: None,
                 mount: PathBuf::from("/srv"),
                 total_bytes: 2000,
                 available_bytes: 500,
@@ -549,6 +600,7 @@ mod tests {
             disks: DiagnosticSource::Available {
                 observed_at: 10,
                 value: vec![DiskUsageEvidence {
+                    filesystem_id: None,
                     storage_domain: "images".to_string(),
                     used_bytes: 1,
                     total_bytes: 2,
