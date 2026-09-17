@@ -727,6 +727,8 @@ async fn run_agent(cli: Cli) -> anyhow::Result<()> {
 
     // Create shutdown token
     let shutdown = CancellationToken::new();
+    // Startup failures must also stop the tasks already launched.
+    let _shutdown_guard = shutdown.clone().drop_guard();
     let readiness = reliaburger::bun::readiness::ReadinessTracker::new();
     for name in ["agent", "api", "registry"] {
         readiness.register(name, true).await;
