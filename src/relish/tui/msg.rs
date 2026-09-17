@@ -23,6 +23,8 @@ pub enum Msg {
     Data(DataUpdate),
     /// An item from a live WebSocket.
     Stream(StreamItem),
+    /// A log subscription update tagged so a cancelled stream cannot affect its successor.
+    LogStream { generation: u64, item: StreamItem },
 }
 
 /// Results from HTTP data providers.

@@ -12,7 +12,19 @@ impl TuiApp {
             Msg::Resize(_, _) | Msg::Tick => {}
             Msg::Data(update) => self.handle_data(update),
             Msg::Stream(item) => self.handle_stream(item),
+            Msg::LogStream { generation, item } if generation == self.log_generation => {
+                self.handle_stream(item)
+            }
+            Msg::LogStream { .. } => {}
         }
+    }
+
+    pub(super) fn reset_log_stream(&mut self) -> u64 {
+        self.log_generation = self.log_generation.wrapping_add(1);
+        self.log_lines.clear();
+        self.log_scroll = 0;
+        self.log_stream_down = None;
+        self.log_generation
     }
 
     fn handle_data(&mut self, update: DataUpdate) {
@@ -160,6 +172,45 @@ mod tests {
         ))));
         assert_eq!(app.data.instances.len(), 1);
         assert!(matches!(app.connection, Connection::Disconnected { .. }));
+    }
+
+    #[test]
+    fn changing_log_stream_discards_queued_lines_and_errors_from_the_previous_target() {
+        let mut app = TuiApp::new();
+        let old = app.reset_log_stream();
+        app.update(Msg::LogStream {
+            generation: old,
+            item: StreamItem::LogLine(LogLine {
+                instance: "web".into(),
+                line: "old namespace".into(),
+            }),
+        });
+        assert_eq!(app.log_lines.len(), 1);
+        let current = app.reset_log_stream();
+        app.update(Msg::LogStream {
+            generation: old,
+            item: StreamItem::LogLine(LogLine {
+                instance: "web".into(),
+                line: "late old namespace".into(),
+            }),
+        });
+        app.update(Msg::LogStream {
+            generation: old,
+            item: StreamItem::StreamDown {
+                what: StreamKind::Logs,
+                error: "stale disconnect".into(),
+            },
+        });
+        assert!(app.log_lines.is_empty());
+        assert!(app.log_stream_down.is_none());
+        app.update(Msg::LogStream {
+            generation: current,
+            item: StreamItem::LogLine(LogLine {
+                instance: "web".into(),
+                line: "new namespace".into(),
+            }),
+        });
+        assert_eq!(app.log_lines[0].line, "new namespace");
     }
 
     #[test]

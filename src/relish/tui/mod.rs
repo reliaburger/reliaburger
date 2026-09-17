@@ -67,7 +67,9 @@ async fn event_loop<P: DataProvider, B: Backend>(
         let tx = tx.clone();
         let cancel = cancel.clone();
         async move {
-            provider.follow_events(tx_for_stream(tx), cancel).await;
+            provider
+                .follow_events(tx_for_stream(tx, None), cancel)
+                .await;
         }
     });
 
@@ -105,24 +107,29 @@ async fn event_loop<P: DataProvider, B: Backend>(
         };
         metrics_tx.send_replace(metrics_target);
 
-        for effect in app.pending.drain(..) {
+        for effect in std::mem::take(&mut app.pending) {
             match effect {
                 Effect::RefreshAll => refresh.notify_one(),
-                Effect::OpenLogStream { app, namespace } => {
+                Effect::OpenLogStream {
+                    app: name,
+                    namespace,
+                } => {
                     if let Some(previous) = log_cancel.take() {
                         previous.cancel();
                     }
                     let stream_cancel = cancel.child_token();
                     log_cancel = Some(stream_cancel.clone());
                     let provider = Arc::clone(&provider);
-                    let stream_tx = tx_for_stream(tx.clone());
+                    let generation = app.reset_log_stream();
+                    let stream_tx = tx_for_stream(tx.clone(), Some(generation));
                     tokio::spawn(async move {
                         provider
-                            .follow_logs(app, namespace, 100, stream_tx, stream_cancel)
+                            .follow_logs(name, namespace, 100, stream_tx, stream_cancel)
                             .await;
                     });
                 }
                 Effect::CloseLogStream => {
+                    app.reset_log_stream();
                     if let Some(previous) = log_cancel.take() {
                         previous.cancel();
                     }
@@ -158,11 +165,15 @@ async fn event_loop<P: DataProvider, B: Backend>(
     }
 }
 
-fn tx_for_stream(tx: mpsc::Sender<Msg>) -> mpsc::Sender<msg::StreamItem> {
+fn tx_for_stream(tx: mpsc::Sender<Msg>, generation: Option<u64>) -> mpsc::Sender<msg::StreamItem> {
     let (stream_tx, mut stream_rx) = mpsc::channel(256);
     tokio::spawn(async move {
         while let Some(item) = stream_rx.recv().await {
-            if tx.send(Msg::Stream(item)).await.is_err() {
+            let message = match generation {
+                Some(generation) => Msg::LogStream { generation, item },
+                None => Msg::Stream(item),
+            };
+            if tx.send(message).await.is_err() {
                 return;
             }
         }
