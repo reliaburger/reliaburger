@@ -484,7 +484,11 @@ threshold_healthy = 1
 [app.hello.ingress]
 host = "localhost"
 "#,
-        crate::testkit::PINNED_TEST_WORKLOAD_IMAGE
+        crate::testkit::PINNED_TEST_WORKLOAD_IMAGE.replacen(
+            "docker.io/library/",
+            "public.ecr.aws/docker/library/",
+            1
+        )
     )
 }
 
@@ -546,7 +550,12 @@ mod tests {
     fn demo_is_a_pinned_container_with_health_and_browser_ingress() {
         let config = crate::config::Config::parse(&demo_config()).unwrap();
         let app = &config.app["hello"];
-        assert!(app.image.as_ref().unwrap().contains("@sha256:"));
+        assert!(
+            app.image
+                .as_ref()
+                .unwrap()
+                .starts_with("public.ecr.aws/docker/library/busybox@sha256:")
+        );
         assert_eq!(app.ingress.as_ref().unwrap().host, "localhost");
         assert_eq!(app.health.as_ref().unwrap().path, "/");
     }

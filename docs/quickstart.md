@@ -105,3 +105,8 @@ Use the same `RELIABURGER_HOME` for subsequent CLI and lifecycle commands.
 The outstanding release gates are tracked in the
 [0.1.0 plan](plans/2026-09-16-v0.1.0-release-plan.md), including clean-host timing,
 interrupted setup, real container networking, restart, recovery and cleanup.
+
+The demo uses Docker's public ECR BusyBox repository, pinned to the same image
+index digest as the test workload. It does not need a Docker Hub login. Public
+registry availability and quotas still apply; setup only succeeds after the
+container answers through ingress.

@@ -861,3 +861,12 @@ for guest provisioning to finish even when Lima reports the VM as running;
 those are different milestones. The last forwarding rule excludes every other
 TCP and UDP port on every guest interface. Lima's automatic forwarding is
 helpful interactively, but it isn't part of this installation's contract.
+
+The initial demo also depended on Docker Hub's anonymous pull allowance. A
+failed cache integration caused repeated requests and exhausted it during the
+real-VM test. We use the identical pinned BusyBox index from
+[Docker's public ECR repository](https://www.docker.com/blog/news-from-aws-reinvent-docker-official-images-on-amazon-ecr-public/)
+for quickstart. Changing the registry does not mean changing the workload:
+the digest stays fixed, and the normal OCI client still resolves the host
+architecture and checks downloaded content. This remains a network dependency,
+so the signed cold-install gate must exercise it too.
