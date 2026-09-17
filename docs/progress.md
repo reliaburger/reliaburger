@@ -106,6 +106,11 @@ remain separate. Older unchecked groups below point into this current ledger.
 
 ### Acceptance and release gates
 
+Release signing preparation: a replacement 0.1.0 public identity is committed
+and its matching private key is configured as `RELIABURGER_RELEASE_KEY` in
+repository Actions. Local signature verification and all five packaging tests
+pass. This is preparation only; signed candidate qualification remains V03.
+
 - [ ] **V01** (gate) Qualify the complete live three-node catalogue.
 - [ ] **V02** (gate) Qualify sustained TLS, storage and upgrade recovery.
 - [ ] **V03** (gate) Publish and install the exact signed candidate.

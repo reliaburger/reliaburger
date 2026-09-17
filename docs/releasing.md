@@ -44,6 +44,13 @@ of the existing Ed25519 PKCS#8 DER private key whose public key is listed in
 rotate the project's identity or generate a replacement when the secret is
 missing.
 
+The 0.1.0 signing identity was established on 17 September 2026 because the
+pre-release development private key was unavailable. Fresh 0.1.0 installations
+trust the new public key in `src/upgrade/keys.rs`; old development binaries are
+not an upgrade source. Keep an encrypted offline backup of the private key.
+Replacing a key after a supported release requires an overlap release trusting
+both identities, not an unannounced replacement.
+
 The packaging script derives the public key and checks it against the compiled
 trust list before signing. A missing key, wrong key, incomplete matrix or failed
 signing operation stops publication. Unit tests use fresh temporary keys and

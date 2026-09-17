@@ -166,7 +166,7 @@ Tuple matching like this is why Rust people keep banging on about exhaustiveness
 
 ```rust
 pub const EMBEDDED_RELEASE_KEYS: &[&str] =
-    &["ed25519:kdNmHSKOupiiF2i5vCyNrNMmEeagWZzB4DOm/w3a1IY="];
+    &["ed25519:NCfgKCWG8/h7N57f3EEtle0NS/nJPr6QxBOtMnfvHDI="];
 ```
 
 Public keys are public; committing one is fine and pinning it in the binary is the point — a config file must never be able to widen what a production binary trusts. The *private* key lives outside the repository (generated with `relish dev keygen`, which chmods it 0600 and prints a warning to that effect).
@@ -717,3 +717,19 @@ minimum-compiler, release-build and upgrade qualification. Rebuild and publish a
 new candidate with its own checksum and provenance; don't replace bytes behind
 an existing release tag. Pinning Rust improves repeatability but does not claim
 bit-for-bit reproducibility across different operating systems or linkers.
+
+
+### Establishing the first supported release identity
+
+The development signing key's private half was unavailable when we prepared
+0.1.0. We generated a new Ed25519 identity, checked its public half into the
+trust list, verified a signature locally and configured the matching private key
+as the repository's release Actions secret. The private file stays outside Git,
+readable only by its owner. It also needs an encrypted offline backup.
+
+This works because 0.1.0 starts with fresh clusters. After a supported release,
+changing the public key alone would strand installed nodes: they would reject
+our next binary. That is why the trust list is a slice rather than one key.
+A future rotation first ships a release trusting both old and new identities,
+then changes the signer, then removes the retired public key in a later release.
+The packaging workflow refuses a signing key absent from the compiled trust list.
