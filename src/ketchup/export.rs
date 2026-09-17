@@ -288,6 +288,7 @@ async fn export_logs_locked(
     candidates.sort();
 
     let mut result = ExportResult::default();
+    let mut live_ids = HashSet::new();
     for filename in candidates {
         let source_path = source_dir.join(&filename);
         let contents = match tokio::fs::read(&source_path).await {
@@ -302,6 +303,7 @@ async fn export_logs_locked(
             }
         };
         let id = durable_id(&filename, &contents);
+        live_ids.insert(id.clone());
         if checkpoint.exported_files.contains(&id) {
             continue;
         }
@@ -323,6 +325,9 @@ async fn export_logs_locked(
         result.bytes_written += len;
     }
 
+    // Only current source generations can need pruning proof. Retired ids
+    // can be forgotten: immutable destination keys make a later retry safe.
+    checkpoint.exported_files.retain(|id| live_ids.contains(id));
     Ok(result)
 }
 

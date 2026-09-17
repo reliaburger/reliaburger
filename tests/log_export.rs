@@ -427,3 +427,61 @@ async fn non_utf8_parquet_names_are_reported() {
     );
     assert!(checkpoint.exported_files.is_empty());
 }
+
+#[tokio::test]
+async fn checkpoint_retains_only_live_source_generations_across_restart() {
+    let source = tempfile::tempdir().unwrap();
+    let destination = tempfile::tempdir().unwrap();
+    let mut store = LogStore::new(source.path().to_path_buf());
+    for generation in 0..32 {
+        for entry in std::fs::read_dir(source.path()).unwrap() {
+            let path = entry.unwrap().path();
+            if path
+                .extension()
+                .is_some_and(|extension| extension == "parquet")
+            {
+                std::fs::remove_file(path).unwrap();
+            }
+        }
+        store.append_at(
+            generation,
+            "web",
+            "default",
+            LogStream::Stdout,
+            &format!("generation {generation}"),
+        );
+        store.flush().await.unwrap();
+        let mut checkpoint = ExportCheckpoint::default();
+        export_logs(
+            source.path(),
+            destination.path().to_str().unwrap(),
+            "node-1",
+            &mut checkpoint,
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            checkpoint.exported_files.len(),
+            1,
+            "retired generations grew the checkpoint"
+        );
+        let repeated = export_logs(
+            source.path(),
+            destination.path().to_str().unwrap(),
+            "node-1",
+            &mut ExportCheckpoint::default(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(repeated.files_exported, 0);
+    }
+    let entries = query_remote(
+        destination.path().join("node-1").to_str().unwrap(),
+        "SELECT timestamp, app, namespace, stream, line FROM logs ORDER BY timestamp",
+    )
+    .await
+    .unwrap();
+    assert_eq!(entries.len(), 32);
+    assert_eq!(entries[0].line, "generation 0");
+    assert_eq!(entries[31].line, "generation 31");
+}

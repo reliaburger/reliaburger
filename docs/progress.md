@@ -50,7 +50,7 @@ remain separate. Older unchecked groups below point into this current ledger.
 - [x] **C19** Count successful metric/rollup deletions only, expose removal and directory-enumeration errors with paths, and ignore concurrent NotFound without counting it. Both failing-removal regressions fail before the fix; all 171 Mayo tests pass.
 - [ ] **C20** (P1) Deduplicate rollup ownership at query merge.
 - [ ] **C21** (P2) Bound and chunk reporting payloads.
-- [ ] **C22** (P2) Bound export checkpoint growth safely.
+- [x] **C22** Compact receipts to current source generations only after a successful scan, in the existing locked durable transaction. The 32-generation retention/restart regression fails before the fix and preserves all archive rows after it; 12 archive integration, 12 exporter unit and 11 disk-pressure tests pass. Receipt count follows live source retention.
 - [ ] **C23** (P2) Distinguish expired certificates from renewal warnings.
 - [ ] **C24** (P2) Keep unknown council membership out of quorum arithmetic.
 - [ ] **C25** (P2) Identify diagnostic filesystems by identity.

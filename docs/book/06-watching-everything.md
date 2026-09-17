@@ -491,3 +491,19 @@ a not-yet-created store directory remains an empty store. Directory enumeration
 errors also reach the caller. A failed pass can have removed earlier files, so
 callers must treat its error as incomplete retention, not an all-or-nothing rollback.
 Both store regressions verify that the failed candidate's contents survive.
+
+### Keep receipts for live source generations
+
+An export checkpoint is evidence that a current source file reached its configured
+destination. It need not be a permanent catalogue of the archive. After a complete
+successful scan, we retain only IDs read from current source files. The same locked,
+durable transaction commits this compacted set. Failed scans leave the previous
+checkpoint intact.
+
+This bounds receipt count by live source generations rather than export history;
+unlimited source retention still means unlimited live receipts. Archived objects
+remain immutable and untouched. If an old source reappears, writing its content
+hash key again is safe. A 32-generation retention/restart regression keeps one
+receipt throughout, skips an immediate duplicate export, and queries all 32
+archived generations afterwards. Destination and pruning tests still apply to
+the smaller checkpoint.
