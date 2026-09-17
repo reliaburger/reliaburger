@@ -2397,3 +2397,25 @@ cleanup request). The reaper leaves A's record intact, visits B, then retries A
 on its next tick. The operation guard still prevents cleanup from overtaking
 a deployment. A regression holds A's guard while the real reaper removes B,
 then checks that A remains active and can be cleaned once the guard is dropped.
+
+### Record intent before sending a fault
+
+The server may accept a fault even if the caller never receives its response.
+Previously the guard added its receipt after the HTTP request, with another
+`.await` to acquire the receipt mutex. Cancellation at either point could leave
+an active fault while cleanup reported `NotRequired`.
+
+We now add a pending receipt before sending the request. The receipt keeps the
+exact owning client and node, then gains the server's fault ID after the response.
+An `Arc<()>` gives each operation a distinct allocation without inventing an ID
+for the server: `Arc::ptr_eq` compares allocation identity, even though both
+values contain only `()`. An unresolved receipt makes cleanup `Unknown`. It
+cannot safely infer that a timeout meant refusal, or clear unrelated faults to
+make the result green.
+
+Cleanup also snapshots receipts instead of taking them out of the shared ledger.
+It removes each receipt only after confirmed reversal. Cancellation during a
+clear therefore leaves a retryable receipt. Local HTTP fixtures exercise both
+lost injection responses and interrupted cleanup; only the exact recorded IDs
+are ever cleared. This is in-process ownership, not a durable replacement for
+server-side fault expiry after the runner itself dies.

@@ -115,7 +115,8 @@ pub fn chaos_preflight(
 
 #[derive(Clone)]
 struct OwnedFault {
-    id: u64,
+    operation: Arc<()>,
+    id: Option<u64>,
     owner: BunClient,
     owner_node: Option<String>,
 }
@@ -124,7 +125,9 @@ struct OwnedFault {
 ///
 /// The runner retains this handle when it gives a clone to the case body, so
 /// timeout and panic cannot skip cleanup. Each entry carries the direct client
-/// for the node-local fault id; cleanup never issues a blanket clear.
+/// for the node-local fault id; cleanup never issues a blanket clear. Pending
+/// injections remain uncertain when cancellation or a lost response prevents
+/// learning their id. Cleanup retains receipts until reversal is confirmed.
 #[derive(Clone, Default)]
 pub struct ChaosGuard {
     faults: Arc<Mutex<Vec<OwnedFault>>>,
@@ -137,12 +140,14 @@ impl ChaosGuard {
         owner: BunClient,
         request: &FaultRequest,
     ) -> Result<FaultSummary, String> {
+        let operation = self
+            .begin_injection(owner.clone(), request.target_node.clone())
+            .await;
         let summary = owner
             .inject_fault(request)
             .await
             .map_err(|error| format!("fault injection failed: {error}"))?;
-        let owner_node = summary.target_node.clone();
-        self.track(owner, &summary, owner_node).await;
+        self.complete_injection(&operation, &summary).await;
         Ok(summary)
     }
 
@@ -154,64 +159,102 @@ impl ChaosGuard {
         peers: &[String],
         duration_seconds: u64,
     ) -> Result<FaultSummary, String> {
+        let operation = self
+            .begin_injection(owner.clone(), Some(owner_node.to_string()))
+            .await;
         let summary = owner
             .inject_partition(peers, duration_seconds, true)
             .await
             .map_err(|error| format!("council partition failed: {error}"))?;
-        self.track(owner, &summary, Some(owner_node.to_string()))
-            .await;
+        self.complete_injection(&operation, &summary).await;
         Ok(summary)
     }
 
-    async fn track(&self, owner: BunClient, summary: &FaultSummary, owner_node: Option<String>) {
+    async fn begin_injection(&self, owner: BunClient, owner_node: Option<String>) -> Arc<()> {
+        let operation = Arc::new(());
         self.faults.lock().await.push(OwnedFault {
-            id: summary.id,
+            operation: Arc::clone(&operation),
+            id: None,
             owner,
             owner_node,
         });
+        operation
+    }
+
+    async fn complete_injection(&self, operation: &Arc<()>, summary: &FaultSummary) {
+        if let Some(fault) = self
+            .faults
+            .lock()
+            .await
+            .iter_mut()
+            .find(|fault| Arc::ptr_eq(&fault.operation, operation))
+        {
+            fault.id = Some(summary.id);
+            if summary.target_node.is_some() {
+                fault.owner_node.clone_from(&summary.target_node);
+            }
+        }
     }
 
     /// Reverse every fault this guard owns, newest first.
     pub async fn cleanup(&self, deadline: Deadline) -> CleanupOutcome {
-        let mut owned = {
-            let mut faults = self.faults.lock().await;
-            std::mem::take(&mut *faults)
+        let mut owned = match deadline
+            .run("fault ownership snapshot", self.faults.lock())
+            .await
+        {
+            Ok(faults) => faults.clone(),
+            Err(error) => {
+                return CleanupOutcome::Unknown {
+                    reason: error.to_string(),
+                };
+            }
         };
         if owned.is_empty() {
             return CleanupOutcome::NotRequired;
         }
         owned.reverse();
 
-        let mut retry = Vec::new();
         let mut failed = Vec::new();
         let mut unknown = Vec::new();
         for fault in owned {
+            let Some(id) = fault.id else {
+                unknown.push(format!(
+                    "unacknowledged injection on {}",
+                    fault.owner_node.as_deref().unwrap_or("owning endpoint")
+                ));
+                continue;
+            };
             match deadline
                 .run(
                     "fault cleanup",
                     fault
                         .owner
-                        .clear_fault(fault.id, fault.owner_node.as_deref(), false),
+                        .clear_fault(id, fault.owner_node.as_deref(), false),
                 )
                 .await
             {
-                Ok(Ok(_)) => {}
+                Ok(Ok(_)) => {
+                    match deadline
+                        .run("fault receipt removal", self.faults.lock())
+                        .await
+                    {
+                        Ok(mut faults) => {
+                            faults.retain(|entry| !Arc::ptr_eq(&entry.operation, &fault.operation))
+                        }
+                        Err(error) => unknown.push(format!("{id}: {error}")),
+                    }
+                }
                 Ok(Err(
                     crate::relish::RelishError::AgentUnreachable
                     | crate::relish::RelishError::RequestTimeout,
                 ))
                 | Err(_) => {
-                    unknown.push(fault.id.to_string());
-                    retry.push(fault);
+                    unknown.push(id.to_string());
                 }
                 Ok(Err(error)) => {
-                    failed.push(format!("{}: {error}", fault.id));
-                    retry.push(fault);
+                    failed.push(format!("{id}: {error}"));
                 }
             }
-        }
-        if !retry.is_empty() {
-            self.faults.lock().await.extend(retry);
         }
         if !failed.is_empty() {
             CleanupOutcome::Failed {
@@ -354,6 +397,131 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn cancelled_injection_retains_uncertain_ownership() {
+        let accepted = Arc::new(tokio::sync::Notify::new());
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let notification = Arc::clone(&accepted);
+        let app = Router::new().route(
+            "/v1/chaos/partition",
+            axum::routing::post(move || {
+                let notification = Arc::clone(&notification);
+                async move {
+                    notification.notify_one();
+                    std::future::pending::<Json<serde_json::Value>>().await
+                }
+            }),
+        );
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        let guard = ChaosGuard::default();
+        let task_guard = guard.clone();
+        let injection = tokio::spawn(async move {
+            task_guard
+                .inject_partition(
+                    BunClient::new(&format!("http://{address}")),
+                    "node-a",
+                    &["node-b".to_string()],
+                    30,
+                )
+                .await
+        });
+        tokio::time::timeout(std::time::Duration::from_secs(2), accepted.notified())
+            .await
+            .unwrap();
+        injection.abort();
+        let _ = injection.await;
+        server.abort();
+        let _ = server.await;
+        let outcome = guard
+            .cleanup(Deadline::after(std::time::Duration::from_secs(1)).unwrap())
+            .await;
+        assert!(
+            matches!(outcome, CleanupOutcome::Unknown { .. }),
+            "{outcome:?}"
+        );
+        assert!(matches!(
+            guard
+                .cleanup(Deadline::after(std::time::Duration::from_secs(1)).unwrap())
+                .await,
+            CleanupOutcome::Unknown { .. }
+        ));
+    }
+
+    #[tokio::test]
+    async fn cancelled_cleanup_keeps_receipts_for_retry() {
+        let accepted = Arc::new(tokio::sync::Notify::new());
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let notification = Arc::clone(&accepted);
+        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let requests = Arc::clone(&calls);
+        let app = Router::new().route(
+            "/v1/fault/{id}",
+            delete(move || {
+                let notification = Arc::clone(&notification);
+                let requests = Arc::clone(&requests);
+                async move {
+                    if requests.fetch_add(1, std::sync::atomic::Ordering::SeqCst) == 0 {
+                        notification.notify_one();
+                        std::future::pending::<()>().await;
+                    }
+                    Json(serde_json::json!({"message": "cleared"}))
+                }
+            }),
+        );
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        let guard = ChaosGuard::default();
+        let operation = guard
+            .begin_injection(
+                BunClient::new(&format!("http://{address}")),
+                Some("node-a".into()),
+            )
+            .await;
+        guard
+            .complete_injection(
+                &operation,
+                &FaultSummary {
+                    id: 7,
+                    fault_type: "node-kill".into(),
+                    target_service: String::new(),
+                    target_instance: None,
+                    target_node: Some("node-a".into()),
+                    remaining_secs: 30,
+                    injected_by: "test".into(),
+                },
+            )
+            .await;
+        let task_guard = guard.clone();
+        let cleanup = tokio::spawn(async move {
+            task_guard
+                .cleanup(Deadline::after(std::time::Duration::from_secs(10)).unwrap())
+                .await
+        });
+        tokio::time::timeout(std::time::Duration::from_secs(2), accepted.notified())
+            .await
+            .unwrap();
+        cleanup.abort();
+        let _ = cleanup.await;
+        let outcome = guard
+            .cleanup(Deadline::after(std::time::Duration::from_secs(2)).unwrap())
+            .await;
+        server.abort();
+        let _ = server.await;
+        assert_eq!(outcome, CleanupOutcome::Confirmed);
+        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 2);
+        assert_eq!(
+            guard
+                .cleanup(Deadline::after(std::time::Duration::from_secs(1)).unwrap())
+                .await,
+            CleanupOutcome::NotRequired
+        );
+    }
+
+    #[tokio::test]
     async fn cleanup_deletes_only_the_fault_ids_the_guard_owns() {
         async fn clear(
             Path(id): Path<u64>,
@@ -375,9 +543,12 @@ mod tests {
         let owner = BunClient::new(&format!("http://{address}"));
         let guard = ChaosGuard::default();
         for id in [7, 9] {
+            let operation = guard
+                .begin_injection(owner.clone(), Some("node-a".to_string()))
+                .await;
             guard
-                .track(
-                    owner.clone(),
+                .complete_injection(
+                    &operation,
                     &FaultSummary {
                         id,
                         fault_type: "node-kill".to_string(),
@@ -387,7 +558,6 @@ mod tests {
                         remaining_secs: 30,
                         injected_by: "test".to_string(),
                     },
-                    Some("node-a".to_string()),
                 )
                 .await;
         }

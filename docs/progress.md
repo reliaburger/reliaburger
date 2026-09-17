@@ -38,7 +38,7 @@ remain separate. Older unchecked groups below point into this current ledger.
 - [ ] **C07** (P1) Define and enforce mixed-version compatibility.
 - [x] **C08** Publish readiness only after each owner explicitly acknowledges acquired resources; catch startup panics and fence signals by attempt. Eight readiness and 94 agent tests pass, all-target/all-feature Clippy passes, and the live three-node placement regression passes (20.89s).
 - [x] **C09** Refuse busy cleanup immediately with a retryable conflict, leaving the lease intact while the reaper visits other expired leases. The real-reaper starvation regression fails before the fix; the full lease unit-test module passes.
-- [ ] **C10** (P1) Record fault ownership before injection can be cancelled.
+- [x] **C10** Record pending fault ownership before sending, retain unknown receipts after lost responses, and remove receipts only after confirmed exact-ID reversal. All nine chaos guard/preflight tests pass, including accepted-but-cancelled injection (previously reported NotRequired) and cancelled cleanup followed by retry.
 - [ ] **C11** (P1) Persist standalone leases through directory-sync failures.
 - [ ] **C12** (P1) Sweep pressure leftovers even after disabling pressure.
 - [ ] **C13** (P1) Issue certificates with exact validity timestamps.
