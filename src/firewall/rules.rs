@@ -171,6 +171,11 @@ fn render_family_table(
     rules.push_str("    iif \"lo\" accept\n");
     rules.push('\n');
 
+    // Ephemeral outbound sockets overlap the container host-port range.
+    // Permit their replies without preserving access for revoked inbound peers.
+    rules.push_str("    ct direction reply ct state established,related accept\n");
+    rules.push('\n');
+
     // Allow cluster node IPs to reach everything (inter-node traffic)
     if !node_ips.is_empty() {
         let ips: Vec<String> = node_ips.iter().map(|ip| ip.to_string()).collect();
@@ -357,6 +362,26 @@ pub async fn apply_ruleset(_ruleset: &str) -> Result<(), FirewallError> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn outbound_replies_are_allowed_before_container_port_drops() {
+        let rules = generate_ruleset(&PerimeterConfig::default(), &ClusterNodes::new()).unwrap();
+        for table in rules.split("chain input").skip(1) {
+            let replies = table
+                .find("ct direction reply ct state established,related accept")
+                .unwrap();
+            assert!(
+                replies
+                    < table
+                        .find("# Block external access to container host ports")
+                        .unwrap()
+            );
+            assert!(
+                !table.contains("    ct state established,related accept"),
+                "an established inbound connection must still obey current peer policy"
+            );
+        }
+    }
+
     #[test]
     fn bootstrap_peers_can_enrol_without_opening_container_ports_to_outsiders() {
         let config = PerimeterConfig {
