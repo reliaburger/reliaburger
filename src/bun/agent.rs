@@ -392,6 +392,7 @@ pub enum AgentCommand {
     /// DNS and ingress resolve services running on other nodes.
     SyncClusterCatalog {
         catalog: Box<crate::onion::catalog::EndpointCatalog>,
+        ingress: Vec<crate::cluster::orchestrate::IngressAssignment>,
     },
     /// List all ingress routes.
     Routes {
@@ -1448,6 +1449,8 @@ pub struct BunAgent<G: Grill> {
     /// Ingress specs keyed by `(namespace, app_name)` so same-named apps
     /// in different namespaces route independently (D3/codex-M1).
     ingress_configs: std::collections::HashMap<(String, String), crate::config::app::IngressSpec>,
+    cluster_ingress_configs:
+        std::collections::HashMap<(String, String), crate::config::app::IngressSpec>,
     /// Perimeter firewall config. Disabled in rootless mode.
     perimeter_config: crate::firewall::rules::PerimeterConfig,
     /// Last applied cluster-node set for firewall reconciliation. `None`
@@ -1588,6 +1591,7 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
                 crate::wrapper::routing::RoutingTable::new(),
             )),
             ingress_configs: std::collections::HashMap::new(),
+            cluster_ingress_configs: std::collections::HashMap::new(),
             // Single-node mode: no nftables needed (no cluster ports to protect)
             perimeter_config: crate::firewall::rules::PerimeterConfig {
                 enabled: false,
@@ -1671,6 +1675,7 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
                 crate::wrapper::routing::RoutingTable::new(),
             )),
             ingress_configs: std::collections::HashMap::new(),
+            cluster_ingress_configs: std::collections::HashMap::new(),
             #[cfg(target_os = "linux")]
             perimeter_config: {
                 let mut cfg = if crate::grill::rootless::is_rootless() {
@@ -3291,14 +3296,14 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
                 // The CLI targets a service by bare name; resolve the first
                 // match in any namespace, against the merged cluster view so a
                 // service running only on other nodes still resolves (12b.4).
-                let merged = self.service_map.with_cluster_catalog(&self.cluster_catalog);
+                let merged = self.merged_service_map();
                 let result = merged
                     .resolve_by_name(&app_name)
                     .map(|e| e.to_resolve_response());
                 let _ = response.send(result);
             }
             AgentCommand::ResolveAll { response } => {
-                let merged = self.service_map.with_cluster_catalog(&self.cluster_catalog);
+                let merged = self.merged_service_map();
                 let results = merged
                     .resolve_all()
                     .iter()
@@ -3306,11 +3311,15 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
                     .collect();
                 let _ = response.send(results);
             }
-            AgentCommand::SyncClusterCatalog { catalog } => {
-                // Only rebuild + republish when the catalogue actually moved;
-                // the reconciler pushes on every tick.
-                if self.cluster_catalog != *catalog {
+            AgentCommand::SyncClusterCatalog { catalog, ingress } => {
+                let ingress = ingress
+                    .into_iter()
+                    .map(|route| ((route.namespace, route.name), route.config))
+                    .collect();
+                // Route changes must propagate even when endpoints stay unchanged.
+                if self.cluster_catalog != *catalog || self.cluster_ingress_configs != ingress {
                     self.cluster_catalog = *catalog;
+                    self.cluster_ingress_configs = ingress;
                     self.rebuild_routing_table().await;
                 }
             }
@@ -4813,15 +4822,14 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
         if let Some(instance) = self.supervisor.get_instance(instance_id)
             && let Some(host_port) = instance.host_port
         {
-            let node_ip = instance
-                .container_ip
-                .unwrap_or(std::net::Ipv4Addr::LOCALHOST);
-            let backend = crate::onion::types::BackendInstance {
-                instance_id: instance_id.0.clone(),
-                node_ip,
+            let service_id = crate::onion::service_id::ServiceId::new(namespace, app_name);
+            let backend = self.local_backend(
+                instance_id,
+                &service_id,
+                instance.container_ip,
                 host_port,
-                healthy: instance.state == ContainerState::Running,
-            };
+                instance.state == ContainerState::Running,
+            );
             if let Err(e) = self.service_map.add_backend(
                 &crate::onion::service_id::ServiceId::new(namespace, app_name),
                 backend,
@@ -4998,16 +5006,13 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
         if spec.port.is_some() {
             for new_id in new_ids {
                 if let Some(host_port) = new_ports.get(new_id).copied().flatten() {
-                    let backend = crate::onion::types::BackendInstance {
-                        instance_id: new_id.0.clone(),
-                        node_ip: new_ips
-                            .get(new_id)
-                            .copied()
-                            .flatten()
-                            .unwrap_or(std::net::Ipv4Addr::LOCALHOST),
+                    let backend = self.local_backend(
+                        new_id,
+                        &service_id,
+                        new_ips.get(new_id).copied().flatten(),
                         host_port,
-                        healthy: true,
-                    };
+                        true,
+                    );
                     if let Err(e) = self.service_map.add_backend(&service_id, backend) {
                         eprintln!("onion: backend not registered for {service_id:?}: {e}");
                     }
@@ -5077,16 +5082,13 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
 
             for new_id in new_ids {
                 if let Some(host_port) = new_ports.get(new_id).copied().flatten() {
-                    let backend = crate::onion::types::BackendInstance {
-                        instance_id: new_id.0.clone(),
-                        node_ip: new_ips
-                            .get(new_id)
-                            .copied()
-                            .flatten()
-                            .unwrap_or(std::net::Ipv4Addr::LOCALHOST),
+                    let backend = self.local_backend(
+                        new_id,
+                        &service_id,
+                        new_ips.get(new_id).copied().flatten(),
                         host_port,
-                        healthy: true,
-                    };
+                        true,
+                    );
                     if let Err(e) = self.service_map.add_backend(&service_id, backend) {
                         eprintln!("onion: backend not registered for {service_id:?}: {e}");
                     }
@@ -6328,12 +6330,7 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
             }
             let service_id = crate::onion::service_id::ServiceId::new(&namespace, &app_name);
             if let Some(port) = host_port {
-                let backend = crate::onion::types::BackendInstance {
-                    instance_id: id.0.clone(),
-                    node_ip: container_ip.unwrap_or(std::net::Ipv4Addr::LOCALHOST),
-                    host_port: port,
-                    healthy: true,
-                };
+                let backend = self.local_backend(&id, &service_id, container_ip, port, true);
                 if let Err(e) = self.service_map.add_backend(&service_id, backend) {
                     eprintln!("onion: backend not registered for {service_id:?}: {e}");
                 }
@@ -6435,6 +6432,47 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
         Ok(())
     }
 
+    fn merged_service_map(&self) -> crate::onion::service_map::ServiceMap {
+        let local_name = self.cluster.as_ref().and_then(|cluster| {
+            cluster.raft_metrics_rx.as_ref().and_then(|receiver| {
+                let metrics = receiver.borrow();
+                metrics
+                    .membership_config
+                    .membership()
+                    .get_node(&metrics.id)
+                    .map(|node| node.name.clone())
+            })
+        });
+        self.service_map
+            .with_cluster_catalog_excluding_node(&self.cluster_catalog, local_name.as_deref())
+    }
+
+    /// Use the container port for direct netns traffic, and the published port
+    /// when the runtime shares the host network.
+    fn local_backend(
+        &self,
+        instance_id: &InstanceId,
+        service: &crate::onion::service_id::ServiceId,
+        container_ip: Option<std::net::Ipv4Addr>,
+        host_port: u16,
+        healthy: bool,
+    ) -> crate::onion::types::BackendInstance {
+        let port = if container_ip.is_some() {
+            self.deployed_specs
+                .get(&(service.name.clone(), service.namespace.clone()))
+                .and_then(|spec| spec.port)
+                .unwrap_or(host_port)
+        } else {
+            host_port
+        };
+        crate::onion::types::BackendInstance {
+            instance_id: instance_id.0.clone(),
+            node_ip: container_ip.unwrap_or(std::net::Ipv4Addr::LOCALHOST),
+            host_port: port,
+            healthy,
+        }
+    }
+
     /// Rebuild the Wrapper routing table from the current service map
     /// and ingress configs.
     ///
@@ -6444,13 +6482,15 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
     /// nodes. The local map alone still drives eBPF backend-map syncing —
     /// this merge only affects what DNS/ingress resolve.
     async fn rebuild_routing_table(&self) {
-        let merged = self.service_map.with_cluster_catalog(&self.cluster_catalog);
+        let merged = self.merged_service_map();
 
         let mut table = self.routing_table.write().await;
         // Invalid ingress configs (unsupported TLS mode, zero/overflow rate)
         // are rejected here: their routes are skipped rather than installed,
         // so a bad app can't serve TLS traffic in plaintext or divide by zero.
-        if let Err(e) = table.rebuild(&merged, &self.ingress_configs) {
+        let mut ingress = self.ingress_configs.clone();
+        ingress.extend(self.cluster_ingress_configs.clone());
+        if let Err(e) = table.rebuild(&merged, &ingress) {
             eprintln!("wrapper: ingress routing rebuild rejected some routes: {e}");
         }
         drop(table);
@@ -7072,7 +7112,7 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
             &request.destination_namespace,
             &request.destination,
         );
-        let merged_services = self.service_map.with_cluster_catalog(&self.cluster_catalog);
+        let merged_services = self.merged_service_map();
         let service = internal_destination
             .then(|| merged_services.resolve(&service_id).cloned())
             .flatten();
@@ -7452,15 +7492,7 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
             return;
         };
         let service_id = crate::onion::service_id::ServiceId::new(namespace, app_name);
-        let backend = crate::onion::types::BackendInstance {
-            instance_id: new_id.0.clone(),
-            node_ip: container_ip.unwrap_or(std::net::Ipv4Addr::LOCALHOST),
-            host_port,
-            // Verified, not assumed: the deploy worker gates on
-            // `wait_instance_healthy` — including the app's own HTTP probe
-            // when one is configured — before sending this op (M5).
-            healthy: true,
-        };
+        let backend = self.local_backend(new_id, &service_id, container_ip, host_port, true);
         if let Err(e) = self.service_map.add_backend(&service_id, backend) {
             eprintln!("onion: backend not registered for {service_id:?}: {e}");
         }
@@ -10260,6 +10292,63 @@ interval = 1
     }
 
     #[tokio::test]
+    async fn ingress_routes_are_installed_without_a_local_replica_and_removed_on_update() {
+        let (mut agent, _tx, _shutdown) = test_agent();
+        let config = Config::parse(
+            r#"[app.remote]
+image = "example:v1"
+port = 8080
+[app.remote.ingress]
+host = "remote.local"
+"#,
+        )
+        .unwrap();
+        let catalog = crate::onion::catalog::EndpointCatalog::rebuild([(
+            crate::onion::service_id::ServiceId::new("default", "remote"),
+            8080,
+            vec![crate::onion::catalog::CatalogBackend {
+                node_id: "other-node".into(),
+                node_ip: "192.168.1.2".parse().unwrap(),
+                host_port: 30001,
+                healthy: true,
+            }],
+        )]);
+        agent
+            .handle_command(AgentCommand::SyncClusterCatalog {
+                catalog: Box::new(catalog.clone()),
+                ingress: vec![crate::cluster::orchestrate::IngressAssignment {
+                    name: "remote".into(),
+                    namespace: "default".into(),
+                    config: config.app["remote"].ingress.clone().unwrap(),
+                }],
+            })
+            .await;
+        assert!(
+            agent
+                .routing_table
+                .read()
+                .await
+                .lookup("remote.local", "/")
+                .is_some()
+        );
+        assert!(agent.supervisor.list_instances().is_empty());
+        agent
+            .handle_command(AgentCommand::SyncClusterCatalog {
+                catalog: Box::new(catalog),
+                ingress: Vec::new(),
+            })
+            .await;
+        assert!(
+            agent
+                .routing_table
+                .read()
+                .await
+                .lookup("remote.local", "/")
+                .is_none()
+        );
+    }
+
+    #[tokio::test]
     async fn deploy_records_the_grills_container_ip_on_instance_and_backend() {
         let (mut agent, _tx, _shutdown, grill) = test_agent_with_grill();
         let ip = std::net::Ipv4Addr::new(10, 0, 2, 5);
@@ -10289,6 +10378,13 @@ interval = 1
         assert!(
             entry.backends.iter().any(|b| b.node_ip == ip),
             "backend registered with loopback instead of the container IP"
+        );
+        assert!(
+            entry
+                .backends
+                .iter()
+                .all(|backend| backend.host_port == 8080),
+            "a container IP must use its declared port, not the allocated host port"
         );
     }
 

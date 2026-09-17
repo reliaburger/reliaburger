@@ -42,6 +42,17 @@ pub struct NodeAssignment {
     pub spec: AppSpec,
 }
 
+/// An ingress route distributed to every node, including nodes without replicas.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct IngressAssignment {
+    /// Application name.
+    pub name: String,
+    /// Application namespace.
+    pub namespace: String,
+    /// Desired ingress configuration.
+    pub config: crate::config::app::IngressSpec,
+}
+
 /// The full assignment list for a node.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct NodeAssignments {
@@ -52,6 +63,9 @@ pub struct NodeAssignments {
     /// `#[serde(default)]` so a node polling a pre-12b.4 leader still parses.
     #[serde(default)]
     pub endpoint_catalog: crate::onion::catalog::EndpointCatalog,
+    /// Cluster-wide ingress routes, independent of local placements.
+    #[serde(default)]
+    pub ingress: Vec<IngressAssignment>,
 }
 
 /// Spawn the leader's scheduling loop, with state reconstruction (L4).
@@ -848,6 +862,7 @@ pub fn spawn_placement_reconciler(
             let _ = cmd_tx
                 .send(AgentCommand::SyncClusterCatalog {
                     catalog: Box::new(assignments.endpoint_catalog.clone()),
+                    ingress: assignments.ingress.clone(),
                 })
                 .await;
 

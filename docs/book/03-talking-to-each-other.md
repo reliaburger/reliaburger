@@ -1004,3 +1004,32 @@ script. Those differ when cross-compiling. An embedded-object integration test
 loads and attaches the object on a real Linux kernel without supplying an object
 directory. This belongs in the privileged eBPF suite; a macOS unit test can't
 prove that a Linux kernel accepts a program.
+
+## A route belongs to the cluster
+
+Our first three-VM quickstart started a healthy container and still returned
+HTTP 502. We had combined its container IP with its published host port. Those
+are two different ways into the same process: `10.0.2.5:8080` reaches it directly
+from its node, while `192.168.104.3:40032` goes through that node's port mapping.
+Combining the first address with the second port reaches nothing.
+
+The agent now builds local backends from the container IP and the application's
+declared port. A runtime sharing the host network keeps the published port.
+Remote endpoints retain their node IP and published port. When we merge the
+cluster catalogue, we exclude this node's own published endpoints; its local
+service map already has the direct addresses. This also avoids routing a local
+request through the node's external NAT rules.
+
+There was another gap. Only nodes running a replica received its ingress
+configuration. A request landing on an otherwise idle node had no route, even
+though that node knew where the container lived. The placements response now
+carries all desired ingress configurations alongside the endpoint catalogue.
+Each node rebuilds its routes when either changes, including when a route is
+removed. We keep these cluster configurations separate from locally deployed
+ones, so a placements poll doesn't erase a standalone deployment's routes.
+
+The regression tests use a mock runtime that returns a container IP, check the
+port in the resulting backend, and install a remote route on an agent with no
+local instances. Removing that route without changing any endpoints must remove
+it from the routing table too. A healthy container is only half the story; the
+request still has to reach it.

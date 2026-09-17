@@ -2610,6 +2610,19 @@ async fn placements_handler(
         // Piggyback the replicated endpoint catalogue (12b.4) so the polling
         // node can resolve services on other nodes.
         endpoint_catalog: desired.endpoint_catalog.clone(),
+        ingress: desired
+            .apps
+            .iter()
+            .filter_map(|(id, spec)| {
+                spec.ingress
+                    .clone()
+                    .map(|config| crate::cluster::orchestrate::IngressAssignment {
+                        name: id.name.clone(),
+                        namespace: id.namespace.clone(),
+                        config,
+                    })
+            })
+            .collect(),
     })
     .into_response()
 }
