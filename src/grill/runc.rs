@@ -74,6 +74,8 @@ pub struct RuncGrill {
     /// `.internal` names resolve inside containers. `None` leaves the
     /// image's resolv.conf untouched (host DNS).
     dns_nameserver: Option<std::net::Ipv4Addr>,
+    /// Source identities change with network ownership, before workloads start.
+    dns_sources: tokio::sync::watch::Sender<crate::onion::dns::DnsSourceNamespaces>,
 }
 
 impl RuncGrill {
@@ -104,7 +106,30 @@ impl RuncGrill {
             node_index,
             next_container_index: Arc::new(Mutex::new(0)),
             dns_nameserver: None,
+            dns_sources: tokio::sync::watch::channel(
+                crate::onion::dns::DnsSourceNamespaces::default(),
+            )
+            .0,
         }
+    }
+
+    /// Subscribe to namespace identities for this runtime's isolated addresses.
+    pub fn dns_source_namespaces(
+        &self,
+    ) -> tokio::sync::watch::Receiver<crate::onion::dns::DnsSourceNamespaces> {
+        self.dns_sources.subscribe()
+    }
+
+    /// Publish while holding the network lock so concurrent lifecycle updates
+    /// cannot overwrite a newer source snapshot with an older one.
+    fn publish_dns_sources(&self, networks: &HashMap<InstanceId, ContainerNetwork>) {
+        self.dns_sources
+            .send_replace(crate::onion::dns::DnsSourceNamespaces::from_bindings(
+                networks.iter().filter_map(|(id, network)| {
+                    let identity = super::InstanceIdentity::parse(&id.0)?;
+                    Some((network.container_ip.into(), identity.namespace))
+                }),
+            ));
     }
 
     /// Point containers' `/etc/resolv.conf` at this nameserver.
@@ -305,7 +330,13 @@ impl RuncGrill {
         {
             eprintln!("warning: port mapping teardown failed for {instance}: {e}");
         }
-        if let Some(network) = self.networks.lock().await.remove(instance)
+        let network = {
+            let mut networks = self.networks.lock().await;
+            let removed = networks.remove(instance);
+            self.publish_dns_sources(&networks);
+            removed
+        };
+        if let Some(network) = network
             && let Err(e) = netns::teardown_container_network(&network).await
         {
             eprintln!("warning: network teardown failed for {instance}: {e}");
@@ -404,7 +435,9 @@ impl RuncGrill {
                             .insert(instance.clone(), handle);
                     }
 
-                    self.networks.lock().await.insert(instance.clone(), network);
+                    let mut networks = self.networks.lock().await;
+                    networks.insert(instance.clone(), network);
+                    self.publish_dns_sources(&networks);
                 }
                 Err(e) => {
                     // A configured resolver is only reachable through this
@@ -843,6 +876,41 @@ impl super::Grill for RuncGrill {
                 exit_code: None,
             },
         );
+
+        if !self.rootless {
+            let network = if let Some(pid) = container_pid {
+                netns::adopt_container_network(instance, pid)
+                    .await
+                    .map_err(|error| GrillError::StartFailed {
+                        instance: instance.clone(),
+                        reason: format!("cannot reclaim container network: {error}"),
+                    })?
+            } else {
+                None
+            };
+            if let Some(network) = network {
+                let next = u32::from(network.container_ip)
+                    .checked_sub(u32::from(netns::container_ip(self.node_index, 0)))
+                    .filter(|index| *index <= 508)
+                    .ok_or_else(|| GrillError::StartFailed {
+                        instance: instance.clone(),
+                        reason: "adopted network subnet differs from the configured node subnet"
+                            .into(),
+                    })?
+                    + 1;
+                let mut index = self.next_container_index.lock().await;
+                *index = (*index).max(next as u16);
+                drop(index);
+                let mut networks = self.networks.lock().await;
+                networks.insert(instance.clone(), network);
+                self.publish_dns_sources(&networks);
+            } else if self.dns_nameserver.is_some() {
+                return Err(GrillError::StartFailed {
+                    instance: instance.clone(),
+                    reason: "DNS-enabled adoption requires an owned container network".into(),
+                });
+            }
+        }
 
         if self.rootless {
             let Some(container_pid) = container_pid else {
@@ -1442,6 +1510,7 @@ mod tests {
 
         let mut map = crate::onion::service_map::ServiceMap::new();
         map.register_app("redis", "default", 6379, None).unwrap();
+        let payments_vip = map.register_app("redis", "payments", 6379, None).unwrap();
         let vip = map
             .resolve(&crate::onion::service_id::ServiceId::new(
                 "default", "redis",
@@ -1456,6 +1525,7 @@ mod tests {
             crate::onion::dns::BoundDnsResponder::bind_freebind(crate::onion::dns::DnsConfig {
                 listen_addr: std::net::SocketAddr::new(nameserver.into(), 53),
                 upstream: "192.0.2.1:53".parse().unwrap(),
+                source_namespaces: grill.dns_source_namespaces(),
                 ..Default::default()
             })
             .expect("bind the future runc gateway before its veth exists");
@@ -1463,8 +1533,8 @@ mod tests {
         let responder_task = tokio::spawn(responder.run(map_rx, fault_rx, responder_shutdown));
 
         let ids = [
-            InstanceId("runc-dns-netns-0".to_string()),
-            InstanceId("runc-dns-netns-1".to_string()),
+            InstanceId("default__runc-dns-netns-0".to_string()),
+            InstanceId("payments__runc-dns-netns-0".to_string()),
         ];
         for id in &ids {
             remove_test_network(id);
@@ -1523,21 +1593,27 @@ mod tests {
             tokio::time::sleep(std::time::Duration::from_millis(20)).await;
         }
 
-        for id in &ids {
+        for (id, expected_vip) in ids.iter().zip([vip, payments_vip]) {
             let logs = grill.logs(id).await.unwrap();
             assert!(
                 logs.contains(&format!("nameserver {nameserver}")),
                 "{id} did not receive the derived resolver: {logs}"
             );
             assert!(
-                logs.contains(&vip.0.to_string()),
-                "{id} did not resolve redis.internal to {vip:?}: {logs}"
+                logs.contains(&expected_vip.0.to_string()),
+                "{id} did not resolve redis.internal to {expected_vip:?}: {logs}"
             );
             assert_eq!(grill.exit_code(id).await, Some(0), "{id} logs: {logs}");
         }
 
         let config: crate::grill::oci::OciSpec = serde_json::from_slice(
-            &std::fs::read(tmp.path().join("bundles/runc-dns-netns-0/config.json")).unwrap(),
+            &std::fs::read(
+                tmp.path()
+                    .join("bundles")
+                    .join(&ids[0].0)
+                    .join("config.json"),
+            )
+            .unwrap(),
         )
         .unwrap();
         let resolver_mount = config
@@ -1549,7 +1625,9 @@ mod tests {
             resolver_mount.source.as_deref(),
             Some(
                 tmp.path()
-                    .join("bundles/runc-dns-netns-0/resolv.conf")
+                    .join("bundles")
+                    .join(&ids[0].0)
+                    .join("resolv.conf")
                     .as_path()
             )
         );
@@ -1781,7 +1859,7 @@ mod tests {
         let bundle_base = tmp.path().join("bundles");
         let image_store = ImageStore::new(tmp.path().join("images"));
         let state_dir = tmp.path().join("state");
-        let id = InstanceId("runc-rootfs-adoption-0".to_string());
+        let id = InstanceId("payments__runc-rootfs-adoption-0".to_string());
         remove_test_network(&id);
         let _network_cleanup = TestNetworkCleanup(vec![id.clone()]);
         let spec = crate::grill::oci::OciSpec {
@@ -1816,7 +1894,15 @@ mod tests {
             false,
             state_dir.clone(),
         );
+        let gateway = original.dns_gateway_address().unwrap();
+        let original = original.with_dns_nameserver(gateway);
+        let sources = original.dns_source_namespaces();
         original.create(&id, &spec).await.unwrap();
+        let container_ip = original.container_ip(&id).await.unwrap();
+        assert_eq!(
+            sources.borrow().namespace(container_ip.into()),
+            Some("payments")
+        );
         original.start(&id).await.unwrap();
         let pid = original.pid(&id).await.unwrap();
         let started_at = crate::grill::records::process_start_time(pid).unwrap();
@@ -1844,7 +1930,7 @@ mod tests {
         let record = crate::grill::records::InstanceRecord {
             schema: 1,
             instance_id: id.0.clone(),
-            namespace: "default".to_string(),
+            namespace: "payments".to_string(),
             app_name: "rootfs-adoption".to_string(),
             replica_index: 0,
             is_job: false,
@@ -1861,8 +1947,15 @@ mod tests {
         };
         drop(original); // A Bun exec/process death drops the child handle only.
 
-        let adopter = RuncGrill::new(bundle_base, image_store, false, state_dir);
+        let adopter =
+            RuncGrill::new(bundle_base, image_store, false, state_dir).with_dns_nameserver(gateway);
+        let adopted_sources = adopter.dns_source_namespaces();
         assert!(adopter.adopt(&id, &record).await.unwrap());
+        assert_eq!(adopter.container_ip(&id).await, Some(container_ip));
+        assert_eq!(
+            adopted_sources.borrow().namespace(container_ip.into()),
+            Some("payments")
+        );
         assert!(crate::grill::rootfs::is_mountpoint(&rootfs));
         let contents = adopter
             .exec(
@@ -1873,7 +1966,24 @@ mod tests {
             .unwrap();
         assert_eq!(contents.trim(), "adopted");
 
+        let next_id = InstanceId("payments__runc-rootfs-adoption-1".into());
+        let _next_cleanup = TestNetworkCleanup(vec![next_id.clone()]);
+        adopter.create(&next_id, &record.oci_spec).await.unwrap();
+        assert_ne!(
+            adopter.container_ip(&next_id).await,
+            Some(container_ip),
+            "adoption reused a live source address"
+        );
+        adopter.start(&next_id).await.unwrap();
+        adopter.kill(&next_id).await.unwrap();
         adopter.kill(&id).await.unwrap();
+        assert!(
+            adopted_sources
+                .borrow()
+                .namespace(container_ip.into())
+                .is_none()
+        );
+        assert!(!netns::namespace_path(&id).exists());
         assert!(!crate::grill::rootfs::is_mountpoint(&rootfs));
     }
 

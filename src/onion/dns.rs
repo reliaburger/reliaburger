@@ -129,6 +129,37 @@ impl DnsCapability {
     }
 }
 
+/// Namespace identities published by the local runtime for isolated source IPs.
+/// Shared or ambiguous addresses must not borrow another workload's namespace.
+#[derive(Debug, Clone, Default)]
+pub struct DnsSourceNamespaces {
+    bindings: BTreeMap<IpAddr, Option<String>>,
+}
+
+impl DnsSourceNamespaces {
+    /// Build a snapshot, refusing conflicting namespaces for the same address.
+    pub fn from_bindings(bindings: impl IntoIterator<Item = (IpAddr, String)>) -> Self {
+        let mut result = Self::default();
+        for (ip, namespace) in bindings {
+            result
+                .bindings
+                .entry(ip)
+                .and_modify(|current| {
+                    if current.as_deref() != Some(namespace.as_str()) {
+                        *current = None;
+                    }
+                })
+                .or_insert_with(|| (!namespace.is_empty()).then_some(namespace));
+        }
+        result
+    }
+
+    /// Return the uniquely identified namespace, or no identity for this source.
+    pub fn namespace(&self, source: IpAddr) -> Option<&str> {
+        self.bindings.get(&source)?.as_deref()
+    }
+}
+
 /// Configuration for the DNS responder.
 #[derive(Debug, Clone)]
 pub struct DnsConfig {
@@ -138,15 +169,9 @@ pub struct DnsConfig {
     pub upstream: SocketAddr,
     /// How long to wait for an upstream reply before SERVFAIL.
     pub upstream_timeout: Duration,
-    /// Namespace a bare `<app>.internal` query resolves within.
-    ///
-    /// A container that asks for `redis.internal` (rather than the fully
-    /// qualified `redis.payments.internal`) means "redis in my namespace".
-    /// The userspace responder can't see the querying container's cgroup,
-    /// so it falls back to this namespace — set per-node to the namespace
-    /// the node predominantly serves, `default` otherwise. Fully qualified
-    /// `<app>.<namespace>.internal` queries ignore it.
-    pub default_namespace: String,
+    /// Runtime-owned source addresses and their workload namespaces.
+    /// Short names are refused when the source is absent or ambiguous.
+    pub source_namespaces: watch::Receiver<DnsSourceNamespaces>,
     /// Which source addresses may query the `.internal` zone.
     pub source_acl: SourceAcl,
 }
@@ -157,7 +182,7 @@ impl Default for DnsConfig {
             listen_addr: SocketAddr::new(Ipv4Addr::UNSPECIFIED.into(), 53),
             upstream: SocketAddr::new(Ipv4Addr::new(8, 8, 8, 8).into(), 53),
             upstream_timeout: Duration::from_secs(2),
-            default_namespace: "default".to_string(),
+            source_namespaces: watch::channel(DnsSourceNamespaces::default()).1,
             source_acl: SourceAcl::default(),
         }
     }
@@ -554,7 +579,7 @@ async fn answer_tcp_query(
 /// Enforces the source ACL first: a client outside the container-reachable
 /// ranges gets REFUSED, so the internal topology never leaks. The name is
 /// then resolved namespace-aware: `<app>.<namespace>` targets that exact
-/// service, while a bare `<app>` resolves in `config.default_namespace`.
+/// service, while a bare `<app>` requires the runtime-owned source namespace.
 ///
 /// Authoritative: resolves A queries from the service map, returns an
 /// empty NOERROR for AAAA on known names (we only have IPv4 VIPs),
@@ -579,7 +604,10 @@ fn answer_internal(
         return build_status_response(query, RCODE_REFUSED);
     }
 
-    let service_id = service_id_for(stripped, &config.default_namespace);
+    let sources = config.source_namespaces.borrow();
+    let Some(service_id) = service_id_for(stripped, sources.namespace(src)) else {
+        return build_status_response(query, RCODE_REFUSED);
+    };
 
     // Smoker DNS fault: a targeted app is forced to NXDOMAIN regardless of
     // whether it resolves. The fault is keyed by bare app name (matching
@@ -601,16 +629,19 @@ fn answer_internal(
     }
 }
 
-/// Map the stripped `.internal` label(s) to a [`ServiceId`].
-///
-/// `<app>.<namespace>` becomes `ServiceId { namespace, app }`; a bare
-/// `<app>` (no dot) resolves in `default_namespace`. A name with more than
-/// two labels keeps the first as the app and the second as the namespace
-/// (deeper labels are ignored — there's no third level in the scheme).
-fn service_id_for(stripped: &str, default_namespace: &str) -> ServiceId {
+/// Resolve qualified names directly and short names only with a source identity.
+fn service_id_for(stripped: &str, namespace: Option<&str>) -> Option<ServiceId> {
     match stripped.split_once('.') {
-        Some((app, namespace)) => ServiceId::new(namespace, app),
-        None => ServiceId::new(default_namespace, stripped),
+        Some((app, namespace))
+            if !app.is_empty() && !namespace.is_empty() && !namespace.contains('.') =>
+        {
+            Some(ServiceId::new(namespace, app))
+        }
+        Some(_) => None,
+        None if !stripped.is_empty() => {
+            namespace.map(|namespace| ServiceId::new(namespace, stripped))
+        }
+        None => None,
     }
 }
 
@@ -956,6 +987,11 @@ mod tests {
     /// separately), resolving bare names in `default`.
     fn test_config() -> DnsConfig {
         DnsConfig {
+            source_namespaces: watch::channel(DnsSourceNamespaces::from_bindings([(
+                LOOPBACK,
+                "default".into(),
+            )]))
+            .1,
             source_acl: SourceAcl {
                 restrict_to_private: false,
             },
@@ -972,14 +1008,14 @@ mod tests {
 
     #[test]
     fn service_id_for_qualified_name() {
-        let id = service_id_for("api.payments", "default");
+        let id = service_id_for("api.payments", None).unwrap();
         assert_eq!(id.namespace, "payments");
         assert_eq!(id.name, "api");
     }
 
     #[test]
-    fn service_id_for_bare_name_uses_default_namespace() {
-        let id = service_id_for("api", "team-b");
+    fn service_id_for_bare_name_uses_source_namespace() {
+        let id = service_id_for("api", Some("team-b")).unwrap();
         assert_eq!(id.namespace, "team-b");
         assert_eq!(id.name, "api");
     }
@@ -1009,7 +1045,53 @@ mod tests {
     }
 
     #[test]
-    fn answer_internal_bare_name_resolves_in_default_namespace() {
+    fn short_names_keep_two_simultaneous_callers_in_their_own_namespaces() {
+        let mut map = ServiceMap::new();
+        let red = map.register_app("redis", "red", 6379, None).unwrap();
+        let blue = map.register_app("redis", "blue", 6379, None).unwrap();
+        let (_map_tx, map_rx) = watch::channel(map);
+        let mut config = test_config();
+        config.source_namespaces = watch::channel(DnsSourceNamespaces::from_bindings([
+            ("10.3.0.2".parse().unwrap(), "red".into()),
+            ("10.3.0.3".parse().unwrap(), "blue".into()),
+        ]))
+        .1;
+        let query = build_dns_query("redis.internal");
+        for (source, vip) in [("10.3.0.2", red), ("10.3.0.3", blue)] {
+            let response = answer_internal(
+                &config,
+                &map_rx,
+                &no_dns_faults(),
+                &query,
+                "redis",
+                QTYPE_A,
+                source.parse().unwrap(),
+            );
+            assert_eq!(response[3] & 0xf, 0);
+            assert_eq!(&response[response.len() - 4..], &vip.0.octets());
+        }
+    }
+
+    #[test]
+    fn unknown_source_cannot_resolve_a_short_name_in_the_nodes_namespace() {
+        let mut map = ServiceMap::new();
+        map.register_app("redis", "default", 6379, None).unwrap();
+        let (_tx, rx) = watch::channel(map);
+        let query = build_dns_query("redis.internal");
+        let response = answer_internal(
+            &DnsConfig::default(),
+            &rx,
+            &no_dns_faults(),
+            &query,
+            "redis",
+            QTYPE_A,
+            "10.3.0.12".parse().unwrap(),
+        );
+        assert_eq!(response[3] & 0x0f, RCODE_REFUSED);
+    }
+
+    #[test]
+    fn answer_internal_bare_name_resolves_in_identified_namespace() {
         let mut map = ServiceMap::new();
         map.register_app("redis", "default", 6379, None).unwrap();
         let vip = map

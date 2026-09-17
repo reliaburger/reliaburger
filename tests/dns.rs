@@ -6,7 +6,8 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use reliaburger::onion::dns::{
-    BoundDnsResponder, DnsCapability, DnsConfig, DnsFaultState, bind_dns_responder, serve,
+    BoundDnsResponder, DnsCapability, DnsConfig, DnsFaultState, DnsSourceNamespaces,
+    bind_dns_responder, serve,
 };
 use reliaburger::onion::service_id::ServiceId;
 use reliaburger::onion::service_map::ServiceMap;
@@ -39,6 +40,11 @@ impl DnsHarness {
             listen_addr: "127.0.0.1:0".parse().unwrap(),
             upstream,
             upstream_timeout: Duration::from_millis(400),
+            source_namespaces: watch::channel(DnsSourceNamespaces::from_bindings([(
+                "127.0.0.1".parse().unwrap(),
+                "default".into(),
+            )]))
+            .1,
             ..DnsConfig::default()
         };
         let (socket, addr) = bind_dns_responder(&config).await.unwrap();
@@ -280,6 +286,11 @@ async fn run_dns_responder_fails_closed_when_it_cannot_bind() {
         listen_addr: taken,
         upstream: unroutable_upstream(),
         upstream_timeout: Duration::from_millis(400),
+        source_namespaces: watch::channel(DnsSourceNamespaces::from_bindings([(
+            "127.0.0.1".parse().unwrap(),
+            "default".into(),
+        )]))
+        .1,
         ..DnsConfig::default()
     };
     let (_tx, rx) = watch::channel(ServiceMap::new());
@@ -301,6 +312,11 @@ async fn startup_binding_requires_both_udp_and_tcp() {
     let taken = tcp.local_addr().unwrap();
     let config = DnsConfig {
         listen_addr: taken,
+        source_namespaces: watch::channel(DnsSourceNamespaces::from_bindings([(
+            "127.0.0.1".parse().unwrap(),
+            "default".into(),
+        )]))
+        .1,
         ..DnsConfig::default()
     };
 
@@ -316,6 +332,11 @@ async fn bound_responder_answers_internal_query_over_tcp_on_the_same_port() {
     let responder = BoundDnsResponder::bind(DnsConfig {
         listen_addr: "127.0.0.1:0".parse().unwrap(),
         upstream: unroutable_upstream(),
+        source_namespaces: watch::channel(DnsSourceNamespaces::from_bindings([(
+            "127.0.0.1".parse().unwrap(),
+            "default".into(),
+        )]))
+        .1,
         ..DnsConfig::default()
     })
     .await
@@ -423,4 +444,88 @@ async fn service_map_updates_are_visible_without_restart() {
 
     // Silence the unused-field lint path: address is used implicitly.
     let _ = harness.addr;
+}
+
+#[tokio::test]
+async fn udp_and_tcp_short_names_follow_live_source_identity() {
+    let mut map = ServiceMap::new();
+    let red = map.register_app("api", "red", 80, None).unwrap();
+    let blue = map.register_app("api", "blue", 80, None).unwrap();
+    let (_map_tx, map_rx) = watch::channel(map);
+    let (_fault_tx, fault_rx) = watch::channel(DnsFaultState::default());
+    let (sources_tx, source_namespaces) = watch::channel(DnsSourceNamespaces::default());
+    let shutdown = CancellationToken::new();
+    let responder = BoundDnsResponder::bind(DnsConfig {
+        listen_addr: "127.0.0.1:0".parse().unwrap(),
+        source_namespaces,
+        ..DnsConfig::default()
+    })
+    .await
+    .unwrap();
+    let addr = responder.local_addr().unwrap();
+    let task = tokio::spawn(responder.run(map_rx, fault_rx, shutdown.clone()));
+    for (bindings, expected) in [
+        (vec![], None),
+        (
+            vec![("127.0.0.1".parse().unwrap(), "red".into())],
+            Some(red),
+        ),
+        (
+            vec![("127.0.0.1".parse().unwrap(), "blue".into())],
+            Some(blue),
+        ),
+        (
+            vec![
+                ("127.0.0.1".parse().unwrap(), "red".into()),
+                ("127.0.0.1".parse().unwrap(), "blue".into()),
+            ],
+            None,
+        ),
+        (vec![], None),
+    ] {
+        sources_tx.send_replace(DnsSourceNamespaces::from_bindings(bindings));
+        for tcp in [false, true] {
+            let query = build_query("api.internal", QTYPE_A);
+            let response = tokio::time::timeout(Duration::from_secs(2), async {
+                if tcp {
+                    let mut stream = tokio::net::TcpStream::connect(addr).await.unwrap();
+                    stream.write_u16(query.len() as u16).await.unwrap();
+                    stream.write_all(&query).await.unwrap();
+                    let len = stream.read_u16().await.unwrap();
+                    let mut response = vec![0; len as usize];
+                    stream.read_exact(&mut response).await.unwrap();
+                    response
+                } else {
+                    let socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+                    socket.send_to(&query, addr).await.unwrap();
+                    let mut response = vec![0; 1500];
+                    let (len, _) = socket.recv_from(&mut response).await.unwrap();
+                    response.truncate(len);
+                    response
+                }
+            })
+            .await
+            .unwrap();
+            if let Some(vip) = expected {
+                assert_eq!(rcode(&response), 0);
+                assert_eq!(&response[response.len() - 4..], &vip.0.octets());
+            } else {
+                assert_eq!(rcode(&response), 5);
+            }
+        }
+    }
+    // A host with no workload identity must still be able to ask an explicit name.
+    let socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    socket
+        .send_to(&build_query("api.red.internal", QTYPE_A), addr)
+        .await
+        .unwrap();
+    let mut response = [0; 1500];
+    let (len, _) = tokio::time::timeout(Duration::from_secs(2), socket.recv_from(&mut response))
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(&response[len - 4..len], &red.0.octets());
+    shutdown.cancel();
+    task.await.unwrap();
 }

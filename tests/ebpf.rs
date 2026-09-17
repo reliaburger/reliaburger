@@ -1047,6 +1047,13 @@ async fn dns_responder_resolves_internal_name() {
         listen_addr: "127.0.0.1:15353".parse().unwrap(),
         upstream: "8.8.8.8:53".parse().unwrap(),
         upstream_timeout: Duration::from_secs(2),
+        source_namespaces: tokio::sync::watch::channel(
+            reliaburger::onion::dns::DnsSourceNamespaces::from_bindings([(
+                "127.0.0.1".parse().unwrap(),
+                "default".into(),
+            )]),
+        )
+        .1,
         ..reliaburger::onion::dns::DnsConfig::default()
     };
 
@@ -1102,6 +1109,13 @@ async fn dns_responder_non_internal_times_out() {
         listen_addr: "127.0.0.1:15354".parse().unwrap(),
         upstream: "192.0.2.1:53".parse().unwrap(), // TEST-NET, unreachable
         upstream_timeout: Duration::from_millis(500),
+        source_namespaces: tokio::sync::watch::channel(
+            reliaburger::onion::dns::DnsSourceNamespaces::from_bindings([(
+                "127.0.0.1".parse().unwrap(),
+                "default".into(),
+            )]),
+        )
+        .1,
         ..reliaburger::onion::dns::DnsConfig::default()
     };
 

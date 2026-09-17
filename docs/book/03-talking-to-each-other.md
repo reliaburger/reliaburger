@@ -532,18 +532,37 @@ That isn't the same as saying eBPF can never answer DNS. TC and XDP packet hooks
 
 So we run a userspace DNS responder instead. It lives in `src/onion/dns.rs`: a `tokio::select!` loop reading from a UDP socket, plus a TCP listener for large answers. Bun configures containers' `/etc/resolv.conf` to point at the responder, and it handles the rest. For `.internal` names, it looks up the service map and responds. For everything else, it forwards to the upstream resolver.
 
-Names are namespace-qualified: `<app>.<namespace>.internal`. A query for `api.payments.internal` resolves the `api` service in the `payments` namespace, and `api.default.internal` resolves the *other* `api` — each to its own VIP. A bare `<app>.internal` is a convenience: it resolves in the node's configured default namespace, because the userspace responder can't see which container asked (it has a source IP, not a cgroup). Mapping the stripped name to a `ServiceId` is a two-line match:
+Names are namespace-qualified: `<app>.<namespace>.internal`. A query for
+`api.payments.internal` resolves the `api` service in `payments`, and
+`api.default.internal` resolves the other `api`, each to its own VIP.
 
-```rust
-fn service_id_for(stripped: &str, default_namespace: &str) -> ServiceId {
-    match stripped.split_once('.') {
-        Some((app, namespace)) => ServiceId::new(namespace, app),
-        None => ServiceId::new(default_namespace, stripped),
-    }
-}
-```
+A short name needs a caller identity. Using the node's default namespace seems
+convenient until two tenants both run Redis. The responder now looks up the
+packet's source address in a snapshot owned by RuncGrill. Runc publishes an
+address/namespace binding when it creates the isolated network, before starting
+the workload. That includes jobs, init containers and apps without a service
+port. Removing a network withdraws the binding before teardown.
 
-`split_once('.')` returns `Some((before, after))` on the first dot or `None` if there isn't one — exactly the "qualified vs bare" distinction we want, in one call.
+The snapshot travels over a `watch` channel. `send_replace` keeps the latest
+value even before DNS subscribes; a receiver's `borrow` reads one consistent
+snapshot without contending with the runtime's network lock. Duplicate source
+addresses with conflicting namespaces resolve to no identity. Unknown sources
+get `REFUSED` for short names on both UDP and TCP. Host tools can use qualified
+names, and no internal query gets forwarded upstream.
+
+Adoption must restore this ownership too. Bun verifies that the recorded network
+namespace and the live container's namespace have the same filesystem identity,
+then reads the actual IPv4 address from the kernel. It restores the runtime's
+network owner, advances the allocation counter past that address, and republishes
+the DNS binding. Guessing the address from a restarted counter would let a new
+container inherit an old container's namespace identity.
+
+Tests send real UDP and TCP queries while changing, removing and conflicting a
+source binding. Two real runc workloads in different namespaces resolve the same short name to
+different VIPs. A privileged adoption test checks the binding before start,
+after Bun replacement and after teardown. The old `dns.default_namespace`
+configuration field is rejected: an operator preference cannot establish which
+workload sent a packet.
 
 The cost is ~50 microseconds per DNS lookup (localhost UDP round trip). That's 10x faster than CoreDNS over the pod network, but it's not zero. Most applications cache DNS results anyway, so this hit happens once per connection lifetime, not per request.
 

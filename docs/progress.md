@@ -23,7 +23,7 @@ for every item below. IDs are scoped to that plan, not the older C1/M1 review ID
 The [audit record](qualification/2026-09-17-code-audit.md) separates local defect
 reproductions from inspected source and previous acceptance evidence.
 
-These are work packages, not 74 mandatory features for 0.1.0. Correctness fixes
+These are work packages, not 76 mandatory features for 0.1.0. Correctness fixes
 need explicit release dispositions; optional refactors and future capabilities
 remain separate. Older unchecked groups below point into this current ledger.
 
@@ -71,10 +71,14 @@ remain separate. Older unchecked groups below point into this current ledger.
 - [x] **C40** Serialise rootless helper replacement and adoption, stop/reap displaced owners, preserve a successor's socket and reject conflicting repeat-adoption records. Startup cancellation kills unpublished helpers; asynchronous socket checks and the forwarding handshake share a two-second deadline. The cancellation regression fails before the fix. All 248 Linux runtime tests pass (12 privileged tests remain explicitly gated), with strict Linux all-target/all-feature Clippy.
 - [x] **C41** Collect structured observations for every owned VM and return exit 1 for missing/stopped VMs, unhealthy APIs or unknown evidence. The real CLI regression fails before the fix and passes all three cases afterwards (11.94s); status remains read-only and reports all owned nodes.
 - [x] **C42** Preserve labelled metric identities through queries, independent alert timers, API/dashboard/diagnostic output and webhook incident keys. Healthy or missing data from another series cannot resolve an alert; derived percentages require fresh components from the same labels. The masking and diagnostic-collapse regressions fail before the fix. All 181 Mayo tests pass with and without default features, plus 48 dashboard and 27 diagnostic tests and strict all-target/all-feature Clippy.
-- [ ] **C43** (P2) Resolve short service names in the caller namespace.
+- [x] **C43** Resolve short DNS names from runtime-owned source namespaces; unknown or ambiguous sources receive REFUSED on UDP and TCP. Remove the node-default override, restore verified network/source ownership during runc adoption, advance the allocation counter and withdraw bindings at teardown. The unknown-source regression fails before the fix. All 3,197 Linux library tests pass (18 explicit privileged gates), with 28 DNS unit tests, 14 wire tests and strict Linux Clippy. Two real containers resolve the same short name in different namespaces (8.78s); real adoption preserves and retires the binding without reusing its address (3.48s).
 - [x] **C44** Remove unused reporting worker listeners, preserve TLS/framing and bound upgrade-harness HTTP requests. Six transport unit tests and three real TCP/TLS integration tests pass. Linux qualification reproduced an ephemeral listener occupying another node's API port; the focused upgrade/rollback rerun passes in 74.61s, but an intermittent upgrade stall remains under V02 (one of three full-suite cases failed).
 
 - [x] **C45** Poll readiness publication alongside its subsystem owner, avoiding a fair-lock deadlock in both supervision loops. Both contention regressions fail before the fix; all ten readiness tests pass afterwards, including retired-attempt fencing and panic/restart behaviour. All three Linux upgrade/rollback/pause-resume cases pass in 177.50s after the repair; sustained qualification remains V02.
+
+- [ ] **C46** (P1) Preserve authorised namespaces and overlapping owners in DNS fault effects. Follow-up inspection found that the fault watch drops namespaces even though API admission checks them.
+
+- [ ] **C47** (P2) Bound and reclaim runtime container addresses within the node /23, including concurrent creation and adoption. The existing index wraps without enforcing the declared capacity.
 
 ### Engineering follow-ups
 
@@ -1934,10 +1938,9 @@ work, not by `M1`.
   was unreachable and every non-`.internal` query SERVFAILed — a failure that reads as "DNS is
   broken" rather than "your upstream is v6". The forward socket now binds the upstream's
   address family, proven against real v4 and v6 loopback resolvers.
-  **Residual:** a bare `<app>.internal` still resolves in the node's `default_namespace`
-  rather than the caller's. Fixing it needs a source-IP→namespace map the userspace responder
-  doesn't have (the limitation is already documented on `DnsConfig::default_namespace`), and
-  eBPF connect enforcement remains the primary control here
+  **Closed by C43:** bare names now require a runtime-owned source namespace on both
+  transports. Unknown/ambiguous sources fail explicitly; qualified names remain available.
+  Network admission/enforcement remains separate from DNS naming.
 - [x] `O20` stale/misleading docs and dead code sweep — one genuine bug, one leak, two
   honesty fixes, one deletion, one already-fine:
   - [x] **Bug:** the gossip datagram was bincode-deserialised before its HMAC was checked (it

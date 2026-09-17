@@ -680,7 +680,6 @@ other combination before it adopts or creates a workload.
 enabled = true
 listen = "0.0.0.0:53"       # derive and bind this node's runc gateway
 upstream = "8.8.8.8:53"
-default_namespace = "default"
 restrict_sources = true
 
 [ebpf]
@@ -693,6 +692,11 @@ Linux `IP_FREEBIND` before the first workload creates the interface. This avoids
 host loopback, which a container namespace can't reach, and avoids claiming
 wildcard port 53 from `systemd-resolved`. `/etc/resolv.conf` has no port syntax,
 so other ports are rejected.
+
+Short names such as `redis.internal` use the namespace of the isolated source
+workload, as published by the runtime. Unknown or ambiguous source addresses are
+refused; host tools should query `redis.<namespace>.internal`. The old
+`dns.default_namespace` setting is no longer accepted.
 
 Runc receives a per-instance, read-only resolver file. Bun doesn't modify the
 shared unpacked image. Both UDP and TCP must bind before the node reports DNS

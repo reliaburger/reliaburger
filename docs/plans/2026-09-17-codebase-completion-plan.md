@@ -37,9 +37,9 @@ F items are missing capabilities, not evidence of failures in supported behaviou
 [Audit evidence and reproducible probes](../qualification/2026-09-17-code-audit.md)
 record those distinctions and the hosted checks inspected.
 
-There are **74 tracked work packages**: 45 correctness/contract items, 12
+There are **76 tracked work packages**: 47 correctness/contract items, 12
 engineering follow-ups, 12 capability families and five acceptance/release gates.
-The correctness items include 19 P1 priorities; these are engineering priorities, not
+The correctness items include 20 P1 priorities; these are engineering priorities, not
 security severity ratings. A capability family can require several commits.
 
 ## What is already done
@@ -564,7 +564,7 @@ Evidence: `src/mayo/webhook.rs:collapse_series`; `gather_latest_values`; `src/ma
 
 Evidence: `src/onion/dns.rs:DnsConfig::default_namespace`.
 
-Bare app.internal names use the node's configured default namespace, not the source workload's namespace.
+**Completed on PR #167.** RuncGrill publishes source IP/namespace bindings before workload start and withdraws them with network ownership. UDP and TCP refuse unidentified or ambiguous short-name callers; qualified names remain explicit. The node-default setting is rejected. Adoption verifies the live namespace identity, reads the kernel address and restores ownership without reusing it. Verification: 3,197 Linux library tests, 28 DNS unit tests, 14 wire tests, strict Linux Clippy, and real two-namespace container resolution/adoption/teardown (8.78s / 3.48s). C46 and C47 record two separate follow-up findings from tracing these paths.
 
 **Completion test:** Same-named apps in two namespaces resolve correctly from their own workloads, including TCP/UDP and qualified names; unknown source identity fails explicitly.
 
@@ -595,6 +595,33 @@ qualification remains V02.
 **Completion test:** Readiness publication and owner execution remain concurrently
 polled under contention. Retired attempts, startup panic, missing readiness and
 restart budget tests retain their existing behaviour.
+
+### C46 — Keep DNS fault effects inside their authorised namespace
+
+**Priority:** P1. **Wave:** 2. **Book chapters:** 03, 08.
+
+Follow-up inspection on 18 September found that `publish_dns_faults` drops the
+namespace from an authorised workload fault. `DnsFaultState` keys only on the
+bare app name, so a DNS fault against one tenant's Redis also affects another
+tenant's Redis. Multiple fault owners also need an expiry union rather than
+last-writer selection.
+
+**Completion test:** Inject a namespaced DNS fault through the agent, observe
+NXDOMAIN only for that namespace over the resolver, and prove clearing or
+expiring one owner preserves another owner's effect.
+
+### C47 — Keep runtime address allocation inside the node subnet
+
+**Priority:** P2. **Wave:** 3. **Book chapters:** 03.
+
+Follow-up inspection on 18 September found that RuncGrill increments its
+container index with wrapping arithmetic without enforcing
+`MAX_CONTAINERS_PER_NODE`. Repeated creation can reach broadcast addresses,
+spill into a neighbouring /23 and eventually reuse an occupied address.
+
+**Completion test:** Exhaust the owned /23, refuse before network mutation,
+release and reuse only retired addresses, and preserve allocations across
+concurrent create, failed setup and adoption.
 
 ## Engineering follow-ups
 

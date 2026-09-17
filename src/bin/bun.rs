@@ -2819,6 +2819,10 @@ async fn prepare_dns_runtime(
     }
 
     let (runtime, nameserver, freebind) = configure_workload_dns(runtime, config.listen_addr)?;
+    #[cfg(target_os = "linux")]
+    if let AnyGrill::Runc(grill) = &runtime {
+        config.source_namespaces = grill.dns_source_namespaces();
+    }
     if config.listen_addr.ip().is_unspecified() {
         config.listen_addr.set_ip(nameserver.into());
     }

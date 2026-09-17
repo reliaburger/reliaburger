@@ -372,6 +372,87 @@ pub async fn setup_container_network(
     })
 }
 
+/// Recover an existing rootful network only when the live container owns it.
+/// The address comes from the kernel, not a guessed allocation or stale record.
+pub async fn adopt_container_network(
+    instance_id: &InstanceId,
+    container_pid: u32,
+) -> Result<Option<ContainerNetwork>, NetnsError> {
+    use std::os::unix::fs::MetadataExt;
+    let failure = |reason: String| NetnsError::SetupFailed {
+        instance: instance_id.0.clone(),
+        reason,
+    };
+    let path = namespace_path(instance_id);
+    let expected = match tokio::fs::metadata(&path).await {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(failure(format!("inspect adopted network: {error}"))),
+    };
+    let live = tokio::fs::metadata(format!("/proc/{container_pid}/ns/net"))
+        .await
+        .map_err(|error| failure(format!("inspect container network namespace: {error}")))?;
+    if (expected.dev(), expected.ino()) != (live.dev(), live.ino()) {
+        return Err(failure(
+            "container no longer owns its recorded network namespace".into(),
+        ));
+    }
+    let output = tokio::time::timeout(
+        std::time::Duration::from_secs(2),
+        tokio::process::Command::new("ip")
+            .args([
+                "-j",
+                "-n",
+                &format!("rb-{}", instance_id.0),
+                "address",
+                "show",
+                "dev",
+                "eth0",
+            ])
+            .kill_on_drop(true)
+            .output(),
+    )
+    .await
+    .map_err(|_| failure("adopted network inspection exceeded 2s".into()))?
+    .map_err(|error| failure(format!("inspect adopted network address: {error}")))?;
+    if !output.status.success() {
+        return Err(failure(
+            "ip could not inspect the adopted network address".into(),
+        ));
+    }
+    let interfaces: serde_json::Value = serde_json::from_slice(&output.stdout)
+        .map_err(|error| failure(format!("invalid adopted network address response: {error}")))?;
+    let addresses: Vec<_> = interfaces
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|interface| interface.get("addr_info")?.as_array())
+        .flatten()
+        .filter(|address| address["family"] == "inet" && address["prefixlen"] == 23)
+        .filter_map(|address| address["local"].as_str()?.parse::<Ipv4Addr>().ok())
+        .collect();
+    let [container_ip] = addresses.as_slice() else {
+        return Err(failure(
+            "adopted network must have exactly one IPv4 /23 address".into(),
+        ));
+    };
+    let [first, second, third, fourth] = container_ip.octets();
+    let host = u16::from(third & 1) * 256 + u16::from(fourth);
+    if first != 10 || !(2..=510).contains(&host) {
+        return Err(failure(
+            "adopted network address is outside the container range".into(),
+        ));
+    }
+    Ok(Some(ContainerNetwork {
+        namespace_path: path,
+        container_ip: *container_ip,
+        gateway_ip: Ipv4Addr::new(10, second, third & !1, 1),
+        host_veth: host_veth_name(instance_id),
+        container_veth: "eth0".into(),
+        rootless: false,
+    }))
+}
+
 /// Add a port mapping from a host port to a container port.
 ///
 /// In root mode, adds an nftables DNAT rule. In rootless mode, spawns
