@@ -23,7 +23,8 @@ Single source of truth for what's done and what's next. Check off an item only w
 - [x] Propagate storage/bootstrap errors, honour experimental Apple runtime settings, and audit HTTP methods (`6c5bd6f`, `95513ea`, `54f9ee7`).
 - [x] Report unavailable GitOps queues/export failures and show real dashboard replica counts (`baf73f2`, `592e285`).
 - [x] Connect the host browser through pinned TLS and show remote app instances (`5343072`; session tests, 48 rendering tests and three-node acceptance).
-- [ ] Close the remaining correctness findings listed in the release plan.
+- [x] Fix promoted first-run defects and record residual dispositions in the release plan (`e2fb093`, `a9feedd`; live ingress acceptance and offline export regressions).
+- [x] Record an empty-cache development-binary laptop run (`8ac0700`; three nodes and sample HTTP in 241.75s).
 - [ ] Qualify the downloaded candidate on clean hosts and record three-node timing.
 - [ ] Pass the real-cluster and final release acceptance gates.
 
