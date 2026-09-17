@@ -474,7 +474,7 @@ fn demo_config() -> String {
     format!(
         r#"[app.hello]
 image = "{}"
-command = ["sh", "-c", "mkdir -p /tmp/www; printf 'Reliaburger is running\\n' > /tmp/www/index.html; exec httpd -f -p 8080 -h /tmp/www"]
+command = ["/bin/sh", "-c", "echo hello-started; mkdir -p /tmp/www; printf 'Reliaburger is running\\n' > /tmp/www/index.html; exec httpd -f -p 8080 -h /tmp/www"]
 port = 8080
 replicas = 1
 [app.hello.health]
@@ -483,6 +483,8 @@ interval = 1
 threshold_healthy = 1
 [app.hello.ingress]
 host = "localhost"
+[app.hello.env]
+PATH = "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
 "#,
         crate::testkit::PINNED_TEST_WORKLOAD_IMAGE.replacen(
             "docker.io/library/",
@@ -556,6 +558,8 @@ mod tests {
                 .unwrap()
                 .starts_with("public.ecr.aws/docker/library/busybox@sha256:")
         );
+        assert_eq!(app.command[0], "/bin/sh");
+        assert!(app.env.contains_key("PATH"));
         assert_eq!(app.ingress.as_ref().unwrap().host, "localhost");
         assert_eq!(app.health.as_ref().unwrap().path, "/");
     }
