@@ -45,7 +45,7 @@ remain separate. Older unchecked groups below point into this current ledger.
 - [ ] **C14** (P1) Renew and hot-reload every served certificate class.
 - [ ] **C15** (P2) Make ingress serials unique across nodes and restarts.
 - [x] **C16** Return contextual errors for invalid DNS/common-name SANs and a root role passed to intermediate issuance. Both former panic paths have failing-before regressions; all 16 CA tests pass.
-- [ ] **C17** (P2) Reject overflowing CLI durations.
+- [x] **C17** Reject overflowing relative durations with checked multiplication and parse units at UTF-8 boundaries. The overflow regression fails before the fix; all 34 CLI command tests pass, including multibyte invalid input.
 - [ ] **C18** (P2) Find a free port before reporting exhaustion.
 - [ ] **C19** (P2) Count only successful metric-file pruning.
 - [ ] **C20** (P1) Deduplicate rollup ownership at query merge.

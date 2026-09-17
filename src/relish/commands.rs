@@ -174,7 +174,11 @@ fn parse_since(value: &str, now_epoch: u64) -> Result<u64, RelishError> {
         });
     }
 
-    let (number, unit) = value.split_at(value.len().saturating_sub(1));
+    let (number, unit) = value
+        .char_indices()
+        .next_back()
+        .map(|(index, _)| value.split_at(index))
+        .unwrap_or(("", ""));
     let multiplier = match unit {
         "s" => 1,
         "m" => 60,
@@ -191,7 +195,13 @@ fn parse_since(value: &str, now_epoch: u64) -> Result<u64, RelishError> {
         flag: "since".to_string(),
         reason: format!("{value:?} — use epoch seconds or a duration like 30s, 5m, 2h, 1d"),
     })?;
-    Ok(now_epoch.saturating_sub(amount * multiplier))
+    let seconds = amount
+        .checked_mul(multiplier)
+        .ok_or_else(|| RelishError::InvalidFlag {
+            flag: "since".to_string(),
+            reason: format!("duration {value:?} exceeds the supported seconds range"),
+        })?;
+    Ok(now_epoch.saturating_sub(seconds))
 }
 
 /// Parse a `--json-field` value of the form `key=value`.
@@ -2052,6 +2062,19 @@ mod tests {
         assert_eq!(parse_since("5m", now).unwrap(), now - 300);
         assert_eq!(parse_since("2h", now).unwrap(), now - 7200);
         assert_eq!(parse_since("1d", now).unwrap(), now - 86_400);
+    }
+
+    #[test]
+    fn oversized_or_unicode_since_values_return_errors() {
+        for value in [
+            "18446744073709551615d",
+            "18446744073709551615h",
+            "18446744073709551615m",
+            "é",
+            "5☃",
+        ] {
+            assert!(parse_since(value, 1_750_000_000).is_err(), "{value}");
+        }
     }
 
     #[test]

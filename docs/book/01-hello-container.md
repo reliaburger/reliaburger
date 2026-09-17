@@ -2910,3 +2910,14 @@ valid intermediate state. Our wall-clock acceptance test now waits for both a
 positive restart count and a live post-restart state within its existing
 deadline. Looking at the counter alone raced that transition and falsely called
 a scheduled restart stuck. A workload which really stays pending still fails.
+
+### Duration input must survive arithmetic and Unicode
+
+`relish logs --since 18446744073709551615d` used to overflow when converting
+days to seconds. We now use `checked_mul`, which returns `None` when the result
+cannot fit, and turn that into the existing CLI flag error. Parsing the final
+unit uses a Unicode character boundary rather than subtracting one byte from
+the string length. Invalid non-ASCII units therefore return an error too, rather
+than panicking while slicing a UTF-8 string. The regression covers overflowing
+minutes, hours and days as well as multibyte units; ordinary durations retain
+their existing saturating subtraction from the current epoch time.
