@@ -2840,3 +2840,18 @@ A result includes the instance's creation time. If a replacement has reused the
 same name, the agent ignores the old result rather than marking the replacement
 healthy. The regression uses a real TCP listener which accepts a connection but
 never answers. Status and shutdown must still complete within half a second.
+
+### Storage failures are ordinary errors
+
+Creating a storage directory can fail because a parent is a file, a disk is
+read-only, or the process lacks permission. None of these warrants a panic.
+Bun now creates metrics, logs and image directories through Tokio's filesystem
+API and propagates failures with `?`. Where the existing user-directory fallback
+applies, an error names both attempted paths and the storage component. A
+successful fallback is also printed, so you know where the data went.
+
+The test first creates the configured directory, then replaces it with a file
+to exercise the fallback, and finally occupies both paths with files. The last
+case must return an error containing both paths. The nested Parquet log directory
+also has to be created successfully before its store starts; ignoring that error
+would merely postpone the failure until the first log write.

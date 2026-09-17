@@ -547,6 +547,39 @@ fn resolve_join_seeds(join: &[String]) -> anyhow::Result<Vec<std::net::SocketAdd
     Ok(seeds)
 }
 
+async fn prepare_storage_directory(
+    configured: &std::path::Path,
+    fallback: &std::path::Path,
+    label: &str,
+) -> anyhow::Result<PathBuf> {
+    match tokio::fs::create_dir_all(configured).await {
+        Ok(()) => Ok(configured.to_path_buf()),
+        Err(primary_error) => {
+            tokio::fs::create_dir_all(fallback).await.with_context(|| {
+                format!(
+                    "failed to create {label} directory {} ({primary_error}) or fallback {}",
+                    configured.display(),
+                    fallback.display()
+                )
+            })?;
+            eprintln!(
+                "bun: using fallback {label} store at {} (cannot create {}: {primary_error})",
+                fallback.display(),
+                configured.display()
+            );
+            Ok(fallback.to_path_buf())
+        }
+    }
+}
+
+async fn storage_directory(configured: &std::path::Path, label: &str) -> anyhow::Result<PathBuf> {
+    let fallback = dirs::data_local_dir()
+        .unwrap_or_else(|| PathBuf::from("/tmp/reliaburger"))
+        .join("reliaburger")
+        .join(label);
+    prepare_storage_directory(configured, &fallback, label).await
+}
+
 async fn run_agent(cli: Cli) -> anyhow::Result<()> {
     // `bun testapp` never becomes an agent — it's the workload, not the
     // orchestrator. Handle it before any node config is touched.
@@ -743,16 +776,7 @@ async fn run_agent(cli: Cli) -> anyhow::Result<()> {
 
     // Mayo store first: the cluster runtime's rollup worker reads it, so
     // it must exist before the runtime starts.
-    let metrics_dir = if std::fs::create_dir_all(&config.storage.metrics).is_ok() {
-        config.storage.metrics.clone()
-    } else {
-        let fallback = dirs::data_local_dir()
-            .unwrap_or_else(|| PathBuf::from("/tmp/reliaburger"))
-            .join("reliaburger")
-            .join("metrics");
-        std::fs::create_dir_all(&fallback).expect("failed to create metrics directory");
-        fallback
-    };
+    let metrics_dir = storage_directory(&config.storage.metrics, "metrics").await?;
     // With `[metrics] object_store_url` set, metrics are persisted to and
     // queried from an object store (s3://, gs://, file://) so they survive node
     // loss (H8); otherwise Parquet stays in the local metrics dir.
@@ -1340,20 +1364,13 @@ async fn run_agent(cli: Cli) -> anyhow::Result<()> {
 
     // Create observability stores (the Mayo store was created above,
     // before the cluster runtime that its rollup worker feeds from)
-    let logs_dir = if std::fs::create_dir_all(&config.storage.logs).is_ok() {
-        config.storage.logs.clone()
-    } else {
-        let fallback = dirs::data_local_dir()
-            .unwrap_or_else(|| PathBuf::from("/tmp/reliaburger"))
-            .join("reliaburger")
-            .join("logs");
-        std::fs::create_dir_all(&fallback).expect("failed to create logs directory");
-        fallback
-    };
+    let logs_dir = storage_directory(&config.storage.logs, "logs").await?;
 
     // Create Arrow/DataFusion log store (SQL queries over logs)
     let log_store_dir = logs_dir.join("parquet");
-    std::fs::create_dir_all(&log_store_dir).ok();
+    tokio::fs::create_dir_all(&log_store_dir)
+        .await
+        .with_context(|| format!("failed to create log store at {}", log_store_dir.display()))?;
     // Seed the log store with startup events so it's never empty
     let mut log_store_inner = LogStore::new(log_store_dir);
     log_store_inner.append(
@@ -2133,22 +2150,7 @@ async fn run_agent(cli: Cli) -> anyhow::Result<()> {
         registry_cluster_advertise,
     )
     .map_err(|error| anyhow::anyhow!("invalid Pickle registry listener: {error}"))?;
-    let pickle_dir = if std::fs::create_dir_all(&config.storage.images).is_ok() {
-        config.storage.images.clone()
-    } else {
-        // Fall back to user-writable directory (e.g. on macOS without root)
-        let fallback = dirs::data_local_dir()
-            .unwrap_or_else(|| PathBuf::from("/tmp/reliaburger"))
-            .join("reliaburger")
-            .join("images");
-        std::fs::create_dir_all(&fallback).expect("failed to create pickle directory");
-        eprintln!(
-            "bun: using fallback image store at {} (cannot write to {})",
-            fallback.display(),
-            config.storage.images.display()
-        );
-        fallback
-    };
+    let pickle_dir = storage_directory(&config.storage.images, "images").await?;
     let node_raft_id = reliaburger::cluster::identity::raft_id_from_name(&node_name);
 
     let blob_store = Arc::new(BlobStore::new(&pickle_dir));
@@ -2868,6 +2870,37 @@ fn configure_workload_dns(
 mod tests {
     use super::*;
     use std::collections::BTreeMap;
+
+    #[tokio::test]
+    async fn storage_directory_preserves_configured_path_and_reports_both_failures() {
+        let temp = tempfile::tempdir().unwrap();
+        let configured = temp.path().join("configured");
+        let fallback = temp.path().join("fallback");
+        assert_eq!(
+            prepare_storage_directory(&configured, &fallback, "metrics")
+                .await
+                .unwrap(),
+            configured
+        );
+        assert!(!fallback.exists());
+        tokio::fs::remove_dir(&configured).await.unwrap();
+        tokio::fs::write(&configured, "occupied").await.unwrap();
+        assert_eq!(
+            prepare_storage_directory(&configured, &fallback, "metrics")
+                .await
+                .unwrap(),
+            fallback
+        );
+        tokio::fs::remove_dir(&fallback).await.unwrap();
+        tokio::fs::write(&fallback, "occupied").await.unwrap();
+        let error = prepare_storage_directory(&configured, &fallback, "metrics")
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("configured"));
+        assert!(error.contains("fallback"));
+        assert!(error.contains("metrics"));
+    }
 
     #[test]
     fn resolve_join_seeds_handles_empty_and_ip_literals() {
