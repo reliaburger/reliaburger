@@ -1707,6 +1707,9 @@ async fn run_agent(cli: Cli) -> anyhow::Result<()> {
                             log_retention_days,
                         )
                         .await;
+                        if let Some(error) = &log_result.export_error {
+                            eprintln!("bun: log export failed during disk pressure: {error}");
+                        }
                         if log_result.files_pruned > 0 {
                             println!(
                                 "bun: disk pressure — pruned {} log file(s), reclaimed {} bytes",
@@ -1725,6 +1728,9 @@ async fn run_agent(cli: Cli) -> anyhow::Result<()> {
                             metrics_retention_days,
                         )
                         .await;
+                        if let Some(error) = &metrics_result.export_error {
+                            eprintln!("bun: metrics export failed during disk pressure: {error}");
+                        }
                         if metrics_result.files_pruned > 0 {
                             println!(
                                 "bun: disk pressure — pruned {} metrics file(s), reclaimed {} bytes",
