@@ -137,7 +137,7 @@ mod tests {
             use tokio::io::AsyncReadExt;
             let (mut socket, _) = listener.accept().await.unwrap();
             let mut request = [0; 4096];
-            socket.read(&mut request).await.unwrap();
+            assert!(socket.read(&mut request).await.unwrap() > 0);
             socket.write_all(b"HTTP/1.1 302 Found\r\nLocation: http://127.0.0.1:9/\r\nContent-Length: 0\r\n\r\n").await.unwrap();
         });
         assert_eq!(
