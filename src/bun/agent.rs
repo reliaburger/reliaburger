@@ -598,13 +598,10 @@ enum DeployOp {
         instance_id: InstanceId,
         reply: oneshot::Sender<()>,
     },
-    /// Post-start bookkeeping for a healthy rolling instance: log forwarder,
-    /// on-disk record, provision identity.
+    /// Persist a started replacement before health wait or traffic publication.
     RegisterRollingInstance {
-        instance_id: InstanceId,
-        app_name: String,
-        namespace: String,
-        reply: oneshot::Sender<()>,
+        instance: Box<RollingInstance>,
+        reply: oneshot::Sender<Result<(), BunError>>,
     },
     /// Roll a failed rolling redeploy back: kill and clean up the new
     /// instances, release their ports, drop their identity dirs, record it.
@@ -692,6 +689,16 @@ enum DeployOp {
         namespace: String,
         reply: oneshot::Sender<()>,
     },
+}
+
+/// Launch data owned by the deploy worker before supervisor registration.
+struct RollingInstance {
+    instance_id: InstanceId,
+    app_name: String,
+    namespace: String,
+    spec: AppSpec,
+    oci_spec: crate::grill::oci::OciSpec,
+    host_port: Option<u16>,
 }
 
 /// The fast pre-create outputs the loop hands back for a fresh instance.
@@ -988,20 +995,16 @@ impl DeployOps {
         .await
     }
 
-    async fn register_rolling_instance(
-        &self,
-        instance_id: &InstanceId,
-        app_name: &str,
-        namespace: &str,
-    ) {
+    async fn register_rolling_instance(&self, instance: RollingInstance) -> Result<(), BunError> {
+        let missing = BunError::InstanceNotFound {
+            instance_id: instance.instance_id.clone(),
+        };
         self.call(
             |reply| DeployOp::RegisterRollingInstance {
-                instance_id: instance_id.clone(),
-                app_name: app_name.to_string(),
-                namespace: namespace.to_string(),
+                instance: Box::new(instance),
                 reply,
             },
-            (),
+            Err(missing),
         )
         .await
     }
@@ -2173,9 +2176,15 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
         let Some(instance) = self.supervisor.get_instance(instance_id) else {
             return;
         };
-        let Some(pid) = self.supervisor.grill().pid(instance_id).await else {
-            return;
+        let runtime = self.supervisor.grill().runtime_kind();
+        // Apple workloads live in VMs. Record the launcher for provenance;
+        // Apple adoption checks the named container, never this host PID.
+        let pid = if runtime == crate::grill::records::RuntimeKind::Apple {
+            Some(std::process::id())
+        } else {
+            self.supervisor.grill().pid(instance_id).await
         };
+        let Some(pid) = pid else { return };
         let Some(pid_started_at) = crate::grill::records::process_start_time(pid) else {
             return;
         };
@@ -2186,7 +2195,6 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
         let replica_index = crate::grill::InstanceIdentity::parse(&instance_id.0)
             .map(|ident| ident.ordinal)
             .unwrap_or(0);
-        let runtime = self.supervisor.grill().runtime_kind();
         let rootless_network = self
             .supervisor
             .grill()
@@ -2218,6 +2226,60 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
         if let Err(e) = crate::grill::records::write_record(dir, &record) {
             eprintln!("bun: warning: failed to write instance record for {instance_id}: {e}");
         }
+    }
+
+    /// Persist launch evidence while the replacement is still owned by its
+    /// rolling worker, before health wait or traffic publication.
+    async fn persist_rolling_instance(&self, instance: &RollingInstance) -> Result<(), BunError> {
+        let Some(directory) = self.records_dir.clone() else {
+            return Ok(());
+        };
+        let fail = |reason: String| BunError::DeployFailed {
+            app_name: instance.app_name.clone(),
+            reason,
+        };
+        let grill = self.supervisor.grill();
+        let runtime = grill.runtime_kind();
+        let pid = if runtime == crate::grill::records::RuntimeKind::Apple {
+            Some(std::process::id())
+        } else {
+            grill.pid(&instance.instance_id).await
+        }
+        .ok_or_else(|| {
+            fail(
+                "runtime did not expose a process identity for durable replacement adoption".into(),
+            )
+        })?;
+        let pid_started_at = crate::grill::records::process_start_time(pid).ok_or_else(|| {
+            fail("replacement process exited before its identity could be recorded".into())
+        })?;
+        let identity = crate::grill::InstanceIdentity::parse(&instance.instance_id.0)
+            .ok_or_else(|| fail("replacement has an invalid instance identity".into()))?;
+        let record = crate::grill::records::InstanceRecord {
+            schema: 2,
+            instance_id: instance.instance_id.0.clone(),
+            namespace: instance.namespace.clone(),
+            app_name: instance.app_name.clone(),
+            replica_index: identity.ordinal,
+            is_job: false,
+            image: instance.spec.image.clone().unwrap_or_default(),
+            runtime,
+            pid,
+            pid_started_at,
+            runc_container_id: matches!(runtime, crate::grill::records::RuntimeKind::Runc)
+                .then(|| instance.instance_id.0.clone()),
+            log_stem: grill.log_stem(&instance.instance_id).await,
+            host_port: instance.host_port,
+            app_spec: Some(instance.spec.clone()),
+            oci_spec: instance.oci_spec.clone(),
+            rootless_network: grill.rootless_network_record(&instance.instance_id).await,
+        };
+        tokio::task::spawn_blocking(move || {
+            crate::grill::records::write_record(&directory, &record)
+        })
+        .await
+        .map_err(|error| fail(format!("persist replacement record: {error}")))?
+        .map_err(|error| fail(format!("persist replacement record: {error}")))
     }
 
     /// Remove an instance's adoption record (instance stopped for good).
@@ -4902,12 +4964,12 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
         app_name: &str,
         namespace: &str,
         spec: &AppSpec,
-        new_ids: &[InstanceId],
+        _new_ids: &[InstanceId],
         new_prepared: &[InstanceId],
         new_ports: &std::collections::HashMap<InstanceId, Option<u16>>,
         replica_count: u32,
     ) {
-        for new_id in new_ids {
+        for new_id in new_prepared {
             let _ = self.supervisor.grill().kill(new_id).await;
             self.clear_egress(new_id).await;
             if let Some(port) = new_ports.get(new_id).copied().flatten() {
@@ -4916,6 +4978,7 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
         }
         for new_id in new_prepared {
             self.cleanup_instance_identity(new_id);
+            self.remove_instance_record(new_id);
         }
         let entry = crate::meat::deploy_types::DeployHistoryEntry {
             id: crate::meat::deploy_types::DeployId(
@@ -4965,6 +5028,7 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
                 let _ = self.supervisor.port_allocator.release(port).await;
             }
             self.cleanup_instance_identity(prepared);
+            self.remove_instance_record(prepared);
         }
         let entry = crate::meat::deploy_types::DeployHistoryEntry {
             id: crate::meat::deploy_types::DeployId(
@@ -7812,15 +7876,16 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
                 self.clear_egress(&instance_id).await;
                 let _ = reply.send(());
             }
-            DeployOp::RegisterRollingInstance {
-                instance_id,
-                app_name,
-                namespace,
-                reply,
-            } => {
-                self.spawn_log_forwarder(&instance_id, &app_name, &namespace);
-                self.persist_instance_record(&instance_id).await;
-                let _ = reply.send(());
+            DeployOp::RegisterRollingInstance { instance, reply } => {
+                let result = self.persist_rolling_instance(&instance).await;
+                if result.is_ok() {
+                    self.spawn_log_forwarder(
+                        &instance.instance_id,
+                        &instance.app_name,
+                        &instance.namespace,
+                    );
+                }
+                let _ = reply.send(result);
             }
             DeployOp::RollbackRollingDeploy {
                 app_name,
@@ -8612,6 +8677,7 @@ impl<G: Grill + Clone + 'static> DeployWorker<G> {
                 None
             };
 
+            new_ports.insert(new_id.clone(), host_port);
             new_prepared.push(new_id.clone());
             let oci_spec = match self
                 .ops
@@ -8665,9 +8731,28 @@ impl<G: Grill + Clone + 'static> DeployWorker<G> {
                 new_failed = true;
                 break;
             }
-            self.ops
-                .register_rolling_instance(&new_id, app_name, namespace)
-                .await;
+            if let Err(error) = self
+                .ops
+                .register_rolling_instance(RollingInstance {
+                    instance_id: new_id.clone(),
+                    app_name: app_name.to_string(),
+                    namespace: namespace.to_string(),
+                    spec: spec.clone(),
+                    oci_spec: oci_spec.clone(),
+                    host_port,
+                })
+                .await
+            {
+                let _ = events
+                    .send(ApplyEvent::Error {
+                        message: error.to_string(),
+                    })
+                    .await;
+                let _ = self.grill.kill(&new_id).await;
+                self.ops.clear_egress(&new_id).await;
+                new_failed = true;
+                break;
+            }
 
             let container_ip = self.grill.container_ip(&new_id).await;
 
@@ -8888,6 +8973,7 @@ impl<G: Grill + Clone + 'static> DeployWorker<G> {
                 None
             };
 
+            new_ports.insert(new_id.clone(), host_port);
             new_prepared.push(new_id.clone());
             let oci_spec = match self
                 .ops
@@ -8940,9 +9026,28 @@ impl<G: Grill + Clone + 'static> DeployWorker<G> {
                 new_failed = true;
                 break;
             }
-            self.ops
-                .register_rolling_instance(&new_id, app_name, namespace)
-                .await;
+            if let Err(error) = self
+                .ops
+                .register_rolling_instance(RollingInstance {
+                    instance_id: new_id.clone(),
+                    app_name: app_name.to_string(),
+                    namespace: namespace.to_string(),
+                    spec: spec.clone(),
+                    oci_spec: oci_spec.clone(),
+                    host_port,
+                })
+                .await
+            {
+                let _ = events
+                    .send(ApplyEvent::Error {
+                        message: error.to_string(),
+                    })
+                    .await;
+                let _ = self.grill.kill(&new_id).await;
+                self.ops.clear_egress(&new_id).await;
+                new_failed = true;
+                break;
+            }
 
             let container_ip = self.grill.container_ip(&new_id).await;
 
@@ -11705,6 +11810,129 @@ host = "remote.local"
             },
             rootless_network: None,
         }
+    }
+
+    #[tokio::test]
+    async fn rolling_replacement_persists_its_launch_spec_for_adoption() {
+        let (mut agent, _tx, _shutdown, grill) = test_agent_with_grill();
+        let records = tempfile::tempdir().unwrap();
+        let volumes = tempfile::tempdir().unwrap();
+        agent.set_records_dir(records.path().to_path_buf());
+        agent.set_volumes_dir(volumes.path().to_path_buf());
+        grill.set_pid(std::process::id());
+        let (events, _receiver) = mpsc::channel(128);
+        agent.deploy(basic_config(), &events).await;
+        let mut replacement = basic_config();
+        replacement.app.get_mut("web").unwrap().image = Some("web:v2".to_string());
+        let (rolling_events, mut rolling_rx) = mpsc::channel(1);
+        let mut deployment = Box::pin(agent.deploy(replacement, &rolling_events));
+        let mut observed_during_rollout = false;
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            loop {
+                tokio::select! {
+                    Some(event) = rolling_rx.recv() => {
+                        if let ApplyEvent::Progress { message } = event
+                            && message.contains("healthy")
+                        {
+                            assert!(crate::grill::records::load_records(records.path()).iter()
+                                .any(|record| record.image == "web:v2"));
+                            observed_during_rollout = true;
+                        }
+                    }
+                    _ = &mut deployment => break,
+                }
+            }
+        })
+        .await
+        .unwrap();
+        drop(deployment);
+        assert!(observed_during_rollout);
+        let persisted = crate::grill::records::load_records(records.path());
+        assert_eq!(
+            persisted.len(),
+            1,
+            "the replacement must retain an adoption record"
+        );
+        assert_eq!(persisted[0].image, "web:v2");
+        assert_eq!(
+            persisted[0].app_spec.as_ref().unwrap().image.as_deref(),
+            Some("web:v2")
+        );
+        let (mut restarted, _tx, _shutdown, runtime) = test_agent_with_grill();
+        restarted.set_records_dir(records.path().to_path_buf());
+        restarted.set_volumes_dir(volumes.path().to_path_buf());
+        let id = InstanceId(persisted[0].instance_id.clone());
+        runtime.set_adopt_result(&id, true);
+        assert_eq!(restarted.adopt_recorded_instances().await, 1);
+        assert!(restarted.supervisor.get_instance(&id).is_some());
+        assert!(
+            !runtime
+                .calls()
+                .iter()
+                .any(|(operation, _)| operation == "create")
+        );
+    }
+
+    #[tokio::test]
+    async fn rolling_record_failure_preserves_old_instances_and_reclaims_new_ports() {
+        for strategy in ["rolling", "blue-green"] {
+            let (mut agent, _tx, _shutdown, grill) = test_agent_with_grill();
+            let records = tempfile::tempdir().unwrap();
+            let volumes = tempfile::tempdir().unwrap();
+            agent.set_records_dir(records.path().to_path_buf());
+            agent.set_volumes_dir(volumes.path().to_path_buf());
+            grill.set_pid(std::process::id());
+            let initial = drain_deploy(&mut agent, basic_config()).await;
+            assert!(matches!(initial.last(), Some(ApplyEvent::Complete { .. })));
+            let allocated_before = agent.supervisor.port_allocator.allocated_count().await;
+            let blocked = tempfile::NamedTempFile::new().unwrap();
+            agent.set_records_dir(blocked.path().to_path_buf());
+            let replacement = Config::parse(&format!(
+                "[app.web]\nimage = \"web:v2\"\nport = 8080\n[app.web.deploy]\nstrategy = \"{strategy}\"\n"
+            )).unwrap();
+            let outcome = drain_deploy(&mut agent, replacement).await;
+            assert!(outcome.iter().any(|event| matches!(event, ApplyEvent::Error { message } if message.contains("persist replacement record"))), "{outcome:?}");
+            assert!(
+                agent
+                    .supervisor
+                    .get_instance(&InstanceId("default__web-0".into()))
+                    .is_some()
+            );
+            assert_eq!(
+                agent.supervisor.port_allocator.allocated_count().await,
+                allocated_before
+            );
+            let created: Vec<_> = grill
+                .calls()
+                .into_iter()
+                .filter(|(op, id)| op == "create" && id.0 != "default__web-0")
+                .collect();
+            assert_eq!(created.len(), 1);
+            assert!(
+                grill
+                    .calls()
+                    .contains(&("kill".to_string(), created[0].1.clone()))
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn apple_launches_persist_records_without_a_host_workload_pid() {
+        let (mut agent, _tx, _shutdown, grill) = test_agent_with_grill();
+        let records = tempfile::tempdir().unwrap();
+        let volumes = tempfile::tempdir().unwrap();
+        agent.set_records_dir(records.path().to_path_buf());
+        agent.set_volumes_dir(volumes.path().to_path_buf());
+        grill.set_runtime_kind(crate::grill::records::RuntimeKind::Apple);
+        let (events, _receiver) = mpsc::channel(128);
+        agent.deploy(basic_config(), &events).await;
+        assert_eq!(crate::grill::records::load_records(records.path()).len(), 1);
+        agent.deploy(basic_config(), &events).await;
+        let saved = crate::grill::records::load_records(records.path());
+        assert_eq!(saved.len(), 1);
+        assert_eq!(saved[0].runtime, crate::grill::records::RuntimeKind::Apple);
+        assert_eq!(saved[0].pid, std::process::id());
+        assert!(saved[0].instance_id.contains("-g"));
     }
 
     #[tokio::test]

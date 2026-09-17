@@ -33,7 +33,7 @@ remain separate. Older unchecked groups below point into this current ledger.
 - [x] **C02** Scope export acknowledgements and pruning proof to the destination URL and node prefix. Seven archive integration tests, ten exporter unit tests and eleven disk-pressure tests pass, including changed destinations/prefixes after restart and failed-export preservation.
 - [x] **C03** Serialise all exporters with a cross-process lock, reload before export, and atomically persist a private checkpoint with file/directory sync before acknowledgement or pruning. Stale-state, busy-lock, corrupt-state, atomic-replacement and rename-failure regressions pass, plus API/offline CLI checks; physical crash/durability qualification remains V02.
 - [x] **C04** Report directory, entry and file-read failures with context; reject non-regular/invalid-name candidates and skip only concurrent NotFound reads. Eleven archive integration tests, twelve exporter unit tests and eleven pressure tests pass on macOS; the invalid-byte filename regression is explicitly Linux-only.
-- [ ] **C05** (P1) Persist new instances during rolling deployments.
+- [x] **C05** Persist replacement launch details before health publication, including private durable records, rollback record/port cleanup and Apple launcher provenance. All 94 agent unit tests and ten record tests pass; regressions inspect records during rollout, adopt after restart and refuse failed record writes in both deployment strategies. Runtime crash-injection qualification remains V02.
 - [ ] **C06** (P1) Reserve node-fault capacity across the cluster.
 - [ ] **C07** (P1) Define and enforce mixed-version compatibility.
 - [ ] **C08** (P1) Publish readiness after resources are acquired.

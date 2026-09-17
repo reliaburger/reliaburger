@@ -921,3 +921,36 @@ delivery ID for replay protection; doing that before discovering a full queue
 would make the provider's retry look like a replay. We reserve before validation,
 so a rejected delivery can be retried after capacity becomes available. Tests
 close the receiver and fill the queue, then drain one slot and retry the same ID.
+
+### Record replacements before they serve traffic
+
+A rolling worker starts its replacement before the supervisor installs the final
+instance list. Asking the supervisor for that replacement's launch details at
+this point returns nothing. That was why our record-writing call silently did
+nothing, even on successful rollouts.
+
+The worker now sends a `RollingInstance` containing the launch spec, app spec,
+allocated port and identity. The command loop persists those details directly,
+before the worker enters its health wait or publishes a backend. Keeping this
+message separate from supervisor registration avoids exposing a not-yet-healthy
+replacement as a normal running instance. The reply carries a result: a failed
+record write aborts the rollout instead of quietly sacrificing adoption.
+
+Records use private temporary files and durable atomic replacement. The blocking
+write owns its record and path inside a `spawn_blocking` closure, keeping filesystem
+sync off Tokio's worker threads. Rollback cleans every prepared replacement,
+including the one that failed before becoming healthy. Port ownership is recorded
+as soon as allocation succeeds, so that failure path can release it too.
+
+The regression reads the replacement record while the rollout is still emitting
+health progress, then constructs a fresh agent and adopts it without creating a
+second workload. Another test replaces the record-directory path with a regular file
+and verifies both rolling and blue-green deployment preserve the old workload,
+kill the replacement and return its allocated port.
+
+Apple Container has no host workload PID. Its record retains the Bun launcher's
+PID and start time as provenance; adoption still inspects the named container,
+not that host process. A mock-runtime regression checks record creation without
+inventing a host workload PID. Real Apple adoption remains in its explicit runtime
+suite, and crash injection around create/start and partial rollout belongs to the
+release recovery qualification.

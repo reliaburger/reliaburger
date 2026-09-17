@@ -62,7 +62,8 @@ pub struct InstanceRecord {
     /// OCI image reference (informational; empty for process workloads).
     pub image: String,
     pub runtime: RuntimeKind,
-    /// ProcessGrill: the workload pid. RunC: the foreground `runc run` pid.
+    /// ProcessGrill: workload PID; runc: launcher PID; Apple: Bun launcher PID.
+    /// Apple adoption uses container identity/inspection, not host PID liveness.
     pub pid: u32,
     /// Process start time (seconds since boot/epoch as reported by the OS)
     /// for pid-reuse detection.
@@ -93,15 +94,9 @@ pub fn record_path(records_dir: &Path, instance_id: &str) -> PathBuf {
 pub fn write_record(records_dir: &Path, record: &InstanceRecord) -> std::io::Result<()> {
     std::fs::create_dir_all(records_dir)?;
     let path = record_path(records_dir, &record.instance_id);
-    let tmp = records_dir.join(format!(
-        ".{}.tmp-{}",
-        record.instance_id,
-        std::process::id()
-    ));
-    // A record is plain data; serialisation cannot fail.
-    let json = serde_json::to_string_pretty(record).expect("record serialises");
-    std::fs::write(&tmp, json)?;
-    std::fs::rename(&tmp, path)?;
+    let json = serde_json::to_vec_pretty(record)
+        .map_err(|error| std::io::Error::other(error.to_string()))?;
+    crate::sesame::identity::atomic_write_mode(&path, &json, Some(0o600))?;
     Ok(())
 }
 
