@@ -4,7 +4,7 @@ use crate::relish::tui::app::{TuiApp, View};
 
 use super::{apps, widgets};
 
-pub fn lines(app: &TuiApp) -> Vec<Line<'static>> {
+pub fn lines(app: &TuiApp, height: usize) -> Vec<Line<'static>> {
     let View::Logs { app: selected } = app.view() else {
         return Vec::new();
     };
@@ -34,11 +34,13 @@ pub fn lines(app: &TuiApp) -> Vec<Line<'static>> {
     if filtered.is_empty() {
         lines.push(Line::raw("waiting for logs…"));
     }
+    let available = height.saturating_sub(lines.len());
+    let scroll = app.log_scroll.min(filtered.len().saturating_sub(available));
     for line in filtered
         .into_iter()
         .rev()
-        .skip(app.log_scroll)
-        .take(32)
+        .skip(scroll)
+        .take(available)
         .collect::<Vec<_>>()
         .into_iter()
         .rev()

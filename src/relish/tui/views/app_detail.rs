@@ -4,7 +4,7 @@ use crate::relish::tui::app::{DetailTab, TuiApp, View};
 
 use super::widgets;
 
-pub fn lines(app: &TuiApp) -> Vec<Line<'static>> {
+pub fn lines(app: &TuiApp, height: usize) -> Vec<Line<'static>> {
     let View::AppDetail {
         app: name,
         namespace,
@@ -84,12 +84,16 @@ pub fn lines(app: &TuiApp) -> Vec<Line<'static>> {
             if app.log_lines.is_empty() {
                 lines.push(Line::raw("waiting for logs…"));
             }
+            let available = height.saturating_sub(lines.len());
+            let scroll = app
+                .log_scroll
+                .min(app.log_lines.len().saturating_sub(available));
             for line in app
                 .log_lines
                 .iter()
                 .rev()
-                .skip(app.log_scroll)
-                .take(30)
+                .skip(scroll)
+                .take(available)
                 .collect::<Vec<_>>()
                 .into_iter()
                 .rev()

@@ -23,6 +23,33 @@ mod tests {
     use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
     #[test]
+    fn log_views_keep_the_tail_visible_at_short_and_tall_terminal_heights() {
+        for view in [
+            View::Logs {
+                app: Some(("web".into(), "default".into())),
+            },
+            View::AppDetail {
+                app: "web".into(),
+                namespace: "default".into(),
+                tab: DetailTab::Logs,
+            },
+        ] {
+            let mut app = TuiApp::new();
+            app.view_stack.push(view);
+            for index in 0..100 {
+                app.log_lines.push_back(LogLine {
+                    instance: "web".into(),
+                    line: format!("MSG-{index:03}"),
+                });
+            }
+            assert!(render_to_string(&app, 80, 24).contains("MSG-099"));
+            assert!(render_to_string(&app, 120, 80).contains("MSG-040"));
+            app.log_scroll = usize::MAX;
+            assert!(render_to_string(&app, 80, 24).contains("MSG-000"));
+        }
+    }
+
+    #[test]
     fn small_terminal_is_deterministic() {
         let app = TuiApp::with_test_data(TestScenario::Empty);
         insta::assert_snapshot!("terminal_too_small", render_to_string(&app, 60, 15));
