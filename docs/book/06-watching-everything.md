@@ -401,3 +401,23 @@ including a custom store whose agent is stopped. A second regression exports
 twice and verifies that the saved checkpoint suppresses the second copy.
 Destinations must be UTF-8 because the object-store interface takes text;
 rejecting an invalid path is safer than silently exporting to a different one.
+
+### Preserve each archive generation
+
+A local flush counter can restart at zero after retention removes every file.
+That makes `logs_000000.parquet` a reusable filename, not a permanent identity.
+Previously the checkpoint noticed new bytes, but the remote write still replaced
+the old object. We now put the full SHA-256 digest in both the checkpoint identity
+and the archive filename. The `.parquet` extension remains at the end so existing
+SQL archive queries discover both generations.
+
+The regression uses actual Parquet files and DataFusion. It exports one batch,
+saves and reloads the checkpoint, removes the local file, restarts the store and
+exports a second batch under the same local name. Querying the archive must return
+both rows. Checking only the number of successful uploads missed the original bug.
+
+Old short-hash checkpoints cannot establish that an immutable object exists.
+Surviving source files are therefore exported again under the new names. Existing
+legacy archive objects are left untouched; a mixed legacy/new archive can contain
+duplicate rows for that migration batch. We prefer that explicit migration
+limitation to deleting an old object whose provenance we cannot establish.

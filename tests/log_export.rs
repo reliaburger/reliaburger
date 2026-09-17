@@ -193,3 +193,43 @@ async fn incremental_export() {
     assert_eq!(entries[0].line, "batch 1");
     assert_eq!(entries[1].line, "batch 2");
 }
+
+/// Retention can remove every source file and reset the sequence on restart.
+/// A durable checkpoint must not let that overwrite the previous archive.
+#[tokio::test]
+async fn reused_filename_preserves_both_generations_across_restart() {
+    let source = tempfile::tempdir().unwrap();
+    let destination = tempfile::tempdir().unwrap();
+    let checkpoint_path = source.path().join("checkpoint.json");
+    let mut checkpoint = ExportCheckpoint::default();
+    for (timestamp, line) in [(1, "first generation"), (2, "second generation")] {
+        let mut store = LogStore::new(source.path().to_path_buf());
+        store.append_at(timestamp, "web", "default", LogStream::Stdout, line);
+        store.flush().await.unwrap();
+        assert!(source.path().join("logs_000000.parquet").exists());
+        export_logs(
+            source.path(),
+            destination.path().to_str().unwrap(),
+            "node-1",
+            &mut checkpoint,
+        )
+        .await
+        .unwrap();
+        checkpoint.save(&checkpoint_path).unwrap();
+        checkpoint = ExportCheckpoint::load(&checkpoint_path);
+        std::fs::remove_file(source.path().join("logs_000000.parquet")).unwrap();
+    }
+    let entries = query_remote(
+        destination.path().join("node-1").to_str().unwrap(),
+        "SELECT timestamp, app, namespace, stream, line FROM logs ORDER BY timestamp",
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        entries
+            .iter()
+            .map(|entry| entry.line.as_str())
+            .collect::<Vec<_>>(),
+        ["first generation", "second generation"]
+    );
+}

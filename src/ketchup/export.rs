@@ -39,7 +39,7 @@ pub const CHECKPOINT_FILENAME: &str = "_export_checkpoint.json";
 /// Tracks which Parquet files have been exported, by durable id.
 ///
 /// Persisted as JSON so export is incremental across node restarts. The
-/// stored ids are `{filename}@{sha256-prefix}` (see [`durable_id`]), so a
+/// stored ids are `{filename}@{sha256}` (see [`durable_id`]), so a
 /// filename reused after retention pruning is treated as a new object.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct ExportCheckpoint {
@@ -97,16 +97,14 @@ pub struct ExportResult {
     pub bytes_written: u64,
 }
 
-/// The durable id of a file: its name plus a short hash of its contents.
+/// The durable id of a file: its name plus the full SHA-256 of its contents.
 ///
 /// Two files sharing a name but not contents (a name reused after
 /// retention pruning) get different ids, so the checkpoint never skips
 /// genuinely new bytes.
 fn durable_id(filename: &str, contents: &[u8]) -> String {
     let hash = hex::encode(Sha256::digest(contents));
-    // 16 hex chars (64 bits) is plenty to distinguish reused filenames
-    // without bloating the checkpoint.
-    format!("{filename}@{}", &hash[..16])
+    format!("{filename}@{hash}")
 }
 
 /// Build the object store and key prefix for a destination.
@@ -142,7 +140,7 @@ fn parse_destination(
 /// Export local Parquet log files to an object store.
 ///
 /// Ships any `.parquet` files in `source_dir` whose durable id isn't yet in
-/// the checkpoint to `{destination}/{node_id}/{filename}`, then records
+/// the checkpoint to `{destination}/{node_id}/{sha256}-{filename}`, then records
 /// each id. `destination` may be a local path, `file://…`, `s3://…` or
 /// `gs://…`. The checkpoint advances only for files that actually landed.
 pub async fn export_logs(
@@ -185,7 +183,12 @@ pub async fn export_logs(
             continue;
         }
 
-        let key = node_prefix.clone().join(filename.as_str());
+        // Include the generation in the object key, not only the checkpoint.
+        // Keep the Parquet extension so archive queries discover every generation.
+        let key = node_prefix.clone().join(format!(
+            "{}-{filename}",
+            hex::encode(Sha256::digest(&contents))
+        ));
         let len = contents.len() as u64;
         store
             .put(&key, object_store::PutPayload::from(contents))
@@ -244,8 +247,22 @@ mod tests {
         .unwrap();
 
         assert_eq!(result.files_exported, 2);
-        assert!(dest.path().join("node-1/logs_000000.parquet").exists());
-        assert!(dest.path().join("node-1/logs_000001.parquet").exists());
+        assert!(
+            dest.path()
+                .join(format!(
+                    "node-1/{}-logs_000000.parquet",
+                    hex::encode(Sha256::digest(b"data1"))
+                ))
+                .exists()
+        );
+        assert!(
+            dest.path()
+                .join(format!(
+                    "node-1/{}-logs_000001.parquet",
+                    hex::encode(Sha256::digest(b"data2"))
+                ))
+                .exists()
+        );
         assert!(!dest.path().join("node-1/not_parquet.txt").exists());
         // The checkpoint advanced by exactly the two exported ids.
         assert_eq!(checkpoint.exported_files.len(), 2);
@@ -264,7 +281,7 @@ mod tests {
             .unwrap();
 
         assert_eq!(result.files_exported, 1);
-        assert!(dest.path().join("node-1/logs_000000.parquet").exists());
+        assert_eq!(exported_files(dest.path()).len(), 1);
     }
 
     #[tokio::test]
@@ -291,7 +308,7 @@ mod tests {
         .unwrap();
 
         assert_eq!(result.files_exported, 1);
-        assert!(dest.path().join("node-1/logs_000001.parquet").exists());
+        assert_eq!(exported_files(dest.path()).len(), 1);
     }
 
     /// The bug OBS7 called out: a filename reused after retention pruning
@@ -313,7 +330,8 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(r1.files_exported, 1);
-        let first_bytes = std::fs::read(dest.path().join("node-1/logs_000000.parquet")).unwrap();
+        let first_path = exported_files(dest.path()).pop().unwrap();
+        let first_bytes = std::fs::read(&first_path).unwrap();
         assert_eq!(first_bytes, b"first batch");
 
         // Retention prunes the local file; the flush counter resets, so a new
@@ -333,8 +351,12 @@ mod tests {
             r2.files_exported, 1,
             "reused filename with new bytes was skipped"
         );
-        let second_bytes = std::fs::read(dest.path().join("node-1/logs_000000.parquet")).unwrap();
-        assert_eq!(second_bytes, b"second batch", "destination not overwritten");
+        assert_eq!(std::fs::read(&first_path).unwrap(), b"first batch");
+        let second_path = exported_files(dest.path())
+            .into_iter()
+            .find(|path| path != &first_path)
+            .unwrap();
+        assert_eq!(std::fs::read(second_path).unwrap(), b"second batch");
     }
 
     #[tokio::test]
