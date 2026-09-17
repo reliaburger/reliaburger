@@ -2309,3 +2309,23 @@ its expected number of active instances survived or were adopted. Missing or
 stopped instances invalidate the fingerprint so normal reconciliation deploys
 them again. If inventory is unavailable, it retries without guessing. A test
 covers a live adopted instance, an absent app and a stopped instance together.
+
+### Bootstrap is allowed to fail
+
+A fresh council used to discard the result of `initialize()`. It also logged a
+failed security-state write and carried on. That could leave a live-looking
+agent without the credentials its joining nodes needed.
+
+Startup now awaits both operations and returns their errors. A ten-second
+outer deadline bounds the whole bootstrap, including a stalled Raft write;
+the existing shorter retry loop still handles the first election settling.
+The test initialises a real in-memory council, verifies a distinctive security
+serial was committed, then attempts to initialise it again. That second attempt
+must return an error.
+
+A cancellation guard covers runtime construction. If any later `?` returns
+an error, dropping the guard cancels the tasks already started, including a
+watcher that shuts down Raft. We disarm the guard only after assembling the
+complete runtime. This is Rust's scope-based resource cleanup applied to async
+startup: the guard's destructor sends cancellation; the tasks perform their
+asynchronous cleanup when they receive it.
