@@ -807,3 +807,18 @@ before opening that listener. Timeout still fails closed. Tests deliver a token
 after startup begins and separately check the empty-store deadline. A shutdown
 guard cancels already spawned tasks when startup exits with an error; Rust drops
 the guard on both the success and error return paths.
+
+### Certificate lifetimes need a clock, not a calendar date
+
+Issue a certificate at lunchtime with a 90-second lifetime. Converting both ends
+of its validity window to year/month/day throws away the entire lifetime: both
+ends become midnight. It is already expired. Our original CA and node issuance
+paths did exactly that, while stored CA metadata kept a different timestamp.
+
+Issuance now captures one instant, rounds to the whole-second precision encoded
+by X.509, and adds the requested lifetime with checked arithmetic. The `time`
+crate handles calendar transitions; the handwritten leap-year conversion is gone.
+We reject lifetimes that cannot produce a valid, positive window. Stored CA
+metadata comes from the same parameters used to sign the certificate. The
+regression decodes a real 90-second certificate and compares both the duration
+and the root CA's encoded timestamps with its stored metadata.

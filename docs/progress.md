@@ -41,7 +41,7 @@ remain separate. Older unchecked groups below point into this current ledger.
 - [x] **C10** Record pending fault ownership before sending, retain unknown receipts after lost responses, and remove receipts only after confirmed exact-ID reversal. All nine chaos guard/preflight tests pass, including accepted-but-cancelled injection (previously reported NotRequired) and cancelled cleanup followed by retry.
 - [x] **C11** Persist leases with private unique files and file/directory sync; retain transaction ownership across caller cancellation and fence mutations after uncertain persistence. Thirteen lease tests pass, including the previously failing temporary-symlink regression and cancellation/restart evidence. Physical crash and injected filesystem-sync qualification remain V02.
 - [ ] **C12** (P1) Sweep pressure leftovers even after disabling pressure.
-- [ ] **C13** (P1) Issue certificates with exact validity timestamps.
+- [x] **C13** Use one whole-second issuance instant and checked lifetime arithmetic for CA, node and general leaf certificates; derive stored CA validity from signing parameters. The 90-second certificate regression fails before the fix, and all CA unit tests pass.
 - [ ] **C14** (P1) Renew and hot-reload every served certificate class.
 - [ ] **C15** (P2) Make ingress serials unique across nodes and restarts.
 - [ ] **C16** (P2) Reject invalid certificate inputs without panicking.
