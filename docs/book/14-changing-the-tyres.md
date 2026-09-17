@@ -739,3 +739,13 @@ our next binary. That is why the trust list is a slice rather than one key.
 A future rotation first ships a release trusting both old and new identities,
 then changes the signer, then removes the retired public key in a later release.
 The packaging workflow refuses a signing key absent from the compiled trust list.
+
+
+### Give bulk uploads their own deadline
+
+The upgrade harness uses a five-second HTTP deadline so a stalled status endpoint
+cannot freeze the test. A debug Bun executable can be hundreds of MiB, though;
+uploading and hashing it is a different operation. A Linux qualification run
+failed in that upload before any rolling replacement began. The upload now has
+its own 60-second deadline. Status calls retain five seconds and the overall
+upgrade deadline is unchanged. The complete Linux suite passes with these bounds.

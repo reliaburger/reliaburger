@@ -400,6 +400,9 @@ retain_versions = 3
         let push = self
             .client
             .post(&push_url)
+            // Debug executables are hundreds of MiB; uploading and hashing one
+            // needs a separate budget from the five-second status requests.
+            .timeout(Duration::from_secs(60))
             .header("authorization", format!("Bearer {}", self.service_token))
             .body(bytes.clone())
             .send()

@@ -115,7 +115,7 @@ repository Actions. Local signature verification and all five packaging tests
 pass. This is preparation only; signed candidate qualification remains V03.
 
 - [ ] **V01** (gate) Qualify the complete live three-node catalogue.
-- [ ] **V02** (gate) Qualify sustained TLS, storage and upgrade recovery.
+- [ ] **V02** (gate) Qualify sustained TLS, storage and upgrade recovery. The upgrade harness now gives large debug-binary uploads a bounded 60-second budget while retaining five-second status requests; the previous shared deadline failed before replacement began.
 - [ ] **V03** (gate) Publish and install the exact signed candidate.
 - [ ] **V04** (gate) Measure repeated cold installs on the advertised host matrix.
 - [ ] **V05** (gate) Review dependency exceptions before their deadline.
