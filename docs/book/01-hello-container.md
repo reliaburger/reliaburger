@@ -2855,3 +2855,30 @@ to exercise the fallback, and finally occupies both paths with files. The last
 case must return an error containing both paths. The nested Parquet log directory
 also has to be created successfully before its store starts; ignoring that error
 would merely postpone the failure until the first log write.
+
+### Preserve the settings across runtimes
+
+A runtime adapter must translate the workload, not merely its image name. Apple
+Container previously ignored bind mounts, process identity, working directory,
+read-only root and host-port publication. The CLI accepted the deployment, but
+it wasn't the deployment you asked for.
+
+The adapter now passes these settings to `container create`. Its Linux VM
+supplies the standard `/proc`, `/dev` and `/sys` mounts; application and identity
+bind mounts become explicit `--mount` arguments. Read-only mounts retain that
+restriction. Unsupported mount options fail before the CLI is called. Because
+Apple's mount syntax uses commas as separators, paths containing commas or
+newlines are rejected rather than interpreted as extra mount fields. Spaces
+remain safe: each argument is a separate string passed directly to the process,
+not shell source.
+
+Apple allocates whole virtual CPUs, so fractional CPU hard limits are explicitly
+unsupported instead of being rounded into a different limit. The adapter also
+rejects zero CPU periods before dividing. This runtime remains experimental;
+the supported laptop cluster uses Linux VMs and runc.
+
+The real-runtime acceptance test mounts a temporary directory read-only, runs
+BusyBox's HTTP server as UID 123 and GID 456 with `/work` as its current directory,
+and reads the file through a published host port. It then verifies process
+identity, working directory and the root mount's read-only flag from inside the
+container. Finally, it removes only that test's container.

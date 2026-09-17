@@ -144,6 +144,111 @@ impl AppleContainerGrill {
             })
     }
 
+    fn create_command_args(
+        instance: &InstanceId,
+        spec: &OciSpec,
+    ) -> Result<Vec<String>, GrillError> {
+        let invalid = |reason: &str| GrillError::StartFailed {
+            instance: instance.clone(),
+            reason: reason.to_string(),
+        };
+        let mut args: Vec<String> = vec![
+            "create".to_string(),
+            "--name".to_string(),
+            instance.0.clone(),
+        ];
+
+        // Environment variables
+        for env_str in &spec.process.env {
+            args.push("-e".to_string());
+            args.push(env_str.clone());
+        }
+
+        // Memory limit
+        if let Some(ref resources) = spec.linux.resources {
+            if let Some(ref mem) = resources.memory {
+                args.push("--memory".to_string());
+                args.push(mem.limit.to_string());
+            }
+            if let Some(ref cpu) = resources.cpu {
+                if cpu.period == 0
+                    || cpu.quota <= 0
+                    || !(cpu.quota as u64).is_multiple_of(cpu.period)
+                {
+                    return Err(invalid(
+                        "Apple Container requires a positive whole number of CPUs",
+                    ));
+                }
+                args.push("--cpus".to_string());
+                args.push((cpu.quota as u64 / cpu.period).to_string());
+            }
+        }
+
+        args.extend([
+            "--workdir".into(),
+            spec.process.cwd.clone(),
+            "--user".into(),
+            format!("{}:{}", spec.process.user.uid, spec.process.user.gid),
+        ]);
+        if spec.root.readonly {
+            args.push("--read-only".into());
+        }
+        if let Some(mapping) = spec.port_mapping {
+            args.extend([
+                "--publish".into(),
+                format!(
+                    "0.0.0.0:{}:{}/tcp",
+                    mapping.host_port, mapping.container_port
+                ),
+            ]);
+        }
+        let standard_mounts = super::oci::standard_mounts();
+        for mount in &spec.mounts {
+            // Apple supplies /proc, /dev and /sys inside its Linux VM.
+            if standard_mounts.contains(mount) {
+                continue;
+            }
+            if mount.mount_type.as_deref() != Some("bind")
+                || mount
+                    .options
+                    .iter()
+                    .any(|option| !matches!(option.as_str(), "bind" | "rbind" | "ro" | "rw"))
+            {
+                return Err(invalid(
+                    "Apple Container supports bind mounts with ro/rw options only",
+                ));
+            }
+            let Some(source) = mount.source.as_ref().and_then(|path| path.to_str()) else {
+                return Err(invalid("Apple Container bind source must be a UTF-8 path"));
+            };
+            let Some(target) = mount.destination.to_str() else {
+                return Err(invalid("Apple Container bind target must be a UTF-8 path"));
+            };
+            for path in [source, target] {
+                if !std::path::Path::new(path).is_absolute() || path.contains([',', '\n', '\r']) {
+                    return Err(invalid(
+                        "Apple Container mount paths must be absolute and contain no commas or newlines",
+                    ));
+                }
+            }
+            let mut mount_arg = format!("type=bind,source={source},target={target}");
+            if mount.options.iter().any(|option| option == "ro") {
+                mount_arg.push_str(",readonly");
+            }
+            args.extend(["--mount".into(), mount_arg]);
+        }
+
+        // Image
+        args.push(spec.root.path.clone());
+
+        // Command args
+        for arg in &spec.process.args {
+            args.push(arg.clone());
+        }
+
+        Ok(args)
+    }
+
     /// Build `container exec` arguments.
     ///
     /// Apple's CLI treats a Docker-style `--` after the container name as the
@@ -218,38 +323,7 @@ impl super::Grill for AppleContainerGrill {
         // reference for Apple Container (it's the OCI image, not a rootfs path).
         let image = spec.root.path.clone();
 
-        let mut args: Vec<String> = vec![
-            "create".to_string(),
-            "--name".to_string(),
-            instance.0.clone(),
-        ];
-
-        // Environment variables
-        for env_str in &spec.process.env {
-            args.push("-e".to_string());
-            args.push(env_str.clone());
-        }
-
-        // Memory limit
-        if let Some(ref resources) = spec.linux.resources {
-            if let Some(ref mem) = resources.memory {
-                args.push("--memory".to_string());
-                args.push(mem.limit.to_string());
-            }
-            if let Some(ref cpu) = resources.cpu {
-                let cpus = cpu.quota as f64 / cpu.period as f64;
-                args.push("--cpus".to_string());
-                args.push(format!("{cpus:.1}"));
-            }
-        }
-
-        // Image
-        args.push(image.clone());
-
-        // Command args
-        for arg in &spec.process.args {
-            args.push(arg.clone());
-        }
+        let args = Self::create_command_args(instance, spec)?;
 
         let args_refs: Vec<&str> = args.iter().map(|s| s.as_str()).collect();
         let output = Self::container_command(&args_refs, instance).await?;
@@ -434,6 +508,144 @@ mod tests {
     use super::*;
     #[allow(unused_imports)]
     use crate::grill::Grill;
+
+    #[test]
+    fn create_preserves_mounts_identity_ports_and_process_settings() {
+        let spec: OciSpec = serde_json::from_value(serde_json::json!({
+            "root": {"path":"example:v1", "readonly":true},
+            "process":{"args":["/bin/sleep","30"],"env":["KEY=value"],"cwd":"/work","user":{"uid":123,"gid":456}},
+            "mounts":[{"destination":"/work","source":"/tmp/source with spaces","type":"bind","options":["bind","ro"]}],
+            "linux":{"namespaces":[]},
+            "port_mapping":{"host_port":30000,"container_port":8080}
+        })).unwrap();
+        let args =
+            AppleContainerGrill::create_command_args(&InstanceId("apple-settings".into()), &spec)
+                .unwrap();
+        for pair in [
+            ["--workdir", "/work"],
+            ["--user", "123:456"],
+            ["--publish", "0.0.0.0:30000:8080/tcp"],
+            [
+                "--mount",
+                "type=bind,source=/tmp/source with spaces,target=/work,readonly",
+            ],
+        ] {
+            assert!(
+                args.windows(2).any(|args| args == pair),
+                "missing {pair:?}: {args:?}"
+            );
+        }
+        assert!(args.iter().any(|arg| arg == "--read-only"));
+        assert!(args.ends_with(&["example:v1".into(), "/bin/sleep".into(), "30".into()]));
+        for (quota, period) in [(50_000, 100_000), (100_000, 0), (0, 100_000)] {
+            let mut fractional = spec.clone();
+            fractional.linux.resources = Some(
+                serde_json::from_value(serde_json::json!({"cpu":{"quota":quota,"period":period}}))
+                    .unwrap(),
+            );
+            assert!(
+                AppleContainerGrill::create_command_args(
+                    &InstanceId("apple-cpu".into()),
+                    &fractional
+                )
+                .is_err()
+            );
+        }
+        let mut unsupported = spec.clone();
+        unsupported.mounts[0].options.push("nosuid".into());
+        assert!(
+            AppleContainerGrill::create_command_args(
+                &InstanceId("apple-settings".into()),
+                &unsupported
+            )
+            .is_err()
+        );
+        unsupported = spec;
+        unsupported.mounts[0].source = Some("/tmp/source,target=/escape".into());
+        assert!(
+            AppleContainerGrill::create_command_args(
+                &InstanceId("apple-settings".into()),
+                &unsupported
+            )
+            .is_err()
+        );
+    }
+
+    #[tokio::test]
+    #[ignore = "requires Apple Container and RELIABURGER_APPLE_CONTAINER_TESTS=1"]
+    async fn apple_serves_a_readonly_bind_mount_with_requested_identity_and_port() {
+        assert!(apple_tests_enabled());
+        let directory = tempfile::tempdir().unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(directory.path(), std::fs::Permissions::from_mode(0o755))
+                .unwrap();
+        }
+        tokio::fs::write(directory.path().join("index.html"), "apple-settings-work")
+            .await
+            .unwrap();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        drop(listener);
+        let id = InstanceId(format!("rb-apple-settings-{}", std::process::id()));
+        let spec: OciSpec = serde_json::from_value(serde_json::json!({
+            "root": {"path":crate::testkit::PINNED_TEST_WORKLOAD_IMAGE.replacen("docker.io/library/", "public.ecr.aws/docker/library/", 1), "readonly":true},
+            "process":{"args":["/bin/httpd","-f","-p","8080","-h","/work"],"env":[],"cwd":"/work","user":{"uid":123,"gid":456}},
+            "mounts":[{"destination":"/work","source":directory.path(),"type":"bind","options":["bind","ro"]}],
+            "linux":{"namespaces":[]},
+            "port_mapping":{"host_port":port,"container_port":8080}
+        })).unwrap();
+        let grill = AppleContainerGrill::new();
+        let result: Result<(), String> = async {
+            grill.create(&id, &spec).await.map_err(|e| e.to_string())?;
+            grill.start(&id).await.map_err(|e| e.to_string())?;
+            let client = reqwest::Client::builder()
+                .timeout(std::time::Duration::from_secs(3))
+                .build()
+                .unwrap();
+            tokio::time::timeout(std::time::Duration::from_secs(20), async {
+                loop {
+                    if let Ok(response) =
+                        client.get(format!("http://127.0.0.1:{port}/")).send().await
+                        && response.status().is_success()
+                        && response
+                            .text()
+                            .await
+                            .is_ok_and(|body| body == "apple-settings-work")
+                    {
+                        break;
+                    }
+                    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+                }
+            })
+            .await
+            .map_err(|_| "published port did not serve the bind mount".to_string())?;
+            let output = grill
+                .exec(
+                    &id,
+                    &[
+                        "/bin/sh".into(),
+                        "-c".into(),
+                        "id -u; id -g; pwd; awk '$2 == \"/\" {print $4}' /proc/mounts".into(),
+                    ],
+                )
+                .await
+                .map_err(|e| e.to_string())?;
+            let lines: Vec<_> = output.lines().collect();
+            if lines.len() < 4
+                || lines[..3] != ["123", "456", "/work"]
+                || !lines[3].split(',').any(|option| option == "ro")
+            {
+                return Err(format!("process settings were not applied: {output}"));
+            }
+            Ok(())
+        }
+        .await;
+        let _ = grill.kill(&id).await;
+        let _ = AppleContainerGrill::container_command(&["rm", "-f", &id.0], &id).await;
+        result.unwrap();
+    }
 
     fn apple_tests_enabled() -> bool {
         std::env::var("RELIABURGER_APPLE_CONTAINER_TESTS").is_ok()

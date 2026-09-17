@@ -975,3 +975,8 @@ It is not treated as a green deploy. Concurrent operations may target different
 apps, but Bun refuses a second operation for the same namespace/name.
 
 Release maintainers: see [the build, signing and publication procedure](releasing.md).
+
+Apple Container remains experimental. Bind mounts, UID/GID, working directory,
+read-only root and published TCP ports are translated to the Apple CLI. Mount
+options other than bind/ro/rw and fractional CPU hard limits are rejected; use
+the managed Linux/runc quickstart for the supported laptop profile.
