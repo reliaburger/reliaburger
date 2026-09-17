@@ -344,16 +344,23 @@ async fn remove_fault_cgroup_async(cgroup: PathBuf) -> Result<(), String> {
 
 #[cfg(target_os = "linux")]
 fn prepare_controller(limits: NodePressureLimits) -> Result<(), String> {
-    if !limits.enabled() {
-        return Err("node pressure is disabled by policy".to_string());
-    }
     if crate::grill::rootless::is_rootless() {
         return Err("rootless Bun has no delegated pressure cgroup".to_string());
     }
     let root = Path::new(NODE_PRESSURE_CGROUP_ROOT);
+    // Policy controls new faults, not our responsibility for existing helpers.
+    // Do not create or enable a cgroup hierarchy when pressure is disabled.
+    if root
+        .try_exists()
+        .map_err(|error| format!("failed to inspect {}: {error}", root.display()))?
+    {
+        cleanup_stale_cgroups(root)?;
+    }
+    if !limits.enabled() {
+        return Err("node pressure is disabled by policy".to_string());
+    }
     std::fs::create_dir_all(root)
         .map_err(|error| format!("failed to create {}: {error}", root.display()))?;
-    cleanup_stale_cgroups(root)?;
 
     let controllers = std::fs::read_to_string(root.join("cgroup.controllers"))
         .map_err(|error| format!("failed to read cgroup controllers: {error}"))?;

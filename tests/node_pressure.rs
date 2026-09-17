@@ -143,3 +143,42 @@ async fn node_pressure_consumes_capacity_outside_bun_and_cleans_up() {
         "startup sweep must remove a previous owner's cgroup"
     );
 }
+
+#[tokio::test]
+#[ignore = "requires rootful Linux cgroup v2 (RELIABURGER_NODE_PRESSURE_TESTS=1)"]
+async fn disabling_pressure_still_reclaims_previous_helpers() {
+    assert_eq!(
+        std::env::var("RELIABURGER_NODE_PRESSURE_TESTS").as_deref(),
+        Ok("1")
+    );
+    let root = Path::new(NODE_PRESSURE_CGROUP_ROOT);
+    std::fs::create_dir_all(root).unwrap();
+    let cgroup = root.join(format!("fault-{}", std::process::id()));
+    std::fs::create_dir(&cgroup).unwrap();
+    let mut child = tokio::process::Command::new("sleep")
+        .arg("60")
+        .kill_on_drop(true)
+        .spawn()
+        .unwrap();
+    std::fs::write(cgroup.join("cgroup.procs"), child.id().unwrap().to_string()).unwrap();
+    let mut controller = NodePressureController::default();
+    let available = controller.configure(NodePressureLimits::default(), "/unused-helper".into());
+    let removed = !cgroup.exists();
+    let exited = tokio::time::timeout(std::time::Duration::from_secs(1), child.wait())
+        .await
+        .is_ok();
+    // Keep a failing pre-fix regression from leaving its own pressure fixture.
+    if !exited {
+        child.kill().await.unwrap();
+    }
+    if cgroup.exists() {
+        std::fs::remove_dir(&cgroup).unwrap();
+    }
+    assert!(
+        removed,
+        "disabled policy left the previous owner's cgroup behind"
+    );
+    assert!(exited, "disabled policy left the previous helper running");
+    assert!(!available, "cleanup must not enable new pressure requests");
+    assert!(controller.apply(FaultId(1), 1, 0).await.is_err());
+}

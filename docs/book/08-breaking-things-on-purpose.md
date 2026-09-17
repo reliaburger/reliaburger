@@ -767,3 +767,18 @@ relish dev test onion                         # eBPF fault enforcement (Lima)
 ```
 
 Phase 8 adds 222 tests, bringing the total to 1263.
+
+### Disabling pressure does not cancel cleanup responsibility
+
+After a Bun crash, an owned pressure helper may still exist. Setting both
+pressure limits to zero should prevent new experiments, but it must also stop
+the old one. The startup controller now sweeps an existing owned cgroup subtree
+before checking the enabled policy. With pressure disabled it neither creates a
+new subtree nor enables controllers, and still reports the capability unavailable.
+Rootless Bun cannot reclaim a rootful owner's cgroups and remains unsupported.
+
+The privileged Linux regression places a real child in an owned cgroup, configures
+a fresh controller with zero limits, then checks that the child exits, its cgroup
+disappears and a new pressure request is refused. It failed before the ordering
+change. Both this regression and the CPU/memory pressure acceptance passed in the
+Linux test VM.
