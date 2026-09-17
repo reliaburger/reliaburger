@@ -491,9 +491,15 @@ async fn health_check_triggers_restart() {
     let config = TestHarness::config_for_test_app(test_app.port());
     harness.client.apply(&config).await.unwrap();
 
+    // Probe completion schedules a restart; the following agent tick drives
+    // creation. Observe completed re-drive, not its legitimate pending state.
     let status = harness
         .wait_for_instance("testapp", Duration::from_secs(15), |status| {
             status.restart_count > 0
+                && matches!(
+                    status.state.as_str(),
+                    "running" | "health-wait" | "unhealthy"
+                )
         })
         .await;
     assert!(

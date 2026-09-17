@@ -2902,3 +2902,11 @@ These probes target local workloads, so they bypass shell proxy settings and
 don't follow redirects. A 302 isn't a successful health response. Tests exercise
 two requests over one HTTP connection, malformed targets, redirects, timeouts,
 and a healthy workload retaining its state after a local probe failure.
+
+Moving probes out of the agent loop also changed what observers can see between
+steps. The completion message increments the restart counter and schedules the
+restart; the next reconciliation tick recreates the workload. `pending` is a
+valid intermediate state. Our wall-clock acceptance test now waits for both a
+positive restart count and a live post-restart state within its existing
+deadline. Looking at the counter alone raced that transition and falsely called
+a scheduled restart stuck. A workload which really stays pending still fails.
