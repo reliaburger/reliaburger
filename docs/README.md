@@ -27,7 +27,9 @@ background node. The public installer remains in development.
 
 ### Rust toolchain
 
-Reliaburger requires Rust 1.85+ (2024 edition). Install via [rustup](https://rustup.rs/):
+Reliaburger requires Rust 1.97 or later (2024 edition). CI tests the minimum
+compiler against `Cargo.lock`; release builds use Rust 1.98.0. Install via
+[rustup](https://rustup.rs/):
 
 ```sh
 curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
@@ -42,14 +44,15 @@ source "$HOME/.cargo/env"
 Verify:
 
 ```sh
-rustc --version   # needs 1.85+
+rustc --version   # needs 1.97+
 cargo --version
 ```
 
-If you already have Rust installed, make sure it's up to date:
+To use the same compiler as release builds:
 
 ```sh
-rustup update
+rustup toolchain install 1.98.0
+cargo +1.98.0 build --locked --bins
 ```
 
 ### Platform build tools

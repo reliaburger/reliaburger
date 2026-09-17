@@ -679,3 +679,17 @@ the binary, and check that verification then fails. They also reject missing
 platforms and an untrusted key. The public release key stays out of the test
 fixture. See [the release procedure](../releasing.md) for the operator steps and
 remaining candidate-qualification gates.
+
+### Pin the compiler used to build a replacement
+
+A tag and a dependency lockfile don't identify the compiler. Release builds now
+use Rust 1.98.0 explicitly, while a separate CI job checks and tests the declared
+minimum, 1.97.0, with the locked graph and both feature configurations. Stacked
+PRs receive the same checks as PRs into main.
+
+Changing either compiler is a reviewed build-policy change: update the manifest
+minimum if necessary, update the workflow pins and documentation, then rerun
+minimum-compiler, release-build and upgrade qualification. Rebuild and publish a
+new candidate with its own checksum and provenance; don't replace bytes behind
+an existing release tag. Pinning Rust improves repeatability but does not claim
+bit-for-bit reproducibility across different operating systems or linkers.

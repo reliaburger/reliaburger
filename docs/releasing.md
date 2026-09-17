@@ -25,6 +25,17 @@ The initial Linux build baseline is Ubuntu 22.04. Compatibility with older
 systems is not promised. macOS builds are not yet Developer ID signed or
 notarised; don't equate an Actions build with clean-host acceptance.
 
+## Compiler baseline
+
+The source minimum is Rust 1.97 (`Cargo.toml`); CI checks the locked dependency
+graph and runs both feature configurations on 1.97.0. Native release jobs pin
+Rust 1.98.0 and build with `--locked`. To change this policy, update the manifest,
+workflow pins and installation docs together, then rerun minimum-compiler,
+native-build and upgrade qualification. A compiler change produces a new
+candidate and new checksums; never replace an existing release's binaries.
+The compiler pin does not promise identical bytes across different linkers or
+host operating systems.
+
 ## Signing identity
 
 Configure the Actions secret `RELIABURGER_RELEASE_KEY` with the base64 encoding

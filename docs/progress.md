@@ -85,7 +85,7 @@ remain separate. Older unchecked groups below point into this current ledger.
 - [ ] **H08** (P2) Identify and eliminate leaked test processes.
 - [ ] **H09** (P3) Complete node-pressure diagnostic hygiene.
 - [ ] **H10** (P3) Reuse one egress observation per health tick.
-- [ ] **H11** (P2) Declare and test the actual Rust/toolchain baseline.
+- [x] **H11** Declare Rust 1.97, pin release/CI builds to 1.98.0 and add a locked minimum-compiler CI job for both feature configurations, including stacked PR triggers. Linux 1.97 checks every target/feature and passes 3,155 default plus 3,115 no-default library tests; macOS 1.98 passes 3,413 default plus 3,373 no-default portable tests. The no-default process leak remains H08. Build/rebuild policy and both READMEs are updated.
 
 - [ ] **H12** (P2) Resolve the active Thrift dependency alert and qualify its parsing path before publication.
 

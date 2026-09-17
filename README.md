@@ -35,8 +35,11 @@ implementation status in [progress.md](docs/progress.md).
 
 ## Quick start
 
+Source builds require Rust 1.97 or later; releases use Rust 1.98.0 and the
+committed lockfile.
+
 ```sh
-cargo build --bins
+cargo build --locked --bins
 
 # Run the node agent — no container runtime needed for the first taste
 target/debug/bun --runtime process

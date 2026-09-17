@@ -5,7 +5,7 @@ on:
     branches: [main]
     tags: ['v*']
   pull_request:
-    branches: [main]
+    branches: [main, "codex/**"]
 
 permissions:
   contents: write
@@ -83,7 +83,7 @@ jobs:
       RELIABURGER_GIT_SHA: ${{ github.sha }}
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@1.98.0
         with:
           targets: ${{ matrix.target }}
       - uses: Swatinem/rust-cache@v2

@@ -30,7 +30,12 @@ $ cargo --version
 cargo 1.85.0 (d73d2caf9 2024-12-20)
 ```
 
-Your version numbers will probably be higher. That's fine — we just need 1.85 or later, because we're using the 2024 edition.
+Those example version strings show the compiler that introduced the 2024 edition.
+The current repository requires Rust 1.97 or later because language editions and
+compiler/library requirements are separate contracts. `Cargo.toml` declares
+`rust-version = "1.97"`, and CI tests the committed dependency graph on 1.97.0.
+Release builds pin 1.98.0; use `cargo +1.98.0 build --locked --bins` after installing
+that toolchain if you want the release compiler locally.
 
 ### Platform prerequisites
 
