@@ -319,11 +319,14 @@ async fn logs_export_from(source: &Path, dest_str: &str, node_id: &str) -> Resul
             if result.files_exported == 0 {
                 println!("no new files to export");
             } else {
+                checkpoint.save(&checkpoint_path).map_err(|error| RelishError::ApiError {
+                    status: 0,
+                    body: format!("files exported but checkpoint could not be saved: {error}; a later export may repeat these files"),
+                })?;
                 println!(
                     "exported {} file(s) ({} bytes) to {}/{}",
                     result.files_exported, result.bytes_written, dest_str, node_id,
                 );
-                checkpoint.save(&checkpoint_path).ok();
             }
             Ok(())
         }

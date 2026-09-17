@@ -386,3 +386,18 @@ The regression writes a log file, configures an unsupported export destination,
 and sets the pressure threshold below the file's size. It asserts both that the
 failure is reported and that the local file survives. Reporting a failed backup
 mustn't turn it into permission to delete the only copy.
+
+### Offline exports must report partial success
+
+Copying the archive is only half an incremental export. We also need to persist
+which files were copied. The offline CLI used to discard a checkpoint write
+failure and print success. It now returns an error that says the files arrived
+but a later export may repeat them. The `?` operator propagates that error before
+we print the success message. A CLI regression makes the checkpoint path a
+directory, then checks both the copied bytes and the non-zero exit status.
+
+`relish logs-export --source PATH --dest PATH` explicitly selects a local store,
+including a custom store whose agent is stopped. A second regression exports
+twice and verifies that the saved checkpoint suppresses the second copy.
+Destinations must be UTF-8 because the object-store interface takes text;
+rejecting an invalid path is safer than silently exporting to a different one.

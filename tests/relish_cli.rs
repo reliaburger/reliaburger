@@ -86,6 +86,38 @@ fn endpoint_environment_rejects_remote_plaintext_before_dispatch() {
     assert!(output.stdout.is_empty());
     assert!(String::from_utf8_lossy(&output.stderr).contains("must use HTTPS"));
 }
+
+#[test]
+fn offline_log_export_reports_a_checkpoint_write_failure() {
+    let dir = tempfile::tempdir().unwrap();
+    let source = dir.path().join("source");
+    let dest = dir.path().join("dest");
+    std::fs::create_dir(&source).unwrap();
+    std::fs::write(source.join("logs.parquet"), b"exported bytes").unwrap();
+    std::fs::create_dir(source.join("_export_checkpoint.json")).unwrap();
+    let output = Command::new(env!("CARGO_BIN_EXE_relish"))
+        .args(["logs-export", "--source"])
+        .arg(&source)
+        .arg("--dest")
+        .arg(&dest)
+        .env("RELIABURGER_HOME", dir.path().join("home"))
+        .env_remove("RELIABURGER_ENDPOINT")
+        .env_remove("RELIABURGER_TOKEN")
+        .env_remove("RELIABURGER_CA_CERT")
+        .output()
+        .unwrap();
+    assert_eq!(output.status.code(), Some(1));
+    assert_eq!(
+        std::fs::read(dest.join("local/logs.parquet")).unwrap(),
+        b"exported bytes"
+    );
+    assert!(String::from_utf8_lossy(&output.stderr).contains("checkpoint"));
+    assert!(
+        output.stdout.is_empty(),
+        "must not report a complete successful export"
+    );
+}
+
 #[test]
 fn offline_log_export_persists_progress_between_runs() {
     let dir = tempfile::tempdir().unwrap();
