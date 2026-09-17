@@ -474,6 +474,12 @@ pub enum AgentCommand {
 /// back as one of these ops. Each carries a `oneshot` the loop replies on, so
 /// the task drives the sequence while the loop applies it.
 enum DeployOp {
+    /// A bounded probe completes off-loop; only the agent mutates health state.
+    HealthProbeResult {
+        instance_id: InstanceId,
+        created_at: Instant,
+        status: super::health::HealthStatus,
+    },
     /// Enforce the image trust policy; returns the digest-pinned image, if any.
     EnforceImageSignature {
         spec: Box<AppSpec>,
@@ -1502,6 +1508,8 @@ pub struct BunAgent<G: Grill> {
     /// Receiver the command loop drains to apply those deploy ops. Paired with
     /// `deploy_ops_tx`; kept here so `run` can `select!` on it.
     deploy_ops_rx: mpsc::Receiver<DeployOp>,
+    /// At most one outstanding health probe per instance identity.
+    health_inflight: std::collections::HashSet<InstanceId>,
     /// Shared drain tracker (DEP5). Handed to the Wrapper proxy so in-flight
     /// requests to a retiring backend are counted; the retire path starts a
     /// drain and waits for it to finish (or time out) before killing the
@@ -1603,6 +1611,7 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
             identity_retry_ticks: 0,
             deploy_ops_tx,
             deploy_ops_rx,
+            health_inflight: std::collections::HashSet::new(),
             drains: new_shared_drains(),
         }
     }
@@ -1696,6 +1705,7 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
             identity_retry_ticks: 0,
             deploy_ops_tx,
             deploy_ops_rx,
+            health_inflight: std::collections::HashSet::new(),
             drains: new_shared_drains(),
         }
     }
@@ -5769,108 +5779,138 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
     /// Run any due health checks.
     async fn run_health_checks(&mut self) {
         let now = Instant::now();
-
-        // Collect all due checks
-        let mut due_checks = Vec::new();
-        while let Some((instance_id, config)) = self.supervisor.health_checker_mut().pop_due(now) {
-            due_checks.push((instance_id, config));
+        let mut due = Vec::new();
+        while let Some(check) = self.supervisor.health_checker_mut().pop_due(now) {
+            due.push(check);
         }
-
-        for (instance_id, config) in due_checks {
-            // Only probe instances in a probeable state
-            let (state, probe_host) = match self.supervisor.get_instance(&instance_id) {
-                Some(i) => (Some(i.state), probe_host(i.container_ip)),
-                None => (None, "127.0.0.1".to_string()),
+        for (instance_id, config) in due {
+            let Some(instance) = self.supervisor.get_instance(&instance_id) else {
+                continue;
             };
-
-            let should_probe = matches!(
-                state,
-                Some(ContainerState::HealthWait)
-                    | Some(ContainerState::Running)
-                    | Some(ContainerState::Unhealthy)
-            );
-
-            if should_probe {
-                let status = probe_health(&config, &probe_host).await;
-
-                let transition = self.supervisor.process_health_result(&instance_id, status);
-
-                // Propagate health transitions to the service map, noting the
-                // service so we can re-sync its eBPF backend_map entry afterwards.
-                let mut health_changed_service: Option<crate::onion::service_id::ServiceId> = None;
-                match &transition {
-                    Ok(Some(ContainerState::Running)) => {
-                        if let Some(inst) = self.supervisor.get_instance(&instance_id) {
-                            let service_id = crate::onion::service_id::ServiceId::new(
-                                inst.namespace.clone(),
-                                inst.app_name.clone(),
-                            );
-                            let _ = self.service_map.set_backend_health(
-                                &service_id,
-                                &instance_id.0,
-                                true,
-                            );
-                            health_changed_service = Some(service_id);
-                        }
-                    }
-                    Ok(Some(ContainerState::Unhealthy)) => {
-                        if let Some(inst) = self.supervisor.get_instance(&instance_id) {
-                            let app = inst.app_name.clone();
-                            let namespace = inst.namespace.clone();
-                            let service_id = crate::onion::service_id::ServiceId::new(
-                                namespace.clone(),
-                                app.clone(),
-                            );
-                            let _ = self.service_map.set_backend_health(
-                                &service_id,
-                                &instance_id.0,
-                                false,
-                            );
-                            self.record_event(
-                                crate::bun::events::EventKind::Health,
-                                crate::bun::events::EventSeverity::Warning,
-                                Some(app),
-                                Some(namespace),
-                                format!("instance {} became unhealthy", instance_id.0),
-                            )
-                            .await;
-                            health_changed_service = Some(service_id);
-                        }
-                    }
-                    _ => {}
+            if !matches!(
+                instance.state,
+                ContainerState::HealthWait | ContainerState::Running | ContainerState::Unhealthy
+            ) || !self.health_inflight.insert(instance_id.clone())
+            {
+                self.supervisor
+                    .health_checker_mut()
+                    .schedule_next(instance_id, now);
+                continue;
+            }
+            let host = probe_host(instance.container_ip);
+            let created_at = instance.created_at;
+            let results = self.deploy_ops_tx.clone();
+            let shutdown = self.shutdown.clone();
+            tokio::spawn(async move {
+                let status = tokio::select! {
+                    _ = shutdown.cancelled() => return,
+                    status = probe_health(&config, &host) => status,
+                };
+                let result = DeployOp::HealthProbeResult {
+                    instance_id,
+                    created_at,
+                    status,
+                };
+                tokio::select! {
+                    _ = shutdown.cancelled() => {},
+                    _ = results.send(result) => {},
                 }
-                if let Some(service_id) = health_changed_service {
-                    self.sync_backend_ebpf(&service_id).await;
-                }
+            });
+        }
+    }
 
-                // Handle restart if unhealthy
-                if let Ok(Some(ContainerState::Unhealthy)) = transition
-                    && self
-                        .supervisor
-                        .maybe_restart(&instance_id, now)
-                        .await
-                        .unwrap_or(false)
-                    && let Some(instance) = self.supervisor.get_instance(&instance_id)
-                {
-                    self.record_event(
-                        crate::bun::events::EventKind::Restart,
-                        crate::bun::events::EventSeverity::Warning,
-                        Some(instance.app_name.clone()),
-                        Some(instance.namespace.clone()),
-                        format!(
-                            "instance {} restarted (attempt {})",
-                            instance_id.0, instance.restart_count
-                        ),
+    async fn complete_health_probe(
+        &mut self,
+        instance_id: InstanceId,
+        created_at: Instant,
+        status: super::health::HealthStatus,
+    ) {
+        self.health_inflight.remove(&instance_id);
+        let now = Instant::now();
+        if !self
+            .supervisor
+            .get_instance(&instance_id)
+            .is_some_and(|instance| {
+                instance.created_at == created_at
+                    && matches!(
+                        instance.state,
+                        ContainerState::HealthWait
+                            | ContainerState::Running
+                            | ContainerState::Unhealthy
                     )
-                    .await;
+            })
+        {
+            return;
+        }
+        let transition = self.supervisor.process_health_result(&instance_id, status);
+
+        // Propagate health transitions to the service map, noting the
+        // service so we can re-sync its eBPF backend_map entry afterwards.
+        let mut health_changed_service: Option<crate::onion::service_id::ServiceId> = None;
+        match &transition {
+            Ok(Some(ContainerState::Running)) => {
+                if let Some(inst) = self.supervisor.get_instance(&instance_id) {
+                    let service_id = crate::onion::service_id::ServiceId::new(
+                        inst.namespace.clone(),
+                        inst.app_name.clone(),
+                    );
+                    let _ = self
+                        .service_map
+                        .set_backend_health(&service_id, &instance_id.0, true);
+                    health_changed_service = Some(service_id);
                 }
             }
-
-            // Schedule the next check
-            self.supervisor
-                .health_checker_mut()
-                .schedule_next(instance_id, now);
+            Ok(Some(ContainerState::Unhealthy)) => {
+                if let Some(inst) = self.supervisor.get_instance(&instance_id) {
+                    let app = inst.app_name.clone();
+                    let namespace = inst.namespace.clone();
+                    let service_id =
+                        crate::onion::service_id::ServiceId::new(namespace.clone(), app.clone());
+                    let _ = self
+                        .service_map
+                        .set_backend_health(&service_id, &instance_id.0, false);
+                    self.record_event(
+                        crate::bun::events::EventKind::Health,
+                        crate::bun::events::EventSeverity::Warning,
+                        Some(app),
+                        Some(namespace),
+                        format!("instance {} became unhealthy", instance_id.0),
+                    )
+                    .await;
+                    health_changed_service = Some(service_id);
+                }
+            }
+            _ => {}
         }
+        if let Some(service_id) = health_changed_service {
+            self.sync_backend_ebpf(&service_id).await;
+        }
+
+        // Handle restart if unhealthy
+        if let Ok(Some(ContainerState::Unhealthy)) = transition
+            && self
+                .supervisor
+                .maybe_restart(&instance_id, now)
+                .await
+                .unwrap_or(false)
+            && let Some(instance) = self.supervisor.get_instance(&instance_id)
+        {
+            self.record_event(
+                crate::bun::events::EventKind::Restart,
+                crate::bun::events::EventSeverity::Warning,
+                Some(instance.app_name.clone()),
+                Some(instance.namespace.clone()),
+                format!(
+                    "instance {} restarted (attempt {})",
+                    instance_id.0, instance.restart_count
+                ),
+            )
+            .await;
+        }
+
+        self.supervisor
+            .health_checker_mut()
+            .schedule_next(instance_id, now);
     }
 
     /// Register (or refresh) the cron-scheduled jobs from an applied config.
@@ -7505,6 +7545,14 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
     /// (DEP4/codex-M3).
     async fn handle_deploy_op(&mut self, op: DeployOp) {
         match op {
+            DeployOp::HealthProbeResult {
+                instance_id,
+                created_at,
+                status,
+            } => {
+                self.complete_health_probe(instance_id, created_at, status)
+                    .await;
+            }
             DeployOp::EnforceImageSignature { spec, reply } => {
                 let _ = reply.send(self.enforce_image_signature(&spec).await);
             }
@@ -9763,6 +9811,51 @@ mod tests {
     /// a `Status` command on the running loop still answers promptly. With
     /// the old serial deploy (awaited inline in the command arm) this
     /// `Status` could not be serviced until the pull finished.
+    #[tokio::test]
+    async fn slow_health_probe_does_not_block_status_or_shutdown() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+        let server = tokio::spawn(async move {
+            let (_socket, _) = listener.accept().await.unwrap();
+            let _ = started_tx.send(());
+            std::future::pending::<()>().await;
+        });
+        let (mut agent, tx, shutdown) = test_agent();
+        let volumes = tempfile::tempdir().unwrap();
+        agent.set_volumes_dir(volumes.path().to_path_buf());
+        let task = tokio::spawn(async move { agent.run().await });
+        let config = Config::parse(&format!(
+            r#"[app.web]
+image = "test:v1"
+port = {port}
+[app.web.health]
+path = "/health"
+timeout = 3
+interval = 1
+"#
+        ))
+        .unwrap();
+        send_deploy(&tx, config).await;
+        tokio::time::timeout(std::time::Duration::from_secs(3), started_rx)
+            .await
+            .unwrap()
+            .unwrap();
+        let (response, received) = tokio::sync::oneshot::channel();
+        tx.send(AgentCommand::Status { response }).await.unwrap();
+        let status = tokio::time::timeout(std::time::Duration::from_millis(500), received).await;
+        shutdown.cancel();
+        let mut task = task;
+        let stopped = tokio::time::timeout(std::time::Duration::from_millis(500), &mut task).await;
+        task.abort();
+        server.abort();
+        assert!(
+            status.is_ok(),
+            "a slow health probe blocked the command loop"
+        );
+        assert!(stopped.is_ok(), "a slow health probe blocked shutdown");
+    }
+
     #[tokio::test]
     async fn slow_deploy_does_not_block_the_command_loop() {
         let (tx, rx) = mpsc::channel(32);

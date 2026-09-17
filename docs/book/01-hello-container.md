@@ -2821,3 +2821,22 @@ Second, `WorkloadInstance` carries a `container_ip` field so health probes and s
 What we deferred: real multi-node clustering (Phase 2), network namespaces (Phase 3), mTLS and authentication (Phase 4), the Pickle registry (Phase 5). ProcessGrill doesn't provide real isolation, and there's no scheduler, no gossip protocol, no persistent state. All of that is coming.
 
 The foundation is solid. The trait boundaries (`Grill`, the state machine, the health checker) were designed so that adding real implementations doesn't change the orchestration logic. When we add runc support, the agent doesn't know the difference. When we add a scheduler in Phase 2, it sends the same `AgentCommand::Deploy` that the API sends today. That's the payoff of getting the abstractions right early: each phase adds new capabilities without rewriting what came before.
+
+### A slow health endpoint must not stop the agent
+
+The laptop cluster caught a problem that a responsive mock server hid. Each
+health probe waited on the agent's command loop. An endpoint taking five seconds
+to time out delayed status requests, shutdown and cluster resource reports too.
+The scheduler could then move work because its reports were stale.
+
+We now start each probe in a Tokio task and send its result back through the
+agent's existing channel. `tokio::select!` waits for either the probe or the
+shutdown token; whichever finishes first determines the branch, and the other
+future is dropped. The task owns cloned channel and cancellation handles, while
+the agent keeps exclusive ownership of lifecycle state. At most one probe per
+instance is outstanding. The next deadline starts when its result arrives.
+
+A result includes the instance's creation time. If a replacement has reused the
+same name, the agent ignores the old result rather than marking the replacement
+healthy. The regression uses a real TCP listener which accepts a connection but
+never answers. Status and shutdown must still complete within half a second.
