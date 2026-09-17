@@ -5581,11 +5581,8 @@ struct LogsExportRequest {
 
 /// `POST /v1/logs/export` — export this node's Parquet log store now.
 ///
-/// Uses the Bun-owned export checkpoint (X8), so a manual export and the
-/// periodic export loop can't double-ship or skip each other's files. Both
-/// load/save the same checkpoint file non-atomically; that load/save window
-/// is a pre-existing exposure shared with the interval task and the
-/// disk-pressure sweep.
+/// Serialises with periodic, pressure and offline exporters through the same
+/// checkpoint lock. Success includes durable acknowledgement persistence.
 async fn logs_export_handler(
     auth: Option<axum::Extension<crate::sesame::auth::AuthContext>>,
     State(state): State<ApiState>,
@@ -5606,8 +5603,7 @@ async fn logs_export_handler(
             .into_response();
     };
     let data_dir = log_store.read().await.data_dir().to_path_buf();
-    let checkpoint_path = data_dir.join(crate::ketchup::export::CHECKPOINT_FILENAME);
-    let mut checkpoint = crate::ketchup::export::ExportCheckpoint::load(&checkpoint_path);
+    let mut checkpoint = crate::ketchup::export::ExportCheckpoint::default();
     let node_id = state
         .node_name
         .clone()
@@ -5621,28 +5617,13 @@ async fn logs_export_handler(
     )
     .await
     {
-        Ok(result) => {
-            // The files landed; a failed checkpoint save only means a later
-            // export may re-ship them. Say so instead of pretending.
-            let checkpoint_saved = if result.files_exported > 0 {
-                match checkpoint.save(&checkpoint_path) {
-                    Ok(()) => true,
-                    Err(e) => {
-                        eprintln!("bun: log export checkpoint save failed: {e}");
-                        false
-                    }
-                }
-            } else {
-                true
-            };
-            Json(serde_json::json!({
-                "files_exported": result.files_exported,
-                "bytes_written": result.bytes_written,
-                "node_id": node_id,
-                "checkpoint_saved": checkpoint_saved,
-            }))
-            .into_response()
-        }
+        Ok(result) => Json(serde_json::json!({
+            "files_exported": result.files_exported,
+            "bytes_written": result.bytes_written,
+            "node_id": node_id,
+            "checkpoint_saved": true,
+        }))
+        .into_response(),
         Err(e) => (
             StatusCode::INTERNAL_SERVER_ERROR,
             Json(serde_json::json!({"error": e.to_string()})),

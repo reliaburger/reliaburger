@@ -1619,16 +1619,11 @@ async fn run_agent(cli: Cli) -> anyhow::Result<()> {
             config.logs.export_interval_secs
         );
         tokio::spawn(async move {
-            use reliaburger::ketchup::export::{
-                CHECKPOINT_FILENAME, ExportCheckpoint, export_logs,
-            };
+            use reliaburger::ketchup::export::{ExportCheckpoint, export_logs};
             let mut tick = tokio::time::interval(export_interval);
             // Skip first tick (fires immediately)
             tick.tick().await;
-            let store_guard = export_store.read().await;
-            let checkpoint_path = store_guard.data_dir().join(CHECKPOINT_FILENAME);
-            let mut checkpoint = ExportCheckpoint::load(&checkpoint_path);
-            drop(store_guard);
+            let mut checkpoint = ExportCheckpoint::default();
             loop {
                 tokio::select! {
                     _ = export_shutdown.cancelled() => break,
@@ -1637,7 +1632,6 @@ async fn run_agent(cli: Cli) -> anyhow::Result<()> {
                         match export_logs(&data_dir, &export_dest, &node_id, &mut checkpoint).await {
                             Ok(result) if result.files_exported > 0 => {
                                 println!("bun: exported {} log file(s) to {}", result.files_exported, export_dest);
-                                checkpoint.save(&checkpoint_path).ok();
                             }
                             Err(e) => eprintln!("bun: log export error: {e}"),
                             _ => {}
@@ -1674,7 +1668,7 @@ async fn run_agent(cli: Cli) -> anyhow::Result<()> {
             use reliaburger::bun::disk_pressure::{
                 DiskPressureResignation, ResignationVerdict, check_and_relieve, dir_parquet_size,
             };
-            use reliaburger::ketchup::export::{CHECKPOINT_FILENAME, ExportCheckpoint};
+            use reliaburger::ketchup::export::ExportCheckpoint;
             let tick_period = std::time::Duration::from_secs(300);
             let mut tick = tokio::time::interval(tick_period);
             // Council resignation waits for two sustained ticks (~10 min) over
@@ -1684,16 +1678,14 @@ async fn run_agent(cli: Cli) -> anyhow::Result<()> {
             tick.tick().await; // skip first immediate tick
 
             let log_store_guard = dp_log_store.read().await;
-            let log_checkpoint_path = log_store_guard.data_dir().join(CHECKPOINT_FILENAME);
             let log_data_dir = log_store_guard.data_dir().to_path_buf();
             drop(log_store_guard);
-            let mut log_checkpoint = ExportCheckpoint::load(&log_checkpoint_path);
+            let mut log_checkpoint = ExportCheckpoint::default();
 
             let mayo_store_guard = dp_mayo_store.read().await;
-            let mayo_checkpoint_path = mayo_store_guard.data_dir().join(CHECKPOINT_FILENAME);
             let mayo_data_dir = mayo_store_guard.data_dir().to_path_buf();
             drop(mayo_store_guard);
-            let mut mayo_checkpoint = ExportCheckpoint::load(&mayo_checkpoint_path);
+            let mut mayo_checkpoint = ExportCheckpoint::default();
 
             loop {
                 tokio::select! {
@@ -1717,7 +1709,6 @@ async fn run_agent(cli: Cli) -> anyhow::Result<()> {
                                 "bun: disk pressure — pruned {} log file(s), reclaimed {} bytes",
                                 log_result.files_pruned, log_result.bytes_reclaimed
                             );
-                            log_checkpoint.save(&log_checkpoint_path).ok();
                         }
 
                         // Check metrics disk pressure
@@ -1738,7 +1729,6 @@ async fn run_agent(cli: Cli) -> anyhow::Result<()> {
                                 "bun: disk pressure — pruned {} metrics file(s), reclaimed {} bytes",
                                 metrics_result.files_pruned, metrics_result.bytes_reclaimed
                             );
-                            mayo_checkpoint.save(&mayo_checkpoint_path).ok();
                         }
 
                         // Rollup retention (E): drop aggregated rollups older

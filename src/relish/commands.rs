@@ -296,12 +296,9 @@ pub async fn logs_export(
 }
 
 async fn logs_export_from(source: &Path, dest_str: &str, node_id: &str) -> Result<(), RelishError> {
-    use crate::ketchup::export::{CHECKPOINT_FILENAME, ExportCheckpoint, export_logs};
+    use crate::ketchup::export::{ExportCheckpoint, export_logs};
 
-    // X8: share Bun's one authoritative checkpoint, not a competing Relish
-    // copy. Whichever process exports last records into the same file, so a
-    // manual `relish logs-export` and the agent's export loop can't
-    // double-ship or skip each other's files.
+    // The exporter owns cross-process locking, reload and durable persistence.
     let _entries = tokio::fs::read_dir(source)
         .await
         .map_err(|error| RelishError::ApiError {
@@ -311,18 +308,13 @@ async fn logs_export_from(source: &Path, dest_str: &str, node_id: &str) -> Resul
                 source.display()
             ),
         })?;
-    let checkpoint_path = source.join(CHECKPOINT_FILENAME);
-    let mut checkpoint = ExportCheckpoint::load(&checkpoint_path);
+    let mut checkpoint = ExportCheckpoint::default();
 
     match export_logs(source, dest_str, node_id, &mut checkpoint).await {
         Ok(result) => {
             if result.files_exported == 0 {
                 println!("no new files to export");
             } else {
-                checkpoint.save(&checkpoint_path).map_err(|error| RelishError::ApiError {
-                    status: 0,
-                    body: format!("files exported but checkpoint could not be saved: {error}; a later export may repeat these files"),
-                })?;
                 println!(
                     "exported {} file(s) ({} bytes) to {}/{}",
                     result.files_exported, result.bytes_written, dest_str, node_id,

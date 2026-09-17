@@ -302,3 +302,88 @@ async fn acknowledgement_from_another_destination_does_not_allow_pruning() {
     assert_eq!(result.files_pruned, 0);
     assert!(file.exists());
 }
+
+#[tokio::test]
+async fn export_persists_and_reloads_the_authoritative_checkpoint() {
+    use reliaburger::ketchup::export::CHECKPOINT_FILENAME;
+    let source = tempfile::tempdir().unwrap();
+    let destination = tempfile::tempdir().unwrap();
+    std::fs::write(source.path().join("logs_000000.parquet"), b"bytes").unwrap();
+    let mut first = ExportCheckpoint::default();
+    export_logs(
+        source.path(),
+        destination.path().to_str().unwrap(),
+        "node-1",
+        &mut first,
+    )
+    .await
+    .unwrap();
+    let saved = ExportCheckpoint::load(&source.path().join(CHECKPOINT_FILENAME));
+    assert_eq!(saved.exported_files.len(), 1);
+    let mut stale = ExportCheckpoint::default();
+    let repeated = export_logs(
+        source.path(),
+        destination.path().to_str().unwrap(),
+        "node-1",
+        &mut stale,
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        repeated.files_exported, 0,
+        "a stale caller must reload the committed receipt"
+    );
+    assert_eq!(stale.exported_files, saved.exported_files);
+}
+
+#[tokio::test]
+async fn active_export_lock_refuses_another_writer_without_uploading() {
+    let source = tempfile::tempdir().unwrap();
+    let destination = tempfile::tempdir().unwrap();
+    std::fs::write(source.path().join("logs_000000.parquet"), b"bytes").unwrap();
+    let lock = std::fs::File::create(source.path().join("_export_checkpoint.lock")).unwrap();
+    lock.try_lock().unwrap();
+    let mut checkpoint = ExportCheckpoint::default();
+    let result = export_logs(
+        source.path(),
+        destination.path().to_str().unwrap(),
+        "node-1",
+        &mut checkpoint,
+    )
+    .await;
+    assert!(result.is_err());
+    assert_eq!(std::fs::read_dir(destination.path()).unwrap().count(), 0);
+    assert!(checkpoint.exported_files.is_empty());
+    drop(lock);
+    export_logs(
+        source.path(),
+        destination.path().to_str().unwrap(),
+        "node-1",
+        &mut checkpoint,
+    )
+    .await
+    .unwrap();
+}
+
+#[tokio::test]
+async fn unreadable_checkpoint_preserves_sources_under_pressure() {
+    use reliaburger::ketchup::export::CHECKPOINT_FILENAME;
+    let source = tempfile::tempdir().unwrap();
+    let destination = tempfile::tempdir().unwrap();
+    let file = source.path().join("logs_000000.parquet");
+    std::fs::write(&file, b"preserve these bytes").unwrap();
+    std::fs::write(source.path().join(CHECKPOINT_FILENAME), b"truncated json").unwrap();
+    let mut checkpoint = ExportCheckpoint::default();
+    let result = reliaburger::bun::disk_pressure::check_and_relieve(
+        source.path(),
+        Some(destination.path().to_str().unwrap()),
+        "node-1",
+        &mut checkpoint,
+        1,
+        0,
+    )
+    .await;
+    assert!(result.export_error.is_some());
+    assert_eq!(result.files_pruned, 0);
+    assert!(file.exists());
+}

@@ -81,7 +81,10 @@ pub async fn check_and_relieve(
                 result.exported = export_result.files_exported > 0;
                 result.files_exported = export_result.files_exported;
             }
-            Err(error) => result.export_error = Some(error.to_string()),
+            Err(error) => {
+                result.export_error = Some(error.to_string());
+                return result;
+            }
         }
     }
 

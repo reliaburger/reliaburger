@@ -88,7 +88,7 @@ fn endpoint_environment_rejects_remote_plaintext_before_dispatch() {
 }
 
 #[test]
-fn offline_log_export_reports_a_checkpoint_write_failure() {
+fn offline_log_export_refuses_an_unreadable_checkpoint_before_upload() {
     let dir = tempfile::tempdir().unwrap();
     let source = dir.path().join("source");
     let dest = dir.path().join("dest");
@@ -108,8 +108,12 @@ fn offline_log_export_reports_a_checkpoint_write_failure() {
         .unwrap();
     assert_eq!(output.status.code(), Some(1));
     assert_eq!(
-        std::fs::read(dest.join("local/logs.parquet")).unwrap(),
+        std::fs::read(source.join("logs.parquet")).unwrap(),
         b"exported bytes"
+    );
+    assert!(
+        !dest.exists(),
+        "invalid checkpoint must be refused before upload"
     );
     assert!(String::from_utf8_lossy(&output.stderr).contains("checkpoint"));
     assert!(

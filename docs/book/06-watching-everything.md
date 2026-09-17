@@ -439,3 +439,29 @@ The pruner checks the scope as well as the content identity. Our regression
 exports to a working destination, switches to an unwritable destination, then
 forces disk pressure. The source must survive. Another test changes both the
 destination and node prefix across checkpoint reloads and queries every archive.
+
+### Own the whole export transaction
+
+Sharing a checkpoint pathname didn't serialise its writers. The periodic task,
+disk-pressure task, API handler and offline CLI could each load an old snapshot
+and later replace a newer one. They now call the same transaction: acquire a
+non-blocking file lock, load the latest checkpoint, export, then persist it before
+returning success. A competing writer gets a busy error and can retry. Corrupt or
+unreadable state is an error, not an empty receipt.
+
+The lock is a separate persistent file. Replacing the JSON atomically must not
+replace the inode that other processes lock. Checkpoint writes use a private
+unique temporary file, sync its contents, rename it, and sync the parent directory.
+Disk-pressure cleanup stops if export or checkpoint persistence fails. The agent
+reports the error through its existing export-error path instead of discarding it.
+
+The blocking persistence closure takes ownership of the lock with `move`. A
+closure is Rust's anonymous function; `move` transfers captured values into it.
+Here that matters if the async caller is cancelled: the blocking filesystem write
+can finish while still holding its lock. Dropping the caller must not admit the
+next writer before the old rename finishes. On return, the committed snapshot
+replaces the caller's borrowed checkpoint; stale caller state never drives uploads.
+
+Regressions exercise a held lock, stale snapshots, corrupt checkpoint data,
+agent exports and the offline CLI's non-zero error result. Actual power-loss and
+storage-device durability qualification remains part of the release recovery gate.
