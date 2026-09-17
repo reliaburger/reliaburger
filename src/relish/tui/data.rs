@@ -6,7 +6,7 @@ use std::sync::Arc;
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 
-use crate::bun::agent::{CouncilStatus, InstanceStatus, JobStatus, NodeStatus};
+use crate::bun::agent::{ClusterInstanceStatus, CouncilStatus, JobStatus, NodeStatus};
 use crate::bun::events::ClusterEvent;
 use crate::mayo::rollup::MetricsQueryResult;
 use crate::relish::client::BunClient;
@@ -38,7 +38,9 @@ impl From<crate::relish::RelishError> for ProviderError {
 
 /// All data and stream operations used by the event loop.
 pub trait DataProvider: Send + Sync + 'static {
-    fn status(&self) -> impl Future<Output = Result<Vec<InstanceStatus>, ProviderError>> + Send;
+    fn status(
+        &self,
+    ) -> impl Future<Output = Result<Vec<ClusterInstanceStatus>, ProviderError>> + Send;
     fn nodes(&self) -> impl Future<Output = Result<Vec<NodeStatus>, ProviderError>> + Send;
     fn council(&self) -> impl Future<Output = Result<CouncilStatus, ProviderError>> + Send;
     fn alerts(&self) -> impl Future<Output = Result<Vec<serde_json::Value>, ProviderError>> + Send;
@@ -79,8 +81,8 @@ pub struct HttpDataProvider {
 }
 
 impl DataProvider for HttpDataProvider {
-    async fn status(&self) -> Result<Vec<InstanceStatus>, ProviderError> {
-        self.client.status().await.map_err(Into::into)
+    async fn status(&self) -> Result<Vec<ClusterInstanceStatus>, ProviderError> {
+        self.client.cluster_status().await.map_err(Into::into)
     }
     async fn nodes(&self) -> Result<Vec<NodeStatus>, ProviderError> {
         self.client.nodes().await.map_err(Into::into)
@@ -143,7 +145,7 @@ pub struct MockDataProvider {
 }
 
 impl DataProvider for MockDataProvider {
-    async fn status(&self) -> Result<Vec<InstanceStatus>, ProviderError> {
+    async fn status(&self) -> Result<Vec<ClusterInstanceStatus>, ProviderError> {
         Ok(self.scenario.data().instances)
     }
     async fn nodes(&self) -> Result<Vec<NodeStatus>, ProviderError> {
@@ -242,4 +244,62 @@ pub fn spawn_refresh<P: DataProvider>(provider: Arc<P>, tx: mpsc::Sender<super::
             }
         }
     });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use axum::{Json, Router, extract::Query, routing::get};
+
+    #[tokio::test]
+    async fn status_requests_cluster_replicas_and_keeps_node_and_namespace() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let app = Router::new().route("/v1/status", get(|Query(query): Query<std::collections::HashMap<String, String>>| async move {
+            if query.get("cluster").map(String::as_str) == Some("true") {
+                Json(serde_json::json!([{"node":"node-b", "id":"web-0", "app_name":"web", "namespace":"production", "state":"running", "restart_count":0, "host_port":8080, "exit_code":null, "pid":123}]))
+            } else { Json(serde_json::json!([])) }
+        }));
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        let provider = HttpDataProvider {
+            client: BunClient::new(&format!("http://{address}")),
+        };
+        let result = provider.status().await;
+        server.abort();
+        let _ = server.await;
+        let statuses = result.unwrap();
+        assert_eq!(statuses.len(), 1, "remote-only replica vanished");
+        let json = serde_json::to_value(statuses).unwrap();
+        assert_eq!(json[0]["node"], "node-b");
+        assert_eq!(json[0]["namespace"], "production");
+    }
+
+    #[tokio::test]
+    async fn partial_cluster_status_remains_an_explicit_error() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let app = Router::new().route(
+            "/v1/status",
+            get(|| async {
+                (
+                    axum::http::StatusCode::SERVICE_UNAVAILABLE,
+                    "node-c did not answer; cluster status is incomplete",
+                )
+            }),
+        );
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        let provider = HttpDataProvider {
+            client: BunClient::new(&format!("http://{address}")),
+        };
+        let result = provider.status().await;
+        server.abort();
+        let _ = server.await;
+        assert!(
+            matches!(result, Err(ProviderError::Api { status: 503, body }) if body.contains("node-c"))
+        );
+    }
 }

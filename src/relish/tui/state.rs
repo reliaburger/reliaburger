@@ -2,7 +2,7 @@
 
 use std::collections::{HashMap, VecDeque};
 
-use crate::bun::agent::{CouncilStatus, InstanceStatus, JobStatus, NodeStatus};
+use crate::bun::agent::{ClusterInstanceStatus, CouncilStatus, JobStatus, NodeStatus};
 use crate::bun::events::ClusterEvent;
 use crate::mayo::rollup::MetricsQueryResult;
 use crate::wrapper::types::RouteInfo;
@@ -70,7 +70,7 @@ pub enum View {
 /// Everything fetched from the agent.
 #[derive(Debug, Clone, Default)]
 pub struct ClusterData {
-    pub instances: Vec<InstanceStatus>,
+    pub instances: Vec<ClusterInstanceStatus>,
     pub nodes: Vec<NodeStatus>,
     pub council: Option<CouncilStatus>,
     pub alerts: Vec<serde_json::Value>,
@@ -215,7 +215,12 @@ impl TuiApp {
             .data
             .instances
             .iter()
-            .map(|instance| (instance.app_name.clone(), instance.namespace.clone()))
+            .map(|instance| {
+                (
+                    instance.instance.app_name.clone(),
+                    instance.instance.namespace.clone(),
+                )
+            })
             .collect();
         apps.sort();
         apps.dedup();
