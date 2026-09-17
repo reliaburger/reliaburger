@@ -2275,3 +2275,15 @@ can unwrap an ephemeral bind they expect to succeed, while `bun testapp` and the
 standalone executable add the requested port to an ordinary error and exit
 non-zero. A port already in use no longer produces a panic. The regression
 holds a real listening socket and attempts a second bind to the same port.
+
+A test called `deploy_history_records_each_version` used to accept any completed
+entry after two deployments. The first deployment alone could satisfy it. We
+now wait for the first command to appear in completed history, deploy the changed
+command, then require both distinct commands in the collected history. Collection
+visits every node because deployment history is currently local to the node
+which performed the work. Every query and poll shares the case deadline.
+
+The regression runs the public catalogue case against a controlled HTTP server.
+One server deliberately records only the first version; another records both.
+The first must fail and the second must pass. This checks the test's verdict,
+not just the implementation it claims to test.

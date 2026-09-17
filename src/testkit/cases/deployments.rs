@@ -72,31 +72,60 @@ async fn failed_deploy_rolls_back_automatically(ctx: TestContext) -> Result<(), 
     Ok(())
 }
 
-/// After two deploys of an app, its history lists a completed deploy.
+/// Both distinct deployed commands must appear in completed history records.
 async fn deploy_history_records_each_version(ctx: TestContext) -> Result<(), String> {
     let app = "history";
-    ctx.apply(&ctx.testapp_spec(app, "healthy", 1)).await?;
+    let first = ctx.testapp_spec(app, "healthy", 1);
+    let second = ctx.testapp_spec_args(app, "slow", 1, &["--delay", "100"]);
+    let first_command = crate::config::Config::parse(&first)
+        .map_err(|error| error.to_string())?
+        .app[app]
+        .command
+        .clone();
+    let second_command = crate::config::Config::parse(&second)
+        .map_err(|error| error.to_string())?
+        .app[app]
+        .command
+        .clone();
+    ctx.apply(&first).await?;
     ctx.wait_running_cluster(app, 1).await?;
-    ctx.apply(&ctx.testapp_spec_args(app, "slow", 1, &["--delay", "100"]))
-        .await?;
+    wait_for_recorded_versions(&ctx, app, std::slice::from_ref(&first_command)).await?;
+    ctx.apply(&second).await?;
     ctx.wait_running_cluster(app, 1).await?;
+    wait_for_recorded_versions(&ctx, app, &[first_command, second_command]).await
+}
 
-    let history = ctx
-        .client
-        .deploy_history(app, &ctx.namespace)
+async fn wait_for_recorded_versions(
+    ctx: &TestContext,
+    app: &str,
+    commands: &[Vec<String>],
+) -> Result<(), String> {
+    ctx.deadline
+        .run("completed history for every deployed version", async {
+            loop {
+                let mut history = Vec::new();
+                for (node, client) in ctx.node_clients().await? {
+                    history.extend(
+                        client
+                            .deploy_history(app, &ctx.namespace)
+                            .await
+                            .map_err(|error| format!("deploy history on {node}: {error}"))?,
+                    );
+                }
+                let complete = commands.iter().all(|command| {
+                    history.iter().any(|entry| {
+                        entry["result"] == "Completed"
+                            && entry["spec"]["command"] == serde_json::json!(command)
+                    })
+                });
+                if complete {
+                    return Ok(());
+                }
+                tokio::time::sleep(Duration::from_millis(100)).await;
+            }
+        })
         .await
-        .map_err(|error| format!("deploy history: {error}"))?;
-    if history.is_empty() {
-        return Err("deploy history is empty after two deploys".to_string());
-    }
-    // DeployResult serialises PascalCase; a successful deploy is "Completed".
-    let has_completed = history
-        .iter()
-        .any(|entry| entry.get("result").and_then(|r| r.as_str()) == Some("Completed"));
-    if !has_completed {
-        return Err(format!("no Completed deploy in history: {history:?}"));
-    }
-    Ok(())
+        .map_err(|error| error.to_string())?
 }
 
 pub fn cases() -> Vec<TestCase> {
@@ -124,4 +153,81 @@ pub fn cases() -> Vec<TestCase> {
             run: testkit_case!(deploy_history_records_each_version),
         },
     ]
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::Arc;
+    use tokio::sync::Mutex;
+
+    async fn run_history_case(record_every_version: bool) -> Result<(), String> {
+        let recorded = Arc::new(Mutex::new(Vec::<serde_json::Value>::new()));
+        let writes = Arc::clone(&recorded);
+        let reads = Arc::clone(&recorded);
+        let router = axum::Router::new()
+            .route("/v1/apply", axum::routing::post(move |body: String| {
+                let writes = Arc::clone(&writes);
+                async move {
+                    let config = crate::config::Config::parse(&body).unwrap();
+                    let mut history = writes.lock().await;
+                    if history.is_empty() || record_every_version {
+                        history.push(serde_json::json!({
+                            "result": "Completed", "spec": config.app["history"]
+                        }));
+                    }
+                    format!("data: {}\n\n", serde_json::to_string(
+                        &crate::bun::agent::ApplyEvent::Complete { created: 1, instances: vec![] }
+                    ).unwrap())
+                }
+            }))
+            .route("/v1/cluster/nodes", axum::routing::get(|| async { axum::Json(serde_json::json!([])) }))
+            .route("/v1/status", axum::routing::get(|| async { axum::Json(serde_json::json!([
+                {"id":"history-0", "app_name":"history", "namespace":"rbtest-history-00", "state":"running", "restart_count":0,"host_port":null,"pid":null}
+            ])) }))
+            .route("/v1/deploys/history/history", axum::routing::get(move || {
+                let reads = Arc::clone(&reads);
+                async move { axum::Json(serde_json::json!({"history": reads.lock().await.clone()})) }
+            }));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            axum::serve(listener, router).await.unwrap();
+        });
+        let timeout = Duration::from_millis(500);
+        let context = TestContext {
+            client: crate::relish::client::BunClient::new_with_token(
+                &format!("http://{address}"),
+                None,
+            ),
+            namespace: "rbtest-history-00".into(),
+            lease_id: None,
+            chaos_guard: crate::testkit::chaos::ChaosGuard::default(),
+            capabilities: crate::bun::capabilities::ClusterCapabilities::default(),
+            timeout,
+            deadline: crate::testkit::deadline::Deadline::after(timeout).unwrap(),
+        };
+        let case = cases()
+            .into_iter()
+            .find(|case| case.name == "deploy_history_records_each_version")
+            .unwrap();
+        let result = tokio::time::timeout(Duration::from_secs(2), (case.run)(context))
+            .await
+            .unwrap();
+        server.abort();
+        result
+    }
+
+    #[tokio::test]
+    async fn history_case_rejects_a_second_version_missing_from_history() {
+        assert!(
+            run_history_case(false).await.is_err(),
+            "one completed version must not prove both versions were recorded"
+        );
+    }
+
+    #[tokio::test]
+    async fn history_case_accepts_both_completed_versions() {
+        run_history_case(true).await.unwrap();
+    }
 }

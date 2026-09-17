@@ -14,7 +14,7 @@ Single source of truth for what's done and what's next. Check off an item only w
 - [x] Commit the release scope and acceptance plan (`99e4ff9`).
 - [x] Validate setup liveness and bounded subsystem readiness (`6ee50a6`; 268 Relish tests).
 - [x] Stream registry uploads and bound writers (`1ea2b1a`; 228 registry tests, all-target Clippy).
-- [ ] Measure registry memory use under concurrent pushes in the laptop VM.
+- [x] Measure registry memory under concurrent pushes (`5343072`; four 128 MiB uploads, 37.5 MiB RSS growth in a 2 GiB VM).
 - [x] Package self-contained Linux agents and native laptop CLIs (`c448f58`, `79b31b9`; all four hosted native builds pass).
 - [ ] Publish verifiable release metadata and signed artefacts.
 - [x] Implement secure, resumable managed laptop clusters and installer (committed on `codex/v0.1.0-release`; three real Linux VMs passed setup, HTTP ingress and stop/start on 17 September).
@@ -22,6 +22,7 @@ Single source of truth for what's done and what's next. Check off an item only w
 - [x] Route ingress across nodes and report cluster-wide CLI status (`ea98c4b`, `81611a0`).
 - [x] Propagate storage/bootstrap errors, honour experimental Apple runtime settings, and audit HTTP methods (`6c5bd6f`, `95513ea`, `54f9ee7`).
 - [x] Report unavailable GitOps queues/export failures and show real dashboard replica counts (`baf73f2`, `592e285`).
+- [x] Connect the host browser through pinned TLS and show remote app instances (`5343072`; session tests, 48 rendering tests and three-node acceptance).
 - [ ] Close the remaining correctness findings listed in the release plan.
 - [ ] Qualify the downloaded candidate on clean hosts and record three-node timing.
 - [ ] Pass the real-cluster and final release acceptance gates.
