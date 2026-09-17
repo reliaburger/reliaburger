@@ -158,17 +158,10 @@ fn confirm_chaos(
     }
 }
 
-/// A short lowercase-hex tag, unique enough per invocation to keep two
-/// concurrent runs' namespaces apart.
+/// A random 128-bit lowercase-hex tag, independent of clock resolution and PID.
+/// Lease admission remains the authority if a namespace is already owned.
 fn generate_run_id() -> String {
-    let seconds = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|elapsed| elapsed.as_secs())
-        .unwrap_or(0);
-    // The low 32 bits are eight hex digits — plenty of spread for the minutes
-    // between two `relish test` calls, and short enough to read in a
-    // namespace name.
-    format!("{:x}", seconds & 0xffff_ffff)
+    format!("{:032x}", rand::random::<u128>())
 }
 
 fn render(report: &TestReport, output: OutputFormat) -> Result<(), RelishError> {
@@ -322,12 +315,32 @@ mod tests {
     fn a_run_id_is_short_lowercase_hex() {
         let id = generate_run_id();
         assert!(!id.is_empty());
-        assert!(id.len() <= 8, "{id}");
+        assert_eq!(id.len(), 32, "{id}");
         assert!(
             id.chars()
                 .all(|c| c.is_ascii_hexdigit() && !c.is_ascii_uppercase()),
             "{id}"
         );
+    }
+
+    #[test]
+    fn concurrent_run_ids_make_distinct_valid_namespaces() {
+        let ids: Vec<_> = std::thread::scope(|scope| {
+            let workers: Vec<_> = (0..8)
+                .map(|_| scope.spawn(|| (0..128).map(|_| generate_run_id()).collect::<Vec<_>>()))
+                .collect();
+            workers
+                .into_iter()
+                .flat_map(|worker| worker.join().unwrap())
+                .collect()
+        });
+        let unique: std::collections::HashSet<_> = ids.iter().collect();
+        assert_eq!(unique.len(), ids.len(), "concurrent invocations collided");
+        for id in ids {
+            assert!(testkit::lease::valid_test_namespace(
+                &testkit::TestContext::namespace_for(&id, 999)
+            ));
+        }
     }
 
     #[test]

@@ -2519,3 +2519,16 @@ Hosted comparisons remain informational, but still display missing observations.
 The regression test replaces a baseline metric with a new one: it must fail and
 name both. Adding a new metric while retaining the baseline measurements stays
 clean. We don't invent a numeric value for absent evidence.
+
+### Give each invocation its own namespace
+
+Two test commands launched in the same second used to share a run ID. A
+1,024-invocation concurrent regression produced exactly one distinct ID. The
+command now draws 128 random bits and formats all 32 hexadecimal digits, leaving
+room for the `rbtest-` prefix and case suffix within a DNS label. It no longer
+depends on clock resolution, PID reuse or a process-local counter.
+
+Randomness makes accidental collisions negligible; it isn't ownership proof.
+The server still refuses a namespace with an active lease, including explicitly
+chosen fixed namespaces. Cleanup remains tied to the granted lease. Tests check
+concurrent IDs, DNS-label validity and the existing collision refusal.
