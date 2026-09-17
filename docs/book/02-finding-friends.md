@@ -2329,3 +2329,19 @@ watcher that shuts down Raft. We disarm the guard only after assembling the
 complete runtime. This is Rust's scope-based resource cleanup applied to async
 startup: the guard's destructor sends cancellation; the tasks perform their
 asynchronous cleanup when they receive it.
+
+### The first boot is part of the cluster
+
+Our first empty-cache laptop run stopped at five minutes. SSH accepted the
+managed key, then took two minutes to open each session on two guests. The
+journals traced the wait to `pam_systemd`, after Lima had replaced the user
+manager during first boot. Rebooting recovered those VMs, and setup resumed
+with its original credentials. Useful recovery behaviour. Still a failed start.
+
+System provisioning now restarts the guest login service after Lima's built-in
+user setup. This changes only the managed guest. It doesn't weaken SSH or PAM,
+and it doesn't touch the host's configuration. The next empty-home run booted
+three Linux nodes and passed sample HTTP in 241.75 seconds. We record the
+[conditions and exclusions](../qualification/2026-09-17-laptop.md): it used local
+development binaries, so downloading and verifying a signed release remains a
+separate acceptance gate. One passing measurement is evidence, not a guarantee.

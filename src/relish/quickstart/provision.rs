@@ -36,6 +36,9 @@ pub fn vm_config(
         "portForwards":forwards,
         "provision":[{"mode":"system","script": concat!(
             "#!/bin/bash\nset -eu\nexport DEBIAN_FRONTEND=noninteractive\n",
+            // Lima changes the user manager during first boot. Reconnect logind
+            // after that transition so subsequent PAM sessions do not stall.
+            "systemctl restart systemd-logind.service\n",
             "apt-get update -qq\napt-get install -y -qq runc uidmap btrfs-progs nftables iptables iproute2\n",
             "install -d -m 700 /etc/reliaburger\n")
         }]
