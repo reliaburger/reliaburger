@@ -533,3 +533,35 @@ workers to a real TCP aggregator. Upgrade tests also bound HTTP requests, so a
 socket that accepts connections without answering cannot hide the failure
 behind an unbounded read. These checks fix the observed listener collision;
 they do not establish that every upgrade failure has the same cause.
+
+
+### Qualifying the parser behind an archive
+
+A dependency advisory named Thrift, which our Parquet reader uses for metadata.
+Updating that crate is only part of the repair. Parquet also has a private
+compact-protocol decoder. Its integer loop kept shifting until an input byte
+said to stop, and used a wrapping shift. Sixty-four continuation bytes could
+therefore turn malformed metadata back into a plausible value.
+
+The regression writes a real one-row Parquet file, changes the metadata integer,
+updates the footer length and asks the public reader to open it. The untouched
+file must work; the malformed one must return an error. This checks the parsing
+path we actually ship, rather than merely comparing dependency version numbers.
+
+We keep the query engine on DataFusion 45 and use Thrift 0.23 with a small,
+reviewable patch to Parquet 54.3.1. The upstream source, licence, archive checksum
+and exact patch live under `vendor/parquet`. Cargo's `[patch.crates-io]` section
+makes every dependent crate use that same parser. It is a temporary maintained
+dependency, with removal criteria recorded beside it.
+
+The decoder now visits only the bit positions that fit the wire integer. Each
+step also checks that the final byte's payload fits the remaining bits. Lengths
+and 32-bit integers get a 32-bit budget; 64-bit values get 64 bits. Unknown-field
+skipping uses these same methods, so adding an unfamiliar field cannot bypass
+the check. We also reject list counts larger than the remaining metadata before
+allocation, and replace a truncated-double indexing panic with an EOF error.
+
+The tests include a valid maximum-width integer to make sure refusal hasn't
+become indiscriminate. Normal metric, rollup and log persistence/query tests
+remain part of qualification. A dependency scan is useful evidence. A parser
+regression is different evidence, and we need both.

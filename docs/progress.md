@@ -74,7 +74,7 @@ remain separate. Older unchecked groups below point into this current ledger.
 - [ ] **C43** (P2) Resolve short service names in the caller namespace.
 - [x] **C44** Remove unused reporting worker listeners, preserve TLS/framing and bound upgrade-harness HTTP requests. Six transport unit tests and three real TCP/TLS integration tests pass. Linux qualification reproduced an ephemeral listener occupying another node's API port; the focused upgrade/rollback rerun passes in 74.61s, but an intermittent upgrade stall remains under V02 (one of three full-suite cases failed).
 
-- [x] **C45** Poll readiness publication alongside its subsystem owner, avoiding a fair-lock deadlock in both supervision loops. Both contention regressions fail before the fix; all ten readiness tests pass afterwards, including retired-attempt fencing and panic/restart behaviour. Full Linux upgrade qualification remains V02.
+- [x] **C45** Poll readiness publication alongside its subsystem owner, avoiding a fair-lock deadlock in both supervision loops. Both contention regressions fail before the fix; all ten readiness tests pass afterwards, including retired-attempt fencing and panic/restart behaviour. All three Linux upgrade/rollback/pause-resume cases pass in 177.50s after the repair; sustained qualification remains V02.
 
 ### Engineering follow-ups
 
@@ -90,7 +90,7 @@ remain separate. Older unchecked groups below point into this current ledger.
 - [ ] **H10** (P3) Reuse one egress observation per health tick.
 - [x] **H11** Declare Rust 1.97, pin release/CI builds to 1.98.0 and add a locked minimum-compiler CI job for both feature configurations, including stacked PR triggers. Linux 1.97 checks every target/feature and passes 3,155 default plus 3,115 no-default library tests; macOS 1.98 passes 3,413 default plus 3,373 no-default portable tests. The no-default process leak remains H08. Build/rebuild policy and both READMEs are updated.
 
-- [ ] **H12** (P2) Resolve the active Thrift dependency alert and qualify its parsing path before publication.
+- [x] **H12** Upgrade to Thrift 0.23 and patch Parquet's independent compact decoder with bounded integer/allocation checks and error-returning truncated reads. The public-reader regression fails against unpatched Parquet; six boundary tests, all 3,433 portable tests, strict all-target/all-feature Clippy and `make audit` pass. The portable run retains one H08 leak report. Upstream source, checksum, licences and exact patch are committed; DataFusion/Arrow versions remain unchanged.
 
 ### Missing capabilities and longer-term scope
 
