@@ -870,3 +870,22 @@ for quickstart. Changing the registry does not mean changing the workload:
 the digest stays fixed, and the normal OCI client still resolves the host
 architecture and checks downloaded content. This remains a network dependency,
 so the signed cold-install gate must exercise it too.
+
+### Status from any node
+
+A one-replica app can run on the third VM while your CLI connects to the first.
+The old `relish status` asked only that first agent and printed “no workloads
+running”. The request succeeded; the answer was still misleading.
+
+The CLI now requests `/v1/status?cluster=true`. Bun collects its own instance
+statuses, then asks the other known members for their local `/v1/status`.
+Keeping the leaf endpoint local prevents recursive fan-out. Internal requests
+reuse the cluster's HTTPS client and service bearer. Each row carries its node
+name, so identical node-local instance IDs remain distinguishable.
+
+The collector runs at most eight peer requests concurrently and puts a deadline
+around each complete response, including its body. An unresponsive member makes
+the operation fail with that node's name. An empty list should mean no workloads,
+not that we silently dropped the machine running them. We test this with a
+listener that accepts connections but never sends an HTTP response, as well as
+three real agents queried from each node.

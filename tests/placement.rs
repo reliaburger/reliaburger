@@ -1132,6 +1132,14 @@ async fn ingress_reaches_nodes_without_local_replicas() {
         }
         tokio::time::sleep(Duration::from_millis(250)).await;
     }
+    if converged {
+        for node in nodes {
+            let instances = node.client.cluster_status().await.unwrap();
+            assert_eq!(instances.len(), 1);
+            assert_eq!(instances[0].instance.app_name, "web");
+            assert!(!instances[0].node.is_empty());
+        }
+    }
     shutdown.cancel();
     for node in nodes {
         if let Some(council) = &node.handle.council {

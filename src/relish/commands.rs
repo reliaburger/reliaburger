@@ -85,7 +85,7 @@ pub async fn status(output: OutputFormat) -> Result<(), RelishError> {
 }
 
 async fn status_with_client(output: OutputFormat, client: &BunClient) -> Result<(), RelishError> {
-    let statuses = client.status().await?;
+    let statuses = client.cluster_status().await?;
 
     match output {
         OutputFormat::Human => {
@@ -93,17 +93,18 @@ async fn status_with_client(output: OutputFormat, client: &BunClient) -> Result<
                 println!("no workloads running");
             } else {
                 println!(
-                    "{:<20} {:<15} {:<12} {:<10} {:<10} {:<6}",
-                    "INSTANCE", "APP", "NAMESPACE", "STATE", "PID", "RESTARTS"
+                    "{:<24} {:<20} {:<15} {:<12} {:<10} {:<10} {:<6}",
+                    "NODE", "INSTANCE", "APP", "NAMESPACE", "STATE", "PID", "RESTARTS"
                 );
-                for s in &statuses {
+                for row in &statuses {
+                    let s = &row.instance;
                     let pid = s
                         .pid
                         .map(|p| p.to_string())
                         .unwrap_or_else(|| "-".to_string());
                     println!(
-                        "{:<20} {:<15} {:<12} {:<10} {:<10} {:<6}",
-                        s.id, s.app_name, s.namespace, s.state, pid, s.restart_count
+                        "{:<24} {:<20} {:<15} {:<12} {:<10} {:<10} {:<6}",
+                        row.node, s.id, s.app_name, s.namespace, s.state, pid, s.restart_count
                     );
                 }
             }

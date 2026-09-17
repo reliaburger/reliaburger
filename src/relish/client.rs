@@ -644,6 +644,13 @@ impl BunClient {
         Ok(())
     }
 
+    /// Read every reachable cluster member, failing if the result is incomplete.
+    pub async fn cluster_status(
+        &self,
+    ) -> Result<Vec<crate::bun::agent::ClusterInstanceStatus>, RelishError> {
+        self.get_typed_json("/v1/status?cluster=true").await
+    }
+
     /// Get status of all instances.
     pub async fn status(&self) -> Result<Vec<InstanceStatus>, RelishError> {
         let url = format!("{}/v1/status", self.base_url);

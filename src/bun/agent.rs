@@ -1241,6 +1241,16 @@ pub struct InstanceStatus {
     pub pid: Option<u32>,
 }
 
+/// A workload status with the node that supplied it.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ClusterInstanceStatus {
+    /// Node name, or `local` for a standalone agent.
+    pub node: String,
+    /// Node-local workload evidence.
+    #[serde(flatten)]
+    pub instance: InstanceStatus,
+}
+
 /// Status of a run-to-completion job instance, as returned by `/v1/jobs`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct JobStatus {

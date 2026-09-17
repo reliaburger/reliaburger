@@ -2675,29 +2675,130 @@ async fn current_apps_handler(State(state): State<ApiState>) -> Response {
     Json(rows).into_response()
 }
 
-async fn status_handler(State(state): State<ApiState>) -> Response {
-    let (resp_tx, resp_rx) = oneshot::channel();
-    if state
-        .cmd_tx
-        .send(AgentCommand::Status { response: resp_tx })
-        .await
-        .is_err()
-    {
-        return (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(serde_json::json!({ "error": "agent unavailable" })),
-        )
-            .into_response();
-    }
+#[derive(Debug, Default, Deserialize)]
+struct StatusQuery {
+    #[serde(default)]
+    cluster: bool,
+}
 
-    match resp_rx.await {
-        Ok(statuses) => Json(serde_json::json!(statuses)).into_response(),
-        Err(_) => (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(serde_json::json!({ "error": "agent dropped response" })),
+async fn local_statuses(state: &ApiState) -> Result<Vec<InstanceStatus>, String> {
+    tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        let (response, receiver) = oneshot::channel();
+        state
+            .cmd_tx
+            .send(AgentCommand::Status { response })
+            .await
+            .map_err(|_| "agent unavailable".to_string())?;
+        receiver
+            .await
+            .map_err(|_| "agent dropped response".to_string())
+    })
+    .await
+    .map_err(|_| "agent status timed out".to_string())?
+}
+
+async fn status_handler(
+    State(state): State<ApiState>,
+    Query(query): Query<StatusQuery>,
+) -> Response {
+    if !query.cluster {
+        return match local_statuses(&state).await {
+            Ok(statuses) => Json(statuses).into_response(),
+            Err(error) => (
+                StatusCode::SERVICE_UNAVAILABLE,
+                Json(serde_json::json!({"error": error})),
+            )
+                .into_response(),
+        };
+    }
+    match cluster_statuses(&state).await {
+        Ok(statuses) => Json(statuses).into_response(),
+        Err(error) => (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(serde_json::json!({"error": error})),
         )
             .into_response(),
     }
+}
+
+async fn cluster_statuses(
+    state: &ApiState,
+) -> Result<Vec<super::agent::ClusterInstanceStatus>, String> {
+    let local_name = state
+        .node_name
+        .clone()
+        .or_else(|| {
+            state.council.as_ref().and_then(|council| {
+                let receiver = council.metrics();
+                let metrics = receiver.borrow();
+                metrics
+                    .membership_config
+                    .membership()
+                    .get_node(&metrics.id)
+                    .map(|node| node.name.clone())
+            })
+        })
+        .unwrap_or_else(|| "local".to_string());
+    let mut statuses: Vec<_> = local_statuses(state)
+        .await?
+        .into_iter()
+        .map(|instance| super::agent::ClusterInstanceStatus {
+            node: local_name.to_string(),
+            instance,
+        })
+        .collect();
+    let members = match &state.membership {
+        Some(membership) => membership.read().await.clone(),
+        None => Vec::new(),
+    };
+    let requests = futures_util::stream::iter(
+        members
+            .into_iter()
+            .filter(|member| member.node_id.0 != local_name)
+            .map(|member| async move {
+                let name = member.node_id.0;
+                let result = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+                    let url = state
+                        .cluster_http
+                        .url(&member.address.to_string(), "/v1/status");
+                    let mut request = state.cluster_http.client().get(url);
+                    if let Some(token) = &state.service_token {
+                        request = request.bearer_auth(token);
+                    }
+                    request
+                        .send()
+                        .await?
+                        .error_for_status()?
+                        .json::<Vec<InstanceStatus>>()
+                        .await
+                })
+                .await;
+                match result {
+                    Ok(Ok(instances)) => Ok(instances
+                        .into_iter()
+                        .map(|instance| super::agent::ClusterInstanceStatus {
+                            node: name.clone(),
+                            instance,
+                        })
+                        .collect::<Vec<_>>()),
+                    Ok(Err(error)) => Err(format!("status incomplete: node {name}: {error}")),
+                    Err(_) => Err(format!("status incomplete: node {name} timed out")),
+                }
+            }),
+    )
+    .buffer_unordered(8);
+    tokio::pin!(requests);
+    while let Some(result) = requests.next().await {
+        statuses.extend(result?);
+    }
+    statuses.sort_by(|left, right| {
+        (&left.node, &left.instance.namespace, &left.instance.id).cmp(&(
+            &right.node,
+            &right.instance.namespace,
+            &right.instance.id,
+        ))
+    });
+    Ok(statuses)
 }
 
 /// List all run-to-completion workload instances.
@@ -9551,6 +9652,58 @@ mod tests {
 
         assert_eq!(response.status(), StatusCode::BAD_REQUEST);
         shutdown.cancel();
+    }
+
+    #[tokio::test]
+    async fn cluster_status_refuses_to_report_success_when_a_member_is_unreachable() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        // Keep the port reserved but never serve HTTP: the entire response
+        // (including its body) must have a deadline.
+        let (cmd_tx, mut cmd_rx) = mpsc::channel(2);
+        let worker = tokio::spawn(async move {
+            if let Some(AgentCommand::Status { response }) = cmd_rx.recv().await {
+                let _ = response.send(Vec::new());
+            }
+        });
+        let members = Arc::new(RwLock::new(vec![NodeMembershipInfo {
+            node_id: crate::meat::NodeId::new("unresponsive"),
+            address,
+        }]));
+        let app = router(
+            cmd_tx,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            Some(members),
+            None,
+            9117,
+            None,
+        );
+        let response = tokio::time::timeout(
+            std::time::Duration::from_secs(7),
+            app.oneshot(
+                axum::http::Request::builder()
+                    .uri("/v1/status?cluster=true")
+                    .body(Body::empty())
+                    .unwrap(),
+            ),
+        )
+        .await
+        .expect("status must be bounded")
+        .unwrap();
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert!(json["error"].as_str().unwrap().contains("unresponsive"));
+        worker.await.unwrap();
+        drop(listener);
     }
 
     #[tokio::test]
