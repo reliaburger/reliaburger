@@ -56,6 +56,8 @@ pub struct MustardNode<T: MustardTransport> {
     /// Optional watch channel for publishing membership snapshots.
     /// Set when running inside the agent, None in standalone tests.
     membership_watch: Option<watch::Sender<Vec<MembershipSnapshot>>>,
+    /// Process-local proof that a peer has acknowledged our gossip.
+    rejoin_watch: Option<watch::Sender<bool>>,
     /// Digest of the last-published membership. Used to publish on any content
     /// change (state/incarnation/council/leader), not just a count change.
     last_published_digest: Vec<(NodeId, NodeState, u64, bool, bool)>,
@@ -98,6 +100,12 @@ pub struct MustardNode<T: MustardTransport> {
 }
 
 impl<T: MustardTransport> MustardNode<T> {
+    /// Publish fresh process-local rejoin evidence after a direct peer ACK.
+    /// Seed entries and piggybacked membership never count as proof.
+    pub fn set_rejoin_watch(&mut self, sender: watch::Sender<bool>) {
+        self.rejoin_watch = Some(sender);
+    }
+
     /// Maximum number of peers to notify during graceful leave.
     const MAX_LEAVE_FANOUT: usize = 10;
 
@@ -117,6 +125,7 @@ impl<T: MustardTransport> MustardNode<T> {
             transport,
             lamport: 0,
             membership_watch: None,
+            rejoin_watch: None,
             last_published_digest: Vec::new(),
             left: false,
             seeds: Vec::new(),
@@ -649,7 +658,13 @@ impl<T: MustardTransport> MustardNode<T> {
                     }
                 }
             }
-            GossipPayload::Ack { .. } => {
+            GossipPayload::Ack { relayed, .. } => {
+                if !relayed
+                    && message.sender != self.node_id
+                    && let Some(sender) = &self.rejoin_watch
+                {
+                    sender.send_replace(true);
+                }
                 // Mark sender as alive (ACK received)
                 if let Some(member) = self.membership.get_mut(&message.sender) {
                     if member.state == NodeState::Suspect {
@@ -894,8 +909,16 @@ mod tests {
         let mut node1 = MustardNode::new(NodeId::new("n1"), addr(1), fast_config(), t1);
         let mut node2 = MustardNode::new(NodeId::new("n2"), addr(2), fast_config(), t2);
 
+        let (rejoin_tx, rejoin_rx) = watch::channel(false);
+        node1.set_rejoin_watch(rejoin_tx);
+
         // n1 knows about n2
         node1.add_seed(NodeId::new("n2"), addr(2));
+
+        assert!(
+            !*rejoin_rx.borrow(),
+            "seed membership is not rejoin evidence"
+        );
 
         // Spawn n2 to handle incoming messages
         let shutdown = CancellationToken::new();
@@ -907,6 +930,11 @@ mod tests {
 
         // n1 runs one probe cycle — should ping n2 and get ACK
         node1.run_one_cycle().await;
+
+        assert!(
+            *rejoin_rx.borrow(),
+            "a responding peer proves gossip rejoin"
+        );
 
         // n2 should still be alive (not suspected)
         let n2_state = node1.membership.get(&NodeId::new("n2")).unwrap().state;
@@ -923,6 +951,8 @@ mod tests {
         // Don't register addr(2) — n2 is unreachable
 
         let mut node1 = MustardNode::new(NodeId::new("n1"), addr(1), fast_config(), t1);
+        let (rejoin_tx, rejoin_rx) = watch::channel(false);
+        node1.set_rejoin_watch(rejoin_tx);
         // Tell n1 about n2 (but n2 isn't actually there)
         node1.membership.add_node(
             NodeId::new("n2"),
@@ -937,6 +967,10 @@ mod tests {
 
         let n2_state = node1.membership.get(&NodeId::new("n2")).unwrap().state;
         assert_eq!(n2_state, NodeState::Suspect);
+        assert!(
+            !*rejoin_rx.borrow(),
+            "unreachable membership cannot prove rejoin"
+        );
     }
 
     #[tokio::test]

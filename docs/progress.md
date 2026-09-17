@@ -65,7 +65,7 @@ remain separate. Older unchecked groups below point into this current ledger.
 - [ ] **C34** (P2) Define lease ownership for the remaining test resources.
 - [ ] **C35** (P2) Gate chaos capabilities per selected scenario.
 - [ ] **C36** (P1) Target and clean up the legacy chaos command precisely.
-- [ ] **C37** (P1) Require rejoin before committing the local upgrade marker.
+- [x] **C37** Require a fresh direct gossip acknowledgement before committing the local upgrade marker, with an enforced rejoin deadline. All 28 gossip and 115 upgrade unit tests pass; a real isolated replacement serves locally, retains its marker, reverts after five seconds and adopts the same workload PID (33.97s). Coordinator rejoin checks remain independent.
 - [ ] **C38** (P2) Make blocked deployment replacement explicit.
 - [ ] **C39** (P2) Handle development CLI paths without unwraps.
 - [ ] **C40** (P2) Own replaced rootless proxy processes.

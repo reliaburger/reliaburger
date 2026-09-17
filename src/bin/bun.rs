@@ -839,6 +839,7 @@ async fn run_agent(cli: Cli) -> anyhow::Result<()> {
     // ClusterHandle moves into the agent (spawned further down, once
     // the service token exists).
     let mut orchestration = None;
+    let mut upgrade_rejoin_rx = None;
     let mut agent = if cli.cluster {
         let mut params = cluster_params_from_config(&config)?;
         registry_cluster_advertise = Some(params.gossip_addr.ip());
@@ -878,6 +879,7 @@ async fn run_agent(cli: Cli) -> anyhow::Result<()> {
             reliaburger::cluster::runtime::start(params, agent_shutdown.clone())
                 .await
                 .map_err(|e| anyhow::anyhow!("failed to start cluster runtime: {e}"))?;
+        upgrade_rejoin_rx = Some(cluster_runtime.gossip_rejoined_rx.clone());
         api_rollup_store = Some(Arc::clone(&cluster_runtime.rollup_store));
         api_council = handle.council.clone();
         crl_refresh = Some(handle.crl_handle.clone());
@@ -1874,17 +1876,24 @@ async fn run_agent(cli: Cli) -> anyhow::Result<()> {
     // A freshly swapped-in version must prove itself: after the boot grace
     // period, ask the agent to verify that every pre-upgrade workload
     // survived, then commit (or flag revert and exit).
-    // TODO(Phase 14, orchestration step): in cluster mode, also require
-    // gossip rejoin within upgrades.gossip_rejoin_secs before committing.
+    // Gossip proof is independent of local API health and restored membership.
     if let Some(marker) = upgrade_verify.take() {
         let verify_tx = cmd_tx.clone();
         let grace_secs = config.upgrades.boot_grace_secs;
+        let rejoin_secs = config.upgrades.gossip_rejoin_secs;
         tokio::spawn(async move {
-            tokio::time::sleep(std::time::Duration::from_secs(grace_secs)).await;
+            let (_, rejoin) = tokio::join!(
+                tokio::time::sleep(std::time::Duration::from_secs(grace_secs)),
+                reliaburger::upgrade::rejoin::wait_for_rejoin(
+                    upgrade_rejoin_rx,
+                    std::time::Duration::from_secs(rejoin_secs),
+                ),
+            );
             let (tx, rx) = tokio::sync::oneshot::channel();
             if verify_tx
                 .send(reliaburger::bun::agent::AgentCommand::UpgradeVerify {
                     marker,
+                    rejoin,
                     response: tx,
                 })
                 .await

@@ -55,6 +55,8 @@ const RECONCILE_OP_TIMEOUT: Duration = Duration::from_secs(5);
 /// working, and exposes the local reporting aggregator's view. The spawned
 /// tasks stop when the shared `CancellationToken` is cancelled.
 pub struct ClusterRuntime {
+    /// Fresh peer acknowledgement from this process, never restored membership.
+    pub gossip_rejoined_rx: watch::Receiver<bool>,
     /// This node's reporting aggregator view. Only meaningful on the leader
     /// (the flat-star topology has every node report to the leader), where it
     /// holds the latest state report from every node.
@@ -235,6 +237,8 @@ pub async fn start(
 
     let (membership_tx, membership_rx) = watch::channel::<Vec<MembershipSnapshot>>(Vec::new());
     node.set_membership_watch(membership_tx);
+    let (rejoin_tx, gossip_rejoined_rx) = watch::channel(false);
+    node.set_rejoin_watch(rejoin_tx);
 
     // Control-plane directory (12b.2): every datagram this node sends
     // advertises its API and reporting endpoints, plus the best leader hint
@@ -631,6 +635,7 @@ pub async fn start(
     Ok((
         handle,
         ClusterRuntime {
+            gossip_rejoined_rx,
             aggregated_rx,
             rollup_store,
             directory_rx,

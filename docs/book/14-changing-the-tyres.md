@@ -562,6 +562,30 @@ Failure detection also falls out of polling. A node that was `Verifying` and rea
 
 One more thing has to be true before a node counts as *done*, and it's easy to miss: the node has to be back in the **gossip mesh**. HTTP-healthy at the target version is necessary but not sufficient — a process can come up, answer `/v1/health`, and still be isolated from the mesh (a firewall that didn't reopen, an interface that didn't come back). An isolated node takes no service traffic and its vote doesn't count; calling it "upgraded" and moving on would quietly shrink the cluster one node at a time. So the `Healthy` transition needs all three: target version, HTTP-healthy, *and* `Alive` in the current gossip snapshot. A node that's healthy-but-not-in-gossip is held in `Verifying` until it rejoins — and if it never does, the stuck-node timeout catches it and pauses the run, which is exactly the operator's cue that something's wrong with that box. The two unit tests spell out the difference: same probe (healthy, on target), one with the node in the gossip-alive set and one without — the first completes, the second doesn't.
 
+### The replacement must prove rejoin locally too
+
+The coordinator's check does not own the marker on a replaced node. We now
+require two independent facts before that process removes its marker: it survived
+`boot_grace_secs`, and its own gossip transport received a direct peer ACK within
+`gossip_rejoin_secs`. Restored membership, configured seeds and an HTTP response
+are not that evidence. Even a singleton running in cluster mode needs a peer;
+standalone mode retains its workload-only verification.
+
+A `watch::Receiver<bool>` carries this process-local observation. The receiver
+starts at `false`; only receipt of a direct acknowledgement changes it. It is
+never serialised or restored from disk. `tokio::join!` polls the boot-grace timer
+and the bounded gossip wait together, so a long grace period does not quietly
+extend the rejoin deadline. A closed channel is a failure too: the owner has
+stopped without proving rejoin.
+
+Failure writes `RevertPending` before exiting. If that write fails, the process
+reports the error and keeps the uncommitted marker; it cannot report success.
+The supervisor then uses the existing revert and workload-adoption machinery.
+The real-process regression runs a healthy isolated cluster node, upgrades it,
+checks that its marker survives boot grace, and verifies that the old binary
+returns with the same workload PID. Separate coordinator tests still require
+that node to appear alive before the rolling upgrade advances.
+
 ### The leader goes last — in place
 
 The original design called for the leader to *transfer* leadership to an already-upgraded member, then upgrade as a follower. We built that, and it failed the integration test in an instructive way. openraft 0.9 has no `transfer_leader`; the closest primitive is `Raft::trigger().elect()`, "call an election on yourself". So the old leader asked an upgraded member to campaign — and it never won. Raft has an *anti-disruption* rule (leader-stickiness): a follower that's recently heard the leader's heartbeat refuses to vote for a challenger, precisely so a flaky node can't unseat a healthy leader. A live leader replicating happily is unseatable this way by design.

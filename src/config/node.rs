@@ -322,8 +322,8 @@ pub struct UpgradeSection {
     /// swap counts as verified.
     pub boot_grace_secs: u64,
     /// Seconds the new binary has to rejoin gossip (cluster mode only).
-    /// Reserved: parsed but not yet enforced (TODO Phase 14 — the cluster-mode
-    /// upgrade-verify path does not yet require a gossip rejoin).
+    /// Requires a direct peer acknowledgement from the replacement process;
+    /// isolated cluster nodes revert even when their local API is healthy.
     pub gossip_rejoin_secs: u64,
     /// Boot attempts on the new version before automatic revert.
     pub max_boot_attempts: u32,

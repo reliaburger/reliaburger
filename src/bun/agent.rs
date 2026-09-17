@@ -462,6 +462,7 @@ pub enum AgentCommand {
     /// Commits on success; flags revert and exits on failure.
     UpgradeVerify {
         marker: crate::upgrade::marker::UpgradeMarker,
+        rejoin: Result<(), String>,
         response: oneshot::Sender<Result<bool, BunError>>,
     },
 }
@@ -3445,8 +3446,12 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
             AgentCommand::UpgradeRollback { version, response } => {
                 self.handle_upgrade_rollback(version, response).await;
             }
-            AgentCommand::UpgradeVerify { marker, response } => {
-                self.handle_upgrade_verify(marker, response).await;
+            AgentCommand::UpgradeVerify {
+                marker,
+                rejoin,
+                response,
+            } => {
+                self.handle_upgrade_verify(marker, rejoin, response).await;
             }
         }
     }
@@ -3548,6 +3553,7 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
     async fn handle_upgrade_verify(
         &mut self,
         marker: crate::upgrade::marker::UpgradeMarker,
+        rejoin: Result<(), String>,
         response: oneshot::Sender<Result<bool, BunError>>,
     ) {
         let Some(manager) = self.upgrade.clone() else {
@@ -3555,11 +3561,25 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
             return;
         };
 
+        if let Err(reason) = rejoin {
+            match manager.mark_revert_pending(&marker, &reason) {
+                Ok(()) => {
+                    let _ = response.send(Ok(false));
+                    eprintln!("bun: {reason}; restarting into the previous binary");
+                    std::process::exit(1);
+                }
+                Err(error) => {
+                    let _ = response.send(Err(BunError::Upgrade(error)));
+                }
+            }
+            return;
+        }
+
         // In cluster mode, workload placement is the cluster's decision:
         // the scheduler may legitimately move an app off this node while it
         // bounces, so a missing pre-upgrade instance is NOT an upgrade
-        // failure. We surviving the boot-grace period (this command runs on
-        // the new binary) is the liveness proof; genuine boot failures are
+        // failure. Boot grace and fresh gossip acknowledgement provide
+        // separate local and cluster liveness proofs; boot failures are
         // caught by the crash-loop budget, which reverts before we ever get
         // here. Single-node keeps the strict check as a local safety net —
         // there is no cluster to reschedule, so a vanished workload really
