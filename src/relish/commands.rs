@@ -658,10 +658,9 @@ pub async fn chaos(action: &str, acknowledged: bool) -> Result<(), RelishError> 
             eprintln!("unknown chaos action: {other}");
             eprintln!();
             eprintln!("available actions:");
-            eprintln!("  council-partition   partition a council minority from the majority");
-            eprintln!("  worker-isolation    isolate a worker from all council members");
+            eprintln!("  use relish test --chaos for guarded recovery scenarios");
             eprintln!("  status              show active fault injections");
-            eprintln!("  heal                remove all fault injections");
+            eprintln!("  mutations and blanket heal are retired");
             Err(RelishError::ApiError {
                 status: 0,
                 body: format!("unknown chaos action: {other}"),

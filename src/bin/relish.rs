@@ -193,9 +193,9 @@ enum Command {
     },
     /// Show ingress routing table.
     Routes,
-    /// Run chaos testing scenarios or manage fault injections.
+    /// Show legacy chaos status (mutations retired; use test --chaos).
     Chaos {
-        /// Scenario or action: council-partition, worker-isolation, status, heal.
+        /// Action: status. Old mutation actions return a migration error.
         action: String,
         /// Confirm that a partition action is intentional.
         #[arg(long)]
