@@ -735,6 +735,23 @@ async fn desired_apps_handler(
     State(state): State<ApiState>,
     auth: Option<axum::Extension<crate::sesame::auth::AuthContext>>,
 ) -> Response {
+    match gather_desired_apps(&state).await {
+        Ok(apps) => Json(filter_desired_apps_for_scope(apps, auth.as_deref())).into_response(),
+        Err(error) => unavailable_response(error),
+    }
+}
+
+fn unavailable_response(error: String) -> Response {
+    (
+        StatusCode::SERVICE_UNAVAILABLE,
+        Json(serde_json::json!({"error": error})),
+    )
+        .into_response()
+}
+
+async fn gather_desired_apps(
+    state: &ApiState,
+) -> Result<Vec<crate::bun::diagnostics::DesiredAppEvidence>, String> {
     let apps = if let Some(council) = &state.council {
         let desired = council.desired_state().await;
         let live_nodes = match &state.membership {
@@ -764,31 +781,21 @@ async fn desired_apps_handler(
         });
         apps
     } else {
-        let (response, receiver) = oneshot::channel();
-        if state
-            .cmd_tx
-            .send(AgentCommand::DesiredApps { response })
-            .await
-            .is_err()
-        {
-            return (
-                StatusCode::SERVICE_UNAVAILABLE,
-                Json(serde_json::json!({"error": "agent unavailable"})),
-            )
-                .into_response();
-        }
-        match receiver.await {
-            Ok(apps) => apps,
-            Err(_) => {
-                return (
-                    StatusCode::SERVICE_UNAVAILABLE,
-                    Json(serde_json::json!({"error": "agent dropped response"})),
-                )
-                    .into_response();
-            }
-        }
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            let (response, receiver) = oneshot::channel();
+            state
+                .cmd_tx
+                .send(AgentCommand::DesiredApps { response })
+                .await
+                .map_err(|_| "agent unavailable".to_string())?;
+            receiver
+                .await
+                .map_err(|_| "agent dropped desired-app response".to_string())
+        })
+        .await
+        .map_err(|_| "desired-app query timed out".to_string())??
     };
-    Json(filter_desired_apps_for_scope(apps, auth.as_deref())).into_response()
+    Ok(apps)
 }
 
 /// `POST /v1/trace` — fixed DNS and TCP probes from a local source workload.
@@ -5129,35 +5136,58 @@ async fn gather_statuses(state: &ApiState) -> Vec<InstanceStatus> {
 }
 
 /// Build dashboard app rows from instance statuses.
-fn statuses_to_dashboard_apps(statuses: &[InstanceStatus]) -> Vec<DashboardApp> {
-    // Group by (app_name, namespace) to get correct instance counts.
-    let mut app_map: std::collections::HashMap<(String, String), (usize, String)> =
-        std::collections::HashMap::new();
-    for s in statuses {
-        let key = (s.app_name.clone(), s.namespace.clone());
-        let entry = app_map.entry(key).or_insert((0, s.state.clone()));
-        entry.0 += 1;
-        // If any instance is not running, show the worst state.
-        if s.state != "running" {
-            entry.1 = s.state.clone();
+fn statuses_to_dashboard_apps(
+    statuses: &[InstanceStatus],
+    desired: &[crate::bun::diagnostics::DesiredAppEvidence],
+) -> Vec<DashboardApp> {
+    let mut rows = std::collections::BTreeMap::new();
+    for app in desired {
+        rows.insert(
+            (app.namespace.clone(), app.app.clone()),
+            DashboardApp {
+                name: app.app.clone(),
+                namespace: app.namespace.clone(),
+                instances_running: 0,
+                instances_desired: app.desired_replicas as usize,
+                state: "pending".to_string(),
+            },
+        );
+    }
+    for instance in statuses {
+        let Some(row) = rows.get_mut(&(instance.namespace.clone(), instance.app_name.clone()))
+        else {
+            continue;
+        };
+        if instance.state == "running" {
+            row.instances_running += 1;
+        }
+        if matches!(instance.state.as_str(), "failed" | "unhealthy") {
+            row.state = "unhealthy".into();
         }
     }
-    app_map
-        .into_iter()
-        .map(|((name, namespace), (count, state))| DashboardApp {
-            name,
-            namespace,
-            instances_running: count,
-            instances_desired: count,
-            state,
-        })
-        .collect()
+    for row in rows.values_mut() {
+        if row.state != "unhealthy" && row.instances_running == row.instances_desired {
+            row.state = if row.instances_desired == 0 {
+                "stopped"
+            } else {
+                "running"
+            }
+            .into();
+        }
+    }
+    rows.into_values().collect()
+}
+
+async fn gather_dashboard_apps(state: &ApiState) -> Result<Vec<DashboardApp>, String> {
+    let (statuses, desired) =
+        tokio::try_join!(cluster_statuses(state), gather_desired_apps(state))?;
+    let statuses: Vec<_> = statuses.into_iter().map(|row| row.instance).collect();
+    Ok(statuses_to_dashboard_apps(&statuses, &desired))
 }
 
 /// Build the dashboard data from current agent state.
-async fn gather_dashboard_data(state: &ApiState) -> DashboardData {
-    let statuses = gather_statuses(state).await;
-    let apps = statuses_to_dashboard_apps(&statuses);
+async fn gather_dashboard_data(state: &ApiState) -> Result<DashboardData, String> {
+    let apps = gather_dashboard_apps(state).await?;
 
     let (alert_count, alerts) = if let Some(ref evaluator) = state.alerts {
         let eval = evaluator.read().await;
@@ -5181,7 +5211,7 @@ async fn gather_dashboard_data(state: &ApiState) -> DashboardData {
     // standalone node with no gossip table still shows itself as one node.
     let node_count = if nodes.is_empty() { 1 } else { nodes.len() };
 
-    DashboardData {
+    Ok(DashboardData {
         cluster_name: String::new(),
         node_count,
         app_count: apps.len(),
@@ -5189,7 +5219,7 @@ async fn gather_dashboard_data(state: &ApiState) -> DashboardData {
         apps,
         nodes,
         alerts,
-    }
+    })
 }
 
 /// Build the dashboard node rows from the live gossip membership (AUTH7).
@@ -5236,8 +5266,10 @@ fn html_response(html: String) -> Response {
 
 /// `GET /` — serve the Brioche cluster overview dashboard.
 async fn dashboard_handler(State(state): State<ApiState>) -> Response {
-    let data = gather_dashboard_data(&state).await;
-    html_response(render_dashboard(&data))
+    match gather_dashboard_data(&state).await {
+        Ok(data) => html_response(render_dashboard(&data)),
+        Err(error) => unavailable_response(error),
+    }
 }
 
 /// `GET /ui/app/{app}/{namespace}` — app detail page.
@@ -5388,9 +5420,10 @@ async fn gitops_handler(State(state): State<ApiState>) -> Response {
 
 /// `GET /ui/fragment/apps` — apps table HTML fragment for HTMX swap.
 async fn fragment_apps_handler(State(state): State<ApiState>) -> Response {
-    let statuses = gather_statuses(&state).await;
-    let apps = statuses_to_dashboard_apps(&statuses);
-    html_response(fragments::render_apps_table_fragment(&apps))
+    match gather_dashboard_apps(&state).await {
+        Ok(apps) => html_response(fragments::render_apps_table_fragment(&apps)),
+        Err(error) => unavailable_response(error),
+    }
 }
 
 /// `GET /ui/fragment/nodes` — nodes table HTML fragment for HTMX swap.
@@ -9719,6 +9752,52 @@ mod tests {
         assert!(json["error"].as_str().unwrap().contains("unresponsive"));
         worker.await.unwrap();
         drop(listener);
+    }
+
+    #[test]
+    fn dashboard_shows_desired_replicas_and_counts_only_running_instances() {
+        let mut running: InstanceStatus = serde_json::from_value(serde_json::json!({
+            "id":"web-0", "app_name":"web", "namespace":"default", "state":"running",
+            "restart_count":0,"host_port":null,"pid":null
+        }))
+        .unwrap();
+        let mut failed = running.clone();
+        failed.id = "web-1".into();
+        failed.state = "failed".into();
+        let desired = vec![
+            crate::bun::diagnostics::DesiredAppEvidence {
+                app: "web".into(),
+                namespace: "default".into(),
+                desired_replicas: 3,
+                scheduled_replicas: 2,
+                service_port: None,
+            },
+            crate::bun::diagnostics::DesiredAppEvidence {
+                app: "pending".into(),
+                namespace: "default".into(),
+                desired_replicas: 2,
+                scheduled_replicas: 0,
+                service_port: None,
+            },
+        ];
+        let rows = statuses_to_dashboard_apps(&[running.clone(), failed], &desired);
+        let web = rows.iter().find(|row| row.name == "web").unwrap();
+        assert_eq!((web.instances_running, web.instances_desired), (1, 3));
+        assert_ne!(web.state, "running");
+        let pending = rows.iter().find(|row| row.name == "pending").unwrap();
+        assert_eq!(
+            (pending.instances_running, pending.instances_desired),
+            (0, 2)
+        );
+        running.state = "stopped".into();
+        let rows = statuses_to_dashboard_apps(&[running], &desired);
+        assert_eq!(
+            rows.iter()
+                .find(|row| row.name == "web")
+                .unwrap()
+                .instances_running,
+            0
+        );
     }
 
     #[tokio::test]
