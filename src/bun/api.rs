@@ -6185,6 +6185,21 @@ async fn gitops_webhook_handler(
             .into_response();
     };
 
+    // Reserve before recording the delivery ID: a full queue must remain
+    // retryable, and a closed receiver must never produce a success response.
+    let permit = match tx.try_reserve() {
+        Ok(permit) => permit,
+        Err(error) => {
+            return (
+                StatusCode::SERVICE_UNAVAILABLE,
+                Json(serde_json::json!({
+                    "error": format!("gitops sync queue unavailable: {error}")
+                })),
+            )
+                .into_response();
+        }
+    };
+
     let signature = headers
         .get("x-hub-signature-256")
         .and_then(|v| v.to_str().ok());
@@ -6204,10 +6219,10 @@ async fn gitops_webhook_handler(
 
     match result {
         Ok(_) => {
-            let _ = tx.send(()).await;
+            permit.send(());
             (
                 StatusCode::ACCEPTED,
-                Json(serde_json::json!({ "message": "sync triggered" })),
+                Json(serde_json::json!({ "message": "sync queued" })),
             )
                 .into_response()
         }
@@ -10275,6 +10290,55 @@ mod tests {
         assert_eq!(status, StatusCode::UNAUTHORIZED);
         // No sync was triggered.
         assert!(rx.try_recv().is_err(), "a bad signature must not sync");
+        shutdown.cancel();
+    }
+
+    #[tokio::test]
+    async fn webhook_full_queue_is_bounded_and_delivery_can_be_retried() {
+        let (app, mut receiver, shutdown) = webhook_setup("hooksecret", 100);
+        let body = br#"{"after":"abc123"}"#;
+        let headers = |id: usize| {
+            vec![
+                ("x-hub-signature-256", github_signature("hooksecret", body)),
+                ("x-github-delivery", format!("queue-{id}")),
+            ]
+        };
+        for id in 0..4 {
+            assert_eq!(
+                post_webhook(&app, body, &headers(id)).await,
+                StatusCode::ACCEPTED
+            );
+        }
+        let status = tokio::time::timeout(
+            std::time::Duration::from_millis(500),
+            post_webhook(&app, body, &headers(4)),
+        )
+        .await
+        .expect("full queue must not stall the request");
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+        receiver.recv().await.unwrap();
+        assert_eq!(
+            post_webhook(&app, body, &headers(4)).await,
+            StatusCode::ACCEPTED
+        );
+        shutdown.cancel();
+    }
+
+    #[tokio::test]
+    async fn webhook_refuses_a_closed_sync_loop() {
+        let (app, receiver, shutdown) = webhook_setup("hooksecret", 10);
+        drop(receiver);
+        let body = br#"{"after":"abc123","ref":"refs/heads/main"}"#;
+        let status = post_webhook(
+            &app,
+            body,
+            &[
+                ("x-hub-signature-256", github_signature("hooksecret", body)),
+                ("x-github-delivery", "closed-loop".into()),
+            ],
+        )
+        .await;
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
         shutdown.cancel();
     }
 

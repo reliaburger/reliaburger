@@ -907,3 +907,17 @@ Declare a namespace with `cpu = "2000m"`, apply an app that wants three replicas
 Blue-green deploys, autoscaling, the Lettuce GitOps engine, and Kubernetes migration tools are all Phase 9. The `DeployPhase` enum already carries the blue-green states (you'll have spotted `StartingGreen` and friends in the transition tests), and `execute` delegates to a separate blue-green path — but we'll cover that in Chapter 9. Rolling deploys with automatic rollback cover the vast majority of production deployment needs, and they're the foundation everything else builds on.
 
 Phase 7 adds 48 tests, bringing the total to 1047.
+
+### Queueing a webhook is an observable operation
+
+A valid signature doesn't prove the sync loop received a notification. The HTTP
+handler used to discard a failed channel send and return 202 even after the
+receiver had gone away. It now reserves queue capacity first and returns 503 if
+the loop is unavailable or its queue is full. Only an authenticated, validated
+delivery uses the reservation and receives “sync queued”.
+
+The reservation also prevents an awkward retry bug. Validation records the
+delivery ID for replay protection; doing that before discovering a full queue
+would make the provider's retry look like a replay. We reserve before validation,
+so a rejected delivery can be retried after capacity becomes available. Tests
+close the receiver and fill the queue, then drain one slot and retry the same ID.
