@@ -63,7 +63,7 @@ remain separate. Older unchecked groups below point into this current ledger.
 - [ ] **C32** (P2) Use typed case outcomes and validated runner configuration.
 - [ ] **C33** (P2) Discover actual registry and ingress test endpoints.
 - [ ] **C34** (P2) Define lease ownership for the remaining test resources.
-- [ ] **C35** (P2) Gate chaos capabilities per selected scenario.
+- [x] **C35** Select exact chaos scenario names and require only their capability/operation union. The complete five-case suite still refuses unavailable pressure or saturation authority; selected node failures need neither. Thirteen chaos and six CLI tests pass, covering unknown/empty selections, consent, protected clusters and exact fault cleanup.
 - [x] **C36** Retire legacy partition/isolation and blanket-heal mutations in favour of the guarded catalogue. Every old mutation returns an explicit migration error before contacting a node, with or without acknowledgement; the unreachable-node regression fails before the fix and passes afterwards. Read-only status remains available.
 - [x] **C37** Require a fresh direct gossip acknowledgement before committing the local upgrade marker, with an enforced rejoin deadline. All 28 gossip and 115 upgrade unit tests pass; a real isolated replacement serves locally, retains its marker, reverts after five seconds and adopts the same workload PID (33.97s). Coordinator rejoin checks remain independent.
 - [ ] **C38** (P2) Make blocked deployment replacement explicit.

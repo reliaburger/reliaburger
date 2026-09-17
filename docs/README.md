@@ -488,6 +488,11 @@ Commands:
 | `upgrade rollback [version]` | Roll back to a previous binary version |
 | `upgrade resume` | Resume a paused upgrade under a fresh attempt id |
 
+Use `test --chaos --filter dead_worker_node_has_workloads_rescheduled` to select
+an exact supported chaos scenario. Omitting the filter runs all five, including
+rootful Linux node pressure; selecting a subset does not qualify the full suite.
+
+
 TUI keys:
 
 | Key | Action |

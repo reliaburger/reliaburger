@@ -84,17 +84,18 @@ async fn run_with_client(
             body: format!("could not read cluster capabilities (is the agent running?): {error}"),
         })?;
 
-    if args.chaos {
-        confirm_chaos(&capabilities, args.yes)?;
-    }
-
     let cases = if args.chaos {
-        testkit::chaos_cases()
+        testkit::chaos::select_scenarios(args.filter.as_deref())
+            .map_err(|body| RelishError::ApiError { status: 0, body })?
     } else {
         let groups = testkit::parse_filter(args.filter.as_deref().unwrap_or(""))
             .map_err(|body| RelishError::ApiError { status: 0, body })?;
         testkit::select(testkit::all_cases(), &groups)
     };
+
+    if args.chaos {
+        confirm_chaos(&capabilities, &cases, args.yes)?;
+    }
 
     let report = testkit::run(
         cases,
@@ -124,13 +125,18 @@ async fn run_with_client(
 
 fn confirm_chaos(
     capabilities: &crate::bun::capabilities::ClusterCapabilities,
+    cases: &[testkit::registry::TestCase],
     yes: bool,
 ) -> Result<(), RelishError> {
     use std::io::{IsTerminal, Write};
 
     let is_tty = std::io::stdin().is_terminal();
-    match testkit::chaos::chaos_preflight(capabilities, testkit::chaos::ChaosFlags { yes }, is_tty)
-    {
+    match testkit::chaos::chaos_preflight_for_cases(
+        capabilities,
+        cases,
+        testkit::chaos::ChaosFlags { yes },
+        is_tty,
+    ) {
         Ok(()) => Ok(()),
         Err(testkit::chaos::RefusalReason::InteractiveConfirmation) => {
             eprint!(

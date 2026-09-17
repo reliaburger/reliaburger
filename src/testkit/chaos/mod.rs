@@ -1,7 +1,7 @@
 //! The chaos scenarios.
 //!
 //! The suite is deliberately stricter than ordinary capability-driven tests:
-//! node failure and pressure are prerequisites, not optional green skips.
+//! selected destructive capabilities are prerequisites, not optional green skips.
 
 use std::sync::Arc;
 
@@ -29,6 +29,8 @@ pub struct ChaosFlags {
 /// Why the chaos suite refused to touch the cluster.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum RefusalReason {
+    #[error("no chaos scenarios selected")]
+    NoScenarios,
     #[error("chaos suite requires at least 3 nodes (found {found})")]
     TooFewNodes { found: u32 },
     #[error("chaos suite requires fresh available capability {capability} ({state})")]
@@ -60,17 +62,35 @@ pub fn chaos_preflight(
     flags: ChaosFlags,
     is_tty: bool,
 ) -> Result<(), RefusalReason> {
+    chaos_preflight_for_cases(capabilities, &scenarios(), flags, is_tty)
+}
+
+/// Check the union of capabilities and grants needed by the selected scenarios.
+/// No selected destructive scenario is silently skipped.
+pub fn chaos_preflight_for_cases(
+    capabilities: &ClusterCapabilities,
+    cases: &[TestCase],
+    flags: ChaosFlags,
+    is_tty: bool,
+) -> Result<(), RefusalReason> {
+    if cases.is_empty() {
+        return Err(RefusalReason::NoScenarios);
+    }
     if capabilities.node_count < 3 {
         return Err(RefusalReason::TooFewNodes {
             found: capabilities.node_count,
         });
     }
 
-    for operation in [
-        OperationPermission::ProvisionIsolatedWorkloads,
-        OperationPermission::AlterNodeState,
-        OperationPermission::SaturateCapacity,
-    ] {
+    let needs = |capability| cases.iter().any(|case| case.requires.contains(&capability));
+    let mut operations = vec![OperationPermission::ProvisionIsolatedWorkloads];
+    if needs(Capability::NodeKill) {
+        operations.push(OperationPermission::AlterNodeState);
+    }
+    if needs(Capability::NodePressure) {
+        operations.push(OperationPermission::SaturateCapacity);
+    }
+    for operation in operations {
         if !capabilities
             .test_policy
             .allowed_operations
@@ -85,11 +105,7 @@ pub fn chaos_preflight(
         return Err(RefusalReason::ProtectedCluster);
     }
 
-    for capability in [
-        Capability::MultiNode,
-        Capability::NodeKill,
-        Capability::NodePressure,
-    ] {
+    for capability in cases.iter().flat_map(|case| case.requires.iter().copied()) {
         let state = capabilities.state(capability);
         if state != CapabilityState::Available {
             let state = match state {
@@ -111,6 +127,33 @@ pub fn chaos_preflight(
         });
     }
     Ok(())
+}
+
+/// Select exact comma-separated chaos names, preserving catalogue order.
+/// A missing or blank filter selects the complete catalogue; unknown names fail.
+pub fn select_scenarios(filter: Option<&str>) -> Result<Vec<TestCase>, String> {
+    let cases = scenarios();
+    let filter = filter.unwrap_or("").trim();
+    if filter.is_empty() {
+        return Ok(cases);
+    }
+    let names: Vec<_> = filter.split(',').map(str::trim).collect();
+    for name in &names {
+        if name.is_empty() || !cases.iter().any(|case| case.name == *name) {
+            return Err(format!(
+                "unknown chaos scenario {name:?}; available: {}",
+                cases
+                    .iter()
+                    .map(|case| case.name)
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ));
+        }
+    }
+    Ok(cases
+        .into_iter()
+        .filter(|case| names.contains(&case.name))
+        .collect())
 }
 
 #[derive(Clone)]
@@ -312,6 +355,7 @@ mod tests {
             ..ClusterCapabilities::default()
         };
         report.capabilities = [
+            Capability::Cluster,
             Capability::MultiNode,
             Capability::NodeKill,
             Capability::NodePressure,
@@ -327,6 +371,43 @@ mod tests {
         })
         .collect();
         report
+    }
+
+    #[test]
+    fn selected_node_failure_does_not_require_pressure_or_saturation() {
+        let mut caps = capabilities(3);
+        caps.test_policy
+            .allowed_operations
+            .remove(&OperationPermission::SaturateCapacity);
+        caps.capabilities
+            .retain(|item| item.capability != Capability::NodePressure);
+        let cases = select_scenarios(Some("dead_worker_node_has_workloads_rescheduled")).unwrap();
+        assert!(chaos_preflight_for_cases(&caps, &cases, ChaosFlags { yes: true }, false).is_ok());
+        assert!(chaos_preflight(&caps, ChaosFlags { yes: true }, false).is_err());
+    }
+
+    #[test]
+    fn selected_pressure_still_requires_its_own_grant_and_capability() {
+        let mut caps = capabilities(3);
+        let cases = select_scenarios(Some("resource_exhaustion_degrades_gracefully")).unwrap();
+        caps.test_policy
+            .allowed_operations
+            .remove(&OperationPermission::AlterNodeState);
+        caps.capabilities
+            .retain(|item| item.capability != Capability::NodeKill);
+        assert!(chaos_preflight_for_cases(&caps, &cases, ChaosFlags { yes: true }, false).is_ok());
+        caps.test_policy
+            .allowed_operations
+            .remove(&OperationPermission::SaturateCapacity);
+        assert!(chaos_preflight_for_cases(&caps, &cases, ChaosFlags { yes: true }, false).is_err());
+    }
+
+    #[test]
+    fn unknown_or_empty_scenario_selection_never_becomes_a_green_empty_run() {
+        assert!(select_scenarios(Some("scheduling")).is_err());
+        assert!(select_scenarios(Some(",")).is_err());
+        assert_eq!(select_scenarios(None).unwrap().len(), 5);
+        assert_eq!(select_scenarios(Some("dead_worker_node_has_workloads_rescheduled,dead_worker_node_has_workloads_rescheduled")).unwrap().len(), 1);
     }
 
     #[test]

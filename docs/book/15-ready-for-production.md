@@ -1746,18 +1746,23 @@ After a case gets that permit, it fetches capability evidence again. The
 evidence expires after 15 seconds; checking it before waiting in the queue
 would let a destructive decision outlive the facts behind it.
 
-The preflight is equally blunt. It requires at least three nodes, an available
-container runtime, node kill, node pressure and the server operations
-`provision_isolated_workloads`, `alter_node_state` and
-`saturate_capacity`. Protected clusters need their server-owned mutation gate.
+The preflight requires at least three nodes, an available container runtime,
+and the union of capabilities and server operations used by the selected cases.
+With no filter, all five run and require node kill, node pressure,
+`provision_isolated_workloads`, `alter_node_state` and `saturate_capacity`.
+Protected clusters need their server-owned mutation gate.
 The interactive command asks the operator to type exactly `yes`; automation
 uses `--yes`. This records consent. It doesn't invent authority, and there is
 no `--override`.
 
-Why fail the invocation instead of skipping the pressure case on a rootless
-machine? Because "five chaos tests passed" must mean we ran five chaos tests.
-A catalogue without the destructive primitive it claims to validate isn't a
-smaller success. It's a different test. ProcessGrill stays separate for the
+Why fail an unfiltered invocation instead of skipping the pressure case on a
+rootless machine? Because "five chaos tests passed" must mean we ran five chaos
+tests. Select a supported subset explicitly with exact scenario names, for
+example `relish test --chaos --filter dead_worker_node_has_workloads_rescheduled`.
+This needs node kill and `alter_node_state`, but neither node pressure nor
+`saturate_capacity`. Selecting the pressure case still requires its capability
+and grant. Unknown names and empty comma-separated selections are errors.
+The report names the cases that actually ran; a subset is not full qualification. ProcessGrill stays separate for the
 same reason: fixed host ports can't restore three replicas onto two surviving
 nodes. The catalogue uses the digest-pinned BusyBox OCI workload which runs
 under both runc and Apple Container, although the full pressure scenario still
