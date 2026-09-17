@@ -511,6 +511,14 @@ The older dev workflow still unwraps filesystem paths and saved node addresses. 
 
 **Completion test:** Non-UTF-8 paths, incomplete/corrupt saved state and missing nodes return actionable errors and leave unrelated VMs untouched.
 
+**Implementation:** all saved cluster inputs are validated before a Lima call;
+start/stop/destroy preflight the complete owned VM set. Non-UTF-8 paths fail with
+context, and shell-bound checkout paths and test filters are quoted. Real CLI
+fixtures prove refusal before mutation, preserved state and literal shell
+metacharacters. The invalid-byte checkout fixture runs on Linux because APFS
+rejects that directory name before the CLI can inspect it.
+
+
 ### C40 — Own replaced rootless proxy processes
 
 **Priority:** P2. **Wave:** 3. **Book chapters:** 01, 14.

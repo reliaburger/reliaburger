@@ -941,3 +941,32 @@ VMs, then holds a TCP listener open without answering TLS to model an
 unresponsive API. All three must fail without changing any VM. Existing
 readiness tests separately prove that liveness without ready critical subsystems
 cannot pass.
+
+
+### Validate a saved development cluster before touching Lima
+
+Suppose a truncated state file says a cluster has no nodes. Indexing its first
+node panics. Worse, a saved node name that belongs to another cluster could send
+`dev destroy` to the wrong VM. Parsing JSON only establishes that we have Rust
+values; it does not prove that those values describe our cluster.
+
+The older `relish dev` commands now check the requested cluster name, complete
+node list, ownership names, runtime, resources and IP addresses before any VM
+operation. Start, stop and destroy confirm that every owned VM exists before
+mutating one. Errors preserve the state file so the operator can diagnose it.
+This development backend discovers IPv4 addresses; it refuses incomplete saved
+addresses instead of substituting loopback.
+
+Paths need the same care. Rust's `Path` can contain bytes that are not UTF-8,
+while a Lima command string needs text. `Path::to_str` therefore returns an
+`Option<&str>`: `Some` contains valid text and `None` means conversion is not
+possible. We turn `None` into an actionable error before creating or recreating
+VMs. Shell commands quote valid paths and test filters as single arguments, so
+spaces, apostrophes and dollar signs keep their literal meaning.
+
+The CLI regressions use a private home directory and fake Lima executable.
+They prove that malformed ownership, missing addresses and unsupported runtimes
+never invoke Lima, that a missing owned VM permits only a listing, and that an
+invalid checkout is refused before `--recreate`. A shell fixture passes a path
+containing quotes and command substitution plus a semicolon-bearing test filter;
+only the intended argument reaches Cargo. No real VM is involved.

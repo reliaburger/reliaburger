@@ -67,7 +67,7 @@ remain separate. Older unchecked groups below point into this current ledger.
 - [x] **C36** Retire legacy partition/isolation and blanket-heal mutations in favour of the guarded catalogue. Every old mutation returns an explicit migration error before contacting a node, with or without acknowledgement; the unreachable-node regression fails before the fix and passes afterwards. Read-only status remains available.
 - [x] **C37** Require a fresh direct gossip acknowledgement before committing the local upgrade marker, with an enforced rejoin deadline. All 28 gossip and 115 upgrade unit tests pass; a real isolated replacement serves locally, retains its marker, reverts after five seconds and adopts the same workload PID (33.97s). Coordinator rejoin checks remain independent.
 - [ ] **C38** (P2) Make blocked deployment replacement explicit.
-- [ ] **C39** (P2) Handle development CLI paths without unwraps.
+- [x] **C39** Validate development cluster names, ownership, resources, runtimes and saved addresses before Lima operations; reject unsupported path encodings and quote checkout paths and test filters. Missing VMs preserve state and stop mutations. Five real CLI regressions pass on macOS and six on Linux (including a non-UTF-8 checkout), with strict all-target/all-feature Clippy. Zero-node and corrupt-ownership regressions fail before the fix.
 - [ ] **C40** (P2) Own replaced rootless proxy processes.
 - [x] **C41** Collect structured observations for every owned VM and return exit 1 for missing/stopped VMs, unhealthy APIs or unknown evidence. The real CLI regression fails before the fix and passes all three cases afterwards (11.94s); status remains read-only and reports all owned nodes.
 - [ ] **C42** (P2) Key alert state by labelled series.
