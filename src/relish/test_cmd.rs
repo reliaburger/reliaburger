@@ -112,7 +112,11 @@ async fn run_with_client(
             lease_ownership: testkit::runner::LeaseOwnership::Required,
         },
     )
-    .await;
+    .await
+    .map_err(|error| RelishError::ApiError {
+        status: 0,
+        body: error.to_string(),
+    })?;
 
     render(&report, args.output)?;
 

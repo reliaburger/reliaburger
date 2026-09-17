@@ -2550,3 +2550,24 @@ The no-default suite reproduced one leak during this audit. Three reruns with
 detailed reporting did not reproduce it, so H08 remains open: we still need the
 case identity, an ownership fix and a focused regression. We haven't increased
 the leak timeout to make the warning disappear.
+
+
+### Case outcomes are data, not an error-message convention
+
+Suppose a failed workload prints `__unknown__:connection refused`. The runner
+used to interpret that prefix as a request to downgrade a failure to missing
+evidence. A workload's text had acquired authority over the test verdict.
+
+Case bodies now return `Result<(), CaseError>`. The enum distinguishes
+`Failed(String)` from `Unknown(String)`, and `unknown(...)` constructs the
+second variant explicitly. Ordinary string errors convert only to `Failed`.
+The catalogue macro boxes either kind of future and converts its error at the
+boundary; it never examines the message. The regression keeps the old prefix
+in a failure string and verifies that the report still counts a failure.
+
+The library entry point also validates its own input before creating tasks,
+leases or requests. Zero or excessive timeouts, invalid parallelism and unsafe
+namespace prefixes return `RunError`. A CLI check cannot protect a library from
+its other callers. Deadline construction uses checked clock arithmetic, so even
+`Duration::MAX` returns an error rather than panicking; a child deadline remains
+bounded by its parent.

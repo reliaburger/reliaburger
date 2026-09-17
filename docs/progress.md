@@ -60,7 +60,7 @@ remain separate. Older unchecked groups below point into this current ledger.
 - [x] **C29** Include missing baseline metrics in the shared comparison verdict and name missing/new observations in human output. The regression fails before the fix; all benchmark tests pass, including informational and added-only comparisons.
 - [ ] **C30** (P1) Replace unconditional unknown catalogue cases with real evidence.
 - [x] **C31** Generate 128-bit random run IDs instead of second-resolution timestamps. The 1,024-invocation concurrent regression fails before the fix; all six command tests and the existing lease collision/refusal test pass. Fixed namespaces retain server ownership checks.
-- [ ] **C32** (P2) Use typed case outcomes and validated runner configuration.
+- [x] **C32** Replace magic-string verdicts with `CaseError::{Failed, Unknown}` and reject invalid runner timeouts, parallelism and namespace inputs before side effects. The workload-prefix regression fails before the fix; all 108 testkit tests and all-target/all-feature Clippy pass, including checked deadline overflow and direct-library invalid inputs.
 - [ ] **C33** (P2) Discover actual registry and ingress test endpoints.
 - [ ] **C34** (P2) Define lease ownership for the remaining test resources.
 - [x] **C35** Select exact chaos scenario names and require only their capability/operation union. The complete five-case suite still refuses unavailable pressure or saturation authority; selected node failures need neither. Thirteen chaos and six CLI tests pass, covering unknown/empty selections, consent, protected clusters and exact fault cleanup.

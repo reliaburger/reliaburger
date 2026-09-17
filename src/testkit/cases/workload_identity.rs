@@ -13,7 +13,9 @@ use crate::testkit_case;
 
 /// A running workload's SPIFFE certificate isn't reachable through the API, so
 /// this can't be asserted end-to-end from the harness yet.
-async fn workload_receives_spiffe_certificate(_ctx: TestContext) -> Result<(), String> {
+async fn workload_receives_spiffe_certificate(
+    _ctx: TestContext,
+) -> crate::testkit::registry::CaseResult {
     unknown("a workload's SPIFFE certificate is not exposed via the orchestrator API")
 }
 
@@ -50,7 +52,9 @@ async fn jwks_endpoint_serves_signing_keys(ctx: TestContext) -> Result<(), Strin
 }
 
 /// A token scoped to one namespace is refused when it writes to another.
-async fn namespace_scoped_token_is_rejected_elsewhere(ctx: TestContext) -> Result<(), String> {
+async fn namespace_scoped_token_is_rejected_elsewhere(
+    ctx: TestContext,
+) -> crate::testkit::registry::CaseResult {
     // Mint a Deployer token confined to this test's namespace. (This needs the
     // harness itself to hold an admin token, which the dev cluster provides.)
     let token_name = format!("rbtest-scope-{}", ctx.namespace);
@@ -95,20 +99,26 @@ async fn namespace_scoped_token_is_rejected_elsewhere(ctx: TestContext) -> Resul
         ) => unknown(format!(
             "could not probe the scope boundary: {error}; enforcement unproven"
         )),
-        Err(error) => Err(format!(
+        Err(error) => Err((format!(
             "expected the scope refusal (403 \"token scope does not allow\"), got: {error}"
-        )),
+        ))
+        .into()),
         Ok(_) => {
             // It was wrongly allowed — clean up the leak, then fail.
             let _ = ctx.client.stop("probe", &other_namespace).await;
-            Err("a namespace-scoped token was allowed to write to another namespace".to_string())
+            Err(
+                ("a namespace-scoped token was allowed to write to another namespace".to_string())
+                    .into(),
+            )
         }
     };
     // Revoke is cleanup: it must not overwrite a genuine verdict. Surface a
     // revoke failure only when the case would otherwise pass.
     let revoked = ctx.client.token_revoke(&token_name).await;
     match (verdict, revoked) {
-        (Ok(()), Err(error)) => Err(format!("could not revoke scoped test token: {error}")),
+        (Ok(()), Err(error)) => {
+            Err((format!("could not revoke scoped test token: {error}")).into())
+        }
         (verdict, _) => verdict,
     }
 }

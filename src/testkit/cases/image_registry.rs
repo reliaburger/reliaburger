@@ -83,7 +83,7 @@ async fn manifest_catalog_lists_pushed_image(ctx: TestContext) -> Result<(), Str
 /// *runnable* image there — which the synthetic fixture is not (it carries one
 /// marker file, no binary). Skipped until the harness can stage a runnable
 /// image in Pickle.
-async fn deploy_from_cluster_registry(_ctx: TestContext) -> Result<(), String> {
+async fn deploy_from_cluster_registry(_ctx: TestContext) -> crate::testkit::registry::CaseResult {
     unknown("needs a runnable image in the cluster registry; the synthetic fixture isn't runnable")
 }
 

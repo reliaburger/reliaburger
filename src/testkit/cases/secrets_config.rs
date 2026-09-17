@@ -40,7 +40,9 @@ async fn config_file_is_mounted_with_contents(ctx: TestContext) -> Result<(), St
 
 /// Decrypting an `ENC[AGE:...]` env value needs a secret encrypted with the
 /// cluster pubkey — which the harness can't fetch (no API endpoint exposes it).
-async fn encrypted_env_value_is_decrypted_in_workload(_ctx: TestContext) -> Result<(), String> {
+async fn encrypted_env_value_is_decrypted_in_workload(
+    _ctx: TestContext,
+) -> crate::testkit::registry::CaseResult {
     unknown(
         "the cluster age pubkey is not exposed via the API, so a secret can't be encrypted here",
     )
@@ -48,7 +50,9 @@ async fn encrypted_env_value_is_decrypted_in_workload(_ctx: TestContext) -> Resu
 
 /// Same blocker: fetching the pubkey to encrypt a value round-trip needs an
 /// API endpoint that doesn't exist yet.
-async fn cluster_pubkey_encrypt_roundtrip(_ctx: TestContext) -> Result<(), String> {
+async fn cluster_pubkey_encrypt_roundtrip(
+    _ctx: TestContext,
+) -> crate::testkit::registry::CaseResult {
     unknown("the cluster age pubkey is not exposed via the API")
 }
 

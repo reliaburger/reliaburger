@@ -5,18 +5,30 @@ use crate::bun::capabilities::Capability;
 use super::context::TestContext;
 use super::report::TestGroup;
 
-/// Prefix a case body returns when it lacks evidence for a verdict.
-///
-/// Only a typed absent capability can produce `Skipped`. A dynamic
-/// prerequisite, missing fixture or unobservable assertion returns
-/// [`unknown`] and the runner records missing evidence.
-pub const UNKNOWN_MARKER: &str = "__unknown__:";
+/// A case's explicit failure or missing-evidence outcome.
+/// Workload error strings always become `Failed`, regardless of their contents.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum CaseError {
+    /// An observed assertion or operation failed.
+    #[error("{0}")]
+    Failed(String),
+    /// Available evidence cannot establish a verdict.
+    #[error("{0}")]
+    Unknown(String),
+}
 
-/// Stop this case because it cannot establish pass or fail.
-///
-/// `return unknown("no node advertises a label to target")`.
-pub fn unknown(reason: impl std::fmt::Display) -> Result<(), String> {
-    Err(format!("{UNKNOWN_MARKER}{reason}"))
+impl From<String> for CaseError {
+    fn from(reason: String) -> Self {
+        Self::Failed(reason)
+    }
+}
+
+/// A completed case, with typed failure and missing-evidence alternatives.
+pub type CaseResult = Result<(), CaseError>;
+
+/// Stop a case because it cannot establish pass or fail.
+pub fn unknown(reason: impl std::fmt::Display) -> CaseResult {
+    Err(CaseError::Unknown(reason.to_string()))
 }
 
 /// A test case body.
@@ -31,9 +43,7 @@ pub fn unknown(reason: impl std::fmt::Display) -> Result<(), String> {
 /// into itself across an `.await`, so once polled it must not move. `Send`
 /// because the runner drives these on a multi-threaded runtime.
 pub type TestFn =
-    fn(
-        TestContext,
-    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), String>> + Send>>;
+    fn(TestContext) -> std::pin::Pin<Box<dyn std::future::Future<Output = CaseResult> + Send>>;
 
 /// One case in the catalogue.
 pub struct TestCase {
@@ -58,9 +68,14 @@ macro_rules! testkit_case {
     ($body:path) => {{
         fn wrapper(
             ctx: $crate::testkit::context::TestContext,
-        ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), String>> + Send>>
-        {
-            Box::pin($body(ctx))
+        ) -> std::pin::Pin<
+            Box<dyn std::future::Future<Output = $crate::testkit::registry::CaseResult> + Send>,
+        > {
+            Box::pin(async move {
+                $body(ctx)
+                    .await
+                    .map_err($crate::testkit::registry::CaseError::from)
+            })
         }
         wrapper as $crate::testkit::registry::TestFn
     }};
