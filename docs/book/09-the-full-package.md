@@ -924,3 +924,20 @@ returned 404. We enable the crate's `debug-embed` feature as well as compression
 Cargo features select optional crate behaviour at compile time; here both debug
 and release builds carry their assets. A development binary should exercise the
 same standalone packaging contract as the release.
+
+
+### A status command must fail when the cluster is unhealthy
+
+A script that runs `relish local status` cannot read our intentions. It sees an
+exit code. The first implementation printed “Missing” or “API not ready” and
+still returned success. We now collect a `NodeStatus` for every owned VM, with a
+`NodeCondition` enum distinguishing ready, missing, stopped, API failure and
+unknown evidence. Only a complete ready set returns exit 0; all other outcomes
+return exit 1 after showing the observations.
+
+The real CLI regression supplies a private saved operation and a tiny Lima
+fixture that answers only read-only list requests. It checks missing and stopped
+VMs, then holds a TCP listener open without answering TLS to model an
+unresponsive API. All three must fail without changing any VM. Existing
+readiness tests separately prove that liveness without ready critical subsystems
+cannot pass.

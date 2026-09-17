@@ -72,6 +72,11 @@ cached assets, the original CA and the owned VMs. A retry won't silently
 change the version, topology or ports, or replace a previously running VM
 that disappeared. The error tells you where the checkpoint lives.
 
+`status` checks every owned VM and its authenticated API. Exit 0 means every
+node is running and its critical subsystems are ready. Missing or stopped VMs,
+unresponsive APIs and unavailable evidence return exit 1 after printing the
+observations. A saved provisioning checkpoint is not a live health check.
+
 `stop` preserves data. `destroy --yes` removes only the VMs named in this
 cluster's saved record, along with its credentials and checkpoints. It keeps
 the downloaded tool and image cache for future clusters. `--name NAME` selects

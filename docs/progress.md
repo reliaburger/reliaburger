@@ -69,7 +69,7 @@ remain separate. Older unchecked groups below point into this current ledger.
 - [ ] **C38** (P2) Make blocked deployment replacement explicit.
 - [ ] **C39** (P2) Handle development CLI paths without unwraps.
 - [ ] **C40** (P2) Own replaced rootless proxy processes.
-- [ ] **C41** (P2) Return a non-zero managed-status result for unhealthy nodes.
+- [x] **C41** Collect structured observations for every owned VM and return exit 1 for missing/stopped VMs, unhealthy APIs or unknown evidence. The real CLI regression fails before the fix and passes all three cases afterwards (11.94s); status remains read-only and reports all owned nodes.
 - [ ] **C42** (P2) Key alert state by labelled series.
 - [ ] **C43** (P2) Resolve short service names in the caller namespace.
 
