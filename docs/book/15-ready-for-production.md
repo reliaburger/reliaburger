@@ -2251,3 +2251,21 @@ rejected a C label directly before a declaration in the eBPF source. We updated
 the locked dependencies and added the empty statement required by the older C
 rules. Release builds need their own gate because local source tests can't prove
 that every supported build environment produces a usable artefact.
+
+### A failed query isn't an empty cluster
+
+The test context used to skip nodes whose status request failed and return the
+remaining rows. A test waiting for zero instances could pass because the node
+holding those instances wasn't answering. Collection now returns the failing
+node's name instead of an incomplete success.
+
+The whole collection, including discovering peers, runs under the case's
+existing absolute deadline. Giving each node a fresh request timeout could make
+a supposedly short test wait many times its budget. Polling sleeps also stop at
+the remaining deadline. A timed-out wait reports the last query error alongside
+the last observed states.
+
+Two HTTP regressions exercise this: one server immediately returns 503, and one
+stalls longer than the case's budget. Neither may satisfy an empty-instance
+predicate. Cleanup retains its separate deadline, so an exhausted test budget
+doesn't prevent the runner from attempting to remove its own workloads.

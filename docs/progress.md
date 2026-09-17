@@ -6,7 +6,8 @@ Single source of truth for what's done and what's next. Check off an item only w
 > [release-readiness review and laptop quickstart plan](plans/2026-09-16-v0.1.0-release-plan.md).
 > It separates current packaging/onboarding blockers from superseded audit findings,
 > proposes a supported release scope, and defines clean-install and real-cluster
-> acceptance gates. This is a proposed plan, not a completed release.
+> acceptance gates. Implementation is in progress; signed-release and cold-install
+> qualification remain open.
 
 ## Current release checklist
 
@@ -16,7 +17,11 @@ Single source of truth for what's done and what's next. Check off an item only w
 - [ ] Measure registry memory use under concurrent pushes in the laptop VM.
 - [x] Package self-contained Linux agents and native laptop CLIs (`c448f58`, `79b31b9`; all four hosted native builds pass).
 - [ ] Publish verifiable release metadata and signed artefacts.
-- [ ] Implement secure, resumable managed laptop clusters and installer.
+- [x] Implement secure, resumable managed laptop clusters and installer (committed on `codex/v0.1.0-release`; three real Linux VMs passed setup, HTTP ingress and stop/start on 17 September).
+- [x] Fix registry/runtime cache compatibility, restart checkpoints and responsive health probing.
+- [x] Route ingress across nodes and report cluster-wide CLI status (`ea98c4b`, `81611a0`).
+- [x] Propagate storage/bootstrap errors, honour experimental Apple runtime settings, and audit HTTP methods (`6c5bd6f`, `95513ea`, `54f9ee7`).
+- [x] Report unavailable GitOps queues/export failures and show real dashboard replica counts (`baf73f2`, `592e285`).
 - [ ] Close the remaining correctness findings listed in the release plan.
 - [ ] Qualify the downloaded candidate on clean hosts and record three-node timing.
 - [ ] Pass the real-cluster and final release acceptance gates.

@@ -295,15 +295,22 @@ impl TestContext {
 
     /// Every instance of `app` in this namespace, gathered across all nodes.
     pub async fn cluster_instances(&self, app: &str) -> Result<Vec<InstanceStatus>, String> {
-        let mut all = Vec::new();
-        for (_node, client) in self.node_clients().await? {
-            if let Ok(statuses) = client.status().await {
-                all.extend(statuses.into_iter().filter(|instance| {
-                    instance.app_name == app && instance.namespace == self.namespace
-                }));
-            }
-        }
-        Ok(all)
+        self.deadline
+            .run("cluster instance collection", async {
+                let mut all = Vec::new();
+                for (node, client) in self.node_clients().await? {
+                    let statuses = client
+                        .status()
+                        .await
+                        .map_err(|error| format!("could not inspect node {node}: {error}"))?;
+                    all.extend(statuses.into_iter().filter(|instance| {
+                        instance.app_name == app && instance.namespace == self.namespace
+                    }));
+                }
+                Ok(all)
+            })
+            .await
+            .map_err(|error| error.to_string())?
     }
 
     async fn namespace_instances(&self) -> Result<Vec<InstanceStatus>, String> {
@@ -348,22 +355,26 @@ impl TestContext {
     {
         let mut last: Vec<InstanceStatus> = Vec::new();
         loop {
-            if let Ok(instances) = self.cluster_instances(app).await {
-                last = instances;
-                if predicate(&last) {
-                    return Ok(());
+            let last_error = match self.cluster_instances(app).await {
+                Ok(instances) => {
+                    last = instances;
+                    if predicate(&last) {
+                        return Ok(());
+                    }
+                    None
                 }
-            }
+                Err(error) => Some(error),
+            };
             if self.deadline.remaining().is_zero() {
                 let seen: Vec<&str> = last.iter().map(|i| i.state.as_str()).collect();
                 return Err(format!(
                     "timed out after {:?} waiting for {app} to reach {what} cluster-wide; \
-                     last saw {} instance(s): {seen:?}",
+                     last saw {} instance(s): {seen:?}; last query error: {last_error:?}",
                     self.timeout,
                     last.len()
                 ));
             }
-            tokio::time::sleep(Duration::from_millis(500)).await;
+            tokio::time::sleep(Duration::from_millis(500).min(self.deadline.remaining())).await;
         }
     }
 
@@ -434,7 +445,7 @@ impl TestContext {
                     last.len()
                 ));
             }
-            tokio::time::sleep(poll).await;
+            tokio::time::sleep(poll.min(self.deadline.remaining())).await;
         }
     }
 
@@ -623,6 +634,62 @@ mod tests {
             timeout: Duration::from_millis(200),
             deadline: Deadline::after(Duration::from_millis(200)).unwrap(),
         }
+    }
+
+    async fn status_server(stalled: bool) -> (BunClient, tokio::task::JoinHandle<()>) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let router = axum::Router::new()
+            .route(
+                "/v1/cluster/nodes",
+                axum::routing::get(|| async {
+                    axum::Json(Vec::<crate::bun::agent::NodeStatus>::new())
+                }),
+            )
+            .route(
+                "/v1/status",
+                axum::routing::get(move || async move {
+                    if stalled {
+                        tokio::time::sleep(Duration::from_secs(10)).await;
+                    }
+                    axum::http::StatusCode::SERVICE_UNAVAILABLE
+                }),
+            );
+        let server = tokio::spawn(async move {
+            axum::serve(listener, router).await.unwrap();
+        });
+        (
+            BunClient::new_with_token(&format!("http://{address}"), None),
+            server,
+        )
+    }
+
+    #[tokio::test]
+    async fn cluster_collection_reports_a_failed_node_instead_of_empty_success() {
+        let (client, server) = status_server(false).await;
+        let mut ctx = context("rbtest-errors");
+        ctx.client = client;
+        let result = ctx.cluster_instances("web").await;
+        server.abort();
+        assert!(result.unwrap_err().contains("local"));
+    }
+
+    #[tokio::test]
+    async fn cluster_wait_cannot_outlive_its_shared_deadline() {
+        let (client, server) = status_server(true).await;
+        let mut ctx = context("rbtest-deadline");
+        ctx.client = client;
+        let result = tokio::time::timeout(
+            Duration::from_secs(1),
+            ctx.wait_for_cluster("web", "no instances", |instances| instances.is_empty()),
+        )
+        .await;
+        server.abort();
+        assert!(
+            result
+                .expect("cluster collection exceeded the case deadline")
+                .is_err()
+        );
     }
 
     #[test]
