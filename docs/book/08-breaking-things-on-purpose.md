@@ -212,45 +212,49 @@ The original plan put the fault in the kernel: a `fault_dns_map` that the in-ker
 The fix is to put the fault where the code actually runs. The responder resolves `.internal` names; the fault belongs in that lookup. We give the responder a read-only handle to "which services are currently faulted", and it checks that handle before it answers:
 
 ```rust
-use std::collections::BTreeMap;
-
-/// Which services the Smoker is currently forcing NXDOMAIN for.
 #[derive(Debug, Clone, Default)]
 pub struct DnsFaultState {
-    /// App name → expiry (CLOCK_MONOTONIC nanoseconds). 0 means "no expiry".
-    faulted: BTreeMap<String, u64>,
+    faulted: HashMap<ServiceId, u64>,
 }
 
 impl DnsFaultState {
-    pub fn is_faulted(&self, app: &str, now_ns: u64) -> bool {
-        match self.faulted.get(app) {
-            Some(&expires_ns) => expires_ns == 0 || now_ns < expires_ns,
-            None => false,
-        }
+    pub fn is_faulted(&self, service: &ServiceId, now_ns: u64) -> bool {
+        self.faulted.get(service)
+            .is_some_and(|expires| *expires == 0 || now_ns < *expires)
     }
 }
 ```
 
-`BTreeMap` is Rust's ordered map (a balanced tree, like C++'s `std::map`); we use it rather than the hash-based `HashMap` because the set is tiny and an ordered map serialises and prints deterministically, which is easier to reason about. The `is_faulted` method returns `true` only while a fault is live: an entry whose deadline has already passed is treated as gone even if it's still sitting in the map. That's a belt-and-braces guard, and it's why the fault can't outlive its window even if a message goes missing.
+`ServiceId` carries both namespace and app name. The first userspace version
+used a bare `String`, losing the namespace that API authorisation had just
+checked. A fault against `red/redis` also broke `blue/redis`. The regression
+injects through the agent and sends real DNS packets; the supposedly unaffected
+blue service answered NXDOMAIN before the repair.
 
-How does the responder *get* this state? The same way it gets the service map: a `watch` channel. A `watch` channel in tokio is a single-writer, many-reader broadcast of the *latest* value — readers don't get a history, they get whatever's current, which is exactly right for "the set of faults right now". The agent owns the writer (`watch::Sender<DnsFaultState>`); the responder holds a `watch::Receiver<DnsFaultState>` and reads the newest value on each query with `borrow()`. When a fault is applied, cleared, or expires, the agent rebuilds the set from its fault registry and sends it:
+`HashMap` is enough here: this snapshot is neither serialised nor presented as
+an ordered list. `is_some_and` calls its closure only for a present entry. The
+closure borrows the stored expiry, so `*expires` reads the number behind that
+reference. An expired entry stops affecting answers even before the next agent
+tick removes it.
 
-```rust
-fn publish_dns_faults(&self) {
-    let faults = self
-        .fault_registry
-        .iter()
-        .filter(|rule| matches!(rule.fault_type, FaultType::DnsNxdomain))
-        .map(|rule| (rule.target_service.clone(), rule.expires_at_ns));
-    let _ = self.dns_faults_tx.send(DnsFaultState::from_faults(faults));
-}
-```
+The agent publishes snapshots on a Tokio `watch` channel after apply, clear and
+expiry. Each entry retains the rule's namespace. Missing namespaces and
+instance-only DNS targets are rejected before publication, because a service
+DNS name cannot honour an individual-instance restriction. The API supplies its
+authorised namespace; internal callers must do the same.
 
-The resolver check itself is three lines, sitting right after the source-ACL check and before the service-map lookup:
+Two experiments can fault the same service. The snapshot takes the latest expiry
+across their owners (or no deadline if an owner is explicitly indefinite).
+Clearing one experiment rebuilds that union from the remaining rules. Taking the
+last map insertion would let an earlier expiry erase the effect of a longer
+experiment, depending on iteration order.
+
+After resolving the caller's namespace, the responder checks the complete
+service identity:
 
 ```rust
 let now_ns = crate::smoker::types::monotonic_now_ns();
-if dns_faults.borrow().is_faulted(&service_id.name, now_ns) {
+if dns_faults.borrow().is_faulted(&service_id, now_ns) {
     return build_status_response(query, RCODE_NXDOMAIN);
 }
 ```
@@ -262,7 +266,8 @@ fault": it works wherever the responder runs, so `requires_ebpf()` returns
 `false` for it. Drop and partition need the connect hook. Delay and bandwidth
 need a future TC hook and are rejected on every current node. Second, reversal
 is free: clearing or expiring the DNS fault removes it from the registry, we
-republish the smaller set, and the name resolves again on the very next query.
+republish the remaining owners, and the name resolves again when its last owner
+is gone.
 No kernel map to clean up, because there never should have been one.
 
 ## Network security

@@ -557,6 +557,10 @@ network owner, advances the allocation counter past that address, and republishe
 the DNS binding. Guessing the address from a restarted counter would let a new
 container inherit an old container's namespace identity.
 
+Fault lookup uses the same complete `ServiceId`. A fault authorised for
+`payments/redis` cannot affect `default/redis`; overlapping experiments retain
+independent ownership until clear or expiry, as Chapter 8 explains.
+
 Tests send real UDP and TCP queries while changing, removing and conflicting a
 source binding. Two real runc workloads in different namespaces resolve the same short name to
 different VIPs. A privileged adoption test checks the binding before start,

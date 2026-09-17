@@ -76,7 +76,7 @@ remain separate. Older unchecked groups below point into this current ledger.
 
 - [x] **C45** Poll readiness publication alongside its subsystem owner, avoiding a fair-lock deadlock in both supervision loops. Both contention regressions fail before the fix; all ten readiness tests pass afterwards, including retired-attempt fencing and panic/restart behaviour. All three Linux upgrade/rollback/pause-resume cases pass in 177.50s after the repair; sustained qualification remains V02.
 
-- [ ] **C46** (P1) Preserve authorised namespaces and overlapping owners in DNS fault effects. Follow-up inspection found that the fault watch drops namespaces even though API admission checks them.
+- [x] **C46** Preserve authorised namespace/service identities through DNS fault publication and lookup; overlapping owners retain the latest expiry, and clearing one preserves the others. Missing namespaces and individual-instance DNS targets refuse without leaving registry entries. The cross-namespace wire regression fails before the fix; 32 DNS-filtered library tests, 14 wire tests, both final agent regressions and strict Linux all-target/all-feature Clippy pass.
 
 - [ ] **C47** (P2) Bound and reclaim runtime container addresses within the node /23, including concurrent creation and adoption. The existing index wraps without enforcing the declared capacity.
 

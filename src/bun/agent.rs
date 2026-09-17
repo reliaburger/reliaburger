@@ -1803,9 +1803,8 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
     /// Republish the current `DnsNxdomain` fault set to the DNS responder.
     ///
     /// Rebuilt from the fault registry so it always reflects reality after an
-    /// apply, clear, or expiry. Keyed by bare service name (`target_service`),
-    /// which is how the resolver checks it. Cheap: the set is tiny and this
-    /// only runs when a fault changes.
+    /// apply, clear, or expiry. Namespace-qualified identities prevent an
+    /// authorised fault in one tenant from affecting another tenant's service.
     fn publish_dns_faults(&self) {
         let faults = self
             .fault_registry
@@ -1816,7 +1815,15 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
                     crate::smoker::types::FaultType::DnsNxdomain
                 )
             })
-            .map(|rule| (rule.target_service.clone(), rule.expires_at_ns));
+            .filter_map(|rule| {
+                Some((
+                    crate::onion::service_id::ServiceId::new(
+                        rule.namespace.as_ref()?,
+                        &rule.target_service,
+                    ),
+                    rule.expires_at_ns,
+                ))
+            });
         let _ = self
             .dns_faults_tx
             .send(crate::onion::dns::DnsFaultState::from_faults(faults));
@@ -3909,6 +3916,12 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
                 })
             }
             FaultType::DnsNxdomain => {
+                if rule.namespace.as_deref().is_none_or(str::is_empty) {
+                    return Err("DNS faults require an explicit namespace".into());
+                }
+                if rule.target_instance.is_some() {
+                    return Err("DNS faults target a namespace-qualified service, not an individual instance".into());
+                }
                 // DNS resolution lives in the userspace responder
                 // (src/onion/dns.rs), so this fault does too. Republish the
                 // faulted-service set and the responder starts returning
@@ -12709,6 +12722,118 @@ host = "remote.local"
                 override_safety: false,
                 acknowledged: true,
             })
+    }
+
+    #[tokio::test]
+    async fn dns_fault_refuses_unknown_namespace_or_instance_scope_without_recording_it() {
+        let (mut agent, _tx, _shutdown) = test_agent();
+        for (namespace, target_instance) in
+            [(None, None), (Some("red".into()), Some("redis-0".into()))]
+        {
+            let (response, result) = oneshot::channel();
+            agent
+                .handle_command(AgentCommand::InjectFault {
+                    request: crate::smoker::types::FaultRequest {
+                        fault_type: crate::smoker::types::FaultType::DnsNxdomain,
+                        target_service: "redis".into(),
+                        namespace,
+                        target_instance,
+                        target_node: None,
+                        duration: std::time::Duration::from_secs(60),
+                        injected_by: "test".into(),
+                        reason: None,
+                        include_leader: false,
+                        override_safety: false,
+                        acknowledged: true,
+                    },
+                    response,
+                })
+                .await;
+            assert!(result.await.unwrap().is_err());
+            assert_eq!(agent.fault_registry.iter().count(), 0);
+        }
+    }
+
+    #[tokio::test]
+    async fn dns_fault_keeps_its_namespace_and_each_owner_until_clear() {
+        use crate::onion::dns::{BoundDnsResponder, DnsConfig};
+        let (mut agent, _tx, shutdown) = test_agent();
+        let mut map = crate::onion::service_map::ServiceMap::new();
+        map.register_app("redis", "red", 6379, None).unwrap();
+        map.register_app("redis", "blue", 6379, None).unwrap();
+        let (_map_tx, map_rx) = tokio::sync::watch::channel(map);
+        let responder = BoundDnsResponder::bind(DnsConfig {
+            listen_addr: "127.0.0.1:0".parse().unwrap(),
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+        let address = responder.local_addr().unwrap();
+        let task = tokio::spawn(responder.run(map_rx, agent.dns_faults_watch(), shutdown.clone()));
+        async fn query(address: std::net::SocketAddr, name: &str) -> u8 {
+            let mut packet = vec![0x12, 0x34, 1, 0, 0, 1, 0, 0, 0, 0, 0, 0];
+            for label in name.split('.') {
+                packet.push(label.len() as u8);
+                packet.extend_from_slice(label.as_bytes());
+            }
+            packet.extend_from_slice(&[0, 0, 1, 0, 1]);
+            let socket = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+            socket.send_to(&packet, address).await.unwrap();
+            let mut answer = [0; 1500];
+            tokio::time::timeout(
+                std::time::Duration::from_secs(2),
+                socket.recv_from(&mut answer),
+            )
+            .await
+            .unwrap()
+            .unwrap();
+            answer[3] & 0xf
+        }
+        let mut owners = Vec::new();
+        for _ in 0..2 {
+            let (response, result) = oneshot::channel();
+            agent
+                .handle_command(AgentCommand::InjectFault {
+                    request: crate::smoker::types::FaultRequest {
+                        fault_type: crate::smoker::types::FaultType::DnsNxdomain,
+                        target_service: "redis".into(),
+                        namespace: Some("red".into()),
+                        target_instance: None,
+                        target_node: None,
+                        duration: std::time::Duration::from_secs(60),
+                        injected_by: "test".into(),
+                        reason: None,
+                        include_leader: false,
+                        override_safety: false,
+                        acknowledged: true,
+                    },
+                    response,
+                })
+                .await;
+            owners.push(result.await.unwrap().unwrap().id);
+        }
+        assert_eq!(query(address, "redis.red.internal").await, 3);
+        assert_eq!(query(address, "redis.blue.internal").await, 0);
+        for (index, id) in owners.into_iter().enumerate() {
+            let (response, result) = oneshot::channel();
+            agent
+                .handle_command(AgentCommand::ClearFault {
+                    fault_id: id,
+                    allow_workload_fault: true,
+                    allow_node_fault: false,
+                    allow_node_pressure: false,
+                    response,
+                })
+                .await;
+            result.await.unwrap().unwrap();
+            assert_eq!(
+                query(address, "redis.red.internal").await,
+                if index == 0 { 3 } else { 0 }
+            );
+            assert_eq!(query(address, "redis.blue.internal").await, 0);
+        }
+        shutdown.cancel();
+        task.await.unwrap();
     }
 
     #[tokio::test]

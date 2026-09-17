@@ -147,7 +147,10 @@ async fn dns_nxdomain_fault_forces_nxdomain_over_the_wire_then_reverses_on_clear
     // Publish the fault (no expiry) and expect NXDOMAIN.
     harness
         .fault_tx
-        .send(DnsFaultState::from_faults([("redis".to_string(), 0)]))
+        .send(DnsFaultState::from_faults([(
+            ServiceId::new("default", "redis"),
+            0,
+        )]))
         .unwrap();
     let during = harness
         .query(&build_query("redis.internal", QTYPE_A))

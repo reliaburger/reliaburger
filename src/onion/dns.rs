@@ -15,7 +15,7 @@
 /// interception, which turned out to be infeasible: the cgroup
 /// sendmsg4/recvmsg4 hooks can modify socket addresses but can't
 /// read or synthesise DNS packet payloads.
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::sync::Arc;
 use std::time::Duration;
@@ -40,37 +40,40 @@ use super::vip::VirtualIP;
 /// names (with their expiry) on a `watch` channel, and [`answer_internal`]
 /// returns NXDOMAIN for any name that matches while the fault is live.
 ///
-/// A fault targets a service by its bare app name (`redis`), the same way
-/// the Smoker keys every other fault, so a name is faulted in every
-/// namespace it appears in. Expiry is belt-and-braces: the agent removes
-/// a fault from the published set when it clears or expires, and the
-/// resolver also ignores any entry whose deadline has already passed, so
-/// a fault can never outlive its window even if a publish is missed.
+/// Faults retain the authorised namespace and service identity. Overlapping
+/// owners keep the name faulted until the latest expiry; clearing one owner
+/// republishes the union of the remaining owners.
 #[derive(Debug, Clone, Default)]
 pub struct DnsFaultState {
-    /// App name → expiry (`CLOCK_MONOTONIC` nanoseconds, matching the
-    /// Smoker registry's `expires_at_ns`). `0` means "no expiry".
-    faulted: BTreeMap<String, u64>,
+    /// Service identity → monotonic expiry. Zero represents an indefinite owner.
+    faulted: HashMap<ServiceId, u64>,
 }
 
 impl DnsFaultState {
-    /// Build a fault state from `(app name, expiry_ns)` pairs.
-    pub fn from_faults(faults: impl IntoIterator<Item = (String, u64)>) -> Self {
-        Self {
-            faulted: faults.into_iter().collect(),
+    /// Build the union of active owners for each namespace-qualified service.
+    pub fn from_faults(faults: impl IntoIterator<Item = (ServiceId, u64)>) -> Self {
+        let mut result = Self::default();
+        for (service, expires) in faults {
+            result
+                .faulted
+                .entry(service)
+                .and_modify(|current| {
+                    *current = if *current == 0 || expires == 0 {
+                        0
+                    } else {
+                        (*current).max(expires)
+                    };
+                })
+                .or_insert(expires);
         }
+        result
     }
 
-    /// Whether `app` should be forced to NXDOMAIN right now.
-    ///
-    /// `now_ns` is the current `CLOCK_MONOTONIC` reading. A fault with a
-    /// non-zero expiry that has already passed is treated as gone even if
-    /// it's still in the map, so a stale publish can't keep a name dark.
-    pub fn is_faulted(&self, app: &str, now_ns: u64) -> bool {
-        match self.faulted.get(app) {
-            Some(&expires_ns) => expires_ns == 0 || now_ns < expires_ns,
-            None => false,
-        }
+    /// Whether this exact service has at least one unexpired DNS fault owner.
+    pub fn is_faulted(&self, service: &ServiceId, now_ns: u64) -> bool {
+        self.faulted
+            .get(service)
+            .is_some_and(|expires| *expires == 0 || now_ns < *expires)
     }
 }
 
@@ -609,12 +612,9 @@ fn answer_internal(
         return build_status_response(query, RCODE_REFUSED);
     };
 
-    // Smoker DNS fault: a targeted app is forced to NXDOMAIN regardless of
-    // whether it resolves. The fault is keyed by bare app name (matching
-    // how every Smoker fault targets a service), so it bites in whatever
-    // namespace the query lands in.
+    // Retain the namespace chosen above when checking fault ownership.
     let now_ns = crate::smoker::types::monotonic_now_ns();
-    if dns_faults.borrow().is_faulted(&service_id.name, now_ns) {
+    if dns_faults.borrow().is_faulted(&service_id, now_ns) {
         return build_status_response(query, RCODE_NXDOMAIN);
     }
 
@@ -1242,6 +1242,20 @@ mod tests {
     }
 
     #[test]
+    fn overlapping_dns_owners_keep_the_latest_expiry_independent_of_order() {
+        let service = ServiceId::new("red", "redis");
+        for expiries in [[10, 20], [20, 10]] {
+            let state =
+                DnsFaultState::from_faults(expiries.map(|expiry| (service.clone(), expiry)));
+            assert!(state.is_faulted(&service, 15));
+            assert!(!state.is_faulted(&service, 20));
+            assert!(!state.is_faulted(&ServiceId::new("blue", "redis"), 15));
+        }
+        let state = DnsFaultState::from_faults([(service.clone(), 0), (service.clone(), 20)]);
+        assert!(state.is_faulted(&service, u64::MAX));
+    }
+
+    #[test]
     fn dns_nxdomain_fault_forces_nxdomain_for_the_targeted_service() {
         // Two services that both normally resolve; the fault targets only
         // `redis`. `redis` must go NXDOMAIN while `api` still resolves.
@@ -1252,8 +1266,10 @@ mod tests {
         let (_map_tx, map_rx) = watch::channel(map);
 
         // No expiry (0) — the fault is live until cleared.
-        let (_fault_tx, fault_rx) =
-            watch::channel(DnsFaultState::from_faults([("redis".to_string(), 0)]));
+        let (_fault_tx, fault_rx) = watch::channel(DnsFaultState::from_faults([(
+            ServiceId::new("default", "redis"),
+            0,
+        )]));
 
         let redis_query = build_dns_query("redis.internal");
         let redis_resp = answer_internal(
@@ -1314,8 +1330,10 @@ mod tests {
 
         // Clear: the agent publishes an empty state, and the service resolves
         // again immediately.
-        let (fault_tx, fault_rx) =
-            watch::channel(DnsFaultState::from_faults([("redis".to_string(), 0)]));
+        let (fault_tx, fault_rx) = watch::channel(DnsFaultState::from_faults([(
+            ServiceId::new("default", "redis"),
+            0,
+        )]));
         assert!(!resolves(&fault_rx), "fault active — should not resolve");
         fault_tx.send(DnsFaultState::default()).unwrap();
         assert!(
@@ -1326,8 +1344,10 @@ mod tests {
         // Expiry: an entry whose deadline has already passed is ignored even
         // if a publish is missed. `1` ns is comfortably in the past for the
         // monotonic clock (which reads seconds-since-boot).
-        let (_expired_tx, expired_rx) =
-            watch::channel(DnsFaultState::from_faults([("redis".to_string(), 1)]));
+        let (_expired_tx, expired_rx) = watch::channel(DnsFaultState::from_faults([(
+            ServiceId::new("default", "redis"),
+            1,
+        )]));
         assert!(
             resolves(&expired_rx),
             "an expired fault must not keep the name dark"

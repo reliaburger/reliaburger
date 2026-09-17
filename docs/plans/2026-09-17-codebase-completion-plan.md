@@ -610,6 +610,13 @@ last-writer selection.
 NXDOMAIN only for that namespace over the resolver, and prove clearing or
 expiring one owner preserves another owner's effect.
 
+**Completed on PR #167.** The fault watch retains `ServiceId` throughout, unions
+owner expiries and rebuilds on exact-ID removal. Missing namespaces and
+instance-scoped DNS requests refuse before recording an effect. A real resolver
+regression reproduces cross-tenant NXDOMAIN before the repair and verifies
+isolation and overlapping-owner cleanup afterwards. Verification: 32 DNS-filtered
+library tests, 14 wire tests, both final agent regressions and strict Linux Clippy.
+
 ### C47 — Keep runtime address allocation inside the node subnet
 
 **Priority:** P2. **Wave:** 3. **Book chapters:** 03.
