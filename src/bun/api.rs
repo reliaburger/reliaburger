@@ -1422,6 +1422,7 @@ fn lease_error_response(error: crate::testkit::lease::LeaseError) -> Response {
         | crate::testkit::lease::LeaseError::InvalidExpiry
         | crate::testkit::lease::LeaseError::UnsupportedSchema { .. } => StatusCode::BAD_REQUEST,
         crate::testkit::lease::LeaseError::Persistence(_)
+        | crate::testkit::lease::LeaseError::PersistenceUncertain
         | crate::testkit::lease::LeaseError::Malformed(_)
         | crate::testkit::lease::LeaseError::StoreTooLarge
         | crate::testkit::lease::LeaseError::Cleanup(_)

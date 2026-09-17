@@ -5,7 +5,6 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use serde::{Deserialize, Serialize};
-use tokio::io::AsyncWriteExt;
 use tokio::sync::{Mutex, OwnedMutexGuard};
 
 use crate::meat::AppId;
@@ -197,6 +196,8 @@ pub enum LeaseError {
     ResourceLimit,
     #[error("local lease store exceeds 4 MiB")]
     StoreTooLarge,
+    #[error("lease persistence is uncertain; reopen the store before further mutations")]
+    PersistenceUncertain,
     #[error("lease persistence failed: {0}")]
     Persistence(#[from] std::io::Error),
     #[error("lease state is malformed: {0}")]
@@ -218,6 +219,12 @@ struct LocalLeaseInner {
     leases: BTreeMap<String, TestLease>,
     operation_locks: BTreeMap<String, Arc<Mutex<()>>>,
     path: Option<PathBuf>,
+    persistence_uncertain: bool,
+    #[cfg(test)]
+    before_commit: Option<(
+        tokio::sync::oneshot::Sender<()>,
+        std::sync::mpsc::Receiver<()>,
+    )>,
 }
 
 /// Proof that cleanup cannot overtake an in-flight standalone lease mutation.
@@ -245,6 +252,9 @@ impl LocalLeaseStore {
                 leases: BTreeMap::new(),
                 operation_locks: BTreeMap::new(),
                 path: None,
+                persistence_uncertain: false,
+                #[cfg(test)]
+                before_commit: None,
             })),
         }
     }
@@ -282,6 +292,9 @@ impl LocalLeaseStore {
                 leases,
                 operation_locks,
                 path: Some(path),
+                persistence_uncertain: false,
+                #[cfg(test)]
+                before_commit: None,
             })),
         })
     }
@@ -289,7 +302,7 @@ impl LocalLeaseStore {
     /// Insert a new lease and durably record it before returning.
     pub async fn create(&self, lease: TestLease) -> Result<(), LeaseError> {
         lease.validate()?;
-        let mut inner = self.inner.lock().await;
+        let inner = Arc::clone(&self.inner).lock_owned().await;
         if inner.leases.contains_key(&lease.lease_id) {
             return Err(LeaseError::AlreadyExists);
         }
@@ -306,11 +319,7 @@ impl LocalLeaseStore {
         let lease_id = lease.lease_id.clone();
         let mut next = inner.leases.clone();
         next.insert(lease_id.clone(), lease);
-        persist_leases(inner.path.as_deref(), &next).await?;
-        inner.leases = next;
-        inner
-            .operation_locks
-            .insert(lease_id, Arc::new(Mutex::new(())));
+        commit_leases(inner, next).await?;
         Ok(())
     }
 
@@ -344,7 +353,7 @@ impl LocalLeaseStore {
     ) -> Result<LocalLeaseOperation, LeaseError> {
         let operation_lock = self.operation_lock(lease_id).await?;
         let operation_guard = operation_lock.lock_owned().await;
-        let mut inner = self.inner.lock().await;
+        let inner = Arc::clone(&self.inner).lock_owned().await;
         let mut next = inner.leases.clone();
         let lease = next.get_mut(lease_id).ok_or(LeaseError::NotFound)?;
         lease.authorise_owner(owner_id, now_unix_ms)?;
@@ -363,8 +372,7 @@ impl LocalLeaseStore {
             return Err(LeaseError::ResourceLimit);
         }
         lease.resources.extend(resources);
-        persist_leases(inner.path.as_deref(), &next).await?;
-        inner.leases = next;
+        commit_leases(inner, next).await?;
         Ok(LocalLeaseOperation {
             _guard: operation_guard,
         })
@@ -378,7 +386,7 @@ impl LocalLeaseStore {
         now_unix_ms: u64,
         expires_at_unix_ms: u64,
     ) -> Result<TestLease, LeaseError> {
-        let mut inner = self.inner.lock().await;
+        let inner = Arc::clone(&self.inner).lock_owned().await;
         let mut next = inner.leases.clone();
         let lease = next.get_mut(lease_id).ok_or(LeaseError::NotFound)?;
         lease.authorise_owner(owner_id, now_unix_ms)?;
@@ -387,8 +395,7 @@ impl LocalLeaseStore {
         }
         lease.expires_at_unix_ms = expires_at_unix_ms;
         let result = lease.clone();
-        persist_leases(inner.path.as_deref(), &next).await?;
-        inner.leases = next;
+        commit_leases(inner, next).await?;
         Ok(result)
     }
 
@@ -411,7 +418,7 @@ impl LocalLeaseStore {
         let operation_guard = operation_lock
             .try_lock_owned()
             .map_err(|_| LeaseError::Busy)?;
-        let mut inner = self.inner.lock().await;
+        let inner = Arc::clone(&self.inner).lock_owned().await;
         let mut next = inner.leases.clone();
         let lease = next.get_mut(lease_id).ok_or(LeaseError::NotFound)?;
         if owner_id.is_some_and(|owner_id| owner_id != lease.owner_id) {
@@ -426,8 +433,7 @@ impl LocalLeaseStore {
             last_error: None,
         };
         let result = lease.clone();
-        persist_leases(inner.path.as_deref(), &next).await?;
-        inner.leases = next;
+        commit_leases(inner, next).await?;
         Ok((
             result,
             LocalLeaseOperation {
@@ -438,7 +444,7 @@ impl LocalLeaseStore {
 
     /// Retain an inconclusive cleanup for the next reaper attempt.
     pub async fn cleanup_failed(&self, lease_id: &str, reason: &str) -> Result<(), LeaseError> {
-        let mut inner = self.inner.lock().await;
+        let inner = Arc::clone(&self.inner).lock_owned().await;
         let mut next = inner.leases.clone();
         let lease = next.get_mut(lease_id).ok_or(LeaseError::NotFound)?;
         let attempts = match lease.state {
@@ -449,23 +455,20 @@ impl LocalLeaseStore {
             attempts,
             last_error: Some(reason.chars().take(512).collect()),
         };
-        persist_leases(inner.path.as_deref(), &next).await?;
-        inner.leases = next;
+        commit_leases(inner, next).await?;
         Ok(())
     }
 
     /// Delete a lease only after its caller confirmed cleanup.
     pub async fn finish_cleanup(&self, lease_id: &str) -> Result<(), LeaseError> {
-        let mut inner = self.inner.lock().await;
+        let inner = Arc::clone(&self.inner).lock_owned().await;
         let lease = inner.leases.get(lease_id).ok_or(LeaseError::NotFound)?;
         if !matches!(lease.state, TestLeaseState::Cleaning { .. }) {
             return Err(LeaseError::NotActive);
         }
         let mut next = inner.leases.clone();
         next.remove(lease_id);
-        persist_leases(inner.path.as_deref(), &next).await?;
-        inner.leases = next;
-        inner.operation_locks.remove(lease_id);
+        commit_leases(inner, next).await?;
         Ok(())
     }
 
@@ -501,41 +504,66 @@ impl Default for LocalLeaseStore {
     }
 }
 
-async fn persist_leases(
+// Move the guard into the blocking transaction: cancelling its caller must not
+// release ownership while a rename can still publish the previous snapshot.
+async fn commit_leases(
+    mut inner: OwnedMutexGuard<LocalLeaseInner>,
+    next: BTreeMap<String, TestLease>,
+) -> Result<(), LeaseError> {
+    if inner.persistence_uncertain {
+        return Err(LeaseError::PersistenceUncertain);
+    }
+    tokio::task::spawn_blocking(move || {
+        #[cfg(test)]
+        if let Some((entered, release)) = inner.before_commit.take() {
+            let _ = entered.send(());
+            let _ = release.recv();
+        }
+        if let Err(error) = persist_leases(inner.path.as_deref(), &next) {
+            // A directory-sync error can occur after rename. Keep the last
+            // acknowledged view, but never overwrite possibly newer disk state.
+            inner.persistence_uncertain = true;
+            return Err(error);
+        }
+        inner.operation_locks.retain(|id, _| next.contains_key(id));
+        for id in next.keys() {
+            inner
+                .operation_locks
+                .entry(id.clone())
+                .or_insert_with(|| Arc::new(Mutex::new(())));
+        }
+        inner.leases = next;
+        Ok(())
+    })
+    .await
+    .map_err(|error| {
+        LeaseError::Persistence(std::io::Error::other(format!(
+            "lease write task failed: {error}"
+        )))
+    })?
+}
+
+fn persist_leases(
     path: Option<&Path>,
     leases: &BTreeMap<String, TestLease>,
 ) -> Result<(), LeaseError> {
     let Some(path) = path else {
         return Ok(());
     };
-    if let Some(parent) = path.parent() {
-        tokio::fs::create_dir_all(parent).await?;
-    }
-    let temporary = temporary_path(path);
     let bytes = serde_json::to_vec_pretty(&LocalLeaseFile {
         leases: leases.clone(),
     })?;
     if bytes.len() > MAX_LOCAL_LEASE_STORE_BYTES {
         return Err(LeaseError::StoreTooLarge);
     }
-    let mut options = tokio::fs::OpenOptions::new();
-    options.write(true).create(true).truncate(true);
-    #[cfg(unix)]
+    if let Some(parent) = path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
     {
-        options.mode(0o600);
+        std::fs::create_dir_all(parent)?;
     }
-    let mut file = options.open(&temporary).await?;
-    file.write_all(&bytes).await?;
-    file.sync_all().await?;
-    drop(file);
-    tokio::fs::rename(&temporary, path).await?;
+    crate::sesame::identity::atomic_write_mode(path, &bytes, Some(0o600))?;
     Ok(())
-}
-
-fn temporary_path(path: &Path) -> PathBuf {
-    let mut name = path.as_os_str().to_os_string();
-    name.push(".tmp");
-    PathBuf::from(name)
 }
 
 /// Current wall-clock time for lease API and reaper decisions.
@@ -827,6 +855,57 @@ mod tests {
         ));
     }
 
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn durable_store_ignores_predictable_temporary_path() {
+        use std::os::unix::fs::{PermissionsExt, symlink};
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("leases.json");
+        let sentinel = dir.path().join("other-writer");
+        std::fs::write(&sentinel, b"untouched").unwrap();
+        symlink(&sentinel, dir.path().join("leases.json.tmp")).unwrap();
+        let store = LocalLeaseStore::open(path.clone()).await.unwrap();
+        store.create(lease("abc", 10, 20)).await.unwrap();
+        assert_eq!(std::fs::read(&sentinel).unwrap(), b"untouched");
+        assert_eq!(
+            std::fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+        assert!(
+            LocalLeaseStore::open(path)
+                .await
+                .unwrap()
+                .get("abc")
+                .await
+                .is_some()
+        );
+    }
+
+    #[tokio::test]
+    async fn cancelled_caller_cannot_release_a_live_write_transaction() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("leases.json");
+        let store = LocalLeaseStore::open(path.clone()).await.unwrap();
+        let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        store.inner.lock().await.before_commit = Some((entered_tx, release_rx));
+        let first = store.clone();
+        let caller = tokio::spawn(async move { first.create(lease("a", 10, 20)).await });
+        entered_rx.await.unwrap();
+        caller.abort();
+        let _ = caller.await;
+        let second = store.clone();
+        let writer = tokio::spawn(async move { second.create(lease("b", 10, 20)).await });
+        tokio::task::yield_now().await;
+        assert!(!writer.is_finished());
+        release_tx.send(()).unwrap();
+        writer.await.unwrap().unwrap();
+        for view in [store, LocalLeaseStore::open(path).await.unwrap()] {
+            assert!(view.get("a").await.is_some());
+            assert!(view.get("b").await.is_some());
+        }
+    }
+
     #[tokio::test]
     async fn durable_store_survives_restart_with_owned_resources() {
         let dir = tempfile::tempdir().unwrap();
@@ -857,6 +936,9 @@ mod tests {
                 leases: BTreeMap::new(),
                 operation_locks: BTreeMap::new(),
                 path: Some(blocker.join("leases.json")),
+                persistence_uncertain: false,
+                #[cfg(test)]
+                before_commit: None,
             })),
         };
 
@@ -865,6 +947,10 @@ mod tests {
             Err(LeaseError::Persistence(_))
         ));
         assert!(store.get("abc").await.is_none());
+        assert!(matches!(
+            store.create(lease("second", 10, 20)).await,
+            Err(LeaseError::PersistenceUncertain)
+        ));
     }
 
     #[tokio::test]

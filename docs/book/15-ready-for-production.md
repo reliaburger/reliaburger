@@ -2419,3 +2419,23 @@ clear therefore leaves a retryable receipt. Local HTTP fixtures exercise both
 lost injection responses and interrupted cleanup; only the exact recorded IDs
 are ever cleared. This is in-process ownership, not a durable replacement for
 server-side fault expiry after the runner itself dies.
+
+### A lease acknowledgement includes the directory entry
+
+Writing and syncing a file does not make its subsequent rename durable. The
+lease store now uses the same private atomic writer as identity files: a unique
+0600 temporary file, file sync, rename, then parent-directory sync. A pre-existing
+`leases.json.tmp` is irrelevant. The regression plants that name as a symlink
+and verifies that another writer's file remains untouched.
+
+We move an `OwnedMutexGuard` into `spawn_blocking` along with the proposed lease
+map. The blocking transaction keeps the lock until it has persisted and published
+the new map and operation locks. Aborting the async caller cannot release that
+ownership halfway through a write. A controlled pause in the test demonstrates
+that a second writer waits and then preserves both leases after restart.
+
+A persistence failure might occur after rename, so the last acknowledged memory
+view might differ from disk. We retain that view for inspection but refuse further
+mutations until the store is reopened. Returning an error and then overwriting
+possibly newer ownership would defeat the safety mechanism. Physical crash and
+filesystem sync-failure qualification remain part of the recovery acceptance gate.
