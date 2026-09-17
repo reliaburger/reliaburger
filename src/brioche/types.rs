@@ -65,6 +65,8 @@ pub struct ChartConfig {
 
 /// Data backing the app detail page.
 pub struct AppDetailData {
+    /// Replica count from desired state, including instances not yet scheduled.
+    pub desired_instances: usize,
     pub app_name: String,
     pub namespace: String,
     pub state: String,

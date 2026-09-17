@@ -5281,37 +5281,54 @@ async fn app_detail_handler(
     if let Err(resp) = crate::sesame::auth::authorize_scoped(auth.as_deref(), &app, &namespace) {
         return resp;
     }
-    let statuses = gather_statuses(&state).await;
-    let instances: Vec<InstanceStatus> = statuses
+    let (rows, desired) =
+        match tokio::try_join!(cluster_statuses(&state), gather_desired_apps(&state)) {
+            Ok(result) => result,
+            Err(error) => return unavailable_response(error),
+        };
+    let instances: Vec<InstanceStatus> = rows
         .into_iter()
-        .filter(|s| s.app_name == app && s.namespace == namespace)
+        .map(|row| row.instance)
+        .filter(|instance| instance.app_name == app && instance.namespace == namespace)
         .collect();
+    let summary = statuses_to_dashboard_apps(&instances, &desired)
+        .into_iter()
+        .find(|row| row.name == app && row.namespace == namespace);
+    let (overall_state, desired_instances) = summary
+        .map(|row| (row.state, row.instances_desired))
+        .unwrap_or_else(|| ("unknown".to_string(), 0));
 
-    let overall_state = if instances.is_empty() {
-        "unknown".to_string()
-    } else if instances.iter().all(|i| i.state == "running") {
-        "running".to_string()
-    } else {
-        instances
+    let env = if let Some(council) = &state.council {
+        let desired = council.desired_state().await;
+        desired
+            .apps
             .iter()
-            .find(|i| i.state != "running")
-            .map(|i| i.state.clone())
-            .unwrap_or_else(|| "unknown".to_string())
-    };
-
-    // Get env vars from deployed spec
-    let (env_tx, env_rx) = oneshot::channel();
-    let _ = state
-        .cmd_tx
-        .send(AgentCommand::AppConfig {
-            app_name: app.clone(),
-            namespace: namespace.clone(),
-            response: env_tx,
+            .find(|(id, _)| id.name == app && id.namespace == namespace)
+            .map(|(_, spec)| safe_env(&spec.env))
+            .unwrap_or_default()
+    } else {
+        let result = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            let (response, receiver) = oneshot::channel();
+            state
+                .cmd_tx
+                .send(AgentCommand::AppConfig {
+                    app_name: app.clone(),
+                    namespace: namespace.clone(),
+                    response,
+                })
+                .await
+                .map_err(|_| "agent unavailable")?;
+            receiver
+                .await
+                .map_err(|_| "agent did not return app configuration")
         })
         .await;
-    let env = match env_rx.await {
-        Ok(Some(spec)) => safe_env(&spec.env),
-        _ => vec![],
+        match result {
+            Ok(Ok(Some(spec))) => safe_env(&spec.env),
+            Ok(Ok(None)) => Vec::new(),
+            Ok(Err(error)) => return unavailable_response(error.to_string()),
+            Err(_) => return unavailable_response("app configuration query timed out".to_string()),
+        }
     };
 
     // Get deploy history
@@ -5343,6 +5360,7 @@ async fn app_detail_handler(
         app_name: app,
         namespace,
         state: overall_state,
+        desired_instances,
         instances,
         env,
         deploy_history,
@@ -5460,7 +5478,10 @@ async fn fragment_instances_handler(
     if let Err(resp) = crate::sesame::auth::authorize_scoped(auth.as_deref(), &app, &namespace) {
         return resp;
     }
-    let statuses = gather_statuses(&state).await;
+    let statuses = match cluster_statuses(&state).await {
+        Ok(rows) => rows.into_iter().map(|row| row.instance).collect::<Vec<_>>(),
+        Err(error) => return unavailable_response(error),
+    };
     let instances: Vec<InstanceStatus> = statuses
         .into_iter()
         .filter(|s| s.app_name == app && s.namespace == namespace)

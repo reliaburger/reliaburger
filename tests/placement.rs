@@ -1138,6 +1138,25 @@ async fn ingress_reaches_nodes_without_local_replicas() {
             assert_eq!(instances.len(), 1);
             assert_eq!(instances[0].instance.app_name, "web");
             assert!(!instances[0].node.is_empty());
+            for path in [
+                "/ui/app/web/default",
+                "/ui/fragment/app/web/default/instances",
+            ] {
+                let response = node
+                    .client
+                    .http()
+                    .unwrap()
+                    .get(format!("{}{path}", node.client.base_url()))
+                    .send()
+                    .await
+                    .unwrap();
+                assert!(response.status().is_success());
+                let html = response.text().await.unwrap();
+                assert!(
+                    html.contains(&instances[0].instance.id),
+                    "{path} must show the remote instance on every node: {html}"
+                );
+            }
         }
     }
     shutdown.cancel();

@@ -734,3 +734,14 @@ as running; desired apps without placements still get a row. If either collectio
 fails, the endpoint returns an error instead of rendering invented empty state.
 The regression covers failed and stopped instances, a partially placed app,
 and an app with no instances at all.
+
+The app detail page needs the same cluster view as the overview. A restart can
+move `hello` off the node serving the browser. Reading only that node's agent
+then displays `unknown` and `0/0`, even while ingress serves the app normally.
+Both the detail page and its periodically refreshed instance fragment now use
+the bounded cluster collector. They report an unavailable member instead of
+silently displaying an incomplete list. The denominator comes from desired
+state, so an unscheduled replica remains visible. Environment values come from
+the replicated spec, with the existing encrypted-value masking; standalone
+agents answer through a bounded command request. Local deployment history also
+filters by namespace, because two tenants can use the same app name.
