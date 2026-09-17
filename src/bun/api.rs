@@ -5334,7 +5334,10 @@ async fn app_detail_handler(
     // Get deploy history
     let deploy_history = if let Some(ref history) = state.deploy_history {
         let h = history.read().await;
-        h.iter().filter(|e| e.app_id.name == app).cloned().collect()
+        h.iter()
+            .filter(|e| e.app_id.name == app && e.app_id.namespace == namespace)
+            .cloned()
+            .collect()
     } else {
         vec![]
     };
