@@ -6,6 +6,7 @@
 use std::path::PathBuf;
 use std::sync::Arc;
 
+use anyhow::Context;
 use clap::Parser;
 use tokio::sync::{RwLock, mpsc};
 use tokio_util::sync::CancellationToken;
@@ -374,6 +375,28 @@ async fn refresh_token_store(
 ) {
     let tokens = council.security_state().await.api_tokens;
     *store.write().await = tokens;
+}
+
+/// Keep the public listener closed while a joining node receives Raft credentials.
+async fn await_api_credentials(
+    store: &reliaburger::sesame::auth::TokenStore,
+    listen: &str,
+    deadline: std::time::Duration,
+) -> anyhow::Result<()> {
+    if !store.read().await.is_empty() || refuse_open_non_loopback_bind(listen).is_ok() {
+        return Ok(());
+    }
+    println!("bun: waiting for replicated API credentials before opening {listen}");
+    tokio::time::timeout(deadline, async {
+        loop {
+            if !store.read().await.is_empty() {
+                return;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        }
+    })
+    .await
+    .context("timed out waiting for replicated API credentials; public listener remains closed")
 }
 
 /// Refuse to bind a token-less (wide-open) API beyond literal loopback (AUTH3).
@@ -1197,6 +1220,12 @@ async fn run_agent(cli: Cli) -> anyhow::Result<()> {
                 }
             },
         );
+        await_api_credentials(
+            &api_token_store,
+            &cli.listen,
+            std::time::Duration::from_secs(30),
+        )
+        .await?;
     }
     agent.set_log_sink(log_tx);
     agent.set_readiness_tracker(readiness.clone());
@@ -2933,6 +2962,40 @@ mod tests {
         // and checking it separately from bind would introduce a TOCTOU gap.
         let err = refuse_open_non_loopback_bind("localhost:9117").unwrap_err();
         assert!(err.to_string().contains("hostnames aren't accepted"));
+    }
+
+    #[tokio::test]
+    async fn public_listener_waits_for_replicated_tokens() {
+        let store = reliaburger::sesame::auth::new_token_store();
+        let incoming = store.clone();
+        let token = create_token("admin", ApiRole::Admin, TokenScope::default(), None)
+            .unwrap()
+            .token;
+        let replicate = async move {
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            incoming.write().await.push(token);
+        };
+        let (result, ()) = tokio::join!(
+            await_api_credentials(&store, "0.0.0.0:9117", std::time::Duration::from_secs(1)),
+            replicate
+        );
+        result.unwrap();
+        assert!(!store.read().await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn missing_replicated_credentials_fail_closed_within_deadline() {
+        let store = reliaburger::sesame::auth::new_token_store();
+        let result = tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            await_api_credentials(&store, "0.0.0.0:9117", std::time::Duration::from_millis(20)),
+        )
+        .await
+        .unwrap();
+        assert!(result.unwrap_err().to_string().contains("API credentials"));
+        await_api_credentials(&store, "127.0.0.1:9117", std::time::Duration::ZERO)
+            .await
+            .unwrap();
     }
 
     #[tokio::test]
