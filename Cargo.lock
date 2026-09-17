@@ -5041,6 +5041,7 @@ dependencies = [
  "serde_yaml",
  "sha2",
  "siphasher",
+ "syn 2.0.117",
  "sysinfo",
  "tar",
  "tempfile",

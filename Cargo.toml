@@ -94,6 +94,7 @@ ebpf = ["aya", "aya-log"]
 [dev-dependencies]
 criterion = { version = "0.5", features = ["async_tokio"] }
 http-body-util = "0.1"
+syn = { version = "2", features = ["full", "visit"] }
 insta = { version = "1", features = ["json"] }
 proptest = "1"
 tower = { version = "0.5", features = ["util"] }
