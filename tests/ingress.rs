@@ -159,7 +159,7 @@ async fn wait_for_status(
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn ingress_routes_request_to_healthy_backend() {
-    let test_app = TestApp::start(TestAppMode::Healthy).await;
+    let test_app = TestApp::start(TestAppMode::Healthy).await.unwrap();
     let harness = IngressHarness::start_reaching(test_app.port()).await;
 
     let config = Config::parse(&format!(
@@ -223,7 +223,7 @@ async fn ingress_returns_502_when_backend_unreachable() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn ingress_rate_limit_returns_429_with_retry_after() {
-    let test_app = TestApp::start(TestAppMode::Healthy).await;
+    let test_app = TestApp::start(TestAppMode::Healthy).await.unwrap();
     let harness = IngressHarness::start_reaching(test_app.port()).await;
 
     let config = Config::parse(&format!(
@@ -409,7 +409,7 @@ async fn ingress_proxies_websocket_handshake_and_bytes() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn ingress_serves_https_with_self_signed_cert() {
-    let test_app = TestApp::start(TestAppMode::Healthy).await;
+    let test_app = TestApp::start(TestAppMode::Healthy).await.unwrap();
     let harness = IngressHarness::start_reaching(test_app.port()).await;
 
     let config = Config::parse(&format!(

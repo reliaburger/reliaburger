@@ -2183,3 +2183,134 @@ rootful runc and Apple Container profiles. The implementation sandbox used for
 this tranche couldn't launch a live Bun process, so the checked evidence is
 the pure contract, API/authentication tests and mock-runtime orchestration. We
 don't turn that platform limitation into a production claim.
+
+
+## Release checks: listening isn't ready
+
+Imagine running setup while an unrelated web server occupies port 9117. It
+returns a perfectly valid HTTP 404. Our original client treated any completed
+HTTP request as success, so setup congratulated you on your new node. There
+wasn't one.
+
+The liveness check now requires a successful HTTP status and Bun's JSON
+`{"status":"ok"}` response. It bounds the response body as well: a health check
+has no reason to download megabytes. This preserves the existing liveness
+protocol, but liveness still doesn't prove that the node can do useful work.
+
+The new `relish::readiness::wait_for_node` checks liveness, a parseable node
+version and authenticated subsystem readiness. An empty critical-subsystem
+list isn't enough, even if the response claims `ready = true`. Every critical
+subsystem must report `Ready`. Setup returns an error, including the log path,
+when those checks don't succeed.
+
+All requests and retry delays share one `tokio::time::Instant` deadline.
+`timeout_at(deadline, future)` polls the future until that absolute instant;
+when time runs out, dropping the future cancels that attempt. Creating a fresh
+30-second timeout for every request would let a multi-step operation take
+several minutes. One deadline means what it says.
+
+The tests run real HTTP listeners on ephemeral loopback ports. They reject
+404/500 responses, unrelated HTML, invalid version evidence and a live node
+whose subsystems are still starting. A deliberately hung handler proves the
+whole operation respects its deadline. This is a node-startup check; cluster
+quorum and a successful workload request still need their own acceptance
+checks before we call a laptop cluster ready.
+
+### Text doesn't arrive one character at a time
+
+A deployment error containing `café` can arrive with the first byte of `é` at
+the end of one network chunk and its second byte in the next. Decoding each
+chunk separately replaces those bytes with invalid-character markers. The
+connection succeeded; the diagnostic was still wrong.
+
+Relish now retains a `Vec<u8>` (a growable byte vector) until an entire SSE event
+has arrived. Only then does it decode the text. Deployment progress, rollback
+and followed logs use this ordering. The regression test serves an error over
+HTTP with a deliberate pause inside the UTF-8 character, then checks the exact
+message returned by both public deployment methods. The old client failed it;
+the corrected client preserves the message.
+
+### A broken client configuration is an error, not a different configuration
+
+If a user supplies an unreadable CA file, continuing with public trust roots
+changes what the client trusts. If a bearer contains an invalid HTTP header
+character, dropping it turns an authenticated request into an anonymous one.
+Neither is the operation the user requested.
+
+The client now retains construction failures as a `Result` and returns them
+before making a request. Existing constructors keep their return type, but the
+HTTP accessor returns `Result<&Client, RelishError>`, so callers use `?` to
+propagate configuration errors. The new explicit-CA constructor validates at
+construction time for managed cluster setup. Tests reject invalid CA material
+and malformed bearer headers; the existing live TLS tests still verify that a
+cluster-pinned client refuses unrelated trust roots.
+
+The first hosted release build also caught two issues a local build hadn't:
+RustSec reported a newly patched Rustls advisory, and Ubuntu 22.04's compiler
+rejected a C label directly before a declaration in the eBPF source. We updated
+the locked dependencies and added the empty statement required by the older C
+rules. Release builds need their own gate because local source tests can't prove
+that every supported build environment produces a usable artefact.
+
+### A failed query isn't an empty cluster
+
+The test context used to skip nodes whose status request failed and return the
+remaining rows. A test waiting for zero instances could pass because the node
+holding those instances wasn't answering. Collection now returns the failing
+node's name instead of an incomplete success.
+
+The whole collection, including discovering peers, runs under the case's
+existing absolute deadline. Giving each node a fresh request timeout could make
+a supposedly short test wait many times its budget. Polling sleeps also stop at
+the remaining deadline. A timed-out wait reports the last query error alongside
+the last observed states.
+
+Two HTTP regressions exercise this: one server immediately returns 503, and one
+stalls longer than the case's budget. Neither may satisfy an empty-instance
+predicate. Cleanup retains its separate deadline, so an exhausted test budget
+doesn't prevent the runner from attempting to remove its own workloads.
+
+The test HTTP server's startup methods now return `std::io::Result` too. Tests
+can unwrap an ephemeral bind they expect to succeed, while `bun testapp` and the
+standalone executable add the requested port to an ordinary error and exit
+non-zero. A port already in use no longer produces a panic. The regression
+holds a real listening socket and attempts a second bind to the same port.
+
+A test called `deploy_history_records_each_version` used to accept any completed
+entry after two deployments. The first deployment alone could satisfy it. We
+now wait for the first command to appear in completed history, deploy the changed
+command, then require both distinct commands in the collected history. Collection
+visits every node because deployment history is currently local to the node
+which performed the work. Every query and poll shares the case deadline.
+
+The regression runs the public catalogue case against a controlled HTTP server.
+One server deliberately records only the first version; another records both.
+The first must fail and the second must pass. This checks the test's verdict,
+not just the implementation it claims to test.
+
+Ingress acceptance needs a known answer. The container fixture now creates its
+own response file and uses absolute BusyBox commands; it no longer assumes the
+image has a `PATH` or `/etc/hostname`. The test polls until both status and body
+match, sharing the case deadline with deployment. Stopping an app removes the
+desired route, so that case expects 404 after convergence. A configured route
+with an unreachable backend still has its separate 502 integration test.
+
+The probe also needs a different HTTP client from the control plane. `BunClient`
+adds the cluster bearer to requests. Reusing it against ingress could send that
+credential to a workload. `TestContext::workload_http_client` carries no bearer,
+disables redirects and ambient proxies, and bounds requests. Its regression
+sends a request to a controlled server and checks that no Authorization header
+arrives, even when the context's API client has an administrator credential.
+
+The first live run passed its ingress request, then labelled the next two cases
+unknown. Their capability snapshot had expired while they waited in the queue.
+We already refreshed before chaos cases; ordinary queued cases now also refresh
+when required evidence is unknown or stale. A failed refresh remains unknown,
+not a pass or a skipped prerequisite. The capability request consumes the same
+case deadline as the lease and workload operations. A controlled-server test
+covers both ordinary and chaos cases starting with expired evidence.
+
+Each ingress case also gets a hostname derived from its own namespace. Sharing
+one hostname across concurrently deployed test apps lets one case accidentally
+route to another case's backend. Namespace isolation must extend to the ingress
+name, not just the app record.

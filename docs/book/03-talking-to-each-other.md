@@ -977,3 +977,59 @@ The rule for a forwarding header is: the proxy owns it. We strip whatever the cl
 Phase 3 adds 114 tests, bringing the total to 702. The new tests cover IP calculation (boundary cases, wrapping, max containers per node), service map operations (register, resolve, backend health, unregister), routing table lookups (longest prefix match, round-robin, case insensitivity), firewall rule generation (policy, ordering, SSH exclusion), the DNS responder (`.internal` resolution, upstream passthrough), and eBPF integration (BPF map ops, connect rewrite, backend failover).
 
 Most of these run under a plain `cargo test` on any machine. The privileged ones split by gate: `RELIABURGER_NETNS_TESTS=1` (network namespaces, needs root on Linux), `RELIABURGER_RUNC_TESTS=1` (runc containers), and `RELIABURGER_EBPF_TESTS=1` together with `--features ebpf` (the connect-rewrite tests, needs Linux and cgroup v2). On a Mac, `relish dev test` sets all three env vars and the feature flag inside the Lima VM, so one command runs the lot — no need to remember the matrix.
+
+## Release packaging: the eBPF object travels with Bun
+
+A local build can load `onion_connect.bpf.o` from Cargo's output directory.
+Copy that executable to another machine and the directory disappears. The old
+configuration default therefore worked for development but failed for a release
+that shipped only Bun.
+
+An eBPF-enabled Linux build now embeds the object in the executable with Aya's
+`include_bytes_aligned!` macro. Like Rust's `include_bytes!`, this reads a file at
+compile time and produces a reference to its bytes. Aya's variant also gives the
+bytes the alignment its ELF parser requires. `concat!` constructs the file name
+from Cargo's `OUT_DIR` environment variable during compilation. No path lookup
+happens when the installed binary starts.
+
+Both embedded and explicitly configured objects go through the same map and
+program validation and cgroup attachment code. An operator can still set
+`ebpf.program_dir` for a custom object. If that override fails, we report the
+failure; silently substituting another object would hide a configuration error.
+The existing capability checks continue to refuse workloads requiring enforcement
+when attachment fails.
+
+The build script checks Cargo's target OS, rather than the OS running the build
+script. Those differ when cross-compiling. An embedded-object integration test
+loads and attaches the object on a real Linux kernel without supplying an object
+directory. This belongs in the privileged eBPF suite; a macOS unit test can't
+prove that a Linux kernel accepts a program.
+
+## A route belongs to the cluster
+
+Our first three-VM quickstart started a healthy container and still returned
+HTTP 502. We had combined its container IP with its published host port. Those
+are two different ways into the same process: `10.0.2.5:8080` reaches it directly
+from its node, while `192.168.104.3:40032` goes through that node's port mapping.
+Combining the first address with the second port reaches nothing.
+
+The agent now builds local backends from the container IP and the application's
+declared port. A runtime sharing the host network keeps the published port.
+Remote endpoints retain their node IP and published port. When we merge the
+cluster catalogue, we exclude this node's own published endpoints; its local
+service map already has the direct addresses. This also avoids routing a local
+request through the node's external NAT rules.
+
+There was another gap. Only nodes running a replica received its ingress
+configuration. A request landing on an otherwise idle node had no route, even
+though that node knew where the container lived. The placements response now
+carries all desired ingress configurations alongside the endpoint catalogue.
+Each node rebuilds its routes when either changes, including when a route is
+removed. We keep these cluster configurations separate from locally deployed
+ones, so a placements poll doesn't erase a standalone deployment's routes.
+
+The regression tests use a mock runtime that returns a container IP, check the
+port in the resulting backend, and install a remote route on an agent with no
+local instances. Removing that route without changing any endpoints must remove
+it from the routing table too. A healthy container is only half the story; the
+request still has to reach it.

@@ -724,3 +724,203 @@ make toml-demo && make kubernetes-demo                # end-to-end round-trips
 ```
 
 Phase 9 adds 117 tests, bringing the total to 1380.
+
+## Release integration: keep the laptop outside the VM
+
+After creating a local cluster, `relish status` should work from your terminal.
+Asking you to enter a VM just to reach the API leaves half the setup unfinished.
+The managed context records the forwarded HTTPS endpoint, its cluster CA and an
+administrator bearer in `~/.reliaburger/context.json`.
+
+That file contains a credential. Writes use mode 0600 and atomic replacement;
+reads refuse group- or world-readable files. A file lock serialises writers, and
+an ownership identifier prevents one cluster operation from replacing another's
+context. Rust releases the lock when its `File` leaves scope, including early
+error returns. The context deliberately doesn't derive `Debug`: accidentally
+printing a struct mustn't print its bearer.
+
+Explicit endpoint flags bypass the saved context credentials. Otherwise, normal
+CLI commands use the context, while explicit token and CA settings remain
+operator overrides. A malformed context produces an error instead of quietly
+connecting to an unrelated service on the old default port. Tests cover private
+round trips, conflicting owners, bad schema/transport, exposed permissions and
+an absent context.
+
+HTTP and WebSockets share the same cluster trust policy. Both verify certificate
+chains and handshake signatures against only the saved cluster CAs. They omit
+DNS-name checking because a forwarded loopback address doesn't match a node's
+certificate name. Rustls performs the certificate and signature verification;
+we supply the trust anchors and policy. Live TLS tests prove both that the
+right CA works and that an unrelated CA fails. WebSocket connection setup also
+has a deadline, so a stalled handshake can't hang the TUI indefinitely.
+
+### Resume the operation, don't create a second cluster
+
+Quickstart records its ownership identifier and all VM names before it runs a
+VM command. A retry opens the same checkpoint under an exclusive file lock.
+Changing the requested version, node count or ports is an error; a retry isn't
+an implicit upgrade or resize. VM names include the ownership identifier, and
+state validation refuses unrelated names before lifecycle commands can use them.
+
+Bootstrap preparation follows the same rule. We generate the CA hierarchy,
+first node identity, master key and administrator token in a private staging
+directory, then rename the complete bundle into place. A retry validates that
+bundle and reuses it. A missing commit marker, mismatched CA or wrong master key
+is an error, never a reason to generate another identity for running VMs.
+
+Checkpoints use the durable writer described in Chapter 4. Async callers send
+writes to Tokio's blocking pool. An `Arc<File>` keeps the operation lock alive
+until a write finishes, even if its awaiting task is cancelled. The tests cover
+exclusive writers, stable identity and names, changed parameters, invalid
+ownership, private bootstrap files and damaged bundles.
+
+### Download before you trust, verify before you replace
+
+The installer needs a guest image and prebuilt binaries. A partial download
+mustn't become tomorrow's cached executable. The downloader streams each body
+to a randomly named private file beside its destination, checks a running
+SHA-256 digest, flushes it, and renames it into place. A bad checksum leaves an
+existing file untouched. Cached files get checked again before reuse.
+
+Request deadlines include the response body. Size limits apply both to the
+advertised length and the bytes actually received, so chunked responses don't
+bypass them. Redirects must keep using HTTPS, and URLs can't contain credentials.
+Loopback HTTP is allowed only in test builds for the local fixture server.
+Release metadata has its own smaller limit and an explicit schema check.
+Checksum verification protects transfer integrity; the release signature remains
+a separate check before executing a downloaded Reliaburger binary.
+
+VM configuration disables host directory mounts and automatic port forwarding.
+Only the API ports and the first node's HTTP ingress get loopback forwards.
+Nodes use the shared guest network for authenticated cluster traffic, with a
+rootful runc runtime and embedded eBPF. The DNS listener binds that shared IP,
+leaving Ubuntu's loopback resolver alone. Systemd owns the agent process and
+its journal instead of a detached shell process with an uncertain lifetime.
+
+A join token can now come from `relish join --token-file`. It must be a small,
+nonempty, owner-only file. This lets provisioning copy the token into a private
+guest directory without exposing it in the host or guest process arguments.
+The existing `--token` option remains available for manual use. Clap enforces
+that you supply exactly one source; both routes use the same pinned-CA join.
+
+### Put the steps together
+
+`setup --quickstart` wraps the whole operation in one five-minute deadline.
+Each completed external step gets a durable checkpoint. The first VM boots
+alone: Lima creates its shared SSH identity during this step, and concurrent
+first boots race that initialisation. The remaining VM boots run through
+`FuturesUnordered`, a collection of futures polled concurrently that yields
+results as they finish. A future is Rust's suspended asynchronous computation;
+putting several in this stream lets one VM boot while another waits for package
+installation. We persist each result before moving on. Dropping a timed-out
+Lima command kills its direct child; VMs already created remain recorded for
+resume or explicit cleanup.
+
+The first node receives the saved bootstrap identity. Subsequent nodes generate
+their own keys through the ordinary pinned-CA join protocol, using short-lived,
+node-bound tokens. The host never invents a second CA on a retry. Guest file
+replacement uses a staging file and rename, which also permits recovery when
+a previous attempt already started the executable being installed.
+
+API readiness alone isn't the finish line. We check the running binary version,
+all owned nodes, council membership and leader, then deploy a digest-pinned
+BusyBox HTTP server. The last probe goes through the host ingress port and
+checks the response body. Only then do we save the active host context and
+print success. This is the distinction between having started processes and
+having demonstrated a usable cluster. Real-VM qualification still has to prove
+these steps work together, and a published candidate with empty caches must
+meet the timing target before we advertise it.
+
+The release mirrors the dated Ubuntu images named in `guest-images.json`.
+Ubuntu can retire older dated downloads; keeping the verified bytes with the
+release preserves reproducibility. The native CLI embeds the same manifest.
+A developer can explicitly supply local Linux binaries for testing before a
+release exists, but that path prints a notice and cannot qualify the signed
+installer. `RELIABURGER_HOME` isolates its state from a normal installation.
+
+Lifecycle commands hold the operation lock and use only its saved VM names.
+Stopping preserves disks. Destroying requires `--yes`, removes the owned VMs,
+and removes the active context only if its owner matches. We preserve the lock
+file's inode: deleting it while holding the lock would let another process
+create a new file at the same path and acquire a different lock.
+
+
+### Keep the host predictable
+
+The managed Lima home lives inside `RELIABURGER_HOME`, so a user's global Lima
+configuration cannot add host mounts or change the network behind our back.
+A root-level setup lock protects the shared SSH identity and active context;
+the per-cluster lock still protects lifecycle operations. VM names use a short
+ownership identifier rather than the human-facing cluster name. Unix sockets
+have a fixed path-length limit, so we check the complete socket path before
+allocating anything and explain how to choose a shorter state directory.
+
+Preflight checks the VM driver, available memory and disk, and the ports needed
+by stopped or missing VMs. Already running VMs aren't charged twice. We wait
+for guest provisioning to finish even when Lima reports the VM as running;
+those are different milestones. The last forwarding rule excludes every other
+TCP and UDP port on every guest interface. Lima's automatic forwarding is
+helpful interactively, but it isn't part of this installation's contract.
+
+The initial demo also depended on Docker Hub's anonymous pull allowance. A
+failed cache integration caused repeated requests and exhausted it during the
+real-VM test. We use the identical pinned BusyBox index from
+[Docker's public ECR repository](https://www.docker.com/blog/news-from-aws-reinvent-docker-official-images-on-amazon-ecr-public/)
+for quickstart. Changing the registry does not mean changing the workload:
+the digest stays fixed, and the normal OCI client still resolves the host
+architecture and checks downloaded content. This remains a network dependency,
+so the signed cold-install gate must exercise it too.
+
+### Status from any node
+
+A one-replica app can run on the third VM while your CLI connects to the first.
+The old `relish status` asked only that first agent and printed “no workloads
+running”. The request succeeded; the answer was still misleading.
+
+The CLI now requests `/v1/status?cluster=true`. Bun collects its own instance
+statuses, then asks the other known members for their local `/v1/status`.
+Keeping the leaf endpoint local prevents recursive fan-out. Internal requests
+reuse the cluster's HTTPS client and service bearer. Each row carries its node
+name, so identical node-local instance IDs remain distinguishable.
+
+The collector runs at most eight peer requests concurrently and puts a deadline
+around each complete response, including its body. An unresponsive member makes
+the operation fail with that node's name. An empty list should mean no workloads,
+not that we silently dropped the machine running them. We test this with a
+listener that accepts connections but never sends an HTTP response, as well as
+three real agents queried from each node.
+
+### A browser connection without copying the administrator token
+
+The managed cluster API uses a private CA. Relish already knows that CA and the
+operator's token, but a fresh browser knows neither. `relish dashboard` now opens
+a read-only connection through a temporary loopback HTTP server in the CLI.
+Relish continues to verify Bun's CA; the browser doesn't need a system trust-store
+change.
+
+The command prints and opens a one-use link containing a fresh random nonce.
+The local server exchanges it for a separate HttpOnly, SameSite=Strict cookie
+and redirects to `/`. Neither value is the cluster token. The server checks its
+exact loopback Host and Origin, refuses cross-site requests and accepts only GET
+and HEAD. The upstream bearer stays in Relish. Browser cookies and Authorization
+headers aren't forwarded, redirects aren't followed, and response bodies stream
+without whole-response buffering. Ctrl-C cancels those streams and closes the
+browser connection while the cluster keeps running.
+
+We use `AtomicBool` to consume the launch link once even if two requests arrive
+concurrently. `Arc` lets cloned request state share that same flag. Each process
+gets fresh random values, and the cookie name includes the listening port so two
+local dashboard sessions don't overwrite one another's cookies.
+
+The tests cover single-use exchange, cookie attributes, missing sessions, foreign
+origins, DNS rebinding through a forged Host, mutation refusal, and a real upstream
+HTTP server. That server verifies it received the saved CLI credential and never
+the browser's supplied cookie or bearer.
+
+The live browser check found another difference between a local build and a
+copied binary. By default, `rust-embed` reads assets from the source tree in
+debug builds. The qualification VM has no source tree, so its CSS and JavaScript
+returned 404. We enable the crate's `debug-embed` feature as well as compression.
+Cargo features select optional crate behaviour at compile time; here both debug
+and release builds carry their assets. A development binary should exercise the
+same standalone packaging contract as the release.

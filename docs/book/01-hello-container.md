@@ -2821,3 +2821,92 @@ Second, `WorkloadInstance` carries a `container_ip` field so health probes and s
 What we deferred: real multi-node clustering (Phase 2), network namespaces (Phase 3), mTLS and authentication (Phase 4), the Pickle registry (Phase 5). ProcessGrill doesn't provide real isolation, and there's no scheduler, no gossip protocol, no persistent state. All of that is coming.
 
 The foundation is solid. The trait boundaries (`Grill`, the state machine, the health checker) were designed so that adding real implementations doesn't change the orchestration logic. When we add runc support, the agent doesn't know the difference. When we add a scheduler in Phase 2, it sends the same `AgentCommand::Deploy` that the API sends today. That's the payoff of getting the abstractions right early: each phase adds new capabilities without rewriting what came before.
+
+### A slow health endpoint must not stop the agent
+
+The laptop cluster caught a problem that a responsive mock server hid. Each
+health probe waited on the agent's command loop. An endpoint taking five seconds
+to time out delayed status requests, shutdown and cluster resource reports too.
+The scheduler could then move work because its reports were stale.
+
+We now start each probe in a Tokio task and send its result back through the
+agent's existing channel. `tokio::select!` waits for either the probe or the
+shutdown token; whichever finishes first determines the branch, and the other
+future is dropped. The task owns cloned channel and cancellation handles, while
+the agent keeps exclusive ownership of lifecycle state. At most one probe per
+instance is outstanding. The next deadline starts when its result arrives.
+
+A result includes the instance's creation time. If a replacement has reused the
+same name, the agent ignores the old result rather than marking the replacement
+healthy. The regression uses a real TCP listener which accepts a connection but
+never answers. Status and shutdown must still complete within half a second.
+
+### Storage failures are ordinary errors
+
+Creating a storage directory can fail because a parent is a file, a disk is
+read-only, or the process lacks permission. None of these warrants a panic.
+Bun now creates metrics, logs and image directories through Tokio's filesystem
+API and propagates failures with `?`. Where the existing user-directory fallback
+applies, an error names both attempted paths and the storage component. A
+successful fallback is also printed, so you know where the data went.
+
+The test first creates the configured directory, then replaces it with a file
+to exercise the fallback, and finally occupies both paths with files. The last
+case must return an error containing both paths. The nested Parquet log directory
+also has to be created successfully before its store starts; ignoring that error
+would merely postpone the failure until the first log write.
+
+### Preserve the settings across runtimes
+
+A runtime adapter must translate the workload, not merely its image name. Apple
+Container previously ignored bind mounts, process identity, working directory,
+read-only root and host-port publication. The CLI accepted the deployment, but
+it wasn't the deployment you asked for.
+
+The adapter now passes these settings to `container create`. Its Linux VM
+supplies the standard `/proc`, `/dev` and `/sys` mounts; application and identity
+bind mounts become explicit `--mount` arguments. Read-only mounts retain that
+restriction. Unsupported mount options fail before the CLI is called. Because
+Apple's mount syntax uses commas as separators, paths containing commas or
+newlines are rejected rather than interpreted as extra mount fields. Spaces
+remain safe: each argument is a separate string passed directly to the process,
+not shell source.
+
+Apple allocates whole virtual CPUs, so fractional CPU hard limits are explicitly
+unsupported instead of being rounded into a different limit. The adapter also
+rejects zero CPU periods before dividing. This runtime remains experimental;
+the supported laptop cluster uses Linux VMs and runc.
+
+The real-runtime acceptance test mounts a temporary directory read-only, runs
+BusyBox's HTTP server as UID 123 and GID 456 with `/work` as its current directory,
+and reads the file through a published host port. It then verifies process
+identity, working directory and the root mount's read-only flag from inside the
+container. Finally, it removes only that test's container.
+
+### Reuse the probe client and distinguish local errors
+
+A node may probe hundreds of containers every second. Constructing a new HTTP
+client for each probe repeatedly builds connection pools and TLS configuration.
+The probe module now keeps one client in `OnceLock`, a standard-library cell
+which initialises a value once and then shares immutable access. Reqwest handles
+the pool's internal synchronisation. Each request still has its own deadline;
+sharing a client doesn't give a slow workload extra time.
+
+Client construction can fail, so the cell contains a `Result`, not a client
+created with `unwrap()`. Malformed probe requests and client setup errors return
+`ProbeError`. They are local failures, distinct from a workload refusing a
+connection. The agent reports them and schedules another probe without changing
+that workload's failure counters. Deploy health gates return the error directly.
+
+These probes target local workloads, so they bypass shell proxy settings and
+don't follow redirects. A 302 isn't a successful health response. Tests exercise
+two requests over one HTTP connection, malformed targets, redirects, timeouts,
+and a healthy workload retaining its state after a local probe failure.
+
+Moving probes out of the agent loop also changed what observers can see between
+steps. The completion message increments the restart counter and schedules the
+restart; the next reconciliation tick recreates the workload. `pending` is a
+valid intermediate state. Our wall-clock acceptance test now waits for both a
+positive restart count and a live post-restart state within its existing
+deadline. Looking at the counter alone raced that transition and falsely called
+a scheduled restart stuck. A workload which really stays pending still fails.

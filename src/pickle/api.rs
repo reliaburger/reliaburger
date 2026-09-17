@@ -7,10 +7,11 @@
 use std::sync::Arc;
 
 use axum::Router;
-use axum::extract::{DefaultBodyLimit, Query, State};
+use axum::extract::{Query, State};
 use axum::http::{HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Json, Response};
 use axum::routing::get;
+use futures_util::StreamExt;
 use serde::Deserialize;
 use tokio::sync::RwLock;
 
@@ -19,20 +20,13 @@ use super::store::{BlobStore, compute_sha256};
 use super::types::{Digest, ImageManifest, LayerDescriptor, ManifestCatalog, ManifestCommit};
 use crate::sesame::auth::AuthState;
 
-/// Maximum bytes buffered for a single registry request (REG4).
-///
-/// Layers are pushed monolithically or chunked; each PATCH/PUT body is
-/// bounded so one request can't buffer an unbounded blob in memory. Large
-/// layers arrive as multiple bounded chunks.
-///
-/// Note (M11): this bounds *one* request, not aggregate memory — the handlers
-/// take the body as an in-memory `Bytes`, so N concurrent monolithic pushes
-/// can still buffer up to N × this. The peer-pull path already streams to disk
-/// (see `pull::pull_layer_from_peer`); streaming the push handlers the same way
-/// — consuming the request body as a chunked stream straight into the upload
-/// temp — is TODO(Phase 15). Until then, keep this ceiling modest and rely on
-/// chunked pushes (buildah/docker default) to keep individual bodies small.
+/// Maximum bytes streamed by a single blob request. Larger layers use PATCH chunks.
 const MAX_REQUEST_BYTES: usize = 512 * 1024 * 1024;
+/// Manifests are small JSON documents, independently bounded from image layers.
+const MAX_MANIFEST_BYTES: usize = 4 * 1024 * 1024;
+/// Admission bounds open writers and the small buffers retained by each stream.
+const MAX_CONCURRENT_WRITES: usize = 4;
+const UPLOAD_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(300);
 
 /// Shared state for Pickle API handlers.
 #[derive(Clone)]
@@ -289,6 +283,7 @@ pub(crate) async fn record_commit(
 /// suffix ourselves in [`dispatch_v2`]. The repository name is then
 /// whatever precedes that suffix, however many segments it spans.
 pub fn router(state: PickleState) -> Router {
+    let writers = Arc::new(tokio::sync::Semaphore::new(MAX_CONCURRENT_WRITES));
     Router::new()
         .route("/v2/", get(v2_check))
         .route(
@@ -299,7 +294,34 @@ pub fn router(state: PickleState) -> Router {
                 .patch(dispatch_v2)
                 .put(dispatch_v2),
         )
-        .layer(DefaultBodyLimit::max(MAX_REQUEST_BYTES))
+        .layer(axum::middleware::from_fn(
+            move |request: axum::extract::Request, next: axum::middleware::Next| {
+                let writers = Arc::clone(&writers);
+                async move {
+                    let _permit = if matches!(
+                        *request.method(),
+                        axum::http::Method::POST
+                            | axum::http::Method::PATCH
+                            | axum::http::Method::PUT
+                    ) {
+                        match writers.try_acquire_owned() {
+                            Ok(permit) => Some(permit),
+                            Err(_) => {
+                                return (
+                                    StatusCode::TOO_MANY_REQUESTS,
+                                    [("retry-after", "1")],
+                                    "registry write capacity exhausted",
+                                )
+                                    .into_response();
+                            }
+                        }
+                    } else {
+                        None
+                    };
+                    next.run(request).await
+                }
+            },
+        ))
         .with_state(state)
 }
 
@@ -367,7 +389,7 @@ async fn dispatch_v2(
     headers: HeaderMap,
     Query(init_query): Query<InitiateUploadQuery>,
     Query(complete_query): Query<CompleteUploadQueryOpt>,
-    body: axum::body::Bytes,
+    body: axum::body::Body,
 ) -> Response {
     use axum::http::Method;
 
@@ -410,7 +432,19 @@ async fn dispatch_v2(
             blob_upload_complete(&state, &name, &upload_id, &digest, &headers, body).await
         }
         (Method::PUT, V2Route::Manifest { name, reference }) => {
-            manifest_put(&state, &name, &reference, &headers, body).await
+            if let Err(response) = state.authorise_write(&headers).await {
+                return response;
+            }
+            match tokio::time::timeout(
+                UPLOAD_TIMEOUT,
+                axum::body::to_bytes(body, MAX_MANIFEST_BYTES),
+            )
+            .await
+            {
+                Ok(Ok(bytes)) => manifest_put(&state, &name, &reference, &headers, bytes).await,
+                Ok(Err(_)) => StatusCode::PAYLOAD_TOO_LARGE.into_response(),
+                Err(_) => StatusCode::REQUEST_TIMEOUT.into_response(),
+            }
         }
         (Method::GET, V2Route::Manifest { name, reference }) => {
             manifest_get(&state, &name, &reference).await
@@ -521,41 +555,27 @@ async fn blob_upload_initiate(
     name: &str,
     query: InitiateUploadQuery,
     headers_in: &HeaderMap,
-    body: axum::body::Bytes,
+    body: axum::body::Body,
 ) -> Response {
     // Registry writes require a principal once auth is configured (REG4).
     if let Err(response) = state.authorise_write(headers_in).await {
         return response;
     }
 
-    // Monolithic upload: body + digest in one POST
-    if let Some(ref digest_str) = query.digest
-        && !body.is_empty()
-    {
-        let Ok(digest) = Digest::new(digest_str) else {
+    // Register monolithic requests too, so cancellation is covered by the TTL reaper.
+    if let Some(digest_str) = query.digest {
+        if Digest::new(&digest_str).is_err() {
             return StatusCode::BAD_REQUEST.into_response();
+        }
+        let upload_id = match state.store.initiate_upload().await {
+            Ok(id) => id,
+            Err(_) => return StatusCode::INTERNAL_SERVER_ERROR.into_response(),
         };
-        // Quota: a monolithic blob is admitted whole (REG4).
-        if let Err(response) = state.enforce_quota(name, body.len() as u64).await {
-            return response;
-        }
-        match store_blob_off_runtime(state, body.to_vec(), digest.clone()).await {
-            Ok(()) => {
-                let mut headers = HeaderMap::new();
-                headers.insert(
-                    "location",
-                    format!("/v2/{name}/blobs/{digest_str}")
-                        .parse()
-                        .expect("ASCII header value"),
-                );
-                headers.insert(
-                    "docker-content-digest",
-                    digest_str.parse().expect("ASCII header value"),
-                );
-                return (StatusCode::CREATED, headers).into_response();
-            }
-            Err(_) => return StatusCode::BAD_REQUEST.into_response(),
-        }
+        state
+            .sessions
+            .register(&upload_id, name, std::time::SystemTime::now())
+            .await;
+        return blob_upload_complete(state, name, &upload_id, &digest_str, headers_in, body).await;
     }
 
     // Chunked upload: start a session and register it for TTL tracking.
@@ -585,19 +605,22 @@ async fn blob_upload_patch(
     name: &str,
     upload_id: &str,
     headers_in: &HeaderMap,
-    body: axum::body::Bytes,
+    body: axum::body::Body,
 ) -> Response {
     if let Err(response) = state.authorise_write(headers_in).await {
         return response;
     }
+    let Some(writer) = state.sessions.claim_writer(upload_id, name).await else {
+        return oci_error(
+            StatusCode::BAD_REQUEST,
+            "BLOB_UPLOAD_UNKNOWN",
+            "upload session unknown, busy or belongs to another repository".to_string(),
+        );
+    };
     // An upload session that outlived its TTL is refused and swept (REG8),
     // so an abandoned push can't dribble chunks into a stale temp forever.
     let now = std::time::SystemTime::now();
-    if !state
-        .sessions
-        .touch(upload_id, body.len() as u64, now)
-        .await
-    {
+    if !state.sessions.touch(upload_id, 0, now).await {
         state.store.cancel_upload(upload_id).await;
         return oci_error(
             StatusCode::BAD_REQUEST,
@@ -605,7 +628,8 @@ async fn blob_upload_patch(
             "upload session unknown or expired".to_string(),
         );
     }
-    match state.store.write_upload_chunk(upload_id, &body).await {
+    let _writer = writer;
+    match stream_upload(state, upload_id, body).await {
         Ok(total) => {
             let mut headers = HeaderMap::new();
             // The OCI distribution spec requires a Location on every
@@ -631,11 +655,47 @@ async fn blob_upload_patch(
             );
             (StatusCode::ACCEPTED, headers).into_response()
         }
-        Err(super::types::PickleError::InvalidUploadId(_)) => {
-            StatusCode::BAD_REQUEST.into_response()
-        }
-        Err(_) => StatusCode::NOT_FOUND.into_response(),
+        Err(response) => response,
     }
+}
+
+/// Consume one request incrementally. On failure discard its partial upload.
+#[allow(clippy::result_large_err)]
+async fn stream_upload(
+    state: &PickleState,
+    upload_id: &str,
+    body: axum::body::Body,
+) -> Result<u64, Response> {
+    let write = async {
+        let mut stream = body.into_data_stream();
+        let mut received = 0usize;
+        while let Some(chunk) = stream.next().await {
+            let chunk = chunk.map_err(|_| StatusCode::BAD_REQUEST.into_response())?;
+            received = received.saturating_add(chunk.len());
+            if received > MAX_REQUEST_BYTES {
+                return Err(StatusCode::PAYLOAD_TOO_LARGE.into_response());
+            }
+            state
+                .store
+                .write_upload_chunk(upload_id, &chunk)
+                .await
+                .map_err(|_| StatusCode::BAD_REQUEST.into_response())?;
+        }
+        state
+            .store
+            .upload_size(upload_id)
+            .await
+            .map_err(|_| StatusCode::BAD_REQUEST.into_response())
+    };
+    let result = match tokio::time::timeout(UPLOAD_TIMEOUT, write).await {
+        Ok(result) => result,
+        Err(_) => Err(StatusCode::REQUEST_TIMEOUT.into_response()),
+    };
+    if result.is_err() {
+        state.store.cancel_upload(upload_id).await;
+        state.sessions.complete(upload_id).await;
+    }
+    result
 }
 
 /// Query params for PUT upload completion. `digest` is optional here so
@@ -653,10 +713,29 @@ async fn blob_upload_complete(
     upload_id: &str,
     digest_str: &str,
     headers_in: &HeaderMap,
-    body: axum::body::Bytes,
+    body: axum::body::Body,
 ) -> Response {
     if let Err(response) = state.authorise_write(headers_in).await {
         return response;
+    }
+    let Some(writer) = state.sessions.claim_writer(upload_id, name).await else {
+        return oci_error(
+            StatusCode::BAD_REQUEST,
+            "BLOB_UPLOAD_UNKNOWN",
+            "upload session unknown, busy or belongs to another repository".to_string(),
+        );
+    };
+    if !state
+        .sessions
+        .touch(upload_id, 0, std::time::SystemTime::now())
+        .await
+    {
+        state.store.cancel_upload(upload_id).await;
+        return oci_error(
+            StatusCode::BAD_REQUEST,
+            "BLOB_UPLOAD_UNKNOWN",
+            "upload session unknown or expired".to_string(),
+        );
     }
     let Ok(digest) = Digest::new(digest_str) else {
         return (
@@ -666,20 +745,12 @@ async fn blob_upload_complete(
             .into_response();
     };
 
-    // If there's a body with the PUT, write it first
-    if !body.is_empty() {
-        match state.store.write_upload_chunk(upload_id, &body).await {
-            Ok(_) => {}
-            Err(super::types::PickleError::InvalidUploadId(_)) => {
-                return StatusCode::BAD_REQUEST.into_response();
-            }
-            Err(_) => return StatusCode::NOT_FOUND.into_response(),
-        }
+    if let Err(response) = stream_upload(state, upload_id, body).await {
+        return response;
     }
 
     // Enforce the storage quota against the fully-assembled blob before it is
-    // committed (M10). The monolithic POST path checks at initiate time, but a
-    // chunked or bare-PUT upload only knows its total size here — the on-disk
+    // committed (M10). Every upload path only knows its total size here — the on-disk
     // temp file is authoritative. Over quota: drop the temp and the session so
     // nothing lands in the blob store.
     match state.store.upload_size(upload_id).await {
@@ -696,7 +767,10 @@ async fn blob_upload_complete(
         Err(_) => return StatusCode::NOT_FOUND.into_response(),
     }
 
-    let result = state.store.complete_upload(upload_id, &digest).await;
+    let result = state
+        .store
+        .complete_upload_guarded(upload_id, &digest, Some(writer))
+        .await;
     // Whatever the outcome, the session is finished (REG8).
     state.sessions.complete(upload_id).await;
     match result {
@@ -1142,6 +1216,152 @@ mod tests {
     use axum::body::Body;
     use http_body_util::BodyExt;
     use tower::ServiceExt;
+
+    #[tokio::test]
+    async fn monolithic_upload_reaches_disk_before_the_request_finishes() {
+        let (state, dir) = test_state();
+        let store = Arc::clone(&state.store);
+        let digest = compute_sha256(b"firstsecond");
+        let app = router(state);
+        let (tx, rx) = tokio::sync::mpsc::channel::<Result<axum::body::Bytes, std::io::Error>>(1);
+        let request = axum::http::Request::builder()
+            .method("POST")
+            .uri(format!("/v2/web/blobs/uploads/?digest={}", digest.as_str()))
+            .body(Body::from_stream(
+                tokio_stream::wrappers::ReceiverStream::new(rx),
+            ))
+            .unwrap();
+        let task = tokio::spawn(async move { app.oneshot(request).await.unwrap() });
+        tx.send(Ok(axum::body::Bytes::from_static(b"first")))
+            .await
+            .unwrap();
+        let reached_disk = tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            loop {
+                if let Ok(mut entries) = tokio::fs::read_dir(dir.path().join("uploads")).await {
+                    while let Some(entry) = entries.next_entry().await.unwrap() {
+                        if entry.metadata().await.unwrap().len() == 5 {
+                            return;
+                        }
+                    }
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        })
+        .await;
+        if reached_disk.is_err() {
+            task.abort();
+        }
+        assert!(
+            reached_disk.is_ok(),
+            "request was buffered until EOF instead of streamed to disk"
+        );
+        tx.send(Ok(axum::body::Bytes::from_static(b"second")))
+            .await
+            .unwrap();
+        drop(tx);
+        assert_eq!(task.await.unwrap().status(), StatusCode::CREATED);
+        assert_eq!(store.read_blob(&digest).unwrap(), b"firstsecond");
+    }
+
+    #[tokio::test]
+    async fn unauthorised_upload_is_refused_without_reading_the_body() {
+        let (state, _dir, _) = read_gated_state().await;
+        let app = router(state);
+        let body = Body::from_stream(futures_util::stream::pending::<
+            Result<axum::body::Bytes, std::io::Error>,
+        >());
+        let request = axum::http::Request::builder()
+            .method("POST")
+            .uri("/v2/web/blobs/uploads/")
+            .body(body)
+            .unwrap();
+        let response =
+            tokio::time::timeout(std::time::Duration::from_millis(200), app.oneshot(request)).await;
+        assert_eq!(
+            response
+                .expect("auth must precede body consumption")
+                .unwrap()
+                .status(),
+            StatusCode::UNAUTHORIZED
+        );
+    }
+
+    #[tokio::test]
+    async fn registry_refuses_excess_writers_without_buffering_their_bodies() {
+        let (state, _dir) = test_state();
+        let app = router(state);
+        let mut writers = Vec::new();
+        let digest = compute_sha256(b"data");
+        for _ in 0..MAX_CONCURRENT_WRITES {
+            let body = Body::from_stream(futures_util::stream::pending::<
+                Result<axum::body::Bytes, std::io::Error>,
+            >());
+            let request = axum::http::Request::builder()
+                .method("POST")
+                .uri(format!("/v2/web/blobs/uploads/?digest={}", digest.as_str()))
+                .body(body)
+                .unwrap();
+            let mut writer = Box::pin(app.clone().oneshot(request));
+            assert!(futures_util::poll!(writer.as_mut()).is_pending());
+            writers.push(writer);
+        }
+        let request = axum::http::Request::builder()
+            .method("POST")
+            .uri("/v2/web/blobs/uploads/")
+            .body(Body::empty())
+            .unwrap();
+        let response = app.oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
+        assert_eq!(response.headers()["retry-after"], "1");
+        drop(writers);
+    }
+
+    #[tokio::test]
+    async fn upload_session_cannot_be_written_through_a_different_repository() {
+        let (state, _dir) = test_state();
+        let id = state.store.initiate_upload().await.unwrap();
+        state
+            .sessions
+            .register(&id, "team-a/web", std::time::SystemTime::now())
+            .await;
+        let store = Arc::clone(&state.store);
+        let app = router(state);
+        let request = axum::http::Request::builder()
+            .method("PATCH")
+            .uri(format!("/v2/team-b/web/blobs/uploads/{id}"))
+            .body(Body::from("unwanted"))
+            .unwrap();
+        assert_eq!(
+            app.oneshot(request).await.unwrap().status(),
+            StatusCode::BAD_REQUEST
+        );
+        assert_eq!(store.upload_size(&id).await.unwrap(), 0);
+    }
+
+    #[tokio::test]
+    async fn expired_upload_cannot_be_completed() {
+        let (state, _dir) = test_state();
+        let id = state.store.initiate_upload().await.unwrap();
+        state
+            .sessions
+            .register(&id, "web", std::time::SystemTime::UNIX_EPOCH)
+            .await;
+        let digest = compute_sha256(b"data");
+        let request = axum::http::Request::builder()
+            .method("PUT")
+            .uri(format!(
+                "/v2/web/blobs/uploads/{id}?digest={}",
+                digest.as_str()
+            ))
+            .body(Body::from("data"))
+            .unwrap();
+        let store = Arc::clone(&state.store);
+        assert_eq!(
+            router(state).oneshot(request).await.unwrap().status(),
+            StatusCode::BAD_REQUEST
+        );
+        assert!(!store.has_blob(&digest));
+    }
 
     fn test_state() -> (PickleState, tempfile::TempDir) {
         let dir = tempfile::tempdir().unwrap();

@@ -8,6 +8,7 @@ pub mod chaos;
 pub mod client;
 pub mod commands;
 pub mod compile;
+pub mod dashboard;
 pub mod dev;
 pub mod diff;
 pub mod fault;
@@ -26,13 +27,17 @@ pub mod k8s_export;
     clippy::single_match
 )]
 pub mod k8s_import;
+pub mod local_context;
 pub mod manual;
 pub mod output;
 pub mod plan;
+pub mod quickstart;
 pub mod reader;
+pub mod readiness;
 pub mod setup;
 pub mod source;
 pub mod test_cmd;
+mod tls;
 pub mod trace_cmd;
 pub mod tui;
 pub mod upgrade;

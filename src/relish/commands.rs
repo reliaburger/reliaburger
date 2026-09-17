@@ -85,7 +85,7 @@ pub async fn status(output: OutputFormat) -> Result<(), RelishError> {
 }
 
 async fn status_with_client(output: OutputFormat, client: &BunClient) -> Result<(), RelishError> {
-    let statuses = client.status().await?;
+    let statuses = client.cluster_status().await?;
 
     match output {
         OutputFormat::Human => {
@@ -93,17 +93,18 @@ async fn status_with_client(output: OutputFormat, client: &BunClient) -> Result<
                 println!("no workloads running");
             } else {
                 println!(
-                    "{:<20} {:<15} {:<12} {:<10} {:<10} {:<6}",
-                    "INSTANCE", "APP", "NAMESPACE", "STATE", "PID", "RESTARTS"
+                    "{:<24} {:<20} {:<15} {:<12} {:<10} {:<10} {:<6}",
+                    "NODE", "INSTANCE", "APP", "NAMESPACE", "STATE", "PID", "RESTARTS"
                 );
-                for s in &statuses {
+                for row in &statuses {
+                    let s = &row.instance;
                     let pid = s
                         .pid
                         .map(|p| p.to_string())
                         .unwrap_or_else(|| "-".to_string());
                     println!(
-                        "{:<20} {:<15} {:<12} {:<10} {:<10} {:<6}",
-                        s.id, s.app_name, s.namespace, s.state, pid, s.restart_count
+                        "{:<24} {:<20} {:<15} {:<12} {:<10} {:<10} {:<6}",
+                        row.node, s.id, s.app_name, s.namespace, s.state, pid, s.restart_count
                     );
                 }
             }
@@ -235,12 +236,22 @@ async fn logs_with_client(
 /// Parquet store directly, preferring the agent's default
 /// `/var/lib/reliaburger/logs/parquet` and then the per-user data dir (the
 /// same order bun itself uses); a custom `[storage] logs` path is only
-/// reachable through the agent.
-pub async fn logs_export(dest: &Path, node_id: &str) -> Result<(), RelishError> {
-    let dest_str = dest.to_string_lossy();
+/// reachable through the agent or an explicit `source` directory.
+pub async fn logs_export(
+    dest: &Path,
+    node_id: &str,
+    source: Option<&Path>,
+) -> Result<(), RelishError> {
+    let dest_str = dest.to_str().ok_or_else(|| RelishError::InvalidFlag {
+        flag: "--dest".into(),
+        reason: "destination must be valid UTF-8".into(),
+    })?;
+    if let Some(source) = source {
+        return logs_export_from(source, dest_str, node_id).await;
+    }
     let client = BunClient::default_local();
     if client.health().await.is_ok() {
-        let outcome = client.logs_export(&dest_str).await?;
+        let outcome = client.logs_export(dest_str).await?;
         if outcome.files_exported == 0 {
             println!("no new files to export");
         } else {
@@ -281,30 +292,41 @@ pub async fn logs_export(dest: &Path, node_id: &str) -> Result<(), RelishError> 
             ),
         });
     };
-    logs_export_from(&source, dest, node_id).await
+    logs_export_from(&source, dest_str, node_id).await
 }
 
-async fn logs_export_from(source: &Path, dest: &Path, node_id: &str) -> Result<(), RelishError> {
+async fn logs_export_from(source: &Path, dest_str: &str, node_id: &str) -> Result<(), RelishError> {
     use crate::ketchup::export::{CHECKPOINT_FILENAME, ExportCheckpoint, export_logs};
 
     // X8: share Bun's one authoritative checkpoint, not a competing Relish
     // copy. Whichever process exports last records into the same file, so a
     // manual `relish logs-export` and the agent's export loop can't
     // double-ship or skip each other's files.
+    let _entries = tokio::fs::read_dir(source)
+        .await
+        .map_err(|error| RelishError::ApiError {
+            status: 0,
+            body: format!(
+                "cannot read log export source {}: {error}",
+                source.display()
+            ),
+        })?;
     let checkpoint_path = source.join(CHECKPOINT_FILENAME);
     let mut checkpoint = ExportCheckpoint::load(&checkpoint_path);
 
-    let dest_str = dest.to_str().unwrap_or(".");
     match export_logs(source, dest_str, node_id, &mut checkpoint).await {
         Ok(result) => {
             if result.files_exported == 0 {
                 println!("no new files to export");
             } else {
+                checkpoint.save(&checkpoint_path).map_err(|error| RelishError::ApiError {
+                    status: 0,
+                    body: format!("files exported but checkpoint could not be saved: {error}; a later export may repeat these files"),
+                })?;
                 println!(
                     "exported {} file(s) ({} bytes) to {}/{}",
                     result.files_exported, result.bytes_written, dest_str, node_id,
                 );
-                checkpoint.save(&checkpoint_path).ok();
             }
             Ok(())
         }
@@ -552,7 +574,7 @@ path = "/"
 }
 
 /// Assemble the first node's on-disk identity from the init result.
-fn node_identity_from_init(
+pub(super) fn node_identity_from_init(
     init_result: &crate::sesame::init::InitResult,
 ) -> Result<crate::sesame::identity_store::NodeIdentity, RelishError> {
     use crate::sesame::types::CaRole;
@@ -722,6 +744,38 @@ pub async fn join(
     println!("  cluster root CA: {fingerprint}");
     println!("  restart bun to bring up mTLS with the new identity.");
     Ok(())
+}
+
+/// Read a bounded, owner-only join credential without exposing it in process arguments.
+pub async fn read_join_token(path: &Path) -> Result<String, RelishError> {
+    use tokio::io::AsyncReadExt;
+    let file = tokio::fs::File::open(path).await?;
+    let metadata = file.metadata().await?;
+    if !metadata.is_file() || metadata.len() > 4096 {
+        return Err(RelishError::JoinFailed(
+            "invalid join token file size or type".into(),
+        ));
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        if metadata.permissions().mode() & 0o077 != 0 {
+            return Err(RelishError::JoinFailed(
+                "join token file must be owner-only (chmod 600)".into(),
+            ));
+        }
+    }
+    let mut token = String::new();
+    file.take(4097).read_to_string(&mut token).await?;
+    if token.len() > 4096
+        || token.trim().is_empty()
+        || token.trim().chars().any(char::is_whitespace)
+    {
+        return Err(RelishError::JoinFailed(
+            "invalid join token file contents".into(),
+        ));
+    }
+    Ok(token.trim().to_owned())
 }
 
 /// Normalise a member address into a base URL. A bare `host:port` assumes
@@ -1481,7 +1535,7 @@ pub async fn build(
         let upload_url =
             crate::pickle::build::context_upload_url(client.scheme(), registry_port, &digest);
         let resp = client
-            .http()
+            .http()?
             .post(&upload_url)
             .body(tar_bytes)
             .send()
@@ -1859,6 +1913,26 @@ pub async fn snapshot_delete(app: &str, namespace: &str, name: &str) -> Result<(
 mod tests {
     use super::*;
     use std::io::Write as _;
+
+    #[tokio::test]
+    async fn join_token_file_rejects_exposed_empty_and_oversized_credentials() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("token");
+        crate::sesame::identity::atomic_write_mode(&path, b"one-time-token\n", Some(0o600))
+            .unwrap();
+        assert_eq!(read_join_token(&path).await.unwrap(), "one-time-token");
+        for invalid in [String::new(), "two tokens".into(), "x".repeat(4097)] {
+            std::fs::write(&path, invalid).unwrap();
+            assert!(read_join_token(&path).await.is_err());
+        }
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::write(&path, "secret").unwrap();
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
+            assert!(read_join_token(&path).await.is_err());
+        }
+    }
 
     /// Port 1 on localhost — nothing listens there, so connections
     /// are refused immediately without waiting for a timeout.

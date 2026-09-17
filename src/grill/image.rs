@@ -193,6 +193,16 @@ pub struct ImageStore {
     unpack_lock: std::sync::Arc<tokio::sync::Mutex<()>>,
 }
 
+/// Resolve shared registry/runtime storage, retaining older flat cache entries.
+pub(crate) fn cached_blob_path(root: &Path, digest: &str) -> PathBuf {
+    let legacy = root.join("blobs").join("sha256").join(digest);
+    if legacy.is_file() {
+        legacy
+    } else {
+        legacy.join("data")
+    }
+}
+
 impl ImageStore {
     /// Create a new image store at the given root directory.
     pub fn new(store_root: PathBuf) -> Self {
@@ -256,7 +266,15 @@ impl ImageStore {
         for path in layer_paths {
             // The blob filename is the layer's sha256 hex — immutable
             // content identity. Hash the ordered set into one generation id.
-            let name = path.file_name().unwrap_or_default().to_string_lossy();
+            let digest_path = if path.file_name().is_some_and(|name| name == "data") {
+                path.parent().unwrap_or(path)
+            } else {
+                path.as_path()
+            };
+            let name = digest_path
+                .file_name()
+                .unwrap_or_default()
+                .to_string_lossy();
             hasher.update(name.as_bytes());
             hasher.update(b"\n");
         }
@@ -279,16 +297,18 @@ impl ImageStore {
     pub fn blob_path(&self, digest: &str) -> PathBuf {
         // digest is typically "sha256:abcdef..." — strip the algorithm prefix
         let hash = digest.strip_prefix("sha256:").unwrap_or(digest);
-        self.store_root.join("blobs").join("sha256").join(hash)
+        cached_blob_path(&self.store_root, hash)
     }
 
     /// Path to the unpacked rootfs for an image reference.
     pub fn rootfs_path(&self, image_ref: &ImageReference) -> PathBuf {
+        // A colon separates overlayfs lower layers. Digest pins and registry
+        // ports contain it, so encode it before this path reaches a mount.
         self.store_root
             .join("rootfs")
-            .join(&image_ref.registry)
+            .join(image_ref.registry.replace(':', "%3A"))
             .join(&image_ref.repository)
-            .join(&image_ref.tag)
+            .join(image_ref.tag.replace(':', "%3A"))
     }
 
     /// Path to the cached manifest for an image reference.
@@ -750,17 +770,68 @@ mod tests {
     // -- Store path construction -----------------------------------------------
 
     #[test]
+    fn registry_and_runtime_share_new_and_legacy_blobs() {
+        let root = tempfile::tempdir().unwrap();
+        let image = ImageStore::new(root.path().to_path_buf());
+        let registry = crate::pickle::store::BlobStore::new(root.path());
+        let bytes = b"shared layer";
+        let digest = crate::pickle::store::compute_sha256(bytes);
+        registry.write_blob(bytes, &digest).unwrap();
+        assert_eq!(
+            std::fs::read(image.blob_path(digest.as_str())).unwrap(),
+            bytes
+        );
+        assert_eq!(
+            image.blob_path(digest.as_str()),
+            registry.blob_path(&digest)
+        );
+
+        let legacy = crate::pickle::store::compute_sha256(b"old layer");
+        let path = root.path().join("blobs/sha256").join(legacy.hex());
+        std::fs::write(&path, b"old layer").unwrap();
+        registry.write_blob(b"old layer", &legacy).unwrap();
+        assert_eq!(registry.read_blob(&legacy).unwrap(), b"old layer");
+        assert_eq!(image.blob_path(legacy.as_str()), path);
+        assert!(registry.list_blobs().unwrap().contains(&legacy));
+    }
+
+    #[test]
+    fn registry_layer_generations_use_digest_instead_of_the_data_filename() {
+        let store = ImageStore::new(PathBuf::from("/tmp/images"));
+        let root = Path::new("/rootfs/tag");
+        let first = store.rootfs_generation_path(root, &[PathBuf::from("/blobs/aaaa/data")]);
+        let second = store.rootfs_generation_path(root, &[PathBuf::from("/blobs/bbbb/data")]);
+        assert_ne!(first, second);
+        assert_eq!(
+            first,
+            store.rootfs_generation_path(root, &[PathBuf::from("/blobs/aaaa")])
+        );
+    }
+
+    #[test]
+    fn digest_pinned_rootfs_paths_are_safe_for_overlayfs() {
+        let store = ImageStore::new(PathBuf::from("/var/lib/reliaburger/images"));
+        let reference =
+            ImageReference::parse(&format!("localhost:5000/demo@sha256:{}", "a".repeat(64)))
+                .unwrap();
+        let path = store.rootfs_path(&reference);
+        assert!(!path.to_string_lossy().contains(':'));
+        assert!(path.to_string_lossy().contains("localhost%3A5000"));
+        assert!(path.to_string_lossy().contains("sha256%3A"));
+    }
+
+    #[test]
     fn blob_path_from_digest() {
         let store = ImageStore::new(PathBuf::from("/tmp/images"));
         let path = store.blob_path("sha256:abc123");
-        assert_eq!(path, PathBuf::from("/tmp/images/blobs/sha256/abc123"));
+        assert_eq!(path, PathBuf::from("/tmp/images/blobs/sha256/abc123/data"));
     }
 
     #[test]
     fn blob_path_without_prefix() {
         let store = ImageStore::new(PathBuf::from("/tmp/images"));
         let path = store.blob_path("abc123");
-        assert_eq!(path, PathBuf::from("/tmp/images/blobs/sha256/abc123"));
+        assert_eq!(path, PathBuf::from("/tmp/images/blobs/sha256/abc123/data"));
     }
 
     /// REG5: two different layer sets for the same tag land in *different*

@@ -12,6 +12,10 @@ use serde::{Deserialize, Serialize};
 use super::error::UpgradeError;
 use super::version::BinaryVersion;
 
+/// Public Bun release metadata, attached to the latest GitHub release.
+pub const DEFAULT_RELEASE_URL: &str =
+    "https://github.com/reliaburger/reliaburger/releases/latest/download/metadata.json";
+
 /// The whole metadata document.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ReleaseMetadata {

@@ -15,7 +15,7 @@ use super::RelishError;
 use super::client::BunClient;
 
 /// Default release metadata endpoint (matches `upgrades.release_url`).
-pub const DEFAULT_RELEASE_URL: &str = "https://releases.reliaburger.dev/metadata.json";
+pub use crate::upgrade::metadata::DEFAULT_RELEASE_URL;
 
 /// Default bun API port, used when deriving node API addresses from
 /// gossip addresses. Override per node with `--node-address id=host:port`.
@@ -496,7 +496,7 @@ async fn push_blob(
         crate::upgrade::BINARY_BLOB_REPO
     );
     let response = client
-        .http()
+        .http()?
         .post(&url)
         .body(bytes.to_vec())
         .send()

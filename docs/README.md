@@ -1,6 +1,18 @@
 # Reliaburger Documentation
 
+For managed Linux VMs on a laptop, see the [quickstart guide](quickstart.md).
+The source implementation is undergoing qualification; the signed public
+installer is pending release.
+
 User guide for building and running Reliaburger. For the full architectural vision, see the [whitepaper](whitepaper.md). For current implementation status, see [progress.md](progress.md).
+
+## Release work
+
+The [0.1.0 plan](plans/2026-09-16-v0.1.0-release-plan.md) tracks packaging and
+the managed laptop cluster. `relish setup` now checks node version and critical
+subsystem readiness before reporting a successful start. A startup timeout
+returns an error with the log path; `--yes` still configures without starting a
+background node. The public installer remains in development.
 
 ## Prerequisites
 
@@ -377,7 +389,8 @@ Commands:
 | `manual examples` | Write the embedded example configs into the current directory |
 | `source [query]` | Browse and fuzzy-search the embedded source tree (e.g. `relish source ebpf`) |
 | `apply <path>` | Deploy workloads from a TOML config file |
-| `status` | List all running workloads |
+| `dashboard` | Open a read-only web dashboard using the current authenticated CLI context |
+| `status` | List workloads across the cluster with node names; fail if a member cannot answer |
 | `logs <name>` | Show captured stdout/stderr for an app |
 | `logs <name> --tail N` | Show only the last N lines |
 | `logs <name> --follow` / `-f` | Stream new log lines as they appear |
@@ -961,3 +974,10 @@ the `finished` phase plus an explicit `completed`, `failed`, `cancelled` or
 `unknown` outcome. `unknown` means the worker ended without terminal evidence.
 It is not treated as a green deploy. Concurrent operations may target different
 apps, but Bun refuses a second operation for the same namespace/name.
+
+Release maintainers: see [the build, signing and publication procedure](releasing.md).
+
+Apple Container remains experimental. Bind mounts, UID/GID, working directory,
+read-only root and published TCP ports are translated to the Apple CLI. Mount
+options other than bind/ro/rw and fractional CPU hard limits are rejected; use
+the managed Linux/runc quickstart for the supported laptop profile.

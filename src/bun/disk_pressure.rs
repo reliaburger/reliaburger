@@ -21,6 +21,8 @@ use crate::ketchup::export::{ExportCheckpoint, export_logs};
 pub struct PressureResult {
     /// Whether any data was exported.
     pub exported: bool,
+    /// Export failure, retained so the caller can report why data remains local.
+    pub export_error: Option<String>,
     /// Number of files exported.
     pub files_exported: usize,
     /// Number of files pruned.
@@ -66,18 +68,21 @@ pub async fn check_and_relieve(
     let current_size = dir_parquet_size(source_dir);
     let mut result = PressureResult {
         exported: false,
+        export_error: None,
         files_exported: 0,
         files_pruned: 0,
         bytes_reclaimed: 0,
     };
 
     // If we have a destination, export un-exported files first
-    if let Some(dest) = export_dest
-        && let Ok(export_result) = export_logs(source_dir, dest, node_id, checkpoint).await
-        && export_result.files_exported > 0
-    {
-        result.exported = true;
-        result.files_exported = export_result.files_exported;
+    if let Some(dest) = export_dest {
+        match export_logs(source_dir, dest, node_id, checkpoint).await {
+            Ok(export_result) => {
+                result.exported = export_result.files_exported > 0;
+                result.files_exported = export_result.files_exported;
+            }
+            Err(error) => result.export_error = Some(error.to_string()),
+        }
     }
 
     // Prune if over threshold or past retention
@@ -212,6 +217,27 @@ impl DiskPressureResignation {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn failed_export_is_reported_and_unexported_data_is_preserved() {
+        let directory = tempfile::tempdir().unwrap();
+        let source = directory.path().join("events.parquet");
+        tokio::fs::write(&source, b"test log bytes").await.unwrap();
+        let mut checkpoint = ExportCheckpoint::default();
+        let result = check_and_relieve(
+            directory.path(),
+            Some("unsupported://destination"),
+            "node",
+            &mut checkpoint,
+            1,
+            0,
+        )
+        .await;
+        assert!(result.export_error.is_some());
+        assert!(!result.exported);
+        assert_eq!(result.files_pruned, 0);
+        assert!(source.exists());
+    }
 
     #[test]
     fn dir_parquet_size_counts_only_parquet() {

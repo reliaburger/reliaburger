@@ -185,6 +185,8 @@ pub async fn start(
     params: ClusterParams,
     shutdown: CancellationToken,
 ) -> std::io::Result<(ClusterHandle, ClusterRuntime)> {
+    // A failed startup must release every subsystem already launched.
+    let startup_guard = shutdown.clone().drop_guard();
     let readiness = params.readiness.clone();
     let supervision = TaskSupervision {
         shutdown: shutdown.clone(),
@@ -352,6 +354,14 @@ pub async fn start(
     .await
     .map_err(|e| std::io::Error::other(format!("council init failed: {e}")))?;
     let council = Arc::new(council);
+    let shutdown_council = Arc::clone(&council);
+    let council_shutdown = shutdown.clone();
+    tokio::spawn(async move {
+        council_shutdown.cancelled().await;
+        if let Err(error) = shutdown_council.shutdown().await {
+            eprintln!("cluster: council shutdown failed: {error}");
+        }
+    });
 
     // On restart (no configured seeds, but a populated durable store), seed
     // gossip from the RESTORED Raft membership. A restarted seeds-empty node
@@ -418,19 +428,12 @@ pub async fn start(
     if params.seeds.is_empty() && store_fresh {
         let mut members = BTreeMap::new();
         members.insert(raft_id, self_info.clone());
-        let _ = council.initialize(members).await;
-
-        // Seed the initial SecurityState (CAs, age keys, OIDC config) into Raft
-        // once, on this bootstrap node. It then replicates to every node that
-        // joins. Durable Raft (C3) makes this idempotent: a restart has a
-        // populated store, skips this whole block, and never re-seeds.
-        if let Some(state) = &params.bootstrap_security_state
-            && let Err(e) = seed_bootstrap_state(&council, state).await
-        {
-            // The cluster still forms without CA material; log loudly rather
-            // than abort so a seed failure is diagnosable, not silent.
-            eprintln!("cluster: failed to seed security bootstrap state: {e}");
-        }
+        initialise_bootstrap(
+            &council,
+            members,
+            params.bootstrap_security_state.as_deref(),
+        )
+        .await?;
     }
 
     let raft_metrics_rx = council.metrics();
@@ -624,6 +627,7 @@ pub async fn start(
         crl_handle,
     };
 
+    startup_guard.disarm();
     Ok((
         handle,
         ClusterRuntime {
@@ -831,6 +835,30 @@ fn spawn_leader_target_maintainer(
             }
         }
     });
+}
+
+async fn initialise_bootstrap(
+    council: &CouncilNode,
+    members: BTreeMap<u64, CouncilNodeInfo>,
+    security: Option<&crate::sesame::types::SecurityState>,
+) -> std::io::Result<()> {
+    tokio::time::timeout(Duration::from_secs(10), async {
+        council.initialize(members).await.map_err(|error| {
+            std::io::Error::other(format!("failed to initialise fresh council: {error}"))
+        })?;
+        if let Some(state) = security {
+            seed_bootstrap_state(council, state)
+                .await
+                .map_err(|error| {
+                    std::io::Error::other(format!(
+                        "failed to commit security bootstrap state: {error}"
+                    ))
+                })?;
+        }
+        Ok(())
+    })
+    .await
+    .map_err(|_| std::io::Error::other("council bootstrap timed out"))?
 }
 
 /// Seed the initial `SecurityState` into Raft on a freshly bootstrapped
@@ -1335,6 +1363,38 @@ mod tests {
     use super::*;
     use crate::cluster::identity::raft_id_from_name;
     use crate::mustard::state::NodeState;
+
+    #[tokio::test]
+    async fn bootstrap_propagates_initialisation_failure_and_persists_security() {
+        use crate::council::log_store::MemLogStore;
+        use crate::council::network::{InMemoryRaftNetworkFactory, InMemoryRaftRouter};
+        let router = InMemoryRaftRouter::new();
+        let council = CouncilNode::new(
+            1,
+            CouncilConfig::default(),
+            InMemoryRaftNetworkFactory::new(1, router.clone()),
+            MemLogStore::new(),
+            CouncilStateMachine::new(),
+            None,
+        )
+        .await
+        .unwrap();
+        router.register(1, council.raft().clone()).await;
+        let members = BTreeMap::from([(1, info("bootstrap", 9444))]);
+        let security = crate::sesame::types::SecurityState {
+            next_serial: 42,
+            ..Default::default()
+        };
+        initialise_bootstrap(&council, members.clone(), Some(&security))
+            .await
+            .unwrap();
+        assert_eq!(council.security_state().await.next_serial, 42);
+        let error = initialise_bootstrap(&council, members, None)
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("initialise"));
+        council.shutdown().await.unwrap();
+    }
 
     fn snap(name: &str, port: u16, now: Instant) -> MembershipSnapshot {
         MembershipSnapshot {

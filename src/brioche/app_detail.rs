@@ -61,7 +61,7 @@ pub fn render_app_detail(data: &AppDetailData) -> String {
             .iter()
             .filter(|i| i.state == "running")
             .count(),
-        data.instances.len(),
+        data.desired_instances,
     ));
     html.push_str("</div>\n");
 
@@ -164,6 +164,7 @@ mod tests {
 
     fn sample_data() -> AppDetailData {
         AppDetailData {
+            desired_instances: 2,
             app_name: "web".to_string(),
             namespace: "default".to_string(),
             state: "running".to_string(),

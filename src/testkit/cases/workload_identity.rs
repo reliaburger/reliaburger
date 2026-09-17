@@ -25,6 +25,7 @@ async fn jwks_endpoint_serves_signing_keys(ctx: TestContext) -> Result<(), Strin
     let response = ctx
         .client
         .http()
+        .map_err(|error| error.to_string())?
         .get(&url)
         .send()
         .await

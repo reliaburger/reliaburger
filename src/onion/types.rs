@@ -205,9 +205,9 @@ pub struct ServiceEntry {
 pub struct BackendInstance {
     /// Instance ID (e.g. "redis-0").
     pub instance_id: String,
-    /// Real node IP where this instance runs.
+    /// Reachable backend IP: a local container or a remote node.
     pub node_ip: Ipv4Addr,
-    /// Dynamically allocated host port.
+    /// Port at that address: the local container port or remote published port.
     pub host_port: u16,
     /// Whether this backend is currently healthy.
     pub healthy: bool,

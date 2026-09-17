@@ -720,3 +720,28 @@ Phase 11 adds 147 tests, bringing the total to 1595.
 Phase 11 is complete. We have cluster-wide metrics via hierarchical aggregation, cross-node log queries, Parquet log export with remote search, disk pressure management, a multi-page Brioche UI with HTMX and uPlot charts, and alert webhooks with HMAC signing and retry.
 
 PromQL-to-SQL translation is deferred to v2. The SQL interface works well enough for now, and building a correct PromQL translator is a project in itself. Better to ship what works and add compatibility later.
+
+### Desired replicas come from desired state
+
+The overview used to count every local instance, including failed ones, then
+reuse that count as the desired replica count. Under-replication was invisible.
+An app with one running replica out of three could appear as 1/1.
+
+The dashboard and its app-table refresh now collect actual instances across the
+cluster and obtain desired replicas separately from the replicated app specs.
+Standalone Bun uses its stored deployment specs. Only running instances count
+as running; desired apps without placements still get a row. If either collection
+fails, the endpoint returns an error instead of rendering invented empty state.
+The regression covers failed and stopped instances, a partially placed app,
+and an app with no instances at all.
+
+The app detail page needs the same cluster view as the overview. A restart can
+move `hello` off the node serving the browser. Reading only that node's agent
+then displays `unknown` and `0/0`, even while ingress serves the app normally.
+Both the detail page and its periodically refreshed instance fragment now use
+the bounded cluster collector. They report an unavailable member instead of
+silently displaying an incomplete list. The denominator comes from desired
+state, so an unscheduled replica remains visible. Environment values come from
+the replicated spec, with the existing encrypted-value masking; standalone
+agents answer through a bounded command request. Local deployment history also
+filters by namespace, because two tenants can use the same app name.

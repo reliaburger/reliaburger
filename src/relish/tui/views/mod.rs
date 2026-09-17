@@ -17,7 +17,7 @@ use ratatui::layout::{Constraint, Direction, Layout};
 use ratatui::text::Line;
 use ratatui::widgets::{Block, Borders, Clear, Paragraph, Wrap};
 
-use super::app::{TuiApp, View};
+use super::app::{DetailTab, TuiApp, View};
 use super::theme;
 
 /// Render the current view plus global chrome.
@@ -35,28 +35,38 @@ pub fn render(frame: &mut Frame<'_>, app: &TuiApp) {
         ])
         .split(frame.area());
     widgets::header(frame, chunks[0], app);
+    let content_height = usize::from(chunks[1].height.saturating_sub(2));
     let lines: Vec<Line<'static>> = match app.view() {
         View::Dashboard => dashboard::lines(app),
         View::Apps => apps::lines(app),
-        View::AppDetail { .. } => app_detail::lines(app),
+        View::AppDetail { .. } => app_detail::lines(app, content_height),
         View::Nodes | View::NodeDetail { .. } => nodes::lines(app),
         View::Jobs | View::JobDetail { .. } => jobs::lines(app),
         View::Events => events::lines(app),
-        View::Logs { .. } => logs::lines(app),
+        View::Logs { .. } => logs::lines(app, content_height),
         View::Routes | View::RouteDetail { .. } => routes::lines(app),
         View::Search => search::lines(app),
         View::Help => help::lines(app),
     };
-    frame.render_widget(
-        Paragraph::new(lines)
-            .block(
-                Block::default()
-                    .borders(Borders::ALL)
-                    .title(widgets::view_title(app.view())),
-            )
-            .wrap(Wrap { trim: false }),
-        chunks[1],
+    let paragraph = Paragraph::new(lines).block(
+        Block::default()
+            .borders(Borders::ALL)
+            .title(widgets::view_title(app.view())),
     );
+    // Each log entry occupies one terminal row, so wrapping cannot hide the newest entry.
+    let paragraph = if matches!(
+        app.view(),
+        View::Logs { .. }
+            | View::AppDetail {
+                tab: DetailTab::Logs,
+                ..
+            }
+    ) {
+        paragraph
+    } else {
+        paragraph.wrap(Wrap { trim: false })
+    };
+    frame.render_widget(paragraph, chunks[1]);
     widgets::status_bar(frame, chunks[2], app);
     if let Some(palette) = &app.palette {
         let area = ratatui::layout::Rect::new(

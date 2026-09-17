@@ -2,9 +2,36 @@
 
 Single source of truth for what's done and what's next. Check off an item only when it compiles, passes tests, and is committed. See [roadmap.md](roadmap.md) for full details on each phase.
 
+> **0.1.0 release planning (16 September 2026):** see the
+> [release-readiness review and laptop quickstart plan](plans/2026-09-16-v0.1.0-release-plan.md).
+> It separates current packaging/onboarding blockers from superseded audit findings,
+> proposes a supported release scope, and defines clean-install and real-cluster
+> acceptance gates. Implementation is in progress; signed-release and cold-install
+> qualification remain open.
+
+## Current release checklist
+
+- [x] Commit the release scope and acceptance plan (`99e4ff9`).
+- [x] Validate setup liveness and bounded subsystem readiness (`6ee50a6`; 268 Relish tests).
+- [x] Stream registry uploads and bound writers (`1ea2b1a`; 228 registry tests, all-target Clippy).
+- [x] Measure registry memory under concurrent pushes (`5343072`; four 128 MiB uploads, 37.5 MiB RSS growth in a 2 GiB VM).
+- [x] Package self-contained Linux agents and native laptop CLIs (`c448f58`, `79b31b9`; all four hosted native builds pass).
+- [ ] Publish verifiable release metadata and signed artefacts.
+- [x] Implement secure, resumable managed laptop clusters and installer (committed on `codex/v0.1.0-release`; three real Linux VMs passed setup, HTTP ingress and stop/start on 17 September).
+- [x] Fix registry/runtime cache compatibility, restart checkpoints and responsive health probing.
+- [x] Route ingress across nodes and report cluster-wide CLI status (`ea98c4b`, `81611a0`).
+- [x] Propagate storage/bootstrap errors, honour experimental Apple runtime settings, and audit HTTP methods (`6c5bd6f`, `95513ea`, `54f9ee7`).
+- [x] Report unavailable GitOps queues/export failures and show real dashboard replica counts (`baf73f2`, `592e285`).
+- [x] Connect the host browser through pinned TLS and show remote app instances (`5343072`; session tests, 48 rendering tests and three-node acceptance).
+- [x] Fix promoted first-run defects and record residual dispositions in the release plan (`e2fb093`, `a9feedd`; live ingress acceptance and offline export regressions).
+- [x] Record an empty-cache development-binary laptop run (`8ac0700`; three nodes and sample HTTP in 241.75s).
+- [ ] Qualify the downloaded candidate on clean hosts and record three-node timing.
+- [ ] Pass the real-cluster and final release acceptance gates.
+
 > **Review note (July 2026):** a full verification pass ([2026-07-02-review-codebase.md](plans/2026-07-02-review-codebase.md))
-> found that many checked items are **library-only** — implemented and unit-tested, but never
-> wired into the `bun`/`relish` binaries. Those are tagged **`[lib-only]`** below with their
+> found that many checked items were **library-only** — implemented and unit-tested, but never
+> wired into the `bun`/`relish` binaries at that review date. Later hardening sections supersede
+> many of these findings; use the release plan above for current blockers. Those are tagged **`[lib-only]`** below with their
 > finding ID (e.g. `L7`, `C5`). `[x]` still means "code exists + tests pass"; `[lib-only]` means
 > "not reachable from the running binary". Critical bugs in *wired* paths are tagged with their
 > ID too (e.g. `C4`). See the review doc for `file:line` and the staged fix plan.

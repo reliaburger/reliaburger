@@ -374,3 +374,30 @@ make observability-demo      # live, end-to-end
 The cross-node and aggregation pieces — querying logs across the whole cluster, hierarchical metric rollups, exporting to S3 — are *advanced* observability, and their integration tests (`tests/metrics_aggregation.rs`, `tests/logs_cross_node.rs`, `tests/log_export.rs`) belong to Chapter 11. This chapter is the single-node foundation they build on.
 
 All of these run in the portable suite: `make test` (which drives them through nextest). No root, no eBPF, no network, no platform-specific runtime, and no fixed sleeps — the flush concurrency test drives both the write and the read to completion with `tokio::join!` rather than guessing at a delay. Chapter 15 covers the suite taxonomy and why a test that can pass without executing its promised behaviour is worse than no test.
+
+### Report export failures before the disk fills
+
+The disk-pressure loop already refused to delete content that hadn't been
+exported, but it discarded export errors. A broken destination could therefore
+leave the disk filling with no explanation. `PressureResult` now carries an
+optional export error, and Bun prints it with the affected store's name.
+
+The regression writes a log file, configures an unsupported export destination,
+and sets the pressure threshold below the file's size. It asserts both that the
+failure is reported and that the local file survives. Reporting a failed backup
+mustn't turn it into permission to delete the only copy.
+
+### Offline exports must report partial success
+
+Copying the archive is only half an incremental export. We also need to persist
+which files were copied. The offline CLI used to discard a checkpoint write
+failure and print success. It now returns an error that says the files arrived
+but a later export may repeat them. The `?` operator propagates that error before
+we print the success message. A CLI regression makes the checkpoint path a
+directory, then checks both the copied bytes and the non-zero exit status.
+
+`relish logs-export --source PATH --dest PATH` explicitly selects a local store,
+including a custom store whose agent is stopped. A second regression exports
+twice and verifies that the saved checkpoint suppresses the second copy.
+Destinations must be UTF-8 because the object-store interface takes text;
+rejecting an invalid path is safer than silently exporting to a different one.

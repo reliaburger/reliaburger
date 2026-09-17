@@ -43,7 +43,7 @@ struct Cli {
 }
 
 #[tokio::main]
-async fn main() {
+async fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
 
     // One parser, shared with `bun testapp`. The two used to have separate
@@ -57,7 +57,9 @@ async fn main() {
         }
     };
 
-    let app = TestApp::start_on_port(mode, cli.port).await;
+    let app = TestApp::start_on_port(mode, cli.port)
+        .await
+        .map_err(|error| anyhow::anyhow!("failed to bind testapp on port {}: {error}", cli.port))?;
     println!(
         "testapp: listening on 0.0.0.0:{} (mode: {})",
         app.port(),
@@ -67,4 +69,5 @@ async fn main() {
     tokio::signal::ctrl_c().await.ok();
     println!("\ntestapp: shutting down");
     app.shutdown();
+    Ok(())
 }

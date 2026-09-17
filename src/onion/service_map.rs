@@ -247,11 +247,25 @@ impl ServiceMap {
     /// node's own backends, so the dedupe keeps a local instance from
     /// appearing twice.
     pub fn with_cluster_catalog(&self, catalog: &super::catalog::EndpointCatalog) -> ServiceMap {
+        self.with_cluster_catalog_excluding_node(catalog, None)
+    }
+
+    /// Merge remote published endpoints, keeping local workloads on their
+    /// directly reachable container addresses instead of hairpinning host NAT.
+    pub fn with_cluster_catalog_excluding_node(
+        &self,
+        catalog: &super::catalog::EndpointCatalog,
+        local_node: Option<&str>,
+    ) -> ServiceMap {
         let mut merged = self.clone();
         for (qualified, service) in &catalog.services {
             match merged.entries.get_mut(qualified) {
                 Some(local) => {
-                    for backend in &service.backends {
+                    for backend in service
+                        .backends
+                        .iter()
+                        .filter(|backend| Some(backend.node_id.as_str()) != local_node)
+                    {
                         let instance_id = catalog_instance_id(backend);
                         if local.backends.iter().any(|b| b.instance_id == instance_id) {
                             continue;
@@ -278,6 +292,7 @@ impl ServiceMap {
                         backends: service
                             .backends
                             .iter()
+                            .filter(|backend| Some(backend.node_id.as_str()) != local_node)
                             .map(|b| BackendInstance {
                                 instance_id: catalog_instance_id(b),
                                 node_ip: b.node_ip,
@@ -634,6 +649,35 @@ mod tests {
         map.register(&sid("default", "redis"), 6379, None).unwrap();
         assert!(!map.is_empty());
         assert_eq!(map.len(), 1);
+    }
+
+    #[test]
+    fn local_node_uses_direct_backends_instead_of_its_own_published_ports() {
+        use crate::onion::catalog::{CatalogBackend, EndpointCatalog};
+        let local = ServiceMap::new();
+        let id = ServiceId::new("default", "web");
+        let catalog = EndpointCatalog::rebuild([(
+            id.clone(),
+            8080,
+            vec![
+                CatalogBackend {
+                    node_id: "here".into(),
+                    node_ip: "192.168.1.1".parse().unwrap(),
+                    host_port: 30001,
+                    healthy: true,
+                },
+                CatalogBackend {
+                    node_id: "there".into(),
+                    node_ip: "192.168.1.2".parse().unwrap(),
+                    host_port: 30002,
+                    healthy: true,
+                },
+            ],
+        )]);
+        let merged = local.with_cluster_catalog_excluding_node(&catalog, Some("here"));
+        let entry = merged.resolve(&id).unwrap();
+        assert_eq!(entry.backends.len(), 1);
+        assert_eq!(entry.backends[0].host_port, 30002);
     }
 
     #[test]

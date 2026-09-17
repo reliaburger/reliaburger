@@ -44,7 +44,7 @@ async fn deploy_app_reaches_running() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn health_check_healthy_app_transitions_to_running() {
-    let test_app = TestApp::start(TestAppMode::Healthy).await;
+    let test_app = TestApp::start(TestAppMode::Healthy).await.unwrap();
     let harness = TestHarness::start().await;
 
     let config = TestHarness::config_for_test_app(test_app.port());
@@ -67,7 +67,9 @@ async fn health_check_healthy_app_transitions_to_running() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[ignore = "wall-clock health probe acceptance; run with make test-slow"]
 async fn health_check_failing_app_never_reaches_running() {
-    let test_app = TestApp::start(TestAppMode::UnhealthyAfter(0)).await;
+    let test_app = TestApp::start(TestAppMode::UnhealthyAfter(0))
+        .await
+        .unwrap();
     let harness = TestHarness::start().await;
 
     let config = TestHarness::config_for_test_app(test_app.port());
@@ -441,7 +443,7 @@ async fn init_container_failure_prevents_start() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[ignore = "wall-clock health timeout acceptance; run with make test-slow"]
 async fn health_check_hang_stays_in_health_wait() {
-    let test_app = TestApp::start(TestAppMode::Hang).await;
+    let test_app = TestApp::start(TestAppMode::Hang).await.unwrap();
     let harness = TestHarness::start().await;
 
     let config = TestHarness::config_for_test_app(test_app.port());
@@ -481,15 +483,23 @@ async fn status_includes_process_details() {
 #[ignore = "wall-clock health restart acceptance; run with make test-slow"]
 async fn health_check_triggers_restart() {
     // App goes unhealthy after 3 healthy responses, then stays unhealthy
-    let test_app = TestApp::start(TestAppMode::UnhealthyAfter(3)).await;
+    let test_app = TestApp::start(TestAppMode::UnhealthyAfter(3))
+        .await
+        .unwrap();
     let harness = TestHarness::start().await;
 
     let config = TestHarness::config_for_test_app(test_app.port());
     harness.client.apply(&config).await.unwrap();
 
+    // Probe completion schedules a restart; the following agent tick drives
+    // creation. Observe completed re-drive, not its legitimate pending state.
     let status = harness
         .wait_for_instance("testapp", Duration::from_secs(15), |status| {
             status.restart_count > 0
+                && matches!(
+                    status.state.as_str(),
+                    "running" | "health-wait" | "unhealthy"
+                )
         })
         .await;
     assert!(

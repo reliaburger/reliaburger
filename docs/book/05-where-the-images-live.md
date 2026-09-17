@@ -534,3 +534,66 @@ cargo test --lib pickle       # the whole registry, in-process
 Reach for the gated commands only when you want to exercise real images or real runtimes. The full env-var table lives in `docs/README.md`.
 
 Phase 5 adds 72 tests, bringing the total to 867.
+
+## Release hardening: a push shouldn't need a layer's worth of RAM
+
+Push a 400 MiB layer to Pickle. Previously, the HTTP handler collected the
+request into memory before checking authentication, and completion read the
+upload file back into another allocation. Four clients could exhaust a small
+laptop VM without running a single container.
+
+The handler now authenticates before reading the body and writes each incoming
+chunk to the upload file before requesting the next one. That gives us
+backpressure: a slow disk slows the sender. Completion hashes the file with a
+64 KiB buffer on Tokio's blocking pool, syncs it, then renames it into the
+content-addressed store. The digest must match before the blob becomes visible.
+Manifests still need parsing in memory, so they have a separate 4 MiB limit.
+
+A semaphore allows four simultaneous write requests. A fifth receives HTTP 429
+with `Retry-After: 1`; it doesn't sit in a queue retaining its body. Each upload
+also owns a one-permit semaphore, so a PATCH can't change a file while a PUT
+verifies it. An `OwnedSemaphorePermit` holds its semaphore through an `Arc`
+(shared ownership), rather than borrowing the request's stack. Moving it into
+`spawn_blocking` keeps the upload locked even if the client disconnects while
+verification is running. Dropping the permit releases the lock automatically.
+The expiry sweep skips uploads with an active writer.
+
+Each request has a five-minute deadline and a 512 MiB byte limit. Failed body
+reads discard their partial upload; abandoned sessions remain subject to expiry.
+Both PATCH and PUT reject expired sessions and repository mismatches. These
+limits bound active request processing, not total temporary disk usage; storage
+quotas and the expiry sweep still matter.
+
+The regression test sends half a body, waits until those bytes reach the upload
+file, and only then sends the rest. An implementation that buffers until EOF
+cannot pass it. Other tests leave an unauthorised body unfinished, saturate the
+writer limit, and try to complete an expired session. This tests the behaviour
+clients depend on, without relying on process memory measurements. The separate
+release acceptance still needs to measure memory under real concurrent pushes
+in the laptop VM.
+
+### One shared cache means one path convention
+
+The laptop test found two implementations of the same promise. `ImageStore`
+wrote a layer to `blobs/sha256/<digest>`, while Pickle wrote it to
+`blobs/sha256/<digest>/data`. Both pointed at the same base directory. Once the
+runtime created a flat file, the registry could no longer create its directory.
+The fallback then pulled upstream again instead of using the bytes on disk.
+
+Both stores now use one path resolver. New blobs use the registry layout, and
+existing flat files remain readable and writable. Enumeration recognises both
+forms and ignores temporary filenames. A regression writes through the registry
+and reads through the runtime, then repeats with a legacy flat file.
+
+That exposed a second assumption: rootfs generation IDs hashed each layer's
+filename. Every registry layer's filename is `data`, so replacing a layer could
+reuse the previous rootfs generation. We now extract the digest from its parent
+for that layout. The same ordered digests produce the same generation in both
+layouts, and changed digests produce a new generation without touching a running
+container's files. The tests exercise those properties directly.
+
+Digest pins also contain a colon (`sha256:...`), as do registries with explicit
+ports. That character separates lower layers in overlayfs mount options. We
+encode it as `%3A` in rootfs directory components while preserving the original
+OCI reference for registry requests. A path regression covers both a pinned
+digest and a registry port; ordinary tag paths keep their existing layout.

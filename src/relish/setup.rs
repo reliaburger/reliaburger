@@ -481,17 +481,12 @@ async fn offer_to_start(
         log_path.display()
     );
 
-    for _ in 0..10 {
-        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
-        if client.health().await.is_ok() {
-            println!("bun is up — try: relish status");
-            return Ok(());
-        }
-    }
-    println!(
-        "bun has not answered a health check yet; watch {}",
-        log_path.display()
-    );
+    super::readiness::wait_for_node(client, std::time::Duration::from_secs(30))
+        .await
+        .map_err(|error| {
+            RelishError::InitFailed(format!("{error}; logs: {}", log_path.display()))
+        })?;
+    println!("bun is ready — try: relish status");
     Ok(())
 }
 

@@ -79,6 +79,17 @@ const CGROUP_PATH: &str = "/sys/fs/cgroup";
 // Tier 1: Load and map verification
 // ---------------------------------------------------------------------------
 
+#[test]
+#[ignore = "requires Linux root and RELIABURGER_EBPF_TESTS=1"]
+fn embedded_program_loads_without_an_object_directory() {
+    assert!(ebpf_tests_enabled(), "set RELIABURGER_EBPF_TESTS=1");
+    let loader = OnionEbpf::load_embedded(std::path::Path::new(CGROUP_PATH)).unwrap();
+    assert!(loader.is_attached());
+    for name in reliaburger::onion::ebpf::loader::REQUIRED_MAPS {
+        assert!(loader.bpf.map(name).is_some(), "missing map {name}");
+    }
+}
+
 #[tokio::test]
 #[ignore = "requires Linux root and RELIABURGER_EBPF_TESTS=1"]
 async fn ebpf_load_and_attach() {

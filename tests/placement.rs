@@ -1078,3 +1078,95 @@ async fn authenticated_node_kill_fails_and_restores_a_real_cluster_member() {
         }
     }
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 6)]
+#[ignore = "slow multi-node placement acceptance; run with make test-cluster"]
+async fn ingress_reaches_nodes_without_local_replicas() {
+    let shutdown = CancellationToken::new();
+    let n1 = start_node("ingress1", 19441, vec![], &shutdown).await;
+    let n2 = start_node("ingress2", 19445, vec![local(19441)], &shutdown).await;
+    let n3 = start_node("ingress3", 19449, vec![local(19441)], &shutdown).await;
+    let nodes = [&n1, &n2, &n3];
+    let config = reliaburger::config::Config::parse(
+        r#"
+        [app.web]
+        image = "proc-grill:image-ignored"
+        command = ["sleep", "600"]
+        replicas = 1
+        port = 8080
+        [app.web.ingress]
+        host = "remote.local"
+    "#,
+    )
+    .unwrap();
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(60);
+    let mut converged = false;
+    let mut last_apply = tokio::time::Instant::now() - Duration::from_secs(8);
+    while tokio::time::Instant::now() < deadline {
+        if last_apply.elapsed() >= Duration::from_secs(8) {
+            let _ = tokio::time::timeout(Duration::from_secs(5), n1.client.apply(&config)).await;
+            last_apply = tokio::time::Instant::now();
+        }
+        let mut routed_nodes = 0;
+        let mut instances = 0;
+        for node in nodes {
+            let routes = node.client.routes().await.expect("node must serve routes");
+            if routes
+                .iter()
+                .any(|r| r.host == "remote.local" && r.healthy_backends == 1)
+            {
+                routed_nodes += 1;
+            }
+            instances += node
+                .client
+                .status()
+                .await
+                .expect("node must serve status")
+                .iter()
+                .filter(|s| s.app_name == "web")
+                .count();
+        }
+        if instances == 1 && routed_nodes == 3 {
+            converged = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(250)).await;
+    }
+    if converged {
+        for node in nodes {
+            let instances = node.client.cluster_status().await.unwrap();
+            assert_eq!(instances.len(), 1);
+            assert_eq!(instances[0].instance.app_name, "web");
+            assert!(!instances[0].node.is_empty());
+            for path in [
+                "/ui/app/web/default",
+                "/ui/fragment/app/web/default/instances",
+            ] {
+                let response = node
+                    .client
+                    .http()
+                    .unwrap()
+                    .get(format!("{}{path}", node.client.base_url()))
+                    .send()
+                    .await
+                    .unwrap();
+                assert!(response.status().is_success());
+                let html = response.text().await.unwrap();
+                assert!(
+                    html.contains(&instances[0].instance.id),
+                    "{path} must show the remote instance on every node: {html}"
+                );
+            }
+        }
+    }
+    shutdown.cancel();
+    for node in nodes {
+        if let Some(council) = &node.handle.council {
+            council.shutdown().await.unwrap();
+        }
+    }
+    assert!(
+        converged,
+        "all three ingress nodes must see the single healthy replica"
+    );
+}

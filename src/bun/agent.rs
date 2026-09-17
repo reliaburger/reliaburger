@@ -181,7 +181,9 @@ async fn wait_instance_healthy<G: Grill>(
     // so a tight `health_timeout` degrades to a single-shot check rather than
     // failing without ever asking the app.
     loop {
-        last_status = crate::bun::probe::probe_health(&config, &host).await;
+        last_status = crate::bun::probe::probe_health(&config, &host)
+            .await
+            .map_err(|error| format!("{}: {error}", id.0))?;
         if last_status == crate::bun::health::HealthStatus::Healthy {
             consecutive += 1;
             if consecutive >= config.threshold_healthy {
@@ -392,6 +394,7 @@ pub enum AgentCommand {
     /// DNS and ingress resolve services running on other nodes.
     SyncClusterCatalog {
         catalog: Box<crate::onion::catalog::EndpointCatalog>,
+        ingress: Vec<crate::cluster::orchestrate::IngressAssignment>,
     },
     /// List all ingress routes.
     Routes {
@@ -474,6 +477,12 @@ pub enum AgentCommand {
 /// back as one of these ops. Each carries a `oneshot` the loop replies on, so
 /// the task drives the sequence while the loop applies it.
 enum DeployOp {
+    /// A bounded probe completes off-loop; only the agent mutates health state.
+    HealthProbeResult {
+        instance_id: InstanceId,
+        created_at: Instant,
+        status: Result<super::health::HealthStatus, super::probe::ProbeError>,
+    },
     /// Enforce the image trust policy; returns the digest-pinned image, if any.
     EnforceImageSignature {
         spec: Box<AppSpec>,
@@ -1234,6 +1243,16 @@ pub struct InstanceStatus {
     pub pid: Option<u32>,
 }
 
+/// A workload status with the node that supplied it.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ClusterInstanceStatus {
+    /// Node name, or `local` for a standalone agent.
+    pub node: String,
+    /// Node-local workload evidence.
+    #[serde(flatten)]
+    pub instance: InstanceStatus,
+}
+
 /// Status of a run-to-completion job instance, as returned by `/v1/jobs`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct JobStatus {
@@ -1442,6 +1461,8 @@ pub struct BunAgent<G: Grill> {
     /// Ingress specs keyed by `(namespace, app_name)` so same-named apps
     /// in different namespaces route independently (D3/codex-M1).
     ingress_configs: std::collections::HashMap<(String, String), crate::config::app::IngressSpec>,
+    cluster_ingress_configs:
+        std::collections::HashMap<(String, String), crate::config::app::IngressSpec>,
     /// Perimeter firewall config. Disabled in rootless mode.
     perimeter_config: crate::firewall::rules::PerimeterConfig,
     /// Last applied cluster-node set for firewall reconciliation. `None`
@@ -1502,6 +1523,8 @@ pub struct BunAgent<G: Grill> {
     /// Receiver the command loop drains to apply those deploy ops. Paired with
     /// `deploy_ops_tx`; kept here so `run` can `select!` on it.
     deploy_ops_rx: mpsc::Receiver<DeployOp>,
+    /// At most one outstanding health probe per instance identity.
+    health_inflight: std::collections::HashSet<InstanceId>,
     /// Shared drain tracker (DEP5). Handed to the Wrapper proxy so in-flight
     /// requests to a retiring backend are counted; the retire path starts a
     /// drain and waits for it to finish (or time out) before killing the
@@ -1580,6 +1603,7 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
                 crate::wrapper::routing::RoutingTable::new(),
             )),
             ingress_configs: std::collections::HashMap::new(),
+            cluster_ingress_configs: std::collections::HashMap::new(),
             // Single-node mode: no nftables needed (no cluster ports to protect)
             perimeter_config: crate::firewall::rules::PerimeterConfig {
                 enabled: false,
@@ -1603,6 +1627,7 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
             identity_retry_ticks: 0,
             deploy_ops_tx,
             deploy_ops_rx,
+            health_inflight: std::collections::HashSet::new(),
             drains: new_shared_drains(),
         }
     }
@@ -1662,6 +1687,7 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
                 crate::wrapper::routing::RoutingTable::new(),
             )),
             ingress_configs: std::collections::HashMap::new(),
+            cluster_ingress_configs: std::collections::HashMap::new(),
             #[cfg(target_os = "linux")]
             perimeter_config: {
                 let mut cfg = if crate::grill::rootless::is_rootless() {
@@ -1696,6 +1722,7 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
             identity_retry_ticks: 0,
             deploy_ops_tx,
             deploy_ops_rx,
+            health_inflight: std::collections::HashSet::new(),
             drains: new_shared_drains(),
         }
     }
@@ -1881,6 +1908,20 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
             metas.push(manager.create(namespace, app_name, volume_path, name.as_deref(), now)?);
         }
         Ok(metas)
+    }
+
+    /// Configure the actual protected listener ports and explicit enrolment peers.
+    /// This grants network reachability only; protocol authentication still applies.
+    pub fn configure_perimeter(
+        &mut self,
+        cluster_ports: Vec<u16>,
+        management_port: u16,
+        bootstrap_peers: Vec<std::net::IpAddr>,
+    ) {
+        self.perimeter_config.cluster_ports = cluster_ports;
+        self.perimeter_config.management_port = management_port;
+        self.perimeter_config.bootstrap_peers = bootstrap_peers;
+        self.last_firewall_nodes = None;
     }
 
     /// Enable or disable the perimeter firewall. In-process multi-node tests
@@ -3267,14 +3308,14 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
                 // The CLI targets a service by bare name; resolve the first
                 // match in any namespace, against the merged cluster view so a
                 // service running only on other nodes still resolves (12b.4).
-                let merged = self.service_map.with_cluster_catalog(&self.cluster_catalog);
+                let merged = self.merged_service_map();
                 let result = merged
                     .resolve_by_name(&app_name)
                     .map(|e| e.to_resolve_response());
                 let _ = response.send(result);
             }
             AgentCommand::ResolveAll { response } => {
-                let merged = self.service_map.with_cluster_catalog(&self.cluster_catalog);
+                let merged = self.merged_service_map();
                 let results = merged
                     .resolve_all()
                     .iter()
@@ -3282,11 +3323,15 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
                     .collect();
                 let _ = response.send(results);
             }
-            AgentCommand::SyncClusterCatalog { catalog } => {
-                // Only rebuild + republish when the catalogue actually moved;
-                // the reconciler pushes on every tick.
-                if self.cluster_catalog != *catalog {
+            AgentCommand::SyncClusterCatalog { catalog, ingress } => {
+                let ingress = ingress
+                    .into_iter()
+                    .map(|route| ((route.namespace, route.name), route.config))
+                    .collect();
+                // Route changes must propagate even when endpoints stay unchanged.
+                if self.cluster_catalog != *catalog || self.cluster_ingress_configs != ingress {
                     self.cluster_catalog = *catalog;
+                    self.cluster_ingress_configs = ingress;
                     self.rebuild_routing_table().await;
                 }
             }
@@ -4789,15 +4834,14 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
         if let Some(instance) = self.supervisor.get_instance(instance_id)
             && let Some(host_port) = instance.host_port
         {
-            let node_ip = instance
-                .container_ip
-                .unwrap_or(std::net::Ipv4Addr::LOCALHOST);
-            let backend = crate::onion::types::BackendInstance {
-                instance_id: instance_id.0.clone(),
-                node_ip,
+            let service_id = crate::onion::service_id::ServiceId::new(namespace, app_name);
+            let backend = self.local_backend(
+                instance_id,
+                &service_id,
+                instance.container_ip,
                 host_port,
-                healthy: instance.state == ContainerState::Running,
-            };
+                instance.state == ContainerState::Running,
+            );
             if let Err(e) = self.service_map.add_backend(
                 &crate::onion::service_id::ServiceId::new(namespace, app_name),
                 backend,
@@ -4974,16 +5018,13 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
         if spec.port.is_some() {
             for new_id in new_ids {
                 if let Some(host_port) = new_ports.get(new_id).copied().flatten() {
-                    let backend = crate::onion::types::BackendInstance {
-                        instance_id: new_id.0.clone(),
-                        node_ip: new_ips
-                            .get(new_id)
-                            .copied()
-                            .flatten()
-                            .unwrap_or(std::net::Ipv4Addr::LOCALHOST),
+                    let backend = self.local_backend(
+                        new_id,
+                        &service_id,
+                        new_ips.get(new_id).copied().flatten(),
                         host_port,
-                        healthy: true,
-                    };
+                        true,
+                    );
                     if let Err(e) = self.service_map.add_backend(&service_id, backend) {
                         eprintln!("onion: backend not registered for {service_id:?}: {e}");
                     }
@@ -5053,16 +5094,13 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
 
             for new_id in new_ids {
                 if let Some(host_port) = new_ports.get(new_id).copied().flatten() {
-                    let backend = crate::onion::types::BackendInstance {
-                        instance_id: new_id.0.clone(),
-                        node_ip: new_ips
-                            .get(new_id)
-                            .copied()
-                            .flatten()
-                            .unwrap_or(std::net::Ipv4Addr::LOCALHOST),
+                    let backend = self.local_backend(
+                        new_id,
+                        &service_id,
+                        new_ips.get(new_id).copied().flatten(),
                         host_port,
-                        healthy: true,
-                    };
+                        true,
+                    );
                     if let Err(e) = self.service_map.add_backend(&service_id, backend) {
                         eprintln!("onion: backend not registered for {service_id:?}: {e}");
                     }
@@ -5755,108 +5793,148 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
     /// Run any due health checks.
     async fn run_health_checks(&mut self) {
         let now = Instant::now();
-
-        // Collect all due checks
-        let mut due_checks = Vec::new();
-        while let Some((instance_id, config)) = self.supervisor.health_checker_mut().pop_due(now) {
-            due_checks.push((instance_id, config));
+        let mut due = Vec::new();
+        while let Some(check) = self.supervisor.health_checker_mut().pop_due(now) {
+            due.push(check);
         }
-
-        for (instance_id, config) in due_checks {
-            // Only probe instances in a probeable state
-            let (state, probe_host) = match self.supervisor.get_instance(&instance_id) {
-                Some(i) => (Some(i.state), probe_host(i.container_ip)),
-                None => (None, "127.0.0.1".to_string()),
+        for (instance_id, config) in due {
+            let Some(instance) = self.supervisor.get_instance(&instance_id) else {
+                continue;
             };
-
-            let should_probe = matches!(
-                state,
-                Some(ContainerState::HealthWait)
-                    | Some(ContainerState::Running)
-                    | Some(ContainerState::Unhealthy)
-            );
-
-            if should_probe {
-                let status = probe_health(&config, &probe_host).await;
-
-                let transition = self.supervisor.process_health_result(&instance_id, status);
-
-                // Propagate health transitions to the service map, noting the
-                // service so we can re-sync its eBPF backend_map entry afterwards.
-                let mut health_changed_service: Option<crate::onion::service_id::ServiceId> = None;
-                match &transition {
-                    Ok(Some(ContainerState::Running)) => {
-                        if let Some(inst) = self.supervisor.get_instance(&instance_id) {
-                            let service_id = crate::onion::service_id::ServiceId::new(
-                                inst.namespace.clone(),
-                                inst.app_name.clone(),
-                            );
-                            let _ = self.service_map.set_backend_health(
-                                &service_id,
-                                &instance_id.0,
-                                true,
-                            );
-                            health_changed_service = Some(service_id);
-                        }
-                    }
-                    Ok(Some(ContainerState::Unhealthy)) => {
-                        if let Some(inst) = self.supervisor.get_instance(&instance_id) {
-                            let app = inst.app_name.clone();
-                            let namespace = inst.namespace.clone();
-                            let service_id = crate::onion::service_id::ServiceId::new(
-                                namespace.clone(),
-                                app.clone(),
-                            );
-                            let _ = self.service_map.set_backend_health(
-                                &service_id,
-                                &instance_id.0,
-                                false,
-                            );
-                            self.record_event(
-                                crate::bun::events::EventKind::Health,
-                                crate::bun::events::EventSeverity::Warning,
-                                Some(app),
-                                Some(namespace),
-                                format!("instance {} became unhealthy", instance_id.0),
-                            )
-                            .await;
-                            health_changed_service = Some(service_id);
-                        }
-                    }
-                    _ => {}
+            if !matches!(
+                instance.state,
+                ContainerState::HealthWait | ContainerState::Running | ContainerState::Unhealthy
+            ) || !self.health_inflight.insert(instance_id.clone())
+            {
+                self.supervisor
+                    .health_checker_mut()
+                    .schedule_next(instance_id, now);
+                continue;
+            }
+            let host = probe_host(instance.container_ip);
+            let created_at = instance.created_at;
+            let results = self.deploy_ops_tx.clone();
+            let shutdown = self.shutdown.clone();
+            tokio::spawn(async move {
+                let status = tokio::select! {
+                    _ = shutdown.cancelled() => return,
+                    status = probe_health(&config, &host) => status,
+                };
+                let result = DeployOp::HealthProbeResult {
+                    instance_id,
+                    created_at,
+                    status,
+                };
+                tokio::select! {
+                    _ = shutdown.cancelled() => {},
+                    _ = results.send(result) => {},
                 }
-                if let Some(service_id) = health_changed_service {
-                    self.sync_backend_ebpf(&service_id).await;
-                }
+            });
+        }
+    }
 
-                // Handle restart if unhealthy
-                if let Ok(Some(ContainerState::Unhealthy)) = transition
-                    && self
-                        .supervisor
-                        .maybe_restart(&instance_id, now)
-                        .await
-                        .unwrap_or(false)
-                    && let Some(instance) = self.supervisor.get_instance(&instance_id)
-                {
-                    self.record_event(
-                        crate::bun::events::EventKind::Restart,
-                        crate::bun::events::EventSeverity::Warning,
-                        Some(instance.app_name.clone()),
-                        Some(instance.namespace.clone()),
-                        format!(
-                            "instance {} restarted (attempt {})",
-                            instance_id.0, instance.restart_count
-                        ),
+    async fn complete_health_probe(
+        &mut self,
+        instance_id: InstanceId,
+        created_at: Instant,
+        status: Result<super::health::HealthStatus, super::probe::ProbeError>,
+    ) {
+        self.health_inflight.remove(&instance_id);
+        let now = Instant::now();
+        if !self
+            .supervisor
+            .get_instance(&instance_id)
+            .is_some_and(|instance| {
+                instance.created_at == created_at
+                    && matches!(
+                        instance.state,
+                        ContainerState::HealthWait
+                            | ContainerState::Running
+                            | ContainerState::Unhealthy
                     )
-                    .await;
+            })
+        {
+            return;
+        }
+        let status = match status {
+            Ok(status) => status,
+            Err(error) => {
+                eprintln!("bun: {}: {error}", instance_id.0);
+                self.supervisor
+                    .health_checker_mut()
+                    .schedule_next(instance_id, now);
+                return;
+            }
+        };
+        let transition = self.supervisor.process_health_result(&instance_id, status);
+
+        // Propagate health transitions to the service map, noting the
+        // service so we can re-sync its eBPF backend_map entry afterwards.
+        let mut health_changed_service: Option<crate::onion::service_id::ServiceId> = None;
+        match &transition {
+            Ok(Some(ContainerState::Running)) => {
+                if let Some(inst) = self.supervisor.get_instance(&instance_id) {
+                    let service_id = crate::onion::service_id::ServiceId::new(
+                        inst.namespace.clone(),
+                        inst.app_name.clone(),
+                    );
+                    let _ = self
+                        .service_map
+                        .set_backend_health(&service_id, &instance_id.0, true);
+                    health_changed_service = Some(service_id);
                 }
             }
-
-            // Schedule the next check
-            self.supervisor
-                .health_checker_mut()
-                .schedule_next(instance_id, now);
+            Ok(Some(ContainerState::Unhealthy)) => {
+                if let Some(inst) = self.supervisor.get_instance(&instance_id) {
+                    let app = inst.app_name.clone();
+                    let namespace = inst.namespace.clone();
+                    let service_id =
+                        crate::onion::service_id::ServiceId::new(namespace.clone(), app.clone());
+                    let _ = self
+                        .service_map
+                        .set_backend_health(&service_id, &instance_id.0, false);
+                    self.record_event(
+                        crate::bun::events::EventKind::Health,
+                        crate::bun::events::EventSeverity::Warning,
+                        Some(app),
+                        Some(namespace),
+                        format!("instance {} became unhealthy", instance_id.0),
+                    )
+                    .await;
+                    health_changed_service = Some(service_id);
+                }
+            }
+            _ => {}
         }
+        if let Some(service_id) = health_changed_service {
+            self.sync_backend_ebpf(&service_id).await;
+        }
+
+        // Handle restart if unhealthy
+        if let Ok(Some(ContainerState::Unhealthy)) = transition
+            && self
+                .supervisor
+                .maybe_restart(&instance_id, now)
+                .await
+                .unwrap_or(false)
+            && let Some(instance) = self.supervisor.get_instance(&instance_id)
+        {
+            self.record_event(
+                crate::bun::events::EventKind::Restart,
+                crate::bun::events::EventSeverity::Warning,
+                Some(instance.app_name.clone()),
+                Some(instance.namespace.clone()),
+                format!(
+                    "instance {} restarted (attempt {})",
+                    instance_id.0, instance.restart_count
+                ),
+            )
+            .await;
+        }
+
+        self.supervisor
+            .health_checker_mut()
+            .schedule_next(instance_id, now);
     }
 
     /// Register (or refresh) the cron-scheduled jobs from an applied config.
@@ -6274,12 +6352,7 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
             }
             let service_id = crate::onion::service_id::ServiceId::new(&namespace, &app_name);
             if let Some(port) = host_port {
-                let backend = crate::onion::types::BackendInstance {
-                    instance_id: id.0.clone(),
-                    node_ip: container_ip.unwrap_or(std::net::Ipv4Addr::LOCALHOST),
-                    host_port: port,
-                    healthy: true,
-                };
+                let backend = self.local_backend(&id, &service_id, container_ip, port, true);
                 if let Err(e) = self.service_map.add_backend(&service_id, backend) {
                     eprintln!("onion: backend not registered for {service_id:?}: {e}");
                 }
@@ -6381,6 +6454,47 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
         Ok(())
     }
 
+    fn merged_service_map(&self) -> crate::onion::service_map::ServiceMap {
+        let local_name = self.cluster.as_ref().and_then(|cluster| {
+            cluster.raft_metrics_rx.as_ref().and_then(|receiver| {
+                let metrics = receiver.borrow();
+                metrics
+                    .membership_config
+                    .membership()
+                    .get_node(&metrics.id)
+                    .map(|node| node.name.clone())
+            })
+        });
+        self.service_map
+            .with_cluster_catalog_excluding_node(&self.cluster_catalog, local_name.as_deref())
+    }
+
+    /// Use the container port for direct netns traffic, and the published port
+    /// when the runtime shares the host network.
+    fn local_backend(
+        &self,
+        instance_id: &InstanceId,
+        service: &crate::onion::service_id::ServiceId,
+        container_ip: Option<std::net::Ipv4Addr>,
+        host_port: u16,
+        healthy: bool,
+    ) -> crate::onion::types::BackendInstance {
+        let port = if container_ip.is_some() {
+            self.deployed_specs
+                .get(&(service.name.clone(), service.namespace.clone()))
+                .and_then(|spec| spec.port)
+                .unwrap_or(host_port)
+        } else {
+            host_port
+        };
+        crate::onion::types::BackendInstance {
+            instance_id: instance_id.0.clone(),
+            node_ip: container_ip.unwrap_or(std::net::Ipv4Addr::LOCALHOST),
+            host_port: port,
+            healthy,
+        }
+    }
+
     /// Rebuild the Wrapper routing table from the current service map
     /// and ingress configs.
     ///
@@ -6390,13 +6504,15 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
     /// nodes. The local map alone still drives eBPF backend-map syncing —
     /// this merge only affects what DNS/ingress resolve.
     async fn rebuild_routing_table(&self) {
-        let merged = self.service_map.with_cluster_catalog(&self.cluster_catalog);
+        let merged = self.merged_service_map();
 
         let mut table = self.routing_table.write().await;
         // Invalid ingress configs (unsupported TLS mode, zero/overflow rate)
         // are rejected here: their routes are skipped rather than installed,
         // so a bad app can't serve TLS traffic in plaintext or divide by zero.
-        if let Err(e) = table.rebuild(&merged, &self.ingress_configs) {
+        let mut ingress = self.ingress_configs.clone();
+        ingress.extend(self.cluster_ingress_configs.clone());
+        if let Err(e) = table.rebuild(&merged, &ingress) {
             eprintln!("wrapper: ingress routing rebuild rejected some routes: {e}");
         }
         drop(table);
@@ -7018,7 +7134,7 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
             &request.destination_namespace,
             &request.destination,
         );
-        let merged_services = self.service_map.with_cluster_catalog(&self.cluster_catalog);
+        let merged_services = self.merged_service_map();
         let service = internal_destination
             .then(|| merged_services.resolve(&service_id).cloned())
             .flatten();
@@ -7398,15 +7514,7 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
             return;
         };
         let service_id = crate::onion::service_id::ServiceId::new(namespace, app_name);
-        let backend = crate::onion::types::BackendInstance {
-            instance_id: new_id.0.clone(),
-            node_ip: container_ip.unwrap_or(std::net::Ipv4Addr::LOCALHOST),
-            host_port,
-            // Verified, not assumed: the deploy worker gates on
-            // `wait_instance_healthy` — including the app's own HTTP probe
-            // when one is configured — before sending this op (M5).
-            healthy: true,
-        };
+        let backend = self.local_backend(new_id, &service_id, container_ip, host_port, true);
         if let Err(e) = self.service_map.add_backend(&service_id, backend) {
             eprintln!("onion: backend not registered for {service_id:?}: {e}");
         }
@@ -7491,6 +7599,14 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
     /// (DEP4/codex-M3).
     async fn handle_deploy_op(&mut self, op: DeployOp) {
         match op {
+            DeployOp::HealthProbeResult {
+                instance_id,
+                created_at,
+                status,
+            } => {
+                self.complete_health_probe(instance_id, created_at, status)
+                    .await;
+            }
             DeployOp::EnforceImageSignature { spec, reply } => {
                 let _ = reply.send(self.enforce_image_signature(&spec).await);
             }
@@ -9750,6 +9866,51 @@ mod tests {
     /// the old serial deploy (awaited inline in the command arm) this
     /// `Status` could not be serviced until the pull finished.
     #[tokio::test]
+    async fn slow_health_probe_does_not_block_status_or_shutdown() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+        let server = tokio::spawn(async move {
+            let (_socket, _) = listener.accept().await.unwrap();
+            let _ = started_tx.send(());
+            std::future::pending::<()>().await;
+        });
+        let (mut agent, tx, shutdown) = test_agent();
+        let volumes = tempfile::tempdir().unwrap();
+        agent.set_volumes_dir(volumes.path().to_path_buf());
+        let task = tokio::spawn(async move { agent.run().await });
+        let config = Config::parse(&format!(
+            r#"[app.web]
+image = "test:v1"
+port = {port}
+[app.web.health]
+path = "/health"
+timeout = 3
+interval = 1
+"#
+        ))
+        .unwrap();
+        send_deploy(&tx, config).await;
+        tokio::time::timeout(std::time::Duration::from_secs(3), started_rx)
+            .await
+            .unwrap()
+            .unwrap();
+        let (response, received) = tokio::sync::oneshot::channel();
+        tx.send(AgentCommand::Status { response }).await.unwrap();
+        let status = tokio::time::timeout(std::time::Duration::from_millis(500), received).await;
+        shutdown.cancel();
+        let mut task = task;
+        let stopped = tokio::time::timeout(std::time::Duration::from_millis(500), &mut task).await;
+        task.abort();
+        server.abort();
+        assert!(
+            status.is_ok(),
+            "a slow health probe blocked the command loop"
+        );
+        assert!(stopped.is_ok(), "a slow health probe blocked shutdown");
+    }
+
+    #[tokio::test]
     async fn slow_deploy_does_not_block_the_command_loop() {
         let (tx, rx) = mpsc::channel(32);
         let shutdown = CancellationToken::new();
@@ -10153,6 +10314,101 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn ingress_routes_are_installed_without_a_local_replica_and_removed_on_update() {
+        let (mut agent, _tx, _shutdown) = test_agent();
+        let config = Config::parse(
+            r#"[app.remote]
+image = "example:v1"
+port = 8080
+[app.remote.ingress]
+host = "remote.local"
+"#,
+        )
+        .unwrap();
+        let catalog = crate::onion::catalog::EndpointCatalog::rebuild([(
+            crate::onion::service_id::ServiceId::new("default", "remote"),
+            8080,
+            vec![crate::onion::catalog::CatalogBackend {
+                node_id: "other-node".into(),
+                node_ip: "192.168.1.2".parse().unwrap(),
+                host_port: 30001,
+                healthy: true,
+            }],
+        )]);
+        agent
+            .handle_command(AgentCommand::SyncClusterCatalog {
+                catalog: Box::new(catalog.clone()),
+                ingress: vec![crate::cluster::orchestrate::IngressAssignment {
+                    name: "remote".into(),
+                    namespace: "default".into(),
+                    config: config.app["remote"].ingress.clone().unwrap(),
+                }],
+            })
+            .await;
+        assert!(
+            agent
+                .routing_table
+                .read()
+                .await
+                .lookup("remote.local", "/")
+                .is_some()
+        );
+        assert!(agent.supervisor.list_instances().is_empty());
+        agent
+            .handle_command(AgentCommand::SyncClusterCatalog {
+                catalog: Box::new(catalog),
+                ingress: Vec::new(),
+            })
+            .await;
+        assert!(
+            agent
+                .routing_table
+                .read()
+                .await
+                .lookup("remote.local", "/")
+                .is_none()
+        );
+    }
+
+    #[tokio::test]
+    async fn local_probe_failure_does_not_restart_a_healthy_workload() {
+        let (mut agent, _tx, _shutdown, _grill) = test_agent_with_grill();
+        let (events, _receiver) = mpsc::channel(64);
+        agent.deploy(config_with_health(), &events).await;
+        let instance = agent.supervisor.list_instances()[0];
+        let id = instance.id.clone();
+        let created_at = instance.created_at;
+        for _ in 0..3 {
+            agent
+                .complete_health_probe(
+                    id.clone(),
+                    created_at,
+                    Ok(super::super::health::HealthStatus::Healthy),
+                )
+                .await;
+        }
+        assert_eq!(
+            agent.supervisor.get_instance(&id).unwrap().state,
+            ContainerState::Running
+        );
+        for _ in 0..3 {
+            agent
+                .complete_health_probe(
+                    id.clone(),
+                    created_at,
+                    Err(super::super::probe::ProbeError::Client(
+                        "local TLS setup failed".into(),
+                    )),
+                )
+                .await;
+        }
+        let instance = agent.supervisor.get_instance(&id).unwrap();
+        assert_eq!(instance.state, ContainerState::Running);
+        assert_eq!(instance.health_counters.consecutive_unhealthy, 0);
+        assert_eq!(instance.restart_count, 0);
+    }
+
+    #[tokio::test]
     async fn deploy_records_the_grills_container_ip_on_instance_and_backend() {
         let (mut agent, _tx, _shutdown, grill) = test_agent_with_grill();
         let ip = std::net::Ipv4Addr::new(10, 0, 2, 5);
@@ -10182,6 +10438,13 @@ mod tests {
         assert!(
             entry.backends.iter().any(|b| b.node_ip == ip),
             "backend registered with loopback instead of the container IP"
+        );
+        assert!(
+            entry
+                .backends
+                .iter()
+                .all(|backend| backend.host_port == 8080),
+            "a container IP must use its declared port, not the allocated host port"
         );
     }
 

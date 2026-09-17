@@ -1023,3 +1023,22 @@ Phase 10 adds a complete security layer on top of the Phase 4 PKI foundation:
 - Egress DNS re-resolves asynchronously
 
 The next chapter tackles advanced observability.
+
+### A path isn't a complete authorisation rule
+
+`GET /v1/status` and `POST /v1/status` are different operations. Our matrix
+already recorded both the method and path, but its coverage test compared only
+paths. Adding a mutation to an existing read route could therefore leave the
+matrix unchanged and the test green.
+
+The coverage test now parses the router source with `syn`, Rust's syntax parser,
+and visits route calls. It extracts the first method and any chained methods,
+then compares each pair with the matrix. Parsing syntax avoids treating comments
+or quoted examples as mounted routes. An unrecognised method-router expression
+fails the test, so a future router abstraction must extend the audit deliberately.
+`syn` is a development dependency; it doesn't ship in Bun.
+
+This remains an audit guard, not the authorisation mechanism. The existing
+request tests still prove that read-only users cannot mutate resources and
+scoped users cannot access another tenant. The new regression places a GET and
+a POST on one path and verifies that both are collected independently.

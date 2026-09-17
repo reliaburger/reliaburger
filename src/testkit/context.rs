@@ -34,7 +34,7 @@ pub const BUN_BINARY_PATH: &str = "/usr/local/bin/bun";
 /// The index contains both `linux/amd64` and `linux/arm64`; pinning the index
 /// rather than a tag makes runc and Apple Container execute identical content
 /// on repeated acceptance runs.
-pub const PINNED_TEST_WORKLOAD_IMAGE: &str = "docker.io/library/busybox@sha256:9532d8c39891ca2ecde4d30d7710e01fb739c87a8b9299685c63704296b16028";
+pub const PINNED_TEST_WORKLOAD_IMAGE: &str = "public.ecr.aws/docker/library/busybox@sha256:9532d8c39891ca2ecde4d30d7710e01fb739c87a8b9299685c63704296b16028";
 
 /// One test case's handle on the cluster.
 #[derive(Clone)]
@@ -58,6 +58,19 @@ pub struct TestContext {
 }
 
 impl TestContext {
+    /// Build a bounded HTTP client for workloads, without cluster credentials.
+    ///
+    /// Workload requests must never use the authenticated Bun API client.
+    /// Redirects and ambient proxies are disabled to keep probes on their target.
+    pub fn workload_http_client(&self) -> Result<reqwest::Client, String> {
+        reqwest::Client::builder()
+            .no_proxy()
+            .redirect(reqwest::redirect::Policy::none())
+            .timeout(Duration::from_secs(3))
+            .build()
+            .map_err(|error| format!("could not create workload HTTP client: {error}"))
+    }
+
     /// Build a namespace name for case number `seq` of run `run_id`.
     pub fn namespace_for(run_id: &str, seq: usize) -> String {
         format!("{TEST_NAMESPACE_PREFIX}-{run_id}-{seq:02}")
@@ -224,7 +237,7 @@ impl TestContext {
         format!(
             "[app.{app}]\n\
              image = \"{PINNED_TEST_WORKLOAD_IMAGE}\"\n\
-             command = [\"sleep\", \"infinity\"]\n\
+             command = [\"/bin/busybox\", \"sleep\", \"infinity\"]\n\
              namespace = \"{ns}\"\n",
             ns = self.namespace,
         )
@@ -232,16 +245,16 @@ impl TestContext {
 
     /// A TOML spec for an HTTP container workload in this test's namespace.
     ///
-    /// Runs the pinned workload's `httpd` serving `/etc`, health-checked on
-    /// `/hostname` (which maps to `/etc/hostname`, always present). This is the
-    /// workload for ingress and firewall-target cases. Port derives from the
-    /// app name.
+    /// Creates a known response file and serves it with the pinned workload's
+    /// HTTP server. Neither the executable nor its content depends on image
+    /// defaults. This is the ingress/firewall fixture; its port derives from
+    /// the app name.
     pub fn container_http_spec(&self, app: &str, replicas: u32) -> String {
         let port = testapp_port(app);
         format!(
             "[app.{app}]\n\
              image = \"{PINNED_TEST_WORKLOAD_IMAGE}\"\n\
-             command = [\"httpd\", \"-f\", \"-p\", \"{port}\", \"-h\", \"/etc\"]\n\
+             command = [\"/bin/sh\", \"-c\", \"/bin/busybox mkdir -p /tmp/reliaburger-test-http; printf 'reliaburger-test' > /tmp/reliaburger-test-http/hostname; exec /bin/busybox httpd -f -p {port} -h /tmp/reliaburger-test-http\"]\n\
              port = {port}\n\
              replicas = {replicas}\n\
              namespace = \"{ns}\"\n\
@@ -295,15 +308,22 @@ impl TestContext {
 
     /// Every instance of `app` in this namespace, gathered across all nodes.
     pub async fn cluster_instances(&self, app: &str) -> Result<Vec<InstanceStatus>, String> {
-        let mut all = Vec::new();
-        for (_node, client) in self.node_clients().await? {
-            if let Ok(statuses) = client.status().await {
-                all.extend(statuses.into_iter().filter(|instance| {
-                    instance.app_name == app && instance.namespace == self.namespace
-                }));
-            }
-        }
-        Ok(all)
+        self.deadline
+            .run("cluster instance collection", async {
+                let mut all = Vec::new();
+                for (node, client) in self.node_clients().await? {
+                    let statuses = client
+                        .status()
+                        .await
+                        .map_err(|error| format!("could not inspect node {node}: {error}"))?;
+                    all.extend(statuses.into_iter().filter(|instance| {
+                        instance.app_name == app && instance.namespace == self.namespace
+                    }));
+                }
+                Ok(all)
+            })
+            .await
+            .map_err(|error| error.to_string())?
     }
 
     async fn namespace_instances(&self) -> Result<Vec<InstanceStatus>, String> {
@@ -348,22 +368,26 @@ impl TestContext {
     {
         let mut last: Vec<InstanceStatus> = Vec::new();
         loop {
-            if let Ok(instances) = self.cluster_instances(app).await {
-                last = instances;
-                if predicate(&last) {
-                    return Ok(());
+            let last_error = match self.cluster_instances(app).await {
+                Ok(instances) => {
+                    last = instances;
+                    if predicate(&last) {
+                        return Ok(());
+                    }
+                    None
                 }
-            }
+                Err(error) => Some(error),
+            };
             if self.deadline.remaining().is_zero() {
                 let seen: Vec<&str> = last.iter().map(|i| i.state.as_str()).collect();
                 return Err(format!(
                     "timed out after {:?} waiting for {app} to reach {what} cluster-wide; \
-                     last saw {} instance(s): {seen:?}",
+                     last saw {} instance(s): {seen:?}; last query error: {last_error:?}",
                     self.timeout,
                     last.len()
                 ));
             }
-            tokio::time::sleep(Duration::from_millis(500)).await;
+            tokio::time::sleep(Duration::from_millis(500).min(self.deadline.remaining())).await;
         }
     }
 
@@ -434,7 +458,7 @@ impl TestContext {
                     last.len()
                 ));
             }
-            tokio::time::sleep(poll).await;
+            tokio::time::sleep(poll.min(self.deadline.remaining())).await;
         }
     }
 
@@ -625,6 +649,62 @@ mod tests {
         }
     }
 
+    async fn status_server(stalled: bool) -> (BunClient, tokio::task::JoinHandle<()>) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let router = axum::Router::new()
+            .route(
+                "/v1/cluster/nodes",
+                axum::routing::get(|| async {
+                    axum::Json(Vec::<crate::bun::agent::NodeStatus>::new())
+                }),
+            )
+            .route(
+                "/v1/status",
+                axum::routing::get(move || async move {
+                    if stalled {
+                        tokio::time::sleep(Duration::from_secs(10)).await;
+                    }
+                    axum::http::StatusCode::SERVICE_UNAVAILABLE
+                }),
+            );
+        let server = tokio::spawn(async move {
+            axum::serve(listener, router).await.unwrap();
+        });
+        (
+            BunClient::new_with_token(&format!("http://{address}"), None),
+            server,
+        )
+    }
+
+    #[tokio::test]
+    async fn cluster_collection_reports_a_failed_node_instead_of_empty_success() {
+        let (client, server) = status_server(false).await;
+        let mut ctx = context("rbtest-errors");
+        ctx.client = client;
+        let result = ctx.cluster_instances("web").await;
+        server.abort();
+        assert!(result.unwrap_err().contains("local"));
+    }
+
+    #[tokio::test]
+    async fn cluster_wait_cannot_outlive_its_shared_deadline() {
+        let (client, server) = status_server(true).await;
+        let mut ctx = context("rbtest-deadline");
+        ctx.client = client;
+        let result = tokio::time::timeout(
+            Duration::from_secs(1),
+            ctx.wait_for_cluster("web", "no instances", |instances| instances.is_empty()),
+        )
+        .await;
+        server.abort();
+        assert!(
+            result
+                .expect("cluster collection exceeded the case deadline")
+                .is_err()
+        );
+    }
+
     #[test]
     fn a_testapp_spec_parses_and_lands_in_the_test_namespace() {
         let ctx = context("rbtest-abc-00");
@@ -647,6 +727,36 @@ mod tests {
         assert!(app.health.is_some(), "testapp_spec carries a health check");
     }
 
+    #[tokio::test]
+    async fn workload_requests_do_not_receive_the_cluster_bearer() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let app = axum::Router::new().route(
+            "/",
+            axum::routing::get(|headers: axum::http::HeaderMap| async move {
+                axum::Json(headers.contains_key(axum::http::header::AUTHORIZATION))
+            }),
+        );
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        let mut ctx = context("rbtest-http-00");
+        ctx.client =
+            BunClient::new_with_token(&format!("http://{address}"), Some("private-cluster-token"));
+        let leaked = ctx
+            .workload_http_client()
+            .unwrap()
+            .get(format!("http://{address}/"))
+            .send()
+            .await
+            .unwrap()
+            .json::<bool>()
+            .await
+            .unwrap();
+        server.abort();
+        assert!(!leaked, "workload requests must never carry the API bearer");
+    }
+
     #[test]
     fn container_specs_parse_and_land_in_the_test_namespace() {
         let ctx = context("rbtest-abc-00");
@@ -662,12 +772,17 @@ mod tests {
         assert!(digest.bytes().all(|byte| byte.is_ascii_hexdigit()));
         assert!(web.health.is_some());
         assert_eq!(web.port, Some(ctx.container_port("web")));
+        assert!(
+            std::path::Path::new(&web.command[0]).is_absolute(),
+            "container fixtures must not depend on an image-provided PATH"
+        );
 
         let idle = Config::parse(&ctx.container_idle_spec("box")).unwrap();
         let box_app = idle.app.get("box").expect("app box");
         assert_eq!(box_app.namespace.as_deref(), Some("rbtest-abc-00"));
         assert!(box_app.command.iter().any(|a| a == "sleep"));
         assert!(box_app.health.is_none());
+        assert!(std::path::Path::new(&box_app.command[0]).is_absolute());
     }
 
     #[test]

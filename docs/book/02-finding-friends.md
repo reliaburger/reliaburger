@@ -2296,3 +2296,52 @@ The cluster handles the hard cases: council member departure, minority partition
 Next up: networking. Chapter 3 gives each container its own network namespace, adds eBPF-based service discovery so containers can find each other by name, and puts an ingress proxy in front of the cluster. The nodes can talk to each other now; it's time to let the apps do the same.
 
 If you want to dig into the code itself, the [Phase 2 Code Walkthrough](02a-code-walkthrough.md) walks through every module in the order that makes sense, highlights the critical paths, and points out where the interesting bits are.
+
+### A checkpoint isn't a running process
+
+The laptop restart test found a gap in deployment recovery. The reconciler loaded
+its saved fingerprint and skipped an unchanged assignment, even when shutdown
+had stopped every instance. The desired state survived. The workload didn't.
+
+Before trusting that checkpoint, the reconciler now asks the local agent for
+its inventory under a five-second deadline. It retains an assignment only when
+its expected number of active instances survived or were adopted. Missing or
+stopped instances invalidate the fingerprint so normal reconciliation deploys
+them again. If inventory is unavailable, it retries without guessing. A test
+covers a live adopted instance, an absent app and a stopped instance together.
+
+### Bootstrap is allowed to fail
+
+A fresh council used to discard the result of `initialize()`. It also logged a
+failed security-state write and carried on. That could leave a live-looking
+agent without the credentials its joining nodes needed.
+
+Startup now awaits both operations and returns their errors. A ten-second
+outer deadline bounds the whole bootstrap, including a stalled Raft write;
+the existing shorter retry loop still handles the first election settling.
+The test initialises a real in-memory council, verifies a distinctive security
+serial was committed, then attempts to initialise it again. That second attempt
+must return an error.
+
+A cancellation guard covers runtime construction. If any later `?` returns
+an error, dropping the guard cancels the tasks already started, including a
+watcher that shuts down Raft. We disarm the guard only after assembling the
+complete runtime. This is Rust's scope-based resource cleanup applied to async
+startup: the guard's destructor sends cancellation; the tasks perform their
+asynchronous cleanup when they receive it.
+
+### The first boot is part of the cluster
+
+Our first empty-cache laptop run stopped at five minutes. SSH accepted the
+managed key, then took two minutes to open each session on two guests. The
+journals traced the wait to `pam_systemd`, after Lima had replaced the user
+manager during first boot. Rebooting recovered those VMs, and setup resumed
+with its original credentials. Useful recovery behaviour. Still a failed start.
+
+System provisioning now restarts the guest login service after Lima's built-in
+user setup. This changes only the managed guest. It doesn't weaken SSH or PAM,
+and it doesn't touch the host's configuration. The next empty-home run booted
+three Linux nodes and passed sample HTTP in 241.75 seconds. We record the
+[conditions and exclusions](../qualification/2026-09-17-laptop.md): it used local
+development binaries, so downloading and verifying a signed release remains a
+separate acceptance gate. One passing measurement is evidence, not a guarantee.

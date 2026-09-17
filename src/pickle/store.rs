@@ -98,11 +98,7 @@ impl BlobStore {
 
     /// Path to a blob on disk.
     pub fn blob_path(&self, digest: &Digest) -> PathBuf {
-        self.base_dir
-            .join("blobs")
-            .join("sha256")
-            .join(digest.hex())
-            .join("data")
+        crate::grill::image::cached_blob_path(&self.base_dir, digest.hex())
     }
 
     /// Path for temporary upload files.
@@ -228,52 +224,60 @@ impl BlobStore {
         upload_id: &str,
         expected_digest: &Digest,
     ) -> Result<(), PickleError> {
+        self.complete_upload_guarded(upload_id, expected_digest, None)
+            .await
+    }
+
+    /// Keep the API session's writer permit until the durable transaction finishes,
+    /// even when the caller disconnects while the blocking task is running.
+    pub(super) async fn complete_upload_guarded(
+        &self,
+        upload_id: &str,
+        expected_digest: &Digest,
+        writer: Option<tokio::sync::OwnedSemaphorePermit>,
+    ) -> Result<(), PickleError> {
         validate_upload_id(upload_id)?;
-        let upload_path = self.upload_path(upload_id);
-        if !upload_path.exists() {
-            return Err(PickleError::UploadNotFound(upload_id.to_string()));
-        }
-
-        // Read the upload and verify digest
-        let data = tokio::fs::read(&upload_path).await?;
-        let actual = compute_sha256(&data);
-        if actual.as_str() != expected_digest.as_str() {
-            // Clean up the failed upload
-            let _ = tokio::fs::remove_file(&upload_path).await;
-            return Err(PickleError::DigestMismatch {
-                expected: expected_digest.clone(),
-                actual,
-            });
-        }
-
-        // Durable move to the blob store (REG5): re-read the verified
-        // upload bytes and write them through the fsync/rename transaction
-        // (`write_file_durably`), then remove the upload temp. The digest
-        // was already checked above, so these are the correct bytes. Runs on
-        // a blocking thread — the file reads, fsyncs and rename are blocking
-        // syscalls that must not sit on a Tokio worker.
-        let blob_path = self.blob_path(expected_digest);
-        let upload = upload_path.clone();
-        tokio::task::spawn_blocking(move || -> std::io::Result<()> {
-            let data = std::fs::read(&upload)?;
-            write_file_durably(&blob_path, &data)?;
-            let _ = std::fs::remove_file(&upload);
+        let upload = self.upload_path(upload_id);
+        let destination = self.blob_path(expected_digest);
+        let expected = expected_digest.clone();
+        tokio::task::spawn_blocking(move || -> Result<(), PickleError> {
+            use std::io::Read as _;
+            let _writer = writer;
+            let mut file = std::fs::File::open(&upload)?;
+            let mut hasher = Sha256::new();
+            let mut buffer = [0u8; 64 * 1024];
+            loop {
+                let count = file.read(&mut buffer)?;
+                if count == 0 {
+                    break;
+                }
+                hasher.update(&buffer[..count]);
+            }
+            let actual = Digest::new(&format!("sha256:{}", hex::encode(hasher.finalize())))?;
+            if actual != expected {
+                let _ = std::fs::remove_file(&upload);
+                return Err(PickleError::DigestMismatch { expected, actual });
+            }
+            file.sync_all()?;
+            drop(file);
+            let parent = destination
+                .parent()
+                .ok_or_else(|| std::io::Error::other("blob has no parent directory"))?;
+            std::fs::create_dir_all(parent)?;
+            std::fs::rename(&upload, &destination)?;
+            std::fs::File::open(parent)?.sync_all()?;
             Ok(())
         })
         .await
-        .map_err(|e| PickleError::CatalogPersist(format!("blob commit task failed: {e}")))??;
-
-        Ok(())
+        .map_err(|error| PickleError::CatalogPersist(format!("blob commit task failed: {error}")))?
     }
 
     /// Commit an already-verified upload temp into the blob store by moving
     /// it, without re-reading its bytes (M11).
     ///
-    /// [`complete_upload`] reads the whole temp file back into memory to
-    /// re-hash it — fine for a small monolithic push, but for a multi-gigabyte
-    /// layer streamed from a peer it would re-buffer the entire blob. The peer
-    /// pull hashes incrementally as it streams to disk, so the digest is
-    /// already proven; this just fsyncs the temp, renames it into place, and
+    /// The peer pull hashes incrementally as it streams to disk, so its
+    /// digest is already proven. Unlike [`complete_upload`](Self::complete_upload),
+    /// this skips the verification pass and just fsyncs the temp, renames it into place, and
     /// fsyncs the parent directory (REG5), all O(1) in memory. The caller MUST
     /// have verified the content hashes to `digest` first.
     pub async fn commit_upload_as_blob(
@@ -342,12 +346,12 @@ impl BlobStore {
         let mut digests = Vec::new();
         for entry in std::fs::read_dir(&sha_dir)? {
             let entry = entry?;
-            if entry.file_type()?.is_dir() {
-                let hex = entry.file_name().to_string_lossy().to_string();
-                let data_path = entry.path().join("data");
-                if data_path.exists() {
-                    digests.push(Digest(format!("sha256:{hex}")));
-                }
+            let hex = entry.file_name().to_string_lossy().to_string();
+            let Ok(digest) = Digest::new(&format!("sha256:{hex}")) else {
+                continue;
+            };
+            if self.blob_path(&digest).is_file() {
+                digests.push(digest);
             }
         }
         Ok(digests)

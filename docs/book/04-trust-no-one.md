@@ -751,3 +751,59 @@ cargo test --lib sesame
 The one thing the unit tests *don't* cover is the full token-and-revocation lifecycle across a running cluster — single-use enforcement in the agent, secret rotation windows, certificate revocation lists. That needs `SecurityState` in Raft, so its integration test (`tests/security_integration.rs`, labelled "Phase 10") arrives with Chapter 10. It drives the `sesame` library directly — no running agent — so it too runs under a plain `cargo test`.
 
 Phase 4 adds 85 tests to the suite, bringing the total to 795.
+
+### Private files need private temporary files too
+
+Writing a credential to `context.tmp`, changing its permissions, and renaming it
+sounds atomic. It still has two problems. The temporary file can be readable
+before the permission change, and a pre-existing symlink at that predictable
+name can redirect the write into another file.
+
+The shared identity writer now uses `tempfile::Builder` to create a unique file
+with the requested mode before writing any bytes. It syncs the contents,
+atomically replaces the destination, and syncs the containing directory. The
+`NamedTempFile` owns cleanup on errors; a successful `persist` transfers ownership
+to the destination path. This also makes managed-cluster checkpoints durable.
+
+A regression test plants a temporary symlink beside a context and verifies that
+saving the context leaves the other file untouched. The original implementation
+failed this test. The identity suite checks that certificate persistence still
+works with the safer writer.
+
+### Let a new node reach the enrolment endpoint
+
+Real VM qualification found a circular dependency in the perimeter firewall.
+Only gossip members could reach the management and cluster ports. A new node
+needed those ports to enrol and become a member. Loopback integration tests,
+which deliberately disable the host firewall, couldn't expose that problem.
+
+`security.bootstrap_peers` lists explicit IP addresses that may reach those
+ports before membership exists. It grants network reachability, not a cluster
+identity: the join endpoint still requires its node-bound token, and internal
+transports still enforce their configured authentication. These rules don't
+permit traffic to container host ports. Quickstart knows the addresses of its
+owned VMs before it configures any node, so it supplies that exact list.
+
+The field uses Rust's `IpAddr` type rather than strings or raw nftables fragments.
+Serde rejects malformed addresses while parsing configuration. Rule rendering
+separates IPv4 and IPv6 and retains the final drop rules for outsiders. We also
+pass the actual configured listener ports into the perimeter instead of assuming
+the default ports. Tests assert both the narrow accept rules and the remaining
+drops; the managed VM test exercises the enrolment path with the firewall active.
+
+
+A real VM also caught a less obvious firewall mistake. Linux chose an ephemeral
+client port inside our protected container-port range for a registry download.
+The reply came back to that port and our input chain dropped it. We now accept
+connection-tracked replies before applying the destination-port restrictions.
+We deliberately match `ct direction reply`, not every established connection:
+an inbound connection must still obey the current peer policy after membership
+changes. Both IPv4 and IPv6 tables use the same ordering.
+
+An enrolled node can join gossip before Raft has replicated its API tokens.
+Refusing its public listener immediately caused a restart loop which delayed
+replication further. Bun now waits up to thirty seconds for the token refresh
+before opening that listener. Timeout still fails closed. Tests deliver a token
+after startup begins and separately check the empty-store deadline. A shutdown
+guard cancels already spawned tasks when startup exits with an error; Rust drops
+the guard on both the success and error return paths.

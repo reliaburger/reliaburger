@@ -215,6 +215,7 @@ struct UploadSession {
     repository: String,
     /// Bytes written so far.
     written: u64,
+    writer: Arc<tokio::sync::Semaphore>,
 }
 
 /// Tracks chunked upload sessions so they can expire and be swept (REG8).
@@ -246,8 +247,23 @@ impl UploadSessions {
                 last_activity: now,
                 repository: repository.to_string(),
                 written: 0,
+                writer: Arc::new(tokio::sync::Semaphore::new(1)),
             },
         );
+    }
+
+    /// Claim the sole writer for this repository's session, preventing PATCH/PUT races.
+    pub async fn claim_writer(
+        &self,
+        upload_id: &str,
+        repository: &str,
+    ) -> Option<tokio::sync::OwnedSemaphorePermit> {
+        let guard = self.inner.read().await;
+        let session = guard.get(upload_id)?;
+        if session.repository != repository {
+            return None;
+        }
+        Arc::clone(&session.writer).try_acquire_owned().ok()
     }
 
     /// Refresh a session's activity and record its running size. Returns
@@ -300,9 +316,11 @@ impl UploadSessions {
         let expired: Vec<String> = guard
             .iter()
             .filter(|(_, s)| {
-                now.duration_since(s.last_activity)
-                    .map(|elapsed| elapsed > self.ttl)
-                    .unwrap_or(false)
+                s.writer.available_permits() > 0
+                    && now
+                        .duration_since(s.last_activity)
+                        .map(|elapsed| elapsed > self.ttl)
+                        .unwrap_or(false)
             })
             .map(|(id, _)| id.clone())
             .collect();

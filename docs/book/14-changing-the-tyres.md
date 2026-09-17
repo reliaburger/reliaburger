@@ -657,3 +657,25 @@ What remains is bookkeeping: progress ticked, READMEs updated, and this chapter 
 The milestone holds: `relish upgrade start v0.2.0` rolls a live cluster onto a new binary — signatures checked twice, workloads never blinking, leadership handed over mid-flight, and a poisoned release walking itself back without a human in the loop. The cluster changes its own tyres at full speed.
 
 Next, Phase 15: teaching Reliaburger to test, benchmark, and diagnose itself — `relish test`, `relish bench`, and the long-promised `relish wtf`.
+
+
+## Release integration: one metadata document per executable
+
+The upgrade reader already understands a version, a platform and a signed
+binary. We keep that schema. `metadata.json` contains Bun, and
+`cli-metadata.json` contains Relish. If both appeared in the same platform map,
+an older Bun could select the wrong executable. Separate documents make that
+mistake impossible without changing the existing reader.
+
+The release workflow builds each platform natively, checks the complete set of
+artefacts, and signs their raw bytes with the existing Ed25519 release identity.
+It refuses to publish if the supplied private key doesn't match a trusted
+public key in the source. Checksums help detect incomplete downloads; signatures
+prove who approved the bytes. The distinction matters when metadata and binaries
+travel through the same hosting service.
+
+The packaging tests generate temporary keys, validate a real signature, corrupt
+the binary, and check that verification then fails. They also reject missing
+platforms and an untrusted key. The public release key stays out of the test
+fixture. See [the release procedure](../releasing.md) for the operator steps and
+remaining candidate-qualification gates.

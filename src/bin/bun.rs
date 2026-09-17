@@ -6,6 +6,7 @@
 use std::path::PathBuf;
 use std::sync::Arc;
 
+use anyhow::Context;
 use clap::Parser;
 use tokio::sync::{RwLock, mpsc};
 use tokio_util::sync::CancellationToken;
@@ -376,6 +377,28 @@ async fn refresh_token_store(
     *store.write().await = tokens;
 }
 
+/// Keep the public listener closed while a joining node receives Raft credentials.
+async fn await_api_credentials(
+    store: &reliaburger::sesame::auth::TokenStore,
+    listen: &str,
+    deadline: std::time::Duration,
+) -> anyhow::Result<()> {
+    if !store.read().await.is_empty() || refuse_open_non_loopback_bind(listen).is_ok() {
+        return Ok(());
+    }
+    println!("bun: waiting for replicated API credentials before opening {listen}");
+    tokio::time::timeout(deadline, async {
+        loop {
+            if !store.read().await.is_empty() {
+                return;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        }
+    })
+    .await
+    .context("timed out waiting for replicated API credentials; public listener remains closed")
+}
+
 /// Refuse to bind a token-less (wide-open) API beyond literal loopback (AUTH3).
 ///
 /// During bootstrap, only an IP-literal loopback address is unambiguously safe.
@@ -455,7 +478,9 @@ async fn run_testapp(
 ) -> anyhow::Result<()> {
     let parsed = reliaburger::bun::testapp::parse_mode(mode, count, delay_ms, alloc_mib)
         .map_err(|e| anyhow::anyhow!(e))?;
-    let app = reliaburger::bun::testapp::TestApp::start_on_port(parsed, port).await;
+    let app = reliaburger::bun::testapp::TestApp::start_on_port(parsed, port)
+        .await
+        .with_context(|| format!("failed to bind testapp on port {port}"))?;
     println!(
         "testapp: listening on 0.0.0.0:{} (mode: {mode})",
         app.port()
@@ -522,6 +547,39 @@ fn resolve_join_seeds(join: &[String]) -> anyhow::Result<Vec<std::net::SocketAdd
         );
     }
     Ok(seeds)
+}
+
+async fn prepare_storage_directory(
+    configured: &std::path::Path,
+    fallback: &std::path::Path,
+    label: &str,
+) -> anyhow::Result<PathBuf> {
+    match tokio::fs::create_dir_all(configured).await {
+        Ok(()) => Ok(configured.to_path_buf()),
+        Err(primary_error) => {
+            tokio::fs::create_dir_all(fallback).await.with_context(|| {
+                format!(
+                    "failed to create {label} directory {} ({primary_error}) or fallback {}",
+                    configured.display(),
+                    fallback.display()
+                )
+            })?;
+            eprintln!(
+                "bun: using fallback {label} store at {} (cannot create {}: {primary_error})",
+                fallback.display(),
+                configured.display()
+            );
+            Ok(fallback.to_path_buf())
+        }
+    }
+}
+
+async fn storage_directory(configured: &std::path::Path, label: &str) -> anyhow::Result<PathBuf> {
+    let fallback = dirs::data_local_dir()
+        .unwrap_or_else(|| PathBuf::from("/tmp/reliaburger"))
+        .join("reliaburger")
+        .join(label);
+    prepare_storage_directory(configured, &fallback, label).await
 }
 
 async fn run_agent(cli: Cli) -> anyhow::Result<()> {
@@ -704,6 +762,8 @@ async fn run_agent(cli: Cli) -> anyhow::Result<()> {
 
     // Create shutdown token
     let shutdown = CancellationToken::new();
+    // Startup failures must also stop the tasks already launched.
+    let _shutdown_guard = shutdown.clone().drop_guard();
     let readiness = reliaburger::bun::readiness::ReadinessTracker::new();
     for name in ["agent", "api", "registry"] {
         readiness.register(name, true).await;
@@ -718,16 +778,7 @@ async fn run_agent(cli: Cli) -> anyhow::Result<()> {
 
     // Mayo store first: the cluster runtime's rollup worker reads it, so
     // it must exist before the runtime starts.
-    let metrics_dir = if std::fs::create_dir_all(&config.storage.metrics).is_ok() {
-        config.storage.metrics.clone()
-    } else {
-        let fallback = dirs::data_local_dir()
-            .unwrap_or_else(|| PathBuf::from("/tmp/reliaburger"))
-            .join("reliaburger")
-            .join("metrics");
-        std::fs::create_dir_all(&fallback).expect("failed to create metrics directory");
-        fallback
-    };
+    let metrics_dir = storage_directory(&config.storage.metrics, "metrics").await?;
     // With `[metrics] object_store_url` set, metrics are persisted to and
     // queried from an object store (s3://, gs://, file://) so they survive node
     // loss (H8); otherwise Parquet stays in the local metrics dir.
@@ -899,6 +950,15 @@ async fn run_agent(cli: Cli) -> anyhow::Result<()> {
     // config deploy could run an arbitrary host binary through ProcessGrill.
     agent.set_process_config(config.process_workloads.clone());
     // Bound fault durations by the `[smoker]` policy (default + maximum).
+    agent.configure_perimeter(
+        vec![
+            config.cluster.gossip_port,
+            config.cluster.raft_port,
+            config.cluster.reporting_port,
+        ],
+        api_port,
+        config.security.bootstrap_peers.clone(),
+    );
     agent.set_smoker_config(config.smoker.to_smoker_config());
     let node_pressure_available = agent.configure_node_pressure(
         reliaburger::smoker::node_pressure::NodePressureLimits {
@@ -957,45 +1017,34 @@ async fn run_agent(cli: Cli) -> anyhow::Result<()> {
     #[cfg_attr(not(all(feature = "ebpf", target_os = "linux")), allow(unused_mut))]
     let mut ebpf_loaded = false;
     if config.ebpf.enabled {
-        match config.ebpf.resolve_program_dir() {
-            Some(program_dir) => {
-                #[cfg(all(feature = "ebpf", target_os = "linux"))]
-                match reliaburger::onion::ebpf::loader::OnionEbpf::load(
-                    &program_dir,
-                    &config.ebpf.cgroup_path,
-                ) {
-                    Ok(ebpf) => {
-                        eprintln!(
-                            "bun: eBPF data path loaded from {} (attached={})",
-                            program_dir.display(),
-                            ebpf.is_attached()
-                        );
-                        ebpf_loaded = ebpf.is_attached();
-                        agent
-                            .set_onion_ebpf(Arc::new(tokio::sync::Mutex::new(ebpf)))
-                            .await;
-                    }
-                    Err(e) => {
-                        eprintln!(
-                            "bun: failed to load eBPF data path: {e}; continuing without enforcement"
-                        );
-                    }
-                }
-                #[cfg(not(all(feature = "ebpf", target_os = "linux")))]
-                {
-                    let _ = program_dir;
+        #[cfg(all(feature = "ebpf", target_os = "linux"))]
+        {
+            use reliaburger::onion::ebpf::loader::OnionEbpf;
+            let loaded = match config.ebpf.resolve_program_dir() {
+                Some(program_dir) => OnionEbpf::load(&program_dir, &config.ebpf.cgroup_path),
+                None => OnionEbpf::load_embedded(&config.ebpf.cgroup_path),
+            };
+            match loaded {
+                Ok(ebpf) => {
                     eprintln!(
-                        "bun: [ebpf] enabled but this binary was built without the `ebpf` feature; \
-                         network faults and egress allowlists are NOT enforced"
+                        "bun: eBPF data path loaded (attached={})",
+                        ebpf.is_attached()
                     );
+                    ebpf_loaded = ebpf.is_attached();
+                    agent
+                        .set_onion_ebpf(Arc::new(tokio::sync::Mutex::new(ebpf)))
+                        .await;
                 }
-            }
-            None => {
-                eprintln!(
-                    "bun: [ebpf] enabled but no program_dir set and no build-time objects; skipping"
-                );
+                Err(error) => eprintln!(
+                    "bun: failed to load eBPF data path: {error}; continuing without enforcement"
+                ),
             }
         }
+        #[cfg(not(all(feature = "ebpf", target_os = "linux")))]
+        eprintln!(
+            "bun: [ebpf] enabled but this binary lacks Linux eBPF support; \
+             network faults and egress allowlists are NOT enforced"
+        );
     }
 
     // Derive the internal service token from the shared master key, so bun's own
@@ -1199,6 +1248,14 @@ async fn run_agent(cli: Cli) -> anyhow::Result<()> {
                 }
             },
         );
+        if config.security.require_mtls && !config.cluster.join.is_empty() {
+            await_api_credentials(
+                &api_token_store,
+                &cli.listen,
+                std::time::Duration::from_secs(30),
+            )
+            .await?;
+        }
     }
     agent.set_log_sink(log_tx);
     agent.set_readiness_tracker(readiness.clone());
@@ -1309,20 +1366,13 @@ async fn run_agent(cli: Cli) -> anyhow::Result<()> {
 
     // Create observability stores (the Mayo store was created above,
     // before the cluster runtime that its rollup worker feeds from)
-    let logs_dir = if std::fs::create_dir_all(&config.storage.logs).is_ok() {
-        config.storage.logs.clone()
-    } else {
-        let fallback = dirs::data_local_dir()
-            .unwrap_or_else(|| PathBuf::from("/tmp/reliaburger"))
-            .join("reliaburger")
-            .join("logs");
-        std::fs::create_dir_all(&fallback).expect("failed to create logs directory");
-        fallback
-    };
+    let logs_dir = storage_directory(&config.storage.logs, "logs").await?;
 
     // Create Arrow/DataFusion log store (SQL queries over logs)
     let log_store_dir = logs_dir.join("parquet");
-    std::fs::create_dir_all(&log_store_dir).ok();
+    tokio::fs::create_dir_all(&log_store_dir)
+        .await
+        .with_context(|| format!("failed to create log store at {}", log_store_dir.display()))?;
     // Seed the log store with startup events so it's never empty
     let mut log_store_inner = LogStore::new(log_store_dir);
     log_store_inner.append(
@@ -1659,6 +1709,9 @@ async fn run_agent(cli: Cli) -> anyhow::Result<()> {
                             log_retention_days,
                         )
                         .await;
+                        if let Some(error) = &log_result.export_error {
+                            eprintln!("bun: log export failed during disk pressure: {error}");
+                        }
                         if log_result.files_pruned > 0 {
                             println!(
                                 "bun: disk pressure — pruned {} log file(s), reclaimed {} bytes",
@@ -1677,6 +1730,9 @@ async fn run_agent(cli: Cli) -> anyhow::Result<()> {
                             metrics_retention_days,
                         )
                         .await;
+                        if let Some(error) = &metrics_result.export_error {
+                            eprintln!("bun: metrics export failed during disk pressure: {error}");
+                        }
                         if metrics_result.files_pruned > 0 {
                             println!(
                                 "bun: disk pressure — pruned {} metrics file(s), reclaimed {} bytes",
@@ -2102,22 +2158,7 @@ async fn run_agent(cli: Cli) -> anyhow::Result<()> {
         registry_cluster_advertise,
     )
     .map_err(|error| anyhow::anyhow!("invalid Pickle registry listener: {error}"))?;
-    let pickle_dir = if std::fs::create_dir_all(&config.storage.images).is_ok() {
-        config.storage.images.clone()
-    } else {
-        // Fall back to user-writable directory (e.g. on macOS without root)
-        let fallback = dirs::data_local_dir()
-            .unwrap_or_else(|| PathBuf::from("/tmp/reliaburger"))
-            .join("reliaburger")
-            .join("images");
-        std::fs::create_dir_all(&fallback).expect("failed to create pickle directory");
-        eprintln!(
-            "bun: using fallback image store at {} (cannot write to {})",
-            fallback.display(),
-            config.storage.images.display()
-        );
-        fallback
-    };
+    let pickle_dir = storage_directory(&config.storage.images, "images").await?;
     let node_raft_id = reliaburger::cluster::identity::raft_id_from_name(&node_name);
 
     let blob_store = Arc::new(BlobStore::new(&pickle_dir));
@@ -2838,6 +2879,37 @@ mod tests {
     use super::*;
     use std::collections::BTreeMap;
 
+    #[tokio::test]
+    async fn storage_directory_preserves_configured_path_and_reports_both_failures() {
+        let temp = tempfile::tempdir().unwrap();
+        let configured = temp.path().join("configured");
+        let fallback = temp.path().join("fallback");
+        assert_eq!(
+            prepare_storage_directory(&configured, &fallback, "metrics")
+                .await
+                .unwrap(),
+            configured
+        );
+        assert!(!fallback.exists());
+        tokio::fs::remove_dir(&configured).await.unwrap();
+        tokio::fs::write(&configured, "occupied").await.unwrap();
+        assert_eq!(
+            prepare_storage_directory(&configured, &fallback, "metrics")
+                .await
+                .unwrap(),
+            fallback
+        );
+        tokio::fs::remove_dir(&fallback).await.unwrap();
+        tokio::fs::write(&fallback, "occupied").await.unwrap();
+        let error = prepare_storage_directory(&configured, &fallback, "metrics")
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("configured"));
+        assert!(error.contains("fallback"));
+        assert!(error.contains("metrics"));
+    }
+
     #[test]
     fn resolve_join_seeds_handles_empty_and_ip_literals() {
         // No seeds → no error, empty list (the node bootstraps a new cluster).
@@ -2935,6 +3007,40 @@ mod tests {
         // and checking it separately from bind would introduce a TOCTOU gap.
         let err = refuse_open_non_loopback_bind("localhost:9117").unwrap_err();
         assert!(err.to_string().contains("hostnames aren't accepted"));
+    }
+
+    #[tokio::test]
+    async fn public_listener_waits_for_replicated_tokens() {
+        let store = reliaburger::sesame::auth::new_token_store();
+        let incoming = store.clone();
+        let token = create_token("admin", ApiRole::Admin, TokenScope::default(), None)
+            .unwrap()
+            .token;
+        let replicate = async move {
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            incoming.write().await.push(token);
+        };
+        let (result, ()) = tokio::join!(
+            await_api_credentials(&store, "0.0.0.0:9117", std::time::Duration::from_secs(1)),
+            replicate
+        );
+        result.unwrap();
+        assert!(!store.read().await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn missing_replicated_credentials_fail_closed_within_deadline() {
+        let store = reliaburger::sesame::auth::new_token_store();
+        let result = tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            await_api_credentials(&store, "0.0.0.0:9117", std::time::Duration::from_millis(20)),
+        )
+        .await
+        .unwrap();
+        assert!(result.unwrap_err().to_string().contains("API credentials"));
+        await_api_credentials(&store, "127.0.0.1:9117", std::time::Duration::ZERO)
+            .await
+            .unwrap();
     }
 
     #[tokio::test]

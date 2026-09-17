@@ -268,23 +268,74 @@ mod tests {
         }
     }
 
-    /// Extract every path literal passed to a `.route("...")` call in the
-    /// given source, so the coverage test below can compare the mounted
-    /// routes against the matrix.
-    fn mounted_route_paths(source: &str) -> Vec<String> {
-        let mut paths = Vec::new();
-        for fragment in source.split(".route(").skip(1) {
-            // The path is the first double-quoted string after `.route(`.
-            let Some(open) = fragment.find('"') else {
-                continue;
+    #[test]
+    fn route_scan_tracks_chained_methods_and_ignores_comments_and_strings() {
+        let source = r#"fn routes() {
+            // router.route("/comment", post(handler));
+            let text = ".route(\"/string\", post(handler))";
+            router.route("/v1/status", get(read).post(write))
+                .route("/v1/health", axum::routing::get(health));
+        }"#;
+        assert_eq!(
+            mounted_route_methods(source),
+            vec![
+                ("get".into(), "/v1/status".into()),
+                ("post".into(), "/v1/status".into()),
+                ("get".into(), "/v1/health".into()),
+            ]
+        );
+        assert_eq!(required_principal(Method::Post, "/v1/status"), None);
+    }
+
+    fn mounted_route_methods(source: &str) -> Vec<(String, String)> {
+        use syn::visit::Visit;
+        fn methods(expression: &syn::Expr, found: &mut Vec<String>) {
+            let method = match expression {
+                syn::Expr::Call(call) => match call.func.as_ref() {
+                    syn::Expr::Path(path) => path.path.segments.last().unwrap().ident.to_string(),
+                    _ => panic!("unrecognised route method expression"),
+                },
+                syn::Expr::MethodCall(call) => {
+                    methods(&call.receiver, found);
+                    call.method.to_string()
+                }
+                syn::Expr::Paren(paren) => return methods(&paren.expr, found),
+                _ => panic!("route methods must be explicit in the audited router"),
             };
-            let rest = &fragment[open + 1..];
-            let Some(close) = rest.find('"') else {
-                continue;
-            };
-            paths.push(rest[..close].to_string());
+            assert!(
+                matches!(
+                    method.as_str(),
+                    "get" | "post" | "delete" | "put" | "patch" | "head" | "options" | "trace"
+                ),
+                "unrecognised route method: {method}"
+            );
+            found.push(method);
         }
-        paths
+        #[derive(Default)]
+        struct Routes(Vec<(String, String)>);
+        impl<'ast> Visit<'ast> for Routes {
+            fn visit_expr_method_call(&mut self, call: &'ast syn::ExprMethodCall) {
+                syn::visit::visit_expr_method_call(self, call);
+                if call.method != "route" {
+                    return;
+                }
+                assert_eq!(call.args.len(), 2, "route must have path and method router");
+                let syn::Expr::Lit(path) = &call.args[0] else {
+                    panic!("route path must be literal");
+                };
+                let syn::Lit::Str(path) = &path.lit else {
+                    panic!("route path must be a string");
+                };
+                let mut found = Vec::new();
+                methods(&call.args[1], &mut found);
+                self.0
+                    .extend(found.into_iter().map(|method| (method, path.value())));
+            }
+        }
+        let file = syn::parse_file(source).expect("router source must parse");
+        let mut routes = Routes::default();
+        routes.visit_file(&file);
+        routes.0
     }
 
     /// Pair each mounted route path with the handler idents it dispatches
@@ -393,7 +444,15 @@ mod tests {
     /// forget the matrix entry, and this fails.
     #[test]
     fn matrix_covers_every_mounted_route() {
-        let matrix_paths: HashSet<&str> = ROUTE_MATRIX.iter().map(|r| r.path).collect();
+        let matrix_routes: HashSet<(String, String)> = ROUTE_MATRIX
+            .iter()
+            .map(|row| {
+                (
+                    format!("{:?}", row.method).to_lowercase(),
+                    row.path.to_string(),
+                )
+            })
+            .collect();
         let sources = [
             include_str!("api.rs"),
             include_str!("batch.rs"),
@@ -401,9 +460,9 @@ mod tests {
         ];
         let mut missing = Vec::new();
         for source in sources {
-            for path in mounted_route_paths(source) {
-                if !matrix_paths.contains(path.as_str()) {
-                    missing.push(path);
+            for route in mounted_route_methods(source) {
+                if !matrix_routes.contains(&route) {
+                    missing.push(route);
                 }
             }
         }

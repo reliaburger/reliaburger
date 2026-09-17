@@ -40,6 +40,10 @@ pub struct PerimeterConfig {
     /// Management port (Bun API, default: 9117).
     /// Accessible from cluster nodes and admin CIDRs.
     pub management_port: u16,
+    /// Explicit peers permitted to reach authenticated enrolment and cluster ports
+    /// before gossip discovers them. Does not open container host ports.
+    #[serde(default)]
+    pub bootstrap_peers: Vec<IpAddr>,
 }
 
 impl Default for PerimeterConfig {
@@ -50,6 +54,7 @@ impl Default for PerimeterConfig {
             cluster_ports: vec![9443, 9444, 9445],
             admin_cidrs: Vec::new(),
             management_port: 9117,
+            bootstrap_peers: Vec::new(),
         }
     }
 }
@@ -166,6 +171,11 @@ fn render_family_table(
     rules.push_str("    iif \"lo\" accept\n");
     rules.push('\n');
 
+    // Ephemeral outbound sockets overlap the container host-port range.
+    // Permit their replies without preserving access for revoked inbound peers.
+    rules.push_str("    ct direction reply ct state established,related accept\n");
+    rules.push('\n');
+
     // Allow cluster node IPs to reach everything (inter-node traffic)
     if !node_ips.is_empty() {
         let ips: Vec<String> = node_ips.iter().map(|ip| ip.to_string()).collect();
@@ -175,6 +185,33 @@ fn render_family_table(
             "    {saddr_keyword} saddr {{ {ip_set} }} accept\n"
         ));
         rules.push('\n');
+    }
+
+    let mut bootstrap_tcp: BTreeSet<_> = config.cluster_ports.iter().copied().collect();
+    bootstrap_tcp.insert(config.management_port);
+    let tcp_ports = bootstrap_tcp
+        .iter()
+        .map(u16::to_string)
+        .collect::<Vec<_>>()
+        .join(", ");
+    let udp_ports = config
+        .cluster_ports
+        .iter()
+        .map(u16::to_string)
+        .collect::<Vec<_>>()
+        .join(", ");
+    for peer in &config.bootstrap_peers {
+        if peer.is_ipv4() != (family == "ip") {
+            continue;
+        }
+        rules.push_str(&format!(
+            "    {saddr_keyword} saddr {peer} tcp dport {{ {tcp_ports} }} accept\n"
+        ));
+        if !udp_ports.is_empty() {
+            rules.push_str(&format!(
+                "    {saddr_keyword} saddr {peer} udp dport {{ {udp_ports} }} accept\n"
+            ));
+        }
     }
 
     // Allow admin CIDRs to reach management port
@@ -325,6 +362,46 @@ pub async fn apply_ruleset(_ruleset: &str) -> Result<(), FirewallError> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn outbound_replies_are_allowed_before_container_port_drops() {
+        let rules = generate_ruleset(&PerimeterConfig::default(), &ClusterNodes::new()).unwrap();
+        for table in rules.split("chain input").skip(1) {
+            let replies = table
+                .find("ct direction reply ct state established,related accept")
+                .unwrap();
+            assert!(
+                replies
+                    < table
+                        .find("# Block external access to container host ports")
+                        .unwrap()
+            );
+            assert!(
+                !table.contains("    ct state established,related accept"),
+                "an established inbound connection must still obey current peer policy"
+            );
+        }
+    }
+
+    #[test]
+    fn bootstrap_peers_can_enrol_without_opening_container_ports_to_outsiders() {
+        let config = PerimeterConfig {
+            bootstrap_peers: vec!["192.168.104.5".parse().unwrap(), "fd00::5".parse().unwrap()],
+            ..Default::default()
+        };
+        let rules = generate_ruleset(&config, &ClusterNodes::new()).unwrap();
+        assert!(
+            rules.contains("ip saddr 192.168.104.5 tcp dport { 9117, 9443, 9444, 9445 } accept")
+        );
+        assert!(rules.contains("ip6 saddr fd00::5 tcp dport { 9117, 9443, 9444, 9445 } accept"));
+        assert!(!rules.contains("ip saddr 192.168.104.5 accept"));
+        assert!(rules.contains("tcp dport 10000-60000 drop"));
+        assert!(rules.contains("tcp dport 9117 drop"));
+        assert!(
+            rules.find("ip saddr 192.168.104.5").unwrap()
+                < rules.find("tcp dport 9117 drop").unwrap()
+        );
+    }
+
     use super::*;
 
     fn default_config() -> PerimeterConfig {

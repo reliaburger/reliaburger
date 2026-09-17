@@ -35,8 +35,9 @@
 
       <aside class="status" aria-label="Release status">
         <strong>Working towards 0.1.0</strong>
-        <p>The core is implemented. Packaging, the laptop installer and release acceptance
-          are next. The five-minute cluster is a goal, not an available install command.</p>
+        <p>Native release builds pass on Linux and macOS. The managed laptop installer
+          is undergoing qualification; the signed public release is still pending.
+          Five minutes remains a target.</p>
         <a href="https://github.com/reliaburger/reliaburger/blob/main/docs/plans/2026-09-16-v0.1.0-release-plan.md">Release plan <span aria-hidden="true">↗</span></a>
       </aside>
 
@@ -52,7 +53,7 @@
               <code>hello</code> under the built-in ProcessGrill runtime; it doesn’t create
               an isolated container or a multi-node cluster.</p>
             <p>For real OCI containers, use runc on Linux. Native Apple Container support
-              has limitations; the planned laptop quickstart uses Linux VMs.</p>
+              has limitations; the managed laptop quickstart uses Linux VMs.</p>
             <a href="https://github.com/reliaburger/reliaburger/blob/main/docs/README.md">Build requirements &amp; runtime setup <span aria-hidden="true">↗</span></a>
           </div>
           <div class="terminal">
@@ -71,6 +72,26 @@ target/debug/relish</code></pre>
             <div class="terminal-footer">Web dashboard: <code>http://127.0.0.1:9117/</code></div>
           </div>
         </div>
+      </section>
+
+      <section class="section" aria-labelledby="install-title">
+        <div class="section-heading">
+          <h2 id="install-title">The 0.1.0 install path</h2>
+        </div>
+        <p>Pending the signed release. Three Linux VMs, runc, authenticated cluster
+          traffic and a sample app. No source build. No host-directory mounts.</p>
+        <pre><code>curl -fsSL https://reliaburger.com/install.sh | bash
+export PATH="$HOME/.reliaburger/bin:$PATH"
+relish nodes
+relish status
+relish logs hello
+relish dashboard             # Ctrl-C stops the browser connection
+<span class="comment"># Sample app: http://localhost:18080/</span>
+relish local stop
+relish local start
+relish local destroy --yes</code></pre>
+        <p><a href="https://github.com/reliaburger/reliaburger/blob/main/docs/quickstart.md">Prerequisites, retries and cleanup</a>
+          · <a href="install.sh">Read the bootstrap script</a></p>
       </section>
 
       <section id="docs" class="section" aria-labelledby="docs-title">

@@ -735,6 +735,23 @@ async fn desired_apps_handler(
     State(state): State<ApiState>,
     auth: Option<axum::Extension<crate::sesame::auth::AuthContext>>,
 ) -> Response {
+    match gather_desired_apps(&state).await {
+        Ok(apps) => Json(filter_desired_apps_for_scope(apps, auth.as_deref())).into_response(),
+        Err(error) => unavailable_response(error),
+    }
+}
+
+fn unavailable_response(error: String) -> Response {
+    (
+        StatusCode::SERVICE_UNAVAILABLE,
+        Json(serde_json::json!({"error": error})),
+    )
+        .into_response()
+}
+
+async fn gather_desired_apps(
+    state: &ApiState,
+) -> Result<Vec<crate::bun::diagnostics::DesiredAppEvidence>, String> {
     let apps = if let Some(council) = &state.council {
         let desired = council.desired_state().await;
         let live_nodes = match &state.membership {
@@ -764,31 +781,21 @@ async fn desired_apps_handler(
         });
         apps
     } else {
-        let (response, receiver) = oneshot::channel();
-        if state
-            .cmd_tx
-            .send(AgentCommand::DesiredApps { response })
-            .await
-            .is_err()
-        {
-            return (
-                StatusCode::SERVICE_UNAVAILABLE,
-                Json(serde_json::json!({"error": "agent unavailable"})),
-            )
-                .into_response();
-        }
-        match receiver.await {
-            Ok(apps) => apps,
-            Err(_) => {
-                return (
-                    StatusCode::SERVICE_UNAVAILABLE,
-                    Json(serde_json::json!({"error": "agent dropped response"})),
-                )
-                    .into_response();
-            }
-        }
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            let (response, receiver) = oneshot::channel();
+            state
+                .cmd_tx
+                .send(AgentCommand::DesiredApps { response })
+                .await
+                .map_err(|_| "agent unavailable".to_string())?;
+            receiver
+                .await
+                .map_err(|_| "agent dropped desired-app response".to_string())
+        })
+        .await
+        .map_err(|_| "desired-app query timed out".to_string())??
     };
-    Json(filter_desired_apps_for_scope(apps, auth.as_deref())).into_response()
+    Ok(apps)
 }
 
 /// `POST /v1/trace` — fixed DNS and TCP probes from a local source workload.
@@ -2610,6 +2617,19 @@ async fn placements_handler(
         // Piggyback the replicated endpoint catalogue (12b.4) so the polling
         // node can resolve services on other nodes.
         endpoint_catalog: desired.endpoint_catalog.clone(),
+        ingress: desired
+            .apps
+            .iter()
+            .filter_map(|(id, spec)| {
+                spec.ingress
+                    .clone()
+                    .map(|config| crate::cluster::orchestrate::IngressAssignment {
+                        name: id.name.clone(),
+                        namespace: id.namespace.clone(),
+                        config,
+                    })
+            })
+            .collect(),
     })
     .into_response()
 }
@@ -2662,29 +2682,130 @@ async fn current_apps_handler(State(state): State<ApiState>) -> Response {
     Json(rows).into_response()
 }
 
-async fn status_handler(State(state): State<ApiState>) -> Response {
-    let (resp_tx, resp_rx) = oneshot::channel();
-    if state
-        .cmd_tx
-        .send(AgentCommand::Status { response: resp_tx })
-        .await
-        .is_err()
-    {
-        return (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(serde_json::json!({ "error": "agent unavailable" })),
-        )
-            .into_response();
-    }
+#[derive(Debug, Default, Deserialize)]
+struct StatusQuery {
+    #[serde(default)]
+    cluster: bool,
+}
 
-    match resp_rx.await {
-        Ok(statuses) => Json(serde_json::json!(statuses)).into_response(),
-        Err(_) => (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(serde_json::json!({ "error": "agent dropped response" })),
+async fn local_statuses(state: &ApiState) -> Result<Vec<InstanceStatus>, String> {
+    tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        let (response, receiver) = oneshot::channel();
+        state
+            .cmd_tx
+            .send(AgentCommand::Status { response })
+            .await
+            .map_err(|_| "agent unavailable".to_string())?;
+        receiver
+            .await
+            .map_err(|_| "agent dropped response".to_string())
+    })
+    .await
+    .map_err(|_| "agent status timed out".to_string())?
+}
+
+async fn status_handler(
+    State(state): State<ApiState>,
+    Query(query): Query<StatusQuery>,
+) -> Response {
+    if !query.cluster {
+        return match local_statuses(&state).await {
+            Ok(statuses) => Json(statuses).into_response(),
+            Err(error) => (
+                StatusCode::SERVICE_UNAVAILABLE,
+                Json(serde_json::json!({"error": error})),
+            )
+                .into_response(),
+        };
+    }
+    match cluster_statuses(&state).await {
+        Ok(statuses) => Json(statuses).into_response(),
+        Err(error) => (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(serde_json::json!({"error": error})),
         )
             .into_response(),
     }
+}
+
+async fn cluster_statuses(
+    state: &ApiState,
+) -> Result<Vec<super::agent::ClusterInstanceStatus>, String> {
+    let local_name = state
+        .node_name
+        .clone()
+        .or_else(|| {
+            state.council.as_ref().and_then(|council| {
+                let receiver = council.metrics();
+                let metrics = receiver.borrow();
+                metrics
+                    .membership_config
+                    .membership()
+                    .get_node(&metrics.id)
+                    .map(|node| node.name.clone())
+            })
+        })
+        .unwrap_or_else(|| "local".to_string());
+    let mut statuses: Vec<_> = local_statuses(state)
+        .await?
+        .into_iter()
+        .map(|instance| super::agent::ClusterInstanceStatus {
+            node: local_name.to_string(),
+            instance,
+        })
+        .collect();
+    let members = match &state.membership {
+        Some(membership) => membership.read().await.clone(),
+        None => Vec::new(),
+    };
+    let requests = futures_util::stream::iter(
+        members
+            .into_iter()
+            .filter(|member| member.node_id.0 != local_name)
+            .map(|member| async move {
+                let name = member.node_id.0;
+                let result = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+                    let url = state
+                        .cluster_http
+                        .url(&member.address.to_string(), "/v1/status");
+                    let mut request = state.cluster_http.client().get(url);
+                    if let Some(token) = &state.service_token {
+                        request = request.bearer_auth(token);
+                    }
+                    request
+                        .send()
+                        .await?
+                        .error_for_status()?
+                        .json::<Vec<InstanceStatus>>()
+                        .await
+                })
+                .await;
+                match result {
+                    Ok(Ok(instances)) => Ok(instances
+                        .into_iter()
+                        .map(|instance| super::agent::ClusterInstanceStatus {
+                            node: name.clone(),
+                            instance,
+                        })
+                        .collect::<Vec<_>>()),
+                    Ok(Err(error)) => Err(format!("status incomplete: node {name}: {error}")),
+                    Err(_) => Err(format!("status incomplete: node {name} timed out")),
+                }
+            }),
+    )
+    .buffer_unordered(8);
+    tokio::pin!(requests);
+    while let Some(result) = requests.next().await {
+        statuses.extend(result?);
+    }
+    statuses.sort_by(|left, right| {
+        (&left.node, &left.instance.namespace, &left.instance.id).cmp(&(
+            &right.node,
+            &right.instance.namespace,
+            &right.instance.id,
+        ))
+    });
+    Ok(statuses)
 }
 
 /// List all run-to-completion workload instances.
@@ -5015,35 +5136,58 @@ async fn gather_statuses(state: &ApiState) -> Vec<InstanceStatus> {
 }
 
 /// Build dashboard app rows from instance statuses.
-fn statuses_to_dashboard_apps(statuses: &[InstanceStatus]) -> Vec<DashboardApp> {
-    // Group by (app_name, namespace) to get correct instance counts.
-    let mut app_map: std::collections::HashMap<(String, String), (usize, String)> =
-        std::collections::HashMap::new();
-    for s in statuses {
-        let key = (s.app_name.clone(), s.namespace.clone());
-        let entry = app_map.entry(key).or_insert((0, s.state.clone()));
-        entry.0 += 1;
-        // If any instance is not running, show the worst state.
-        if s.state != "running" {
-            entry.1 = s.state.clone();
+fn statuses_to_dashboard_apps(
+    statuses: &[InstanceStatus],
+    desired: &[crate::bun::diagnostics::DesiredAppEvidence],
+) -> Vec<DashboardApp> {
+    let mut rows = std::collections::BTreeMap::new();
+    for app in desired {
+        rows.insert(
+            (app.namespace.clone(), app.app.clone()),
+            DashboardApp {
+                name: app.app.clone(),
+                namespace: app.namespace.clone(),
+                instances_running: 0,
+                instances_desired: app.desired_replicas as usize,
+                state: "pending".to_string(),
+            },
+        );
+    }
+    for instance in statuses {
+        let Some(row) = rows.get_mut(&(instance.namespace.clone(), instance.app_name.clone()))
+        else {
+            continue;
+        };
+        if instance.state == "running" {
+            row.instances_running += 1;
+        }
+        if matches!(instance.state.as_str(), "failed" | "unhealthy") {
+            row.state = "unhealthy".into();
         }
     }
-    app_map
-        .into_iter()
-        .map(|((name, namespace), (count, state))| DashboardApp {
-            name,
-            namespace,
-            instances_running: count,
-            instances_desired: count,
-            state,
-        })
-        .collect()
+    for row in rows.values_mut() {
+        if row.state != "unhealthy" && row.instances_running == row.instances_desired {
+            row.state = if row.instances_desired == 0 {
+                "stopped"
+            } else {
+                "running"
+            }
+            .into();
+        }
+    }
+    rows.into_values().collect()
+}
+
+async fn gather_dashboard_apps(state: &ApiState) -> Result<Vec<DashboardApp>, String> {
+    let (statuses, desired) =
+        tokio::try_join!(cluster_statuses(state), gather_desired_apps(state))?;
+    let statuses: Vec<_> = statuses.into_iter().map(|row| row.instance).collect();
+    Ok(statuses_to_dashboard_apps(&statuses, &desired))
 }
 
 /// Build the dashboard data from current agent state.
-async fn gather_dashboard_data(state: &ApiState) -> DashboardData {
-    let statuses = gather_statuses(state).await;
-    let apps = statuses_to_dashboard_apps(&statuses);
+async fn gather_dashboard_data(state: &ApiState) -> Result<DashboardData, String> {
+    let apps = gather_dashboard_apps(state).await?;
 
     let (alert_count, alerts) = if let Some(ref evaluator) = state.alerts {
         let eval = evaluator.read().await;
@@ -5067,7 +5211,7 @@ async fn gather_dashboard_data(state: &ApiState) -> DashboardData {
     // standalone node with no gossip table still shows itself as one node.
     let node_count = if nodes.is_empty() { 1 } else { nodes.len() };
 
-    DashboardData {
+    Ok(DashboardData {
         cluster_name: String::new(),
         node_count,
         app_count: apps.len(),
@@ -5075,7 +5219,7 @@ async fn gather_dashboard_data(state: &ApiState) -> DashboardData {
         apps,
         nodes,
         alerts,
-    }
+    })
 }
 
 /// Build the dashboard node rows from the live gossip membership (AUTH7).
@@ -5122,8 +5266,10 @@ fn html_response(html: String) -> Response {
 
 /// `GET /` — serve the Brioche cluster overview dashboard.
 async fn dashboard_handler(State(state): State<ApiState>) -> Response {
-    let data = gather_dashboard_data(&state).await;
-    html_response(render_dashboard(&data))
+    match gather_dashboard_data(&state).await {
+        Ok(data) => html_response(render_dashboard(&data)),
+        Err(error) => unavailable_response(error),
+    }
 }
 
 /// `GET /ui/app/{app}/{namespace}` — app detail page.
@@ -5135,43 +5281,63 @@ async fn app_detail_handler(
     if let Err(resp) = crate::sesame::auth::authorize_scoped(auth.as_deref(), &app, &namespace) {
         return resp;
     }
-    let statuses = gather_statuses(&state).await;
-    let instances: Vec<InstanceStatus> = statuses
+    let (rows, desired) =
+        match tokio::try_join!(cluster_statuses(&state), gather_desired_apps(&state)) {
+            Ok(result) => result,
+            Err(error) => return unavailable_response(error),
+        };
+    let instances: Vec<InstanceStatus> = rows
         .into_iter()
-        .filter(|s| s.app_name == app && s.namespace == namespace)
+        .map(|row| row.instance)
+        .filter(|instance| instance.app_name == app && instance.namespace == namespace)
         .collect();
+    let summary = statuses_to_dashboard_apps(&instances, &desired)
+        .into_iter()
+        .find(|row| row.name == app && row.namespace == namespace);
+    let (overall_state, desired_instances) = summary
+        .map(|row| (row.state, row.instances_desired))
+        .unwrap_or_else(|| ("unknown".to_string(), 0));
 
-    let overall_state = if instances.is_empty() {
-        "unknown".to_string()
-    } else if instances.iter().all(|i| i.state == "running") {
-        "running".to_string()
-    } else {
-        instances
+    let env = if let Some(council) = &state.council {
+        let desired = council.desired_state().await;
+        desired
+            .apps
             .iter()
-            .find(|i| i.state != "running")
-            .map(|i| i.state.clone())
-            .unwrap_or_else(|| "unknown".to_string())
-    };
-
-    // Get env vars from deployed spec
-    let (env_tx, env_rx) = oneshot::channel();
-    let _ = state
-        .cmd_tx
-        .send(AgentCommand::AppConfig {
-            app_name: app.clone(),
-            namespace: namespace.clone(),
-            response: env_tx,
+            .find(|(id, _)| id.name == app && id.namespace == namespace)
+            .map(|(_, spec)| safe_env(&spec.env))
+            .unwrap_or_default()
+    } else {
+        let result = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            let (response, receiver) = oneshot::channel();
+            state
+                .cmd_tx
+                .send(AgentCommand::AppConfig {
+                    app_name: app.clone(),
+                    namespace: namespace.clone(),
+                    response,
+                })
+                .await
+                .map_err(|_| "agent unavailable")?;
+            receiver
+                .await
+                .map_err(|_| "agent did not return app configuration")
         })
         .await;
-    let env = match env_rx.await {
-        Ok(Some(spec)) => safe_env(&spec.env),
-        _ => vec![],
+        match result {
+            Ok(Ok(Some(spec))) => safe_env(&spec.env),
+            Ok(Ok(None)) => Vec::new(),
+            Ok(Err(error)) => return unavailable_response(error.to_string()),
+            Err(_) => return unavailable_response("app configuration query timed out".to_string()),
+        }
     };
 
     // Get deploy history
     let deploy_history = if let Some(ref history) = state.deploy_history {
         let h = history.read().await;
-        h.iter().filter(|e| e.app_id.name == app).cloned().collect()
+        h.iter()
+            .filter(|e| e.app_id.name == app && e.app_id.namespace == namespace)
+            .cloned()
+            .collect()
     } else {
         vec![]
     };
@@ -5197,6 +5363,7 @@ async fn app_detail_handler(
         app_name: app,
         namespace,
         state: overall_state,
+        desired_instances,
         instances,
         env,
         deploy_history,
@@ -5274,9 +5441,10 @@ async fn gitops_handler(State(state): State<ApiState>) -> Response {
 
 /// `GET /ui/fragment/apps` — apps table HTML fragment for HTMX swap.
 async fn fragment_apps_handler(State(state): State<ApiState>) -> Response {
-    let statuses = gather_statuses(&state).await;
-    let apps = statuses_to_dashboard_apps(&statuses);
-    html_response(fragments::render_apps_table_fragment(&apps))
+    match gather_dashboard_apps(&state).await {
+        Ok(apps) => html_response(fragments::render_apps_table_fragment(&apps)),
+        Err(error) => unavailable_response(error),
+    }
 }
 
 /// `GET /ui/fragment/nodes` — nodes table HTML fragment for HTMX swap.
@@ -5313,7 +5481,10 @@ async fn fragment_instances_handler(
     if let Err(resp) = crate::sesame::auth::authorize_scoped(auth.as_deref(), &app, &namespace) {
         return resp;
     }
-    let statuses = gather_statuses(&state).await;
+    let statuses = match cluster_statuses(&state).await {
+        Ok(rows) => rows.into_iter().map(|row| row.instance).collect::<Vec<_>>(),
+        Err(error) => return unavailable_response(error),
+    };
     let instances: Vec<InstanceStatus> = statuses
         .into_iter()
         .filter(|s| s.app_name == app && s.namespace == namespace)
@@ -6071,6 +6242,21 @@ async fn gitops_webhook_handler(
             .into_response();
     };
 
+    // Reserve before recording the delivery ID: a full queue must remain
+    // retryable, and a closed receiver must never produce a success response.
+    let permit = match tx.try_reserve() {
+        Ok(permit) => permit,
+        Err(error) => {
+            return (
+                StatusCode::SERVICE_UNAVAILABLE,
+                Json(serde_json::json!({
+                    "error": format!("gitops sync queue unavailable: {error}")
+                })),
+            )
+                .into_response();
+        }
+    };
+
     let signature = headers
         .get("x-hub-signature-256")
         .and_then(|v| v.to_str().ok());
@@ -6090,10 +6276,10 @@ async fn gitops_webhook_handler(
 
     match result {
         Ok(_) => {
-            let _ = tx.send(()).await;
+            permit.send(());
             (
                 StatusCode::ACCEPTED,
-                Json(serde_json::json!({ "message": "sync triggered" })),
+                Json(serde_json::json!({ "message": "sync queued" })),
             )
                 .into_response()
         }
@@ -9541,6 +9727,104 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn cluster_status_refuses_to_report_success_when_a_member_is_unreachable() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        // Keep the port reserved but never serve HTTP: the entire response
+        // (including its body) must have a deadline.
+        let (cmd_tx, mut cmd_rx) = mpsc::channel(2);
+        let worker = tokio::spawn(async move {
+            if let Some(AgentCommand::Status { response }) = cmd_rx.recv().await {
+                let _ = response.send(Vec::new());
+            }
+        });
+        let members = Arc::new(RwLock::new(vec![NodeMembershipInfo {
+            node_id: crate::meat::NodeId::new("unresponsive"),
+            address,
+        }]));
+        let app = router(
+            cmd_tx,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            Some(members),
+            None,
+            9117,
+            None,
+        );
+        let response = tokio::time::timeout(
+            std::time::Duration::from_secs(7),
+            app.oneshot(
+                axum::http::Request::builder()
+                    .uri("/v1/status?cluster=true")
+                    .body(Body::empty())
+                    .unwrap(),
+            ),
+        )
+        .await
+        .expect("status must be bounded")
+        .unwrap();
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert!(json["error"].as_str().unwrap().contains("unresponsive"));
+        worker.await.unwrap();
+        drop(listener);
+    }
+
+    #[test]
+    fn dashboard_shows_desired_replicas_and_counts_only_running_instances() {
+        let mut running: InstanceStatus = serde_json::from_value(serde_json::json!({
+            "id":"web-0", "app_name":"web", "namespace":"default", "state":"running",
+            "restart_count":0,"host_port":null,"pid":null
+        }))
+        .unwrap();
+        let mut failed = running.clone();
+        failed.id = "web-1".into();
+        failed.state = "failed".into();
+        let desired = vec![
+            crate::bun::diagnostics::DesiredAppEvidence {
+                app: "web".into(),
+                namespace: "default".into(),
+                desired_replicas: 3,
+                scheduled_replicas: 2,
+                service_port: None,
+            },
+            crate::bun::diagnostics::DesiredAppEvidence {
+                app: "pending".into(),
+                namespace: "default".into(),
+                desired_replicas: 2,
+                scheduled_replicas: 0,
+                service_port: None,
+            },
+        ];
+        let rows = statuses_to_dashboard_apps(&[running.clone(), failed], &desired);
+        let web = rows.iter().find(|row| row.name == "web").unwrap();
+        assert_eq!((web.instances_running, web.instances_desired), (1, 3));
+        assert_ne!(web.state, "running");
+        let pending = rows.iter().find(|row| row.name == "pending").unwrap();
+        assert_eq!(
+            (pending.instances_running, pending.instances_desired),
+            (0, 2)
+        );
+        running.state = "stopped".into();
+        let rows = statuses_to_dashboard_apps(&[running], &desired);
+        assert_eq!(
+            rows.iter()
+                .find(|row| row.name == "web")
+                .unwrap()
+                .instances_running,
+            0
+        );
+    }
+
+    #[tokio::test]
     async fn status_returns_instances() {
         let (cmd_tx, cmd_rx) = mpsc::channel(32);
         let shutdown = CancellationToken::new();
@@ -10109,6 +10393,55 @@ mod tests {
         assert_eq!(status, StatusCode::UNAUTHORIZED);
         // No sync was triggered.
         assert!(rx.try_recv().is_err(), "a bad signature must not sync");
+        shutdown.cancel();
+    }
+
+    #[tokio::test]
+    async fn webhook_full_queue_is_bounded_and_delivery_can_be_retried() {
+        let (app, mut receiver, shutdown) = webhook_setup("hooksecret", 100);
+        let body = br#"{"after":"abc123"}"#;
+        let headers = |id: usize| {
+            vec![
+                ("x-hub-signature-256", github_signature("hooksecret", body)),
+                ("x-github-delivery", format!("queue-{id}")),
+            ]
+        };
+        for id in 0..4 {
+            assert_eq!(
+                post_webhook(&app, body, &headers(id)).await,
+                StatusCode::ACCEPTED
+            );
+        }
+        let status = tokio::time::timeout(
+            std::time::Duration::from_millis(500),
+            post_webhook(&app, body, &headers(4)),
+        )
+        .await
+        .expect("full queue must not stall the request");
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+        receiver.recv().await.unwrap();
+        assert_eq!(
+            post_webhook(&app, body, &headers(4)).await,
+            StatusCode::ACCEPTED
+        );
+        shutdown.cancel();
+    }
+
+    #[tokio::test]
+    async fn webhook_refuses_a_closed_sync_loop() {
+        let (app, receiver, shutdown) = webhook_setup("hooksecret", 10);
+        drop(receiver);
+        let body = br#"{"after":"abc123","ref":"refs/heads/main"}"#;
+        let status = post_webhook(
+            &app,
+            body,
+            &[
+                ("x-hub-signature-256", github_signature("hooksecret", body)),
+                ("x-github-delivery", "closed-loop".into()),
+            ],
+        )
+        .await;
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
         shutdown.cancel();
     }
 

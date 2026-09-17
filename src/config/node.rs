@@ -158,17 +158,15 @@ impl DnsSection {
 /// network faults, Sesame egress allowlists).
 ///
 /// Disabled by default: loading eBPF programs needs root, a 5.7+ kernel
-/// and cgroup v2, and it is Linux-only. `program_dir` defaults to the
-/// directory the build compiled the `.bpf.o` objects into (baked in at
-/// build time), so a dev/Lima build "just works" with `enabled = true`;
-/// a packaged install points it at the installed objects.
+/// and cgroup v2, and it is Linux-only. Builds with the `ebpf` feature embed
+/// the matching object, so packaged binaries need no build directory.
+/// `program_dir` explicitly overrides the embedded object for development.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct EbpfSection {
     /// Load and attach the eBPF programs on this node at startup.
     pub enabled: bool,
-    /// Directory holding the compiled `.bpf.o` objects. When unset, the
-    /// build-time output directory is used.
+    /// Optional directory overriding the version-matched embedded `.bpf.o` object.
     pub program_dir: Option<PathBuf>,
     /// Root cgroup v2 path to attach the connect hook to.
     pub cgroup_path: PathBuf,
@@ -191,13 +189,10 @@ impl Default for EbpfSection {
 }
 
 impl EbpfSection {
-    /// Resolve the directory to load `.bpf.o` objects from: the explicit
-    /// config value, or the build-time output directory baked in by
-    /// `build.rs`. Returns `None` if neither is available.
+    /// Return the explicit object directory override. `None` selects the
+    /// version-matched object embedded in an eBPF-enabled Linux binary.
     pub fn resolve_program_dir(&self) -> Option<PathBuf> {
-        self.program_dir
-            .clone()
-            .or_else(|| option_env!("RELIABURGER_BPF_DIR").map(PathBuf::from))
+        self.program_dir.clone()
     }
 }
 
@@ -291,6 +286,10 @@ pub struct SecuritySection {
     /// identity on disk, and a joiner starts in enrollment mode until
     /// `relish join` installs one.
     pub require_mtls: bool,
+    /// Known joining peers allowed through the perimeter to management and cluster
+    /// ports before membership exists. Does not change protocol authentication.
+    pub bootstrap_peers: Vec<std::net::IpAddr>,
+
     /// Acknowledge running cluster transports (gossip, Raft, reporting) in
     /// the clear on a routable address. Without `require_mtls`, a clustered
     /// node refuses to bind these unauthenticated transports on a non-loopback
@@ -339,7 +338,7 @@ impl Default for UpgradeSection {
         Self {
             external_signing_key: None,
             retain_versions: 3,
-            release_url: "https://releases.reliaburger.dev/metadata.json".to_string(),
+            release_url: crate::upgrade::metadata::DEFAULT_RELEASE_URL.to_string(),
             binary_dir: None,
             boot_grace_secs: 30,
             gossip_rejoin_secs: 60,
@@ -1022,7 +1021,7 @@ mod tests {
         )
         .unwrap();
         assert!(nc.ebpf.enabled);
-        // An explicit program_dir wins over the build-time default.
+        // An explicit program_dir overrides the embedded object.
         assert_eq!(
             nc.ebpf.resolve_program_dir(),
             Some(PathBuf::from("/opt/reliaburger/bpf"))

@@ -2,7 +2,7 @@
 
 This roadmap defines the implementation phases for Reliaburger, ordered by dependency. Each phase builds on the previous and ends with a concrete, demonstrable milestone.
 
-**Methodology:** Every phase starts by writing tests, then implementing until they pass. Each phase produces a chapter of the Reliaburger book, combining design narrative with Rust implementation walkthrough. See [CLAUDE.md](CLAUDE.md) for the full methodology.
+**Methodology:** Every phase starts by writing tests, then implementing until they pass. Each phase produces a chapter of the Reliaburger book, combining design narrative with Rust implementation walkthrough. See [AGENTS.md](../AGENTS.md) for the full methodology.
 
 For the full architectural vision, see [whitepaper.md](whitepaper.md). For implementation details on each component, see the [design/](design/) directory.
 
@@ -715,6 +715,20 @@ Integration tests:
 Design docs: [cli-relish.md](design/cli-relish.md), [agent-bun.md](design/agent-bun.md), [chaos-smoker.md](design/chaos-smoker.md)
 
 **Milestone:** `relish test` runs the full suite and reports all green. `relish bench` measures performance across all subsystems. `relish wtf` diagnoses common failure patterns. All Phase 15 tests pass.
+
+---
+
+## Release closure: 0.1.0
+
+The implementation and hardening work after Phase 15 is recorded in
+[progress.md](progress.md), including Phase 16's audit fixes. The next delivery
+is the [0.1.0 release plan](plans/2026-09-16-v0.1.0-release-plan.md), which closes
+these phases with signed release artefacts, a managed laptop cluster and measured
+acceptance on the downloaded product. It doesn't start a new architecture phase.
+
+The release gates remain open until the actual candidate passes the portable,
+Linux runtime, multi-node and clean-install checks. Historical phase checkboxes
+are implementation evidence, not a substitute for those gates.
 
 ---
 

@@ -20,9 +20,22 @@ async fn push_and_pull_image_roundtrip(ctx: TestContext) -> Result<(), String> {
     let repo = "rbtest-roundtrip";
     let image = oci::build_synthetic_image("roundtrip");
 
-    oci::push_image(ctx.client.http(), &base, repo, "v1", &image).await?;
+    oci::push_image(
+        ctx.client.http().map_err(|error| error.to_string())?,
+        &base,
+        repo,
+        "v1",
+        &image,
+    )
+    .await?;
 
-    let pulled = oci::fetch_manifest(ctx.client.http(), &base, repo, "v1").await?;
+    let pulled = oci::fetch_manifest(
+        ctx.client.http().map_err(|error| error.to_string())?,
+        &base,
+        repo,
+        "v1",
+    )
+    .await?;
     let pulled_digest = oci::sha256_digest(&pulled);
     if pulled_digest != image.manifest_digest {
         return Err(format!(
@@ -38,7 +51,14 @@ async fn manifest_catalog_lists_pushed_image(ctx: TestContext) -> Result<(), Str
     let base = ctx.registry_base();
     let repo = "rbtest-listed";
     let image = oci::build_synthetic_image("listed");
-    oci::push_image(ctx.client.http(), &base, repo, "v1", &image).await?;
+    oci::push_image(
+        ctx.client.http().map_err(|error| error.to_string())?,
+        &base,
+        repo,
+        "v1",
+        &image,
+    )
+    .await?;
 
     let images = ctx
         .client

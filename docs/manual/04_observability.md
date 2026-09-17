@@ -23,6 +23,11 @@ relish logs-export --dest ./archive
 relish logs-search ./archive "SELECT count(*) FROM logs WHERE line LIKE '%error%'"
 ```
 
+To export a local store directly, including a custom store while its agent is
+stopped, use `relish logs-export --source /path/to/parquet --dest ./archive`.
+If files copy but the checkpoint cannot be saved, the command exits non-zero
+and explains that a later export may repeat them.
+
 ## Metrics
 
 System, per-app and Prometheus-endpoint metrics are collected on every node:
@@ -43,6 +48,7 @@ rollups so one node can answer for the fleet.
 
 ```sh
 relish                           # the terminal dashboard (TUI)
+relish dashboard                 # authenticated, read-only browser session
 ```
 
 The TUI shows apps, nodes, jobs, routes, live logs and events on WebSockets;

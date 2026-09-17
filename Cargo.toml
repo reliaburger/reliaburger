@@ -33,6 +33,7 @@ serde_json = "1"
 serde_yaml = "0.9"
 semver = "1"
 thiserror = "2"
+tempfile = "3"
 tokio = { version = "1", features = ["full", "test-util"] }
 tokio-util = "0.7"
 toml = "0.8"
@@ -47,7 +48,7 @@ tokio-stream = "0.1"
 futures-util = "0.3"
 crossterm = { version = "0.28", features = ["event-stream"] }
 ratatui = "0.30"
-tokio-tungstenite = "0.28"
+tokio-tungstenite = { version = "0.28", features = ["rustls-tls-webpki-roots"] }
 openraft = { version = "0.9", features = ["serde", "storage-v2"] }
 bincode = "1"
 redb = "2"
@@ -71,7 +72,7 @@ sysinfo = "0.33"
 prometheus-parse = "0.2"
 # The compression feature shrinks the release-embedded src/ tree
 # (`relish source`); debug builds read embeds from disk as before.
-rust-embed = { version = "8", features = ["compression"] }
+rust-embed = { version = "8", features = ["compression", "debug-embed"] }
 mime_guess = "2"
 k8s-openapi = { version = "0.22", default-features = false, features = ["latest"], optional = true }
 hyper-util = { version = "0.1", features = ["tokio", "server-auto", "service"] }
@@ -93,9 +94,9 @@ ebpf = ["aya", "aya-log"]
 [dev-dependencies]
 criterion = { version = "0.5", features = ["async_tokio"] }
 http-body-util = "0.1"
+syn = { version = "2", features = ["full", "visit"] }
 insta = { version = "1", features = ["json"] }
 proptest = "1"
-tempfile = "3"
 tower = { version = "0.5", features = ["util"] }
 
 [profile.dev]

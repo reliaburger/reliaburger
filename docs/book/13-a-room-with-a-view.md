@@ -212,3 +212,23 @@ The TUI is mostly a lesson in boundaries. One task owns mutable state. Renderers
 The event store is intentionally temporary. A later phase can persist events through Ketchup if operators need history across restarts. Full resolved configuration is also absent because the API doesn't expose it, and exec streaming remains request/response despite the design document's broader WebSocket sketch.
 
 For now, Relish gives you apps, instances, nodes, jobs, routes, events, metrics and live logs in one terminal. No collection of half-forgotten watch commands required. Progress.
+
+### Don't show yesterday's stream in today's view
+
+Cancelling a log subscription doesn't remove messages already queued for the
+UI. A late message from `team-a/web` could therefore appear after switching to
+`team-b/web`. Clearing the buffer alone wasn't enough.
+
+Each subscription now has a generation number. The forwarding task tags every
+line and connection-status update with that generation, and the reducer accepts
+only the current one. Opening or closing a stream advances the generation and
+clears its buffered lines, scroll position and connection error. A regression
+test delivers both a late line and a late disconnection after switching streams.
+Neither affects the new view.
+
+Log views also calculate their row budget from the terminal's current height.
+A fixed thirty-two-line tail hid the newest messages on a short terminal and
+wasted space on a tall one. Each entry occupies one row, with long lines clipped
+horizontally, so wrapping can't push the tail below the viewport. Home clamps to
+the oldest available page instead of skipping beyond the buffer. Tests render
+both log views at short and tall sizes and check the newest and oldest entries.
