@@ -15,21 +15,116 @@ gates; those stay unchecked.
 > acceptance gates. Implementation is in progress; signed-release and cold-install
 > qualification remain open.
 
+## Current completion backlog (17 September 2026)
+
+The [codebase completion plan](plans/2026-09-17-codebase-completion-plan.md)
+contains the evidence, priority, dependency order, completion test and book chapter
+for every item below. IDs are scoped to that plan, not the older C1/M1 review IDs.
+The [audit record](qualification/2026-09-17-code-audit.md) separates local defect
+reproductions from inspected source and previous acceptance evidence.
+
+These are work packages, not 71 mandatory features for 0.1.0. Correctness fixes
+need explicit release dispositions; optional refactors and future capabilities
+remain separate. Older unchecked groups below point into this current ledger.
+
+### Correctness and behavioural contracts
+
+- [ ] **C01** (P1) Preserve every exported log generation.
+- [ ] **C02** (P1) Scope export acknowledgements to their destination.
+- [ ] **C03** (P1) Make export checkpoints durable and serialised.
+- [ ] **C04** (P1) Report non-transient export read failures.
+- [ ] **C05** (P1) Persist new instances during rolling deployments.
+- [ ] **C06** (P1) Reserve node-fault capacity across the cluster.
+- [ ] **C07** (P1) Define and enforce mixed-version compatibility.
+- [ ] **C08** (P1) Publish readiness after resources are acquired.
+- [ ] **C09** (P1) Bound lease cleanup lock acquisition.
+- [ ] **C10** (P1) Record fault ownership before injection can be cancelled.
+- [ ] **C11** (P1) Persist standalone leases through directory-sync failures.
+- [ ] **C12** (P1) Sweep pressure leftovers even after disabling pressure.
+- [ ] **C13** (P1) Issue certificates with exact validity timestamps.
+- [ ] **C14** (P1) Renew and hot-reload every served certificate class.
+- [ ] **C15** (P2) Make ingress serials unique across nodes and restarts.
+- [ ] **C16** (P2) Reject invalid certificate inputs without panicking.
+- [ ] **C17** (P2) Reject overflowing CLI durations.
+- [ ] **C18** (P2) Find a free port before reporting exhaustion.
+- [ ] **C19** (P2) Count only successful metric-file pruning.
+- [ ] **C20** (P1) Deduplicate rollup ownership at query merge.
+- [ ] **C21** (P2) Bound and chunk reporting payloads.
+- [ ] **C22** (P2) Bound export checkpoint growth safely.
+- [ ] **C23** (P2) Distinguish expired certificates from renewal warnings.
+- [ ] **C24** (P2) Keep unknown council membership out of quorum arithmetic.
+- [ ] **C25** (P2) Identify diagnostic filesystems by identity.
+- [ ] **C26** (P2) Match diagnostic instance and VIP evidence exactly.
+- [ ] **C27** (P2) Preserve watch-mode failures and exit outcomes.
+- [ ] **C28** (P2) Make TUI status reflect the cluster.
+- [ ] **C29** (P1) Fail benchmark comparisons when required metrics vanish.
+- [ ] **C30** (P1) Replace unconditional unknown catalogue cases with real evidence.
+- [ ] **C31** (P2) Give concurrent test runs distinct namespaces.
+- [ ] **C32** (P2) Use typed case outcomes and validated runner configuration.
+- [ ] **C33** (P2) Discover actual registry and ingress test endpoints.
+- [ ] **C34** (P2) Define lease ownership for the remaining test resources.
+- [ ] **C35** (P2) Gate chaos capabilities per selected scenario.
+- [ ] **C36** (P1) Target and clean up the legacy chaos command precisely.
+- [ ] **C37** (P1) Require rejoin before committing the local upgrade marker.
+- [ ] **C38** (P2) Make blocked deployment replacement explicit.
+- [ ] **C39** (P2) Handle development CLI paths without unwraps.
+- [ ] **C40** (P2) Own replaced rootless proxy processes.
+- [ ] **C41** (P2) Return a non-zero managed-status result for unhealthy nodes.
+- [ ] **C42** (P2) Key alert state by labelled series.
+- [ ] **C43** (P2) Resolve short service names in the caller namespace.
+
+### Engineering follow-ups
+
+- [ ] **H01** (P2) Remove stale wiring claims and validate documentation.
+- [ ] **H02** (P3) Remove or deliberately expose unused helper entry points.
+- [ ] **H03** (P2) Resolve inert configuration and wire fields explicitly.
+- [ ] **H04** (P3) Use typed alert and scheduler error contracts.
+- [ ] **H05** (P3) Split modules along existing ownership boundaries.
+- [ ] **H06** (P3) Evaluate shared DNS and duration parsers.
+- [ ] **H07** (P3) Add useful public API doctests.
+- [ ] **H08** (P2) Identify and eliminate leaked test processes.
+- [ ] **H09** (P3) Complete node-pressure diagnostic hygiene.
+- [ ] **H10** (P3) Reuse one egress observation per health tick.
+- [ ] **H11** (P2) Declare and test the actual Rust/toolchain baseline.
+
+### Missing capabilities and longer-term scope
+
+- [ ] **F01** (feature) Propagate GPU capacity and cached-image placement evidence.
+- [ ] **F02** (feature) Complete rootless and process-workload isolation.
+- [ ] **F03** (feature) Finish upstream image trust and worker key separation.
+- [ ] **F04** (feature) Add supported CA recovery and rotation operations.
+- [ ] **F05** (feature) Complete namespace-scoped identity and token lifecycle.
+- [ ] **F06** (feature) Complete the metrics/query and reporting architecture.
+- [ ] **F07** (feature) Finish cross-node views and log-stream capabilities.
+- [ ] **F08** (feature) Complete WebSocket ingress parity and certificate automation.
+- [ ] **F09** (feature) Implement packet-level delay/bandwidth faults if retained.
+- [ ] **F10** (feature) Provide explicit managed-volume retirement and runtime parity.
+- [ ] **F11** (feature) Finish supported Kubernetes translations.
+- [ ] **F12** (future) Keep the long-term vision explicitly separate.
+
+### Acceptance and release gates
+
+- [ ] **V01** (gate) Qualify the complete live three-node catalogue.
+- [ ] **V02** (gate) Qualify sustained TLS, storage and upgrade recovery.
+- [ ] **V03** (gate) Publish and install the exact signed candidate.
+- [ ] **V04** (gate) Measure repeated cold installs on the advertised host matrix.
+- [ ] **V05** (gate) Review dependency exceptions before their deadline.
+
 ## Current release checklist
 
 - [x] Commit the release scope and acceptance plan (`99e4ff9`).
 - [x] Validate setup liveness and bounded subsystem readiness (`6ee50a6`; 268 Relish tests).
 - [x] Stream registry uploads and bound writers (`1ea2b1a`; 228 registry tests, all-target Clippy).
-- [x] Measure registry memory under concurrent pushes (`5343072`; four 128 MiB uploads, 37.5 MiB RSS growth in a 2 GiB VM).
-- [x] Package self-contained Linux agents and native laptop CLIs (`c448f58`, `79b31b9`; all four hosted native builds pass).
+- [x] Measure registry memory under concurrent pushes (`3fcba4c`, `f1882be`, `598a893`, `b16d723`; four 128 MiB uploads, 37.5 MiB RSS growth in a 2 GiB VM).
+- [x] Package self-contained Linux agents and native laptop CLIs (`22e334a`, `e834832`, `ee4e945`, `d95e636`, `e346aec`; all four hosted native builds pass).
 - [ ] Publish verifiable release metadata and signed artefacts.
 - [x] Implement secure, resumable managed laptop clusters and installer (committed on `codex/v0.1.0-release`; three real Linux VMs passed setup, HTTP ingress and stop/start on 17 September).
 - [x] Fix registry/runtime cache compatibility, restart checkpoints and responsive health probing.
 - [x] Route ingress across nodes and report cluster-wide CLI status (`f5404f9`, `8072209`).
-- [x] Propagate storage/bootstrap errors, honour experimental Apple runtime settings, and audit HTTP methods (`6c5bd6f`, `bbe9c9b`, `e5f4208`).
-- [x] Report unavailable GitOps queues/export failures and show real dashboard replica counts (`baf73f2`, `afee562`).
-- [x] Connect the host browser through pinned TLS and show remote app instances (`5343072`; session tests, 48 rendering tests and three-node acceptance).
-- [x] Fix promoted first-run defects and record residual dispositions in the release plan (`e2fb093`, `a9feedd`; live ingress acceptance and offline export regressions).
+- [x] Propagate storage/bootstrap errors, honour experimental Apple runtime settings, and audit HTTP methods (`a805575`, `3d302de`, `bbe9c9b`, `e5f4208`).
+- [x] Report unavailable GitOps queues/export failures and show real dashboard replica counts (`b7735ba`, `7acb36b`, `afee562`).
+- [x] Connect the host browser through pinned TLS and show remote app instances (`3fcba4c`, `f1882be`, `598a893`, `b16d723`; session tests, 48 rendering tests and three-node acceptance).
+- [x] Fix promoted first-run defects and record residual dispositions in the release plan (`01b9b00`, `3f97aea`, `6b3400f`, `df91a67`, `cfb483f`; live ingress acceptance and offline export regressions).
 - [x] Record an empty-cache development-binary laptop run (`38cc6b7`; three nodes and sample HTTP in 241.75s).
 - [ ] Qualify the downloaded candidate on clean hosts and record three-node timing.
 - [ ] Pass the real-cluster and final release acceptance gates.
@@ -1408,7 +1503,7 @@ verification alone; its separate gossip-rejoin deadline remains unfinished.
   versus compiled-out tests, deterministic async tests, nextest, benchmarks and coverage
 - [x] Complete chapter 15 with the built-in diagnostics commands (`relish test`, `wtf`,
   `trace`), including safety, evidence provenance and acceptance limitations
-- [ ] All Phase 15 tests green
+- [ ] All Phase 15 tests green (current backlog: V01)
 
 ## Phase 15a: Current-State Hardening
 
@@ -1550,10 +1645,10 @@ verification alone; its separate gossip-rejoin deadline remains unfinished.
 
 ### Optional
 
-- [ ] Ownership-based module splits (O1)
-- [ ] Library-backed DNS/duration parsing where compatibility tests justify it (O2)
-- [ ] Public API doctests (O3)
-- [ ] Production TC DNS fast-path evaluation if profiling justifies it (O4)
+- [ ] Ownership-based module splits (O1) (current backlog: H05)
+- [ ] Library-backed DNS/duration parsing where compatibility tests justify it (O2) (current backlog: H06)
+- [ ] Public API doctests (O3) (current backlog: H07)
+- [ ] Production TC DNS fast-path evaluation if profiling justifies it (O4) (current backlog: F09)
 - [x] Audit shipped/planned/experimental claims (O5, Phase 16 Sections D–G). Mechanical drift prevention and new findings remain ongoing work.
 
 ## Phase 15b: Code-Logic Review Hardening
@@ -2497,7 +2592,7 @@ blocking calls).
 ### Low — hygiene, minor bugs, stale docs
 
 - [x] **TUI log switching and viewport sizing** — subscription generations reject late lines/errors; both log views use the actual terminal height (`90d7081`, `cfd6d81`; reducer and viewport regressions).
-- [ ] **Stale TODO / doc drift** — `src/meat/filter.rs:41` `TODO(wiring)` is stale
+- [ ] **Stale TODO / doc drift** (current backlog: H01) — `src/meat/filter.rs:41` `TODO(wiring)` is stale
   (`apply_upgrade_cordon` *is* wired via `orchestrate.rs:172`, `bin/bun.rs:1001`), delete it;
   `src/meat/score.rs:3-8` doc claims a "0–130 scale, Spread (40)" but constants give
   `WEIGHT_SPREAD = 60`, max 150; `src/mayo/scrape.rs:114-122` "there is no scrape loop yet"
@@ -2508,7 +2603,7 @@ blocking calls).
 - [x] **Bootstrap, GitOps and disk-pressure export errors** — fresh council failures propagate, unavailable sync queues return 503 without consuming delivery IDs, and failed exports are logged (`3d302de`, `b7735ba`, `7acb36b`).
 - [x] **HTTP health-probe pooling and attribution** — pooled requests retain deadlines and distinguish local client errors from workload refusal (`3c78b09`).
 - [x] **The listed startup/testapp/client-construction panics** — storage errors propagate, occupied testapp ports return errors, and invalid client trust configuration fails explicitly (`a805575`, `d70699d`, `e346aec`). This is not a claim that all public panic paths are eliminated.
-- [ ] **Unwired library-only helpers** (delete or wire): `src/wrapper/proxy.rs:343`
+- [ ] **Unwired library-only helpers** (current backlog: H02/F04) (delete or wire): `src/wrapper/proxy.rs:343`
   `run_proxy`; `src/onion/dns.rs:364-375` `run_dns_responder`; `src/sesame/identity.rs:543-551`
   `extend_grace_period` (so `RotationState::GracePeriod` and the documented 4-hour grace
   extension are unreachable; failed rotation marches to `Expired` with an `eprintln`);
@@ -2517,7 +2612,7 @@ blocking calls).
   contains the DEP8 bug the wired path fixed); `src/pickle/pull.rs:193`
   `image_available_locally`; `src/relish/client.rs:707` `renew_test_lease`; various
   smoker helpers (`resource.rs:230`, `types.rs:285`, `registry.rs:155,188`).
-- [ ] **Dead wire/config fields** — `src/mustard/message.rs:171` `lamport` is stamped and
+- [ ] **Dead wire/config fields** (current backlog: H03) — `src/mustard/message.rs:171` `lamport` is stamped and
   shipped "for causal ordering" but never read (conflict resolution is incarnation-only);
   `src/wrapper/types.rs:136-142` `LoadBalanceStrategy::LeastConnections` is populated but
   `select_backend` is unconditionally round-robin; `src/wrapper/types.rs:99`
@@ -2525,9 +2620,9 @@ blocking calls).
   are unpopulated for remote peers, so council resource-eligibility (`selection.rs:113-120`)
   and image-locality scoring (`score.rs:103-111`) are inert in production.
 - [x] **Authorisation matrix checks methods as well as paths** (`e5f4208`), and dashboard desired counts come from desired state (`afee562`, `f1882be`).
-- [ ] **Remaining minor-correctness group** — premature port exhaustion, hand-written certificate-date conversion, prune counts after failed deletion, and growing export checkpoint history remain. The September audit also identifies archive overwrite and destination-scope defects.
+- [ ] **Remaining minor-correctness group** (current backlog: C01–C04/C13/C18–C19/C22) — premature port exhaustion, hand-written certificate-date conversion, prune counts after failed deletion, and growing export checkpoint history remain. The September audit also identifies archive overwrite and destination-scope defects.
 - [x] **Native Apple mounts and publication** — bind/config mounts, process identity, working directory, read-only root and published ports are translated and live-tested (`bbe9c9b`). Broader runtime parity remains experimental.
-- [ ] **Planned capability boundaries** — PromQL, remote read, extra rollup tiers and live WebSocket drain-close remain unimplemented. Labelling them planned completed the documentation task, not these features.
+- [ ] **Planned capability boundaries** (current backlog: F06/F08) — PromQL, remote read, extra rollup tiers and live WebSocket drain-close remain unimplemented. Labelling them planned completed the documentation task, not these features.
 
 
 ### Deep re-audit of the previously-skimmed areas (16 Aug 2026)
@@ -2624,6 +2719,6 @@ and a handful of test cases whose assertions are too loose to catch the bug they
 **Low — hygiene and minor bugs from the deep pass:**
 
 - [x] **Relish liveness, client configuration, streamed UTF-8 and offline export errors** — health validates the response; invalid trust settings return errors; split UTF-8 survives SSE framing; explicit offline export validates paths and reports checkpoint failures (`6ee50a6`, `e346aec`, `a057634`, `df91a67`, `cfb483f`).
-- [ ] **Remaining CLI robustness** — `parse_since` still multiplies unchecked (reproduced exit 101 for `18446744073709551615d`); development VM commands retain non-UTF-8 path unwraps; diagnostic certificate wording and misplaced API docs need correction.
+- [ ] **Remaining CLI robustness** (current backlog: C17/C23/C39/H01) — `parse_since` still multiplies unchecked (reproduced exit 101 for `18446744073709551615d`); development VM commands retain non-UTF-8 path unwraps; diagnostic certificate wording and misplaced API docs need correction.
 - [x] **Cluster collection, deadlines, deployment history and ingress acceptance** — incomplete collection fails, waits share the case deadline, history must contain both tested versions, and ingress polls exact responses using credential-free clients and isolated hosts (`c6163b8`, `265aa99`, `6b3400f`). Expired queued capabilities refresh (`3f97aea`); three live ingress cases passed.
-- [ ] **Remaining test-harness robustness** — registry URLs still split on `:` (breaking IPv6 and ignoring configured registry ports), teardown prose overstates client guarantees, unused helpers remain, and fully disabled-auth workload faults retain different semantics from node faults. Broader runner/lease/verdict defects are tracked in the completion plan.
+- [ ] **Remaining test-harness robustness** (current backlog: C29–C36/H01–H02) — registry URLs still split on `:` (breaking IPv6 and ignoring configured registry ports), teardown prose overstates client guarantees, unused helpers remain, and fully disabled-auth workload faults retain different semantics from node faults. Broader runner/lease/verdict defects are tracked in the completion plan.
