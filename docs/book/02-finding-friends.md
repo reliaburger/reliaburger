@@ -2296,3 +2296,16 @@ The cluster handles the hard cases: council member departure, minority partition
 Next up: networking. Chapter 3 gives each container its own network namespace, adds eBPF-based service discovery so containers can find each other by name, and puts an ingress proxy in front of the cluster. The nodes can talk to each other now; it's time to let the apps do the same.
 
 If you want to dig into the code itself, the [Phase 2 Code Walkthrough](02a-code-walkthrough.md) walks through every module in the order that makes sense, highlights the critical paths, and points out where the interesting bits are.
+
+### A checkpoint isn't a running process
+
+The laptop restart test found a gap in deployment recovery. The reconciler loaded
+its saved fingerprint and skipped an unchanged assignment, even when shutdown
+had stopped every instance. The desired state survived. The workload didn't.
+
+Before trusting that checkpoint, the reconciler now asks the local agent for
+its inventory under a five-second deadline. It retains an assignment only when
+its expected number of active instances survived or were adopted. Missing or
+stopped instances invalidate the fingerprint so normal reconciliation deploys
+them again. If inventory is unavailable, it retries without guessing. A test
+covers a live adopted instance, an absent app and a stopped instance together.

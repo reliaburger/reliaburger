@@ -703,6 +703,40 @@ fn build_cluster_cache(
     cache
 }
 
+/// Discard checkpoint entries whose expected instances did not survive restart.
+/// Retains adopted active workloads so they aren't needlessly redeployed.
+pub fn retain_live_assignments(
+    applied: &mut crate::cluster::applied::AppliedMap,
+    statuses: &[crate::bun::agent::InstanceStatus],
+) {
+    applied.retain(|(name, namespace), fingerprint| {
+        let Ok(spec) = serde_json::from_str::<AppSpec>(fingerprint) else {
+            return false;
+        };
+        let Replicas::Fixed(expected) = spec.replicas else {
+            return false;
+        };
+        let active = statuses
+            .iter()
+            .filter(|instance| {
+                &instance.app_name == name
+                    && &instance.namespace == namespace
+                    && matches!(
+                        instance.state.as_str(),
+                        "pending"
+                            | "preparing"
+                            | "initialising"
+                            | "starting"
+                            | "health-wait"
+                            | "running"
+                            | "unhealthy"
+                    )
+            })
+            .count();
+        active == expected as usize
+    });
+}
+
 /// Spawn the per-node placement reconciler.
 ///
 /// Polls the leader's `/v1/placements/{node}` endpoint and converges
@@ -741,6 +775,7 @@ pub fn spawn_placement_reconciler(
             .as_deref()
             .map(crate::cluster::applied::load)
             .unwrap_or_default();
+        let mut checkpoint_verified = false;
 
         loop {
             tokio::select! {
@@ -753,6 +788,24 @@ pub fn spawn_placement_reconciler(
             // lets a node OUTSIDE the council keep converging, H1/CP1).
             // The reporting offset is passed as 0 because only the API
             // address matters here.
+            if !checkpoint_verified {
+                let inventory = async {
+                    let (response, received) = tokio::sync::oneshot::channel();
+                    cmd_tx.send(AgentCommand::Status { response }).await.ok()?;
+                    received.await.ok()
+                };
+                let Ok(Some(statuses)) =
+                    tokio::time::timeout(Duration::from_secs(5), inventory).await
+                else {
+                    continue;
+                };
+                retain_live_assignments(&mut applied, &statuses);
+                if let Some(path) = &checkpoint_path {
+                    crate::cluster::applied::save(path, &applied);
+                }
+                checkpoint_verified = true;
+            }
+
             let leader_url = {
                 let metrics = metrics_rx.borrow();
                 let directory = directory_rx.borrow();
@@ -932,6 +985,51 @@ mod tests {
     use crate::reporting::types::{ResourceUsage, StateReport};
     use std::collections::HashMap;
     use std::time::{Instant, SystemTime};
+
+    #[test]
+    fn restart_checkpoint_only_retains_assignments_with_live_instances() {
+        let mut spec = spec_from_toml(
+            r#"[app.demo]
+image = "busybox:latest"
+"#,
+        );
+        spec.replicas = Replicas::Fixed(1);
+        let fingerprint = serde_json::to_string(&spec).unwrap();
+        let mut applied = BTreeMap::from([
+            (("live".into(), "default".into()), fingerprint.clone()),
+            (("gone".into(), "default".into()), fingerprint.clone()),
+            (("stopped".into(), "default".into()), fingerprint),
+        ]);
+        let statuses = vec![
+            crate::bun::agent::InstanceStatus {
+                id: "live-0".into(),
+                app_name: "live".into(),
+                namespace: "default".into(),
+                state: "running".into(),
+                restart_count: 0,
+                host_port: None,
+                exit_code: None,
+                pid: Some(42),
+            },
+            crate::bun::agent::InstanceStatus {
+                id: "stopped-0".into(),
+                app_name: "stopped".into(),
+                namespace: "default".into(),
+                state: "stopped".into(),
+                restart_count: 0,
+                host_port: None,
+                exit_code: Some(0),
+                pid: None,
+            },
+        ];
+        retain_live_assignments(&mut applied, &statuses);
+        assert_eq!(
+            applied.keys().cloned().collect::<Vec<_>>(),
+            vec![("live".into(), "default".into())]
+        );
+        retain_live_assignments(&mut applied, &[]);
+        assert!(applied.is_empty());
+    }
 
     // -- M14: reconciler deploy-wait timeout ---------------------------------
 
