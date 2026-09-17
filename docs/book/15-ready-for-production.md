@@ -2269,3 +2269,9 @@ Two HTTP regressions exercise this: one server immediately returns 503, and one
 stalls longer than the case's budget. Neither may satisfy an empty-instance
 predicate. Cleanup retains its separate deadline, so an exhausted test budget
 doesn't prevent the runner from attempting to remove its own workloads.
+
+The test HTTP server's startup methods now return `std::io::Result` too. Tests
+can unwrap an ephemeral bind they expect to succeed, while `bun testapp` and the
+standalone executable add the requested port to an ordinary error and exit
+non-zero. A port already in use no longer produces a panic. The regression
+holds a real listening socket and attempts a second bind to the same port.

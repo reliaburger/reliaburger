@@ -116,7 +116,7 @@ pub struct TestApp {
 
 impl TestApp {
     /// Start the test app on an ephemeral port. Returns immediately.
-    pub async fn start(mode: TestAppMode) -> Self {
+    pub async fn start(mode: TestAppMode) -> std::io::Result<Self> {
         Self::start_on_port(mode, 0).await
     }
 
@@ -126,9 +126,9 @@ impl TestApp {
     /// its own network namespace, and a loopback-only bind would be
     /// unreachable from the node that needs to health-check it. Loopback
     /// callers are unaffected — `0.0.0.0` accepts on every interface.
-    pub async fn start_on_port(mode: TestAppMode, port: u16) -> Self {
-        let listener = TcpListener::bind(format!("0.0.0.0:{port}")).await.unwrap();
-        let port = listener.local_addr().unwrap().port();
+    pub async fn start_on_port(mode: TestAppMode, port: u16) -> std::io::Result<Self> {
+        let listener = TcpListener::bind(format!("0.0.0.0:{port}")).await?;
+        let port = listener.local_addr()?.port();
         let shutdown = CancellationToken::new();
         let token = shutdown.clone();
         let request_count = Arc::new(AtomicU32::new(0));
@@ -226,7 +226,7 @@ impl TestApp {
             }
         });
 
-        Self { port, shutdown }
+        Ok(Self { port, shutdown })
     }
 
     /// The port the test app is listening on.
@@ -350,8 +350,16 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn occupied_port_returns_an_error_without_panicking() {
+        let listener = TcpListener::bind("0.0.0.0:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let result = TestApp::start_on_port(TestAppMode::Healthy, port).await;
+        assert!(matches!(result, Err(error) if error.kind() == std::io::ErrorKind::AddrInUse));
+    }
+
+    #[tokio::test]
     async fn a_running_app_serves_payload_and_falls_through_to_the_mode() {
-        let app = TestApp::start(TestAppMode::Healthy).await;
+        let app = TestApp::start(TestAppMode::Healthy).await.unwrap();
         let address = format!("127.0.0.1:{}", app.port());
 
         let payload = fetch(&address, "/payload?bytes=512").await;
@@ -367,7 +375,7 @@ mod tests {
     /// /payload is not hanging.
     #[tokio::test]
     async fn a_hanging_app_hangs_on_the_special_routes_too() {
-        let app = TestApp::start(TestAppMode::Hang).await;
+        let app = TestApp::start(TestAppMode::Hang).await.unwrap();
         let address = format!("127.0.0.1:{}", app.port());
         let result = tokio::time::timeout(
             Duration::from_millis(300),

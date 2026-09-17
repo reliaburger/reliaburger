@@ -478,7 +478,9 @@ async fn run_testapp(
 ) -> anyhow::Result<()> {
     let parsed = reliaburger::bun::testapp::parse_mode(mode, count, delay_ms, alloc_mib)
         .map_err(|e| anyhow::anyhow!(e))?;
-    let app = reliaburger::bun::testapp::TestApp::start_on_port(parsed, port).await;
+    let app = reliaburger::bun::testapp::TestApp::start_on_port(parsed, port)
+        .await
+        .with_context(|| format!("failed to bind testapp on port {port}"))?;
     println!(
         "testapp: listening on 0.0.0.0:{} (mode: {mode})",
         app.port()
