@@ -313,9 +313,9 @@ retain_versions = 3
     }
 
     /// Wait until the leader agrees that it is the leader and has archived
-    /// the previous operation. Another node can observe the committed
-    /// completion slightly earlier, but the next write must go through the
-    /// leader's local Raft state.
+    /// the previous operation and rebuilt its live membership. Another node
+    /// can observe completion earlier, but the next write must go through
+    /// the leader's local Raft and membership state.
     async fn wait_for_idle_leader(&self) -> String {
         let deadline = tokio::time::Instant::now() + WAIT;
         loop {
@@ -326,7 +326,29 @@ retain_versions = 3
                     .cluster_state_from(node)
                     .await
                     .is_some_and(|state| state["active"].is_null());
-                if leader_agrees && upgrade_idle {
+                let live_members = async {
+                    let response = self
+                        .client
+                        .get(format!("http://{}/v1/cluster/nodes", node.api))
+                        .send()
+                        .await
+                        .ok()?
+                        .error_for_status()
+                        .ok()?;
+                    response
+                        .json::<Vec<reliaburger::bun::agent::NodeStatus>>()
+                        .await
+                        .ok()
+                }
+                .await;
+                let membership_ready = live_members.is_some_and(|members| {
+                    self.nodes.iter().all(|expected| {
+                        members.iter().any(|member| {
+                            member.node_id == expected.name && member.state == "alive"
+                        })
+                    })
+                });
+                if leader_agrees && upgrade_idle && membership_ready {
                     return leader;
                 }
             }

@@ -749,3 +749,15 @@ uploading and hashing it is a different operation. A Linux qualification run
 failed in that upload before any rolling replacement began. The upload now has
 its own 60-second deadline. Status calls retain five seconds and the overall
 upgrade deadline is unchanged. The complete Linux suite passes with these bounds.
+
+
+### Wait for the replacement coordinator's membership view
+
+A completed rolling upgrade and a reachable new leader do not mean that leader
+has already rediscovered every peer. Gossip rebuilds its local view after exec.
+An immediate rollback request can therefore be correctly refused as targeting
+an unknown live member. The harness now waits for the leader to agree on its
+role, archive the previous operation, and see every target alive before asking
+for rollback. It keeps the same bounded wait and does not retry a mutation with
+an unknown outcome. All three Linux upgrade cases pass in 198.90 seconds with
+this preflight; the server continues to reject an incomplete authoritative view.
