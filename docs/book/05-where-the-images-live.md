@@ -571,3 +571,29 @@ writer limit, and try to complete an expired session. This tests the behaviour
 clients depend on, without relying on process memory measurements. The separate
 release acceptance still needs to measure memory under real concurrent pushes
 in the laptop VM.
+
+### One shared cache means one path convention
+
+The laptop test found two implementations of the same promise. `ImageStore`
+wrote a layer to `blobs/sha256/<digest>`, while Pickle wrote it to
+`blobs/sha256/<digest>/data`. Both pointed at the same base directory. Once the
+runtime created a flat file, the registry could no longer create its directory.
+The fallback then pulled upstream again instead of using the bytes on disk.
+
+Both stores now use one path resolver. New blobs use the registry layout, and
+existing flat files remain readable and writable. Enumeration recognises both
+forms and ignores temporary filenames. A regression writes through the registry
+and reads through the runtime, then repeats with a legacy flat file.
+
+That exposed a second assumption: rootfs generation IDs hashed each layer's
+filename. Every registry layer's filename is `data`, so replacing a layer could
+reuse the previous rootfs generation. We now extract the digest from its parent
+for that layout. The same ordered digests produce the same generation in both
+layouts, and changed digests produce a new generation without touching a running
+container's files. The tests exercise those properties directly.
+
+Digest pins also contain a colon (`sha256:...`), as do registries with explicit
+ports. That character separates lower layers in overlayfs mount options. We
+encode it as `%3A` in rootfs directory components while preserving the original
+OCI reference for registry requests. A path regression covers both a pinned
+digest and a registry port; ordinary tag paths keep their existing layout.
