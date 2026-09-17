@@ -159,6 +159,18 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)]
+    fn saving_context_does_not_follow_a_preexisting_temporary_symlink() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("context.json");
+        let victim = root.path().join("unrelated.txt");
+        std::fs::write(&victim, b"keep this file").unwrap();
+        std::os::unix::fs::symlink(&victim, path.with_extension("tmp")).unwrap();
+        context(root.path(), "cluster-a").save(&path).unwrap();
+        assert_eq!(std::fs::read(&victim).unwrap(), b"keep this file");
+    }
+
+    #[test]
     fn context_roundtrip_preserves_credentials_privately() {
         let root = tempfile::tempdir().unwrap();
         let path = root.path().join("context.json");

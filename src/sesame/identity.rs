@@ -486,23 +486,33 @@ pub(crate) fn atomic_write(path: &Path, data: &[u8]) -> std::io::Result<()> {
 
 /// Write + atomic rename, optionally restricting the final file mode.
 ///
-/// The mode is applied to the temp file before the rename so the file is
-/// never briefly world-readable at its final path (M25).
+/// A unique temporary file is created with the requested mode before any
+/// bytes are written. File and directory syncs make the replacement durable.
 pub(crate) fn atomic_write_mode(
     path: &Path,
     data: &[u8],
     mode: Option<u32>,
 ) -> std::io::Result<()> {
-    let tmp = path.with_extension("tmp");
-    std::fs::write(&tmp, data)?;
+    use std::io::Write as _;
+    let parent = path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    let mut builder = tempfile::Builder::new();
+    builder.prefix(".reliaburger-");
     #[cfg(unix)]
-    if let Some(mode) = mode {
+    {
         use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(mode))?;
+        builder.permissions(std::fs::Permissions::from_mode(mode.unwrap_or(0o666)));
     }
     #[cfg(not(unix))]
     let _ = mode;
-    std::fs::rename(&tmp, path)?;
+    let mut temporary = builder.tempfile_in(parent)?;
+    temporary.write_all(data)?;
+    temporary.as_file().sync_all()?;
+    temporary.persist(path).map_err(|error| error.error)?;
+    #[cfg(unix)]
+    std::fs::File::open(parent)?.sync_all()?;
     Ok(())
 }
 

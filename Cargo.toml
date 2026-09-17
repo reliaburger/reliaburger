@@ -33,6 +33,7 @@ serde_json = "1"
 serde_yaml = "0.9"
 semver = "1"
 thiserror = "2"
+tempfile = "3"
 tokio = { version = "1", features = ["full", "test-util"] }
 tokio-util = "0.7"
 toml = "0.8"
@@ -95,7 +96,6 @@ criterion = { version = "0.5", features = ["async_tokio"] }
 http-body-util = "0.1"
 insta = { version = "1", features = ["json"] }
 proptest = "1"
-tempfile = "3"
 tower = { version = "0.5", features = ["util"] }
 
 [profile.dev]

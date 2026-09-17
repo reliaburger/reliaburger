@@ -751,3 +751,21 @@ cargo test --lib sesame
 The one thing the unit tests *don't* cover is the full token-and-revocation lifecycle across a running cluster — single-use enforcement in the agent, secret rotation windows, certificate revocation lists. That needs `SecurityState` in Raft, so its integration test (`tests/security_integration.rs`, labelled "Phase 10") arrives with Chapter 10. It drives the `sesame` library directly — no running agent — so it too runs under a plain `cargo test`.
 
 Phase 4 adds 85 tests to the suite, bringing the total to 795.
+
+### Private files need private temporary files too
+
+Writing a credential to `context.tmp`, changing its permissions, and renaming it
+sounds atomic. It still has two problems. The temporary file can be readable
+before the permission change, and a pre-existing symlink at that predictable
+name can redirect the write into another file.
+
+The shared identity writer now uses `tempfile::Builder` to create a unique file
+with the requested mode before writing any bytes. It syncs the contents,
+atomically replaces the destination, and syncs the containing directory. The
+`NamedTempFile` owns cleanup on errors; a successful `persist` transfers ownership
+to the destination path. This also makes managed-cluster checkpoints durable.
+
+A regression test plants a temporary symlink beside a context and verifies that
+saving the context leaves the other file untouched. The original implementation
+failed this test. The identity suite checks that certificate persistence still
+works with the safer writer.
