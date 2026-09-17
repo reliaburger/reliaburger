@@ -2491,3 +2491,17 @@ answer section and compare `IpAddr` values. This rejects longer textual matches
 and recognises equivalent IPv6 spellings. The agent regression supplies successful
 probe output with misleading resolver/name text and verifies that DNS still fails;
 the existing correct-answer trace remains successful.
+
+### Watch mode keeps watching when collection fails
+
+An unavailable entry node is an observation worth displaying. Watch mode now
+renders that collection as unknown and retries after its normal 30-second
+interval. A pinned Ctrl-C future is polled both during collection and between
+reports, so an interruption can stop an in-flight collection too. `tokio::pin!`
+keeps that future at a stable address while multiple `select!` calls borrow it.
+
+Ctrl-C returns the last diagnostic outcome. Missing evidence cannot downgrade
+previously observed critical problems to clean; before any successful report,
+the outcome is unknown/warning. A real Relish subprocess test makes the first
+health request fail, waits for recovery on the next collection, then sends SIGINT
+and checks warning exit code 2. The test owns and reaps its child on failure too.

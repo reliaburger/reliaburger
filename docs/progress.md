@@ -55,7 +55,7 @@ remain separate. Older unchecked groups below point into this current ledger.
 - [x] **C24** Require observed configured voters for quorum arithmetic; unavailable/empty council responses and degraded membership remain unknown instead of using stale gossip flags. The public collector regression fails before the fix; all 25 diagnostic collector/engine tests pass, including observed quorum loss.
 - [x] **C25** Report node-local Unix device identity without paths and coalesce only matching identities; preserve separate legacy observations and the busiest complete shared-device reading. The HTTP regression fails before the fix; all 26 diagnostic collector/engine and seven local diagnostic tests pass, including real sibling-path identity.
 - [x] **C26** Track exact CPU sample identities and compare parsed DNS answer IPs, excluding resolver/name/target text. Both substring regressions fail before the fix; local diagnostics, agent trace and pure trace tests pass, including equivalent IPv6 addresses.
-- [ ] **C27** (P2) Preserve watch-mode failures and exit outcomes.
+- [x] **C27** Render collection failures as unknown and continue polling; handle interruption during collection and retain the last meaningful exit outcome. The real-process regression fails before the fix, then recovers on the next 30-second interval and exits 2 on SIGINT; all four command rendering/outcome tests pass.
 - [ ] **C28** (P2) Make TUI status reflect the cluster.
 - [ ] **C29** (P1) Fail benchmark comparisons when required metrics vanish.
 - [ ] **C30** (P1) Replace unconditional unknown catalogue cases with real evidence.
