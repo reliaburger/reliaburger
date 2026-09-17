@@ -57,7 +57,7 @@ remain separate. Older unchecked groups below point into this current ledger.
 - [x] **C26** Track exact CPU sample identities and compare parsed DNS answer IPs, excluding resolver/name/target text. Both substring regressions fail before the fix; local diagnostics, agent trace and pure trace tests pass, including equivalent IPv6 addresses.
 - [x] **C27** Render collection failures as unknown and continue polling; handle interruption during collection and retain the last meaningful exit outcome. The real-process regression fails before the fix, then recovers on the next 30-second interval and exits 2 on SIGINT; all four command rendering/outcome tests pass.
 - [x] **C28** (P2) Make TUI status reflect the cluster.
-- [ ] **C29** (P1) Fail benchmark comparisons when required metrics vanish.
+- [x] **C29** Include missing baseline metrics in the shared comparison verdict and name missing/new observations in human output. The regression fails before the fix; all benchmark tests pass, including informational and added-only comparisons.
 - [ ] **C30** (P1) Replace unconditional unknown catalogue cases with real evidence.
 - [ ] **C31** (P2) Give concurrent test runs distinct namespaces.
 - [ ] **C32** (P2) Use typed case outcomes and validated runner configuration.

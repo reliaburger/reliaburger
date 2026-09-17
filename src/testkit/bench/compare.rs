@@ -28,6 +28,14 @@ pub struct BenchComparison {
     pub missing_in_baseline: Vec<String>,
 }
 
+impl BenchComparison {
+    /// Whether measured regressions or missing baseline metrics fail this comparison.
+    /// Hosted comparisons remain informational, including missing measurements.
+    pub fn failed(&self) -> bool {
+        !self.informational && (!self.regressions.is_empty() || !self.missing_in_current.is_empty())
+    }
+}
+
 /// Why two reports cannot produce a meaningful regression verdict.
 #[derive(Debug, Clone, PartialEq, thiserror::Error)]
 pub enum BenchComparisonError {

@@ -2505,3 +2505,17 @@ previously observed critical problems to clean; before any successful report,
 the outcome is unknown/warning. A real Relish subprocess test makes the first
 health request fail, waits for recovery on the next collection, then sends SIGINT
 and checks warning exit code 2. The test owns and reaps its child on failure too.
+
+### A missing measurement is a regression
+
+A baseline might contain network throughput while today's run contains only
+latency. Comparing their common metrics alone can print PASS without ever
+measuring throughput. `BenchComparison::failed` now includes missing baseline
+metrics as well as measured regressions. The command uses that same verdict for
+its exit outcome and human summary, and names missing and newly added metrics
+on separate lines. JSON and YAML retain their existing missing-metric lists.
+
+Hosted comparisons remain informational, but still display missing observations.
+The regression test replaces a baseline metric with a new one: it must fail and
+name both. Adding a new metric while retaining the baseline measurements stays
+clean. We don't invent a numeric value for absent evidence.
