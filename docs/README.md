@@ -135,6 +135,15 @@ No installation needed. This is what you get by default.
 
 ## Building
 
+The portable test gate requires cargo-nextest 0.9.145 or newer. That release
+fixes capture-pipe inheritance between concurrent macOS tests, which could make
+a completed test appear to leak a child process. CI pins 0.9.145 and treats a
+leak as a failure at the existing 100 ms deadline.
+
+```sh
+cargo install cargo-nextest --locked --version 0.9.145
+```
+
 The [Makefile](../Makefile) provides all build targets:
 
 ```sh

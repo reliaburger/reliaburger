@@ -2597,3 +2597,24 @@ Releasing it must let the owner publish. We exercise both supervision loops;
 both stalled before the repair. The existing tests still cover startup panics,
 missing acknowledgements, bounded restarts and stale signals. This establishes
 a reproducible deadlock fix; the full upgrade runs remain separate evidence.
+
+
+### A leak reported by the runner
+
+The portable suite passed while nextest reported one leaked output handle. Once
+we retained the per-test report, it named a metrics backfill test. That case
+writes and queries Parquet files; it does not launch child processes.
+
+The local runner was nextest 0.9.140. Upstream's 0.9.145 release describes a
+matching macOS race: one concurrently launched test could inherit another
+test's capture pipe before its close-on-exec flag was set. The completed test
+then appeared to leak a handle held by its sibling. This explains why the
+reported case need not be the process that kept the pipe open.
+
+We require the repaired runner and pin it in CI. The leak deadline stays at
+100 ms, and a future report now fails the gate. We verify both feature
+configurations with the new runner; increasing a timeout would not repair
+ownership. The runtime's child-process cleanup tests remain necessary too.
+
+See the [nextest 0.9.145 release notes](https://github.com/nextest-rs/nextest/releases/tag/cargo-nextest-0.9.145)
+for the capture-pipe fix.

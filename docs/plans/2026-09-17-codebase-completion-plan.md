@@ -661,6 +661,16 @@ The final pre-audit no-default run reported one passing-but-leaky test without p
 
 **Completion test:** Retain per-test leak diagnostics, reproduce the offending case, repair process ownership and repeat the relevant suite with no cleanup warning. Do not hide it with a longer timeout.
 
+**Disposition:** The retained report named
+`metrics_aggregation::backfill_after_reassignment_neither_drops_nor_double_counts`,
+which does not launch subprocesses. The local 0.9.140 runner predates the
+[0.9.145 macOS sibling-pipe fix](https://github.com/nextest-rs/nextest/releases/tag/cargo-nextest-0.9.145).
+The repository now requires that repaired version and pins it in CI. Both full
+feature configurations pass without leaks on 0.9.145; future leak reports fail
+at the unchanged 100 ms deadline. This disposition concerns the observed runner
+symptom, not a blanket exemption for application process-ownership defects.
+
+
 ### H09 — Complete node-pressure diagnostic hygiene
 
 **Priority:** P3. **Wave:** 5. **Book chapters:** 08, 15.

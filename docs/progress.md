@@ -85,7 +85,7 @@ remain separate. Older unchecked groups below point into this current ledger.
 - [ ] **H05** (P3) Split modules along existing ownership boundaries.
 - [ ] **H06** (P3) Evaluate shared DNS and duration parsers.
 - [ ] **H07** (P3) Add useful public API doctests.
-- [ ] **H08** (P2) Identify and eliminate leaked test processes. The 3,373-test no-default run reproduced one passing-but-leaky test; three subsequent diagnostic reruns passed without a leak. Default/CI nextest output now retains per-test leak identity instead of hiding it under the slow filter. The offending case and ownership repair remain unresolved; no timeout was relaxed.
+- [x] **H08** Require nextest 0.9.145 and pin it in CI. The captured leak named the subprocess-free metrics backfill test; upstream 0.9.145 fixes sibling capture-pipe inheritance on macOS. With that runner, all 3,433 default and 3,393 no-default tests pass without leaks (70.80s / 63.02s). The existing 100 ms leak deadline is unchanged and future leaks now fail the gate. Older runners refuse with exit 92; both READMEs and the book explain the requirement.
 - [ ] **H09** (P3) Complete node-pressure diagnostic hygiene.
 - [ ] **H10** (P3) Reuse one egress observation per health tick.
 - [x] **H11** Declare Rust 1.97, pin release/CI builds to 1.98.0 and add a locked minimum-compiler CI job for both feature configurations, including stacked PR triggers. Linux 1.97 checks every target/feature and passes 3,155 default plus 3,115 no-default library tests; macOS 1.98 passes 3,413 default plus 3,373 no-default portable tests. The no-default process leak remains H08. Build/rebuild policy and both READMEs are updated.

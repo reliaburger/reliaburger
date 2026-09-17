@@ -110,7 +110,9 @@ repo layout live in the manual (`relish manual`, "Under the hood") and the
 ## Try it
 
 Use the source-based quick start above while we prepare the first release.
-From a checkout, you can run the portable tests and check the examples:
+From a checkout, install cargo-nextest 0.9.145 or newer (see
+[build prerequisites](docs/README.md#building)), then run the portable tests and
+check the examples:
 
 ```sh
 make test                    # run the portable nextest suite
