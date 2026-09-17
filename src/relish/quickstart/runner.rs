@@ -88,7 +88,7 @@ pub async fn run(options: Options) -> Result<()> {
                 "  app: http://localhost:{}",
                 operation.state.spec.ingress_port
             );
-            println!("  next: relish nodes; relish status; relish logs hello");
+            println!("  next: relish nodes; relish status; relish logs hello; relish dashboard");
             println!(
                 "  lifecycle: relish local status|stop|start|destroy --name {}",
                 operation.state.spec.name

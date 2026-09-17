@@ -43,6 +43,7 @@ rollups so one node can answer for the fleet.
 
 ```sh
 relish                           # the terminal dashboard (TUI)
+relish dashboard                 # authenticated, read-only browser session
 ```
 
 The TUI shows apps, nodes, jobs, routes, live logs and events on WebSockets;

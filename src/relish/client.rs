@@ -295,8 +295,9 @@ impl BunClient {
     fn build(base_url: &str, token: Option<&str>, ca_pem: Option<&[u8]>) -> Self {
         let mut websocket_tls = None;
         let client = (|| -> Result<reqwest::Client, String> {
-            let mut builder =
-                reqwest::Client::builder().timeout(std::time::Duration::from_secs(300));
+            let mut builder = reqwest::Client::builder()
+                .timeout(std::time::Duration::from_secs(300))
+                .redirect(reqwest::redirect::Policy::none());
             if let Some(token) = token {
                 let mut headers = reqwest::header::HeaderMap::new();
                 let mut value = reqwest::header::HeaderValue::from_str(&format!("Bearer {token}"))

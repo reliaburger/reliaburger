@@ -44,6 +44,15 @@ fn parse_endpoint(value: &str) -> Result<String, String> {
 enum Command {
     /// Launch the interactive terminal UI.
     Tui,
+    /// Open a read-only web dashboard through the current authenticated context.
+    Dashboard {
+        /// Loopback port; zero chooses an available port.
+        #[arg(long, default_value_t = 0)]
+        port: u16,
+        /// Print the browser link without launching a browser.
+        #[arg(long)]
+        no_open: bool,
+    },
     /// Apply configuration from a file or directory.
     Apply {
         /// Path to a TOML config file or directory.
@@ -1051,6 +1060,9 @@ async fn main() -> ExitCode {
         Command::Tui => reliaburger::relish::tui::run().await,
         Command::Apply { ref path, dry_run } => commands::apply(path, cli.output, dry_run).await,
         Command::Status => commands::status(cli.output).await,
+        Command::Dashboard { port, no_open } => {
+            reliaburger::relish::dashboard::run(port, no_open).await
+        }
         Command::Logs {
             ref name,
             tail,
@@ -1671,6 +1683,19 @@ mod tests {
             output: cli.output,
             token: cli.token,
         })
+    }
+
+    #[test]
+    fn dashboard_accepts_a_port_and_headless_browser_mode() {
+        let cli =
+            Cli::try_parse_from(["relish", "dashboard", "--port", "18117", "--no-open"]).unwrap();
+        assert!(matches!(
+            cli.command,
+            Some(Command::Dashboard {
+                port: 18117,
+                no_open: true
+            })
+        ));
     }
 
     #[test]

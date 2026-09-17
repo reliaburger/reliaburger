@@ -8,6 +8,7 @@ pub mod chaos;
 pub mod client;
 pub mod commands;
 pub mod compile;
+pub mod dashboard;
 pub mod dev;
 pub mod diff;
 pub mod fault;

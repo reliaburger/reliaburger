@@ -389,6 +389,7 @@ Commands:
 | `manual examples` | Write the embedded example configs into the current directory |
 | `source [query]` | Browse and fuzzy-search the embedded source tree (e.g. `relish source ebpf`) |
 | `apply <path>` | Deploy workloads from a TOML config file |
+| `dashboard` | Open a read-only web dashboard using the current authenticated CLI context |
 | `status` | List workloads across the cluster with node names; fail if a member cannot answer |
 | `logs <name>` | Show captured stdout/stderr for an app |
 | `logs <name> --tail N` | Show only the last N lines |

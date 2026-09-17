@@ -132,6 +132,8 @@ curl -fsSL https://reliaburger.com/install.sh | bash
 export PATH="$HOME/.reliaburger/bin:$PATH"
 relish nodes
 relish status
+relish logs hello
+relish dashboard             # Ctrl-C stops the browser connection
 # Open http://localhost:18080/
 relish local stop
 relish local start

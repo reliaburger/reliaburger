@@ -13,6 +13,7 @@ export PATH="$HOME/.reliaburger/bin:$PATH"
 relish nodes
 relish status
 relish logs hello
+relish dashboard             # Ctrl-C stops the browser connection
 ```
 
 The default is three Linux VMs, running real OCI containers with runc. Relish
@@ -22,6 +23,12 @@ node. It checks the authenticated APIs, the three-member council and a sample
 container through the host ingress port. Open `http://localhost:18080/` to see
 the sample app. Your first application config is saved under
 `~/.reliaburger/clusters/laptop/hello.toml`.
+
+`relish dashboard` opens a temporary, read-only browser session on a loopback
+port. Relish keeps the cluster credentials and CA verification on the CLI side;
+you don't need to install the cluster CA in your browser or copy a token.
+Ctrl-C stops the browser connection, leaving the cluster running. Use
+`--no-open` to print the browser link, or `--port PORT` to select a local port.
 
 There is no Rust build and no repository checkout in the published path.
 Native macOS uses Apple's Virtualization.framework through Lima. Linux needs

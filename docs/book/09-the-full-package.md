@@ -889,3 +889,38 @@ the operation fail with that node's name. An empty list should mean no workloads
 not that we silently dropped the machine running them. We test this with a
 listener that accepts connections but never sends an HTTP response, as well as
 three real agents queried from each node.
+
+### A browser connection without copying the administrator token
+
+The managed cluster API uses a private CA. Relish already knows that CA and the
+operator's token, but a fresh browser knows neither. `relish dashboard` now opens
+a read-only connection through a temporary loopback HTTP server in the CLI.
+Relish continues to verify Bun's CA; the browser doesn't need a system trust-store
+change.
+
+The command prints and opens a one-use link containing a fresh random nonce.
+The local server exchanges it for a separate HttpOnly, SameSite=Strict cookie
+and redirects to `/`. Neither value is the cluster token. The server checks its
+exact loopback Host and Origin, refuses cross-site requests and accepts only GET
+and HEAD. The upstream bearer stays in Relish. Browser cookies and Authorization
+headers aren't forwarded, redirects aren't followed, and response bodies stream
+without whole-response buffering. Ctrl-C cancels those streams and closes the
+browser connection while the cluster keeps running.
+
+We use `AtomicBool` to consume the launch link once even if two requests arrive
+concurrently. `Arc` lets cloned request state share that same flag. Each process
+gets fresh random values, and the cookie name includes the listening port so two
+local dashboard sessions don't overwrite one another's cookies.
+
+The tests cover single-use exchange, cookie attributes, missing sessions, foreign
+origins, DNS rebinding through a forged Host, mutation refusal, and a real upstream
+HTTP server. That server verifies it received the saved CLI credential and never
+the browser's supplied cookie or bearer.
+
+The live browser check found another difference between a local build and a
+copied binary. By default, `rust-embed` reads assets from the source tree in
+debug builds. The qualification VM has no source tree, so its CSS and JavaScript
+returned 404. We enable the crate's `debug-embed` feature as well as compression.
+Cargo features select optional crate behaviour at compile time; here both debug
+and release builds carry their assets. A development binary should exercise the
+same standalone packaging contract as the release.
