@@ -724,3 +724,32 @@ make toml-demo && make kubernetes-demo                # end-to-end round-trips
 ```
 
 Phase 9 adds 117 tests, bringing the total to 1380.
+
+## Release integration: keep the laptop outside the VM
+
+After creating a local cluster, `relish status` should work from your terminal.
+Asking you to enter a VM just to reach the API leaves half the setup unfinished.
+The managed context records the forwarded HTTPS endpoint, its cluster CA and an
+administrator bearer in `~/.reliaburger/context.json`.
+
+That file contains a credential. Writes use mode 0600 and atomic replacement;
+reads refuse group- or world-readable files. A file lock serialises writers, and
+an ownership identifier prevents one cluster operation from replacing another's
+context. Rust releases the lock when its `File` leaves scope, including early
+error returns. The context deliberately doesn't derive `Debug`: accidentally
+printing a struct mustn't print its bearer.
+
+Explicit endpoint flags bypass the saved context credentials. Otherwise, normal
+CLI commands use the context, while explicit token and CA settings remain
+operator overrides. A malformed context produces an error instead of quietly
+connecting to an unrelated service on the old default port. Tests cover private
+round trips, conflicting owners, bad schema/transport, exposed permissions and
+an absent context.
+
+HTTP and WebSockets share the same cluster trust policy. Both verify certificate
+chains and handshake signatures against only the saved cluster CAs. They omit
+DNS-name checking because a forwarded loopback address doesn't match a node's
+certificate name. Rustls performs the certificate and signature verification;
+we supply the trust anchors and policy. Live TLS tests prove both that the
+right CA works and that an unrelated CA fails. WebSocket connection setup also
+has a deadline, so a stalled handshake can't hang the TUI indefinitely.

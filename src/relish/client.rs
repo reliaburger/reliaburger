@@ -21,6 +21,7 @@ use super::RelishError;
 pub struct BunClient {
     base_url: String,
     client: Result<reqwest::Client, String>,
+    websocket_tls: Option<std::sync::Arc<rustls::ClientConfig>>,
     token: Option<String>,
 }
 
@@ -271,6 +272,7 @@ impl BunClient {
                 return Self {
                     base_url: base_url.trim_end_matches('/').to_string(),
                     client: Err(format!("failed to read cluster CA: {error}")),
+                    websocket_tls: None,
                     token: token.map(str::to_string),
                 };
             }
@@ -291,6 +293,7 @@ impl BunClient {
     }
 
     fn build(base_url: &str, token: Option<&str>, ca_pem: Option<&[u8]>) -> Self {
+        let mut websocket_tls = None;
         let client = (|| -> Result<reqwest::Client, String> {
             let mut builder =
                 reqwest::Client::builder().timeout(std::time::Duration::from_secs(300));
@@ -309,20 +312,15 @@ impl BunClient {
                 if certificates.is_empty() {
                     return Err("cluster CA PEM contains no certificates".to_string());
                 }
-                // Node certificates name the node, not its forwarded loopback
-                // endpoint. Disable hostname checks only with these trust anchors.
-                builder = builder
-                    .tls_built_in_root_certs(false)
-                    .danger_accept_invalid_hostnames(true);
                 let mut roots = rustls::RootCertStore::empty();
                 for certificate in certificates {
                     roots
-                        .add(certificate.clone())
+                        .add(certificate)
                         .map_err(|error| format!("invalid cluster CA certificate: {error}"))?;
-                    let certificate = reqwest::Certificate::from_der(certificate.as_ref())
-                        .map_err(|error| format!("invalid cluster CA certificate: {error}"))?;
-                    builder = builder.add_root_certificate(certificate);
                 }
+                let tls = super::tls::cluster_config(roots)?;
+                builder = builder.use_preconfigured_tls((*tls).clone());
+                websocket_tls = Some(tls);
             }
             builder
                 .build()
@@ -331,6 +329,7 @@ impl BunClient {
         Self {
             base_url: base_url.trim_end_matches('/').to_string(),
             client,
+            websocket_tls,
             token: token.map(str::to_string),
         }
     }
@@ -361,6 +360,7 @@ impl BunClient {
         Self {
             base_url: base_url.trim_end_matches('/').to_string(),
             client: self.client.clone(),
+            websocket_tls: self.websocket_tls.clone(),
             token: self.token.clone(),
         }
     }
@@ -381,10 +381,35 @@ impl BunClient {
 
     /// Create a client pointing at the default local agent. Uses HTTPS when a
     /// cluster CA cert is configured (`--ca-cert` / `RELIABURGER_CA_CERT`). An
-    /// explicit `--endpoint` / `RELIABURGER_ENDPOINT` replaces the whole URL.
+    /// explicit `--endpoint` / `RELIABURGER_ENDPOINT` replaces the whole URL
+    /// and bypasses saved context credentials. Otherwise a managed context takes
+    /// precedence over the ordinary localhost default.
     pub fn default_local() -> Self {
         if let Some(endpoint) = resolve_endpoint() {
             return Self::new(&endpoint);
+        }
+        let context = super::local_context::default_path()
+            .and_then(|path| super::local_context::LocalContext::load(&path));
+        match context {
+            Ok(Some(context)) => {
+                return context
+                    .client(resolve_token().as_deref(), resolve_ca_cert().as_deref())
+                    .unwrap_or_else(|error| Self {
+                        base_url: context.endpoint,
+                        client: Err(error.to_string()),
+                        websocket_tls: None,
+                        token: None,
+                    });
+            }
+            Err(error) => {
+                return Self {
+                    base_url: "https://127.0.0.1:19117".to_string(),
+                    client: Err(error.to_string()),
+                    websocket_tls: None,
+                    token: None,
+                };
+            }
+            Ok(None) => {}
         }
         let scheme = if resolve_ca_cert().is_some() {
             "https"
@@ -889,6 +914,7 @@ impl BunClient {
         >,
         RelishError,
     > {
+        self.http()?;
         let scheme = if self.base_url.starts_with("https://") {
             "wss://"
         } else {
@@ -909,9 +935,18 @@ impl BunClient {
                 .map_err(|_| RelishError::WebSocket("bad token".to_string()))?;
             request.headers_mut().insert("Authorization", value);
         }
-        let (stream, _) = tokio_tungstenite::connect_async(request)
-            .await
-            .map_err(|error| RelishError::WebSocket(error.to_string()))?;
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        let connector = self
+            .websocket_tls
+            .clone()
+            .map(tokio_tungstenite::Connector::Rustls);
+        let (stream, _) = tokio::time::timeout(
+            std::time::Duration::from_secs(30),
+            tokio_tungstenite::connect_async_tls_with_config(request, None, false, connector),
+        )
+        .await
+        .map_err(|_| RelishError::WebSocket("connection timed out".to_string()))?
+        .map_err(|error| RelishError::WebSocket(error.to_string()))?;
         Ok(stream)
     }
 
@@ -2143,6 +2178,22 @@ mod tests {
             "/v1/health",
             get(|| async { axum::Json(serde_json::json!({"status": "ok"})) }),
         );
+        let router = router.route(
+            "/ws",
+            get(
+                |headers: axum::http::HeaderMap, ws: axum::extract::WebSocketUpgrade| async move {
+                    use axum::response::IntoResponse;
+                    if headers
+                        .get("authorization")
+                        .and_then(|value| value.to_str().ok())
+                        != Some("Bearer rbrg_ws")
+                    {
+                        return axum::http::StatusCode::UNAUTHORIZED.into_response();
+                    }
+                    ws.on_upgrade(|_socket| async {}).into_response()
+                },
+            ),
+        );
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         tokio::spawn(async move {
@@ -2163,7 +2214,7 @@ mod tests {
                             let _ = hyper_util::server::conn::auto::Builder::new(
                                 hyper_util::rt::TokioExecutor::new(),
                             )
-                            .serve_connection(hyper_util::rt::TokioIo::new(tls), svc)
+                            .serve_connection_with_upgrades(hyper_util::rt::TokioIo::new(tls), svc)
                             .await;
                         });
                     }
@@ -2197,6 +2248,39 @@ mod tests {
             not_before: now,
             not_after: now + Duration::from_secs(3600),
         }
+    }
+
+    #[tokio::test]
+    async fn websocket_uses_the_pinned_cluster_ca_and_bearer() {
+        let hierarchy = crate::sesame::ca::generate_ca_hierarchy("websocket-test", b"ikm").unwrap();
+        let identity = test_identity(&hierarchy, "node-01");
+        let shutdown = tokio_util::sync::CancellationToken::new();
+        let address = spawn_tls_health(&identity, shutdown.clone()).await;
+        let ca = pem_cert(&hierarchy.node.ca.certificate_der);
+        let client =
+            BunClient::new_with_ca(&format!("https://{address}"), Some("rbrg_ws"), &ca).unwrap();
+        let result = client.ws_connect("/ws").await;
+        shutdown.cancel();
+        assert!(
+            result.is_ok(),
+            "pinned WebSocket connection failed: {result:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn websocket_refuses_an_unrelated_ca() {
+        let hierarchy =
+            crate::sesame::ca::generate_ca_hierarchy("websocket-server", b"ikm").unwrap();
+        let other = crate::sesame::ca::generate_ca_hierarchy("unrelated", b"other").unwrap();
+        let identity = test_identity(&hierarchy, "node-01");
+        let shutdown = tokio_util::sync::CancellationToken::new();
+        let address = spawn_tls_health(&identity, shutdown.clone()).await;
+        let ca = pem_cert(&other.node.ca.certificate_der);
+        let client =
+            BunClient::new_with_ca(&format!("https://{address}"), Some("rbrg_ws"), &ca).unwrap();
+        let result = client.ws_connect("/ws").await;
+        shutdown.cancel();
+        assert!(result.is_err());
     }
 
     /// The legitimate mTLS path must keep working with built-in roots disabled:
