@@ -779,9 +779,10 @@ failing halfway through setup.
 
 ### A prefix as a safety net
 
-One more small thing with a large consequence. Every namespace the runner
-creates is `rbtest-{run}-{seq}`, and teardown checks the prefix before
-stopping anything:
+Production runs acquire server-owned leases for their apps and namespaces.
+The server checks exact ownership before cleanup; a familiar name is not proof
+of ownership. Names still use `rbtest-{run}-{seq}` for recognition. The legacy
+lease-free path used by focused tests also checks that prefix:
 
 ```rust
 pub fn is_test_namespace(namespace: &str) -> bool {
@@ -860,8 +861,8 @@ outer task owns both the body and cleanup, a panic kills the owner before it
 can clean anything. The nested task turns the panic into evidence and leaves
 the owner alive.
 
-Then teardown, which is the whole reason this is safe to point at a real
-cluster. It runs after every case:
+Then teardown. The runner attempts it after every case and records a separate
+cleanup outcome:
 
 ```rust
 let cleanup = context.teardown(cleanup_deadline).await;
@@ -871,9 +872,12 @@ Note "after every case" — pass, fail *or* timeout. It's tempting to only clean
 up after a pass, but that's exactly backwards: the case that failed halfway is
 the one that left a workload running. Teardown is the runner's job precisely so
 a case body can `return Err(...)` the moment something's wrong without a pile of
-cleanup code first. Teardown then asks `/v1/status` until the resources have
-actually gone. We record timeout, API failure and a workload which remains
-present as cleanup evidence. Discarding the result with `let _ =` would make
+cleanup code first. Teardown reverses exact fault receipts, releases the
+server-owned lease and checks runtime absence. Timeout or unreachable peers
+mean unknown cleanup; they do not prove the resources are gone. The server's
+expiry reaper can still finish later. Jobs, images, tokens and mounts need the
+additional ownership work tracked as C34. We record timeout, API failure and a
+workload which remains present as cleanup evidence. Discarding the result with `let _ =` would make
 the happy path shorter and the report less true.
 
 Two smaller decisions round it out. Cases finish whenever they finish — a
@@ -2631,3 +2635,16 @@ as the quorum refusal. It still rejects unrelated failures and verifies that
 neither the second target nor the routing node acquired a fault. Then it reverses
 the first fault and observes recovery. The invariant is refusal without an
 effect, including while leadership evidence is incomplete.
+
+
+### Disabled authentication does not grant every chaos operation
+
+In the explicit disabled-auth development mode, a workload fault is attributed
+to `local-bootstrap` with the local administrator role. Server policy must still
+allow workload fault injection and any required acknowledgement must be present.
+When authentication is enabled, the caller's role and namespace scope apply.
+Node-level faults always require an authenticated principal, including in
+disabled-auth mode. They also pass the separate node-state or capacity policy
+and cluster safety checks. A successful workload-fault test therefore says
+nothing about permission to kill, drain or pressure a node. C06 still tracks
+the cluster-wide reservation needed to make concurrent node faults safe.

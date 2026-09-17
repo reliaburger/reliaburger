@@ -652,6 +652,16 @@ Cordon, quotas and scraping are wired, but comments say otherwise; scoring says 
 
 **Completion test:** Correct claims against call sites, test runnable snippets, check links/commands and keep explicit shipped/planned/experimental labels. Review the book at the same time. Clarify disabled-auth workload-fault versus node-fault authorisation and client teardown guarantees; do not silently weaken either contract.
 
+**Completed on PR #167.** Source and chapters 2/6/15 now describe the wired
+scheduler, namespace quotas, configured scrape targets and evidence-based
+cleanup. The roadmap identifies actual unit, process and live-catalogue tests
+and includes Phase 16. Completed historical groups point to their verified C
+items; unresolved catalogue, endpoint and resource-ownership work stays open.
+Eleven existing Rustdoc errors are repaired. All-feature public docs build with
+warnings denied, 74 relative Markdown file links resolve, and test/bench/wtf/trace
+CLI help confirms the documented option names. These checks do not substitute
+for the full live catalogue gate.
+
 ### H02 — Remove or deliberately expose unused helper entry points
 
 **Priority:** P3. **Wave:** 5. **Book chapters:** 03, 07, 15.

@@ -197,7 +197,7 @@ pub struct OidcSigningConfig {
     pub public_key_der: Vec<u8>,
     /// Key ID for the JWKS entry.
     pub key_id: String,
-    /// The issuer URL (e.g., "https://prod.reliaburger.dev").
+    /// The issuer URL (e.g., "<https://prod.reliaburger.dev>").
     pub issuer: String,
 }
 

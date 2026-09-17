@@ -381,7 +381,7 @@ pub async fn serve_raft_rpc_with_node_gate(
 }
 
 /// [`serve_raft_rpc`] with an injectable connection cap, so the bound can be
-/// exercised without opening [`MAX_RAFT_CONNECTIONS`] sockets.
+/// exercised without opening `MAX_RAFT_CONNECTIONS` sockets.
 pub async fn serve_raft_rpc_with_limit(
     listener: tokio::net::TcpListener,
     raft: Raft<TypeConfig>,

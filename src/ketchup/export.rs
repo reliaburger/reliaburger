@@ -38,7 +38,7 @@ pub const CHECKPOINT_FILENAME: &str = "_export_checkpoint.json";
 /// Tracks which Parquet files have been exported, by durable id.
 ///
 /// Persisted as JSON so export is incremental across node restarts. The
-/// stored ids are `{filename}@{sha256}` (see [`durable_id`]), so a
+/// stored ids are `{filename}@{sha256}` (see `durable_id`), so a
 /// filename reused after retention pruning is treated as a new object.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct ExportCheckpoint {

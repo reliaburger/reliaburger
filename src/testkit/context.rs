@@ -1,10 +1,11 @@
 //! What a test case is handed.
 //!
 //! The context is the only way a case touches the cluster: a `BunClient`
-//! pointed at a node, and a namespace of its own. Everything a case creates
-//! carries that namespace, and teardown stops that namespace and nothing
-//! else — which is what makes it safe to point `relish test` at a cluster
-//! that has real work on it.
+//! pointed at a node, and a namespace of its own. Production runners use
+//! server-owned leases for apps and namespaces and exact receipts for chaos
+//! faults. Cleanup is attempted after every case and reported separately as
+//! confirmed, failed or unknown. Other resource kinds still need explicit
+//! ownership support; a namespace prefix alone does not provide that support.
 
 use std::time::Duration;
 
@@ -462,13 +463,13 @@ impl TestContext {
         }
     }
 
-    /// Stop every app this case created and report whether removal was seen.
+    /// Attempt reversal of owned faults and leased resources, then report evidence.
     ///
-    /// The runner calls this after *every* case — pass, fail or timeout —
-    /// because the case that failed halfway is exactly the one that left a
-    /// workload running. The [`is_test_namespace`](Self::is_test_namespace)
-    /// guard is a second lock on top of the name match: even a bug in
-    /// namespace construction cannot make teardown stop an operator's app.
+    /// The runner calls this after pass, fail, panic or timeout. Production
+    /// cleanup uses the server's lease ownership record and checks runtime
+    /// absence independently. An unreachable owner or expired cleanup deadline
+    /// returns unknown, not a guarantee that resources are gone. The legacy
+    /// lease-free test path also checks [`is_test_namespace`](Self::is_test_namespace).
     pub async fn teardown(&self, deadline: Deadline) -> CleanupOutcome {
         let faults = self.chaos_guard.cleanup(deadline).await;
         let resources = self.teardown_resources(deadline).await;

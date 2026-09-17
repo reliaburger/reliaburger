@@ -392,7 +392,7 @@ impl<T: MustardTransport> MustardNode<T> {
 
     /// Run the protocol loop until cancelled.
     ///
-    /// On shutdown, announces graceful departure via [`leave()`] before
+    /// On shutdown, announces graceful departure via [`Self::leave()`] before
     /// returning, so other nodes learn about the departure immediately
     /// rather than waiting for the suspicion timeout.
     pub async fn run(&mut self, shutdown: CancellationToken) {

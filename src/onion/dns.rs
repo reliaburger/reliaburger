@@ -37,7 +37,7 @@ use super::vip::VirtualIP;
 /// entry into an eBPF object that was never loaded, so the fault did
 /// nothing. DNS resolution lives entirely in this responder now, so the
 /// fault lives here too: the agent publishes the set of faulted service
-/// names (with their expiry) on a `watch` channel, and [`answer_internal`]
+/// names (with their expiry) on a `watch` channel, and `answer_internal`
 /// returns NXDOMAIN for any name that matches while the fault is live.
 ///
 /// Faults retain the authorised namespace and service identity. Overlapping

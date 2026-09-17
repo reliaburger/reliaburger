@@ -3,8 +3,8 @@
 //! The runner owns three things a case body must never have to think about:
 //! **parallelism** (cases run concurrently, bounded so a big cluster isn't
 //! stampeded), **timeouts** (a wedged case fails with a message rather than
-//! hanging the run), and **teardown** (every case is cleaned up afterwards, no
-//! matter how it ended). Keeping those here is what lets a case body be a plain
+//! hanging the run), and **teardown** (attempted after every case, with a
+//! separate confirmed, failed or unknown outcome). Keeping those here is what lets a case body be a plain
 //! `async fn` that applies some config and asserts.
 //!
 //! Nothing here uses `tokio`'s paused clock. Combining `start_paused` with

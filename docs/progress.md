@@ -82,7 +82,7 @@ remain separate. Older unchecked groups below point into this current ledger.
 
 ### Engineering follow-ups
 
-- [ ] **H01** (P2) Remove stale wiring claims and validate documentation.
+- [x] **H01** Reconcile scheduler/quota/scrape wiring and weights, roadmap test locations, cleanup evidence and disabled-auth chaos policy with their callers. Mark completed historical bug groups done while retaining C30/C33/C34/H02. Repair eleven Rustdoc errors; all-feature public documentation now builds with warnings denied, all 74 relative links in the changed Markdown pass, and the four documented diagnostic CLI help interfaces are verified.
 - [ ] **H02** (P3) Remove or deliberately expose unused helper entry points.
 - [ ] **H03** (P2) Resolve inert configuration and wire fields explicitly.
 - [ ] **H04** (P3) Use typed alert and scheduler error contracts.
@@ -2605,14 +2605,7 @@ blocking calls).
 ### Low — hygiene, minor bugs, stale docs
 
 - [x] **TUI log switching and viewport sizing** — subscription generations reject late lines/errors; both log views use the actual terminal height (`90d7081`, `cfd6d81`; reducer and viewport regressions).
-- [ ] **Stale TODO / doc drift** (current backlog: H01) — `src/meat/filter.rs:41` `TODO(wiring)` is stale
-  (`apply_upgrade_cordon` *is* wired via `orchestrate.rs:172`, `bin/bun.rs:1001`), delete it;
-  `src/meat/score.rs:3-8` doc claims a "0–130 scale, Spread (40)" but constants give
-  `WEIGHT_SPREAD = 60`, max 150; `src/mayo/scrape.rs:114-122` "there is no scrape loop yet"
-  is stale (loop at bin/bun.rs:1400-1416); `src/meat/quota.rs:204-207` and
-  `src/mustard/dissemination.rs:180-189` carry stale/left-in editing notes;
-  `docs/roadmap.md:686` Phase 15 "Tests (write first)" names 7 integration tests that live
-  only as in-module unit tests, and roadmap.md has no Phase 16 section at all.
+- [x] **Stale TODO / doc drift** — H01 updates cordon/quota/scrape comments against their production callers, corrects the scheduler weights in source and chapter 2, and gives Phase 15's actual test locations plus a Phase 16 roadmap entry. Current tests already cover the dissemination code; no editing note remains there.
 - [x] **Bootstrap, GitOps and disk-pressure export errors** — fresh council failures propagate, unavailable sync queues return 503 without consuming delivery IDs, and failed exports are logged (`3d302de`, `b7735ba`, `7acb36b`).
 - [x] **HTTP health-probe pooling and attribution** — pooled requests retain deadlines and distinguish local client errors from workload refusal (`3c78b09`).
 - [x] **The listed startup/testapp/client-construction panics** — storage errors propagate, occupied testapp ports return errors, and invalid client trust configuration fails explicitly (`a805575`, `d70699d`, `e346aec`). This is not a claim that all public panic paths are eliminated.
@@ -2633,7 +2626,7 @@ blocking calls).
   are unpopulated for remote peers, so council resource-eligibility (`selection.rs:113-120`)
   and image-locality scoring (`score.rs:103-111`) are inert in production.
 - [x] **Authorisation matrix checks methods as well as paths** (`e5f4208`), and dashboard desired counts come from desired state (`afee562`, `f1882be`).
-- [ ] **Remaining minor-correctness group** (current backlog: C01–C04/C13/C18–C19/C22) — premature port exhaustion, hand-written certificate-date conversion, prune counts after failed deletion, and growing export checkpoint history remain. The September audit also identifies archive overwrite and destination-scope defects.
+- [x] **Remaining minor-correctness group** — C01–C04, C13, C18–C19 and C22 are implemented and verified on this branch: archive preservation/scope/durability, bounded port allocation, precise certificate validity, truthful prune counts and bounded export receipts. See their current-ledger evidence above.
 - [x] **Native Apple mounts and publication** — bind/config mounts, process identity, working directory, read-only root and published ports are translated and live-tested (`bbe9c9b`). Broader runtime parity remains experimental.
 - [ ] **Planned capability boundaries** (current backlog: F06/F08) — PromQL, remote read, extra rollup tiers and live WebSocket drain-close remain unimplemented. Labelling them planned completed the documentation task, not these features.
 
@@ -2732,6 +2725,6 @@ and a handful of test cases whose assertions are too loose to catch the bug they
 **Low — hygiene and minor bugs from the deep pass:**
 
 - [x] **Relish liveness, client configuration, streamed UTF-8 and offline export errors** — health validates the response; invalid trust settings return errors; split UTF-8 survives SSE framing; explicit offline export validates paths and reports checkpoint failures (`6ee50a6`, `e346aec`, `a057634`, `df91a67`, `cfb483f`).
-- [ ] **Remaining CLI robustness** (current backlog: C17/C23/C39/H01) — `parse_since` still multiplies unchecked (reproduced exit 101 for `18446744073709551615d`); development VM commands retain non-UTF-8 path unwraps; diagnostic certificate wording and misplaced API docs need correction.
+- [x] **Remaining CLI robustness** — C17 rejects duration overflow, C23 reports encoded certificate expiry, C39 rejects invalid development paths before mutation, and C15/H01 correct the misplaced CA API documentation. Their regressions and verification are recorded above.
 - [x] **Cluster collection, deadlines, deployment history and ingress acceptance** — incomplete collection fails, waits share the case deadline, history must contain both tested versions, and ingress polls exact responses using credential-free clients and isolated hosts (`c6163b8`, `265aa99`, `6b3400f`). Expired queued capabilities refresh (`3f97aea`); three live ingress cases passed.
-- [ ] **Remaining test-harness robustness** (current backlog: C29–C36/H01–H02) — registry URLs still split on `:` (breaking IPv6 and ignoring configured registry ports), teardown prose overstates client guarantees, unused helpers remain, and fully disabled-auth workload faults retain different semantics from node faults. Broader runner/lease/verdict defects are tracked in the completion plan.
+- [ ] **Remaining test-harness robustness** — C29, C31–C32 and C35–C36 are complete; H01 now describes cleanup evidence and disabled-auth workload/node policy accurately. C30 catalogue fixtures, C33 endpoint discovery, C34 remaining resource ownership and H02 helper disposition remain open.

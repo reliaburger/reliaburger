@@ -1671,17 +1671,17 @@ pub fn filter_nodes(
 
 Required labels are hard constraints. If an app says `required = ["gpu=a100"]`, only nodes with that label are eligible. If no nodes match, the app stays unscheduled. Preferred labels are soft constraints handled in scoring.
 
-**Phase 2: Score.** Rank the surviving candidates on a 0–100 scale. The score is a weighted sum of several dimensions:
+**Phase 2: Score.** Rank the surviving candidates on a 0–150 scale. The score is a weighted sum of several dimensions:
 
 | Dimension | Weight | Logic |
 |-----------|--------|-------|
-| Bin-packing | 50% | Prefer fuller nodes (maximise density) |
-| Preferred labels | 20% | Prefer nodes matching soft constraints |
-| Image locality | 15% | Prefer nodes with cached images (Phase 5) |
-| Spread | 10% | Penalise nodes already running this app |
-| Stability | 5% | Prefer longer-running nodes |
+| Bin-packing | 50 | Prefer fuller nodes (maximise density) |
+| Preferred labels | 20 | Prefer nodes matching soft constraints |
+| Image locality | 15 | Prefer nodes with cached images (Phase 5) |
+| Spread | 60 | Penalise nodes already running this app |
+| Stability | 5 | Prefer longer-running nodes |
 
-Bin-packing dominates on purpose. Reliaburger wants to pack workloads densely so idle nodes can be powered down. Spread is a secondary concern — it matters most when nodes are already heavily loaded, which is when you want replicas on different machines for resilience.
+These are points, not percentages. Spread contributes either zero or 60 points, so it outweighs bin-packing when the other dimensions are equal. Once candidates are equal on spread, bin-packing favours density. Image locality only helps when the cache contains image evidence; propagation of remote cached-image evidence remains F01 in the completion plan.
 
 **Phase 3: Select.** Pick the highest-scoring node. Ties are broken by `NodeId` (alphabetical), which gives us deterministic results. The same inputs always produce the same placement. This matters for debugging and for the property-based tests.
 
@@ -1698,6 +1698,8 @@ Namespaces provide resource isolation. Each namespace can have limits on CPU, me
 ```
 namespace "staging" would exceed CPU quota: 1800+500 > 2000m
 ```
+
+The leader builds a quota ledger from desired-state namespaces once per scheduling pass and accounts for each admitted app cumulatively. It also applies the active upgrade cordon before selecting nodes.
 
 The `check_quota` function is straightforward: for each limit that's set, check if current usage plus the requested resources exceeds it. No limit means unlimited.
 

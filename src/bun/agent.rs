@@ -1459,7 +1459,7 @@ pub struct BunAgent<G: Grill> {
     /// every apply/clear/expire and the responder returns NXDOMAIN for any
     /// service in the set. See [`crate::onion::dns::DnsFaultState`].
     dns_faults_tx: tokio::sync::watch::Sender<crate::onion::dns::DnsFaultState>,
-    /// Wrapper routing table (shared with the proxy via Arc<RwLock>).
+    /// Wrapper routing table (shared with the proxy via `Arc<RwLock<_>>`).
     routing_table: std::sync::Arc<tokio::sync::RwLock<crate::wrapper::routing::RoutingTable>>,
     /// Ingress configs for deployed apps (app_name → IngressSpec).
     /// Ingress specs keyed by `(namespace, app_name)` so same-named apps

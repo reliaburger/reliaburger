@@ -415,7 +415,7 @@ impl ManifestCatalog {
         Ok(())
     }
 
-    /// Load a catalog previously written by [`persist_to`]. A missing
+    /// Load a catalog previously written by [`Self::persist_to`]. A missing
     /// file yields an empty catalog (fresh node); a corrupt file is an
     /// error — silently starting empty would orphan every stored blob.
     pub fn load_from(path: &std::path::Path) -> Result<Self, PickleError> {
@@ -497,7 +497,7 @@ pub enum SigningMethod {
     /// Keyless signing via workload identity OIDC token.
     /// The build job's SPIFFE identity serves as the signing credential.
     Keyless {
-        /// OIDC issuer URL (e.g. "https://prod.reliaburger.dev").
+        /// OIDC issuer URL (e.g. "<https://prod.reliaburger.dev>").
         issuer: String,
         /// SPIFFE URI of the signing workload.
         identity: String,

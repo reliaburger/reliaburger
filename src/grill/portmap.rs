@@ -44,7 +44,7 @@ const MAP: &str = "portmap";
 /// Two implementations exist: the production one shells out to the
 /// `nft` binary, and the test one records argv and returns scripted
 /// results. The error is the human-readable reason (stderr or exec
-/// failure); callers wrap it in a [`NetnsError`].
+/// failure); callers wrap it in a `NetnsError`.
 pub trait NftExecutor: Send + Sync {
     fn run(&self, args: &[String]) -> impl std::future::Future<Output = Result<(), String>> + Send;
 }

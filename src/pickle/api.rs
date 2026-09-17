@@ -280,7 +280,7 @@ pub(crate) async fn record_commit(
 /// — REG8). Axum can't put a wildcard *before* a fixed suffix like
 /// `/blobs/…`, so instead of one route per shape we capture the whole path
 /// after `/v2/` with a trailing wildcard and split off the OCI operation
-/// suffix ourselves in [`dispatch_v2`]. The repository name is then
+/// suffix ourselves in `dispatch_v2`. The repository name is then
 /// whatever precedes that suffix, however many segments it spans.
 pub fn router(state: PickleState) -> Router {
     let writers = Arc::new(tokio::sync::Semaphore::new(MAX_CONCURRENT_WRITES));

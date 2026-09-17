@@ -65,7 +65,7 @@ Collection runs every 10 seconds. Each sample is a `(timestamp, metric_name, lab
 
 Not everything comes from system stats. Your apps might expose custom metrics via a `/metrics` endpoint in the Prometheus text format. Reliaburger scrapes these automatically.
 
-The `prometheus-parse` crate handles the parsing. When an app has a health check configured, we probe `/metrics` on the same port. If it responds with valid Prometheus text, we ingest it alongside the system metrics. Same Arrow schema, same SQL queries.
+The `prometheus-parse` crate handles the parsing. Configure `(job, url)` targets in `[metrics]` using `scrape_targets`; Bun's scrape task calls `scrape_once` at `scrape_interval_secs`. A health check does not automatically register a scrape target. Valid samples enter the same Arrow schema and SQL queries as system metrics. An empty target list starts no scrape task.
 
 ## Alert evaluation
 
