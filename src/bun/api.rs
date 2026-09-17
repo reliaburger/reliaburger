@@ -5206,6 +5206,7 @@ async fn gather_dashboard_data(state: &ApiState) -> Result<DashboardData, String
         let alert_rows = firing
             .iter()
             .map(|a| crate::brioche::dashboard::DashboardAlert {
+                labels: a.labels.clone(),
                 name: a.rule_name.clone(),
                 severity: format!("{:?}", a.severity),
                 description: a.description.clone(),
@@ -5471,6 +5472,7 @@ async fn fragment_alerts_handler(State(state): State<ApiState>) -> Response {
         eval.firing_alerts()
             .iter()
             .map(|a| crate::brioche::dashboard::DashboardAlert {
+                labels: a.labels.clone(),
                 name: a.rule_name.clone(),
                 severity: format!("{:?}", a.severity),
                 description: a.description.clone(),

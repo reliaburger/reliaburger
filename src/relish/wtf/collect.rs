@@ -597,7 +597,7 @@ fn collect_alerts(
 ) -> Evidence<Vec<AlertObservation>> {
     if app_scope.is_some() {
         return Evidence::Unsupported {
-            reason: "alert statuses do not yet carry application and namespace labels".to_string(),
+            reason: "application-scoped alert collection is not supported; inspect cluster alerts and their series labels".to_string(),
         };
     }
     let mut builder = EvidenceBuilder::default();
@@ -617,7 +617,15 @@ fn collect_alerts(
                         .get("description")
                         .and_then(serde_json::Value::as_str)
                         .unwrap_or("no description");
-                    let message = format!("{rule}: {description}");
+                    let labels: BTreeMap<String, String> = alert
+                        .get("labels")
+                        .and_then(|labels| serde_json::from_value(labels.clone()).ok())
+                        .unwrap_or_default();
+                    let message = if labels.is_empty() {
+                        format!("{rule}: {description}")
+                    } else {
+                        format!("{rule}: {description} {labels:?}")
+                    };
                     if seen.insert(message.clone()) {
                         builder.values.push(AlertObservation {
                             app: None,
@@ -1026,6 +1034,30 @@ mod tests {
             0.5
         );
         assert!(matches!(evidence.certificates, Evidence::Degraded { .. }));
+    }
+
+    #[test]
+    fn labelled_alerts_remain_distinct_across_collected_nodes() {
+        let alerts = ["hot-a", "hot-b"].map(|node| {
+            serde_json::json!({
+                "rule_name": "cpu", "description": "CPU high", "state": "firing",
+                "labels": {"node": node}
+            })
+        });
+        let collected = ["reporter-a", "reporter-b"].map(|node| NodeCollection {
+            node_id: node.into(),
+            reachable: true,
+            diagnostics: Err("unused".into()),
+            events: Ok(Vec::new()),
+            deploys: Err("unused".into()),
+            alerts: Ok(alerts.to_vec()),
+            faults: Err("unused".into()),
+        });
+        let evidence = collect_alerts(&collected, None, 10);
+        let observed = evidence.value().unwrap();
+        assert_eq!(observed.len(), 2);
+        assert!(observed[0].message.contains("hot-a"));
+        assert!(observed[1].message.contains("hot-b"));
     }
 
     #[test]

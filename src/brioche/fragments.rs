@@ -67,14 +67,17 @@ pub fn render_alerts_table_fragment(alerts: &[DashboardAlert]) -> String {
     }
 
     let mut html = String::with_capacity(512);
-    html.push_str("<table>\n<tr><th>Name</th><th>Severity</th><th>Description</th></tr>\n");
+    html.push_str(
+        "<table>\n<tr><th>Name</th><th>Severity</th><th>Description</th><th>Labels</th></tr>\n",
+    );
     for alert in alerts {
         html.push_str(&format!(
-            "<tr class=\"alert-{}\"><td>{}</td><td>{}</td><td>{}</td></tr>\n",
+            "<tr class=\"alert-{}\"><td>{}</td><td>{}</td><td>{}</td><td>{}</td></tr>\n",
             escape_html(&alert.severity.to_lowercase()),
             escape_html(&alert.name),
             escape_html(&alert.severity),
             escape_html(&alert.description),
+            escape_html(&format!("{:?}", alert.labels)),
         ));
     }
     html.push_str("</table>\n");

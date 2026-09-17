@@ -314,23 +314,37 @@ The lesson: don't build config for things that have obvious defaults. Ship the d
 
 ### "How far back do we look?" is not "how stale may this be?"
 
-The evaluator needs one number per metric, so something has to turn a table of readings into that number. The first version queried the last 120 seconds and took the newest row per metric *name*:
+Node A reports 95% CPU. A second later, node B reports 10%. If we keep only
+one reading per metric name, B's healthy reading hides A's problem. The regression
+`healthy_series_cannot_hide_another_nodes_alert` reproduces exactly that failure.
 
-```rust
-for (_ts, name, _labels, val) in rows {
-    values.entry(name).or_insert(val);   // DESC order, so first = newest
-}
-```
+The evaluator now keeps each `MetricKey`: the metric name plus its sorted label
+map. Its state belongs to `(rule_name, labels)`. Two nodes, or two namespaces
+running an app with the same name, have independent pending timers, firing
+states and recoveries. `BTreeMap` gives the labels a stable order; deriving `Ord`
+and `PartialOrd` on our private `AlertInstance` lets Rust compare those compound
+keys without hand-written comparison code. We reuse the existing metric type
+rather than inventing another representation at the query boundary.
 
-Two problems hide in those three lines, and both are the same mistake: treating a query bound as an answer.
+Freshness remains a separate decision. `QUERY_WINDOW_SECS` bounds the query;
+`MAX_VALUE_AGE_SECS` decides whether a returned reading is usable. Memory and disk
+percentages require fresh numerator and denominator readings with identical
+labels. Invalid labels and non-finite values provide no recovery evidence.
+Missing data cancels an inconclusive pending timer but leaves a firing alert
+active. Only a healthy reading from that same series resolves it.
 
-The `_ts` is discarded, so the 120-second window is doing double duty. It's the range we search, and by accident it's also the freshness guarantee — a metric that stopped being emitted 110 seconds ago is still evaluated as though it were live. Those are different questions with different right answers, so they now have different names: `QUERY_WINDOW_SECS` for how far back to look, `MAX_VALUE_AGE_SECS` for how stale an answer may be. Naming the second one made it a decision rather than a leftover.
+Labels travel with API statuses, dashboard rows and webhook notifications.
+PagerDuty's deduplication key includes a SHA-256 digest of the canonical label
+JSON, so resolving A cannot close B's incident. Diagnostic collection also keeps
+the labels when deduplicating repeated reports of the same incident. App-scoped
+diagnostic collection remains explicitly unsupported; not every metric carries
+an application identity.
 
-The `_labels` is discarded too, so distinct labelled series collapse into whichever one happened to be newest. For a single node's own gauges that's harmless. For the derived percentages it isn't: `node_memory_usage_percent` divided a `used` from one series by a `total` from another, and could produce a number that belonged to neither. The values are now keyed by `(name, labels)` and the percentages computed *within* a label set before anything collapses.
-
-There's a smaller lesson in the collapse itself. When two series tie on timestamp, the old code picked whichever row the query returned first — deterministic in practice, arbitrary in principle, and a lovely source of a test that passes on your machine and fails in CI. Ties now break on the label string. If a rule can go either way, pick the way that doesn't depend on row order.
-
-What we *didn't* do is worth recording: the evaluator still takes one value per metric name. Giving each labelled series its own alert state is the honest fix, and it changes what an alert is keyed on — rule, or rule-and-series? That ripples into state storage, transition detection and webhook dedup keys. It's a real change, not a tidy-up, so it's written down as open rather than half-done and quietly declared finished.
+The tests exercise independent pending, firing and recovery transitions, missing
+and stale data, namespace collisions and notification identities. One writes two
+labelled series to a real Parquet-backed store and queries them through the same
+path the production evaluator uses. Keeping labels in a unit-test map wouldn't
+help if the SQL path discarded them first.
 
 ### Server-rendered HTML with meta refresh beats React
 

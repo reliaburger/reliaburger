@@ -632,13 +632,14 @@ Resolved notifications are just as important as firing ones. An operator who get
 
 ### The webhook payload
 
-Every destination receives the same JSON structure:
+A generic webhook receives this JSON structure:
 
 ```json
 {
   "version": "1",
   "alert": {
     "name": "cpu_throttle",
+    "labels": {"node": "worker-a"},
     "severity": "critical",
     "status": "firing",
     "message": "CPU usage above 90% for 5 minutes",
@@ -650,7 +651,7 @@ Every destination receives the same JSON structure:
 }
 ```
 
-We deliberately don't format this for Slack or PagerDuty specifically. A generic webhook endpoint can parse this JSON and do whatever it needs. Slack's incoming webhooks expect a `text` field -- the receiver can transform the generic payload into that format. This keeps the Reliaburger side simple and lets operators adapt the integration to their workflow.
+Slack and PagerDuty receive their provider-specific formats. Every notification preserves the metric labels: Slack includes them in its text, and PagerDuty carries them in `custom_details`. Its incident key includes the cluster, rule and a digest of the sorted labels. Two workers can fire the same CPU rule independently, and one worker's recovery cannot resolve the other's incident. Chapter 6 follows that identity from stored readings through the evaluator.
 
 ### HMAC signing
 
@@ -666,7 +667,7 @@ This is the same pattern we use in `lettuce/webhook.rs` for verifying incoming G
 
 ### Retry with backoff
 
-Failed deliveries get three attempts: 1 second, 5 seconds, 25 seconds. After three failures, the notification is dropped and logged. We considered a queue with persistent retries, but that adds complexity for diminishing returns. If your webhook endpoint is down for 31 seconds, you probably have bigger problems -- and the next evaluation cycle will fire the same alert again if it's still active.
+Failed deliveries get three attempts: 1 second, 5 seconds, 25 seconds. After three failures, the notification is dropped and logged. We considered a queue with persistent retries, but that adds complexity for diminishing returns. Notifications are transition-driven: an alert that stays firing does not generate a new transition on the next evaluation. Exhausted delivery retries therefore remain a limitation; operators must inspect delivery errors and the active alert list.
 
 ### Configuration
 

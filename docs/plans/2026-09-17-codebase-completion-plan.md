@@ -554,7 +554,7 @@ Missing VMs and failed API readiness are printed, but the action still returns O
 
 Evidence: `src/mayo/webhook.rs:collapse_series`; `gather_latest_values`; `src/mayo/alert.rs`.
 
-Fresh per-series values are collapsed back to one value per metric name, so separate labelled workloads do not get independent alert state.
+**Completed on PR #167.** Fresh values now retain `MetricKey` identities. Each rule/label set owns its state, and labels reach statuses, dashboard rows, diagnostic output and provider notifications. PagerDuty recovery targets the matching labelled incident. Missing/non-finite readings cannot resolve a firing alert; percentage components must share fresh labels. The original masking and diagnostic-collapse regressions fail before the fix. Verification: 181 Mayo tests in both feature configurations, 48 dashboard tests, 27 diagnostic tests and strict all-target/all-feature Clippy.
 
 **Completion test:** Two label sets cross thresholds independently, retain separate pending/firing/resolved state and do not divide values across series.
 
