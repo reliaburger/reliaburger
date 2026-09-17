@@ -286,6 +286,10 @@ pub struct SecuritySection {
     /// identity on disk, and a joiner starts in enrollment mode until
     /// `relish join` installs one.
     pub require_mtls: bool,
+    /// Known joining peers allowed through the perimeter to management and cluster
+    /// ports before membership exists. Does not change protocol authentication.
+    pub bootstrap_peers: Vec<std::net::IpAddr>,
+
     /// Acknowledge running cluster transports (gossip, Raft, reporting) in
     /// the clear on a routable address. Without `require_mtls`, a clustered
     /// node refuses to bind these unauthenticated transports on a non-loopback

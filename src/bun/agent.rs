@@ -1883,6 +1883,20 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
         Ok(metas)
     }
 
+    /// Configure the actual protected listener ports and explicit enrolment peers.
+    /// This grants network reachability only; protocol authentication still applies.
+    pub fn configure_perimeter(
+        &mut self,
+        cluster_ports: Vec<u16>,
+        management_port: u16,
+        bootstrap_peers: Vec<std::net::IpAddr>,
+    ) {
+        self.perimeter_config.cluster_ports = cluster_ports;
+        self.perimeter_config.management_port = management_port;
+        self.perimeter_config.bootstrap_peers = bootstrap_peers;
+        self.last_firewall_nodes = None;
+    }
+
     /// Enable or disable the perimeter firewall. In-process multi-node tests
     /// run several agents on one host and must not spawn `nft` against the
     /// shared host firewall (`with_cluster` enables it by default on Linux).

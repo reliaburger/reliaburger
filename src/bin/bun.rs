@@ -899,6 +899,15 @@ async fn run_agent(cli: Cli) -> anyhow::Result<()> {
     // config deploy could run an arbitrary host binary through ProcessGrill.
     agent.set_process_config(config.process_workloads.clone());
     // Bound fault durations by the `[smoker]` policy (default + maximum).
+    agent.configure_perimeter(
+        vec![
+            config.cluster.gossip_port,
+            config.cluster.raft_port,
+            config.cluster.reporting_port,
+        ],
+        api_port,
+        config.security.bootstrap_peers.clone(),
+    );
     agent.set_smoker_config(config.smoker.to_smoker_config());
     let node_pressure_available = agent.configure_node_pressure(
         reliaburger::smoker::node_pressure::NodePressureLimits {
