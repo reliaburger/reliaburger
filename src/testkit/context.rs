@@ -34,7 +34,7 @@ pub const BUN_BINARY_PATH: &str = "/usr/local/bin/bun";
 /// The index contains both `linux/amd64` and `linux/arm64`; pinning the index
 /// rather than a tag makes runc and Apple Container execute identical content
 /// on repeated acceptance runs.
-pub const PINNED_TEST_WORKLOAD_IMAGE: &str = "docker.io/library/busybox@sha256:9532d8c39891ca2ecde4d30d7710e01fb739c87a8b9299685c63704296b16028";
+pub const PINNED_TEST_WORKLOAD_IMAGE: &str = "public.ecr.aws/docker/library/busybox@sha256:9532d8c39891ca2ecde4d30d7710e01fb739c87a8b9299685c63704296b16028";
 
 /// One test case's handle on the cluster.
 #[derive(Clone)]
