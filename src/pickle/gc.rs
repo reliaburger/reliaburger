@@ -213,7 +213,7 @@ mod tests {
     use std::collections::BTreeSet;
 
     fn test_digest(suffix: &str) -> Digest {
-        Digest(format!("sha256:{suffix:0>64}"))
+        crate::pickle::store::compute_sha256(suffix.as_bytes())
     }
 
     fn test_layer(suffix: &str) -> LayerDescriptor {

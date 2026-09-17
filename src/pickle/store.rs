@@ -98,11 +98,7 @@ impl BlobStore {
 
     /// Path to a blob on disk.
     pub fn blob_path(&self, digest: &Digest) -> PathBuf {
-        self.base_dir
-            .join("blobs")
-            .join("sha256")
-            .join(digest.hex())
-            .join("data")
+        crate::grill::image::cached_blob_path(&self.base_dir, digest.hex())
     }
 
     /// Path for temporary upload files.
@@ -350,12 +346,12 @@ impl BlobStore {
         let mut digests = Vec::new();
         for entry in std::fs::read_dir(&sha_dir)? {
             let entry = entry?;
-            if entry.file_type()?.is_dir() {
-                let hex = entry.file_name().to_string_lossy().to_string();
-                let data_path = entry.path().join("data");
-                if data_path.exists() {
-                    digests.push(Digest(format!("sha256:{hex}")));
-                }
+            let hex = entry.file_name().to_string_lossy().to_string();
+            let Ok(digest) = Digest::new(&format!("sha256:{hex}")) else {
+                continue;
+            };
+            if self.blob_path(&digest).is_file() {
+                digests.push(digest);
             }
         }
         Ok(digests)
