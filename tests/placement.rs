@@ -1049,11 +1049,24 @@ async fn authenticated_node_kill_fails_and_restores_a_real_cluster_member() {
     unsafe_second_kill.target_node = Some(other.name.clone());
     let refused = other.client.inject_fault(&unsafe_second_kill).await;
     assert!(
-        refused
-            .as_ref()
-            .is_err_and(|error| error.to_string().to_lowercase().contains("quorum")),
+        refused.as_ref().is_err_and(|error| match error {
+            reliaburger::relish::RelishError::ApiError { status: 400, body } =>
+                body.to_lowercase().contains("quorum"),
+            reliaburger::relish::RelishError::ApiError { status: 503, body } =>
+                body == "node fault safety cannot map the council leader to live membership"
+                    || body == "node fault safety requires a known council leader",
+            _ => false,
+        }),
         "second voter failure must be refused after {target_name} is down: {refused:?}",
         target_name = target.name
+    );
+    assert!(
+        other.client.list_faults().await.unwrap().is_empty(),
+        "a refused second voter fault must leave no active effect"
+    );
+    assert!(
+        source.client.list_faults().await.unwrap().is_empty(),
+        "a refused second voter fault must not mutate the routing node"
     );
 
     target

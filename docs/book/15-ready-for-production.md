@@ -2618,3 +2618,16 @@ ownership. The runtime's child-process cleanup tests remain necessary too.
 
 See the [nextest 0.9.145 release notes](https://github.com/nextest-rs/nextest/releases/tag/cargo-nextest-0.9.145)
 for the capture-pipe fix.
+
+### A safety refusal can arrive during an election
+
+The three-node chaos acceptance test kills one voter, then tries to kill a
+second. It originally demanded an error containing "quorum". CI caught another
+valid outcome: the surviving node temporarily lacked a live mapping for its
+Raft leader and refused with HTTP 503 before it could evaluate quorum.
+
+The test now accepts those two explicit missing-leader-evidence refusals as well
+as the quorum refusal. It still rejects unrelated failures and verifies that
+neither the second target nor the routing node acquired a fault. Then it reverses
+the first fault and observes recovery. The invariant is refusal without an
+effect, including while leadership evidence is incomplete.
