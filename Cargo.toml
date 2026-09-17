@@ -72,7 +72,7 @@ sysinfo = "0.33"
 prometheus-parse = "0.2"
 # The compression feature shrinks the release-embedded src/ tree
 # (`relish source`); debug builds read embeds from disk as before.
-rust-embed = { version = "8", features = ["compression"] }
+rust-embed = { version = "8", features = ["compression", "debug-embed"] }
 mime_guess = "2"
 k8s-openapi = { version = "0.22", default-features = false, features = ["latest"], optional = true }
 hyper-util = { version = "0.1", features = ["tokio", "server-auto", "service"] }
