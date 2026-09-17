@@ -1222,12 +1222,14 @@ async fn run_agent(cli: Cli) -> anyhow::Result<()> {
                 }
             },
         );
-        await_api_credentials(
-            &api_token_store,
-            &cli.listen,
-            std::time::Duration::from_secs(30),
-        )
-        .await?;
+        if config.security.require_mtls && !config.cluster.join.is_empty() {
+            await_api_credentials(
+                &api_token_store,
+                &cli.listen,
+                std::time::Duration::from_secs(30),
+            )
+            .await?;
+        }
     }
     agent.set_log_sink(log_tx);
     agent.set_readiness_tracker(readiness.clone());
