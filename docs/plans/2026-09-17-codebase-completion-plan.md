@@ -37,7 +37,7 @@ F items are missing capabilities, not evidence of failures in supported behaviou
 [Audit evidence and reproducible probes](../qualification/2026-09-17-code-audit.md)
 record those distinctions and the hosted checks inspected.
 
-There are **73 tracked work packages**: 44 correctness/contract items, 12
+There are **74 tracked work packages**: 45 correctness/contract items, 12
 engineering follow-ups, 12 capability families and five acceptance/release gates.
 The correctness items include 19 P1 priorities; these are engineering priorities, not
 security severity ratings. A capability family can require several commits.
@@ -563,6 +563,21 @@ only send messages; neither consumes incoming connections.
 node fault gate and own no receive loop. Bound upgrade-harness HTTP requests and
 include the address in API bind errors. The separate intermittent cluster
 upgrade stall remains a release qualification blocker under V02.
+
+### C45 — Keep polling subsystem owners during readiness publication
+
+**Priority:** P1. **Wave:** 2. **Book chapters:** 15.
+
+Both supervision loops awaited the readiness tracker write inside a selected
+branch. An owner already queued for the same fair lock could then never be
+polled to acquire and release it. Deterministic contention tests reproduce the
+stall for owned and reconstructible tasks. This is a concrete deadlock found
+while investigating intermittent Linux upgrade stalls; final runtime
+qualification remains V02.
+
+**Completion test:** Readiness publication and owner execution remain concurrently
+polled under contention. Retired attempts, startup panic, missing readiness and
+restart budget tests retain their existing behaviour.
 
 ## Engineering follow-ups
 

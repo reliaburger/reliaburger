@@ -252,21 +252,24 @@ where
 {
     tokio::spawn(async move {
         evidence.register(name, critical).await;
-        let (ready_tx, mut ready_rx) = tokio::sync::oneshot::channel();
+        let (ready_tx, ready_rx) = tokio::sync::oneshot::channel();
         let task =
             std::panic::AssertUnwindSafe(async move { factory(ReadySignal(ready_tx)).await })
                 .catch_unwind();
         tokio::pin!(task);
+        let publication = async {
+            if ready_rx.await.is_ok() && !shutdown.is_cancelled() {
+                evidence.ready(name).await;
+            }
+        };
+        tokio::pin!(publication);
         let mut readiness_received = false;
         let outcome = loop {
             tokio::select! {
                 biased;
                 outcome = &mut task => break outcome,
-                ready = &mut ready_rx, if !readiness_received => {
+                _ = &mut publication, if !readiness_received => {
                     readiness_received = true;
-                    if ready.is_ok() && !shutdown.is_cancelled() {
-                        evidence.ready(name).await;
-                    }
                 }
             }
         };
@@ -304,12 +307,18 @@ where
         loop {
             let attempt_started = Instant::now();
             let attempt_shutdown = shutdown.child_token();
-            let (ready_tx, mut ready_rx) = tokio::sync::oneshot::channel();
+            let (ready_tx, ready_rx) = tokio::sync::oneshot::channel();
             let task = std::panic::AssertUnwindSafe(async {
                 factory(attempt_shutdown.clone(), ReadySignal(ready_tx)).await
             })
             .catch_unwind();
             tokio::pin!(task);
+            let publication = async {
+                if ready_rx.await.is_ok() && !shutdown.is_cancelled() {
+                    evidence.ready(name).await;
+                }
+            };
+            tokio::pin!(publication);
 
             let mut readiness_received = false;
             let failure = loop {
@@ -329,11 +338,8 @@ where
                         }
                         return;
                     }
-                    ready = &mut ready_rx, if !readiness_received => {
+                    _ = &mut publication, if !readiness_received => {
                         readiness_received = true;
-                        if ready.is_ok() && !shutdown.is_cancelled() {
-                            evidence.ready(name).await;
-                        }
                     }
                 }
             };
@@ -497,6 +503,85 @@ mod tests {
             evidence.snapshot().await.subsystems[0].state,
             SubsystemState::Stopped
         );
+    }
+
+    async fn owner_can_publish_while_readiness_is_contended(reconstructible: bool) {
+        let evidence = ReadinessTracker::new();
+        let shutdown = CancellationToken::new();
+        let (entered, mut entered_rx) = tokio::sync::mpsc::unbounded_channel();
+        let (proceed, proceed_rx) = tokio::sync::watch::channel(false);
+        let (published, mut published_rx) = tokio::sync::mpsc::unbounded_channel();
+        let owner_evidence = evidence.clone();
+        let owner_shutdown = shutdown.clone();
+        let factory = move |ready: ReadySignal| {
+            let evidence = owner_evidence.clone();
+            let shutdown = owner_shutdown.clone();
+            let entered = entered.clone();
+            let published = published.clone();
+            let mut proceed = proceed_rx.clone();
+            async move {
+                entered.send(()).unwrap();
+                proceed.wait_for(|allowed| *allowed).await.unwrap();
+                ready.ready();
+                evidence.set_capabilities(Default::default()).await;
+                published.send(()).unwrap();
+                shutdown.cancelled().await;
+            }
+        };
+        let handle = if reconstructible {
+            spawn_reconstructible(
+                "contended",
+                true,
+                evidence.clone(),
+                shutdown.clone(),
+                RestartBudget {
+                    max_restarts: 0,
+                    retry_delay: Duration::ZERO,
+                    recovery_deadline: Duration::from_secs(5),
+                    shutdown_deadline: Duration::from_secs(1),
+                },
+                move |_, ready| {
+                    let owner = factory(ready);
+                    async move {
+                        owner.await;
+                        Ok(())
+                    }
+                },
+            )
+        } else {
+            spawn_owned(
+                "contended",
+                true,
+                evidence.clone(),
+                shutdown.clone(),
+                factory,
+            )
+        };
+        entered_rx.recv().await.unwrap();
+        // Hold a reader while the owner queues its capability write and its
+        // supervisor receives the ready signal. Both writers must progress.
+        let reader = evidence.inner.read().await;
+        proceed.send(true).unwrap();
+        tokio::task::yield_now().await;
+        drop(reader);
+        let published = tokio::time::timeout(Duration::from_secs(1), published_rx.recv()).await;
+        shutdown.cancel();
+        handle.abort();
+        let _ = handle.await;
+        assert!(
+            published.is_ok(),
+            "readiness publication stopped polling its owner"
+        );
+    }
+
+    #[tokio::test]
+    async fn owned_readiness_does_not_suspend_a_contending_owner() {
+        owner_can_publish_while_readiness_is_contended(false).await;
+    }
+
+    #[tokio::test]
+    async fn reconstructible_readiness_does_not_suspend_a_contending_owner() {
+        owner_can_publish_while_readiness_is_contended(true).await;
     }
 
     #[tokio::test]

@@ -2571,3 +2571,29 @@ namespace prefixes return `RunError`. A CLI check cannot protect a library from
 its other callers. Deadline construction uses checked clock arithmetic, so even
 `Duration::MAX` returns an error rather than panicking; a child deadline remains
 bounded by its parent.
+
+
+### Readiness reporting must not suspend its owner
+
+A subsystem sends its ready signal, then queues a capability update behind a
+reader of the readiness tracker. Its supervisor receives the signal and queues
+its own write. Tokio's read-write lock admits writers in order, so the owner is
+first in line. Who polls it now? In the original loop, nobody. The supervisor
+had entered a selected branch and was awaiting its own write there.
+
+This can deadlock without a thread holding a mutex forever. An async future
+only progresses when its caller polls it. `tokio::select!` polls the competing
+futures until a branch becomes ready, then runs that branch's body. An `await`
+in that body does not keep polling the other branches.
+
+The repair keeps readiness publication as a separate future inside the select.
+While that future waits for the tracker, the owner remains polled and can finish
+its earlier write. We retain the owner in the same supervision task, preserving
+cancellation and panic handling. Each restart still owns its own acknowledgement
+channel and publication future, so an old attempt cannot mark a new one ready.
+
+The regression deliberately holds a tracker reader while both writes queue.
+Releasing it must let the owner publish. We exercise both supervision loops;
+both stalled before the repair. The existing tests still cover startup panics,
+missing acknowledgements, bounded restarts and stale signals. This establishes
+a reproducible deadlock fix; the full upgrade runs remain separate evidence.
