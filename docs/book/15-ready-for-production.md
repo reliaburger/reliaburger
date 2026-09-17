@@ -2383,3 +2383,17 @@ futures. The agent waits until initial capability collection completes, and the
 security refresh worker loads its state before signalling. Regression tests hold
 an owner before readiness, fail a real bind, retain a stale attempt's signal and
 panic during startup. Each checks the externally visible readiness snapshot.
+
+### One busy lease must not stop the reaper
+
+Suppose a deployment still owns lease A when leases A and B expire. Cleanup
+must wait for A's deployment to finish, but B has no reason to wait. Previously
+the reaper awaited A's operation mutex and never reached B.
+
+Cleanup now calls `try_lock_owned()`. This returns immediately with either an
+owned guard or an error; unlike `lock_owned().await`, it never joins a waiting
+queue. We translate contention into `LeaseError::Busy` (HTTP 409 for an explicit
+cleanup request). The reaper leaves A's record intact, visits B, then retries A
+on its next tick. The operation guard still prevents cleanup from overtaking
+a deployment. A regression holds A's guard while the real reaper removes B,
+then checks that A remains active and can be cleaned once the guard is dropped.

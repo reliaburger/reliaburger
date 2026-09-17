@@ -1410,6 +1410,7 @@ fn lease_error_response(error: crate::testkit::lease::LeaseError) -> Response {
         crate::testkit::lease::LeaseError::NotFound => StatusCode::NOT_FOUND,
         crate::testkit::lease::LeaseError::WrongOwner => StatusCode::FORBIDDEN,
         crate::testkit::lease::LeaseError::NotActive
+        | crate::testkit::lease::LeaseError::Busy
         | crate::testkit::lease::LeaseError::AlreadyExists
         | crate::testkit::lease::LeaseError::NamespaceOwned
         | crate::testkit::lease::LeaseError::NamespaceMismatch

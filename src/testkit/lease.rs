@@ -187,6 +187,8 @@ pub enum LeaseError {
     NotFound,
     #[error("lease belongs to another principal")]
     WrongOwner,
+    #[error("lease has an in-flight operation; retry cleanup later")]
+    Busy,
     #[error("lease is expired or cleanup has started")]
     NotActive,
     #[error("app namespace does not match its lease")]
@@ -406,7 +408,9 @@ impl LocalLeaseStore {
         owner_id: Option<&str>,
     ) -> Result<(TestLease, LocalLeaseOperation), LeaseError> {
         let operation_lock = self.operation_lock(lease_id).await?;
-        let operation_guard = operation_lock.lock_owned().await;
+        let operation_guard = operation_lock
+            .try_lock_owned()
+            .map_err(|_| LeaseError::Busy)?;
         let mut inner = self.inner.lock().await;
         let mut next = inner.leases.clone();
         let lease = next.get_mut(lease_id).ok_or(LeaseError::NotFound)?;
@@ -872,16 +876,42 @@ mod tests {
             .await
             .unwrap();
 
-        assert!(
-            tokio::time::timeout(
-                std::time::Duration::from_millis(10),
-                store.begin_cleanup("abc", None),
-            )
-            .await
-            .is_err()
-        );
+        assert!(matches!(
+            store.begin_cleanup("abc", None).await,
+            Err(LeaseError::Busy)
+        ));
         drop(operation);
         assert!(store.begin_cleanup("abc", None).await.is_ok());
+    }
+
+    #[tokio::test]
+    async fn busy_lease_does_not_block_reaping_other_expired_leases() {
+        let store = LocalLeaseStore::in_memory();
+        store.create(lease("a", 10, 20)).await.unwrap();
+        store.create(lease("b", 10, 20)).await.unwrap();
+        let operation = store
+            .begin_app_operation("a", "token:ci", vec![], 11)
+            .await
+            .unwrap();
+        let (commands, _receiver) = tokio::sync::mpsc::channel(1);
+        let shutdown = tokio_util::sync::CancellationToken::new();
+        let reaper = spawn_local_lease_reaper(store.clone(), commands, shutdown.clone());
+        let result = tokio::time::timeout(std::time::Duration::from_secs(1), async {
+            while store.get("b").await.is_some() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await;
+        shutdown.cancel();
+        reaper.abort();
+        let _ = reaper.await;
+        assert!(
+            result.is_ok(),
+            "busy lease a prevented cleanup of expired lease b"
+        );
+        assert_eq!(store.get("a").await.unwrap().state, TestLeaseState::Active);
+        drop(operation);
+        assert!(store.begin_cleanup("a", None).await.is_ok());
     }
 
     #[tokio::test]
