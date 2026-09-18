@@ -109,3 +109,6 @@ pub enum BunError {
     #[error("self-upgrade is not available on this node (no upgrade manager)")]
     UpgradesUnavailable,
 }
+
+#[cfg(test)]
+mod job_lifecycle_tests;

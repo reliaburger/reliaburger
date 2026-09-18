@@ -588,6 +588,14 @@ jobs in reserved test namespaces. Both regressions fail before the repair;
 14 context tests and 48 lease-filtered tests pass (one explicit gate), with
 strict Linux/macOS Clippy. This closes the bypass, not durable job support.
 
+**Job retry prerequisite (18 September):** Both a successful retry and an
+explicitly stopped retry were selected again merely because their historical
+restart count was non-zero. Two running-agent regressions reproduce this.
+Track pending retry intent separately; retain the historical counter and clear
+intent on success, stop, accepted restart or exhausted budget. Both regressions
+pass after the fix (5.03s), along with 44 supervisor tests, 104 agent tests
+(12.28s) and strict Linux/macOS Clippy.
+
 Remaining resource contracts, each in its own commit: node-local jobs,
 registry uploads/repositories,
 and managed volume/mount cleanup. Node effects already use C06 reservations

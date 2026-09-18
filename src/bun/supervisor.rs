@@ -53,6 +53,8 @@ pub struct WorkloadInstance {
     pub health_config: Option<HealthCheckConfig>,
     /// Whether this instance is a job (run-to-completion) rather than an app.
     pub is_job: bool,
+    /// A failed job is waiting for its retry backoff, rather than completed or stopped.
+    pub job_retry_pending: bool,
     /// OCI image reference, e.g. "docker.io/library/nginx:latest".
     pub image: String,
     /// Stored OCI spec for restart re-drive. Set during initial startup.
@@ -467,6 +469,7 @@ impl<G: Grill> WorkloadSupervisor<G> {
                 restart_policy: RestartPolicy::default(),
                 health_config,
                 is_job: false,
+                job_retry_pending: false,
                 image: spec.image.clone().unwrap_or_default(),
                 oci_spec: None,
                 identity: None,
@@ -533,6 +536,7 @@ impl<G: Grill> WorkloadSupervisor<G> {
             restart_policy: RestartPolicy::for_job(3),
             health_config: None,
             is_job: true,
+            job_retry_pending: false,
             image: spec.image.clone().unwrap_or_default(),
             oci_spec: None,
             identity: None,
@@ -568,6 +572,7 @@ impl<G: Grill> WorkloadSupervisor<G> {
                         instance_id: id.clone(),
                     })?;
 
+            instance.job_retry_pending = false;
             if matches!(
                 instance.state,
                 ContainerState::Running | ContainerState::Unhealthy
@@ -742,6 +747,7 @@ impl<G: Grill> WorkloadSupervisor<G> {
         }
 
         instance.state = instance.state.transition_to(ContainerState::Pending)?;
+        instance.job_retry_pending = false;
         instance.restart_count += 1;
         instance.last_restart = Some(now);
         instance.health_counters.reset();

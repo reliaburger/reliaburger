@@ -898,3 +898,25 @@ fires, so CI's wall clock cannot turn the test into a different case. The old
 code returns `AppNotFound`; the repaired path succeeds and retains only the
 other namespace's registration. This closes pre-first-run retirement. Durable
 job leases and fencing already in-flight job workers remain C34 work.
+
+### A completed retry must stay completed
+
+A job fails once, retries, then succeeds. Its restart counter is still one.
+That counter tells us what happened earlier; it does not tell us whether the
+job needs another attempt. Using `restart_count > 0` to select stopped jobs
+made a successful retry run again. An operator's explicit stop had the same
+problem.
+
+Each instance now records whether a failed job is actually waiting for retry.
+A failed exit sets that flag. Starting the retry, observing success, exhausting
+the budget or accepting an explicit stop clears it. The backoff loop selects
+stopped jobs with pending retry intent, leaving their historical restart
+counts intact. This is local runtime state, not a promise that retry history
+survives a node crash; durable job ownership is separate work.
+
+Two tests drive the running agent through its command channel and use a mock
+runtime to report exits. Both first prove that a failure retries. One then
+reports exit zero; the other sends Stop. After several real ticks and the
+retry backoff, the instance must remain stopped with exactly one restart.
+Before the fix, both tests observed a second restart. Cleanup needs this
+property too: stopping a leased job cannot mean “until the next tick”.

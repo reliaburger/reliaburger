@@ -2443,6 +2443,7 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
                 restart_policy: super::restart::RestartPolicy::default(),
                 health_config,
                 is_job: record.is_job,
+                job_retry_pending: false,
                 image: record.image.clone(),
                 oci_spec: Some(record.oci_spec.clone()),
                 identity,
@@ -5394,6 +5395,7 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
                     restart_policy: crate::bun::restart::RestartPolicy::default(),
                     health_config,
                     is_job: false,
+                    job_retry_pending: false,
                     image: spec.image.clone().unwrap_or_default(),
                     oci_spec: new_specs.remove(new_id),
                     identity: None,
@@ -6391,6 +6393,7 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
 
                 // Transition Running → Stopping → Stopped
                 if let Some(instance) = self.supervisor.get_instance_mut(&id) {
+                    instance.job_retry_pending = exit_code != Some(0);
                     if let Ok(s) = instance.state.transition_to(ContainerState::Stopping) {
                         instance.state = s;
                     }
@@ -6441,6 +6444,7 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
                             && let Ok(s) = instance.state.transition_to(ContainerState::Failed)
                         {
                             instance.state = s;
+                            instance.job_retry_pending = false;
                         }
                         if let Some(instance) = self.supervisor.get_instance(&id) {
                             self.record_event(
@@ -6462,7 +6466,7 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
             .supervisor
             .list_instances()
             .iter()
-            .filter(|i| i.is_job && i.state == ContainerState::Stopped && i.restart_count > 0)
+            .filter(|i| i.is_job && i.state == ContainerState::Stopped && i.job_retry_pending)
             .map(|i| i.id.clone())
             .collect();
 
@@ -6492,6 +6496,7 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
                         && let Ok(s) = instance.state.transition_to(ContainerState::Failed)
                     {
                         instance.state = s;
+                        instance.job_retry_pending = false;
                     }
                     if let Some(instance) = self.supervisor.get_instance(&id) {
                         self.record_event(
