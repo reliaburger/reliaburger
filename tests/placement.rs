@@ -35,6 +35,7 @@ struct Node {
     client: BunClient,
     handle: ClusterHandle,
     thinks_leader: watch::Receiver<bool>,
+    token_store: Option<reliaburger::sesame::auth::TokenStore>,
     rollup_store: Arc<RwLock<reliaburger::mayo::rollup_store::RollupStore>>,
     _runtime: runtime::ClusterRuntime,
     _tasks: TestTasks,
@@ -214,8 +215,10 @@ async fn start_node_with_auth(
     let listener = tokio::net::TcpListener::bind(local(api_port))
         .await
         .unwrap();
-    let app = if let Some(auth) = &auth {
-        let token_store = Arc::new(RwLock::new(vec![auth.token.clone()]));
+    let token_store = auth
+        .as_ref()
+        .map(|auth| Arc::new(RwLock::new(vec![auth.token.clone()])));
+    let app = if auth.is_some() {
         let static_capabilities = reliaburger::bun::capabilities::StaticCapabilities {
             cluster_mode: true,
             test_policy: reliaburger::testkit::safety::ClusterTestPolicy {
@@ -235,7 +238,7 @@ async fn start_node_with_auth(
             None,
             None,
             council.clone(),
-            Some(token_store),
+            token_store.clone(),
             Some("placement-test-internal-service-identity".into()),
             None,
             Some(Arc::clone(&membership_table)),
@@ -329,6 +332,7 @@ async fn start_node_with_auth(
             crl_handle: Default::default(),
         },
         thinks_leader: leader_rx,
+        token_store,
         rollup_store,
         _runtime: cluster_runtime,
         _tasks: TestTasks::new(shutdown.clone(), tasks),
@@ -1446,4 +1450,117 @@ async fn concurrent_node_kills_and_leader_change_preserve_reserved_capacity() {
     for node in nodes {
         node.handle.council.as_ref().unwrap().shutdown().await.ok();
     }
+}
+
+/// Administrative apply must retain the user's authority at the leader.
+#[tokio::test(flavor = "multi_thread", worker_threads = 6)]
+#[ignore = "multi-node apply forwarding acceptance; run with make test-cluster"]
+async fn follower_apply_preserves_user_authority_for_administrative_manifests() {
+    use reliaburger::sesame::types::{ApiRole, TokenScope};
+    let created = reliaburger::sesame::token::create_token(
+        "apply-admin",
+        ApiRole::Admin,
+        TokenScope::default(),
+        None,
+    )
+    .unwrap();
+    let auth = NodeFaultAuth {
+        token: created.token,
+        plaintext: created.plaintext,
+    };
+    let shutdown = CancellationToken::new();
+    let n1 = start_node_with_auth("apply1", 20401, vec![], &shutdown, Some(auth.clone())).await;
+    let n2 = start_node_with_auth(
+        "apply2",
+        20405,
+        vec![local(20401)],
+        &shutdown,
+        Some(auth.clone()),
+    )
+    .await;
+    let n3 = start_node_with_auth(
+        "apply3",
+        20409,
+        vec![local(20401)],
+        &shutdown,
+        Some(auth.clone()),
+    )
+    .await;
+    let nodes = [&n1, &n2, &n3];
+    assert!(
+        wait_until(Duration::from_secs(60), || nodes.iter().all(|node| {
+            node.handle.council.as_ref().is_some_and(|council| {
+                let metrics = council.metrics().borrow().clone();
+                metrics.current_leader.is_some()
+                    && metrics.membership_config.membership().voter_ids().count() == 3
+            })
+        }))
+        .await
+    );
+    let follower = nodes
+        .iter()
+        .find(|node| !*node.thinks_leader.borrow())
+        .unwrap();
+    let manifest = "[namespace.release]\nmax_apps = 2\n[permission.ci]\nactions = [\"deploy\"]\napps = [\"web\"]\nnamespaces = [\"release\"]\n";
+    let response = reqwest::Client::new()
+        .post(format!("{}/v1/apply", follower.client.base_url()))
+        .bearer_auth(&auth.plaintext)
+        .body(manifest)
+        .timeout(Duration::from_secs(10))
+        .send()
+        .await
+        .unwrap();
+    let status = response.status();
+    let content_type = response
+        .headers()
+        .get("content-type")
+        .unwrap()
+        .to_str()
+        .unwrap()
+        .to_owned();
+    let body = response.text().await.unwrap();
+    assert!(status.is_success(), "{status}: {body}");
+    assert!(content_type.starts_with("text/event-stream"));
+    assert!(body.contains("committed to the cluster"), "{body}");
+    assert!(!body.contains("error"), "{body}");
+    let leader = nodes
+        .iter()
+        .find(|node| *node.thinks_leader.borrow())
+        .unwrap();
+    let state = leader
+        .handle
+        .council
+        .as_ref()
+        .unwrap()
+        .desired_state()
+        .await;
+    assert_eq!(state.namespaces["release"].max_apps, Some(2));
+    assert!(state.permissions.contains_key("ci"));
+
+    // A follower can temporarily lag credential revocation. The leader's
+    // refusal must retain its HTTP status and plain-text body at the client.
+    let replacement = reliaburger::sesame::token::create_token(
+        "replacement-admin",
+        ApiRole::Admin,
+        TokenScope::default(),
+        None,
+    )
+    .unwrap();
+    *leader.token_store.as_ref().unwrap().write().await = vec![replacement.token];
+    let response = reqwest::Client::new()
+        .post(format!("{}/v1/apply", follower.client.base_url()))
+        .bearer_auth(&auth.plaintext)
+        .body(manifest)
+        .timeout(Duration::from_secs(10))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), reqwest::StatusCode::UNAUTHORIZED);
+    assert!(
+        response.headers()["content-type"]
+            .to_str()
+            .unwrap()
+            .starts_with("text/plain")
+    );
+    shutdown.cancel();
 }

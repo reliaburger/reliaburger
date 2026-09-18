@@ -2243,6 +2243,21 @@ async fn apply_handler(
         }
     }
 
+    // Ordinary namespace quotas and permission grants are operator policy.
+    // A test lease has already confined its namespace declaration to the
+    // caller-owned reservation above; its quota cannot affect other tenants.
+    if !config.permission.is_empty() || (lease_id.is_none() && !config.namespace.is_empty()) {
+        if let Err(response) = crate::sesame::auth::authorize_user(
+            auth.as_deref(),
+            crate::sesame::types::ApiRole::Admin,
+        ) {
+            return response;
+        }
+        if let Err(response) = crate::sesame::auth::require_unscoped(auth.as_deref()) {
+            return response;
+        }
+    }
+
     // Check every workload before any Raft write or agent command. A job in
     // a mixed manifest must not bypass admission after its apps have committed.
     // Host execution includes both explicit binaries and inline scripts.
@@ -2433,26 +2448,30 @@ async fn cluster_apply(
             if let Some(value) = caller_headers.get(CAPACITY_PROBE_HEADER) {
                 request = request.header(CAPACITY_PROBE_HEADER, value.as_bytes());
             }
-            for name in [
-                axum::http::header::AUTHORIZATION,
-                axum::http::header::COOKIE,
-            ] {
-                if let Some(value) = caller_headers.get(&name) {
-                    request = request.header(name.as_str(), value.as_bytes());
-                }
-            }
-        } else if let Some(token) = &state.service_token {
-            request = request.bearer_auth(token);
         }
-        return match request.send().await {
-            Ok(response) => {
-                let stream = response.bytes_stream();
-                Response::builder()
-                    .header("content-type", "text/event-stream")
-                    .body(axum::body::Body::from_stream(stream))
+        // The leader must evaluate the user's current grants, not the
+        // follower's internal service identity. ClusterHttp has no default
+        // bearer; node-to-node requests attach theirs explicitly.
+        request = copy_forwarded_auth(request, &caller_headers);
+        let response =
+            tokio::time::timeout(std::time::Duration::from_secs(5), request.send()).await;
+        return match response {
+            Ok(Ok(response)) => {
+                let mut builder = Response::builder().status(response.status());
+                if let Some(content_type) = response.headers().get(axum::http::header::CONTENT_TYPE)
+                {
+                    builder = builder.header(axum::http::header::CONTENT_TYPE, content_type);
+                }
+                builder
+                    .body(axum::body::Body::from_stream(response.bytes_stream()))
                     .unwrap_or_else(|_| StatusCode::BAD_GATEWAY.into_response())
             }
-            Err(e) => (
+            Err(_) => (
+                StatusCode::GATEWAY_TIMEOUT,
+                "leader apply request timed out",
+            )
+                .into_response(),
+            Ok(Err(e)) => (
                 StatusCode::BAD_GATEWAY,
                 Json(serde_json::json!({
                     "error": format!("failed to forward apply to the leader: {e}")
@@ -9499,6 +9518,70 @@ mod tests {
             None,
         );
         (app, council, rx)
+    }
+
+    #[tokio::test]
+    async fn administrative_manifests_require_unscoped_user_admin_before_any_write() {
+        let (app, council, mut commands) = workload_admission_fixture("manifest-admin").await;
+        let declarations = [
+            "[permission.ci]\nactions = [\"deploy\", \"host-exec\"]\napps = [\"*\"]\n",
+            "[namespace.default]\nmax_apps = 1000\n",
+        ];
+        for declaration in declarations {
+            for mixed in [false, true] {
+                let manifest = if mixed {
+                    format!(
+                        "{declaration}[app.web]\nimage = \"test:v1\"\n[job.work]\nimage = \"test:v1\"\n"
+                    )
+                } else {
+                    declaration.to_owned()
+                };
+                for auth in [
+                    deployer_context(),
+                    {
+                        let mut auth = deployer_context();
+                        auth.role = crate::sesame::types::ApiRole::Admin;
+                        auth.scoped_namespaces = Some(vec!["default".into()]);
+                        auth
+                    },
+                    {
+                        let mut auth = deployer_context();
+                        auth.role = crate::sesame::types::ApiRole::Admin;
+                        auth.token_name = crate::sesame::auth::SYSTEM_PRINCIPAL.into();
+                        auth
+                    },
+                ] {
+                    assert_eq!(
+                        apply_as_context(&app, auth, &manifest).await,
+                        StatusCode::FORBIDDEN
+                    );
+                    let desired = council.desired_state().await;
+                    assert!(desired.permissions.is_empty());
+                    assert!(desired.namespaces.is_empty());
+                    assert!(desired.apps.is_empty());
+                    assert!(matches!(
+                        commands.try_recv(),
+                        Err(mpsc::error::TryRecvError::Empty)
+                    ));
+                }
+            }
+        }
+        let mut auth = deployer_context();
+        auth.role = crate::sesame::types::ApiRole::Admin;
+        let mut request = axum::http::Request::post("/v1/apply")
+            .body(Body::from(declarations.join("")))
+            .unwrap();
+        request.extensions_mut().insert(auth);
+        let response = app.oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(response.into_body(), 65536)
+            .await
+            .unwrap();
+        assert!(!String::from_utf8_lossy(&body).contains("error"));
+        let desired = council.desired_state().await;
+        assert!(desired.permissions.contains_key("ci"));
+        assert_eq!(desired.namespaces["default"].max_apps, Some(1000));
+        council.shutdown().await.unwrap();
     }
 
     #[tokio::test]

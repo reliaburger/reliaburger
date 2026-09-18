@@ -23,7 +23,7 @@ for every item below. IDs are scoped to that plan, not the older C1/M1 review ID
 The [audit record](qualification/2026-09-17-code-audit.md) separates local defect
 reproductions from inspected source and previous acceptance evidence.
 
-These are work packages, not 77 mandatory features for 0.1.0. Correctness fixes
+These are work packages, not 81 mandatory features for 0.1.0. Correctness fixes
 need explicit release dispositions; optional refactors and future capabilities
 remain separate. Older unchecked groups below point into this current ledger.
 
@@ -96,7 +96,7 @@ remain separate. Older unchecked groups below point into this current ledger.
 - [x] **C49** Reject zero and overflowing token lifetimes before hashing or committing credentials. Both public API regressions fail before the fix and pass afterwards, covering multiplication overflow, clock overflow, normal expiry and explicit non-expiring tokens. Token unit tests and strict Linux/macOS Clippy pass. Found during C34 ownership work.
 
 - [x] **C50** Enforce scope and configured Deploy/HostExec permission checks for all app/job targets before any part of a manifest applies. Three admission regressions fail before the fix; all 113 API tests, eight route audits and strict Linux/macOS Clippy pass. Mixed manifests refuse before app commits or job commands.
-- [ ] **C51** (P1) Reproduce and restrict Deployer writes to administrative permission/quota declarations, including mixed manifests.
+- [x] **C51** Require an unscoped user administrator for ordinary permission/quota declarations before any mixed-manifest mutation. Followers preserve caller credentials and upstream status/content type. Both admission and forwarding regressions fail before their fixes; 114 API tests (14.25s), real three-node acceptance with leader-side credential revocation (13.93s) and strict Linux/macOS Clippy pass. Lease-owned test namespaces retain their bounded exception.
 - [ ] **C52** (P1) Reproduce scoped-Admin credential widening and confine global user-management operations.
 
 ### Engineering follow-ups

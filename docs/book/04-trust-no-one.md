@@ -1238,3 +1238,23 @@ not just HTTP status. Refusal must leave both untouched. Positive tests show
 that an in-scope job and an explicitly permitted host job still reach the
 agent. A permission check that refuses everything isn't a working permission
 system either.
+
+### A deployment must not rewrite its own permission grant
+
+Suppose `ci` may deploy `web`, but may not execute host scripts. If that same
+credential can apply `[permission.ci]` with `host-exec`, the restriction buys
+us nothing. Namespace quotas have the same problem: the user constrained by
+a budget must not be able to remove that budget in the next manifest.
+
+Ordinary permission and namespace declarations now require an unscoped user
+administrator. We check this before any part of a mixed manifest changes
+state. The internal service identity cannot grant permissions. A test lease
+remains a separate, bounded exception: its existing ownership checks allow
+only its reserved namespace, and never permission declarations.
+
+The check must survive a network hop. When a follower forwards apply to the
+leader, it preserves the user's bearer token or session cookie. Substituting
+the node's service token would erase the identity whose permissions the
+leader needs to check. The forwarding response also retains the leader's
+status and content type, so an authorisation refusal stays a refusal rather
+than looking like a successful event stream.

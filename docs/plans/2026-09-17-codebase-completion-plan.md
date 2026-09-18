@@ -37,9 +37,9 @@ F items are missing capabilities, not evidence of failures in supported behaviou
 [Audit evidence and reproducible probes](../qualification/2026-09-17-code-audit.md)
 record those distinctions and the hosted checks inspected.
 
-There are **76 tracked work packages**: 47 correctness/contract items, 12
+There are **81 tracked work packages**: 52 correctness/contract items, 12
 engineering follow-ups, 12 capability families and five acceptance/release gates.
-The correctness items include 20 P1 priorities; these are engineering priorities, not
+The correctness items include 25 P1 priorities; these are engineering priorities, not
 security severity ratings. A capability family can require several commits.
 
 ## What is already done
@@ -825,10 +825,16 @@ manifests. In-scope and explicitly granted jobs must still be accepted.
 
 **Priority:** P1. **Wave:** 4. **Book chapter:** 04.
 
-Inspected during C50: apply accepts permission and namespace quota declarations
-through its Deployer gate. A caller may be able to rewrite the permission
-specification intended to restrict it. Reproduce and enforce the administrative
-authority required for these writes before any part of a mixed manifest applies.
+Found during C50: apply accepted permission and namespace quota declarations
+through its Deployer gate, allowing callers to rewrite their own restrictions.
+
+**Completed:** Require an unscoped user administrator before any ordinary
+policy declaration or mixed-manifest mutation. Existing lease ownership checks
+remain the bounded exception for reserved test namespaces. Forward apply with
+the caller's credentials and preserve upstream status/content type. Both the
+admission and three-node forwarding regressions fail before their fixes.
+All 114 API tests (14.25s), real three-node acceptance including leader-side
+credential revocation (13.93s), and strict Linux/macOS Clippy pass.
 
 ### C52 — Confine scoped administrators on credential-management routes
 
