@@ -459,6 +459,7 @@ async fn build_ingress_cert_resolver(
     match reliaburger::wrapper::tls::IngressCertResolver::new(
         keypair,
         params,
+        rustls::pki_types::CertificateDer::from(ingress_ca.certificate_der.clone()),
         lifetime,
         routing_table,
         vec![default_cert],

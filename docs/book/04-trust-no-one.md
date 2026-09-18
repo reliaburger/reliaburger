@@ -865,3 +865,24 @@ This does not add ingress CRL distribution. Our cluster revocation API owns
 to revoke it. Individual ingress-leaf revocation remains unsupported. Certificate
 renewal and hot reload are tracked separately under C14, and CA rotation remains
 an explicit future capability under F04.
+
+
+### Send the issuer along with the leaf
+
+A certificate signed by the Ingress CA isn't directly signed by the cluster
+root. The client needs the intermediate certificate to connect those two facts.
+Our first SNI resolver sent just the leaf. Unit tests proved its signature was
+correct, but a real client trusting only the documented root returned
+`UnknownIssuer`.
+
+Ingress issuance and the resolver now carry the original root-signed Ingress CA
+certificate and send `[leaf, intermediate]` during the handshake. We don't
+recreate a self-signed copy of that intermediate from its signing parameters;
+that would discard the root's signature. The root itself stays with the client
+as its configured trust anchor and needn't travel in the server's chain.
+
+The regression starts a real TLS listener and a client whose trust store contains
+only the root. It fails against the leaf-only implementation and succeeds with
+the complete chain, checking that the server sends exactly those two certificates.
+This is a prerequisite for testing renewal: a fresh certificate must also be one
+the documented client can validate.

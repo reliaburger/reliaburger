@@ -54,12 +54,14 @@ pub fn generate_self_signed_cert()
 /// `ca_keypair` and `ca_params` come from the Ingress `GeneratedCa`
 /// (`hierarchy.ingress`). `hostnames` are the ingress hosts to put in the
 /// certificate's SANs. The returned cert/key plug straight into
-/// [`build_tls_config`].
+/// [`build_tls_config`]. The chain includes the original root-signed Ingress CA
+/// certificate so clients need only the cluster root as their trust anchor.
 pub fn issue_ingress_cert(
     hostnames: &[String],
     lifetime: std::time::Duration,
     ca_keypair: &rcgen::KeyPair,
     ca_params: &rcgen::CertificateParams,
+    issuer_certificate: &CertificateDer<'static>,
 ) -> Result<(Vec<CertificateDer<'static>>, PrivateKeyDer<'static>), TlsError> {
     let common_name = hostnames
         .first()
@@ -78,7 +80,7 @@ pub fn issue_ingress_cert(
     let cert = CertificateDer::from(cert_der);
     let key = PrivateKeyDer::try_from(key_der)
         .map_err(|e| TlsError::CertGenFailed(format!("invalid issued key: {e}")))?;
-    Ok((vec![cert], key))
+    Ok((vec![cert, issuer_certificate.clone()], key))
 }
 
 /// Load a certificate and private key from PEM files on disk.
@@ -198,6 +200,7 @@ const MAX_SNI_CACHE: usize = 1024;
 pub struct IngressCertResolver {
     ca_keypair: rcgen::KeyPair,
     ca_params: rcgen::CertificateParams,
+    issuer_certificate: CertificateDer<'static>,
     lifetime: std::time::Duration,
     default_key: Arc<rustls::sign::CertifiedKey>,
     routes: Arc<tokio::sync::RwLock<super::routing::RoutingTable>>,
@@ -219,6 +222,7 @@ impl IngressCertResolver {
     pub fn new(
         ca_keypair: rcgen::KeyPair,
         ca_params: rcgen::CertificateParams,
+        issuer_certificate: CertificateDer<'static>,
         lifetime: std::time::Duration,
         routes: Arc<tokio::sync::RwLock<super::routing::RoutingTable>>,
         default_cert: Vec<CertificateDer<'static>>,
@@ -227,6 +231,7 @@ impl IngressCertResolver {
         Ok(Self {
             ca_keypair,
             ca_params,
+            issuer_certificate,
             lifetime,
             default_key: certified_key(default_cert, default_key)?,
             routes,
@@ -242,8 +247,14 @@ impl IngressCertResolver {
             return Some(Arc::clone(existing));
         }
         let hosts = [hostname.to_string()];
-        let (chain, key) =
-            issue_ingress_cert(&hosts, self.lifetime, &self.ca_keypair, &self.ca_params).ok()?;
+        let (chain, key) = issue_ingress_cert(
+            &hosts,
+            self.lifetime,
+            &self.ca_keypair,
+            &self.ca_params,
+            &self.issuer_certificate,
+        )
+        .ok()?;
         let certified = certified_key(chain, key).ok()?;
         if let Ok(mut cache) = self.cache.lock()
             && (cache.len() < MAX_SNI_CACHE || cache.contains_key(hostname))
@@ -339,10 +350,11 @@ mod tests {
             std::time::Duration::from_secs(90 * 24 * 3600),
             &hierarchy.ingress.signing_keypair,
             &hierarchy.ingress.certificate_params,
+            &CertificateDer::from(hierarchy.ingress.ca.certificate_der.clone()),
         )
         .unwrap();
 
-        assert_eq!(certs.len(), 1);
+        assert_eq!(certs.len(), 2);
         // The issued cert and key must yield a working rustls config.
         let config = build_tls_config(certs, key).unwrap();
         let _ = config; // built without error means it's servable
@@ -367,6 +379,7 @@ mod tests {
             std::time::Duration::from_secs(3600),
             &key,
             &params,
+            &certificate,
         )
         .unwrap();
         let destination = std::env::var_os("RELIABURGER_SERIAL_TEST_OUTPUT").unwrap();
@@ -451,6 +464,7 @@ mod tests {
             std::time::Duration::from_secs(3600),
             &hierarchy.ingress.signing_keypair,
             &hierarchy.ingress.certificate_params,
+            &CertificateDer::from(hierarchy.ingress.ca.certificate_der.clone()),
         );
         assert!(result.is_err());
     }
@@ -466,6 +480,7 @@ mod tests {
         let resolver = IngressCertResolver::new(
             hierarchy.ingress.signing_keypair,
             hierarchy.ingress.certificate_params,
+            CertificateDer::from(hierarchy.ingress.ca.certificate_der),
             std::time::Duration::from_secs(90 * 24 * 3600),
             empty_routes(),
             vec![default_cert],
@@ -498,6 +513,7 @@ mod tests {
         IngressCertResolver::new(
             hierarchy.ingress.signing_keypair,
             hierarchy.ingress.certificate_params,
+            CertificateDer::from(hierarchy.ingress.ca.certificate_der),
             std::time::Duration::from_secs(3600),
             routes,
             vec![default_cert],
