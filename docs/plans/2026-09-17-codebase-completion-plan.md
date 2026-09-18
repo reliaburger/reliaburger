@@ -747,6 +747,16 @@ child. Eight native unit tests pass (10.01s), including deadline/reaping, and
 real Apple Container adoption plus removal passes (1.89s). Strict native and
 Linux Clippy pass; the Apple module is macOS-only, so Linux runs no Apple tests.
 
+**Restart ownership prerequisite:** The retry driver discarded kill errors and
+recreated an instance without observing exit. It now shares explicit stop's
+bounded force-kill/exit path. Failed, ineffective, unreadable or stalled cleanup
+keeps the instance Pending with its port, record and in-memory retry count;
+a later tick retries without creating a replacement first. All four regressions
+fail before implementation and pass with subsequent recovery. All 440 Linux
+Bun tests (one explicit gate, 34.83s), 441 native Bun tests (one gate, 20.68s),
+and strict Linux/macOS Clippy pass. Durable retry budgets and recovery from
+later create/start errors remain separate work.
+
 Job schedule registrations and last-fired stamps are currently in-memory;
 adoption resets job retries to the generic restart policy. Persist the intended
 schedule and retry budget, with restart/no-duplicate-firing tests. Durable test
@@ -787,7 +797,8 @@ returns EPERM in all twelve cases. A non-reaping `waitid` regression reproduces
 EPERM through ProcessGrill itself (0.07s). Stop and kill now collect an already
 completed child's result before deciding whether to signal, preserving both
 zero and non-zero exits. Live-process observation/signal errors still propagate.
-Full process-tree ownership remains a separate gate. The release build at
+Full process-tree ownership remains a separate gate. Both hosted CI and Build
+& Release pass at `50fed01`, including the repaired macOS path. The release build at
 `c4ec142` passed. After the repair, 21 native ProcessGrill tests pass (0.24s),
 the actual macOS catalogue reports three passes with confirmed cleanup (17.79s),
 and 274 Linux runtime tests (13 explicit gates, 7.58s), seven job lifecycle tests

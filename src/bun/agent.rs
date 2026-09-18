@@ -6663,7 +6663,10 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
             // create is rejected (ProcessGrill: stale-Running entry) or fails
             // (runc/apple: container still exists), leaving the instance wedged
             // in Preparing and the old process leaked.
-            let _ = self.supervisor.grill().kill(&id).await;
+            if let Err(error) = self.kill_and_wait_for_exit(&id).await {
+                eprintln!("bun: restart of {id} awaits runtime cleanup: {error}");
+                continue;
+            }
 
             // Pending → Preparing
             if let Some(instance) = self.supervisor.get_instance_mut(&id) {
@@ -7952,6 +7955,12 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
         if self.wait_for_runtime_exit(id, grace).await? {
             return Ok(());
         }
+        self.kill_and_wait_for_exit(id).await
+    }
+
+    /// Preserve ownership until both force-kill and observed runtime exit succeed.
+    async fn kill_and_wait_for_exit(&self, id: &InstanceId) -> Result<(), BunError> {
+        let signal_timeout = std::time::Duration::from_secs(2);
         tokio::time::timeout(signal_timeout, self.supervisor.grill().kill(id))
             .await
             .map_err(|_| BunError::StopUnconfirmed {
@@ -11362,6 +11371,85 @@ interval = 1
         );
 
         agent.stop_app("web", "default").await.unwrap();
+    }
+
+    async fn restart_preserves_uncertain_cleanup(inject: fn(&MockGrill)) {
+        let (mut agent, _tx, _shutdown, grill) = test_agent_with_grill();
+        let directory = tempfile::tempdir().unwrap();
+        agent.set_volumes_dir(directory.path().join("volumes"));
+        let records = directory.path().join("instances");
+        agent.set_records_dir(records.clone());
+        let config = Config::parse("[app.restart]\nimage = \"mock:image\"\nport = 8080\n").unwrap();
+        let (events, _received) = mpsc::channel(256);
+        agent.deploy(config, &events).await;
+        let id = agent.supervisor.list_instances()[0].id.clone();
+        let port = agent.supervisor.get_instance(&id).unwrap().host_port;
+        assert!(port.is_some());
+        std::fs::create_dir_all(&records).unwrap();
+        let record = crate::grill::records::record_path(&records, &id.0);
+        std::fs::write(&record, "retained ownership").unwrap();
+        agent.supervisor.get_instance_mut(&id).unwrap().state = ContainerState::Unhealthy;
+        assert!(
+            agent
+                .supervisor
+                .maybe_restart(&id, Instant::now())
+                .await
+                .unwrap()
+        );
+        let before = grill.calls().len();
+        inject(&grill);
+        tokio::time::timeout(
+            std::time::Duration::from_secs(6),
+            agent.drive_pending_restarts(),
+        )
+        .await
+        .expect("restart cleanup stalled the agent");
+        assert_eq!(
+            agent.supervisor.get_instance(&id).unwrap().state,
+            ContainerState::Pending
+        );
+        assert_eq!(agent.supervisor.get_instance(&id).unwrap().host_port, port);
+        assert_eq!(
+            std::fs::read_to_string(&record).unwrap(),
+            "retained ownership"
+        );
+        assert!(
+            !grill.calls()[before..]
+                .iter()
+                .any(|(operation, _)| operation == "create" || operation == "start")
+        );
+
+        grill.set_fail_kill(false);
+        grill.set_ignore_kill(false);
+        grill.set_fail_state(false);
+        grill.release_kills(1);
+        agent.drive_pending_restarts().await;
+        assert_eq!(
+            agent.supervisor.get_instance(&id).unwrap().state,
+            ContainerState::Running
+        );
+        assert_eq!(agent.supervisor.get_instance(&id).unwrap().restart_count, 1);
+        agent.stop_app("restart", "default").await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn restart_retains_owner_after_failed_kill() {
+        restart_preserves_uncertain_cleanup(|grill| grill.set_fail_kill(true)).await;
+    }
+
+    #[tokio::test]
+    async fn restart_retains_owner_after_unconfirmed_kill() {
+        restart_preserves_uncertain_cleanup(|grill| grill.set_ignore_kill(true)).await;
+    }
+
+    #[tokio::test]
+    async fn restart_retains_owner_after_failed_observation() {
+        restart_preserves_uncertain_cleanup(|grill| grill.set_fail_state(true)).await;
+    }
+
+    #[tokio::test]
+    async fn restart_retains_owner_after_stalled_kill() {
+        restart_preserves_uncertain_cleanup(MockGrill::block_kills).await;
     }
 
     #[tokio::test]

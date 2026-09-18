@@ -1144,3 +1144,24 @@ Production code uses the safe `Child` interface.
 This repair establishes exit of the owned child. Complete descendant ownership
 and atomic identity checks remain separate release work; a child exit by itself
 doesn't prove that every process it ever started has disappeared.
+
+### A restart must finish retiring its predecessor
+
+A failed health check moves an instance into Pending for a retry. That says
+what the supervisor intends to do; it doesn't prove the old process has gone.
+The restart driver used to discard the result of `kill()` and immediately
+recreate the same runtime ID. A permission error or an acknowledged signal
+without an exit could therefore overwrite the runtime's ownership evidence.
+A stalled kill blocked the agent loop indefinitely.
+
+Retries now share the force-kill and exit-observation path used by explicit
+stops. The signal request and subsequent observation each have a two-second
+bound. Any error leaves the retry Pending, with its port, adoption record and
+restart count intact. The next tick can retry cleanup. Only confirmed exit
+allows create and start to run again.
+
+Four regressions inject a rejected kill, an ineffective kill, an inspection
+error and a stalled kill. Each fails against the old driver. After the repair,
+each keeps ownership and completes the same pending retry once the fault is
+removed. This preserves the retry count in memory; persisting job retry budgets
+across a Bun restart is separate work.
