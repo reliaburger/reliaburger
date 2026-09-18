@@ -1070,5 +1070,34 @@ unbound peer verification. They also check invalid replacements, persistence
 failure and recovery, concurrent serial ordering and expired client refusal.
 For cancellation, a blocking test worker holds publication after the new snapshot
 is durable. Cancelling the caller and releasing that hold still publishes the
-same identity that disk contains. Bun's transport wiring and the authenticated
-renewal request remain separate implementation steps.
+same identity that disk contains. The authenticated renewal request remains a
+separate implementation step.
+
+
+### Give every transport the same live identity
+
+A replacement in memory only helps if the listeners use it. Bun now loads one
+`LiveNodeIdentity` and clones that handle into the API and registry listeners,
+Raft and reporting transports, and internal HTTPS clients. Their configurations
+keep the existing trust anchors and revocation checks, but ask the shared
+resolver for the current certificate at each handshake. Raft also retains its
+expected-node check. Client session resumption is disabled so reconnects cannot
+silently retain an earlier identity.
+
+The HTTP pool can keep an established connection until its existing lifetime
+limit. Once it reconnects, the same `reqwest::Client` presents the replacement.
+The registry client's service-token header survives this change too. TLS proves
+which node connected; the token still authorises the operation.
+
+Diagnostics read the live snapshot per request. Axum's `Extension<T>` carries
+an application value through the router; `Option<Extension<T>>` also permits
+plaintext development routers where no node identity exists. This isn't input
+from a request header. Bun installs the handle when it constructs the router.
+We report the current public serial and expiry, with automatic renewal still
+false until the issuance loop exists.
+
+The regressions use actual handshakes and HTTPS requests while retaining the
+same configurations and client. A cluster test goes further: replace all three
+node identities, revoke every old leaf, then require a new Raft write to reach
+all voters and new reports to reach the leader. A stale resolver can no longer
+pass just because yesterday's certificate hasn't expired yet.

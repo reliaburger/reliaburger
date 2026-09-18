@@ -530,28 +530,25 @@ async fn handle_raft_rpc<S: AsyncRead + AsyncWrite + Unpin>(
 /// connection to the specific node id it is dialling.
 #[derive(Clone)]
 pub struct RaftTlsMaterial {
-    identity: std::sync::Arc<crate::sesame::identity_store::NodeIdentity>,
+    identity: crate::sesame::credentials::LiveNodeIdentity,
     crl: crate::sesame::mtls::CrlHandle,
 }
 
 impl RaftTlsMaterial {
     /// Bundle a node identity and CRL handle for node-id-bound dialling.
     pub fn new(
-        identity: crate::sesame::identity_store::NodeIdentity,
+        identity: crate::sesame::credentials::LiveNodeIdentity,
         crl: crate::sesame::mtls::CrlHandle,
     ) -> Self {
-        Self {
-            identity: std::sync::Arc::new(identity),
-            crl,
-        }
+        Self { identity, crl }
     }
 
     /// Build a connector that binds the handshake to `expected_node_id`.
     fn connector_for(&self, expected_node_id: &str) -> Option<tokio_rustls::TlsConnector> {
-        let config = crate::sesame::mtls::build_mtls_client_config_bound(
+        let config = crate::sesame::mtls::build_live_mtls_client_config(
             &self.identity,
             self.crl.clone(),
-            expected_node_id,
+            Some(expected_node_id),
         )
         .ok()?;
         Some(tokio_rustls::TlsConnector::from(config))

@@ -104,7 +104,7 @@ pub struct ClusterParams {
     /// This node's mTLS identity. When set, the Raft RPC listener requires
     /// client certificates and peers are dialled over mTLS. `None` keeps the
     /// internal transports plaintext (the caller enforces `require_mtls`).
-    pub identity: Option<Arc<crate::sesame::identity_store::NodeIdentity>>,
+    pub identity: Option<crate::sesame::credentials::LiveNodeIdentity>,
     /// Encrypted external council backup (`[cluster.backup]`, 12b.2 D21/CP12).
     /// The leader-only export loop runs when `url` is set and a master key is
     /// available to seal with.
@@ -315,15 +315,16 @@ pub async fn start(
     let (raft_acceptor, raft_connector, raft_tls_material) = match &params.identity {
         Some(identity) => {
             let server =
-                crate::sesame::mtls::build_mtls_server_config(identity, crl_handle.clone())
+                crate::sesame::mtls::build_live_mtls_server_config(identity, crl_handle.clone())
                     .map_err(|e| std::io::Error::other(format!("mTLS server config: {e}")))?;
-            let client =
-                crate::sesame::mtls::build_mtls_client_config(identity, crl_handle.clone())
-                    .map_err(|e| std::io::Error::other(format!("mTLS client config: {e}")))?;
-            let material = crate::council::network::RaftTlsMaterial::new(
-                (**identity).clone(),
+            let client = crate::sesame::mtls::build_live_mtls_client_config(
+                identity,
                 crl_handle.clone(),
-            );
+                None,
+            )
+            .map_err(|e| std::io::Error::other(format!("mTLS client config: {e}")))?;
+            let material =
+                crate::council::network::RaftTlsMaterial::new(identity.clone(), crl_handle.clone());
             (
                 Some(tokio_rustls::TlsAcceptor::from(server)),
                 Some(tokio_rustls::TlsConnector::from(client)),

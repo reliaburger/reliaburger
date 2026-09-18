@@ -306,18 +306,21 @@ Node identity renewal remains, split into separately reviewable changes:
   tests pass (6.15s), including required/optional authentication, bound/unbound
   peer verification, failure recovery and expired-client refusal; the deliberate
   post-persistence cancellation test passes (0.04s). Strict Linux/macOS Clippy
-  passes. Bun still needs to wire this handle into API/registry listeners,
-  Raft/reporting clients and servers, and internal HTTPS clients. CA rotation
-  remains separate; expired clients must never become omitted certificates on
-  optional-mTLS API connections.
+  passes. CA rotation remains separate; expired clients must never become
+  omitted certificates on optional-mTLS API connections.
+- Bun now shares the live handle across API/registry listeners, Raft/reporting
+  clients and servers, internal HTTPS clients and diagnostics. Seven live tests
+  pass (6.54s), including reused HTTPS clients and current diagnostic metadata.
+  The real three-node test replaces every identity, revokes all old leaves,
+  then proves Raft replication and fresh reports still work (15.18s).
 - Authorise renewal using the existing authenticated node identity, bind the CSR
   to that same node, allocate the serial through Raft, persist before publishing,
   and retry safely through leader changes. Bound node leaves by the issuer's
   validity; an already expired offline identity requires authorised re-enrolment.
   The private key stays on its node.
-- Update diagnostics from the currently served credentials and prove renewal,
-  reconnects, refusal of invalid replacements, restart recovery and leader-change
-  behaviour with real TLS and cluster tests.
+- Qualify automatic renewal, restart recovery and leader-change behaviour with
+  real TLS and cluster tests. Live diagnostic serials and replacement reconnects
+  are covered; automatic issuance remains open.
 
 ### C15 — Make ingress serials unique across nodes and restarts
 

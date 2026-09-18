@@ -180,9 +180,16 @@ async fn start_mtls_node(
     seeds: Vec<SocketAddr>,
     identity: NodeIdentity,
     shutdown: &CancellationToken,
-) -> (ClusterHandle, ClusterRuntime) {
+) -> (
+    ClusterHandle,
+    ClusterRuntime,
+    reliaburger::sesame::credentials::LiveNodeIdentity,
+) {
     let data_dir = std::env::temp_dir().join(format!("rb-cluster-mtls-{name}-{gossip_port}"));
     let _ = std::fs::remove_dir_all(&data_dir);
+    let identity_dir = data_dir.join("identity");
+    reliaburger::sesame::identity_store::save(&identity_dir, &identity).unwrap();
+    let identity = reliaburger::sesame::credentials::LiveNodeIdentity::load(&identity_dir).unwrap();
 
     let (mut handle, runtime) = runtime::start(
         ClusterParams {
@@ -202,7 +209,7 @@ async fn start_mtls_node(
             data_dir,
             mayo: None,
             rollup_interval: Duration::from_millis(300),
-            identity: Some(Arc::new(identity)),
+            identity: Some(identity.clone()),
             backup: Default::default(),
             labels: std::collections::BTreeMap::new(),
             self_disk_pressured_rx: None,
@@ -216,7 +223,7 @@ async fn start_mtls_node(
     let (_dummy_tx, dummy_rx) = mpsc::channel(1);
     let snapshot_rx = std::mem::replace(&mut handle.snapshot_rx, dummy_rx);
     spawn_fake_agent(snapshot_rx, shutdown.clone());
-    (handle, runtime)
+    (handle, runtime, identity)
 }
 
 async fn spawn_identity_observing_api(
@@ -481,6 +488,71 @@ async fn generated_security_model_protects_all_live_cluster_transports() {
         })
         .await,
         "the mTLS reporting tree did not deliver all three node reports"
+    );
+
+    // Keep the running runtime and all its listeners/connectors. Revoke the
+    // original leaves after replacement so static credentials cannot pass.
+    for (index, node) in nodes.iter().enumerate() {
+        let replacement =
+            issued_node_identity(&hierarchy, &format!("tls-{}", index + 1), 20 + index as u64);
+        node.2.replace(replacement).await.unwrap();
+    }
+    let revoked = reliaburger::sesame::types::Crl {
+        entries: (10..=12)
+            .map(|serial| reliaburger::sesame::types::CrlEntry {
+                serial: SerialNumber(serial),
+                issuer: reliaburger::sesame::types::CaRole::Node,
+                revoked_at: SystemTime::now(),
+                reason: "superseded test identity".into(),
+                expires_at: None,
+            })
+            .collect(),
+        version: 1,
+        updated_at: SystemTime::now(),
+    };
+    for node in nodes {
+        node.0.crl_handle.update(revoked.clone());
+    }
+    let reports_after = SystemTime::now() + Duration::from_secs(1);
+    let leader = nodes
+        .iter()
+        .find(|node| thinks_it_is_leader(&node.0))
+        .unwrap();
+    let council = leader.0.council.as_ref().unwrap();
+    tokio::time::timeout(
+        Duration::from_secs(10),
+        council.write(reliaburger::council::types::RaftRequest::AllocateSerial),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    let committed = council.raft().metrics().borrow().last_applied;
+    assert!(
+        wait_until(Duration::from_secs(15), || {
+            nodes.iter().all(|node| {
+                node.0
+                    .raft_metrics_rx
+                    .as_ref()
+                    .unwrap()
+                    .borrow()
+                    .last_applied
+                    >= committed
+            })
+        })
+        .await,
+        "Raft stopped replicating after the old leaves were revoked"
+    );
+    assert!(
+        wait_until(Duration::from_secs(15), || {
+            let reports = leader.1.aggregated_rx.borrow();
+            reports.reports.len() == 3
+                && reports
+                    .reports
+                    .values()
+                    .all(|report| report.timestamp > reports_after)
+        })
+        .await,
+        "reporting did not reconnect with renewed credentials"
     );
 
     let saw_client_certificate = Arc::new(AtomicBool::new(false));

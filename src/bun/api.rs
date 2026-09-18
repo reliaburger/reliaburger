@@ -662,6 +662,7 @@ struct DiagnosticsQuery {
 /// caller can request a 1–10 second window; one second is the default so the
 /// endpoint cannot be turned into an arbitrarily long-lived request.
 async fn diagnostics_handler(
+    live_identity: Option<axum::Extension<crate::sesame::credentials::LiveNodeIdentity>>,
     State(state): State<ApiState>,
     Query(query): Query<DiagnosticsQuery>,
 ) -> Json<crate::bun::diagnostics::LocalDiagnosticSnapshot> {
@@ -711,24 +712,43 @@ async fn diagnostics_handler(
             reason: format!("disk capacity collector failed: {error}"),
         },
     };
-    let certificates = match &state.static_capabilities.diagnostics.node_certificate {
-        // The node leaf metadata is genuinely available and diagnosable (expiry
-        // is checked from it). That the broader workload-certificate inventory
-        // and hot-reload state aren't exposed yet is a static product
-        // limitation, not a per-request collection failure — reporting it
-        // `Degraded` forced every mTLS cluster's `relish wtf` to exit 2, which
-        // the "0 = healthy" contract forbids. Serve it as `Available`.
-        Some(certificate) => DiagnosticSource::Available {
-            observed_at,
-            value: vec![certificate.clone()],
-        },
-        None if !state.static_capabilities.identity => DiagnosticSource::Unsupported {
-            reason: "workload identity issuance is disabled and no node mTLS leaf is loaded"
-                .to_string(),
-        },
-        None => DiagnosticSource::Unavailable {
-            reason: "identity issuance is enabled but no safe certificate inventory is available"
-                .to_string(),
+    let certificates = match live_identity {
+        Some(identity) => {
+            let current = identity.snapshot();
+            let rotation_state = if std::time::SystemTime::now() >= current.not_after {
+                "expired"
+            } else {
+                // The transports reload, but automated issuance is not wired yet.
+                "manual"
+            };
+            match crate::bun::diagnostics::public_certificate_metadata(
+                "node",
+                &current.node_id,
+                &current.certificate_der,
+                rotation_state,
+                false,
+            ) {
+                Ok(metadata) => DiagnosticSource::Available {
+                    observed_at,
+                    value: vec![metadata],
+                },
+                Err(reason) => DiagnosticSource::Unavailable { reason },
+            }
+        }
+        None => match &state.static_capabilities.diagnostics.node_certificate {
+            Some(certificate) => DiagnosticSource::Available {
+                observed_at,
+                value: vec![certificate.clone()],
+            },
+            None if !state.static_capabilities.identity => DiagnosticSource::Unsupported {
+                reason: "workload identity issuance is disabled and no node mTLS leaf is loaded"
+                    .to_string(),
+            },
+            None => DiagnosticSource::Unavailable {
+                reason:
+                    "identity issuance is enabled but no safe certificate inventory is available"
+                        .to_string(),
+            },
         },
     };
 

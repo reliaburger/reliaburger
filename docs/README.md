@@ -405,7 +405,10 @@ long-lived streams must reconnect. This does not rotate the
 Ingress CA or renew node identities.
 Node identity persistence uses a private atomic `node.bundle.json`; the PEM
 files are exports, and Bun validates the complete snapshot when loading it.
-Automatic node renewal and live transport updates are still tracked in C14 of
+Bun shares a live identity across API/registry, Raft/reporting and internal HTTPS
+connections; diagnostics read its current public serial and expiry. Replacements
+published by the daemon take effect on new handshakes. Editing PEM exports does
+not update that identity. Automatic node issuance is still tracked in C14 of
 [the completion plan](plans/2026-09-17-codebase-completion-plan.md).
 
 If you specifically need plaintext transports for an isolated local test,

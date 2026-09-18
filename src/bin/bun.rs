@@ -248,12 +248,18 @@ fn node_identity_dir(config: &NodeConfig) -> std::path::PathBuf {
 /// Load this node's mTLS identity from disk, if one has been installed.
 fn load_node_identity(
     config: &NodeConfig,
-) -> anyhow::Result<Option<std::sync::Arc<reliaburger::sesame::identity_store::NodeIdentity>>> {
+) -> anyhow::Result<Option<reliaburger::sesame::credentials::LiveNodeIdentity>> {
     use anyhow::Context;
     let dir = node_identity_dir(config);
     let identity = reliaburger::sesame::identity_store::load(&dir)
         .with_context(|| format!("failed to load node identity from {}", dir.display()))?;
-    Ok(identity.map(std::sync::Arc::new))
+    identity
+        .map(|_| {
+            reliaburger::sesame::credentials::LiveNodeIdentity::load(&dir).with_context(|| {
+                format!("failed to load live node identity from {}", dir.display())
+            })
+        })
+        .transpose()
 }
 
 /// Serve an axum router over TLS, handshaking each connection in its own task
@@ -858,9 +864,7 @@ async fn run_agent(cli: Cli) -> anyhow::Result<()> {
     let mut crl_refresh: Option<reliaburger::sesame::mtls::CrlHandle> = None;
     // This node's mTLS identity, when the cluster runs mTLS. Drives the API
     // listener TLS and the cluster HTTP client (peer calls over https).
-    let mut api_identity: Option<
-        std::sync::Arc<reliaburger::sesame::identity_store::NodeIdentity>,
-    > = None;
+    let mut api_identity: Option<reliaburger::sesame::credentials::LiveNodeIdentity> = None;
     // The leader-side rollup store, exposed at /v1/metrics/cluster.
     let mut api_rollup_store = None;
     // Gossip membership for the pickle replication loop (cluster only).
@@ -946,9 +950,10 @@ async fn run_agent(cli: Cli) -> anyhow::Result<()> {
     // placement reconciler and upgrade orchestrator.
     let cluster_http = match &api_identity {
         Some(identity) => reliaburger::cluster::ClusterHttp::secure(
-            reliaburger::sesame::mtls::build_cluster_http_client(
+            reliaburger::sesame::mtls::build_live_cluster_http_client(
                 identity,
                 crl_refresh.clone().unwrap_or_default(),
+                None,
             )
             .map_err(|e| anyhow::anyhow!("failed to build cluster HTTP client: {e}"))?,
         ),
@@ -1969,29 +1974,6 @@ async fn run_agent(cli: Cli) -> anyhow::Result<()> {
     // Everything here is observed at startup rather than assumed: a
     // capability report that overstates is worse than none, because it turns
     // "this cluster can't" into "this test mysteriously fails".
-    let node_certificate = api_identity.as_ref().and_then(|identity| {
-        let rotation_state = if std::time::SystemTime::now() >= identity.not_after {
-            "expired"
-        } else {
-            // Node leaves are loaded at process start. We expose that fact
-            // rather than claiming the workload identity rotation loop also
-            // hot-reloads the API and cluster transports.
-            "restart_required"
-        };
-        match reliaburger::bun::diagnostics::public_certificate_metadata(
-            "node",
-            &identity.node_id,
-            &identity.certificate_der,
-            rotation_state,
-            false,
-        ) {
-            Ok(metadata) => Some(metadata),
-            Err(error) => {
-                eprintln!("bun: node certificate diagnostics unavailable: {error}");
-                None
-            }
-        }
-    });
     let diagnostic_storage_paths = [
         ("data", &config.storage.data),
         ("images", &config.storage.images),
@@ -2070,7 +2052,7 @@ async fn run_agent(cli: Cli) -> anyhow::Result<()> {
         registry_signatures_required: config.images.trust_policy.require_signatures,
         diagnostics: reliaburger::bun::diagnostics::DiagnosticStaticEvidence {
             storage_paths: diagnostic_storage_paths,
-            node_certificate,
+            node_certificate: None,
         },
         test_policy: config.testing.clone(),
     };
@@ -2125,6 +2107,10 @@ async fn run_agent(cli: Cli) -> anyhow::Result<()> {
         Some(local_test_leases),
         jwt_verifier,
     );
+    let app = match &api_identity {
+        Some(identity) => app.layer(axum::Extension(identity.clone())),
+        None => app,
+    };
     let server_shutdown = shutdown.clone();
     // Serve the API over TLS when this node has an mTLS identity; the listener
     // accepts client certs optionally, so relish and browsers connect with a
@@ -2133,7 +2119,7 @@ async fn run_agent(cli: Cli) -> anyhow::Result<()> {
     let api_acceptor = match &api_identity {
         Some(identity) => {
             let crl = crl_refresh.clone().unwrap_or_default();
-            let cfg = reliaburger::sesame::mtls::build_api_server_config(identity, crl)
+            let cfg = reliaburger::sesame::mtls::build_live_api_server_config(identity, crl)
                 .map_err(|e| anyhow::anyhow!("failed to build API TLS config: {e}"))?;
             Some(tokio_rustls::TlsAcceptor::from(cfg))
         }
@@ -2268,7 +2254,7 @@ async fn run_agent(cli: Cli) -> anyhow::Result<()> {
     // as a bearer: Pickle authorises node-to-node writes by that token, not by
     // the client certificate, so it is required even under mTLS (M2).
     let registry_client = match &api_identity {
-        Some(identity) => reliaburger::sesame::mtls::build_cluster_http_client_with_bearer(
+        Some(identity) => reliaburger::sesame::mtls::build_live_cluster_http_client(
             identity,
             crl_refresh.clone().unwrap_or_default(),
             service_token.as_deref(),
@@ -2416,7 +2402,7 @@ async fn run_agent(cli: Cli) -> anyhow::Result<()> {
     let pickle_acceptor = match (&api_identity, registry_over_tls) {
         (Some(identity), true) => {
             let crl = crl_refresh.clone().unwrap_or_default();
-            match reliaburger::sesame::mtls::build_api_server_config(identity, crl) {
+            match reliaburger::sesame::mtls::build_live_api_server_config(identity, crl) {
                 Ok(cfg) => Some(tokio_rustls::TlsAcceptor::from(cfg)),
                 Err(e) => {
                     eprintln!("bun: failed to build registry TLS config, serving plaintext: {e}");
@@ -3201,7 +3187,7 @@ mod tests {
             .identity
             .as_ref()
             .expect("normal init should produce loadable mTLS identity parameters");
-        assert_eq!(identity.node_id, "node-secure");
+        assert_eq!(identity.snapshot().node_id, "node-secure");
         enforce_mtls_mode(&config, &params).unwrap();
     }
 
