@@ -1008,3 +1008,21 @@ through the running agent and checks the status inventory. The released app
 must be absent; the other namespace must still have its running instance.
 This covers normal retirement. Durable cleanup across an unfinished deployment
 or a node crash still needs the separate ownership qualifications.
+
+
+### Give cleanup observations their remaining budget
+
+A namespace may be stopping correctly while the agent is too busy to answer a
+status request. The cleanup probe used to return Unknown on that first failed
+observation, even with most of its separate cleanup deadline still available.
+
+After the server accepts lease release, the probe now retries failed runtime
+observations within the original deadline. Only an observed empty namespace
+confirms cleanup. An uninterrupted failure still returns Unknown when the
+budget expires, with the last observation error attached. No new deadline is
+started on a retry.
+
+One HTTP regression returns 503 for the first status request and an empty
+inventory for the next. The probe must confirm cleanup after the second
+observation. Another keeps returning 503; that result must remain Unknown and
+finish within its bounded budget.

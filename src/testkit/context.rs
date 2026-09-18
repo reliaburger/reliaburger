@@ -588,6 +588,7 @@ impl TestContext {
                     };
                 }
             }
+            let mut last_error = None;
             loop {
                 match deadline
                     .run("cleanup confirmation", self.namespace_instances())
@@ -596,17 +597,18 @@ impl TestContext {
                     Ok(Ok(instances)) if instances.is_empty() => {
                         return CleanupOutcome::Confirmed;
                     }
-                    Ok(Ok(_)) => {}
-                    Ok(Err(error)) => {
-                        return CleanupOutcome::Unknown { reason: error };
-                    }
+                    Ok(Ok(_)) => last_error = None,
+                    Ok(Err(error)) => last_error = Some(error),
                     Err(error) => {
                         return CleanupOutcome::Unknown {
-                            reason: error.to_string(),
+                            reason: match last_error {
+                                Some(last) => format!("{error}; last observation: {last}"),
+                                None => error.to_string(),
+                            },
                         };
                     }
                 }
-                tokio::time::sleep(Duration::from_millis(100)).await;
+                tokio::time::sleep(Duration::from_millis(100).min(deadline.remaining())).await;
             }
         }
         if !Self::is_test_namespace(&self.namespace) {
@@ -731,6 +733,74 @@ mod tests {
             timeout: Duration::from_millis(200),
             deadline: Deadline::after(Duration::from_millis(200)).unwrap(),
         }
+    }
+
+    #[tokio::test]
+    async fn lease_cleanup_keeps_unreachable_runtime_evidence_unknown_at_the_deadline() {
+        let (client, server) = status_server(false).await;
+        let mut ctx = context("rbtest-unreachable");
+        ctx.client = client;
+        ctx.lease_id = Some("already-released".into());
+        let result = tokio::time::timeout(
+            Duration::from_secs(1),
+            ctx.teardown(Deadline::after(Duration::from_millis(200)).unwrap()),
+        )
+        .await
+        .unwrap();
+        server.abort();
+        assert!(
+            matches!(result, CleanupOutcome::Unknown { .. }),
+            "{result:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn lease_cleanup_retries_busy_status_until_absence_is_observed() {
+        use axum::{
+            response::IntoResponse,
+            routing::{delete, get},
+        };
+        use std::sync::{
+            Arc,
+            atomic::{AtomicUsize, Ordering},
+        };
+        let polls = Arc::new(AtomicUsize::new(0));
+        let observed = polls.clone();
+        let router = axum::Router::new()
+            .route(
+                "/v1/test/leases/owned",
+                delete(|| async { axum::http::StatusCode::NO_CONTENT }),
+            )
+            .route(
+                "/v1/cluster/nodes",
+                get(|| async { axum::Json(Vec::<crate::bun::agent::NodeStatus>::new()) }),
+            )
+            .route(
+                "/v1/status",
+                get(move || {
+                    let number = observed.fetch_add(1, Ordering::SeqCst);
+                    async move {
+                        if number == 0 {
+                            axum::http::StatusCode::SERVICE_UNAVAILABLE.into_response()
+                        } else {
+                            axum::Json(Vec::<crate::bun::agent::InstanceStatus>::new())
+                                .into_response()
+                        }
+                    }
+                }),
+            );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
+        let mut ctx = context("rbtest-cleanup");
+        ctx.client = BunClient::new_with_token(&format!("http://{address}"), None);
+        ctx.lease_id = Some("owned".into());
+        let result = ctx
+            .teardown(Deadline::after(Duration::from_secs(2)).unwrap())
+            .await;
+        server.abort();
+        assert!(matches!(result, CleanupOutcome::Confirmed), "{result:?}");
+        assert!(polls.load(Ordering::SeqCst) >= 2);
     }
 
     #[tokio::test]

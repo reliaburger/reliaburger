@@ -625,6 +625,13 @@ host ports and cached specs. Ordinary Stop retains completion history. The
 running-agent lease regression fails before the fix; all 106 agent tests
 (12.44s) and strict Linux Clippy pass. This does not close the crash window below.
 
+**Observation prerequisite (18 September):** After lease release, a temporary
+status failure no longer ends cleanup confirmation early. Observations retry
+inside the original deadline; only an empty namespace confirms absence, and
+persistent failure remains Unknown. The HTTP recovery regression fails before
+the fix; recovery/deadline cases, all 117 testkit tests (0.54s) and strict Linux
+Clippy pass.
+
 **Additional cleanup evidence to establish:** Process/runc runtime
 adapters still need review: their kill paths currently suppress errors and set
 Stopped without independent proof. Reproduce the crash window between runtime
