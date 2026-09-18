@@ -15,7 +15,7 @@ async fn job_runs_to_completion_and_reports_exit(ctx: TestContext) -> Result<(),
     ctx.wait_for_cluster(job, "stopped with exit 0", |instances| {
         instances
             .iter()
-            .any(|i| i.state == "stopped" && matches!(i.exit_code, Some(0) | None))
+            .any(|i| i.state == "stopped" && i.exit_code == Some(0))
     })
     .await
 }
@@ -88,4 +88,77 @@ pub fn cases() -> Vec<TestCase> {
             run: testkit_case!(job_logs_are_retrievable_after_completion),
         },
     ]
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::time::Duration;
+
+    async fn completion_case(exit_code: Option<i32>) -> Result<(), String> {
+        let router = axum::Router::new()
+            .route(
+                "/v1/apply",
+                axum::routing::post(|| async {
+                    format!(
+                        "data: {}\n\n",
+                        serde_json::to_string(&crate::bun::agent::ApplyEvent::Complete {
+                            created: 1,
+                            instances: vec![]
+                        })
+                        .unwrap()
+                    )
+                }),
+            )
+            .route(
+                "/v1/status",
+                axum::routing::get(move || async move {
+                    axum::Json(serde_json::json!([{
+                        "id":"batch-0", "app_name":"batch", "namespace":"rbtest-node-exit",
+                        "state":"stopped", "restart_count":0, "host_port":null,
+                        "exit_code": exit_code,
+                    }]))
+                }),
+            );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            axum::serve(listener, router).await.unwrap();
+        });
+        let timeout = Duration::from_millis(150);
+        let context = TestContext {
+            client: crate::relish::client::BunClient::new_with_token(
+                &format!("http://{address}"),
+                None,
+            ),
+            namespace: "rbtest-node-exit".into(),
+            lease_id: Some("node-jobs-exit".into()),
+            chaos_guard: crate::testkit::chaos::ChaosGuard::default(),
+            capabilities: crate::bun::capabilities::ClusterCapabilities::default(),
+            timeout,
+            deadline: crate::testkit::deadline::Deadline::after(timeout).unwrap(),
+        };
+        let result = tokio::time::timeout(
+            Duration::from_secs(2),
+            job_runs_to_completion_and_reports_exit(context),
+        )
+        .await
+        .unwrap();
+        server.abort();
+        let _ = server.await;
+        result
+    }
+
+    #[tokio::test]
+    async fn completion_case_requires_an_observed_zero_exit() {
+        assert!(
+            completion_case(None).await.is_err(),
+            "missing exit evidence passed the catalogue"
+        );
+        assert!(
+            completion_case(Some(7)).await.is_err(),
+            "failed job passed the catalogue"
+        );
+        completion_case(Some(0)).await.unwrap();
+    }
 }

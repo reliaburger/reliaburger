@@ -2951,3 +2951,15 @@ correctly skipped them because the fixture lacked an executable allowlist; the
 fixture now declares its exact binaries. A skipped case isn't a passing case.
 This tests process-crash recovery after the adoption record exists. It doesn't
 establish recovery from power loss or the earlier runtime-creation window.
+
+### A stopped job doesn't imply a successful job
+
+The completion probe used to accept both `Some(0)` and `None` as a successful
+exit. Those values mean different things: `Some(0)` contains an observed zero
+exit status; `None` means the API has no exit status to report. A stopped process
+with missing evidence cannot prove that its command succeeded.
+
+The catalogue now requires `exit_code == Some(0)`. Its HTTP regression serves a
+stopped job without an exit code and reproduces the old false pass. The same
+fixture rejects exit 7 and accepts exit 0. We run the actual job case as well,
+so changing the assertion cannot hide a runtime that never supplies the evidence.

@@ -719,6 +719,14 @@ CI and Build & Release both pass at the repaired `d7897fc` head.
 
 **Additional cleanup evidence to establish:** Atomic process identity,
 complete process-tree retirement and physical crash recovery remain open.
+Startup currently collapses runtime adoption errors into “not adopted”, removes
+the record and can sweep identity material. Refuse uncertain adoption without
+forgetting ownership, and qualify unreadable/corrupt records before serving.
+Job schedule registrations and last-fired stamps are currently in-memory;
+adoption resets job retries to the generic restart policy. Persist the intended
+schedule and retry budget, with restart/no-duplicate-firing tests. Durable test
+leases establish cleanup ownership; they do not yet repair those execution
+continuity contracts.
 Discovery of resources created before their initial runtime adoption record,
 and cluster-lease completion before every former placement confirms retirement,
 still need implementation and qualification. Controlled reconciler interruption
@@ -746,6 +754,13 @@ TLS/CLI catalogue pass together (14.00s), including confirmed cleanup.
 Protocol/state advance to 6/6 and the lease schema to 3. The full Linux library checkpoint passes 3,306 tests (19 explicit gates, 63.99s), and both actual-binary compatibility tests pass (0.01s). Strict Linux/macOS all-target/all-feature Clippy passes. This retains node-local
 job scheduling; physical-crash, initial-record and full process-tree gates remain
 separate.
+
+**Job completion evidence (18 September):** The catalogue previously counted a
+stopped job with no exit code as success. Its HTTP regression fails first; the
+probe now requires an observed zero exit, rejects both missing and non-zero
+values, and retains the original deadline. All 120 testkit tests pass (1.52s),
+and the actual TLS/CLI job catalogue passes with confirmed cleanup (8.65s).
+Strict Linux/macOS Clippy passes.
 
 Remaining resource contracts, each in its own commit: registry uploads/repositories,
 and managed volume/mount cleanup. Node effects already use C06 reservations
