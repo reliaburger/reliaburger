@@ -2780,3 +2780,19 @@ actual Relish catalogue against HTTPS Bun, and kills a three-node cluster's
 leader before the token expires to check successor cleanup. These new persisted
 variants require protocol 5, state 4 and lease schema 2: create fresh development
 clusters instead of reading them with an older binary.
+
+### An unsupported manifest cannot shed its lease
+
+A manifest with both an app and a job was refused by the runner. A manifest
+with only a job took the ordinary, unleased apply path. The same fallback
+accepted permission-only and build-only manifests. Removing the supported
+resource from a request must not remove its ownership requirement.
+
+The `match` now handles every `Some(lease_id)` path explicitly: supported
+resources use leased apply, while unsupported or empty manifests fail before
+HTTP. Only `None`, used by focused runner fixtures, selects ordinary apply.
+At the API boundary, the reserved test-namespace check covers jobs as well as
+apps and namespace declarations. The runner regression observes three outgoing
+mutations before the repair and zero afterwards; the API regression changes
+from accepting an unleased test job to returning a conflict. Durable job
+ownership remains required before job catalogue cases can run under a lease.

@@ -577,6 +577,13 @@ The running-agent command regression fails before the fix; all 104 agent tests
 pass afterwards (12.57s), with strict Linux/macOS Clippy. In-flight job-worker
 fencing and durable job ownership are still open.
 
+**Admission prerequisite completed:** Lease-bearing manifests no longer fall
+back to ordinary apply when they contain only jobs, builds or permissions.
+Unsupported/empty manifests refuse before HTTP; the API also refuses unleased
+jobs in reserved test namespaces. Both regressions fail before the repair;
+14 context tests and 48 lease-filtered tests pass (one explicit gate), with
+strict Linux/macOS Clippy. This closes the bypass, not durable job support.
+
 Remaining resource contracts, each in its own commit: node-local jobs,
 registry uploads/repositories,
 and managed volume/mount cleanup. Node effects already use C06 reservations

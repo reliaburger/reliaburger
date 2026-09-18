@@ -2226,8 +2226,13 @@ async fn apply_handler(
             )
                 .into_response();
         }
-        for spec in config.app.values() {
-            let namespace = spec.namespace.as_deref().unwrap_or("default");
+        for namespace in config
+            .app
+            .values()
+            .map(|spec| spec.namespace.as_deref())
+            .chain(config.job.values().map(|spec| spec.namespace.as_deref()))
+        {
+            let namespace = namespace.unwrap_or("default");
             if crate::testkit::lease::valid_test_namespace(namespace) {
                 return (
                     StatusCode::CONFLICT,
@@ -8790,6 +8795,19 @@ mod tests {
             None,
         )
         .await;
+        let (job_status, _) = post_authenticated(
+            app.clone(),
+            "/v1/apply",
+            &plaintext,
+            "[job.probe]\nimage = \"test:v1\"\nnamespace = \"rbtest-unleased\"\n",
+            None,
+        )
+        .await;
+        assert_eq!(
+            job_status,
+            StatusCode::CONFLICT,
+            "unleased test jobs must not reach the agent"
+        );
         let (status, body) = post_authenticated(
             app.clone(),
             "/v1/apply",

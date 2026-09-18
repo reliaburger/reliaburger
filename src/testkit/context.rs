@@ -105,13 +105,13 @@ impl TestContext {
             Some(lease_id) if lease_compatible => {
                 self.client.apply_with_lease(&config, lease_id).await
             }
-            Some(_) if has_owned_declarative_resources => {
+            Some(_) => {
                 return Err(
-                    "test manifest mixes lease-owned apps/namespaces with unsupported resource kinds"
+                    "test lease currently accepts only apps and namespace declarations; unsupported or empty manifests are refused"
                         .to_string(),
                 );
             }
-            _ => self.client.apply(&config).await,
+            None => self.client.apply(&config).await,
         };
         result
             .map(|_| ())
@@ -731,6 +731,42 @@ mod tests {
             timeout: Duration::from_millis(200),
             deadline: Deadline::after(Duration::from_millis(200)).unwrap(),
         }
+    }
+
+    #[tokio::test]
+    async fn leased_apply_never_falls_back_to_unowned_mutations() {
+        use std::sync::{
+            Arc,
+            atomic::{AtomicUsize, Ordering},
+        };
+        let calls = Arc::new(AtomicUsize::new(0));
+        let observed = calls.clone();
+        let router = axum::Router::new().route(
+            "/v1/apply",
+            axum::routing::post(move || {
+                observed.fetch_add(1, Ordering::SeqCst);
+                async { axum::http::StatusCode::SERVICE_UNAVAILABLE }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
+        let mut ctx = context("rbtest-admission");
+        ctx.client = BunClient::new_with_token(&format!("http://{address}"), None);
+        ctx.lease_id = Some("lease".into());
+        for manifest in [
+            "[job.batch]\nimage = \"busybox:latest\"\nnamespace = \"rbtest-admission\"\n",
+            "[permission.operator]\nactions = [\"deploy\"]\n",
+            "[build.image]\ncontext = \".\"\ndestination = \"pickle://image:v1\"\n",
+        ] {
+            assert!(ctx.apply(manifest).await.is_err());
+        }
+        server.abort();
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            0,
+            "unsupported resources escaped their lease before refusal"
+        );
     }
 
     async fn status_server(stalled: bool) -> (BunClient, tokio::task::JoinHandle<()>) {
