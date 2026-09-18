@@ -94,7 +94,7 @@ fn reserve_ports() -> [u16; 3] {
 /// How a freshly spawned bun came up.
 enum BunStart {
     /// The API answered on its address; every earlier bind succeeded.
-    Ready,
+    Ready(SocketAddr),
     /// Bun exited with "Address already in use": between reserving a port
     /// and bun binding it, another process on the runner grabbed it.
     PortRace,
@@ -112,8 +112,20 @@ fn wait_for_bind(bun: &mut BunProcess, address: SocketAddr) -> BunStart {
             }
             panic!("bun exited before binding its listeners ({status}):\n{log}");
         }
-        if TcpStream::connect_timeout(&address, Duration::from_millis(100)).is_ok() {
-            return BunStart::Ready;
+        let bound_address = if address.port() == 0 {
+            std::fs::read_to_string(&bun.log_path)
+                .unwrap_or_default()
+                .lines()
+                .find_map(|line| line.strip_prefix("bun: API server listening on "))
+                .and_then(|address| address.parse::<SocketAddr>().ok())
+                .filter(|address| address.port() != 0)
+        } else {
+            Some(address)
+        };
+        if let Some(address) = bound_address
+            && TcpStream::connect_timeout(&address, Duration::from_millis(100)).is_ok()
+        {
+            return BunStart::Ready(address);
         }
         assert!(Instant::now() < deadline, "bun never listened on {address}");
         std::thread::sleep(Duration::from_millis(25));
@@ -149,7 +161,7 @@ where
         let (config, address, log_path) = build();
         let mut bun = BunProcess::spawn_runtime(&config, address, clustered, log_path, runtime);
         match wait_for_bind(&mut bun, address) {
-            BunStart::Ready => return (bun, address),
+            BunStart::Ready(address) => return (bun, address),
             BunStart::PortRace => {
                 let log = std::fs::read_to_string(&bun.log_path).unwrap_or_default();
                 assert!(
@@ -369,7 +381,7 @@ fn secure_cluster_first_run_initialises_authenticates_and_deploys() {
         std::fs::write(&node_path, toml::to_string_pretty(&node).unwrap()).unwrap();
         (
             node_path.clone(),
-            reserve_address(),
+            "127.0.0.1:0".parse().unwrap(),
             root.path().join("cluster-bun.log"),
         )
     });
@@ -441,7 +453,7 @@ command = [{testapp:?}, "--port", "0"]
     ]);
     assert_success(&apply, "authenticated clustered apply");
 
-    wait_for_relish_output(
+    let status = wait_for_relish_output(
         &mut bun,
         &[
             "--endpoint",
@@ -450,9 +462,18 @@ command = [{testapp:?}, "--port", "0"]
             ca,
             "--token",
             token,
+            "--output",
+            "json",
             "status",
         ],
-        "cluster-hello",
+        "\"state\": \"running\"",
+    );
+    let rows: serde_json::Value = serde_json::from_slice(&status.stdout).unwrap();
+    assert!(
+        rows.as_array()
+            .unwrap()
+            .iter()
+            .any(|row| { row["app_name"] == "cluster-hello" && row["state"] == "running" })
     );
 }
 

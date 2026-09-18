@@ -408,6 +408,30 @@ async fn refresh_token_store(
     *store.write().await = tokens;
 }
 
+/// Reserve a port without accepting connections during cluster bootstrap.
+async fn reserve_api_socket(listen: &str) -> anyhow::Result<tokio::net::TcpSocket> {
+    let addresses = tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        tokio::net::lookup_host(listen),
+    )
+    .await
+    .context("timed out resolving Bun API address")??;
+    let mut last_error = std::io::Error::other("no addresses resolved");
+    for address in addresses {
+        let socket = if address.is_ipv4() {
+            tokio::net::TcpSocket::new_v4()?
+        } else {
+            tokio::net::TcpSocket::new_v6()?
+        };
+        socket.set_reuseaddr(true)?;
+        match socket.bind(address) {
+            Ok(()) => return Ok(socket),
+            Err(error) => last_error = error,
+        }
+    }
+    Err(last_error).with_context(|| format!("failed to bind Bun API on {listen}"))
+}
+
 /// Keep the public listener closed while a joining node receives Raft credentials.
 async fn await_api_credentials(
     store: &reliaburger::sesame::auth::TokenStore,
@@ -849,12 +873,10 @@ async fn run_agent(cli: Cli) -> anyhow::Result<()> {
         .name
         .clone()
         .unwrap_or_else(|| format!("node-{}", config.cluster.gossip_port));
-    let api_port: u16 = cli
-        .listen
-        .rsplit(':')
-        .next()
-        .and_then(|p| p.parse().ok())
-        .unwrap_or(9117);
+    // Reserve the actual port before publishing cluster endpoints, including
+    // when the OS selects port zero. Do not listen until credentials are ready.
+    let api_socket = reserve_api_socket(&cli.listen).await?;
+    let api_port = api_socket.local_addr()?.port();
 
     // Disk-pressure resignation signal (12b.2 T3): the disk-pressure loop below
     // publishes this node's own sustained-pressure verdict here; in cluster mode
@@ -1853,9 +1875,9 @@ async fn run_agent(cli: Cli) -> anyhow::Result<()> {
     if no_tokens {
         refuse_open_non_loopback_bind(&cli.listen)?;
     }
-    let listener = tokio::net::TcpListener::bind(&cli.listen)
-        .await
-        .with_context(|| format!("failed to bind Bun API on {}", cli.listen))?;
+    let listener = api_socket
+        .listen(1024)
+        .with_context(|| format!("failed to listen for Bun API on {}", cli.listen))?;
     println!("bun: API server listening on {}", listener.local_addr()?);
 
     // L10: the catalog used to be `default()` on every boot — image

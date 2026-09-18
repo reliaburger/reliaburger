@@ -112,7 +112,7 @@ hosted feature-matrix validation remains separate.
 
 - [x] **H01** Reconcile scheduler/quota/scrape wiring and weights, roadmap test locations, cleanup evidence and disabled-auth chaos policy with their callers. Mark completed historical bug groups done while retaining C30/C33/C34/H02. Repair eleven Rustdoc errors; all-feature public documentation now builds with warnings denied, all 74 relative links in the changed Markdown pass, and the four documented diagnostic CLI help interfaces are verified.
 - [ ] **H02** (P3) Remove or deliberately expose unused helper entry points.
-- [ ] **H03** (P2) Resolve inert configuration and wire fields explicitly. Additional inspection: cluster startup derives internal API endpoints from the requested port before binding; `--listen 127.0.0.1:0` therefore leaves internal port zero. Standalone ephemeral API listeners are qualified, but cluster ephemeral-port propagation still needs a regression and repair.
+- [ ] **H03** (P2) Resolve inert configuration and wire fields explicitly. Cluster ephemeral API ports are repaired: bind a socket before cluster startup, advertise its actual port and delay listening until authentication is ready. The real clustered first-run regression fails before the fix; all eight ordinary first-run tests (17.04s), five authentication tests, endpoint discovery and strict Linux/macOS Clippy pass. The strengthened running-workload assertion also passes (8.81s). The original inert configuration/wire-field inventory remains open.
 - [ ] **H04** (P3) Use typed alert and scheduler error contracts.
 - [ ] **H05** (P3) Split modules along existing ownership boundaries.
 - [ ] **H06** (P3) Evaluate shared DNS and duration parsers.

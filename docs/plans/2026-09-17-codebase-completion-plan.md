@@ -530,8 +530,7 @@ Workload SPIFFE observation and runnable registry deployment remain open.
 
 The broad library checkpoint was not green: 3,276 passed, one upgrade probe
 failed with Linux ETXTBSY, and 19 privileged gates were ignored. This execution
-race was subsequently repaired with bounded ETXTBSY-only retries under V02. Cluster API port-zero propagation is separately
-tracked under H03; the runc fixture uses the existing fixed-port retry harness.
+race was subsequently repaired with bounded ETXTBSY-only retries under V02. Cluster API port-zero propagation is repaired separately under H03; the runc fixture uses the existing fixed-port retry harness.
 
 ### C31 — Give concurrent test runs distinct namespaces
 
@@ -981,6 +980,8 @@ Evidence: `src/wrapper/types.rs:LeastConnections`; `worker_threads`; `src/mustar
 Several fields promise behaviour that no reader applies. Removing bincode fields casually would break peers and persisted state.
 
 **Completion test:** Implement the named behaviour or reject/deprecate it with compatibility tests. Preserve historical wire layout until a negotiated migration exists.
+
+**Startup follow-up completed (18 September):** Cluster startup advertised the requested API port before binding. A real `--listen 127.0.0.1:0` first-run regression failed with no eligible scheduler node. Bun now reserves a socket before cluster startup, publishes its actual port and starts listening only after credential/bootstrap checks. Eight ordinary first-run tests (17.04s), five bootstrap-authentication tests, service-endpoint discovery and strict Linux/macOS Clippy pass. The strengthened assertion of a running workload passes in 8.81s. The original inert-field inventory remains open.
 
 ### H04 — Use typed alert and scheduler error contracts
 

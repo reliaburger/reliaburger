@@ -2851,3 +2851,23 @@ generated cluster CA, closes the unauthenticated bootstrap window and runs all
 three secrets/config cases against runc. Both the case verdict and server-owned
 cleanup must succeed. Missing capability, Unknown, timeout and cleanup failure
 all fail this qualification.
+
+
+### Reserve the API port before advertising it
+
+A listener on `127.0.0.1:0` asks the kernel to choose a free port. Printing that
+chosen address fixed standalone discovery, but the clustered first-run test
+found another dependency: cluster startup had already copied zero into its
+internal API endpoints. The API accepted an app while the scheduler reported
+no eligible node.
+
+Bun now binds a `TcpSocket` before starting the cluster and uses its actual
+local port everywhere it advertises the API. Binding reserves the address;
+listening is a separate operation. We delay that second step until replicated
+credentials are ready and the existing bootstrap checks pass. This keeps a
+joining node closed to connections while it waits for authentication.
+
+The black-box first-run test asks for port zero, reads the selected endpoint,
+creates the first administrator and deploys a process workload. It requires
+an observed running instance. Merely accepting the manifest wouldn't prove
+that the scheduler can use the advertised endpoint.
