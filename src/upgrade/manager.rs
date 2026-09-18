@@ -840,6 +840,45 @@ mod tests {
         assert_eq!(marker.pre_upgrade_instances, inventory());
     }
 
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn verified_upgrade_probes_survive_concurrent_process_creation() {
+        let shutdown = tokio_util::sync::CancellationToken::new();
+        let mut churn = Vec::new();
+        for _ in 0..4 {
+            let shutdown = shutdown.clone();
+            churn.push(tokio::spawn(async move {
+                while !shutdown.is_cancelled() {
+                    let status = tokio::process::Command::new("true")
+                        .kill_on_drop(true)
+                        .status()
+                        .await
+                        .unwrap();
+                    assert!(status.success());
+                }
+            }));
+        }
+        let results = futures_util::future::join_all((0..32).map(|_| async {
+            let fixture = fixture();
+            let directive = directive_for(&fixture, b"concurrent probe", "concurrent");
+            fixture
+                .manager
+                .prepare(&directive, vec![])
+                .await
+                .map(|prepared| {
+                    assert!(prepared.is_some());
+                    assert!(fixture.manager.upgrade_in_flight());
+                })
+        }))
+        .await;
+        shutdown.cancel();
+        for task in churn {
+            task.await.unwrap();
+        }
+        for result in results {
+            result.unwrap();
+        }
+    }
+
     #[tokio::test]
     async fn apply_rejects_second_concurrent_upgrade() {
         let fixture = fixture();

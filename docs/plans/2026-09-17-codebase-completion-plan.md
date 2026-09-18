@@ -530,7 +530,7 @@ Workload SPIFFE observation and runnable registry deployment remain open.
 
 The broad library checkpoint was not green: 3,276 passed, one upgrade probe
 failed with Linux ETXTBSY, and 19 privileged gates were ignored. This execution
-race remains tracked under V02. Cluster API port-zero propagation is separately
+race was subsequently repaired with bounded ETXTBSY-only retries under V02. Cluster API port-zero propagation is separately
 tracked under H03; the runc fixture uses the existing fixed-port retry harness.
 
 ### C31 — Give concurrent test runs distinct namespaces
@@ -1253,6 +1253,8 @@ A short successful setup does not establish renewal, retention, mixed-version re
 **Completion test:** Time-controlled certificate/retention tests plus sustained load, node/leader failure, interrupted deploy/upgrade and crash recovery close C01-C22/C37 on actual runtimes.
 
 **Harness repair (18 September):** CI at `78119fd` reproduced HTTP 413 in all three cluster-upgrade cases. Strip debug symbols from a private fixture before copying, hashing and signing, retain the registry upload cap, assert the fixture size and include response bodies on upload failures. All three real Linux cases then pass in 200.22s; V02 stays open.
+
+**Probe launch repair (18 September):** The earlier 3,276-pass library checkpoint had one ETXTBSY failure during verified candidate launch. Retry only that error while keeping the same private bytes and one ten-second deadline for launch and response. Concurrent preparation coverage also passes before the fix, so it is stress coverage rather than a deterministic reproduction. After the repair, all 3,281 Linux library tests pass (19 explicit gates, 50.55s), as do strict Linux/macOS Clippy. Sustained crash qualification remains open.
 
 ### V03 — Publish and install the exact signed candidate
 

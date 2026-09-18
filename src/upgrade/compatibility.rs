@@ -24,19 +24,41 @@ pub(super) async fn check_binary(bytes: Vec<u8>, directory: &Path) -> Result<(),
     })
     .await
     .map_err(|e| UpgradeError::IncompatibleBinary(e.to_string()))??;
-    let mut child = tokio::process::Command::new(&executable)
-        .arg("--compatibility")
-        .stdin(std::process::Stdio::null())
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::null())
-        .kill_on_drop(true)
-        .spawn()
-        .map_err(|e| UpgradeError::IncompatibleBinary(format!("cannot query candidate: {e}")))?;
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    let mut child = loop {
+        match tokio::process::Command::new(&executable)
+            .arg("--compatibility")
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::null())
+            .kill_on_drop(true)
+            .spawn()
+        {
+            Ok(child) => break child,
+            // Another concurrent fork can briefly inherit the writable file
+            // before its exec closes CLOEXEC descriptors. Retain the same
+            // private verified bytes and the original query deadline.
+            Err(error)
+                if error.raw_os_error() == Some(nix::libc::ETXTBSY)
+                    && tokio::time::Instant::now() < deadline =>
+            {
+                tokio::time::sleep_until(
+                    (tokio::time::Instant::now() + Duration::from_millis(10)).min(deadline),
+                )
+                .await;
+            }
+            Err(error) => {
+                return Err(UpgradeError::IncompatibleBinary(format!(
+                    "cannot query candidate: {error}"
+                )));
+            }
+        }
+    };
     let stdout = child
         .stdout
         .take()
         .ok_or_else(|| UpgradeError::IncompatibleBinary("missing query output pipe".into()))?;
-    let result = tokio::time::timeout(Duration::from_secs(10), async {
+    let result = tokio::time::timeout_at(deadline, async {
         let read = async {
             let mut output = Vec::new();
             stdout.take(4097).read_to_end(&mut output).await?;

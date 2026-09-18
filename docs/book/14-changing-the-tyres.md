@@ -770,3 +770,26 @@ old or invalid declarations. This distinction caught up with us when leased
 tokens advanced the state format: three hard-coded fixtures caused ten CI
 failures, all at compatibility admission rather than the behaviour under test.
 We repaired the fixtures and retained the independent refusal tests.
+
+
+### A closed writer can still leave an executable busy
+
+The full Linux library run caught an upgrade preparation failing with
+`Text file busy`. We had already closed our writable temporary file before
+launching it. Another thread can fork during that write, though, briefly
+inheriting the descriptor until its own exec closes it. This is a
+[documented Rust process-launch race](https://github.com/rust-lang/rust/issues/114554)
+and is consistent with the failure we observed.
+
+The compatibility probe now retries only that operating-system error. It keeps
+the same private, signature-verified executable and shares one ten-second
+deadline between launch attempts and the compatibility response. Permission
+errors, invalid executables and incompatible declarations still fail. Retrying
+cannot turn an incompatible binary into an accepted one.
+
+Our regression prepares 32 signed candidates while four tasks repeatedly launch
+other processes. It passed before the repair too: a stress test does not force
+this race on every run. The failing full-suite checkpoint is the evidence for
+the original defect; the concurrent test protects the surrounding behaviour.
+Existing stalled-probe tests still check that preparation is bounded and leaves
+no staged upgrade behind.
