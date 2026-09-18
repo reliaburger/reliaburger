@@ -635,7 +635,7 @@ pub async fn cleanup_local_lease(
                 let (response_tx, response_rx) = tokio::sync::oneshot::channel();
                 let cleanup = async {
                     cmd_tx
-                        .send(crate::bun::agent::AgentCommand::Stop {
+                        .send(crate::bun::agent::AgentCommand::Retire {
                             app_name: app_id.name,
                             namespace: app_id.namespace,
                             response: response_tx,

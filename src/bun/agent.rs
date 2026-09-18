@@ -258,6 +258,13 @@ pub enum AgentCommand {
         namespace: String,
         response: oneshot::Sender<Result<(), BunError>>,
     },
+    /// Stop and retire an app removed from desired state or a resource lease.
+    /// Successful retirement also releases its status and port ownership.
+    Retire {
+        app_name: String,
+        namespace: String,
+        response: oneshot::Sender<Result<(), BunError>>,
+    },
     /// Get status of all instances.
     Status {
         response: oneshot::Sender<Vec<InstanceStatus>>,
@@ -3029,6 +3036,14 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
                 response,
             } => {
                 let result = self.stop_workload_when_idle(&app_name, &namespace).await;
+                let _ = response.send(result);
+            }
+            AgentCommand::Retire {
+                app_name,
+                namespace,
+                response,
+            } => {
+                let result = self.retire_workload(&app_name, &namespace).await;
                 let _ = response.send(result);
             }
             AgentCommand::Status { response } => {
@@ -6733,6 +6748,27 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
         self.stop_app(app_name, namespace).await
     }
 
+    /// Forget ownership only after stop has confirmed every instance's exit.
+    async fn retire_workload(&mut self, app_name: &str, namespace: &str) -> Result<(), BunError> {
+        match self.stop_workload_when_idle(app_name, namespace).await {
+            Ok(()) | Err(BunError::AppNotFound { .. }) => {}
+            Err(error) => return Err(error),
+        }
+        let instances: Vec<_> = self
+            .supervisor
+            .list_instances()
+            .into_iter()
+            .filter(|instance| instance.app_name == app_name && instance.namespace == namespace)
+            .map(|instance| instance.id.clone())
+            .collect();
+        for id in instances {
+            self.supervisor.retire_instance(&id).await;
+        }
+        self.deployed_specs
+            .remove(&(app_name.to_string(), namespace.to_string()));
+        Ok(())
+    }
+
     /// Stop an app's instances.
     async fn stop_app(&mut self, app_name: &str, namespace: &str) -> Result<(), BunError> {
         // A schedule exists before its first instance. Retire future firings
@@ -10126,6 +10162,54 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[tokio::test]
+    async fn lease_cleanup_retires_owned_instances_without_erasing_another_namespace() {
+        use crate::testkit::lease::{
+            LeasedResource, LocalLeaseStore, TestLease, cleanup_local_lease,
+        };
+        let (mut agent, tx, shutdown) = test_agent();
+        let volumes = tempfile::tempdir().unwrap();
+        agent.set_volumes_dir(volumes.path().to_path_buf());
+        let task = tokio::spawn(async move { agent.run().await });
+        for namespace in ["rbtest-cleanup", "rbtest-keep"] {
+            let config = Config::parse(&format!(
+                "[app.web]\nimage = 'test:v1'\nnamespace = '{namespace}'\n"
+            ))
+            .unwrap();
+            expect_complete(&send_deploy(&tx, config).await);
+        }
+        let store = LocalLeaseStore::in_memory();
+        let mut lease = TestLease::new(
+            "cleanup".into(),
+            "owner".into(),
+            "owner".into(),
+            "rbtest-cleanup".into(),
+            1,
+            2,
+        )
+        .unwrap();
+        lease.resources.insert(LeasedResource::App {
+            app_id: crate::meat::AppId::new("web", "rbtest-cleanup"),
+        });
+        store.create(lease).await.unwrap();
+        cleanup_local_lease(&store, &tx, "cleanup", Some("owner"))
+            .await
+            .unwrap();
+        let (response, result) = oneshot::channel();
+        tx.send(AgentCommand::Status { response }).await.unwrap();
+        let instances = result.await.unwrap();
+        shutdown.cancel();
+        task.await.unwrap();
+        assert!(store.get("cleanup").await.is_none());
+        assert_eq!(
+            instances.len(),
+            1,
+            "cleanup must retire its status record too"
+        );
+        assert_eq!(instances[0].namespace, "rbtest-keep");
+        assert_eq!(instances[0].state, "running");
     }
 
     #[tokio::test]

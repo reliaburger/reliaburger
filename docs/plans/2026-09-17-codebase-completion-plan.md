@@ -618,6 +618,13 @@ before the fix; a fourth covers stalled kill. All seven lifecycle tests
 (12.21s), 105 agent tests (11.79s), 48 lease-filtered tests (one explicit gate)
 and strict Linux Clippy pass.
 
+**Normal retirement prerequisite (18 September):** Local lease cleanup and
+removed cluster placements now use an internal Retire command. It shares the
+busy-worker fence and confirmed-exit path, then releases instance inventory,
+host ports and cached specs. Ordinary Stop retains completion history. The
+running-agent lease regression fails before the fix; all 106 agent tests
+(12.44s) and strict Linux Clippy pass. This does not close the crash window below.
+
 **Additional cleanup evidence to establish:** Process/runc runtime
 adapters still need review: their kill paths currently suppress errors and set
 Stopped without independent proof. Reproduce the crash window between runtime

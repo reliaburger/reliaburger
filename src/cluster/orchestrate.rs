@@ -915,7 +915,7 @@ pub fn spawn_placement_reconciler(
             for (name, namespace) in removed {
                 let (response_tx, response_rx) = tokio::sync::oneshot::channel();
                 if cmd_tx
-                    .send(AgentCommand::Stop {
+                    .send(AgentCommand::Retire {
                         app_name: name.clone(),
                         namespace: namespace.clone(),
                         response: response_tx,

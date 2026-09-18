@@ -989,3 +989,22 @@ The HTTP regressions inject a failed kill, an acknowledged kill without exit,
 an inspection error and a stalled kill. Each must return failure, retain its
 adoption record and remain Stopping. Restoring a confirmed stopped state and
 retrying must succeed and remove the record.
+
+
+### Retire a resource after stopping it
+
+An operator stopping a job still needs its completion history. A lease reaper
+removing a test app needs that app gone from the active ownership inventory.
+Those are different outcomes, even when both first stop the same process.
+
+The internal Retire command reuses the normal deployment-ownership fence and
+confirmed-exit stop path, then releases supervisor entries, host-port ownership
+and cached app specs. Local lease cleanup and removal of a cluster placement
+use Retire. Ordinary Stop keeps its existing status/history behaviour. Failed
+or busy stops preserve the resource so the owner can retry.
+
+The regression creates the same app in two test namespaces, releases one lease
+through the running agent and checks the status inventory. The released app
+must be absent; the other namespace must still have its running instance.
+This covers normal retirement. Durable cleanup across an unfinished deployment
+or a node crash still needs the separate ownership qualifications.
