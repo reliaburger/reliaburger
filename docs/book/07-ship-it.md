@@ -982,3 +982,25 @@ active until we release that call and rollback finishes. A corrective deployment
 then succeeds. A second test leaves the event reader alive without reading and
 still requires terminal history. Cooperative cancellation and the app/job naming
 contract remain the rest of C38; an error event is no longer an accidental unlock.
+
+## Apps and jobs share the runtime name space
+
+An app called `web` and a job called `web`, both in `default`, used to generate
+the same runtime ID: `default__web-0`. The job deployment could replace the app's
+supervisor record. Going the other way was worse: the rolling-app code could see
+the job as the old app generation and stop it.
+
+For 0.1.0, these kinds must use distinct names within a namespace. Config
+validation rejects a conflicting pair in one file. On a node, admission refuses
+the opposite kind while any of its instances still own the name, including
+retained terminal records. The same name in a different namespace is fine.
+This keeps the existing runtime identity format and its adoption records intact.
+
+The check runs before an accepted deployment can register schedules or change
+specs. The supervisor repeats it before allocating or inserting instances, so
+imperative job paths receive the same protection. The agent also checks before
+recording an app spec, and app replacement selects only app instances. A test
+tries both kind orderings and verifies that refusal preserves the original owner;
+an agent test proves that an app cannot roll over a live job. These are runtime
+ownership checks, not a new cluster-wide catalogue of jobs. Jobs still have the
+separate ownership work tracked in C34.

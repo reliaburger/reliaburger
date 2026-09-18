@@ -522,7 +522,9 @@ A stuck health-check rollout blocks a corrective deploy. Historical supersede/ca
 
 **Completion test:** Cancel or supersede records a terminal outcome and releases ownership before replacement; errors show active ID/age/phase; app/job identity cannot collide.
 
-**Ownership prerequisite completed (18 September):** An error event previously released the target before runtime rollback completed. Terminal accounting now waits for the worker's internal channel to close and its task to finish; panics remain Unknown. Full/disconnected event streams close without blocking worker accounting, and busy errors include ID, age and phase. The blocked-kill regression fails before the fix and passes for rolling and blue-green afterwards; all 98 agent, four operation-store and six deploy API tests and strict Linux all-target/all-feature Clippy pass. Cooperative cancellation and the cross-kind naming contract remain open.
+**Ownership prerequisite completed (18 September):** An error event previously released the target before runtime rollback completed. Terminal accounting now waits for the worker's internal channel to close and its task to finish; panics remain Unknown. Full/disconnected event streams close without blocking worker accounting, and busy errors include ID, age and phase. The blocked-kill regression fails before the fix and passes for rolling and blue-green afterwards; all 98 agent, four operation-store and six deploy API tests and strict Linux all-target/all-feature Clippy pass. Cooperative cancellation remains open.
+
+**Naming prerequisite completed (18 September):** App and job kinds must use distinct names within a namespace. Configuration rejects collisions; runtime admission refuses the opposite kind while an instance retains ownership, and app replacement excludes jobs. The overwrite regression fails before the fix. All 99 agent, 44 supervisor and 173 configuration tests and strict Linux all-target/all-feature Clippy pass. This preserves existing runtime IDs and is not a new cluster-wide job catalogue (C34).
 
 ### C39 — Handle development CLI paths without unwraps
 

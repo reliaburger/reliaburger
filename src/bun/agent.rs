@@ -489,12 +489,12 @@ enum DeployOp {
         spec: Box<AppSpec>,
         reply: oneshot::Sender<Result<Option<String>, String>>,
     },
-    /// Record the deployed spec for the Brioche UI.
+    /// Admit the app kind before recording the deployed spec for the Brioche UI.
     StoreDeployedSpec {
         app_name: String,
         namespace: String,
         spec: Box<AppSpec>,
-        reply: oneshot::Sender<()>,
+        reply: oneshot::Sender<Result<(), BunError>>,
     },
     /// Active (non-terminal) instance ids for an app in a namespace.
     ListExistingActive {
@@ -744,7 +744,12 @@ impl DeployOps {
         .await
     }
 
-    async fn store_deployed_spec(&self, app_name: &str, namespace: &str, spec: &AppSpec) {
+    async fn store_deployed_spec(
+        &self,
+        app_name: &str,
+        namespace: &str,
+        spec: &AppSpec,
+    ) -> Result<(), BunError> {
         self.call(
             |reply| DeployOp::StoreDeployedSpec {
                 app_name: app_name.to_string(),
@@ -752,7 +757,10 @@ impl DeployOps {
                 spec: Box::new(spec.clone()),
                 reply,
             },
-            (),
+            Err(BunError::DeployFailed {
+                app_name: app_name.into(),
+                reason: "agent shutting down".into(),
+            }),
         )
         .await
     }
@@ -2812,10 +2820,40 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
         }
     }
 
+    fn validate_deploy_names(&self, config: &Config) -> Result<(), String> {
+        use crate::bun::deploy_operations::DeployTargetKind;
+        config
+            .validate_workload_names()
+            .map_err(|error| error.to_string())?;
+        for (name, spec) in &config.app {
+            self.supervisor
+                .admit_workload_kind(
+                    name,
+                    spec.namespace.as_deref().unwrap_or("default"),
+                    DeployTargetKind::App,
+                )
+                .map_err(|error| error.to_string())?;
+        }
+        for (name, spec) in &config.job {
+            self.supervisor
+                .admit_workload_kind(
+                    name,
+                    spec.namespace.as_deref().unwrap_or("default"),
+                    DeployTargetKind::Job,
+                )
+                .map_err(|error| error.to_string())?;
+        }
+        Ok(())
+    }
+
     /// Handle a single command.
     async fn handle_command(&mut self, cmd: AgentCommand) {
         match cmd {
             AgentCommand::Deploy { config, events } => {
+                if let Err(message) = self.validate_deploy_names(&config) {
+                    let _ = events.send(ApplyEvent::Error { message }).await;
+                    return;
+                }
                 let operation = match self.deploy_operations.start(&config).await {
                     Ok(operation) => operation,
                     Err(error) => {
@@ -7743,8 +7781,15 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
                 spec,
                 reply,
             } => {
-                self.deployed_specs.insert((app_name, namespace), *spec);
-                let _ = reply.send(());
+                let result = self.supervisor.admit_workload_kind(
+                    &app_name,
+                    &namespace,
+                    crate::bun::deploy_operations::DeployTargetKind::App,
+                );
+                if result.is_ok() {
+                    self.deployed_specs.insert((app_name, namespace), *spec);
+                }
+                let _ = reply.send(result);
             }
             DeployOp::ListExistingActive {
                 app_name,
@@ -7755,7 +7800,7 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
                     .supervisor
                     .list_instances()
                     .iter()
-                    .filter(|i| i.app_name == app_name && i.namespace == namespace)
+                    .filter(|i| !i.is_job && i.app_name == app_name && i.namespace == namespace)
                     .filter(|i| {
                         !matches!(
                             i.state,
@@ -8203,9 +8248,18 @@ impl<G: Grill + Clone + 'static> DeployWorker<G> {
                 }
             };
 
-            self.ops
+            if let Err(error) = self
+                .ops
                 .store_deployed_spec(app_name, namespace, spec)
-                .await;
+                .await
+            {
+                let _ = events
+                    .send(ApplyEvent::Error {
+                        message: error.to_string(),
+                    })
+                    .await;
+                return;
+            }
 
             let existing = self.ops.list_existing_active(app_name, namespace).await;
 
@@ -10188,6 +10242,30 @@ interval = 1
         grill_handle.release_creates(1);
         shutdown.cancel();
         let _ = handle.await;
+    }
+
+    #[tokio::test]
+    async fn app_deploy_does_not_roll_over_an_existing_job() {
+        let (mut agent, tx, shutdown, grill) = test_agent_with_grill();
+        let task = tokio::spawn(async move { agent.run().await });
+        let job = Config::parse("[job.web]\nimage = 'job:v1'\n").unwrap();
+        expect_complete(&send_deploy(&tx, job).await);
+        let events = send_deploy(&tx, basic_config()).await;
+        let calls_before_shutdown = grill.calls();
+        shutdown.cancel();
+        task.await.unwrap();
+        assert!(
+            events
+                .iter()
+                .any(|event| matches!(event, ApplyEvent::Error { .. })),
+            "an app rollout accepted a live job as its previous generation"
+        );
+        assert!(
+            !calls_before_shutdown
+                .iter()
+                .any(|(call, _)| call == "stop" || call == "kill"),
+            "the conflicting deploy changed the existing job"
+        );
     }
 
     #[tokio::test]

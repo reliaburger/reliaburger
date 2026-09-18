@@ -13,6 +13,7 @@ impl Config {
     ///
     /// Returns the first error found. Call after `from_str` or `from_file`.
     pub fn validate(&self) -> Result<(), ConfigError> {
+        self.validate_workload_names()?;
         for (name, app) in &self.app {
             validate_app(name, app)?;
         }
@@ -36,10 +37,28 @@ impl Config {
         Ok(())
     }
 
+    /// Refuse app/job names that would share the runtime identity namespace.
+    pub(crate) fn validate_workload_names(&self) -> Result<(), ConfigError> {
+        for (name, app) in &self.app {
+            let namespace = app.namespace.as_deref().unwrap_or("default");
+            if let Some(job) = self.job.get(name)
+                && job.namespace.as_deref().unwrap_or("default") == namespace
+            {
+                return Err(ConfigError::Validation {
+                    field: format!("job.{name}"),
+                    context: namespace.into(),
+                    reason: "apps and jobs must use distinct names within a namespace".into(),
+                });
+            }
+        }
+        Ok(())
+    }
+
     /// Validate this config, treating `known_namespaces` (from committed
     /// desired state) as also declared. Permissions and builds may target
     /// a namespace created by an earlier apply, not just one in this file.
     pub fn validate_against(&self, known_namespaces: &[String]) -> Result<(), ConfigError> {
+        self.validate_workload_names()?;
         for (name, app) in &self.app {
             validate_app(name, app)?;
         }
@@ -542,6 +561,17 @@ mod tests {
             matches!(err, ConfigError::Validation { ref field, .. } if field == "dns.enabled"),
             "expected a dns/ebpf validation error, got {err:?}"
         );
+    }
+
+    #[test]
+    fn app_and_job_cannot_share_a_name_in_one_namespace() {
+        let mut config =
+            Config::parse("[app.web]\nimage = 'web:v1'\n[job.web]\nimage = 'job:v1'\n").unwrap();
+        assert!(config.validate().is_err());
+        assert!(config.validate_against(&[]).is_err());
+        config.job.get_mut("web").unwrap().namespace = Some("batch".into());
+        config.validate().unwrap();
+        config.validate_against(&[]).unwrap();
     }
 
     #[test]

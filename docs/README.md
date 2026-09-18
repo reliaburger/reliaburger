@@ -1023,7 +1023,10 @@ apps, but Bun refuses a second operation for the same namespace/name, naming
 the current ID, age and phase. A failed operation retains ownership until its
 rollback worker finishes. Stalled event streams close without cancelling the
 worker; query the accepted ID if the stream ends without completion. Cooperative
-cancellation remains pending under C38.
+cancellation remains pending under C38. Apps and jobs must use distinct names
+within a namespace: configuration rejects a conflicting pair, and node admission
+preserves an existing instance's kind until its ownership is removed. Use a
+different name or namespace for the other kind.
 
 Release maintainers: see [the build, signing and publication procedure](releasing.md).
 

@@ -354,6 +354,30 @@ impl<G: Grill> WorkloadSupervisor<G> {
         self.health_checker.register(id, config, now);
     }
 
+    /// Preserve the kind of every retained runtime owner before admitting work.
+    pub(crate) fn admit_workload_kind(
+        &self,
+        name: &str,
+        namespace: &str,
+        kind: super::deploy_operations::DeployTargetKind,
+    ) -> Result<(), BunError> {
+        let is_job = kind == super::deploy_operations::DeployTargetKind::Job;
+        if let Some(existing) = self.instances.values().find(|instance| {
+            instance.app_name == name
+                && instance.namespace == namespace
+                && instance.is_job != is_job
+        }) {
+            let owner = if existing.is_job { "job" } else { "app" };
+            return Err(BunError::DeployFailed {
+                app_name: name.into(),
+                reason: format!(
+                    "{namespace}/{name} is owned by an existing {owner}; apps and jobs must use distinct names"
+                ),
+            });
+        }
+        Ok(())
+    }
+
     /// Deploy an app, creating workload instances in Pending state.
     ///
     /// Creates one instance per replica. For `DaemonSet` mode, creates
@@ -368,6 +392,11 @@ impl<G: Grill> WorkloadSupervisor<G> {
         // Refuse anything this node can't honour before we allocate a thing:
         // an un-allowlisted host binary/script, a GPU we don't have, or a
         // resource limit rootless can't enforce.
+        self.admit_workload_kind(
+            app_name,
+            namespace,
+            super::deploy_operations::DeployTargetKind::App,
+        )?;
         self.admit_app(app_name, spec)?;
 
         let replica_count = match spec.replicas {
@@ -478,6 +507,11 @@ impl<G: Grill> WorkloadSupervisor<G> {
         spec: &JobSpec,
         now: Instant,
     ) -> Result<Vec<InstanceId>, BunError> {
+        self.admit_workload_kind(
+            job_name,
+            namespace,
+            super::deploy_operations::DeployTargetKind::Job,
+        )?;
         // Same admission gate as apps (jobs have no GPU field, so only the
         // host-exec/script allowlist and rootless-limit checks apply).
         self.admit_process_workload(job_name, spec.exec.as_deref(), spec.script.as_deref())?;
@@ -1232,6 +1266,35 @@ mod tests {
         "#,
         )
         .unwrap()
+    }
+
+    #[tokio::test]
+    async fn workload_kind_collision_preserves_existing_instances() {
+        for job_first in [false, true] {
+            let mut supervisor = test_supervisor();
+            let app = basic_app_spec(None);
+            let job = basic_job_spec();
+            let now = Instant::now();
+            let ids = if job_first {
+                supervisor
+                    .deploy_job("same", "default", &job, now)
+                    .await
+                    .unwrap()
+            } else {
+                supervisor
+                    .deploy_app("same", "default", &app, now)
+                    .await
+                    .unwrap()
+            };
+            let result = if job_first {
+                supervisor.deploy_app("same", "default", &app, now).await
+            } else {
+                supervisor.deploy_job("same", "default", &job, now).await
+            };
+            assert!(result.is_err(), "opposite kind replaced the original owner");
+            assert_eq!(supervisor.get_instance(&ids[0]).unwrap().is_job, job_first);
+            assert_eq!(supervisor.list_instances().len(), ids.len());
+        }
     }
 
     #[tokio::test]
