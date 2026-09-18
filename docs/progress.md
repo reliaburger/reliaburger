@@ -23,7 +23,7 @@ for every item below. IDs are scoped to that plan, not the older C1/M1 review ID
 The [audit record](qualification/2026-09-17-code-audit.md) separates local defect
 reproductions from inspected source and previous acceptance evidence.
 
-These are work packages, not 82 mandatory features for 0.1.0. Correctness fixes
+These are work packages, not 83 mandatory features for 0.1.0. Correctness fixes
 need explicit release dispositions; optional refactors and future capabilities
 remain separate. Older unchecked groups below point into this current ledger.
 
@@ -107,6 +107,8 @@ hosted feature-matrix validation remains separate.
 - [x] **C52** Require unscoped user administrators for token create/list/revoke, join-token creation, secret rotation and image signing. The scoped-credential escalation regression fails before the fix; six token API tests (2.33s), 114 API tests, 33 authentication tests, eight route audits and strict Linux/macOS Clippy pass. App- and namespace-scoped callers refuse before mutation; unrestricted token management still works.
 
 - [x] **C53** Require an unscoped administrator to inspect or release another credential's lease. Both API regressions fail before the fix; eight token/lease API tests (2.29s), 48 lease-filtered library tests (one explicit gate, 1.89s) and strict Linux/macOS Clippy pass. Exact scoped owners and unrestricted operator overrides retain access.
+
+- [x] **C54** Bound transient upstream registry reads to four attempts and one deadline (30 seconds for manifest/config, 120 seconds per layer), retaining permanent failures and digest-verified atomic publication. Hosted CI at `af32c3f` passed 42 privileged checks but failed the pinned pull with “Rate exceeded”. Three hermetic regressions fail first; all 33 image-store tests pass (7.62s), including stalled-request expiry and permanent denial, alongside strict Linux/macOS Clippy. The exact real privileged pinned-image test passes (1.93s).
 
 ### Engineering follow-ups
 

@@ -618,3 +618,32 @@ second; the second records whether it received an Authorization header. Before
 the fix it did. After the fix, the client reports an origin violation without
 contacting it. Separate cases cover protocol-relative URLs, TLS downgrades,
 changed ports, and valid relative and same-origin absolute locations.
+
+
+### Give a busy registry room to recover
+
+A privileged CI run reached the public registry successfully, then lost its
+pinned BusyBox pull to a `Rate exceeded` response. The other 42 runtime checks
+passed. A laptop making its first pull can hit the same path.
+
+External manifest/config reads and layer downloads now retry only recognised
+rate-limit or temporary gateway/service errors. Each operation makes at most
+four attempts, with roughly one, two and four seconds between them and a small
+random delay to spread simultaneous nodes. One deadline covers every attempt:
+30 seconds for manifest/config retrieval and 120 seconds per layer. A stalled
+request cannot reset that budget. Authentication failures, missing images,
+malformed responses and digest mismatches still fail.
+
+The retry helper accepts a closure which creates a fresh future for each
+attempt. In Rust, `FnMut() -> F` means a callable that may update captured state
+and returns a value of type `F`; the `Future` bound says that value represents
+asynchronous work. Each layer attempt creates a new byte buffer, so a failed
+transfer's prefix cannot contaminate the next attempt. Only a complete,
+digest-verified layer reaches the atomic cache publication step.
+
+The pinned OCI client exposes structured error codes but discards response
+headers on this path. Our backoff therefore doesn't claim to honour a server's
+`Retry-After` value. Hermetic registry tests exercise transient recovery,
+permanent denial and attempt limits; a stalled-response test advances time
+only after the real HTTP request reaches the fixture. The external registry
+qualification remains a separate check.

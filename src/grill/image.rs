@@ -203,6 +203,55 @@ pub(crate) fn cached_blob_path(root: &Path, digest: &str) -> PathBuf {
     }
 }
 
+/// Retry only transient registry reads, retaining one deadline across attempts.
+async fn retry_registry_read<T, F>(
+    budget: std::time::Duration,
+    mut read: impl FnMut() -> F,
+) -> oci_distribution::errors::Result<T>
+where
+    F: std::future::Future<Output = oci_distribution::errors::Result<T>>,
+{
+    use oci_distribution::errors::{OciDistributionError, OciErrorCode};
+    use tokio::time::{Instant, sleep_until, timeout_at};
+
+    let deadline = Instant::now() + budget;
+    let mut attempt = 0;
+    loop {
+        let result = timeout_at(deadline, read()).await.map_err(|_| {
+            OciDistributionError::GenericError(Some("registry read deadline exceeded".into()))
+        })?;
+        let error = match result {
+            Ok(value) => return Ok(value),
+            Err(error) => error,
+        };
+        let transient = match &error {
+            OciDistributionError::RegistryError { envelope, .. } => {
+                !envelope.errors.is_empty()
+                    && envelope
+                        .errors
+                        .iter()
+                        .all(|error| error.code == OciErrorCode::Toomanyrequests)
+            }
+            OciDistributionError::ServerError { code, .. } => matches!(code, 429 | 502 | 503 | 504),
+            OciDistributionError::RequestError(error) => {
+                matches!(
+                    error.status().map(|status| status.as_u16()),
+                    Some(429 | 502 | 503 | 504)
+                )
+            }
+            _ => false,
+        };
+        if !transient || attempt == 3 || Instant::now() >= deadline {
+            return Err(error);
+        }
+        // Jitter keeps simultaneous cold nodes from retrying in lockstep.
+        let delay =
+            std::time::Duration::from_millis((1000 << attempt) + u64::from(rand::random::<u8>()));
+        attempt += 1;
+        sleep_until((Instant::now() + delay).min(deadline)).await;
+    }
+}
+
 impl ImageStore {
     /// Create a new image store at the given root directory.
     pub fn new(store_root: PathBuf) -> Self {
@@ -392,13 +441,15 @@ impl ImageStore {
         let auth = oci_distribution::secrets::RegistryAuth::Anonymous;
 
         // Pull the manifest (handles multi-platform resolution automatically)
-        let (manifest, _digest, _config) = client
-            .pull_manifest_and_config(&oci_ref, &auth)
+        let (manifest, _digest, _config) =
+            retry_registry_read(std::time::Duration::from_secs(30), || {
+                client.pull_manifest_and_config(&oci_ref, &auth)
+            })
             .await
             .map_err(|e| ImageError::ManifestPull {
-            image: image_ref.full_reference(),
-            reason: e.to_string(),
-        })?;
+                image: image_ref.full_reference(),
+                reason: e.to_string(),
+            })?;
 
         // Save the manifest for cache validation
         let manifest_path = self.manifest_path(&image_ref);
@@ -425,14 +476,18 @@ impl ImageStore {
                 tokio::fs::create_dir_all(parent).await?;
             }
 
-            let mut blob_data: Vec<u8> = Vec::new();
-            client
-                .pull_blob(&oci_ref, layer, &mut blob_data)
-                .await
-                .map_err(|e| ImageError::LayerPull {
-                    digest: digest.clone(),
-                    reason: e.to_string(),
-                })?;
+            let blob_data = retry_registry_read(std::time::Duration::from_secs(120), || async {
+                // A failed transfer may have written a prefix. Each attempt
+                // owns a fresh buffer; no partial bytes reach the cache.
+                let mut blob_data = Vec::new();
+                client.pull_blob(&oci_ref, layer, &mut blob_data).await?;
+                Ok(blob_data)
+            })
+            .await
+            .map_err(|e| ImageError::LayerPull {
+                digest: digest.clone(),
+                reason: e.to_string(),
+            })?;
 
             // Verify the SHA-256 digest
             let computed = format!("sha256:{}", sha256_hex(&blob_data));
@@ -1136,6 +1191,32 @@ mod tests {
     // -- Hermetic OCI distribution fixture ------------------------------------
 
     #[derive(Clone)]
+    struct RegistryFault {
+        layer: bool,
+        status: StatusCode,
+        code: &'static str,
+        remaining: Arc<AtomicUsize>,
+        delay: std::time::Duration,
+        received: Arc<tokio::sync::Notify>,
+    }
+
+    fn registry_fault(
+        layer: bool,
+        status: StatusCode,
+        code: &'static str,
+        count: usize,
+    ) -> RegistryFault {
+        RegistryFault {
+            layer,
+            status,
+            code,
+            remaining: Arc::new(AtomicUsize::new(count)),
+            delay: std::time::Duration::ZERO,
+            received: Arc::new(tokio::sync::Notify::new()),
+        }
+    }
+
+    #[derive(Clone)]
     struct RegistryState {
         manifest_path: String,
         manifest: Vec<u8>,
@@ -1144,11 +1225,14 @@ mod tests {
         layer_path: String,
         layer: Vec<u8>,
         layer_requests: Arc<AtomicUsize>,
+        manifest_requests: Arc<AtomicUsize>,
+        fault: Option<RegistryFault>,
     }
 
     struct RegistryFixture {
         reference: String,
         layer_requests: Arc<AtomicUsize>,
+        manifest_requests: Arc<AtomicUsize>,
         shutdown: CancellationToken,
         task: tokio::task::JoinHandle<()>,
     }
@@ -1172,6 +1256,35 @@ mod tests {
                 .unwrap();
         }
 
+        if path == state.manifest_path {
+            state.manifest_requests.fetch_add(1, Ordering::SeqCst);
+        }
+        if path == state.layer_path {
+            state.layer_requests.fetch_add(1, Ordering::SeqCst);
+        }
+        if let Some(fault) = &state.fault
+            && path
+                == if fault.layer {
+                    &state.layer_path
+                } else {
+                    &state.manifest_path
+                }
+            && fault
+                .remaining
+                .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |remaining| {
+                    remaining.checked_sub(1)
+                })
+                .is_ok()
+        {
+            fault.received.notify_one();
+            tokio::time::sleep(fault.delay).await;
+            return Response::builder()
+                .status(fault.status)
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(serde_json::json!({"errors": [{"code": fault.code, "message": "injected registry failure"}]}).to_string()))
+                .unwrap();
+        }
+
         let (body, content_type) = if path == state.manifest_path {
             (
                 state.manifest.clone(),
@@ -1183,7 +1296,6 @@ mod tests {
                 "application/vnd.oci.image.config.v1+json",
             )
         } else if path == state.layer_path {
-            state.layer_requests.fetch_add(1, Ordering::SeqCst);
             (
                 state.layer.clone(),
                 "application/vnd.oci.image.layer.v1.tar+gzip",
@@ -1204,6 +1316,10 @@ mod tests {
     }
 
     async fn start_registry_fixture() -> RegistryFixture {
+        start_registry_fixture_with_fault(None).await
+    }
+
+    async fn start_registry_fixture_with_fault(fault: Option<RegistryFault>) -> RegistryFixture {
         let dir = tempfile::tempdir().unwrap();
         let layer_path = dir.path().join("layer.tar.gz");
         create_test_layer_with_dirs(
@@ -1238,6 +1354,7 @@ mod tests {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap();
         let layer_requests = Arc::new(AtomicUsize::new(0));
+        let manifest_requests = Arc::new(AtomicUsize::new(0));
         let state = RegistryState {
             manifest_path: format!("/v2/fixture/manifests/{manifest_digest}"),
             manifest,
@@ -1246,6 +1363,8 @@ mod tests {
             layer_path: format!("/v2/fixture/blobs/{layer_digest}"),
             layer,
             layer_requests: Arc::clone(&layer_requests),
+            manifest_requests: Arc::clone(&manifest_requests),
+            fault,
         };
         let app = axum::Router::new()
             .fallback(registry_response)
@@ -1262,9 +1381,111 @@ mod tests {
         RegistryFixture {
             reference: format!("{address}/fixture@{manifest_digest}"),
             layer_requests,
+            manifest_requests,
             shutdown,
             task,
         }
+    }
+
+    #[tokio::test]
+    async fn registry_rate_limited_manifest_is_retried_before_unpacking() {
+        let fixture = start_registry_fixture_with_fault(Some(registry_fault(
+            false,
+            StatusCode::TOO_MANY_REQUESTS,
+            "TOOMANYREQUESTS",
+            2,
+        )))
+        .await;
+        let tmp = tempfile::tempdir().unwrap();
+        let store = ImageStore::new(tmp.path().to_path_buf());
+        let rootfs = store.pull_and_unpack(&fixture.reference).await.unwrap();
+        assert!(rootfs.join("bin/sh").exists());
+        assert_eq!(fixture.manifest_requests.load(Ordering::SeqCst), 3);
+    }
+
+    #[tokio::test]
+    async fn registry_unavailable_layer_is_retried_and_verified() {
+        let fixture = start_registry_fixture_with_fault(Some(registry_fault(
+            true,
+            StatusCode::SERVICE_UNAVAILABLE,
+            "UNAVAILABLE",
+            1,
+        )))
+        .await;
+        let tmp = tempfile::tempdir().unwrap();
+        let store = ImageStore::new(tmp.path().to_path_buf());
+        let rootfs = store.pull_and_unpack(&fixture.reference).await.unwrap();
+        assert_eq!(
+            std::fs::read(rootfs.join("bin/sh")).unwrap(),
+            b"fixture shell"
+        );
+        assert_eq!(fixture.layer_requests.load(Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test]
+    async fn registry_persistent_rate_limit_has_a_bounded_attempt_count() {
+        let fixture = start_registry_fixture_with_fault(Some(registry_fault(
+            false,
+            StatusCode::TOO_MANY_REQUESTS,
+            "TOOMANYREQUESTS",
+            usize::MAX,
+        )))
+        .await;
+        let tmp = tempfile::tempdir().unwrap();
+        let store = ImageStore::new(tmp.path().to_path_buf());
+        let result = tokio::time::timeout(
+            std::time::Duration::from_secs(15),
+            store.pull_and_unpack(&fixture.reference),
+        )
+        .await
+        .unwrap();
+        assert!(matches!(result, Err(ImageError::ManifestPull { .. })));
+        assert_eq!(fixture.manifest_requests.load(Ordering::SeqCst), 4);
+        assert!(
+            !store
+                .rootfs_path(&ImageReference::parse(&fixture.reference).unwrap())
+                .exists()
+        );
+    }
+
+    #[tokio::test]
+    async fn registry_stalled_manifest_exhausts_the_original_deadline() {
+        let mut fault = registry_fault(false, StatusCode::SERVICE_UNAVAILABLE, "UNAVAILABLE", 1);
+        fault.delay = std::time::Duration::from_secs(60);
+        let received = fault.received.clone();
+        let fixture = start_registry_fixture_with_fault(Some(fault)).await;
+        let tmp = tempfile::tempdir().unwrap();
+        let store = ImageStore::new(tmp.path().to_path_buf());
+        let reference = fixture.reference.clone();
+        let pull = tokio::spawn(async move { store.pull_and_unpack(&reference).await });
+        tokio::time::timeout(std::time::Duration::from_secs(5), received.notified())
+            .await
+            .unwrap();
+        // Pause only after the real HTTP server receives the request, so
+        // simulated time cannot race socket readiness during setup.
+        tokio::time::pause();
+        tokio::time::advance(std::time::Duration::from_secs(30)).await;
+        let result = pull.await.unwrap();
+        tokio::time::resume();
+        assert!(
+            matches!(result, Err(ImageError::ManifestPull { reason, .. }) if reason.contains("deadline exceeded"))
+        );
+        assert_eq!(fixture.manifest_requests.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn registry_denial_is_not_retried() {
+        let fixture = start_registry_fixture_with_fault(Some(registry_fault(
+            false,
+            StatusCode::FORBIDDEN,
+            "DENIED",
+            usize::MAX,
+        )))
+        .await;
+        let tmp = tempfile::tempdir().unwrap();
+        let store = ImageStore::new(tmp.path().to_path_buf());
+        assert!(store.pull_and_unpack(&fixture.reference).await.is_err());
+        assert_eq!(fixture.manifest_requests.load(Ordering::SeqCst), 1);
     }
 
     #[tokio::test]

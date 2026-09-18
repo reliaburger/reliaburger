@@ -37,9 +37,9 @@ F items are missing capabilities, not evidence of failures in supported behaviou
 [Audit evidence and reproducible probes](../qualification/2026-09-17-code-audit.md)
 record those distinctions and the hosted checks inspected.
 
-There are **82 tracked work packages**: 53 correctness/contract items, 12
+There are **83 tracked work packages**: 54 correctness/contract items, 12
 engineering follow-ups, 12 capability families and five acceptance/release gates.
-The correctness items include 26 P1 priorities; these are engineering priorities, not
+The correctness items include 27 P1 priorities; these are engineering priorities, not
 security severity ratings. A capability family can require several commits.
 
 ## What is already done
@@ -948,6 +948,29 @@ instead of 403). The override now requires an unscoped user administrator;
 exact owners retain their existing access. Eight token/lease API tests (2.29s),
 48 lease-filtered library tests (one explicit gate, 1.89s) and strict
 Linux/macOS Clippy pass.
+
+### C54 — Bound retries for transient upstream registry failures
+
+**Priority:** P1. **Wave:** 4. **Book chapters:** 05.
+
+**Observed (18 September):** Hosted CI at `af32c3f` passed 42 privileged checks
+but failed the pinned BusyBox pull with the registry's `Rate exceeded` error.
+The same direct pull path is used by a fresh installation. Three hermetic
+regressions fail before implementation: transient manifest and layer recovery,
+and bounded attempts during persistent rate limiting.
+
+**Completion test:** Retry only typed transient read failures with finite
+attempts and one deadline; retain authentication/parse/digest failures and
+atomic cache publication. Exercise a stalled response, run image-store tests
+and strict Clippy, and qualify the real pinned container pull independently.
+
+**Completed on PR #167.** Four attempts share one 30-second manifest/config or
+120-second layer deadline. Only typed rate-limit and temporary gateway/service
+errors retry; each layer attempt has a fresh buffer. All 33 image-store tests
+pass (7.62s), including stalled-request expiry and permanent denial, as do
+strict Linux/macOS Clippy and the exact real privileged pinned pull (1.93s).
+The pinned upstream client discards error-response headers, so this policy does
+not claim to honour `Retry-After`. Current-head hosted CI remains separate.
 
 ## Engineering follow-ups
 
