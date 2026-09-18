@@ -17,6 +17,11 @@ Log exports now preserve content generations, scope receipts to the destination,
 and serialise durable checkpoint updates across agent and offline exports. Source
 and checkpoint errors stop the export and prevent disk-pressure pruning.
 
+Runc retirement reports OCI, mount and network cleanup failures and retains
+ownership for retry. A busy root filesystem stays mounted; Stopped is reported
+only after cleanup completes. Short rootful jobs retain their actual exit codes,
+including when they finish before the first startup observation.
+
 ## Release work
 
 The [0.1.0 plan](plans/2026-09-16-v0.1.0-release-plan.md) tracks packaging and

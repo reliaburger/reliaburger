@@ -230,12 +230,30 @@ impl Slirp4netnsHandle {
         mut self,
         preserve: Option<&Path>,
     ) -> std::io::Result<()> {
+        self.shutdown_retaining_owner(preserve).await
+    }
+
+    /// Keep the handle available when teardown fails or its caller is cancelled.
+    pub(crate) async fn shutdown_retaining_owner(
+        &mut self,
+        preserve: Option<&Path>,
+    ) -> std::io::Result<()> {
         match &mut self.process {
             SlirpProcess::Owned(child) => {
-                child.kill().await?;
+                tokio::time::timeout(std::time::Duration::from_secs(2), child.kill())
+                    .await
+                    .map_err(|_| {
+                        std::io::Error::new(
+                            std::io::ErrorKind::TimedOut,
+                            "slirp4netns owner did not exit",
+                        )
+                    })??;
             }
             SlirpProcess::Adopted { pid, started_at } => {
-                if super::records::process_matches(*pid, *started_at) {
+                if super::records::poll_adopted_process(*pid, Some(*started_at))?.0 {
+                    if !super::records::process_matches(*pid, *started_at) {
+                        return Err(std::io::Error::other("cannot verify slirp4netns owner"));
+                    }
                     nix::sys::signal::kill(
                         nix::unistd::Pid::from_raw(*pid as i32),
                         nix::sys::signal::Signal::SIGKILL,

@@ -682,11 +682,22 @@ Nine ordinary tests, seven rootful acceptance cases (26.35s), non-root
 port adoption (3.85s, with the CI AppArmor prerequisite) and strict
 Linux/macOS Clippy pass.
 
-**Additional cleanup evidence to establish:** The runc cleanup path still
-suppresses teardown failures; complete container and host resource retirement
-remains unproved. ProcessGrill signal/inspection errors
-are repaired above, while atomic process identity and process-tree retirement
-remain open. Reproduce the crash window between runtime
+**Retryable runtime cleanup (18 September):** Runc cleanup now propagates OCI,
+launcher, rootfs and network failures. It confirms OCI absence and launcher exit,
+requires a normal unmount, and removes forwarding and the namespace before
+retiring the address. Failed or cancelled cleanup retains ownership; status and
+exit-code reads cannot publish Stopped before cleanup succeeds. Rootless helper
+retirement borrows the tracked handle until success. Repeated adopted-process
+observations preserve an already recorded exit code. Two deletion regressions,
+an adopted exit-code regression and a real busy-overlay regression fail first;
+controlled cancellation/retry, 271 ordinary runtime tests (13 explicit gates,
+7.64s), seven rootful cases (26.49s), non-root port recovery (3.70s), the real
+TLS/runc secret/config catalogue (three confirmed cleanups, 62.76s), and strict
+Linux/macOS Clippy pass.
+
+**Additional cleanup evidence to establish:** Atomic process identity,
+complete process-tree retirement and physical crash recovery remain open.
+Reproduce the crash window between runtime
 creation and placement-checkpoint persistence; a lease must not forget an
 orphaned workload merely because its desired Raft entry was removed. These
 are inspected paths, not completed crash qualifications.

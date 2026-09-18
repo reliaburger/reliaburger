@@ -81,11 +81,11 @@ pub async fn mount_private(lower: PathBuf, bundle: PathBuf) -> Result<MountedRoo
 
 /// Release the overlay mounted at a bundle's rootfs path.
 ///
-/// Cleanup first waits for a normal unmount. A final lazy detach prevents a
-/// dead or wedged runc process from leaving a mount visible in the host mount
-/// namespace. The upper directory remains for restart/adoption recovery.
+/// Require a normal unmount: a busy filesystem retains ownership for retry.
+/// Lazy detachment cannot prove resource retirement. The upper directory
+/// remains for restart/adoption recovery.
 pub async fn unmount_bundle(bundle: PathBuf) -> Result<(), RootfsError> {
-    tokio::task::spawn_blocking(move || unmount_cleanup(&bundle.join(ROOTFS_DIR)))
+    tokio::task::spawn_blocking(move || unmount_strict(&bundle.join(ROOTFS_DIR)))
         .await
         .map_err(|error| RootfsError::Worker(error.to_string()))?
 }
@@ -231,27 +231,6 @@ fn atomic_write(path: &Path, contents: &[u8]) -> Result<(), RootfsError> {
 
 fn unmount_strict(path: &Path) -> Result<(), RootfsError> {
     match umount2(path, MntFlags::UMOUNT_NOFOLLOW) {
-        Ok(()) | Err(Errno::EINVAL) | Err(Errno::ENOENT) => Ok(()),
-        Err(source) => Err(RootfsError::Unmount {
-            path: path.to_path_buf(),
-            source,
-        }),
-    }
-}
-
-fn unmount_cleanup(path: &Path) -> Result<(), RootfsError> {
-    for _ in 0..50 {
-        match unmount_strict(path) {
-            Ok(()) => return Ok(()),
-            Err(RootfsError::Unmount {
-                source: Errno::EBUSY,
-                ..
-            }) => std::thread::sleep(std::time::Duration::from_millis(10)),
-            Err(error) => return Err(error),
-        }
-    }
-
-    match umount2(path, MntFlags::MNT_DETACH | MntFlags::UMOUNT_NOFOLLOW) {
         Ok(()) | Err(Errno::EINVAL) | Err(Errno::ENOENT) => Ok(()),
         Err(source) => Err(RootfsError::Unmount {
             path: path.to_path_buf(),

@@ -233,7 +233,7 @@ impl RuncGrill {
         })?;
         match observation {
             Some(code) => {
-                entry.exit_code = code;
+                entry.exit_code = code.or(entry.exit_code);
                 Ok(true)
             }
             None => Ok(false),
@@ -395,8 +395,8 @@ impl RuncGrill {
                 // Keep an owned Child (and its reaping responsibility) on repeat adoption.
                 return Ok(());
             }
-            if let Some(old) = handles.remove(instance) {
-                old.shutdown_preserving_socket(Some(&record.api_socket))
+            if let Some(old) = handles.get_mut(instance) {
+                old.shutdown_retaining_owner(Some(&record.api_socket))
                     .await
                     .map_err(|error| GrillError::StartFailed {
                         instance: instance.clone(),
@@ -406,14 +406,15 @@ impl RuncGrill {
             handles.insert(instance.clone(), surviving);
             return Ok(());
         }
-        if let Some(old) = handles.remove(instance) {
-            old.shutdown()
+        if let Some(old) = handles.get_mut(instance) {
+            old.shutdown_retaining_owner(None)
                 .await
                 .map_err(|error| GrillError::StartFailed {
                     instance: instance.clone(),
                     reason: format!("failed to retire rootless network owner: {error}"),
                 })?;
         }
+        handles.remove(instance);
         if let Some(record) = recorded {
             super::rootless::stop_recorded_owner(record);
         }
@@ -427,70 +428,103 @@ impl RuncGrill {
         Ok(())
     }
 
-    /// Release a container's resources: force-delete any lingering runc state
-    /// and tear down its network namespace + veth pair. Best-effort — safe to
-    /// call more than once. `runc run` auto-deletes on exit, so the delete is a
-    /// backstop; the netns teardown is the part that actually prevents leaks.
-    async fn cleanup(&self, instance: &InstanceId) {
-        // slirp holds the container network namespace open. Stop it before
-        // deleting runc state so teardown cannot leave an orphaned forward.
-        if let Some(handle) = self.slirp_handles.lock().await.remove(instance)
-            && let Err(error) = handle.shutdown().await
-        {
-            eprintln!("warning: rootless network teardown failed for {instance}: {error}");
-        }
-        let _ = tokio::time::timeout(
-            std::time::Duration::from_secs(5),
-            self.runc_command(&["delete", "--force", &instance.0], instance),
-        )
-        .await;
-        if let Err(error) = super::rootfs::unmount_bundle(self.bundle_base.join(&instance.0)).await
-        {
-            eprintln!("warning: rootfs teardown failed for {instance}: {error}");
-        }
-        if let Some(handle) = self.port_handles.lock().await.remove(instance)
-            && let Err(e) = handle.shutdown().await
-        {
-            eprintln!("warning: port mapping teardown failed for {instance}: {e}");
-        }
-        {
-            let mut networks = self.networks.lock().await;
-            networks.remove(instance);
-            self.publish_dns_sources(&networks);
-        }
-        if self.rootless {
-            return;
-        }
-        let index = match self.network_leases.lookup(instance, self.node_index).await {
-            Ok(Some(index)) => index,
-            Ok(None) => return,
-            Err(error) => {
-                eprintln!("warning: cannot recover network reservation for {instance}: {error}");
-                return;
-            }
+    /// Retire owned runtime resources, retaining ownership until every step succeeds.
+    async fn cleanup(&self, instance: &InstanceId) -> Result<(), GrillError> {
+        let failure = |reason: String| GrillError::StopFailed {
+            instance: instance.clone(),
+            reason,
         };
-        let network = match netns::planned_container_network(instance, self.node_index, index) {
-            Ok(network) => network,
-            Err(error) => {
-                eprintln!("warning: invalid network reservation for {instance}: {error}");
-                return;
-            }
-        };
-        if let Err(error) = netns::teardown_container_network(&network).await {
-            eprintln!("warning: retaining network reservation for {instance}: {error}");
-            return;
-        }
-        if let Err(error) = netns::retire_address_forwarding(network.container_ip).await {
-            eprintln!("warning: retaining forwarded address for {instance}: {error}");
-            return;
-        }
-        if let Err(error) = self
-            .network_leases
-            .retire(instance, self.node_index, index)
+        let state_path = self.state_dir.join(&instance.0);
+        if tokio::fs::try_exists(&state_path)
             .await
+            .map_err(|error| failure(format!("cannot inspect OCI state: {error}")))?
         {
-            eprintln!("warning: cannot retire network reservation for {instance}: {error}");
+            let output = tokio::time::timeout(
+                std::time::Duration::from_secs(5),
+                self.runc_command(&["delete", "--force", &instance.0], instance),
+            )
+            .await
+            .map_err(|_| failure("runc deletion exceeded five seconds".into()))?
+            .map_err(|error| failure(error.to_string()))?;
+            let remains = tokio::fs::try_exists(&state_path)
+                .await
+                .map_err(|error| failure(format!("cannot confirm OCI deletion: {error}")))?;
+            if remains {
+                return Err(failure(format!(
+                    "runc deletion left OCI state ({}): {}",
+                    output.status,
+                    String::from_utf8_lossy(&output.stderr).trim(),
+                )));
+            }
         }
+        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            while !self.launcher_exited(instance).await? {
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+            Ok::<(), GrillError>(())
+        })
+        .await
+        .map_err(|_| failure("launcher remains alive during cleanup".into()))??;
+        // A launcher that was still starting could create state after the first
+        // inspection. Never tear down its resources based on that earlier read.
+        if tokio::fs::try_exists(&state_path)
+            .await
+            .map_err(|error| failure(format!("cannot confirm OCI absence: {error}")))?
+        {
+            return Err(failure(
+                "OCI state appeared during cleanup; retry required".into(),
+            ));
+        }
+        {
+            let mut handles = self.slirp_handles.lock().await;
+            if let Some(handle) = handles.get_mut(instance) {
+                handle
+                    .shutdown_retaining_owner(None)
+                    .await
+                    .map_err(|error| {
+                        failure(format!("rootless network teardown failed: {error}"))
+                    })?;
+            }
+            handles.remove(instance);
+        }
+        if !self.rootless {
+            super::rootfs::unmount_bundle(self.bundle_base.join(&instance.0))
+                .await
+                .map_err(|error| failure(format!("rootfs teardown failed: {error}")))?;
+            if let Some(index) = self
+                .network_leases
+                .lookup(instance, self.node_index)
+                .await
+                .map_err(|error| failure(format!("cannot recover network reservation: {error}")))?
+            {
+                let network = netns::planned_container_network(instance, self.node_index, index)
+                    .map_err(|error| failure(format!("invalid network reservation: {error}")))?;
+                // Address-based retirement is idempotent after cancellation and
+                // removes only forwards to this exclusively reserved address.
+                netns::retire_address_forwarding(network.container_ip)
+                    .await
+                    .map_err(|error| failure(format!("forwarding teardown failed: {error}")))?;
+                netns::teardown_container_network(&network)
+                    .await
+                    .map_err(|error| failure(format!("network teardown failed: {error}")))?;
+                self.port_handles.lock().await.remove(instance);
+                self.network_leases
+                    .retire(instance, self.node_index, index)
+                    .await
+                    .map_err(|error| {
+                        failure(format!("cannot retire network reservation: {error}"))
+                    })?;
+            } else if self.port_handles.lock().await.contains_key(instance) {
+                return Err(failure(
+                    "port mapping has no owned network reservation".into(),
+                ));
+            }
+        }
+        self.port_handles.lock().await.remove(instance);
+        let mut networks = self.networks.lock().await;
+        networks.remove(instance);
+        self.publish_dns_sources(&networks);
+        Ok(())
     }
 }
 
@@ -769,7 +803,7 @@ impl super::Grill for RuncGrill {
         };
         let result = self.prepare(instance, spec, container_index).await;
         if result.is_err() {
-            self.cleanup(instance).await;
+            self.cleanup(instance).await?;
         }
         result
     }
@@ -833,7 +867,7 @@ impl super::Grill for RuncGrill {
         let (bundle_dir, port_mapping) = match result {
             Ok(values) => values,
             Err(error) => {
-                self.cleanup(instance).await;
+                self.cleanup(instance).await?;
                 return Err(error);
             }
         };
@@ -862,7 +896,7 @@ impl super::Grill for RuncGrill {
         }
         .await;
         if let Err(error) = startup {
-            self.cleanup(instance).await;
+            self.cleanup(instance).await?;
             return Err(error);
         }
 
@@ -873,7 +907,7 @@ impl super::Grill for RuncGrill {
         let _lifecycle = self.lock_lifecycle(instance).await;
         let signalled = self.signal_container(instance, "SIGTERM").await?;
         if !signalled {
-            self.cleanup(instance).await;
+            self.cleanup(instance).await?;
         }
         if let Some(entry) = self.entries.lock().await.get_mut(instance) {
             entry.state = if signalled {
@@ -902,7 +936,7 @@ impl super::Grill for RuncGrill {
             instance: instance.clone(),
             reason: "runc launcher did not exit after force-kill".into(),
         })??;
-        self.cleanup(instance).await;
+        self.cleanup(instance).await?;
         if let Some(entry) = self.entries.lock().await.get_mut(instance) {
             entry.state = ContainerState::Stopped;
         }
@@ -924,7 +958,9 @@ impl super::Grill for RuncGrill {
                 match child.try_wait() {
                     Ok(Some(status)) => {
                         just_exited = entry.state != ContainerState::Stopped;
-                        entry.state = ContainerState::Stopped;
+                        if just_exited {
+                            entry.state = ContainerState::Stopping;
+                        }
                         entry.exit_code = status.code();
                     }
                     Ok(None) => {}
@@ -948,8 +984,8 @@ impl super::Grill for RuncGrill {
                         })?;
                 if !running {
                     just_exited = true;
-                    entry.state = ContainerState::Stopped;
-                    entry.exit_code = exit_code;
+                    entry.state = ContainerState::Stopping;
+                    entry.exit_code = exit_code.or(entry.exit_code);
                 }
             }
             (entry.state, just_exited)
@@ -957,7 +993,11 @@ impl super::Grill for RuncGrill {
 
         // Release all host resources once `runc run` has exited (lock released).
         if just_exited {
-            self.cleanup(instance).await;
+            self.cleanup(instance).await?;
+            if let Some(entry) = self.entries.lock().await.get_mut(instance) {
+                entry.state = ContainerState::Stopped;
+            }
+            return Ok(ContainerState::Stopped);
         }
         Ok(result_state)
     }
@@ -973,7 +1013,9 @@ impl super::Grill for RuncGrill {
             if let Some(ref mut child) = entry.child {
                 if let Ok(Some(status)) = child.try_wait() {
                     just_exited = entry.state != ContainerState::Stopped;
-                    entry.state = ContainerState::Stopped;
+                    if just_exited {
+                        entry.state = ContainerState::Stopping;
+                    }
                     entry.exit_code = status.code();
                 }
             } else if let Some(pid) = entry.adopted_pid
@@ -983,14 +1025,17 @@ impl super::Grill for RuncGrill {
                     super::records::poll_adopted_process(pid, entry.adopted_pid_started_at).ok()?;
                 if !running {
                     just_exited = true;
-                    entry.state = ContainerState::Stopped;
-                    entry.exit_code = exit_code;
+                    entry.state = ContainerState::Stopping;
+                    entry.exit_code = exit_code.or(entry.exit_code);
                 }
             }
             (entry.exit_code, just_exited)
         };
         if just_exited {
-            self.cleanup(instance).await;
+            self.cleanup(instance).await.ok()?;
+            if let Some(entry) = self.entries.lock().await.get_mut(instance) {
+                entry.state = ContainerState::Stopped;
+            }
         }
         exit_code
     }
@@ -1042,7 +1087,7 @@ impl super::Grill for RuncGrill {
         let _lifecycle = self.lock_lifecycle(instance).await;
         // The recorded `runc run` process must still be the one we started...
         if !super::records::is_live(record) {
-            self.cleanup(instance).await;
+            self.cleanup(instance).await?;
             return Ok(false);
         }
         // ...and runc itself must agree the container is running.
@@ -1050,12 +1095,12 @@ impl super::Grill for RuncGrill {
         let output = match self.runc_command(&["state", container_id], instance).await {
             Ok(output) => output,
             Err(error) => {
-                self.cleanup(instance).await;
+                self.cleanup(instance).await?;
                 return Err(error);
             }
         };
         if !output.status.success() {
-            self.cleanup(instance).await;
+            self.cleanup(instance).await?;
             return Ok(false);
         }
         let state = serde_json::from_slice::<serde_json::Value>(&output.stdout).ok();
@@ -1065,7 +1110,7 @@ impl super::Grill for RuncGrill {
             .and_then(|status| status.as_str())
             == Some("running");
         if !running {
-            self.cleanup(instance).await;
+            self.cleanup(instance).await?;
             return Ok(false);
         }
         let container_pid = state
@@ -1114,7 +1159,7 @@ impl super::Grill for RuncGrill {
 
         if self.rootless {
             let Some(container_pid) = container_pid else {
-                self.cleanup(instance).await;
+                self.cleanup(instance).await?;
                 return Err(GrillError::StartFailed {
                     instance: instance.clone(),
                     reason:
@@ -1137,7 +1182,7 @@ impl super::Grill for RuncGrill {
                 )
                 .await
             {
-                self.cleanup(instance).await;
+                self.cleanup(instance).await?;
                 return Err(error);
             }
         } else if let Some(pm) = &record.oci_spec.port_mapping {
@@ -1294,6 +1339,117 @@ impl Drop for RuncGrill {
 mod tests {
     use super::*;
     use crate::grill::Grill;
+
+    async fn failed_deletion_retains_runtime_ownership(force: bool, adopted: bool) {
+        use std::os::unix::fs::PermissionsExt;
+        let root = tempfile::tempdir().unwrap();
+        let program = root.path().join("runc-fixture");
+        std::fs::write(
+            &program,
+            "#!/bin/sh\nif [ \"$3\" = delete ]; then\n  if [ -e \"$2/block-delete\" ]; then touch \"$2/delete-entered\"; exec sleep 60; fi\n  if [ -e \"$2/fail-delete\" ]; then echo injected-delete-failure >&2; exit 1; fi\n  rmdir \"$2/$5\"\nfi\n",
+        ).unwrap();
+        std::fs::set_permissions(&program, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let state_dir = root.path().join("state");
+        let id = InstanceId("retry-runtime-cleanup".into());
+        std::fs::create_dir_all(state_dir.join(&id.0)).unwrap();
+        let refusal = state_dir.join("fail-delete");
+        std::fs::write(&refusal, b"refuse").unwrap();
+        let mut grill = RuncGrill::new(
+            root.path().join("bundles"),
+            ImageStore::new(root.path().join("images")),
+            true,
+            state_dir.clone(),
+        );
+        grill.runc_program = program;
+        let mut child = tokio::process::Command::new("sh")
+            .args(["-c", "exit 7"])
+            .spawn()
+            .unwrap();
+        let pid = child.id().unwrap();
+        child.wait().await.unwrap();
+        grill.entries.lock().await.insert(
+            id.clone(),
+            RuncEntry {
+                bundle_dir: root.path().join("bundles").join(&id.0),
+                log_path: root.path().join("container.log"),
+                child: (!adopted).then_some(child),
+                adopted_pid: adopted.then_some(pid),
+                adopted_pid_started_at: None,
+                port_mapping: None,
+                state: ContainerState::Running,
+                exit_code: adopted.then_some(7),
+            },
+        );
+        let result = if force {
+            grill.kill(&id).await
+        } else {
+            grill.state(&id).await.map(|_| ())
+        };
+        assert!(
+            result.is_err(),
+            "failed OCI deletion was acknowledged: {result:?}"
+        );
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("injected-delete-failure")
+        );
+        assert_ne!(
+            grill.entries.lock().await[&id].state,
+            ContainerState::Stopped
+        );
+        assert!(state_dir.join(&id.0).exists());
+        let blocked = state_dir.join("block-delete");
+        std::fs::write(&blocked, b"wait").unwrap();
+        let cleanup = tokio::spawn({
+            let grill = grill.clone();
+            let id = id.clone();
+            async move { grill.state(&id).await }
+        });
+        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            while !tokio::fs::try_exists(state_dir.join("delete-entered"))
+                .await
+                .unwrap()
+            {
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap();
+        cleanup.abort();
+        assert!(cleanup.await.unwrap_err().is_cancelled());
+        assert_eq!(
+            grill.entries.lock().await[&id].state,
+            ContainerState::Stopping
+        );
+        assert!(state_dir.join(&id.0).exists());
+        std::fs::remove_file(blocked).unwrap();
+        assert!(
+            grill.state(&id).await.is_err(),
+            "later observation forgot failed cleanup"
+        );
+        std::fs::remove_file(refusal).unwrap();
+        assert_eq!(grill.state(&id).await.unwrap(), ContainerState::Stopped);
+        assert!(!state_dir.join(&id.0).exists());
+        assert_eq!(grill.state(&id).await.unwrap(), ContainerState::Stopped);
+        assert_eq!(grill.exit_code(&id).await, Some(7));
+    }
+
+    #[tokio::test]
+    async fn state_retries_failed_runtime_deletion() {
+        failed_deletion_retains_runtime_ownership(false, false).await;
+    }
+
+    #[tokio::test]
+    async fn force_stop_preserves_failed_runtime_deletion() {
+        failed_deletion_retains_runtime_ownership(true, false).await;
+    }
+
+    #[tokio::test]
+    async fn cleanup_retries_preserve_recorded_adopted_exit_code() {
+        failed_deletion_retains_runtime_ownership(false, true).await;
+    }
 
     #[tokio::test]
     async fn state_preserves_resources_when_launcher_exit_cannot_be_observed() {
@@ -2472,6 +2628,15 @@ mod tests {
         );
         adopter.start(&next_id).await.unwrap();
         adopter.kill(&next_id).await.unwrap();
+        let busy_mount = std::fs::File::open(&rootfs).unwrap();
+        let error = adopter.kill(&id).await.unwrap_err();
+        assert!(error.to_string().contains("rootfs"), "{error}");
+        assert!(crate::grill::rootfs::is_mountpoint(&rootfs));
+        assert_ne!(
+            adopter.entries.lock().await[&id].state,
+            ContainerState::Stopped
+        );
+        drop(busy_mount);
         adopter.kill(&id).await.unwrap();
         assert!(
             adopted_sources

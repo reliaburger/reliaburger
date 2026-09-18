@@ -1085,3 +1085,31 @@ between polls, so they retain their actual exit status instead of requiring an
 observation of a state that has already passed. The acceptance test runs both
 `exit 0` and `exit 7`, checks their distinct results, and retires each workload.
 Rootless startup still requires a live PID to attach its userspace network.
+
+### Cleanup is a retryable operation
+
+A container exits, but its root filesystem is still busy. Can we release its
+address and tell the test runner that cleanup succeeded? No. A lazy unmount
+hides a mount from the host's directory tree while existing users retain it.
+That isn't evidence that the resource has gone.
+
+Runc cleanup now returns a result. It confirms OCI state removal and launcher
+exit, stops the userspace network owner, requires a normal rootfs unmount, and
+removes forwarding and the network namespace before releasing the address
+reservation. A failure keeps the instance in Stopping and returns the reason.
+The next observation retries cleanup. Stopped is published only after these
+steps succeed; asking for an exit code cannot bypass this requirement.
+
+The userspace network handle also stays in its map while shutdown runs. The
+shutdown method takes `&mut self`, a mutable borrow, so an error or cancelled
+future doesn't consume the handle we need for another attempt. We remove it
+only after success. This matters in Rust: moving a handle out of the map before
+an `.await` gives the future ownership, and dropping that future then drops the
+handle too. Cancellation isn't an error return that the caller can catch.
+
+Controlled deletion failures exercise repeated observation and eventual
+recovery. A real overlay test holds an open directory on the mount, requires
+cleanup to refuse, then closes it and retries. The address and runtime record
+must remain owned throughout. These checks don't establish atomic process
+identity or close the crash window before the initial adoption record is
+persisted; those remain separate release work.
