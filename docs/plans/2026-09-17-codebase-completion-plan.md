@@ -300,11 +300,16 @@ Node identity renewal remains, split into separately reviewable changes:
   refused. Seventeen persistence tests, 29 managed-bootstrap tests, the full 3,255-test
   Linux library checkpoint (19 privileged gates), 11 security and two API TLS
   integrations, and strict Linux/macOS Clippy pass.
-- Share validated live credentials across API/registry servers, Raft/reporting
-  client and server configurations, and internal HTTPS clients. Keep CA rotation
-  out of this package; reject accidental identity or trust-anchor changes.
-  An expired client identity must not turn into an omitted certificate on an
-  optional-mTLS API connection and thereby fall back to bearer-only access.
+- The shared live credential handle is implemented. It preserves node/CA
+  identity, serialises replacements, persists before publishing, refuses stale
+  serials and completes publication after caller cancellation. Five real TLS
+  tests pass (6.15s), including required/optional authentication, bound/unbound
+  peer verification, failure recovery and expired-client refusal; the deliberate
+  post-persistence cancellation test passes (0.04s). Strict Linux/macOS Clippy
+  passes. Bun still needs to wire this handle into API/registry listeners,
+  Raft/reporting clients and servers, and internal HTTPS clients. CA rotation
+  remains separate; expired clients must never become omitted certificates on
+  optional-mTLS API connections.
 - Authorise renewal using the existing authenticated node identity, bind the CSR
   to that same node, allocate the serial through Raft, persist before publishing,
   and retry safely through leader changes. Bound node leaves by the issuer's

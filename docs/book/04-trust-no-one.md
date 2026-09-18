@@ -1036,3 +1036,39 @@ incomplete identity, never an unenrolled node that may choose plaintext. Other r
 an unrelated private key, alter identity metadata and corrupt or remove the
 snapshot. Automatic issuance and live transport replacement remain separate
 steps.
+
+### Keep TLS configurations, replace their credentials
+
+Rebuilding a certificate file doesn't change a `rustls::ServerConfig` that
+already owns the old key. The same problem appears in client configurations.
+We need those configurations to ask for the current credentials at each new
+handshake.
+
+`LiveNodeIdentity` loads a validated identity and keeps its persistence directory
+alongside a Tokio `watch` value containing the identity and signing key together.
+Clones share that value. The type implements rustls's server and client
+certificate resolver traits, so existing configurations can select a replacement
+without rebuilding listeners or dropping established connections.
+
+Replacement validates the new certificate, preserves the node identifier and
+trust anchors, and requires a newer signed serial. Replaying the exact current
+certificate is harmless. A shared Tokio mutex serialises writers; the blocking
+worker owns its guard through disk persistence and publication. Dropping the
+requesting future therefore cannot cancel a transaction that has started. A
+failed save leaves the live value unchanged.
+
+Why treat expired client and server identities differently? A server resolver can
+refuse an expired leaf. Returning `None` from a client resolver means "send no
+certificate", which our optional-mTLS API permits for browsers and CLI users.
+An expired node mustn't quietly become one of those anonymous TLS clients. Its
+resolver continues presenting the configured certificate so the peer rejects
+its expiry, matching rustls's static certificate behaviour.
+
+The tests retain existing configurations across replacement and perform real
+handshakes for both required and optional client authentication, with bound and
+unbound peer verification. They also check invalid replacements, persistence
+failure and recovery, concurrent serial ordering and expired client refusal.
+For cancellation, a blocking test worker holds publication after the new snapshot
+is durable. Cancelling the caller and releasing that hold still publishes the
+same identity that disk contains. Bun's transport wiring and the authenticated
+renewal request remain separate implementation steps.

@@ -574,7 +574,7 @@ pub fn build_mtls_client_config_bound(
 }
 
 /// The certificate chain this node presents, plus its private key.
-fn identity_chain_and_key(
+pub(super) fn identity_chain_and_key(
     identity: &NodeIdentity,
 ) -> Result<(Vec<CertificateDer<'static>>, PrivateKeyDer<'static>), MtlsError> {
     let chain = vec![

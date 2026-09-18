@@ -8,6 +8,7 @@ pub mod bootstrap;
 pub mod ca;
 pub mod cert;
 pub mod connection;
+pub mod credentials;
 pub mod crypto;
 pub mod egress;
 pub mod firewall;
