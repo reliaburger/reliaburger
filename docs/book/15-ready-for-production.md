@@ -2817,3 +2817,17 @@ an advisory database or waiting for the review deadline. The real audit then
 fetches the current database and checks the actual lockfile. These are
 separate pieces of evidence: one proves the gate's behaviour, the other checks
 what we intend to ship today.
+
+
+### Let the server reserve its own port
+
+The portable Linux run caught a bootstrap test losing its chosen port between
+closing a temporary listener and starting Bun. Another process bound that port
+first. A longer startup timeout could not repair the race.
+
+Bun now reports the API listener's actual bound address, including the kernel's
+choice when you request port zero. The bootstrap and service-endpoint tests
+start Bun on `127.0.0.1:0`, read that address from its output and probe that exact
+listener. No test releases a guessed API port for Bun to reclaim. The bootstrap
+regression first failed because the old startup line printed the requested
+port zero; it now requires a non-zero address and a successful health response.

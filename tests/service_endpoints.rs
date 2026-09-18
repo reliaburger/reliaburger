@@ -17,16 +17,13 @@ async fn bun_publishes_reachable_ephemeral_service_endpoints() {
     node.ingress.https_port = 0;
     let path = root.path().join("node.toml");
     std::fs::write(&path, toml::to_string_pretty(&node).unwrap()).unwrap();
-    let reserved = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-    let address = reserved.local_addr().unwrap();
-    drop(reserved);
     let log = std::fs::File::create(root.path().join("bun.log")).unwrap();
     let mut child = tokio::process::Command::new(env!("CARGO_BIN_EXE_bun"))
         .args([
             "--runtime",
             "process",
             "--listen",
-            &address.to_string(),
+            "127.0.0.1:0",
             "--config",
         ])
         .arg(path)
@@ -35,6 +32,23 @@ async fn bun_publishes_reachable_ephemeral_service_endpoints() {
         .kill_on_drop(true)
         .spawn()
         .unwrap();
+    let address: std::net::SocketAddr = tokio::time::timeout(Duration::from_secs(30), async {
+        loop {
+            let output = std::fs::read_to_string(root.path().join("bun.log")).unwrap();
+            assert!(child.try_wait().unwrap().is_none(), "bun exited: {output}");
+            if let Some(address) = output.lines().find_map(|line| {
+                line.strip_prefix("bun: API server listening on ")?
+                    .parse()
+                    .ok()
+            }) {
+                break address;
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+    })
+    .await
+    .unwrap();
+    assert_ne!(address.port(), 0);
     let client =
         reliaburger::relish::client::BunClient::new_with_token(&format!("http://{address}"), None);
     let report = tokio::time::timeout(Duration::from_secs(30), async {

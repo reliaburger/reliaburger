@@ -1856,7 +1856,7 @@ async fn run_agent(cli: Cli) -> anyhow::Result<()> {
     let listener = tokio::net::TcpListener::bind(&cli.listen)
         .await
         .with_context(|| format!("failed to bind Bun API on {}", cli.listen))?;
-    println!("bun: API server listening on {}", cli.listen);
+    println!("bun: API server listening on {}", listener.local_addr()?);
 
     // L10: the catalog used to be `default()` on every boot — image
     // metadata evaporated on restart. Load the persisted copy; a

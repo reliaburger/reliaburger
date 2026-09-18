@@ -633,6 +633,14 @@ cache state and never evicts arbitrary images; any future cold-cache mode needs
 exclusive ownership before eviction.
 
 
+**Hosted qualification repair (18 September):** Portable Linux no-default CI
+at `e095a13` failed because the bootstrap test released a candidate API port
+before Bun acquired it. Bun now prints the actual bound API address. Both the
+bootstrap and service-endpoint probes request port zero and discover that
+address without a release/rebind gap. The updated bootstrap regression fails
+against the old reporting line. Five bootstrap tests (0.62s), the endpoint test
+(0.06s) and strict Linux Clippy pass.
+
 ### C35 — Gate chaos capabilities per selected scenario
 
 **Priority:** P2. **Wave:** 4. **Book chapters:** 08, 15.

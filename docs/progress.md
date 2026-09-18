@@ -27,6 +27,13 @@ These are work packages, not 82 mandatory features for 0.1.0. Correctness fixes
 need explicit release dispositions; optional refactors and future capabilities
 remain separate. Older unchecked groups below point into this current ledger.
 
+The 18 September portable Linux no-default CI run found an API port reservation
+race in the bootstrap harness. Bun now reports its actual bound API address;
+bootstrap and endpoint qualification bind port zero and discover that address.
+The reporting regression fails before the fix; five real-process bootstrap tests
+(0.62s), the service-endpoint probe (0.06s) and strict Linux Clippy pass. Latest
+hosted feature-matrix validation remains separate.
+
 ### Correctness and behavioural contracts
 
 - [x] **C01** Preserve every exported log generation with full content-hash object names. Five real Parquet export/query tests and ten exporter unit tests pass; the restart/name-reuse regression fails before the fix. Legacy archive objects remain untouched (migration duplicates documented in chapter 6).
