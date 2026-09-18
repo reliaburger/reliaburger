@@ -37,7 +37,7 @@ Install and usage details are in the [documentation](docs/README.md), and
 implementation status in [progress.md](docs/progress.md).
 
 0.1.0 requires a fresh cluster; development state is refused. Rolling upgrades
-require matching explicit formats (currently protocol 4 and state 3). See the
+require matching explicit formats (currently protocol 5 and state 4). See the
 [compatibility policy](docs/releasing.md#cluster-compatibility).
 
 ## Quick start

@@ -229,7 +229,21 @@ pub enum RaftRequest {
         name: String,
         spec: Box<crate::config::NamespaceSpec>,
     },
-    /// Extend an active lease. An expired lease cannot be revived.
+    /// Atomically mint a bounded test credential and record its exact ownership.
+    TestLeaseApiToken {
+        lease_id: String,
+        owner_id: String,
+        observed_at_unix_ms: u64,
+        token: Box<crate::sesame::types::ApiToken>,
+    },
+    /// Revoke only the exact credential owned by a cleaning lease.
+    TestLeaseRevokeApiToken {
+        lease_id: String,
+        name: String,
+        fingerprint: [u8; 32],
+    },
+    /// Extend an active lease. Existing token expiries are not extended.
+    /// An expired lease cannot be revived.
     TestLeaseRenew {
         lease_id: String,
         owner_id: String,

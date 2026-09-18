@@ -15,10 +15,10 @@ pub struct Compatibility {
     pub state: u32,
 }
 
-/// Supported formats; node-chaos reservations require protocol four and state three.
+/// Supported formats; leased API tokens require protocol five and state four.
 pub const CURRENT: Compatibility = Compatibility {
-    protocol: 4,
-    state: 3,
+    protocol: 5,
+    state: 4,
 };
 
 /// Name of the durable format stamp at the root of a node's data directory.

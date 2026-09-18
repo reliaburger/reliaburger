@@ -1028,3 +1028,162 @@ async fn node_renewal_retries_directly_after_leader_failure_and_persists_the_new
         }
     }
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "slow multi-node test-token cleanup acceptance; run with make test-cluster"]
+async fn leased_token_cleanup_survives_leader_failure_without_revoking_operator_tokens() {
+    use reliaburger::council::RaftRequest;
+    use reliaburger::sesame::types::{ApiRole, ApiToken, TokenScope};
+    use reliaburger::testkit::lease::{TestLease, now_unix_millis, spawn_cluster_lease_reaper};
+    let shutdown = CancellationToken::new();
+    let _cancel_on_drop = CancelOnDrop(shutdown.clone());
+    let hierarchy = ca::generate_ca_hierarchy("leased-token-cluster", &[42; 32]).unwrap();
+    let names = ["token-1", "token-2", "token-3"];
+    let ports = [17941, 17943, 17945];
+    let mut nodes = Vec::new();
+    for index in 0..3 {
+        nodes.push(
+            start_mtls_node(
+                names[index],
+                ports[index],
+                if index == 0 {
+                    vec![]
+                } else {
+                    vec![local(ports[0])]
+                },
+                issued_node_identity(&hierarchy, names[index], 10 + index as u64),
+                &shutdown,
+            )
+            .await,
+        );
+    }
+    let voters: BTreeSet<_> = names.iter().map(|name| raft_id_from_name(name)).collect();
+    assert!(
+        wait_until(Duration::from_secs(30), || nodes
+            .iter()
+            .all(|node| voter_ids(&node.0) == voters)
+            && nodes
+                .iter()
+                .filter(|node| thinks_it_is_leader(&node.0))
+                .count()
+                == 1)
+        .await
+    );
+    let old_leader = nodes
+        .iter()
+        .position(|node| thinks_it_is_leader(&node.0))
+        .unwrap();
+    let council = nodes[old_leader].0.council.as_ref().unwrap();
+    let operator = ApiToken {
+        name: "operator".into(),
+        token_hash: vec![1; 32],
+        token_salt: vec![2; 16],
+        role: ApiRole::Admin,
+        scope: TokenScope::default(),
+        expires_at: None,
+        created_at: SystemTime::now(),
+    };
+    council
+        .write(RaftRequest::CreateApiToken(operator.clone()))
+        .await
+        .unwrap();
+    let now = now_unix_millis();
+    let lease = TestLease::new(
+        "token-cleanup".into(),
+        "operator-fingerprint".into(),
+        "operator".into(),
+        "rbtest-leader".into(),
+        now,
+        now + 3_000,
+    )
+    .unwrap();
+    council
+        .write(RaftRequest::TestLeaseCreate(lease.clone()))
+        .await
+        .unwrap();
+    let token = ApiToken {
+        name: "rbtest-leader-scope".into(),
+        token_hash: vec![3; 32],
+        token_salt: vec![4; 16],
+        role: ApiRole::Deployer,
+        scope: TokenScope {
+            apps: None,
+            namespaces: Some(vec![lease.namespace.clone()]),
+        },
+        expires_at: Some(SystemTime::UNIX_EPOCH + Duration::from_millis(lease.expires_at_unix_ms)),
+        created_at: SystemTime::now(),
+    };
+    let admitted = council
+        .write(RaftRequest::TestLeaseApiToken {
+            lease_id: lease.lease_id.clone(),
+            owner_id: lease.owner_id.clone(),
+            observed_at_unix_ms: now_unix_millis(),
+            token: Box::new(token),
+        })
+        .await
+        .unwrap();
+    assert!(!matches!(
+        admitted,
+        reliaburger::council::CouncilResponse::Refused { .. }
+    ));
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            let mut replicated = true;
+            for node in &nodes {
+                replicated &= node
+                    .0
+                    .council
+                    .as_ref()
+                    .unwrap()
+                    .security_state()
+                    .await
+                    .api_tokens
+                    .len()
+                    == 2;
+            }
+            if replicated {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .unwrap();
+    council.shutdown().await.unwrap();
+    let mut reapers = Vec::new();
+    for (index, node) in nodes.iter().enumerate() {
+        if index != old_leader {
+            reapers.push(spawn_cluster_lease_reaper(
+                node.0.council.as_ref().unwrap().clone(),
+                shutdown.clone(),
+            ));
+        }
+    }
+    tokio::time::timeout(Duration::from_secs(20), async {
+        loop {
+            let mut reclaimed = true;
+            for (index, node) in nodes.iter().enumerate() {
+                if index == old_leader {
+                    continue;
+                }
+                let council = node.0.council.as_ref().unwrap();
+                reclaimed &= !council
+                    .desired_state()
+                    .await
+                    .test_leases
+                    .contains_key(&lease.lease_id);
+                reclaimed &= council.security_state().await.api_tokens == vec![operator.clone()];
+            }
+            if reclaimed {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    })
+    .await
+    .unwrap();
+    shutdown.cancel();
+    for reaper in reapers {
+        reaper.await.unwrap();
+    }
+}

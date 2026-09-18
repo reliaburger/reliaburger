@@ -931,3 +931,130 @@ fn secure_bun_renews_a_due_node_leaf_and_reuses_it_after_restart() {
     let after_restart = identity_store::load(&identity_dir).unwrap().unwrap();
     assert_eq!(after_restart.certificate_der, renewed.certificate_der);
 }
+
+#[test]
+fn secure_catalogue_scoped_token_uses_explicit_ca_and_server_owned_cleanup() {
+    let root = tempfile::tempdir().unwrap();
+    let cluster_dir = root.path().join("cluster");
+    assert_success(
+        &run_relish(&[
+            "init",
+            cluster_dir.to_str().unwrap(),
+            "--cluster-name",
+            "token-lease",
+            "--node-id",
+            "node-01",
+        ]),
+        "initialise scoped-token fixture",
+    );
+    let node_path = cluster_dir.join("reliaburger.toml");
+    let mut node = reliaburger::config::NodeConfig::from_file(&node_path).unwrap();
+    node.node.name = Some("node-01".into());
+    node.network.advertise_address = Some("127.0.0.1".into());
+    node.storage.data = root.path().join("data");
+    node.storage.images = root.path().join("images");
+    node.storage.logs = root.path().join("logs");
+    node.storage.metrics = root.path().join("metrics");
+    node.storage.volumes = root.path().join("volumes");
+    node.images.registry_port = 0;
+    node.testing.safety_class = reliaburger::testkit::safety::ClusterSafetyClass::Development;
+    node.testing
+        .allowed_operations
+        .insert(reliaburger::testkit::safety::OperationPermission::ProvisionIsolatedWorkloads);
+    let (mut bun, address) = spawn_bun_with_port_retry(true, || {
+        let [gossip, raft, reporting] = reserve_ports();
+        node.cluster.gossip_port = gossip;
+        node.cluster.raft_port = raft;
+        node.cluster.reporting_port = reporting;
+        std::fs::write(&node_path, toml::to_string_pretty(&node).unwrap()).unwrap();
+        (
+            node_path.clone(),
+            reserve_address(),
+            root.path().join("token-lease-bun.log"),
+        )
+    });
+    let endpoint = format!("https://{address}");
+    let ca = cluster_dir.join("identity/root-ca.crt");
+    let ca = ca.to_str().unwrap();
+    wait_for_relish(
+        &mut bun,
+        &["--endpoint", &endpoint, "--ca-cert", ca, "status"],
+    );
+    let token = run_relish(&[
+        "--endpoint",
+        &endpoint,
+        "--ca-cert",
+        ca,
+        "token",
+        "create",
+        "--name",
+        "test-admin",
+        "--role",
+        "admin",
+    ]);
+    assert_success(&token, "create catalogue admin");
+    let token = String::from_utf8(token.stdout).unwrap();
+    let token = token.trim();
+    let deadline = Instant::now() + WAIT;
+    // The auth-store refresh is asynchronous; wait until anonymous management
+    // is refused, so the probe cannot accidentally run in bootstrap mode.
+    loop {
+        let anonymous = run_relish(&["--endpoint", &endpoint, "--ca-cert", ca, "token", "list"]);
+        if !anonymous.status.success() {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "auth store did not adopt the admin token"
+        );
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    let output = run_relish(&[
+        "--endpoint",
+        &endpoint,
+        "--ca-cert",
+        ca,
+        "--token",
+        token,
+        "--output",
+        "json",
+        "test",
+        "--filter",
+        "workload-identity",
+        "--timeout",
+        "15s",
+    ]);
+    let report: serde_json::Value =
+        serde_json::from_slice(&output.stdout).unwrap_or_else(|error| {
+            panic!(
+                "invalid catalogue JSON: {error}; stdout={}; stderr={}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            )
+        });
+    let case = report["results"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|case| case["name"] == "namespace_scoped_token_is_rejected_elsewhere")
+        .unwrap();
+    assert_eq!(case["outcome"]["status"], "pass", "{case}");
+    assert_eq!(case["cleanup"]["status"], "confirmed", "{case}");
+    let listed = run_relish(&[
+        "--endpoint",
+        &endpoint,
+        "--ca-cert",
+        ca,
+        "--token",
+        token,
+        "token",
+        "list",
+    ]);
+    assert_success(&listed, "inspect token cleanup");
+    let listed = String::from_utf8(listed.stdout).unwrap();
+    assert!(listed.contains("test-admin"));
+    assert!(
+        !listed.contains("rbtest-"),
+        "test token survived cleanup: {listed}"
+    );
+}

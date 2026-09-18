@@ -4,8 +4,6 @@
 //! runtime-independent, so they run on a process-runtime cluster too.
 
 use crate::bun::capabilities::Capability;
-use crate::config::Config;
-use crate::relish::client::BunClient;
 use crate::testkit::TestContext;
 use crate::testkit::registry::{TestCase, unknown};
 use crate::testkit::report::TestGroup;
@@ -51,75 +49,71 @@ async fn jwks_endpoint_serves_signing_keys(ctx: TestContext) -> Result<(), Strin
     Ok(())
 }
 
-/// A token scoped to one namespace is refused when it writes to another.
+/// A token scoped to one namespace is refused when it reads another's logs.
 async fn namespace_scoped_token_is_rejected_elsewhere(
     ctx: TestContext,
 ) -> crate::testkit::registry::CaseResult {
-    // Mint a Deployer token confined to this test's namespace. (This needs the
-    // harness itself to hold an admin token, which the dev cluster provides.)
-    let token_name = format!("rbtest-scope-{}", ctx.namespace);
+    let lease_id = ctx
+        .lease_id
+        .as_deref()
+        .ok_or_else(|| "scoped-token probe requires a server-owned lease".to_string())?;
+    let token_name = format!("{}-scope", ctx.namespace);
     let token = ctx
         .client
-        .token_create(
-            &token_name,
-            "Deployer",
-            None,
-            Some(vec![ctx.namespace.clone()]),
-            Some(1),
-        )
+        .token_create_with_lease(&token_name, &ctx.namespace, lease_id)
         .await
-        .map_err(|error| format!("could not mint a scoped token: {error}"))?;
-
-    let scoped = BunClient::new_with_token(ctx.client.base_url(), Some(&token));
-    // Deliberately avoid rbtest-* here. Those names are lease-only, and a
-    // rejection at that boundary would not prove token-scope enforcement.
+        .map_err(|error| format!("could not mint a leased scoped token: {error}"))?;
+    let scoped = ctx.client.with_token(&token);
     let other_namespace = format!("outside-{}", ctx.namespace.trim_start_matches("rbtest-"));
-    let spec = format!(
-        "[app.probe]\n\
-         image = \"proc-grill:image-ignored\"\n\
-         command = [\"true\"]\n\
-         namespace = \"{other_namespace}\"\n",
-    );
-    let config =
-        Config::parse(&spec).map_err(|error| format!("probe spec does not parse: {error}"))?;
-
-    // Only the scope gate's own refusal proves enforcement: AUTH1 answers
-    // 403 with "token scope does not allow …". Any error used to count as a
-    // pass, so a network blip or a 500 silently green-lit the case; and 403
-    // alone is not enough — a role failure is also 403.
-    let verdict = match scoped.apply(&config).await {
-        Err(crate::relish::RelishError::ApiError { status: 403, body })
-            if body.contains("token scope does not allow") =>
-        {
-            Ok(())
-        }
-        Err(
-            error @ (crate::relish::RelishError::AgentUnreachable
-            | crate::relish::RelishError::RequestTimeout),
-        ) => unknown(format!(
-            "could not probe the scope boundary: {error}; enforcement unproven"
-        )),
-        Err(error) => Err((format!(
-            "expected the scope refusal (403 \"token scope does not allow\"), got: {error}"
-        ))
-        .into()),
-        Ok(_) => {
-            // It was wrongly allowed — clean up the leak, then fail.
-            let _ = ctx.client.stop("probe", &other_namespace).await;
-            Err(
-                ("a namespace-scoped token was allowed to write to another namespace".to_string())
-                    .into(),
+    // A read proves the scope gate without creating an unowned resource if that
+    // very gate is broken. Raft owns token cleanup even if this future is dropped.
+    loop {
+        let result = ctx
+            .deadline
+            .run(
+                "scoped-token probe",
+                scoped.log_entries("probe", &other_namespace, 1, 0),
             )
+            .await
+            .map_err(|error| format!("scope enforcement unproven: {error}"))?;
+        match result {
+            Err(crate::relish::RelishError::ApiError { status: 403, body })
+                if body.contains("token scope does not allow") =>
+            {
+                return Ok(());
+            }
+            Err(crate::relish::RelishError::ApiError { status: 401, .. }) => {
+                // Each node refreshes its local authentication store from Raft.
+                ctx.deadline
+                    .run(
+                        "token propagation",
+                        tokio::time::sleep(std::time::Duration::from_millis(100)),
+                    )
+                    .await
+                    .map_err(|error| format!("scope enforcement unproven: {error}"))?;
+            }
+            Err(
+                error @ (crate::relish::RelishError::AgentUnreachable
+                | crate::relish::RelishError::RequestTimeout),
+            ) => {
+                return unknown(format!(
+                    "could not probe the scope boundary: {error}; enforcement unproven"
+                ));
+            }
+            Err(error) => {
+                return Err(format!(
+                    "expected the scope refusal (403 with token scope does not allow), got: {error}"
+                )
+                .into());
+            }
+            Ok(_) => {
+                return Err(
+                    "a namespace-scoped token could read another namespace's logs"
+                        .to_string()
+                        .into(),
+                );
+            }
         }
-    };
-    // Revoke is cleanup: it must not overwrite a genuine verdict. Surface a
-    // revoke failure only when the case would otherwise pass.
-    let revoked = ctx.client.token_revoke(&token_name).await;
-    match (verdict, revoked) {
-        (Ok(()), Err(error)) => {
-            Err((format!("could not revoke scoped test token: {error}")).into())
-        }
-        (verdict, _) => verdict,
     }
 }
 
@@ -140,7 +134,7 @@ pub fn cases() -> Vec<TestCase> {
         TestCase {
             name: "namespace_scoped_token_is_rejected_elsewhere",
             group: TestGroup::WorkloadIdentity,
-            requires: &[Capability::Identity],
+            requires: &[Capability::Council, Capability::Identity],
             run: testkit_case!(namespace_scoped_token_is_rejected_elsewhere),
         },
     ]

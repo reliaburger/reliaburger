@@ -1459,6 +1459,7 @@ fn lease_error_response(error: crate::testkit::lease::LeaseError) -> Response {
         | crate::testkit::lease::LeaseError::InvalidOwner
         | crate::testkit::lease::LeaseError::InvalidNamespace
         | crate::testkit::lease::LeaseError::InvalidExpiry
+        | crate::testkit::lease::LeaseError::InvalidToken
         | crate::testkit::lease::LeaseError::UnsupportedSchema { .. } => StatusCode::BAD_REQUEST,
         crate::testkit::lease::LeaseError::Persistence(_)
         | crate::testkit::lease::LeaseError::PersistenceUncertain
@@ -7017,6 +7018,7 @@ async fn token_revoke_handler(
 async fn token_create_handler(
     auth: Option<axum::Extension<crate::sesame::auth::AuthContext>>,
     State(state): State<ApiState>,
+    headers: HeaderMap,
     body: String,
 ) -> Response {
     // AUTH4: the highest-value lateral-movement target. A stolen service
@@ -7026,7 +7028,7 @@ async fn token_create_handler(
     {
         return resp;
     }
-    #[derive(serde::Deserialize)]
+    #[derive(serde::Deserialize, serde::Serialize)]
     struct CreateRequest {
         name: String,
         role: String,
@@ -7036,6 +7038,8 @@ async fn token_create_handler(
         namespaces: Option<Vec<String>>,
         #[serde(default)]
         ttl_days: Option<u64>,
+        #[serde(default)]
+        lease_id: Option<String>,
     }
 
     let req: CreateRequest = match serde_json::from_str(&body) {
@@ -7084,11 +7088,53 @@ async fn token_create_handler(
             .into_response();
     };
 
+    let lease_owner = if req.lease_id.is_some() {
+        let user =
+            match authenticated_test_user(auth.as_deref(), crate::sesame::types::ApiRole::Admin) {
+                Ok(user) => user,
+                Err(response) => return response,
+            };
+        if let Err(response) = crate::sesame::auth::require_unscoped(Some(user)) {
+            return response;
+        }
+        if let Err(response) = test_operation_authorisation(&state, user) {
+            return response;
+        }
+        if !council.is_leader().await {
+            return forward_test_lease_request(
+                &state,
+                council,
+                reqwest::Method::POST,
+                "/v1/token/create",
+                &headers,
+                Some(&req),
+            )
+            .await;
+        }
+        Some(user.principal_id.clone())
+    } else {
+        None
+    };
+    let lease = if let Some(lease_id) = &req.lease_id {
+        let Some(lease) = find_test_lease(&state, lease_id).await else {
+            return lease_error_response(crate::testkit::lease::LeaseError::NotFound);
+        };
+        if let Err(error) = lease.authorise_owner(
+            lease_owner.as_deref().unwrap_or_default(),
+            crate::testkit::lease::now_unix_millis(),
+        ) {
+            return lease_error_response(error);
+        }
+        Some(lease)
+    } else {
+        None
+    };
+
     let scope = crate::sesame::types::TokenScope {
         apps: req.apps.clone(),
         namespaces: req.namespaces.clone(),
     };
-    let expires_at = match req.ttl_days {
+    let mut expires_at = match req.ttl_days {
         None => None,
         Some(days) => {
             let expiry = days
@@ -7110,6 +7156,15 @@ async fn token_create_handler(
             Some(expiry)
         }
     };
+
+    if let Some(lease) = &lease {
+        let Some(bound) = std::time::UNIX_EPOCH
+            .checked_add(std::time::Duration::from_millis(lease.expires_at_unix_ms))
+        else {
+            return lease_error_response(crate::testkit::lease::LeaseError::InvalidExpiry);
+        };
+        expires_at = Some(expires_at.map_or(bound, |expiry| expiry.min(bound)));
+    }
 
     // Argon2id hashing is deliberately slow + memory-hungry (M7): run it on the
     // blocking pool so it doesn't stall the async runtime worker.
@@ -7136,22 +7191,24 @@ async fn token_create_handler(
         }
     };
 
-    match council
-        .write(crate::council::RaftRequest::CreateApiToken(created.token))
-        .await
-    {
-        Ok(_) => Json(serde_json::json!({
-            "name": req.name,
-            "role": req.role,
-            "token": created.plaintext,
-        }))
-        .into_response(),
-        Err(e) => (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(serde_json::json!({ "error": e.to_string() })),
-        )
-            .into_response(),
+    let request = match (lease, lease_owner) {
+        (Some(lease), Some(owner_id)) => crate::council::RaftRequest::TestLeaseApiToken {
+            lease_id: lease.lease_id,
+            owner_id,
+            observed_at_unix_ms: crate::testkit::lease::now_unix_millis(),
+            token: Box::new(created.token),
+        },
+        _ => crate::council::RaftRequest::CreateApiToken(created.token),
+    };
+    if let Err(response) = write_lease_request(council, request).await {
+        return response;
     }
+    Json(serde_json::json!({
+        "name": req.name,
+        "role": req.role,
+        "token": created.plaintext,
+    }))
+    .into_response()
 }
 
 /// Create a short-lived, single-use node join token and persist its hash.

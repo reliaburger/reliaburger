@@ -1117,8 +1117,8 @@ container required. Cluster-coordination is the same shape: every node reports
 alive, the council has a leader, every member answers `/v1/health` directly.
 And workload identity is API-level auth: the JWKS endpoint serves a well-formed
 signing key, and a token scoped to one namespace is refused when it tries to
-write to another. Mint the token, point a second client at it, watch the write
-bounce with a 403. None of that needs a container either.
+read another namespace's logs. Mint a leased token, point a second client at it,
+and watch the read bounce with the scope gate's own 403. None of that needs a container either.
 
 But the other part-B groups — firewall, ingress, volumes, mounted secrets,
 image-registry deploys — are exactly the ones that *do*. Firewall enforcement
@@ -2738,3 +2738,45 @@ the third voter. The legacy partition acceptance now waits for every node to see
 a known leader and a stable, non-joint three-voter membership as well as live
 gossip. The server continues to refuse an earlier request. Waiting only for the
 network view made the test race bootstrap on hosted runners.
+
+### A test token belongs to the server lease
+
+Suppose Relish creates a token, sends its probe and then loses power. A cleanup
+call at the end of the function never runs. The token must still disappear.
+
+Token issuance now commits the credential and its lease ownership in one Raft
+entry. Only the lease's exact authenticated owner may request it, with an
+unscoped Admin credential and permission to provision test resources. The
+token's name begins with the lease namespace, its namespace scope contains
+exactly that namespace, and its role cannot be Admin. Its expiry is capped at
+the lease's current expiry. Renewing the lease doesn't extend a token already
+issued; a longer test must mint another credential.
+
+`LeasedResource::ApiToken { name, fingerprint }` is another variant of the
+resource enum. Matching on the enum makes Rust ask us to handle this new kind
+in both cleanup paths. The cluster reaper first commits the Cleaning state,
+then revokes the exact fingerprint. A changed credential with the same name
+is an error, never permission to delete the replacement. The ownership record
+remains until absence is confirmed. A new leader resumes the same work.
+Standalone nodes refuse token cleanup because they have no token council.
+
+Names beginning with `rbtest-` are reserved for leased token issuance. Existing
+names cannot be overwritten or reclaimed by another lease, even after an
+operator revokes the original token before cleanup finishes. This also means
+a lost issuance response cannot be retried into a second live credential.
+The caller may obtain a new name under the same lease.
+
+The catalogue now uses the accepted lowercase `deployer` role and preserves
+the original connection's CA and managed forwards when switching credentials.
+It probes a read-only log endpoint outside its namespace. If scope enforcement
+breaks, the probe fails without creating a workload that it cannot own. A role
+refusal, authentication propagation delay, transport failure or arbitrary 403
+isn't evidence that the scope check worked.
+
+API tests exercise anonymous and wrong-owner refusal, bounded expiry and
+client-free reclamation. Raft tests cover invalid authority and scope, existing
+names, snapshot recovery and replacement fencing. Live acceptance runs the
+actual Relish catalogue against HTTPS Bun, and kills a three-node cluster's
+leader before the token expires to check successor cleanup. These new persisted
+variants require protocol 5, state 4 and lease schema 2: create fresh development
+clusters instead of reading them with an older binary.

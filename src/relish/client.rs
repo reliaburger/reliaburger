@@ -374,6 +374,13 @@ impl BunClient {
         }
     }
 
+    /// Use another bearer credential with this connection's existing trust roots and forwards.
+    pub fn with_token(&self, token: &str) -> Self {
+        let mut client = Self::build(&self.base_url, Some(token), self.ca_pem.as_deref());
+        client.service_endpoints = self.service_endpoints.clone();
+        client
+    }
+
     /// Declare the host forwards owned by this managed connection. Missing
     /// forwards remain unavailable instead of falling back to guest addresses.
     pub fn with_service_endpoints(
@@ -1825,17 +1832,32 @@ impl BunClient {
         namespaces: Option<Vec<String>>,
         ttl_days: Option<u64>,
     ) -> Result<String, RelishError> {
+        self.create_token_request(serde_json::json!({
+            "name": name, "role": role, "apps": apps,
+            "namespaces": namespaces, "ttl_days": ttl_days,
+        }))
+        .await
+    }
+
+    /// Mint a namespace-scoped Deployer token whose lifetime and cleanup belong to a test lease.
+    pub async fn token_create_with_lease(
+        &self,
+        name: &str,
+        namespace: &str,
+        lease_id: &str,
+    ) -> Result<String, RelishError> {
+        self.create_token_request(serde_json::json!({
+            "name": name, "role": "deployer", "namespaces": [namespace], "lease_id": lease_id,
+        }))
+        .await
+    }
+
+    async fn create_token_request(&self, body: serde_json::Value) -> Result<String, RelishError> {
         let url = format!("{}/v1/token/create", self.base_url);
         let response = self
             .http()?
             .post(&url)
-            .json(&serde_json::json!({
-                "name": name,
-                "role": role,
-                "apps": apps,
-                "namespaces": namespaces,
-                "ttl_days": ttl_days,
-            }))
+            .json(&body)
             .send()
             .await
             .map_err(classify_error)?;
@@ -2350,6 +2372,22 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn replacing_bearer_preserves_explicit_ca_and_uses_the_new_credential() {
+        let hierarchy = crate::sesame::ca::generate_ca_hierarchy("scoped-client", b"ikm").unwrap();
+        let identity = test_identity(&hierarchy, "node-01");
+        let shutdown = tokio_util::sync::CancellationToken::new();
+        let address = spawn_tls_health(&identity, shutdown.clone()).await;
+        let ca = pem_cert(&hierarchy.node.ca.certificate_der);
+        let client =
+            BunClient::new_with_ca(&format!("https://{address}"), Some("original"), &ca).unwrap();
+        // This endpoint accepts only rbrg_ws. The replacement must keep the
+        // explicit CA without inheriting the old credential's default header.
+        let result = client.with_token("rbrg_ws").ws_connect("/ws").await;
+        shutdown.cancel();
+        assert!(result.is_ok(), "replacement credential failed: {result:?}");
+    }
+
+    #[tokio::test]
     async fn websocket_refuses_an_unrelated_ca() {
         let hierarchy =
             crate::sesame::ca::generate_ca_hierarchy("websocket-server", b"ikm").unwrap();
@@ -2424,6 +2462,15 @@ mod tests {
             .with_service_endpoints(forwards.clone());
         assert_eq!(
             client.capabilities().await.unwrap().service_endpoints,
+            forwards
+        );
+        assert_eq!(
+            client
+                .with_token("scoped")
+                .capabilities()
+                .await
+                .unwrap()
+                .service_endpoints,
             forwards
         );
         assert!(

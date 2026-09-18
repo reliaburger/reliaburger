@@ -10,7 +10,7 @@ use tokio::sync::{Mutex, OwnedMutexGuard};
 use crate::meat::AppId;
 
 /// Current persisted and API schema version for test leases.
-pub const TEST_LEASE_SCHEMA_VERSION: u32 = 1;
+pub const TEST_LEASE_SCHEMA_VERSION: u32 = 2;
 
 /// Maximum live lease records accepted by one standalone node or cluster.
 pub const MAX_ACTIVE_TEST_LEASES: usize = 64;
@@ -29,6 +29,8 @@ pub enum LeasedResource {
     App { app_id: AppId },
     /// A declarative namespace created for an owned app.
     Namespace { name: String },
+    /// An exact API credential, never a name-only deletion target.
+    ApiToken { name: String, fingerprint: [u8; 32] },
 }
 
 /// Whether a lease accepts new resources or is being reclaimed.
@@ -132,6 +134,9 @@ impl TestLease {
         if self.resources.iter().any(|resource| match resource {
             LeasedResource::App { app_id } => app_id.namespace != self.namespace,
             LeasedResource::Namespace { name } => name != &self.namespace,
+            LeasedResource::ApiToken { name, .. } => {
+                !name.starts_with(&format!("{}-", self.namespace))
+            }
         }) {
             return Err(LeaseError::NamespaceMismatch);
         }
@@ -139,6 +144,36 @@ impl TestLease {
             return Err(LeaseError::ResourceLimit);
         }
         Ok(())
+    }
+
+    /// Validate a test credential before atomically attaching it in Raft.
+    pub fn token_resource(
+        &self,
+        token: &crate::sesame::types::ApiToken,
+        owner_id: &str,
+        now_unix_ms: u64,
+    ) -> Result<LeasedResource, LeaseError> {
+        self.authorise_owner(owner_id, now_unix_ms)?;
+        let expires = token
+            .expires_at
+            .and_then(|time| time.duration_since(std::time::UNIX_EPOCH).ok());
+        if !token.name.starts_with(&format!("{}-", self.namespace))
+            || token.role == crate::sesame::types::ApiRole::Admin
+            || token.scope.namespaces.as_deref() != Some(std::slice::from_ref(&self.namespace))
+            || expires.is_none_or(|expiry| {
+                expiry <= std::time::Duration::from_millis(now_unix_ms)
+                    || expiry > std::time::Duration::from_millis(self.expires_at_unix_ms)
+            })
+        {
+            return Err(LeaseError::InvalidToken);
+        }
+        if self.resources.len() >= MAX_LEASED_RESOURCES {
+            return Err(LeaseError::ResourceLimit);
+        }
+        Ok(LeasedResource::ApiToken {
+            name: token.name.clone(),
+            fingerprint: token_fingerprint(token),
+        })
     }
 
     /// Check ownership and active lifetime before attaching a resource.
@@ -151,6 +186,12 @@ impl TestLease {
         }
         Ok(())
     }
+}
+
+/// Public fingerprint used to fence cleanup against a replaced credential.
+pub fn token_fingerprint(token: &crate::sesame::types::ApiToken) -> [u8; 32] {
+    use sha2::{Digest, Sha256};
+    Sha256::digest(&token.token_hash).into()
 }
 
 /// Return whether a namespace is reserved and safe for lease-wide cleanup.
@@ -192,6 +233,10 @@ pub enum LeaseError {
     NotActive,
     #[error("app namespace does not match its lease")]
     NamespaceMismatch,
+    #[error(
+        "leased token must use its namespace prefix, a non-admin role, exactly its namespace scope and a positive lifetime within the lease"
+    )]
+    InvalidToken,
     #[error("lease resource limit reached")]
     ResourceLimit,
     #[error("local lease store exceeds 4 MiB")]
@@ -622,6 +667,11 @@ pub async fn cleanup_local_lease(
                     }
                 }
             }
+            LeasedResource::ApiToken { .. } => {
+                let reason = "API token cleanup requires a council";
+                store.cleanup_failed(lease_id, reason).await?;
+                return Err(LeaseError::Cleanup(reason.into()));
+            }
             LeasedResource::Namespace { .. } => {
                 // Standalone namespace specs are validation input rather than
                 // durable agent state. Cluster mode removes its Raft record.
@@ -678,6 +728,21 @@ pub async fn cleanup_cluster_lease(
     };
     for resource in &resources {
         match resource {
+            LeasedResource::ApiToken { name, fingerprint } => {
+                if let Err(error) = write_cluster_lease_request(
+                    council,
+                    crate::council::RaftRequest::TestLeaseRevokeApiToken {
+                        lease_id: lease_id.to_string(),
+                        name: name.clone(),
+                        fingerprint: *fingerprint,
+                    },
+                )
+                .await
+                {
+                    record_cluster_cleanup_failure(council, lease_id, &error).await;
+                    return Err(error);
+                }
+            }
             LeasedResource::App { app_id } => {
                 if let Err(error) = write_cluster_lease_request(
                     council,

@@ -557,6 +557,28 @@ Only apps and namespaces are leased. Jobs, images, tokens, mounts and node effec
 
 **Completion test:** Extend one resource family per commit with durable ownership, renewal bounds, leader/client-death cleanup and refusal to delete pre-existing resources.
 
+**Token family completed on PR #167:** Atomic Raft issuance binds a non-admin
+credential to the exact authenticated lease owner, its namespace and expiry.
+Reserved test names cannot be created without a lease; duplicate and already
+owned names refuse without returning an uncommitted secret. Cleanup fences
+against the credential fingerprint and survives snapshots and leader failure.
+Renewal never extends existing token expiry. The catalogue preserves explicit
+CA/host-forward settings and proves namespace refusal with a read-only probe.
+Protocol 5/state 4 and lease schema 2 require fresh development clusters.
+Both ownership API regressions fail before implementation. Five final API tests
+(2.36s), 74 Raft state-machine tests, 13 local lease tests, actual HTTPS Bun/Relish
+catalogue execution and cleanup (12.33s), and three-node leader-failure cleanup
+(17.60s) pass. Two compatibility checks (0.01s), all 17 client tests (0.17s), and strict
+Linux/macOS all-target/all-feature Clippy also pass.
+
+Remaining resource contracts, each in its own commit: node-local jobs (including
+retiring cron schedules before the first run), registry uploads/repositories,
+and managed volume/mount cleanup. Node effects already use C06 reservations
+and C10 exact-fault receipts. Image distribution currently reports uncontrolled
+cache state and never evicts arbitrary images; any future cold-cache mode needs
+exclusive ownership before eviction.
+
+
 ### C35 — Gate chaos capabilities per selected scenario
 
 **Priority:** P2. **Wave:** 4. **Book chapters:** 08, 15.

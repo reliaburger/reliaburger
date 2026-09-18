@@ -377,6 +377,18 @@ impl StateMachineInner {
                 return Some(CouncilResponse::JoinTokenConsumed { serial });
             }
             RaftRequest::CreateApiToken(token) => {
+                if token.name.starts_with("rbtest-")
+                    || self
+                        .state
+                        .security_state
+                        .api_tokens
+                        .iter()
+                        .any(|existing| existing.name == token.name)
+                {
+                    return Some(CouncilResponse::Refused {
+                        reason: "token name already exists or requires a test lease".into(),
+                    });
+                }
                 self.state.security_state.api_tokens.push(token.clone());
             }
             RaftRequest::RevokeApiToken { name } => {
@@ -742,6 +754,78 @@ impl StateMachineInner {
                 }
                 self.state.namespaces.insert(name.clone(), *spec.clone());
             }
+            RaftRequest::TestLeaseApiToken {
+                lease_id,
+                owner_id,
+                observed_at_unix_ms,
+                token,
+            } => {
+                let Some(lease) = self.state.test_leases.get(lease_id) else {
+                    return Some(CouncilResponse::Refused {
+                        reason: "lease not found".into(),
+                    });
+                };
+                let resource = match lease.token_resource(token, owner_id, *observed_at_unix_ms) {
+                    Ok(resource) => resource,
+                    Err(error) => {
+                        return Some(CouncilResponse::Refused {
+                            reason: error.to_string(),
+                        });
+                    }
+                };
+                let name_owned = self.state.test_leases.values().any(|lease| lease.resources.iter().any(|resource| {
+                    matches!(resource, crate::testkit::lease::LeasedResource::ApiToken { name, .. } if name == &token.name)
+                }));
+                if name_owned
+                    || self
+                        .state
+                        .security_state
+                        .api_tokens
+                        .iter()
+                        .any(|existing| existing.name == token.name)
+                {
+                    return Some(CouncilResponse::Refused {
+                        reason: "token name already exists or is lease-owned".into(),
+                    });
+                }
+                if let Some(lease) = self.state.test_leases.get_mut(lease_id) {
+                    lease.resources.insert(resource);
+                }
+                self.state.security_state.api_tokens.push(*token.clone());
+            }
+            RaftRequest::TestLeaseRevokeApiToken {
+                lease_id,
+                name,
+                fingerprint,
+            } => {
+                let resource = crate::testkit::lease::LeasedResource::ApiToken {
+                    name: name.clone(),
+                    fingerprint: *fingerprint,
+                };
+                if !self.state.test_leases.get(lease_id).is_some_and(|lease| {
+                    matches!(
+                        lease.state,
+                        crate::testkit::lease::TestLeaseState::Cleaning { .. }
+                    ) && lease.resources.contains(&resource)
+                }) {
+                    return Some(CouncilResponse::Refused {
+                        reason: "token is not owned by this cleaning lease".into(),
+                    });
+                }
+                if self.state.security_state.api_tokens.iter().any(|token| {
+                    &token.name == name
+                        && (crate::testkit::lease::token_fingerprint(token) != *fingerprint
+                            || token.role == crate::sesame::types::ApiRole::Admin)
+                }) {
+                    return Some(CouncilResponse::Refused {
+                        reason: "owned token has been replaced; refusing to revoke it".into(),
+                    });
+                }
+                self.state
+                    .security_state
+                    .api_tokens
+                    .retain(|token| &token.name != name);
+            }
             RaftRequest::TestLeaseRenew {
                 lease_id,
                 owner_id,
@@ -807,6 +891,16 @@ impl StateMachineInner {
                 let remaining: Vec<String> = resources
                     .iter()
                     .filter_map(|resource| match resource {
+                        crate::testkit::lease::LeasedResource::ApiToken { name, .. }
+                            if self
+                                .state
+                                .security_state
+                                .api_tokens
+                                .iter()
+                                .any(|token| &token.name == name) =>
+                        {
+                            Some(format!("token {name}"))
+                        }
                         crate::testkit::lease::LeasedResource::App { app_id }
                             if self.state.apps.contains_key(app_id) =>
                         {
@@ -3304,6 +3398,196 @@ mod tests {
             "got: {:?}",
             responses[0]
         );
+    }
+
+    fn leased_token() -> crate::sesame::types::ApiToken {
+        crate::sesame::types::ApiToken {
+            name: "rbtest-run1-scope".into(),
+            token_hash: vec![1; 32],
+            token_salt: vec![2; 16],
+            role: crate::sesame::types::ApiRole::Deployer,
+            scope: crate::sesame::types::TokenScope {
+                apps: None,
+                namespaces: Some(vec!["rbtest-run1".into()]),
+            },
+            expires_at: Some(
+                std::time::SystemTime::UNIX_EPOCH + std::time::Duration::from_millis(100),
+            ),
+            created_at: std::time::SystemTime::UNIX_EPOCH,
+        }
+    }
+
+    fn leased_token_request(token: crate::sesame::types::ApiToken) -> RaftRequest {
+        RaftRequest::TestLeaseApiToken {
+            lease_id: "run1".into(),
+            owner_id: "token:ci".into(),
+            observed_at_unix_ms: 20,
+            token: Box::new(token),
+        }
+    }
+
+    #[test]
+    fn leased_token_refuses_invalid_authority_scope_expiry_and_existing_names() {
+        let mut inner = StateMachineInner::default();
+        inner.apply_request(&RaftRequest::TestLeaseCreate(test_lease("run1", 100)));
+        let mut invalid = Vec::new();
+        let mut token = leased_token();
+        token.role = crate::sesame::types::ApiRole::Admin;
+        invalid.push(token);
+        let mut token = leased_token();
+        token.scope.namespaces = None;
+        invalid.push(token);
+        let mut token = leased_token();
+        token.scope.namespaces = Some(vec!["outside".into()]);
+        invalid.push(token);
+        let mut token = leased_token();
+        token.expires_at = None;
+        invalid.push(token);
+        let mut token = leased_token();
+        token.expires_at =
+            Some(std::time::SystemTime::UNIX_EPOCH + std::time::Duration::from_millis(101));
+        invalid.push(token);
+        let mut token = leased_token();
+        token.expires_at = Some(std::time::SystemTime::UNIX_EPOCH);
+        invalid.push(token);
+        let mut token = leased_token();
+        token.name = "operator-token".into();
+        invalid.push(token);
+        for token in invalid {
+            assert!(matches!(
+                inner.apply_request(&leased_token_request(token)),
+                Some(CouncilResponse::Refused { .. })
+            ));
+            assert!(inner.state.security_state.api_tokens.is_empty());
+            assert!(inner.state.test_leases["run1"].resources.is_empty());
+        }
+        for (owner, observed) in [("other", 20), ("token:ci", 100)] {
+            assert!(matches!(
+                inner.apply_request(&RaftRequest::TestLeaseApiToken {
+                    lease_id: "run1".into(),
+                    owner_id: owner.into(),
+                    observed_at_unix_ms: observed,
+                    token: Box::new(leased_token()),
+                }),
+                Some(CouncilResponse::Refused { .. })
+            ));
+        }
+        inner.state.security_state.api_tokens.push(leased_token());
+        assert!(matches!(
+            inner.apply_request(&leased_token_request(leased_token())),
+            Some(CouncilResponse::Refused { .. })
+        ));
+        assert!(inner.state.test_leases["run1"].resources.is_empty());
+    }
+
+    #[test]
+    fn leased_token_expiry_does_not_extend_on_renewal_and_revocation_does_not_release_ownership() {
+        let mut inner = StateMachineInner::default();
+        inner.apply_request(&RaftRequest::TestLeaseCreate(test_lease("run1", 100)));
+        inner.apply_request(&leased_token_request(leased_token()));
+        inner.apply_request(&RaftRequest::TestLeaseRenew {
+            lease_id: "run1".into(),
+            owner_id: "token:ci".into(),
+            renewed_at_unix_ms: 30,
+            expires_at_unix_ms: 200,
+        });
+        assert_eq!(
+            inner.state.security_state.api_tokens[0].expires_at,
+            leased_token().expires_at
+        );
+        inner.apply_request(&RaftRequest::RevokeApiToken {
+            name: leased_token().name,
+        });
+        assert!(inner.state.security_state.api_tokens.is_empty());
+        assert!(matches!(
+            inner.apply_request(&leased_token_request(leased_token())),
+            Some(CouncilResponse::Refused { .. })
+        ));
+        let mut replacement = leased_token();
+        replacement.name = "rbtest-run1-next".into();
+        assert!(!matches!(
+            inner.apply_request(&leased_token_request(replacement)),
+            Some(CouncilResponse::Refused { .. })
+        ));
+    }
+
+    #[tokio::test]
+    async fn leased_token_snapshot_preserves_cleanup_fences_and_exact_credential() {
+        let mut sm = CouncilStateMachine::new();
+        sm.apply(vec![
+            normal_entry(1, 1, RaftRequest::TestLeaseCreate(test_lease("run1", 100))),
+            normal_entry(1, 2, leased_token_request(leased_token())),
+        ])
+        .await
+        .unwrap();
+        let state = sm.desired_state().await;
+        let resource = state.test_leases["run1"]
+            .resources
+            .iter()
+            .next()
+            .unwrap()
+            .clone();
+        let crate::testkit::lease::LeasedResource::ApiToken { name, fingerprint } = resource else {
+            panic!("wrong resource")
+        };
+        let mut builder = sm.get_snapshot_builder().await;
+        let snapshot = builder.build_snapshot().await.unwrap();
+        let mut restored = CouncilStateMachine::new();
+        restored
+            .install_snapshot(&snapshot.meta, snapshot.snapshot)
+            .await
+            .unwrap();
+        let mut inner = restored.inner.write().await;
+        let cleanup = RaftRequest::TestLeaseRevokeApiToken {
+            lease_id: "run1".into(),
+            name: name.clone(),
+            fingerprint,
+        };
+        assert!(matches!(
+            inner.apply_request(&cleanup),
+            Some(CouncilResponse::Refused { .. })
+        ));
+        inner.apply_request(&RaftRequest::TestLeaseBeginCleanup {
+            lease_id: "run1".into(),
+        });
+        assert!(matches!(
+            inner.apply_request(&leased_token_request(leased_token())),
+            Some(CouncilResponse::Refused { .. })
+        ));
+        assert!(matches!(
+            inner.apply_request(&RaftRequest::TestLeaseFinishCleanup {
+                lease_id: "run1".into()
+            }),
+            Some(CouncilResponse::Refused { .. })
+        ));
+        // Even corrupt/external replacement state must never cause name-only deletion.
+        inner.state.security_state.api_tokens[0].token_hash = vec![3; 32];
+        assert!(matches!(
+            inner.apply_request(&cleanup),
+            Some(CouncilResponse::Refused { .. })
+        ));
+        assert_eq!(
+            inner.state.security_state.api_tokens[0].token_hash,
+            vec![3; 32]
+        );
+        inner.state.security_state.api_tokens[0] = leased_token();
+        assert!(!matches!(
+            inner.apply_request(&cleanup),
+            Some(CouncilResponse::Refused { .. })
+        ));
+        assert!(inner.state.security_state.api_tokens.is_empty());
+        assert!(!matches!(
+            inner.apply_request(&cleanup),
+            Some(CouncilResponse::Refused { .. })
+        ));
+        assert!(matches!(
+            inner.apply_request(&RaftRequest::CreateApiToken(leased_token())),
+            Some(CouncilResponse::Refused { .. })
+        ));
+        inner.apply_request(&RaftRequest::TestLeaseFinishCleanup {
+            lease_id: "run1".into(),
+        });
+        assert!(inner.state.test_leases.is_empty());
     }
 
     fn test_lease(id: &str, expires_at_unix_ms: u64) -> crate::testkit::lease::TestLease {
