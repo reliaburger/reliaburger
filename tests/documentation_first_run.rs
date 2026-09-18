@@ -579,8 +579,9 @@ fn post_bootstrap_join_tokens_enrol_two_distinct_nodes_and_fail_closed() {
     }
     assert_ne!(issued[0], issued[1]);
 
+    use rustls::pki_types::{CertificateDer, pem::PemObject};
     let root_ca = std::fs::read(&ca_path).unwrap();
-    let root_ca_der = rustls_pemfile::certs(&mut root_ca.as_slice())
+    let root_ca_der = CertificateDer::pem_slice_iter(&root_ca)
         .next()
         .unwrap()
         .unwrap();

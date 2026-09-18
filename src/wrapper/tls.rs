@@ -10,7 +10,7 @@ use std::path::Path;
 use std::sync::Arc;
 
 use rustls::ServerConfig;
-use rustls::pki_types::{CertificateDer, PrivateKeyDer};
+use rustls::pki_types::{CertificateDer, PrivateKeyDer, pem::PemObject};
 
 /// Errors from TLS operations.
 #[derive(Debug, thiserror::Error)]
@@ -96,8 +96,8 @@ pub fn load_certs_from_disk(
     cert_path: &Path,
     key_path: &Path,
 ) -> Result<(Vec<CertificateDer<'static>>, PrivateKeyDer<'static>), TlsError> {
-    let mut cert_reader = read_pem(cert_path)?;
-    let certs: Vec<CertificateDer<'static>> = rustls_pemfile::certs(&mut cert_reader)
+    let cert_reader = read_pem(cert_path)?;
+    let certs: Vec<CertificateDer<'static>> = CertificateDer::pem_reader_iter(cert_reader)
         .collect::<Result<_, _>>()
         .map_err(|e| TlsError::LoadFailed {
             path: cert_path.display().to_string(),
@@ -111,8 +111,10 @@ pub fn load_certs_from_disk(
         });
     }
 
-    let mut key_reader = read_pem(key_path)?;
-    let key = rustls_pemfile::private_key(&mut key_reader)
+    let key_reader = read_pem(key_path)?;
+    let key = PrivateKeyDer::pem_reader_iter(key_reader)
+        .next()
+        .transpose()
         .map_err(|e| TlsError::LoadFailed {
             path: key_path.display().to_string(),
             reason: e.to_string(),

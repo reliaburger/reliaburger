@@ -7,6 +7,7 @@
 /// reads incrementally — printing progress to stderr and collecting
 /// the final result.
 use futures_util::StreamExt;
+use rustls::pki_types::{CertificateDer, pem::PemObject};
 use tokio_tungstenite::tungstenite::client::IntoClientRequest;
 
 use crate::bun::agent::{
@@ -311,7 +312,7 @@ impl BunClient {
                 builder = builder.default_headers(headers);
             }
             if let Some(pem) = ca_pem {
-                let certificates = rustls_pemfile::certs(&mut &pem[..])
+                let certificates = CertificateDer::pem_slice_iter(pem)
                     .collect::<Result<Vec<_>, _>>()
                     .map_err(|error| format!("invalid cluster CA PEM: {error}"))?;
                 if certificates.is_empty() {
@@ -400,7 +401,7 @@ impl BunClient {
             .redirect(reqwest::redirect::Policy::none())
             .timeout(std::time::Duration::from_secs(3));
         if let Some(pem) = &self.ca_pem {
-            for certificate in rustls_pemfile::certs(&mut &pem[..]) {
+            for certificate in CertificateDer::pem_slice_iter(pem) {
                 let certificate = certificate.map_err(|error| error.to_string())?;
                 builder = builder.add_root_certificate(
                     reqwest::Certificate::from_der(&certificate)

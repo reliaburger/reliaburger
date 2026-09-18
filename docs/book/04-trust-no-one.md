@@ -1293,3 +1293,24 @@ returned 204 for a scoped outsider. The repaired tests also exercise the two
 legitimate paths, an unscoped operator and the exact scoped Deployer who owns
 the lease. Ownership and the administrator override are distinct authorities;
 a role check alone cannot stand in for both.
+
+### Retiring the extra PEM parser dependency
+
+Rustls already provides PEM parsing through `rustls::pki_types`. The separate
+`rustls-pemfile` crate wraps that parser and is now unmaintained, so we use the
+underlying API directly and remove the dependency and its audit exception.
+The bounded file reader, certificate validation and reload rules stay in place.
+
+`PemObject` is a trait providing parsing functions on certificate and key
+types. Importing the trait lets Rust resolve an associated function such as
+`CertificateDer::pem_slice_iter(bytes)`. The type before `::` determines which
+PEM sections the iterator accepts. For a private key, `next()` produces
+`Option<Result<PrivateKeyDer, Error>>`: there might be no key, or parsing the
+next key might fail. `transpose()` turns that into
+`Result<Option<PrivateKeyDer>, Error>`, letting `?` propagate a parse error
+before we report the separate “no private key” case.
+
+The advisory gate fails with the old dependency when its exception is removed.
+After migration it passes without that exception. TLS file-reload and client
+certificate tests check the behaviour that matters to users; a shorter
+lockfile is useful, but it is not evidence that a TLS connection still works.

@@ -1220,7 +1220,13 @@ Evidence: `docs/qualification/2026-09-17-laptop.md`; `docs/quickstart.md`.
 
 Evidence: `.cargo/audit.toml`; `Makefile:audit`.
 
-The current audit passes with five named exceptions. An exception is a tracked risk, not a fixed dependency.
+The baseline audit passed with five named exceptions. An exception is a tracked
+risk, not a fixed dependency. The September release review removes
+`rustls-pemfile` and RUSTSEC-2025-0134 by using the existing Rustls `PemObject`
+parser directly. The advisory gate failed before migration with that exception
+removed. Twelve TLS unit tests, 17 client tests, seven ingress tests, three
+operator file-reload tests and strict Linux/macOS Clippy pass. `make audit`
+passes with four exceptions; their explicit review disposition remains open.
 
 **Completion test:** Before 18 November 2026, re-evaluate reachable advisories and migration options, record evidence and remove or explicitly renew each exception under the fail-closed gate.
 
