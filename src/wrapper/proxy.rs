@@ -96,6 +96,7 @@ pub struct BoundProxy {
     http_listener: TcpListener,
     https_listener: TcpListener,
     tls_acceptor: tokio_rustls::TlsAcceptor,
+    file_cert_resolver: Option<Arc<super::tls::FileCertResolver>>,
     /// Bounds concurrent TLS handshakes so a slow-handshake flood can't
     /// pile up tasks (ING2).
     handshake_limit: Arc<Semaphore>,
@@ -166,11 +167,18 @@ pub async fn bind_proxy_with_tls(
     // An operator disk cert always wins. Otherwise, if the cluster Ingress CA
     // resolver is wired, serve per-SNI cluster-signed certs; failing both, a
     // self-signed `localhost` cert (dev / no-cluster).
+    let mut file_cert_resolver = None;
     let tls_config = match (&config.tls_cert_path, &config.tls_key_path) {
         (Some(cert), Some(key)) => {
-            let (certs, key) = super::tls::load_certs_from_disk(cert, key)
-                .map_err(|e| WrapperError::ProxyFailed(format!("failed to load TLS files: {e}")))?;
-            super::tls::build_tls_config(certs, key).map_err(|e| {
+            let resolver = Arc::new(
+                super::tls::FileCertResolver::load(cert, key)
+                    .await
+                    .map_err(|e| {
+                        WrapperError::ProxyFailed(format!("failed to load TLS files: {e}"))
+                    })?,
+            );
+            file_cert_resolver = Some(Arc::clone(&resolver));
+            super::tls::build_tls_config_with_resolver(resolver).map_err(|e| {
                 WrapperError::ProxyFailed(format!("failed to build TLS config: {e}"))
             })?
         }
@@ -200,6 +208,7 @@ pub async fn bind_proxy_with_tls(
         http_listener,
         https_listener,
         tls_acceptor,
+        file_cert_resolver,
         handshake_limit: Arc::new(Semaphore::new(config.max_tls_handshakes)),
         handshake_timeout: config.tls_handshake_timeout,
         state,
@@ -262,7 +271,14 @@ impl BoundProxy {
             self.shutdown.clone(),
         );
 
-        tokio::try_join!(http, https)?;
+        let reload = async {
+            match self.file_cert_resolver {
+                Some(resolver) => resolver.run(self.shutdown.clone()).await,
+                None => self.shutdown.cancelled().await,
+            }
+            Ok::<(), WrapperError>(())
+        };
+        tokio::try_join!(http, https, reload)?;
         Ok(())
     }
 }

@@ -278,8 +278,12 @@ with `UnknownIssuer` before the fix and succeeds after it (0.02s); ten ingress
 TLS tests and strict Linux 1.97/macOS 1.98 Clippy pass. This does not close renewal.
 Cached-leaf renewal now uses the X.509 validity midpoint, rejects expired cache
 entries and limits issued leaves to the original issuer certificate's validity.
-Remaining implementation covers operator file replacement, node/API/Raft/reporting
-identity updates and bounded connection retirement. The
+Operator files now reload as validated pairs, retaining the last usable pair
+during incomplete or invalid replacements. Real Wrapper acceptance verifies
+new full handshakes use the replacement and existing HTTP connections survive
+(3.26s); expired and future-dated initial files are refused.
+Remaining implementation covers node/API/Raft/reporting identity updates,
+session resumption policy and bounded connection retirement. The
 working connection-lifetime policy is one hour, pending any operator preference.
 
 ### C15 — Make ingress serials unique across nodes and restarts

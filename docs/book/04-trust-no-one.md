@@ -915,3 +915,33 @@ checks reuse immediately, a different valid leaf after six seconds, and another
 valid leaf after eleven idle seconds. Two issuance tests also reject an expired
 issuer and prove a leaf cannot outlive it. Operator file replacement and node
 transport renewal still have their own implementation and acceptance work.
+
+### Replacing a certificate while the listener stays open
+
+An operator updates `tls_cert_path` first, then `tls_key_path`. Between those
+writes, the new certificate and the old key don't match. Installing each file
+independently would break every new handshake during that interval.
+
+Wrapper now polls the pair once a second, reads both files on a blocking worker,
+and checks that the key matches the leaf and every certificate in the supplied
+chain is currently valid. Only then does it publish the complete pair. Missing,
+malformed, oversized or mismatched files leave the previous pair in place. The
+resolver checks validity again at handshake time, so retaining a broken
+replacement doesn't make the old certificate immortal. Repeated identical reload
+errors produce one warning until the files recover or the error changes.
+
+A Tokio `watch` channel holds the latest validated pair. Unlike a queue, it
+represents one current value: the resolver briefly borrows it, clones the `Arc`
+and releases the borrow. The polling future belongs to `BoundProxy::serve`,
+alongside the listeners, and stops when that server shuts down. File reads and
+key parsing happen in `spawn_blocking`, so neither can stall an async worker.
+Each input must be a regular file and fit within one MiB; symlink-based atomic
+replacement still works.
+
+The acceptance test runs the real Wrapper listener. It deliberately writes a
+mismatched intermediate pair, finishes the replacement, then writes malformed
+PEM. New connections observe the latest valid certificate; an existing HTTP
+connection keeps working throughout. A separate test rejects expired and
+not-yet-valid certificates at startup. This reload doesn't provision certificates
+for the operator, and it doesn't yet renew the node identity used by the API,
+Raft or reporting.

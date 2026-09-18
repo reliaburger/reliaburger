@@ -395,7 +395,10 @@ authenticate with a bearer token or session cookie over TLS.
 
 Cluster-signed ingress leaves renew on the first handshake after half their
 validity period. Idle hosts renew when clients return; expired cached leaves
-are never reused. This does not rotate the Ingress CA or renew node identities.
+are never reused. Operator-supplied ingress certificate/key files reload once
+per second as a validated pair. Invalid replacements retain the previous pair
+only until its expiry; existing connections continue. This does not rotate the
+Ingress CA or renew node identities.
 The remaining certificate lifecycle work is tracked in C14 of
 [the completion plan](plans/2026-09-17-codebase-completion-plan.md).
 

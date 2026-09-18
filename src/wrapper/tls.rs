@@ -96,11 +96,7 @@ pub fn load_certs_from_disk(
     cert_path: &Path,
     key_path: &Path,
 ) -> Result<(Vec<CertificateDer<'static>>, PrivateKeyDer<'static>), TlsError> {
-    let cert_file = std::fs::File::open(cert_path).map_err(|e| TlsError::LoadFailed {
-        path: cert_path.display().to_string(),
-        reason: e.to_string(),
-    })?;
-    let mut cert_reader = std::io::BufReader::new(cert_file);
+    let mut cert_reader = read_pem(cert_path)?;
     let certs: Vec<CertificateDer<'static>> = rustls_pemfile::certs(&mut cert_reader)
         .collect::<Result<_, _>>()
         .map_err(|e| TlsError::LoadFailed {
@@ -115,11 +111,7 @@ pub fn load_certs_from_disk(
         });
     }
 
-    let key_file = std::fs::File::open(key_path).map_err(|e| TlsError::LoadFailed {
-        path: key_path.display().to_string(),
-        reason: e.to_string(),
-    })?;
-    let mut key_reader = std::io::BufReader::new(key_file);
+    let mut key_reader = read_pem(key_path)?;
     let key = rustls_pemfile::private_key(&mut key_reader)
         .map_err(|e| TlsError::LoadFailed {
             path: key_path.display().to_string(),
@@ -131,6 +123,146 @@ pub fn load_certs_from_disk(
         })?;
 
     Ok((certs, key))
+}
+
+// Read each local regular file once with a hard size cap, off the async runtime.
+// O_NONBLOCK also keeps a mistakenly configured FIFO from hanging the loader.
+fn read_pem(path: &Path) -> Result<std::io::Cursor<Vec<u8>>, TlsError> {
+    use std::io::Read;
+    let read = || -> std::io::Result<Vec<u8>> {
+        let mut options = std::fs::OpenOptions::new();
+        options.read(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.custom_flags(nix::fcntl::OFlag::O_NONBLOCK.bits());
+        }
+        let file = options.open(path)?;
+        if !file.metadata()?.is_file() {
+            return Err(std::io::Error::other(
+                "certificate material must be a regular file",
+            ));
+        }
+        const MAX_PEM_BYTES: u64 = 1024 * 1024;
+        let mut bytes = Vec::new();
+        file.take(MAX_PEM_BYTES + 1).read_to_end(&mut bytes)?;
+        if bytes.len() as u64 > MAX_PEM_BYTES {
+            return Err(std::io::Error::other("certificate material exceeds 1 MiB"));
+        }
+        Ok(bytes)
+    };
+    read()
+        .map(std::io::Cursor::new)
+        .map_err(|error| TlsError::LoadFailed {
+            path: path.display().to_string(),
+            reason: error.to_string(),
+        })
+}
+
+/// An operator-supplied certificate pair reloaded without restarting listeners.
+/// Invalid replacements retain the previous pair only while it remains valid.
+pub(super) struct FileCertResolver {
+    cert_path: std::path::PathBuf,
+    key_path: std::path::PathBuf,
+    current: tokio::sync::watch::Sender<CachedCertificate>,
+}
+
+impl std::fmt::Debug for FileCertResolver {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("FileCertResolver").finish_non_exhaustive()
+    }
+}
+
+impl FileCertResolver {
+    pub(super) async fn load(cert_path: &Path, key_path: &Path) -> Result<Self, TlsError> {
+        let current = Self::read_pair(cert_path.to_owned(), key_path.to_owned()).await?;
+        let (current, _) = tokio::sync::watch::channel(current);
+        Ok(Self {
+            cert_path: cert_path.to_owned(),
+            key_path: key_path.to_owned(),
+            current,
+        })
+    }
+
+    async fn read_pair(
+        cert_path: std::path::PathBuf,
+        key_path: std::path::PathBuf,
+    ) -> Result<CachedCertificate, TlsError> {
+        tokio::task::spawn_blocking(move || {
+            let (chain, key) = load_certs_from_disk(&cert_path, &key_path)?;
+            let now = time::OffsetDateTime::now_utc().unix_timestamp();
+            let mut validity = CertificateValidity {
+                not_before: i64::MIN,
+                not_after: i64::MAX,
+            };
+            for certificate in &chain {
+                let window = CertificateValidity::parse(certificate)?;
+                if !window.contains(now) {
+                    return Err(TlsError::ConfigFailed(
+                        "certificate chain is outside its validity period".into(),
+                    ));
+                }
+                validity.not_before = validity.not_before.max(window.not_before);
+                validity.not_after = validity.not_after.min(window.not_after);
+            }
+            Ok(CachedCertificate {
+                key: certified_key(chain, key)?,
+                validity,
+            })
+        })
+        .await
+        .map_err(|error| TlsError::ConfigFailed(format!("certificate loader failed: {error}")))?
+    }
+
+    /// Poll once a second; the caller owns this future alongside the listeners.
+    pub(super) async fn run(&self, shutdown: tokio_util::sync::CancellationToken) {
+        let mut interval = tokio::time::interval(std::time::Duration::from_secs(1));
+        interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        let mut last_error = None;
+        loop {
+            tokio::select! {
+                biased;
+                _ = shutdown.cancelled() => return,
+                _ = interval.tick() => {}
+            }
+            let replacement = tokio::select! {
+                biased;
+                _ = shutdown.cancelled() => return,
+                replacement = Self::read_pair(self.cert_path.clone(), self.key_path.clone()) => replacement,
+            };
+            match replacement {
+                Ok(replacement) => {
+                    last_error = None;
+                    let changed = self.current.borrow().key.cert != replacement.key.cert;
+                    if changed {
+                        self.current.send_replace(replacement);
+                    }
+                }
+                Err(error) => {
+                    let error = error.to_string();
+                    if last_error.as_ref() != Some(&error) {
+                        eprintln!(
+                            "wrapper: TLS file reload refused; keeping the last pair subject to its expiry: {error}"
+                        );
+                        last_error = Some(error);
+                    }
+                }
+            }
+        }
+    }
+}
+
+impl rustls::server::ResolvesServerCert for FileCertResolver {
+    fn resolve(
+        &self,
+        _: rustls::server::ClientHello<'_>,
+    ) -> Option<Arc<rustls::sign::CertifiedKey>> {
+        let current = self.current.borrow();
+        current
+            .validity
+            .contains(time::OffsetDateTime::now_utc().unix_timestamp())
+            .then(|| Arc::clone(&current.key))
+    }
 }
 
 /// Build a rustls `ServerConfig` from a certificate and key.
@@ -181,10 +313,11 @@ fn certified_key(
 ) -> Result<Arc<rustls::sign::CertifiedKey>, TlsError> {
     let signing_key = rustls::crypto::ring::sign::any_supported_type(&key)
         .map_err(|e| TlsError::ConfigFailed(format!("unsupported ingress key: {e}")))?;
-    Ok(Arc::new(rustls::sign::CertifiedKey::new(
-        certs,
-        signing_key,
-    )))
+    let certified = rustls::sign::CertifiedKey::new(certs, signing_key);
+    certified
+        .keys_match()
+        .map_err(|error| TlsError::ConfigFailed(error.to_string()))?;
+    Ok(Arc::new(certified))
 }
 
 #[derive(Debug, Clone, Copy)]
