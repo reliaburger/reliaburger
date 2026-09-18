@@ -761,7 +761,7 @@ mod tests {
     }
 
     fn compatible_binary(label: &[u8]) -> Vec<u8> {
-        let mut binary = b"#!/bin/sh\nprintf '%s' '{\"protocol\":2,\"state\":2}'\n# ".to_vec();
+        let mut binary = b"#!/bin/sh\nprintf '%s' '{\"protocol\":3,\"state\":2}'\n# ".to_vec();
         binary.extend_from_slice(label);
         binary.push(b'\n');
         binary

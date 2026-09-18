@@ -776,3 +776,39 @@ Tests reproduce 60 instead of 50 through HTTP fan-out, then prove 50 after the
 fix. Real Parquet stores retain overlapping history across reopening and retry;
 the merge still counts each contribution once. The existing backfill integration
 test now expects one for every minute, including the two both parents hold.
+
+## Reporting has an admission boundary (C21)
+
+A rollup can contain one series with a very long label, or thousands of small
+series. Counting series alone doesn't bound its wire size. Before encoding, the
+sender asks bincode for the serialised size, including the format header. Anything
+above 1 MiB returns `ReportTooLarge` before allocating an encoded copy or opening
+a socket. Reports with more than 100 events also refuse. We don't truncate a
+batch and call that delivery. Automatic chunking remains future work.
+
+The receiver admits at most 16 connection tasks and queues at most 16 reports.
+Each connection shares a ten-second budget across its TLS handshake and body
+read. `JoinSet` owns those tasks: its length is the admission count, completed
+tasks are reaped, and shutdown aborts and joins the remainder. Rust drops each
+aborted task's socket and payload. This bounds queued and in-flight wire data to
+32 MiB, with additional bounded decoding/container overhead; it isn't a promise
+about the whole process's memory use or stored metrics. Neither a half-written
+prefix nor a full inbox creates a waiting task outside that limit.
+
+A successful socket write isn't proof that the receiver accepted the report.
+Protocol generation 3 adds a one-byte acknowledgement after decoding and queue
+admission. Missing acknowledgements, exhausted capacity and node-fault gates
+return send errors. The receipt means volatile queue admission, not persistence
+or successful application by the aggregator. A receiver can die after sending
+it. A lost acknowledgement can also cause a duplicate: state snapshots replace
+older observations and rollups retain their existing worker/minute ownership and
+deduplication rules.
+
+The state worker prints admission failures and collects fresh state next tick;
+its snapshot queue and response share a two-second deadline, and shutdown can
+interrupt the whole send cycle. Normal rollup failures now request the same
+five-minute backfill as failed reassignment sends. This is bounded recovery, not
+an infinite delivery queue. The failure message names that window; older gaps
+remain in node-local metrics until normal retention removes them. The agent still
+doesn't populate report events (F06), and custom `max_events_per_report` values
+refuse validation instead of pretending to control an unwired event producer.

@@ -350,6 +350,8 @@ A single rollup over 1 MiB cannot be sent; max_events_per_report is explicitly r
 
 **Completion test:** Oversized event/metric batches deliver within bounded memory using versioned chunks and idempotent assembly, or fail admission explicitly; no silent event loss.
 
+**Completed (18 September):** Use explicit refusal for 0.1.0. Preflight serialised size before allocating a payload; reject over 1 MiB or 100 events, and refuse custom event-limit configuration. Bound both connection tasks and queued reports to 16; shutdown aborts and joins stalled peers. Protocol 3 adds volatile queue-admission receipts, with missing receipts and capacity exhaustion returned to senders. State workers log failures and bound snapshot admission/response waits; normal rollup failures request the existing five-minute backfill and name older gaps explicitly. Event production and automatic chunking remain F06. Three before/after regressions prove former false success and stalled shutdown. All 3,217 Linux library tests pass (19 privileged gates), strict all-target/all-feature Clippy passes, and TCP/TLS (3), reporting-tree (1), startup compatibility (2) and security (11) integration tests pass. State stays generation 2.
+
 ### C22 — Bound export checkpoint growth safely
 
 **Priority:** P2. **Wave:** 3. **Book chapters:** 06.
@@ -879,7 +881,7 @@ Per-namespace encryption keys, per-app audiences, token lifecycle automation and
 
 Evidence: `docs/design/metrics-mayo.md`; `docs/design/gossip-mustard.md`.
 
-PromQL/remote read, additional retention/downsampling tiers and the multi-level reporting tree are planned. A flat council aggregation path already works.
+PromQL/remote read, additional retention/downsampling tiers, event production, versioned chunking beyond C21’s explicit admission limits and the multi-level reporting tree are planned. A flat council aggregation path already works.
 
 **Completion test:** Specify one protocol/storage feature at a time, test compatibility and measured limits, and do not count existing SQL endpoints as these features.
 

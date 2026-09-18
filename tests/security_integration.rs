@@ -410,7 +410,7 @@ async fn incompatible_member_never_receives_the_join_token() {
     };
     for version in [
         serde_json::json!({"version":"development"}),
-        serde_json::json!({"compatibility":{"protocol":2,"state":99}}),
+        serde_json::json!({"compatibility":{"protocol":3,"state":99}}),
     ] {
         let calls = Arc::new(AtomicUsize::new(0));
         let observed = calls.clone();

@@ -30,7 +30,8 @@ pub type InboundReport = (SocketAddr, Option<NodeId>, ReportingMessage);
 /// Implementations must be `Send + Sync` for use across async tasks.
 /// Uses RPITIT (Rust 2024) to avoid `async_trait` overhead.
 pub trait ReportingTransport: Send + Sync {
-    /// Send a reporting message to the given address.
+    /// Send a report, returning an error when transport admission is refused
+    /// or unacknowledged. Success does not promise durable processing.
     fn send(
         &self,
         target: SocketAddr,
@@ -147,12 +148,16 @@ impl ReportingTransport for InMemoryReportingTransport {
             .iter()
             .any(|(from, to)| *from == self.address && *to == target)
         {
-            return Ok(());
+            return Err(ReportingError::SendFailed {
+                reason: "reporting target is partitioned".into(),
+            });
         }
 
         if let Some(tx) = inner.inboxes.get(&target) {
-            let _ = tx.try_send((self.address, self.authenticated_as.clone(), message.clone()));
-            Ok(())
+            tx.try_send((self.address, self.authenticated_as.clone(), message.clone()))
+                .map_err(|error| ReportingError::SendFailed {
+                    reason: error.to_string(),
+                })
         } else {
             Err(ReportingError::SendFailed {
                 reason: format!("no node registered at {target}"),
@@ -172,6 +177,11 @@ impl ReportingTransport for InMemoryReportingTransport {
 
 /// Maximum reporting message size (1 MiB).
 const MAX_REPORT_SIZE: usize = 1_048_576;
+const MAX_REPORT_CONNECTIONS: usize = 16;
+const MAX_QUEUED_REPORTS: usize = 16;
+const ADMITTED: u8 = 1;
+/// Fixed event admission limit for protocol generation three.
+pub(crate) const MAX_EVENTS_PER_REPORT: usize = 100;
 
 /// How long the accept side waits for a peer to complete its handshake and
 /// deliver a full framed message before dropping the connection (CP11). A
@@ -206,7 +216,9 @@ impl ReportingTransport for TcpReportingSender {
         message: &ReportingMessage,
     ) -> Result<(), ReportingError> {
         if self.node_gate.is_quiesced() {
-            return Ok(());
+            return Err(ReportingError::SendFailed {
+                reason: "reporting is quiesced".into(),
+            });
         }
         TcpReportingTransport::send_framed(target, message, self.connector.as_ref()).await
     }
@@ -290,7 +302,7 @@ impl TcpReportingTransport {
                 reason: format!("failed to get local address: {e}"),
             })?;
 
-        let (inbound_tx, inbound_rx) = mpsc::channel(256);
+        let (inbound_tx, inbound_rx) = mpsc::channel(MAX_QUEUED_REPORTS);
 
         // Spawn accept loop
         tokio::spawn(Self::accept_loop(
@@ -332,72 +344,57 @@ impl TcpReportingTransport {
         acceptor: Option<tokio_rustls::TlsAcceptor>,
         node_gate: crate::smoker::node_fault::NodeTransportGate,
     ) {
+        let mut connections = tokio::task::JoinSet::new();
         loop {
+            // Completed tasks also occupy JoinSet storage until reaped.
+            while connections.try_join_next().is_some() {}
             tokio::select! {
                 _ = shutdown.cancelled() => break,
+                _ = connections.join_next(), if !connections.is_empty() => {},
                 result = listener.accept() => {
-                    match result {
-                        Ok((stream, peer)) => {
-                            if node_gate.is_quiesced() {
-                                continue;
-                            }
-                            let tx = tx.clone();
-                            let connection_gate = node_gate.clone();
-                            match acceptor.clone() {
+                    let Ok((stream, peer)) = result else { continue };
+                    if node_gate.is_quiesced() { continue; }
+                    if connections.len() >= MAX_REPORT_CONNECTIONS {
+                        // Refuse immediately rather than spawn a task waiting for capacity.
+                        continue;
+                    }
+                    let tx = tx.clone();
+                    let acceptor = acceptor.clone();
+                    let connection_gate = node_gate.clone();
+                    connections.spawn(async move {
+                        let _ = tokio::time::timeout(REPORT_ACCEPT_DEADLINE, async {
+                            match acceptor {
                                 Some(acceptor) => {
-                                    tokio::spawn(async move {
-                                        // A refused/failed handshake is dropped
-                                        // silently; a rejected peer learns nothing.
-                                        // One deadline covers the handshake and
-                                        // the framed read so a stalled peer can't
-                                        // pin the task (CP11).
-                                        let _ = tokio::time::timeout(
-                                            REPORT_ACCEPT_DEADLINE,
-                                            async {
-                                                if let Ok(tls) = acceptor.accept(stream).await
-                                                    && !connection_gate.is_quiesced()
-                                                {
-                                                    // The verified client cert
-                                                    // binds the peer's identity
-                                                    // (C6); extract it before
-                                                    // reading the message.
-                                                    let peer_id = peer_node_id_from_tls(&tls);
-                                                    Self::handle_connection(tls, peer, peer_id, tx)
-                                                        .await;
-                                                }
-                                            },
-                                        )
-                                        .await;
-                                    });
+                                    if let Ok(tls) = acceptor.accept(stream).await
+                                        && !connection_gate.is_quiesced()
+                                    {
+                                        let peer_id = peer_node_id_from_tls(&tls);
+                                        Self::handle_connection(tls, peer, peer_id, tx).await;
+                                    }
                                 }
                                 None => {
-                                    tokio::spawn(async move {
-                                        if !connection_gate.is_quiesced() {
-                                            let _ = tokio::time::timeout(
-                                                REPORT_ACCEPT_DEADLINE,
-                                                Self::handle_connection(stream, peer, None, tx),
-                                            )
-                                            .await;
-                                        }
-                                    });
+                                    if !connection_gate.is_quiesced() {
+                                        Self::handle_connection(stream, peer, None, tx).await;
+                                    }
                                 }
                             }
-                        }
-                        Err(_) => continue,
-                    }
+                        }).await;
+                    });
                 }
             }
         }
+        connections.abort_all();
+        while connections.join_next().await.is_some() {}
     }
 
     /// Read one framed message from any byte stream (plain TCP or TLS).
-    async fn handle_connection<S: tokio::io::AsyncRead + Unpin>(
+    async fn handle_connection<S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin>(
         mut stream: S,
         peer: SocketAddr,
         peer_node_id: Option<NodeId>,
         tx: mpsc::Sender<InboundReport>,
     ) {
-        use tokio::io::AsyncReadExt;
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
         // Read 4-byte length prefix
         let mut len_buf = [0u8; 4];
@@ -415,8 +412,13 @@ impl TcpReportingTransport {
             return;
         }
 
-        if let Ok(msg) = decode_report(&payload) {
-            let _ = tx.send((peer, peer_node_id, msg)).await;
+        if let Ok(msg) = decode_report(&payload)
+            && tx.try_send((peer, peer_node_id, msg)).is_ok()
+        {
+            // Admission is volatile, not a durable processing receipt. A lost
+            // ACK can cause a retry; snapshots and owned rollups are idempotent.
+            let _ = stream.write_all(&[ADMITTED]).await;
+            let _ = stream.flush().await;
         }
     }
 
@@ -426,14 +428,7 @@ impl TcpReportingTransport {
         message: &ReportingMessage,
         connector: Option<&tokio_rustls::TlsConnector>,
     ) -> Result<(), ReportingError> {
-        let payload =
-            encode_report(message).map_err(|e| ReportingError::Serialisation(e.to_string()))?;
-        if payload.len() > MAX_REPORT_SIZE {
-            return Err(ReportingError::ReportTooLarge {
-                size: payload.len(),
-                max: MAX_REPORT_SIZE,
-            });
-        }
+        let payload = encode_report(message)?;
 
         let tcp = tokio::time::timeout(
             std::time::Duration::from_secs(5),
@@ -476,12 +471,12 @@ impl TcpReportingTransport {
     }
 
     /// Write a length-prefixed payload over an established stream.
-    async fn write_framed<S: tokio::io::AsyncWrite + Unpin>(
+    async fn write_framed<S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin>(
         mut stream: S,
         payload: &[u8],
         target: SocketAddr,
     ) -> Result<(), ReportingError> {
-        use tokio::io::AsyncWriteExt;
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
         let len_bytes = (payload.len() as u32).to_be_bytes();
         stream
@@ -503,6 +498,17 @@ impl TcpReportingTransport {
             .map_err(|e| ReportingError::SendFailed {
                 reason: format!("TCP flush to {target}: {e}"),
             })?;
+        let admission = stream
+            .read_u8()
+            .await
+            .map_err(|error| ReportingError::SendFailed {
+                reason: format!("report admission at {target} was not acknowledged: {error}"),
+            })?;
+        if admission != ADMITTED {
+            return Err(ReportingError::SendFailed {
+                reason: format!("report admission at {target} was refused"),
+            });
+        }
         Ok(())
     }
 }
@@ -514,10 +520,14 @@ impl ReportingTransport for TcpReportingTransport {
         message: &ReportingMessage,
     ) -> Result<(), ReportingError> {
         if self.node_gate.is_quiesced() {
-            return Ok(());
+            return Err(ReportingError::SendFailed {
+                reason: "reporting is quiesced".into(),
+            });
         }
         if self.blocklist.read().await.contains(&target) {
-            return Ok(()); // silently drop for chaos testing
+            return Err(ReportingError::SendFailed {
+                reason: "reporting target is partitioned".into(),
+            });
         }
         Self::send_framed(target, message, self.tls_connector.as_ref()).await
     }
@@ -564,9 +574,38 @@ fn report_header() -> [u8; 12] {
     header
 }
 
-fn encode_report(message: &ReportingMessage) -> Result<Vec<u8>, bincode::Error> {
-    let mut bytes = report_header().to_vec();
-    bincode::serialize_into(&mut bytes, message)?;
+fn check_event_admission(message: &ReportingMessage) -> Result<(), String> {
+    let too_many = match message {
+        ReportingMessage::Report(report) => report.event_log.len() > MAX_EVENTS_PER_REPORT,
+        ReportingMessage::AggregatedReport { reports } => reports
+            .values()
+            .any(|report| report.event_log.len() > MAX_EVENTS_PER_REPORT),
+        _ => false,
+    };
+    if too_many {
+        return Err(format!(
+            "report exceeds the {MAX_EVENTS_PER_REPORT}-event admission limit; no events admitted"
+        ));
+    }
+    Ok(())
+}
+
+fn encode_report(message: &ReportingMessage) -> Result<Vec<u8>, ReportingError> {
+    check_event_admission(message).map_err(|reason| ReportingError::SendFailed { reason })?;
+    // The size pass traverses borrowed data without allocating an encoded copy.
+    let body_size = bincode::serialized_size(message)
+        .map_err(|error| ReportingError::Serialisation(error.to_string()))?;
+    let size = body_size.saturating_add(report_header().len() as u64);
+    if size > MAX_REPORT_SIZE as u64 {
+        return Err(ReportingError::ReportTooLarge {
+            size: usize::try_from(size).unwrap_or(usize::MAX),
+            max: MAX_REPORT_SIZE,
+        });
+    }
+    let mut bytes = Vec::with_capacity(size as usize);
+    bytes.extend(report_header());
+    bincode::serialize_into(&mut bytes, message)
+        .map_err(|error| ReportingError::Serialisation(error.to_string()))?;
     Ok(bytes)
 }
 
@@ -577,11 +616,14 @@ fn decode_report(payload: &[u8]) -> Result<ReportingMessage, bincode::Error> {
             "incompatible reporting formats".into(),
         ))
     })?;
-    bincode::DefaultOptions::new()
+    let message = bincode::DefaultOptions::new()
         .with_fixint_encoding()
         .with_limit(body.len() as u64)
         .reject_trailing_bytes()
-        .deserialize(body)
+        .deserialize(body)?;
+    check_event_admission(&message)
+        .map_err(|reason| Box::new(bincode::ErrorKind::Custom(reason)))?;
+    Ok(message)
 }
 
 #[cfg(test)]
@@ -607,6 +649,179 @@ mod tests {
         })
     }
 
+    #[tokio::test]
+    async fn oversized_events_and_metrics_refuse_without_partial_delivery() {
+        use crate::mayo::rollup::{NodeRollup, RollupAggregate, RollupEntry};
+        use crate::reporting::{EventKind, NodeEvent};
+        let shutdown = tokio_util::sync::CancellationToken::new();
+        let receiver = TcpReportingTransport::bind(addr(0), shutdown.clone())
+            .await
+            .unwrap();
+        let sender = TcpReportingSender::new(None, Default::default());
+        let ReportingMessage::Report(mut events) = sample_msg("worker") else {
+            unreachable!()
+        };
+        events.event_log.push(NodeEvent {
+            timestamp: SystemTime::now(),
+            kind: EventKind::ContainerStart,
+            detail: "e".repeat(MAX_REPORT_SIZE),
+        });
+        let metrics = ReportingMessage::MetricsRollup(NodeRollup {
+            node_id: NodeId::new("worker"),
+            timestamp: 60,
+            entries: vec![RollupEntry {
+                metric_name: "m".repeat(MAX_REPORT_SIZE),
+                labels: Default::default(),
+                aggregate: RollupAggregate {
+                    min: 1.0,
+                    max: 1.0,
+                    sum: 1.0,
+                    count: 1,
+                },
+            }],
+        });
+        for message in [ReportingMessage::Report(events.clone()), metrics] {
+            assert!(matches!(
+                sender.send(receiver.local_addr(), &message).await,
+                Err(ReportingError::ReportTooLarge { .. })
+            ));
+        }
+        events.event_log[0].detail = "small".into();
+        events.event_log = vec![events.event_log[0].clone(); 101];
+        assert!(
+            sender
+                .send(receiver.local_addr(), &ReportingMessage::Report(events))
+                .await
+                .is_err()
+        );
+        assert!(
+            tokio::time::timeout(Duration::from_millis(50), receiver.recv())
+                .await
+                .is_err()
+        );
+        shutdown.cancel();
+    }
+
+    #[tokio::test]
+    async fn exact_byte_limit_is_admitted_and_one_extra_byte_is_refused() {
+        let shutdown = tokio_util::sync::CancellationToken::new();
+        let receiver = TcpReportingTransport::bind(addr(0), shutdown.clone())
+            .await
+            .unwrap();
+        let sender = TcpReportingSender::new(None, Default::default());
+        let empty_size = bincode::serialized_size(&sample_msg("")).unwrap() as usize + 12;
+        let name = "w".repeat(MAX_REPORT_SIZE - empty_size);
+        sender
+            .send(receiver.local_addr(), &sample_msg(&name))
+            .await
+            .unwrap();
+        let (_, _, received) = receiver.recv().await.unwrap();
+        let ReportingMessage::Report(report) = received else {
+            panic!("missing report")
+        };
+        assert_eq!(report.node_id, NodeId::new(&name));
+        assert!(matches!(
+            sender
+                .send(receiver.local_addr(), &sample_msg(&(name + "x")))
+                .await,
+            Err(ReportingError::ReportTooLarge { .. })
+        ));
+        shutdown.cancel();
+    }
+
+    #[tokio::test]
+    async fn stalled_connections_cannot_create_unbounded_receiver_tasks() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let shutdown = tokio_util::sync::CancellationToken::new();
+        let receiver = TcpReportingTransport::bind(addr(0), shutdown.clone())
+            .await
+            .unwrap();
+        let mut clients = Vec::new();
+        for _ in 0..MAX_REPORT_CONNECTIONS {
+            let mut client = tokio::net::TcpStream::connect(receiver.local_addr())
+                .await
+                .unwrap();
+            client.write_all(&[0, 0]).await.unwrap();
+            clients.push(client);
+        }
+        let mut excess = tokio::net::TcpStream::connect(receiver.local_addr())
+            .await
+            .unwrap();
+        let mut byte = [0];
+        let refused = tokio::time::timeout(Duration::from_secs(1), excess.read(&mut byte)).await;
+        assert!(
+            matches!(refused, Ok(Ok(0)) | Ok(Err(_))),
+            "capacity was not refused: {refused:?}"
+        );
+        shutdown.cancel();
+        drop(clients);
+    }
+
+    #[tokio::test]
+    async fn full_receiver_refuses_admission_instead_of_acknowledging_loss() {
+        let shutdown = tokio_util::sync::CancellationToken::new();
+        let receiver = TcpReportingTransport::bind(addr(0), shutdown.clone())
+            .await
+            .unwrap();
+        let sender = TcpReportingSender::new(None, Default::default());
+        for _ in 0..16 {
+            sender
+                .send(receiver.local_addr(), &sample_msg("worker"))
+                .await
+                .unwrap();
+        }
+        assert!(
+            sender
+                .send(receiver.local_addr(), &sample_msg("overflow"))
+                .await
+                .is_err()
+        );
+        assert!(receiver.recv().await.is_some());
+        sender
+            .send(receiver.local_addr(), &sample_msg("retry"))
+            .await
+            .unwrap();
+        shutdown.cancel();
+    }
+
+    #[tokio::test]
+    async fn completed_write_without_admission_ack_is_a_failure() {
+        use tokio::io::AsyncReadExt;
+        let listener = tokio::net::TcpListener::bind(addr(0)).await.unwrap();
+        let target = listener.local_addr().unwrap();
+        let peer = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let length = stream.read_u32().await.unwrap();
+            let mut payload = vec![0; length as usize];
+            stream.read_exact(&mut payload).await.unwrap();
+            // Simulate a receiver dying before admitting the message.
+        });
+        let sender = TcpReportingSender::new(None, Default::default());
+        assert!(sender.send(target, &sample_msg("worker")).await.is_err());
+        peer.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn shutdown_closes_stalled_reporting_connections() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let shutdown = tokio_util::sync::CancellationToken::new();
+        let receiver = TcpReportingTransport::bind(addr(0), shutdown.clone())
+            .await
+            .unwrap();
+        let mut client = tokio::net::TcpStream::connect(receiver.local_addr())
+            .await
+            .unwrap();
+        client.write_all(&[0, 0]).await.unwrap();
+        tokio::task::yield_now().await;
+        shutdown.cancel();
+        let mut byte = [0];
+        let result = tokio::time::timeout(Duration::from_secs(1), client.read(&mut byte)).await;
+        assert!(
+            matches!(result, Ok(Ok(0)) | Ok(Err(_))),
+            "stalled peer survived shutdown: {result:?}"
+        );
+    }
+
     #[test]
     fn reporting_rejects_either_format_mismatch_and_oversized_collection_claims() {
         let valid = encode_report(&sample_msg("current")).unwrap();
@@ -630,7 +845,10 @@ mod tests {
         let mut frame = (payload.len() as u32).to_be_bytes().to_vec();
         frame.extend(payload);
         let (tx, mut rx) = mpsc::channel(1);
-        TcpReportingTransport::handle_connection(frame.as_slice(), addr(1234), None, tx).await;
+        use tokio::io::AsyncWriteExt;
+        let (mut client, server) = tokio::io::duplex(frame.len());
+        client.write_all(&frame).await.unwrap();
+        TcpReportingTransport::handle_connection(server, addr(1234), None, tx).await;
         assert!(rx.recv().await.is_none());
     }
 
@@ -689,7 +907,7 @@ mod tests {
 
         net.partition(addr(1), addr(2)).await;
 
-        t1.send(addr(2), &sample_msg("w1")).await.unwrap();
+        assert!(t1.send(addr(2), &sample_msg("w1")).await.is_err());
 
         let result = tokio::time::timeout(Duration::from_millis(50), t2.recv()).await;
         assert!(result.is_err());
@@ -723,7 +941,7 @@ mod tests {
             .unwrap();
 
         gate.quiesce();
-        t1.send(t2.local_addr(), &sample_msg("w1")).await.unwrap();
+        assert!(t1.send(t2.local_addr(), &sample_msg("w1")).await.is_err());
         assert!(
             tokio::time::timeout(Duration::from_millis(100), t2.recv())
                 .await

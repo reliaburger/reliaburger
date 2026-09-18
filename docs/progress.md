@@ -49,7 +49,7 @@ remain separate. Older unchecked groups below point into this current ledger.
 - [x] **C18** Scan candidates once from a random starting point, preserving concurrency and out-of-range adoption semantics. The nearly-full-pool regression fails before the fix; all 16 allocator tests pass.
 - [x] **C19** Count successful metric/rollup deletions only, expose removal and directory-enumeration errors with paths, and ignore concurrent NotFound without counting it. Both failing-removal regressions fail before the fix; all 171 Mayo tests pass.
 - [x] **C20** Retain worker/minute/series identity through an owned-rollup endpoint and deduplicate before summing; conflicting copies and legacy/malformed peers remain explicit unknown evidence. The HTTP double-count regression fails before the fix; Mayo, real Parquet restart/retry, four aggregation integration tests and endpoint scope/authority tests pass. Oversized queries refuse rather than silently truncate.
-- [ ] **C21** (P2) Bound and chunk reporting payloads.
+- [x] **C21** Choose explicit admission refusal: preflight the 1 MiB/100-event limits, bound the receiver to 16 connections and 16 queued reports, and acknowledge queue admission under protocol 3 (state 2). Workers expose failures; normal rollup failures request five-minute backfill, with older gaps explicit. Three admission/shutdown regressions fail before the fix. All 3,217 Linux library tests pass (19 privileged gates), plus strict all-target/all-feature Clippy, three TCP/TLS, one reporting-tree, two startup-compatibility and eleven security integration tests. Chunking and event production remain F06.
 - [x] **C22** Compact receipts to current source generations only after a successful scan, in the existing locked durable transaction. The 32-generation retention/restart regression fails before the fix and preserves all archive rows after it; 12 archive integration, 12 exporter unit and 11 disk-pressure tests pass. Receipt count follows live source retention.
 - [x] **C23** Treat encoded expiry as critical regardless of stale rotation labels; require positive healthy rotation evidence to suppress near-expiry warnings and describe short-lived validity accurately. Both diagnostic regressions fail before the fix; all 17 diagnosis tests pass.
 - [x] **C24** Require observed configured voters for quorum arithmetic; unavailable/empty council responses and degraded membership remain unknown instead of using stale gossip flags. The public collector regression fails before the fix; all 25 diagnostic collector/engine tests pass, including observed quorum loss.
@@ -103,7 +103,7 @@ remain separate. Older unchecked groups below point into this current ledger.
 - [ ] **F03** (feature) Finish upstream image trust and worker key separation.
 - [ ] **F04** (feature) Add supported CA recovery and rotation operations.
 - [ ] **F05** (feature) Complete namespace-scoped identity and token lifecycle.
-- [ ] **F06** (feature) Complete the metrics/query and reporting architecture.
+- [ ] **F06** (feature) Complete the metrics/query and reporting architecture, including event production and versioned chunking beyond C21’s explicit admission limits.
 - [ ] **F07** (feature) Finish cross-node views and log-stream capabilities.
 - [ ] **F08** (feature) Complete WebSocket ingress parity and certificate automation.
 - [ ] **F09** (feature) Implement packet-level delay/bandwidth faults if retained.

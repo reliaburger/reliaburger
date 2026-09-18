@@ -534,9 +534,9 @@ impl Default for PortRange {
 pub struct ReportingTreeSection {
     /// How often worker nodes send StateReports (seconds).
     pub report_interval_secs: u64,
-    /// Maximum events in a single report's event log. Reserved: plumbed into
-    /// ClusterParams but not yet enforced — the worker does not currently
-    /// truncate a report's event log to this cap.
+    /// Fixed admission limit of 100 events per report. Other values refuse
+    /// configuration validation; oversized reports refuse without truncation.
+    /// The current agent does not populate the event log (future F06).
     pub max_events_per_report: usize,
     /// Time after which a report is considered stale (seconds).
     pub stale_report_timeout_secs: u64,

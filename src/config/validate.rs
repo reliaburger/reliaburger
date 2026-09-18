@@ -326,6 +326,15 @@ fn validate_job(name: &str, job: &super::job::JobSpec) -> Result<(), ConfigError
 impl NodeConfig {
     /// Validate the parsed node configuration.
     pub fn validate(&self) -> Result<(), ConfigError> {
+        if self.reporting_tree.max_events_per_report
+            != crate::reporting::transport::MAX_EVENTS_PER_REPORT
+        {
+            return Err(ConfigError::Validation {
+                field: "reporting_tree.max_events_per_report".into(),
+                context: "node config".into(),
+                reason: "0.1.0 supports a fixed 100-event admission limit; custom limits are not supported".into(),
+            });
+        }
         // Storage paths must be absolute
         let paths = [
             ("storage.data", &self.storage.data),
@@ -633,6 +642,21 @@ mod tests {
             nc.validate(),
             Err(ConfigError::InvalidPortRange { .. })
         ));
+    }
+
+    #[test]
+    fn custom_event_limit_is_refused_instead_of_ignored() {
+        let mut config = NodeConfig::default();
+        config.reporting_tree.max_events_per_report = 101;
+        assert!(
+            config
+                .validate()
+                .unwrap_err()
+                .to_string()
+                .contains("fixed 100-event")
+        );
+        config.reporting_tree.max_events_per_report = 100;
+        assert!(config.validate().is_ok());
     }
 
     #[test]

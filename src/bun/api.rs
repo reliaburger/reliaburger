@@ -10006,7 +10006,7 @@ mod tests {
                     .uri("/v1/cluster/join")
                     .header("content-type", "application/json")
                     .body(Body::from(
-                        r#"{"compatibility":{"protocol":2,"state":2},"token":"abc123","node_id":"node-02","csr_b64":""}"#,
+                        r#"{"compatibility":{"protocol":3,"state":2},"token":"abc123","node_id":"node-02","csr_b64":""}"#,
                     ))
                     .unwrap(),
             )
@@ -10044,7 +10044,7 @@ mod tests {
                     .uri("/v1/cluster/join")
                     .header("content-type", "application/json")
                     .body(Body::from(
-                        r#"{"compatibility":{"protocol":2,"state":2},"token":"whatever","node_id":"node-09","csr_b64":""}"#,
+                        r#"{"compatibility":{"protocol":3,"state":2},"token":"whatever","node_id":"node-09","csr_b64":""}"#,
                     ))
                     .unwrap(),
             )

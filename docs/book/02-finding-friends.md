@@ -1376,7 +1376,7 @@ pub enum ReportHealthStatus {
 }
 ```
 
-The `event_log` is bounded to `max_events_per_report` (default 100) and carries recent events like container starts, crashes, health check failures, and image pulls. These are for the leader's benefit during state reconstruction.
+The wire type has an `event_log` for future event reporting, but the agent currently sends it empty (F06). Protocol generation 3 refuses reports containing more than 100 events rather than truncating them. `max_events_per_report` must remain 100; other values fail configuration validation. The transport also checks the complete encoded size against its 1 MiB limit before allocating a payload.
 
 ### The transport trait
 

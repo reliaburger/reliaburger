@@ -42,7 +42,7 @@ host operating systems.
 startup and recovery refuse it rather than attempting an implicit migration.
 Do not copy a format stamp onto old data to bypass this check.
 
-`bun --compatibility` reports `{"protocol":2,"state":2}` without starting a node.
+`bun --compatibility` reports `{"protocol":3,"state":2}` without starting a node.
 `GET /v1/version` includes the same contract. Different product versions may
 roll or roll back only when both generations match exactly. The agent verifies
 the signed executable and checks this contract before staging it. Joins and

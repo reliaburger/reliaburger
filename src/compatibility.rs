@@ -15,9 +15,9 @@ pub struct Compatibility {
     pub state: u32,
 }
 
-/// First supported format generation; development generation one is refused.
+/// Supported formats; reporting admission acknowledgements require protocol three.
 pub const CURRENT: Compatibility = Compatibility {
-    protocol: 2,
+    protocol: 3,
     state: 2,
 };
 

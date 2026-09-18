@@ -24,8 +24,15 @@ returns an error with the log path; `--yes` still configures without starting a
 background node. The public installer remains in development.
 
 0.1.0 requires a fresh cluster; development state is refused. Rolling upgrades
-require matching explicit protocol and state formats. See the
+require matching explicit formats (currently protocol 3 and state 2). See the
 [compatibility policy](releasing.md#cluster-compatibility).
+
+Reporting refuses messages over 1 MiB or containing more than 100 events;
+`reporting_tree.max_events_per_report` currently supports only 100. Admission
+failures appear in node logs. State snapshots refresh next tick, while metrics
+retry the last five minutes; longer gaps require the retained node-local data.
+The reporting event producer remains future work. See
+[reporting admission](book/11-eyes-everywhere.md#reporting-has-an-admission-boundary-c21).
 
 ## Prerequisites
 
