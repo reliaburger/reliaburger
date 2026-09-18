@@ -611,6 +611,20 @@ cron firings bypass registration and retain their recurring schedule. The
 command-channel regression fails before the fix; all 105 agent tests (12.50s),
 three lifecycle tests (5.03s) and strict Linux Clippy pass.
 
+**Stop acknowledgement prerequisite (18 September):** Local stop now requires
+observed exit even after SIGKILL, bounds signal/observation calls and preserves
+adoption records and enforcement on uncertainty. Three HTTP regressions fail
+before the fix; a fourth covers stalled kill. All seven lifecycle tests
+(12.21s), 105 agent tests (11.79s), 48 lease-filtered tests (one explicit gate)
+and strict Linux Clippy pass.
+
+**Additional cleanup evidence to establish:** Process/runc runtime
+adapters still need review: their kill paths currently suppress errors and set
+Stopped without independent proof. Reproduce the crash window between runtime
+creation and placement-checkpoint persistence; a lease must not forget an
+orphaned workload merely because its desired Raft entry was removed. These
+are inspected paths, not completed crash qualifications.
+
 Remaining resource contracts, each in its own commit: node-local jobs,
 registry uploads/repositories,
 and managed volume/mount cleanup. Node effects already use C06 reservations

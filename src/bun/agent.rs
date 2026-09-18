@@ -6766,9 +6766,19 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
         // SIGKILL on timeout. Only then do we record Stopped. Recording it
         // before the process exits let container and supervisor state
         // diverge — a "stopped" app whose process was still serving traffic.
+        let mut first_error = None;
         for id in &instances {
-            self.stop_and_wait_for_exit(id, std::time::Duration::from_secs(STOP_GRACE_SECS))
-                .await;
+            if let Err(error) = self
+                .stop_and_wait_for_exit(id, std::time::Duration::from_secs(STOP_GRACE_SECS))
+                .await
+            {
+                first_error.get_or_insert(error);
+            }
+        }
+        // Try every replica, but preserve ownership and enforcement until all
+        // exits are confirmed. A later stop can retry the incomplete cleanup.
+        if let Some(error) = first_error {
+            return Err(error);
         }
 
         // Transition Stopping → Stopped now the exit is confirmed.
@@ -7835,30 +7845,54 @@ impl<G: Grill + Clone + 'static> PreparedTrace<G> {
 }
 
 impl<G: Grill + Clone + 'static> BunAgent<G> {
-    /// Stop one instance and wait for it to actually exit (DEP6).
-    ///
-    /// SIGTERM first, then poll the runtime until the container reports
-    /// `Stopped` or `grace` elapses, then SIGKILL whatever is still running.
-    /// Returns only once the runtime confirms the exit (or the kill lands),
-    /// so the supervisor never records `Stopped` for a process that is still
-    /// alive — container and supervisor state stay in step.
-    async fn stop_and_wait_for_exit(&self, id: &InstanceId, grace: std::time::Duration) {
-        let _ = self.supervisor.grill().stop(id).await;
-        let deadline = Instant::now() + grace;
-        while Instant::now() < deadline {
-            if matches!(
-                self.supervisor.grill().state(id).await,
-                Ok(ContainerState::Stopped)
-            ) {
-                return;
-            }
-            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    /// Stop one instance, requiring observed exit even after force-kill.
+    async fn stop_and_wait_for_exit(
+        &self,
+        id: &InstanceId,
+        grace: std::time::Duration,
+    ) -> Result<(), BunError> {
+        let signal_timeout = std::time::Duration::from_secs(2);
+        tokio::time::timeout(signal_timeout, self.supervisor.grill().stop(id))
+            .await
+            .map_err(|_| BunError::StopUnconfirmed {
+                instance_id: id.clone(),
+                reason: "graceful stop request timed out",
+            })??;
+        if self.wait_for_runtime_exit(id, grace).await? {
+            return Ok(());
         }
-        if !matches!(
-            self.supervisor.grill().state(id).await,
-            Ok(ContainerState::Stopped)
-        ) {
-            let _ = self.supervisor.grill().kill(id).await;
+        tokio::time::timeout(signal_timeout, self.supervisor.grill().kill(id))
+            .await
+            .map_err(|_| BunError::StopUnconfirmed {
+                instance_id: id.clone(),
+                reason: "force-kill request timed out",
+            })??;
+        if self.wait_for_runtime_exit(id, signal_timeout).await? {
+            return Ok(());
+        }
+        Err(BunError::StopUnconfirmed {
+            instance_id: id.clone(),
+            reason: "runtime did not confirm exit after force-kill",
+        })
+    }
+
+    /// Bound the whole observation loop, including a stalled runtime query.
+    async fn wait_for_runtime_exit(
+        &self,
+        id: &InstanceId,
+        wait: std::time::Duration,
+    ) -> Result<bool, BunError> {
+        let observation = async {
+            loop {
+                if self.supervisor.grill().state(id).await? == ContainerState::Stopped {
+                    return Ok::<(), BunError>(());
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+            }
+        };
+        match tokio::time::timeout(wait, observation).await {
+            Ok(result) => result.map(|()| true),
+            Err(_) => Ok(false),
         }
     }
 

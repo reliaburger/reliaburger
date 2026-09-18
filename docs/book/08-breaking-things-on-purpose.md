@@ -961,3 +961,31 @@ so its temporary one-off specification does not remove the recurring job.
 The regression applies never-firing schedules in two namespaces, then removes
 one through the running agent's Deploy command. Only that namespace loses its
 registration.
+
+
+### A signal is not proof of exit
+
+A runtime can accept a kill request while the process is still alive. It can
+also fail to send the signal or fail to inspect the process. The old local
+stop path ignored those distinctions, recorded Stopped and deleted the
+adoption record after its grace period.
+
+Now a local stop bounds signal requests, waits for an observed Stopped state
+and repeats that observation after force-kill. A failed runtime call or an
+unconfirmed exit returns an error. Bun attempts every replica, but retains
+adoption records, workload identity and enforcement until all exits have been
+confirmed. A later request can retry cleanup. This protects the agent's
+contract with the runtime; runtime adapters must themselves report honest
+state, and their crash qualification remains separate.
+
+The Rust timeout returns a nested result: one failure means the deadline
+elapsed, while the inner failure comes from the runtime. `??` propagates both
+layers after we attach context to the timeout. The bounded observation loop
+returns `Result<bool, BunError>`: true means observed exit, false means the
+observation deadline expired, and Err means inspection failed. None of those
+failure paths may be treated as successful cleanup.
+
+The HTTP regressions inject a failed kill, an acknowledged kill without exit,
+an inspection error and a stalled kill. Each must return failure, retain its
+adoption record and remain Stopping. Restoring a confirmed stopped state and
+retrying must succeed and remove the record.

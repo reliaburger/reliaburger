@@ -64,6 +64,13 @@ pub enum BunError {
         operation_id: deploy_operations::DeployOperationId,
     },
 
+    /// Runtime exit could not be confirmed within the stop deadline.
+    #[error("stop not confirmed for instance {instance_id}: {reason}")]
+    StopUnconfirmed {
+        instance_id: InstanceId,
+        reason: &'static str,
+    },
+
     /// An `exec` did not finish within its deadline.
     #[error("exec timed out after {seconds}s")]
     ExecTimeout { seconds: u64 },

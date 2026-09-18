@@ -41,6 +41,9 @@ pub struct MockGrill {
     /// to `Stopped` — the process ignores SIGTERM. Lets tests prove the
     /// exit-aware stop path escalates to SIGKILL (DEP6).
     ignore_stop: Arc<Mutex<bool>>,
+    ignore_kill: Arc<AtomicBool>,
+    fail_kill: Arc<AtomicBool>,
+    fail_state: Arc<AtomicBool>,
 }
 
 impl Default for MockGrill {
@@ -66,6 +69,9 @@ impl Default for MockGrill {
             kill_started: Arc::new(tokio::sync::Semaphore::new(0)),
             kill_release: Arc::new(tokio::sync::Semaphore::new(0)),
             ignore_stop: Arc::default(),
+            ignore_kill: Arc::default(),
+            fail_kill: Arc::default(),
+            fail_state: Arc::default(),
         }
     }
 }
@@ -74,6 +80,21 @@ impl MockGrill {
     /// Create a new MockGrill.
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Keep reporting the existing state after an acknowledged kill.
+    pub fn set_ignore_kill(&self, value: bool) {
+        self.ignore_kill.store(value, Ordering::SeqCst);
+    }
+
+    /// Make force-kill requests fail without changing runtime state.
+    pub fn set_fail_kill(&self, value: bool) {
+        self.fail_kill.store(value, Ordering::SeqCst);
+    }
+
+    /// Make runtime state inspection fail without proving absence.
+    pub fn set_fail_state(&self, value: bool) {
+        self.fail_state.store(value, Ordering::SeqCst);
     }
 
     /// Return a clone of all recorded calls.
@@ -282,10 +303,18 @@ impl super::Grill for MockGrill {
             let permit = self.kill_release.acquire().await.unwrap();
             permit.forget();
         }
-        self.state_overrides
-            .lock()
-            .unwrap()
-            .insert(instance.clone(), ContainerState::Stopped);
+        if self.fail_kill.load(Ordering::SeqCst) {
+            return Err(GrillError::StartFailed {
+                instance: instance.clone(),
+                reason: "injected kill failure".into(),
+            });
+        }
+        if !self.ignore_kill.load(Ordering::SeqCst) {
+            self.state_overrides
+                .lock()
+                .unwrap()
+                .insert(instance.clone(), ContainerState::Stopped);
+        }
         Ok(())
     }
 
@@ -294,6 +323,12 @@ impl super::Grill for MockGrill {
             .lock()
             .unwrap()
             .push(("state".to_string(), instance.clone()));
+        if self.fail_state.load(Ordering::SeqCst) {
+            return Err(GrillError::StartFailed {
+                instance: instance.clone(),
+                reason: "injected state inspection failure".into(),
+            });
+        }
         let overrides = self.state_overrides.lock().unwrap();
         if let Some(&state) = overrides.get(instance) {
             return Ok(state);

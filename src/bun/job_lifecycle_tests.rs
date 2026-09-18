@@ -217,3 +217,128 @@ async fn cron_worker_owns_its_target_until_runtime_creation_finishes() {
     );
     assert_eq!(stopped_after_create, StatusCode::OK);
 }
+
+async fn unconfirmed_stop_retains_runtime_ownership(configure: fn(&MockGrill)) {
+    use axum::{
+        body::Body,
+        http::{Request, StatusCode},
+    };
+    use tower::ServiceExt;
+    let (tx, rx) = mpsc::channel(32);
+    let shutdown = CancellationToken::new();
+    let grill = MockGrill::new();
+    grill.set_pid(std::process::id());
+    let records = tempfile::tempdir().unwrap();
+    let mut agent = BunAgent::new(
+        grill.clone(),
+        PortAllocator::new(30000, 31000),
+        rx,
+        shutdown.clone(),
+    );
+    agent.set_records_dir(records.path().to_path_buf());
+    let task = tokio::spawn(async move { agent.run().await });
+    let (events, mut results) = mpsc::channel(32);
+    tx.send(AgentCommand::Deploy {
+        config: Config::parse("[job.work]\nimage = 'test:v1'\n").unwrap(),
+        events,
+    })
+    .await
+    .unwrap();
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while let Some(event) = results.recv().await {
+            assert!(!matches!(event, ApplyEvent::Error { .. }), "{event:?}");
+            if matches!(event, ApplyEvent::Complete { .. }) {
+                break;
+            }
+        }
+    })
+    .await
+    .unwrap();
+    assert_eq!(crate::grill::records::load_records(records.path()).len(), 1);
+    let id = InstanceId(status(&tx).await.id);
+    grill.set_state(&id, ContainerState::Running);
+    grill.set_ignore_stop(true);
+    configure(&grill);
+    let app = crate::bun::api::router(
+        tx.clone(),
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        0,
+        None,
+    );
+    let response = tokio::time::timeout(
+        Duration::from_secs(25),
+        app.clone().oneshot(
+            Request::post("/v1/stop/work/default")
+                .body(Body::empty())
+                .unwrap(),
+        ),
+    )
+    .await
+    .expect("stop must have a bounded failure response")
+    .unwrap();
+    let first_status = response.status();
+    let after_failure = status(&tx).await;
+    let retained_records = crate::grill::records::load_records(records.path());
+    grill.release_kills(1);
+    grill.set_fail_kill(false);
+    grill.set_ignore_kill(false);
+    grill.set_fail_state(false);
+    grill.set_ignore_stop(false);
+    grill.set_state(&id, ContainerState::Stopped);
+    let retried = app
+        .oneshot(
+            Request::post("/v1/stop/work/default")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let final_status = status(&tx).await;
+    let final_records = crate::grill::records::load_records(records.path());
+    shutdown.cancel();
+    task.await.unwrap();
+    assert_eq!(
+        first_status,
+        StatusCode::INTERNAL_SERVER_ERROR,
+        "unconfirmed runtime exit must not acknowledge cleanup"
+    );
+    assert_eq!(after_failure.state, "stopping");
+    assert_eq!(
+        retained_records.len(),
+        1,
+        "failed cleanup must preserve adoption ownership"
+    );
+    assert_eq!(retried.status(), StatusCode::OK);
+    assert_eq!(final_status.state, "stopped");
+    assert!(final_records.is_empty());
+}
+
+#[tokio::test]
+async fn failed_kill_does_not_acknowledge_stop_or_discard_adoption() {
+    unconfirmed_stop_retains_runtime_ownership(|grill| grill.set_fail_kill(true)).await;
+}
+
+#[tokio::test]
+async fn acknowledged_kill_without_exit_does_not_acknowledge_stop() {
+    unconfirmed_stop_retains_runtime_ownership(|grill| grill.set_ignore_kill(true)).await;
+}
+
+#[tokio::test]
+async fn failed_exit_observation_does_not_acknowledge_stop() {
+    unconfirmed_stop_retains_runtime_ownership(|grill| grill.set_fail_state(true)).await;
+}
+
+#[tokio::test]
+async fn stalled_kill_does_not_acknowledge_stop_or_block_the_agent_forever() {
+    unconfirmed_stop_retains_runtime_ownership(MockGrill::block_kills).await;
+}
