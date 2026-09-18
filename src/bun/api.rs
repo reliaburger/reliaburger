@@ -2243,18 +2243,31 @@ async fn apply_handler(
         }
     }
 
-    // AUTH1: a scoped token may only deploy apps its scope covers. Check
-    // every app in the manifest, so one out-of-scope app rejects the whole
-    // apply rather than being silently dropped. A principal's `[permission]`
-    // spec (when it has one) must also grant `deploy` on each app — and
-    // `host-exec` for any app that runs an inline `script` (a host process),
-    // which is the capability the whitepaper ties to script workloads.
+    // Check every workload before any Raft write or agent command. A job in
+    // a mixed manifest must not bypass admission after its apps have committed.
+    // Host execution includes both explicit binaries and inline scripts.
     let permissions = match &state.council {
         Some(council) => council.desired_state().await.permissions,
         None => std::collections::BTreeMap::new(),
     };
-    for (app_name, spec) in &config.app {
-        let namespace = spec.namespace.as_deref().unwrap_or("default");
+    let targets = config
+        .app
+        .iter()
+        .map(|(name, spec)| {
+            (
+                name.as_str(),
+                spec.namespace.as_deref().unwrap_or("default"),
+                spec.script.is_some() || spec.exec.is_some(),
+            )
+        })
+        .chain(config.job.iter().map(|(name, spec)| {
+            (
+                name.as_str(),
+                spec.namespace.as_deref().unwrap_or("default"),
+                spec.script.is_some() || spec.exec.is_some(),
+            )
+        }));
+    for (app_name, namespace, host_execution) in targets {
         if let Err(resp) =
             crate::sesame::auth::authorize_scoped(auth.as_deref(), app_name, namespace)
         {
@@ -2269,7 +2282,7 @@ async fn apply_handler(
         ) {
             return resp;
         }
-        if spec.script.is_some()
+        if host_execution
             && let Err(resp) = crate::sesame::auth::authorize_permission(
                 auth.as_deref(),
                 crate::config::PermissionAction::HostExec,
@@ -9436,6 +9449,181 @@ mod tests {
         let status = post_status(app, "/v1/apply", &tok, manifest).await;
         assert_eq!(status, StatusCode::FORBIDDEN);
         shutdown.cancel();
+    }
+
+    fn deployer_context() -> crate::sesame::auth::AuthContext {
+        crate::sesame::auth::AuthContext {
+            token_name: "ci".into(),
+            principal_id: "ci-credential".into(),
+            role: crate::sesame::types::ApiRole::Deployer,
+            scoped_apps: None,
+            scoped_namespaces: None,
+        }
+    }
+
+    async fn apply_as_context(
+        app: &Router,
+        auth: crate::sesame::auth::AuthContext,
+        manifest: &str,
+    ) -> StatusCode {
+        let mut request = axum::http::Request::post("/v1/apply")
+            .body(Body::from(manifest.to_owned()))
+            .unwrap();
+        request.extensions_mut().insert(auth);
+        app.clone().oneshot(request).await.unwrap().status()
+    }
+
+    async fn workload_admission_fixture(
+        tag: &str,
+    ) -> (
+        Router,
+        Arc<crate::council::CouncilNode>,
+        mpsc::Receiver<AgentCommand>,
+    ) {
+        let council = seeded_council(tag).await;
+        let (tx, rx) = mpsc::channel(16);
+        let app = router(
+            tx,
+            None,
+            None,
+            None,
+            None,
+            None,
+            Some(council.clone()),
+            None,
+            None,
+            None,
+            None,
+            None,
+            0,
+            None,
+        );
+        (app, council, rx)
+    }
+
+    #[tokio::test]
+    async fn job_apply_checks_namespace_and_app_scope_before_enqueuing_work() {
+        let (app, council, mut commands) = workload_admission_fixture("job-scope").await;
+        for (apps, namespaces) in [
+            (None, Some(vec!["allowed".into()])),
+            (Some(vec!["allowed".into()]), None),
+        ] {
+            let mut auth = deployer_context();
+            auth.scoped_apps = apps;
+            auth.scoped_namespaces = namespaces;
+            assert_eq!(
+                apply_as_context(
+                    &app,
+                    auth,
+                    "[job.denied]\nimage = \"test:v1\"\nnamespace = \"denied\"\n"
+                )
+                .await,
+                StatusCode::FORBIDDEN
+            );
+            assert!(matches!(
+                commands.try_recv(),
+                Err(mpsc::error::TryRecvError::Empty)
+            ));
+        }
+        let mut auth = deployer_context();
+        auth.scoped_apps = Some(vec!["allowed".into()]);
+        auth.scoped_namespaces = Some(vec!["allowed".into()]);
+        assert_eq!(
+            apply_as_context(
+                &app,
+                auth,
+                "[job.allowed]\nimage = \"test:v1\"\nnamespace = \"allowed\"\n"
+            )
+            .await,
+            StatusCode::OK
+        );
+        assert!(matches!(
+            commands.try_recv(),
+            Ok(AgentCommand::Deploy { .. })
+        ));
+        council.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn out_of_scope_job_refuses_the_entire_manifest_before_app_commit() {
+        let (app, council, mut commands) = workload_admission_fixture("mixed-job-scope").await;
+        let mut auth = deployer_context();
+        auth.scoped_namespaces = Some(vec!["allowed".into()]);
+        let manifest = "[app.allowed]\nimage = \"test:v1\"\nnamespace = \"allowed\"\n[job.denied]\nimage = \"test:v1\"\nnamespace = \"denied\"\n";
+        assert_eq!(
+            apply_as_context(&app, auth, manifest).await,
+            StatusCode::FORBIDDEN
+        );
+        assert!(council.desired_state().await.apps.is_empty());
+        assert!(matches!(
+            commands.try_recv(),
+            Err(mpsc::error::TryRecvError::Empty)
+        ));
+        council.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn workload_apply_checks_deploy_and_host_execution_permission_for_jobs_and_apps() {
+        let (app, council, mut commands) = workload_admission_fixture("job-permissions").await;
+        for (actions, fragments, expected) in [
+            (
+                vec!["logs"],
+                vec!["image = \"test:v1\""],
+                StatusCode::FORBIDDEN,
+            ),
+            (
+                vec!["deploy"],
+                vec!["script = \"echo hello\"", "exec = \"/bin/true\""],
+                StatusCode::FORBIDDEN,
+            ),
+            (
+                vec!["deploy", "host-exec"],
+                vec!["script = \"echo hello\"", "exec = \"/bin/true\""],
+                StatusCode::OK,
+            ),
+        ] {
+            council
+                .write(crate::council::RaftRequest::PermissionSpec {
+                    name: "ci".into(),
+                    spec: Box::new(crate::config::PermissionSpec {
+                        actions: actions.into_iter().map(str::to_string).collect(),
+                        apps: vec!["*".into()],
+                        namespaces: None,
+                    }),
+                })
+                .await
+                .unwrap();
+            for fragment in &fragments {
+                // Apps are cluster-scheduled; exercise their refusal paths here.
+                // The positive local-job path also proves the grant opens the gate.
+                let kinds: &[&str] = if expected == StatusCode::OK {
+                    &["job"]
+                } else {
+                    &["app", "job"]
+                };
+                for kind in kinds {
+                    let manifest = format!("[{kind}.work]\n{fragment}\n");
+                    assert_eq!(
+                        apply_as_context(&app, deployer_context(), &manifest).await,
+                        expected,
+                        "{manifest}"
+                    );
+                    if expected == StatusCode::OK {
+                        assert!(matches!(
+                            commands.try_recv(),
+                            Ok(AgentCommand::Deploy { .. })
+                        ));
+                    } else {
+                        assert!(matches!(
+                            commands.try_recv(),
+                            Err(mpsc::error::TryRecvError::Empty)
+                        ));
+                        assert!(council.desired_state().await.apps.is_empty());
+                    }
+                }
+            }
+        }
+        council.shutdown().await.unwrap();
     }
 
     /// A completed history entry for `web` in the `default` namespace; tests

@@ -1215,3 +1215,26 @@ was missing the new route, and the syntax-tree scanner mistook `.layer(...)`
 for an HTTP method. The scanner now follows the receiver through `layer` and
 `route_layer`, retaining every explicit HTTP method before and after them.
 Unknown constructs still fail the audit instead of silently disappearing.
+
+### Admit the whole workload manifest before changing anything
+
+A token confined to namespace `a` must not deploy a job into namespace `b`.
+The apply handler checked apps, then handed jobs to the receiving node without
+the same checks. A mixed manifest could even commit its apps before admitting
+an unauthorised job.
+
+Apps and jobs now contribute to one borrowed iterator of target name, namespace
+and whether the workload executes a host process. `Iterator::chain` visits
+the second iterator after the first; it doesn't allocate another manifest or
+convert job specifications into app specifications. Every target passes the
+token scope and its principal's configured Deploy permission before the first
+Raft write or agent command. Both `exec` and `script` additionally check the
+configured HostExec permission. Principals without a permission specification
+retain the existing role-and-token-scope policy, and the node's host binary
+allowlist remains a separate admission boundary.
+
+The API regressions inspect the agent command queue and Raft desired state,
+not just HTTP status. Refusal must leave both untouched. Positive tests show
+that an in-scope job and an explicitly permitted host job still reach the
+agent. A permission check that refuses everything isn't a working permission
+system either.

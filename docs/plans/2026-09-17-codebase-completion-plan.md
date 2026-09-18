@@ -805,6 +805,40 @@ hashing or committing. An omitted lifetime remains explicitly non-expiring.
 Both API regressions fail before the fix and pass afterwards; token unit tests
 and strict Linux and macOS all-target/all-feature Clippy pass.
 
+### C50 — Apply workload scope and permission checks to every manifest target
+
+**Priority:** P1. **Wave:** 4. **Book chapter:** 04.
+
+Found during C34: apply checked only app scope/permissions. Jobs reached the
+agent without those checks, including jobs in manifests whose apps were
+already committed. Explicit host binaries also missed the HostExec check
+which inline scripts received.
+
+**Completion test:** Out-of-scope jobs and denied Deploy/HostExec permissions
+must refuse before any command or desired-state write, including mixed
+manifests. In-scope and explicitly granted jobs must still be accepted.
+
+**Completed:** Three failing-first regressions now pass. All 113 API tests
+(13.97s), eight route audits and strict Linux/macOS Clippy pass.
+
+### C51 — Restrict administrative manifest writes
+
+**Priority:** P1. **Wave:** 4. **Book chapter:** 04.
+
+Inspected during C50: apply accepts permission and namespace quota declarations
+through its Deployer gate. A caller may be able to rewrite the permission
+specification intended to restrict it. Reproduce and enforce the administrative
+authority required for these writes before any part of a mixed manifest applies.
+
+### C52 — Confine scoped administrators on credential-management routes
+
+**Priority:** P1. **Wave:** 4. **Book chapter:** 04.
+
+Inspected during C50: ordinary token creation checks the Admin role but does
+not require an unscoped caller or confine the requested credential to the
+caller's scope. Reproduce the scope-widening path and apply an explicit boundary
+to global user-management operations, with positive unscoped-admin coverage.
+
 ## Engineering follow-ups
 
 ### H01 — Remove stale wiring claims and validate documentation
