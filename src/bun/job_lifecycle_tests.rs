@@ -96,3 +96,124 @@ async fn explicitly_stopped_retry_does_not_run_again() {
     assert_eq!(instance.state, "stopped");
     assert_eq!(instance.restart_count, 1);
 }
+
+#[tokio::test]
+async fn cron_worker_owns_its_target_until_runtime_creation_finishes() {
+    use axum::{
+        body::{Body, to_bytes},
+        http::{Request, StatusCode},
+    };
+    use tower::ServiceExt;
+    let (tx, rx) = mpsc::channel(32);
+    let shutdown = CancellationToken::new();
+    let grill = MockGrill::new();
+    grill.block_creates();
+    let mut agent = BunAgent::new(
+        grill.clone(),
+        PortAllocator::new(30000, 31000),
+        rx,
+        shutdown.clone(),
+    );
+    let task = tokio::spawn(async move { agent.run().await });
+    let (events, mut results) = mpsc::channel(32);
+    tx.send(AgentCommand::Deploy {
+        config: Config::parse("[job.cron]\nimage = 'test:v1'\nschedule = '* * * * *'\n").unwrap(),
+        events,
+    })
+    .await
+    .unwrap();
+    while let Some(event) = results.recv().await {
+        if matches!(event, ApplyEvent::Complete { .. }) {
+            break;
+        }
+        assert!(!matches!(event, ApplyEvent::Error { .. }), "{event:?}");
+    }
+    tokio::time::timeout(Duration::from_secs(5), grill.wait_for_creates(1))
+        .await
+        .unwrap();
+    let (response, result) = oneshot::channel();
+    tx.send(AgentCommand::DeployOperations { response })
+        .await
+        .unwrap();
+    let operations = result.await.unwrap();
+    let app = crate::bun::api::router(
+        tx.clone(),
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        0,
+        None,
+    );
+    let stopped_during_create = app
+        .clone()
+        .oneshot(
+            Request::post("/v1/stop/cron/default")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let busy_status = stopped_during_create.status();
+    let busy_body = to_bytes(stopped_during_create.into_body(), 65536)
+        .await
+        .unwrap();
+    let (events, mut overlap) = mpsc::channel(8);
+    tx.send(AgentCommand::Deploy {
+        config: Config::parse("[job.cron]\nimage = 'test:v2'\n").unwrap(),
+        events,
+    })
+    .await
+    .unwrap();
+    let overlapping_result = tokio::time::timeout(Duration::from_secs(2), overlap.recv())
+        .await
+        .unwrap()
+        .unwrap();
+    grill.release_creates(1);
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            let (response, result) = oneshot::channel();
+            tx.send(AgentCommand::DeployOperations { response })
+                .await
+                .unwrap();
+            if result.await.unwrap().active_deploys.is_empty() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .unwrap();
+    let stopped_after_create = app
+        .oneshot(
+            Request::post("/v1/stop/cron/default")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap()
+        .status();
+    shutdown.cancel();
+    task.await.unwrap();
+    assert_eq!(
+        operations.active_deploys.len(),
+        1,
+        "cron work must be tracked"
+    );
+    let operation = &operations.active_deploys[0];
+    assert!(operation.targets.iter().any(|target| target.name == "cron"));
+    assert_eq!(busy_status, StatusCode::CONFLICT);
+    assert!(String::from_utf8_lossy(&busy_body).contains(operation.id.as_str()));
+    assert!(
+        matches!(overlapping_result, ApplyEvent::Error { .. }),
+        "{overlapping_result:?}"
+    );
+    assert_eq!(stopped_after_create, StatusCode::OK);
+}

@@ -920,3 +920,28 @@ reports exit zero; the other sends Stop. After several real ticks and the
 retry backoff, the instance must remain stopped with exactly one restart.
 Before the fix, both tests observed a second restart. Cleanup needs this
 property too: stopping a leased job cannot mean “until the next tick”.
+
+### Cron firings own their in-flight work
+
+A cron job used to construct a deployment worker directly. Ordinary apply
+registered an operation first, but cron skipped that step. While the runtime
+was still creating the container, Stop could report success and the worker
+could subsequently finish starting it.
+
+Both paths now use the same admission and worker-completion code. Each cron
+firing appears in the active deployment list, prevents overlapping deploys
+and retains its target until the worker and any rollback finish. Firing the
+job does not rewrite its registered schedule. The existing drain check and
+cooperative cancellation mechanism apply to cron workers too.
+
+A user or lease-cleanup stop refuses while a deployment still owns the target.
+The local HTTP API returns 409 with the operation ID; the caller can wait or
+cancel that operation before retrying. Internal emergency stops after loss of
+egress enforcement retain their immediate fail-closed path. Cluster stop
+still requests desired-state removal; its reconciliation contract is separate
+from this node-local runtime acknowledgement.
+
+The regression holds runtime creation at a barrier. It checks that cron owns
+an active operation, an overlapping deploy refuses and a local HTTP stop
+returns conflict. After releasing creation and observing worker completion,
+the same stop succeeds. No guessed sleep decides whether creation is finished.

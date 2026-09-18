@@ -596,6 +596,15 @@ intent on success, stop, accepted restart or exhausted budget. Both regressions
 pass after the fix (5.03s), along with 44 supervisor tests, 104 agent tests
 (12.28s) and strict Linux/macOS Clippy.
 
+**Cron worker fencing prerequisite (18 September):** The running-agent
+regression reproduces an untracked cron worker during blocked runtime creation.
+Cron and ordinary apply now share operation admission and completion tracking.
+User/cleanup stops refuse before mutation while a worker owns their target;
+the node-local HTTP API returns 409 with the operation ID. Internal egress-loss
+emergency stops retain their fail-closed path. The regression now also checks
+HTTP conflict/success and overlapping-deploy refusal. Three lifecycle tests,
+104 agent tests, 114 API tests and strict Linux/macOS Clippy pass.
+
 Remaining resource contracts, each in its own commit: node-local jobs,
 registry uploads/repositories,
 and managed volume/mount cleanup. Node effects already use C06 reservations

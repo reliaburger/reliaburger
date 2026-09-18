@@ -2868,155 +2868,167 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
         Ok(())
     }
 
+    /// Admit and track either an operator apply or one cron firing through
+    /// worker completion, including rollback and cancellation.
+    async fn begin_deploy(
+        &mut self,
+        config: Config,
+        events: mpsc::Sender<ApplyEvent>,
+        register_schedule: bool,
+    ) {
+        if let Err(message) = self.validate_deploy_names(&config) {
+            let _ = events.send(ApplyEvent::Error { message }).await;
+            return;
+        }
+        let operation = match self.deploy_operations.start(&config).await {
+            Ok(operation) => operation,
+            Err(error) => {
+                let message = format!("deploy refused: {error}");
+                self.record_event(
+                    crate::bun::events::EventKind::Deploy,
+                    crate::bun::events::EventSeverity::Critical,
+                    None,
+                    None,
+                    message.clone(),
+                )
+                .await;
+                let _ = events.send(ApplyEvent::Error { message }).await;
+                return;
+            }
+        };
+        let _ = events
+            .send(ApplyEvent::Accepted {
+                operation_id: operation.id().to_string(),
+            })
+            .await;
+        if self.draining.load(std::sync::atomic::Ordering::Relaxed) {
+            let message = "node is draining for a binary upgrade; retry shortly".to_string();
+            self.record_event(
+                crate::bun::events::EventKind::Deploy,
+                crate::bun::events::EventSeverity::Critical,
+                None,
+                None,
+                "deploy refused while node is draining".to_string(),
+            )
+            .await;
+            operation
+                .finish(
+                    crate::bun::deploy_operations::DeployOperationOutcome::Failed,
+                    message.clone(),
+                )
+                .await;
+            let _ = events.send(ApplyEvent::Error { message }).await;
+            return;
+        }
+        // Register any cron-scheduled jobs so the event loop fires them
+        // on their schedule rather than at deploy time (E).
+        if register_schedule {
+            self.register_scheduled_jobs(&config);
+        }
+
+        // Forward deploy events to the caller, mirroring errors into the
+        // event store. The deploy itself runs on its own task so a slow
+        // pull or a rolling health wait can't wedge this loop
+        // (DEP4/codex-M3); it drives its authoritative steps back
+        // through `deploy_ops_tx`.
+        let (forward_tx, mut forward_rx) = mpsc::channel(64);
+        let event_store = self.events.clone();
+        let observed_operation = operation.clone();
+        let worker = DeployWorker {
+            grill: self.supervisor.grill().clone(),
+            port_allocator: self.supervisor.port_allocator(),
+            ops: DeployOps {
+                tx: self.deploy_ops_tx.clone(),
+            },
+            drains: self.drains.clone(),
+            operation: Some(operation),
+        };
+        let worker_task = tokio::spawn(async move {
+            worker.run_deploy(config, forward_tx).await;
+        });
+        tokio::spawn(async move {
+            use crate::bun::deploy_operations::DeployOperationOutcome;
+            let mut outcome = DeployOperationOutcome::Unknown;
+            let mut message = "deploy worker ended without a terminal event".to_string();
+            let mut completion = None;
+            let mut events = Some(events);
+            while let Some(event) = forward_rx.recv().await {
+                match &event {
+                    ApplyEvent::Complete { created, .. } => {
+                        if outcome != DeployOperationOutcome::Failed {
+                            outcome = DeployOperationOutcome::Completed;
+                            message = format!("deploy completed ({created} instances)");
+                            // Success becomes visible only after all trailing
+                            // bookkeeping and the worker itself have finished.
+                            completion = Some(event);
+                        }
+                        continue;
+                    }
+                    ApplyEvent::Error { message: error } => {
+                        outcome = DeployOperationOutcome::Failed;
+                        message = error.clone();
+                        completion = None;
+                        if let Some(store) = &event_store {
+                            let timestamp = SystemTime::now()
+                                .duration_since(SystemTime::UNIX_EPOCH)
+                                .unwrap_or_default()
+                                .as_secs();
+                            store.write().await.record(
+                                timestamp,
+                                crate::bun::events::EventKind::Deploy,
+                                crate::bun::events::EventSeverity::Critical,
+                                None,
+                                None,
+                                None,
+                                error.clone(),
+                            );
+                        }
+                    }
+                    _ => {}
+                }
+                // A stalled or disconnected observer cannot hold the
+                // worker's outcome hostage. Close a full stream; its
+                // client sees an incomplete stream and can query the ID.
+                if let Some(sender) = &events
+                    && sender.try_send(event).is_err()
+                {
+                    events = None;
+                }
+            }
+            if let Err(error) = worker_task.await {
+                outcome = DeployOperationOutcome::Unknown;
+                message = format!("deploy worker ended unexpectedly: {error}");
+                completion = None;
+            } else if observed_operation.cancellation_observed() {
+                outcome = DeployOperationOutcome::Cancelled;
+                message = "deploy cancelled; in-flight work has finished".into();
+                completion = None;
+            }
+            // Error events can precede rollback. Release target ownership
+            // only after the worker has completed every mutation.
+            observed_operation.finish(outcome, message.clone()).await;
+            if let Some(sender) = events {
+                if let Some(event) = completion {
+                    let _ = sender.try_send(event);
+                } else if outcome == DeployOperationOutcome::Unknown {
+                    let _ = sender.try_send(ApplyEvent::Error { message });
+                }
+            }
+        });
+    }
+
     /// Handle a single command.
     async fn handle_command(&mut self, cmd: AgentCommand) {
         match cmd {
             AgentCommand::Deploy { config, events } => {
-                if let Err(message) = self.validate_deploy_names(&config) {
-                    let _ = events.send(ApplyEvent::Error { message }).await;
-                    return;
-                }
-                let operation = match self.deploy_operations.start(&config).await {
-                    Ok(operation) => operation,
-                    Err(error) => {
-                        let message = format!("deploy refused: {error}");
-                        self.record_event(
-                            crate::bun::events::EventKind::Deploy,
-                            crate::bun::events::EventSeverity::Critical,
-                            None,
-                            None,
-                            message.clone(),
-                        )
-                        .await;
-                        let _ = events.send(ApplyEvent::Error { message }).await;
-                        return;
-                    }
-                };
-                let _ = events
-                    .send(ApplyEvent::Accepted {
-                        operation_id: operation.id().to_string(),
-                    })
-                    .await;
-                if self.draining.load(std::sync::atomic::Ordering::Relaxed) {
-                    let message =
-                        "node is draining for a binary upgrade; retry shortly".to_string();
-                    self.record_event(
-                        crate::bun::events::EventKind::Deploy,
-                        crate::bun::events::EventSeverity::Critical,
-                        None,
-                        None,
-                        "deploy refused while node is draining".to_string(),
-                    )
-                    .await;
-                    operation
-                        .finish(
-                            crate::bun::deploy_operations::DeployOperationOutcome::Failed,
-                            message.clone(),
-                        )
-                        .await;
-                    let _ = events.send(ApplyEvent::Error { message }).await;
-                    return;
-                }
-                // Register any cron-scheduled jobs so the event loop fires them
-                // on their schedule rather than at deploy time (E).
-                self.register_scheduled_jobs(&config);
-
-                // Forward deploy events to the caller, mirroring errors into the
-                // event store. The deploy itself runs on its own task so a slow
-                // pull or a rolling health wait can't wedge this loop
-                // (DEP4/codex-M3); it drives its authoritative steps back
-                // through `deploy_ops_tx`.
-                let (forward_tx, mut forward_rx) = mpsc::channel(64);
-                let event_store = self.events.clone();
-                let observed_operation = operation.clone();
-                let worker = DeployWorker {
-                    grill: self.supervisor.grill().clone(),
-                    port_allocator: self.supervisor.port_allocator(),
-                    ops: DeployOps {
-                        tx: self.deploy_ops_tx.clone(),
-                    },
-                    drains: self.drains.clone(),
-                    operation: Some(operation),
-                };
-                let worker_task = tokio::spawn(async move {
-                    worker.run_deploy(config, forward_tx).await;
-                });
-                tokio::spawn(async move {
-                    use crate::bun::deploy_operations::DeployOperationOutcome;
-                    let mut outcome = DeployOperationOutcome::Unknown;
-                    let mut message = "deploy worker ended without a terminal event".to_string();
-                    let mut completion = None;
-                    let mut events = Some(events);
-                    while let Some(event) = forward_rx.recv().await {
-                        match &event {
-                            ApplyEvent::Complete { created, .. } => {
-                                if outcome != DeployOperationOutcome::Failed {
-                                    outcome = DeployOperationOutcome::Completed;
-                                    message = format!("deploy completed ({created} instances)");
-                                    // Success becomes visible only after all trailing
-                                    // bookkeeping and the worker itself have finished.
-                                    completion = Some(event);
-                                }
-                                continue;
-                            }
-                            ApplyEvent::Error { message: error } => {
-                                outcome = DeployOperationOutcome::Failed;
-                                message = error.clone();
-                                completion = None;
-                                if let Some(store) = &event_store {
-                                    let timestamp = SystemTime::now()
-                                        .duration_since(SystemTime::UNIX_EPOCH)
-                                        .unwrap_or_default()
-                                        .as_secs();
-                                    store.write().await.record(
-                                        timestamp,
-                                        crate::bun::events::EventKind::Deploy,
-                                        crate::bun::events::EventSeverity::Critical,
-                                        None,
-                                        None,
-                                        None,
-                                        error.clone(),
-                                    );
-                                }
-                            }
-                            _ => {}
-                        }
-                        // A stalled or disconnected observer cannot hold the
-                        // worker's outcome hostage. Close a full stream; its
-                        // client sees an incomplete stream and can query the ID.
-                        if let Some(sender) = &events
-                            && sender.try_send(event).is_err()
-                        {
-                            events = None;
-                        }
-                    }
-                    if let Err(error) = worker_task.await {
-                        outcome = DeployOperationOutcome::Unknown;
-                        message = format!("deploy worker ended unexpectedly: {error}");
-                        completion = None;
-                    } else if observed_operation.cancellation_observed() {
-                        outcome = DeployOperationOutcome::Cancelled;
-                        message = "deploy cancelled; in-flight work has finished".into();
-                        completion = None;
-                    }
-                    // Error events can precede rollback. Release target ownership
-                    // only after the worker has completed every mutation.
-                    observed_operation.finish(outcome, message.clone()).await;
-                    if let Some(sender) = events {
-                        if let Some(event) = completion {
-                            let _ = sender.try_send(event);
-                        } else if outcome == DeployOperationOutcome::Unknown {
-                            let _ = sender.try_send(ApplyEvent::Error { message });
-                        }
-                    }
-                });
+                self.begin_deploy(config, events, true).await;
             }
             AgentCommand::Stop {
                 app_name,
                 namespace,
                 response,
             } => {
-                let result = self.stop_app(&app_name, &namespace).await;
+                let result = self.stop_workload_when_idle(&app_name, &namespace).await;
                 let _ = response.send(result);
             }
             AgentCommand::Status { response } => {
@@ -6340,28 +6352,15 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
 
             let mut config = Config::default();
             config.job.insert(name, spec);
-            self.spawn_scheduled_job_deploy(config);
+            self.spawn_scheduled_job_deploy(config).await;
         }
     }
 
-    /// Spawn a one-off deploy of a cron-fired job on its own task, draining the
-    /// event stream. Mirrors the worker construction in the deploy command path.
-    fn spawn_scheduled_job_deploy(&self, config: Config) {
+    /// Admit a cron firing without changing the registered schedule.
+    async fn spawn_scheduled_job_deploy(&mut self, config: Config) {
         let (events_tx, mut events_rx) = mpsc::channel::<ApplyEvent>(64);
         tokio::spawn(async move { while events_rx.recv().await.is_some() {} });
-
-        let worker = DeployWorker {
-            grill: self.supervisor.grill().clone(),
-            port_allocator: self.supervisor.port_allocator(),
-            ops: DeployOps {
-                tx: self.deploy_ops_tx.clone(),
-            },
-            drains: self.drains.clone(),
-            operation: None,
-        };
-        tokio::spawn(async move {
-            worker.run_deploy(config, events_tx).await;
-        });
+        self.begin_deploy(config, events_tx, false).await;
     }
 
     /// Monitor running job instances for process exit.
@@ -6700,6 +6699,37 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
                 }
             }
         }
+    }
+
+    /// Refuse user/cleanup stops while a deploy can still mutate the target.
+    async fn stop_workload_when_idle(
+        &mut self,
+        app_name: &str,
+        namespace: &str,
+    ) -> Result<(), BunError> {
+        // Worker completion releases ownership only after its last runtime
+        // mutation. Refuse before retiring a schedule or claiming a stop.
+        // Both command admission and cron firing run on this same event loop.
+        if let Some(operation) = self
+            .deploy_operations
+            .snapshot()
+            .await
+            .active_deploys
+            .into_iter()
+            .find(|operation| {
+                operation
+                    .targets
+                    .iter()
+                    .any(|target| target.name == app_name && target.namespace == namespace)
+            })
+        {
+            return Err(BunError::WorkloadBusy {
+                app_name: app_name.to_owned(),
+                namespace: namespace.to_owned(),
+                operation_id: operation.id,
+            });
+        }
+        self.stop_app(app_name, namespace).await
     }
 
     /// Stop an app's instances.

@@ -3162,11 +3162,18 @@ async fn stop_local(state: &ApiState, app: String, namespace: String) -> Respons
 
     match resp_rx.await {
         Ok(Ok(())) => Json(serde_json::json!({ "status": "stopped" })).into_response(),
-        Ok(Err(e)) => (
-            StatusCode::NOT_FOUND,
-            Json(serde_json::json!({ "error": e.to_string() })),
-        )
-            .into_response(),
+        Ok(Err(error)) => {
+            let status = match error {
+                crate::bun::BunError::AppNotFound { .. } => StatusCode::NOT_FOUND,
+                crate::bun::BunError::WorkloadBusy { .. } => StatusCode::CONFLICT,
+                _ => StatusCode::INTERNAL_SERVER_ERROR,
+            };
+            (
+                status,
+                Json(serde_json::json!({ "error": error.to_string() })),
+            )
+                .into_response()
+        }
         Err(_) => (
             StatusCode::INTERNAL_SERVER_ERROR,
             Json(serde_json::json!({ "error": "agent dropped response" })),
