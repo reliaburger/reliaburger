@@ -2341,18 +2341,33 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
     /// are seeded into the supervisor as Running so they don't get
     /// double-started. Records whose process is gone are deleted (the
     /// instance reschedules through the normal path). Returns the number
-    /// of instances adopted.
+    /// of instances adopted. Any uncertain observation refuses startup and
+    /// preserves durable records and identity material for recovery.
     ///
     /// Restart backoff counters start fresh for adopted instances, and
     /// cluster routing is rebuilt by the normal reconcile paths.
-    pub async fn adopt_recorded_instances(&mut self) -> usize {
+    pub async fn adopt_recorded_instances(&mut self) -> Result<usize, BunError> {
         let Some(dir) = self.records_dir.clone() else {
-            return 0;
+            return Ok(0);
         };
         let now = Instant::now();
         let mut adopted_count = 0;
 
-        for record in crate::grill::records::load_records(&dir) {
+        let records_dir = dir.clone();
+        let records =
+            tokio::task::spawn_blocking(move || crate::grill::records::load_records(&records_dir))
+                .await
+                .map_err(|error| BunError::AdoptionState(error.to_string()))?
+                .map_err(|error| BunError::AdoptionState(error.to_string()))?;
+        for record in records {
+            if record.runtime != self.supervisor.grill().runtime_kind() {
+                return Err(BunError::AdoptionState(format!(
+                    "instance {} belongs to {:?}, but the selected runtime is {:?}",
+                    record.instance_id,
+                    record.runtime,
+                    self.supervisor.grill().runtime_kind(),
+                )));
+            }
             // The runtime knows the still-running container by the id it was
             // started under, which is what the record stores. The supervisor
             // and everything downstream key on the canonical id: for a fresh
@@ -2385,26 +2400,32 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
                 continue;
             }
 
-            let adopted = matches!(
-                self.supervisor.grill().adopt(&runtime_id, &record).await,
-                Ok(true)
-            );
+            let adopted = tokio::time::timeout(
+                std::time::Duration::from_secs(10),
+                self.supervisor.grill().adopt(&runtime_id, &record),
+            )
+            .await
+            .map_err(|_| {
+                BunError::AdoptionState(format!("runtime adoption timed out for {runtime_id}"))
+            })??;
             if !adopted {
-                let _ = crate::grill::records::remove_record(&dir, &record.instance_id);
-                // The instance is gone for good — its key material goes
-                // with it (PKI7). The identity dir was created under the id
-                // the container ran as (the runtime id), which for a legacy
-                // record differs from the canonical supervisor key.
+                let records_dir = dir.clone();
                 let identity_dir = self.instance_identity_dir(&runtime_id);
-                if let Err(e) = crate::sesame::identity::cleanup_identity_dir(&identity_dir) {
-                    eprintln!("bun: warning: failed to remove identity dir for {runtime_id}: {e}");
-                }
+                // Keep the record if identity retirement fails, so the next
+                // startup retries instead of forgetting incomplete cleanup.
+                tokio::task::spawn_blocking(move || {
+                    crate::sesame::identity::cleanup_identity_dir(&identity_dir)?;
+                    crate::grill::records::remove_record(&records_dir, &record.instance_id)
+                })
+                .await
+                .map_err(|error| BunError::AdoptionState(error.to_string()))?
+                .map_err(|error| BunError::AdoptionState(error.to_string()))?;
                 continue;
             }
 
             // The surviving instance still holds its port.
             if let Some(port) = record.host_port {
-                let _ = self.supervisor.port_allocator.reserve(port).await;
+                self.supervisor.port_allocator.reserve(port).await?;
             }
 
             // Rebuild the health check from the recorded app spec.
@@ -2481,7 +2502,7 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
         // instances that died while bun was down — are stale key material.
         self.sweep_orphaned_identity_dirs();
 
-        adopted_count
+        Ok(adopted_count)
     }
 
     /// Spawn a background forwarder that streams a started instance's log lines
@@ -12750,7 +12771,7 @@ host = "remote.local"
                         if let ApplyEvent::Progress { message } = event
                             && message.contains("healthy")
                         {
-                            assert!(crate::grill::records::load_records(records.path()).iter()
+                            assert!(crate::grill::records::load_records(records.path()).unwrap().iter()
                                 .any(|record| record.image == "web:v2"));
                             observed_during_rollout = true;
                         }
@@ -12763,7 +12784,7 @@ host = "remote.local"
         .unwrap();
         drop(deployment);
         assert!(observed_during_rollout);
-        let persisted = crate::grill::records::load_records(records.path());
+        let persisted = crate::grill::records::load_records(records.path()).unwrap();
         assert_eq!(
             persisted.len(),
             1,
@@ -12779,7 +12800,7 @@ host = "remote.local"
         restarted.set_volumes_dir(volumes.path().to_path_buf());
         let id = InstanceId(persisted[0].instance_id.clone());
         runtime.set_adopt_result(&id, true);
-        assert_eq!(restarted.adopt_recorded_instances().await, 1);
+        assert_eq!(restarted.adopt_recorded_instances().await.unwrap(), 1);
         assert!(restarted.supervisor.get_instance(&id).is_some());
         assert!(
             !runtime
@@ -12842,9 +12863,14 @@ host = "remote.local"
         grill.set_runtime_kind(crate::grill::records::RuntimeKind::Apple);
         let (events, _receiver) = mpsc::channel(128);
         agent.deploy(basic_config(), &events).await;
-        assert_eq!(crate::grill::records::load_records(records.path()).len(), 1);
+        assert_eq!(
+            crate::grill::records::load_records(records.path())
+                .unwrap()
+                .len(),
+            1
+        );
         agent.deploy(basic_config(), &events).await;
-        let saved = crate::grill::records::load_records(records.path());
+        let saved = crate::grill::records::load_records(records.path()).unwrap();
         assert_eq!(saved.len(), 1);
         assert_eq!(saved[0].runtime, crate::grill::records::RuntimeKind::Apple);
         assert_eq!(saved[0].pid, std::process::id());
@@ -12877,10 +12903,129 @@ host = "remote.local"
         drop(events);
         while event_rx.recv().await.is_some() {}
 
-        let persisted = crate::grill::records::load_records(records.path());
+        let persisted = crate::grill::records::load_records(records.path()).unwrap();
         assert_eq!(persisted.len(), 1);
         assert_eq!(persisted[0].schema, 2);
         assert_eq!(persisted[0].rootless_network, Some(rootless_network));
+    }
+
+    #[tokio::test]
+    async fn adoption_refuses_conflicting_port_ownership() {
+        let (mut agent, _tx, _shutdown, grill) = test_agent_with_grill();
+        let records = tempfile::tempdir().unwrap();
+        agent.set_records_dir(records.path().to_path_buf());
+        for app in ["web", "api"] {
+            let record = adoption_record(&format!("default__{app}-0"), app, false);
+            crate::grill::records::write_record(records.path(), &record).unwrap();
+            grill.set_adopt_result(&InstanceId(record.instance_id), true);
+        }
+        assert!(agent.adopt_recorded_instances().await.is_err());
+        assert_eq!(agent.supervisor.list_instances().len(), 1);
+        assert_eq!(
+            crate::grill::records::load_records(records.path())
+                .unwrap()
+                .len(),
+            2
+        );
+    }
+
+    #[tokio::test]
+    async fn adoption_refuses_a_different_runtime_without_touching_the_record() {
+        let (mut agent, _tx, _shutdown, grill) = test_agent_with_grill();
+        let records = tempfile::tempdir().unwrap();
+        let mut record = adoption_record("default__web-0", "web", false);
+        record.runtime = crate::grill::records::RuntimeKind::Runc;
+        crate::grill::records::write_record(records.path(), &record).unwrap();
+        agent.set_records_dir(records.path().to_path_buf());
+        assert!(agent.adopt_recorded_instances().await.is_err());
+        assert!(grill.calls().is_empty());
+        assert_eq!(
+            crate::grill::records::load_records(records.path()).unwrap(),
+            vec![record]
+        );
+    }
+
+    #[tokio::test]
+    async fn adoption_retains_dead_owner_record_until_identity_cleanup_succeeds() {
+        let (mut agent, _tx, _shutdown, _grill) = test_agent_with_grill();
+        let records = tempfile::tempdir().unwrap();
+        let volumes = tempfile::tempdir().unwrap();
+        let record = adoption_record("default__web-0", "web", false);
+        crate::grill::records::write_record(records.path(), &record).unwrap();
+        agent.set_records_dir(records.path().to_path_buf());
+        agent.set_volumes_dir(volumes.path().to_path_buf());
+        let identity =
+            crate::sesame::identity::instance_identity_dir(volumes.path(), &record.instance_id);
+        std::fs::create_dir_all(identity.parent().unwrap()).unwrap();
+        std::fs::write(&identity, b"not a directory").unwrap();
+        assert!(agent.adopt_recorded_instances().await.is_err());
+        assert!(crate::grill::records::record_path(records.path(), &record.instance_id).exists());
+        std::fs::remove_file(identity).unwrap();
+        assert_eq!(agent.adopt_recorded_instances().await.unwrap(), 0);
+        assert!(
+            crate::grill::records::load_records(records.path())
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[tokio::test]
+    async fn uncertain_adoption_preserves_the_record_and_identity_for_retry() {
+        let (mut agent, _tx, _shutdown, grill) = test_agent_with_grill();
+        let records = tempfile::tempdir().unwrap();
+        let volumes = tempfile::tempdir().unwrap();
+        let record = adoption_record("default__web-0", "web", false);
+        crate::grill::records::write_record(records.path(), &record).unwrap();
+        write_test_identity(volumes.path(), &record.instance_id);
+        agent.set_records_dir(records.path().to_path_buf());
+        agent.set_volumes_dir(volumes.path().to_path_buf());
+        grill.set_fail_state(true);
+        assert!(agent.adopt_recorded_instances().await.is_err());
+        assert!(
+            crate::grill::records::record_path(records.path(), &record.instance_id).exists(),
+            "uncertain runtime inspection discarded durable ownership"
+        );
+        let identity =
+            crate::sesame::identity::instance_identity_dir(volumes.path(), &record.instance_id);
+        assert!(
+            crate::sesame::identity::load_identity(&identity)
+                .unwrap()
+                .is_some(),
+            "uncertain runtime inspection swept a surviving owner's identity"
+        );
+        grill.set_fail_state(false);
+        grill.set_adopt_result(&InstanceId(record.instance_id.clone()), true);
+        agent.adopt_recorded_instances().await.unwrap();
+        assert!(
+            agent
+                .supervisor
+                .get_instance(&InstanceId(record.instance_id))
+                .is_some()
+        );
+    }
+
+    #[tokio::test]
+    async fn corrupt_adoption_record_never_sweeps_its_workload_identity() {
+        let (mut agent, _tx, _shutdown, _grill) = test_agent_with_grill();
+        let records = tempfile::tempdir().unwrap();
+        let volumes = tempfile::tempdir().unwrap();
+        let instance = "default__web-0";
+        std::fs::write(
+            records.path().join(format!("{instance}.json")),
+            b"{incomplete",
+        )
+        .unwrap();
+        write_test_identity(volumes.path(), instance);
+        agent.set_records_dir(records.path().to_path_buf());
+        agent.set_volumes_dir(volumes.path().to_path_buf());
+        assert!(agent.adopt_recorded_instances().await.is_err());
+        let identity = crate::sesame::identity::instance_identity_dir(volumes.path(), instance);
+        assert!(
+            crate::sesame::identity::load_identity(&identity)
+                .unwrap()
+                .is_some(),
+            "unreadable ownership was incorrectly treated as absence"
+        );
     }
 
     #[tokio::test]
@@ -12894,7 +13039,7 @@ host = "remote.local"
         let id = InstanceId("default__web-0".to_string());
         grill.set_adopt_result(&id, true);
 
-        assert_eq!(agent.adopt_recorded_instances().await, 1);
+        assert_eq!(agent.adopt_recorded_instances().await.unwrap(), 1);
 
         let instance = agent.supervisor.get_instance(&id).unwrap();
         assert_eq!(instance.state, ContainerState::Running);
@@ -12923,7 +13068,7 @@ host = "remote.local"
         let runtime_id = InstanceId("web-0".to_string());
         grill.set_adopt_result(&runtime_id, true);
 
-        assert_eq!(agent.adopt_recorded_instances().await, 1);
+        assert_eq!(agent.adopt_recorded_instances().await.unwrap(), 1);
 
         // But the supervisor keys it canonically.
         let canonical = InstanceId("default__web-0".to_string());
@@ -12951,12 +13096,17 @@ host = "remote.local"
         let record = adoption_record("default__web-0", "web", false);
         crate::grill::records::write_record(dir.path(), &record).unwrap();
         agent.set_records_dir(dir.path().to_path_buf());
+        agent.set_volumes_dir(dir.path().join("volumes"));
 
-        assert_eq!(agent.adopt_recorded_instances().await, 0);
+        assert_eq!(agent.adopt_recorded_instances().await.unwrap(), 0);
 
         // The stale record is gone and nothing was seeded: the normal
         // reconcile path is free to reschedule the instance.
-        assert!(crate::grill::records::load_records(dir.path()).is_empty());
+        assert!(
+            crate::grill::records::load_records(dir.path())
+                .unwrap()
+                .is_empty()
+        );
         assert!(
             agent
                 .supervisor
@@ -13022,7 +13172,7 @@ host = "remote.local"
         let id = InstanceId("default__web-0".to_string());
         grill.set_adopt_result(&id, true);
 
-        assert_eq!(agent.adopt_recorded_instances().await, 1);
+        assert_eq!(agent.adopt_recorded_instances().await.unwrap(), 1);
 
         let instance = agent.supervisor.get_instance(&id).unwrap();
         let restored = instance
@@ -13084,7 +13234,7 @@ host = "remote.local"
         let id = InstanceId("default__web-0".to_string());
         grill.set_adopt_result(&id, true);
 
-        assert_eq!(agent.adopt_recorded_instances().await, 1);
+        assert_eq!(agent.adopt_recorded_instances().await.unwrap(), 1);
 
         assert_eq!(
             identity_dir_names(volumes.path()),
@@ -13103,7 +13253,7 @@ host = "remote.local"
 
         let id = InstanceId("default__web-0".to_string());
         grill.set_adopt_result(&id, true);
-        assert_eq!(agent.adopt_recorded_instances().await, 1);
+        assert_eq!(agent.adopt_recorded_instances().await.unwrap(), 1);
 
         let instance = agent.supervisor.get_instance(&id).unwrap();
         assert!(instance.health_config.is_some());
@@ -13119,7 +13269,7 @@ host = "remote.local"
 
         let id = InstanceId("default__web-0".to_string());
         grill.set_adopt_result(&id, true);
-        assert_eq!(agent.adopt_recorded_instances().await, 1);
+        assert_eq!(agent.adopt_recorded_instances().await.unwrap(), 1);
 
         // The adopted instance's port must not be handed out again.
         assert!(agent.supervisor.port_allocator.is_allocated(30123).await);
@@ -13144,7 +13294,7 @@ host = "remote.local"
         crate::grill::records::write_record(dir.path(), &record).unwrap();
         grill.set_adopt_result(&id, true);
 
-        assert_eq!(agent.adopt_recorded_instances().await, 0);
+        assert_eq!(agent.adopt_recorded_instances().await.unwrap(), 0);
     }
 
     // ---------------------------------------------------------------------

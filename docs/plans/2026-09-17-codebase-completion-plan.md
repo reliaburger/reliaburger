@@ -719,9 +719,21 @@ CI and Build & Release both pass at the repaired `d7897fc` head.
 
 **Additional cleanup evidence to establish:** Atomic process identity,
 complete process-tree retirement and physical crash recovery remain open.
-Startup currently collapses runtime adoption errors into “not adopted”, removes
-the record and can sweep identity material. Refuse uncertain adoption without
-forgetting ownership, and qualify unreadable/corrupt records before serving.
+**Startup ownership refusal (18 September):** Adoption now propagates runtime
+errors and enforces a ten-second deadline before the API serves. The complete
+record inventory is read on a blocking worker; unreadable/corrupt records,
+unsupported schemas, filename mismatches, symlinks and non-regular inputs
+refuse instead of implying absence. Runtime mismatches and host-port conflicts
+also refuse. Confirmed dead-owner cleanup removes identity material before its
+record and retains the record on failure. Both original record/identity-loss
+regressions fail first. All 435 Bun tests (one explicit gate, 34.34s), 12 record
+tests and 11 ordinary actual-binary first-run cases (17.60s; two privileged cases
+remain gated) pass, including corrupt-state refusal and job recovery after Bun
+is killed. Strict Linux/macOS Clippy passes. The stale-record fixture now has an isolated volume path after strict
+error handling exposed its accidental access to the system volume directory.
+Runtime-specific absence prechecks still need qualification: Process/Runc use
+an optional process observation and Apple inspection can mask errors as absence.
+
 Job schedule registrations and last-fired stamps are currently in-memory;
 adoption resets job retries to the generic restart policy. Persist the intended
 schedule and retry budget, with restart/no-duplicate-firing tests. Durable test
@@ -754,6 +766,13 @@ TLS/CLI catalogue pass together (14.00s), including confirmed cleanup.
 Protocol/state advance to 6/6 and the lease schema to 3. The full Linux library checkpoint passes 3,306 tests (19 explicit gates, 63.99s), and both actual-binary compatibility tests pass (0.01s). Strict Linux/macOS all-target/all-feature Clippy passes. This retains node-local
 job scheduling; physical-crash, initial-record and full process-tree gates remain
 separate.
+
+**Hosted macOS follow-up:** CI at `c4ec142` passed the three job assertions but
+failed cron cleanup with EPERM. The same real catalogue failure reproduces on
+macOS (17.74s), and signalling twelve exited, unreaped child-owned groups
+returns EPERM in all twelve cases. Observe child exit before deciding whether to
+signal; do not ignore permission errors for live processes. Full process-tree
+ownership remains a separate gate. The release build at `c4ec142` passed.
 
 **Job completion evidence (18 September):** The catalogue previously counted a
 stopped job with no exit code as success. Its HTTP regression fails first; the

@@ -392,6 +392,12 @@ impl super::Grill for MockGrill {
             .lock()
             .unwrap()
             .push(("adopt".to_string(), instance.clone()));
+        if self.fail_state.load(Ordering::SeqCst) {
+            return Err(GrillError::StateUnavailable {
+                instance: instance.clone(),
+                reason: "simulated adoption inspection failure".into(),
+            });
+        }
         Ok(self
             .adopt_results
             .lock()

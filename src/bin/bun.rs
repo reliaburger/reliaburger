@@ -1341,7 +1341,7 @@ async fn run_agent(cli: Cli) -> anyhow::Result<()> {
     }
     // Adopt workloads that survived a previous bun process (restart or
     // self-upgrade exec) BEFORE the agent loop starts reconciling.
-    agent.adopt_recorded_instances().await;
+    agent.adopt_recorded_instances().await?;
     let deploy_history = agent.deploy_history_handle();
 
     // Onion DNS: start the .internal responder when [dns] enables it,

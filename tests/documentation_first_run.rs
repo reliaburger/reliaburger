@@ -1126,6 +1126,39 @@ fn qualify_process_catalogue(group: &str) {
     );
 }
 
+#[test]
+fn corrupt_workload_ownership_refuses_startup_before_the_api_listens() {
+    let root = tempfile::tempdir().unwrap();
+    let config = write_portable_node_config(root.path());
+    let data = root.path().join("data");
+    reliaburger::compatibility::ensure_state_compatible(&data).unwrap();
+    let records = data.join("instances");
+    std::fs::create_dir_all(&records).unwrap();
+    let record = records.join("default__web-0.json");
+    std::fs::write(&record, b"{incomplete").unwrap();
+    let log = root.path().join("corrupt-ownership.log");
+    let mut bun = BunProcess::spawn(&config, "127.0.0.1:0".parse().unwrap(), false, log.clone());
+    let deadline = Instant::now() + WAIT;
+    let status = loop {
+        if let Some(status) = bun.child.try_wait().unwrap() {
+            break status;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "Bun did not refuse corrupt ownership"
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    };
+    assert!(!status.success());
+    assert_eq!(std::fs::read(&record).unwrap(), b"{incomplete");
+    let output = std::fs::read_to_string(log).unwrap();
+    assert!(
+        output.contains("cannot restore workload ownership"),
+        "{output}"
+    );
+    assert!(!output.contains("API server listening"), "{output}");
+}
+
 #[tokio::test]
 async fn node_job_lease_reaps_a_surviving_process_after_bun_is_killed() {
     let root = tempfile::tempdir().unwrap();
@@ -1220,6 +1253,7 @@ async fn node_job_lease_reaps_a_surviving_process_after_bun_is_killed() {
         .unwrap();
     let records_dir = node.storage.data.join("instances");
     let record = reliaburger::grill::records::load_records(&records_dir)
+        .unwrap()
         .into_iter()
         .find(|record| record.app_name == "survivor" && record.namespace == lease.namespace)
         .unwrap();
@@ -1270,6 +1304,7 @@ async fn node_job_lease_reaps_a_surviving_process_after_bun_is_killed() {
                 );
                 assert!(
                     reliaburger::grill::records::load_records(&records_dir)
+                        .unwrap()
                         .iter()
                         .all(|record| record.namespace != lease.namespace)
                 );

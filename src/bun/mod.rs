@@ -34,6 +34,10 @@ use crate::grill::{GrillError, InstanceId};
 /// Errors from Bun agent operations.
 #[derive(Debug, thiserror::Error)]
 pub enum BunError {
+    /// Startup cannot establish the complete ownership inventory.
+    #[error("cannot restore workload ownership: {0}")]
+    AdoptionState(String),
+
     /// An error from the container runtime.
     #[error(transparent)]
     Grill(#[from] GrillError),

@@ -254,7 +254,12 @@ async fn unconfirmed_stop_retains_runtime_ownership(configure: fn(&MockGrill)) {
     })
     .await
     .unwrap();
-    assert_eq!(crate::grill::records::load_records(records.path()).len(), 1);
+    assert_eq!(
+        crate::grill::records::load_records(records.path())
+            .unwrap()
+            .len(),
+        1
+    );
     let id = InstanceId(status(&tx).await.id);
     grill.set_state(&id, ContainerState::Running);
     grill.set_ignore_stop(true);
@@ -288,7 +293,7 @@ async fn unconfirmed_stop_retains_runtime_ownership(configure: fn(&MockGrill)) {
     .unwrap();
     let first_status = response.status();
     let after_failure = status(&tx).await;
-    let retained_records = crate::grill::records::load_records(records.path());
+    let retained_records = crate::grill::records::load_records(records.path()).unwrap();
     grill.release_kills(1);
     grill.set_fail_kill(false);
     grill.set_ignore_kill(false);
@@ -304,7 +309,7 @@ async fn unconfirmed_stop_retains_runtime_ownership(configure: fn(&MockGrill)) {
         .await
         .unwrap();
     let final_status = status(&tx).await;
-    let final_records = crate::grill::records::load_records(records.path());
+    let final_records = crate::grill::records::load_records(records.path()).unwrap();
     shutdown.cancel();
     task.await.unwrap();
     assert_eq!(

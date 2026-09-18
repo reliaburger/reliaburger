@@ -800,3 +800,43 @@ this race on every run. The failing full-suite checkpoint is the evidence for
 the original defect; the concurrent test protects the surrounding behaviour.
 Existing stalled-probe tests still check that preparation is bounded and leaves
 no staged upgrade behind.
+
+### An inspection error isn't a dead workload
+
+Suppose Bun restarts while the container runtime cannot answer its inspection
+request. The old adoption loop treated every result except `Ok(true)` as a dead
+workload. It removed the instance record, then swept identity files that no
+in-memory instance claimed. The process could still be running. We'd lost the
+information needed to recover it.
+
+Adoption now returns `Result<usize, BunError>`. The count belongs to the `Ok`
+case; an inspection error belongs to `Err` and propagates through startup's `?`.
+Only an explicit `Ok(false)` from the runtime permits dead-owner cleanup.
+Each runtime adoption call has a ten-second deadline. An error or timeout stops
+startup before Bun starts accepting API requests, leaving ownership records and
+identity material available for recovery. An incompatible runtime or conflicting
+host-port reservation also refuses. A later retry can adopt the same instance.
+
+The record loader follows the same rule. A fresh node may have no records
+directory, but an unreadable directory, malformed JSON, unknown schema or an
+identifier that disagrees with its filename isn't an empty inventory. Symlinks
+and non-regular records refuse too. On Unix, `O_NOFOLLOW` prevents opening a
+symlink target and `O_NONBLOCK` prevents a FIFO named `.json` from hanging the
+open. We check that the opened descriptor describes a regular file before
+parsing it. `BufReader` batches filesystem reads for the JSON parser.
+
+We load the complete inventory on `spawn_blocking` before adopting any record.
+The outer result reports a failed worker task; the inner result reports a failed
+filesystem read or parse. Both must succeed. For a confirmed dead owner, identity
+cleanup also runs off the async executor and must finish before we remove its
+record. A failed unmount or removal leaves a record that the next startup can
+retry.
+
+The two original regressions reproduce lost ownership and swept identity files
+before the repair. Further tests cover port conflicts, runtime mismatches,
+malformed records, symlinks, FIFOs and failed identity cleanup followed by retry.
+The actual-binary refusal fixture keeps its corrupt record intact and requires
+Bun to exit before announcing an API listener. These checks don't establish
+atomic process identity, nor do they excuse a runtime that incorrectly reports
+an inspection failure as `Ok(false)`. Those runtime boundaries need their own
+proof.

@@ -109,33 +109,78 @@ pub fn remove_record(records_dir: &Path, instance_id: &str) -> std::io::Result<(
     }
 }
 
-/// Load every parseable record in the directory. Unparseable files are
-/// skipped with a warning — a corrupt record must not block the others.
-pub fn load_records(records_dir: &Path) -> Vec<InstanceRecord> {
-    let entries = match std::fs::read_dir(records_dir) {
-        Ok(entries) => entries,
-        Err(_) => return Vec::new(),
+/// Load all ownership records, refusing unreadable or malformed state.
+/// A missing directory represents a fresh node; other failures never imply absence.
+pub fn load_records(records_dir: &Path) -> std::io::Result<Vec<InstanceRecord>> {
+    let contextual = |path: &Path, error: std::io::Error| {
+        std::io::Error::new(
+            error.kind(),
+            format!("cannot read ownership record {}: {error}", path.display()),
+        )
     };
+    match std::fs::symlink_metadata(records_dir) {
+        Ok(metadata) if metadata.is_dir() => {}
+        Ok(_) => {
+            return Err(contextual(
+                records_dir,
+                std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "expected an ownership directory",
+                ),
+            ));
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(error) => return Err(contextual(records_dir, error)),
+    }
+    let entries = std::fs::read_dir(records_dir).map_err(|error| contextual(records_dir, error))?;
     let mut records = Vec::new();
-    for entry in entries.flatten() {
+    for entry in entries {
+        let entry = entry.map_err(|error| contextual(records_dir, error))?;
         let path = entry.path();
-        if path.extension().and_then(|e| e.to_str()) != Some("json") {
+        if path.extension().and_then(|extension| extension.to_str()) != Some("json") {
             continue;
         }
-        match std::fs::read_to_string(&path)
-            .ok()
-            .and_then(|s| serde_json::from_str::<InstanceRecord>(&s).ok())
+        let mut options = std::fs::OpenOptions::new();
+        options.read(true);
+        #[cfg(unix)]
         {
-            Some(record) => records.push(record),
-            None => {
-                eprintln!(
-                    "bun: warning: skipping unreadable instance record {}",
-                    path.display()
-                );
-            }
+            use std::os::unix::fs::OpenOptionsExt;
+            options.custom_flags(nix::libc::O_NOFOLLOW | nix::libc::O_NONBLOCK);
         }
+        let file = options
+            .open(&path)
+            .map_err(|error| contextual(&path, error))?;
+        if !file
+            .metadata()
+            .map_err(|error| contextual(&path, error))?
+            .is_file()
+        {
+            return Err(contextual(
+                &path,
+                std::io::Error::new(std::io::ErrorKind::InvalidData, "expected a regular file"),
+            ));
+        }
+        let record: InstanceRecord = serde_json::from_reader(std::io::BufReader::new(file))
+            .map_err(|error| {
+                contextual(
+                    &path,
+                    std::io::Error::new(std::io::ErrorKind::InvalidData, error),
+                )
+            })?;
+        if !matches!(record.schema, 1 | 2)
+            || path.file_stem() != Some(std::ffi::OsStr::new(&record.instance_id))
+        {
+            return Err(contextual(
+                &path,
+                std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "unsupported schema or mismatched instance identifier",
+                ),
+            ));
+        }
+        records.push(record);
     }
-    records
+    Ok(records)
 }
 
 /// The start time of a live process, or `None` if it doesn't exist.
@@ -277,7 +322,7 @@ mod tests {
         let original = record(4242, 1000);
         write_record(dir.path(), &original).unwrap();
 
-        let loaded = load_records(dir.path());
+        let loaded = load_records(dir.path()).unwrap();
         assert_eq!(loaded, vec![original]);
     }
 
@@ -310,23 +355,69 @@ mod tests {
         write_record(dir.path(), &record(4242, 1000)).unwrap();
         remove_record(dir.path(), "web-0").unwrap();
         remove_record(dir.path(), "web-0").unwrap();
-        assert!(load_records(dir.path()).is_empty());
+        assert!(load_records(dir.path()).unwrap().is_empty());
     }
 
     #[test]
-    fn load_records_skips_corrupt_files() {
+    fn load_records_refuses_corrupt_files() {
         let dir = tempfile::tempdir().unwrap();
         write_record(dir.path(), &record(4242, 1000)).unwrap();
         std::fs::write(dir.path().join("broken.json"), "not json").unwrap();
         std::fs::write(dir.path().join("ignored.txt"), "not a record").unwrap();
 
-        assert_eq!(load_records(dir.path()).len(), 1);
+        assert!(load_records(dir.path()).is_err());
+    }
+
+    #[test]
+    fn load_records_refuses_unreadable_directory_and_mismatched_identity() {
+        let dir = tempfile::tempdir().unwrap();
+        let blocked = tempfile::NamedTempFile::new().unwrap();
+        assert!(load_records(blocked.path()).is_err());
+        let mut owner = record(4242, 1000);
+        write_record(dir.path(), &owner).unwrap();
+        owner.instance_id = "other".into();
+        std::fs::write(
+            dir.path().join("web-0.json"),
+            serde_json::to_vec(&owner).unwrap(),
+        )
+        .unwrap();
+        assert!(load_records(dir.path()).is_err());
+        owner.instance_id = "web-0".into();
+        owner.schema = 999;
+        write_record(dir.path(), &owner).unwrap();
+        assert!(load_records(dir.path()).is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn load_records_refuses_symlinks_and_non_regular_records() {
+        let dir = tempfile::tempdir().unwrap();
+        let link_parent = tempfile::tempdir().unwrap();
+        let directory_link = link_parent.path().join("instances");
+        std::os::unix::fs::symlink(dir.path(), &directory_link).unwrap();
+        assert!(load_records(&directory_link).is_err());
+        let target = tempfile::NamedTempFile::new().unwrap();
+        std::fs::write(
+            target.path(),
+            serde_json::to_vec(&record(4242, 1000)).unwrap(),
+        )
+        .unwrap();
+        let path = dir.path().join("web-0.json");
+        std::os::unix::fs::symlink(target.path(), &path).unwrap();
+        assert!(load_records(dir.path()).is_err());
+        std::fs::remove_file(&path).unwrap();
+        nix::unistd::mkfifo(
+            &path,
+            nix::sys::stat::Mode::S_IRUSR | nix::sys::stat::Mode::S_IWUSR,
+        )
+        .unwrap();
+        assert!(load_records(dir.path()).is_err());
     }
 
     #[test]
     fn load_records_from_missing_dir_is_empty() {
         let dir = tempfile::tempdir().unwrap();
-        assert!(load_records(&dir.path().join("nope")).is_empty());
+        assert!(load_records(&dir.path().join("nope")).unwrap().is_empty());
     }
 
     #[test]

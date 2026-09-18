@@ -30,6 +30,11 @@ that is down retains its record until it can run cleanup again. These leases
 support job-only manifests and use server-selected namespaces. Ordinary jobs
 remain node-local; this does not introduce cluster job scheduling.
 
+Startup refuses unreadable or malformed workload ownership records and runtime
+adoption errors before serving the API. It preserves records and identity files
+for recovery; inspect the reported path or runtime error and retry once repaired.
+Do not delete ownership records to bypass the refusal while workloads may survive.
+
 ## Release work
 
 The [0.1.0 plan](plans/2026-09-16-v0.1.0-release-plan.md) tracks packaging and
