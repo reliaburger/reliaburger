@@ -762,6 +762,13 @@ values, and retains the original deadline. All 120 testkit tests pass (1.52s),
 and the actual TLS/CLI job catalogue passes with confirmed cleanup (8.65s).
 Strict Linux/macOS Clippy passes.
 
+**Job log publication (18 September):** The log probe no longer assumes that
+stdout is queryable in the same instant as process exit. It polls inside the
+original case deadline, including the HTTP request, and requires the expected
+line. The corrected delayed-publication fixture fails first; a never-published
+line still fails. All 122 testkit tests pass (1.76s), and the actual TLS/CLI job
+catalogue passes with confirmed cleanup (7.48s). Strict Linux/macOS Clippy passes.
+
 Remaining resource contracts, each in its own commit: registry uploads/repositories,
 and managed volume/mount cleanup. Node effects already use C06 reservations
 and C10 exact-fault receipts. Image distribution currently reports uncontrolled

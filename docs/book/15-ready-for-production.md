@@ -2963,3 +2963,19 @@ The catalogue now requires `exit_code == Some(0)`. Its HTTP regression serves a
 stopped job without an exit code and reproduces the old false pass. The same
 fixture rejects exit 7 and accepts exit 0. We run the actual job case as well,
 so changing the assertion cannot hide a runtime that never supplies the evidence.
+
+### Let the log collector catch up
+
+Job exit and log ingestion happen on different tasks. A successful exit can
+reach the status API before the collector publishes the job's stdout. Reading
+logs once at that instant used to fail an otherwise healthy catalogue case.
+
+The log probe now polls every 100 ms under the case's original `Deadline`.
+The same deadline wraps the HTTP read as well as the delay, so a stalled request
+or output that never arrives cannot turn this into an unlimited wait. An API
+error remains an error. The success condition is still the expected output.
+
+The regression serves an empty indexed result and an empty local fallback on
+the first read, then publishes the expected line. That reproduces the race
+without depending on task scheduling. A second case never publishes the line
+and must fail at the deadline. Neither test treats empty output as success.
