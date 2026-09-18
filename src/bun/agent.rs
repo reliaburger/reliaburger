@@ -1427,6 +1427,8 @@ pub struct BunAgent<G: Grill> {
     shutdown: CancellationToken,
     /// Process-wide long-lived-task evidence shared with the API and reporter.
     readiness: Option<crate::bun::readiness::ReadinessTracker>,
+    #[cfg(test)]
+    egress_observation_count: std::sync::atomic::AtomicUsize,
     /// Hard per-node concurrency bound for workload connectivity traces.
     trace_slots: std::sync::Arc<tokio::sync::Semaphore>,
     volumes_dir: PathBuf,
@@ -1605,6 +1607,8 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
             command_rx,
             shutdown,
             readiness: None,
+            #[cfg(test)]
+            egress_observation_count: std::sync::atomic::AtomicUsize::new(0),
             trace_slots: std::sync::Arc::new(tokio::sync::Semaphore::new(MAX_CONCURRENT_TRACES)),
             volumes_dir: crate::config::node::StorageSection::default().volumes,
             cluster: None,
@@ -1690,6 +1694,8 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
             command_rx,
             shutdown,
             readiness: None,
+            #[cfg(test)]
+            egress_observation_count: std::sync::atomic::AtomicUsize::new(0),
             trace_slots: std::sync::Arc::new(tokio::sync::Semaphore::new(MAX_CONCURRENT_TRACES)),
             volumes_dir: crate::config::node::StorageSection::default().volumes,
             cluster: Some(cluster),
@@ -2580,11 +2586,7 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
                     self.handle_snapshot_request(req).await;
                 }
                 _ = health_interval.tick() => {
-                    self.enforce_live_egress_or_stop().await;
-                    if let Some(readiness) = self.readiness.clone() {
-                        let (capabilities, _) = self.live_egress_report_state().await;
-                        readiness.set_capabilities(capabilities).await;
-                    }
+                    self.refresh_egress_readiness().await;
                     self.run_health_checks().await;
                     self.check_jobs().await;
                     self.fire_due_jobs().await;
@@ -2597,6 +2599,19 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
                     self.check_identity_rotation().await;
                 }
             }
+        }
+    }
+
+    /// Enforce the current kernel boundary and publish this tick's capabilities.
+    async fn refresh_egress_readiness(&mut self) {
+        let egress = self.enforce_live_egress_or_stop().await;
+        if let Some(readiness) = self.readiness.clone() {
+            readiness
+                .set_capabilities(crate::meat::cluster_state::NodeCapabilities {
+                    egress,
+                    dns: self.supervisor.dns_capability(),
+                })
+                .await;
         }
     }
 
@@ -2715,6 +2730,9 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
         crate::meat::cluster_state::NodeCapabilities,
         std::collections::HashSet<InstanceId>,
     ) {
+        #[cfg(test)]
+        self.egress_observation_count
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let Some(handle) = self.onion_ebpf.as_ref() else {
             return (
                 crate::meat::cluster_state::NodeCapabilities {
@@ -2754,6 +2772,9 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
         crate::meat::cluster_state::NodeCapabilities,
         std::collections::HashSet<InstanceId>,
     ) {
+        #[cfg(test)]
+        self.egress_observation_count
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         (
             crate::meat::cluster_state::NodeCapabilities {
                 dns: self.supervisor.dns_capability(),
@@ -5867,7 +5888,12 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
     /// affected workload. Keeping it running would turn its allowlist into a
     /// label rather than a control.
     #[cfg(all(feature = "ebpf", target_os = "linux"))]
-    async fn enforce_live_egress_or_stop(&mut self) {
+    async fn enforce_live_egress_or_stop(
+        &mut self,
+    ) -> crate::sesame::egress::EgressEnforcementCapability {
+        #[cfg(test)]
+        self.egress_observation_count
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         use crate::sesame::egress;
 
         let unbound: std::collections::HashSet<InstanceId> = self
@@ -5897,7 +5923,7 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
                 self.egress_bindings.keys().cloned().collect();
             affected.extend(unbound);
             self.stop_instances_after_egress_loss(affected).await;
-            return;
+            return Default::default();
         };
         let expected: std::collections::HashSet<u64> =
             self.egress_bindings.values().map(|b| b.cgroup_id).collect();
@@ -5918,7 +5944,7 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
             if capability.can_enforce_allowlist() {
                 self.egress_affected_workloads.clear();
             }
-            return;
+            return capability;
         }
 
         let plan = egress::plan_live_egress_health(capability, &expected, &kernel_enforced);
@@ -5937,7 +5963,7 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
         }
         if fence.is_empty() && unbound.is_empty() {
             self.egress_affected_workloads.clear();
-            return;
+            return capability;
         }
 
         let mut affected_ids: std::collections::HashSet<InstanceId> = self
@@ -5948,6 +5974,7 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
             .collect();
         affected_ids.extend(unbound);
         self.stop_instances_after_egress_loss(affected_ids).await;
+        capability
     }
 
     #[cfg(all(feature = "ebpf", target_os = "linux"))]
@@ -5979,7 +6006,14 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
 
     /// Portable builds cannot have live egress bindings.
     #[cfg(not(all(feature = "ebpf", target_os = "linux")))]
-    async fn enforce_live_egress_or_stop(&mut self) {}
+    async fn enforce_live_egress_or_stop(
+        &mut self,
+    ) -> crate::sesame::egress::EgressEnforcementCapability {
+        #[cfg(test)]
+        self.egress_observation_count
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        Default::default()
+    }
 
     /// Periodically re-resolve DNS-based egress allowlists and reprogram the
     /// eBPF egress maps when an app's destination IPs change (L16). Rate-
@@ -10087,6 +10121,40 @@ mod tests {
             crate::onion::trace::TraceVerdict::Unknown { .. }
         ));
         handle.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn health_tick_reuses_egress_evidence_but_later_reports_refresh_it() {
+        use std::sync::atomic::Ordering;
+        let (mut agent, _tx, _shutdown) = test_agent();
+        let readiness = crate::bun::readiness::ReadinessTracker::new();
+        agent.set_readiness_tracker(readiness.clone());
+        readiness
+            .set_capabilities(crate::meat::cluster_state::NodeCapabilities {
+                egress: crate::sesame::egress::EgressEnforcementCapability {
+                    connect_ipv4: true,
+                    connect_ipv6: true,
+                    udp_ipv4: true,
+                    udp_ipv6: true,
+                    pre_start: true,
+                },
+                ..Default::default()
+            })
+            .await;
+        agent.refresh_egress_readiness().await;
+        assert!(
+            !readiness
+                .capability_snapshot()
+                .await
+                .egress
+                .can_enforce_allowlist()
+        );
+        assert_eq!(agent.egress_observation_count.load(Ordering::Relaxed), 1);
+        agent.refresh_egress_readiness().await;
+        assert_eq!(agent.egress_observation_count.load(Ordering::Relaxed), 2);
+        let (capabilities, _) = agent.live_egress_report_state().await;
+        assert!(!capabilities.egress.can_enforce_allowlist());
+        assert_eq!(agent.egress_observation_count.load(Ordering::Relaxed), 3);
     }
 
     fn test_agent() -> (

@@ -712,6 +712,21 @@ One surprise: returning 0 from a `cgroup/connect4` hook gives `EPERM`, not `ECON
 
 The name `cgroup/connect4` gives it away: this hook only sees IPv4 `connect()` calls. IPv6 connects go through a separate hook, `cgroup/connect6`, and for a long time we simply didn't attach one. For the VIP rewrite that's fine — VIPs live in `127.128.0.0/16` and are v4 by construction. For the egress policy that later grew inside this same program (Chapter 10), it was a hole you could drive a truck through: any dual-stack workload could bypass its entire allowlist by connecting over IPv6. Phase 12b added `onion_connect6` to the same object file and attaches it right next to connect4. It does no rewriting (there are no v6 VIPs to rewrite), it's pure policy.
 
+Each health tick checks those live hooks and the enforcement map. The result
+drives both workload fencing and the readiness capability published for that
+tick. Previously readiness immediately repeated the same probe, paying for
+another map read and potentially describing a different observation. The
+enforcement method now returns its capability value after handling affected
+workloads; readiness consumes that value directly.
+
+This isn't a cache across ticks or requests. The next tick observes the kernel
+again, and a separate cluster report also gets fresh evidence. Repairing a
+missing enforcement flag still requires a second map read to verify the repair.
+That read proves a change took effect; removing it would weaken the boundary.
+The regression counts observation calls rather than relying on a benchmark's
+timing. A real eBPF test detaches the hooks and requires both workload stop and
+withdrawn readiness capability within the existing four-second bound.
+
 One wrinkle worth knowing about: a dual-stack socket reaching an IPv4 server goes through *connect6* with a "v4-mapped" address, `::ffff:a.b.c.d`. The connect6 hook has to spot that pattern and judge the connection against the IPv4 policy, or the mapped form becomes yet another bypass. The kernel also insists that `user_ip6` is read in 32-bit chunks — the verifier rejects byte-wise loads from that context field.
 
 While we were in there, we fixed how a defective object file fails. The map handles used to be fetched lazily, deep inside the agent, with `.unwrap()` — a `.bpf.o` missing a map would panic Bun at the first write, minutes or hours after startup. Now the loader validates every required map and program against a single list the moment the object loads, and refuses with the full roster of what's missing. One clear error at load time beats nine scattered panics at use time.

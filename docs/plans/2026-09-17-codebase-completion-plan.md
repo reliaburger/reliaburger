@@ -1233,9 +1233,16 @@ The legacy 100 ms stderr drain and parent-death commentary remain after the func
 
 Evidence: `src/bun/agent.rs:live_egress_report_state call sites`.
 
-The same expensive probe is called for readiness and again for reporting in a health cycle, which can also give inconsistent snapshots.
-
-**Completion test:** One observation feeds both consumers, preserving fail-closed freshness and health deadlines; instrument call counts rather than timing a microbenchmark.
+**Completed on PR #167.** The duplicate was in one health tick: enforcement
+read the kernel, then readiness immediately repeated that observation. The
+enforcement method now returns the capability it observed, and readiness uses
+that value. A later tick or separate cluster report still samples afresh; map
+repair retains its verification read. The instrumented call-count regression
+fails first (two observations instead of one) and passes in portable and
+Linux eBPF builds. All 437 native Bun tests pass (one explicit gate, 20.15s).
+The real kernel hook-loss test now requires both workload stop and withdrawn
+readiness, and passes within its existing four-second bound (1.37s).
+Strict native/Linux all-target/all-feature Clippy passes.
 
 ### H11 — Declare and test the actual Rust/toolchain baseline
 
