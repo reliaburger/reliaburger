@@ -2730,3 +2730,11 @@ and headers so a successful response cannot hide a leaked administrator token.
 A negative handshake checks that API-specific hostname leniency hasn't escaped
 into workload requests. Managed-context tests verify that unforwarded guest
 endpoints never sneak back in.
+
+
+A partition test must also wait for the authority that admits the fault. Gossip
+can report three live nodes before Raft has elected a leader or finished adding
+the third voter. The legacy partition acceptance now waits for every node to see
+a known leader and a stable, non-joint three-voter membership as well as live
+gossip. The server continues to refuse an earlier request. Waiting only for the
+network view made the test race bootstrap on hosted runners.

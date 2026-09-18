@@ -879,16 +879,31 @@ async fn partition_isolates_a_node_for_real() {
     let n3 = start_node_with_auth("q3", 18649, vec![local(18641)], &shutdown, Some(auth)).await;
     let nodes = [&n1, &n2, &n3];
 
-    // Everyone sees everyone Alive before we cut the wire.
+    // Gossip can converge before Raft has elected a stable three-voter council.
+    // The reservation endpoint correctly refuses during that bootstrap window.
     let converged = wait_until(Duration::from_secs(30), || {
         nodes.iter().all(|obs| {
             ["q1", "q2", "q3"]
                 .iter()
                 .all(|t| peer_state(obs, t) == Some(NodeState::Alive))
+                && obs.handle.council.as_ref().is_some_and(|council| {
+                    let metrics = council.metrics().borrow().clone();
+                    metrics.current_leader.is_some()
+                        && metrics.membership_config.membership().voter_ids().count() == 3
+                        && metrics
+                            .membership_config
+                            .membership()
+                            .get_joint_config()
+                            .len()
+                            == 1
+                })
         })
     })
     .await;
-    assert!(converged, "cluster never fully converged to Alive");
+    assert!(
+        converged,
+        "gossip and the three-voter council never fully converged"
+    );
 
     // Cut q3 off from q1 and q2. The partition is injected ON q3, whose
     // agent holds the real blocklist handles; the transport drops traffic
