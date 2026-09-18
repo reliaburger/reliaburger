@@ -336,6 +336,9 @@ Node identity renewal remains, split into separately reviewable changes:
   new leader and reloads from disk (20.40s). Actual Bun startup automatically
   renews a due leaf, serves HTTPS and reuses it after restart (3.64s). All 23 Bun
   tests, seven live TLS tests and strict Linux/macOS Clippy pass.
+- Hosted CI caught the missing renewal-route matrix entry and middleware-layer
+  handling in the syntax-tree audit. Both are repaired; all eight route/scope
+  audit tests pass (0.19s), including refusal of unknown wrappers.
 - Expired offline identities still require authorised re-enrolment, and CA
   rotation remains F04. Sustained expiry/storage/upgrade qualification is V02;
   these functional tests do not mark that separate release gate complete.

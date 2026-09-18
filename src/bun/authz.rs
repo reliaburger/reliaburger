@@ -132,6 +132,8 @@ pub const ROUTE_MATRIX: &[Route] = &[
     route(Get, "/v1/logs/query/{app}/{namespace}", AnyToken),
     route(Post, "/v1/exec/{app}/{namespace}", Deployer),
     // Cluster + upgrade.
+    // Renewal additionally requires the existing node TLS peer certificate.
+    route(Post, "/v1/cluster/renew", System),
     route(Get, "/v1/capabilities", AnyToken),
     route(Get, "/v1/capabilities/cluster", AnyToken),
     route(Get, "/v1/diagnostics", AnyToken),
@@ -259,6 +261,7 @@ mod tests {
     #[test]
     fn node_to_node_routes_require_the_system_principal() {
         for path in [
+            "/v1/cluster/renew",
             "/v1/batch/run",
             "/v1/batch/{id}/report",
             "/v1/build/run",
@@ -278,7 +281,9 @@ mod tests {
             // router.route("/comment", post(handler));
             let text = ".route(\"/string\", post(handler))";
             router.route("/v1/status", get(read).post(write))
-                .route("/v1/health", axum::routing::get(health));
+                .route("/v1/health", axum::routing::get(health))
+                .route("/v1/cluster/renew", post(renew).layer(body_limit))
+                .route("/layered", get(read).route_layer(auth).post(write));
         }"#;
         assert_eq!(
             mounted_route_methods(source),
@@ -286,9 +291,22 @@ mod tests {
                 ("get".into(), "/v1/status".into()),
                 ("post".into(), "/v1/status".into()),
                 ("get".into(), "/v1/health".into()),
+                ("post".into(), "/v1/cluster/renew".into()),
+                ("get".into(), "/layered".into()),
+                ("post".into(), "/layered".into()),
             ]
         );
         assert_eq!(required_principal(Method::Post, "/v1/status"), None);
+    }
+
+    #[test]
+    fn route_scan_still_refuses_unrecognised_method_wrappers() {
+        assert!(
+            std::panic::catch_unwind(|| mounted_route_methods(
+                r#"fn routes() { router.route("/hidden", get(read).unknown_wrapper(handler)); }"#,
+            ))
+            .is_err()
+        );
     }
 
     fn mounted_route_methods(source: &str) -> Vec<(String, String)> {
@@ -301,6 +319,9 @@ mod tests {
                 },
                 syn::Expr::MethodCall(call) => {
                     methods(&call.receiver, found);
+                    if call.method == "layer" || call.method == "route_layer" {
+                        return;
+                    }
                     call.method.to_string()
                 }
                 syn::Expr::Paren(paren) => return methods(&paren.expr, found),

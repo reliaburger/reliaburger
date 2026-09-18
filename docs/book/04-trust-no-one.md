@@ -1207,3 +1207,11 @@ zero is not another spelling of that choice.
 The API tests submit both multiplication and clock overflows, then inspect
 the committed token store. They also check zero, an ordinary one-day token
 and an omitted lifetime. The two regressions failed before the repair.
+
+The central route audit must describe renewal too. Its principal is System,
+with the additional TLS peer-certificate requirement enforced by the handler.
+CI caught two omissions when we added its request-size limit: the audit table
+was missing the new route, and the syntax-tree scanner mistook `.layer(...)`
+for an HTTP method. The scanner now follows the receiver through `layer` and
+`route_layer`, retaining every explicit HTTP method before and after them.
+Unknown constructs still fail the audit instead of silently disappearing.
