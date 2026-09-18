@@ -120,6 +120,7 @@ pass. This is preparation only; signed candidate qualification remains V03.
 
 - [ ] **V01** (gate) Qualify the complete live three-node catalogue. Hosted multi-node CI caught a valid fail-closed missing-leader refusal that the chaos test accepted only as a quorum error. The test now recognises the two explicit leader-evidence refusals and checks that neither surviving node acquires a fault; real Linux reversal/recovery passes in 16.37s. C06 concurrent reservation safety and the complete catalogue remain open.
 - [ ] **V02** (gate) Qualify sustained TLS, storage and upgrade recovery. The upgrade harness now gives large debug-binary uploads a bounded 60-second budget while retaining five-second status requests; the previous shared deadline failed before replacement began. Rollback preflight also waits for the restarted leader to see every target alive, preserving the server's refusal while its membership is incomplete. All three cases pass in 198.90s; sustained/cold-candidate qualification remains open.
+  Cluster-upgrade CI at `78119fd` refused debug-binary uploads with HTTP 413. The harness now strips symbols from a private fixture before signing; all three real Linux upgrade/rollback/pause-resume cases pass in 200.22s. This repairs the harness and does not close sustained qualification.
 - [ ] **V03** (gate) Publish and install the exact signed candidate.
 - [ ] **V04** (gate) Measure repeated cold installs on the advertised host matrix.
 - [ ] **V05** (gate) Review dependency exceptions before their deadline.

@@ -2648,3 +2648,20 @@ disabled-auth mode. They also pass the separate node-state or capacity policy
 and cluster safety checks. A successful workload-fault test therefore says
 nothing about permission to kill, drain or pressure a node. C06 still tracks
 the cluster-wide reservation needed to make concurrent node faults safe.
+
+## Keep debug symbols out of upgrade fixtures
+
+The cluster-upgrade CI job failed before its first upgrade. Pickle returned HTTP
+413 when the harness uploaded Bun. The registry's 512 MiB request limit was doing
+its job; the debug executable had grown past the fixture's upload budget.
+
+The harness now copies Cargo's executable into its temporary directory and runs
+`strip -S` on that copy. This removes debug information before we make versioned
+copies, hash them or sign them. Cargo's original stays available for backtraces.
+An explicit size assertion catches an oversized fixture before starting four
+nodes, and upload failures include the server's response body. The same real
+executable still has to boot, pass compatibility preflight, replace its running
+predecessor and survive rollback. Removing symbols doesn't relax those checks.
+
+This is acceptance-test preparation, not release qualification. We still need to
+exercise the exact signed release artefacts under V03.

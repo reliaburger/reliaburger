@@ -965,6 +965,8 @@ A short successful setup does not establish renewal, retention, mixed-version re
 
 **Completion test:** Time-controlled certificate/retention tests plus sustained load, node/leader failure, interrupted deploy/upgrade and crash recovery close C01-C22/C37 on actual runtimes.
 
+**Harness repair (18 September):** CI at `78119fd` reproduced HTTP 413 in all three cluster-upgrade cases. Strip debug symbols from a private fixture before copying, hashing and signing, retain the registry upload cap, assert the fixture size and include response bodies on upload failures. All three real Linux cases then pass in 200.22s; V02 stays open.
+
 ### V03 — Publish and install the exact signed candidate
 
 **Priority:** gate. **Wave:** 7. **Book chapters:** 09, 14.
