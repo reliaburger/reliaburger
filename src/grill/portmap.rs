@@ -149,6 +149,52 @@ pub fn legacy_rule_handles(listing: &str) -> Vec<u64> {
         .collect()
 }
 
+/// Find owned port-map entries that still reference a retiring container address.
+/// Unknown element shapes refuse retirement rather than hiding a forwarding rule.
+pub fn ports_for_address(listing: &[u8], address: Ipv4Addr) -> Result<Vec<u16>, String> {
+    let json: serde_json::Value = serde_json::from_slice(listing).map_err(|e| e.to_string())?;
+    let entries = json
+        .get("nftables")
+        .and_then(serde_json::Value::as_array)
+        .ok_or("nftables listing has no object array")?;
+    let mut ports = Vec::new();
+    for entry in entries {
+        let Some(map) = entry.get("map") else {
+            continue;
+        };
+        if map["family"] != "ip" || map["table"] != TABLE || map["name"] != MAP {
+            continue;
+        }
+        let Some(elements) = map.get("elem") else {
+            continue;
+        };
+        for element in elements.as_array().ok_or("invalid port map elements")? {
+            let pair = element
+                .as_array()
+                .filter(|pair| pair.len() == 2)
+                .ok_or("unknown port map element shape")?;
+            let port = pair[0]
+                .as_u64()
+                .and_then(|p| u16::try_from(p).ok())
+                .ok_or("invalid port map key")?;
+            let destination = pair[1]
+                .get("concat")
+                .and_then(serde_json::Value::as_array)
+                .filter(|parts| parts.len() == 2)
+                .ok_or("invalid port map destination")?;
+            let ip = destination[0]
+                .as_str()
+                .ok_or("missing port map address")?
+                .parse::<Ipv4Addr>()
+                .map_err(|e| e.to_string())?;
+            if ip == address {
+                ports.push(port);
+            }
+        }
+    }
+    Ok(ports)
+}
+
 /// Tracks which host ports are currently mapped, so repeated applies
 /// are incremental and a mid-batch failure can be rolled back.
 #[derive(Debug, Default)]
@@ -222,11 +268,16 @@ pub struct NftCommandExecutor;
 
 impl NftExecutor for NftCommandExecutor {
     async fn run(&self, args: &[String]) -> Result<(), String> {
-        let output = tokio::process::Command::new("nft")
-            .args(args)
-            .output()
-            .await
-            .map_err(|e| format!("failed to execute nft: {e}"))?;
+        let output = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            tokio::process::Command::new("nft")
+                .args(args)
+                .kill_on_drop(true)
+                .output(),
+        )
+        .await
+        .map_err(|_| "nft operation exceeded five seconds".to_string())?
+        .map_err(|e| format!("failed to execute nft: {e}"))?;
 
         if !output.status.success() {
             let stderr = String::from_utf8_lossy(&output.stderr);
@@ -304,6 +355,34 @@ pub(crate) mod tests {
         assert_eq!(
             portmap_definition().join(" "),
             "add map ip reliaburger portmap { type inet_service : ipv4_addr . inet_service ; }"
+        );
+    }
+
+    #[test]
+    fn retirement_selects_only_owned_forwarding_for_the_exact_address() {
+        let listing = serde_json::json!({"nftables": [
+            {"map": {"family":"ip", "table":"reliaburger", "name":"portmap", "elem":[
+                [19001, {"concat":["10.240.0.2",80]}],
+                [19002, {"concat":["10.240.0.3",80]}]
+            ]}},
+            {"map": {"family":"ip", "table":"operator", "name":"portmap", "elem":[
+                [19003, {"concat":["10.240.0.2",80]}]
+            ]}}
+        ]});
+        assert_eq!(
+            ports_for_address(
+                &serde_json::to_vec(&listing).unwrap(),
+                "10.240.0.2".parse().unwrap()
+            )
+            .unwrap(),
+            vec![19001]
+        );
+        assert!(ports_for_address(br#"{"nftables": [{"map":{"family":"ip","table":"reliaburger","name":"portmap","elem":["unknown"]}}]}"#, Ipv4Addr::LOCALHOST).is_err());
+        assert!(ports_for_address(br#"{}"#, Ipv4Addr::LOCALHOST).is_err());
+        assert!(
+            ports_for_address(br#"{"nftables":[]}"#, Ipv4Addr::LOCALHOST)
+                .unwrap()
+                .is_empty()
         );
     }
 

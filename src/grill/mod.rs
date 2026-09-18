@@ -15,6 +15,8 @@ pub mod image;
 pub mod mock;
 #[cfg(target_os = "linux")]
 pub mod netns;
+#[cfg(target_os = "linux")]
+mod network_leases;
 pub mod oci;
 pub mod port;
 pub mod portmap;

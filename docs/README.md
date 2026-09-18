@@ -90,7 +90,7 @@ Reliaburger supports three container runtimes. The agent auto-detects which one 
 **Install on Ubuntu/Debian:**
 
 ```sh
-sudo apt install runc
+sudo apt install runc iproute2 nftables
 ```
 
 **Install from GitHub releases:**
@@ -105,6 +105,11 @@ Notes:
 - Root-mode writable images use one private OverlayFS upper per workload over the shared content-addressed image generation. A restart or Bun adoption reuses that workload's upper; exit and kill unmount it.
 - To run provisioned Linux runtime tests: `sudo make test-linux`
 - OCI protocol tests use a local digest-pinned registry fixture; they need no public registry
+
+Rootful runc reserves up to 509 container addresses per node durably. Exhaustion
+refuses new creation. Addresses become reusable only after confirmed network
+teardown and nftables forwarding inspection; retain `.network-leases.json` with the runtime bundle state across
+restarts. Uncertain teardown keeps its reservation for explicit cleanup.
 
 ### Apple Container (macOS)
 

@@ -640,6 +640,19 @@ spill into a neighbouring /23 and eventually reuse an occupied address.
 release and reuse only retired addresses, and preserve allocations across
 concurrent create, failed setup and adoption.
 
+**Completed on PR #167.** The 509-slot pool uses a private, bounded, locked and
+atomically persisted ownership journal; it reloads after uncertain writes and
+keeps persistence owned through caller cancellation. Per-instance lifecycle
+guards prevent cleanup racing a successor. Adoption claims verified kernel
+addresses, and retirement proves namespace/veth absence and clears any remaining
+owned nftables map entries before reuse. Missing inspection tools or uncertain
+teardown retain capacity; abandoned plans require explicit runtime cleanup rather
+than unsafe expiry. Rootful install instructions and development VM provisioning
+include the inspection tools. Verification: the exhaustion regression fails before
+the fix; 255 runtime tests, strict Linux Clippy and real cancelled-creation recovery,
+adoption/duplicate refusal/reuse, failed setup and orphaned forwarding retirement
+all pass (0.32s / 4.32s / 2.26s / 0.16s). Physical crash qualification remains V02.
+
 ## Engineering follow-ups
 
 ### H01 — Remove stale wiring claims and validate documentation

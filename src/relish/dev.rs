@@ -379,7 +379,7 @@ provision:
       #!/bin/bash
       set -eux
       apt-get update -qq
-      apt-get install -y -qq runc uidmap btrfs-progs
+      apt-get install -y -qq runc uidmap btrfs-progs nftables iproute2
       mkdir -p /etc/reliaburger
 "#
     )
@@ -886,7 +886,7 @@ provision:
       #!/bin/bash
       set -eux
       apt-get update -qq
-      apt-get install -y -qq runc uidmap slirp4netns curl buildah btrfs-progs build-essential pkg-config libssl-dev clang llvm libbpf-dev linux-headers-$(uname -r)
+      apt-get install -y -qq runc uidmap nftables iproute2 slirp4netns curl buildah btrfs-progs build-essential pkg-config libssl-dev clang llvm libbpf-dev linux-headers-$(uname -r)
   - mode: user
     script: |
       #!/bin/bash

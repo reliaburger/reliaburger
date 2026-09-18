@@ -78,7 +78,7 @@ remain separate. Older unchecked groups below point into this current ledger.
 
 - [x] **C46** Preserve authorised namespace/service identities through DNS fault publication and lookup; overlapping owners retain the latest expiry, and clearing one preserves the others. Missing namespaces and individual-instance DNS targets refuse without leaving registry entries. The cross-namespace wire regression fails before the fix; 32 DNS-filtered library tests, 14 wire tests, both final agent regressions and strict Linux all-target/all-feature Clippy pass.
 
-- [ ] **C47** (P2) Bound and reclaim runtime container addresses within the node /23, including concurrent creation and adoption. The existing index wraps without enforcing the declared capacity.
+- [x] **C47** Persist exclusive ownership of the 509-address rootful pool before network mutation; serialise each instance lifecycle, refuse exhaustion and retain reservations on uncertain cleanup. Reuse requires confirmed namespace/veth removal and inspection/removal of owned nftables forwarding. Corrupt or conflicting journals and adoption refuse. The exhaustion regression fails before the fix; 255 runtime tests and strict Linux Clippy pass, plus real cancellation/restart recovery (0.32s), adoption/duplicate-create/reuse (4.32s), failed setup (2.26s) and orphaned forwarding retirement (0.16s). Abandoned reservations remain occupied until explicit runtime cleanup; physical crash qualification remains V02.
 
 ### Engineering follow-ups
 

@@ -553,8 +553,8 @@ names, and no internal query gets forwarded upstream.
 Adoption must restore this ownership too. Bun verifies that the recorded network
 namespace and the live container's namespace have the same filesystem identity,
 then reads the actual IPv4 address from the kernel. It restores the runtime's
-network owner, advances the allocation counter past that address, and republishes
-the DNS binding. Guessing the address from a restarted counter would let a new
+network owner, claims that address in the durable reservation journal, and
+republishes the DNS binding. Guessing the address from a restarted counter would let a new
 container inherit an old container's namespace identity.
 
 Fault lookup uses the same complete `ServiceId`. A fault authorised for
@@ -1081,3 +1081,52 @@ port in the resulting backend, and install a remote route on an agent with no
 local instances. Removing that route without changing any endpoints must remove
 it from the routing table too. A healthy container is only half the story; the
 request still has to reach it.
+
+
+### A finite subnet needs durable ownership
+
+A /23 provides 510 usable addresses. The gateway takes one, so the rootful
+runtime has 509 container slots. Incrementing a `u16` counter does not enforce
+that boundary: it eventually chooses a broadcast address, spills into another
+subnet and wraps onto an occupied slot. Restarting the counter makes matters
+worse.
+
+`NetworkLeases` records each instance's index before any network command runs.
+The private `.network-leases.json` file also identifies its node subnet and
+format. Updates use a unique temporary file, file sync, atomic rename and
+directory sync. Every transaction reloads the journal under a process lock;
+corrupt data, duplicate indices, symlinks and a changed subnet refuse allocation.
+A full pool refuses before creating the instance's bundle. The low-level network
+setup function independently rejects indices outside the declared subnet.
+
+The transaction runs in `spawn_blocking`, which moves filesystem work off the
+async executor. It owns an `OwnedMutexGuard`, so cancelling the waiting future
+does not release that guard while the file write is still running. The OS file
+lock also needs explicit release in `Drop`: a concurrent fork can briefly inherit
+its file descriptor before exec, so closing only our descriptor can leave the
+lock busy. A guard's destructor is a useful place to express that ownership.
+
+Each instance also has a lifecycle mutex. Create, adoption, exit observation
+and teardown cannot race for that instance, while different instances can
+progress concurrently. The lock map stores `Weak` references: unlike `Arc`, a
+`Weak` does not keep the lock alive. `upgrade()` returns `Some(Arc<_>)` only while
+an owner still exists, and unused map entries can be discarded.
+
+Failed or cancelled setup leaves its reservation intact until cleanup confirms
+that the named namespace, host veth and owned host-port forwarding entries have
+disappeared. It inspects the actual nftables map, so a cancellation between
+installing a mapping and publishing its handle cannot hide a stale entry. Cleanup can
+reconstruct this plan from the journal even if Bun died before publishing an
+in-memory network handle. It retains the address on uncertain teardown. A new
+Bun adopts verified live kernel addresses into the same journal; a conflicting
+owner refuses. Operators must retain this journal with the runtime state and
+must not delete it to bypass exhaustion. Cancelled, unadopted plans can consume
+capacity until the runtime explicitly retires their owner; there is no expiry
+that silently reuses a possibly live address.
+
+Tests fill all 509 slots, reload the pool, retire one slot and reuse exactly
+that slot. Concurrent reservations remain distinct. Real rootful tests cancel
+a creation while its registry request is stalled, replace the runtime object,
+and show that the address is unavailable until recovered teardown succeeds.
+They also cover duplicate-create refusal, adoption, failed bundle preparation
+and reuse after namespace removal.
