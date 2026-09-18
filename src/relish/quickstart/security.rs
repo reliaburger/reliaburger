@@ -255,6 +255,7 @@ mod tests {
             "admin.token",
             "security-bootstrap.json",
             "identity/node.key",
+            "identity/node.bundle.json",
         ] {
             assert_eq!(
                 std::fs::metadata(bootstrap.directory.join(name))

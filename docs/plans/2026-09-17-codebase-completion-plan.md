@@ -293,15 +293,23 @@ upgraded ingress retirement and reconnect (0.12s), and Bun API in-flight drainin
 (0.05s) pass. Raft and reporting already use short deadline-bounded RPC exchanges.
 Node identity renewal remains, split into separately reviewable changes:
 
-- Persist a replacement identity atomically so an interrupted renewal retains a
-  complete, usable identity; validate the key, node identity, chain and actual
-  certificate validity rather than trusting sidecar timestamps.
+- Identity persistence is implemented: one private snapshot is the source of
+  truth, with validated key/chain/node/serial binding and signed validity dates.
+  Failed export replacement preserves the previous snapshot; missing/corrupt
+  snapshots never fall back to PEM exports, and partial initial installation is
+  refused. Seventeen persistence tests, 29 managed-bootstrap tests, the full 3,255-test
+  Linux library checkpoint (19 privileged gates), 11 security and two API TLS
+  integrations, and strict Linux/macOS Clippy pass.
 - Share validated live credentials across API/registry servers, Raft/reporting
   client and server configurations, and internal HTTPS clients. Keep CA rotation
   out of this package; reject accidental identity or trust-anchor changes.
+  An expired client identity must not turn into an omitted certificate on an
+  optional-mTLS API connection and thereby fall back to bearer-only access.
 - Authorise renewal using the existing authenticated node identity, bind the CSR
   to that same node, allocate the serial through Raft, persist before publishing,
-  and retry safely through leader changes. The private key stays on its node.
+  and retry safely through leader changes. Bound node leaves by the issuer's
+  validity; an already expired offline identity requires authorised re-enrolment.
+  The private key stays on its node.
 - Update diagnostics from the currently served credentials and prove renewal,
   reconnects, refusal of invalid replacements, restart recovery and leader-change
   behaviour with real TLS and cluster tests.

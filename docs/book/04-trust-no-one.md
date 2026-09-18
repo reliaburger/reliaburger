@@ -996,3 +996,43 @@ retires the old stream and still accepts a fresh connection. Bun's actual API
 serving function also completes an in-flight request during the drain grace,
 then closes that connection. Node certificate issuance and hot replacement
 remain the unfinished part of C14.
+
+### Replace a node identity without tearing it in half
+
+Suppose renewal writes `node.crt`, then cannot replace `node.key`. The old store
+had already removed its commit marker. Even the old, still-valid identity could
+no longer be loaded. A process restart turned a recoverable write failure into
+an enrolment problem.
+
+The store now commits a complete `node.bundle.json` in one private atomic
+replacement. It contains the leaf, matching key, CA certificates and metadata.
+The existing PEM files remain exports, but Bun loads the snapshot. A layout-2
+marker requires that snapshot: a missing or corrupt snapshot cannot silently
+fall back to older exports. Initial installation still writes the marker last.
+A validated layout-1 identity is snapshotted before its exports are replaced,
+so importing that layout doesn't create another partial-write window.
+
+Before writing, we verify the chain, issuer names, signed node URI and serial,
+and the private key's match to the leaf. Validity comes from X.509 dates, not
+from sidecar timestamps. Those checks also run when loading. The snapshot and
+key use mode `0600`; the managed installer copies the snapshot before the
+marker and retains private permissions. Parse errors report locations without
+quoting input that could contain key material.
+
+The snapshot uses the existing unique temporary-file, file-sync, rename and
+parent-directory-sync helper. Before replacement, readers see the old complete
+identity. After replacement, they see the new complete identity. A directory
+sync error after rename can still make durability uncertain; a renewal caller
+must treat that as failure and must not publish an unacknowledged write to its
+live TLS resolvers. Atomicity prevents a mixture of identities, not every
+possible storage failure.
+
+`IdentityBundle` is private to the persistence module. Its serde implementations
+encode the complete snapshot without making the public `NodeIdentity` type a
+wire format for private keys. Loading moves those owned vectors into a validated
+identity. A concurrent-reader test checks that replacements never expose a
+half-written pair. Even a lone PEM file from an interrupted first install is an
+incomplete identity, never an unenrolled node that may choose plaintext. Other regressions force an export write failure, substitute
+an unrelated private key, alter identity metadata and corrupt or remove the
+snapshot. Automatic issuance and live transport replacement remain separate
+steps.

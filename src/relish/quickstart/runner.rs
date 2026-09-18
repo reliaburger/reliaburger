@@ -276,6 +276,7 @@ async fn provision_cluster(
                     "node-ca.crt",
                     "root-ca.crt",
                     "meta.json",
+                    "node.bundle.json",
                     "bundle.committed",
                 ] {
                     lima.install(
