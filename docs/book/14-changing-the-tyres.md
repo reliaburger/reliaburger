@@ -849,5 +849,20 @@ poller converts with `i32::try_from` and rejects non-positive values before any
 process inspection or syscall. Unlike `as`, this conversion reports overflow.
 Both runtimes propagate that error, and runc leaves its container resources
 untouched without even invoking its CLI. Tests exercise all three invalid PID
-boundaries alongside live, exited and reused processes. Apple inspection needs
-its own runtime-specific absence evidence; this change doesn't establish that.
+boundaries alongside live, exited and reused processes.
+
+Apple Container needs different evidence because its workloads live in VMs.
+Its [inspection command](https://github.com/apple/container/blob/0.10.0/Sources/ContainerCommands/Container/ContainerInspect.swift)
+returns an empty JSON array when a successful daemon inventory doesn't contain
+the requested name. We verified that with the installed CLI as well. A failed
+command, malformed response or mismatched identity is an error, not absence.
+Only a matching running container is adopted; a matching stopped container or
+confirmed absence declines adoption. Created and paused containers refuse
+startup rather than losing their ownership records.
+
+Inspection has a ten-second deadline. `kill_on_drop(true)` tells Tokio to kill
+the CLI child if cancellation drops its handle, including when the deadline
+expires. Our stalled-command fixture verifies that the child disappears. The
+other fixture feeds daemon errors, malformed JSON, wrong identities and valid
+running/stopped/absent results through the public runtime interface. Neither
+test needs to stop the machine's actual container daemon to simulate failure.

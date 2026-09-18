@@ -736,7 +736,16 @@ PID selectors before any syscall. The invalid-record regression fails first;
 runc also proves it never invokes cleanup on that error. All 277 Linux runtime
 tests (13 explicit gates, 7.26s), 22 native ProcessGrill tests (0.22s), real
 rootful runc adoption/rootfs retirement (6.81s), and strict Linux/macOS Clippy
-pass. Apple inspection can still mask errors as absence and needs repair.
+pass.
+
+**Apple inspection refusal:** A failing-first CLI fixture reproduces daemon
+failure being reported as absence. Inspection now requires a successful,
+identity-matched response; only an empty successful inventory means NotFound.
+Nonterminal created/paused containers refuse adoption, as do command and parse
+errors. Inspection has a ten-second deadline and cancellation kills its CLI
+child. Eight native unit tests pass (10.01s), including deadline/reaping, and
+real Apple Container adoption plus removal passes (1.89s). Strict native and
+Linux Clippy pass; the Apple module is macOS-only, so Linux runs no Apple tests.
 
 Job schedule registrations and last-fired stamps are currently in-memory;
 adoption resets job retries to the generic restart policy. Persist the intended
