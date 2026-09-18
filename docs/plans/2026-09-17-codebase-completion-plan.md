@@ -313,10 +313,15 @@ Node identity renewal remains, split into separately reviewable changes:
   pass (6.54s), including reused HTTPS clients and current diagnostic metadata.
   The real three-node test replaces every identity, revokes all old leaves,
   then proves Raft replication and fresh reports still work (15.18s).
+- Node issuance now caps leaf expiry at the real Node CA expiry and refuses
+  expired or future issuers. Both failing-first regressions pass (0.01s), checking
+  local issuance, direct CSR signing and reconstruction from stored CA DER, with
+  274 Sesame tests (one privileged gate), seven live identity tests and strict
+  Linux/macOS Clippy. Sidecar dates cannot extend the signed issuer window.
 - Authorise renewal using the existing authenticated node identity, bind the CSR
   to that same node, allocate the serial through Raft, persist before publishing,
-  and retry safely through leader changes. Bound node leaves by the issuer's
-  validity; an already expired offline identity requires authorised re-enrolment.
+  and retry safely through leader changes. An already expired offline identity
+  requires authorised re-enrolment.
   The private key stays on its node.
 - Qualify automatic renewal, restart recovery and leader-change behaviour with
   real TLS and cluster tests. Live diagnostic serials and replacement reconnects

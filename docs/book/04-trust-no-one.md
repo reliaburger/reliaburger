@@ -1101,3 +1101,19 @@ same configurations and client. A cluster test goes further: replace all three
 node identities, revoke every old leaf, then require a new Raft write to reach
 all voters and new reports to reach the leader. A stale resolver can no longer
 pass just because yesterday's certificate hasn't expired yet.
+
+### A renewed leaf cannot extend its issuer's life
+
+Suppose the Node CA expires in 90 seconds. Issuing the usual one-year node leaf
+would advertise a year of validity even though its chain stops working almost
+immediately. Both locally generated node certificates and CSR-signed leaves now
+cap their expiry at the issuer's expiry, and refuse issuance if the issuer isn't
+currently valid.
+
+Joining and renewal reconstruct signing parameters from the stored CA. Those
+parameters are useful for the subject and constraints, but we explicitly copy
+the original certificate's signed validity dates into them before signing. The
+sidecar dates in cluster state don't get to extend that window. The tests shorten
+an actual root-signed Node CA while deliberately leaving its sidecar unchanged,
+then check all three issuance paths. Separate cases use expired and future-dated
+issuers and require refusal. Renewal can't substitute for CA rotation.

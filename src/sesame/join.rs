@@ -408,8 +408,18 @@ pub fn sign_join_csr(
     // Derive the issuer params (DN, constraints) from the stored Node CA cert
     // so the issued leaf's issuer field matches the CA in the trust store.
     let ca_cert_der = rustls::pki_types::CertificateDer::from(node_ca_der.clone());
-    let ca_params = rcgen::CertificateParams::from_ca_cert_der(&ca_cert_der)
+    let mut ca_params = rcgen::CertificateParams::from_ca_cert_der(&ca_cert_der)
         .map_err(|e| JoinError::CertIssueFailed(format!("invalid Node CA cert: {e}")))?;
+    // rcgen's reconstructed parameters are for signing, not authority to extend
+    // the stored issuer's lifetime. Read its actual signed validity window.
+    let (_, issuer) = x509_parser::parse_x509_certificate(&node_ca_der)
+        .map_err(|e| JoinError::CertIssueFailed(format!("invalid Node CA cert: {e}")))?;
+    ca_params.not_before =
+        time::OffsetDateTime::from_unix_timestamp(issuer.validity().not_before.timestamp())
+            .map_err(|e| JoinError::CertIssueFailed(format!("invalid Node CA validity: {e}")))?;
+    ca_params.not_after =
+        time::OffsetDateTime::from_unix_timestamp(issuer.validity().not_after.timestamp())
+            .map_err(|e| JoinError::CertIssueFailed(format!("invalid Node CA validity: {e}")))?;
 
     let (cert_der, serial) = ca::sign_node_csr(csr_der, node_id, serial, &ca_keypair, &ca_params)?;
 

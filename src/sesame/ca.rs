@@ -319,12 +319,7 @@ fn sign_end_entity_cert(
     params.subject_alt_names = all_sans;
 
     set_validity(&mut params, lifetime)?;
-    if params.not_before < ca_params.not_before || params.not_before >= ca_params.not_after {
-        return Err(CaError::InvalidInput(
-            "issuer is outside its validity period".into(),
-        ));
-    }
-    params.not_after = params.not_after.min(ca_params.not_after);
+    bound_leaf_validity(&mut params, ca_params)?;
 
     let ca_cert = ca_params
         .clone()
@@ -355,7 +350,8 @@ pub fn issue_node_cert(
     let key_pair = KeyPair::generate_for(&rcgen::PKCS_ECDSA_P256_SHA256)
         .map_err(|e| CaError::KeyGenFailed(e.to_string()))?;
     let private_key_der = key_pair.serialize_der();
-    let params = node_cert_params(node_id, serial)?;
+    let mut params = node_cert_params(node_id, serial)?;
+    bound_leaf_validity(&mut params, ca_params)?;
 
     let ca_cert = ca_params
         .clone()
@@ -389,7 +385,8 @@ pub fn sign_node_csr(
     let csr_params = rcgen::CertificateSigningRequestParams::from_der(&csr_der_ref)
         .map_err(|e| CaError::SignFailed(format!("failed to parse node CSR: {e}")))?;
 
-    let params = node_cert_params(node_id, serial)?;
+    let mut params = node_cert_params(node_id, serial)?;
+    bound_leaf_validity(&mut params, ca_params)?;
     let ca_cert = ca_params
         .clone()
         .self_signed(ca_keypair)
@@ -399,6 +396,19 @@ pub fn sign_node_csr(
         .map_err(|e| CaError::SignFailed(e.to_string()))?;
 
     Ok((certificate.der().to_vec(), serial))
+}
+
+fn bound_leaf_validity(
+    params: &mut CertificateParams,
+    issuer: &CertificateParams,
+) -> Result<(), CaError> {
+    if params.not_before < issuer.not_before || params.not_before >= issuer.not_after {
+        return Err(CaError::InvalidInput(
+            "issuer is outside its validity period".into(),
+        ));
+    }
+    params.not_after = params.not_after.min(issuer.not_after);
+    Ok(())
 }
 
 /// Build the certificate params for a node certificate (shared by the
