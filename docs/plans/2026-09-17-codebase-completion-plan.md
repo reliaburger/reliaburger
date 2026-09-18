@@ -710,6 +710,13 @@ tests pass (4.15s), followed by the strengthened refusal/restart regression
 (135.38s), the full Linux library checkpoint (3,299 passed, 19 explicit gates,
 54.89s), and strict Linux/macOS Clippy.
 
+**Compatibility fixture follow-up:** Hosted CI at `806b1f6` caught the actual
+binary query test still asserting state 4. It now decodes `Compatibility` and
+compares with `CURRENT`. Both actual-binary query/development-state refusal
+tests pass (0.04s); the independent refusal test remains unchanged. Runtime,
+cluster, upgrade and release-build jobs passed at that commit, but portable
+CI remains unqualified until the repaired fixture passes on the new head.
+
 **Additional cleanup evidence to establish:** Atomic process identity,
 complete process-tree retirement and physical crash recovery remain open.
 Discovery of resources created before their initial runtime adoption record,

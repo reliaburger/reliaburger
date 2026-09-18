@@ -771,6 +771,13 @@ tokens advanced the state format: three hard-coded fixtures caused ten CI
 failures, all at compatibility admission rather than the behaviour under test.
 We repaired the fixtures and retained the independent refusal tests.
 
+The real `bun --compatibility` integration test must follow the same rule.
+Placement ownership advanced durable state to generation 5, but this last
+fixture still required 4. Hosted CI caught it across both platforms. It now
+decodes the typed `Compatibility` response and compares it with `CURRENT`;
+the separate startup test still requires unmarked development state to be
+refused without changing its files.
+
 
 ### A closed writer can still leave an executable busy
 

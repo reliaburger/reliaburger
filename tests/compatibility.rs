@@ -17,9 +17,9 @@ async fn compatibility_query_requires_no_configuration_or_runtime_state() {
         "{}",
         String::from_utf8_lossy(&output.stderr)
     );
-    let value: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
-    assert_eq!(value["protocol"], 5);
-    assert_eq!(value["state"], 4);
+    let value: reliaburger::compatibility::Compatibility =
+        serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(value, reliaburger::compatibility::CURRENT);
     assert_eq!(std::fs::read_dir(directory.path()).unwrap().count(), 0);
 }
 

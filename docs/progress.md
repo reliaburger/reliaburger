@@ -34,6 +34,13 @@ The reporting regression fails before the fix; five real-process bootstrap tests
 (0.62s), the service-endpoint probe (0.06s) and strict Linux Clippy pass. Latest
 hosted feature-matrix validation remains separate.
 
+The placement journal advances durable state to generation 5 (protocol 5).
+Hosted CI at `806b1f6` passed runtime, cluster and upgrade acceptance but caught
+one integration fixture still expecting state 4 in both portable matrices.
+The real `bun --compatibility` query now compares the typed response with
+`CURRENT`; both actual-binary compatibility/refusal tests pass (0.04s).
+Current-head hosted qualification remains separate.
+
 ### Correctness and behavioural contracts
 
 - [x] **C01** Preserve every exported log generation with full content-hash object names. Five real Parquet export/query tests and ten exporter unit tests pass; the restart/name-reuse regression fails before the fix. Legacy archive objects remain untouched (migration duplicates documented in chapter 6).
