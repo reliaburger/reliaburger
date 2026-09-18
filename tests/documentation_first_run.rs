@@ -806,3 +806,128 @@ command = ["true"]
     assert_eq!(join.status.code(), Some(1));
     assert!(String::from_utf8_lossy(&join.stderr).contains("join failed"));
 }
+
+#[test]
+fn secure_bun_renews_a_due_node_leaf_and_reuses_it_after_restart() {
+    use reliaburger::sesame::{bootstrap, ca, crypto, identity_store, types::CaRole};
+    let root = tempfile::tempdir().unwrap();
+    let cluster_dir = root.path().join("cluster");
+    assert_success(
+        &run_relish(&[
+            "init",
+            cluster_dir.to_str().unwrap(),
+            "--cluster-name",
+            "renewal-startup",
+            "--node-id",
+            "node-01",
+        ]),
+        "initialise renewal fixture",
+    );
+    let node_path = cluster_dir.join("reliaburger.toml");
+    let mut node = reliaburger::config::NodeConfig::from_file(&node_path).unwrap();
+    node.node.name = Some("node-01".into());
+    node.network.advertise_address = Some("127.0.0.1".into());
+    node.storage.data = root.path().join("data");
+    node.storage.images = root.path().join("images");
+    node.storage.logs = root.path().join("logs");
+    node.storage.metrics = root.path().join("metrics");
+    node.storage.volumes = root.path().join("volumes");
+    node.images.registry_port = 0;
+    let identity_dir = node.security.identity_dir.as_ref().unwrap().clone();
+    let mut identity = identity_store::load(&identity_dir).unwrap().unwrap();
+    let original_serial = identity.serial;
+    let master =
+        bootstrap::load_master_key(node.security.master_key_path.as_ref().unwrap()).unwrap();
+    let state =
+        bootstrap::load_bootstrap_state(node.security.bootstrap_path.as_ref().unwrap()).unwrap();
+    let issuer = state.get_ca(CaRole::Node).unwrap();
+    let ca_key = rustls::pki_types::PrivateKeyDer::try_from(
+        crypto::unwrap_key(&master, issuer.private_key_wrapped.as_ref().unwrap()).unwrap(),
+    )
+    .unwrap();
+    let ca_key =
+        rcgen::KeyPair::from_der_and_sign_algo(&ca_key, &rcgen::PKCS_ECDSA_P256_SHA256).unwrap();
+    let issuer_params = rcgen::CertificateParams::from_ca_cert_der(
+        &rustls::pki_types::CertificateDer::from(issuer.certificate_der.clone()),
+    )
+    .unwrap();
+    let issuer = issuer_params.self_signed(&ca_key).unwrap();
+    let key = rcgen::KeyPair::generate().unwrap();
+    let mut params = rcgen::CertificateParams::default();
+    params.serial_number = Some(identity.serial.0.into());
+    params.subject_alt_names = vec![rcgen::SanType::URI(
+        ca::node_spiffe_uri("node-01").try_into().unwrap(),
+    )];
+    params.extended_key_usages = vec![
+        rcgen::ExtendedKeyUsagePurpose::ServerAuth,
+        rcgen::ExtendedKeyUsagePurpose::ClientAuth,
+    ];
+    let now = time::OffsetDateTime::now_utc();
+    params.not_before = now - time::Duration::seconds(300);
+    params.not_after = now + time::Duration::seconds(120);
+    identity.certificate_der = params
+        .signed_by(&key, &issuer, &ca_key)
+        .unwrap()
+        .der()
+        .to_vec();
+    identity.private_key_der = key.serialize_der();
+    identity_store::save(&identity_dir, &identity).unwrap();
+    let (mut bun, address) = spawn_bun_with_port_retry(true, || {
+        let [gossip, raft, reporting] = reserve_ports();
+        node.cluster.gossip_port = gossip;
+        node.cluster.raft_port = raft;
+        node.cluster.reporting_port = reporting;
+        std::fs::write(&node_path, toml::to_string_pretty(&node).unwrap()).unwrap();
+        (
+            node_path.clone(),
+            reserve_address(),
+            root.path().join("renewal-bun.log"),
+        )
+    });
+    let deadline = Instant::now() + WAIT;
+    let renewed = loop {
+        bun.assert_running();
+        let current = identity_store::load(&identity_dir).unwrap().unwrap();
+        if current.serial.0 > original_serial.0 {
+            break current;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "Bun did not renew its due node certificate: {}",
+            std::fs::read_to_string(&bun.log_path).unwrap_or_default()
+        );
+        std::thread::sleep(Duration::from_millis(50));
+    };
+    assert!(renewed.not_after > std::time::SystemTime::now() + Duration::from_secs(24 * 3600));
+    let endpoint = format!("https://{address}");
+    let ca = cluster_dir.join("identity/root-ca.crt");
+    wait_for_relish(
+        &mut bun,
+        &[
+            "--endpoint",
+            &endpoint,
+            "--ca-cert",
+            ca.to_str().unwrap(),
+            "status",
+        ],
+    );
+    drop(bun);
+    let mut restarted = BunProcess::spawn(
+        &node_path,
+        address,
+        true,
+        root.path().join("renewal-restart.log"),
+    );
+    wait_for_relish(
+        &mut restarted,
+        &[
+            "--endpoint",
+            &endpoint,
+            "--ca-cert",
+            ca.to_str().unwrap(),
+            "status",
+        ],
+    );
+    let after_restart = identity_store::load(&identity_dir).unwrap().unwrap();
+    assert_eq!(after_restart.certificate_der, renewed.certificate_der);
+}

@@ -1150,3 +1150,43 @@ seconds; signing runs in a blocking worker with an owned state snapshot.
 Concurrent requests get distinct committed serials. Callers rejected at
 admission do not spend a serial. The generated private key remains on the
 requesting node throughout.
+
+### Let the node own its renewal loop
+
+Bun now starts one renewal owner when it has a live node identity, a council,
+resolved member API addresses and the internal service token. Once a second the
+owner reads the actual signed validity window. Before the midpoint it waits;
+afterwards it generates a fresh local key and CSR and contacts the current
+leader directly. It resolves the leader again on every retry, so a failed
+request doesn't pin the worker to a former leader.
+
+The renewal HTTP client refuses redirects and opens a new TLS connection for
+each attempt. Its connection, request and whole-attempt deadlines bound waiting;
+the response body is capped at 64 KiB. A successful response still has to pass
+the identity handle's checks for key binding, node and CA continuity and a newer
+serial. Only a durable save permits publication. A network error, refusal,
+malformed response or failed save leaves the current identity installed and
+schedules another attempt after five seconds. An expired identity never gets
+an authentication bypass; an operator must re-enrol it.
+
+The owner publishes an enum through a Tokio `watch` channel: starting, valid,
+renewing, retrying or expired. Diagnostics hold a receiver, not a copy of the
+last result. When the owner exits or panics its sender disappears, and the
+receiver reports stopped even if the last stored value was valid. That small
+ownership detail prevents a dead background task from claiming healthy renewal
+forever. Shutdown cancels pending network work; a persistence transaction that
+has already started still owns its completion.
+
+The tests use real TLS and the real renewal endpoint. They show that the worker
+waits before the midpoint, retains the old identity after a failed save, rejects
+redirects, recovers after server errors and cancels an in-flight request. A
+separate test checks that diagnostics distinguish a starting worker from a
+stopped one. The cluster acceptance test holds a renewal request at the old
+leader, shuts down that council member and requires the worker to reach the new
+leader and reload the resulting identity from disk.
+
+The black-box test starts the actual Bun executable with a generated secure
+configuration and a leaf already past its midpoint. It waits for a newer serial
+on disk, connects with Relish over HTTPS, restarts Bun and checks that the same
+renewed leaf is still installed. Malformed responses and valid bundles padded
+beyond the response limit must leave both disk and live credentials unchanged.

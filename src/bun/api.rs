@@ -667,6 +667,7 @@ struct DiagnosticsQuery {
 /// endpoint cannot be turned into an arbitrarily long-lived request.
 async fn diagnostics_handler(
     live_identity: Option<axum::Extension<crate::sesame::credentials::LiveNodeIdentity>>,
+    renewal: Option<axum::Extension<crate::sesame::renewal_worker::RenewalMonitor>>,
     State(state): State<ApiState>,
     Query(query): Query<DiagnosticsQuery>,
 ) -> Json<crate::bun::diagnostics::LocalDiagnosticSnapshot> {
@@ -719,18 +720,20 @@ async fn diagnostics_handler(
     let certificates = match live_identity {
         Some(identity) => {
             let current = identity.snapshot();
+            let worker_state = renewal.as_ref().map(|monitor| monitor.state());
             let rotation_state = if std::time::SystemTime::now() >= current.not_after {
                 "expired"
             } else {
-                // The transports reload, but automated issuance is not wired yet.
-                "manual"
+                worker_state.map_or("manual", |state| state.as_str())
             };
+            let automatic_rotation = worker_state
+                .is_some_and(|state| state != crate::sesame::renewal_worker::RenewalState::Stopped);
             match crate::bun::diagnostics::public_certificate_metadata(
                 "node",
                 &current.node_id,
                 &current.certificate_der,
                 rotation_state,
-                false,
+                automatic_rotation,
             ) {
                 Ok(metadata) => DiagnosticSource::Available {
                     observed_at,

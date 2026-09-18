@@ -2118,6 +2118,46 @@ async fn run_agent(cli: Cli) -> anyhow::Result<()> {
         Some(identity) => app.layer(axum::Extension(identity.clone())),
         None => app,
     };
+    let app = match (
+        &api_identity,
+        &api_council,
+        &api_membership,
+        service_token.as_deref(),
+    ) {
+        (Some(identity), Some(council), Some(membership), Some(token)) => {
+            let (worker, monitor) = reliaburger::sesame::renewal_worker::NodeRenewalWorker::new(
+                identity.clone(),
+                crl_refresh.clone().unwrap_or_default(),
+                token,
+            )
+            .map_err(|error| anyhow::anyhow!("failed to prepare node renewal: {error}"))?;
+            let mut local_api = listener.local_addr()?;
+            if local_api.ip().is_unspecified() {
+                local_api.set_ip(if local_api.is_ipv6() {
+                    std::net::IpAddr::V6(std::net::Ipv6Addr::LOCALHOST)
+                } else {
+                    std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST)
+                });
+            }
+            let council = council.clone();
+            let membership = membership.clone();
+            let renewal_shutdown = shutdown.clone();
+            reliaburger::bun::readiness::spawn_owned(
+                "node-identity-renewal",
+                false,
+                readiness.clone(),
+                shutdown.clone(),
+                move |ready| async move {
+                    ready.ready();
+                    worker
+                        .run(council, membership, local_api, renewal_shutdown)
+                        .await;
+                },
+            );
+            app.layer(axum::Extension(monitor))
+        }
+        _ => app,
+    };
     let server_shutdown = shutdown.clone();
     // Serve the API over TLS when this node has an mTLS identity; the listener
     // accepts client certs optionally, so relish and browsers connect with a

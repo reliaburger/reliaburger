@@ -401,17 +401,22 @@ only until its expiry; existing connections continue. Ingress disables TLS
 session resumption, so reconnects validate the current certificate. API, registry
 and ingress TLS connections have a one-hour lifetime, including WebSocket
 upgrades. HTTP draining starts 30 seconds before that limit; clients of
-long-lived streams must reconnect. This does not rotate the
-Ingress CA or renew node identities.
+long-lived streams must reconnect.
+
+With a generated mTLS cluster configuration, Bun renews its node leaf at the
+midpoint of the signed validity window. It contacts the current leader using
+its existing TLS identity and service token, keeps the new private key local,
+and persists the validated response before publishing it to API/registry,
+Raft/reporting and internal HTTPS consumers. Failed requests or saves leave the
+current identity installed and retry after five seconds. Leader changes don't
+require a process restart.
+
 Node identity persistence uses a private atomic `node.bundle.json`; the PEM
-files are exports, and Bun validates the complete snapshot when loading it.
-Bun shares a live identity across API/registry, Raft/reporting and internal HTTPS
-connections; diagnostics read its current public serial and expiry. Replacements
-published by the daemon take effect on new handshakes. Editing PEM exports does
-not update that identity. The leader-only renewal API requires the service
-token and the current TLS node identity; the automatic worker is still tracked
-in C14 of
-[the completion plan](plans/2026-09-17-codebase-completion-plan.md).
+files are exports, and editing them does not update the running identity.
+Diagnostics report the current serial, expiry and renewal worker state. A node
+without the required master key/service token cannot renew automatically. An
+identity that expired while offline needs authorised re-enrolment. Leaf renewal
+does not rotate the cluster CAs; CA rotation remains separately tracked.
 
 If you specifically need plaintext transports for an isolated local test,
 make that exception explicit:

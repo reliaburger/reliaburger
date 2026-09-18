@@ -365,3 +365,349 @@ async fn renewal_refuses_revoked_node_and_root_issuers() {
         council.shutdown().await.unwrap();
     }
 }
+
+fn worker_identity(
+    hierarchy: &ca::CaHierarchy,
+    serial: u64,
+    due: bool,
+) -> reliaburger::sesame::identity_store::NodeIdentity {
+    let (certificate_der, private_key_der) = if due {
+        let key = rcgen::KeyPair::generate().unwrap();
+        let mut params = rcgen::CertificateParams::default();
+        params.subject_alt_names = vec![rcgen::SanType::URI(
+            ca::node_spiffe_uri("node").try_into().unwrap(),
+        )];
+        params.extended_key_usages = vec![
+            rcgen::ExtendedKeyUsagePurpose::ServerAuth,
+            rcgen::ExtendedKeyUsagePurpose::ClientAuth,
+        ];
+        params.serial_number = Some(serial.into());
+        let now = time::OffsetDateTime::now_utc();
+        params.not_before = now - time::Duration::seconds(300);
+        params.not_after = now + time::Duration::seconds(120);
+        let issuer = hierarchy
+            .node
+            .certificate_params
+            .clone()
+            .self_signed(&hierarchy.node.signing_keypair)
+            .unwrap();
+        (
+            params
+                .signed_by(&key, &issuer, &hierarchy.node.signing_keypair)
+                .unwrap()
+                .der()
+                .to_vec(),
+            key.serialize_der(),
+        )
+    } else {
+        let (cert, key, _) = ca::issue_node_cert(
+            "node",
+            SerialNumber(serial),
+            &hierarchy.node.signing_keypair,
+            &hierarchy.node.certificate_params,
+        )
+        .unwrap();
+        (cert, key)
+    };
+    reliaburger::sesame::identity_store::NodeIdentity {
+        node_id: "node".into(),
+        certificate_der,
+        private_key_der,
+        serial: SerialNumber(serial),
+        ca_generation: 0,
+        node_ca_der: hierarchy.node.ca.certificate_der.clone(),
+        root_ca_der: hierarchy.root.ca.certificate_der.clone(),
+        not_before: SystemTime::UNIX_EPOCH,
+        not_after: SystemTime::UNIX_EPOCH,
+    }
+}
+
+struct WorkerFixture {
+    council: Arc<CouncilNode>,
+    live: reliaburger::sesame::credentials::LiveNodeIdentity,
+    directory: tempfile::TempDir,
+    tasks: tokio::task::JoinSet<()>,
+    shutdown: tokio_util::sync::CancellationToken,
+    mode: Arc<std::sync::atomic::AtomicU8>,
+    calls: Arc<std::sync::atomic::AtomicUsize>,
+    address: std::net::SocketAddr,
+}
+
+impl Drop for WorkerFixture {
+    fn drop(&mut self) {
+        self.shutdown.cancel();
+        self.tasks.abort_all();
+    }
+}
+
+impl WorkerFixture {
+    async fn new(hierarchy: &ca::CaHierarchy, due: bool) -> Self {
+        use reliaburger::sesame::{credentials::LiveNodeIdentity, identity_store, mtls};
+        use std::sync::atomic::{AtomicU8, AtomicUsize, Ordering};
+        let council = council(hierarchy, true).await;
+        let directory = tempfile::tempdir().unwrap();
+        identity_store::save(directory.path(), &worker_identity(hierarchy, 10, due)).unwrap();
+        let live = LiveNodeIdentity::load(directory.path()).unwrap();
+        let mode = Arc::new(AtomicU8::new(0));
+        let calls = Arc::new(AtomicUsize::new(0));
+        let route_mode = mode.clone();
+        let route_calls = calls.clone();
+        let app = router(council.clone(), None).layer(axum::middleware::from_fn(
+            move |request: axum::extract::Request, next: axum::middleware::Next| {
+                let mode = route_mode.clone();
+                let calls = route_calls.clone();
+                async move {
+                    use axum::response::IntoResponse;
+                    calls.fetch_add(1, Ordering::SeqCst);
+                    match mode.load(Ordering::SeqCst) {
+                        1 => StatusCode::SERVICE_UNAVAILABLE.into_response(),
+                        2 => (StatusCode::TEMPORARY_REDIRECT, [("location", "/leak")])
+                            .into_response(),
+                        3 => std::future::pending().await,
+                        4 => (StatusCode::OK, "not a renewal bundle").into_response(),
+                        5 => {
+                            let response = next.run(request).await;
+                            assert_eq!(response.status(), StatusCode::OK);
+                            let body = axum::body::to_bytes(response.into_body(), 65536)
+                                .await
+                                .unwrap();
+                            let mut value: serde_json::Value =
+                                serde_json::from_slice(&body).unwrap();
+                            // Valid bundle plus an ignored field: without the response
+                            // limit this would install successfully instead of refusing.
+                            value["padding"] = serde_json::Value::String("x".repeat(65536));
+                            axum::Json(value).into_response()
+                        }
+                        _ => next.run(request).await,
+                    }
+                }
+            },
+        ));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let acceptor = tokio_rustls::TlsAcceptor::from(
+            mtls::build_live_api_server_config(&live, mtls::CrlHandle::default()).unwrap(),
+        );
+        let shutdown = tokio_util::sync::CancellationToken::new();
+        let stop = shutdown.clone();
+        let mut tasks = tokio::task::JoinSet::new();
+        tasks.spawn(async move {
+            let mut connections = tokio::task::JoinSet::new();
+            loop {
+                tokio::select! {
+                    _ = stop.cancelled() => return,
+                    _ = connections.join_next(), if !connections.is_empty() => {},
+                    accepted = listener.accept() => {
+                        let (tcp, _) = accepted.unwrap();
+                        let acceptor = acceptor.clone(); let app = app.clone();
+                        connections.spawn(async move {
+                            let tls = acceptor.accept(tcp).await.unwrap();
+                            let leaf = tls.get_ref().1.peer_certificates().unwrap()[0].clone();
+                            let service = app.layer(axum::Extension(TlsPeerCertificate(leaf)));
+                            let _ = hyper_util::server::conn::auto::Builder::new(hyper_util::rt::TokioExecutor::new())
+                                .serve_connection(hyper_util::rt::TokioIo::new(tls), hyper_util::service::TowerToHyperService::new(service)).await;
+                        });
+                    }
+                }
+            }
+        });
+        Self {
+            council,
+            live,
+            directory,
+            tasks,
+            shutdown,
+            mode,
+            calls,
+            address,
+        }
+    }
+
+    fn start(&mut self) -> reliaburger::sesame::renewal_worker::RenewalMonitor {
+        let (worker, monitor) = reliaburger::sesame::renewal_worker::NodeRenewalWorker::new(
+            self.live.clone(),
+            reliaburger::sesame::mtls::CrlHandle::default(),
+            "internal-token",
+        )
+        .unwrap();
+        let council = self.council.clone();
+        let stop = self.shutdown.clone();
+        let address = self.address;
+        self.tasks.spawn(async move {
+            worker
+                .run(
+                    council,
+                    Arc::new(tokio::sync::RwLock::new(Vec::new())),
+                    address,
+                    stop,
+                )
+                .await;
+        });
+        monitor
+    }
+}
+
+async fn wait_for_condition(mut condition: impl FnMut() -> bool) {
+    tokio::time::timeout(Duration::from_secs(12), async {
+        while !condition() {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .unwrap();
+}
+
+#[tokio::test]
+async fn worker_waits_until_midpoint_then_retries_failed_persistence_without_publishing() {
+    use reliaburger::sesame::{identity_store, renewal_worker::RenewalState};
+    use std::sync::atomic::Ordering;
+    let hierarchy = ca::generate_ca_hierarchy("renewal", &IKM).unwrap();
+    let mut fixture = WorkerFixture::new(&hierarchy, false).await;
+    let monitor = fixture.start();
+    wait_for_condition(|| monitor.state() == RenewalState::Valid).await;
+    assert_eq!(fixture.calls.load(Ordering::SeqCst), 0);
+    fixture
+        .live
+        .replace(worker_identity(&hierarchy, 20, true))
+        .await
+        .unwrap();
+    let key = fixture.directory.path().join("node.key");
+    std::fs::remove_file(&key).unwrap();
+    std::fs::create_dir(&key).unwrap();
+    wait_for_condition(|| monitor.state() == RenewalState::Retrying).await;
+    assert_eq!(fixture.live.snapshot().serial, SerialNumber(20));
+    assert_eq!(
+        identity_store::load(fixture.directory.path())
+            .unwrap()
+            .unwrap()
+            .serial,
+        SerialNumber(20)
+    );
+    std::fs::remove_dir(&key).unwrap();
+    wait_for_condition(|| {
+        fixture.live.snapshot().serial.0 >= 100 && monitor.state() == RenewalState::Valid
+    })
+    .await;
+    assert_eq!(
+        fixture.live.snapshot().serial,
+        identity_store::load(fixture.directory.path())
+            .unwrap()
+            .unwrap()
+            .serial
+    );
+    fixture.shutdown.cancel();
+    wait_for_condition(|| monitor.state() == RenewalState::Stopped).await;
+    fixture.council.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn worker_refuses_redirects_then_recovers_from_a_retryable_member() {
+    use reliaburger::sesame::renewal_worker::RenewalState;
+    use std::sync::atomic::Ordering;
+    let hierarchy = ca::generate_ca_hierarchy("renewal", &IKM).unwrap();
+    let mut fixture = WorkerFixture::new(&hierarchy, true).await;
+    fixture.mode.store(2, Ordering::SeqCst);
+    let monitor = fixture.start();
+    wait_for_condition(|| monitor.state() == RenewalState::Retrying).await;
+    assert_eq!(fixture.live.snapshot().serial, SerialNumber(10));
+    assert_eq!(fixture.council.security_state().await.next_serial, 100);
+    assert_eq!(
+        fixture.calls.load(Ordering::SeqCst),
+        1,
+        "the client followed a redirect"
+    );
+    fixture.mode.store(1, Ordering::SeqCst);
+    wait_for_condition(|| fixture.calls.load(Ordering::SeqCst) >= 2).await;
+    assert_eq!(fixture.live.snapshot().serial, SerialNumber(10));
+    fixture.mode.store(0, Ordering::SeqCst);
+    wait_for_condition(|| fixture.live.snapshot().serial.0 >= 100).await;
+    fixture.shutdown.cancel();
+    wait_for_condition(|| monitor.state() == RenewalState::Stopped).await;
+    fixture.council.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn worker_shutdown_cancels_an_inflight_request_and_exposes_stopped_health() {
+    use reliaburger::sesame::renewal_worker::RenewalState;
+    use std::sync::atomic::Ordering;
+    let hierarchy = ca::generate_ca_hierarchy("renewal", &IKM).unwrap();
+    let mut fixture = WorkerFixture::new(&hierarchy, true).await;
+    fixture.mode.store(3, Ordering::SeqCst);
+    let monitor = fixture.start();
+    wait_for_condition(|| fixture.calls.load(Ordering::SeqCst) > 0).await;
+    assert_eq!(monitor.state(), RenewalState::Renewing);
+    fixture.shutdown.cancel();
+    tokio::time::timeout(Duration::from_secs(1), async {
+        while monitor.state() != RenewalState::Stopped {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+    assert_eq!(fixture.live.snapshot().serial, SerialNumber(10));
+    fixture.council.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn diagnostics_does_not_report_a_stopped_renewal_owner_as_healthy() {
+    use reliaburger::bun::diagnostics::{DiagnosticSource, LocalDiagnosticSnapshot};
+    use reliaburger::sesame::{
+        credentials::LiveNodeIdentity, identity_store, mtls::CrlHandle,
+        renewal_worker::NodeRenewalWorker,
+    };
+    let hierarchy = ca::generate_ca_hierarchy("renewal", &IKM).unwrap();
+    let council = council(&hierarchy, true).await;
+    let dir = tempfile::tempdir().unwrap();
+    identity_store::save(dir.path(), &worker_identity(&hierarchy, 10, false)).unwrap();
+    let live = LiveNodeIdentity::load(dir.path()).unwrap();
+    let (worker, monitor) =
+        NodeRenewalWorker::new(live.clone(), CrlHandle::default(), "internal-token").unwrap();
+    let app = router(council.clone(), None)
+        .layer(axum::Extension(live))
+        .layer(axum::Extension(monitor));
+    let mut worker = Some(worker);
+    for (label, automatic) in [("starting", true), ("stopped", false)] {
+        if !automatic {
+            drop(worker.take());
+        }
+        let response = app
+            .clone()
+            .oneshot(Request::get("/v1/diagnostics").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let bytes = axum::body::to_bytes(response.into_body(), 65536)
+            .await
+            .unwrap();
+        let snapshot: LocalDiagnosticSnapshot = serde_json::from_slice(&bytes).unwrap();
+        let DiagnosticSource::Available { value, .. } = snapshot.certificates else {
+            panic!("missing node certificate");
+        };
+        assert_eq!(value[0].rotation_state, label);
+        assert_eq!(value[0].automatic_rotation, automatic);
+    }
+    council.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn worker_keeps_its_identity_after_malformed_or_oversized_success_responses() {
+    use reliaburger::sesame::{identity_store, renewal_worker::RenewalState};
+    use std::sync::atomic::Ordering;
+    for mode in [4, 5] {
+        let hierarchy = ca::generate_ca_hierarchy("renewal", &IKM).unwrap();
+        let mut fixture = WorkerFixture::new(&hierarchy, true).await;
+        fixture.mode.store(mode, Ordering::SeqCst);
+        let monitor = fixture.start();
+        wait_for_condition(|| monitor.state() == RenewalState::Retrying).await;
+        assert_eq!(fixture.live.snapshot().serial, SerialNumber(10));
+        assert_eq!(
+            identity_store::load(fixture.directory.path())
+                .unwrap()
+                .unwrap()
+                .serial,
+            SerialNumber(10)
+        );
+        fixture.shutdown.cancel();
+        fixture.council.shutdown().await.unwrap();
+    }
+}

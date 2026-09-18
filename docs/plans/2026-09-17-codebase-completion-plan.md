@@ -264,11 +264,13 @@ Issuance rounds validity to calendar days; a requested 60-second leaf had a zero
 
 ### C14 — Renew and hot-reload every served certificate class
 
+**Functional fixes completed on PR #167. Sustained qualification remains V02.**
+
 **Priority:** P1. **Wave:** 2. **Book chapters:** 03, 04, 15.
 
 Evidence: `src/wrapper/tls.rs:IngressCertResolver::key_for`; `src/bin/bun.rs:security refresh`.
 
-The ingress resolver returns cached keys without expiry checks; node/API leaves are loaded at process start and report restart_required. Workload rotation does not cover these consumers.
+**Original finding:** The ingress resolver returned cached keys without expiry checks; node/API leaves were loaded at process start and reported restart_required. Workload rotation did not cover these consumers.
 
 **Completion test:** Advance time through renewal/expiry and replace configured cert files while serving TLS; prove new connections get valid leaves, old connections drain safely and diagnostics name unsupported consumers.
 
@@ -325,13 +327,18 @@ Node identity renewal remains, split into separately reviewable changes:
   forward another node's identity. Seven renewal tests pass (0.24s), the actual
   Bun listener proves TLS peer attribution and draining (0.05s), and strict
   Linux/macOS Clippy passes.
-- Start automatic renewal at the signed lifetime midpoint, persist before
-  publishing and report current worker health. Retry directly against the leader
-  through leadership changes. An already expired offline identity requires
-  authorised re-enrolment; the private key stays on its node.
-- Qualify automatic renewal, restart recovery and leader-change behaviour with
-  real TLS and cluster tests. Live diagnostic serials and replacement reconnects
-  are covered; the automatic worker remains open.
+- The automatic worker renews at the signed lifetime midpoint, persists before
+  publishing and reports live health. It resolves the leader on every attempt,
+  refuses redirects, bounds response size/time and retries failures after five
+  seconds. Twelve endpoint/worker regressions pass (12.13s), including failed
+  persistence, oversized responses, cancellation and stopped-owner diagnostics.
+  The real three-node request interrupted by leader failure succeeds on the
+  new leader and reloads from disk (20.40s). Actual Bun startup automatically
+  renews a due leaf, serves HTTPS and reuses it after restart (3.64s). All 23 Bun
+  tests, seven live TLS tests and strict Linux/macOS Clippy pass.
+- Expired offline identities still require authorised re-enrolment, and CA
+  rotation remains F04. Sustained expiry/storage/upgrade qualification is V02;
+  these functional tests do not mark that separate release gate complete.
 
 ### C15 — Make ingress serials unique across nodes and restarts
 
@@ -1112,10 +1119,10 @@ instead of treating a historical checkbox as today's verdict.
 | G4: advisory review | August review implemented; five exceptions remain under V05's November deadline. |
 | H1: three-node lease/leader-death acceptance | V01 explicitly retains this missing acceptance scenario; local lease tests are not a substitute. |
 | H2: complete runbook | V01; amend profiles/prerequisites and retain every result. |
-| Carried-forward streaming, cert lifecycle, resource leases | Streaming implemented; C14 and C34 remain. |
+| Carried-forward streaming, cert lifecycle, resource leases | Streaming and C14 certificate lifecycle implemented; C34 remains. |
 
 The July 18 M8 infrastructure/command milestone is done, but its fixtures and
-complete acceptance are C30/V01. Its certificate lifecycle follow-up is C14.
+complete acceptance are C30/V01. Its certificate lifecycle follow-up C14 is complete; sustained qualification remains V02.
 O1–O4 are H05–H07/F09. O5's shipped/planned labels were implemented; preventing
 new drift remains H01. The July 6 full chaos acceptance is V01.
 
