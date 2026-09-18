@@ -714,10 +714,18 @@ tests pass (4.15s), followed by the strengthened refusal/restart regression
 complete process-tree retirement and physical crash recovery remain open.
 Discovery of resources created before their initial runtime adoption record,
 and cluster-lease completion before every former placement confirms retirement,
-still need implementation and qualification. Placement response-body reads and
-agent retirement replies also need explicit deadlines; these inspected waits
-can currently stall reconciliation. Controlled reconciler interruption is not
-physical crash qualification.
+still need implementation and qualification. Controlled reconciler interruption
+is not physical crash qualification.
+
+**Reconciliation deadline prerequisite (18 September):** Two failing-first
+regressions reproduce an unfinished HTTP body stalling future placement polls
+and a withheld retirement reply blocking later owners. Placement headers and
+body now share one ten-second timeout; retirement queueing and acknowledgement
+also share ten seconds. Unknown outcomes keep their ownership record while the
+loop continues. Routing/deployment queue sends are bounded, and shutdown can
+interrupt read-only observation while durable intent remains. All 63 cluster
+unit tests (10.32s), real three-node stop/non-resurrection (13.14s), and strict
+Linux/macOS Clippy pass.
 
 Remaining resource contracts, each in its own commit: node-local jobs,
 registry uploads/repositories,

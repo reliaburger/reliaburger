@@ -1090,3 +1090,25 @@ record is written still needs separate crash qualification.
 Checkpoint schema 2 changes durable state, so the binary now advertises state
 generation 5 while protocol generation 5 is unchanged. Earlier development
 clusters require fresh state; a rolling upgrade must match both generations.
+
+### A deadline must include the reply body
+
+An HTTP peer can send `200 OK` and then stop sending bytes. Timing only the
+request's `send()` call doesn't bound JSON decoding, because receiving headers
+is enough for that call to finish. The placement poll now puts request, status
+validation and body decoding inside one ten-second timeout. Shutdown can cancel
+this read without changing ownership.
+
+Agent retirement needs the same treatment. One owner whose reply never arrives
+must not block every later owner. Queueing and the retirement reply share a
+ten-second deadline; an unknown outcome leaves the journal entry intact and
+allows the loop to try the next resource. A later iteration can retry the first
+one. Routing updates and deployment queueing also have bounded waits. Deployment
+completion retains its existing five-minute deadline and its durable Pending
+record if shutdown interrupts observation.
+
+Two regressions exercise the actual reconciler. A TCP server sends headers and
+an unfinished JSON body; another fixture withholds one agent retirement reply.
+The first must receive another poll, and the second must retire a different
+owner while keeping the stalled owner's journal entry. Both stalled before the
+repair. Neither test treats elapsed time as proof that the original work stopped.
