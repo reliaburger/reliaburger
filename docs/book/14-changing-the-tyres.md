@@ -840,3 +840,14 @@ Bun to exit before announcing an API listener. These checks don't establish
 atomic process identity, nor do they excuse a runtime that incorrectly reports
 an inspection failure as `Ok(false)`. Those runtime boundaries need their own
 proof.
+
+The process and runc adoption boundaries now use the checked process poller,
+too. A positive liveness check can establish a running owner; an inspection
+error cannot establish a dead one. In particular, a corrupt record must not
+turn PID zero or an overflowing unsigned PID into a Unix group selector. The
+poller converts with `i32::try_from` and rejects non-positive values before any
+process inspection or syscall. Unlike `as`, this conversion reports overflow.
+Both runtimes propagate that error, and runc leaves its container resources
+untouched without even invoking its CLI. Tests exercise all three invalid PID
+boundaries alongside live, exited and reused processes. Apple inspection needs
+its own runtime-specific absence evidence; this change doesn't establish that.

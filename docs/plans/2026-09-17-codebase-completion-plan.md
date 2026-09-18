@@ -731,8 +731,12 @@ tests and 11 ordinary actual-binary first-run cases (17.60s; two privileged case
 remain gated) pass, including corrupt-state refusal and job recovery after Bun
 is killed. Strict Linux/macOS Clippy passes. The stale-record fixture now has an isolated volume path after strict
 error handling exposed its accidental access to the system volume directory.
-Runtime-specific absence prechecks still need qualification: Process/Runc use
-an optional process observation and Apple inspection can mask errors as absence.
+Process/runc adoption now uses checked process observation and refuses invalid
+PID selectors before any syscall. The invalid-record regression fails first;
+runc also proves it never invokes cleanup on that error. All 277 Linux runtime
+tests (13 explicit gates, 7.26s), 22 native ProcessGrill tests (0.22s), real
+rootful runc adoption/rootfs retirement (6.81s), and strict Linux/macOS Clippy
+pass. Apple inspection can still mask errors as absence and needs repair.
 
 Job schedule registrations and last-fired stamps are currently in-memory;
 adoption resets job retries to the generic restart policy. Persist the intended

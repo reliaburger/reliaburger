@@ -474,7 +474,14 @@ impl super::Grill for ProcessGrill {
         instance: &InstanceId,
         record: &InstanceRecord,
     ) -> Result<bool, GrillError> {
-        if !super::records::is_live(record) {
+        let (running, _) =
+            poll_adopted_process(record.pid, Some(record.pid_started_at)).map_err(|error| {
+                GrillError::StateUnavailable {
+                    instance: instance.clone(),
+                    reason: error.to_string(),
+                }
+            })?;
+        if !running {
             return Ok(false);
         }
         let mut procs = self.processes.lock().await;
@@ -1010,6 +1017,18 @@ mod tests {
 
         external.kill().unwrap();
         external.wait().unwrap();
+    }
+
+    #[tokio::test]
+    async fn adoption_refuses_invalid_process_ids_without_claiming_absence() {
+        let grill = ProcessGrill::new();
+        let id = InstanceId("invalid-adoption-0".into());
+        for pid in [0, u32::MAX, i32::MAX as u32 + 1] {
+            assert!(
+                grill.adopt(&id, &record_for(&id, pid, 1000)).await.is_err(),
+                "invalid pid {pid} was treated as a dead workload"
+            );
+        }
     }
 
     #[tokio::test]

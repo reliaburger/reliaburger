@@ -1086,7 +1086,14 @@ impl super::Grill for RuncGrill {
     ) -> Result<bool, GrillError> {
         let _lifecycle = self.lock_lifecycle(instance).await;
         // The recorded `runc run` process must still be the one we started...
-        if !super::records::is_live(record) {
+        let (running, _) =
+            super::records::poll_adopted_process(record.pid, Some(record.pid_started_at)).map_err(
+                |error| GrillError::StateUnavailable {
+                    instance: instance.clone(),
+                    reason: error.to_string(),
+                },
+            )?;
+        if !running {
             self.cleanup(instance).await?;
             return Ok(false);
         }
@@ -1339,6 +1346,47 @@ impl Drop for RuncGrill {
 mod tests {
     use super::*;
     use crate::grill::Grill;
+
+    #[tokio::test]
+    async fn invalid_adoption_preserves_resources_without_invoking_runc() {
+        use std::os::unix::fs::PermissionsExt;
+        let root = tempfile::tempdir().unwrap();
+        let program = root.path().join("runc-fixture");
+        std::fs::write(&program, "#!/bin/sh\ntouch \"$2/command-run\"\nexit 1\n").unwrap();
+        std::fs::set_permissions(&program, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let state_dir = root.path().join("state");
+        let id = InstanceId("invalid-adoption".into());
+        std::fs::create_dir_all(state_dir.join(&id.0)).unwrap();
+        let mut grill = RuncGrill::new(
+            root.path().join("bundles"),
+            ImageStore::new(root.path().join("images")),
+            true,
+            state_dir.clone(),
+        );
+        grill.runc_program = program;
+        let mut record: super::super::records::InstanceRecord =
+            serde_json::from_value(serde_json::json!({
+                "schema": 2, "instance_id": id.0, "namespace": "default",
+                "app_name": "invalid-adoption", "replica_index": 0,
+                "is_job": false, "image": "unused", "runtime": "Runc",
+                "pid": 0, "pid_started_at": 1000,
+                "oci_spec": {
+                    "root": {"path": "/unused", "readonly": true},
+                    "process": {"args": [], "env": [], "cwd": "/", "user": {"uid": 0, "gid": 0}},
+                    "mounts": [], "linux": {"namespaces": []}
+                }
+            }))
+            .unwrap();
+        for pid in [0, u32::MAX, i32::MAX as u32 + 1] {
+            record.pid = pid;
+            assert!(matches!(
+                grill.adopt(&id, &record).await,
+                Err(GrillError::StateUnavailable { .. })
+            ));
+            assert!(state_dir.join(&id.0).exists());
+            assert!(!state_dir.join("command-run").exists());
+        }
+    }
 
     async fn failed_deletion_retains_runtime_ownership(force: bool, adopted: bool) {
         use std::os::unix::fs::PermissionsExt;

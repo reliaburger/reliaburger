@@ -238,6 +238,16 @@ pub fn poll_adopted_process(
     use nix::sys::signal::kill;
     use nix::sys::wait::{WaitPidFlag, WaitStatus, waitpid};
 
+    // Zero and negative wait/kill selectors address process groups, not a workload.
+    let signed_pid = i32::try_from(pid)
+        .ok()
+        .filter(|pid| *pid > 0)
+        .ok_or_else(|| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "invalid adopted process id",
+            )
+        })?;
     let current_start = process_start_time(pid);
     if let (Some(recorded), Some(current)) = (pid_started_at, current_start)
         && current.abs_diff(recorded) > 2
@@ -245,7 +255,7 @@ pub fn poll_adopted_process(
         // Do not reap an unrelated child after PID reuse either.
         return Ok((false, None));
     }
-    let nix_pid = nix::unistd::Pid::from_raw(pid as i32);
+    let nix_pid = nix::unistd::Pid::from_raw(signed_pid);
     match waitpid(nix_pid, Some(WaitPidFlag::WNOHANG)) {
         Ok(WaitStatus::Exited(_, code)) => Ok((false, Some(code))),
         Ok(WaitStatus::Signaled(..)) => Ok((false, None)),
@@ -418,6 +428,14 @@ mod tests {
     fn load_records_from_missing_dir_is_empty() {
         let dir = tempfile::tempdir().unwrap();
         assert!(load_records(&dir.path().join("nope")).unwrap().is_empty());
+    }
+
+    #[test]
+    fn adopted_process_observation_rejects_invalid_identifiers() {
+        for pid in [0, u32::MAX, i32::MAX as u32 + 1] {
+            let error = poll_adopted_process(pid, Some(1000)).unwrap_err();
+            assert_eq!(error.kind(), std::io::ErrorKind::InvalidInput);
+        }
     }
 
     #[test]
