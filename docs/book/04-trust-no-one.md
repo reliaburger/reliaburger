@@ -945,3 +945,18 @@ connection keeps working throughout. A separate test rejects expired and
 not-yet-valid certificates at startup. This reload doesn't provision certificates
 for the operator, and it doesn't yet renew the node identity used by the API,
 Raft or reporting.
+
+### A reconnect must check the current certificate
+
+Reloading the key is only half the job. TLS session resumption can establish a
+new connection from a previously negotiated session without asking the resolver
+for a certificate. Our real reconnect test reused a client configuration,
+consumed the server's session tickets and observed exactly that: `Resumed`
+instead of a full handshake.
+
+Ingress now disables the server session cache and TLS 1.3 tickets, matching the
+node/API policy. Every reconnect performs certificate validation against the
+current resolver. Existing connections stay open during renewal or file reload;
+their eventual retirement needs its own connection lifetime limit. This costs a
+full TLS handshake per connection, a deliberate trade-off for an explicit
+certificate lifecycle in 0.1.0.

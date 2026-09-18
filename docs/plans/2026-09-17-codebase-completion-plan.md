@@ -282,8 +282,12 @@ Operator files now reload as validated pairs, retaining the last usable pair
 during incomplete or invalid replacements. Real Wrapper acceptance verifies
 new full handshakes use the replacement and existing HTTP connections survive
 (3.26s); expired and future-dated initial files are refused.
-Remaining implementation covers node/API/Raft/reporting identity updates,
-session resumption policy and bounded connection retirement. The
+Ingress session resumption is disabled: a reconnect must consult the current
+resolver and validate its certificate, matching the node/API policy. Real TLS
+1.2/1.3 reconnections pass for static and dynamic resolvers (0.02s), with renewal,
+file reload and strict Linux/macOS Clippy still passing.
+Remaining implementation covers node/API/Raft/reporting identity updates and
+bounded connection retirement. The
 working connection-lifetime policy is one hour, pending any operator preference.
 
 ### C15 — Make ingress serials unique across nodes and restarts

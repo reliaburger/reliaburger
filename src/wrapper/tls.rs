@@ -285,6 +285,10 @@ pub fn build_tls_config(
 
     // Advertise HTTP/2 then HTTP/1.1 (E); hyper's auto builder serves whichever
     // ALPN the client negotiates.
+    // A resumed session skips certificate resolution and validity checks.
+    // Every reconnect must observe the current leaf after renewal or reload.
+    config.session_storage = Arc::new(rustls::server::NoServerSessionStorage {});
+    config.send_tls13_tickets = 0;
     config.alpn_protocols = crate::wrapper::types::alpn_protocols();
 
     Ok(Arc::new(config))
@@ -302,6 +306,10 @@ pub fn build_tls_config_with_resolver(
     let mut config = ServerConfig::builder()
         .with_no_client_auth()
         .with_cert_resolver(resolver);
+    // A resumed session skips certificate resolution and validity checks.
+    // Every reconnect must observe the current leaf after renewal or reload.
+    config.session_storage = Arc::new(rustls::server::NoServerSessionStorage {});
+    config.send_tls13_tickets = 0;
     config.alpn_protocols = crate::wrapper::types::alpn_protocols();
     Ok(Arc::new(config))
 }
