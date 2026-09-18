@@ -672,9 +672,21 @@ persistent failure remains Unknown. The HTTP recovery regression fails before
 the fix; recovery/deadline cases, all 117 testkit tests (0.54s) and strict Linux
 Clippy pass.
 
-**Additional cleanup evidence to establish:** Process/runc runtime
-adapters still need review: their kill paths currently suppress errors and set
-Stopped without independent proof. Reproduce the crash window between runtime
+**Runc startup and signalling prerequisite (18 September):** Stop and force-stop
+now check the CLI outcome, preserve the foreground launcher and require its
+observed exit after a force signal. Three controlled regressions fail first.
+Real adoption qualification also caught rootful start returning before OCI
+creation; startup now waits for a running PID or a completed batch launcher.
+The real fixture covers immediate kill and both zero/non-zero short jobs.
+Nine ordinary tests, seven rootful acceptance cases (26.35s), non-root
+port adoption (3.85s, with the CI AppArmor prerequisite) and strict
+Linux/macOS Clippy pass.
+
+**Additional cleanup evidence to establish:** The runc cleanup path still
+suppresses teardown failures; complete container and host resource retirement
+remains unproved. ProcessGrill signal/inspection errors
+are repaired above, while atomic process identity and process-tree retirement
+remain open. Reproduce the crash window between runtime
 creation and placement-checkpoint persistence; a lease must not forget an
 orphaned workload merely because its desired Raft entry was removed. These
 are inspected paths, not completed crash qualifications.

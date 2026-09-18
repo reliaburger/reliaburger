@@ -1053,3 +1053,35 @@ These checks don't make a start-time comparison and a later PID signal atomic.
 Nor do they prove that a runc launcher’s exit means every container resource is
 gone. Kernel-backed process ownership, process-tree exit and complete runc
 cleanup remain part of the release recovery gate.
+
+
+### Keep the runc launcher until the workload exits
+
+`runc kill` can exit unsuccessfully. The adapter previously ignored both that
+status and command-launch errors, then killed its own `runc run` process and
+reported Stopped. That destroyed the process we were using to observe the
+workload's exit.
+
+Stop and force-stop now retain the CLI failure. After a successful force signal,
+the adapter waits for the foreground owner to exit instead of killing it.
+A successful signal followed by a live launcher is an error after a bounded
+wait. Ownership stays recorded. Naturally completed workloads remain safe to
+stop again: an observed exited launcher and absent OCI state permit idempotent
+cleanup, including recovery of a prepared network reservation.
+
+The tests give the adapter a private executable, without changing the process's
+PATH. One returns a signal failure; another acknowledges a signal without
+ending the launcher. Both must preserve that launcher and refuse completion.
+Real rootful recovery and container tests check the normal path separately.
+Complete host-resource teardown still needs its own error and cancellation
+proof before the release gate can close.
+
+The real adoption test found a second race: rootful `start` returned as soon as
+it spawned the CLI, before runc had created its OCI state. An immediate kill
+then correctly refused “container does not exist”. Startup now waits, within
+five seconds, for a running init PID or an already completed rootful launcher.
+Only the running observation publishes Running. Short batch jobs can finish
+between polls, so they retain their actual exit status instead of requiring an
+observation of a state that has already passed. The acceptance test runs both
+`exit 0` and `exit 7`, checks their distinct results, and retires each workload.
+Rootless startup still requires a live PID to attach its userspace network.

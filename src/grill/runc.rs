@@ -58,6 +58,8 @@ pub struct RuncGrill {
     /// Runc state directory (`--root` flag). Must be writable by the
     /// current user; in rootless mode this is under $XDG_RUNTIME_DIR.
     state_dir: PathBuf,
+    /// Executable used for every invocation, including the foreground launcher.
+    runc_program: PathBuf,
     entries: Arc<Mutex<HashMap<InstanceId, RuncEntry>>>,
     /// Per-container network namespaces (root mode only).
     /// Rootless mode uses slirp4netns instead.
@@ -103,6 +105,7 @@ impl RuncGrill {
             image_store,
             rootless,
             state_dir,
+            runc_program: PathBuf::from("runc"),
             entries: Arc::new(Mutex::new(HashMap::new())),
             networks: Arc::new(Mutex::new(HashMap::new())),
             port_handles: Arc::new(Mutex::new(HashMap::new())),
@@ -192,7 +195,7 @@ impl RuncGrill {
         let mut full_args = vec!["--root", &state_dir_str];
         full_args.extend_from_slice(args);
 
-        let output = tokio::process::Command::new("runc")
+        let output = tokio::process::Command::new(&self.runc_program)
             .args(&full_args)
             .kill_on_drop(true)
             .output()
@@ -205,18 +208,116 @@ impl RuncGrill {
         Ok(output)
     }
 
-    /// Wait for `runc run` to publish the container init PID.
-    async fn wait_for_container_pid(&self, instance: &InstanceId) -> Result<u32, GrillError> {
+    /// Observe the foreground owner without killing it to manufacture an exit.
+    async fn launcher_exited(&self, instance: &InstanceId) -> Result<bool, GrillError> {
+        let mut entries = self.entries.lock().await;
+        let Some(entry) = entries.get_mut(instance) else {
+            // Recovery may hold only a durable network reservation. Runtime
+            // absence must still be established separately before cleanup.
+            return Ok(true);
+        };
+        let observation = if let Some(child) = &mut entry.child {
+            child
+                .try_wait()
+                .map(|status| status.map(|status| status.code()))
+        } else if let Some(pid) = entry.adopted_pid {
+            super::records::poll_adopted_process(pid, entry.adopted_pid_started_at)
+                .map(|(running, code)| (!running).then_some(code))
+        } else {
+            // A prepared bundle has not launched a foreground owner yet.
+            Ok(Some(None))
+        }
+        .map_err(|error| GrillError::StateUnavailable {
+            instance: instance.clone(),
+            reason: error.to_string(),
+        })?;
+        match observation {
+            Some(code) => {
+                entry.exit_code = code;
+                Ok(true)
+            }
+            None => Ok(false),
+        }
+    }
+
+    /// An exited foreground owner and absent OCI state permit idempotent stop.
+    async fn runtime_already_absent(&self, instance: &InstanceId) -> Result<bool, GrillError> {
+        if !self.launcher_exited(instance).await? {
+            return Ok(false);
+        }
+        tokio::fs::try_exists(self.state_dir.join(&instance.0))
+            .await
+            .map(|exists| !exists)
+            .map_err(|error| GrillError::StateUnavailable {
+                instance: instance.clone(),
+                reason: error.to_string(),
+            })
+    }
+
+    /// Send a signal, retaining non-zero CLI status and transport failures.
+    async fn signal_container(
+        &self,
+        instance: &InstanceId,
+        signal: &str,
+    ) -> Result<bool, GrillError> {
+        if self.runtime_already_absent(instance).await? {
+            return Ok(false);
+        }
+        let output = tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            self.runc_command(&["kill", &instance.0, signal], instance),
+        )
+        .await
+        .map_err(|_| GrillError::StopFailed {
+            instance: instance.clone(),
+            reason: format!("runc {signal} timed out"),
+        })??;
+        if !output.status.success() {
+            // The workload may have exited naturally while the CLI ran.
+            if self.runtime_already_absent(instance).await? {
+                return Ok(false);
+            }
+            return Err(GrillError::StopFailed {
+                instance: instance.clone(),
+                reason: format!(
+                    "runc {signal} exited {}: {}",
+                    output.status,
+                    String::from_utf8_lossy(&output.stderr).trim()
+                ),
+            });
+        }
+        Ok(true)
+    }
+
+    /// Wait for OCI startup or, for rootful jobs, an already completed launcher.
+    async fn wait_for_container_start(
+        &self,
+        instance: &InstanceId,
+    ) -> Result<Option<u32>, GrillError> {
         let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
         loop {
-            let output = self.runc_command(&["state", &instance.0], instance).await?;
+            let output = tokio::time::timeout_at(
+                deadline,
+                self.runc_command(&["state", &instance.0], instance),
+            )
+            .await
+            .map_err(|_| GrillError::StartFailed {
+                instance: instance.clone(),
+                reason: "runc startup inspection exceeded 5s".into(),
+            })??;
             if output.status.success()
                 && let Ok(state) = serde_json::from_slice::<serde_json::Value>(&output.stdout)
                 && state.get("status").and_then(|value| value.as_str()) == Some("running")
                 && let Some(pid) = state.get("pid").and_then(|value| value.as_u64())
                 && let Ok(pid) = u32::try_from(pid)
             {
-                return Ok(pid);
+                return Ok(Some(pid));
+            }
+            // A rootful batch job can finish before the first state query.
+            // Preserve its exit result for normal supervision. Rootless startup
+            // needs a live init PID to attach the network before it can succeed.
+            if !self.rootless && self.launcher_exited(instance).await? {
+                return Ok(None);
             }
             if let Some(reason) = self.runc_start_failure(instance).await {
                 return Err(GrillError::StartFailed {
@@ -707,7 +808,7 @@ impl super::Grill for RuncGrill {
                 // container's exit code.
                 let state_dir_str = self.state_dir.to_string_lossy().to_string();
                 let bundle_str = entry.bundle_dir.to_string_lossy().to_string();
-                let child = tokio::process::Command::new("runc")
+                let child = tokio::process::Command::new(&self.runc_program)
                     .args([
                         "--root",
                         &state_dir_str,
@@ -725,7 +826,6 @@ impl super::Grill for RuncGrill {
                     })?;
 
                 entry.child = Some(child);
-                entry.state = ContainerState::Running;
                 Ok((entry.bundle_dir.clone(), entry.port_mapping))
             })()
         };
@@ -738,22 +838,32 @@ impl super::Grill for RuncGrill {
             }
         };
 
-        if self.rootless {
-            let rootless = async {
-                let container_pid = self.wait_for_container_pid(instance).await?;
+        let startup = async {
+            let container_pid = self.wait_for_container_start(instance).await?;
+            if self.rootless {
+                let container_pid = container_pid.ok_or_else(|| GrillError::StartFailed {
+                    instance: instance.clone(),
+                    reason: "rootless startup requires a running container".into(),
+                })?;
                 self.start_rootless_network(
                     instance,
                     container_pid,
                     &bundle_dir.join("slirp4netns.sock"),
                     port_mapping,
                 )
-                .await
+                .await?;
             }
-            .await;
-            if let Err(error) = rootless {
-                self.cleanup(instance).await;
-                return Err(error);
+            if container_pid.is_some()
+                && let Some(entry) = self.entries.lock().await.get_mut(instance)
+            {
+                entry.state = ContainerState::Running;
             }
+            Ok::<(), GrillError>(())
+        }
+        .await;
+        if let Err(error) = startup {
+            self.cleanup(instance).await;
+            return Err(error);
         }
 
         Ok(())
@@ -761,31 +871,37 @@ impl super::Grill for RuncGrill {
 
     async fn stop(&self, instance: &InstanceId) -> Result<(), GrillError> {
         let _lifecycle = self.lock_lifecycle(instance).await;
-        // Best-effort graceful signal; the container exits and `runc run`
-        // returns, which `state()` observes.
-        let _ = self
-            .runc_command(&["kill", &instance.0, "SIGTERM"], instance)
-            .await;
+        let signalled = self.signal_container(instance, "SIGTERM").await?;
+        if !signalled {
+            self.cleanup(instance).await;
+        }
         if let Some(entry) = self.entries.lock().await.get_mut(instance) {
-            entry.state = ContainerState::Stopping;
+            entry.state = if signalled {
+                ContainerState::Stopping
+            } else {
+                ContainerState::Stopped
+            };
         }
         Ok(())
     }
 
     async fn kill(&self, instance: &InstanceId) -> Result<(), GrillError> {
         let _lifecycle = self.lock_lifecycle(instance).await;
-        let _ = self
-            .runc_command(&["kill", &instance.0, "SIGKILL"], instance)
-            .await;
-        // Also kill the `runc run` process in case the container is unresponsive.
+        self.signal_container(instance, "SIGKILL").await?;
         if let Some(entry) = self.entries.lock().await.get_mut(instance) {
-            if let Some(ref mut child) = entry.child {
-                let _ = child.kill().await;
-            } else if let Some(pid) = entry.adopted_pid {
-                let pid = nix::unistd::Pid::from_raw(pid as i32);
-                let _ = nix::sys::signal::kill(pid, nix::sys::signal::Signal::SIGKILL);
-            }
+            entry.state = ContainerState::Stopping;
         }
+        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            while !self.launcher_exited(instance).await? {
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+            Ok::<(), GrillError>(())
+        })
+        .await
+        .map_err(|_| GrillError::StopFailed {
+            instance: instance.clone(),
+            reason: "runc launcher did not exit after force-kill".into(),
+        })??;
         self.cleanup(instance).await;
         if let Some(entry) = self.entries.lock().await.get_mut(instance) {
             entry.state = ContainerState::Stopped;
@@ -1217,6 +1333,91 @@ mod tests {
             grill.entries.lock().await.get(&id).unwrap().state,
             ContainerState::Running
         );
+    }
+
+    async fn signal_does_not_discard_a_live_launcher(force: bool, succeeds: bool) {
+        use std::os::unix::fs::PermissionsExt;
+        let root = tempfile::tempdir().unwrap();
+        let program = root.path().join("runc-fixture");
+        std::fs::write(
+            &program,
+            if succeeds {
+                "#!/bin/sh\nexit 0\n"
+            } else {
+                "#!/bin/sh\necho injected-signal-failure >&2\nexit 1\n"
+            },
+        )
+        .unwrap();
+        std::fs::set_permissions(&program, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let mut grill = RuncGrill::new(
+            root.path().join("bundles"),
+            ImageStore::new(root.path().join("images")),
+            true,
+            root.path().join("state"),
+        );
+        grill.runc_program = program;
+        let id = InstanceId("signal-owner".into());
+        let child = tokio::process::Command::new("sleep")
+            .arg("60")
+            .kill_on_drop(true)
+            .spawn()
+            .unwrap();
+        grill.entries.lock().await.insert(
+            id.clone(),
+            RuncEntry {
+                bundle_dir: root.path().join("bundles").join(&id.0),
+                log_path: root.path().join("container.log"),
+                child: Some(child),
+                adopted_pid: None,
+                adopted_pid_started_at: None,
+                port_mapping: None,
+                state: ContainerState::Running,
+                exit_code: None,
+            },
+        );
+        let result = if force {
+            grill.kill(&id).await
+        } else {
+            grill.stop(&id).await
+        };
+        let mut entries = grill.entries.lock().await;
+        let entry = entries.get_mut(&id).unwrap();
+        let state = entry.state;
+        let child = entry.child.as_mut().unwrap();
+        let still_running = child.try_wait().unwrap().is_none();
+        let _ = child.kill().await;
+        let error = result.expect_err("unconfirmed signal/exit was acknowledged");
+        if succeeds {
+            assert!(
+                error.to_string().contains("launcher did not exit"),
+                "{error}"
+            );
+        } else {
+            assert!(
+                error.to_string().contains("injected-signal-failure"),
+                "{error}"
+            );
+        }
+        assert_ne!(state, ContainerState::Stopped);
+        assert!(
+            still_running,
+            "the runtime killed its launcher instead of establishing container exit"
+        );
+    }
+
+    #[tokio::test]
+    async fn failed_graceful_signal_preserves_the_launcher() {
+        signal_does_not_discard_a_live_launcher(false, false).await;
+    }
+
+    #[tokio::test]
+    async fn failed_force_signal_preserves_the_launcher() {
+        signal_does_not_discard_a_live_launcher(true, false).await;
+    }
+
+    #[tokio::test]
+    async fn acknowledged_force_signal_requires_observed_launcher_exit() {
+        signal_does_not_discard_a_live_launcher(true, true).await;
     }
 
     fn runc_tests_enabled() -> bool {
@@ -2287,6 +2488,26 @@ mod tests {
             "confirmed teardown should make the retired address reusable"
         );
         adopter.kill(&next_id).await.unwrap();
+
+        // Batch commands may finish before startup's first OCI state query.
+        // Both successful and failed jobs must retain their actual exit status.
+        for code in [0, 7] {
+            let job_id = InstanceId(format!("payments__runc-short-job-{code}"));
+            let _job_cleanup = TestNetworkCleanup(vec![job_id.clone()]);
+            let mut job_spec = record.oci_spec.clone();
+            job_spec.process.args = vec!["/bin/sh".into(), "-c".into(), format!("exit {code}")];
+            adopter.create(&job_id, &job_spec).await.unwrap();
+            adopter.start(&job_id).await.unwrap();
+            tokio::time::timeout(std::time::Duration::from_secs(5), async {
+                while adopter.state(&job_id).await.unwrap() != ContainerState::Stopped {
+                    tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+                }
+            })
+            .await
+            .unwrap();
+            assert_eq!(adopter.exit_code(&job_id).await, Some(code));
+            adopter.kill(&job_id).await.unwrap();
+        }
     }
 
     #[tokio::test]
