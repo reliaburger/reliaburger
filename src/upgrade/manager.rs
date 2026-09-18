@@ -761,7 +761,8 @@ mod tests {
     }
 
     fn compatible_binary(label: &[u8]) -> Vec<u8> {
-        let mut binary = b"#!/bin/sh\nprintf '%s' '{\"protocol\":4,\"state\":3}'\n# ".to_vec();
+        let formats = serde_json::to_string(&crate::compatibility::CURRENT).unwrap();
+        let mut binary = format!("#!/bin/sh\nprintf '%s' '{formats}'\n# ").into_bytes();
         binary.extend_from_slice(label);
         binary.push(b'\n');
         binary

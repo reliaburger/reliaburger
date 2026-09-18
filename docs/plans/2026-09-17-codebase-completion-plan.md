@@ -569,7 +569,11 @@ Both ownership API regressions fail before implementation. Five final API tests
 (2.36s), 74 Raft state-machine tests, 13 local lease tests, actual HTTPS Bun/Relish
 catalogue execution and cleanup (12.33s), and three-node leader-failure cleanup
 (17.60s) pass. Two compatibility checks (0.01s), all 17 client tests (0.17s), and strict
-Linux/macOS all-target/all-feature Clippy also pass.
+Linux/macOS all-target/all-feature Clippy also pass. Hosted CI then exposed
+three old-format literals in compatible join/upgrade fixtures (ten failures).
+The fixtures now derive their declaration from CURRENT; explicit incompatible
+fixtures remain. The complete Linux library checkpoint passes 3,263 tests with
+19 explicit privileged gates (39.69s), with strict Linux/macOS Clippy.
 
 **Job cleanup prerequisite completed:** Stopping a registered cron job now
 retires its exact namespace's schedule even before its first instance exists.

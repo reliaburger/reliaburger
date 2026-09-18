@@ -761,3 +761,12 @@ role, archive the previous operation, and see every target alive before asking
 for rollback. It keeps the same bounded wait and does not retry a mutation with
 an unknown outcome. All three Linux upgrade cases pass in 198.90 seconds with
 this preflight; the server continues to reject an incomplete authoritative view.
+
+Compatibility fixtures need two distinct jobs. A fixture for a *compatible*
+upgrade or join derives its declaration from `compatibility::CURRENT`, so a
+new state generation doesn't turn an unrelated signature or rollback test
+into an old-format rejection. Tests of incompatible binaries keep deliberately
+old or invalid declarations. This distinction caught up with us when leased
+tokens advanced the state format: three hard-coded fixtures caused ten CI
+failures, all at compatibility admission rather than the behaviour under test.
+We repaired the fixtures and retained the independent refusal tests.

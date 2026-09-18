@@ -10687,7 +10687,7 @@ mod tests {
                     .uri("/v1/cluster/join")
                     .header("content-type", "application/json")
                     .body(Body::from(
-                        r#"{"compatibility":{"protocol":4,"state":3},"token":"abc123","node_id":"node-02","csr_b64":""}"#,
+                        serde_json::json!({"compatibility": crate::compatibility::CURRENT, "token": "abc123", "node_id": "node-02", "csr_b64": ""}).to_string(),
                     ))
                     .unwrap(),
             )
@@ -10725,7 +10725,7 @@ mod tests {
                     .uri("/v1/cluster/join")
                     .header("content-type", "application/json")
                     .body(Body::from(
-                        r#"{"compatibility":{"protocol":4,"state":3},"token":"whatever","node_id":"node-09","csr_b64":""}"#,
+                        serde_json::json!({"compatibility": crate::compatibility::CURRENT, "token": "whatever", "node_id": "node-09", "csr_b64": ""}).to_string(),
                     ))
                     .unwrap(),
             )
