@@ -64,10 +64,8 @@ impl TestContext {
     /// Workload requests must never use the authenticated Bun API client.
     /// Redirects and ambient proxies are disabled to keep probes on their target.
     pub fn workload_http_client(&self) -> Result<reqwest::Client, String> {
-        reqwest::Client::builder()
-            .no_proxy()
-            .redirect(reqwest::redirect::Policy::none())
-            .timeout(Duration::from_secs(3))
+        self.client
+            .workload_http_builder()?
             .build()
             .map_err(|error| format!("could not create workload HTTP client: {error}"))
     }
@@ -392,23 +390,108 @@ impl TestContext {
         }
     }
 
-    /// The Pickle registry base URL on the entry node.
-    ///
-    /// The dev registry is bound to loopback (`127.0.0.1:5050`), reachable only
-    /// from *on* the node — so the registry cases run only when the harness
-    /// itself runs on a cluster node. The host is taken from the client so a
-    /// loopback client yields a loopback registry.
-    pub fn registry_base(&self) -> String {
-        let scheme = self.client.scheme();
-        let host = self
+    /// The declared Pickle origin, including its actual scheme and bound port.
+    pub fn registry_base(&self) -> Result<String, String> {
+        self.service_endpoint(
+            self.capabilities.service_endpoints.registry.as_deref(),
+            "registry",
+        )
+        .map(|url| url.as_str().trim_end_matches('/').to_string())
+    }
+
+    /// Select an explicitly declared ingress listener, preferring HTTP when
+    /// both protocols are available. No native port is inferred from the API.
+    pub fn ingress_endpoint(&self) -> Result<url::Url, String> {
+        let endpoints = &self.capabilities.service_endpoints;
+        self.service_endpoint(
+            endpoints
+                .ingress_http
+                .as_deref()
+                .or(endpoints.ingress_https.as_deref()),
+            "ingress",
+        )
+    }
+
+    fn service_endpoint(&self, declared: Option<&str>, service: &str) -> Result<url::Url, String> {
+        let declared = declared.ok_or_else(|| {
+            format!(
+                "{service} endpoint is not declared; managed clusters need an explicit host forward"
+            )
+        })?;
+        let mut endpoint = url::Url::parse(declared)
+            .map_err(|error| format!("invalid {service} endpoint: {error}"))?;
+        if !matches!(endpoint.scheme(), "http" | "https")
+            || endpoint.host().is_none()
+            || !endpoint.username().is_empty()
+            || endpoint.password().is_some()
+            || endpoint.query().is_some()
+            || endpoint.fragment().is_some()
+            || endpoint.path() != "/"
+            || endpoint.port_or_known_default() == Some(0)
+        {
+            return Err(format!("invalid {service} origin"));
+        }
+        let api = url::Url::parse(self.client.base_url()).map_err(|error| error.to_string())?;
+        let address = match endpoint.host() {
+            Some(url::Host::Ipv4(address)) => Some(std::net::IpAddr::V4(address)),
+            Some(url::Host::Ipv6(address)) => Some(std::net::IpAddr::V6(address)),
+            _ => None,
+        };
+        if address.is_some_and(|address| address.is_unspecified()) {
+            endpoint
+                .set_host(api.host_str())
+                .map_err(|error| error.to_string())?;
+        } else if address.is_some_and(|address| address.is_loopback()) {
+            let api_loopback = match api.host() {
+                Some(url::Host::Ipv4(address)) => address.is_loopback(),
+                Some(url::Host::Ipv6(address)) => address.is_loopback(),
+                _ => false,
+            };
+            if !api_loopback {
+                return Err(format!(
+                    "{service} listener is node-local; configure an explicit reachable forward"
+                ));
+            }
+        }
+        Ok(endpoint)
+    }
+
+    /// Keep the application's Host and TLS SNI while connecting to the declared
+    /// listener or host forward. Resolution and HTTP have independent bounds.
+    pub async fn ingress_probe(
+        &self,
+        hostname: &str,
+    ) -> Result<(url::Url, reqwest::Client), String> {
+        let mut endpoint = self.ingress_endpoint()?;
+        let port = endpoint
+            .port_or_known_default()
+            .ok_or("ingress port is missing")?;
+        let host = match endpoint.host().ok_or("ingress host is missing")? {
+            url::Host::Domain(host) => host.to_string(),
+            url::Host::Ipv4(host) => host.to_string(),
+            url::Host::Ipv6(host) => host.to_string(),
+        };
+        let addresses: Vec<_> = tokio::time::timeout(
+            Duration::from_secs(3),
+            tokio::net::lookup_host((host.as_str(), port)),
+        )
+        .await
+        .map_err(|_| "ingress endpoint resolution timed out")?
+        .map_err(|error| error.to_string())?
+        .collect();
+        if addresses.is_empty() {
+            return Err("ingress endpoint resolved to no addresses".into());
+        }
+        endpoint
+            .set_host(Some(hostname))
+            .map_err(|error| error.to_string())?;
+        let client = self
             .client
-            .base_url()
-            .trim_start_matches("http://")
-            .trim_start_matches("https://")
-            .split(':')
-            .next()
-            .unwrap_or("127.0.0.1");
-        format!("{scheme}://{host}:5050")
+            .workload_http_builder()?
+            .resolve_to_addrs(hostname, &addresses)
+            .build()
+            .map_err(|error| error.to_string())?;
+        Ok((endpoint, client))
     }
 
     /// The API port the entry node serves on, reused for every node.
@@ -756,6 +839,147 @@ mod tests {
             .unwrap();
         server.abort();
         assert!(!leaked, "workload requests must never carry the API bearer");
+    }
+
+    #[test]
+    fn registry_uses_declared_ipv6_scheme_and_port() {
+        let mut ctx = context("rbtest-endpoints");
+        ctx.client = BunClient::new_with_token("http://[::1]:19117", None);
+        let mut report = serde_json::to_value(&ctx.capabilities).unwrap();
+        report["service_endpoints"] = serde_json::json!({
+            "registry": "https://[::1]:15051"
+        });
+        ctx.capabilities = serde_json::from_value(report).unwrap();
+        assert_eq!(ctx.registry_base().unwrap(), "https://[::1]:15051");
+    }
+
+    #[tokio::test]
+    async fn registry_reaches_a_declared_ipv6_listener_with_explicit_authentication() {
+        let listener = tokio::net::TcpListener::bind("[::1]:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let router = axum::Router::new().route(
+            "/v2/",
+            axum::routing::get(|headers: axum::http::HeaderMap| async move {
+                assert_eq!(
+                    headers.get("authorization").unwrap(),
+                    "Bearer registry-token"
+                );
+                "registry"
+            }),
+        );
+        let server = tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
+        let mut ctx = context("rbtest-ipv6");
+        ctx.client = BunClient::new_with_token("http://[::1]:19117", Some("registry-token"));
+        ctx.capabilities.service_endpoints.registry = Some(format!("http://{address}"));
+        let origin = ctx.registry_base().unwrap();
+        let client = ctx.client.registry_http_client(&origin).unwrap();
+        assert_eq!(
+            client
+                .get(format!("{origin}/v2/"))
+                .send()
+                .await
+                .unwrap()
+                .text()
+                .await
+                .unwrap(),
+            "registry"
+        );
+        server.abort();
+    }
+
+    #[test]
+    fn endpoints_refuse_guesses_and_use_the_api_host_only_for_wildcard_binds() {
+        let mut ctx = context("rbtest-endpoints");
+        assert!(ctx.registry_base().unwrap_err().contains("not declared"));
+        assert!(ctx.ingress_endpoint().unwrap_err().contains("not declared"));
+        ctx.client = BunClient::new_with_token("https://[2001:db8::1]:19117", None);
+        ctx.capabilities.service_endpoints.registry = Some("https://[::]:15051".into());
+        assert_eq!(ctx.registry_base().unwrap(), "https://[2001:db8::1]:15051");
+        for invalid in [
+            "http://127.0.0.1:5050",
+            "https://user:secret@example.com",
+            "ftp://example.com",
+            "https://example.com/path",
+            "https://example.com?token=secret",
+        ] {
+            ctx.capabilities.service_endpoints.registry = Some(invalid.into());
+            assert!(ctx.registry_base().is_err(), "accepted {invalid}");
+        }
+    }
+
+    #[tokio::test]
+    async fn https_ingress_uses_a_forward_with_workload_sni_and_no_api_credentials() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let certificate =
+            rcgen::generate_simple_self_signed(vec!["workload.example".into()]).unwrap();
+        let config = rustls::ServerConfig::builder_with_provider(std::sync::Arc::new(
+            rustls::crypto::ring::default_provider(),
+        ))
+        .with_safe_default_protocol_versions()
+        .unwrap()
+        .with_no_client_auth()
+        .with_single_cert(
+            vec![certificate.cert.der().clone()],
+            rustls::pki_types::PrivatePkcs8KeyDer::from(certificate.key_pair.serialize_der())
+                .into(),
+        )
+        .unwrap();
+        let acceptor = tokio_rustls::TlsAcceptor::from(std::sync::Arc::new(config));
+        let guest = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let guest_address = guest.local_addr().unwrap();
+        let (observed_tx, observed_rx) = tokio::sync::oneshot::channel();
+        let server = tokio::spawn(async move {
+            let (socket, _) = guest.accept().await.unwrap();
+            let mut tls = acceptor.accept(socket).await.unwrap();
+            let sni = tls.get_ref().1.server_name().map(str::to_string);
+            let mut bytes = Vec::new();
+            loop {
+                let mut chunk = [0; 1024];
+                let count = tls.read(&mut chunk).await.unwrap();
+                assert!(count > 0 && bytes.len() < 8192);
+                bytes.extend_from_slice(&chunk[..count]);
+                if bytes.ends_with(b"\r\n\r\n") {
+                    break;
+                }
+            }
+            observed_tx
+                .send((sni, String::from_utf8(bytes).unwrap()))
+                .unwrap();
+            tls.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok")
+                .await
+                .unwrap();
+            tls.shutdown().await.unwrap();
+        });
+        let forward = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = forward.local_addr().unwrap();
+        let forwarding = tokio::spawn(async move {
+            let (mut host, _) = forward.accept().await.unwrap();
+            let mut guest = tokio::net::TcpStream::connect(guest_address).await.unwrap();
+            tokio::io::copy_bidirectional(&mut host, &mut guest)
+                .await
+                .ok();
+        });
+        let mut ctx = context("rbtest-tls");
+        ctx.client = BunClient::new_with_ca(
+            "https://127.0.0.1:19117",
+            Some("private-api-token"),
+            certificate.cert.pem().as_bytes(),
+        )
+        .unwrap();
+        ctx.capabilities.service_endpoints.ingress_https = Some(format!("https://{address}"));
+        let (url, client) = ctx.ingress_probe("workload.example").await.unwrap();
+        assert_eq!(url.port(), Some(address.port()));
+        assert_eq!(
+            client.get(url).send().await.unwrap().text().await.unwrap(),
+            "ok"
+        );
+        let (sni, headers) = observed_rx.await.unwrap();
+        assert_eq!(sni.as_deref(), Some("workload.example"));
+        assert!(headers.to_lowercase().contains("host: workload.example:"));
+        assert!(!headers.to_lowercase().contains("authorization:"));
+        assert!(!headers.contains("private-api-token"));
+        server.await.unwrap();
+        forwarding.await.unwrap();
     }
 
     #[test]

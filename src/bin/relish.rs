@@ -388,6 +388,9 @@ enum Command {
         api_port: Option<u16>,
         #[arg(long, requires = "quickstart")]
         ingress_port: Option<u16>,
+        /// Host port forwarded to the managed Pickle registry (default: 15050).
+        #[arg(long, requires = "quickstart")]
+        registry_port: Option<u16>,
         /// Use explicitly supplied Linux binaries for development before a release exists.
         #[arg(long, requires = "quickstart")]
         development_binaries: Option<PathBuf>,
@@ -1546,6 +1549,7 @@ async fn main() -> ExitCode {
             nodes,
             api_port,
             ingress_port,
+            registry_port,
             development_binaries,
             yes,
             ref dir,
@@ -1559,6 +1563,7 @@ async fn main() -> ExitCode {
                         nodes: nodes.unwrap_or(3),
                         api_port: api_port.unwrap_or(19117),
                         ingress_port: ingress_port.unwrap_or(18080),
+                        registry_port: registry_port.unwrap_or(15050),
                         development_binaries,
                     },
                 )

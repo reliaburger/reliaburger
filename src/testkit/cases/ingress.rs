@@ -15,40 +15,33 @@ fn ingress_host(ctx: &TestContext) -> String {
     format!("{}.rbtest-ingress.example", ctx.namespace)
 }
 
-fn app_with_ingress(ctx: &TestContext, app: &str) -> String {
-    format!(
-        "{}\n[app.{app}.ingress]\nhost = \"{host}\"\npath = \"/\"\n",
+fn app_with_ingress(ctx: &TestContext, app: &str) -> Result<String, String> {
+    let tls = if ctx.ingress_endpoint()?.scheme() == "https" {
+        if ctx.capabilities.has(Capability::IngressClusterTls) {
+            "cluster"
+        } else {
+            "explicit"
+        }
+    } else {
+        "none"
+    };
+    Ok(format!(
+        "{}\n[app.{app}.ingress]\nhost = \"{host}\"\npath = \"/\"\ntls = \"{tls}\"\n",
         ctx.container_http_spec(app, 1),
         host = ingress_host(ctx),
-    )
+    ))
 }
 
-/// Probe the default native ingress listener without forwarding API credentials.
+/// Probe the declared listener without forwarding API credentials.
 async fn wait_for_proxy(ctx: &TestContext, expected_status: u16) -> Result<(), String> {
-    let mut url = url::Url::parse(ctx.client.base_url()).map_err(|error| error.to_string())?;
-    url.set_scheme("http")
-        .map_err(|_| "invalid ingress scheme")?;
-    url.set_port(Some(80)).map_err(|_| "invalid ingress port")?;
+    let (mut url, client) = ctx.ingress_probe(&ingress_host(ctx)).await?;
     url.set_path("/hostname");
-    url.set_query(None);
-    url.set_username("")
-        .map_err(|_| "invalid ingress authority")?;
-    url.set_password(None)
-        .map_err(|_| "invalid ingress authority")?;
-    // BunClient carries the administrator's bearer. Workload HTTP must use
-    // a separate client, or the ingress proxy would forward it to the app.
-    let client = ctx.workload_http_client()?;
     let mut last = "no response".to_string();
     let outcome = ctx
         .deadline
         .run("ingress convergence", async {
             loop {
-                match client
-                    .get(url.clone())
-                    .header("Host", ingress_host(ctx))
-                    .send()
-                    .await
-                {
+                match client.get(url.clone()).send().await {
                     Ok(response) => {
                         let status = response.status().as_u16();
                         match response.text().await {
@@ -74,7 +67,7 @@ async fn wait_for_proxy(ctx: &TestContext, expected_status: u16) -> Result<(), S
 /// A request carrying the app's host header reaches the app through the proxy.
 async fn ingress_routes_host_header_to_app(ctx: TestContext) -> Result<(), String> {
     let app = "ing-web";
-    ctx.apply(&app_with_ingress(&ctx, app)).await?;
+    ctx.apply(&app_with_ingress(&ctx, app)?).await?;
     ctx.wait_running_cluster(app, 1).await?;
 
     wait_for_proxy(&ctx, 200).await
@@ -83,7 +76,7 @@ async fn ingress_routes_host_header_to_app(ctx: TestContext) -> Result<(), Strin
 /// Stopping the app removes its desired route and eventually returns not found.
 async fn ingress_removes_route_after_stop(ctx: TestContext) -> Result<(), String> {
     let app = "ing-gone";
-    ctx.apply(&app_with_ingress(&ctx, app)).await?;
+    ctx.apply(&app_with_ingress(&ctx, app)?).await?;
     ctx.wait_running_cluster(app, 1).await?;
     wait_for_proxy(&ctx, 200).await?;
     ctx.client
@@ -97,7 +90,7 @@ async fn ingress_removes_route_after_stop(ctx: TestContext) -> Result<(), String
 /// The route appears in the routing table with its backend.
 async fn ingress_route_appears_in_routing_table(ctx: TestContext) -> Result<(), String> {
     let app = "ing-listed";
-    ctx.apply(&app_with_ingress(&ctx, app)).await?;
+    ctx.apply(&app_with_ingress(&ctx, app)?).await?;
     ctx.wait_running_cluster(app, 1).await?;
 
     ctx.deadline

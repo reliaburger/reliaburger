@@ -123,6 +123,9 @@ repo layout live in the manual (`relish manual`, "Under the hood") and the
 
 ## Try it
 
+The managed quickstart records localhost ingress and authenticated registry
+forwards. See the [port options](docs/quickstart.md#resume-stop-and-remove).
+
 Use the source-based quick start above while we prepare the first release.
 From a checkout, install cargo-nextest 0.9.145 or newer (see
 [build prerequisites](docs/README.md#building)), then run the portable tests and

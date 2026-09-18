@@ -1,6 +1,8 @@
 # Reliaburger Documentation
 
 For managed Linux VMs on a laptop, see the [quickstart guide](quickstart.md).
+The managed context records ingress and authenticated registry forwards; catalogue
+probes use declared service endpoints, including configured ports and IPv6.
 The source implementation is undergoing qualification; the signed public
 installer is pending release.
 

@@ -970,3 +970,12 @@ never invoke Lima, that a missing owned VM permits only a listing, and that an
 invalid checkout is refused before `--recreate`. A shell fixture passes a path
 containing quotes and command substitution plus a semicolon-bearing test filter;
 only the intended argument reaches Cargo. No real VM is involved.
+
+
+The managed context also records service forwards. HTTP ingress defaults to
+localhost port 18080 and the authenticated HTTPS registry to 15050. The latter is
+selected with `relish setup --quickstart --registry-port PORT`. Setup checks that
+it doesn't overlap an API or ingress port, and Lima exposes it only on loopback.
+The context lets the test catalogue use the host address rather than guessing a
+guest port from the API URL. Chapter 15 follows that distinction through IPv6,
+TLS server names and credential-free workload probes.

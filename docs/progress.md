@@ -23,7 +23,7 @@ for every item below. IDs are scoped to that plan, not the older C1/M1 review ID
 The [audit record](qualification/2026-09-17-code-audit.md) separates local defect
 reproductions from inspected source and previous acceptance evidence.
 
-These are work packages, not 76 mandatory features for 0.1.0. Correctness fixes
+These are work packages, not 77 mandatory features for 0.1.0. Correctness fixes
 need explicit release dispositions; optional refactors and future capabilities
 remain separate. Older unchecked groups below point into this current ledger.
 
@@ -61,7 +61,7 @@ remain separate. Older unchecked groups below point into this current ledger.
 - [ ] **C30** (P1) Replace unconditional unknown catalogue cases with real evidence.
 - [x] **C31** Generate 128-bit random run IDs instead of second-resolution timestamps. The 1,024-invocation concurrent regression fails before the fix; all six command tests and the existing lease collision/refusal test pass. Fixed namespaces retain server ownership checks.
 - [x] **C32** Replace magic-string verdicts with `CaseError::{Failed, Unknown}` and reject invalid runner timeouts, parallelism and namespace inputs before side effects. The workload-prefix regression fails before the fix; all 108 testkit tests and all-target/all-feature Clippy pass, including checked deadline overflow and direct-library invalid inputs.
-- [ ] **C33** (P2) Discover actual registry and ingress test endpoints.
+- [x] **C33** Publish actual bound service origins and use explicit managed host forwards, including an authenticated registry forward configurable with `--registry-port`. Parse IPv6 and configured ports without guessing; refuse missing/unsafe origins. Workload clients preserve Host/SNI through forwards with normal certificate hostname verification and no API credentials. The malformed-IPv6 regression fails before the fix. The 3,241-test library checkpoint, 13 final endpoint tests, 29 managed-cluster tests, real ephemeral Bun listener probes (0.11s), managed-status integration (5.66s) and strict all-target/all-feature Clippy pass. Exact-candidate VM qualification remains V03/V04.
 - [ ] **C34** (P2) Define lease ownership for the remaining test resources.
 - [x] **C35** Select exact chaos scenario names and require only their capability/operation union. The complete five-case suite still refuses unavailable pressure or saturation authority; selected node failures need neither. Thirteen chaos and six CLI tests pass, covering unknown/empty selections, consent, protected clusters and exact fault cleanup.
 - [x] **C36** Retire legacy partition/isolation and blanket-heal mutations in favour of the guarded catalogue. Every old mutation returns an explicit migration error before contacting a node, with or without acknowledgement; the unreachable-node regression fails before the fix and passes afterwards. Read-only status remains available.
@@ -79,6 +79,8 @@ remain separate. Older unchecked groups below point into this current ledger.
 - [x] **C46** Preserve authorised namespace/service identities through DNS fault publication and lookup; overlapping owners retain the latest expiry, and clearing one preserves the others. Missing namespaces and individual-instance DNS targets refuse without leaving registry entries. The cross-namespace wire regression fails before the fix; 32 DNS-filtered library tests, 14 wire tests, both final agent regressions and strict Linux all-target/all-feature Clippy pass.
 
 - [x] **C47** Persist exclusive ownership of the 509-address rootful pool before network mutation; serialise each instance lifecycle, refuse exhaustion and retain reservations on uncertain cleanup. Reuse requires confirmed namespace/veth removal and inspection/removal of owned nftables forwarding. Corrupt or conflicting journals and adoption refuse. The exhaustion regression fails before the fix; 255 runtime tests and strict Linux Clippy pass, plus real cancellation/restart recovery (0.32s), adoption/duplicate-create/reuse (4.32s), failed setup (2.26s) and orphaned forwarding retirement (0.16s). Abandoned reservations remain occupied until explicit runtime cleanup; physical crash qualification remains V02.
+
+- [ ] **C48** (P1) Confine registry upload credentials to the declared origin; reject cross-origin upload locations before PATCH or PUT. Found while validating C33 endpoint discovery.
 
 ### Engineering follow-ups
 

@@ -1376,8 +1376,9 @@ That last group — image-registry — is the one we said needed its own day. Th
 day came. Its cases push an image to the cluster's Pickle registry and check it
 comes back, and the reason it was awkward is worth stating plainly: the harness
 has no image to push and no push method to call. `BunClient` can *list* images
-but not upload one, and the dev registry binds to loopback, reachable only from
-on a node. So the harness has to become, briefly, a registry client.
+but not upload one. Originally the dev registry was reachable only from its
+node; declared endpoints and managed forwards now remove that assumption. The
+harness still has to become, briefly, a registry client.
 
 Building the image is the interesting half. An OCI image is not a magic format;
 it's three blobs and a bit of JSON. A **config** blob describing the platform, a
@@ -1405,7 +1406,7 @@ runnable image in Pickle is a job for another day, and it says so.
 That completes the catalogue: thirteen groups, thirty-nine cases. Not all of
 them run everywhere — the process-runtime cases skip on runc and the container
 cases skip on a process cluster; firewall wants eBPF, ingress wants the proxy,
-the registry cases want to be on a node. But every skip names its reason, every
+the registry cases need a declared reachable endpoint. But every skip names its reason, every
 group that can be exercised is, and the shape of what the cluster promises is now
 written down as tests that either hold it to that promise or say, out loud, why
 they couldn't. Which was the whole point of the chapter.
@@ -2682,3 +2683,50 @@ addresses and had forgotten every peer. We added bounded gossip rediscovery and
 a separate regression for that case. The reservation remained held throughout
 the failure, which was the safe outcome, but the experiment still hadn't recovered.
 A refusal is not a substitute for testing the recovery path.
+
+
+### Finding the service we actually started
+
+Suppose the API is at `https://[::1]:19117` and Pickle is at
+`https://[::1]:15051`. Splitting the API string at its first colon doesn't find a
+host. It finds `https`. Even after removing the scheme, it finds `[`. Assuming
+port 5050 then produces an invalid URL and tests a listener we never started.
+
+Bun now publishes a `ServiceEndpoints` value with its capabilities. Each field is
+an `Option<String>`: `Some(origin)` names a bound listener; `None` says no endpoint
+was declared. A capability boolean alone doesn't tell a client how to reach the
+service. We bind Pickle before constructing that report, so a configured port of
+zero becomes the actual port assigned by the kernel. Ingress uses its bound HTTP
+and HTTPS addresses too.
+
+A wildcard bind such as `0.0.0.0` means all local interfaces. The probe substitutes
+the API host for that wildcard, while retaining the declared service's scheme and
+port. A node-local loopback address on a remote API is refused. It isn't the
+caller's loopback. Origins with credentials, paths, queries or unsupported schemes
+are refused rather than repaired by string manipulation.
+
+Managed VMs need another translation. Their listeners live in a guest network,
+while the laptop connects through explicit forwards. The saved context therefore
+replaces the report's endpoints with the forwards the setup operation owns. An
+absent forward stays absent. Setup adds one authenticated HTTPS Pickle forward on
+localhost port 15050, alongside HTTP ingress on 18080; both are configurable and
+checked for collisions. Older state has no registry forward, so lifecycle commands
+can still manage it without claiming that an uncreated forward exists.
+
+TLS adds one more name. The socket might be localhost port 18443, but the route
+and certificate belong to `workload.example`. We resolve the declared socket,
+then keep the workload name in the request URL and override DNS resolution for
+that name in a separate HTTP client. That preserves both the HTTP Host header and
+TLS SNI (the server name sent during the handshake). The client trusts the cluster
+CA alongside ordinary roots and performs normal hostname verification. It never
+inherits the API bearer or the control-plane hostname exception. Pickle's client
+is separate: it authenticates control-plane operations and refuses remote HTTP
+before sending credentials.
+
+The regression first reproduces the malformed IPv6 URL. A real Bun process then
+binds all three service ports to zero and proves the published listeners answer.
+A separate TLS server, reached through a TCP forward, records the workload SNI
+and headers so a successful response cannot hide a leaked administrator token.
+A negative handshake checks that API-specific hostname leniency hasn't escaped
+into workload requests. Managed-context tests verify that unforwarded guest
+endpoints never sneak back in.

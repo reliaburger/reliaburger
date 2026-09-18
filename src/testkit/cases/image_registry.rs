@@ -1,8 +1,8 @@
 //! Image-registry cases: push, list, and deploy from the Pickle registry.
 //!
 //! These build a synthetic OCI image in the harness and speak the raw `/v2`
-//! protocol to the node's registry, which is loopback-bound on a dev cluster —
-//! so they run only when the harness itself runs on a node. Gated on
+//! protocol to the registry origin declared by the node or managed host
+//! context. Missing reachability is an explicit error. Gated on
 //! [`Capability::Registry`].
 //!
 //! [`Capability::Registry`]: crate::bun::capabilities::Capability::Registry
@@ -16,26 +16,14 @@ use crate::testkit_case;
 
 /// A pushed image can be pulled back with a matching manifest digest.
 async fn push_and_pull_image_roundtrip(ctx: TestContext) -> Result<(), String> {
-    let base = ctx.registry_base();
+    let base = ctx.registry_base()?;
+    let client = ctx.client.registry_http_client(&base)?;
     let repo = "rbtest-roundtrip";
     let image = oci::build_synthetic_image("roundtrip");
 
-    oci::push_image(
-        ctx.client.http().map_err(|error| error.to_string())?,
-        &base,
-        repo,
-        "v1",
-        &image,
-    )
-    .await?;
+    oci::push_image(&client, &base, repo, "v1", &image).await?;
 
-    let pulled = oci::fetch_manifest(
-        ctx.client.http().map_err(|error| error.to_string())?,
-        &base,
-        repo,
-        "v1",
-    )
-    .await?;
+    let pulled = oci::fetch_manifest(&client, &base, repo, "v1").await?;
     let pulled_digest = oci::sha256_digest(&pulled);
     if pulled_digest != image.manifest_digest {
         return Err(format!(
@@ -48,17 +36,11 @@ async fn push_and_pull_image_roundtrip(ctx: TestContext) -> Result<(), String> {
 
 /// A pushed image appears in the manifest catalogue.
 async fn manifest_catalog_lists_pushed_image(ctx: TestContext) -> Result<(), String> {
-    let base = ctx.registry_base();
+    let base = ctx.registry_base()?;
+    let client = ctx.client.registry_http_client(&base)?;
     let repo = "rbtest-listed";
     let image = oci::build_synthetic_image("listed");
-    oci::push_image(
-        ctx.client.http().map_err(|error| error.to_string())?,
-        &base,
-        repo,
-        "v1",
-        &image,
-    )
-    .await?;
+    oci::push_image(&client, &base, repo, "v1", &image).await?;
 
     let images = ctx
         .client

@@ -29,6 +29,8 @@ pub struct Options {
     pub api_port: u16,
     /// Browser-facing HTTP ingress port.
     pub ingress_port: u16,
+    /// Host port forwarded to Pickle on the first node.
+    pub registry_port: u16,
     /// Explicit development-only directory containing prebuilt Linux bun and relish.
     pub development_binaries: Option<PathBuf>,
 }
@@ -42,6 +44,7 @@ pub async fn run(options: Options) -> Result<()> {
         version: env!("CARGO_PKG_VERSION").parse::<BinaryVersion>()?,
         api_port: options.api_port,
         ingress_port: options.ingress_port,
+        registry_port: Some(options.registry_port),
     };
     let operation_root = root.clone();
     let (mut operation, bootstrap, _setup_lock) =
@@ -168,15 +171,18 @@ async fn provision_cluster(
             std::env::consts::ARCH,
             spec.api_port + index as u16,
             (index == 0).then_some(spec.ingress_port),
+            (index == 0).then_some(spec.registry_port).flatten(),
         )?;
         tokio::fs::write(&config_path, yaml).await?;
         let status = statuses[index].clone();
         let api_port = spec.api_port + index as u16;
         let ingress_port = (index == 0).then_some(spec.ingress_port);
+        let registry_port = (index == 0).then_some(spec.registry_port).flatten();
         let boot = async move {
             if status.as_deref() != Some("Running") {
                 let mut ports = vec![api_port];
                 ports.extend(ingress_port);
+                ports.extend(registry_port);
                 super::preflight::ports(&ports).await?;
             }
             match status.as_deref() {
@@ -412,6 +418,13 @@ async fn provision_cluster(
         endpoint,
         token: tokio::fs::read_to_string(bootstrap.directory.join("admin.token")).await?,
         ca_cert: bootstrap.directory.join("identity/root-ca.crt"),
+        service_endpoints: crate::bun::capabilities::ServiceEndpoints {
+            registry: spec
+                .registry_port
+                .map(|port| format!("https://127.0.0.1:{port}")),
+            ingress_http: Some(format!("http://127.0.0.1:{}", spec.ingress_port)),
+            ingress_https: None,
+        },
     };
     let path = root.join("context.json");
     tokio::task::spawn_blocking(move || context.save(&path)).await??;

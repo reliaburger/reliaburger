@@ -23,6 +23,8 @@ pub struct BunClient {
     client: Result<reqwest::Client, String>,
     websocket_tls: Option<std::sync::Arc<rustls::ClientConfig>>,
     token: Option<String>,
+    ca_pem: Option<Vec<u8>>,
+    service_endpoints: Option<crate::bun::capabilities::ServiceEndpoints>,
 }
 
 /// Options for fetching or streaming logs.
@@ -273,6 +275,8 @@ impl BunClient {
                     base_url: base_url.trim_end_matches('/').to_string(),
                     client: Err(format!("failed to read cluster CA: {error}")),
                     websocket_tls: None,
+                    ca_pem: None,
+                    service_endpoints: None,
                     token: token.map(str::to_string),
                 };
             }
@@ -331,6 +335,8 @@ impl BunClient {
             base_url: base_url.trim_end_matches('/').to_string(),
             client,
             websocket_tls,
+            ca_pem: ca_pem.map(<[u8]>::to_vec),
+            service_endpoints: None,
             token: token.map(str::to_string),
         }
     }
@@ -362,8 +368,48 @@ impl BunClient {
             base_url: base_url.trim_end_matches('/').to_string(),
             client: self.client.clone(),
             websocket_tls: self.websocket_tls.clone(),
+            ca_pem: self.ca_pem.clone(),
+            service_endpoints: None,
             token: self.token.clone(),
         }
+    }
+
+    /// Declare the host forwards owned by this managed connection. Missing
+    /// forwards remain unavailable instead of falling back to guest addresses.
+    pub fn with_service_endpoints(
+        mut self,
+        endpoints: crate::bun::capabilities::ServiceEndpoints,
+    ) -> Self {
+        self.service_endpoints = Some(endpoints);
+        self
+    }
+
+    /// Build a separate workload client with normal hostname verification and
+    /// the cluster CA, without the API bearer or client identity.
+    pub fn workload_http_builder(&self) -> Result<reqwest::ClientBuilder, String> {
+        self.http().map_err(|error| error.to_string())?;
+        let mut builder = reqwest::Client::builder()
+            .no_proxy()
+            .redirect(reqwest::redirect::Policy::none())
+            .timeout(std::time::Duration::from_secs(3));
+        if let Some(pem) = &self.ca_pem {
+            for certificate in rustls_pemfile::certs(&mut &pem[..]) {
+                let certificate = certificate.map_err(|error| error.to_string())?;
+                builder = builder.add_root_certificate(
+                    reqwest::Certificate::from_der(&certificate)
+                        .map_err(|error| error.to_string())?,
+                );
+            }
+        }
+        Ok(builder)
+    }
+
+    /// Address a declared Pickle endpoint with control-plane credentials. Remote
+    /// plaintext and credentials embedded in URLs are refused before sending.
+    pub fn registry_http_client(&self, endpoint: &str) -> Result<reqwest::Client, String> {
+        validate_endpoint(endpoint).map_err(|error| error.to_string())?;
+        let client = Self::build(endpoint, self.token.as_deref(), self.ca_pem.as_deref());
+        client.http().cloned().map_err(|error| error.to_string())
     }
 
     /// The underlying HTTP client, pre-configured with the resolved bearer
@@ -399,6 +445,8 @@ impl BunClient {
                         base_url: context.endpoint,
                         client: Err(error.to_string()),
                         websocket_tls: None,
+                        ca_pem: None,
+                        service_endpoints: None,
                         token: None,
                     });
             }
@@ -407,6 +455,8 @@ impl BunClient {
                     base_url: "https://127.0.0.1:19117".to_string(),
                     client: Err(error.to_string()),
                     websocket_tls: None,
+                    ca_pem: None,
+                    service_endpoints: None,
                     token: None,
                 };
             }
@@ -710,7 +760,12 @@ impl BunClient {
     pub async fn capabilities(
         &self,
     ) -> Result<crate::bun::capabilities::ClusterCapabilities, RelishError> {
-        self.get_typed_json("/v1/capabilities").await
+        let mut report: crate::bun::capabilities::ClusterCapabilities =
+            self.get_typed_json("/v1/capabilities").await?;
+        if let Some(endpoints) = &self.service_endpoints {
+            report.service_endpoints = endpoints.clone();
+        }
+        Ok(report)
     }
 
     /// Fetch an authenticated, bounded collection from current cluster peers.
@@ -2328,7 +2383,55 @@ mod tests {
             .await
             .expect("cluster-CA client should reach the agent over HTTPS");
 
+        let workload = client.workload_http_builder().unwrap().build().unwrap();
+        assert!(
+            workload
+                .get(format!("https://{addr}/v1/health"))
+                .send()
+                .await
+                .is_err(),
+            "workload clients must not inherit the control-plane hostname exception"
+        );
+
         shutdown.cancel();
+    }
+
+    #[tokio::test]
+    async fn managed_capabilities_use_only_declared_host_forwards() {
+        use crate::bun::capabilities::{ClusterCapabilities, ServiceEndpoints};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let router = axum::Router::new().route(
+            "/v1/capabilities",
+            axum::routing::get(|| async {
+                axum::Json(ClusterCapabilities {
+                    service_endpoints: ServiceEndpoints {
+                        registry: Some("https://192.168.104.2:5050".into()),
+                        ingress_http: Some("http://0.0.0.0:80".into()),
+                        ingress_https: Some("https://0.0.0.0:443".into()),
+                    },
+                    ..Default::default()
+                })
+            }),
+        );
+        let server = tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
+        let forwards = ServiceEndpoints {
+            registry: Some("https://127.0.0.1:15050".into()),
+            ingress_http: Some("http://127.0.0.1:18080".into()),
+            ingress_https: None,
+        };
+        let client = BunClient::new_with_token(&format!("http://{address}"), None)
+            .with_service_endpoints(forwards.clone());
+        assert_eq!(
+            client.capabilities().await.unwrap().service_endpoints,
+            forwards
+        );
+        assert!(
+            client
+                .registry_http_client("http://192.168.104.2:5050")
+                .is_err()
+        );
+        server.abort();
     }
 
     /// With built-in roots off, only the configured CA is trusted: a client

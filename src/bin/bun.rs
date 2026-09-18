@@ -790,6 +790,7 @@ async fn run_agent(cli: Cli) -> anyhow::Result<()> {
         readiness.register("dns", true).await;
     }
     let mut ingress_cluster_tls_ready = false;
+    let mut service_endpoints = reliaburger::bun::capabilities::ServiceEndpoints::default();
     if config.ingress.enabled {
         readiness.register("ingress", true).await;
     }
@@ -1365,6 +1366,8 @@ async fn run_agent(cli: Cli) -> anyhow::Result<()> {
         )
         .await
         .map_err(|e| anyhow::anyhow!("failed to bind ingress listeners: {e}"))?;
+        service_endpoints.ingress_http = Some(format!("http://{}", bound.http_addr));
+        service_endpoints.ingress_https = Some(format!("https://{}", bound.https_addr));
         println!(
             "bun: ingress listening on http {} / https {}",
             bound.http_addr, bound.https_addr
@@ -1989,7 +1992,18 @@ async fn run_agent(cli: Cli) -> anyhow::Result<()> {
         },
     )
     .collect();
+    let mut registry_bind = reliaburger::pickle::capability::plan_registry_bind(
+        &config.images.registry_bind,
+        config.images.registry_port,
+        registry_cluster_advertise,
+    )
+    .map_err(|error| anyhow::anyhow!("invalid Pickle registry listener: {error}"))?;
+    let pickle_listener = tokio::net::TcpListener::bind(registry_bind.listen_addr).await?;
+    registry_bind.listen_addr = pickle_listener.local_addr()?;
+    let registry_addr = registry_bind.listen_addr;
+    service_endpoints.registry = Some(format!("{registry_scheme}://{registry_addr}"));
     let static_capabilities = reliaburger::bun::capabilities::StaticCapabilities {
+        service_endpoints,
         node_id: node_name.clone(),
         cluster_name: config.cluster.name.clone(),
         cluster_mode: cli.cluster,
@@ -2188,12 +2202,6 @@ async fn run_agent(cli: Cli) -> anyhow::Result<()> {
     }
 
     // Start the Pickle OCI registry server
-    let mut registry_bind = reliaburger::pickle::capability::plan_registry_bind(
-        &config.images.registry_bind,
-        config.images.registry_port,
-        registry_cluster_advertise,
-    )
-    .map_err(|error| anyhow::anyhow!("invalid Pickle registry listener: {error}"))?;
     let pickle_dir = storage_directory(&config.storage.images, "images").await?;
     let node_raft_id = reliaburger::cluster::identity::raft_id_from_name(&node_name);
 
@@ -2286,9 +2294,6 @@ async fn run_agent(cli: Cli) -> anyhow::Result<()> {
     }
 
     let pickle_app = reliaburger::pickle::api::router(pickle_state);
-    let pickle_listener = tokio::net::TcpListener::bind(registry_bind.listen_addr).await?;
-    registry_bind.listen_addr = pickle_listener.local_addr()?;
-    let registry_addr = registry_bind.listen_addr;
     // Describe the listener honestly (B3). A clustered listener authenticates
     // writes (service token or a Deployer bearer) and, on a routable bind,
     // reads too — regardless of TLS. Only the literal loopback standalone

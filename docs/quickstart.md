@@ -83,8 +83,12 @@ the downloaded tool and image cache for future clusters. `--name NAME` selects
 a different saved cluster; setup currently supports one active CLI context.
 
 The API forwards bind loopback ports 19117–19119. The first node's HTTP ingress
-uses 18080. Change these with `setup --quickstart --api-port PORT
---ingress-port PORT` if needed. Other guest ports aren't automatically exposed.
+uses 18080, and its authenticated HTTPS Pickle registry uses 15050. Change these
+with `setup --quickstart --api-port PORT --ingress-port PORT --registry-port PORT`
+if needed. Other guest ports aren't automatically exposed. The saved context
+records the explicit host forwards so catalogue tests don't guess guest ports.
+Older development clusters without a registry forward can still be stopped or
+destroyed; recreate them to use the new setup ports.
 The context contains an administrator credential and is stored with mode 0600;
 normal CLI commands read it without requiring a VM shell. The node APIs use
 TLS and pinned cluster CAs. Explicit `--endpoint` settings don't inherit this

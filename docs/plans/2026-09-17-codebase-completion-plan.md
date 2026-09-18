@@ -474,6 +474,8 @@ Registry host extraction splits at the first colon and hardcodes 5050; ingress n
 
 **Completion test:** Bracketed IPv6, configured ports, HTTPS and host-forwarded managed clusters reach the declared service. Workload requests never inherit control-plane credentials.
 
+**Completed on PR #167:** Bun reports actual bound service origins, including ephemeral ports. Managed contexts substitute only explicit host forwards, with a configurable authenticated registry forward. Ingress probes preserve workload Host/SNI through forwards using a separate CA-aware client with normal hostname verification and no API credentials. The 3,241-test library checkpoint, 13 final endpoint tests, 29 managed-cluster tests, real ephemeral Bun listener probes, managed-status integration and strict all-target/all-feature Clippy pass. A focused run also caught and removed a test-only dependency on another TLS test installing the process crypto provider.
+
 ### C34 — Define lease ownership for the remaining test resources
 
 **Priority:** P2. **Wave:** 4. **Book chapters:** 15.
@@ -662,6 +664,17 @@ include the inspection tools. Verification: the exhaustion regression fails befo
 the fix; 255 runtime tests, strict Linux Clippy and real cancelled-creation recovery,
 adoption/duplicate refusal/reuse, failed setup and orphaned forwarding retirement
 all pass (0.32s / 4.32s / 2.26s / 0.16s). Physical crash qualification remains V02.
+
+### C48 — Confine registry upload credentials to the declared origin
+
+**Priority:** P1. **Wave:** 4. **Book chapter:** 05.
+
+Evidence: `src/testkit/oci.rs:resolve_location` accepts any absolute upload
+`Location`, then reuses a bearer-authenticated client for PATCH and PUT.
+
+**Completion test:** A registry response naming another origin, a protocol-relative
+URL or a plaintext downgrade must fail before credentials leave the declared
+origin. Relative and same-origin absolute locations must still upload successfully.
 
 ## Engineering follow-ups
 
