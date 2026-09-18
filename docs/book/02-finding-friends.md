@@ -2354,3 +2354,31 @@ separate acceptance gate. One passing measurement is evidence, not a guarantee.
 A development snapshot might deserialize successfully and still represent a different contract. Before 0.1.0 we therefore require fresh clusters. Startup stamps a fresh data directory with its state generation and refuses an existing unmarked directory. Snapshot loading no longer silently rewrites pre-envelope development state.
 
 A Raft request now carries protocol and state generations as well as its recovery epoch. All three checks run before dispatch to Raft. Responses carry the format contract too, so a new caller cannot mistake a development server's reply for an accepted negotiation. Gossip checks both generations before learning membership; reporting checks both generations before decoding its payload. Chapter 14 explains how the same contract gates binary replacement and rollback. Different product versions are supported only when they explicitly advertise equal formats.
+
+### Finding the cluster again without a seed list
+
+The first node starts without seeds. Other nodes find it, gossip supplies their
+addresses, and everything works until the first node loses contact with all of
+them. Once it has marked every peer dead and reaped the records, reopening its
+network isn't enough. Its seed list is still empty. Nobody is probing it either.
+
+Mustard now retains at most sixteen previously contacted peers separately from
+live membership. While isolated, it probes its configured seeds and one retained
+contact per cycle, rotating through the contacts. Those addresses are discovery
+candidates, not evidence that a node is alive. Direct messages refresh the bounded
+queue; relayed acknowledgements cannot put a relay's socket under another node's
+identity. An explicit `Left` state removes the contact before membership reaping,
+so a graceful departure doesn't become a permanent fallback seed.
+
+There's a second trap. The returning node may still be marked dead at its peer,
+but the ordinary piggyback queue may have exhausted every retransmission of that
+claim. A direct ping or reply now includes the current non-alive claim about its
+recipient, within the existing eight-update limit. That recipient can refute the
+claim with a higher incarnation. We don't silently turn an old `Dead` into
+`Alive` just because another datagram arrived.
+
+The regression starts a seedless bootstrap node, removes every peer from its
+membership table, and exhausts the other node's piggyback queue. Both sides must
+rediscover each other as alive. A separate test checks the contact bound and
+retirement of explicit departures. This was found while testing node-fault expiry:
+the transport gates reopened correctly, but discovery had forgotten its way home.

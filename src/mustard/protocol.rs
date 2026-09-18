@@ -10,7 +10,7 @@
 ///
 /// The `MustardNode` struct owns the membership table, dissemination
 /// queue, and transport, and drives the protocol as an async task.
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, VecDeque};
 use std::net::SocketAddr;
 use std::time::Instant;
 
@@ -71,6 +71,9 @@ pub struct MustardNode<T: MustardTransport> {
     /// Used to bootstrap a join by address without inserting a placeholder
     /// member: we ping the seed, and learn its real identity from the reply.
     seeds: Vec<SocketAddr>,
+    /// Bounded, previously contacted peers retained after dead-member reaping.
+    /// Bootstrap has no configured seeds, but still needs a way back after isolation.
+    rejoin_contacts: VecDeque<(NodeId, SocketAddr)>,
     /// This node's advertised control-plane endpoints (API, reporting),
     /// stamped on every outgoing datagram. `None` until the runtime wires
     /// them in — then no extension is sent (pre-12b.2 behaviour).
@@ -108,6 +111,7 @@ impl<T: MustardTransport> MustardNode<T> {
 
     /// Maximum number of peers to notify during graceful leave.
     const MAX_LEAVE_FANOUT: usize = 10;
+    const MAX_REJOIN_CONTACTS: usize = 16;
 
     /// Create a new Mustard node.
     pub fn new(node_id: NodeId, address: SocketAddr, config: GossipConfig, transport: T) -> Self {
@@ -129,6 +133,7 @@ impl<T: MustardTransport> MustardNode<T> {
             last_published_digest: Vec::new(),
             left: false,
             seeds: Vec::new(),
+            rejoin_contacts: VecDeque::new(),
             advertised: None,
             advertised_labels: BTreeMap::new(),
             leader_hint_rx: None,
@@ -280,21 +285,54 @@ impl<T: MustardTransport> MustardNode<T> {
         self.seeds = seeds;
     }
 
-    /// Ping every seed address with an empty Ping. The reply registers the
-    /// seed by its real identity and carries piggybacked membership, so one
-    /// successful round bootstraps the whole view; lost UDP datagrams are
-    /// retried on the next probe cycle while still isolated.
-    async fn ping_seeds(&self) {
-        for &addr in &self.seeds {
+    /// Probe configured seeds and one former direct peer while isolated.
+    /// Contacts survive member reaping, but are bounded and round-robin so an
+    /// unavailable recent peer does not permanently hide the other candidates.
+    async fn ping_seeds(&mut self) {
+        let mut addresses = self.seeds.clone();
+        if let Some((node, address)) = self.rejoin_contacts.pop_front() {
+            self.rejoin_contacts.push_back((node, address));
+            if !addresses.contains(&address) {
+                addresses.push(address);
+            }
+        }
+        for address in addresses {
+            let peer = self
+                .membership
+                .iter()
+                .find(|member| member.address == address)
+                .map(|member| member.node_id.clone());
+            let updates = self.updates_for_peer(peer.as_ref());
             let ping = GossipMessage::new(
                 self.node_id.clone(),
                 self.incarnation,
-                GossipPayload::Ping {
-                    updates: Vec::new(),
+                GossipPayload::Ping { updates },
+            );
+            let _ = self.transport.send(address, &self.stamp(ping)).await;
+        }
+    }
+
+    /// A directly contacted peer must learn our current suspicion/death claim
+    /// even if its ordinary piggyback retransmissions have been exhausted.
+    fn updates_for_peer(&mut self, peer: Option<&NodeId>) -> Vec<MembershipUpdate> {
+        let mut updates = self.dissemination.select_updates();
+        if let Some(member) = peer.and_then(|peer| self.membership.get(peer))
+            && member.state != NodeState::Alive
+        {
+            updates.retain(|update| update.node_id != member.node_id);
+            updates.insert(
+                0,
+                MembershipUpdate {
+                    node_id: member.node_id.clone(),
+                    address: member.address,
+                    state: member.state,
+                    incarnation: member.incarnation,
+                    lamport: self.lamport,
                 },
             );
-            let _ = self.transport.send(addr, &self.stamp(ping)).await;
+            updates.truncate(super::message::MAX_PIGGYBACK_UPDATES);
         }
+        updates
     }
 
     /// Set the membership watch channel for publishing snapshots.
@@ -424,6 +462,13 @@ impl<T: MustardTransport> MustardNode<T> {
     /// probing), and promotes expired suspects to dead. Exposed publicly
     /// so tests can drive the protocol step-by-step.
     pub async fn run_one_cycle(&mut self) {
+        // An explicit departure retires a contact; a failure does not. Inspect
+        // Left before reaping, while that distinction still exists.
+        self.rejoin_contacts.retain(|(node, _)| {
+            self.membership
+                .get(node)
+                .is_none_or(|member| member.state != NodeState::Left)
+        });
         self.promote_expired_suspects();
         let now = Instant::now();
         let reaped = self
@@ -435,10 +480,8 @@ impl<T: MustardTransport> MustardNode<T> {
 
         let target = self.pick_probe_target();
         let Some((target_id, target_addr)) = target else {
-            // No live peers — we're isolated. If we have seed addresses,
-            // ping them directly to (re)join. Their replies register them
-            // by their real NodeId via handle_message, so no placeholder
-            // member is ever created.
+            // Bootstrap may have no configured seeds. Remembered direct
+            // contacts give it a route back even after every member is reaped.
             self.ping_seeds().await;
             return;
         };
@@ -535,6 +578,15 @@ impl<T: MustardTransport> MustardNode<T> {
         let is_new = if is_relayed_ack {
             false
         } else {
+            if message.sender != self.node_id && from != self.address {
+                self.rejoin_contacts
+                    .retain(|(node, _)| node != &message.sender);
+                self.rejoin_contacts
+                    .push_back((message.sender.clone(), from));
+                if self.rejoin_contacts.len() > Self::MAX_REJOIN_CONTACTS {
+                    self.rejoin_contacts.pop_front();
+                }
+            }
             self.membership.add_node(
                 message.sender.clone(),
                 from,
@@ -604,8 +656,9 @@ impl<T: MustardTransport> MustardNode<T> {
         // Handle the message type
         match &message.payload {
             GossipPayload::Ping { .. } => {
-                // Reply with ACK
-                let updates = self.dissemination.select_updates();
+                // A returning peer can refute a retained Dead claim even when
+                // ordinary dissemination has already forgotten that update.
+                let updates = self.updates_for_peer(Some(&message.sender));
                 let ack = GossipMessage::new(
                     self.node_id.clone(),
                     self.incarnation,
@@ -903,6 +956,114 @@ mod tests {
             indirect_probe_count: 2,
             cleanup_timeout: Duration::from_millis(200),
         }
+    }
+
+    #[tokio::test]
+    async fn rejoin_contacts_are_bounded_and_retire_explicit_departures() {
+        let net = InMemoryNetwork::new();
+        let transport = net.register(addr(1)).await;
+        let mut node = MustardNode::new(NodeId::new("root"), addr(1), fast_config(), transport);
+        for number in 2..100 {
+            node.handle_message(
+                addr(number),
+                GossipMessage::new(
+                    NodeId::new(format!("peer-{number}")),
+                    1,
+                    GossipPayload::Ping { updates: vec![] },
+                ),
+            )
+            .await;
+        }
+        assert_eq!(node.rejoin_contacts.len(), 16);
+        for member in node
+            .membership
+            .iter()
+            .filter(|member| member.node_id != node.node_id)
+            .map(|member| MembershipUpdate {
+                node_id: member.node_id.clone(),
+                address: member.address,
+                state: NodeState::Left,
+                incarnation: member.incarnation,
+                lamport: 1,
+            })
+            .collect::<Vec<_>>()
+        {
+            node.membership.apply_update(&member, Instant::now());
+        }
+        node.config.cleanup_timeout = std::time::Duration::ZERO;
+        node.run_one_cycle().await;
+        assert!(
+            node.rejoin_contacts.is_empty(),
+            "explicit departures must not become fallback seeds"
+        );
+    }
+
+    #[tokio::test]
+    async fn seedless_bootstrap_rejoins_after_all_peers_are_reaped() {
+        let net = InMemoryNetwork::new();
+        let t1 = net.register(addr(1)).await;
+        let t2 = net.register(addr(2)).await;
+        let mut root = MustardNode::new(NodeId::new("root"), addr(1), fast_config(), t1);
+        let mut peer = MustardNode::new(NodeId::new("peer"), addr(2), fast_config(), t2);
+        // Bootstrap has no configured seeds, but has previously heard a real
+        // peer. Both sides then lose contact long enough to declare death.
+        root.handle_message(
+            addr(2),
+            GossipMessage::new(
+                NodeId::new("peer"),
+                1,
+                GossipPayload::Ping { updates: vec![] },
+            ),
+        )
+        .await;
+        peer.add_seed(NodeId::new("root"), addr(1));
+        peer.membership.declare_dead(&NodeId::new("root"));
+        root.membership.declare_dead(&NodeId::new("peer"));
+        root.membership.reap_dead();
+        // Exhausting ordinary piggyback retransmissions must not make a Dead
+        // claim impossible for the returning sender to discover and refute.
+        for _ in 0..100 {
+            peer.dissemination.select_updates();
+        }
+        let (root_tx, root_rx) = watch::channel(Vec::new());
+        let (peer_tx, peer_rx) = watch::channel(Vec::new());
+        root.set_membership_watch(root_tx);
+        peer.set_membership_watch(peer_tx);
+        let shutdown = CancellationToken::new();
+        let root_shutdown = shutdown.clone();
+        let peer_shutdown = shutdown.clone();
+        let root_task = tokio::spawn(async move {
+            root.run(root_shutdown).await;
+            root
+        });
+        let peer_task = tokio::spawn(async move {
+            peer.run(peer_shutdown).await;
+            peer
+        });
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(2);
+        let converged =
+            loop {
+                let root_live = root_rx.borrow().iter().any(|node| {
+                    node.node_id == NodeId::new("peer") && node.state == NodeState::Alive
+                });
+                let peer_live = peer_rx.borrow().iter().any(|node| {
+                    node.node_id == NodeId::new("root") && node.state == NodeState::Alive
+                });
+                if root_live && peer_live {
+                    break true;
+                }
+                if tokio::time::Instant::now() >= deadline {
+                    break false;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            };
+        shutdown.cancel();
+        root_task.await.unwrap();
+        peer_task.await.unwrap();
+        assert!(
+            converged,
+            "both nodes must rediscover each other before graceful shutdown"
+        );
     }
 
     #[tokio::test]
