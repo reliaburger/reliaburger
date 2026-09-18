@@ -645,6 +645,19 @@ before the fix; a fourth covers stalled kill. All seven lifecycle tests
 (12.21s), 105 agent tests (11.79s), 48 lease-filtered tests (one explicit gate)
 and strict Linux Clippy pass.
 
+**Runtime observation prerequisite (18 September):** Four public ProcessGrill
+regressions fail before the fix: stop/kill/drop signal a PID whose recorded
+identity no longer matches, and a failed child-status read reports Stopped.
+Explicit signals now refuse an unverified adoptee, drop leaves it alone,
+forced waits are bounded and signal/wait errors propagate. Process/runc status
+reads and the shared adopted-process poller retain inspection errors; rootless
+shutdown propagates them. A direct runc status regression preserves ownership
+when the launcher cannot be observed. All 265 Linux runtime tests pass (13
+explicit gates, 7.57s), plus seven lifecycle tests (12.03s), 106 agent tests
+(11.73s), native process tests and strict Linux/macOS Clippy. This is not an
+atomic kernel-backed process-identity guarantee or complete process-tree/runc
+resource cleanup; those remain open with the crash window below.
+
 **Normal retirement prerequisite (18 September):** Local lease cleanup and
 removed cluster placements now use an internal Retire command. It shares the
 busy-worker fence and confirmed-exit path, then releases instance inventory,

@@ -22,7 +22,7 @@ use tokio::process::Command;
 use tokio::sync::Mutex;
 
 use super::oci::OciSpec;
-use super::records::InstanceRecord;
+use super::records::{self, InstanceRecord};
 use super::state::ContainerState;
 use super::{GrillError, InstanceId};
 
@@ -61,7 +61,11 @@ impl Drop for ProcessEntry {
             let pid = nix::unistd::Pid::from_raw(pid as i32);
             let _ = nix::sys::signal::kill(pid, nix::sys::signal::Signal::SIGKILL);
             let _ = child.start_kill();
-        } else if let Some(pid) = self.adopted_pid {
+        } else if let Some(pid) = self.adopted_pid
+            && self
+                .adopted_pid_started_at
+                .is_some_and(|started| records::process_matches(pid, started))
+        {
             let _ = nix::sys::signal::kill(
                 nix::unistd::Pid::from_raw(pid as i32),
                 nix::sys::signal::Signal::SIGKILL,
@@ -71,6 +75,45 @@ impl Drop for ProcessEntry {
 }
 
 use super::records::poll_adopted_process;
+
+/// Signal only an adopted process whose recorded identity still matches.
+fn signal_adopted_process(
+    entry: &ProcessEntry,
+    signal: nix::sys::signal::Signal,
+) -> std::io::Result<bool> {
+    let Some(pid) = entry.adopted_pid else {
+        return Ok(false);
+    };
+    let nix_pid = nix::unistd::Pid::from_raw(pid as i32);
+    let owned = entry
+        .adopted_pid_started_at
+        .is_some_and(|started| records::process_matches(pid, started));
+    if !owned {
+        if nix::sys::signal::kill(nix_pid, None) == Err(nix::errno::Errno::ESRCH) {
+            return Ok(false);
+        }
+        return Err(std::io::Error::other(
+            "adopted process identity cannot be verified",
+        ));
+    }
+    match nix::sys::signal::kill(nix_pid, signal) {
+        Ok(()) => Ok(true),
+        Err(nix::errno::Errno::ESRCH) => Ok(false),
+        Err(error) => Err(error.into()),
+    }
+}
+
+/// Signal the group while the unreaped Child still owns its process identifier.
+fn signal_child_group(pid: u32, signal: nix::sys::signal::Signal) -> std::io::Result<()> {
+    #[cfg(unix)]
+    let pid = nix::unistd::Pid::from_raw(-(pid as i32));
+    #[cfg(not(unix))]
+    let pid = nix::unistd::Pid::from_raw(pid as i32);
+    match nix::sys::signal::kill(pid, signal) {
+        Ok(()) | Err(nix::errno::Errno::ESRCH) => Ok(()),
+        Err(error) => Err(error.into()),
+    }
+}
 
 fn log_file(stem: &Path, suffix: &str) -> PathBuf {
     let mut name = stem
@@ -312,21 +355,27 @@ impl super::Grill for ProcessGrill {
             .ok_or_else(|| GrillError::NotFound {
                 instance: instance.clone(),
             })?;
-
-        if let Some(pid) = entry.child.as_ref().and_then(|child| child.id()) {
-            #[cfg(unix)]
-            let pid = nix::unistd::Pid::from_raw(-(pid as i32));
-            #[cfg(not(unix))]
-            let pid = nix::unistd::Pid::from_raw(pid as i32);
-            let _ = nix::sys::signal::kill(pid, nix::sys::signal::Signal::SIGTERM);
-        } else if let Some(pid) = entry.adopted_pid {
-            // An adopted workload may not lead a process group created by us.
-            let _ = nix::sys::signal::kill(
-                nix::unistd::Pid::from_raw(pid as i32),
-                nix::sys::signal::Signal::SIGTERM,
-            );
+        if entry.state == ContainerState::Stopped {
+            return Ok(());
         }
-        entry.state = ContainerState::Stopping;
+        let error = |error: std::io::Error| GrillError::StopFailed {
+            instance: instance.clone(),
+            reason: error.to_string(),
+        };
+        if let Some(pid) = entry.child.as_ref().and_then(|child| child.id()) {
+            signal_child_group(pid, nix::sys::signal::Signal::SIGTERM).map_err(error)?;
+            entry.state = ContainerState::Stopping;
+        } else if entry.adopted_pid.is_some() {
+            entry.state = if signal_adopted_process(entry, nix::sys::signal::Signal::SIGTERM)
+                .map_err(error)?
+            {
+                ContainerState::Stopping
+            } else {
+                ContainerState::Stopped
+            };
+        } else {
+            entry.state = ContainerState::Stopped;
+        }
         Ok(())
     }
 
@@ -337,24 +386,39 @@ impl super::Grill for ProcessGrill {
             .ok_or_else(|| GrillError::NotFound {
                 instance: instance.clone(),
             })?;
-
+        if entry.state == ContainerState::Stopped {
+            return Ok(());
+        }
+        let error = |error: std::io::Error| GrillError::StopFailed {
+            instance: instance.clone(),
+            reason: error.to_string(),
+        };
         if let Some(ref mut child) = entry.child {
             if let Some(pid) = child.id() {
-                #[cfg(unix)]
-                let pid = nix::unistd::Pid::from_raw(-(pid as i32));
-                #[cfg(not(unix))]
-                let pid = nix::unistd::Pid::from_raw(pid as i32);
-                let _ = nix::sys::signal::kill(pid, nix::sys::signal::Signal::SIGKILL);
+                signal_child_group(pid, nix::sys::signal::Signal::SIGKILL).map_err(error)?;
             }
-            // Reap the direct child after the group signal. The direct kill is
-            // a cross-platform backstop if group signalling raced an exit.
-            let _ = child.start_kill();
-            let _ = child.wait().await;
-        } else if let Some(pid) = entry.adopted_pid {
-            let pid = nix::unistd::Pid::from_raw(pid as i32);
-            let _ = nix::sys::signal::kill(pid, nix::sys::signal::Signal::SIGKILL);
+            entry.state = ContainerState::Stopping;
+            child.start_kill().map_err(error)?;
+            let status = tokio::time::timeout(std::time::Duration::from_secs(2), child.wait())
+                .await
+                .map_err(|_| GrillError::StopFailed {
+                    instance: instance.clone(),
+                    reason: "process did not exit after force-kill".into(),
+                })?
+                .map_err(error)?;
+            entry.exit_code = status.code();
+            entry.state = ContainerState::Stopped;
+        } else if entry.adopted_pid.is_some() {
+            entry.state = if signal_adopted_process(entry, nix::sys::signal::Signal::SIGKILL)
+                .map_err(error)?
+            {
+                ContainerState::Stopping
+            } else {
+                ContainerState::Stopped
+            };
+        } else {
+            entry.state = ContainerState::Stopped;
         }
-        entry.state = ContainerState::Stopped;
         Ok(())
     }
 
@@ -376,9 +440,11 @@ impl super::Grill for ProcessGrill {
                 Ok(None) => {
                     // Still running — keep current state
                 }
-                Err(_) => {
-                    entry.state = ContainerState::Stopped;
-                    entry.exit_code = None;
+                Err(error) => {
+                    return Err(GrillError::StateUnavailable {
+                        instance: instance.clone(),
+                        reason: error.to_string(),
+                    });
                 }
             }
         } else if let Some(pid) = entry.adopted_pid {
@@ -386,7 +452,11 @@ impl super::Grill for ProcessGrill {
             // doubles as the zombie reaper — the supervisor polls state
             // regularly, so exited adoptees get waitpid'd here.
             if entry.state != ContainerState::Stopped {
-                let (running, exit_code) = poll_adopted_process(pid, entry.adopted_pid_started_at);
+                let (running, exit_code) = poll_adopted_process(pid, entry.adopted_pid_started_at)
+                    .map_err(|error| GrillError::StateUnavailable {
+                        instance: instance.clone(),
+                        reason: error.to_string(),
+                    })?;
                 if !running {
                     entry.state = ContainerState::Stopped;
                     entry.exit_code = exit_code;
@@ -892,6 +962,81 @@ mod tests {
         let adopted = grill.adopt(&id, &record_for(&id, pid, 1000)).await.unwrap();
 
         assert!(!adopted);
+        assert!(grill.state(&id).await.is_err());
+    }
+
+    async fn stale_adopted_owner_is_not_signalled(operation: &str) {
+        let mut external = std::process::Command::new("sleep")
+            .arg("60")
+            .spawn()
+            .unwrap();
+        let pid = external.id();
+        let started_at = records::process_start_time(pid).unwrap();
+        let grill = ProcessGrill::new();
+        let id = InstanceId("stale-adoptee".into());
+        assert!(
+            grill
+                .adopt(&id, &record_for(&id, pid, started_at))
+                .await
+                .unwrap()
+        );
+        // Model a persisted owner that no longer matches the live PID. This
+        // avoids depending on the operating system actually recycling a PID.
+        grill
+            .processes
+            .lock()
+            .await
+            .get_mut(&id)
+            .unwrap()
+            .adopted_pid_started_at = Some(started_at + 3600);
+        let refused = match operation {
+            "stop" => grill.stop(&id).await.is_err(),
+            "kill" => grill.kill(&id).await.is_err(),
+            "drop" => true,
+            _ => unreachable!(),
+        };
+        drop(grill);
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        let survived = external.try_wait().unwrap().is_none();
+        let _ = external.kill();
+        let _ = external.wait();
+        assert!(refused, "{operation} accepted an unverified adopted owner");
+        assert!(
+            survived,
+            "{operation} signalled a process with a different recorded identity"
+        );
+    }
+
+    #[tokio::test]
+    async fn stop_refuses_a_stale_adopted_owner() {
+        stale_adopted_owner_is_not_signalled("stop").await;
+    }
+
+    #[tokio::test]
+    async fn kill_refuses_a_stale_adopted_owner() {
+        stale_adopted_owner_is_not_signalled("kill").await;
+    }
+
+    #[tokio::test]
+    async fn drop_preserves_a_stale_adopted_owner() {
+        stale_adopted_owner_is_not_signalled("drop").await;
+    }
+
+    #[tokio::test]
+    async fn state_does_not_claim_exit_when_the_child_cannot_be_observed() {
+        let root = tempfile::tempdir().unwrap();
+        let grill = ProcessGrill::with_log_dir(root.path().join("logs"));
+        let id = InstanceId("lost-wait-owner".into());
+        grill.create(&id, &sleep_spec("0.01")).await.unwrap();
+        grill.start(&id).await.unwrap();
+        let pid = grill.pid(&id).await.unwrap();
+        // Consume the kernel wait result outside the Child handle. The
+        // runtime can no longer obtain its own exit evidence and must refuse.
+        tokio::task::spawn_blocking(move || {
+            nix::sys::wait::waitpid(nix::unistd::Pid::from_raw(pid as i32), None).unwrap();
+        })
+        .await
+        .unwrap();
         assert!(grill.state(&id).await.is_err());
     }
 

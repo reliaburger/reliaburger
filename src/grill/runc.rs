@@ -812,9 +812,11 @@ impl super::Grill for RuncGrill {
                         entry.exit_code = status.code();
                     }
                     Ok(None) => {}
-                    Err(_) => {
-                        just_exited = entry.state != ContainerState::Stopped;
-                        entry.state = ContainerState::Stopped;
+                    Err(error) => {
+                        return Err(GrillError::StateUnavailable {
+                            instance: instance.clone(),
+                            reason: error.to_string(),
+                        });
                     }
                 }
             } else if let Some(pid) = entry.adopted_pid
@@ -823,7 +825,11 @@ impl super::Grill for RuncGrill {
                 // Adopted `runc run` process: no handle, poll (and reap)
                 // by pid. See records::poll_adopted_process.
                 let (running, exit_code) =
-                    super::records::poll_adopted_process(pid, entry.adopted_pid_started_at);
+                    super::records::poll_adopted_process(pid, entry.adopted_pid_started_at)
+                        .map_err(|error| GrillError::StateUnavailable {
+                            instance: instance.clone(),
+                            reason: error.to_string(),
+                        })?;
                 if !running {
                     just_exited = true;
                     entry.state = ContainerState::Stopped;
@@ -858,7 +864,7 @@ impl super::Grill for RuncGrill {
                 && entry.state != ContainerState::Stopped
             {
                 let (running, exit_code) =
-                    super::records::poll_adopted_process(pid, entry.adopted_pid_started_at);
+                    super::records::poll_adopted_process(pid, entry.adopted_pid_started_at).ok()?;
                 if !running {
                     just_exited = true;
                     entry.state = ContainerState::Stopped;
@@ -1172,6 +1178,46 @@ impl Drop for RuncGrill {
 mod tests {
     use super::*;
     use crate::grill::Grill;
+
+    #[tokio::test]
+    async fn state_preserves_resources_when_launcher_exit_cannot_be_observed() {
+        let root = tempfile::tempdir().unwrap();
+        let grill = RuncGrill::new(
+            root.path().join("bundles"),
+            ImageStore::new(root.path().join("images")),
+            true,
+            root.path().join("state"),
+        );
+        let id = InstanceId("lost-launcher-wait".into());
+        let child = tokio::process::Command::new("true").spawn().unwrap();
+        let pid = child.id().unwrap();
+        tokio::task::spawn_blocking(move || {
+            nix::sys::wait::waitpid(nix::unistd::Pid::from_raw(pid as i32), None).unwrap();
+        })
+        .await
+        .unwrap();
+        grill.entries.lock().await.insert(
+            id.clone(),
+            RuncEntry {
+                bundle_dir: root.path().join("bundles").join(&id.0),
+                log_path: root.path().join("container.log"),
+                child: Some(child),
+                adopted_pid: None,
+                adopted_pid_started_at: None,
+                port_mapping: None,
+                state: ContainerState::Running,
+                exit_code: None,
+            },
+        );
+        assert!(matches!(
+            grill.state(&id).await,
+            Err(GrillError::StateUnavailable { .. })
+        ));
+        assert_eq!(
+            grill.entries.lock().await.get(&id).unwrap().state,
+            ContainerState::Running
+        );
+    }
 
     fn runc_tests_enabled() -> bool {
         std::env::var("RELIABURGER_RUNC_TESTS").is_ok()

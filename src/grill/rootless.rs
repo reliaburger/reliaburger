@@ -248,9 +248,10 @@ impl Slirp4netnsHandle {
                         }
                     })?;
                     tokio::time::timeout(std::time::Duration::from_secs(2), async {
-                        while super::records::poll_adopted_process(*pid, Some(*started_at)).0 {
+                        while super::records::poll_adopted_process(*pid, Some(*started_at))?.0 {
                             tokio::time::sleep(std::time::Duration::from_millis(10)).await;
                         }
+                        Ok::<(), std::io::Error>(())
                     })
                     .await
                     .map_err(|_| {
@@ -258,7 +259,7 @@ impl Slirp4netnsHandle {
                             std::io::ErrorKind::TimedOut,
                             "retired slirp4netns owner did not exit",
                         )
-                    })?;
+                    })??;
                 }
             }
         }
@@ -462,7 +463,11 @@ mod tests {
             .unwrap()
             .parse::<u32>()
             .unwrap();
-        assert!(!super::super::records::poll_adopted_process(pid, None).0);
+        assert!(
+            !super::super::records::poll_adopted_process(pid, None)
+                .unwrap()
+                .0
+        );
         assert!(!tokio::fs::try_exists(socket).await.unwrap());
     }
 
@@ -492,7 +497,10 @@ mod tests {
         assert!(matches!(task.await, Err(error) if error.is_cancelled()));
         let stopped = tokio::time::timeout(std::time::Duration::from_secs(2), async {
             loop {
-                if !super::super::records::poll_adopted_process(pid, None).0 {
+                if !super::super::records::poll_adopted_process(pid, None)
+                    .unwrap()
+                    .0
+                {
                     break;
                 }
                 tokio::time::sleep(std::time::Duration::from_millis(10)).await;

@@ -1026,3 +1026,30 @@ One HTTP regression returns 503 for the first status request and an empty
 inventory for the next. The probe must confirm cleanup after the second
 observation. Another keeps returning 503; that result must remain Unknown and
 finish within its bounded budget.
+
+
+### An inspection error is not an exit
+
+The agent now waits for runtime exit before confirming a stop. That only helps
+if the runtime tells the truth. ProcessGrill used to turn a failed child-status
+read into `Stopped`; its forced-stop path also discarded signal and wait errors.
+The runc adapter made the same status-read mistake. An unobservable process is
+not evidence that cleanup finished.
+
+Both adapters now preserve inspection errors. ProcessGrill propagates stop
+errors, bounds the forced-exit wait and reports an adopted process as stopping
+until a later observation establishes its exit. The shared adopted-process
+poller returns a `Result` rather than mapping permission and inspection failures
+to “gone”. Rootless helper shutdown propagates that uncertainty too.
+
+There was another ownership hole: stop, kill and drop could signal an adopted
+PID without rechecking its recorded start time. The explicit operations now
+refuse an unverified identity; drop leaves it alone. Tests model a stale record
+without waiting for an actual PID reuse, then confirm the unrelated process
+survives. Separate tests consume a child's kernel wait result outside the
+runtime and require inspection to fail while ownership remains recorded.
+
+These checks don't make a start-time comparison and a later PID signal atomic.
+Nor do they prove that a runc launcher’s exit means every container resource is
+gone. Kernel-backed process ownership, process-tree exit and complete runc
+cleanup remain part of the release recovery gate.

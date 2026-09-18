@@ -210,6 +210,20 @@ pub enum GrillError {
         reason: String,
     },
 
+    /// A stop signal or exit wait could not be completed safely.
+    #[error("container {instance} failed to stop: {reason}")]
+    StopFailed {
+        instance: InstanceId,
+        reason: String,
+    },
+
+    /// Runtime inspection could not establish the instance's current state.
+    #[error("container {instance} state unavailable: {reason}")]
+    StateUnavailable {
+        instance: InstanceId,
+        reason: String,
+    },
+
     #[error("container {instance} not found")]
     NotFound { instance: InstanceId },
 
