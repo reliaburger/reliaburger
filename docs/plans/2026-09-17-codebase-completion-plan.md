@@ -37,9 +37,9 @@ F items are missing capabilities, not evidence of failures in supported behaviou
 [Audit evidence and reproducible probes](../qualification/2026-09-17-code-audit.md)
 record those distinctions and the hosted checks inspected.
 
-There are **81 tracked work packages**: 52 correctness/contract items, 12
+There are **82 tracked work packages**: 53 correctness/contract items, 12
 engineering follow-ups, 12 capability families and five acceptance/release gates.
-The correctness items include 25 P1 priorities; these are engineering priorities, not
+The correctness items include 26 P1 priorities; these are engineering priorities, not
 security severity ratings. A capability family can require several commits.
 
 ## What is already done
@@ -867,6 +867,18 @@ middleware. The regression covers both scope dimensions, refuses every global
 management route before mutation, and verifies unrestricted token management.
 Six token API tests (2.33s), 114 API tests, 33 authentication tests, eight route
 audits and strict Linux/macOS Clippy pass.
+
+### C53 — Confine administrator overrides on test leases
+
+**Priority:** P1. **Wave:** 4. **Book chapter:** 04.
+
+Found while designing durable job ownership: lease inspection and release
+allowed any Admin to override the exact credential owner, including administrators
+scoped to another tenant. Both API regressions fail before the fix (200/204
+instead of 403). The override now requires an unscoped user administrator;
+exact owners retain their existing access. Eight token/lease API tests (2.29s),
+48 lease-filtered library tests (one explicit gate, 1.89s) and strict
+Linux/macOS Clippy pass.
 
 ## Engineering follow-ups
 

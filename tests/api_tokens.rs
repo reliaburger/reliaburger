@@ -381,3 +381,68 @@ async fn scoped_admin_cannot_mint_unscoped_credentials_or_use_global_management(
     assert!(council.security_state().await.api_tokens.is_empty());
     council.shutdown().await.unwrap();
 }
+
+async fn access_lease(
+    router: Router,
+    method: &str,
+    auth: reliaburger::sesame::auth::AuthContext,
+) -> StatusCode {
+    let mut request = Request::builder()
+        .method(method)
+        .uri("/v1/test/leases/token-lease")
+        .body(Body::empty())
+        .unwrap();
+    request.extensions_mut().insert(auth);
+    router.oneshot(request).await.unwrap().status()
+}
+
+async fn check_lease_admin_override(method: &str, success: StatusCode) {
+    let (council, router) = api().await;
+    lease(&council, Duration::from_secs(60)).await;
+    for (apps, namespaces) in [
+        (Some(vec!["web".into()]), None),
+        (None, Some(vec!["another-tenant".into()])),
+    ] {
+        let mut outsider = owner();
+        outsider.principal_id = "other-credential".into();
+        outsider.token_name = "other-admin".into();
+        outsider.scoped_apps = apps;
+        outsider.scoped_namespaces = namespaces;
+        assert_eq!(
+            access_lease(router.clone(), method, outsider).await,
+            StatusCode::FORBIDDEN
+        );
+        assert!(
+            council
+                .desired_state()
+                .await
+                .test_leases
+                .contains_key("token-lease")
+        );
+    }
+    let mut operator = owner();
+    operator.principal_id = "global-operator".into();
+    assert_eq!(
+        access_lease(router.clone(), method, operator).await,
+        success
+    );
+    if method == "DELETE" {
+        lease(&council, Duration::from_secs(60)).await;
+    }
+    // Exact owners do not need the administrator override.
+    let mut scoped_owner = owner();
+    scoped_owner.role = reliaburger::sesame::types::ApiRole::Deployer;
+    scoped_owner.scoped_namespaces = Some(vec!["rbtest-token".into()]);
+    assert_eq!(access_lease(router, method, scoped_owner).await, success);
+    council.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn scoped_admin_cannot_inspect_another_credentials_lease() {
+    check_lease_admin_override("GET", StatusCode::OK).await;
+}
+
+#[tokio::test]
+async fn scoped_admin_cannot_release_another_credentials_lease() {
+    check_lease_admin_override("DELETE", StatusCode::NO_CONTENT).await;
+}

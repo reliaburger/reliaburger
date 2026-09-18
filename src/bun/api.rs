@@ -1191,8 +1191,13 @@ async fn test_lease_get_handler(
     let Some(lease) = find_test_lease(&state, &lease_id).await else {
         return lease_error_response(crate::testkit::lease::LeaseError::NotFound);
     };
-    if lease.owner_id != auth.principal_id && auth.role != crate::sesame::types::ApiRole::Admin {
-        return lease_error_response(crate::testkit::lease::LeaseError::WrongOwner);
+    if lease.owner_id != auth.principal_id {
+        if auth.role != crate::sesame::types::ApiRole::Admin {
+            return lease_error_response(crate::testkit::lease::LeaseError::WrongOwner);
+        }
+        if let Err(response) = crate::sesame::auth::require_unscoped(Some(auth)) {
+            return response;
+        }
     }
     Json(lease).into_response()
 }
@@ -1298,6 +1303,9 @@ async fn test_lease_release_handler(
     let owner_id = if lease.owner_id == auth.principal_id {
         Some(auth.principal_id.as_str())
     } else if auth.role == crate::sesame::types::ApiRole::Admin {
+        if let Err(response) = crate::sesame::auth::require_unscoped(Some(auth)) {
+            return response;
+        }
         None
     } else {
         return lease_error_response(crate::testkit::lease::LeaseError::WrongOwner);

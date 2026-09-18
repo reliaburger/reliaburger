@@ -321,7 +321,8 @@ Ordinary `[namespace]` quota and `[permission]` declarations also require an
 unscoped Admin; a Deployer can apply workloads within its scope and configured
 permissions. Apps and jobs receive the same admission checks before any part
 of a manifest changes state. Lease-owned test namespace declarations retain
-their separate ownership checks.
+their separate ownership checks. An administrator overriding another credential's
+lease ownership must also be unscoped, for both inspection and cleanup.
 
 ### Secure cluster initialisation
 
@@ -895,7 +896,7 @@ The bun agent exposes a local HTTP API on port 9117:
 | `GET` | `/v1/diagnostics/apps` | Desired replicas, scheduled replicas and service exposure used by diagnostics |
 | `POST` | `/v1/trace` | Run fixed DNS and TCP probes from a local source workload and return live service/firewall evidence |
 | `POST` | `/v1/test/leases` | Create a policy-authorised, server-owned Phase 15 app lease |
-| `GET` | `/v1/test/leases/{id}` | Inspect an owned lease (or inspect any lease as Admin) |
+| `GET` | `/v1/test/leases/{id}` | Inspect an owned lease (or inspect any lease as unscoped Admin) |
 | `POST` | `/v1/test/leases/{id}/renew` | Renew an active owned lease within the server TTL ceiling |
 | `DELETE` | `/v1/test/leases/{id}` | Release a lease and start/confirm owned app cleanup |
 | `POST` | `/v1/deploys/operations/{id}/cancel` | Request node-local cooperative deploy cancellation (Deployer, all target scopes) |

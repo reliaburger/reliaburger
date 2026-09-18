@@ -1279,3 +1279,17 @@ namespace-scoped administrators. Every global management request must return
 lists and revokes a token through the same router. That positive path matters:
 refusing every request would also prevent escalation, but it would leave us
 with a rather unhelpful administration API.
+
+### An administrator's lease override needs global authority
+
+Lease inspection and release usually require the exact credential that created
+the lease. Operators also need a way to inspect or clean up an abandoned run.
+That override now requires an unscoped administrator, just like global
+credential management. Being an administrator for one app or namespace does
+not permit inspecting or deleting another credential's lease.
+
+Both API paths had failing regressions: inspection returned 200 and release
+returned 204 for a scoped outsider. The repaired tests also exercise the two
+legitimate paths, an unscoped operator and the exact scoped Deployer who owns
+the lease. Ownership and the administrator override are distinct authorities;
+a role check alone cannot stand in for both.
