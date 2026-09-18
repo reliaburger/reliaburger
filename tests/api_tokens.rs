@@ -317,3 +317,67 @@ async fn token_creation_refuses_duplicate_and_unleased_test_names_without_return
     assert_eq!(council.security_state().await.api_tokens.len(), 2);
     council.shutdown().await.unwrap();
 }
+
+#[tokio::test]
+async fn scoped_admin_cannot_mint_unscoped_credentials_or_use_global_management() {
+    let (council, router) = api().await;
+    for (apps, namespaces) in [
+        (Some(vec!["web".into()]), None),
+        (None, Some(vec!["team".into()])),
+    ] {
+        let mut auth = owner();
+        auth.scoped_apps = apps;
+        auth.scoped_namespaces = namespaces;
+        for (method, path, body) in [
+            (
+                "POST",
+                "/v1/token/create",
+                r#"{"name":"escape","role":"admin"}"#,
+            ),
+            ("GET", "/v1/token/list", ""),
+            ("POST", "/v1/token/revoke", r#"{"name":"operator"}"#),
+            ("POST", "/v1/join-token/create", "{}"),
+            ("POST", "/v1/secret/rotate", "{}"),
+            (
+                "POST",
+                "/v1/identity/sign",
+                r#"{"digest":"sha256:example"}"#,
+            ),
+        ] {
+            let mut request = Request::builder()
+                .method(method)
+                .uri(path)
+                .header("content-type", "application/json")
+                .body(Body::from(body))
+                .unwrap();
+            request.extensions_mut().insert(auth.clone());
+            let response = router.clone().oneshot(request).await.unwrap();
+            assert_eq!(response.status(), StatusCode::FORBIDDEN, "{method} {path}");
+            assert!(council.security_state().await.api_tokens.is_empty());
+        }
+    }
+    // An unrestricted operator retains ordinary token administration.
+    for (method, path, body) in [
+        (
+            "POST",
+            "/v1/token/create",
+            r#"{"name":"operator","role":"deployer"}"#,
+        ),
+        ("GET", "/v1/token/list", ""),
+        ("POST", "/v1/token/revoke", r#"{"name":"operator"}"#),
+    ] {
+        let mut request = Request::builder()
+            .method(method)
+            .uri(path)
+            .header("content-type", "application/json")
+            .body(Body::from(body))
+            .unwrap();
+        request.extensions_mut().insert(owner());
+        assert_eq!(
+            router.clone().oneshot(request).await.unwrap().status(),
+            StatusCode::OK
+        );
+    }
+    assert!(council.security_state().await.api_tokens.is_empty());
+    council.shutdown().await.unwrap();
+}

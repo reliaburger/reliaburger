@@ -314,6 +314,15 @@ hostname listeners are rejected before subsystem startup. Initialise an
 authenticated cluster and create the first admin token before exposing the API
 on a non-loopback address.
 
+After bootstrap, cluster-wide token management, node join tokens, secret
+rotation and image signing require an **unscoped Admin** credential. An Admin
+restricted by `--apps` or `--namespaces` cannot use those global operations.
+Ordinary `[namespace]` quota and `[permission]` declarations also require an
+unscoped Admin; a Deployer can apply workloads within its scope and configured
+permissions. Apps and jobs receive the same admission checks before any part
+of a manifest changes state. Lease-owned test namespace declarations retain
+their separate ownership checks.
+
 ### Secure cluster initialisation
 
 `relish init` generates the cluster PKI, the first node's identity and a

@@ -97,7 +97,7 @@ remain separate. Older unchecked groups below point into this current ledger.
 
 - [x] **C50** Enforce scope and configured Deploy/HostExec permission checks for all app/job targets before any part of a manifest applies. Three admission regressions fail before the fix; all 113 API tests, eight route audits and strict Linux/macOS Clippy pass. Mixed manifests refuse before app commits or job commands.
 - [x] **C51** Require an unscoped user administrator for ordinary permission/quota declarations before any mixed-manifest mutation. Followers preserve caller credentials and upstream status/content type. Both admission and forwarding regressions fail before their fixes; 114 API tests (14.25s), real three-node acceptance with leader-side credential revocation (13.93s) and strict Linux/macOS Clippy pass. Lease-owned test namespaces retain their bounded exception.
-- [ ] **C52** (P1) Reproduce scoped-Admin credential widening and confine global user-management operations.
+- [x] **C52** Require unscoped user administrators for token create/list/revoke, join-token creation, secret rotation and image signing. The scoped-credential escalation regression fails before the fix; six token API tests (2.33s), 114 API tests, 33 authentication tests, eight route audits and strict Linux/macOS Clippy pass. App- and namespace-scoped callers refuse before mutation; unrestricted token management still works.
 
 ### Engineering follow-ups
 

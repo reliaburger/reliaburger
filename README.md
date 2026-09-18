@@ -213,6 +213,10 @@ Log exports now preserve content generations, scope receipts to the destination,
 and serialise durable checkpoint updates across agent and offline exports. Source
 and checkpoint errors stop the export and prevent disk-pressure pruning.
 
+Cluster-wide credential management and permission/quota declarations require
+an unscoped Admin. App and job manifests enforce the caller's scope and configured
+permissions before applying changes; see the [user guide](docs/README.md).
+
 ## Licence
 
 [Apache 2.0](LICENSE)

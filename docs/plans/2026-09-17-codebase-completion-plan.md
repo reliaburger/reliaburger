@@ -840,10 +840,16 @@ credential revocation (13.93s), and strict Linux/macOS Clippy pass.
 
 **Priority:** P1. **Wave:** 4. **Book chapter:** 04.
 
-Inspected during C50: ordinary token creation checks the Admin role but does
-not require an unscoped caller or confine the requested credential to the
-caller's scope. Reproduce the scope-widening path and apply an explicit boundary
-to global user-management operations, with positive unscoped-admin coverage.
+Found during C50: a scoped administrator could create an unrestricted Admin
+credential. The public API regression reproduced the widening before the fix.
+
+**Completed:** Token create/list/revoke, join-token creation, secret rotation
+and image signing now additionally require an unscoped user. Workload routes
+retain their target-specific scope rules, and bootstrap remains governed by
+middleware. The regression covers both scope dimensions, refuses every global
+management route before mutation, and verifies unrestricted token management.
+Six token API tests (2.33s), 114 API tests, 33 authentication tests, eight route
+audits and strict Linux/macOS Clippy pass.
 
 ## Engineering follow-ups
 

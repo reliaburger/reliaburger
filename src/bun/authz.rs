@@ -206,6 +206,7 @@ pub const ROUTE_MATRIX: &[Route] = &[
     // Operator-only (Admin). The service principal is refused here (AUTH4),
     // so despite being a signing route it isn't a node-to-node one.
     route(Post, "/v1/identity/sign", Admin),
+    // Credential and trust management additionally requires an unscoped user.
     route(Post, "/v1/token/create", Admin),
     route(Get, "/v1/token/list", Admin),
     route(Post, "/v1/token/revoke", Admin),

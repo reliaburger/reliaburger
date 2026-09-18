@@ -6912,6 +6912,9 @@ async fn identity_sign_handler(
     {
         return resp;
     }
+    if let Err(response) = crate::sesame::auth::require_unscoped(auth.as_deref()) {
+        return response;
+    }
     #[derive(serde::Deserialize)]
     struct SignRequest {
         digest: String,
@@ -6966,6 +6969,9 @@ async fn token_list_handler(
     {
         return resp;
     }
+    if let Err(response) = crate::sesame::auth::require_unscoped(auth.as_deref()) {
+        return response;
+    }
     let Some(ref council) = state.council else {
         return (
             StatusCode::SERVICE_UNAVAILABLE,
@@ -7001,6 +7007,9 @@ async fn token_revoke_handler(
         crate::sesame::auth::authorize_user(auth.as_deref(), crate::sesame::types::ApiRole::Admin)
     {
         return resp;
+    }
+    if let Err(response) = crate::sesame::auth::require_unscoped(auth.as_deref()) {
+        return response;
     }
     #[derive(serde::Deserialize)]
     struct RevokeRequest {
@@ -7064,6 +7073,9 @@ async fn token_create_handler(
         crate::sesame::auth::authorize_user(auth.as_deref(), crate::sesame::types::ApiRole::Admin)
     {
         return resp;
+    }
+    if let Err(response) = crate::sesame::auth::require_unscoped(auth.as_deref()) {
+        return response;
     }
     #[derive(serde::Deserialize, serde::Serialize)]
     struct CreateRequest {
@@ -7263,6 +7275,9 @@ async fn join_token_create_handler(
     {
         return resp;
     }
+    if let Err(response) = crate::sesame::auth::require_unscoped(auth.as_deref()) {
+        return response;
+    }
 
     fn default_ttl_seconds() -> u64 {
         crate::sesame::join::DEFAULT_JOIN_TOKEN_TTL.as_secs()
@@ -7370,6 +7385,9 @@ async fn secret_rotate_handler(
         crate::sesame::auth::authorize_user(auth.as_deref(), crate::sesame::types::ApiRole::Admin)
     {
         return resp;
+    }
+    if let Err(response) = crate::sesame::auth::require_unscoped(auth.as_deref()) {
+        return response;
     }
     #[derive(serde::Deserialize)]
     struct RotateRequest {

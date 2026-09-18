@@ -1258,3 +1258,24 @@ the node's service token would erase the identity whose permissions the
 leader needs to check. The forwarding response also retains the leader's
 status and content type, so an authorisation refusal stays a refusal rather
 than looking like a successful event stream.
+
+### A scoped administrator is still scoped
+
+An administrator restricted to namespace `team` must not create an unrestricted
+administrator token. Otherwise the first call to token creation discards the
+boundary that the original credential was meant to enforce.
+
+Token creation, listing and revocation, node join-token creation, cluster secret
+rotation and image signing now require an unscoped user administrator. These
+operations manage cluster-wide credentials or trust; they have no individual
+workload target against which we could check an app or namespace restriction.
+Scoped administrators can still use workload routes within their own scope.
+The bootstrap path remains governed by authentication middleware, and internal
+service credentials still cannot use user-management routes.
+
+The regression goes through the router with both app-scoped and
+namespace-scoped administrators. Every global management request must return
+403 before changing credential state. An unrestricted administrator then creates,
+lists and revokes a token through the same router. That positive path matters:
+refusing every request would also prevent escalation, but it would leave us
+with a rather unhelpful administration API.
