@@ -933,6 +933,21 @@ impl BunClient {
         parse_typed_response(response).await
     }
 
+    /// Create a durable job lease on this exact node, even in a cluster.
+    pub async fn create_node_job_lease(
+        &self,
+        ttl_seconds: u64,
+    ) -> Result<crate::testkit::lease::TestLease, RelishError> {
+        let response = self
+            .http()?
+            .post(format!("{}/v1/test/leases", self.base_url))
+            .json(&serde_json::json!({"ttl_seconds": ttl_seconds, "scope": "node_jobs"}))
+            .send()
+            .await
+            .map_err(classify_error)?;
+        parse_typed_response(response).await
+    }
+
     /// Renew an active test resource lease.
     pub async fn renew_test_lease(
         &self,

@@ -36,6 +36,7 @@ use crate::mayo::rollup_store::RollupStore;
 use crate::mayo::store::MayoStore;
 use crate::meat::deploy_types::DeployHistoryEntry;
 use crate::pickle::types::ManifestCatalog;
+use crate::testkit::lease::{LeaseScope, is_node_job_lease};
 
 use super::agent::{AgentCommand, ApplyEvent, InstanceStatus};
 
@@ -1031,6 +1032,8 @@ fn system_time_millis(time: std::time::SystemTime) -> u64 {
 #[derive(Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 struct CreateTestLeaseRequest {
+    #[serde(default)]
+    scope: LeaseScope,
     ttl_seconds: u64,
     namespace: Option<String>,
 }
@@ -1108,7 +1111,16 @@ async fn test_lease_create_handler(
         Ok(ttl) => ttl,
         Err(response) => return response,
     };
+    if request.scope == LeaseScope::NodeJobs {
+        if let Err(response) = crate::sesame::auth::require_unscoped(Some(auth)) {
+            return response;
+        }
+        if request.namespace.is_some() {
+            return lease_error_response(crate::testkit::lease::LeaseError::InvalidScope);
+        }
+    }
     if let Some(council) = &state.council
+        && request.scope == LeaseScope::Applications
         && !council.is_leader().await
     {
         return forward_test_lease_request(
@@ -1129,10 +1141,19 @@ async fn test_lease_create_handler(
         )
             .into_response();
     }
-    let lease_id = hex::encode(random);
-    let namespace = request
-        .namespace
-        .unwrap_or_else(|| format!("rbtest-{}", &lease_id[..12]));
+    let random_id = hex::encode(random);
+    let (lease_id, namespace) = match request.scope {
+        LeaseScope::Applications => {
+            let namespace = request
+                .namespace
+                .unwrap_or_else(|| format!("rbtest-{}", &random_id[..12]));
+            (random_id, namespace)
+        }
+        LeaseScope::NodeJobs => (
+            format!("node-jobs-{random_id}"),
+            format!("rbtest-node-{random_id}"),
+        ),
+    };
     if !crate::testkit::lease::valid_test_namespace(&namespace) {
         return (
             StatusCode::BAD_REQUEST,
@@ -1152,19 +1173,22 @@ async fn test_lease_create_handler(
             .into_response();
     }
     let now = crate::testkit::lease::now_unix_millis();
-    let lease = match crate::testkit::lease::TestLease::new(
+    let lease = match crate::testkit::lease::TestLease::new_scoped(
         lease_id,
         auth.principal_id.clone(),
         auth.token_name.clone(),
         namespace,
         now,
         now.saturating_add(ttl_millis),
+        request.scope,
     ) {
         Ok(lease) => lease,
         Err(error) => return lease_error_response(error),
     };
 
-    if let Some(council) = &state.council {
+    if let Some(council) = &state.council
+        && request.scope == LeaseScope::Applications
+    {
         if let Err(response) = write_lease_request(
             council,
             crate::council::RaftRequest::TestLeaseCreate(lease.clone()),
@@ -1223,6 +1247,7 @@ async fn test_lease_renew_handler(
         Err(response) => return response,
     };
     if let Some(council) = &state.council
+        && !is_node_job_lease(&lease_id)
         && !council.is_leader().await
     {
         return forward_test_lease_request(
@@ -1244,7 +1269,9 @@ async fn test_lease_renew_handler(
         return lease_error_response(error);
     }
 
-    if let Some(council) = &state.council {
+    if let Some(council) = &state.council
+        && !is_node_job_lease(&lease_id)
+    {
         if let Err(response) = write_lease_request(
             council,
             crate::council::RaftRequest::TestLeaseRenew {
@@ -1286,6 +1313,7 @@ async fn test_lease_release_handler(
             Err(response) => return response,
         };
     if let Some(council) = &state.council
+        && !is_node_job_lease(&lease_id)
         && !council.is_leader().await
     {
         return forward_test_lease_request::<()>(
@@ -1311,7 +1339,9 @@ async fn test_lease_release_handler(
     } else {
         return lease_error_response(crate::testkit::lease::LeaseError::WrongOwner);
     };
-    let result = if let Some(council) = &state.council {
+    let result = if let Some(council) = &state.council
+        && !is_node_job_lease(&lease_id)
+    {
         crate::testkit::lease::cleanup_cluster_lease(council, &lease_id, owner_id).await
     } else {
         crate::testkit::lease::cleanup_local_lease(
@@ -1426,6 +1456,9 @@ async fn find_test_lease(
     state: &ApiState,
     lease_id: &str,
 ) -> Option<crate::testkit::lease::TestLease> {
+    if is_node_job_lease(lease_id) {
+        return state.local_test_leases.get(lease_id).await;
+    }
     match &state.council {
         Some(council) => council
             .desired_state()
@@ -1465,6 +1498,7 @@ fn lease_error_response(error: crate::testkit::lease::LeaseError) -> Response {
         | crate::testkit::lease::LeaseError::ResourceLimit => StatusCode::CONFLICT,
         crate::testkit::lease::LeaseError::TooManyLeases => StatusCode::TOO_MANY_REQUESTS,
         crate::testkit::lease::LeaseError::InvalidId
+        | crate::testkit::lease::LeaseError::InvalidScope
         | crate::testkit::lease::LeaseError::InvalidOwner
         | crate::testkit::lease::LeaseError::InvalidNamespace
         | crate::testkit::lease::LeaseError::InvalidExpiry
@@ -2183,19 +2217,21 @@ async fn apply_handler(
     }
     let mut lease_owner_id = None;
     if let Some(lease_id) = &lease_id {
-        if !config.job.is_empty() || !config.permission.is_empty() || !config.build.is_empty() {
-            return (
-                StatusCode::BAD_REQUEST,
-                "leased apply currently accepts apps and their namespace declaration only",
-            )
-                .into_response();
-        }
         let Some(auth) = auth.as_deref() else {
             return (StatusCode::UNAUTHORIZED, "authentication required").into_response();
         };
         let Some(lease) = find_test_lease(&state, lease_id).await else {
             return lease_error_response(crate::testkit::lease::LeaseError::NotFound);
         };
+        let wrong_kind = match lease.scope {
+            LeaseScope::Applications => !config.job.is_empty(),
+            LeaseScope::NodeJobs => {
+                config.job.is_empty() || !config.app.is_empty() || !config.namespace.is_empty()
+            }
+        };
+        if wrong_kind || !config.permission.is_empty() || !config.build.is_empty() {
+            return lease_error_response(crate::testkit::lease::LeaseError::InvalidScope);
+        }
         if auth.token_name != crate::sesame::auth::SYSTEM_PRINCIPAL
             && lease.owner_id != auth.principal_id
         {
@@ -2212,6 +2248,17 @@ async fn apply_handler(
             return lease_error_response(crate::testkit::lease::LeaseError::NamespaceMismatch);
         }
         for spec in config.app.values_mut() {
+            match &spec.namespace {
+                Some(namespace) if namespace != &lease.namespace => {
+                    return lease_error_response(
+                        crate::testkit::lease::LeaseError::NamespaceMismatch,
+                    );
+                }
+                Some(_) => {}
+                None => spec.namespace = Some(lease.namespace.clone()),
+            }
+        }
+        for spec in config.job.values_mut() {
             match &spec.namespace {
                 Some(namespace) if namespace != &lease.namespace => {
                     return lease_error_response(
@@ -2342,18 +2389,32 @@ async fn apply_handler(
         (&lease_id, lease_owner_id.as_deref())
     {
         let now = crate::testkit::lease::now_unix_millis();
-        let app_ids = config
-            .app
-            .iter()
-            .map(|(app_name, spec)| {
-                crate::meat::AppId::new(app_name, spec.namespace.as_deref().unwrap_or("default"))
-            })
-            .collect();
-        match state
-            .local_test_leases
-            .begin_app_operation(lease_id, owner_id, app_ids, now)
-            .await
-        {
+        let result = if is_node_job_lease(lease_id) {
+            let job_ids = config
+                .job
+                .iter()
+                .map(|(name, spec)| {
+                    crate::meat::AppId::new(name, spec.namespace.as_deref().unwrap_or("default"))
+                })
+                .collect();
+            state
+                .local_test_leases
+                .begin_job_operation(lease_id, owner_id, job_ids, now)
+                .await
+        } else {
+            let app_ids = config
+                .app
+                .iter()
+                .map(|(name, spec)| {
+                    crate::meat::AppId::new(name, spec.namespace.as_deref().unwrap_or("default"))
+                })
+                .collect();
+            state
+                .local_test_leases
+                .begin_app_operation(lease_id, owner_id, app_ids, now)
+                .await
+        };
+        match result {
             Ok(operation) => Some(operation),
             Err(error) => return lease_error_response(error),
         }
@@ -7882,6 +7943,27 @@ mod tests {
         local_test_leases: Option<crate::testkit::lease::LocalLeaseStore>,
         events: Option<Arc<RwLock<crate::bun::events::EventStore>>>,
     ) -> (Router, CancellationToken) {
+        setup_with_auth_leases_events_and_council(
+            tokens,
+            service_token,
+            readiness,
+            static_capabilities,
+            local_test_leases,
+            events,
+            None,
+        )
+        .await
+    }
+
+    async fn setup_with_auth_leases_events_and_council(
+        tokens: Vec<crate::sesame::types::ApiToken>,
+        service_token: Option<String>,
+        readiness: crate::bun::readiness::ReadinessTracker,
+        static_capabilities: crate::bun::capabilities::StaticCapabilities,
+        local_test_leases: Option<crate::testkit::lease::LocalLeaseStore>,
+        events: Option<Arc<RwLock<crate::bun::events::EventStore>>>,
+        council: Option<Arc<crate::council::CouncilNode>>,
+    ) -> (Router, CancellationToken) {
         let (cmd_tx, cmd_rx) = mpsc::channel(32);
         let shutdown = CancellationToken::new();
         let grill = MockGrill::new();
@@ -7899,7 +7981,7 @@ mod tests {
             None,
             None,
             None,
-            None,
+            council,
             Some(store),
             service_token,
             None,
@@ -8623,6 +8705,290 @@ mod tests {
         )
         .await;
         assert_eq!(status, StatusCode::FORBIDDEN);
+        shutdown.cancel();
+    }
+
+    #[tokio::test]
+    async fn node_job_lease_scope_is_fenced_and_stays_on_its_receiving_node() {
+        let council = seeded_council("node-jobs").await;
+        let (token, plaintext) = a_user_token(crate::sesame::types::ApiRole::Deployer);
+        let (other, other_text) =
+            named_user_token("other", crate::sesame::types::ApiRole::Deployer);
+        let (mut scoped, scoped_text) =
+            named_user_token("scoped", crate::sesame::types::ApiRole::Deployer);
+        scoped.scope.apps = Some(vec!["batch".into()]);
+        let tokens = vec![token, other, scoped];
+        let (app, shutdown) = setup_with_auth_leases_events_and_council(
+            tokens.clone(),
+            None,
+            crate::bun::readiness::ReadinessTracker::new(),
+            lease_static_capabilities(),
+            None,
+            None,
+            Some(Arc::clone(&council)),
+        )
+        .await;
+        let body = r#"{"ttl_seconds":60,"scope":"node_jobs"}"#;
+        assert_eq!(
+            post_authenticated(app.clone(), "/v1/test/leases", &scoped_text, body, None)
+                .await
+                .0,
+            StatusCode::FORBIDDEN
+        );
+        let (status, bytes) =
+            post_authenticated(app.clone(), "/v1/test/leases", &plaintext, body, None).await;
+        assert_eq!(status, StatusCode::CREATED);
+        let lease: crate::testkit::lease::TestLease = serde_json::from_slice(&bytes).unwrap();
+        assert!(council.desired_state().await.test_leases.is_empty());
+        for body in [
+            format!(
+                r#"{{"ttl_seconds":60,"scope":"node_jobs","namespace":"{}"}}"#,
+                lease.namespace
+            ),
+            format!(r#"{{"ttl_seconds":60,"namespace":"{}"}}"#, lease.namespace),
+        ] {
+            assert_eq!(
+                post_authenticated(app.clone(), "/v1/test/leases", &plaintext, &body, None)
+                    .await
+                    .0,
+                StatusCode::BAD_REQUEST
+            );
+        }
+        assert_eq!(
+            post_authenticated(
+                app.clone(),
+                "/v1/apply",
+                &plaintext,
+                "[app.web]\nimage = 'test:v1'",
+                Some(&lease.lease_id)
+            )
+            .await
+            .0,
+            StatusCode::BAD_REQUEST
+        );
+        let job = "[job.batch]\nimage = 'test:v1'";
+        assert_eq!(
+            post_authenticated(
+                app.clone(),
+                "/v1/apply",
+                &other_text,
+                job,
+                Some(&lease.lease_id)
+            )
+            .await
+            .0,
+            StatusCode::FORBIDDEN
+        );
+        assert_eq!(
+            post_authenticated(
+                app.clone(),
+                "/v1/apply",
+                &plaintext,
+                job,
+                Some(&lease.lease_id)
+            )
+            .await
+            .0,
+            StatusCode::OK
+        );
+        let path = format!("/v1/test/leases/{}", lease.lease_id);
+        assert_eq!(
+            post_authenticated(
+                app.clone(),
+                &format!("{path}/renew"),
+                &other_text,
+                r#"{"ttl_seconds":60}"#,
+                None
+            )
+            .await
+            .0,
+            StatusCode::FORBIDDEN
+        );
+        assert_eq!(
+            delete_authenticated(app.clone(), &path, &other_text).await,
+            StatusCode::FORBIDDEN
+        );
+        assert_eq!(
+            post_authenticated(
+                app.clone(),
+                &format!("{path}/renew"),
+                &plaintext,
+                r#"{"ttl_seconds":60}"#,
+                None
+            )
+            .await
+            .0,
+            StatusCode::OK
+        );
+
+        // An uninitialised council has no leader to forward to. All node-job
+        // routes must still answer from this node's own store.
+        use crate::council::network::{InMemoryRaftNetworkFactory, InMemoryRaftRouter};
+        use crate::council::{
+            CouncilNode, log_store::MemLogStore, state_machine::CouncilStateMachine,
+        };
+        let uninitialised = Arc::new(
+            CouncilNode::new(
+                2,
+                crate::council::types::CouncilConfig::default(),
+                InMemoryRaftNetworkFactory::new(2, InMemoryRaftRouter::new()),
+                MemLogStore::new(),
+                CouncilStateMachine::new(),
+                None,
+            )
+            .await
+            .unwrap(),
+        );
+        let (wrong_node, wrong_shutdown) = setup_with_auth_leases_events_and_council(
+            tokens,
+            None,
+            crate::bun::readiness::ReadinessTracker::new(),
+            lease_static_capabilities(),
+            None,
+            None,
+            Some(Arc::clone(&uninitialised)),
+        )
+        .await;
+        assert_eq!(
+            get_authenticated(wrong_node.clone(), &path, &plaintext)
+                .await
+                .0,
+            StatusCode::NOT_FOUND
+        );
+        assert_eq!(
+            post_authenticated(
+                wrong_node.clone(),
+                &format!("{path}/renew"),
+                &plaintext,
+                r#"{"ttl_seconds":60}"#,
+                None
+            )
+            .await
+            .0,
+            StatusCode::NOT_FOUND
+        );
+        assert_eq!(
+            delete_authenticated(wrong_node.clone(), &path, &plaintext).await,
+            StatusCode::NOT_FOUND
+        );
+        assert_eq!(
+            post_authenticated(
+                wrong_node.clone(),
+                "/v1/apply",
+                &plaintext,
+                job,
+                Some(&lease.lease_id)
+            )
+            .await
+            .0,
+            StatusCode::NOT_FOUND
+        );
+        assert_eq!(
+            post_authenticated(wrong_node, "/v1/test/leases", &plaintext, body, None)
+                .await
+                .0,
+            StatusCode::CREATED
+        );
+        assert_eq!(
+            get_authenticated(app.clone(), &path, &plaintext).await.0,
+            StatusCode::OK
+        );
+        assert_eq!(
+            delete_authenticated(app, &path, &plaintext).await,
+            StatusCode::NO_CONTENT
+        );
+        assert!(council.desired_state().await.test_leases.is_empty());
+        shutdown.cancel();
+        wrong_shutdown.cancel();
+        council.raft().shutdown().await.unwrap();
+        uninitialised.raft().shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn node_job_lease_persists_jobs_and_reclaims_their_schedule() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("leases.json");
+        let store = crate::testkit::lease::LocalLeaseStore::open(path.clone())
+            .await
+            .unwrap();
+        let (token, plaintext) = a_user_token(crate::sesame::types::ApiRole::Deployer);
+        let (app, shutdown) = setup_with_auth_readiness_and_leases(
+            vec![token],
+            None,
+            crate::bun::readiness::ReadinessTracker::new(),
+            lease_static_capabilities(),
+            Some(store),
+        )
+        .await;
+        let (status, body) = post_authenticated(
+            app.clone(),
+            "/v1/test/leases",
+            &plaintext,
+            r#"{"ttl_seconds":60,"scope":"node_jobs"}"#,
+            None,
+        )
+        .await;
+        assert_eq!(
+            status,
+            StatusCode::CREATED,
+            "{}",
+            String::from_utf8_lossy(&body)
+        );
+        let lease: crate::testkit::lease::TestLease = serde_json::from_slice(&body).unwrap();
+        assert!(lease.lease_id.starts_with("node-jobs-"));
+        assert!(lease.namespace.starts_with("rbtest-node-"));
+        let (status, body) = post_authenticated(
+            app.clone(),
+            "/v1/apply",
+            &plaintext,
+            r#"[job.batch]
+image = "test:v1"
+[job.scheduled]
+image = "test:v1"
+schedule = "* * * * *"
+"#,
+            Some(&lease.lease_id),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{}", String::from_utf8_lossy(&body));
+        let reopened = crate::testkit::lease::LocalLeaseStore::open(path)
+            .await
+            .unwrap();
+        let owned = reopened.get(&lease.lease_id).await.unwrap();
+        let owned_json = serde_json::to_value(&owned).unwrap();
+        assert_eq!(owned.resources.len(), 2);
+        assert!(
+            owned_json["resources"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .all(|resource| resource["kind"] == "job")
+        );
+        assert_eq!(
+            delete_authenticated(
+                app.clone(),
+                &format!("/v1/test/leases/{}", lease.lease_id),
+                &plaintext
+            )
+            .await,
+            StatusCode::NO_CONTENT
+        );
+        let (_, status) = get_authenticated(app.clone(), "/v1/status", &plaintext).await;
+        let instances: serde_json::Value = serde_json::from_slice(&status).unwrap();
+        assert!(
+            !String::from_utf8_lossy(&status).contains(&lease.namespace),
+            "{instances}"
+        );
+        assert_eq!(
+            get_authenticated(
+                app,
+                &format!("/v1/test/leases/{}", lease.lease_id),
+                &plaintext
+            )
+            .await
+            .0,
+            StatusCode::NOT_FOUND
+        );
         shutdown.cancel();
     }
 

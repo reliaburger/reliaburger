@@ -387,10 +387,15 @@ async fn run_one(
                 };
             }
             match deadline
-                .run(
-                    "lease creation",
-                    client.create_test_lease(ttl_seconds, Some(&namespace)),
-                )
+                .run("lease creation", async {
+                    if case.group == TestGroup::Jobs {
+                        client.create_node_job_lease(ttl_seconds).await
+                    } else {
+                        client
+                            .create_test_lease(ttl_seconds, Some(&namespace))
+                            .await
+                    }
+                })
                 .await
             {
                 Ok(Ok(lease)) => (lease.namespace, Some(lease.lease_id)),

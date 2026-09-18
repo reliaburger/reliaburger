@@ -15,10 +15,10 @@ pub struct Compatibility {
     pub state: u32,
 }
 
-/// Supported formats; placement ownership journals require state five.
+/// Supported formats; scoped node-job leases require generation six.
 pub const CURRENT: Compatibility = Compatibility {
-    protocol: 5,
-    state: 5,
+    protocol: 6,
+    state: 6,
 };
 
 /// Name of the durable format stamp at the root of a node's data directory.

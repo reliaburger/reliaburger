@@ -22,6 +22,14 @@ ownership for retry. A busy root filesystem stays mounted; Stopped is reported
 only after cleanup completes. Short rootful jobs retain their actual exit codes,
 including when they finish before the first startup observation.
 
+`relish test --filter jobs` creates durable leases on the receiving node for
+batch jobs and cron registrations. Keep using the same node endpoint for a
+lease's lifetime. Creation requires an unscoped credential and the server's
+isolated-workload test grant. Expiry resumes cleanup after Bun restarts; a node
+that is down retains its record until it can run cleanup again. These leases
+support job-only manifests and use server-selected namespaces. Ordinary jobs
+remain node-local; this does not introduce cluster job scheduling.
+
 ## Release work
 
 The [0.1.0 plan](plans/2026-09-16-v0.1.0-release-plan.md) tracks packaging and
@@ -31,7 +39,7 @@ returns an error with the log path; `--yes` still configures without starting a
 background node. The public installer remains in development.
 
 0.1.0 requires a fresh cluster; development state is refused. Rolling upgrades
-require matching explicit formats (currently protocol 5 and state 5). See the
+require matching explicit formats (currently protocol 6 and state 6). See the
 [compatibility policy](releasing.md#cluster-compatibility).
 
 Reporting refuses messages over 1 MiB or containing more than 100 events;

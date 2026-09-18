@@ -639,6 +639,11 @@ impl StateMachineInner {
                 self.state.endpoint_catalog = *catalog.clone();
             }
             RaftRequest::TestLeaseCreate(lease) => {
+                if lease.scope != crate::testkit::lease::LeaseScope::Applications {
+                    return Some(CouncilResponse::Refused {
+                        reason: "node job leases must remain on their owning node".to_string(),
+                    });
+                }
                 if let Err(error) = lease.validate() {
                     return Some(CouncilResponse::Refused {
                         reason: error.to_string(),
@@ -891,6 +896,9 @@ impl StateMachineInner {
                 let remaining: Vec<String> = resources
                     .iter()
                     .filter_map(|resource| match resource {
+                        crate::testkit::lease::LeasedResource::Job { job_id } => {
+                            Some(format!("node job {job_id}"))
+                        }
                         crate::testkit::lease::LeasedResource::ApiToken { name, .. }
                             if self
                                 .state
@@ -3600,6 +3608,32 @@ mod tests {
             expires_at_unix_ms,
         )
         .unwrap()
+    }
+
+    #[tokio::test]
+    async fn node_job_leases_never_enter_replicated_state() {
+        let mut sm = CouncilStateMachine::new();
+        let suffix = "0123456789abcdef0123456789abcdef";
+        let lease = crate::testkit::lease::TestLease::new_scoped(
+            format!("node-jobs-{suffix}"),
+            "owner".into(),
+            "owner".into(),
+            format!("rbtest-node-{suffix}"),
+            10,
+            100,
+            crate::testkit::lease::LeaseScope::NodeJobs,
+        )
+        .unwrap();
+        let responses = sm
+            .apply(vec![normal_entry(
+                1,
+                1,
+                RaftRequest::TestLeaseCreate(lease),
+            )])
+            .await
+            .unwrap();
+        assert!(matches!(responses[0], CouncilResponse::Refused { .. }));
+        assert!(sm.inner.read().await.state.test_leases.is_empty());
     }
 
     #[tokio::test]

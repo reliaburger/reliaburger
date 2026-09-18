@@ -126,19 +126,24 @@ impl TestContext {
     pub async fn apply(&self, toml: &str) -> Result<(), String> {
         let config = crate::config::Config::parse(toml)
             .map_err(|error| format!("config does not parse: {error}"))?;
-        let has_owned_declarative_resources =
-            !config.app.is_empty() || !config.namespace.is_empty();
-        let lease_compatible = config.job.is_empty()
-            && config.permission.is_empty()
+        let node_jobs = self
+            .lease_id
+            .as_deref()
+            .is_some_and(crate::testkit::lease::is_node_job_lease);
+        let lease_compatible = config.permission.is_empty()
             && config.build.is_empty()
-            && has_owned_declarative_resources;
+            && if node_jobs {
+                !config.job.is_empty() && config.app.is_empty() && config.namespace.is_empty()
+            } else {
+                config.job.is_empty() && (!config.app.is_empty() || !config.namespace.is_empty())
+            };
         let result = match &self.lease_id {
             Some(lease_id) if lease_compatible => {
                 self.client.apply_with_lease(&config, lease_id).await
             }
             Some(_) => {
                 return Err(
-                    "test lease currently accepts only apps and namespace declarations; unsupported or empty manifests are refused"
+                    "test lease refuses unsupported or empty manifests for its resource scope"
                         .to_string(),
                 );
             }
@@ -312,6 +317,13 @@ impl TestContext {
     /// with the entry node's API port and scheme — every `bun` serves its API
     /// on the same port, so the entry client's port is the right one to reuse.
     pub async fn node_clients(&self) -> Result<Vec<(String, BunClient)>, String> {
+        if self
+            .lease_id
+            .as_deref()
+            .is_some_and(crate::testkit::lease::is_node_job_lease)
+        {
+            return Ok(vec![("local".to_string(), self.client.clone())]);
+        }
         let nodes = self
             .client
             .nodes()

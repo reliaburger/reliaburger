@@ -1976,27 +1976,33 @@ async fn run_agent(cli: Cli) -> anyhow::Result<()> {
         });
     }
 
-    let local_test_leases = if api_council.is_some() {
-        // Cluster leases are Raft state. Don't let an old standalone file
-        // shadow or block the replicated source of truth after a mode change.
-        reliaburger::testkit::lease::LocalLeaseStore::in_memory()
+    // Cluster apps live in Raft; jobs always belong to the receiving node.
+    let local_lease_file = if api_council.is_some() {
+        "node-test-leases.json"
     } else {
-        reliaburger::testkit::lease::LocalLeaseStore::open(
-            config.storage.data.join("test-leases.json"),
-        )
-        .await
-        .map_err(|error| anyhow::anyhow!("failed to open test lease store: {error}"))?
+        "test-leases.json"
     };
-    let lease_reaper_handle = match &api_council {
-        Some(council) => reliaburger::testkit::lease::spawn_cluster_lease_reaper(
+    let local_test_leases = reliaburger::testkit::lease::LocalLeaseStore::open(
+        config.storage.data.join(local_lease_file),
+    )
+    .await
+    .map_err(|error| anyhow::anyhow!("failed to open test lease store: {error}"))?;
+    let local_lease_reaper = reliaburger::testkit::lease::spawn_local_lease_reaper(
+        local_test_leases.clone(),
+        cmd_tx.clone(),
+        shutdown.clone(),
+    );
+    let cluster_lease_reaper = api_council.as_ref().map(|council| {
+        reliaburger::testkit::lease::spawn_cluster_lease_reaper(
             Arc::clone(council),
             shutdown.clone(),
-        ),
-        None => reliaburger::testkit::lease::spawn_local_lease_reaper(
-            local_test_leases.clone(),
-            cmd_tx.clone(),
-            shutdown.clone(),
-        ),
+        )
+    });
+    let lease_reaper_handle = async move {
+        let _ = local_lease_reaper.await;
+        if let Some(handle) = cluster_lease_reaper {
+            let _ = handle.await;
+        }
     };
 
     // What this node can actually do, for `/v1/capabilities` (Phase 15).

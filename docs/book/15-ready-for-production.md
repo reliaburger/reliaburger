@@ -2896,3 +2896,58 @@ fixture runs the identity case with that restricted trust anchor and requires
 a chain-verification failure plus confirmed resource cleanup. Trusting whatever
 root appears inside the container's bundle would make this test incorrectly
 pass. With no explicit CA configured, the case remains Unknown.
+
+### Give jobs an owner on the node that runs them
+
+Consider a catalogue case that starts a batch job, then loses its connection.
+The job may still be running. A cron registration can be even less visible:
+there may be no instance yet, but the next minute can start one. Cleaning up
+only the client's list of running instances misses both situations.
+
+Jobs in 0.1 run on the receiving node. Their test leases now do too. A request
+with `scope = "node_jobs"` reserves a server-generated namespace and records the
+job names before handing the manifest to the agent. Cluster nodes persist these
+records in `node-test-leases.json` and run a local reaper alongside the leader's
+application-lease reaper. A client disconnect doesn't drop the deployment guard:
+the server keeps draining the agent's event channel until deployment finishes.
+Only then may cleanup retire the job and its schedule.
+
+`LeaseScope` is an enum with two variants, `Applications` and `NodeJobs`.
+Matching on it makes the admission rule explicit: a job lease accepts job-only
+manifests, while an application lease cannot acquire jobs. The resource enum
+also distinguishes `Job { job_id }` from `App { app_id }`. Both contain an
+`AppId`, our existing namespace/name identity, but the enum variant preserves
+which kind of workload the record owns. Rust's exhaustive `match` requires us
+to consider the new kind in cleanup as well as validation.
+
+Routing needs a boundary too. Job lease IDs start with `node-jobs-`, followed by
+128 random bits encoded as lowercase hexadecimal. Their namespaces use the
+same complete suffix after `rbtest-node-`. Application leases cannot reserve
+that prefix, and callers cannot select or reuse a job lease's namespace.
+Creation requires an unscoped user credential and the ordinary test-operation
+grant. Renew, release and apply require the exact owner; an unscoped
+administrator may inspect or reclaim a lease. Raft refuses node-job records.
+Even an invalid or unknown ID with that prefix stays local: sending it to
+another node returns a missing lease, rather than forwarding to a leader.
+
+Cleanup removes ownership only after the agent confirms retirement. The test
+reopens the durable store, drops the first retirement reply and starts the
+reaper. The record must remain in `Cleaning` with its job still attached until
+a later reply confirms success. A separate running-agent test covers a batch
+job and a cron registration before its first firing. These exercise different
+failure modes; parsing a valid ownership record alone proves neither.
+
+The persisted lease schema is now 3, with protocol and durable-state generation
+6. This branch still requires fresh development clusters. Keeping old nodes
+from joining prevents a node without job-scope admission from accepting a new
+node's reserved namespace as an ordinary application lease.
+
+The actual-process fixture adds a stronger check. It starts a leased sleep job,
+records its PID and start time, kills Bun and verifies that the job survives.
+After expiry, a replacement Bun must adopt and retire that same process before
+removing the lease and instance record. The real TLS/Relish catalogue separately
+requires all three job cases to run and report confirmed cleanup. Its first run
+correctly skipped them because the fixture lacked an executable allowlist; the
+fixture now declares its exact binaries. A skipped case isn't a passing case.
+This tests process-crash recovery after the adoption record exists. It doesn't
+establish recovery from power loss or the earlier runtime-creation window.

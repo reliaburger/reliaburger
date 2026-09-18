@@ -715,7 +715,7 @@ binary query test still asserting state 4. It now decodes `Compatibility` and
 compares with `CURRENT`. Both actual-binary query/development-state refusal
 tests pass (0.04s); the independent refusal test remains unchanged. Runtime,
 cluster, upgrade and release-build jobs passed at that commit, but portable
-CI remains unqualified until the repaired fixture passes on the new head.
+CI and Build & Release both pass at the repaired `d7897fc` head.
 
 **Additional cleanup evidence to establish:** Atomic process identity,
 complete process-tree retirement and physical crash recovery remain open.
@@ -734,8 +734,20 @@ interrupt read-only observation while durable intent remains. All 63 cluster
 unit tests (10.32s), real three-node stop/non-resurrection (13.14s), and strict
 Linux/macOS Clippy pass.
 
-Remaining resource contracts, each in its own commit: node-local jobs,
-registry uploads/repositories,
+**Node-local job ownership (18 September):** Typed node-job leases reserve a
+server-generated 128-bit namespace, persist job ownership before deployment,
+and keep cleanup behind the deployment guard. Cluster nodes persist and reap
+their own job leases alongside Raft's application leases. Job IDs never forward
+to a leader or resolve on another node; Raft and application scopes refuse
+job records and reserved job namespaces. The running-agent regression fails
+before implementation. Five scope/routing/restart regressions pass (5.97s),
+119 testkit tests pass (1.23s), and the actual Bun-kill recovery plus three-case
+TLS/CLI catalogue pass together (14.00s), including confirmed cleanup.
+Protocol/state advance to 6/6 and the lease schema to 3. The full Linux library checkpoint passes 3,306 tests (19 explicit gates, 63.99s), and both actual-binary compatibility tests pass (0.01s). Strict Linux/macOS all-target/all-feature Clippy passes. This retains node-local
+job scheduling; physical-crash, initial-record and full process-tree gates remain
+separate.
+
+Remaining resource contracts, each in its own commit: registry uploads/repositories,
 and managed volume/mount cleanup. Node effects already use C06 reservations
 and C10 exact-fault receipts. Image distribution currently reports uncontrolled
 cache state and never evicts arbitrary images; any future cold-cache mode needs

@@ -977,6 +977,15 @@ fn secure_bun_renews_a_due_node_leaf_and_reuses_it_after_restart() {
 
 #[test]
 fn secure_catalogue_scoped_token_uses_explicit_ca_and_server_owned_cleanup() {
+    qualify_process_catalogue("workload-identity");
+}
+
+#[test]
+fn secure_catalogue_node_jobs_have_durable_ownership_and_confirmed_cleanup() {
+    qualify_process_catalogue("jobs");
+}
+
+fn qualify_process_catalogue(group: &str) {
     let root = tempfile::tempdir().unwrap();
     let cluster_dir = root.path().join("cluster");
     assert_success(
@@ -1000,6 +1009,8 @@ fn secure_catalogue_scoped_token_uses_explicit_ca_and_server_owned_cleanup() {
     node.storage.metrics = root.path().join("metrics");
     node.storage.volumes = root.path().join("volumes");
     node.images.registry_port = 0;
+    node.process_workloads.allowed_binaries =
+        vec!["/bin/sh".into(), "/bin/sleep".into(), "/bin/true".into()];
     node.testing.safety_class = reliaburger::testkit::safety::ClusterSafetyClass::Development;
     node.testing
         .allowed_operations
@@ -1063,9 +1074,9 @@ fn secure_catalogue_scoped_token_uses_explicit_ca_and_server_owned_cleanup() {
         "json",
         "test",
         "--filter",
-        "workload-identity",
+        group,
         "--timeout",
-        "15s",
+        if group == "jobs" { "90s" } else { "15s" },
     ]);
     let report: serde_json::Value =
         serde_json::from_slice(&output.stdout).unwrap_or_else(|error| {
@@ -1075,6 +1086,19 @@ fn secure_catalogue_scoped_token_uses_explicit_ca_and_server_owned_cleanup() {
                 String::from_utf8_lossy(&output.stderr)
             )
         });
+    if group == "jobs" {
+        assert_success(&output, "qualify node-local jobs catalogue");
+        let results = report["results"].as_array().unwrap();
+        assert_eq!(results.len(), 3, "{report}");
+        for case in results {
+            assert_eq!(case["outcome"]["status"], "pass", "{case}");
+            assert_eq!(case["cleanup"]["status"], "confirmed", "{case}");
+        }
+        let leases =
+            std::fs::read_to_string(node.storage.data.join("node-test-leases.json")).unwrap();
+        assert!(!leases.contains("node-jobs-"), "{leases}");
+        return;
+    }
     let case = report["results"]
         .as_array()
         .unwrap()
@@ -1100,6 +1124,168 @@ fn secure_catalogue_scoped_token_uses_explicit_ca_and_server_owned_cleanup() {
         !listed.contains("rbtest-"),
         "test token survived cleanup: {listed}"
     );
+}
+
+#[tokio::test]
+async fn node_job_lease_reaps_a_surviving_process_after_bun_is_killed() {
+    let root = tempfile::tempdir().unwrap();
+    let cluster_dir = root.path().join("cluster");
+    assert_success(
+        &run_relish(&[
+            "init",
+            cluster_dir.to_str().unwrap(),
+            "--cluster-name",
+            "token-lease",
+            "--node-id",
+            "node-01",
+        ]),
+        "initialise scoped-token fixture",
+    );
+    let node_path = cluster_dir.join("reliaburger.toml");
+    let mut node = reliaburger::config::NodeConfig::from_file(&node_path).unwrap();
+    node.node.name = Some("node-01".into());
+    node.network.advertise_address = Some("127.0.0.1".into());
+    node.storage.data = root.path().join("data");
+    node.storage.images = root.path().join("images");
+    node.storage.logs = root.path().join("logs");
+    node.storage.metrics = root.path().join("metrics");
+    node.storage.volumes = root.path().join("volumes");
+    node.images.registry_port = 0;
+    node.process_workloads.allowed_binaries =
+        vec!["/bin/sh".into(), "/bin/sleep".into(), "/bin/true".into()];
+    node.testing.safety_class = reliaburger::testkit::safety::ClusterSafetyClass::Development;
+    node.testing
+        .allowed_operations
+        .insert(reliaburger::testkit::safety::OperationPermission::ProvisionIsolatedWorkloads);
+    let (mut bun, address) = spawn_bun_with_port_retry(true, || {
+        let [gossip, raft, reporting] = reserve_ports();
+        node.cluster.gossip_port = gossip;
+        node.cluster.raft_port = raft;
+        node.cluster.reporting_port = reporting;
+        std::fs::write(&node_path, toml::to_string_pretty(&node).unwrap()).unwrap();
+        (
+            node_path.clone(),
+            reserve_address(),
+            root.path().join("token-lease-bun.log"),
+        )
+    });
+    let endpoint = format!("https://{address}");
+    let ca = cluster_dir.join("identity/root-ca.crt");
+    let ca = ca.to_str().unwrap();
+    wait_for_relish(
+        &mut bun,
+        &["--endpoint", &endpoint, "--ca-cert", ca, "status"],
+    );
+    let token = run_relish(&[
+        "--endpoint",
+        &endpoint,
+        "--ca-cert",
+        ca,
+        "token",
+        "create",
+        "--name",
+        "test-admin",
+        "--role",
+        "admin",
+    ]);
+    assert_success(&token, "create catalogue admin");
+    let token = String::from_utf8(token.stdout).unwrap();
+    let token = token.trim();
+    let deadline = Instant::now() + WAIT;
+    // The auth-store refresh is asynchronous; wait until anonymous management
+    // is refused, so the probe cannot accidentally run in bootstrap mode.
+    loop {
+        let anonymous = run_relish(&["--endpoint", &endpoint, "--ca-cert", ca, "token", "list"]);
+        if !anonymous.status.success() {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "auth store did not adopt the admin token"
+        );
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    let ca_bytes = std::fs::read(ca).unwrap();
+    let client =
+        reliaburger::relish::client::BunClient::new_with_ca(&endpoint, Some(token), &ca_bytes)
+            .unwrap();
+    let lease = client.create_node_job_lease(60).await.unwrap();
+    let manifest = reliaburger::config::Config::parse(&format!(
+        "[job.survivor]\nimage = 'proc-grill:image-ignored'\ncommand = ['/bin/sleep', '45']\nnamespace = '{}'\n[job.cron]\nimage = 'proc-grill:image-ignored'\ncommand = ['/bin/true']\nschedule = '* * * * *'\nnamespace = '{}'\n",
+        lease.namespace, lease.namespace,
+    )).unwrap();
+    client
+        .apply_with_lease(&manifest, &lease.lease_id)
+        .await
+        .unwrap();
+    let records_dir = node.storage.data.join("instances");
+    let record = reliaburger::grill::records::load_records(&records_dir)
+        .into_iter()
+        .find(|record| record.app_name == "survivor" && record.namespace == lease.namespace)
+        .unwrap();
+    assert!(record.is_job);
+    assert!(reliaburger::grill::records::is_live(&record));
+    client.renew_test_lease(&lease.lease_id, 3).await.unwrap();
+    bun.child.kill().unwrap();
+    bun.child.wait().unwrap();
+    assert!(
+        reliaburger::grill::records::is_live(&record),
+        "job did not survive Bun's crash"
+    );
+    let lease_path = node.storage.data.join("node-test-leases.json");
+    let persisted = reliaburger::testkit::lease::LocalLeaseStore::open(lease_path.clone())
+        .await
+        .unwrap();
+    assert_eq!(
+        persisted
+            .get(&lease.lease_id)
+            .await
+            .unwrap()
+            .resources
+            .len(),
+        2
+    );
+    drop(persisted);
+    tokio::time::sleep(Duration::from_millis(3100)).await;
+    let mut restarted = BunProcess::spawn(
+        &node_path,
+        address,
+        true,
+        root.path().join("job-restarted.log"),
+    );
+    assert!(matches!(
+        wait_for_bind(&mut restarted, address),
+        BunStart::Ready(_)
+    ));
+    tokio::time::timeout(Duration::from_secs(25), async {
+        loop {
+            restarted.assert_running();
+            let leases = reliaburger::testkit::lease::LocalLeaseStore::open(lease_path.clone())
+                .await
+                .unwrap();
+            if leases.get(&lease.lease_id).await.is_none() {
+                assert!(
+                    !reliaburger::grill::records::is_live(&record),
+                    "cleanup acknowledged a live process"
+                );
+                assert!(
+                    reliaburger::grill::records::load_records(&records_dir)
+                        .iter()
+                        .all(|record| record.namespace != lease.namespace)
+                );
+                let instances = client.status().await.unwrap();
+                assert!(
+                    instances
+                        .iter()
+                        .all(|instance| instance.namespace != lease.namespace)
+                );
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+    })
+    .await
+    .expect("expired job lease did not recover after Bun was killed");
 }
 
 #[cfg(target_os = "linux")]
