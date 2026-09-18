@@ -144,7 +144,7 @@ pass. This is preparation only; signed candidate qualification remains V03.
   Cluster-upgrade CI at `78119fd` refused debug-binary uploads with HTTP 413. The harness now strips symbols from a private fixture before signing; all three real Linux upgrade/rollback/pause-resume cases pass in 200.22s. This repairs the harness and does not close sustained qualification.
 - [ ] **V03** (gate) Publish and install the exact signed candidate.
 - [ ] **V04** (gate) Measure repeated cold installs on the advertised host matrix.
-- [ ] **V05** (gate) Review dependency exceptions before their deadline. The direct rustls-pemfile dependency and RUSTSEC-2025-0134 exception are removed in favour of the existing Rustls parser. The advisory gate fails before migration without that exception and passes afterwards. Twelve TLS unit, 17 client, seven ingress and three file-reload tests plus strict Linux/macOS Clippy pass. Four exceptions remain for explicit review.
+- [x] **V05** Review all exceptions against the current RustSec database and [record their reachability and migration dispositions](qualification/2026-09-18-dependency-exceptions.md). Remove rustls-pemfile and its exception; retain four explicitly until 18 November 2026. `make audit` also refuses an active rkyv graph or failed inspection. The failing-first gate regression passes on Linux and macOS, and the real audit passes across 707 locked packages. Twelve TLS unit, 17 client, seven ingress and three file-reload tests plus strict Linux/macOS Clippy validate the parser migration. This review does not waive later dependency/feature changes or candidate qualification.
 
 ## Current release checklist
 

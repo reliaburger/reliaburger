@@ -1226,7 +1226,12 @@ risk, not a fixed dependency. The September release review removes
 parser directly. The advisory gate failed before migration with that exception
 removed. Twelve TLS unit tests, 17 client tests, seven ingress tests, three
 operator file-reload tests and strict Linux/macOS Clippy pass. `make audit`
-passes with four exceptions; their explicit review disposition remains open.
+passes with four exceptions. The [18 September review](../qualification/2026-09-18-dependency-exceptions.md)
+records each remaining dependency path, risk and migration option, retaining
+the 18 November expiry. The audit now checks that rkyv remains inactive across
+all root features and targets, and refuses failed inspection. The failing-first
+gate regression passes on Linux and macOS. **V05 is complete for this lockfile;**
+future dependency/feature changes and exact-candidate qualification remain gates.
 
 **Completion test:** Before 18 November 2026, re-evaluate reachable advisories and migration options, record evidence and remove or explicitly renew each exception under the fail-closed gate.
 
@@ -1252,7 +1257,7 @@ instead of treating a historical checkbox as today's verdict.
 | G1: documentation sweep | Earlier label corrections implemented; remaining drift H01. This PR reconciles progress and the release-plan overflow claim. |
 | G2: chapter 15 lessons | Added with this audit; implementation explanations already existed. |
 | G3: manual diagnostics | Implemented; retain command/example validation under H01. |
-| G4: advisory review | August review implemented; five exceptions remain under V05's November deadline. |
+| G4: advisory review | September V05 review complete; four explicit exceptions retain the November deadline. |
 | H1: three-node lease/leader-death acceptance | V01 explicitly retains this missing acceptance scenario; local lease tests are not a substitute. |
 | H2: complete runbook | V01; amend profiles/prerequisites and retain every result. |
 | Carried-forward streaming, cert lifecycle, resource leases | Streaming and C14 certificate lifecycle implemented; C34 remains. |

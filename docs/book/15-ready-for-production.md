@@ -2796,3 +2796,24 @@ apps and namespace declarations. The runner regression observes three outgoing
 mutations before the repair and zero afterwards; the API regression changes
 from accepting an unleased test job to returning a conflict. Durable job
 ownership remains required before job catalogue cases can run under a lease.
+
+### An advisory exception is a condition we must keep checking
+
+Our release review removed the unused PEM wrapper rather than extending its
+exception. Four explicit exceptions remain: three maintenance notices and one
+vulnerable archive crate that Cargo does not currently build. The
+[dated review](../qualification/2026-09-18-dependency-exceptions.md) records the
+paths, migration options and the unchanged November review deadline.
+
+The archive exception has an extra condition. Before auditing the lockfile,
+`make audit` asks Cargo for the active rkyv dependency graph across all root
+features and targets. An active path refuses the build. A failed inspection
+also refuses it; an unavailable observation cannot prove absence. Only an
+empty, successfully inspected graph allows that exception to remain in force.
+
+A command-level test supplies a controlled Cargo executable and date. It
+checks the inactive, active and failed-inspection outcomes without downloading
+an advisory database or waiting for the review deadline. The real audit then
+fetches the current database and checks the actual lockfile. These are
+separate pieces of evidence: one proves the gate's behaviour, the other checks
+what we intend to ship today.
