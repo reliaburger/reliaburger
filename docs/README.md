@@ -398,7 +398,10 @@ validity period. Idle hosts renew when clients return; expired cached leaves
 are never reused. Operator-supplied ingress certificate/key files reload once
 per second as a validated pair. Invalid replacements retain the previous pair
 only until its expiry; existing connections continue. Ingress disables TLS
-session resumption, so reconnects validate the current certificate. This does not rotate the
+session resumption, so reconnects validate the current certificate. API, registry
+and ingress TLS connections have a one-hour lifetime, including WebSocket
+upgrades. HTTP draining starts 30 seconds before that limit; clients of
+long-lived streams must reconnect. This does not rotate the
 Ingress CA or renew node identities.
 The remaining certificate lifecycle work is tracked in C14 of
 [the completion plan](plans/2026-09-17-codebase-completion-plan.md).

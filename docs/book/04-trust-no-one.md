@@ -960,3 +960,39 @@ current resolver. Existing connections stay open during renewal or file reload;
 their eventual retirement needs its own connection lifetime limit. This costs a
 full TLS handshake per connection, a deliberate trade-off for an explicit
 certificate lifecycle in 0.1.0.
+
+### Give established connections a retirement date
+
+A WebSocket can keep a TLS session alive long after we replace its certificate.
+Timing out the HTTP serving future doesn't solve that: once Hyper accepts the
+upgrade, it hands the byte stream to the WebSocket forwarding task and finishes
+that future.
+
+API, registry and ingress TLS connections now have a one-hour maximum lifetime.
+For ordinary HTTP, the server starts graceful shutdown thirty seconds before
+that deadline. HTTP/2 stops admitting new streams; HTTP/1 finishes its current
+request. Work still running at the final deadline ends, so clients of long-lived
+streams must reconnect. The API TLS handshake itself also has a ten-second
+limit. Raft and reporting already exchange one RPC per connection under much
+shorter deadlines; they don't need the HTTP retirement policy.
+
+`LifetimeLimitedIo<S>` wraps the stream itself, so the hard limit survives an
+upgrade. The `S` type parameter lets the same wrapper hold each listener's TLS
+stream. It implements Tokio's `AsyncRead` and `AsyncWrite`: every poll first
+checks the deadline, then delegates to the underlying stream. Activity never
+moves the deadline. Polling the timer registers a wakeup, which also retires an
+idle reader or a writer blocked by a peer that stopped reading.
+
+The timer lives in `Pin<Box<Sleep>>`. `Box` gives it a stable heap allocation;
+`Pin` promises not to move the timer while Tokio holds references into its
+state. The stream's `Unpin` bound lets us borrow and poll that field normally.
+We need no `unsafe` pointer manipulation. Returning `Poll::Pending` means
+"wake me when something changes", not "block this thread".
+
+The tests advance Tokio's clock, rather than wait an hour. Three I/O tests prove
+that active traffic cannot extend the limit and that blocked reads and writes
+wake at expiry. A real HTTPS listener upgrades to WebSocket, echoes bytes,
+retires the old stream and still accepts a fresh connection. Bun's actual API
+serving function also completes an in-flight request during the drain grace,
+then closes that connection. Node certificate issuance and hot replacement
+remain the unfinished part of C14.

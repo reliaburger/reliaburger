@@ -286,9 +286,25 @@ Ingress session resumption is disabled: a reconnect must consult the current
 resolver and validate its certificate, matching the node/API policy. Real TLS
 1.2/1.3 reconnections pass for static and dynamic resolvers (0.02s), with renewal,
 file reload and strict Linux/macOS Clippy still passing.
-Remaining implementation covers node/API/Raft/reporting identity updates and
-bounded connection retirement. The
-working connection-lifetime policy is one hour, pending any operator preference.
+API/registry/ingress connections now enforce the one-hour lifetime policy,
+starting HTTP draining 30 seconds before the deadline. The deadline follows the
+I/O stream through WebSocket upgrades. Three failing-first timer tests, actual
+upgraded ingress retirement and reconnect (0.12s), and Bun API in-flight draining
+(0.05s) pass. Raft and reporting already use short deadline-bounded RPC exchanges.
+Node identity renewal remains, split into separately reviewable changes:
+
+- Persist a replacement identity atomically so an interrupted renewal retains a
+  complete, usable identity; validate the key, node identity, chain and actual
+  certificate validity rather than trusting sidecar timestamps.
+- Share validated live credentials across API/registry servers, Raft/reporting
+  client and server configurations, and internal HTTPS clients. Keep CA rotation
+  out of this package; reject accidental identity or trust-anchor changes.
+- Authorise renewal using the existing authenticated node identity, bind the CSR
+  to that same node, allocate the serial through Raft, persist before publishing,
+  and retry safely through leader changes. The private key stays on its node.
+- Update diagnostics from the currently served credentials and prove renewal,
+  reconnects, refusal of invalid replacements, restart recovery and leader-change
+  behaviour with real TLS and cluster tests.
 
 ### C15 — Make ingress serials unique across nodes and restarts
 

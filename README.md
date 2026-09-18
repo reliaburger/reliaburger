@@ -25,8 +25,8 @@ No sidecars. No add-on shopping list. No YAML archaeology. You get:
   joins are single-use-token, CSR-based; images can be signature-gated;
   secrets are encrypted at rest. Cluster-signed ingress leaves renew on demand
   before expiry, and operator certificate files reload without a restart.
-  [Certificate lifecycle work](docs/progress.md) remains for node identities
-  and connection retirement.
+  TLS connections have bounded lifetimes; [node identity renewal](docs/progress.md)
+  remains in progress.
 - **Batteries you'd otherwise deploy separately.** Built-in registry with
   P2P image distribution, time-series metrics with SQL, indexed logs,
   ingress with TLS and draining, web + terminal dashboards, and a fault

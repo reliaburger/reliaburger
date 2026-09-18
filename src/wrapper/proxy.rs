@@ -325,6 +325,7 @@ async fn serve_tls(
                     Err(infallible) => match infallible {},
                 };
                 let acceptor = acceptor.clone();
+                let connection_shutdown = shutdown.clone();
                 tokio::spawn(async move {
                     // Hold the handshake permit only until the handshake
                     // resolves; the request itself is bounded separately.
@@ -338,15 +339,26 @@ async fn serve_tls(
                         // handshake failed or timed out; drop the connection
                         _ => return,
                     };
+                    use crate::sesame::connection::{
+                        LifetimeLimitedIo, MAX_TLS_CONNECTION_LIFETIME, TLS_CONNECTION_DRAIN_GRACE,
+                    };
+                    let tls_stream = LifetimeLimitedIo::new(tls_stream, MAX_TLS_CONNECTION_LIFETIME);
                     let hyper_service = hyper_util::service::TowerToHyperService::new(service);
-                    let _ = hyper_util::server::conn::auto::Builder::new(
+                    let builder = hyper_util::server::conn::auto::Builder::new(
                         hyper_util::rt::TokioExecutor::new(),
-                    )
-                    .serve_connection_with_upgrades(
-                        hyper_util::rt::TokioIo::new(tls_stream),
-                        hyper_service,
-                    )
-                    .await;
+                    );
+                    let connection = builder.serve_connection_with_upgrades(
+                        hyper_util::rt::TokioIo::new(tls_stream), hyper_service,
+                    );
+                    tokio::pin!(connection);
+                    let drain_after = MAX_TLS_CONNECTION_LIFETIME.saturating_sub(TLS_CONNECTION_DRAIN_GRACE);
+                    tokio::select! {
+                        _ = &mut connection => return,
+                        _ = connection_shutdown.cancelled() => {},
+                        _ = tokio::time::sleep(drain_after) => {},
+                    }
+                    connection.as_mut().graceful_shutdown();
+                    let _ = tokio::time::timeout(TLS_CONNECTION_DRAIN_GRACE, connection).await;
                 });
             }
         }

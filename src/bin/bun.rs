@@ -273,21 +273,35 @@ async fn serve_api_over_tls(
             accepted = listener.accept() => {
                 let Ok((tcp, _peer)) = accepted else { continue };
                 let acceptor = acceptor.clone();
+                let connection_shutdown = shutdown.clone();
                 let service = match make_service.call(()).await {
                     Ok(service) => service,
                     Err(infallible) => match infallible {},
                 };
                 tokio::spawn(async move {
-                    let Ok(tls) = acceptor.accept(tcp).await else { return };
+                    use reliaburger::sesame::connection::{
+                        LifetimeLimitedIo, MAX_TLS_CONNECTION_LIFETIME, TLS_CONNECTION_DRAIN_GRACE,
+                    };
+                    let Ok(Ok(tls)) = tokio::time::timeout(
+                        std::time::Duration::from_secs(10), acceptor.accept(tcp),
+                    ).await else { return };
+                    let tls = LifetimeLimitedIo::new(tls, MAX_TLS_CONNECTION_LIFETIME);
                     let hyper_service = hyper_util::service::TowerToHyperService::new(service);
-                    let _ = hyper_util::server::conn::auto::Builder::new(
+                    let builder = hyper_util::server::conn::auto::Builder::new(
                         hyper_util::rt::TokioExecutor::new(),
-                    )
-                    .serve_connection_with_upgrades(
-                        hyper_util::rt::TokioIo::new(tls),
-                        hyper_service,
-                    )
-                    .await;
+                    );
+                    let connection = builder.serve_connection_with_upgrades(
+                        hyper_util::rt::TokioIo::new(tls), hyper_service,
+                    );
+                    tokio::pin!(connection);
+                    let drain_after = MAX_TLS_CONNECTION_LIFETIME.saturating_sub(TLS_CONNECTION_DRAIN_GRACE);
+                    tokio::select! {
+                        _ = &mut connection => return,
+                        _ = connection_shutdown.cancelled() => {},
+                        _ = tokio::time::sleep(drain_after) => {},
+                    }
+                    connection.as_mut().graceful_shutdown();
+                    let _ = tokio::time::timeout(TLS_CONNECTION_DRAIN_GRACE, connection).await;
                 });
             }
         }
@@ -3260,5 +3274,95 @@ mod tests {
         // require_mtls defaults to false — plaintext is allowed.
         let params = cluster_params_from_config(&config).unwrap();
         assert!(enforce_mtls_mode(&config, &params).is_ok());
+    }
+    #[tokio::test]
+    async fn api_tls_connection_drains_inflight_work_before_retiring() {
+        use reliaburger::sesame::connection::{
+            MAX_TLS_CONNECTION_LIFETIME, TLS_CONNECTION_DRAIN_GRACE,
+        };
+        use std::sync::Arc;
+        use std::time::Duration;
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let started = Arc::new(tokio::sync::Notify::new());
+        let finish = Arc::new(tokio::sync::Notify::new());
+        let route_started = started.clone();
+        let route_finish = finish.clone();
+        let router = axum::Router::new().route(
+            "/slow",
+            axum::routing::get(move || {
+                let started = route_started.clone();
+                let finish = route_finish.clone();
+                async move {
+                    started.notify_one();
+                    finish.notified().await;
+                    axum::http::StatusCode::NO_CONTENT
+                }
+            }),
+        );
+        let (certificate, key) = reliaburger::wrapper::tls::generate_self_signed_cert().unwrap();
+        let config =
+            reliaburger::wrapper::tls::build_tls_config(vec![certificate.clone()], key).unwrap();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let shutdown = tokio_util::sync::CancellationToken::new();
+        let mut tasks = tokio::task::JoinSet::new();
+        tasks.spawn(serve_api_over_tls(
+            listener,
+            tokio_rustls::TlsAcceptor::from(config),
+            router,
+            shutdown.clone(),
+        ));
+        let mut roots = rustls::RootCertStore::empty();
+        roots.add(certificate).unwrap();
+        let config = rustls::ClientConfig::builder_with_provider(Arc::new(
+            rustls::crypto::ring::default_provider(),
+        ))
+        .with_safe_default_protocol_versions()
+        .unwrap()
+        .with_root_certificates(roots)
+        .with_no_client_auth();
+        let connector = tokio_rustls::TlsConnector::from(Arc::new(config));
+        let mut stream = connector
+            .connect(
+                rustls::pki_types::ServerName::try_from("localhost").unwrap(),
+                tokio::net::TcpStream::connect(address).await.unwrap(),
+            )
+            .await
+            .unwrap();
+        stream
+            .write_all(b"GET /slow HTTP/1.1\r\nHost: localhost\r\n\r\n")
+            .await
+            .unwrap();
+        tokio::time::timeout(Duration::from_secs(3), started.notified())
+            .await
+            .unwrap();
+        tokio::time::pause();
+        tokio::time::advance(
+            MAX_TLS_CONNECTION_LIFETIME - TLS_CONNECTION_DRAIN_GRACE + Duration::from_secs(1),
+        )
+        .await;
+        tokio::task::yield_now().await;
+        tokio::time::resume();
+        finish.notify_one();
+        let mut headers = Vec::new();
+        tokio::time::timeout(Duration::from_secs(3), async {
+            while !headers.ends_with(b"\r\n\r\n") {
+                assert!(headers.len() < 4096);
+                headers.push(stream.read_u8().await.unwrap());
+            }
+        })
+        .await
+        .unwrap();
+        assert!(
+            headers.starts_with(b"HTTP/1.1 204"),
+            "inflight work must finish during the drain grace"
+        );
+        let retired = tokio::time::timeout(Duration::from_secs(3), stream.read_u8()).await;
+        assert!(
+            retired.is_ok(),
+            "the drained connection must close without waiting for another request"
+        );
+        assert!(retired.unwrap().is_err());
+        shutdown.cancel();
     }
 }
