@@ -219,6 +219,11 @@ enum Command {
         #[arg(long)]
         dry_run: bool,
     },
+    /// Cancel a node-local deploy and wait for its current work to finish.
+    CancelDeploy {
+        /// Operation ID from the apply stream or deploy-operation API.
+        operation_id: String,
+    },
     /// Show deploy history for an app.
     History {
         /// App name.
@@ -1361,6 +1366,9 @@ async fn main() -> ExitCode {
             } => reliaburger::relish::fault::scenario(path, *dry_run, *speed, *acknowledge).await,
         },
         Command::Deploy { ref path, dry_run } => commands::deploy(path, cli.output, dry_run).await,
+        Command::CancelDeploy { ref operation_id } => {
+            commands::cancel_deploy(operation_id, cli.output).await
+        }
         Command::History {
             ref app,
             ref namespace,
@@ -2361,6 +2369,15 @@ mod tests {
             Command::Logs { since, .. } => assert_eq!(since.as_deref(), Some("1h")),
             _ => panic!("expected Logs command"),
         }
+    }
+
+    #[test]
+    fn parse_cancel_deploy_requires_an_operation_id() {
+        let cli = parse(&["relish", "cancel-deploy", "deploy-123"]).unwrap();
+        assert!(
+            matches!(cli.command, Command::CancelDeploy { operation_id } if operation_id == "deploy-123")
+        );
+        assert!(parse(&["relish", "cancel-deploy"]).is_err());
     }
 
     #[test]

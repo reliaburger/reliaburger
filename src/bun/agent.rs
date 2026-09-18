@@ -284,6 +284,11 @@ pub enum AgentCommand {
     DeployOperations {
         response: oneshot::Sender<crate::bun::deploy_operations::DeployOperationSnapshot>,
     },
+    /// Request cancellation of an operation owned by this node.
+    CancelDeploy {
+        operation_id: crate::bun::deploy_operations::DeployOperationId,
+        response: oneshot::Sender<Option<crate::bun::deploy_operations::DeployOperation>>,
+    },
     /// Get logs for an app.
     Logs {
         app_name: String,
@@ -2972,6 +2977,10 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
                         outcome = DeployOperationOutcome::Unknown;
                         message = format!("deploy worker ended unexpectedly: {error}");
                         completion = None;
+                    } else if observed_operation.cancellation_observed() {
+                        outcome = DeployOperationOutcome::Cancelled;
+                        message = "deploy cancelled; in-flight work has finished".into();
+                        completion = None;
                     }
                     // Error events can precede rollback. Release target ownership
                     // only after the worker has completed every mutation.
@@ -3060,6 +3069,16 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
                     .filter(|image| !image.is_empty())
                     .collect();
                 let _ = response.send(images);
+            }
+            AgentCommand::CancelDeploy {
+                operation_id,
+                response,
+            } => {
+                let operation = self
+                    .deploy_operations
+                    .request_cancellation(&operation_id)
+                    .await;
+                let _ = response.send(operation);
             }
             AgentCommand::DeployOperations { response } => {
                 let _ = response.send(self.deploy_operations.snapshot().await);
@@ -8148,9 +8167,47 @@ struct DeployWorker<G: Grill> {
 }
 
 impl<G: Grill + Clone + 'static> DeployWorker<G> {
+    async fn report_cancellation(&self, events: &mpsc::Sender<ApplyEvent>) -> bool {
+        if self
+            .operation
+            .as_ref()
+            .is_some_and(|operation| operation.cancellation_requested())
+        {
+            let _ = events
+                .send(ApplyEvent::Error {
+                    message: "deploy cancellation requested; finishing owned cleanup".into(),
+                })
+                .await;
+            return true;
+        }
+        false
+    }
+
+    async fn wait_for_deploy_health(
+        &self,
+        id: &InstanceId,
+        spec: &AppSpec,
+        container_ip: Option<std::net::Ipv4Addr>,
+        wait: std::time::Duration,
+    ) -> Result<(), String> {
+        let health = wait_instance_healthy(&self.grill, id, spec, container_ip, wait);
+        if let Some(operation) = &self.operation {
+            tokio::select! {
+                biased;
+                _ = operation.cancelled() => Err("deploy cancellation requested; finishing owned cleanup".into()),
+                result = health => result,
+            }
+        } else {
+            health.await
+        }
+    }
+
     /// Deploy all apps and jobs from a config, streaming progress events. The
     /// mirror of the former `BunAgent::deploy`, but off the command loop.
     async fn run_deploy(self, config: Config, events: mpsc::Sender<ApplyEvent>) {
+        if self.report_cancellation(&events).await {
+            return;
+        }
         let now = Instant::now();
         let mut all_ids: Vec<String> = Vec::new();
         // Jobs already run as `run_before` prerequisites, so the regular jobs
@@ -8182,6 +8239,9 @@ impl<G: Grill + Clone + 'static> DeployWorker<G> {
         }
 
         for (app_name, spec) in &config.app {
+            if self.report_cancellation(&events).await {
+                return;
+            }
             let namespace = spec.namespace.as_deref().unwrap_or("default");
 
             // run_before (E): jobs declaring `run_before = ["app.<name>"]` must
@@ -8214,6 +8274,9 @@ impl<G: Grill + Clone + 'static> DeployWorker<G> {
                     return;
                 }
                 ran_prereqs.insert(job_name.clone());
+            }
+            if self.report_cancellation(&events).await {
+                return;
             }
 
             if let Some(operation) = &self.operation {
@@ -8402,6 +8465,9 @@ impl<G: Grill + Clone + 'static> DeployWorker<G> {
         }
 
         for (job_name, spec) in &config.job {
+            if self.report_cancellation(&events).await {
+                return;
+            }
             // Already run to completion as a run_before prerequisite above, or a
             // cron-scheduled job that fires on its schedule rather than now.
             if ran_prereqs.contains(job_name) || spec.schedule.is_some() {
@@ -8470,6 +8536,9 @@ impl<G: Grill + Clone + 'static> DeployWorker<G> {
             all_ids.extend(ids.iter().map(|id| id.0.clone()));
         }
 
+        if self.report_cancellation(&events).await {
+            return;
+        }
         if let Some(operation) = &self.operation {
             operation
                 .advance(
@@ -8715,6 +8784,10 @@ impl<G: Grill + Clone + 'static> DeployWorker<G> {
         let mut retired: usize = 0;
         let mut next_replica_index: u32 = 0;
         loop {
+            if self.report_cancellation(events).await {
+                new_failed = true;
+                break;
+            }
             let step = crate::meat::deploy_types::plan_rolling_step(
                 replica_count,
                 new_ids.len() as u32,
@@ -8881,7 +8954,10 @@ impl<G: Grill + Clone + 'static> DeployWorker<G> {
             // health check the operator configured, not merely because its
             // process came up.
             let wait = effective_health_wait(&deploy_config);
-            match wait_instance_healthy(&self.grill, &new_id, spec, container_ip, wait).await {
+            match self
+                .wait_for_deploy_health(&new_id, spec, container_ip, wait)
+                .await
+            {
                 Ok(()) => {
                     let _ = events
                         .send(ApplyEvent::Progress {
@@ -9065,6 +9141,10 @@ impl<G: Grill + Clone + 'static> DeployWorker<G> {
         // Unlike the rolling planner, nothing retires here and nothing is
         // published to routing yet: green comes up dark, alongside blue.
         for i in 0..replica_count {
+            if self.report_cancellation(events).await {
+                new_failed = true;
+                break;
+            }
             let new_id = crate::grill::InstanceIdentity::canary(namespace, app_name, deploy_gen, i)
                 .instance_id();
             let _ = events
@@ -9173,7 +9253,10 @@ impl<G: Grill + Clone + 'static> DeployWorker<G> {
             // otherwise a green fleet that starts but can't serve replaces a
             // blue fleet that can.
             let wait = effective_health_wait(&deploy_config);
-            match wait_instance_healthy(&self.grill, &new_id, spec, container_ip, wait).await {
+            match self
+                .wait_for_deploy_health(&new_id, spec, container_ip, wait)
+                .await
+            {
                 Ok(()) => {
                     let _ = events
                         .send(ApplyEvent::Progress {
@@ -9199,6 +9282,9 @@ impl<G: Grill + Clone + 'static> DeployWorker<G> {
             new_ids.push(new_id);
         }
 
+        if !new_failed && self.report_cancellation(events).await {
+            new_failed = true;
+        }
         if new_failed {
             // Green never took over routing, so blue is still live regardless of
             // auto_rollback. Rollback tears green down; halt leaves it up for
@@ -10242,6 +10328,141 @@ interval = 1
         grill_handle.release_creates(1);
         shutdown.cancel();
         let _ = handle.await;
+    }
+
+    #[tokio::test]
+    async fn cancellation_waits_for_in_flight_create_before_releasing_ownership() {
+        let (mut agent, tx, shutdown, grill) = test_agent_with_grill();
+        let task = tokio::spawn(async move { agent.run().await });
+        grill.block_creates();
+        let (events, mut stream) = mpsc::channel(64);
+        tx.send(AgentCommand::Deploy {
+            config: basic_config(),
+            events,
+        })
+        .await
+        .unwrap();
+        let ApplyEvent::Accepted { operation_id } = stream.recv().await.unwrap() else {
+            panic!("no ID")
+        };
+        tokio::time::timeout(std::time::Duration::from_secs(2), grill.wait_for_creates(1))
+            .await
+            .unwrap();
+        let (response, result) = oneshot::channel();
+        tx.send(AgentCommand::CancelDeploy {
+            operation_id: operation_id.clone().into(),
+            response,
+        })
+        .await
+        .unwrap();
+        let receipt = result.await.unwrap().unwrap();
+        assert!(receipt.cancellation_requested_at.is_some());
+        assert!(receipt.outcome.is_none());
+        let conflict = send_deploy(&tx, basic_config()).await;
+        assert!(conflict.iter().any(|event| matches!(event, ApplyEvent::Error { message } if message.contains(&operation_id))));
+        grill.release_creates(1);
+        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            while stream.recv().await.is_some() {}
+        })
+        .await
+        .unwrap();
+        let (response, result) = oneshot::channel();
+        tx.send(AgentCommand::DeployOperations { response })
+            .await
+            .unwrap();
+        assert_eq!(
+            result.await.unwrap().history[0].outcome,
+            Some(crate::bun::deploy_operations::DeployOperationOutcome::Cancelled)
+        );
+        expect_complete(&send_deploy(&tx, basic_config()).await);
+        shutdown.cancel();
+        task.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn cancellation_interrupts_health_wait_and_holds_ownership_through_rollback() {
+        for strategy in ["rolling", "blue-green"] {
+            let port = spawn_health_responder(500).await;
+            let (mut agent, tx, shutdown, grill) = test_agent_with_grill();
+            let task = tokio::spawn(async move { agent.run().await });
+            expect_complete(&send_deploy(&tx, no_health_config(port)).await);
+            let mut config = health_gated_config(port, strategy);
+            config
+                .app
+                .get_mut("web")
+                .unwrap()
+                .deploy
+                .as_mut()
+                .unwrap()
+                .health_timeout = Some("30s".into());
+            let (events, mut stream) = mpsc::channel(64);
+            tx.send(AgentCommand::Deploy { config, events })
+                .await
+                .unwrap();
+            let ApplyEvent::Accepted { operation_id } = stream.recv().await.unwrap() else {
+                panic!("no ID")
+            };
+            let canary =
+                crate::grill::InstanceIdentity::canary("default", "web", 1, 0).instance_id();
+            tokio::time::timeout(std::time::Duration::from_secs(2), async {
+                while !grill
+                    .calls()
+                    .iter()
+                    .any(|(call, id)| call == "start" && id == &canary)
+                {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .unwrap();
+            grill.block_kills();
+            let (response, result) = oneshot::channel();
+            tx.send(AgentCommand::CancelDeploy {
+                operation_id: operation_id.clone().into(),
+                response,
+            })
+            .await
+            .unwrap();
+            assert!(
+                result
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .cancellation_requested_at
+                    .is_some()
+            );
+            tokio::time::timeout(std::time::Duration::from_secs(2), grill.wait_for_kills(1))
+                .await
+                .expect("cancellation did not interrupt the 30-second health wait");
+            let (response, result) = oneshot::channel();
+            tx.send(AgentCommand::DeployOperations { response })
+                .await
+                .unwrap();
+            let snapshot = result.await.unwrap();
+            grill.release_kills(1);
+            assert!(
+                snapshot
+                    .active_deploys
+                    .iter()
+                    .any(|op| op.id.as_str() == operation_id)
+            );
+            tokio::time::timeout(std::time::Duration::from_secs(2), async {
+                while stream.recv().await.is_some() {}
+            })
+            .await
+            .unwrap();
+            let (response, result) = oneshot::channel();
+            tx.send(AgentCommand::DeployOperations { response })
+                .await
+                .unwrap();
+            assert_eq!(
+                result.await.unwrap().history[0].outcome,
+                Some(crate::bun::deploy_operations::DeployOperationOutcome::Cancelled)
+            );
+            expect_complete(&send_deploy(&tx, no_health_config(port)).await);
+            shutdown.cancel();
+            task.await.unwrap();
+        }
     }
 
     #[tokio::test]

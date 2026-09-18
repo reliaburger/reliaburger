@@ -827,6 +827,25 @@ impl BunClient {
         self.get_typed_json("/v1/deploys/operations").await
     }
 
+    /// Request cancellation of a node-local operation; admission is not completion.
+    pub async fn cancel_deploy(
+        &self,
+        operation_id: &str,
+    ) -> Result<crate::bun::deploy_operations::DeployOperation, RelishError> {
+        let segment: String =
+            url::form_urlencoded::byte_serialize(operation_id.as_bytes()).collect();
+        let response = self
+            .http()?
+            .post(format!(
+                "{}/v1/deploys/operations/{segment}/cancel",
+                self.base_url
+            ))
+            .send()
+            .await
+            .map_err(classify_error)?;
+        parse_typed_response(response).await
+    }
+
     /// Create a server-owned test resource lease.
     pub async fn create_test_lease(
         &self,

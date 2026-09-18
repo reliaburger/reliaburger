@@ -1032,6 +1032,58 @@ pub async fn deploy(path: &Path, output: OutputFormat, dry_run: bool) -> Result<
     }
 }
 
+/// Request cooperative cancellation and wait up to 30 seconds for terminal evidence.
+pub async fn cancel_deploy(operation_id: &str, output: OutputFormat) -> Result<(), RelishError> {
+    let client = BunClient::default_local();
+    let operation = tokio::time::timeout(std::time::Duration::from_secs(30), async {
+        let mut operation = client.cancel_deploy(operation_id).await?;
+        while operation.outcome.is_none() {
+            tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+            let snapshot = client.deploy_operations().await?;
+            operation = snapshot.active_deploys.into_iter().chain(snapshot.history)
+                .find(|operation| operation.id.as_str() == operation_id)
+                .ok_or_else(|| RelishError::ApiError { status: 404,
+                    body: format!("operation {operation_id} is no longer retained; cancellation outcome is unknown") })?;
+        }
+        Ok::<_, RelishError>(operation)
+    }).await.map_err(|_| RelishError::ApiError { status: 202,
+        body: format!("cancellation of {operation_id} is still pending; in-flight work retains ownership; query or retry the same ID") })??;
+    match output {
+        OutputFormat::Human => println!(
+            "{}: {:?}: {}",
+            operation.id,
+            operation
+                .outcome
+                .unwrap_or(crate::bun::deploy_operations::DeployOperationOutcome::Unknown),
+            operation.message
+        ),
+        OutputFormat::Json => println!(
+            "{}",
+            serde_json::to_string_pretty(&operation).map_err(RelishError::SerialiseJson)?
+        ),
+        OutputFormat::Yaml => print!(
+            "{}",
+            serde_yaml::to_string(&operation).map_err(RelishError::SerialiseYaml)?
+        ),
+    }
+    if matches!(
+        operation.outcome,
+        Some(
+            crate::bun::deploy_operations::DeployOperationOutcome::Unknown
+                | crate::bun::deploy_operations::DeployOperationOutcome::Failed
+        )
+    ) {
+        return Err(RelishError::ApiError {
+            status: 0,
+            body: format!(
+                "deployment ended with {:?}: {}",
+                operation.outcome, operation.message
+            ),
+        });
+    }
+    Ok(())
+}
+
 /// Show deploy history for an app in a namespace.
 pub async fn history(app: &str, namespace: &str, output: OutputFormat) -> Result<(), RelishError> {
     let client = BunClient::default_local();

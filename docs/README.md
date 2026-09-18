@@ -862,6 +862,7 @@ The bun agent exposes a local HTTP API on port 9117:
 | `GET` | `/v1/test/leases/{id}` | Inspect an owned lease (or inspect any lease as Admin) |
 | `POST` | `/v1/test/leases/{id}/renew` | Renew an active owned lease within the server TTL ceiling |
 | `DELETE` | `/v1/test/leases/{id}` | Release a lease and start/confirm owned app cleanup |
+| `POST` | `/v1/deploys/operations/{id}/cancel` | Request node-local cooperative deploy cancellation (Deployer, all target scopes) |
 | `POST` | `/v1/apply` | Deploy workloads (TOML body) |
 | `GET` | `/v1/deploys/active` | Live accepted deploy operations, phases and current targets |
 | `GET` | `/v1/deploys/operations` | Live operations plus the newest 50 terminal outcomes |
@@ -1022,9 +1023,14 @@ It is not treated as a green deploy. Concurrent operations may target different
 apps, but Bun refuses a second operation for the same namespace/name, naming
 the current ID, age and phase. A failed operation retains ownership until its
 rollback worker finishes. Stalled event streams close without cancelling the
-worker; query the accepted ID if the stream ends without completion. Cooperative
-cancellation remains pending under C38. Apps and jobs must use distinct names
-within a namespace: configuration rejects a conflicting pair, and node admission
+worker; query the accepted ID if the stream ends without completion.
+`relish cancel-deploy <operation-id>` requests cooperative cancellation on the
+selected node and waits up to 30 seconds for terminal evidence. Health waits can
+be interrupted, while in-flight runtime work retains ownership until it finishes.
+Pending, failed or unknown results exit non-zero. Apply the corrected config too:
+cancellation doesn't change cluster desired state or undo completed workloads.
+
+Apps and jobs must use distinct names within a namespace: configuration rejects a conflicting pair, and node admission
 preserves an existing instance's kind until its ownership is removed. Use a
 different name or namespace for the other kind.
 

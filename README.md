@@ -65,6 +65,11 @@ service names resolve in the calling workload's namespace. Host tools use explic
 names such as `redis.payments.internal`; unknown sources cannot inherit a node's
 namespace.
 
+A blocked local rollout can be cancelled with `relish cancel-deploy <operation-id>`.
+The command waits for owned work to finish before you submit the correction;
+cluster users should also update the desired configuration. See the
+[deployment guide](docs/README.md).
+
 ## The manual is in the binary
 
 Reliaburger documents itself. `relish manual` opens the reference as a

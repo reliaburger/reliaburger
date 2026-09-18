@@ -424,6 +424,10 @@ pub fn router_with_upgrade(
         .route("/v1/logs/export", post(logs_export_handler))
         .route("/v1/deploys/active", get(deploys_active_handler))
         .route("/v1/deploys/operations", get(deploys_operations_handler))
+        .route(
+            "/v1/deploys/operations/{id}/cancel",
+            post(deploy_cancel_handler),
+        )
         .route("/v1/deploys/history/{app}", get(deploys_history_handler))
         .route("/v1/rollback/{app}/{namespace}", post(rollback_handler))
         .route("/v1/placements/{node_id}", get(placements_handler))
@@ -5999,6 +6003,86 @@ async fn metrics_app_handler(
 // Deploy endpoints
 // ---------------------------------------------------------------------------
 
+/// Request node-local cooperative cancellation under the same authority as apply.
+async fn deploy_cancel_handler(
+    auth: Option<axum::Extension<crate::sesame::auth::AuthContext>>,
+    State(state): State<ApiState>,
+    Path(id): Path<String>,
+) -> Response {
+    if let Err(response) =
+        crate::sesame::auth::authorize(auth.as_deref(), crate::sesame::types::ApiRole::Deployer)
+    {
+        return response;
+    }
+    let snapshot = match deploy_operation_snapshot(&state).await {
+        Ok(snapshot) => snapshot,
+        Err(response) => return response,
+    };
+    let Some(operation) = snapshot
+        .active_deploys
+        .iter()
+        .chain(&snapshot.history)
+        .find(|operation| operation.id.as_str() == id)
+    else {
+        return (
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({"error": "deploy operation not found on this node"})),
+        )
+            .into_response();
+    };
+    let permissions = match &state.council {
+        Some(council) => council.desired_state().await.permissions,
+        None => std::collections::BTreeMap::new(),
+    };
+    for target in &operation.targets {
+        if let Err(response) =
+            crate::sesame::auth::authorize_scoped(auth.as_deref(), &target.name, &target.namespace)
+        {
+            return response;
+        }
+        if let Err(response) = crate::sesame::auth::authorize_permission(
+            auth.as_deref(),
+            crate::config::PermissionAction::Deploy,
+            &target.name,
+            &target.namespace,
+            &permissions,
+        ) {
+            return response;
+        }
+    }
+    let (response, result) = oneshot::channel();
+    let request = async {
+        state
+            .cmd_tx
+            .send(AgentCommand::CancelDeploy {
+                operation_id: id.into(),
+                response,
+            })
+            .await
+            .ok()?;
+        result.await.ok()
+    };
+    match tokio::time::timeout(std::time::Duration::from_secs(2), request).await {
+        Ok(Some(Some(operation))) => {
+            let status = if operation.outcome.is_some() {
+                StatusCode::OK
+            } else {
+                StatusCode::ACCEPTED
+            };
+            (status, Json(operation)).into_response()
+        }
+        Ok(Some(None)) => {
+            (StatusCode::NOT_FOUND, "deploy operation no longer retained").into_response()
+        }
+        Ok(None) => (StatusCode::SERVICE_UNAVAILABLE, "agent unavailable").into_response(),
+        Err(_) => (
+            StatusCode::GATEWAY_TIMEOUT,
+            "cancellation receipt unknown; query or retry the same operation ID",
+        )
+            .into_response(),
+    }
+}
+
 /// `GET /v1/deploys/active` — list active deploys.
 async fn deploys_active_handler(State(state): State<ApiState>) -> Response {
     match deploy_operation_snapshot(&state).await {
@@ -8662,6 +8746,82 @@ mod tests {
         .await;
         assert_eq!(status, StatusCode::FORBIDDEN);
         shutdown.cancel();
+    }
+
+    #[tokio::test]
+    async fn deploy_cancellation_checks_every_target_scope_and_is_idempotent() {
+        let (admin, admin_secret) = a_user_token(crate::sesame::types::ApiRole::Admin);
+        let scoped = crate::sesame::token::create_token(
+            "cancel-scoped",
+            crate::sesame::types::ApiRole::Deployer,
+            crate::sesame::types::TokenScope {
+                apps: None,
+                namespaces: Some(vec!["team-a".into()]),
+            },
+            None,
+        )
+        .unwrap();
+        let secret = scoped.plaintext.clone();
+        let (app, shutdown) = setup_with_auth(vec![admin, scoped.token], None).await;
+        let response = app
+            .clone()
+            .oneshot(
+                axum::http::Request::builder()
+                    .method("POST")
+                    .uri("/v1/apply")
+                    .header("authorization", format!("Bearer {admin_secret}"))
+                    .body(Body::from(
+                        "[app.web]\nimage = 'web:v1'\nnamespace = 'team-b'\n",
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let body = axum::body::to_bytes(response.into_body(), 65536)
+            .await
+            .unwrap();
+        let text = String::from_utf8(body.to_vec()).unwrap();
+        let operation_id = text
+            .lines()
+            .filter_map(|line| line.strip_prefix("data:"))
+            .filter_map(|line| serde_json::from_str::<ApplyEvent>(line.trim()).ok())
+            .find_map(|event| match event {
+                ApplyEvent::Accepted { operation_id } => Some(operation_id),
+                _ => None,
+            })
+            .unwrap();
+        let path = format!("/v1/deploys/operations/{operation_id}/cancel");
+        assert_eq!(
+            post_status(app.clone(), &path, &secret, "").await,
+            StatusCode::FORBIDDEN
+        );
+        for _ in 0..2 {
+            assert_eq!(
+                post_status(app.clone(), &path, &admin_secret, "").await,
+                StatusCode::OK
+            );
+        }
+        shutdown.cancel();
+    }
+
+    #[tokio::test]
+    async fn deploy_cancellation_requires_deployer_and_reports_unknown_ids() {
+        for (role, expected) in [
+            (
+                crate::sesame::types::ApiRole::ReadOnly,
+                StatusCode::FORBIDDEN,
+            ),
+            (
+                crate::sesame::types::ApiRole::Deployer,
+                StatusCode::NOT_FOUND,
+            ),
+        ] {
+            let (app, shutdown, token) = setup_with_role("cancel-role", role).await;
+            let status =
+                post_status(app, "/v1/deploys/operations/unknown/cancel", &token, "").await;
+            assert_eq!(status, expected);
+            shutdown.cancel();
+        }
     }
 
     #[tokio::test]

@@ -980,8 +980,8 @@ The regression holds the runtime's `kill()` call open after a failed health
 probe, for both rolling and blue-green strategies. The operation must remain
 active until we release that call and rollback finishes. A corrective deployment
 then succeeds. A second test leaves the event reader alive without reading and
-still requires terminal history. Cooperative cancellation and the app/job naming
-contract remain the rest of C38; an error event is no longer an accidental unlock.
+still requires terminal history. The next sections cover cooperative cancellation and the app/job naming
+contract. An error event is no longer an accidental unlock.
 
 ## Apps and jobs share the runtime name space
 
@@ -1004,3 +1004,48 @@ tries both kind orderings and verifies that refusal preserves the original owner
 an agent test proves that an app cannot roll over a live job. These are runtime
 ownership checks, not a new cluster-wide catalogue of jobs. Jobs still have the
 separate ownership work tracked in C34.
+
+## Cancelling the work, not its ownership
+
+A replacement is waiting thirty seconds for a health check that you already know
+will fail. You want to deploy the correction now. `relish cancel-deploy <id>`
+requests cancellation of that node's accepted operation and waits up to thirty
+seconds for terminal evidence. Use the ID from the apply stream or
+`GET /v1/deploys/operations`, against the same node's endpoint.
+
+Cancellation has two steps. The tracker first records `cancellation_requested_at`
+and signals a `CancellationToken`, keeping the target reservation. The worker
+then observes the token at a safe boundary. Health waits are read-only and can be
+interrupted with `tokio::select!`. Runtime creation, start, drain and cleanup are
+allowed to finish: dropping an in-flight mutation and immediately admitting a
+successor would recreate the race we just fixed. Prerequisite jobs and init work
+can therefore keep a request pending until their current step returns. There is
+no force-abort option.
+
+The worker stops between workloads and replacement steps. Cancelling a rolling
+or blue-green health wait uses the existing rollback or halt policy, including
+`auto_rollback = false`. Completed work isn't undone. The operation becomes
+`Cancelled` only after the worker observed the request and returned from its
+cleanup; a panic is still `Unknown`. A request that arrives too late can return
+the ordinary completed or failed outcome. Retrying the same ID is idempotent
+while its record remains in the node's bounded history.
+
+The API returns 202 for a pending request and 200 for a terminal record. It
+checks the Deployer role, token scope and deploy permission for every target,
+before signalling anything. A missing local ID returns 404. The CLI polls the
+same node for up to thirty seconds; a timeout says that ownership is still
+pending, and failed or unknown terminal evidence returns a non-zero exit status.
+An interrupted client can query or retry the same ID safely.
+
+This cancels one local attempt. It doesn't change Raft desired state, undo
+completed workloads or remove a cron schedule. Apply the corrected configuration
+as well, so reconciliation doesn't retry the old desired version. There is no
+automatic cluster-wide supersede operation hidden behind the command.
+
+The tests hold `create()` open and prove that cancellation can't release its
+reservation early. They interrupt a thirty-second health wait in each rollout
+strategy, hold the subsequent `kill()` open, and require the same reservation to
+survive until cleanup completes. A corrective deployment then succeeds. API
+tests cover role and namespace scope, including repeated requests for a terminal
+record. A real CLI process receives 202, polls for terminal evidence, and refuses
+to report an unknown outcome as success.

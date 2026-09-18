@@ -183,6 +183,7 @@ pub const ROUTE_MATRIX: &[Route] = &[
     route(Post, "/v1/logs/export", Admin),
     route(Get, "/v1/deploys/active", AnyToken),
     route(Get, "/v1/deploys/operations", AnyToken),
+    route(Post, "/v1/deploys/operations/{id}/cancel", Deployer),
     route(Get, "/v1/deploys/history/{app}", AnyToken),
     route(Post, "/v1/rollback/{app}/{namespace}", Deployer),
     route(Get, "/v1/placements/{node_id}", AnyToken),
