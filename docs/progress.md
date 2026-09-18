@@ -93,6 +93,8 @@ remain separate. Older unchecked groups below point into this current ledger.
 
 - [x] **C48** Confine both upload Location responses to the declared registry origin before PATCH or PUT; refuse changed schemes/hosts/ports, URL credentials and fragments. Stop on POST/PATCH errors. The two-server credential-leak regression fails before the fix; all six OCI unit tests, authenticated uploads through the real Pickle API using relative and same-origin absolute locations (0.20s), and strict all-target/all-feature Clippy pass. Found while validating C33 endpoint discovery.
 
+- [x] **C49** Reject zero and overflowing token lifetimes before hashing or committing credentials. Both public API regressions fail before the fix and pass afterwards, covering multiplication overflow, clock overflow, normal expiry and explicit non-expiring tokens. Token unit tests and strict Linux/macOS Clippy pass. Found during C34 ownership work.
+
 ### Engineering follow-ups
 
 - [x] **H01** Reconcile scheduler/quota/scrape wiring and weights, roadmap test locations, cleanup evidence and disabled-auth chaos policy with their callers. Mark completed historical bug groups done while retaining C30/C33/C34/H02. Repair eleven Rustdoc errors; all-feature public documentation now builds with warnings denied, all 74 relative links in the changed Markdown pass, and the four documented diagnostic CLI help interfaces are verified.

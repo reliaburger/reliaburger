@@ -750,6 +750,19 @@ The two-server leak regression fails before the fix; six OCI unit tests, real
 authenticated Pickle uploads with both supported location forms (0.20s) and
 strict all-target/all-feature Clippy pass.
 
+### C49 — Reject unrepresentable API token lifetimes
+
+**Priority:** P1. **Wave:** 4. **Book chapter:** 04.
+
+Found while implementing C34: token creation multiplied untrusted `ttl_days`
+and added the result to `SystemTime` without checked arithmetic. Overflow
+panicked; zero produced an already expired credential.
+
+**Completed on PR #167:** Return HTTP 400 for zero and either overflow before
+hashing or committing. An omitted lifetime remains explicitly non-expiring.
+Both API regressions fail before the fix and pass afterwards; token unit tests
+and strict Linux and macOS all-target/all-feature Clippy pass.
+
 ## Engineering follow-ups
 
 ### H01 — Remove stale wiring claims and validate documentation

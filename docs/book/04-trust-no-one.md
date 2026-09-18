@@ -1190,3 +1190,20 @@ configuration and a leaf already past its midpoint. It waits for a newer serial
 on disk, connects with Relish over HTTPS, restarts Bun and checks that the same
 renewed leaf is still installed. Malformed responses and valid bundles padded
 beyond the response limit must leave both disk and live credentials unchanged.
+
+### Reject lifetimes that the clock cannot represent
+
+A token request with `ttl_days = 0` used to create an already expired credential.
+A sufficiently large number could panic while converting days to seconds or
+adding that duration to the system clock. Neither request should reach Raft.
+
+We now use `checked_mul` and `SystemTime::checked_add`. Each returns an
+`Option`: `Some(value)` on success, `None` when the result cannot be represented.
+The `filter` rejects zero, and `and_then` continues only when the previous
+calculation succeeded. Invalid lifetimes return HTTP 400 before hashing or
+committing a token. Omitting the lifetime still means explicitly non-expiring;
+zero is not another spelling of that choice.
+
+The API tests submit both multiplication and clock overflows, then inspect
+the committed token store. They also check zero, an ordinary one-day token
+and an omitted lifetime. The two regressions failed before the repair.

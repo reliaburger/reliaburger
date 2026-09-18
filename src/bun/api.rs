@@ -7088,9 +7088,28 @@ async fn token_create_handler(
         apps: req.apps.clone(),
         namespaces: req.namespaces.clone(),
     };
-    let expires_at = req
-        .ttl_days
-        .map(|d| std::time::SystemTime::now() + std::time::Duration::from_secs(d * 86400));
+    let expires_at = match req.ttl_days {
+        None => None,
+        Some(days) => {
+            let expiry = days
+                .checked_mul(86_400)
+                .filter(|seconds| *seconds > 0)
+                .and_then(|seconds| {
+                    std::time::SystemTime::now()
+                        .checked_add(std::time::Duration::from_secs(seconds))
+                });
+            let Some(expiry) = expiry else {
+                return (
+                    StatusCode::BAD_REQUEST,
+                    Json(serde_json::json!({
+                        "error": "ttl_days must be positive and produce a representable expiry"
+                    })),
+                )
+                    .into_response();
+            };
+            Some(expiry)
+        }
+    };
 
     // Argon2id hashing is deliberately slow + memory-hungry (M7): run it on the
     // blocking pool so it doesn't stall the async runtime worker.
