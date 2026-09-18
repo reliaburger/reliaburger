@@ -886,3 +886,32 @@ only the root. It fails against the leaf-only implementation and succeeds with
 the complete chain, checking that the server sends exactly those two certificates.
 This is a prerequisite for testing renewal: a fresh certificate must also be one
 the documented client can validate.
+
+### A cached leaf still has an expiry date
+
+Open a connection, leave the ingress running for ninety days, then open another.
+The original cache returned the same certificate both times. Caching had quietly
+turned a validity period into a suggestion.
+
+The resolver now reads the leaf's X.509 validity dates when it caches the key.
+Before the midpoint it reuses that key. From the midpoint onwards, the next
+handshake issues a replacement and swaps the cache entry. An idle host needs no
+background signing: its first returning client triggers renewal, even if the old
+leaf expired while nobody was using it. Cache keys use lower-case hostnames.
+
+Signing happens outside the short cache lock. If signing fails, an existing leaf
+can still serve until its expiry; an expired or not-yet-valid leaf cannot. The
+issuer's actual certificate sets another boundary: we refuse issuance outside
+its validity window and cap each leaf at the issuer's expiry. Renewing leaves
+cannot extend the lifetime of a CA. CA rotation remains separate work.
+
+`CachedCertificate` owns an `Arc<CertifiedKey>` and a small validity value. Cloning
+the `Arc` gives a handshake ownership of the current key without copying its
+secret bytes. Replacing the entry doesn't invalidate a connection already using
+that key. The lifetime limit for established connections is a separate policy.
+
+The regression uses real TLS connections with a ten-second certificate. It
+checks reuse immediately, a different valid leaf after six seconds, and another
+valid leaf after eleven idle seconds. Two issuance tests also reject an expired
+issuer and prove a leaf cannot outlive it. Operator file replacement and node
+transport renewal still have their own implementation and acceptance work.

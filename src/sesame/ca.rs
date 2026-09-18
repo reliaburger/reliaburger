@@ -319,6 +319,12 @@ fn sign_end_entity_cert(
     params.subject_alt_names = all_sans;
 
     set_validity(&mut params, lifetime)?;
+    if params.not_before < ca_params.not_before || params.not_before >= ca_params.not_after {
+        return Err(CaError::InvalidInput(
+            "issuer is outside its validity period".into(),
+        ));
+    }
+    params.not_after = params.not_after.min(ca_params.not_after);
 
     let ca_cert = ca_params
         .clone()

@@ -23,7 +23,9 @@ No sidecars. No add-on shopping list. No YAML archaeology. You get:
   rolling binary upgrades where workloads survive the swap.
 - **Security that's on by default.** Generated clusters require mTLS;
   joins are single-use-token, CSR-based; images can be signature-gated;
-  secrets are encrypted at rest.
+  secrets are encrypted at rest. Cluster-signed ingress leaves renew on demand
+  before expiry; [certificate lifecycle work](docs/progress.md) remains for node
+  identities and operator file reload.
 - **Batteries you'd otherwise deploy separately.** Built-in registry with
   P2P image distribution, time-series metrics with SQL, indexed logs,
   ingress with TLS and draining, web + terminal dashboards, and a fault

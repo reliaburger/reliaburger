@@ -68,12 +68,20 @@ pub fn issue_ingress_cert(
         .cloned()
         .ok_or_else(|| TlsError::CertGenFailed("no ingress hostname supplied".to_string()))?;
 
+    // The original certificate, not reconstructed signing parameters, defines
+    // the issuer's validity. A leaf must never extend that trust window.
+    let issuer_validity = CertificateValidity::parse(issuer_certificate)?;
+    let mut ca_params = ca_params.clone();
+    ca_params.not_before = time::OffsetDateTime::from_unix_timestamp(issuer_validity.not_before)
+        .map_err(|e| TlsError::CertGenFailed(e.to_string()))?;
+    ca_params.not_after = time::OffsetDateTime::from_unix_timestamp(issuer_validity.not_after)
+        .map_err(|e| TlsError::CertGenFailed(e.to_string()))?;
     let (cert_der, key_der) = crate::sesame::ca::issue_ingress_leaf_cert(
         &common_name,
         lifetime,
         hostnames,
         ca_keypair,
-        ca_params,
+        &ca_params,
     )
     .map_err(|e| TlsError::CertGenFailed(e.to_string()))?;
 
@@ -179,6 +187,38 @@ fn certified_key(
     )))
 }
 
+#[derive(Debug, Clone, Copy)]
+struct CertificateValidity {
+    not_before: i64,
+    not_after: i64,
+}
+
+impl CertificateValidity {
+    fn parse(certificate: &CertificateDer<'_>) -> Result<Self, TlsError> {
+        use x509_parser::prelude::FromDer;
+        let (_, parsed) = x509_parser::certificate::X509Certificate::from_der(certificate)
+            .map_err(|error| TlsError::ConfigFailed(format!("invalid certificate: {error}")))?;
+        Ok(Self {
+            not_before: parsed.validity().not_before.timestamp(),
+            not_after: parsed.validity().not_after.timestamp(),
+        })
+    }
+
+    fn contains(self, now: i64) -> bool {
+        self.not_before <= now && now < self.not_after
+    }
+
+    fn renewal_due(self, now: i64) -> bool {
+        now >= self.not_before + (self.not_after - self.not_before) / 2
+    }
+}
+
+#[derive(Clone)]
+struct CachedCertificate {
+    key: Arc<rustls::sign::CertifiedKey>,
+    validity: CertificateValidity,
+}
+
 /// Largest number of per-SNI certificates the resolver caches. The host
 /// allowlist already bounds this to the number of configured ingress routes;
 /// the cap is defence in depth against a pathologically large route set.
@@ -204,7 +244,7 @@ pub struct IngressCertResolver {
     lifetime: std::time::Duration,
     default_key: Arc<rustls::sign::CertifiedKey>,
     routes: Arc<tokio::sync::RwLock<super::routing::RoutingTable>>,
-    cache: std::sync::Mutex<std::collections::HashMap<String, Arc<rustls::sign::CertifiedKey>>>,
+    cache: std::sync::Mutex<std::collections::HashMap<String, CachedCertificate>>,
 }
 
 impl std::fmt::Debug for IngressCertResolver {
@@ -241,11 +281,34 @@ impl IngressCertResolver {
 
     /// Issue (or fetch from cache) a certified key for `hostname`.
     fn key_for(&self, hostname: &str) -> Option<Arc<rustls::sign::CertifiedKey>> {
-        if let Ok(cache) = self.cache.lock()
-            && let Some(existing) = cache.get(hostname)
+        let hostname = hostname.to_ascii_lowercase();
+        let now = time::OffsetDateTime::now_utc().unix_timestamp();
+        let existing = self
+            .cache
+            .lock()
+            .ok()
+            .and_then(|cache| cache.get(&hostname).cloned())
+            .filter(|entry| entry.validity.contains(now));
+        if let Some(entry) = &existing
+            && !entry.validity.renewal_due(now)
         {
-            return Some(Arc::clone(existing));
+            return Some(Arc::clone(&entry.key));
         }
+
+        // Signing stays outside the cache lock. If renewal fails, the previous
+        // key is usable only for its remaining validity, never after expiry.
+        self.issue_key(&hostname).or_else(|| {
+            existing
+                .filter(|entry| {
+                    entry
+                        .validity
+                        .contains(time::OffsetDateTime::now_utc().unix_timestamp())
+                })
+                .map(|entry| entry.key)
+        })
+    }
+
+    fn issue_key(&self, hostname: &str) -> Option<Arc<rustls::sign::CertifiedKey>> {
         let hosts = [hostname.to_string()];
         let (chain, key) = issue_ingress_cert(
             &hosts,
@@ -255,11 +318,21 @@ impl IngressCertResolver {
             &self.issuer_certificate,
         )
         .ok()?;
+        let validity = CertificateValidity::parse(chain.first()?).ok()?;
+        if !validity.contains(time::OffsetDateTime::now_utc().unix_timestamp()) {
+            return None;
+        }
         let certified = certified_key(chain, key).ok()?;
         if let Ok(mut cache) = self.cache.lock()
             && (cache.len() < MAX_SNI_CACHE || cache.contains_key(hostname))
         {
-            cache.insert(hostname.to_string(), Arc::clone(&certified));
+            cache.insert(
+                hostname.to_string(),
+                CachedCertificate {
+                    key: Arc::clone(&certified),
+                    validity,
+                },
+            );
         }
         Some(certified)
     }
@@ -467,6 +540,56 @@ mod tests {
             &CertificateDer::from(hierarchy.ingress.ca.certificate_der.clone()),
         );
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn ingress_leaf_cannot_outlive_its_issuer() {
+        use x509_parser::prelude::FromDer;
+        let mut hierarchy =
+            crate::sesame::ca::generate_ca_hierarchy("short-issuer", b"test-ikm").unwrap();
+        hierarchy.ingress.certificate_params.not_after =
+            time::OffsetDateTime::now_utc() + time::Duration::seconds(30);
+        let issuer = hierarchy
+            .ingress
+            .certificate_params
+            .clone()
+            .self_signed(&hierarchy.ingress.signing_keypair)
+            .unwrap();
+        let (chain, _) = issue_ingress_cert(
+            &["web.example".into()],
+            std::time::Duration::from_secs(3600),
+            &hierarchy.ingress.signing_keypair,
+            &hierarchy.ingress.certificate_params,
+            issuer.der(),
+        )
+        .unwrap();
+        let (_, leaf) = x509_parser::certificate::X509Certificate::from_der(&chain[0]).unwrap();
+        let (_, issuer) = x509_parser::certificate::X509Certificate::from_der(&chain[1]).unwrap();
+        assert!(leaf.validity().not_after <= issuer.validity().not_after);
+    }
+
+    #[test]
+    fn expired_ingress_issuer_cannot_mint_a_leaf() {
+        let mut hierarchy =
+            crate::sesame::ca::generate_ca_hierarchy("expired-issuer", b"test-ikm").unwrap();
+        hierarchy.ingress.certificate_params.not_after =
+            time::OffsetDateTime::now_utc() - time::Duration::seconds(1);
+        let issuer = hierarchy
+            .ingress
+            .certificate_params
+            .clone()
+            .self_signed(&hierarchy.ingress.signing_keypair)
+            .unwrap();
+        assert!(
+            issue_ingress_cert(
+                &["web.example".into()],
+                std::time::Duration::from_secs(3600),
+                &hierarchy.ingress.signing_keypair,
+                &hierarchy.ingress.certificate_params,
+                issuer.der(),
+            )
+            .is_err()
+        );
     }
 
     /// M8: the per-SNI resolver issues a cluster-CA cert for the requested

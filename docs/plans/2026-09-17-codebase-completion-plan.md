@@ -276,8 +276,10 @@ The ingress resolver returns cached keys without expiry checks; node/API leaves 
 root-signed intermediate with every ingress leaf. Root-only real TLS trust fails
 with `UnknownIssuer` before the fix and succeeds after it (0.02s); ten ingress
 TLS tests and strict Linux 1.97/macOS 1.98 Clippy pass. This does not close renewal.
-Remaining implementation covers cached-leaf renewal, operator file replacement,
-node/API/Raft/reporting identity updates and bounded connection retirement. The
+Cached-leaf renewal now uses the X.509 validity midpoint, rejects expired cache
+entries and limits issued leaves to the original issuer certificate's validity.
+Remaining implementation covers operator file replacement, node/API/Raft/reporting
+identity updates and bounded connection retirement. The
 working connection-lifetime policy is one hour, pending any operator preference.
 
 ### C15 — Make ingress serials unique across nodes and restarts

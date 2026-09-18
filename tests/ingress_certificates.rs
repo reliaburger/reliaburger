@@ -2,8 +2,9 @@
 
 use std::sync::Arc;
 
-#[tokio::test]
-async fn cluster_ingress_sends_the_issuer_chain_to_root_trusting_clients() {
+fn server_config(
+    lifetime: std::time::Duration,
+) -> (Arc<rustls::ServerConfig>, rustls::RootCertStore) {
     let hierarchy =
         reliaburger::sesame::ca::generate_ca_hierarchy("ingress-chain", b"test-ikm").unwrap();
     let mut roots = rustls::RootCertStore::empty();
@@ -37,7 +38,7 @@ async fn cluster_ingress_sends_the_issuer_chain_to_root_trusting_clients() {
         hierarchy.ingress.signing_keypair,
         hierarchy.ingress.certificate_params,
         rustls::pki_types::CertificateDer::from(hierarchy.ingress.ca.certificate_der),
-        std::time::Duration::from_secs(3600),
+        lifetime,
         Arc::new(tokio::sync::RwLock::new(routes)),
         vec![default_certificate],
         default_key,
@@ -45,6 +46,13 @@ async fn cluster_ingress_sends_the_issuer_chain_to_root_trusting_clients() {
     .unwrap();
     let server_config =
         reliaburger::wrapper::tls::build_tls_config_with_resolver(Arc::new(resolver)).unwrap();
+    (server_config, roots)
+}
+
+async fn handshake(
+    server_config: Arc<rustls::ServerConfig>,
+    roots: rustls::RootCertStore,
+) -> Vec<rustls::pki_types::CertificateDer<'static>> {
     let acceptor = tokio_rustls::TlsAcceptor::from(server_config);
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let address = listener.local_addr().unwrap();
@@ -77,6 +85,40 @@ async fn cluster_ingress_sends_the_issuer_chain_to_root_trusting_clients() {
         "the cluster root alone must validate the served chain: {result:?}"
     );
     let client = result.unwrap();
-    assert_eq!(client.get_ref().1.peer_certificates().unwrap().len(), 2);
+    let chain = client.get_ref().1.peer_certificates().unwrap().to_vec();
     assert!(server.await.unwrap().is_ok());
+    chain
+}
+
+#[tokio::test]
+async fn cluster_ingress_sends_the_issuer_chain_to_root_trusting_clients() {
+    let (config, roots) = server_config(std::time::Duration::from_secs(3600));
+    assert_eq!(handshake(config, roots).await.len(), 2);
+}
+
+#[tokio::test]
+async fn cached_ingress_leaves_renew_before_expiry_and_after_an_idle_expiry() {
+    let (config, roots) = server_config(std::time::Duration::from_secs(10));
+    let first = handshake(config.clone(), roots.clone()).await;
+    let cached = handshake(config.clone(), roots.clone()).await;
+    assert_eq!(
+        first, cached,
+        "ordinary cache hits should retain the current certificate"
+    );
+    tokio::time::sleep(std::time::Duration::from_secs(6)).await;
+    let renewed = handshake(config.clone(), roots.clone()).await;
+    assert_ne!(
+        first[0], renewed[0],
+        "renew before the original ten-second leaf expires"
+    );
+    assert_eq!(
+        first[1], renewed[1],
+        "renewal must retain the trusted issuer"
+    );
+    tokio::time::sleep(std::time::Duration::from_secs(11)).await;
+    let after_idle = handshake(config, roots).await;
+    assert_ne!(
+        renewed[0], after_idle[0],
+        "an expired cache entry must never be served"
+    );
 }

@@ -393,6 +393,12 @@ certificates. Peer API calls also present their node certificate and check the
 live revocation list; Relish and browsers may omit a client certificate and
 authenticate with a bearer token or session cookie over TLS.
 
+Cluster-signed ingress leaves renew on the first handshake after half their
+validity period. Idle hosts renew when clients return; expired cached leaves
+are never reused. This does not rotate the Ingress CA or renew node identities.
+The remaining certificate lifecycle work is tracked in C14 of
+[the completion plan](plans/2026-09-17-codebase-completion-plan.md).
+
 If you specifically need plaintext transports for an isolated local test,
 make that exception explicit:
 
