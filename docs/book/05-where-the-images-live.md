@@ -597,3 +597,24 @@ ports. That character separates lower layers in overlayfs mount options. We
 encode it as `%3A` in rootfs directory components while preserving the original
 OCI reference for registry requests. A path regression covers both a pinned
 digest and a registry port; ordinary tag paths keep their existing layout.
+
+### An upload location is not permission to forward credentials
+
+The registry starts an upload by returning a `Location` header. Our catalogue
+client used to accept any absolute URL there, then reuse its authenticated HTTP
+client for PATCH and PUT. A response naming a different server could therefore
+send the administrator's bearer to that server. Disabling automatic redirects
+doesn't fix an explicit request made by our own code.
+
+We now resolve both relative and absolute upload locations with `url::Url`, then
+compare their origins. An origin includes the scheme, host and effective port:
+changing any of those refuses the next request. Credentials embedded in the URL
+and fragments are refused too. Query strings remain valid because registries can
+use them to identify an upload session. POST and PATCH error responses stop the
+upload before any location from that response is used.
+
+The regression runs two HTTP servers. The first supplies a location on the
+second; the second records whether it received an Authorization header. Before
+the fix it did. After the fix, the client reports an origin violation without
+contacting it. Separate cases cover protocol-relative URLs, TLS downgrades,
+changed ports, and valid relative and same-origin absolute locations.

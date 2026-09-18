@@ -1,0 +1,73 @@
+//! Authenticated catalogue uploads retain same-origin OCI compatibility.
+
+use std::sync::Arc;
+
+#[tokio::test]
+async fn catalogue_uploads_accept_relative_and_same_origin_absolute_locations() {
+    for absolute in [false, true] {
+        let root = tempfile::tempdir().unwrap();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let origin = format!("http://{}", listener.local_addr().unwrap());
+        let state = reliaburger::pickle::api::PickleState {
+            store: Arc::new(reliaburger::pickle::store::BlobStore::new(root.path())),
+            catalog: Default::default(),
+            node_raft_id: 1,
+            council: None,
+            persist_path: None,
+            auth: Some(reliaburger::sesame::auth::AuthState::new(
+                Default::default(),
+                Some("fixture-registry-token".into()),
+            )),
+            require_read_auth: true,
+            allow_unauthenticated_bootstrap: false,
+            quota: Default::default(),
+            sessions: reliaburger::pickle::registry_auth::UploadSessions::new(
+                reliaburger::pickle::registry_auth::DEFAULT_UPLOAD_TTL,
+            ),
+        };
+        let mut router = reliaburger::pickle::api::router(state);
+        if absolute {
+            let origin = origin.clone();
+            router = router.layer(axum::middleware::map_response(
+                move |mut response: axum::response::Response| {
+                    let origin = origin.clone();
+                    async move {
+                        if let Some(location) = response.headers().get(axum::http::header::LOCATION)
+                        {
+                            let location = format!("{origin}{}", location.to_str().unwrap());
+                            response
+                                .headers_mut()
+                                .insert(axum::http::header::LOCATION, location.parse().unwrap());
+                        }
+                        response
+                    }
+                },
+            ));
+        }
+        let server = tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
+        let mut headers = reqwest::header::HeaderMap::new();
+        headers.insert(
+            reqwest::header::AUTHORIZATION,
+            "Bearer fixture-registry-token".parse().unwrap(),
+        );
+        let http = reqwest::Client::builder()
+            .default_headers(headers)
+            .no_proxy()
+            .timeout(std::time::Duration::from_secs(3))
+            .build()
+            .unwrap();
+        let image = reliaburger::testkit::oci::build_synthetic_image("origin");
+        let pushed =
+            reliaburger::testkit::oci::push_image(&http, &origin, "test", "v1", &image).await;
+        assert!(pushed.is_ok(), "absolute={absolute}: {pushed:?}");
+        let manifest = reliaburger::testkit::oci::fetch_manifest(&http, &origin, "test", "v1")
+            .await
+            .unwrap();
+        assert_eq!(
+            reliaburger::testkit::oci::sha256_digest(&manifest),
+            image.manifest_digest
+        );
+        server.abort();
+        let _ = server.await;
+    }
+}

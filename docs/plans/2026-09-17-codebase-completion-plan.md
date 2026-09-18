@@ -676,6 +676,12 @@ Evidence: `src/testkit/oci.rs:resolve_location` accepts any absolute upload
 URL or a plaintext downgrade must fail before credentials leave the declared
 origin. Relative and same-origin absolute locations must still upload successfully.
 
+**Completed on PR #167:** Both POST and PATCH locations are parsed and compared
+by origin before another authenticated request. Error responses stop the upload.
+The two-server leak regression fails before the fix; six OCI unit tests, real
+authenticated Pickle uploads with both supported location forms (0.20s) and
+strict all-target/all-feature Clippy pass.
+
 ## Engineering follow-ups
 
 ### H01 — Remove stale wiring claims and validate documentation
