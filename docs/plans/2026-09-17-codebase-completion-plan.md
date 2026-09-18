@@ -770,9 +770,16 @@ separate.
 **Hosted macOS follow-up:** CI at `c4ec142` passed the three job assertions but
 failed cron cleanup with EPERM. The same real catalogue failure reproduces on
 macOS (17.74s), and signalling twelve exited, unreaped child-owned groups
-returns EPERM in all twelve cases. Observe child exit before deciding whether to
-signal; do not ignore permission errors for live processes. Full process-tree
-ownership remains a separate gate. The release build at `c4ec142` passed.
+returns EPERM in all twelve cases. A non-reaping `waitid` regression reproduces
+EPERM through ProcessGrill itself (0.07s). Stop and kill now collect an already
+completed child's result before deciding whether to signal, preserving both
+zero and non-zero exits. Live-process observation/signal errors still propagate.
+Full process-tree ownership remains a separate gate. The release build at
+`c4ec142` passed. After the repair, 21 native ProcessGrill tests pass (0.24s),
+the actual macOS catalogue reports three passes with confirmed cleanup (17.79s),
+and 274 Linux runtime tests (13 explicit gates, 7.58s), seven job lifecycle tests
+(12.03s), both real Linux job catalogue/recovery cases (13.32s) and strict
+Linux/macOS Clippy pass. Hosted qualification of the repair remains separate.
 
 **Job completion evidence (18 September):** The catalogue previously counted a
 stopped job with no exit code as success. Its HTTP regression fails first; the

@@ -1113,3 +1113,34 @@ cleanup to refuse, then closes it and retries. The address and runtime record
 must remain owned throughout. These checks don't establish atomic process
 identity or close the crash window before the initial adoption record is
 persisted; those remain separate release work.
+
+### Collect a short job's exit before signalling it
+
+A cron job can finish between the agent publishing its instance and the test
+client requesting cleanup. On macOS, signalling the process group of an exited,
+unreaped child returns EPERM. We reproduced this in the actual job catalogue:
+all three cases passed their assertions, but cron cleanup failed. Twelve direct
+kernel probes produced the same error.
+
+`ProcessGrill` now calls `Child::try_wait()` before deciding whether stop or kill
+needs to send a signal. If the child has finished, it records the actual exit
+code and reports Stopped. If it is still running, normal signalling proceeds.
+Inspection errors and live-process signal errors still propagate. The state
+query uses the same helper, so these three paths agree about observed exit.
+
+The regression waits for exit without reaping the child, then invokes the
+runtime's public stop or kill method. `waitid` with `WNOWAIT` leaves the exit
+status available for the owner; `WNOHANG` makes that observation non-blocking.
+The fixture checks both exit 0 and exit 7. Calling the ordinary state method
+before stop would have reaped the child and hidden the bug.
+
+The test needs a small FFI call on macOS, where our `nix` version doesn't expose
+`waitid`. `MaybeUninit<siginfo_t>` reserves a buffer of the correct size without
+pretending it already contains a Rust value. We zero its bytes and only call
+`assume_init()` after the kernel reports success. The `unsafe` blocks state the
+buffer and process-ownership conditions that make those operations valid.
+Production code uses the safe `Child` interface.
+
+This repair establishes exit of the owned child. Complete descendant ownership
+and atomic identity checks remain separate release work; a child exit by itself
+doesn't prove that every process it ever started has disappeared.

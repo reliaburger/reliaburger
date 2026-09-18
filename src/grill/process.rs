@@ -103,6 +103,17 @@ fn signal_adopted_process(
     }
 }
 
+/// Record an owned child's observed exit before deciding whether to signal it.
+fn observe_child_exit(entry: &mut ProcessEntry) -> std::io::Result<()> {
+    if let Some(child) = entry.child.as_mut()
+        && let Some(status) = child.try_wait()?
+    {
+        entry.exit_code = status.code();
+        entry.state = ContainerState::Stopped;
+    }
+    Ok(())
+}
+
 /// Signal the group while the unreaped Child still owns its process identifier.
 fn signal_child_group(pid: u32, signal: nix::sys::signal::Signal) -> std::io::Result<()> {
     #[cfg(unix)]
@@ -355,13 +366,14 @@ impl super::Grill for ProcessGrill {
             .ok_or_else(|| GrillError::NotFound {
                 instance: instance.clone(),
             })?;
-        if entry.state == ContainerState::Stopped {
-            return Ok(());
-        }
         let error = |error: std::io::Error| GrillError::StopFailed {
             instance: instance.clone(),
             reason: error.to_string(),
         };
+        observe_child_exit(entry).map_err(error)?;
+        if entry.state == ContainerState::Stopped {
+            return Ok(());
+        }
         if let Some(pid) = entry.child.as_ref().and_then(|child| child.id()) {
             signal_child_group(pid, nix::sys::signal::Signal::SIGTERM).map_err(error)?;
             entry.state = ContainerState::Stopping;
@@ -386,13 +398,14 @@ impl super::Grill for ProcessGrill {
             .ok_or_else(|| GrillError::NotFound {
                 instance: instance.clone(),
             })?;
-        if entry.state == ContainerState::Stopped {
-            return Ok(());
-        }
         let error = |error: std::io::Error| GrillError::StopFailed {
             instance: instance.clone(),
             reason: error.to_string(),
         };
+        observe_child_exit(entry).map_err(error)?;
+        if entry.state == ContainerState::Stopped {
+            return Ok(());
+        }
         if let Some(ref mut child) = entry.child {
             if let Some(pid) = child.id() {
                 signal_child_group(pid, nix::sys::signal::Signal::SIGKILL).map_err(error)?;
@@ -431,22 +444,11 @@ impl super::Grill for ProcessGrill {
             })?;
 
         // Check if the process has exited
-        if let Some(ref mut child) = entry.child {
-            match child.try_wait() {
-                Ok(Some(status)) => {
-                    entry.state = ContainerState::Stopped;
-                    entry.exit_code = status.code();
-                }
-                Ok(None) => {
-                    // Still running — keep current state
-                }
-                Err(error) => {
-                    return Err(GrillError::StateUnavailable {
-                        instance: instance.clone(),
-                        reason: error.to_string(),
-                    });
-                }
-            }
+        if entry.child.is_some() {
+            observe_child_exit(entry).map_err(|error| GrillError::StateUnavailable {
+                instance: instance.clone(),
+                reason: error.to_string(),
+            })?;
         } else if let Some(pid) = entry.adopted_pid {
             // Adopted process: no handle, poll (and reap) by pid. This
             // doubles as the zombie reaper — the supervisor polls state
@@ -708,6 +710,65 @@ mod tests {
             app_spec: None,
             oci_spec: sleep_spec("60"),
             rootless_network: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn stop_and_kill_reap_already_exited_children_without_signalling_zombies() {
+        for operation in ["stop", "kill"] {
+            for exit in [0, 7] {
+                let grill = ProcessGrill::new();
+                let id = InstanceId(format!("completed-{operation}-{exit}"));
+                let spec =
+                    spec_with_args(vec!["/bin/sh".into(), "-c".into(), format!("exit {exit}")]);
+                grill.create(&id, &spec).await.unwrap();
+                grill.start(&id).await.unwrap();
+                let pid = grill.pid(&id).await.unwrap();
+                // WNOWAIT observes exit without reaping the child, preserving
+                // the exact zombie-group state that macOS refuses to signal.
+                tokio::time::timeout(std::time::Duration::from_secs(5), async {
+                    loop {
+                        let mut info = std::mem::MaybeUninit::<nix::libc::siginfo_t>::zeroed();
+                        // SAFETY: pid belongs to the child just spawned above;
+                        // info points to correctly sized, initialised storage.
+                        // WNOHANG bounds the call and WNOWAIT preserves ownership.
+                        let result = unsafe {
+                            nix::libc::waitid(
+                                nix::libc::P_PID,
+                                pid as nix::libc::id_t,
+                                info.as_mut_ptr(),
+                                nix::libc::WEXITED | nix::libc::WNOHANG | nix::libc::WNOWAIT,
+                            )
+                        };
+                        assert_eq!(
+                            result,
+                            0,
+                            "waitid failed: {}",
+                            std::io::Error::last_os_error()
+                        );
+                        // SAFETY: the POD buffer was zero-initialised and waitid
+                        // succeeded; si_pid reads the process-event member.
+                        let observed_pid = unsafe { info.assume_init().si_pid() };
+                        if observed_pid == pid as nix::libc::pid_t {
+                            break;
+                        }
+                        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+                    }
+                })
+                .await
+                .unwrap();
+                let result = if operation == "stop" {
+                    grill.stop(&id).await
+                } else {
+                    grill.kill(&id).await
+                };
+                assert!(
+                    result.is_ok(),
+                    "{operation} on exited child failed: {result:?}"
+                );
+                assert_eq!(grill.state(&id).await.unwrap(), ContainerState::Stopped);
+                assert_eq!(grill.exit_code(&id).await, Some(exit));
+            }
         }
     }
 
