@@ -945,6 +945,14 @@ pass, failure, panic or timeout. Container cases use the official BusyBox
 The same immutable reference is accepted by the provisioned runc and Apple
 Container gates; ProcessGrill cases keep using the node's installed Bun.
 
+The `workload-identity` group deploys a leased container and reads its public
+certificate bundle through namespace-scoped exec on the owning node. It checks
+the chain and validity against your configured `--ca-cert`, plus the exact
+SPIFFE URI for the cluster, namespace and app. It never reads the workload
+private key or token, and never trusts a CA merely because it appears in the
+mounted bundle. Without an explicit CA, certificate verification reports
+Unknown. The group's JWKS and scoped-token cases also work with ProcessGrill.
+
 `relish test --chaos` adds five serial recovery scenarios: council leader
 failure, worker death with live replicas, a minority council partition,
 bounded node pressure, and node death during a rolling deploy. Run it

@@ -29,6 +29,8 @@ No sidecars. No add-on shopping list. No YAML archaeology. You get:
   before expiry, and operator certificate files reload without a restart.
   Node leaves renew automatically through the current leader, and every node
   transport observes replacements. TLS connections have bounded lifetimes.
+  `relish test --filter workload-identity` checks a container's SPIFFE certificate
+  against the configured cluster CA, alongside JWKS and token-scope checks.
 - **Batteries you'd otherwise deploy separately.** Built-in registry with
   P2P image distribution, time-series metrics with SQL, indexed logs,
   ingress with TLS and draining, web + terminal dashboards, and a fault

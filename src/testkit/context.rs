@@ -59,6 +59,37 @@ pub struct TestContext {
 }
 
 impl TestContext {
+    /// Inspect the actual owning node, since the entry node may not run this app.
+    pub async fn exec_in_workload(&self, app: &str, command: &[String]) -> Result<String, String> {
+        self.deadline
+            .run("inspect workload contents", async {
+                for (node, client) in self.node_clients().await? {
+                    let instances = client
+                        .status()
+                        .await
+                        .map_err(|error| format!("could not inspect node {node}: {error}"))?;
+                    if instances.iter().any(|instance| {
+                        instance.app_name == app
+                            && instance.namespace == self.namespace
+                            && instance.state == "running"
+                    }) {
+                        return client
+                            .exec(app, &self.namespace, command)
+                            .await
+                            .map_err(|error| {
+                                format!("workload inspection failed on {node}: {error}")
+                            });
+                    }
+                }
+                Err(format!(
+                    "no running instance of {}/{app} found",
+                    self.namespace
+                ))
+            })
+            .await
+            .map_err(|error| error.to_string())?
+    }
+
     /// Build a bounded HTTP client for workloads, without cluster credentials.
     ///
     /// Workload requests must never use the authenticated Bun API client.

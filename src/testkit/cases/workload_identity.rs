@@ -1,7 +1,7 @@
 //! Workload-identity cases: JWKS and token scoping.
 //!
-//! These exercise the identity/auth control plane, which is API-level and
-//! runtime-independent, so they run on a process-runtime cluster too.
+//! JWKS and token scoping exercise the control plane on any runtime. The
+//! certificate case also requires a container and inspects its public bundle.
 
 use crate::bun::capabilities::Capability;
 use crate::testkit::TestContext;
@@ -9,12 +9,85 @@ use crate::testkit::registry::{TestCase, unknown};
 use crate::testkit::report::TestGroup;
 use crate::testkit_case;
 
-/// A running workload's SPIFFE certificate isn't reachable through the API, so
-/// this can't be asserted end-to-end from the harness yet.
+/// A workload receives the expected SPIFFE leaf under the configured cluster CA.
 async fn workload_receives_spiffe_certificate(
-    _ctx: TestContext,
+    ctx: TestContext,
 ) -> crate::testkit::registry::CaseResult {
-    unknown("a workload's SPIFFE certificate is not exposed via the orchestrator API")
+    use rustls::pki_types::{CertificateDer, UnixTime, pem::PemObject};
+    use std::sync::Arc;
+    use x509_parser::prelude::{FromDer, X509Certificate};
+
+    let Some(ca_pem) = ctx.client.cluster_ca_pem() else {
+        return unknown("certificate verification requires an explicit cluster CA");
+    };
+    let mut roots = rustls::RootCertStore::empty();
+    for certificate in CertificateDer::pem_slice_iter(ca_pem) {
+        roots
+            .add(certificate.map_err(|error| format!("invalid cluster CA PEM: {error}"))?)
+            .map_err(|error| format!("invalid cluster CA certificate: {error}"))?;
+    }
+    let verifier = rustls::server::WebPkiClientVerifier::builder_with_provider(
+        Arc::new(roots),
+        Arc::new(rustls::crypto::ring::default_provider()),
+    )
+    .build()
+    .map_err(|error| format!("cannot configure workload certificate verification: {error}"))?;
+
+    let app = "identity-app";
+    ctx.apply(&ctx.container_idle_spec(app)).await?;
+    ctx.wait_running_cluster(app, 1).await?;
+    let bundle = ctx
+        .deadline
+        .run("wait for workload certificate", async {
+            loop {
+                if let Ok(bundle) = ctx
+                    .exec_in_workload(
+                        app,
+                        &[
+                            "/bin/busybox".into(),
+                            "cat".into(),
+                            "/run/reliaburger/identity/bundle.pem".into(),
+                        ],
+                    )
+                    .await
+                    && bundle.starts_with("-----BEGIN CERTIFICATE-----")
+                {
+                    return bundle;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+            }
+        })
+        .await
+        .map_err(|error| error.to_string())?;
+    let certificates = CertificateDer::pem_slice_iter(bundle.as_bytes())
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|error| format!("invalid workload certificate PEM: {error}"))?;
+    let (leaf, intermediates) = certificates
+        .split_first()
+        .ok_or_else(|| "workload certificate bundle is empty".to_string())?;
+    verifier
+        .verify_client_cert(leaf, intermediates, UnixTime::now())
+        .map_err(|error| format!("workload certificate chain is invalid: {error}"))?;
+
+    let (_, certificate) = X509Certificate::from_der(leaf.as_ref())
+        .map_err(|error| format!("invalid workload certificate: {error}"))?;
+    let expected = crate::sesame::types::SpiffeUri {
+        trust_domain: ctx.capabilities.cluster_name.clone(),
+        namespace: ctx.namespace.clone(),
+        workload_type: crate::sesame::types::WorkloadType::App,
+        name: app.into(),
+    }
+    .to_uri();
+    let names = certificate
+        .subject_alternative_name()
+        .map_err(|error| format!("invalid workload certificate names: {error}"))?
+        .ok_or_else(|| "workload certificate has no subject alternative names".to_string())?;
+    if names.value.general_names.as_slice()
+        != [x509_parser::extensions::GeneralName::URI(&expected)]
+    {
+        return Err(format!("workload certificate does not identify exactly {expected}").into());
+    }
+    Ok(())
 }
 
 /// The JWKS endpoint serves at least one well-formed signing key.
@@ -122,7 +195,11 @@ pub fn cases() -> Vec<TestCase> {
         TestCase {
             name: "workload_receives_spiffe_certificate",
             group: TestGroup::WorkloadIdentity,
-            requires: &[Capability::Identity],
+            requires: &[
+                Capability::ContainerRuntime,
+                Capability::Council,
+                Capability::Identity,
+            ],
             run: testkit_case!(workload_receives_spiffe_certificate),
         },
         TestCase {

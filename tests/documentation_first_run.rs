@@ -1106,6 +1106,18 @@ fn secure_catalogue_scoped_token_uses_explicit_ca_and_server_owned_cleanup() {
 #[test]
 #[ignore = "requires rootful runc, networking tools and registry access"]
 fn runc_catalogue_decrypts_secrets_using_only_the_public_key_api() {
+    qualify_runc_catalogue("secrets-config");
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+#[ignore = "requires rootful runc, networking tools and registry access"]
+fn runc_catalogue_verifies_workload_spiffe_certificates() {
+    qualify_runc_catalogue("workload-identity");
+}
+
+#[cfg(target_os = "linux")]
+fn qualify_runc_catalogue(group: &str) {
     assert!(
         nix::unistd::geteuid().is_root(),
         "run this qualification as root"
@@ -1117,11 +1129,11 @@ fn runc_catalogue_decrypts_secrets_using_only_the_public_key_api() {
             "init",
             cluster_dir.to_str().unwrap(),
             "--cluster-name",
-            "secrets-catalogue",
+            "identity-catalogue",
             "--node-id",
             "node-01",
         ]),
-        "initialise secrets fixture",
+        "initialise catalogue fixture",
     );
     let node_path = cluster_dir.join("reliaburger.toml");
     let mut node = reliaburger::config::NodeConfig::from_file(&node_path).unwrap();
@@ -1164,11 +1176,11 @@ fn runc_catalogue_decrypts_secrets_using_only_the_public_key_api() {
         "token",
         "create",
         "--name",
-        "secrets-test-admin",
+        "catalogue-test-admin",
         "--role",
         "admin",
     ]);
-    assert_success(&token, "create secrets catalogue administrator");
+    assert_success(&token, "create catalogue administrator");
     let token = String::from_utf8(token.stdout).unwrap();
     let deadline = Instant::now() + WAIT;
     while run_relish(&["--endpoint", &endpoint, "--ca-cert", ca, "token", "list"])
@@ -1192,7 +1204,7 @@ fn runc_catalogue_decrypts_secrets_using_only_the_public_key_api() {
         "json",
         "test",
         "--filter",
-        "secrets-config",
+        group,
         "--timeout",
         "90s",
         "--parallel",
@@ -1212,5 +1224,56 @@ fn runc_catalogue_decrypts_secrets_using_only_the_public_key_api() {
         assert_eq!(case["outcome"]["status"], "pass", "{report}");
         assert_eq!(case["cleanup"]["status"], "confirmed", "{report}");
     }
-    assert_success(&output, "qualify secret encryption and config mounting");
+    assert_success(&output, "qualify runtime catalogue");
+    if group == "workload-identity" {
+        // A Node CA can authenticate the API, but cannot validate a workload
+        // leaf issued by the separate Workload CA. The mounted bundle must
+        // never be promoted into the client's own trust anchors.
+        let node_ca = cluster_dir.join("identity/node-ca.crt");
+        let output = run_relish(&[
+            "--endpoint",
+            &endpoint,
+            "--ca-cert",
+            node_ca.to_str().unwrap(),
+            "--token",
+            token.trim(),
+            "--output",
+            "json",
+            "test",
+            "--filter",
+            "workload-identity",
+            "--timeout",
+            "90s",
+            "--parallel",
+            "1",
+        ]);
+        let report: serde_json::Value =
+            serde_json::from_slice(&output.stdout).unwrap_or_else(|error| {
+                panic!(
+                    "negative trust probe returned no report: {error}; stderr={}",
+                    String::from_utf8_lossy(&output.stderr)
+                )
+            });
+        let results = report["results"].as_array().unwrap();
+        assert_eq!(results.len(), 3, "{report}");
+        let certificate = results
+            .iter()
+            .find(|case| case["name"] == "workload_receives_spiffe_certificate")
+            .unwrap();
+        assert_eq!(certificate["outcome"]["status"], "fail", "{report}");
+        assert!(
+            certificate["outcome"]["reason"]
+                .as_str()
+                .unwrap()
+                .contains("workload certificate chain is invalid"),
+            "{report}"
+        );
+        for case in results {
+            assert_eq!(case["cleanup"]["status"], "confirmed", "{report}");
+        }
+        assert!(
+            !output.status.success(),
+            "untrusted workload certificate passed"
+        );
+    }
 }

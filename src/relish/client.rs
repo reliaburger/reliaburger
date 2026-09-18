@@ -392,6 +392,11 @@ impl BunClient {
         self
     }
 
+    /// Public trust anchors configured for this cluster client.
+    pub(crate) fn cluster_ca_pem(&self) -> Option<&[u8]> {
+        self.ca_pem.as_deref()
+    }
+
     /// Build a separate workload client with normal hostname verification and
     /// the cluster CA, without the API bearer or client identity.
     pub fn workload_http_builder(&self) -> Result<reqwest::ClientBuilder, String> {

@@ -511,7 +511,7 @@ Missing metric lists exist in the result but neither drive the non-zero exit nor
 
 Evidence: `src/testkit/cases/secrets_config.rs`; `image_registry.rs`; `workload_identity.rs`; `src/testkit/report.rs`.
 
-Four cases return unknown unconditionally. Development and full profiles share a failed_any verdict, so a complete catalogue cannot be a clean pass.
+The audit found four cases returning Unknown unconditionally. Secret/config and workload-identity observations are now implemented; runnable registry deployment remains. Development and full profiles share a failed_any verdict, so missing required evidence still rejects acceptance.
 
 **Completion test:** Implement runnable registry, secret/config and workload-identity fixtures in separate commits. Full profiles require their observations; development reports supported skips/warnings honestly and never converts missing evidence to success.
 
@@ -526,7 +526,17 @@ eight route audits, 117 testkit tests and strict Linux/macOS Clippy pass. The re
 TLS/runc catalogue now passes all three cases with confirmed cleanup (65.36s),
 after the separately committed C34 retirement/observation repairs. Its ignored
 `runc_` acceptance test is included by the existing privileged CI target.
-Workload SPIFFE observation and runnable registry deployment remain open.
+**Workload identity fixture completed (18 September):** The real TLS/runc
+regression initially returns Unknown. The case now deploys a leased container,
+reads only its public certificate bundle on the owning node and validates the
+chain, current validity and client-auth usage against the caller’s configured
+CA anchors. Its sole SAN must match the exact cluster/namespace/app SPIFFE URI.
+The three-case group passes; a second run trusting only the Node CA rejects the
+Workload-CA-issued leaf, with confirmed cleanup in both runs (51.73s total). All 117 testkit tests
+(0.62s) and strict Linux/macOS Clippy pass.
+No private key/token is read, and a mounted CA never becomes a trust anchor.
+A missing configured CA remains conditional Unknown. Runnable registry
+deployment remains open and depends on C34 registry ownership.
 
 The broad library checkpoint was not green: 3,276 passed, one upgrade probe
 failed with Linux ETXTBSY, and 19 privileged gates were ignored. This execution

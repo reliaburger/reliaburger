@@ -23,53 +23,20 @@ async fn config_file_is_mounted_with_contents(ctx: TestContext) -> Result<(), St
     ctx.apply(&spec).await?;
     ctx.wait_running_cluster(app, 1).await?;
 
-    let contents = exec_in_workload(
-        &ctx,
-        app,
-        &[
-            "/bin/busybox".into(),
-            "cat".into(),
-            "/etc/app/config.yaml".into(),
-        ],
-    )
-    .await?;
+    let contents = ctx
+        .exec_in_workload(
+            app,
+            &[
+                "/bin/busybox".into(),
+                "cat".into(),
+                "/etc/app/config.yaml".into(),
+            ],
+        )
+        .await?;
     if !contents.contains("key: value") {
         return Err(format!("config file content not mounted: {contents:?}"));
     }
     Ok(())
-}
-
-/// Inspect the actual owning node, since the entry node may not run this app.
-async fn exec_in_workload(
-    ctx: &TestContext,
-    app: &str,
-    command: &[String],
-) -> Result<String, String> {
-    ctx.deadline
-        .run("inspect workload contents", async {
-            for (node, client) in ctx.node_clients().await? {
-                let instances = client
-                    .status()
-                    .await
-                    .map_err(|error| format!("could not inspect node {node}: {error}"))?;
-                if instances.iter().any(|instance| {
-                    instance.app_name == app
-                        && instance.namespace == ctx.namespace
-                        && instance.state == "running"
-                }) {
-                    return client
-                        .exec(app, &ctx.namespace, command)
-                        .await
-                        .map_err(|error| format!("workload inspection failed on {node}: {error}"));
-                }
-            }
-            Err(format!(
-                "no running instance of {}/{app} found",
-                ctx.namespace
-            ))
-        })
-        .await
-        .map_err(|error| error.to_string())?
 }
 
 /// Decrypt a sealed variable without changing an adjacent plaintext value.
@@ -115,12 +82,12 @@ async fn encrypted_environment_roundtrip(
         ("SECOND", plaintext),
         ("PLAIN", "unchanged"),
     ] {
-        let output = exec_in_workload(
-            ctx,
-            app,
-            &["/bin/busybox".into(), "printenv".into(), name.into()],
-        )
-        .await?;
+        let output = ctx
+            .exec_in_workload(
+                app,
+                &["/bin/busybox".into(), "printenv".into(), name.into()],
+            )
+            .await?;
         if output.strip_suffix('\n') != Some(expected) {
             return Err(format!(
                 "{name} did not preserve its expected value in the workload"

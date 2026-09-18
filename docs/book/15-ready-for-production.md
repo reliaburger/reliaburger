@@ -2871,3 +2871,28 @@ The black-box first-run test asks for port zero, reads the selected endpoint,
 creates the first administrator and deploys a process workload. It requires
 an observed running instance. Merely accepting the manifest wouldn't prove
 that the scheduler can use the advertised endpoint.
+
+
+### Observe workload identity without trusting its own bundle
+
+The identity catalogue used to return Unknown because it couldn't observe a
+workload certificate. A running container already exposes its public bundle at
+`/run/reliaburger/identity/bundle.pem`. We can inspect that through the same
+namespace-scoped exec path used by the secret/config cases. The helper selects
+the node that actually owns the running instance and keeps the case deadline.
+
+The new probe deploys a leased BusyBox workload and waits for identity issuance.
+It reads the public bundle, never the private key or bearer token. Rustls checks
+the leaf's signature chain, validity and client-auth usage against the CA
+configured by the caller. `CertificateDer` represents an encoded certificate;
+it doesn't make those bytes trusted. Only the configured anchors do that.
+The probe also requires exactly the SPIFFE URI for the expected cluster,
+namespace and app. This proves certificate delivery and validation, not a
+workload-to-workload TLS handshake or private-key possession.
+
+There is a useful negative test here. A Node CA can authenticate the Bun API,
+but it cannot validate a leaf signed by the separate Workload CA. The privileged
+fixture runs the identity case with that restricted trust anchor and requires
+a chain-verification failure plus confirmed resource cleanup. Trusting whatever
+root appears inside the container's bundle would make this test incorrectly
+pass. With no explicit CA configured, the case remains Unknown.
