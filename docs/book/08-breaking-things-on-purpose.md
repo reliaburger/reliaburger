@@ -872,3 +872,10 @@ released when it leaves scope. Membership changes resume after confirmed reversa
 target, fault type and cleanup deadline. A retained slot can therefore be
 inspected even when its target's fault list is unavailable. These fields describe
 ownership, not proof that the target is still running the fault.
+
+
+The reservation helpers return `Box<Response>` on failure. `Box<T>` owns a value
+on the heap while the surrounding `Result` carries its small pointer. Rust 1.98's
+Clippy check caught the large inline HTTP response even though the minimum Rust
+1.97 check passed. Boxing that error keeps the helper's error representation
+small without changing any HTTP status or body.

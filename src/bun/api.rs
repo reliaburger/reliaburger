@@ -3812,7 +3812,7 @@ async fn chaos_partition_handler(
     };
     let reservation = match prepare_and_reserve_node_fault(&state, request).await {
         Ok(grant) => grant,
-        Err(response) => return response,
+        Err(response) => return *response,
     };
     let duration_secs = reservation.request.duration.as_secs();
     let (resp_tx, resp_rx) = oneshot::channel();
@@ -4295,7 +4295,7 @@ async fn fault_inject_handler(
                 request = grant.request.clone();
                 Some(grant)
             }
-            Err(response) => return response,
+            Err(response) => return *response,
         }
     } else {
         None
@@ -4525,7 +4525,7 @@ async fn node_fault_reserve_handler(
     }
     match reserve_node_fault_on_leader(&state, prepared).await {
         Ok(grant) => Json(grant).into_response(),
-        Err(response) => response,
+        Err(response) => *response,
     }
 }
 
@@ -4559,7 +4559,7 @@ async fn node_fault_fence_handler(
 async fn prepare_and_reserve_node_fault(
     state: &ApiState,
     request: crate::smoker::types::FaultRequest,
-) -> Result<crate::smoker::reservation::NodeFaultReservation, Response> {
+) -> Result<crate::smoker::reservation::NodeFaultReservation, Box<Response>> {
     let operation = async {
         let (response, receiver) = oneshot::channel();
         state
@@ -4575,13 +4575,14 @@ async fn prepare_and_reserve_node_fault(
     let (boot_id, request) =
         match tokio::time::timeout(std::time::Duration::from_secs(5), operation).await {
             Ok(Ok(value)) => value,
-            Ok(Err(error)) => return Err((StatusCode::BAD_REQUEST, error).into_response()),
+            Ok(Err(error)) => return Err((StatusCode::BAD_REQUEST, error).into_response().into()),
             Err(_) => {
                 return Err((
                     StatusCode::GATEWAY_TIMEOUT,
                     "node fault preparation timed out",
                 )
-                    .into_response());
+                    .into_response()
+                    .into());
             }
         };
     let prepared = NodeFaultPreparation { boot_id, request };
@@ -4590,7 +4591,8 @@ async fn prepare_and_reserve_node_fault(
             StatusCode::SERVICE_UNAVAILABLE,
             "node fault safety requires live council evidence",
         )
-            .into_response());
+            .into_response()
+            .into());
     };
     if council.is_leader().await {
         return reserve_node_fault_on_leader(state, prepared).await;
@@ -4600,30 +4602,32 @@ async fn prepare_and_reserve_node_fault(
             StatusCode::SERVICE_UNAVAILABLE,
             "node fault safety requires a known council leader",
         )
-            .into_response());
+            .into_response()
+            .into());
     };
     let bytes = post_node_fault_internal(state, format!("{leader}/v1/chaos/reserve"), &prepared)
         .await
-        .map_err(|error| (StatusCode::SERVICE_UNAVAILABLE, error).into_response())?;
+        .map_err(|error| Box::new((StatusCode::SERVICE_UNAVAILABLE, error).into_response()))?;
     serde_json::from_slice(&bytes)
-        .map_err(|error| (StatusCode::BAD_GATEWAY, error.to_string()).into_response())
+        .map_err(|error| Box::new((StatusCode::BAD_GATEWAY, error.to_string()).into_response()))
 }
 
 async fn reserve_node_fault_on_leader(
     state: &ApiState,
     prepared: NodeFaultPreparation,
-) -> Result<crate::smoker::reservation::NodeFaultReservation, Response> {
+) -> Result<crate::smoker::reservation::NodeFaultReservation, Box<Response>> {
     check_node_fault_cluster_safety(state, &prepared.request).await?;
     let council = state
         .council
         .as_ref()
-        .ok_or_else(|| StatusCode::SERVICE_UNAVAILABLE.into_response())?;
+        .ok_or_else(|| Box::new(StatusCode::SERVICE_UNAVAILABLE.into_response()))?;
     if !council.is_leader().await {
         return Err((
             StatusCode::SERVICE_UNAVAILABLE,
             "node fault leader changed; retry",
         )
-            .into_response());
+            .into_response()
+            .into());
     }
     let metrics = council.metrics().borrow().clone();
     let voters: std::collections::BTreeSet<_> =
@@ -4631,7 +4635,7 @@ async fn reserve_node_fault_on_leader(
     let membership = state
         .membership
         .as_ref()
-        .ok_or_else(|| StatusCode::SERVICE_UNAVAILABLE.into_response())?;
+        .ok_or_else(|| Box::new(StatusCode::SERVICE_UNAVAILABLE.into_response()))?;
     let members = membership.read().await;
     if !members
         .iter()
@@ -4641,7 +4645,8 @@ async fn reserve_node_fault_on_leader(
             StatusCode::SERVICE_UNAVAILABLE,
             "node fault target is not in live membership",
         )
-            .into_response());
+            .into_response()
+            .into());
     }
     let alive: std::collections::BTreeSet<_> = members
         .iter()
@@ -4650,7 +4655,9 @@ async fn reserve_node_fault_on_leader(
     drop(members);
     let ledger = council.desired_state().await.node_fault_reservations;
     let Some(sequence) = ledger.last_sequence.checked_add(1) else {
-        return Err((StatusCode::CONFLICT, "node fault sequence exhausted").into_response());
+        return Err((StatusCode::CONFLICT, "node fault sequence exhausted")
+            .into_response()
+            .into());
     };
     let reservation = crate::smoker::reservation::NodeFaultReservation {
         sequence,
@@ -4666,15 +4673,18 @@ async fn reserve_node_fault_on_leader(
     });
     match tokio::time::timeout(std::time::Duration::from_secs(5), write).await {
         Ok(Ok(crate::council::CouncilResponse::Refused { reason })) => {
-            Err((StatusCode::CONFLICT, reason).into_response())
+            Err((StatusCode::CONFLICT, reason).into_response().into())
         }
         Ok(Ok(_)) => Ok(reservation),
-        Ok(Err(error)) => Err((StatusCode::SERVICE_UNAVAILABLE, error.to_string()).into_response()),
+        Ok(Err(error)) => Err((StatusCode::SERVICE_UNAVAILABLE, error.to_string())
+            .into_response()
+            .into()),
         Err(_) => Err((
             StatusCode::GATEWAY_TIMEOUT,
             "node fault reservation outcome unknown; capacity retained until fenced",
         )
-            .into_response()),
+            .into_response()
+            .into()),
     }
 }
 
