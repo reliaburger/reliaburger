@@ -285,17 +285,9 @@ impl<T: MustardTransport> MustardNode<T> {
         self.seeds = seeds;
     }
 
-    /// Probe configured seeds and one former direct peer while isolated.
-    /// Contacts survive member reaping, but are bounded and round-robin so an
-    /// unavailable recent peer does not permanently hide the other candidates.
+    /// Probe configured seeds while isolated.
     async fn ping_seeds(&mut self) {
-        let mut addresses = self.seeds.clone();
-        if let Some((node, address)) = self.rejoin_contacts.pop_front() {
-            self.rejoin_contacts.push_back((node, address));
-            if !addresses.contains(&address) {
-                addresses.push(address);
-            }
-        }
+        let addresses = self.seeds.clone();
         for address in addresses {
             let peer = self
                 .membership
@@ -310,6 +302,30 @@ impl<T: MustardTransport> MustardNode<T> {
             );
             let _ = self.transport.send(address, &self.stamp(ping)).await;
         }
+    }
+
+    /// Repair partial membership loss as well as complete isolation. One
+    /// retained contact per cycle bounds traffic without depending on which
+    /// other peers are currently alive.
+    async fn ping_rejoin_contact(&mut self) {
+        let Some((node, address)) = self.rejoin_contacts.pop_front() else {
+            return;
+        };
+        self.rejoin_contacts.push_back((node.clone(), address));
+        if self
+            .membership
+            .get(&node)
+            .is_some_and(|member| member.state == NodeState::Alive)
+        {
+            return;
+        }
+        let updates = self.updates_for_peer(Some(&node));
+        let ping = GossipMessage::new(
+            self.node_id.clone(),
+            self.incarnation,
+            GossipPayload::Ping { updates },
+        );
+        let _ = self.transport.send(address, &self.stamp(ping)).await;
     }
 
     /// A directly contacted peer must learn our current suspicion/death claim
@@ -477,6 +493,7 @@ impl<T: MustardTransport> MustardNode<T> {
         if !reaped.is_empty() && self.directory.prune(&reaped) {
             self.publish_directory();
         }
+        self.ping_rejoin_contact().await;
 
         let target = self.pick_probe_target();
         let Some((target_id, target_addr)) = target else {
@@ -995,6 +1012,34 @@ mod tests {
         assert!(
             node.rejoin_contacts.is_empty(),
             "explicit departures must not become fallback seeds"
+        );
+    }
+
+    #[tokio::test]
+    async fn reaped_contact_is_probed_even_with_another_live_peer() {
+        let net = InMemoryNetwork::new();
+        let transport = net.register(addr(1)).await;
+        let returning = net.register(addr(3)).await;
+        let mut node = MustardNode::new(NodeId::new("observer"), addr(1), fast_config(), transport);
+        node.handle_message(
+            addr(3),
+            GossipMessage::new(
+                NodeId::new("returning"),
+                1,
+                GossipPayload::Ping { updates: vec![] },
+            ),
+        )
+        .await;
+        returning.recv().await.unwrap(); // Consume the original acknowledgement.
+        node.membership.declare_dead(&NodeId::new("returning"));
+        node.membership.reap_dead();
+        node.add_seed(NodeId::new("other"), addr(2));
+        node.run_one_cycle().await;
+        let probe =
+            tokio::time::timeout(std::time::Duration::from_millis(100), returning.recv()).await;
+        assert!(
+            probe.is_ok(),
+            "a live neighbour must not suppress rediscovery of a reaped peer"
         );
     }
 

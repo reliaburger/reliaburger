@@ -2363,9 +2363,11 @@ them. Once it has marked every peer dead and reaped the records, reopening its
 network isn't enough. Its seed list is still empty. Nobody is probing it either.
 
 Mustard now retains at most sixteen previously contacted peers separately from
-live membership. While isolated, it probes its configured seeds and one retained
-contact per cycle, rotating through the contacts. Those addresses are discovery
-candidates, not evidence that a node is alive. Direct messages refresh the bounded
+live membership. Each cycle considers one retained contact, rotating through the
+queue, and probes it if it is absent or no longer alive. While isolated, it also
+probes configured seeds. Keeping one live neighbour must not suppress recovery of
+the others: a three-node experiment exposed exactly that partial recovery gap.
+Those addresses are discovery candidates, not evidence that a node is alive. Direct messages refresh the bounded
 queue; relayed acknowledgements cannot put a relay's socket under another node's
 identity. An explicit `Left` state removes the contact before membership reaping,
 so a graceful departure doesn't become a permanent fallback seed.
@@ -2380,5 +2382,7 @@ claim with a higher incarnation. We don't silently turn an old `Dead` into
 The regression starts a seedless bootstrap node, removes every peer from its
 membership table, and exhausts the other node's piggyback queue. Both sides must
 rediscover each other as alive. A separate test checks the contact bound and
-retirement of explicit departures. This was found while testing node-fault expiry:
+retirement of explicit departures. Another regression keeps a live neighbour
+while reaping a different peer, then requires a rediscovery probe. This was found
+while testing node-fault expiry:
 the transport gates reopened correctly, but discovery had forgotten its way home.
