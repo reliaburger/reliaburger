@@ -6699,6 +6699,12 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
 
     /// Stop an app's instances.
     async fn stop_app(&mut self, app_name: &str, namespace: &str) -> Result<(), BunError> {
+        // A schedule exists before its first instance. Retire future firings
+        // even when there is no running process (or runtime cleanup fails).
+        let had_schedule = self
+            .scheduled_jobs
+            .remove(&(app_name.to_string(), namespace.to_string()))
+            .is_some();
         // Get instance IDs for this app
         let instances: Vec<InstanceId> = self
             .supervisor
@@ -6708,7 +6714,7 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
             .map(|i| i.id.clone())
             .collect();
 
-        if instances.is_empty() {
+        if instances.is_empty() && !had_schedule {
             return Err(BunError::AppNotFound {
                 app_name: app_name.to_string(),
                 namespace: namespace.to_string(),
@@ -6716,7 +6722,9 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
         }
 
         // Stop via supervisor (moves the tracked state to Stopping).
-        self.supervisor.stop_app(app_name, namespace).await?;
+        if !instances.is_empty() {
+            self.supervisor.stop_app(app_name, namespace).await?;
+        }
 
         // DEP6: SIGTERM, wait for the runtime to confirm exit, escalate to
         // SIGKILL on timeout. Only then do we record Stopped. Recording it
@@ -10048,6 +10056,62 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[tokio::test]
+    async fn stopping_a_scheduled_job_before_its_first_run_retires_only_its_namespace() {
+        let (tx, rx) = mpsc::channel(32);
+        let shutdown = CancellationToken::new();
+        let mut agent = BunAgent::new(
+            crate::grill::mock::MockGrill::new(),
+            PortAllocator::new(30000, 31000),
+            rx,
+            shutdown.clone(),
+        );
+        let task = tokio::spawn(async move {
+            agent.run().await;
+            agent
+        });
+        for namespace in ["red", "blue"] {
+            // February 30 never matches, so this tests the pre-first-run path
+            // without depending on which minute CI happens to execute it.
+            let config = Config::parse(&format!(
+                "[job.backup]\nimage = \"busybox:latest\"\ncommand = [\"true\"]\nschedule = \"0 0 30 2 *\"\nnamespace = \"{namespace}\"\n"
+            )).unwrap();
+            let events = send_deploy(&tx, config).await;
+            assert!(
+                events
+                    .iter()
+                    .any(|event| matches!(event, ApplyEvent::Complete { .. })),
+                "{events:?}"
+            );
+        }
+        let (response, result) = oneshot::channel();
+        tx.send(AgentCommand::Stop {
+            app_name: "backup".into(),
+            namespace: "red".into(),
+            response,
+        })
+        .await
+        .unwrap();
+        let stopped = result.await.unwrap();
+        shutdown.cancel();
+        let agent = task.await.unwrap();
+        assert!(
+            stopped.is_ok(),
+            "stopping a registered schedule failed: {stopped:?}"
+        );
+        assert!(
+            !agent
+                .scheduled_jobs
+                .contains_key(&("backup".into(), "red".into()))
+        );
+        assert!(
+            agent
+                .scheduled_jobs
+                .contains_key(&("backup".into(), "blue".into()))
+        );
+        assert!(agent.supervisor.list_instances().is_empty());
     }
 
     /// Send a Deploy command and collect all events. Returns the list

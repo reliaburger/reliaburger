@@ -571,8 +571,14 @@ catalogue execution and cleanup (12.33s), and three-node leader-failure cleanup
 (17.60s) pass. Two compatibility checks (0.01s), all 17 client tests (0.17s), and strict
 Linux/macOS all-target/all-feature Clippy also pass.
 
-Remaining resource contracts, each in its own commit: node-local jobs (including
-retiring cron schedules before the first run), registry uploads/repositories,
+**Job cleanup prerequisite completed:** Stopping a registered cron job now
+retires its exact namespace's schedule even before its first instance exists.
+The running-agent command regression fails before the fix; all 104 agent tests
+pass afterwards (12.57s), with strict Linux/macOS Clippy. In-flight job-worker
+fencing and durable job ownership are still open.
+
+Remaining resource contracts, each in its own commit: node-local jobs,
+registry uploads/repositories,
 and managed volume/mount cleanup. Node effects already use C06 reservations
 and C10 exact-fault receipts. Image distribution currently reports uncontrolled
 cache state and never evicts arbitrary images; any future cold-cache mode needs

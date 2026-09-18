@@ -879,3 +879,22 @@ on the heap while the surrounding `Result` carries its small pointer. Rust 1.98'
 Clippy check caught the large inline HTTP response even though the minimum Rust
 1.97 check passed. Boxing that error keeps the helper's error representation
 small without changing any HTTP status or body.
+
+### Stop the schedule before looking for a process
+
+You apply a backup job scheduled for tonight, then change your mind and stop
+it. There is no process yet. There is still a job to stop.
+
+Bun used to look only for workload instances and return “not found” before it
+consulted the cron registry. We now remove the exact `(name, namespace)`
+registration first, then stop any instances that exist. `HashMap::remove`
+returns `Some(value)` if it removed an entry and `None` otherwise; `is_some()`
+gives us the evidence that a schedule existed, even when the instance list
+is empty. A matching job in another namespace keeps its schedule.
+
+The regression sends Deploy and Stop through the running agent's command
+channel. It uses February 30 as a syntactically valid schedule that never
+fires, so CI's wall clock cannot turn the test into a different case. The old
+code returns `AppNotFound`; the repaired path succeeds and retains only the
+other namespace's registration. This closes pre-first-run retirement. Durable
+job leases and fencing already in-flight job workers remain C34 work.
