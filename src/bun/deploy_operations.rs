@@ -145,10 +145,14 @@ pub struct ActiveDeployOperations {
 pub enum StartDeployOperationError {
     #[error("too many active deploy operations ({limit})")]
     ActiveLimit { limit: usize },
-    #[error("target {target:?} is already being changed by {operation_id}")]
+    #[error(
+        "target {target:?} is already being changed by {operation_id} (age {age_secs}s, phase {phase:?})"
+    )]
     TargetBusy {
         target: DeployTarget,
         operation_id: DeployOperationId,
+        age_secs: u64,
+        phase: DeployOperationPhase,
     },
 }
 
@@ -183,7 +187,7 @@ impl DeployOperationStore {
         targets.sort();
         targets.dedup();
         for target in &targets {
-            if let Some((operation_id, _)) = self.active.iter().find(|(_, operation)| {
+            if let Some((operation_id, operation)) = self.active.iter().find(|(_, operation)| {
                 operation.targets.iter().any(|active| {
                     active.name == target.name && active.namespace == target.namespace
                 })
@@ -191,6 +195,8 @@ impl DeployOperationStore {
                 return Err(StartDeployOperationError::TargetBusy {
                     target: target.clone(),
                     operation_id: operation_id.clone(),
+                    age_secs: now.saturating_sub(operation.started_at),
+                    phase: operation.phase,
                 });
             }
         }
@@ -425,6 +431,8 @@ mod tests {
             )
             .unwrap_err();
         assert!(error.to_string().contains("deploy-100"));
+        assert!(error.to_string().contains("age 1s"));
+        assert!(error.to_string().contains("phase Accepted"));
     }
 
     #[test]

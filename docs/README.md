@@ -1019,7 +1019,11 @@ the operation ID used by these endpoints. Active records report `accepted`,
 the `finished` phase plus an explicit `completed`, `failed`, `cancelled` or
 `unknown` outcome. `unknown` means the worker ended without terminal evidence.
 It is not treated as a green deploy. Concurrent operations may target different
-apps, but Bun refuses a second operation for the same namespace/name.
+apps, but Bun refuses a second operation for the same namespace/name, naming
+the current ID, age and phase. A failed operation retains ownership until its
+rollback worker finishes. Stalled event streams close without cancelling the
+worker; query the accepted ID if the stream ends without completion. Cooperative
+cancellation remains pending under C38.
 
 Release maintainers: see [the build, signing and publication procedure](releasing.md).
 

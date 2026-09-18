@@ -2869,24 +2869,40 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
                 let (forward_tx, mut forward_rx) = mpsc::channel(64);
                 let event_store = self.events.clone();
                 let observed_operation = operation.clone();
+                let worker = DeployWorker {
+                    grill: self.supervisor.grill().clone(),
+                    port_allocator: self.supervisor.port_allocator(),
+                    ops: DeployOps {
+                        tx: self.deploy_ops_tx.clone(),
+                    },
+                    drains: self.drains.clone(),
+                    operation: Some(operation),
+                };
+                let worker_task = tokio::spawn(async move {
+                    worker.run_deploy(config, forward_tx).await;
+                });
                 tokio::spawn(async move {
+                    use crate::bun::deploy_operations::DeployOperationOutcome;
+                    let mut outcome = DeployOperationOutcome::Unknown;
+                    let mut message = "deploy worker ended without a terminal event".to_string();
+                    let mut completion = None;
+                    let mut events = Some(events);
                     while let Some(event) = forward_rx.recv().await {
                         match &event {
                             ApplyEvent::Complete { created, .. } => {
-                                observed_operation
-                                    .finish(
-                                        crate::bun::deploy_operations::DeployOperationOutcome::Completed,
-                                        format!("deploy completed ({created} instances)"),
-                                    )
-                                    .await;
+                                if outcome != DeployOperationOutcome::Failed {
+                                    outcome = DeployOperationOutcome::Completed;
+                                    message = format!("deploy completed ({created} instances)");
+                                    // Success becomes visible only after all trailing
+                                    // bookkeeping and the worker itself have finished.
+                                    completion = Some(event);
+                                }
+                                continue;
                             }
-                            ApplyEvent::Error { message } => {
-                                observed_operation
-                                    .finish(
-                                        crate::bun::deploy_operations::DeployOperationOutcome::Failed,
-                                        message.clone(),
-                                    )
-                                    .await;
+                            ApplyEvent::Error { message: error } => {
+                                outcome = DeployOperationOutcome::Failed;
+                                message = error.clone();
+                                completion = None;
                                 if let Some(store) = &event_store {
                                     let timestamp = SystemTime::now()
                                         .duration_since(SystemTime::UNIX_EPOCH)
@@ -2899,35 +2915,36 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
                                         None,
                                         None,
                                         None,
-                                        message.clone(),
+                                        error.clone(),
                                     );
                                 }
                             }
                             _ => {}
                         }
-                        // A disconnected SSE client doesn't cancel the deploy or
-                        // its evidence. Keep draining the worker to a terminal
-                        // outcome even when this send fails.
-                        let _ = events.send(event).await;
+                        // A stalled or disconnected observer cannot hold the
+                        // worker's outcome hostage. Close a full stream; its
+                        // client sees an incomplete stream and can query the ID.
+                        if let Some(sender) = &events
+                            && sender.try_send(event).is_err()
+                        {
+                            events = None;
+                        }
                     }
-                    observed_operation
-                        .finish(
-                            crate::bun::deploy_operations::DeployOperationOutcome::Unknown,
-                            "deploy worker ended without a terminal event",
-                        )
-                        .await;
-                });
-                let worker = DeployWorker {
-                    grill: self.supervisor.grill().clone(),
-                    port_allocator: self.supervisor.port_allocator(),
-                    ops: DeployOps {
-                        tx: self.deploy_ops_tx.clone(),
-                    },
-                    drains: self.drains.clone(),
-                    operation: Some(operation),
-                };
-                tokio::spawn(async move {
-                    worker.run_deploy(config, forward_tx).await;
+                    if let Err(error) = worker_task.await {
+                        outcome = DeployOperationOutcome::Unknown;
+                        message = format!("deploy worker ended unexpectedly: {error}");
+                        completion = None;
+                    }
+                    // Error events can precede rollback. Release target ownership
+                    // only after the worker has completed every mutation.
+                    observed_operation.finish(outcome, message.clone()).await;
+                    if let Some(sender) = events {
+                        if let Some(event) = completion {
+                            let _ = sender.try_send(event);
+                        } else if outcome == DeployOperationOutcome::Unknown {
+                            let _ = sender.try_send(ApplyEvent::Error { message });
+                        }
+                    }
                 });
             }
             AgentCommand::Stop {
@@ -10171,6 +10188,110 @@ interval = 1
         grill_handle.release_creates(1);
         shutdown.cancel();
         let _ = handle.await;
+    }
+
+    #[tokio::test]
+    async fn failed_deploy_keeps_target_ownership_until_rollback_finishes() {
+        for strategy in ["rolling", "blue-green"] {
+            let port = spawn_health_responder(500).await;
+            let (mut agent, tx, shutdown, grill) = test_agent_with_grill();
+            let task = tokio::spawn(async move { agent.run().await });
+            expect_complete(&send_deploy(&tx, no_health_config(port)).await);
+            grill.block_kills();
+            let (events, mut event_rx) = mpsc::channel(64);
+            tx.send(AgentCommand::Deploy {
+                config: health_gated_config(port, strategy),
+                events,
+            })
+            .await
+            .unwrap();
+            let operation_id = match event_rx.recv().await.unwrap() {
+                ApplyEvent::Accepted { operation_id } => operation_id,
+                event => panic!("expected acceptance, got {event:?}"),
+            };
+            tokio::time::timeout(std::time::Duration::from_secs(3), async {
+                while let Some(event) = event_rx.recv().await {
+                    if matches!(event, ApplyEvent::Error { .. }) {
+                        break;
+                    }
+                }
+                grill.wait_for_kills(1).await;
+            })
+            .await
+            .expect("failed replacement did not enter cleanup");
+            let (response, result) = oneshot::channel();
+            tx.send(AgentCommand::DeployOperations { response })
+                .await
+                .unwrap();
+            let snapshot = result.await.unwrap();
+            // Release the fixture even when the assertion below fails.
+            grill.release_kills(1);
+            assert!(
+                snapshot
+                    .active_deploys
+                    .iter()
+                    .any(|op| op.id.as_str() == operation_id),
+                "{strategy} released target ownership while rollback still owned its runtime mutation"
+            );
+            assert!(
+                !snapshot
+                    .history
+                    .iter()
+                    .any(|op| op.id.as_str() == operation_id)
+            );
+            while event_rx.recv().await.is_some() {}
+            let (response, result) = oneshot::channel();
+            tx.send(AgentCommand::DeployOperations { response })
+                .await
+                .unwrap();
+            let snapshot = result.await.unwrap();
+            assert_eq!(
+                snapshot
+                    .history
+                    .iter()
+                    .find(|op| op.id.as_str() == operation_id)
+                    .unwrap()
+                    .outcome,
+                Some(crate::bun::deploy_operations::DeployOperationOutcome::Failed)
+            );
+            expect_complete(&send_deploy(&tx, no_health_config(port)).await);
+            shutdown.cancel();
+            task.await.unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn stalled_event_consumer_cannot_pin_deployment_ownership() {
+        let (mut agent, tx, shutdown, _) = test_agent_with_grill();
+        let task = tokio::spawn(async move { agent.run().await });
+        // Acceptance fills this queue. Keep its receiver alive without reading.
+        let (events, _event_rx) = mpsc::channel(1);
+        tx.send(AgentCommand::Deploy {
+            config: basic_config(),
+            events,
+        })
+        .await
+        .unwrap();
+        let outcome = tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            loop {
+                let (response, result) = oneshot::channel();
+                tx.send(AgentCommand::DeployOperations { response })
+                    .await
+                    .unwrap();
+                let snapshot = result.await.unwrap();
+                if let Some(operation) = snapshot.history.first() {
+                    break operation.outcome;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await;
+        shutdown.cancel();
+        task.await.unwrap();
+        assert_eq!(
+            outcome.expect("client backpressure prevented terminal history"),
+            Some(crate::bun::deploy_operations::DeployOperationOutcome::Completed)
+        );
     }
 
     #[tokio::test]

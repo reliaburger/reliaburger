@@ -522,6 +522,8 @@ A stuck health-check rollout blocks a corrective deploy. Historical supersede/ca
 
 **Completion test:** Cancel or supersede records a terminal outcome and releases ownership before replacement; errors show active ID/age/phase; app/job identity cannot collide.
 
+**Ownership prerequisite completed (18 September):** An error event previously released the target before runtime rollback completed. Terminal accounting now waits for the worker's internal channel to close and its task to finish; panics remain Unknown. Full/disconnected event streams close without blocking worker accounting, and busy errors include ID, age and phase. The blocked-kill regression fails before the fix and passes for rolling and blue-green afterwards; all 98 agent, four operation-store and six deploy API tests and strict Linux all-target/all-feature Clippy pass. Cooperative cancellation and the cross-kind naming contract remain open.
+
 ### C39 — Handle development CLI paths without unwraps
 
 **Priority:** P2. **Wave:** 3. **Book chapters:** 09.

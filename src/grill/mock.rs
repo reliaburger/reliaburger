@@ -33,6 +33,10 @@ pub struct MockGrill {
     block_create: Arc<AtomicBool>,
     create_started: Arc<tokio::sync::Semaphore>,
     create_release: Arc<tokio::sync::Semaphore>,
+    /// Deterministic gate for testing unfinished deployment rollback.
+    block_kill: Arc<AtomicBool>,
+    kill_started: Arc<tokio::sync::Semaphore>,
+    kill_release: Arc<tokio::sync::Semaphore>,
     /// When set, `stop` records the call but does NOT transition the instance
     /// to `Stopped` — the process ignores SIGTERM. Lets tests prove the
     /// exit-aware stop path escalates to SIGKILL (DEP6).
@@ -58,6 +62,9 @@ impl Default for MockGrill {
             block_create: Arc::new(AtomicBool::new(false)),
             create_started: Arc::new(tokio::sync::Semaphore::new(0)),
             create_release: Arc::new(tokio::sync::Semaphore::new(0)),
+            block_kill: Arc::new(AtomicBool::new(false)),
+            kill_started: Arc::new(tokio::sync::Semaphore::new(0)),
+            kill_release: Arc::new(tokio::sync::Semaphore::new(0)),
             ignore_stop: Arc::default(),
         }
     }
@@ -189,6 +196,29 @@ impl MockGrill {
         self.create_release.add_permits(count);
     }
 
+    /// Hold future `kill()` calls until [`Self::release_kills`] is called.
+    #[allow(dead_code)]
+    pub fn block_kills(&self) {
+        self.block_kill.store(true, Ordering::SeqCst);
+    }
+
+    /// Wait until `count` blocked `kill()` calls have started.
+    #[allow(dead_code)]
+    pub async fn wait_for_kills(&self, count: u32) {
+        let permits = Arc::clone(&self.kill_started)
+            .acquire_many_owned(count)
+            .await
+            .unwrap();
+        permits.forget();
+    }
+
+    /// Release held kills and allow subsequent calls through.
+    #[allow(dead_code)]
+    pub fn release_kills(&self, count: usize) {
+        self.block_kill.store(false, Ordering::SeqCst);
+        self.kill_release.add_permits(count);
+    }
+
     /// Make `stop()` a no-op on state, simulating a process that ignores
     /// SIGTERM. The exit-aware stop path must then escalate to SIGKILL.
     #[allow(dead_code)]
@@ -247,6 +277,11 @@ impl super::Grill for MockGrill {
             .lock()
             .unwrap()
             .push(("kill".to_string(), instance.clone()));
+        if self.block_kill.load(Ordering::SeqCst) {
+            self.kill_started.add_permits(1);
+            let permit = self.kill_release.acquire().await.unwrap();
+            permit.forget();
+        }
         self.state_overrides
             .lock()
             .unwrap()

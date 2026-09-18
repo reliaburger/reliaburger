@@ -954,3 +954,31 @@ not that host process. A mock-runtime regression checks record creation without
 inventing a host workload PID. Real Apple adoption remains in its explicit runtime
 suite, and crash injection around create/start and partial rollout belongs to the
 release recovery qualification.
+
+## An error event doesn't end a deployment
+
+A replacement fails its health probe. The deploy worker reports an error, kills
+the replacement and restores the old routing. If we release the target lock when
+that first error reaches the event stream, a corrective deploy can start while
+the old worker is still changing the same workload. Two owners. One bad race.
+
+The operation observer now remembers error and completion events without marking
+the operation terminal. It drains the worker's internal channel, then awaits its
+`JoinHandle`. In Tokio, awaiting this handle observes whether the spawned task
+returned normally or panicked. Only then does the observer write terminal history
+and release the namespace/name reservation. A panic records `Unknown`, even if
+an earlier event suggested success. A normal failure records `Failed` after the
+rollback work returns. Successful completion also waits for trailing bookkeeping.
+
+The external event stream is an observer. If its bounded queue fills or its
+reader disconnects, we close that stream and keep draining the worker internally.
+The CLI treats a stream without completion as incomplete; the accepted operation
+ID remains queryable. This prevents a slow client from blocking terminal
+accounting. Busy-target errors include the owning ID, age and phase.
+
+The regression holds the runtime's `kill()` call open after a failed health
+probe, for both rolling and blue-green strategies. The operation must remain
+active until we release that call and rollback finishes. A corrective deployment
+then succeeds. A second test leaves the event reader alive without reading and
+still requires terminal history. Cooperative cancellation and the app/job naming
+contract remain the rest of C38; an error event is no longer an accidental unlock.
