@@ -897,7 +897,7 @@ channel. It uses February 30 as a syntactically valid schedule that never
 fires, so CI's wall clock cannot turn the test into a different case. The old
 code returns `AppNotFound`; the repaired path succeeds and retains only the
 other namespace's registration. This closes pre-first-run retirement. Durable
-job leases and fencing already in-flight job workers remain C34 work.
+job leases remain C34 work; in-flight worker fencing is covered below.
 
 ### A completed retry must stay completed
 
@@ -945,3 +945,19 @@ The regression holds runtime creation at a barrier. It checks that cron owns
 an active operation, an overlapping deploy refuses and a local HTTP stop
 returns conflict. After releasing creation and observing worker completion,
 the same stop succeeds. No guessed sleep decides whether creation is finished.
+
+
+### Removing a schedule removes future firings
+
+You change a recurring backup into a one-off job by removing `schedule` and
+applying the manifest again. Keeping the old registration would launch the
+previous job specification at its next scheduled time, even though the new
+manifest no longer requests that behaviour.
+
+Registration now reconciles each named job in its namespace: a schedule adds
+or updates its entry, and an absent schedule removes that entry. The cron
+firing path deliberately skips registration when it launches one occurrence,
+so its temporary one-off specification does not remove the recurring job.
+The regression applies never-firing schedules in two namespaces, then removes
+one through the running agent's Deploy command. Only that namespace loses its
+registration.

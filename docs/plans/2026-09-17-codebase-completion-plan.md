@@ -605,6 +605,12 @@ emergency stops retain their fail-closed path. The regression now also checks
 HTTP conflict/success and overlapping-deploy refusal. Three lifecycle tests,
 104 agent tests, 114 API tests and strict Linux/macOS Clippy pass.
 
+**Schedule removal prerequisite (18 September):** Reapplying a job without a
+schedule now removes its prior cron registration in that namespace. Actual
+cron firings bypass registration and retain their recurring schedule. The
+command-channel regression fails before the fix; all 105 agent tests (12.50s),
+three lifecycle tests (5.03s) and strict Linux Clippy pass.
+
 Remaining resource contracts, each in its own commit: node-local jobs,
 registry uploads/repositories,
 and managed volume/mount cleanup. Node effects already use C06 reservations

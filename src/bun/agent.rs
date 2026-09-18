@@ -6281,16 +6281,17 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
     /// same minute doesn't fire twice; a parse failure is logged and skipped.
     fn register_scheduled_jobs(&mut self, config: &Config) {
         for (name, spec) in &config.job {
-            let Some(expression) = spec.schedule.as_deref() else {
-                continue;
-            };
             let namespace = spec
                 .namespace
                 .clone()
                 .unwrap_or_else(|| "default".to_string());
+            let key = (name.clone(), namespace.clone());
+            let Some(expression) = spec.schedule.as_deref() else {
+                self.scheduled_jobs.remove(&key);
+                continue;
+            };
             match crate::meat::cron::CronSchedule::parse(expression) {
                 Ok(schedule) => {
-                    let key = (name.clone(), namespace.clone());
                     let last_fired_minute = self
                         .scheduled_jobs
                         .get(&key)
@@ -10091,6 +10092,36 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[tokio::test]
+    async fn reapplying_a_job_without_schedule_retires_only_its_previous_cron() {
+        let (mut agent, tx, shutdown) = test_agent();
+        let task = tokio::spawn(async move {
+            agent.run().await;
+            agent
+        });
+        for namespace in ["red", "blue"] {
+            let config = Config::parse(&format!(
+                "[job.backup]\nimage = 'test:v1'\nschedule = '0 0 30 2 *'\nnamespace = '{namespace}'\n"
+            )).unwrap();
+            expect_complete(&send_deploy(&tx, config).await);
+        }
+        let config = Config::parse("[job.backup]\nimage = 'test:v2'\nnamespace = 'red'\n").unwrap();
+        expect_complete(&send_deploy(&tx, config).await);
+        shutdown.cancel();
+        let agent = task.await.unwrap();
+        assert!(
+            !agent
+                .scheduled_jobs
+                .contains_key(&("backup".into(), "red".into())),
+            "removing schedule from the applied job must retire its old cron"
+        );
+        assert!(
+            agent
+                .scheduled_jobs
+                .contains_key(&("backup".into(), "blue".into()))
+        );
     }
 
     #[tokio::test]
