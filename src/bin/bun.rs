@@ -291,6 +291,13 @@ async fn serve_api_over_tls(
                     let Ok(Ok(tls)) = tokio::time::timeout(
                         std::time::Duration::from_secs(10), acceptor.accept(tcp),
                     ).await else { return };
+                    let service = match tls.get_ref().1.peer_certificates()
+                        .and_then(|certificates| certificates.first()) {
+                        Some(certificate) => service.layer(axum::Extension(
+                            reliaburger::sesame::renewal::TlsPeerCertificate(certificate.clone()),
+                        )),
+                        None => service,
+                    };
                     let tls = LifetimeLimitedIo::new(tls, MAX_TLS_CONNECTION_LIFETIME);
                     let hyper_service = hyper_util::service::TowerToHyperService::new(service);
                     let builder = hyper_util::server::conn::auto::Builder::new(
@@ -3349,6 +3356,89 @@ mod tests {
             "the drained connection must close without waiting for another request"
         );
         assert!(retired.unwrap().is_err());
+        shutdown.cancel();
+    }
+    #[tokio::test]
+    async fn api_tls_exposes_only_the_certificate_from_the_actual_handshake() {
+        use reliaburger::sesame::{
+            ca, identity_store::NodeIdentity, mtls, renewal::TlsPeerCertificate,
+            types::SerialNumber,
+        };
+        let hierarchy = ca::generate_ca_hierarchy("peer-extension", b"test-ikm").unwrap();
+        let identity = |node: &str, serial| {
+            let (certificate_der, private_key_der, serial) = ca::issue_node_cert(
+                node,
+                SerialNumber(serial),
+                &hierarchy.node.signing_keypair,
+                &hierarchy.node.certificate_params,
+            )
+            .unwrap();
+            NodeIdentity {
+                node_id: node.into(),
+                certificate_der,
+                private_key_der,
+                serial,
+                ca_generation: 0,
+                node_ca_der: hierarchy.node.ca.certificate_der.clone(),
+                root_ca_der: hierarchy.root.ca.certificate_der.clone(),
+                not_before: std::time::SystemTime::UNIX_EPOCH,
+                not_after: std::time::SystemTime::UNIX_EPOCH,
+            }
+        };
+        let server = identity("server", 10);
+        let client = identity("client", 11);
+        let router = axum::Router::new().route(
+            "/peer",
+            axum::routing::get(
+                |peer: Option<axum::Extension<TlsPeerCertificate>>| async move {
+                    peer.map(|peer| {
+                        reliaburger::sesame::cert::serial_from_der(&peer.0.0)
+                            .unwrap()
+                            .0
+                            .to_string()
+                    })
+                    .unwrap_or_else(|| "anonymous".into())
+                },
+            ),
+        );
+        let config = mtls::build_api_server_config(&server, mtls::CrlHandle::default()).unwrap();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("https://{}/peer", listener.local_addr().unwrap());
+        let shutdown = tokio_util::sync::CancellationToken::new();
+        let mut tasks = tokio::task::JoinSet::new();
+        tasks.spawn(serve_api_over_tls(
+            listener,
+            tokio_rustls::TlsAcceptor::from(config),
+            router,
+            shutdown.clone(),
+        ));
+        let http = mtls::build_cluster_http_client(&client, mtls::CrlHandle::default()).unwrap();
+        assert_eq!(
+            http.get(&url)
+                .timeout(std::time::Duration::from_secs(5))
+                .send()
+                .await
+                .unwrap()
+                .text()
+                .await
+                .unwrap(),
+            "11"
+        );
+        let anonymous =
+            mtls::build_ca_pinned_client(server.node_ca_der, server.root_ca_der).unwrap();
+        assert_eq!(
+            anonymous
+                .get(&url)
+                .header("x-client-certificate", "11")
+                .header("x-node-id", "client")
+                .send()
+                .await
+                .unwrap()
+                .text()
+                .await
+                .unwrap(),
+            "anonymous"
+        );
         shutdown.cancel();
     }
 }

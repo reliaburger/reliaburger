@@ -19,6 +19,7 @@ pub mod join;
 pub mod mtls;
 pub mod oidc;
 pub mod raft_encryption;
+pub mod renewal;
 pub mod secret;
 pub mod session;
 pub mod token;

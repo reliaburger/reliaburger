@@ -363,6 +363,10 @@ pub fn router_with_upgrade(
             "/v1/capabilities/cluster",
             get(cluster_capabilities_handler),
         )
+        .route(
+            "/v1/cluster/renew",
+            post(node_renewal_handler).layer(axum::extract::DefaultBodyLimit::max(16 * 1024)),
+        )
         .route("/v1/diagnostics", get(diagnostics_handler))
         .route("/v1/diagnostics/apps", get(desired_apps_handler))
         .route("/v1/trace", post(trace_handler))
@@ -3707,6 +3711,51 @@ async fn cluster_ca_handler(State(state): State<ApiState>) -> Response {
         "root_ca_b64": encoder.encode(&root_ca.certificate_der),
     }))
     .into_response()
+}
+
+/// Renew only the node authenticated on this connection. A follower refuses;
+/// forwarding would substitute the follower's TLS identity for the caller's.
+async fn node_renewal_handler(
+    auth: Option<axum::Extension<crate::sesame::auth::AuthContext>>,
+    peer: Option<axum::Extension<crate::sesame::renewal::TlsPeerCertificate>>,
+    State(state): State<ApiState>,
+    Json(request): Json<crate::sesame::renewal::RenewalRequest>,
+) -> Response {
+    use crate::sesame::renewal::{RenewalError, issue_renewal};
+    if let Err(response) = crate::sesame::auth::require_system(auth.as_deref()) {
+        return response;
+    }
+    let Some(peer) = peer else {
+        return (
+            StatusCode::FORBIDDEN,
+            "node renewal requires a TLS client certificate",
+        )
+            .into_response();
+    };
+    let Some(council) = &state.council else {
+        return (StatusCode::SERVICE_UNAVAILABLE, "no council available").into_response();
+    };
+    match tokio::time::timeout(
+        std::time::Duration::from_secs(10),
+        issue_renewal(council, &peer, &request),
+    )
+    .await
+    {
+        Ok(Ok(bundle)) => Json(bundle).into_response(),
+        Ok(Err(error)) => {
+            let status = match &error {
+                RenewalError::Identity(_) => StatusCode::FORBIDDEN,
+                RenewalError::Request(_) => StatusCode::BAD_REQUEST,
+                RenewalError::Unavailable(_) => StatusCode::SERVICE_UNAVAILABLE,
+            };
+            (
+                status,
+                Json(serde_json::json!({ "error": error.to_string() })),
+            )
+                .into_response()
+        }
+        Err(_) => (StatusCode::GATEWAY_TIMEOUT, "node renewal timed out").into_response(),
+    }
 }
 
 async fn join_handler(

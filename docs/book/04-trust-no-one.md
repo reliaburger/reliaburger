@@ -1117,3 +1117,36 @@ sidecar dates in cluster state don't get to extend that window. The tests shorte
 an actual root-signed Node CA while deliberately leaving its sidecar unchanged,
 then check all three issuance paths. Separate cases use expired and future-dated
 issuers and require refusal. Renewal can't substitute for CA rotation.
+
+### Renew the caller's identity, not a name from its request
+
+A service token proves that a request came from internal automation. It doesn't
+say which node sent it. Allowing that token alone to request any node name would
+let one compromised node impersonate every other node.
+
+`POST /v1/cluster/renew` therefore requires both the service principal and the
+client certificate from the actual TLS connection. Bun places that public leaf
+in a typed Axum extension after the handshake. Headers cannot populate it, and
+anonymous TLS clients don't receive one. The endpoint takes a CSR and format
+compatibility, not a caller-selected node name.
+
+The leader checks the existing leaf against a quorum-confirmed security state:
+chain, issuer binding, signed validity, node URI and revocation of the leaf and
+its issuers. It then checks that the signed CSR names the same node. The CSR's
+public key is the only request-controlled field that reaches the new
+certificate; issuance rebuilds the identity and usages server-side.
+
+Why check again when TLS already did? An established connection can survive a
+revocation or pass its certificate's expiry. Each renewal request needs current
+admission evidence. After allocating a serial through Raft, the issuer reads
+current security state and validates again before signing. Serial allocation
+may commit even if the request disappears, so a retry can leave a gap in the
+sequence. That's harmless. Reusing an allocated serial would not be.
+
+Followers refuse this request. Forwarding it would present the follower's TLS
+identity and change who is asking. The renewing node must contact the leader
+directly. HTTP admission caps the body at 16 KiB and the operation at ten
+seconds; signing runs in a blocking worker with an owned state snapshot.
+Concurrent requests get distinct committed serials. Callers rejected at
+admission do not spend a serial. The generated private key remains on the
+requesting node throughout.

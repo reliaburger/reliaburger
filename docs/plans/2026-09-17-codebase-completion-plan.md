@@ -318,14 +318,20 @@ Node identity renewal remains, split into separately reviewable changes:
   local issuance, direct CSR signing and reconstruction from stored CA DER, with
   274 Sesame tests (one privileged gate), seven live identity tests and strict
   Linux/macOS Clippy. Sidecar dates cannot extend the signed issuer window.
-- Authorise renewal using the existing authenticated node identity, bind the CSR
-  to that same node, allocate the serial through Raft, persist before publishing,
-  and retry safely through leader changes. An already expired offline identity
-  requires authorised re-enrolment.
-  The private key stays on its node.
+- The authenticated renewal endpoint is implemented. It requires the service
+  principal and the actual TLS peer leaf, validates the CSR's node identity,
+  checks current validity and leaf/issuer revocation with quorum-backed reads,
+  and allocates distinct serials through Raft. Followers refuse rather than
+  forward another node's identity. Seven renewal tests pass (0.24s), the actual
+  Bun listener proves TLS peer attribution and draining (0.05s), and strict
+  Linux/macOS Clippy passes.
+- Start automatic renewal at the signed lifetime midpoint, persist before
+  publishing and report current worker health. Retry directly against the leader
+  through leadership changes. An already expired offline identity requires
+  authorised re-enrolment; the private key stays on its node.
 - Qualify automatic renewal, restart recovery and leader-change behaviour with
   real TLS and cluster tests. Live diagnostic serials and replacement reconnects
-  are covered; automatic issuance remains open.
+  are covered; the automatic worker remains open.
 
 ### C15 — Make ingress serials unique across nodes and restarts
 

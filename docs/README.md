@@ -408,7 +408,9 @@ files are exports, and Bun validates the complete snapshot when loading it.
 Bun shares a live identity across API/registry, Raft/reporting and internal HTTPS
 connections; diagnostics read its current public serial and expiry. Replacements
 published by the daemon take effect on new handshakes. Editing PEM exports does
-not update that identity. Automatic node issuance is still tracked in C14 of
+not update that identity. The leader-only renewal API requires the service
+token and the current TLS node identity; the automatic worker is still tracked
+in C14 of
 [the completion plan](plans/2026-09-17-codebase-completion-plan.md).
 
 If you specifically need plaintext transports for an isolated local test,
@@ -894,7 +896,8 @@ The bun agent exposes a local HTTP API on port 9117:
 | `POST` | `/v1/exec/{app}/{namespace}` | Execute a command (JSON body: `{"command":["..."]}`) |
 | `GET` | `/v1/cluster/nodes` | List cluster nodes (gossip membership) |
 | `GET` | `/v1/cluster/council` | Council (Raft) status |
-| `POST` | `/v1/cluster/join` | Join a cluster (JSON body: `{"token":"...","addr":"..."}`) |
+| `POST` | `/v1/cluster/join` | Join with a single-use token, node ID, CSR and format compatibility |
+| `POST` | `/v1/cluster/renew` | Renew the authenticated TLS node’s CSR on the leader; requires the service token, current peer certificate and format compatibility |
 | `POST` | `/v1/chaos/partition` | Inject an acknowledged council partition and return its exact fault id |
 | `POST` | `/v1/chaos/heal` | Remove all active partitions |
 | `GET` | `/v1/chaos/status` | Query active chaos state |
