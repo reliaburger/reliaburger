@@ -2665,3 +2665,20 @@ predecessor and survive rollback. Removing symbols doesn't relax those checks.
 
 This is acceptance-test preparation, not release qualification. We still need to
 exercise the exact signed release artefacts under V03.
+
+
+### Testing two faults that race each other
+
+The node-chaos acceptance test sends two kill requests through different API
+nodes in a live three-voter cluster. Exactly one may succeed. It clears that
+fault and waits for both gossip recovery and confirmed reservation release,
+then fails the current leader. The successor must inherit the outstanding slot,
+refuse another kill, and release capacity only after the old leader's fault
+expires and its target-side fence is acknowledged.
+
+This test found a recovery bug that the individual fault tests missed. The
+bootstrap node reopened its transports after expiry but had no configured seed
+addresses and had forgotten every peer. We added bounded gossip rediscovery and
+a separate regression for that case. The reservation remained held throughout
+the failure, which was the safe outcome, but the experiment still hadn't recovered.
+A refusal is not a substitute for testing the recovery path.

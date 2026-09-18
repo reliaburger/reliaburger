@@ -283,6 +283,8 @@ pub fn router_with_upgrade(
         build_signers: Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new())),
     };
 
+    spawn_node_fault_reaper(state.clone());
+
     let mut auth_state = crate::sesame::auth::AuthState::new(
         token_store.unwrap_or_else(crate::sesame::auth::new_token_store),
         service_token,
@@ -385,6 +387,8 @@ pub fn router_with_upgrade(
         )
         .route("/v1/cluster/elect", post(cluster_elect_handler))
         .route("/v1/chaos/partition", post(chaos_partition_handler))
+        .route("/v1/chaos/reserve", post(node_fault_reserve_handler))
+        .route("/v1/chaos/fence", post(node_fault_fence_handler))
         .route("/v1/chaos/heal", post(chaos_heal_handler))
         .route("/v1/chaos/status", get(chaos_status_handler))
         .route(
@@ -3786,12 +3790,38 @@ async fn chaos_partition_handler(
         .as_deref()
         .map(|auth| auth.token_name.clone())
         .unwrap_or_else(|| "local-bootstrap".to_string());
+    let Some(target_node) = state.node_name.clone() else {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            "node fault safety requires a cluster identity",
+        )
+            .into_response();
+    };
+    let request = crate::smoker::types::FaultRequest {
+        fault_type: crate::smoker::types::FaultType::CouncilPartition,
+        target_service: body.peers.join(","),
+        namespace: None,
+        target_instance: None,
+        target_node: Some(target_node),
+        duration: std::time::Duration::from_secs(body.duration_secs),
+        injected_by: injected_by.clone(),
+        reason: Some("legacy chaos partition".into()),
+        include_leader: true,
+        override_safety: false,
+        acknowledged: body.acknowledged,
+    };
+    let reservation = match prepare_and_reserve_node_fault(&state, request).await {
+        Ok(grant) => grant,
+        Err(response) => return response,
+    };
+    let duration_secs = reservation.request.duration.as_secs();
     let (resp_tx, resp_rx) = oneshot::channel();
     if state
         .cmd_tx
         .send(AgentCommand::InjectPartition {
+            reservation: Some(reservation),
             peers: body.peers,
-            duration_secs: body.duration_secs,
+            duration_secs,
             injected_by,
             response: resp_tx,
         })
@@ -3928,7 +3958,22 @@ async fn chaos_status_handler(State(state): State<ApiState>) -> Response {
     }
 
     match resp_rx.await {
-        Ok(status) => Json(serde_json::json!(status)).into_response(),
+        Ok(status) => {
+            let reservation = match &state.council {
+                Some(council) => council.desired_state().await.node_fault_reservations.active,
+                None => None,
+            };
+            Json(serde_json::json!({
+                "active_partition": status.active_partition,
+                "node_fault_reservation": reservation.map(|grant| serde_json::json!({
+                    "sequence": grant.sequence,
+                    "target_node": grant.request.target_node,
+                    "fault_type": grant.request.fault_type,
+                    "cleanup_after_unix_ms": grant.cleanup_after_unix_ms,
+                })),
+            }))
+            .into_response()
+        }
         Err(_) => (
             StatusCode::INTERNAL_SERVER_ERROR,
             Json(serde_json::json!({ "error": "agent dropped response" })),
@@ -4244,6 +4289,17 @@ async fn fault_inject_handler(
         .as_deref()
         .map(|auth| auth.token_name.clone())
         .unwrap_or_else(|| "local-bootstrap".to_string());
+    let reservation = if request.fault_type.is_node_targeted() {
+        match prepare_and_reserve_node_fault(&state, request.clone()).await {
+            Ok(grant) => {
+                request = grant.request.clone();
+                Some(grant)
+            }
+            Err(response) => return response,
+        }
+    } else {
+        None
+    };
     let audit_principal = auth
         .as_deref()
         .map(|auth| auth.principal_id.clone())
@@ -4261,6 +4317,7 @@ async fn fault_inject_handler(
     if state
         .cmd_tx
         .send(AgentCommand::InjectFault {
+            reservation,
             request,
             response: resp_tx,
         })
@@ -4448,6 +4505,299 @@ async fn check_node_fault_cluster_safety(
         )
             .into_response())
     }
+}
+
+#[derive(Clone, Serialize, Deserialize)]
+struct NodeFaultPreparation {
+    boot_id: String,
+    request: crate::smoker::types::FaultRequest,
+}
+
+/// The public endpoint remains an operator action; only a trusted target API
+/// may obtain the internal grant after it has checked its own server policy.
+async fn node_fault_reserve_handler(
+    auth: Option<axum::Extension<crate::sesame::auth::AuthContext>>,
+    State(state): State<ApiState>,
+    Json(prepared): Json<NodeFaultPreparation>,
+) -> Response {
+    if let Err(response) = crate::sesame::auth::require_system(auth.as_deref()) {
+        return response;
+    }
+    match reserve_node_fault_on_leader(&state, prepared).await {
+        Ok(grant) => Json(grant).into_response(),
+        Err(response) => response,
+    }
+}
+
+#[derive(Serialize, Deserialize)]
+struct NodeFaultFenceRequest {
+    reservation: crate::smoker::reservation::NodeFaultReservation,
+    only_if_finished: bool,
+}
+
+async fn node_fault_fence_handler(
+    auth: Option<axum::Extension<crate::sesame::auth::AuthContext>>,
+    State(state): State<ApiState>,
+    Json(request): Json<NodeFaultFenceRequest>,
+) -> Response {
+    if let Err(response) = crate::sesame::auth::require_system(auth.as_deref()) {
+        return response;
+    }
+    if request.reservation.request.target_node.as_deref() != state.node_name.as_deref() {
+        return (
+            StatusCode::BAD_REQUEST,
+            "node fault fence targets another node",
+        )
+            .into_response();
+    }
+    match fence_node_fault_locally(&state, request.reservation, request.only_if_finished).await {
+        Ok(()) => StatusCode::NO_CONTENT.into_response(),
+        Err(error) => (StatusCode::SERVICE_UNAVAILABLE, error).into_response(),
+    }
+}
+
+async fn prepare_and_reserve_node_fault(
+    state: &ApiState,
+    request: crate::smoker::types::FaultRequest,
+) -> Result<crate::smoker::reservation::NodeFaultReservation, Response> {
+    let operation = async {
+        let (response, receiver) = oneshot::channel();
+        state
+            .cmd_tx
+            .send(AgentCommand::PrepareNodeFault { request, response })
+            .await
+            .map_err(|_| "agent unavailable".to_string())?;
+        receiver
+            .await
+            .map_err(|_| "agent dropped preparation response".to_string())?
+            .map_err(|error| error.to_string())
+    };
+    let (boot_id, request) =
+        match tokio::time::timeout(std::time::Duration::from_secs(5), operation).await {
+            Ok(Ok(value)) => value,
+            Ok(Err(error)) => return Err((StatusCode::BAD_REQUEST, error).into_response()),
+            Err(_) => {
+                return Err((
+                    StatusCode::GATEWAY_TIMEOUT,
+                    "node fault preparation timed out",
+                )
+                    .into_response());
+            }
+        };
+    let prepared = NodeFaultPreparation { boot_id, request };
+    let Some(council) = &state.council else {
+        return Err((
+            StatusCode::SERVICE_UNAVAILABLE,
+            "node fault safety requires live council evidence",
+        )
+            .into_response());
+    };
+    if council.is_leader().await {
+        return reserve_node_fault_on_leader(state, prepared).await;
+    }
+    let Some(leader) = leader_api_url(state, council).await else {
+        return Err((
+            StatusCode::SERVICE_UNAVAILABLE,
+            "node fault safety requires a known council leader",
+        )
+            .into_response());
+    };
+    let bytes = post_node_fault_internal(state, format!("{leader}/v1/chaos/reserve"), &prepared)
+        .await
+        .map_err(|error| (StatusCode::SERVICE_UNAVAILABLE, error).into_response())?;
+    serde_json::from_slice(&bytes)
+        .map_err(|error| (StatusCode::BAD_GATEWAY, error.to_string()).into_response())
+}
+
+async fn reserve_node_fault_on_leader(
+    state: &ApiState,
+    prepared: NodeFaultPreparation,
+) -> Result<crate::smoker::reservation::NodeFaultReservation, Response> {
+    check_node_fault_cluster_safety(state, &prepared.request).await?;
+    let council = state
+        .council
+        .as_ref()
+        .ok_or_else(|| StatusCode::SERVICE_UNAVAILABLE.into_response())?;
+    if !council.is_leader().await {
+        return Err((
+            StatusCode::SERVICE_UNAVAILABLE,
+            "node fault leader changed; retry",
+        )
+            .into_response());
+    }
+    let metrics = council.metrics().borrow().clone();
+    let voters: std::collections::BTreeSet<_> =
+        metrics.membership_config.membership().voter_ids().collect();
+    let membership = state
+        .membership
+        .as_ref()
+        .ok_or_else(|| StatusCode::SERVICE_UNAVAILABLE.into_response())?;
+    let members = membership.read().await;
+    if !members
+        .iter()
+        .any(|member| Some(member.node_id.0.as_str()) == prepared.request.target_node.as_deref())
+    {
+        return Err((
+            StatusCode::SERVICE_UNAVAILABLE,
+            "node fault target is not in live membership",
+        )
+            .into_response());
+    }
+    let alive: std::collections::BTreeSet<_> = members
+        .iter()
+        .map(|member| crate::cluster::identity::raft_id_from_name(&member.node_id.0))
+        .collect();
+    drop(members);
+    let ledger = council.desired_state().await.node_fault_reservations;
+    let Some(sequence) = ledger.last_sequence.checked_add(1) else {
+        return Err((StatusCode::CONFLICT, "node fault sequence exhausted").into_response());
+    };
+    let reservation = crate::smoker::reservation::NodeFaultReservation {
+        sequence,
+        boot_id: prepared.boot_id,
+        cleanup_after_unix_ms: crate::testkit::lease::now_unix_millis()
+            .saturating_add(prepared.request.duration.as_millis().min(u64::MAX as u128) as u64),
+        request: prepared.request,
+    };
+    let write = council.write(crate::council::RaftRequest::ReserveNodeFault {
+        reservation: Box::new(reservation.clone()),
+        membership_log_id: *metrics.membership_config.log_id(),
+        unavailable_voters: voters.difference(&alive).copied().collect(),
+    });
+    match tokio::time::timeout(std::time::Duration::from_secs(5), write).await {
+        Ok(Ok(crate::council::CouncilResponse::Refused { reason })) => {
+            Err((StatusCode::CONFLICT, reason).into_response())
+        }
+        Ok(Ok(_)) => Ok(reservation),
+        Ok(Err(error)) => Err((StatusCode::SERVICE_UNAVAILABLE, error.to_string()).into_response()),
+        Err(_) => Err((
+            StatusCode::GATEWAY_TIMEOUT,
+            "node fault reservation outcome unknown; capacity retained until fenced",
+        )
+            .into_response()),
+    }
+}
+
+async fn post_node_fault_internal<T: Serialize>(
+    state: &ApiState,
+    url: String,
+    body: &T,
+) -> Result<Vec<u8>, String> {
+    let token = state
+        .service_token
+        .as_ref()
+        .ok_or("node fault coordination requires a service identity")?;
+    let operation = async {
+        let mut response = state
+            .cluster_http
+            .client()
+            .post(url)
+            .bearer_auth(token)
+            .json(body)
+            .send()
+            .await
+            .map_err(|error| error.to_string())?;
+        let status = response.status();
+        let mut bytes = Vec::new();
+        while let Some(chunk) = response.chunk().await.map_err(|error| error.to_string())? {
+            if bytes.len().saturating_add(chunk.len()) > MAX_FAULT_FORWARD_RESPONSE_BYTES {
+                return Err("node fault coordination response exceeds 64 KiB".to_string());
+            }
+            bytes.extend_from_slice(&chunk);
+        }
+        if !status.is_success() {
+            return Err(format!(
+                "node fault coordination refused ({status}): {}",
+                String::from_utf8_lossy(&bytes)
+            ));
+        }
+        Ok(bytes)
+    };
+    tokio::time::timeout(std::time::Duration::from_secs(5), operation)
+        .await
+        .map_err(|_| "node fault coordination timed out; ownership remains reserved".to_string())?
+}
+
+async fn fence_node_fault_locally(
+    state: &ApiState,
+    reservation: crate::smoker::reservation::NodeFaultReservation,
+    only_if_finished: bool,
+) -> Result<(), String> {
+    let operation = async {
+        let (response, receiver) = oneshot::channel();
+        state
+            .cmd_tx
+            .send(AgentCommand::FenceNodeFault {
+                only_if_finished,
+                reservation,
+                response,
+            })
+            .await
+            .map_err(|_| "agent unavailable".to_string())?;
+        receiver
+            .await
+            .map_err(|_| "agent dropped fence response".to_string())?
+            .map_err(|error| error.to_string())
+    };
+    tokio::time::timeout(std::time::Duration::from_secs(5), operation)
+        .await
+        .map_err(|_| "node fault fence outcome unknown".to_string())?
+}
+
+fn spawn_node_fault_reaper(state: ApiState) {
+    let Some(council) = state.council.clone() else {
+        return;
+    };
+    tokio::spawn(async move {
+        let mut interval = tokio::time::interval(std::time::Duration::from_secs(1));
+        interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        loop {
+            tokio::select! { _ = state.cmd_tx.closed() => return, _ = interval.tick() => {} }
+            let cleanup = async {
+                if !council.is_leader().await {
+                    return;
+                }
+                let Some(grant) = council.desired_state().await.node_fault_reservations.active
+                else {
+                    return;
+                };
+                let only_if_finished =
+                    grant.cleanup_after_unix_ms > crate::testkit::lease::now_unix_millis();
+                let result = if grant.request.target_node.as_deref() == state.node_name.as_deref() {
+                    fence_node_fault_locally(&state, grant.clone(), only_if_finished).await
+                } else if let Some(target) = grant.request.target_node.as_deref() {
+                    match target_node_api_url(&state, target, "/v1/chaos/fence").await {
+                        Ok(url) => post_node_fault_internal(
+                            &state,
+                            url,
+                            &NodeFaultFenceRequest {
+                                reservation: grant.clone(),
+                                only_if_finished,
+                            },
+                        )
+                        .await
+                        .map(|_| ()),
+                        Err(_) => Err("node fault target is unavailable for fencing".to_string()),
+                    }
+                } else {
+                    Err("node fault reservation has no target".to_string())
+                };
+                if result.is_ok() {
+                    // A new leader either inherits this slot or sees the release.
+                    // No deadline or failed acknowledgement can clear ownership.
+                    let _ = council
+                        .write(crate::council::RaftRequest::ReleaseNodeFault {
+                            sequence: grant.sequence,
+                        })
+                        .await;
+                }
+            };
+            tokio::select! {
+                _ = state.cmd_tx.closed() => return,
+                _ = tokio::time::timeout(std::time::Duration::from_secs(10), cleanup) => {}
+            }
+        }
+    });
 }
 
 const MAX_FAULT_FORWARD_RESPONSE_BYTES: usize = 64 * 1024;
@@ -7647,7 +7997,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn legacy_partition_response_exposes_the_exact_owned_fault_id() {
+    async fn legacy_partition_requires_cluster_reservation_evidence() {
         let (token, plaintext) = a_user_token(crate::sesame::types::ApiRole::Admin);
         let (app, shutdown) = setup_with_auth_readiness_and_leases(
             vec![token],
@@ -7666,13 +8016,8 @@ mod tests {
             None,
         )
         .await;
-        assert_eq!(status, StatusCode::OK);
-        let response: serde_json::Value = serde_json::from_slice(&body).unwrap();
-        assert!(response["fault"]["id"].as_u64().is_some(), "{response}");
-        assert_eq!(
-            response["fault"]["fault_type"].as_str(),
-            Some("council-partition")
-        );
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+        assert!(String::from_utf8_lossy(&body).contains("cluster identity"));
         shutdown.cancel();
     }
 
@@ -10166,7 +10511,7 @@ mod tests {
                     .uri("/v1/cluster/join")
                     .header("content-type", "application/json")
                     .body(Body::from(
-                        r#"{"compatibility":{"protocol":3,"state":2},"token":"abc123","node_id":"node-02","csr_b64":""}"#,
+                        r#"{"compatibility":{"protocol":4,"state":3},"token":"abc123","node_id":"node-02","csr_b64":""}"#,
                     ))
                     .unwrap(),
             )
@@ -10204,7 +10549,7 @@ mod tests {
                     .uri("/v1/cluster/join")
                     .header("content-type", "application/json")
                     .body(Body::from(
-                        r#"{"compatibility":{"protocol":3,"state":2},"token":"whatever","node_id":"node-09","csr_b64":""}"#,
+                        r#"{"compatibility":{"protocol":4,"state":3},"token":"whatever","node_id":"node-09","csr_b64":""}"#,
                     ))
                     .unwrap(),
             )

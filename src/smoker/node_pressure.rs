@@ -311,6 +311,36 @@ impl NodePressureController {
         }
     }
 
+    /// Establish that no pressure process remains, including helpers inherited
+    /// from an earlier Bun process. A cleanup error must retain cluster capacity.
+    pub async fn confirm_no_helpers(&self) -> Result<(), String> {
+        #[cfg(target_os = "linux")]
+        {
+            tokio::task::spawn_blocking(|| {
+                let root = Path::new(NODE_PRESSURE_CGROUP_ROOT);
+                if !root.try_exists().map_err(|error| error.to_string())? {
+                    return Ok(());
+                }
+                for entry in std::fs::read_dir(root).map_err(|error| error.to_string())? {
+                    let path = entry.map_err(|error| error.to_string())?.path();
+                    if !path.is_dir() {
+                        continue;
+                    }
+                    let processes = std::fs::read_to_string(path.join("cgroup.procs"))
+                        .map_err(|error| format!("cannot establish pressure cleanup: {error}"))?;
+                    if !processes.trim().is_empty() {
+                        return Err("node pressure helpers remain active".to_string());
+                    }
+                }
+                Ok(())
+            })
+            .await
+            .map_err(|error| error.to_string())?
+        }
+        #[cfg(not(target_os = "linux"))]
+        Err("node pressure cleanup requires Linux cgroup evidence".to_string())
+    }
+
     /// Re-attempt removal of any cgroup directory that lingered after its helper
     /// was killed (a transient busy/permission error during `clear` or expiry).
     /// Invoked on each health tick; a directory that still won't remove stays

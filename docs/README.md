@@ -24,7 +24,7 @@ returns an error with the log path; `--yes` still configures without starting a
 background node. The public installer remains in development.
 
 0.1.0 requires a fresh cluster; development state is refused. Rolling upgrades
-require matching explicit formats (currently protocol 3 and state 2). See the
+require matching explicit formats (currently protocol 4 and state 3). See the
 [compatibility policy](releasing.md#cluster-compatibility).
 
 Reporting refuses messages over 1 MiB or containing more than 100 events;
@@ -1040,3 +1040,8 @@ Apple Container remains experimental. Bind mounts, UID/GID, working directory,
 read-only root and published TCP ports are translated to the Apple CLI. Mount
 options other than bind/ro/rw and fractional CPU hard limits are rejected; use
 the managed Linux/runc quickstart for the supported laptop profile.
+
+Node chaos (kill, drain, pressure and council partitions) reserves one cluster-wide
+experiment slot. A deadline triggers target-side fencing and reversal; only a
+confirmed cleanup releases the slot. Failed or unreachable cleanup retains the
+reservation across leader changes. Workload faults retain their replica limits.

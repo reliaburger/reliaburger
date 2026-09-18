@@ -107,6 +107,7 @@ async fn start_node_with_auth(
     .await
     .unwrap();
 
+    let partition_blocklists = handle.partition_blocklists.clone();
     let council = handle.council.clone();
     let membership_rx = handle.membership_rx.clone();
     let metrics_rx = handle.raft_metrics_rx.clone();
@@ -235,7 +236,7 @@ async fn start_node_with_auth(
             None,
             council.clone(),
             Some(token_store),
-            None,
+            Some("placement-test-internal-service-identity".into()),
             None,
             Some(Arc::clone(&membership_table)),
             None,
@@ -324,7 +325,7 @@ async fn start_node_with_auth(
             council,
             snapshot_rx: mpsc::channel(1).1,
             wrapping_ikm: None,
-            partition_blocklists: Default::default(),
+            partition_blocklists,
             crl_handle: Default::default(),
         },
         thinks_leader: leader_rx,
@@ -821,7 +822,7 @@ async fn fault_injection_rejected_when_quorum_at_risk() {
     );
     let msg = format!("{}", rejected.unwrap_err()).to_lowercase();
     assert!(
-        msg.contains("quorum"),
+        msg.contains("quorum") || msg.contains("capacity is reserved"),
         "rejection should cite the quorum rail, got: {msg}"
     );
 
@@ -1052,6 +1053,8 @@ async fn authenticated_node_kill_fails_and_restores_a_real_cluster_member() {
         refused.as_ref().is_err_and(|error| match error {
             reliaburger::relish::RelishError::ApiError { status: 400, body } =>
                 body.to_lowercase().contains("quorum"),
+            reliaburger::relish::RelishError::ApiError { status: 409, body } =>
+                body.contains("capacity is reserved") || body.contains("quorum"),
             reliaburger::relish::RelishError::ApiError { status: 503, body } =>
                 body == "node fault safety cannot map the council leader to live membership"
                     || body == "node fault safety requires a known council leader",
@@ -1182,4 +1185,250 @@ async fn ingress_reaches_nodes_without_local_replicas() {
         converged,
         "all three ingress nodes must see the single healthy replica"
     );
+}
+
+/// C06: requests sent through different APIs share one committed reservation.
+/// A leader failure retains that ownership until target-side reversal is proven.
+#[tokio::test(flavor = "multi_thread", worker_threads = 6)]
+#[ignore = "slow multi-node reservation acceptance; run with make test-cluster"]
+async fn concurrent_node_kills_and_leader_change_preserve_reserved_capacity() {
+    use reliaburger::mustard::state::NodeState;
+    use reliaburger::sesame::types::{ApiRole, TokenScope};
+    use reliaburger::smoker::types::{FaultRequest, FaultType};
+    let created = reliaburger::sesame::token::create_token(
+        "reservation-admin",
+        ApiRole::Admin,
+        TokenScope::default(),
+        None,
+    )
+    .unwrap();
+    let auth = NodeFaultAuth {
+        token: created.token,
+        plaintext: created.plaintext,
+    };
+    let shutdown = CancellationToken::new();
+    let n1 =
+        start_node_with_auth("reservation1", 20341, vec![], &shutdown, Some(auth.clone())).await;
+    let n2 = start_node_with_auth(
+        "reservation2",
+        20345,
+        vec![local(20341)],
+        &shutdown,
+        Some(auth.clone()),
+    )
+    .await;
+    let n3 = start_node_with_auth(
+        "reservation3",
+        20349,
+        vec![local(20341)],
+        &shutdown,
+        Some(auth),
+    )
+    .await;
+    let nodes = [&n1, &n2, &n3];
+    assert!(
+        wait_until(Duration::from_secs(60), || nodes.iter().all(|node| {
+            nodes
+                .iter()
+                .all(|peer| peer_state(node, &peer.name) == Some(NodeState::Alive))
+                && node.handle.council.as_ref().is_some_and(|council| {
+                    let metrics = council.metrics().borrow().clone();
+                    metrics.current_leader.is_some()
+                        && metrics.membership_config.membership().voter_ids().count() == 3
+                        && metrics
+                            .membership_config
+                            .membership()
+                            .get_joint_config()
+                            .len()
+                            == 1
+                })
+        }))
+        .await,
+        "three voters must converge before fault admission"
+    );
+    let leader = nodes
+        .iter()
+        .find(|node| *node.thinks_leader.borrow())
+        .copied()
+        .unwrap();
+    let followers: Vec<_> = nodes
+        .iter()
+        .filter(|node| node.name != leader.name)
+        .copied()
+        .collect();
+    let request = |target: &Node, duration| FaultRequest {
+        fault_type: FaultType::NodeKill {
+            kill_containers: false,
+        },
+        target_service: String::new(),
+        namespace: None,
+        target_instance: None,
+        target_node: Some(target.name.clone()),
+        duration,
+        injected_by: "untrusted-body".into(),
+        reason: Some("concurrent reservation acceptance".into()),
+        include_leader: true,
+        override_safety: true,
+        acknowledged: true,
+    };
+    let first = request(followers[0], Duration::from_secs(30));
+    let second = request(followers[1], Duration::from_secs(30));
+    let (left, right) = tokio::join!(
+        followers[0].client.inject_fault(&first),
+        followers[1].client.inject_fault(&second),
+    );
+    assert_eq!(
+        usize::from(left.is_ok()) + usize::from(right.is_ok()),
+        1,
+        "exactly one competing kill may be admitted: {left:?}, {right:?}"
+    );
+    assert_eq!(
+        nodes
+            .iter()
+            .filter(|node| node.handle.partition_blocklists.node_gate.is_quiesced())
+            .count(),
+        1,
+        "exactly one transport gate may close, regardless of HTTP outcomes"
+    );
+    let (target, summary) = match (left, right) {
+        (Ok(summary), Err(_)) => (followers[0], summary),
+        (Err(_), Ok(summary)) => (followers[1], summary),
+        _ => unreachable!("checked one admission"),
+    };
+    let council = leader.handle.council.as_ref().unwrap();
+    let reservation = council
+        .desired_state()
+        .await
+        .node_fault_reservations
+        .active
+        .unwrap();
+    assert_eq!(
+        reservation.request.target_node.as_deref(),
+        Some(target.name.as_str())
+    );
+    target
+        .client
+        .clear_fault(summary.id, Some(&target.name), true)
+        .await
+        .unwrap();
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+    loop {
+        if council
+            .desired_state()
+            .await
+            .node_fault_reservations
+            .active
+            .is_none()
+            && nodes.iter().all(|observer| {
+                nodes
+                    .iter()
+                    .all(|peer| peer_state(observer, &peer.name) == Some(NodeState::Alive))
+            })
+        {
+            break;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "manual reversal must release the fenced reservation"
+        );
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+
+    let old_leader = nodes
+        .iter()
+        .find(|node| *node.thinks_leader.borrow())
+        .copied()
+        .unwrap();
+    let sender = nodes
+        .iter()
+        .find(|node| node.name != old_leader.name)
+        .copied()
+        .unwrap();
+    sender
+        .client
+        .inject_fault(&request(old_leader, Duration::from_secs(12)))
+        .await
+        .unwrap();
+    let mut inherited = None;
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(8);
+    while tokio::time::Instant::now() < deadline {
+        for node in nodes.iter().filter(|node| node.name != old_leader.name) {
+            if *node.thinks_leader.borrow() {
+                inherited = node
+                    .handle
+                    .council
+                    .as_ref()
+                    .unwrap()
+                    .desired_state()
+                    .await
+                    .node_fault_reservations
+                    .active;
+                if inherited.is_some() {
+                    break;
+                }
+            }
+        }
+        if inherited.is_some() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    let inherited = inherited.expect("new leader must inherit the outstanding reservation");
+    assert!(inherited.sequence > reservation.sequence);
+    assert_eq!(
+        inherited.request.target_node.as_deref(),
+        Some(old_leader.name.as_str())
+    );
+    let refused = sender
+        .client
+        .inject_fault(&request(sender, Duration::from_secs(5)))
+        .await;
+    assert!(
+        refused.is_err(),
+        "leader change must not free fault capacity"
+    );
+    assert!(sender.client.list_faults().await.unwrap().is_empty());
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(40);
+    loop {
+        let current = nodes
+            .iter()
+            .find(|node| *node.thinks_leader.borrow())
+            .copied();
+        if let Some(current) = current {
+            let state = current
+                .handle
+                .council
+                .as_ref()
+                .unwrap()
+                .desired_state()
+                .await;
+            if state.node_fault_reservations.active.is_none()
+                && peer_state(current, &old_leader.name) == Some(NodeState::Alive)
+            {
+                break;
+            }
+        }
+        if tokio::time::Instant::now() >= deadline {
+            let faults = old_leader.client.list_faults().await;
+            let views: Vec<_> = nodes
+                .iter()
+                .map(|node| {
+                    (
+                        node.name.clone(),
+                        *node.thinks_leader.borrow(),
+                        peer_state(node, &old_leader.name),
+                        node.handle.partition_blocklists.node_gate.is_quiesced(),
+                    )
+                })
+                .collect();
+            panic!(
+                "expiry and confirmed reversal must recover capacity after election; faults={faults:?}, views={views:?}"
+            );
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    shutdown.cancel();
+    for node in nodes {
+        node.handle.council.as_ref().unwrap().shutdown().await.ok();
+    }
 }

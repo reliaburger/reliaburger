@@ -195,6 +195,46 @@ impl StateMachineInner {
     /// the generic `Applied` response.
     fn apply_request(&mut self, request: &RaftRequest) -> Option<CouncilResponse> {
         match request {
+            RaftRequest::ReserveNodeFault {
+                reservation,
+                membership_log_id,
+                unavailable_voters,
+            } => {
+                let membership = self.state.last_membership.membership();
+                let voters: std::collections::BTreeSet<_> = membership.voter_ids().collect();
+                let refuse = |reason: &str| {
+                    Some(CouncilResponse::Refused {
+                        reason: reason.into(),
+                    })
+                };
+                if self.state.last_membership.log_id() != membership_log_id
+                    || membership.get_joint_config().len() != 1
+                    || voters.is_empty()
+                {
+                    return refuse(
+                        "node fault safety requires a stable current council membership",
+                    );
+                }
+                // Pressure may starve a voter just as effectively as a transport
+                // fault. Drain alone only withdraws scheduler readiness.
+                let quorum_effect = !matches!(
+                    reservation.request.fault_type,
+                    crate::smoker::types::FaultType::NodeDrain
+                );
+                if quorum_effect
+                    && unavailable_voters.intersection(&voters).count() + 1 > (voters.len() - 1) / 2
+                {
+                    return refuse("node fault would risk council quorum");
+                }
+                if let Err(reason) = self.state.node_fault_reservations.reserve(reservation) {
+                    return Some(CouncilResponse::Refused { reason });
+                }
+            }
+            RaftRequest::ReleaseNodeFault { sequence } => {
+                if let Err(reason) = self.state.node_fault_reservations.release(*sequence) {
+                    return Some(CouncilResponse::Refused { reason });
+                }
+            }
             RaftRequest::AppSpec { app_id, spec } => {
                 if crate::testkit::lease::valid_test_namespace(&app_id.namespace) {
                     return Some(CouncilResponse::Refused {
@@ -1292,6 +1332,120 @@ mod tests {
             log_id: log_id(term, index),
             payload: EntryPayload::Normal(request),
         }
+    }
+
+    #[tokio::test]
+    async fn node_fault_capacity_survives_snapshot_and_leader_term_changes() {
+        use crate::smoker::reservation::NodeFaultReservation;
+        use crate::smoker::types::{FaultRequest, FaultType};
+        let mut sm = CouncilStateMachine::new();
+        sm.apply(vec![openraft::Entry {
+            log_id: log_id(1, 1),
+            payload: EntryPayload::Membership(Membership::new(
+                vec![std::collections::BTreeSet::from([1, 2, 3])],
+                None::<std::collections::BTreeSet<u64>>,
+            )),
+        }])
+        .await
+        .unwrap();
+        let grant = NodeFaultReservation {
+            sequence: 1,
+            boot_id: "boot-a".into(),
+            cleanup_after_unix_ms: 1,
+            request: FaultRequest {
+                fault_type: FaultType::NodeKill {
+                    kill_containers: false,
+                },
+                target_node: Some("node-a".into()),
+                target_service: String::new(),
+                target_instance: None,
+                namespace: None,
+                duration: std::time::Duration::from_secs(1),
+                injected_by: "operator".into(),
+                reason: None,
+                include_leader: true,
+                override_safety: true,
+                acknowledged: true,
+            },
+        };
+        let reserve = |reservation: NodeFaultReservation, membership_log_id, unavailable_voters| {
+            RaftRequest::ReserveNodeFault {
+                reservation: Box::new(reservation),
+                membership_log_id,
+                unavailable_voters,
+            }
+        };
+        let stale = sm
+            .apply(vec![normal_entry(
+                1,
+                2,
+                reserve(grant.clone(), None, Default::default()),
+            )])
+            .await
+            .unwrap();
+        assert!(matches!(stale[0], CouncilResponse::Refused { .. }));
+        let risk = sm
+            .apply(vec![normal_entry(
+                1,
+                3,
+                reserve(grant.clone(), Some(log_id(1, 1)), [2].into()),
+            )])
+            .await
+            .unwrap();
+        assert!(matches!(risk[0], CouncilResponse::Refused { .. }));
+        let admitted = sm
+            .apply(vec![normal_entry(
+                1,
+                4,
+                reserve(grant.clone(), Some(log_id(1, 1)), Default::default()),
+            )])
+            .await
+            .unwrap();
+        assert!(matches!(admitted[0], CouncilResponse::Applied { .. }));
+        let mut builder = sm.get_snapshot_builder().await;
+        let snapshot = builder.build_snapshot().await.unwrap();
+        let mut restored = CouncilStateMachine::new();
+        restored
+            .install_snapshot(&snapshot.meta, snapshot.snapshot)
+            .await
+            .unwrap();
+        let mut other = grant.clone();
+        other.sequence = 2;
+        other.request.target_node = Some("node-b".into());
+        let refused = restored
+            .apply(vec![normal_entry(
+                2,
+                5,
+                reserve(other.clone(), Some(log_id(1, 1)), Default::default()),
+            )])
+            .await
+            .unwrap();
+        assert!(matches!(refused[0], CouncilResponse::Refused { .. }));
+        assert_eq!(
+            restored
+                .desired_state()
+                .await
+                .node_fault_reservations
+                .active,
+            Some(grant)
+        );
+        restored
+            .apply(vec![normal_entry(
+                2,
+                6,
+                RaftRequest::ReleaseNodeFault { sequence: 1 },
+            )])
+            .await
+            .unwrap();
+        let admitted = restored
+            .apply(vec![normal_entry(
+                2,
+                7,
+                reserve(other, Some(log_id(1, 1)), Default::default()),
+            )])
+            .await
+            .unwrap();
+        assert!(matches!(admitted[0], CouncilResponse::Applied { .. }));
     }
 
     #[tokio::test]

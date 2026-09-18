@@ -63,6 +63,14 @@ async fn node_pressure_consumes_capacity_outside_bun_and_cleans_up() {
         .expect("apply node pressure");
     let cgroup = Path::new(NODE_PRESSURE_CGROUP_ROOT).join(id.to_string());
     assert!(cgroup.exists());
+    assert!(controller.confirm_no_helpers().await.is_err());
+    // A new process must inspect kernel ownership, not its empty in-memory map.
+    assert!(
+        NodePressureController::default()
+            .confirm_no_helpers()
+            .await
+            .is_err()
+    );
     assert_eq!(
         std::fs::read_to_string(cgroup.join("cpu.max"))
             .unwrap()
@@ -124,6 +132,7 @@ async fn node_pressure_consumes_capacity_outside_bun_and_cleans_up() {
 
     controller.clear(id).await.expect("clear node pressure");
     assert!(!cgroup.exists(), "clear must remove the owned cgroup");
+    controller.confirm_no_helpers().await.unwrap();
 
     // Dropping an owner sends SIGKILL through Child::kill_on_drop. A fresh
     // controller then sweeps the now-empty stale cgroup, modelling the
@@ -142,6 +151,7 @@ async fn node_pressure_consumes_capacity_outside_bun_and_cleans_up() {
         !stale_cgroup.exists(),
         "startup sweep must remove a previous owner's cgroup"
     );
+    restarted.confirm_no_helpers().await.unwrap();
 }
 
 #[tokio::test]

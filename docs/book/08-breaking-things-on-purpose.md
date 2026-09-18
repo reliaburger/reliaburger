@@ -803,3 +803,72 @@ routes to the selected node and keeps exact fault receipts through cancellation
 and cleanup. Existing faults can be inspected with `relish fault list` and
 reversed by their owned ID; `chaos status` remains read-only. An unreachable-node
 regression proves that the refusal does not depend on a server response.
+
+### Two requests, one quorum budget
+
+Two administrators ask different nodes to fail a voter. Each API sees three
+healthy voters and approves one failure. Both requests look safe on their own.
+Together, they remove the majority. Counting gossip observations cannot reserve
+capacity that another request is about to consume.
+
+Node experiments now acquire one cluster-wide reservation through Raft. For
+0.1.0 we deliberately allow only one node experiment at a time, including drains,
+pressure and the legacy council-partition endpoint. Pressure can starve a voter
+just as effectively as closing its socket. Draining only withdraws scheduling
+readiness, so it doesn't require spare voting capacity, but it still occupies
+the experiment slot. Workload faults keep their separate replica safety checks.
+
+The leader proposes the exact observed membership generation along with the
+unavailable voters. The state machine checks that the membership is still
+current and isn't in joint consensus, checks the quorum budget, then claims the
+slot in log order. `checked_add(1)` returns `Option<u64>`: `Some(next)` when the
+counter has room, `None` on overflow. Exhaustion refuses admission rather than
+wrapping round and reusing an old grant. A snapshot includes both the outstanding
+reservation and the last allocated number. Electing another leader doesn't free
+anything.
+
+A deadline is a cleanup trigger. It isn't proof that the effect stopped. Imagine
+an injection waiting in an agent's command queue while its reservation expires.
+If we simply freed the slot, another fault could begin before that delayed
+injection finally ran. Instead, the reaper asks the target to fence the grant
+and reverse its effect. Only a successful acknowledgement permits the Raft
+release. An unavailable target, failed pressure cleanup or uncertain response
+keeps capacity reserved. Manual reversal and failed activation can release early,
+but they pass through the same acknowledgement path.
+
+The target actor owns a random process identity and a sequence watermark. A
+grant names that process, its exact normalised request and its sequence. Before
+applying an effect, the actor consumes the sequence. A duplicate, changed request
+or grant for an earlier process is refused. Fencing advances the same watermark
+before reversing anything, so activation and cleanup have one serial owner. An
+old fence cannot clear a newer fault. After a restart, pressure cleanup also
+checks the owned cgroups for surviving helper processes before acknowledging;
+a different process identity alone wouldn't prove those helpers had died.
+
+The two coordination endpoints accept only the internal service identity.
+Operators still enter through the normal authenticated fault endpoints, which
+check their role, server policy and acknowledgement. The original request body
+cannot supply its own grant. Coordination has bounded response sizes and request
+deadlines. Losing an HTTP response may make the operation uncertain; it never
+makes another experiment safe to admit.
+
+Tests cover competing reservations, snapshot restoration into a later leader
+term, stale membership, insufficient quorum, sequence exhaustion, duplicate
+activation and delayed activation after a fence. The actor test verifies that
+transport gates reopen before cleanup is acknowledged and that an old fence
+leaves a newer fault running. The three-node acceptance case sends competing
+kills to different APIs, then fails the leader and checks that its successor
+inherits the reservation until reversal is confirmed.
+
+Membership changes share the admission ordering too. Before changing voters or
+learners, the leader commits a no-op and checks for an outstanding reservation.
+The no-op matters when an earlier caller timed out: dropping its Rust future
+doesn't undo a Raft proposal already queued. Once the barrier applies, that prior
+proposal's outcome is visible. A Tokio mutex orders local proposals and membership
+changes; Raft supplies the durable ordering across leader changes. The guard is
+released when it leaves scope. Membership changes resume after confirmed reversal.
+
+`GET /v1/chaos/status` includes the locally replicated reservation's sequence,
+target, fault type and cleanup deadline. A retained slot can therefore be
+inspected even when its target's fault list is unavailable. These fields describe
+ownership, not proof that the target is still running the fault.

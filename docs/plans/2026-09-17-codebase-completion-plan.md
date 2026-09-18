@@ -181,6 +181,8 @@ Safety counts unavailable voters from current observations but does not reserve 
 
 **Completion test:** Concurrent kills via different API nodes and leader changes never exceed the permitted unavailable-voter budget; reservations expire or reverse reliably.
 
+**Completed on PR #167:** One durable node-experiment slot serialises kills, drains, pressure and legacy council partitions. Grants bind the exact normalised request to a target process and increasing sequence. Expiry triggers a target-side fence; capacity is released only after confirmed reversal, including pressure-helper absence. Snapshot/leader-term and actor fencing regressions are implemented. Protocol 4/state 3 refuse earlier development clusters. Membership changes wait behind a committed barrier until reversal. Live concurrent kills and leader failover pass in 27.93s, including exactly one closed transport gate, inherited ownership and expiry recovery. Legacy quorum refusal, manual recovery and privileged pressure cleanup pass too; a fresh pressure controller detects surviving helpers before acknowledging cleanup. The full Linux library checkpoint passes 3,236 tests, followed by 152 final gossip tests and strict all-target/all-feature Clippy. Separate gossip fixes repair both seedless bootstrap isolation and partial membership loss.
+
 ### C07 — Define and enforce mixed-version compatibility
 
 **Priority:** P1. **Wave:** 2. **Book chapters:** 02, 14.
@@ -1016,7 +1018,7 @@ instead of treating a historical checkbox as today's verdict.
 | A1–A3: startup, upgrade harness, CI | Implemented; current applicable hosted jobs pass. V05 retains the next advisory review. |
 | B1–B3: registry/build auth, upgrade bearer, startup warning | Implemented in Phase 16. |
 | C1–C4: lease snapshot race, Raft refusal, fault-clear auth, pressure expiry retry | Implemented. This does not close the separate cancellation/lock/durability gaps below. |
-| C5: node-fault routing and quorum safety | Standalone/wrong-target refusal implemented; concurrent reservations remain C06. |
+| C5: node-fault routing and quorum safety | Standalone/wrong-target refusal and durable concurrent reservations implemented (C06). |
 | D1–D2: mixed-version readiness and new Raft variants | C07. Replace the old implicit-readiness suggestion with negotiated compatibility; missing evidence must not become healthy. |
 | E1–E2: probe status, reachable clean wtf result | Implemented. |
 | E3–E7: vanished metrics, profiles, diagnostics, ownership, readiness | C08–C10, C23–C27, C29–C32. |

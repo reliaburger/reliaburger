@@ -15,10 +15,10 @@ pub struct Compatibility {
     pub state: u32,
 }
 
-/// Supported formats; reporting admission acknowledgements require protocol three.
+/// Supported formats; node-chaos reservations require protocol four and state three.
 pub const CURRENT: Compatibility = Compatibility {
-    protocol: 3,
-    state: 2,
+    protocol: 4,
+    state: 3,
 };
 
 /// Name of the durable format stamp at the root of a node's data directory.

@@ -18,8 +18,8 @@ async fn compatibility_query_requires_no_configuration_or_runtime_state() {
         String::from_utf8_lossy(&output.stderr)
     );
     let value: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
-    assert_eq!(value["protocol"], 3);
-    assert_eq!(value["state"], 2);
+    assert_eq!(value["protocol"], 4);
+    assert_eq!(value["state"], 3);
     assert_eq!(std::fs::read_dir(directory.path()).unwrap().count(), 0);
 }
 

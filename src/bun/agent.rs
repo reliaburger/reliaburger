@@ -341,6 +341,7 @@ pub enum AgentCommand {
     },
     /// Inject a network partition (chaos testing).
     InjectPartition {
+        reservation: Option<crate::smoker::reservation::NodeFaultReservation>,
         peers: Vec<String>,
         duration_secs: u64,
         injected_by: String,
@@ -405,8 +406,20 @@ pub enum AgentCommand {
     Routes {
         response: oneshot::Sender<Vec<crate::wrapper::types::RouteInfo>>,
     },
-    /// Inject a fault (Smoker).
+    /// Prepare the canonical request and identify this target process.
+    PrepareNodeFault {
+        request: crate::smoker::types::FaultRequest,
+        response: oneshot::Sender<Result<(String, crate::smoker::types::FaultRequest), BunError>>,
+    },
+    /// Fence delayed activation and confirm reversal before releasing capacity.
+    FenceNodeFault {
+        only_if_finished: bool,
+        reservation: crate::smoker::reservation::NodeFaultReservation,
+        response: oneshot::Sender<Result<(), BunError>>,
+    },
+    /// Apply a workload fault, or a node fault carrying a committed grant.
     InjectFault {
+        reservation: Option<crate::smoker::reservation::NodeFaultReservation>,
         request: crate::smoker::types::FaultRequest,
         response: oneshot::Sender<Result<crate::smoker::types::FaultSummary, BunError>>,
     },
@@ -1418,6 +1431,7 @@ pub struct BunAgent<G: Grill> {
     /// Smoker duration limits (`[smoker]`): default + maximum fault lifetime.
     smoker_config: crate::smoker::config::SmokerConfig,
     /// Reference-counted node drains, independent from binary-upgrade drains.
+    node_fault_fence: crate::smoker::reservation::NodeFaultFence,
     node_drain_gate: crate::smoker::node_fault::NodeDrainGate,
     /// Owned helper processes and cgroups for node-scoped capacity pressure.
     node_pressure: crate::smoker::node_pressure::NodePressureController,
@@ -1590,6 +1604,7 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
             trust_domain: "default".to_string(),
             fault_registry: crate::smoker::registry::FaultRegistry::new(),
             smoker_config: crate::smoker::config::SmokerConfig::default(),
+            node_fault_fence: crate::smoker::reservation::NodeFaultFence::default(),
             node_drain_gate: crate::smoker::node_fault::NodeDrainGate::new(),
             node_pressure: crate::smoker::node_pressure::NodePressureController::default(),
             #[cfg(all(feature = "ebpf", target_os = "linux"))]
@@ -1674,6 +1689,7 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
             trust_domain,
             fault_registry: crate::smoker::registry::FaultRegistry::new(),
             smoker_config: crate::smoker::config::SmokerConfig::default(),
+            node_fault_fence: crate::smoker::reservation::NodeFaultFence::default(),
             node_drain_gate: crate::smoker::node_fault::NodeDrainGate::new(),
             node_pressure: crate::smoker::node_pressure::NodePressureController::default(),
             #[cfg(all(feature = "ebpf", target_os = "linux"))]
@@ -3172,25 +3188,36 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
                 let _ = response.send(result);
             }
             AgentCommand::InjectPartition {
+                reservation,
                 peers,
                 duration_secs,
                 injected_by,
                 response,
             } => {
-                // Legacy chaos API — create a partition fault in the registry
-                let request = crate::smoker::types::FaultRequest {
-                    fault_type: crate::smoker::types::FaultType::CouncilPartition,
-                    target_service: peers.join(","),
-                    namespace: None,
-                    target_instance: None,
-                    target_node: None,
-                    duration: std::time::Duration::from_secs(duration_secs),
-                    injected_by,
-                    reason: Some("legacy chaos partition".into()),
-                    include_leader: false,
-                    override_safety: false,
-                    acknowledged: false,
+                let Some(grant) = reservation else {
+                    let _ = response.send(Err(BunError::FaultRejected {
+                        reason: "partitions require a committed cluster reservation".into(),
+                    }));
+                    return;
                 };
+                let request = grant.request.clone();
+                if request.target_service != peers.join(",")
+                    || request.duration != std::time::Duration::from_secs(duration_secs)
+                    || request.injected_by != injected_by
+                    || !matches!(
+                        request.fault_type,
+                        crate::smoker::types::FaultType::CouncilPartition
+                    )
+                {
+                    let _ = response.send(Err(BunError::FaultRejected {
+                        reason: "partition grant does not match the operation".into(),
+                    }));
+                    return;
+                }
+                if let Err(reason) = self.node_fault_fence.activate(&grant, &request) {
+                    let _ = response.send(Err(BunError::FaultRejected { reason }));
+                    return;
+                }
                 // Safety rails apply to the legacy path too (M1): a partition
                 // that would strand quorum must be refused, not waved through
                 // just because it came in on the old chaos API.
@@ -3205,6 +3232,7 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
                     return;
                 }
                 let rule = self.fault_registry.insert(&request);
+                self.node_fault_fence.active = Some((grant.sequence, rule.id));
                 // L15: actually partition. Resolve each peer (by name)
                 // to its gossip address from membership, then block both
                 // the gossip and Raft transports to it — the old code
@@ -3321,7 +3349,35 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
                     );
                 });
             }
+            AgentCommand::PrepareNodeFault {
+                mut request,
+                response,
+            } => {
+                let result = crate::smoker::config::effective_duration(
+                    request.duration,
+                    false,
+                    &self.smoker_config,
+                )
+                .map(|duration| {
+                    request.duration = duration;
+                    (self.node_fault_fence.boot_id.clone(), request)
+                })
+                .map_err(|reason| BunError::FaultRejected { reason });
+                let _ = response.send(result);
+            }
+            AgentCommand::FenceNodeFault {
+                only_if_finished,
+                reservation,
+                response,
+            } => {
+                let result = self
+                    .fence_node_fault(&reservation, only_if_finished)
+                    .await
+                    .map_err(|reason| BunError::FaultRejected { reason });
+                let _ = response.send(result);
+            }
             AgentCommand::InjectFault {
+                reservation,
                 mut request,
                 response,
             } => {
@@ -3335,6 +3391,19 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
                 ) {
                     Ok(effective) => request.duration = effective,
                     Err(reason) => {
+                        let _ = response.send(Err(BunError::FaultRejected { reason }));
+                        return;
+                    }
+                }
+
+                if request.fault_type.is_node_targeted() {
+                    let result = reservation
+                        .as_ref()
+                        .ok_or_else(|| {
+                            "node faults require a committed cluster reservation".to_string()
+                        })
+                        .and_then(|grant| self.node_fault_fence.activate(grant, &request));
+                    if let Err(reason) = result {
                         let _ = response.send(Err(BunError::FaultRejected { reason }));
                         return;
                     }
@@ -3361,6 +3430,9 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
                 // be applied must not report success (the old code
                 // recorded everything, injecting nothing).
                 let rule = self.fault_registry.insert(&request);
+                if let Some(grant) = &reservation {
+                    self.node_fault_fence.active = Some((grant.sequence, rule.id));
+                }
                 match self.apply_fault(&rule).await {
                     Ok(()) => {
                         let summary = crate::smoker::types::FaultSummary::from(&rule);
@@ -4339,6 +4411,66 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
         "8:0".to_string()
     }
 
+    /// Serialise the fence with activation and retain ownership if cleanup fails.
+    async fn fence_node_fault(
+        &mut self,
+        grant: &crate::smoker::reservation::NodeFaultReservation,
+        only_if_finished: bool,
+    ) -> Result<(), String> {
+        if only_if_finished
+            && (!self.node_fault_fence.consumed(grant)
+                || (grant.boot_id == self.node_fault_fence.boot_id
+                    && self.node_fault_fence.active.is_some_and(|(sequence, id)| {
+                        sequence == grant.sequence && self.fault_registry.get(id).is_some()
+                    })))
+        {
+            return Err("node fault activation or reversal is still pending".into());
+        }
+        if let Some(id) = self.node_fault_fence.fence(grant) {
+            if matches!(
+                grant.request.fault_type,
+                crate::smoker::types::FaultType::CouncilPartition
+            ) {
+                // The single node-experiment slot owns these transport lists.
+                // Peer addresses may have changed since activation; removing
+                // only today's addresses cannot prove the old entries are gone.
+                self.clear_partition().await;
+            }
+            if matches!(
+                grant.request.fault_type,
+                crate::smoker::types::FaultType::NodePressure { .. }
+            ) {
+                self.node_pressure.clear(id).await?;
+            }
+            if let Some(rule) = self.fault_registry.get(id).cloned() {
+                if !matches!(
+                    rule.fault_type,
+                    crate::smoker::types::FaultType::NodePressure { .. }
+                ) {
+                    self.reverse_fault(&rule).await;
+                }
+                self.fault_registry.remove(id);
+            }
+            // A failed apply or expiry may have removed its registry entry;
+            // inspect pressure helpers independently before acknowledging.
+        }
+        if matches!(
+            grant.request.fault_type,
+            crate::smoker::types::FaultType::NodePressure { .. }
+        ) {
+            self.node_pressure.confirm_no_helpers().await?;
+        }
+        if self
+            .node_fault_fence
+            .active
+            .is_some_and(|(sequence, _)| sequence <= grant.sequence)
+            && self.node_fault_fence.boot_id == grant.boot_id
+        {
+            self.node_fault_fence.active = None;
+        }
+        Ok(())
+    }
+
     /// Reverse a cleared or expired fault's persistent effect.
     ///
     /// eBPF network faults are undone by `delete_fault_bpf_entry`; this handles
@@ -4406,6 +4538,12 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
             FaultReversal::NodeQuiesce => {
                 if let Some(cluster) = &self.cluster {
                     cluster.partition_blocklists.node_gate.restore();
+                    eprintln!(
+                        "smoker: reversed node fault {} on {:?}; transports quiesced={}",
+                        rule.id,
+                        rule.target_node,
+                        cluster.partition_blocklists.node_gate.is_quiesced()
+                    );
                 }
             }
             FaultReversal::NodePressure => {
@@ -13153,6 +13291,7 @@ host = "remote.local"
             let (response, result) = oneshot::channel();
             agent
                 .handle_command(AgentCommand::InjectFault {
+                    reservation: None,
                     request: crate::smoker::types::FaultRequest {
                         fault_type: crate::smoker::types::FaultType::DnsNxdomain,
                         target_service: "redis".into(),
@@ -13214,6 +13353,7 @@ host = "remote.local"
             let (response, result) = oneshot::channel();
             agent
                 .handle_command(AgentCommand::InjectFault {
+                    reservation: None,
                     request: crate::smoker::types::FaultRequest {
                         fault_type: crate::smoker::types::FaultType::DnsNxdomain,
                         target_service: "redis".into(),
@@ -13257,6 +13397,79 @@ host = "remote.local"
     }
 
     #[tokio::test]
+    async fn node_fault_fence_reverses_before_acknowledging_and_blocks_late_activation() {
+        use crate::smoker::{
+            reservation::NodeFaultReservation,
+            types::{FaultRequest, FaultType},
+        };
+        let (mut agent, gate, _) = test_cluster_fault_agent().await;
+        let request = FaultRequest {
+            fault_type: FaultType::NodeKill {
+                kill_containers: false,
+            },
+            target_service: String::new(),
+            namespace: None,
+            target_instance: None,
+            target_node: Some("node-a".into()),
+            duration: std::time::Duration::from_secs(30),
+            injected_by: "operator".into(),
+            reason: None,
+            include_leader: true,
+            override_safety: true,
+            acknowledged: true,
+        };
+        let mut grant = NodeFaultReservation {
+            sequence: 1,
+            boot_id: agent.node_fault_fence.boot_id.clone(),
+            cleanup_after_unix_ms: 30_000,
+            request: request.clone(),
+        };
+        assert!(agent.fence_node_fault(&grant, true).await.is_err());
+        let (response, result) = oneshot::channel();
+        agent
+            .handle_command(AgentCommand::InjectFault {
+                reservation: Some(grant.clone()),
+                request: request.clone(),
+                response,
+            })
+            .await;
+        result.await.unwrap().unwrap();
+        assert!(gate.is_quiesced());
+        assert!(agent.fence_node_fault(&grant, true).await.is_err());
+        agent.fence_node_fault(&grant, false).await.unwrap();
+        assert!(!gate.is_quiesced());
+        assert!(agent.fault_registry.iter().next().is_none());
+        let (response, result) = oneshot::channel();
+        agent
+            .handle_command(AgentCommand::InjectFault {
+                reservation: Some(grant.clone()),
+                request: request.clone(),
+                response,
+            })
+            .await;
+        assert!(result.await.unwrap().is_err());
+        assert!(!gate.is_quiesced());
+        let old = grant.clone();
+        grant.sequence = 2;
+        let (response, result) = oneshot::channel();
+        agent
+            .handle_command(AgentCommand::InjectFault {
+                reservation: Some(grant.clone()),
+                request,
+                response,
+            })
+            .await;
+        result.await.unwrap().unwrap();
+        agent.fence_node_fault(&old, false).await.unwrap();
+        assert!(
+            gate.is_quiesced(),
+            "an old fence must not reverse a later operation"
+        );
+        agent.fence_node_fault(&grant, false).await.unwrap();
+        assert!(!gate.is_quiesced());
+    }
+
+    #[tokio::test]
     async fn node_drain_stops_scheduling_but_keeps_cluster_transports() {
         let (mut agent, gate, readiness) = test_cluster_fault_agent().await;
         let rule = register_fault(
@@ -13293,6 +13506,24 @@ host = "remote.local"
 
         let stored = agent.fault_registry.get(rule.id).cloned().unwrap();
         agent.reverse_fault(&stored).await;
+        assert!(!gate.is_quiesced());
+    }
+
+    #[tokio::test]
+    async fn node_fault_expiry_restores_the_transport_gate() {
+        let (mut agent, gate, _) = test_cluster_fault_agent().await;
+        let rule = register_fault(
+            &mut agent,
+            crate::smoker::types::FaultType::NodeKill {
+                kill_containers: false,
+            },
+            std::time::Duration::from_millis(1),
+        );
+        agent.apply_fault(&rule).await.unwrap();
+        assert!(gate.is_quiesced());
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        agent.expire_faults().await;
+        assert!(agent.fault_registry.is_empty());
         assert!(!gate.is_quiesced());
     }
 
