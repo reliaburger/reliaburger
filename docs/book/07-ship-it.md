@@ -1049,3 +1049,44 @@ survive until cleanup completes. A corrective deployment then succeeds. API
 tests cover role and namespace scope, including repeated requests for a terminal
 record. A real CLI process receives 202, polls for terminal evidence, and refuses
 to report an unknown outcome as success.
+
+
+### Record ownership before starting work
+
+Suppose a worker receives an assignment for `api`, starts a container, and dies
+before saving its successful deployment. While it's down, the operator removes
+the application. On restart, the old checkpoint has no `api` entry, so a loop
+that only compares assignments against completed deployments never retires it.
+The container has fallen between two records.
+
+The placement checkpoint now distinguishes Pending from Applied. We persist
+Pending before putting a Deploy command on the agent's queue. Applied carries
+the specification fingerprint only after the terminal success event. Both
+states own resources. If the leader withdraws an assignment, either state
+requires a successful Retire response before we remove its record.
+
+An `enum` expresses these alternatives directly: `Pending` has no payload,
+while `Applied { fingerprint: String }` owns the serialised specification. A
+`match` on this enum makes the compiler check that callers handle both states.
+After restart, an inventory mismatch changes Applied back to Pending; it never
+removes ownership. This lets the reconciler retry an incomplete deployment or
+retire its resources when the assignment has disappeared.
+
+The journal uses a private unique temporary file, file sync, rename and directory
+sync before acknowledgement. Blocking filesystem operations run in
+`spawn_blocking`. A failed write prevents deployment; malformed data, duplicate
+owners, symlinks and unsupported schemas refuse reconciliation. The worker
+retries loading instead of treating an unreadable file as an empty inventory.
+The file has a 64 MiB size limit to bound decoding.
+
+A real HTTP and agent-channel regression checks the journal at the instant the
+agent receives Deploy. It then aborts the reconciler, withdraws the assignment,
+restarts from disk and drops the first retirement reply. Ownership must survive
+until a later confirmed reply. Separate tests cover durable round trips, private
+atomic replacement and rejected checkpoints. This is controlled interruption,
+not proof against power loss. Runtime discovery before the first adoption
+record is written still needs separate crash qualification.
+
+Checkpoint schema 2 changes durable state, so the binary now advertises state
+generation 5 while protocol generation 5 is unchanged. Earlier development
+clusters require fresh state; a rolling upgrade must match both generations.

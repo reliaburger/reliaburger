@@ -15,10 +15,10 @@ pub struct Compatibility {
     pub state: u32,
 }
 
-/// Supported formats; leased API tokens require protocol five and state four.
+/// Supported formats; placement ownership journals require state five.
 pub const CURRENT: Compatibility = Compatibility {
     protocol: 5,
-    state: 4,
+    state: 5,
 };
 
 /// Name of the durable format stamp at the root of a node's data directory.

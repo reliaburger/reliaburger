@@ -695,12 +695,29 @@ controlled cancellation/retry, 271 ordinary runtime tests (13 explicit gates,
 TLS/runc secret/config catalogue (three confirmed cleanups, 62.76s), and strict
 Linux/macOS Clippy pass.
 
+**Placement ownership prerequisite (18 September):** A real HTTP/agent-channel
+regression finds no persisted owner when Deploy reaches the agent. The reconciler
+now syncs Pending ownership before queueing deployment, records Applied only after
+terminal success, and keeps either state until Retire succeeds. Restart inventory
+checks invalidate convergence without deleting ownership. Unreadable, malformed,
+duplicate or unsupported checkpoints refuse; private atomic replacement syncs
+both file and directory. Checkpoint schema 2 requires state generation 5; protocol
+5 and lease schema 2 are unchanged. The restart fixture aborts the reconciler,
+withdraws the assignment, drops a cleanup reply, and requires eventual retirement;
+it also injects a persistence failure before deployment. All 61 cluster unit
+tests pass (4.15s), followed by the strengthened refusal/restart regression
+(6.17s), five compatibility tests, all nine real multi-node placement cases
+(135.38s), the full Linux library checkpoint (3,299 passed, 19 explicit gates,
+54.89s), and strict Linux/macOS Clippy.
+
 **Additional cleanup evidence to establish:** Atomic process identity,
 complete process-tree retirement and physical crash recovery remain open.
-Reproduce the crash window between runtime
-creation and placement-checkpoint persistence; a lease must not forget an
-orphaned workload merely because its desired Raft entry was removed. These
-are inspected paths, not completed crash qualifications.
+Discovery of resources created before their initial runtime adoption record,
+and cluster-lease completion before every former placement confirms retirement,
+still need implementation and qualification. Placement response-body reads and
+agent retirement replies also need explicit deadlines; these inspected waits
+can currently stall reconciliation. Controlled reconciler interruption is not
+physical crash qualification.
 
 Remaining resource contracts, each in its own commit: node-local jobs,
 registry uploads/repositories,
