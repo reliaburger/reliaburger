@@ -18,6 +18,16 @@ struct BunProcess {
 
 impl BunProcess {
     fn spawn(config: &Path, address: SocketAddr, clustered: bool, log_path: PathBuf) -> Self {
+        Self::spawn_runtime(config, address, clustered, log_path, "process")
+    }
+
+    fn spawn_runtime(
+        config: &Path,
+        address: SocketAddr,
+        clustered: bool,
+        log_path: PathBuf,
+        runtime: &str,
+    ) -> Self {
         let log = std::fs::File::create(&log_path).unwrap();
         let mut command = Command::new(env!("CARGO_BIN_EXE_bun"));
         command
@@ -26,7 +36,7 @@ impl BunProcess {
             .arg("--listen")
             .arg(address.to_string())
             .arg("--runtime")
-            .arg("process")
+            .arg(runtime)
             .stdout(Stdio::from(log.try_clone().unwrap()))
             .stderr(Stdio::from(log));
         if clustered {
@@ -119,14 +129,25 @@ fn wait_for_bind(bun: &mut BunProcess, address: SocketAddr) -> BunStart {
 /// the exact "Address already in use" exit. `build` reserves fresh ports,
 /// writes the config and returns `(config, api_address, log_path)`; on the
 /// race it runs again, so nothing from the lost attempt is reused.
-fn spawn_bun_with_port_retry<F>(clustered: bool, mut build: F) -> (BunProcess, SocketAddr)
+fn spawn_bun_with_port_retry<F>(clustered: bool, build: F) -> (BunProcess, SocketAddr)
+where
+    F: FnMut() -> (PathBuf, SocketAddr, PathBuf),
+{
+    spawn_bun_with_runtime_port_retry(clustered, "process", build)
+}
+
+fn spawn_bun_with_runtime_port_retry<F>(
+    clustered: bool,
+    runtime: &str,
+    mut build: F,
+) -> (BunProcess, SocketAddr)
 where
     F: FnMut() -> (PathBuf, SocketAddr, PathBuf),
 {
     const ATTEMPTS: usize = 3;
     for attempt in 1..=ATTEMPTS {
         let (config, address, log_path) = build();
-        let mut bun = BunProcess::spawn(&config, address, clustered, log_path);
+        let mut bun = BunProcess::spawn_runtime(&config, address, clustered, log_path, runtime);
         match wait_for_bind(&mut bun, address) {
             BunStart::Ready => return (bun, address),
             BunStart::PortRace => {
@@ -1058,4 +1079,117 @@ fn secure_catalogue_scoped_token_uses_explicit_ca_and_server_owned_cleanup() {
         !listed.contains("rbtest-"),
         "test token survived cleanup: {listed}"
     );
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+#[ignore = "requires rootful runc, networking tools and registry access"]
+fn runc_catalogue_decrypts_secrets_using_only_the_public_key_api() {
+    assert!(
+        nix::unistd::geteuid().is_root(),
+        "run this qualification as root"
+    );
+    let root = tempfile::tempdir().unwrap();
+    let cluster_dir = root.path().join("cluster");
+    assert_success(
+        &run_relish(&[
+            "init",
+            cluster_dir.to_str().unwrap(),
+            "--cluster-name",
+            "secrets-catalogue",
+            "--node-id",
+            "node-01",
+        ]),
+        "initialise secrets fixture",
+    );
+    let node_path = cluster_dir.join("reliaburger.toml");
+    let mut node = reliaburger::config::NodeConfig::from_file(&node_path).unwrap();
+    node.node.name = Some("node-01".into());
+    node.network.advertise_address = Some("127.0.0.1".into());
+    node.storage.data = root.path().join("data");
+    node.storage.images = root.path().join("images");
+    node.storage.logs = root.path().join("logs");
+    node.storage.metrics = root.path().join("metrics");
+    node.storage.volumes = root.path().join("volumes");
+    node.images.registry_port = 0;
+    node.testing.safety_class = reliaburger::testkit::safety::ClusterSafetyClass::Development;
+    node.testing
+        .allowed_operations
+        .insert(reliaburger::testkit::safety::OperationPermission::ProvisionIsolatedWorkloads);
+    let (mut bun, address) = spawn_bun_with_runtime_port_retry(true, "runc", || {
+        let [gossip, raft, reporting] = reserve_ports();
+        node.cluster.gossip_port = gossip;
+        node.cluster.raft_port = raft;
+        node.cluster.reporting_port = reporting;
+        std::fs::write(&node_path, toml::to_string_pretty(&node).unwrap()).unwrap();
+        (
+            node_path.clone(),
+            reserve_address(),
+            root.path().join("secrets-bun.log"),
+        )
+    });
+    let endpoint = format!("https://{address}");
+    let ca = cluster_dir.join("identity/root-ca.crt");
+    let ca = ca.to_str().unwrap();
+    wait_for_relish(
+        &mut bun,
+        &["--endpoint", &endpoint, "--ca-cert", ca, "status"],
+    );
+    let token = run_relish(&[
+        "--endpoint",
+        &endpoint,
+        "--ca-cert",
+        ca,
+        "token",
+        "create",
+        "--name",
+        "secrets-test-admin",
+        "--role",
+        "admin",
+    ]);
+    assert_success(&token, "create secrets catalogue administrator");
+    let token = String::from_utf8(token.stdout).unwrap();
+    let deadline = Instant::now() + WAIT;
+    while run_relish(&["--endpoint", &endpoint, "--ca-cert", ca, "token", "list"])
+        .status
+        .success()
+    {
+        assert!(
+            Instant::now() < deadline,
+            "authentication never left bootstrap"
+        );
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    let output = run_relish(&[
+        "--endpoint",
+        &endpoint,
+        "--ca-cert",
+        ca,
+        "--token",
+        token.trim(),
+        "--output",
+        "json",
+        "test",
+        "--filter",
+        "secrets-config",
+        "--timeout",
+        "90s",
+        "--parallel",
+        "1",
+    ]);
+    let report: serde_json::Value =
+        serde_json::from_slice(&output.stdout).unwrap_or_else(|error| {
+            panic!(
+                "invalid catalogue report: {error}; stdout={}; stderr={}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+        });
+    let results = report["results"].as_array().unwrap();
+    assert_eq!(results.len(), 3, "{report}");
+    for case in results {
+        assert_eq!(case["outcome"]["status"], "pass", "{report}");
+        assert_eq!(case["cleanup"]["status"], "confirmed", "{report}");
+    }
+    assert_success(&output, "qualify secret encryption and config mounting");
 }

@@ -465,6 +465,7 @@ pub fn router_with_upgrade(
         .route("/v1/token/list", get(token_list_handler))
         .route("/v1/token/revoke", post(token_revoke_handler))
         .route("/v1/join-token/create", post(join_token_create_handler))
+        .route("/v1/secret/public-key", get(secret_public_key_handler))
         .route("/v1/secret/rotate", post(secret_rotate_handler))
         .route_layer(axum::middleware::from_fn_with_state(
             auth_state,
@@ -7388,6 +7389,42 @@ async fn join_token_create_handler(
 // Secret rotation endpoint
 // ---------------------------------------------------------------------------
 
+/// Read the active public encryption recipient from locally applied state.
+///
+/// Publishing a recipient grants no decryption authority. Scoped read-only
+/// users may encrypt new values without gaining access to any private key.
+async fn secret_public_key_handler(
+    auth: Option<axum::Extension<crate::sesame::auth::AuthContext>>,
+    State(state): State<ApiState>,
+) -> Response {
+    if let Err(response) =
+        crate::sesame::auth::authorize(auth.as_deref(), crate::sesame::types::ApiRole::ReadOnly)
+    {
+        return response;
+    }
+    let Some(council) = &state.council else {
+        return (StatusCode::SERVICE_UNAVAILABLE, "no council available").into_response();
+    };
+    let security = council.security_state().await;
+    let Some(keypair) = security
+        .age_keypairs
+        .iter()
+        .filter(|key| key.scope == crate::sesame::types::AgeKeyScope::ClusterWide && !key.read_only)
+        .max_by_key(|key| key.generation)
+    else {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            "no active cluster encryption key available",
+        )
+            .into_response();
+    };
+    Json(crate::sesame::types::SecretPublicKey {
+        public_key: keypair.public_key.clone(),
+        generation: keypair.generation,
+    })
+    .into_response()
+}
+
 /// Rotate or finalise secret encryption key via Raft.
 async fn secret_rotate_handler(
     auth: Option<axum::Extension<crate::sesame::auth::AuthContext>>,
@@ -9245,6 +9282,108 @@ mod tests {
             None,
         );
         (app, shutdown, plaintext)
+    }
+
+    #[tokio::test]
+    async fn secret_public_key_exposes_only_current_public_material_to_scoped_readers() {
+        let council = seeded_council_with_ikm("public-key").await;
+        let reader = crate::sesame::token::create_token(
+            "public-key-reader",
+            crate::sesame::types::ApiRole::ReadOnly,
+            crate::sesame::types::TokenScope {
+                apps: Some(vec!["web".into()]),
+                namespaces: Some(vec!["team-a".into()]),
+            },
+            None,
+        )
+        .unwrap();
+        let store = crate::sesame::auth::new_token_store();
+        store.write().await.push(reader.token);
+        let (tx, _rx) = mpsc::channel(1);
+        let app = router(
+            tx,
+            None,
+            None,
+            None,
+            None,
+            None,
+            Some(council.clone()),
+            Some(store),
+            None,
+            None,
+            None,
+            None,
+            0,
+            None,
+        );
+        assert_eq!(
+            get_status(app.clone(), "/v1/secret/public-key", None).await,
+            StatusCode::UNAUTHORIZED
+        );
+        for generation in 0..=1 {
+            if generation == 1 {
+                let (key, _) = crate::sesame::secret::generate_age_keypair(
+                    crate::sesame::types::AgeKeyScope::ClusterWide,
+                    council.wrapping_ikm().unwrap(),
+                    generation,
+                )
+                .unwrap();
+                council
+                    .write(crate::council::RaftRequest::RotateSecretKey {
+                        scope: crate::sesame::types::AgeKeyScope::ClusterWide,
+                        new_keypair: key,
+                    })
+                    .await
+                    .unwrap();
+            }
+            let response = app
+                .clone()
+                .oneshot(
+                    axum::http::Request::builder()
+                        .uri("/v1/secret/public-key")
+                        .header("authorization", format!("Bearer {}", reader.plaintext))
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::OK);
+            let body = response.into_body().collect().await.unwrap().to_bytes();
+            let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+            assert_eq!(
+                json.as_object().unwrap().len(),
+                2,
+                "public key responses must not serialise the stored keypair"
+            );
+            assert_eq!(json["generation"], generation);
+            let security = council.security_state().await;
+            let keypair = security.cluster_age_keypair().unwrap();
+            assert_eq!(json["public_key"], keypair.public_key);
+            let encrypted = crate::sesame::secret::encrypt_secret(
+                "probe",
+                json["public_key"].as_str().unwrap(),
+            )
+            .unwrap();
+            let identity = crate::sesame::secret::unwrap_age_identity(
+                keypair,
+                council.wrapping_ikm().unwrap(),
+            )
+            .unwrap();
+            assert_eq!(
+                crate::sesame::secret::decrypt_secret(&encrypted, &identity).unwrap(),
+                "probe"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn secret_public_key_refuses_when_cluster_keys_are_unavailable() {
+        let (app, shutdown) = setup_with_auth(vec![], None).await;
+        assert_eq!(
+            get_status(app, "/v1/secret/public-key", None).await,
+            StatusCode::SERVICE_UNAVAILABLE
+        );
+        shutdown.cancel();
     }
 
     /// PKI8 end-to-end: finalising while a stored secret is still sealed

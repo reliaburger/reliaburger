@@ -515,6 +515,24 @@ Four cases return unknown unconditionally. Development and full profiles share a
 
 **Completion test:** Implement runnable registry, secret/config and workload-identity fixtures in separate commits. Full profiles require their observations; development reports supported skips/warnings honestly and never converts missing evidence to success.
 
+**Secret/config fixtures completed (18 September):** A scoped read-only API
+returns only the active public age recipient and generation. The harness fetches
+it over its authenticated client, seals independent ciphertexts, deploys a leased
+container and reads the actual owning node's environment, including Unicode and
+newline preservation and an unchanged plaintext value. The config-file probe
+also selects the owning node. Two API regressions fail against the missing
+endpoint; the actual catalogue initially returns Unknown. The public-key tests,
+eight route audits, 117 testkit tests and strict Linux/macOS Clippy pass. The real
+TLS/runc catalogue now passes all three cases with confirmed cleanup (65.36s),
+after the separately committed C34 retirement/observation repairs. Its ignored
+`runc_` acceptance test is included by the existing privileged CI target.
+Workload SPIFFE observation and runnable registry deployment remain open.
+
+The broad library checkpoint was not green: 3,276 passed, one upgrade probe
+failed with Linux ETXTBSY, and 19 privileged gates were ignored. This execution
+race remains tracked under V02. Cluster API port-zero propagation is separately
+tracked under H03; the runc fixture uses the existing fixed-port retry harness.
+
 ### C31 — Give concurrent test runs distinct namespaces
 
 **Priority:** P2. **Wave:** 4. **Book chapters:** 15.

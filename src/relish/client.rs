@@ -1944,6 +1944,13 @@ impl BunClient {
             })
     }
 
+    /// Fetch the active public recipient without accessing cluster key files.
+    pub async fn secret_public_key(
+        &self,
+    ) -> Result<crate::sesame::types::SecretPublicKey, RelishError> {
+        self.get_typed_json("/v1/secret/public-key").await
+    }
+
     /// Rotate or finalise the secret encryption key.
     pub async fn secret_rotate(&self, finalize: bool) -> Result<String, RelishError> {
         let url = format!("{}/v1/secret/rotate", self.base_url);

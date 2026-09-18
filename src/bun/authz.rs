@@ -211,6 +211,7 @@ pub const ROUTE_MATRIX: &[Route] = &[
     route(Get, "/v1/token/list", Admin),
     route(Post, "/v1/token/revoke", Admin),
     route(Post, "/v1/join-token/create", Admin),
+    route(Get, "/v1/secret/public-key", AnyToken),
     route(Post, "/v1/secret/rotate", Admin),
 ];
 

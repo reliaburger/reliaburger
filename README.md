@@ -23,7 +23,9 @@ No sidecars. No add-on shopping list. No YAML archaeology. You get:
   rolling binary upgrades where workloads survive the swap.
 - **Security that's on by default.** Generated clusters require mTLS;
   joins are single-use-token, CSR-based; images can be signature-gated;
-  secrets are encrypted at rest. Cluster-signed ingress leaves renew on demand
+  secrets are encrypted at rest, with
+  [public encryption keys available over the API](docs/README.md#encrypting-secrets-without-cluster-files).
+  Cluster-signed ingress leaves renew on demand
   before expiry, and operator certificate files reload without a restart.
   Node leaves renew automatically through the current leader, and every node
   transport observes replacements. TLS connections have bounded lifetimes.

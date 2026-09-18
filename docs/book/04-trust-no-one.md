@@ -1314,3 +1314,32 @@ The advisory gate fails with the old dependency when its exception is removed.
 After migration it passes without that exception. TLS file-reload and client
 certificate tests check the behaviour that matters to users; a shorter
 lockfile is useful, but it is not evidence that a TLS connection still works.
+
+
+### Fetch the recipient, keep the private key on the cluster
+
+You have an API token and a manifest to deploy, but no copy of the directory
+created by `relish init`. Encrypting a new environment value should not require
+copying cluster key files onto your laptop.
+
+`GET /v1/secret/public-key` returns the cluster's active age public recipient
+and its generation. Authenticated readers, including scoped readers, can use
+it. A public recipient lets you encrypt a value; it cannot decrypt anything.
+The endpoint returns a dedicated `SecretPublicKey` struct with just two fields,
+instead of serialising the stored `AgeKeypair` that also contains wrapped
+private material. A node without an active cluster key returns 503.
+
+This is a read of the node's applied Raft state. A follower can briefly lag a
+rotation, so the response does not promise a quorum-fresh generation. Rotation
+keeps retiring keys for decryption until finalisation; if a key is retired
+between fetching it and applying a manifest, fetch again and re-encrypt.
+Ordinary apply and decryption still enforce their existing checks.
+
+The API regression uses a scoped read-only credential, verifies anonymous
+refusal after bootstrap, and checks that the response contains exactly the
+public recipient and generation. It rotates the key through Raft and proves
+that values sealed with each returned recipient decrypt with that generation.
+The catalogue goes further: it fetches through TLS, seals two different age
+ciphertexts for the same value, deploys them into a leased OCI workload and
+reads their plaintext from the actual container. Unicode and newline bytes
+must survive; a neighbouring unencrypted value must remain unchanged.

@@ -312,6 +312,17 @@ pub enum AgeKeyScope {
     Namespace(String),
 }
 
+/// Public recipient and generation for encrypting new cluster secrets.
+///
+/// This response deliberately contains no wrapped or plaintext private key.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SecretPublicKey {
+    /// age X25519 recipient string.
+    pub public_key: String,
+    /// Generation selected from the node's applied cluster state.
+    pub generation: u64,
+}
+
 /// An age keypair used for encrypting/decrypting secrets.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct AgeKeypair {

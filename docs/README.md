@@ -505,7 +505,7 @@ Commands:
 | `snapshot list <app>` | List an app's snapshots, newest first |
 | `snapshot restore <app> <name>` | Restore a snapshot over the live volume (stop the app first) |
 | `snapshot delete <app> <name>` | Delete a snapshot |
-| `secret pubkey [dir]` | Print the cluster's age public key |
+| `secret pubkey [dir]` | Print the age public key from a local cluster directory |
 | `secret encrypt --pubkey <key> <value>` | Encrypt a value for use in app configs |
 | `secret rotate [--finalize]` | Start (or finalise) secret encryption-key rotation |
 | `token create --name <name>` | Create an API token (`--role`, `--apps`, `--namespaces`, `--ttl-days`) |
@@ -1083,3 +1083,24 @@ Node chaos (kill, drain, pressure and council partitions) reserves one cluster-w
 experiment slot. A deadline triggers target-side fencing and reversal; only a
 confirmed cleanup releases the slot. Failed or unreachable cleanup retains the
 reservation across leader changes. Workload faults retain their replica limits.
+
+
+### Encrypting secrets without cluster files
+
+Authenticated clients can fetch the public age recipient with
+`GET /v1/secret/public-key`. The JSON response contains `public_key` and
+`generation`, never private key material. Scoped read-only credentials may
+fetch it; deployments still require their normal permissions.
+
+```sh
+curl --fail --cacert cluster/identity/root-ca.crt \
+  -H "Authorization: Bearer $RELIABURGER_TOKEN" \
+  https://127.0.0.1:9117/v1/secret/public-key
+relish secret encrypt --pubkey '<public_key from the response>' 'value'
+```
+
+Use the resulting `ENC[AGE:...]` string in an app environment variable. A
+follower may briefly report the previous generation during rotation; fetch
+again and re-encrypt if that generation has been finalised before deployment.
+`relish test --filter secrets-config` checks actual container decryption and
+config-file mounting on a cluster with a container runtime.

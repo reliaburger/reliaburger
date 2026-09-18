@@ -2831,3 +2831,23 @@ start Bun on `127.0.0.1:0`, read that address from its output and probe that exa
 listener. No test releases a guessed API port for Bun to reclaim. The bootstrap
 regression first failed because the old startup line printed the requested
 port zero; it now requires a non-zero address and a successful health response.
+
+
+### Secret tests need a workload observation
+
+The secret catalogue used to return Unknown immediately because it could not
+obtain the cluster encryption recipient. It now fetches the public recipient
+over the authenticated API, encrypts fixture values and applies an app inside
+its server-owned test lease. It never reads a cluster private key.
+
+After placement, the probe finds the node that actually runs the app and uses
+that node's scoped exec API to read the container environment. The entry API
+node need not own the workload. Two independently randomised ciphertexts must
+recover the expected bytes, while an adjacent plaintext variable stays intact.
+The config-file case uses the same node selection to read its mounted file.
+
+The rootful acceptance test starts the real Bun and Relish binaries with a
+generated cluster CA, closes the unauthenticated bootstrap window and runs all
+three secrets/config cases against runc. Both the case verdict and server-owned
+cleanup must succeed. Missing capability, Unknown, timeout and cleanup failure
+all fail this qualification.
