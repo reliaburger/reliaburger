@@ -71,6 +71,59 @@ class ReleasePackageTests(unittest.TestCase):
         self.assertNotEqual(result.returncode, 0)
         self.assertEqual(installed.read_bytes(), original)
 
+    def test_candidate_mirror_keeps_installer_bytes_and_forwards_signed_source(self):
+        import os
+        binary = self.assets / "relish-macos-aarch64"
+        binary.write_text('#!/usr/bin/env bash\nprintf "%s\\n" "$@" > "$ARGUMENTS"\n')
+        self.package()
+        installer_bytes = (self.assets / "install.sh").read_bytes()
+        tools = self.root / "mirror-tools"
+        tools.mkdir()
+        (tools / "uname").write_text('#!/bin/sh\ncase "$1" in -s) echo Darwin;; -m) echo arm64;; esac\n')
+        (tools / "curl").write_text("""#!/bin/sh
+while [ "$#" -gt 0 ]; do
+  case "$1" in
+    -o) output=$2; shift ;;
+    https://*) url=$1 ;;
+  esac
+  shift
+done
+printf '%s\\n' "$url" >> "$URLS"
+case "$url" in
+  */install.sh) cp "$INSTALLER" "$output" ;;
+  *) cp "$FIXTURE" "$output" ;;
+esac
+""")
+        for tool in tools.iterdir():
+            tool.chmod(0o755)
+        urls = self.root / "urls"
+        arguments = self.root / "arguments"
+        home = self.root / "mirror-home"
+        home.mkdir()
+        mirror = "https://example.com/staging/candidate-123"
+        env = dict(os.environ, HOME=str(home), PATH=str(tools) + os.pathsep + os.environ["PATH"],
+                   RELIABURGER_RELEASE_BASE_URL=mirror, FIXTURE=str(binary), URLS=str(urls),
+                   ARGUMENTS=str(arguments), INSTALLER=str(self.assets / "install.sh"))
+        bootstrap = Path(__file__).resolve().parents[2] / "docs/website/install.sh"
+        for script in [self.assets / "install.sh", bootstrap]:
+            with self.subTest(script=script):
+                urls.unlink(missing_ok=True)
+                result = subprocess.run(["bash", str(script), "--nodes", "1"], env=env, capture_output=True)
+                self.assertEqual(result.returncode, 0, result.stderr)
+                expected = [mirror + "/relish-macos-aarch64"]
+                if script == bootstrap:
+                    expected.insert(0, mirror + "/install.sh")
+                self.assertEqual(urls.read_text().splitlines(), expected)
+                self.assertEqual(arguments.read_text().splitlines(),
+                                 ["setup", "--quickstart", "--release-mirror", mirror, "--nodes", "1"])
+                self.assertEqual((self.assets / "install.sh").read_bytes(), installer_bytes)
+                for invalid in ["http://example.com", "https://user:pass@example.com", "https://example.com/?key=x", "https://example.com/#fragment", "https://example.com/a b"]:
+                    urls.unlink(missing_ok=True)
+                    result = subprocess.run(["bash", str(script), "--install-only"],
+                                            env=dict(env, RELIABURGER_RELEASE_BASE_URL=invalid), capture_output=True)
+                    self.assertNotEqual(result.returncode, 0)
+                    self.assertFalse(urls.exists(), "invalid mirror reached curl")
+
     def test_untrusted_key_cannot_publish_metadata(self):
         self.trusted = ["ed25519:" + base64.b64encode(bytes(32)).decode()]
         with self.assertRaises(ValueError):

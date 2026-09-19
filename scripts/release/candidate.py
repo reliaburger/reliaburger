@@ -111,7 +111,7 @@ def gh_json(*arguments):
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("operation", choices=["record", "fetch", "verify-upload"])
+    parser.add_argument("operation", choices=["record", "verify", "fetch", "verify-upload"])
     parser.add_argument("--directory", type=Path, default=Path("dist"))
     parser.add_argument("--version", required=True)
     parser.add_argument("--repository", required=True)
@@ -124,6 +124,11 @@ def main():
     images = json.loads(Path(__file__).with_name("guest-images.json").read_text())
     if args.operation == "record":
         print(record_candidate(args.directory, images, **expected))
+        return
+
+    if args.operation == "verify":
+        verify_candidate(args.directory, images, args.qualified_digest or "", **expected)
+        print(f"verified local candidate {args.commit}")
         return
 
     # Resolve the remote tag again immediately before publication. No tag is created.

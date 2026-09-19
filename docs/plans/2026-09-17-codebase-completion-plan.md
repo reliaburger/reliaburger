@@ -1924,6 +1924,20 @@ Hosted candidate execution, pre-publication
 transport for its final URLs and actual installation remain open; no tag or
 release was created by this change.
 
+**Candidate transport implemented (19 September):** Both shell installers accept
+an explicit HTTPS directory and forward it to managed setup's `--release-mirror`.
+Only this version's release asset URLs are mapped; tooling URLs, checksums,
+embedded signatures and request bounds remain intact. Local candidate inventory
+verification needs no tag. The installer and CLI regressions fail before the
+feature. All 18 packaging tests, 32 managed quickstart tests and 85 CLI tests
+pass on macOS/Linux, with strict Clippy. HTTP fixtures verify metadata routing,
+independent tooling downloads and checksum refusal without replacing cached
+bytes. The actual built CLI also refuses three invalid mirror forms before
+creating setup state, and its help exposes the option. Actual staged
+HTTPS/cold-host qualification still remains. The subsequent full library
+checkpoint passes 3,338 tests on macOS (five explicit gates, 37.72s) and 3,392
+on Linux (19 explicit gates, 76.01s); 109 changed-document relative links resolve.
+
 ### V04 — Measure repeated cold installs on the advertised host matrix
 
 **Priority:** gate. **Wave:** 7. **Book chapters:** 09, 15.

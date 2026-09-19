@@ -127,9 +127,8 @@ from unqualified downloads defeats the gate. Workflow verification establishes
 identity and byte preservation; it cannot establish that somebody actually ran
 the cold-install and recovery tests. Those remain operator acceptance criteria.
 The complete hosted candidate and promotion paths have not yet been exercised.
-Pre-publication hosting/transport for the unchanged candidate's final release
-URLs also remains part of V03; downloading an Actions artefact alone does not
-qualify the public quickstart.
+Actual pre-publication mirror delivery remains part of V03; downloading an
+Actions artefact alone does not qualify the public quickstart.
 
 GitHub documents the [default-branch requirement for manual workflows](https://docs.github.com/en/actions/how-tos/manage-workflow-runs/manually-run-a-workflow)
 and the [release asset digest fields](https://docs.github.com/en/rest/releases/releases).
@@ -152,6 +151,49 @@ Before tagging 0.1.0, complete the managed-cluster and clean-install gates in th
 release plan. Record timing from an empty cache, the actual artefact digests,
 host and guest versions, memory use, and the successful sample workload. Don't
 publish a five-minute claim from a source build or a warmed VM.
+
+## Qualifying a staged candidate
+
+Download the candidate artefact and verify it against the separately recorded
+source/run identity and manifest digest before staging it:
+
+```sh
+python3 scripts/release/candidate.py verify --directory candidate \
+  --version v0.1.0 --repository reliaburger/reliaburger \
+  --commit FULL_COMMIT_SHA --run-id RUN_ID --run-attempt ATTEMPT \
+  --qualified-digest RECORDED_SHA256
+```
+
+Serve those unchanged files from one HTTPS directory. The directory must contain
+the entire inventory, including both guest images and both metadata documents.
+Do not rewrite URLs inside the metadata or regenerate the installer. To exercise
+the candidate installer from empty caches:
+
+```sh
+curl --fail --location --proto '=https' --proto-redir '=https' \
+  https://YOUR_HOST/candidate/install.sh -o /tmp/reliaburger-candidate-install.sh
+RELIABURGER_RELEASE_BASE_URL=https://YOUR_HOST/candidate \
+  bash /tmp/reliaburger-candidate-install.sh
+```
+
+The static bootstrap accepts the same environment variable and fetches the
+candidate's installer first. The generated installer pins the CLI's checksum
+and passes `--release-mirror` to managed setup. If you installed the candidate
+CLI separately, run `relish setup --quickstart --release-mirror https://YOUR_HOST/candidate`.
+Repeat the same command to resume an interrupted setup.
+
+Only that version's Reliaburger release URLs are redirected to the directory.
+The pinned Lima tooling URLs stay unchanged. HTTPS, bounded requests, guest-image
+hashes and embedded binary signatures remain enforced. Credentials in URLs,
+query strings and fragments are refused. This cannot be combined with
+`--development-binaries`. As with the default bootstrap, HTTPS authenticates the
+selected installer host; the independently retained candidate digest establishes
+which complete file set is under qualification.
+
+Record the mirror URL and all downloaded hashes with the cold-run measurements.
+A staged run qualifies those signed bytes; final public URL/Pages checks still
+need their own evidence after publication. No staging host or public candidate
+has been created by this code change.
 
 ## Guest images and bootstrap installer
 

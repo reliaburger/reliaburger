@@ -102,6 +102,19 @@ LIMA_HOME="$HOME/.reliaburger/lima" \
   sudo journalctl -u reliaburger.service --no-pager -n 100
 ```
 
+## Signed candidate qualification
+
+A release candidate can use an explicit HTTPS mirror of its unchanged assets:
+
+```sh
+relish setup --quickstart --release-mirror https://YOUR_HOST/candidate
+```
+
+This keeps guest-image checksums and embedded binary signatures enabled. It
+cannot be combined with development binaries. Repeat the mirror option when
+resuming. The [release guide](releasing.md#qualifying-a-staged-candidate) covers
+candidate verification and the matching installer environment variable.
+
 ## Development qualification
 
 Before a release exists, build Linux `bun` and `relish` with `--features ebpf`

@@ -8,7 +8,9 @@ installer is pending release.
 
 Release candidates now have a separate [build and promotion procedure](releasing.md#metadata-and-publication).
 Promotion preserves qualified files instead of rebuilding at tag time. The first
-hosted candidate and cold-install qualification remain pending.
+hosted candidate and cold-install qualification remain pending. An explicit
+HTTPS [candidate mirror](releasing.md#qualifying-a-staged-candidate) exercises
+unchanged installer/assets with checksums and signatures still enabled.
 
 User guide for building and running Reliaburger. For the full architectural vision, see the [whitepaper](whitepaper.md). For current implementation status, see [progress.md](progress.md).
 

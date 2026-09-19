@@ -394,6 +394,9 @@ enum Command {
         /// Use explicitly supplied Linux binaries for development before a release exists.
         #[arg(long, requires = "quickstart")]
         development_binaries: Option<PathBuf>,
+        /// HTTPS directory containing unchanged signed release candidate assets.
+        #[arg(long, requires = "quickstart", conflicts_with = "development_binaries")]
+        release_mirror: Option<String>,
 
         /// Accept the default answer to every question (non-interactive).
         #[arg(long)]
@@ -1551,6 +1554,7 @@ async fn main() -> ExitCode {
             ingress_port,
             registry_port,
             development_binaries,
+            release_mirror,
             yes,
             ref dir,
             ref release_url,
@@ -1565,6 +1569,7 @@ async fn main() -> ExitCode {
                         ingress_port: ingress_port.unwrap_or(18080),
                         registry_port: registry_port.unwrap_or(15050),
                         development_binaries,
+                        release_mirror,
                     },
                 )
                 .await
@@ -2124,6 +2129,41 @@ mod tests {
                 action: Some(CouncilCommand::Recover { force: true, .. })
             }
         ));
+    }
+
+    #[test]
+    fn parse_release_mirror_requires_managed_signed_quickstart() {
+        assert!(
+            parse(&[
+                "relish",
+                "setup",
+                "--quickstart",
+                "--release-mirror",
+                "https://example.com/candidate/"
+            ])
+            .is_ok()
+        );
+        assert!(
+            parse(&[
+                "relish",
+                "setup",
+                "--release-mirror",
+                "https://example.com/candidate/"
+            ])
+            .is_err()
+        );
+        assert!(
+            parse(&[
+                "relish",
+                "setup",
+                "--quickstart",
+                "--release-mirror",
+                "https://example.com/candidate/",
+                "--development-binaries",
+                "/tmp/binaries"
+            ])
+            .is_err()
+        );
     }
 
     #[test]

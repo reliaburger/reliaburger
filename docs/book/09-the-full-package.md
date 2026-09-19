@@ -1048,3 +1048,28 @@ symlinks, incomplete matrices, changed guest images and mismatched uploaded
 assets. A passing round trip preserves every original byte. This gives us a
 repeatable publication gate, not evidence that the first public installation
 has already passed; that still needs the real candidate and empty caches.
+
+### Test the final installer before its final URL exists
+
+Our candidate contains metadata pointing at `v0.1.0` on GitHub. Those URLs won't
+exist until publication. Rewriting metadata for a test server would change the
+file set we just promised to preserve.
+
+Instead, the installer accepts `RELIABURGER_RELEASE_BASE_URL`, an explicit HTTPS
+directory of unchanged candidate files. It downloads the same checksum-pinned
+CLI and passes that directory to `setup --quickstart --release-mirror`. The
+managed downloader translates only this version's Reliaburger asset URLs. Lima
+still comes from its pinned upstream URL. Every transferred binary and guest
+image keeps the existing checksum or signature verification.
+
+The optional mirror is a transport choice for one setup command, not a new
+cluster identity or a weaker development mode. Repeat it when resuming. We
+validate the directory before creating setup state, reject credentials/query
+strings/fragments, and refuse combining it with development binaries. Tests
+run both shell entry points with a captured download transport, then exercise
+metadata and binary downloads through a real local HTTP fixture. The fixture's
+HTTP exception exists only in test builds; distributed CLIs require HTTPS.
+
+The candidate record can also be verified locally before staging, without
+creating a release tag. None of these tests claims that the first signed
+candidate has completed the cold-host matrix. They make that test possible.

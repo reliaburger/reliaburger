@@ -11,6 +11,7 @@ use crate::upgrade::metadata::ReleaseMetadata;
 /// Downloads artefacts with bounded requests and atomic, verified cache writes.
 pub struct Downloader {
     client: reqwest::Client,
+    release_mirror: Option<(String, reqwest::Url)>,
 }
 
 fn validate_url(url: &reqwest::Url) -> Result<()> {
@@ -43,12 +44,53 @@ impl Downloader {
                 }
             }))
             .build()?;
-        Ok(Self { client })
+        Ok(Self {
+            client,
+            release_mirror: None,
+        })
+    }
+
+    /// Fetch this version's release assets from an explicit HTTPS directory.
+    /// Checksums, signatures, deadlines and unrelated tooling URLs are unchanged.
+    pub fn with_release_mirror(
+        mut self,
+        version: &crate::upgrade::BinaryVersion,
+        mirror: &str,
+    ) -> Result<Self> {
+        let mut base = reqwest::Url::parse(mirror).context("invalid release mirror URL")?;
+        validate_url(&base)?;
+        if base.query().is_some() || base.fragment().is_some() {
+            bail!("release mirror URL must not contain a query or fragment");
+        }
+        base.set_path(&format!("{}/", base.path().trim_end_matches('/')));
+        let original =
+            format!("https://github.com/reliaburger/reliaburger/releases/download/{version}/");
+        self.release_mirror = Some((original, base));
+        Ok(self)
+    }
+
+    fn download_url(&self, url: &str) -> Result<reqwest::Url> {
+        let url = reqwest::Url::parse(url).context("invalid download URL")?;
+        validate_url(&url)?;
+        if let Some((original, mirror)) = &self.release_mirror
+            && let Some(name) = url.as_str().strip_prefix(original)
+        {
+            if name.is_empty()
+                || name == "."
+                || name == ".."
+                || !name
+                    .bytes()
+                    .all(|byte| byte.is_ascii_alphanumeric() || b"-_.".contains(&byte))
+            {
+                bail!("mirrored release asset must have one plain filename");
+            }
+            return Ok(mirror.join(name)?);
+        }
+        Ok(url)
     }
 
     async fn response(&self, url: &str, limit: u64) -> Result<reqwest::Response> {
-        let url = reqwest::Url::parse(url).context("invalid download URL")?;
-        validate_url(&url)?;
+        let url = self.download_url(url)?;
         let response = self
             .client
             .get(url)
@@ -90,7 +132,7 @@ impl Downloader {
 
     /// Reuse only a checksum-verified cache entry; publish new bytes atomically.
     pub async fn fetch(&self, url: &str, digest: &str, path: &Path, limit: u64) -> Result<()> {
-        validate_url(&reqwest::Url::parse(url)?)?;
+        self.download_url(url)?;
         if digest.len() != 64 || !digest.bytes().all(|byte| byte.is_ascii_hexdigit()) {
             bail!("invalid SHA-256 digest");
         }
@@ -200,6 +242,84 @@ mod tests {
         let address = listener.local_addr().unwrap();
         let task = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
         (format!("http://{address}/asset"), calls, task)
+    }
+
+    #[tokio::test]
+    async fn release_mirror_fetches_exact_candidate_bytes_and_retains_checksums() {
+        let (mirror, calls, task) = server(b"candidate bytes").await;
+        let downloader = Downloader::new(Duration::from_secs(2))
+            .unwrap()
+            .with_release_mirror(&"v0.1.0".parse().unwrap(), mirror.trim_end_matches("asset"))
+            .unwrap();
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("download");
+        let original = "https://github.com/reliaburger/reliaburger/releases/download/v0.1.0/asset";
+        let digest = format!("{:x}", Sha256::digest(b"candidate bytes"));
+        downloader
+            .fetch(original, &digest, &path, 1024)
+            .await
+            .unwrap();
+        assert_eq!(tokio::fs::read(&path).await.unwrap(), b"candidate bytes");
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        assert!(
+            downloader
+                .fetch(original, &"0".repeat(64), &path, 1024)
+                .await
+                .is_err()
+        );
+        assert_eq!(tokio::fs::read(&path).await.unwrap(), b"candidate bytes");
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
+        task.abort();
+    }
+
+    #[tokio::test]
+    async fn release_mirror_fetches_metadata_without_rewriting_unrelated_downloads() {
+        let (mirror, calls, task) =
+            server(br#"{"schema":1,"latest":"v0.1.0","releases":[]}"#).await;
+        let downloader = Downloader::new(Duration::from_secs(2))
+            .unwrap()
+            .with_release_mirror(&"v0.1.0".parse().unwrap(), mirror.trim_end_matches("asset"))
+            .unwrap();
+        let metadata = downloader
+            .metadata("https://github.com/reliaburger/reliaburger/releases/download/v0.1.0/asset")
+            .await
+            .unwrap();
+        assert_eq!(metadata.schema, 1);
+        let (other, other_calls, other_task) = server(b"separate tooling").await;
+        let root = tempfile::tempdir().unwrap();
+        downloader
+            .fetch(
+                &other,
+                &format!("{:x}", Sha256::digest(b"separate tooling")),
+                &root.path().join("tool"),
+                1024,
+            )
+            .await
+            .unwrap();
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        assert_eq!(other_calls.load(Ordering::SeqCst), 1);
+        task.abort();
+        other_task.abort();
+    }
+
+    #[test]
+    fn release_mirror_refuses_ambiguous_or_insecure_bases() {
+        for mirror in [
+            "http://example.com/",
+            "file:///tmp/",
+            "relative/path",
+            "https://user:password@example.com/",
+            "https://example.com/?token=secret",
+            "https://example.com/#fragment",
+        ] {
+            assert!(
+                Downloader::new(Duration::from_secs(2))
+                    .unwrap()
+                    .with_release_mirror(&"v0.1.0".parse().unwrap(), mirror)
+                    .is_err(),
+                "accepted {mirror}"
+            );
+        }
     }
 
     #[tokio::test]
