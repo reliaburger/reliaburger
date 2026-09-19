@@ -256,7 +256,9 @@ impl ClusterSource {
         // at admission are the bytes pulled — a tag moved between
         // verify and pull changes nothing (IMG1).
         let manifest = match Digest::new(tag) {
-            Ok(digest) => catalog.get_manifest(digest.as_str()).cloned(),
+            Ok(digest) => catalog
+                .get_repository_manifest(repository, digest.as_str())
+                .cloned(),
             Err(_) => catalog.get_manifest_by_tag(repository, tag).cloned(),
         };
         let Some(manifest) = manifest else {

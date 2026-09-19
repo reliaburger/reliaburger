@@ -868,6 +868,22 @@ line. The corrected delayed-publication fixture fails first; a never-published
 line still fails. All 122 testkit tests pass (1.76s), and the actual TLS/CLI job
 catalogue passes with confirmed cleanup (7.48s). Strict Linux/macOS Clippy passes.
 
+**Repository metadata prerequisite (19 September):** Identical image bytes
+pushed into two repositories used to collapse into one digest-keyed metadata
+row. A failing-first regression reproduces the lost owner. The catalogue now
+keeps a row per repository/digest while blobs and holder locations remain
+content-addressed. Deleting a tag updates only its repository. Moving a tag
+preserves the old digest for pulls which already verified it; an existing
+integrity test caught an initial implementation that removed that evidence.
+Content signatures apply to every copy and survive later copies and reload.
+Peer pulls and scheduling select the repository for pinned references too.
+All 235 Pickle, 82 Raft state-machine and 29 scheduler tests pass on both
+platforms. The 17 registry cluster, five integrity and two upload integration
+tests pass on macOS/Linux, including new actual HTTP and snapshot recovery
+cases. Both compatibility checks and strict Clippy pass. Durable state advances
+to generation 11; protocol 8 and lease schema 4 remain unchanged. This is a
+prerequisite, not completion of repository/upload lease cleanup.
+
 Remaining resource contracts, each in its own commit: registry uploads/repositories,
 and managed volume/mount cleanup. Node effects already use C06 reservations
 and C10 exact-fault receipts. Image distribution currently reports uncontrolled

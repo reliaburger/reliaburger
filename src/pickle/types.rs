@@ -208,7 +208,8 @@ pub struct DeleteTag {
 /// The manifest catalog stored in Raft as part of DesiredState.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct ManifestCatalog {
-    /// Manifests keyed by digest string.
+    /// Per-repository manifest rows, carrying their content digest as the key.
+    /// Identical content may have independent tags in several repositories.
     pub manifests: Vec<(String, ImageManifest)>,
     /// Tag→digest mappings. Key is `"repository:tag"`, value is digest string.
     pub tags: Vec<(String, String)>,
@@ -217,7 +218,8 @@ pub struct ManifestCatalog {
 }
 
 impl ManifestCatalog {
-    /// Look up a manifest by digest.
+    /// Look up shared content by digest, without selecting repository metadata.
+    /// Repository-aware callers must use `get_repository_manifest` instead.
     pub fn get_manifest(&self, digest: &str) -> Option<&ImageManifest> {
         self.manifests
             .iter()
@@ -225,11 +227,23 @@ impl ManifestCatalog {
             .map(|(_, m)| m)
     }
 
+    /// Look up one repository's manifest metadata for content with this digest.
+    pub fn get_repository_manifest(
+        &self,
+        repository: &str,
+        digest: &str,
+    ) -> Option<&ImageManifest> {
+        self.manifests
+            .iter()
+            .find(|(stored, manifest)| stored == digest && manifest.repository == repository)
+            .map(|(_, manifest)| manifest)
+    }
+
     /// Look up a manifest by repository and tag.
     pub fn get_manifest_by_tag(&self, repository: &str, tag: &str) -> Option<&ImageManifest> {
         let key = format!("{repository}:{tag}");
         let digest = self.tags.iter().find(|(k, _)| k == &key).map(|(_, v)| v)?;
-        self.get_manifest(digest)
+        self.get_repository_manifest(repository, digest)
     }
 
     /// Get all tags for a repository.
@@ -256,17 +270,32 @@ impl ManifestCatalog {
         let digest_str = commit.manifest.digest.0.clone();
         let tag_key = format!("{}:{}", commit.manifest.repository, commit.tag);
 
-        // Remove old tag→digest mapping if tag existed
-        self.tags.retain(|(k, _)| k != &tag_key);
-        // Add new tag→digest
+        // Signatures attest content, while tags and retirement belong to a
+        // repository. A new repository copy preserves the content signature.
+        let signature = commit.manifest.signature.clone().or_else(|| {
+            self.get_manifest(&digest_str)
+                .and_then(|manifest| manifest.signature.clone())
+        });
+        // A pull may already have verified and pinned the old digest. Moving
+        // its tag must not discard the metadata needed to finish that pull.
+        self.tags.retain(|(key, _)| key != &tag_key);
+        for (_, manifest) in self
+            .manifests
+            .iter_mut()
+            .filter(|(_, manifest)| manifest.repository == commit.manifest.repository)
+        {
+            manifest.tags.remove(&commit.tag);
+        }
         self.tags.push((tag_key, digest_str.clone()));
 
-        // Upsert the manifest (update tags if it already exists)
-        if let Some((_, existing)) = self.manifests.iter_mut().find(|(d, _)| d == &digest_str) {
+        if let Some((_, existing)) = self.manifests.iter_mut().find(|(digest, manifest)| {
+            digest == &digest_str && manifest.repository == commit.manifest.repository
+        }) {
             existing.tags.insert(commit.tag.clone());
         } else {
             let mut manifest = commit.manifest.clone();
-            manifest.tags.insert(commit.tag.clone());
+            manifest.tags = BTreeSet::from([commit.tag.clone()]);
+            manifest.signature = signature;
             self.manifests.push((digest_str.clone(), manifest));
         }
 
@@ -431,17 +460,16 @@ impl ManifestCatalog {
     /// manifest). Returns `false` when the digest is unknown, so the
     /// state machine can refuse instead of no-opping (JOB7).
     pub fn apply_attach_signature(&mut self, attach: &AttachSignature) -> bool {
-        match self
+        let mut found = false;
+        for (_, manifest) in self
             .manifests
             .iter_mut()
-            .find(|(d, _)| d == &attach.manifest_digest.0)
+            .filter(|(digest, _)| digest == &attach.manifest_digest.0)
         {
-            Some((_, manifest)) => {
-                manifest.signature = Some(attach.signature.clone());
-                true
-            }
-            None => false,
+            manifest.signature = Some(attach.signature.clone());
+            found = true;
         }
+        found
     }
 
     /// Apply a DeleteTag.
@@ -458,18 +486,17 @@ impl ManifestCatalog {
         // Remove the tag
         self.tags.retain(|(k, _)| k != &tag_key);
 
-        // If the manifest has no remaining tags, remove it
         if let Some(digest_str) = digest {
-            // Remove tag from the manifest's tag set
-            if let Some((_, manifest)) = self.manifests.iter_mut().find(|(d, _)| d == &digest_str) {
+            for (_, manifest) in self.manifests.iter_mut().filter(|(digest, manifest)| {
+                digest == &digest_str && manifest.repository == delete.repository
+            }) {
                 manifest.tags.remove(&delete.tag);
             }
-
-            // Check if any other tags still reference this digest
-            let still_referenced = self.tags.iter().any(|(_, v)| v == &digest_str);
-            if !still_referenced {
-                self.manifests.retain(|(d, _)| d != &digest_str);
-            }
+            self.manifests.retain(|(digest, manifest)| {
+                digest != &digest_str
+                    || manifest.repository != delete.repository
+                    || !manifest.tags.is_empty()
+            });
         }
     }
 }
@@ -938,6 +965,113 @@ mod tests {
         assert_eq!(tags.len(), 2);
         assert!(tags.contains(&"latest".to_string()));
         assert!(tags.contains(&"v1.0".to_string()));
+    }
+
+    #[test]
+    fn identical_manifests_keep_repository_ownership_through_retirement() {
+        let mut catalog = ManifestCatalog::default();
+        let ordinary = test_manifest("production/app", "shared-manifest");
+        let mut leased = ordinary.clone();
+        leased.repository = "rbtest-owned/app".into();
+        for manifest in [ordinary.clone(), leased] {
+            catalog.apply_manifest_commit(&ManifestCommit {
+                manifest,
+                tag: "latest".into(),
+                holder_nodes: BTreeSet::from([1]),
+            });
+        }
+        assert_eq!(catalog.manifests.len(), 2);
+        for repository in ["production/app", "rbtest-owned/app"] {
+            let manifest = catalog.get_manifest_by_tag(repository, "latest").unwrap();
+            assert_eq!(manifest.repository, repository);
+            assert_eq!(manifest.tags, BTreeSet::from(["latest".into()]));
+        }
+        // An operator/test tag deletion must retire only its repository's row.
+        catalog.apply_delete_tag(&DeleteTag {
+            repository: "rbtest-owned/app".into(),
+            tag: "latest".into(),
+        });
+        assert_eq!(catalog.manifests.len(), 1);
+        let retained = catalog
+            .get_manifest_by_tag("production/app", "latest")
+            .unwrap();
+        assert_eq!(retained.repository, "production/app");
+        assert_eq!(retained.tags, BTreeSet::from(["latest".into()]));
+        assert!(
+            catalog
+                .get_manifest_by_tag("rbtest-owned/app", "latest")
+                .is_none()
+        );
+        assert!(
+            catalog
+                .apply_gc_report(&GcReport {
+                    node_id: 1,
+                    deleted_layers: ordinary.referenced_digests().into_iter().cloned().collect(),
+                })
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn moving_a_tag_preserves_the_verified_digest_in_its_repository() {
+        let mut catalog = ManifestCatalog::default();
+        let original = test_manifest("one", "original");
+        let mut other = original.clone();
+        other.repository = "two".into();
+        for manifest in [original.clone(), other, test_manifest("one", "replacement")] {
+            catalog.apply_manifest_commit(&ManifestCommit {
+                manifest,
+                tag: "latest".into(),
+                holder_nodes: BTreeSet::from([1]),
+            });
+        }
+        assert_eq!(catalog.manifests.len(), 3);
+        assert!(
+            catalog
+                .get_repository_manifest("one", original.digest.as_str())
+                .unwrap()
+                .tags
+                .is_empty()
+        );
+        assert_eq!(
+            catalog.get_manifest_by_tag("two", "latest").unwrap().digest,
+            original.digest
+        );
+        assert_ne!(
+            catalog.get_manifest_by_tag("one", "latest").unwrap().digest,
+            original.digest
+        );
+    }
+
+    #[test]
+    fn content_signatures_survive_repository_copies_and_tag_refresh() {
+        let mut catalog = ManifestCatalog::default();
+        let original = test_manifest("one", "signed");
+        for repository in ["one", "two", "three", "one"] {
+            let mut manifest = original.clone();
+            manifest.repository = repository.into();
+            catalog.apply_manifest_commit(&ManifestCommit {
+                manifest,
+                tag: "latest".into(),
+                holder_nodes: BTreeSet::from([1]),
+            });
+            if repository == "two" {
+                assert!(catalog.apply_attach_signature(&AttachSignature {
+                    manifest_digest: original.digest.clone(),
+                    signature: test_signature(),
+                }));
+            }
+        }
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("catalog.json");
+        catalog.persist_to(&path).unwrap();
+        let recovered = ManifestCatalog::load_from(&path).unwrap();
+        assert_eq!(recovered.manifests.len(), 3);
+        for repository in ["one", "two", "three"] {
+            let manifest = recovered.get_manifest_by_tag(repository, "latest").unwrap();
+            assert_eq!(manifest.repository, repository);
+            assert!(manifest.signature.is_some());
+        }
     }
 
     #[test]

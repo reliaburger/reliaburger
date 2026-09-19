@@ -2571,6 +2571,50 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn repository_ownership_survives_snapshot_and_independent_tag_retirement() {
+        let mut state_machine = CouncilStateMachine::new();
+        let original = test_manifest_commit();
+        let mut copy = original.clone();
+        copy.manifest.repository = "rbtest-copy/app".into();
+        state_machine
+            .apply(vec![
+                normal_entry(1, 1, RaftRequest::ManifestCommit(original)),
+                normal_entry(1, 2, RaftRequest::ManifestCommit(copy)),
+            ])
+            .await
+            .unwrap();
+        let mut builder = state_machine.get_snapshot_builder().await;
+        let snapshot = builder.build_snapshot().await.unwrap();
+        let mut restored = CouncilStateMachine::new();
+        restored
+            .install_snapshot(&snapshot.meta, snapshot.snapshot)
+            .await
+            .unwrap();
+        restored
+            .apply(vec![normal_entry(
+                1,
+                3,
+                RaftRequest::DeleteTag(crate::pickle::types::DeleteTag {
+                    repository: "rbtest-copy/app".into(),
+                    tag: "latest".into(),
+                }),
+            )])
+            .await
+            .unwrap();
+        let state = restored.desired_state().await;
+        assert_eq!(state.manifest_catalog.manifests.len(), 1);
+        let retained = state
+            .manifest_catalog
+            .get_manifest_by_tag("myapp", "latest")
+            .unwrap();
+        assert_eq!(retained.repository, "myapp");
+        assert_eq!(
+            retained.tags,
+            std::collections::BTreeSet::from(["latest".into()])
+        );
+    }
+
+    #[tokio::test]
     async fn apply_update_layer_locations() {
         let mut sm = CouncilStateMachine::new();
         let digest = test_digest("layer1");

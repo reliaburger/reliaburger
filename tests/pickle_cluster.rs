@@ -159,6 +159,57 @@ async fn push_test_image(base_url: &str, repo: &str, tag: &str) -> (Digest, Dige
     (config_digest, layer_digest)
 }
 
+#[tokio::test]
+async fn identical_wire_pushes_keep_independent_repository_metadata() {
+    let registry = Registry::start(42, true).await;
+    let base = registry.base_url();
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(5))
+        .no_proxy()
+        .build()
+        .unwrap();
+    let image = reliaburger::testkit::oci::build_synthetic_image("shared");
+    for repository in ["production/app", "rbtest-copy/app"] {
+        reliaburger::testkit::oci::push_image(&client, &base, repository, "latest", &image)
+            .await
+            .unwrap();
+    }
+    let mut recovered =
+        ManifestCatalog::load_from(registry.state.persist_path.as_ref().unwrap()).unwrap();
+    assert_eq!(recovered.manifests.len(), 2);
+    for repository in ["production/app", "rbtest-copy/app"] {
+        assert_eq!(
+            recovered
+                .get_manifest_by_tag(repository, "latest")
+                .unwrap()
+                .repository,
+            repository
+        );
+    }
+    recovered.apply_delete_tag(&reliaburger::pickle::types::DeleteTag {
+        repository: "rbtest-copy/app".into(),
+        tag: "latest".into(),
+    });
+    *registry.state.catalog.write().await = recovered;
+    let retained =
+        reliaburger::testkit::oci::fetch_manifest(&client, &base, "production/app", "latest")
+            .await
+            .unwrap();
+    assert_eq!(
+        reliaburger::testkit::oci::sha256_digest(&retained),
+        image.manifest_digest
+    );
+    assert_eq!(
+        client
+            .get(format!("{base}/v2/rbtest-copy/app/manifests/latest"))
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        reqwest::StatusCode::NOT_FOUND
+    );
+}
+
 /// L10: pushes must record the pushing node's real raft id as the
 /// holder — not the hardcoded `{0}` they used to.
 #[tokio::test]

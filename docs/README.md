@@ -102,6 +102,12 @@ are not trusted; integrity failures stop the pull without retries. Upstream laye
 sizes must be non-negative, fit accounting bounds and match the downloaded or
 cached bytes. Descriptor values are never used as an up-front allocation budget.
 
+Registry catalogue metadata now belongs to a repository and manifest digest.
+Pushing identical bytes into another repository preserves independent tags;
+retiring one repository's final tag leaves the other copy and shared layers
+referenced. Content signatures remain available across repository copies and
+restart. Repository/upload lease cleanup is still tracked separately in C34.
+
 Registry startup claims exclusive ownership of the configured image store's
 upload directory. Run only one Bun with that writable image store. A restart
 reclaims abandoned temporary uploads before serving; clients restart interrupted
@@ -123,7 +129,7 @@ development configurations. Ingress currently uses unweighted round-robin on
 Bun's shared runtime, with no separate strategy or worker-thread setting.
 
 0.1.0 requires a fresh cluster; development state is refused. Rolling upgrades
-require matching explicit formats (currently protocol 8 and state 10). See the
+require matching explicit formats (currently protocol 8 and state 11). See the
 [compatibility policy](releasing.md#cluster-compatibility).
 
 Reporting refuses messages over 1 MiB or containing more than 100 events;

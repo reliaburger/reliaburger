@@ -15,10 +15,10 @@ pub struct Compatibility {
     pub state: u32,
 }
 
-/// Supported formats; durable job attempts require protocol eight/state ten.
+/// Supported formats; repository-scoped manifests require protocol eight/state eleven.
 pub const CURRENT: Compatibility = Compatibility {
     protocol: 8,
-    state: 10,
+    state: 11,
 };
 
 /// Name of the durable format stamp at the root of a node's data directory.

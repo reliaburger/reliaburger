@@ -814,3 +814,39 @@ before advancing Tokio's clock past its budget. Separate denial and incorrect
 length cases prove that retries don't turn permanent failures into repeated
 downloads. This establishes the cache's read behaviour without depending on
 a public registry's availability.
+
+### One image, two repository owners
+
+Push the same image to `production/app:latest` and `rbtest-copy/app:latest`.
+The bytes have the same digest. The repositories still have different owners.
+Our catalogue used to keep only one manifest row per digest, so the second push
+inherited the first repository's metadata. Deleting the test tag could also
+remove `latest` from the production row's tag set. That is a poor foundation
+for automatic test cleanup.
+
+The catalogue now identifies a metadata row by both repository and digest.
+Tags point to content within that repository. Moving a tag updates its
+repository's tag sets but preserves the previous digest for a pull that has
+already verified and pinned it. Explicitly deleting the last tag removes only
+that repository's row. Blob storage and holder locations remain keyed by content
+digest; the registry does not write a second copy of identical bytes. Garbage
+collection considers references from every remaining repository before allowing
+a shared blob to be deleted.
+
+The Rust lookup uses `.find(...)` with a closure that checks both fields. A
+closure is an unnamed function; its `|...|` parameters receive each candidate.
+The deletion path uses `.retain(...)`, which keeps entries for which its
+predicate returns `true`. Checking the repository in that predicate is the
+part that prevents one owner's cleanup from retiring somebody else's metadata.
+Signatures attest the digest, so attaching one updates every repository copy
+and later copies preserve it. Scheduler and peer pulls select the repository
+when looking up a pinned digest too.
+
+The first regression pushes identical metadata into two repositories and fails
+because only one row survives. Further checks move a tag, preserve signatures
+through disk reload, restore a Raft snapshot and push the actual same bytes over
+HTTP. They then delete the test reference and verify that the ordinary reference
+and its shared content remain available. Durable state advances to generation
+11; fresh pre-release clusters avoid interpreting an older collapsed catalogue
+as complete ownership evidence. Repository leases and upload retirement are the
+next, separate boundary.

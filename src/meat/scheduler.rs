@@ -310,7 +310,9 @@ fn lookup_pickle_manifest<'a>(
     catalog: &'a crate::pickle::types::ManifestCatalog,
 ) -> Option<&'a crate::pickle::types::ImageManifest> {
     let manifest = match image_ref.split_once('@') {
-        Some((_, digest)) => catalog.get_manifest(digest),
+        Some((repository, digest)) => {
+            catalog.get_repository_manifest(canonical_repository(repository), digest)
+        }
         None => {
             let (name, tag) = split_repo_tag(image_ref);
             catalog.get_manifest_by_tag(canonical_repository(name), tag)
