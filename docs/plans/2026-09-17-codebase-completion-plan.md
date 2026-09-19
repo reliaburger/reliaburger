@@ -592,6 +592,12 @@ Only apps and namespaces are leased. Jobs, images, tokens, mounts and node effec
 
 **Completion test:** Extend one resource family per commit with durable ownership, renewal bounds, leader/client-death cleanup and refusal to delete pre-existing resources.
 
+**Ordinary-job recovery decision:** The user selected explicit rerun for a batch
+job whose outcome is unknown after Bun crashes. Recovery must persist/report
+that uncertainty rather than automatically repeat the execution. Durable intent
+and retry-budget implementation remains open; this decision does not mark it
+complete or change the separately agreed cron skip policy.
+
 **Token family completed on PR #167:** Atomic Raft issuance binds a non-admin
 credential to the exact authenticated lease owner, its namespace and expiry.
 Reserved test names cannot be created without a lease; duplicate and already
