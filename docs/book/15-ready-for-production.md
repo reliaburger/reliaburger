@@ -3185,3 +3185,43 @@ The affected agent, batch, build, ingress and discovery suites pass on macOS and
 Linux, as do all ten live Linux placement cases. Two build tests require Buildah
 to be absent; on the tool-equipped VM we execute those binaries in child
 processes with an empty PATH. Both negative scenarios still run and pass.
+
+### Every worker that might still own the workload
+
+Move a test application from worker A to worker B while A is disconnected.
+Deleting the application from Raft removes desired state. It tells us nothing
+about the process still running on A. If we also delete its lease, we've lost
+our reminder to go back and check.
+
+The lease now keeps every `(application, node)` pair ever assigned to it.
+Scheduling records that pair in the same Raft entry that publishes placement.
+A `BTreeSet<LeasedPlacement>` stores each distinct pair once, in deterministic
+order. `LeasedPlacement` is a struct containing our application and node identity
+types. Its `Ord` derive supplies the ordering a tree set needs; `Eq` makes the
+meaning of equality explicit. Rescheduling adds an owner rather than replacing
+history. A hard limit refuses further scheduling before history can grow
+without bound.
+
+Beginning cleanup fences new work. The current leader deletes desired state
+but retains those owners, then includes exact lease retirement instructions in
+each worker's placement response. A worker runs Retire even if its own journal
+is empty. Only observed runtime exit, artifact cleanup and a saved local
+checkpoint permit its acknowledgement. Lost responses and disk errors leave
+the owner recorded for retry. An acknowledgement includes the immutable lease
+ID, so an old request cannot release a replacement lease's resources.
+
+Reads need care too. An isolated former leader can still serve an empty local
+snapshot. We require a quorum-confirmed read before publishing placements or
+answering lease inspection. Followers forward inspection with the caller's
+credentials and a one-hop marker; a loop or unavailable quorum returns an
+error. HTTP 202 means cleanup is pending. HTTP 204 means every recorded owner
+has confirmed retirement and the remaining resource records are gone.
+
+The tests move a workload between owners, restore a Raft snapshot, replay
+acknowledgements and reject late scheduling. A worker test drops a response,
+returns a runtime error and breaks checkpoint persistence before allowing a
+successful acknowledgement. A real three-node fixture pauses the owner,
+changes leader, then resumes it with an empty journal. Cleanup must remain
+pending through the outage and finish only after that worker retires its real
+process. Operator-attested decommissioning is a separate path: it will record
+who retired an identity after stopping or fencing that machine's workloads.

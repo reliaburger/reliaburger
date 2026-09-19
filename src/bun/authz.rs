@@ -191,6 +191,7 @@ pub const ROUTE_MATRIX: &[Route] = &[
     route(Get, "/v1/deploys/history/{app}", AnyToken),
     route(Post, "/v1/rollback/{app}/{namespace}", Deployer),
     route(Get, "/v1/placements/{node_id}", AnyToken),
+    route(Post, "/v1/test/leases/retired", System),
     route(Get, "/v1/images", AnyToken),
     // Batch + build. `run`/`report`/`track` are node-to-node (System).
     route(Post, "/v1/batch", Deployer),

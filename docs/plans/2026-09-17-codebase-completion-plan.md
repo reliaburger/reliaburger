@@ -1045,6 +1045,29 @@ remain valid but cannot claim another owner's ID; the encoding and compatibility
 formats are unchanged. All 466 native/465 Linux Bun tests pass (one explicit gate
 each; 22.82s/42.29s), with strict all-target/all-feature Clippy on both platforms.
 
+**Confirmed cluster retirement (19 September):** The original rescheduling
+regression allowed a lease to disappear while both its former and current
+workers could still own runtime resources. The approved protocol records the
+union of exact application/node owners in the scheduling entry, fences new
+work once cleaning starts, and requires system-authenticated retirement
+acknowledgements after runtime/artifact cleanup and checkpoint persistence.
+Leases return 202 until their owners have retired. Placement reads and lease
+inspection require a current quorum; followers preserve user credentials when
+forwarding, with a one-hop loop bound. An unavailable owner remains pending.
+Protocol 7/state 8 and lease schema 4 require fresh development clusters.
+
+The missing-journal and premature API-completion regressions fail before the
+wiring. Both now pass, including dropped replies, runtime failure, checkpoint
+failure, ordinary-admin refusal and duplicate acknowledgements. Snapshot
+restoration, late scheduling, replacement-lease isolation and the placement
+history bound are covered. The real three-node paused-worker/leader-change
+case passes on macOS (19.50s). Full library suites pass 3,343 macOS and 3,397
+Linux tests (five/nineteen explicit platform gates); strict Clippy and both
+actual-binary compatibility checks pass on both platforms. The Linux three-node
+case passes in 18.79s, and all three real rolling upgrade/pause-revert/cluster
+rollback cases pass in 177.58s. Operator-attested node identity retirement
+is approved as a separate feature; see the [protocol and operator plan](2026-09-19-lease-retirement.md).
+
 ### C35 — Gate chaos capabilities per selected scenario
 
 **Priority:** P2. **Wave:** 4. **Book chapters:** 08, 15.

@@ -1,13 +1,15 @@
 # Confirm cluster lease retirement before forgetting ownership
 
-Status: proposed; implementation is incomplete and must not be released.
+Status: confirmed cleanup approved by the user, with operator decommissioning
+as an explicit alternative to a node acknowledgement. Confirmed cleanup is
+implemented and qualified; operator decommissioning remains the next feature.
 
 The regression in `src/council/state_machine.rs` demonstrates the defect: an
 application moves from one worker to another, cleanup deletes desired state,
 and `TestLeaseFinishCleanup` succeeds without either worker confirming runtime
 retirement. A missing worker can still be running the application.
 
-## Proposed protocol
+## Approved confirmed-cleanup protocol
 
 1. Each application lease stores the union of every `(application, node)` pair
    ever committed by scheduling. Raft records ownership in the same entry that
@@ -33,6 +35,32 @@ retirement. A missing worker can still be running the application.
    DELETE returns 202 while pending, 204 only when finished. Relish polls with
    a deadline and reports unknown on timeout. Lease GET requests use the leader,
    preserving the caller's credentials, so stale follower absence is not proof.
+
+## Operator decommissioning extension
+
+The user also approved retiring a node's identity and requiring fresh enrolment
+before it returns. A maintenance cordon alone cannot prove that workloads have
+stopped. The decommission operation therefore requires an unscoped operator
+administrator to explicitly attest that the node's workloads have been stopped
+or fenced outside the cluster.
+
+Implement this as a separate commit after ordinary confirmed retirement:
+
+- Commit a durable retired-node record with the node identity, operator and
+  reason. In the same state transition, resolve every cluster lease placement
+  awaiting that node and fence new scheduling to it.
+- Reject attempts by the retired identity to renew or resume membership/work.
+  Rejoining requires fresh state, credentials and a new node identity. A stale
+  acknowledgement cannot undo retirement or affect a replacement node.
+- Report operator decommissioning separately from runtime-confirmed retirement.
+  The control plane cannot remotely prove that a disconnected machine stopped;
+  the operator's explicit attestation is the authority for this path.
+- Expose the operation through authenticated API and CLI, with an explicit
+  acknowledgement and a reason. Repeated requests must be safe; leader changes
+  and snapshot restoration must retain the retired identity and cleared duties.
+- Test multiple leases, unavailable nodes, auth/scope refusal, stale scheduling,
+  certificate/identity reuse and fresh replacement enrolment. Update the final
+  format generations and runbook with the implemented contract.
 
 ## Compatibility and operational impact
 
@@ -63,6 +91,12 @@ actual-binary compatibility and upgrade qualification must run again.
 - Complete council, cluster, lease, API and library suites; strict Clippy and
   formatting on macOS/Linux; actual compatibility and rolling upgrade checks.
 
-Current evidence: the lost-owner regression fails before implementation. The
-initial core changes pass 207 council, five compatibility and 15 lease tests on
-macOS. Runtime/API wiring and the full verification matrix remain incomplete.
+Current evidence: the lost-owner, missing-journal and HTTP response regressions
+fail before implementation. Runtime and authenticated API wiring now pass,
+including uncertain responses, persistence failure and isolated-leader reads.
+The actual three-node paused-worker/leader-change case passes on macOS (19.50s).
+Full library suites pass 3,343 macOS and 3,397 Linux tests; strict Clippy and
+both actual-binary compatibility cases pass on both platforms. The Linux
+three-node case passes in 18.79s. All three actual rolling upgrade/pause-revert/
+cluster rollback tests pass in 177.58s. Operator decommissioning is approved
+but remains a separate implementation commit.

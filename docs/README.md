@@ -983,7 +983,8 @@ The bun agent exposes a local HTTP API on port 9117:
 | `POST` | `/v1/test/leases` | Create a policy-authorised, server-owned Phase 15 app lease |
 | `GET` | `/v1/test/leases/{id}` | Inspect an owned lease (or inspect any lease as unscoped Admin) |
 | `POST` | `/v1/test/leases/{id}/renew` | Renew an active owned lease within the server TTL ceiling |
-| `DELETE` | `/v1/test/leases/{id}` | Release a lease and start/confirm owned app cleanup |
+| `DELETE` | `/v1/test/leases/{id}` | Start cleanup; 202 while owners remain, 204 after confirmed retirement |
+| `POST` | `/v1/test/leases/retired` | Internal system-only acknowledgement of an exact lease/application/node retirement |
 | `POST` | `/v1/deploys/operations/{id}/cancel` | Request node-local cooperative deploy cancellation (Deployer, all target scopes) |
 | `POST` | `/v1/apply` | Deploy workloads (TOML body) |
 | `GET` | `/v1/deploys/active` | Live accepted deploy operations, phases and current targets |
@@ -1023,7 +1024,11 @@ need `allow_protected_mutation = true`. Lease lifetimes default to a maximum of
 apply carries `X-Reliaburger-Test-Lease: <id>` and may contain apps plus the
 lease's own namespace quota declaration. Bun reserves every `rbtest-*`
 namespace for this path, persists ownership across a standalone restart or in
-Raft, and retries interrupted cleanup. The runner releases the lease after a
+Raft, and retries interrupted cleanup. Cluster leases retain every former
+placement owner until that worker confirms runtime retirement and saves its
+checkpoint. A disconnected owner keeps cleanup pending (HTTP 202); the client
+reports unknown if its bounded wait expires. Placement and lease reads require
+a current leader with quorum. The runner releases the lease after a
 pass, failure, panic or timeout. Container cases use the official BusyBox
 1.37.0 multi-architecture OCI index pinned at
 `sha256:9532d8c39891ca2ecde4d30d7710e01fb739c87a8b9299685c63704296b16028`.

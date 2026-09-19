@@ -44,6 +44,7 @@ fn cluster_tests_enabled() -> bool {
     std::env::var("RELIABURGER_CLUSTER_TESTS").is_ok()
 }
 
+const RETIREMENT_SERVICE_TOKEN: &str = "cluster-test-retirement-service";
 const NODE_COUNT: usize = 9;
 const BASE_PORT: u16 = 19510;
 
@@ -64,6 +65,9 @@ struct NodeHarness {
     cmd_tx: mpsc::Sender<reliaburger::bun::agent::AgentCommand>,
     /// Cancelling this token kills THIS node only.
     shutdown: CancellationToken,
+    reconciler: tokio::task::JoinHandle<()>,
+    directory_rx: watch::Receiver<reliaburger::mustard::directory::NodeDirectory>,
+    api_port: u16,
     _runtime: runtime::ClusterRuntime,
     _tasks: TestTasks,
 }
@@ -110,6 +114,15 @@ impl NodeHarness {
 
 /// Start one fully wired node: the same subsystems `bun --cluster` runs.
 async fn start_node(index: usize, seeds: Vec<SocketAddr>, root: &CancellationToken) -> NodeHarness {
+    start_node_with_scheduler(index, seeds, root, true).await
+}
+
+async fn start_node_with_scheduler(
+    index: usize,
+    seeds: Vec<SocketAddr>,
+    root: &CancellationToken,
+    schedule: bool,
+) -> NodeHarness {
     let name = format!("fo{index}");
     let gossip_port = BASE_PORT + (index as u16) * 10;
     let raft_port = gossip_port + 1;
@@ -187,32 +200,34 @@ async fn start_node(index: usize, seeds: Vec<SocketAddr>, root: &CancellationTok
 
     // Leader scheduler with a fast learning period, so a fresh leader
     // starts scheduling within seconds of gaining coverage.
-    spawn_leader_scheduler(
-        Arc::clone(&council),
-        membership_rx.clone(),
-        aggregated_rx.clone(),
-        false,
-        reliaburger::config::node::ReconstructionSection {
-            report_threshold_percent: 80,
-            learning_period_timeout_secs: 5,
-            large_cluster_timeout_secs: 10,
-            large_cluster_node_count: 5000,
-        },
-        shutdown.clone(),
-    );
+    if schedule {
+        spawn_leader_scheduler(
+            Arc::clone(&council),
+            membership_rx.clone(),
+            aggregated_rx.clone(),
+            false,
+            reliaburger::config::node::ReconstructionSection {
+                report_threshold_percent: 80,
+                learning_period_timeout_secs: 5,
+                large_cluster_timeout_secs: 10,
+                large_cluster_node_count: 5000,
+            },
+            shutdown.clone(),
+        );
+    }
 
     // Placement reconciler: resolves the leader through Raft metrics OR the
     // gossip directory — on the two worker nodes only the latter exists.
-    spawn_placement_reconciler(
+    let reconciler = spawn_placement_reconciler(
         name.clone(),
         metrics_rx.clone(),
-        directory_rx,
+        directory_rx.clone(),
         2, // api = raft + 2 in this port block
-        None,
+        Some(RETIREMENT_SERVICE_TOKEN.into()),
         cmd_tx.clone(),
         shutdown.clone(),
         reliaburger::cluster::ClusterHttp::plaintext(),
-        Some(reconciler_state_dir),
+        Some(reconciler_state_dir.clone()),
     );
 
     // HTTP API (serves /v1/placements for the reconcilers).
@@ -228,7 +243,7 @@ async fn start_node(index: usize, seeds: Vec<SocketAddr>, root: &CancellationTok
         None,
         Some(Arc::clone(&council)),
         None,
-        None,
+        Some(RETIREMENT_SERVICE_TOKEN.into()),
         None,
         Some(Arc::new(RwLock::new(Vec::new()))),
         None,
@@ -251,6 +266,9 @@ async fn start_node(index: usize, seeds: Vec<SocketAddr>, root: &CancellationTok
         aggregated_rx,
         cmd_tx: resolve_cmd_tx,
         shutdown: shutdown.clone(),
+        reconciler,
+        directory_rx,
+        api_port,
         _runtime: cluster_runtime,
         _tasks: TestTasks::new(shutdown, vec![agent_task, api_task]),
     }
@@ -570,4 +588,163 @@ async fn eight_plus_node_cluster_reconciles_and_reports_through_leader_failover(
     root.cancel();
     // Give agents a moment to stop their sleep processes.
     tokio::time::sleep(Duration::from_millis(500)).await;
+}
+
+/// Ownership survives a real leader change even when the worker's local
+/// placement journal is missing and it has missed the deletion entirely.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+#[ignore = "requires RELIABURGER_CLUSTER_TESTS=1 and a multi-core host"]
+async fn lease_retirement_waits_for_paused_worker_across_leader_change() {
+    use reliaburger::meat::{Placement, Resources, SchedulingDecision};
+    use reliaburger::testkit::lease::{
+        LeaseError, TestLease, cleanup_cluster_lease, now_unix_millis,
+    };
+    assert!(cluster_tests_enabled());
+    let root = CancellationToken::new();
+    let mut nodes = Vec::new();
+    nodes.push(start_node_with_scheduler(200, vec![], &root, false).await);
+    for index in 201..203 {
+        nodes.push(
+            start_node_with_scheduler(index, vec![local(BASE_PORT + 2000)], &root, false).await,
+        );
+    }
+    wait_until(
+        "three committed voters",
+        Duration::from_secs(60),
+        async || nodes[0].voter_count() == 3,
+    )
+    .await;
+    let now = now_unix_millis();
+    let lease = TestLease::new(
+        "failover".into(),
+        "operator".into(),
+        "operator".into(),
+        "rbtest-failover".into(),
+        now,
+        now + 600_000,
+    )
+    .unwrap();
+    let app_id = AppId::new("cleanup", &lease.namespace);
+    let mut spec = ported_service_spec(8181);
+    spec.namespace = Some(lease.namespace.clone());
+    for request in [
+        RaftRequest::TestLeaseCreate(lease.clone()),
+        RaftRequest::TestLeaseAppSpec {
+            lease_id: lease.lease_id.clone(),
+            observed_at_unix_ms: now,
+            app_id: app_id.clone(),
+            spec: Box::new(spec),
+        },
+        RaftRequest::SchedulingDecision(SchedulingDecision {
+            app_id: app_id.clone(),
+            placements: vec![Placement {
+                node_id: NodeId::new(&nodes[2].name),
+                resources: Resources::new(500, 1024 * 1024, 0),
+            }],
+        }),
+    ] {
+        assert!(!matches!(
+            nodes[0].council.write(request).await.unwrap(),
+            reliaburger::council::CouncilResponse::Refused { .. }
+        ));
+    }
+    wait_until(
+        "worker running leased process",
+        Duration::from_secs(30),
+        async || {
+            nodes[2]
+                .resolve("cleanup")
+                .await
+                .is_some_and(|view| view.total_backends == 1)
+        },
+    )
+    .await;
+    nodes[2].reconciler.abort();
+    let _ = (&mut nodes[2].reconciler).await;
+    assert!(matches!(
+        cleanup_cluster_lease(&nodes[0].council, "failover", None).await,
+        Err(LeaseError::CleanupPending)
+    ));
+    let client = reqwest::Client::new();
+    // A follower must never turn its possibly stale empty view into an
+    // authoritative instruction to retire local work.
+    assert_eq!(
+        client
+            .get(format!(
+                "http://127.0.0.1:{}/v1/placements/{}",
+                nodes[1].api_port, nodes[2].name
+            ))
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        reqwest::StatusCode::SERVICE_UNAVAILABLE
+    );
+    nodes[0].shutdown.cancel();
+    nodes[0].council.shutdown().await.unwrap();
+    let mut leader = None;
+    wait_until("successor leader", Duration::from_secs(60), async || {
+        for (index, node) in nodes.iter().enumerate().skip(1) {
+            if node.is_leader().await {
+                leader = Some(index);
+                return true;
+            }
+        }
+        false
+    })
+    .await;
+    let leader = leader.unwrap();
+    assert!(matches!(
+        cleanup_cluster_lease(&nodes[leader].council, "failover", None).await,
+        Err(LeaseError::CleanupPending)
+    ));
+    assert_eq!(
+        nodes[leader].council.desired_state().await.test_leases["failover"]
+            .placements
+            .len(),
+        1
+    );
+    // A fresh checkpoint cannot hide the still-live runtime from the leader's
+    // retirement instruction. No local inventory is available on this restart.
+    let checkpoint = tempfile::tempdir().unwrap();
+    let resumed = spawn_placement_reconciler(
+        nodes[2].name.clone(),
+        nodes[2].metrics_rx.clone(),
+        nodes[2].directory_rx.clone(),
+        2,
+        Some(RETIREMENT_SERVICE_TOKEN.into()),
+        nodes[2].cmd_tx.clone(),
+        nodes[2].shutdown.clone(),
+        reliaburger::cluster::ClusterHttp::plaintext(),
+        Some(checkpoint.path().into()),
+    );
+    wait_until(
+        "confirmed worker retirement",
+        Duration::from_secs(30),
+        async || {
+            nodes[leader].council.desired_state().await.test_leases["failover"]
+                .placements
+                .is_empty()
+        },
+    )
+    .await;
+    assert!(
+        nodes[2]
+            .resolve("cleanup")
+            .await
+            .is_none_or(|view| view.total_backends == 0)
+    );
+    cleanup_cluster_lease(&nodes[leader].council, "failover", None)
+        .await
+        .unwrap();
+    assert!(
+        !nodes[leader]
+            .council
+            .desired_state()
+            .await
+            .test_leases
+            .contains_key("failover")
+    );
+    root.cancel();
+    resumed.await.unwrap();
 }

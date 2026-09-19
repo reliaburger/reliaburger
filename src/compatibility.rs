@@ -15,10 +15,10 @@ pub struct Compatibility {
     pub state: u32,
 }
 
-/// Supported formats; durable cron registrations require state generation seven.
+/// Supported formats; durable lease placement retirement requires protocol seven/state eight.
 pub const CURRENT: Compatibility = Compatibility {
-    protocol: 6,
-    state: 7,
+    protocol: 7,
+    state: 8,
 };
 
 /// Name of the durable format stamp at the root of a node's data directory.

@@ -54,7 +54,9 @@ inconsistent stored instance identities refuse startup without runtime mutation.
 Workload and namespace
 names must be lowercase DNS labels; invalid names are refused before deployment.
 Rollback and halt retain replacement ownership until runtime and artifact
-cleanup are confirmed. Node-local cron registrations survive restart. Cron skips missed or uncertain firings after a
+cleanup are confirmed. Cluster test leases also retain former placement owners
+through rescheduling and leader changes; an unavailable worker keeps cleanup
+pending until it confirms retirement. Node-local cron registrations survive restart. Cron skips missed or uncertain firings after a
 crash; it does not promise catch-up or exactly-once job execution.
 
 ## Quick start

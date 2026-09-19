@@ -55,10 +55,22 @@ pub struct IngressAssignment {
     pub config: crate::config::app::IngressSpec,
 }
 
+/// An exact lease generation whose runtime ownership must retire on one node.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct LeaseRetirement {
+    /// Immutable lease identifier; namespace reuse cannot acknowledge another lease.
+    pub lease_id: String,
+    /// Application and node whose absence the reconciler must establish.
+    pub placement: crate::testkit::lease::LeasedPlacement,
+}
+
 /// The full assignment list for a node.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct NodeAssignments {
     pub apps: Vec<NodeAssignment>,
+    /// Confirmed-cleanup instructions, including nodes absent from current placement.
+    pub retirements: Vec<LeaseRetirement>,
     /// The cluster-wide service endpoint catalogue (12b.4), piggybacked on
     /// the placements poll so every node — council voter or not — gets the
     /// replicated catalogue over the one HTTP call it already makes.
@@ -1006,17 +1018,26 @@ pub fn spawn_placement_reconciler(
                 }
             }
 
-            // Anything we applied before that is no longer assigned to
-            // this node gets stopped.
-            let removed: Vec<(String, String)> = applied
+            // The leader retains owners across rescheduling and local journal
+            // loss. Its instructions therefore supplement our local inventory.
+            let mut removed: std::collections::BTreeMap<_, Vec<&LeaseRetirement>> = applied
                 .keys()
                 .filter(|key| !seen.contains(*key))
-                .cloned()
+                .map(|key| (key.clone(), Vec::new()))
                 .collect();
-            for (name, namespace) in removed {
+            for retirement in &assignments.retirements {
+                let app = &retirement.placement.app_id;
+                let key = (app.name.clone(), app.namespace.clone());
+                if retirement.placement.node_id.0 != node_name || seen.contains(&key) {
+                    eprintln!("orchestrator: refusing conflicting retirement instruction");
+                    continue;
+                }
+                removed.entry(key).or_default().push(retirement);
+            }
+            for ((name, namespace), confirmations) in removed {
                 let (response_tx, response_rx) = tokio::sync::oneshot::channel();
                 // Queueing and acknowledgement share one deadline. An unknown
-                // outcome keeps the journal entry and lets other owners progress.
+                // outcome keeps ownership and lets other owners progress.
                 let retire = async {
                     cmd_tx
                         .send(AgentCommand::Retire {
@@ -1038,16 +1059,35 @@ pub fn spawn_placement_reconciler(
                     Ok(Ok(Ok(()))) => {
                         let mut next = applied.clone();
                         next.remove(&(name, namespace));
-                        match persist_placements(checkpoint_path.as_deref(), &next).await {
-                            Ok(()) => applied = next,
-                            Err(error) => {
-                                eprintln!("orchestrator: cannot record retirement: {error}")
+                        if let Err(error) =
+                            persist_placements(checkpoint_path.as_deref(), &next).await
+                        {
+                            eprintln!("orchestrator: cannot record retirement: {error}");
+                            continue;
+                        }
+                        applied = next;
+                        for confirmation in confirmations {
+                            let mut request = client
+                                .post(format!("{leader_url}/v1/test/leases/retired"))
+                                .json(confirmation);
+                            if let Some(token) = &service_token {
+                                request = request.bearer_auth(token);
+                            }
+                            let acknowledged = tokio::select! {
+                                _ = shutdown.cancelled() => return,
+                                result = tokio::time::timeout(RECONCILE_IO_TIMEOUT, request.send()) => result,
+                            };
+                            if !matches!(acknowledged, Ok(Ok(ref response)) if response.status() == reqwest::StatusCode::NO_CONTENT)
+                            {
+                                eprintln!(
+                                    "orchestrator: lease retirement acknowledgement failed; leader retains ownership"
+                                );
                             }
                         }
                     }
                     Ok(Ok(Err(e))) => {
                         eprintln!(
-                            "orchestrator: stop of {name}/{namespace} failed, will retry: {e}"
+                            "orchestrator: retirement of {name}/{namespace} failed, will retry: {e}"
                         );
                     }
                     Ok(Err(error)) => {
@@ -1137,6 +1177,105 @@ mod tests {
             crate::cluster::ClusterHttp::plaintext(),
             Some(directory.to_path_buf()),
         )
+    }
+
+    #[tokio::test]
+    async fn leased_retirement_without_a_journal_waits_for_runtime_and_persistence() {
+        use std::sync::{
+            Arc,
+            atomic::{AtomicUsize, Ordering},
+        };
+        let root = tempfile::tempdir().unwrap();
+        let checkpoint = crate::cluster::applied::checkpoint_path(root.path());
+        let acknowledgements = Arc::new(AtomicUsize::new(0));
+        let retirement = serde_json::json!({
+            "lease_id": "run1",
+            "placement": {"app_id": {"name": "web", "namespace": "rbtest-run1"}, "node_id": "worker"}
+        });
+        let expected = retirement.clone();
+        let (ack_tx, mut ack_rx) = mpsc::channel(1);
+        let count = acknowledgements.clone();
+        let persisted = checkpoint.clone();
+        let router = axum::Router::new()
+            .route(
+                "/v1/placements/worker",
+                axum::routing::get(move || {
+                    let retirement = retirement.clone();
+                    async move {
+                        axum::Json(serde_json::json!({"apps": [], "retirements": [retirement]}))
+                    }
+                }),
+            )
+            .route(
+                "/v1/test/leases/retired",
+                axum::routing::post(move |axum::Json(body): axum::Json<serde_json::Value>| {
+                    let expected = expected.clone();
+                    let checkpoint = persisted.clone();
+                    let count = count.clone();
+                    let ack_tx = ack_tx.clone();
+                    async move {
+                        assert_eq!(body, expected);
+                        assert!(
+                            crate::cluster::applied::load(&checkpoint)
+                                .unwrap()
+                                .is_empty()
+                        );
+                        count.fetch_add(1, Ordering::SeqCst);
+                        ack_tx.send(()).await.unwrap();
+                        axum::http::StatusCode::NO_CONTENT
+                    }
+                }),
+            );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
+        let (commands, mut received) = mpsc::channel(8);
+        let reconciler = reconciler_for_deadline_test(address, root.path(), commands);
+        let mut attempts = 0;
+        let outcome = tokio::time::timeout(Duration::from_secs(12), async {
+            loop {
+                tokio::select! {
+                    _ = ack_rx.recv() => break,
+                    command = received.recv() => match command.unwrap() {
+                        AgentCommand::Status { response } => { response.send(vec![]).unwrap(); }
+                        AgentCommand::SyncClusterCatalog { .. } => {}
+                        AgentCommand::Retire { app_name, namespace, response } => {
+                            assert_eq!((app_name.as_str(), namespace.as_str()), ("web", "rbtest-run1"));
+                            assert_eq!(acknowledgements.load(Ordering::SeqCst), 0);
+                            attempts += 1;
+                            match attempts {
+                                1 => drop(response),
+                                2 => { response.send(Err(crate::bun::BunError::RetirementState {
+                                    instance_id: crate::grill::InstanceId("web-0".into()),
+                                    reason: "injected runtime uncertainty".into(),
+                                })).unwrap(); }
+                                3 => {
+                                    std::fs::remove_file(&checkpoint).unwrap();
+                                    std::fs::create_dir(&checkpoint).unwrap();
+                                    response.send(Ok(())).unwrap();
+                                }
+                                4 => {
+                                    std::fs::remove_dir(&checkpoint).unwrap();
+                                    response.send(Ok(())).unwrap();
+                                }
+                                _ => panic!("retirement did not complete after repair"),
+                            }
+                        }
+                        _ => panic!("unexpected mutation during retirement"),
+                    }
+                }
+            }
+        }).await;
+        reconciler.abort();
+        let _ = reconciler.await;
+        server.abort();
+        let _ = server.await;
+        assert!(
+            outcome.is_ok(),
+            "retirement instruction was ignored or acknowledged before confirmation"
+        );
+        assert_eq!(attempts, 4);
+        assert_eq!(acknowledgements.load(Ordering::SeqCst), 1);
     }
 
     #[tokio::test]

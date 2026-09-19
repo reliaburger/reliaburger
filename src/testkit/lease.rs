@@ -10,7 +10,7 @@ use tokio::sync::{Mutex, OwnedMutexGuard};
 use crate::meat::AppId;
 
 /// Current persisted and API schema version for test leases.
-pub const TEST_LEASE_SCHEMA_VERSION: u32 = 3;
+pub const TEST_LEASE_SCHEMA_VERSION: u32 = 4;
 
 /// Maximum live lease records accepted by one standalone node or cluster.
 pub const MAX_ACTIVE_TEST_LEASES: usize = 64;
@@ -67,6 +67,18 @@ pub enum TestLeaseState {
     },
 }
 
+/// One node that may still own a leased application, including former placements.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+pub struct LeasedPlacement {
+    /// Exact application whose runtime resources must retire.
+    pub app_id: AppId,
+    /// Node that accepted or could have accepted the assignment.
+    pub node_id: crate::meat::NodeId,
+}
+
+/// Bound retained placement history without silently discarding an owner.
+pub const MAX_LEASED_PLACEMENTS: usize = 65_536;
+
 /// Durable server-owned lifetime for one isolated test namespace.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TestLease {
@@ -90,6 +102,8 @@ pub struct TestLease {
     pub expires_at_unix_ms: u64,
     /// Resources atomically associated with this lease.
     pub resources: BTreeSet<LeasedResource>,
+    /// All possible runtime owners, removed only by confirmed retirement.
+    pub placements: BTreeSet<LeasedPlacement>,
 }
 
 impl TestLease {
@@ -134,6 +148,7 @@ impl TestLease {
             issued_at_unix_ms,
             expires_at_unix_ms,
             resources: BTreeSet::new(),
+            placements: BTreeSet::new(),
         };
         lease.validate()?;
         Ok(lease)
@@ -201,6 +216,18 @@ impl TestLease {
             }
         }) {
             return Err(LeaseError::NamespaceMismatch);
+        }
+        if self.placements.iter().any(|placement| {
+            placement.node_id.0.is_empty()
+                || !self.resources.contains(&LeasedResource::App {
+                    app_id: placement.app_id.clone(),
+                })
+                || self.scope != LeaseScope::Applications
+        }) {
+            return Err(LeaseError::InvalidScope);
+        }
+        if self.placements.len() > MAX_LEASED_PLACEMENTS {
+            return Err(LeaseError::ResourceLimit);
         }
         if self.resources.len() > MAX_LEASED_RESOURCES {
             return Err(LeaseError::ResourceLimit);
@@ -296,6 +323,8 @@ pub enum LeaseError {
     WrongOwner,
     #[error("lease has an in-flight operation; retry cleanup later")]
     Busy,
+    #[error("lease cleanup is waiting for runtime retirement acknowledgements")]
+    CleanupPending,
     #[error("lease is expired or cleanup has started")]
     NotActive,
     #[error("app namespace does not match its lease")]
@@ -879,6 +908,15 @@ pub async fn cleanup_cluster_lease(
             }
         }
     }
+    if council
+        .desired_state()
+        .await
+        .test_leases
+        .get(lease_id)
+        .is_some_and(|lease| !lease.placements.is_empty())
+    {
+        return Err(LeaseError::CleanupPending);
+    }
     let result = write_cluster_lease_request(
         council,
         crate::council::RaftRequest::TestLeaseFinishCleanup {
@@ -986,7 +1024,9 @@ pub fn spawn_cluster_lease_reaper(
                 .map(|lease| lease.lease_id.clone())
                 .collect();
             for lease_id in due {
-                if let Err(error) = cleanup_cluster_lease(&council, &lease_id, None).await {
+                if let Err(error) = cleanup_cluster_lease(&council, &lease_id, None).await
+                    && !matches!(error, LeaseError::CleanupPending)
+                {
                     eprintln!("bun: cluster test lease {lease_id} cleanup deferred: {error}");
                 }
             }

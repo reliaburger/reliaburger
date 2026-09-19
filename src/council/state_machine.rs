@@ -258,6 +258,46 @@ impl StateMachineInner {
                     .retain(|key, _| !key.starts_with(&prefix));
             }
             RaftRequest::SchedulingDecision(decision) => {
+                if decision.app_id.namespace.starts_with("rbtest-") {
+                    let resource = crate::testkit::lease::LeasedResource::App {
+                        app_id: decision.app_id.clone(),
+                    };
+                    let Some(lease) = self
+                        .state
+                        .test_leases
+                        .values_mut()
+                        .find(|lease| lease.resources.contains(&resource))
+                    else {
+                        return Some(CouncilResponse::Refused {
+                            reason: "leased scheduling requires an owner".into(),
+                        });
+                    };
+                    if !matches!(lease.state, crate::testkit::lease::TestLeaseState::Active)
+                        || !self.state.apps.contains_key(&decision.app_id)
+                    {
+                        return Some(CouncilResponse::Refused {
+                            reason: "lease is cleaning or application was deleted".into(),
+                        });
+                    }
+                    let mut owners = lease.placements.clone();
+                    for placement in &decision.placements {
+                        if placement.node_id.0.is_empty() {
+                            return Some(CouncilResponse::Refused {
+                                reason: "placement node is empty".into(),
+                            });
+                        }
+                        owners.insert(crate::testkit::lease::LeasedPlacement {
+                            app_id: decision.app_id.clone(),
+                            node_id: placement.node_id.clone(),
+                        });
+                    }
+                    if owners.len() > crate::testkit::lease::MAX_LEASED_PLACEMENTS {
+                        return Some(CouncilResponse::Refused {
+                            reason: "lease placement history limit reached".into(),
+                        });
+                    }
+                    lease.placements = owners;
+                }
                 self.state
                     .scheduling
                     .insert(decision.app_id.clone(), decision.placements.clone());
@@ -871,6 +911,33 @@ impl StateMachineInner {
                     last_error: None,
                 };
             }
+            RaftRequest::TestLeasePlacementRetired {
+                lease_id,
+                placement,
+            } => {
+                let Some(lease) = self.state.test_leases.get_mut(lease_id) else {
+                    return Some(CouncilResponse::Refused {
+                        reason: "lease not found".into(),
+                    });
+                };
+                if !matches!(
+                    lease.state,
+                    crate::testkit::lease::TestLeaseState::Cleaning { .. }
+                ) || self.state.apps.contains_key(&placement.app_id)
+                    || !lease
+                        .resources
+                        .contains(&crate::testkit::lease::LeasedResource::App {
+                            app_id: placement.app_id.clone(),
+                        })
+                {
+                    return Some(CouncilResponse::Refused {
+                        reason: "lease application is not retiring".into(),
+                    });
+                }
+                // Retried acknowledgements are harmless; a different lease ID
+                // cannot clear this generation's ownership.
+                lease.placements.remove(placement);
+            }
             RaftRequest::TestLeaseFinishCleanup { lease_id } => {
                 let Some(lease) = self.state.test_leases.get(lease_id) else {
                     return Some(CouncilResponse::Refused {
@@ -883,6 +950,11 @@ impl StateMachineInner {
                 ) {
                     return Some(CouncilResponse::Refused {
                         reason: "lease cleanup has not started".to_string(),
+                    });
+                }
+                if !lease.placements.is_empty() {
+                    return Some(CouncilResponse::Refused {
+                        reason: "lease still owns unconfirmed runtime placements".into(),
                     });
                 }
                 // Defence in depth against the cleanup-snapshot race: never
@@ -3885,6 +3957,193 @@ mod tests {
         .await
         .unwrap();
         assert!(sm.desired_state().await.test_leases.is_empty());
+    }
+
+    #[test]
+    fn lease_placement_limit_refuses_new_owners_without_losing_existing_work() {
+        use crate::testkit::lease::{LeasedPlacement, LeasedResource, MAX_LEASED_PLACEMENTS};
+        let mut inner = StateMachineInner::default();
+        let app_id = AppId::new("web", "rbtest-run1");
+        let mut lease = test_lease("run1", 100);
+        lease.resources.insert(LeasedResource::App {
+            app_id: app_id.clone(),
+        });
+        lease.placements = (0..MAX_LEASED_PLACEMENTS)
+            .map(|index| LeasedPlacement {
+                app_id: app_id.clone(),
+                node_id: NodeId::new(format!("worker-{index}")),
+            })
+            .collect();
+        assert!(lease.validate().is_ok());
+        inner.state.apps.insert(app_id.clone(), default_spec());
+        inner.state.test_leases.insert("run1".into(), lease);
+        let decision = |node: &str| {
+            RaftRequest::SchedulingDecision(SchedulingDecision {
+                app_id: app_id.clone(),
+                placements: vec![Placement {
+                    node_id: NodeId::new(node),
+                    resources: Resources::new(1, 1, 0),
+                }],
+            })
+        };
+        assert!(inner.apply_request(&decision("worker-0")).is_none());
+        for rejected in ["", "overflow-worker"] {
+            assert!(matches!(
+                inner.apply_request(&decision(rejected)),
+                Some(CouncilResponse::Refused { .. })
+            ));
+            assert_eq!(
+                inner.state.scheduling[&app_id][0].node_id,
+                NodeId::new("worker-0")
+            );
+            assert_eq!(
+                inner.state.test_leases["run1"].placements.len(),
+                MAX_LEASED_PLACEMENTS
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn lease_cleanup_retains_former_placement_owners_after_rescheduling() {
+        let mut sm = CouncilStateMachine::new();
+        let app_id = AppId::new("web", "rbtest-run1");
+        let schedule = |node: &str| {
+            RaftRequest::SchedulingDecision(SchedulingDecision {
+                app_id: app_id.clone(),
+                placements: vec![Placement {
+                    node_id: NodeId::new(node),
+                    resources: Resources::new(500, 256 * 1024 * 1024, 0),
+                }],
+            })
+        };
+        let requests = vec![
+            RaftRequest::TestLeaseCreate(test_lease("run1", 100)),
+            RaftRequest::TestLeaseAppSpec {
+                lease_id: "run1".into(),
+                observed_at_unix_ms: 20,
+                app_id: app_id.clone(),
+                spec: Box::new(default_spec()),
+            },
+            schedule("old-worker"),
+            schedule("new-worker"),
+            RaftRequest::TestLeaseBeginCleanup {
+                lease_id: "run1".into(),
+            },
+            RaftRequest::AppDelete {
+                app_id: app_id.clone(),
+            },
+        ];
+        for (index, request) in requests.into_iter().enumerate() {
+            let result = sm
+                .apply(vec![normal_entry(1, index as u64 + 1, request)])
+                .await
+                .unwrap();
+            assert!(
+                !matches!(result[0], CouncilResponse::Refused { .. }),
+                "{result:?}"
+            );
+        }
+        let result = sm
+            .apply(vec![normal_entry(
+                1,
+                7,
+                RaftRequest::TestLeaseFinishCleanup {
+                    lease_id: "run1".into(),
+                },
+            )])
+            .await
+            .unwrap();
+        assert!(
+            matches!(result[0], CouncilResponse::Refused { .. }),
+            "runtime owners must outlive desired-state deletion: {result:?}"
+        );
+        assert!(sm.desired_state().await.test_leases.contains_key("run1"));
+        let result = sm
+            .apply(vec![normal_entry(1, 8, schedule("late-worker"))])
+            .await
+            .unwrap();
+        assert!(
+            matches!(result[0], CouncilResponse::Refused { .. }),
+            "cleanup must fence stale scheduling decisions"
+        );
+        // A new leader must retain former owners even though desired placement
+        // now contains neither node. Exercise the real snapshot codec.
+        let mut builder = sm.get_snapshot_builder().await;
+        let snapshot = builder.build_snapshot().await.unwrap();
+        let mut restored = CouncilStateMachine::new();
+        restored
+            .install_snapshot(&snapshot.meta, snapshot.snapshot)
+            .await
+            .unwrap();
+        let mut inner = restored.inner.write().await;
+        assert_eq!(inner.state.test_leases["run1"].placements.len(), 2);
+        let acknowledge = |lease: &str, node: &str| RaftRequest::TestLeasePlacementRetired {
+            lease_id: lease.into(),
+            placement: crate::testkit::lease::LeasedPlacement {
+                app_id: app_id.clone(),
+                node_id: NodeId::new(node),
+            },
+        };
+        assert!(matches!(
+            inner.apply_request(&acknowledge("another-lease", "old-worker")),
+            Some(CouncilResponse::Refused { .. })
+        ));
+        assert_eq!(inner.state.test_leases["run1"].placements.len(), 2);
+        assert!(
+            inner
+                .apply_request(&acknowledge("run1", "new-worker"))
+                .is_none()
+        );
+        assert!(
+            inner
+                .apply_request(&acknowledge("run1", "new-worker"))
+                .is_none()
+        );
+        assert!(matches!(
+            inner.apply_request(&RaftRequest::TestLeaseFinishCleanup {
+                lease_id: "run1".into()
+            }),
+            Some(CouncilResponse::Refused { .. })
+        ));
+        assert!(
+            inner
+                .apply_request(&acknowledge("run1", "old-worker"))
+                .is_none()
+        );
+        assert!(
+            inner
+                .apply_request(&RaftRequest::TestLeaseFinishCleanup {
+                    lease_id: "run1".into()
+                })
+                .is_none()
+        );
+        let mut replacement = test_lease("run2", 100);
+        replacement.namespace = "rbtest-run1".into();
+        assert!(
+            inner
+                .apply_request(&RaftRequest::TestLeaseCreate(replacement))
+                .is_none()
+        );
+        assert!(
+            inner
+                .apply_request(&RaftRequest::TestLeaseAppSpec {
+                    lease_id: "run2".into(),
+                    observed_at_unix_ms: 20,
+                    app_id: app_id.clone(),
+                    spec: Box::new(default_spec())
+                })
+                .is_none()
+        );
+        assert!(inner.apply_request(&schedule("old-worker")).is_none());
+        assert!(matches!(
+            inner.apply_request(&acknowledge("run1", "old-worker")),
+            Some(CouncilResponse::Refused { .. })
+        ));
+        assert!(matches!(
+            inner.apply_request(&acknowledge("run2", "old-worker")),
+            Some(CouncilResponse::Refused { .. })
+        ));
+        assert_eq!(inner.state.test_leases["run2"].placements.len(), 1);
     }
 
     /// The cleanup-snapshot race made executable. A cleanup driver snapshots

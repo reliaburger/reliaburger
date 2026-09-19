@@ -264,6 +264,11 @@ pub enum RaftRequest {
     },
     /// Release only after the target has fenced late activation and reversed effects.
     ReleaseNodeFault { sequence: u64 },
+    /// Confirm runtime retirement on one exact owner of a cleaning lease.
+    TestLeasePlacementRetired {
+        lease_id: String,
+        placement: crate::testkit::lease::LeasedPlacement,
+    },
 }
 
 // ---------------------------------------------------------------------------
