@@ -131,6 +131,7 @@ async fn start_node_with_auth(
         handle,
         "default".to_string(),
     );
+    agent.set_volumes_dir(reconciler_state_dir.join("volumes"));
     agent.set_node_capacity(8000, 16384);
     agent.set_readiness_tracker(readiness.clone());
     // Several agents share this host; don't spawn nft against the real

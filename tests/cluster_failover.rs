@@ -172,6 +172,7 @@ async fn start_node(index: usize, seeds: Vec<SocketAddr>, root: &CancellationTok
         handle,
         "default".to_string(),
     );
+    agent.set_volumes_dir(reconciler_state_dir.join("volumes"));
     agent.set_node_capacity(8000, 16384);
     agent.set_readiness_tracker(readiness.clone());
     // Co-located test agents must not touch the shared host firewall.

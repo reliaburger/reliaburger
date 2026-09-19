@@ -52,6 +52,10 @@ repaired head remains pending.
 The native full suite also reproduced an HTTP keep-alive error in the request-ID
 echo fixture. Its backend now uses axum and both server tasks are joined; the
 full native suite and explicit Linux regression pass, with strict Clippy.
+Integration-agent volume roots are now private to each fixture and retained
+through shutdown. All 46 affected ordinary integration tests and strict Clippy
+pass on macOS/Linux; ten live Linux placement cases pass (154.71s). The two
+Buildah-absence cases execute in isolated child environments on the equipped VM.
 
 ### Correctness and behavioural contracts
 

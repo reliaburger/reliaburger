@@ -926,6 +926,15 @@ on both. Rolling deploy
 rollback/halt/finalisation still use separate best-effort
 artifact cleanup paths; their error propagation remains open.
 
+**Integration fixture ownership (19 September):** Agent, batch, build, ingress,
+discovery and cluster harnesses now own private volume directories through agent
+shutdown. This removes the production-path assumption exposed by strict artifact
+cleanup. All 46 affected ordinary integration cases pass on macOS/Linux (two
+additional Buildah gates remain explicit), with strict Clippy; all ten actual
+Linux placement cases pass (154.71s). The VM has Buildah, so the two absence tests
+run successfully as separate child processes with an empty PATH rather than
+being skipped or changing installed tools.
+
 ### C35 — Gate chaos capabilities per selected scenario
 
 **Priority:** P2. **Wave:** 4. **Book chapters:** 08, 15.

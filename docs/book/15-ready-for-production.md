@@ -3170,3 +3170,18 @@ then separately replaces the identity directory with a file. Each fault must
 refuse retirement and retain the owner. Removing the fault lets the next command
 finish. Rolling deployment cleanup has separate call paths and still needs its
 own error-propagation audit.
+
+### Integration agents own their filesystem paths
+
+A ProcessGrill fixture still prepares workload identity directories. Leaving its
+volume root at the production default makes tests depend on the host's existing
+permissions and lets otherwise independent fixtures share paths. Stricter Stop
+first exposed this in three Linux unit tests. The integration harnesses now give
+each agent a temporary volume root, kept alive until that agent exits; cluster
+fixtures use their existing private node directory. This keeps a test's cleanup
+inside the files that test owns.
+
+The affected agent, batch, build, ingress and discovery suites pass on macOS and
+Linux, as do all ten live Linux placement cases. Two build tests require Buildah
+to be absent; on the tool-equipped VM we execute those binaries in child
+processes with an empty PATH. Both negative scenarios still run and pass.
