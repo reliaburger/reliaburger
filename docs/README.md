@@ -31,6 +31,12 @@ Before signalling an old instance, the rollout fences the periodic restart and
 health tasks so they cannot revive it during retirement. After Bun replacement,
 new rollout IDs advance past restored generations. Stopped/Failed entries with
 unfinished cleanup remain owners and cannot be overwritten by a fresh apply.
+Rollback and halt also require confirmed runtime and artifact cleanup. Failed
+cleanup retains replacements and their ports for retry; healthy replacements
+kept by a halt enter ordinary supervision. History reports Failed for incomplete
+cleanup and Halted after partial cutover, rather than claiming old instances were
+restored. Replacement preparation reserves an in-memory owner before launch;
+crash recovery before the first durable runtime record remains tracked in C34.
 
 `relish test --filter jobs` creates durable leases on the receiving node for
 batch jobs and cron registrations. Keep using the same node endpoint for a

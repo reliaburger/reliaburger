@@ -611,7 +611,6 @@ The fix is to get the blocking work off the loop. Each deploy now runs on its ow
 ```rust
 let worker = DeployWorker {
     grill: self.supervisor.grill().clone(),
-    port_allocator: self.supervisor.port_allocator(),
     ops: DeployOps { tx: self.deploy_ops_tx.clone() },
 };
 tokio::spawn(async move {
@@ -1216,3 +1215,44 @@ counter exhaustion and replacement while a terminal owner's record cannot be
 removed. The real binary-upgrade test now rolls an app once before exec, checks
 that its PID survives the swap, then rolls it again and requires generation two.
 This tests recovery where it matters: at the next mutation after adoption.
+
+
+### A failed rollback still owns its replacements
+
+Cancel a deployment while its replacement is waiting for health. Now make
+`kill` fail. The old rollback path ignored that error, deleted the replacement's
+record, released its port and wrote `RolledBack` into history. The process could
+still exist, but the supervisor no longer knew about it. Our regression sees
+one owner where there should be two.
+
+The command loop now reserves a replacement ID and its port together, before
+creating identity files or attempting a runtime launch. It records a Preparing
+owner in both supervisor inventories. A failed preparation leaves that owner
+available for cleanup; an already-owned ID refuses before allocating another
+port. The prepared OCI specification joins the owner before runtime creation.
+This is in-memory preparation ownership. Durable recovery of resources created
+before their first adoption record remains separate release work.
+
+Rolling and blue-green workers share one abort path. They distinguish a reserved
+ID that never attempted creation from a creation attempt that may have changed
+the runtime before returning an error. The latter always requires bounded kill
+and observed exit. Only then can checked identity/record removal, directory
+sync, backend removal and port release forget the owner. A failed cleanup keeps
+its owner and reports the failure; the worker tries its other replacements too.
+The runtime waits happen off the command loop, so status and cancellation remain
+responsive.
+
+With automatic rollback disabled, healthy replacements enter ordinary
+supervision and remain available for a later Stop or Retire. With automatic
+rollback enabled, cleanup includes them. History says RolledBack only when
+cleanup succeeds and no old instance has already retired. After partial cutover,
+removing replacements cannot recreate an old instance, so history says Halted.
+Unconfirmed cleanup records Failed. Those outcomes describe what happened.
+
+The failure matrix covers rolling and blue-green, rollback and halt, and six
+faults: failed, ignored and stalled kills; failed inspection; blocked records;
+and blocked identity cleanup. Each retained owner becomes retireable after the
+fault is repaired. Additional cases keep a healthy replacement after a partial
+halt, then retire every owner through the ordinary path. A blocked record
+directory keeps the replacement's port until directory recovery and confirmed
+artifact removal; releasing it early would forget part of that ownership.

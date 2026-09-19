@@ -23,9 +23,8 @@ for every item below. IDs are scoped to that plan, not the older C1/M1 review ID
 The [audit record](qualification/2026-09-17-code-audit.md) separates local defect
 reproductions from inspected source and previous acceptance evidence.
 
-These are work packages, not 84 mandatory features for 0.1.0. Correctness fixes
-need explicit release dispositions; optional refactors and future capabilities
-remain separate. Older unchecked groups below point into this current ledger.
+The work packages distinguish release correctness, optional refactors and future
+capabilities. Correctness fixes need explicit release dispositions. Older unchecked groups below point into this current ledger.
 
 The 18 September portable Linux no-default CI run found an API port reservation
 race in the bootstrap harness. Bun now reports its actual bound API address;
@@ -116,7 +115,7 @@ Buildah-absence cases execute in isolated child environments on the equipped VM.
   - [x] Keep normal Stop/Retire ownership when identity or adoption-record removal fails. Sync both parent directories and retry; full library checkpoints pass 3,308 macOS/3,362 Linux tests with strict Clippy.
   - [x] Require observed runtime exit on rolling/blue-green retirement. Failed, ignored/stalled kills or inspection errors preserve both generations; a later Retire cleans up. Both regressions fail first, all eight fault/strategy cases pass, and the full Bun suites plus strict Clippy pass on both platforms.
   - [x] Propagate artifact-cleanup errors on rolling/blue-green finalisation; retain the entire retired fleet as stopped if one artifact fails. Both regressions fail first, all 457 native/456 Linux Bun tests pass (one explicit gate each), and strict Clippy passes on both platforms.
-  - [ ] Propagate runtime/artifact cleanup failures on halt and rollback, retaining every incomplete owner.
+  - [x] Propagate runtime/artifact cleanup failures on halt and rollback. Reserve replacement ownership and ports before preparation; use bounded off-loop kill/exit observation and checked artifact removal, retaining failures. The 24-case regression fails first, then passes; healthy halted replacements remain supervised and directory recovery releases retained ports. All 465 native/464 Linux Bun tests, 29 real HTTP/process integration tests per platform and strict Clippy pass. Recovery before the first durable runtime record remains open below.
   - [x] Fence the periodic restart driver before off-loop rollout retirement starts. A blocked-kill regression fails first, then verifies stepped rolling, surplus and blue-green paths. All 458 native/457 Linux Bun tests and strict Clippy pass.
   - [x] Prevent rollout generation reuse after adoption and preserve stopped/failed cleanup owners when applying replacements. Three failing-first regressions, all 461 native/460 Linux Bun tests and strict Clippy pass. Actual signed exec preserves a generation-one workload, then redeploys generation two on macOS/Linux (19.17s/10.35s).
   - [x] Reject invalid app/job names and namespace labels before runtime mutation. Configuration and actual command-admission regressions fail first; lowercase DNS label boundaries pass. Full library suites pass 3,322 macOS/3,376 Linux tests (five/19 explicit gates), with strict Clippy on both.

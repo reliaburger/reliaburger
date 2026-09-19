@@ -53,8 +53,8 @@ preserving records and workload identities for recovery. Legacy aliases and
 inconsistent stored instance identities refuse startup without runtime mutation.
 Workload and namespace
 names must be lowercase DNS labels; invalid names are refused before deployment.
-Node-local cron
-registrations survive restart. Cron skips missed or uncertain firings after a
+Rollback and halt retain replacement ownership until runtime and artifact
+cleanup are confirmed. Node-local cron registrations survive restart. Cron skips missed or uncertain firings after a
 crash; it does not promise catch-up or exactly-once job execution.
 
 ## Quick start

@@ -659,6 +659,14 @@ enum DeployOp {
         is_job: bool,
         reply: oneshot::Sender<()>,
     },
+    /// Claim replacement ownership before allocating identity or runtime resources.
+    ReserveRollingInstance {
+        instance_id: InstanceId,
+        app_name: String,
+        namespace: String,
+        spec: Box<AppSpec>,
+        reply: oneshot::Sender<Result<Option<u16>, BunError>>,
+    },
     /// Fast pre-create bookkeeping for a rolling-redeploy instance: fail closed
     /// on undecryptable secrets, prepare its identity dir, build the OCI spec.
     PrepareRollingInstance {
@@ -670,11 +678,6 @@ enum DeployOp {
         index: u32,
         reply: oneshot::Sender<Result<crate::grill::oci::OciSpec, BunError>>,
     },
-    /// Lift an instance's egress enforcement.
-    ClearEgress {
-        instance_id: InstanceId,
-        reply: oneshot::Sender<()>,
-    },
     /// Persist a started replacement before health wait or traffic publication.
     RegisterRollingInstance {
         instance: Box<RollingInstance>,
@@ -684,31 +687,6 @@ enum DeployOp {
     RetainRollingInstance {
         instance: Box<RollingInstance>,
         reply: oneshot::Sender<Result<(), BunError>>,
-    },
-    /// Roll a failed rolling redeploy back: kill and clean up the new
-    /// instances, release their ports, drop their identity dirs, record it.
-    RollbackRollingDeploy {
-        app_name: String,
-        namespace: String,
-        spec: Box<AppSpec>,
-        new_ids: Vec<InstanceId>,
-        new_prepared: Vec<InstanceId>,
-        new_ports: std::collections::HashMap<InstanceId, Option<u16>>,
-        replica_count: u32,
-        reply: oneshot::Sender<()>,
-    },
-    /// Halt a failed rolling deploy without reverting (`auto_rollback = false`):
-    /// keep the healthy new + surviving old instances, tear down only the
-    /// incomplete one, record a `Halted` result.
-    HaltRollingDeploy {
-        app_name: String,
-        namespace: String,
-        spec: Box<AppSpec>,
-        new_ids: Vec<InstanceId>,
-        new_prepared: Vec<InstanceId>,
-        new_ports: std::collections::HashMap<InstanceId, Option<u16>>,
-        replica_count: u32,
-        reply: oneshot::Sender<()>,
     },
     /// Forget the already-stopped old instances and register the healthy new
     /// ones: service map, health config, backends, kernel networking, ingress,
@@ -1062,6 +1040,28 @@ impl DeployOps {
     }
 
     #[allow(clippy::too_many_arguments)]
+    async fn reserve_rolling_instance(
+        &self,
+        instance_id: &InstanceId,
+        app_name: &str,
+        namespace: &str,
+        spec: &AppSpec,
+    ) -> Result<Option<u16>, BunError> {
+        self.call(
+            |reply| DeployOp::ReserveRollingInstance {
+                instance_id: instance_id.clone(),
+                app_name: app_name.into(),
+                namespace: namespace.into(),
+                spec: Box::new(spec.clone()),
+                reply,
+            },
+            Err(BunError::InstanceNotFound {
+                instance_id: instance_id.clone(),
+            }),
+        )
+        .await
+    }
+
     async fn prepare_rolling_instance(
         &self,
         instance_id: &InstanceId,
@@ -1084,17 +1084,6 @@ impl DeployOps {
             Err(BunError::InstanceNotFound {
                 instance_id: instance_id.clone(),
             }),
-        )
-        .await
-    }
-
-    async fn clear_egress(&self, instance_id: &InstanceId) {
-        self.call(
-            |reply| DeployOp::ClearEgress {
-                instance_id: instance_id.clone(),
-                reply,
-            },
-            (),
         )
         .await
     }
@@ -1123,60 +1112,6 @@ impl DeployOps {
                 reply,
             },
             Err(missing),
-        )
-        .await
-    }
-
-    #[allow(clippy::too_many_arguments)]
-    async fn rollback_rolling_deploy(
-        &self,
-        app_name: &str,
-        namespace: &str,
-        spec: &AppSpec,
-        new_ids: Vec<InstanceId>,
-        new_prepared: Vec<InstanceId>,
-        new_ports: std::collections::HashMap<InstanceId, Option<u16>>,
-        replica_count: u32,
-    ) {
-        self.call(
-            |reply| DeployOp::RollbackRollingDeploy {
-                app_name: app_name.to_string(),
-                namespace: namespace.to_string(),
-                spec: Box::new(spec.clone()),
-                new_ids,
-                new_prepared,
-                new_ports,
-                replica_count,
-                reply,
-            },
-            (),
-        )
-        .await
-    }
-
-    #[allow(clippy::too_many_arguments)]
-    async fn halt_rolling_deploy(
-        &self,
-        app_name: &str,
-        namespace: &str,
-        spec: &AppSpec,
-        new_ids: Vec<InstanceId>,
-        new_prepared: Vec<InstanceId>,
-        new_ports: std::collections::HashMap<InstanceId, Option<u16>>,
-        replica_count: u32,
-    ) {
-        self.call(
-            |reply| DeployOp::HaltRollingDeploy {
-                app_name: app_name.to_string(),
-                namespace: namespace.to_string(),
-                spec: Box::new(spec.clone()),
-                new_ids,
-                new_prepared,
-                new_ports,
-                replica_count,
-                reply,
-            },
-            (),
         )
         .await
     }
@@ -2444,15 +2379,6 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
         .map_err(|error| fail(format!("persist replacement record: {error}")))
     }
 
-    /// Remove an instance's adoption record (instance stopped for good).
-    fn remove_instance_record(&self, instance_id: &InstanceId) {
-        if let Some(dir) = &self.records_dir
-            && let Err(e) = crate::grill::records::remove_record(dir, &instance_id.0)
-        {
-            eprintln!("bun: warning: failed to remove instance record for {instance_id}: {e}");
-        }
-    }
-
     /// Adopt still-running workloads recorded by a previous bun process.
     ///
     /// Called once at startup, BEFORE any reconciliation: adopted instances
@@ -3169,7 +3095,6 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
         let observed_operation = operation.clone();
         let worker = DeployWorker {
             grill: self.supervisor.grill().clone(),
-            port_allocator: self.supervisor.port_allocator(),
             ops: DeployOps {
                 tx: self.deploy_ops_tx.clone(),
             },
@@ -5428,6 +5353,58 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
         Ok(())
     }
 
+    async fn reserve_rolling_instance(
+        &mut self,
+        id: &InstanceId,
+        app_name: &str,
+        namespace: &str,
+        spec: &AppSpec,
+    ) -> Result<Option<u16>, BunError> {
+        if let Some(owner) = self.supervisor.get_instance(id) {
+            return Err(BunError::DeployFailed {
+                app_name: app_name.into(),
+                reason: format!(
+                    "instance {id} is still owned by {}/{}",
+                    owner.namespace, owner.app_name
+                ),
+            });
+        }
+        let host_port = if spec.port.is_some() {
+            Some(self.supervisor.port_allocator.allocate().await?)
+        } else {
+            None
+        };
+        self.supervisor.instances.insert(
+            id.clone(),
+            super::supervisor::WorkloadInstance {
+                id: id.clone(),
+                app_name: app_name.into(),
+                namespace: namespace.into(),
+                state: ContainerState::Preparing,
+                health_counters: Default::default(),
+                restart_count: 0,
+                last_restart: None,
+                host_port,
+                container_ip: None,
+                created_at: Instant::now(),
+                restart_policy: Default::default(),
+                health_config: None,
+                is_job: false,
+                retry_pending: false,
+                image: spec.image.clone().unwrap_or_default(),
+                oci_spec: None,
+                identity: None,
+                identity_mount: None,
+            },
+        );
+        self.supervisor
+            .app_instances
+            .entry((app_name.into(), namespace.into()))
+            .or_default()
+            .push(id.clone());
+        Ok(host_port)
+    }
+
     /// Fast pre-create bookkeeping for a rolling-redeploy instance: fail closed
     /// on undecryptable secrets, prepare its identity dir, build the OCI spec.
     /// The spawned task then creates and starts it off the loop.
@@ -5454,7 +5431,7 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
             eprintln!("bun: warning: {e}");
         }
         let cgroup_path = crate::grill::cgroup::cgroup_path(namespace, app_name, index);
-        Self::oci_spec_with_secrets(
+        let oci_spec = Self::oci_spec_with_secrets(
             app_name,
             namespace,
             spec,
@@ -5464,101 +5441,15 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
             Some(&self.volumes_dir),
             None,
             identities,
-        )
-    }
-
-    /// Roll a failed rolling redeploy back: kill and clean up the new
-    /// instances (grill-created but never supervisor-tracked), release their
-    /// ports and identity dirs, and record the rollback in history.
-    #[allow(clippy::too_many_arguments)]
-    async fn rollback_rolling_deploy(
-        &mut self,
-        app_name: &str,
-        namespace: &str,
-        spec: &AppSpec,
-        _new_ids: &[InstanceId],
-        new_prepared: &[InstanceId],
-        new_ports: &std::collections::HashMap<InstanceId, Option<u16>>,
-        replica_count: u32,
-    ) {
-        for new_id in new_prepared {
-            let _ = self.supervisor.grill().kill(new_id).await;
-            self.clear_egress(new_id).await;
-            if let Some(port) = new_ports.get(new_id).copied().flatten() {
-                let _ = self.supervisor.port_allocator.release(port).await;
-            }
-        }
-        for new_id in new_prepared {
-            self.cleanup_instance_identity(new_id);
-            self.remove_instance_record(new_id);
-        }
-        let entry = crate::meat::deploy_types::DeployHistoryEntry {
-            id: crate::meat::deploy_types::DeployId(
-                SystemTime::now()
-                    .duration_since(SystemTime::UNIX_EPOCH)
-                    .unwrap_or_default()
-                    .as_secs(),
-            ),
-            app_id: crate::meat::types::AppId::new(app_name, namespace),
-            image: spec.image.clone().unwrap_or_default(),
-            result: crate::meat::deploy_types::DeployResult::RolledBack,
-            created_at: SystemTime::now(),
-            completed_at: SystemTime::now(),
-            steps_completed: 0,
-            steps_total: replica_count as usize,
-            spec: Some(Box::new(spec.clone())),
-        };
-        self.deploy_history.write().await.push(entry);
-    }
-
-    /// Halt a failed rolling deploy without reverting (`auto_rollback = false`).
-    ///
-    /// Unlike [`rollback_rolling_deploy`], the healthy new instances that were
-    /// already published stay in service alongside the surviving old ones — the
-    /// operator inspects the mixed state and decides. Only the incomplete
-    /// instance (prepared but never made healthy, so not in `new_ids`) is torn
-    /// down, so a failed replacement can't leak its container, port or identity
-    /// dir.
-    #[allow(clippy::too_many_arguments)]
-    async fn halt_rolling_deploy(
-        &mut self,
-        app_name: &str,
-        namespace: &str,
-        spec: &AppSpec,
-        new_ids: &[InstanceId],
-        new_prepared: &[InstanceId],
-        new_ports: &std::collections::HashMap<InstanceId, Option<u16>>,
-        replica_count: u32,
-    ) {
-        for prepared in new_prepared {
-            if new_ids.contains(prepared) {
-                continue; // healthy and serving — leave it running
-            }
-            let _ = self.supervisor.grill().kill(prepared).await;
-            self.clear_egress(prepared).await;
-            if let Some(port) = new_ports.get(prepared).copied().flatten() {
-                let _ = self.supervisor.port_allocator.release(port).await;
-            }
-            self.cleanup_instance_identity(prepared);
-            self.remove_instance_record(prepared);
-        }
-        let entry = crate::meat::deploy_types::DeployHistoryEntry {
-            id: crate::meat::deploy_types::DeployId(
-                SystemTime::now()
-                    .duration_since(SystemTime::UNIX_EPOCH)
-                    .unwrap_or_default()
-                    .as_secs(),
-            ),
-            app_id: crate::meat::types::AppId::new(app_name, namespace),
-            image: spec.image.clone().unwrap_or_default(),
-            result: crate::meat::deploy_types::DeployResult::Halted,
-            created_at: SystemTime::now(),
-            completed_at: SystemTime::now(),
-            steps_completed: new_ids.len(),
-            steps_total: replica_count as usize,
-            spec: Some(Box::new(spec.clone())),
-        };
-        self.deploy_history.write().await.push(entry);
+        )?;
+        let owner = self
+            .supervisor
+            .get_instance_mut(instance_id)
+            .ok_or_else(|| BunError::InstanceNotFound {
+                instance_id: instance_id.clone(),
+            })?;
+        owner.oci_spec = Some(oci_spec.clone());
+        Ok(oci_spec)
     }
 
     /// Forget the old instances and register the healthy new ones after a
@@ -5631,6 +5522,11 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
                 self.supervisor
                     .register_health(new_id.clone(), cfg.clone(), now);
             }
+            let (identity, identity_mount) = self
+                .supervisor
+                .get_instance_mut(new_id)
+                .map(|owner| (owner.identity.take(), owner.identity_mount.take()))
+                .unwrap_or_default();
             self.supervisor.instances.insert(
                 new_id.clone(),
                 super::supervisor::WorkloadInstance {
@@ -5650,8 +5546,8 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
                     retry_pending: false,
                     image: spec.image.clone().unwrap_or_default(),
                     oci_spec: new_specs.remove(new_id),
-                    identity: None,
-                    identity_mount: None,
+                    identity,
+                    identity_mount,
                 },
             );
         }
@@ -7367,19 +7263,6 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
         Ok(())
     }
 
-    /// Remove an instance's identity directory (and drop the in-memory
-    /// identity), so key material never outlives the instance (PKI7).
-    fn cleanup_instance_identity(&mut self, instance_id: &InstanceId) {
-        let dir = self.instance_identity_dir(instance_id);
-        if let Err(e) = crate::sesame::identity::cleanup_identity_dir(&dir) {
-            eprintln!("bun: warning: failed to remove identity dir for {instance_id}: {e}");
-        }
-        if let Some(inst) = self.supervisor.get_instance_mut(instance_id) {
-            inst.identity = None;
-            inst.identity_mount = None;
-        }
-    }
-
     /// Remove identity directories that don't belong to any tracked
     /// instance. Runs once after adoption: legacy app-scoped directories
     /// and instances that died while bun was down both get swept, so
@@ -8296,10 +8179,19 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
     async fn finish_retire_bookkeeping(&mut self, old_id: &InstanceId) -> Result<(), BunError> {
         // The worker already observed exit. Preserve a stopped cleanup owner,
         // so a filesystem failure cannot make the restart driver revive it.
+        let service_id = self.supervisor.get_instance(old_id).map(|owner| {
+            crate::onion::service_id::ServiceId::new(&owner.namespace, &owner.app_name)
+        });
         self.retain_stopped_instance(old_id);
         self.retire_instance_artifacts(old_id).await?;
         self.clear_egress(old_id).await;
         self.supervisor.retire_instance(old_id).await;
+        if let Some(service_id) = service_id {
+            let _ = self.service_map.remove_backend(&service_id, &old_id.0);
+            self.sync_backend_ebpf(&service_id).await;
+            self.sync_firewall_ebpf().await;
+            self.rebuild_routing_table().await;
+        }
         Ok(())
     }
 
@@ -8586,6 +8478,18 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
                 while drain.recv().await.is_some() {}
                 let _ = reply.send(());
             }
+            DeployOp::ReserveRollingInstance {
+                instance_id,
+                app_name,
+                namespace,
+                spec,
+                reply,
+            } => {
+                let result = self
+                    .reserve_rolling_instance(&instance_id, &app_name, &namespace, &spec)
+                    .await;
+                let _ = reply.send(result);
+            }
             DeployOp::PrepareRollingInstance {
                 instance_id,
                 app_name,
@@ -8607,10 +8511,6 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
                     .await;
                 let _ = reply.send(result);
             }
-            DeployOp::ClearEgress { instance_id, reply } => {
-                self.clear_egress(&instance_id).await;
-                let _ = reply.send(());
-            }
             DeployOp::RegisterRollingInstance { instance, reply } => {
                 let result = self.persist_rolling_instance(&instance).await;
                 if result.is_ok() {
@@ -8624,95 +8524,32 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
             }
             DeployOp::RetainRollingInstance { instance, reply } => {
                 let id = instance.instance_id.clone();
-                if !self.supervisor.instances.contains_key(&id) {
-                    let health_config = instance.spec.health.as_ref().zip(instance.spec.port).map(
-                        |(health, port)| {
-                            crate::bun::health::HealthCheckConfig::from_spec(health, port)
-                        },
-                    );
-                    let now = Instant::now();
-                    if let Some(config) = &health_config {
-                        self.supervisor
-                            .register_health(id.clone(), config.clone(), now);
+                let container_ip = self.supervisor.grill().container_ip(&id).await;
+                let result = match self.supervisor.get_instance_mut(&id) {
+                    Some(owner)
+                        if owner.app_name == instance.app_name
+                            && owner.namespace == instance.namespace =>
+                    {
+                        owner.state = ContainerState::Running;
+                        owner.container_ip = container_ip;
+                        owner.retry_pending = false;
+                        owner.oci_spec = Some(instance.oci_spec);
+                        let health_config =
+                            instance.spec.health.as_ref().zip(instance.spec.port).map(
+                                |(health, port)| {
+                                    crate::bun::health::HealthCheckConfig::from_spec(health, port)
+                                },
+                            );
+                        owner.health_config = health_config.clone();
+                        if let Some(config) = health_config {
+                            self.supervisor
+                                .register_health(id.clone(), config, Instant::now());
+                        }
+                        Ok(())
                     }
-                    let container_ip = self.supervisor.grill().container_ip(&id).await;
-                    self.supervisor.instances.insert(
-                        id.clone(),
-                        super::supervisor::WorkloadInstance {
-                            id: id.clone(),
-                            app_name: instance.app_name.clone(),
-                            namespace: instance.namespace.clone(),
-                            state: ContainerState::Running,
-                            health_counters: Default::default(),
-                            restart_count: 0,
-                            last_restart: None,
-                            host_port: instance.host_port,
-                            container_ip,
-                            created_at: now,
-                            restart_policy: Default::default(),
-                            health_config,
-                            is_job: false,
-                            retry_pending: false,
-                            image: instance.spec.image.clone().unwrap_or_default(),
-                            oci_spec: Some(instance.oci_spec),
-                            identity: None,
-                            identity_mount: None,
-                        },
-                    );
-                }
-                let ids = self
-                    .supervisor
-                    .app_instances
-                    .entry((instance.app_name, instance.namespace))
-                    .or_default();
-                if !ids.contains(&id) {
-                    ids.push(id);
-                }
-                let _ = reply.send(Ok(()));
-            }
-            DeployOp::RollbackRollingDeploy {
-                app_name,
-                namespace,
-                spec,
-                new_ids,
-                new_prepared,
-                new_ports,
-                replica_count,
-                reply,
-            } => {
-                self.rollback_rolling_deploy(
-                    &app_name,
-                    &namespace,
-                    &spec,
-                    &new_ids,
-                    &new_prepared,
-                    &new_ports,
-                    replica_count,
-                )
-                .await;
-                let _ = reply.send(());
-            }
-            DeployOp::HaltRollingDeploy {
-                app_name,
-                namespace,
-                spec,
-                new_ids,
-                new_prepared,
-                new_ports,
-                replica_count,
-                reply,
-            } => {
-                self.halt_rolling_deploy(
-                    &app_name,
-                    &namespace,
-                    &spec,
-                    &new_ids,
-                    &new_prepared,
-                    &new_ports,
-                    replica_count,
-                )
-                .await;
-                let _ = reply.send(());
+                    _ => Err(BunError::InstanceNotFound { instance_id: id }),
+                };
+                let _ = reply.send(result);
             }
             DeployOp::FinaliseRollingDeploy {
                 app_name,
@@ -8830,7 +8667,6 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
 /// supervisor / service-map / networking state.
 struct DeployWorker<G: Grill> {
     grill: G,
-    port_allocator: PortAllocator,
     ops: DeployOps,
     /// Shared drain tracker, so the worker can drain-and-stop a retiring
     /// instance off the command loop (M7) rather than sending the whole wait
@@ -9452,6 +9288,7 @@ impl<G: Grill + Clone + 'static> DeployWorker<G> {
         let mut new_ips: std::collections::HashMap<InstanceId, Option<std::net::Ipv4Addr>> =
             std::collections::HashMap::new();
         let mut new_prepared: Vec<InstanceId> = Vec::new();
+        let mut runtime_attempted = std::collections::HashSet::new();
         let mut new_failed = false;
 
         // M7: drive the rollout through `plan_rolling_step` rather than
@@ -9571,21 +9408,21 @@ impl<G: Grill + Clone + 'static> DeployWorker<G> {
                 })
                 .await;
 
-            let host_port = if spec.port.is_some() {
-                match self.port_allocator.allocate().await {
-                    Ok(p) => Some(p),
-                    Err(e) => {
-                        let _ = events
-                            .send(ApplyEvent::Error {
-                                message: format!("port allocation failed: {e}"),
-                            })
-                            .await;
-                        new_failed = true;
-                        break;
-                    }
+            let host_port = match self
+                .ops
+                .reserve_rolling_instance(&new_id, app_name, namespace, spec)
+                .await
+            {
+                Ok(port) => port,
+                Err(error) => {
+                    let _ = events
+                        .send(ApplyEvent::Error {
+                            message: error.to_string(),
+                        })
+                        .await;
+                    new_failed = true;
+                    break;
                 }
-            } else {
-                None
             };
 
             new_ports.insert(new_id.clone(), host_port);
@@ -9608,6 +9445,7 @@ impl<G: Grill + Clone + 'static> DeployWorker<G> {
             };
             let cgroup_path = crate::grill::cgroup::cgroup_path(namespace, app_name, i);
 
+            runtime_attempted.insert(new_id.clone());
             if let Err(e) = self.grill.create(&new_id, &oci_spec).await {
                 let _ = events
                     .send(ApplyEvent::Error {
@@ -9628,7 +9466,6 @@ impl<G: Grill + Clone + 'static> DeployWorker<G> {
                         message: format!("failed to program egress for {}: {e}", new_id.0),
                     })
                     .await;
-                let _ = self.grill.stop(&new_id).await;
                 new_failed = true;
                 break;
             }
@@ -9638,7 +9475,6 @@ impl<G: Grill + Clone + 'static> DeployWorker<G> {
                         message: format!("failed to start {}: {e}", new_id.0),
                     })
                     .await;
-                self.ops.clear_egress(&new_id).await;
                 new_failed = true;
                 break;
             }
@@ -9659,8 +9495,6 @@ impl<G: Grill + Clone + 'static> DeployWorker<G> {
                         message: error.to_string(),
                     })
                     .await;
-                let _ = self.grill.kill(&new_id).await;
-                self.ops.clear_egress(&new_id).await;
                 new_failed = true;
                 break;
             }
@@ -9691,8 +9525,6 @@ impl<G: Grill + Clone + 'static> DeployWorker<G> {
                 }
                 Err(message) => {
                     let _ = events.send(ApplyEvent::Error { message }).await;
-                    let _ = self.grill.kill(&new_id).await;
-                    self.ops.clear_egress(&new_id).await;
                     new_failed = true;
                     break;
                 }
@@ -9720,49 +9552,21 @@ impl<G: Grill + Clone + 'static> DeployWorker<G> {
         }
 
         if new_failed {
-            if deploy_config.auto_rollback {
-                self.ops
-                    .rollback_rolling_deploy(
-                        app_name,
-                        namespace,
-                        spec,
-                        new_ids,
-                        new_prepared,
-                        new_ports,
-                        replica_count,
-                    )
-                    .await;
-                let _ = events
-                    .send(ApplyEvent::Error {
-                        message: "rolled back — old instances preserved".to_string(),
-                    })
-                    .await;
-            } else {
-                // auto_rollback = false: halt without reverting. Keep the
-                // healthy new instances and the surviving old ones in place for
-                // the operator to inspect; tear down only the incomplete one.
-                let new_live = new_ids.len();
-                let old_live = existing.len().saturating_sub(retired);
-                self.ops
-                    .halt_rolling_deploy(
-                        app_name,
-                        namespace,
-                        spec,
-                        new_ids,
-                        new_prepared,
-                        new_ports,
-                        replica_count,
-                    )
-                    .await;
-                let _ = events
-                    .send(ApplyEvent::Error {
-                        message: format!(
-                            "deploy halted (auto_rollback = false): {new_live} new and \
-                             {old_live} old instance(s) left running for inspection"
-                        ),
-                    })
-                    .await;
-            }
+            self.abort_rollout(
+                app_name,
+                namespace,
+                spec,
+                &new_ids,
+                &new_prepared,
+                &runtime_attempted,
+                &new_ports,
+                &new_specs,
+                deploy_config.auto_rollback,
+                retired,
+                replica_count,
+                events,
+            )
+            .await;
             return std::ops::ControlFlow::Break(());
         }
 
@@ -9845,6 +9649,91 @@ impl<G: Grill + Clone + 'static> DeployWorker<G> {
         }
 
         std::ops::ControlFlow::Continue(())
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn abort_rollout(
+        &self,
+        app_name: &str,
+        namespace: &str,
+        spec: &AppSpec,
+        healthy: &[InstanceId],
+        prepared: &[InstanceId],
+        runtime_attempted: &std::collections::HashSet<InstanceId>,
+        ports: &std::collections::HashMap<InstanceId, Option<u16>>,
+        specs: &std::collections::HashMap<InstanceId, crate::grill::oci::OciSpec>,
+        auto_rollback: bool,
+        retired: usize,
+        replica_count: u32,
+        events: &mpsc::Sender<ApplyEvent>,
+    ) {
+        let mut errors = Vec::new();
+        if !auto_rollback
+            && let Err(error) = self
+                .retain_started_replacements(app_name, namespace, spec, healthy, ports, specs)
+                .await
+        {
+            errors.push(error.to_string());
+        }
+        for id in prepared {
+            if !auto_rollback && healthy.contains(id) {
+                continue;
+            }
+            let cleanup = async {
+                self.ops.begin_retire(id).await?;
+                // A failed create may already own runtime resources. Only a
+                // reservation that never attempted create proves their absence.
+                if runtime_attempted.contains(id) {
+                    kill_runtime_instance(&self.grill, id).await?;
+                }
+                self.ops.finish_retire(id).await
+            }
+            .await;
+            if let Err(error) = cleanup {
+                errors.push(format!("{id}: {error}"));
+            }
+        }
+        let (result, message) = if !errors.is_empty() {
+            (
+                crate::meat::deploy_types::DeployResult::Failed,
+                format!(
+                    "rollout cleanup incomplete; remaining owners retained: {}",
+                    errors.join("; ")
+                ),
+            )
+        } else if auto_rollback && retired == 0 {
+            (
+                crate::meat::deploy_types::DeployResult::RolledBack,
+                "rolled back — old instances preserved".to_string(),
+            )
+        } else {
+            (
+                crate::meat::deploy_types::DeployResult::Halted,
+                format!(
+                    "deploy halted: {} healthy new instance(s) left running; {retired} old instance(s) already retired",
+                    if auto_rollback { 0 } else { healthy.len() }
+                ),
+            )
+        };
+        self.ops
+            .push_deploy_history(crate::meat::deploy_types::DeployHistoryEntry {
+                id: crate::meat::deploy_types::DeployId(
+                    SystemTime::now()
+                        .duration_since(SystemTime::UNIX_EPOCH)
+                        .unwrap_or_default()
+                        .as_secs(),
+                ),
+                app_id: crate::meat::types::AppId::new(app_name, namespace),
+                image: spec.image.clone().unwrap_or_default(),
+                result,
+                created_at: SystemTime::now(),
+                completed_at: SystemTime::now(),
+                steps_completed: healthy.len(),
+                steps_total: replica_count as usize,
+                spec: Some(Box::new(spec.clone())),
+            })
+            .await;
+        let _ = events.send(ApplyEvent::Error { message }).await;
     }
 
     /// Publish retirement intent before runtime exit can trigger the restart driver.
@@ -9939,6 +9828,7 @@ impl<G: Grill + Clone + 'static> DeployWorker<G> {
         let mut new_ips: std::collections::HashMap<InstanceId, Option<std::net::Ipv4Addr>> =
             std::collections::HashMap::new();
         let mut new_prepared: Vec<InstanceId> = Vec::new();
+        let mut runtime_attempted = std::collections::HashSet::new();
         let mut new_failed = false;
 
         // Start and health check the entire green fleet before touching blue.
@@ -9957,21 +9847,21 @@ impl<G: Grill + Clone + 'static> DeployWorker<G> {
                 })
                 .await;
 
-            let host_port = if spec.port.is_some() {
-                match self.port_allocator.allocate().await {
-                    Ok(p) => Some(p),
-                    Err(e) => {
-                        let _ = events
-                            .send(ApplyEvent::Error {
-                                message: format!("port allocation failed: {e}"),
-                            })
-                            .await;
-                        new_failed = true;
-                        break;
-                    }
+            let host_port = match self
+                .ops
+                .reserve_rolling_instance(&new_id, app_name, namespace, spec)
+                .await
+            {
+                Ok(port) => port,
+                Err(error) => {
+                    let _ = events
+                        .send(ApplyEvent::Error {
+                            message: error.to_string(),
+                        })
+                        .await;
+                    new_failed = true;
+                    break;
                 }
-            } else {
-                None
             };
 
             new_ports.insert(new_id.clone(), host_port);
@@ -9994,6 +9884,7 @@ impl<G: Grill + Clone + 'static> DeployWorker<G> {
             };
             let cgroup_path = crate::grill::cgroup::cgroup_path(namespace, app_name, i);
 
+            runtime_attempted.insert(new_id.clone());
             if let Err(e) = self.grill.create(&new_id, &oci_spec).await {
                 let _ = events
                     .send(ApplyEvent::Error {
@@ -10013,7 +9904,6 @@ impl<G: Grill + Clone + 'static> DeployWorker<G> {
                         message: format!("failed to program egress for {}: {e}", new_id.0),
                     })
                     .await;
-                let _ = self.grill.stop(&new_id).await;
                 new_failed = true;
                 break;
             }
@@ -10023,7 +9913,6 @@ impl<G: Grill + Clone + 'static> DeployWorker<G> {
                         message: format!("failed to start {}: {e}", new_id.0),
                     })
                     .await;
-                self.ops.clear_egress(&new_id).await;
                 new_failed = true;
                 break;
             }
@@ -10044,8 +9933,6 @@ impl<G: Grill + Clone + 'static> DeployWorker<G> {
                         message: error.to_string(),
                     })
                     .await;
-                let _ = self.grill.kill(&new_id).await;
-                self.ops.clear_egress(&new_id).await;
                 new_failed = true;
                 break;
             }
@@ -10073,8 +9960,6 @@ impl<G: Grill + Clone + 'static> DeployWorker<G> {
                 }
                 Err(message) => {
                     let _ = events.send(ApplyEvent::Error { message }).await;
-                    let _ = self.grill.kill(&new_id).await;
-                    self.ops.clear_egress(&new_id).await;
                     new_failed = true;
                     break;
                 }
@@ -10090,46 +9975,21 @@ impl<G: Grill + Clone + 'static> DeployWorker<G> {
             new_failed = true;
         }
         if new_failed {
-            // Green never took over routing, so blue is still live regardless of
-            // auto_rollback. Rollback tears green down; halt leaves it up for
-            // inspection. Either way blue keeps serving.
-            if deploy_config.auto_rollback {
-                self.ops
-                    .rollback_rolling_deploy(
-                        app_name,
-                        namespace,
-                        spec,
-                        new_ids,
-                        new_prepared,
-                        new_ports,
-                        replica_count,
-                    )
-                    .await;
-                let _ = events
-                    .send(ApplyEvent::Error {
-                        message: "rolled back — blue fleet preserved".to_string(),
-                    })
-                    .await;
-            } else {
-                self.ops
-                    .halt_rolling_deploy(
-                        app_name,
-                        namespace,
-                        spec,
-                        new_ids,
-                        new_prepared,
-                        new_ports,
-                        replica_count,
-                    )
-                    .await;
-                let _ = events
-                    .send(ApplyEvent::Error {
-                        message: "deploy halted (auto_rollback = false): green fleet left running \
-                                  for inspection"
-                            .to_string(),
-                    })
-                    .await;
-            }
+            self.abort_rollout(
+                app_name,
+                namespace,
+                spec,
+                &new_ids,
+                &new_prepared,
+                &runtime_attempted,
+                &new_ports,
+                &new_specs,
+                deploy_config.auto_rollback,
+                0,
+                replica_count,
+                events,
+            )
+            .await;
             return std::ops::ControlFlow::Break(());
         }
 
@@ -10780,7 +10640,6 @@ mod tests {
         async fn deploy(&mut self, config: Config, events: &mpsc::Sender<ApplyEvent>) {
             let worker = DeployWorker {
                 grill: self.supervisor.grill().clone(),
-                port_allocator: self.supervisor.port_allocator(),
                 ops: DeployOps {
                     tx: self.deploy_ops_tx.clone(),
                 },
@@ -13112,6 +12971,41 @@ host = "remote.local"
     }
 
     #[tokio::test]
+    async fn halted_rollout_keeps_healthy_replacements_in_ordinary_supervision() {
+        for strategy in ["rolling", "blue-green"] {
+            let (mut agent, _tx, _shutdown, grill) = test_agent_with_grill();
+            let records = tempfile::tempdir().unwrap();
+            agent.set_records_dir(records.path().to_path_buf());
+            grill.set_pid(std::process::id());
+            let config =
+                Config::parse("[app.web]\nimage = 'web:v1'\nport = 8080\nreplicas = 2\n").unwrap();
+            expect_complete(&drain_deploy(&mut agent, config).await);
+            let failed = InstanceId("default__web-g1-1".into());
+            grill.set_state(&failed, ContainerState::Failed);
+            let replacement = Config::parse(&format!("[app.web]\nimage = 'web:v2'\nport = 8080\nreplicas = 2\n[app.web.deploy]\nstrategy = '{strategy}'\nauto_rollback = false\nhealth_timeout = '1s'\n")).unwrap();
+            let outcome = drain_deploy(&mut agent, replacement).await;
+            assert!(
+                matches!(outcome.last(), Some(ApplyEvent::Error { message }) if message.contains("halted")),
+                "{outcome:?}"
+            );
+            let healthy = InstanceId("default__web-g1-0".into());
+            let owner = agent.supervisor.get_instance(&healthy).unwrap();
+            assert_eq!(owner.state, ContainerState::Running);
+            assert!(owner.oci_spec.is_some());
+            assert!(agent.supervisor.get_instance(&failed).is_none());
+            assert!(crate::grill::records::record_path(records.path(), &healthy.0).exists());
+            agent.retire_workload("web", "default").await.unwrap();
+            assert!(agent.supervisor.instances.is_empty());
+            assert_eq!(agent.supervisor.port_allocator.allocated_count().await, 0);
+            assert!(
+                crate::grill::records::load_records(records.path())
+                    .unwrap()
+                    .is_empty()
+            );
+        }
+    }
+
+    #[tokio::test]
     async fn rolling_redeploy_halts_without_reverting_when_auto_rollback_is_false() {
         let (mut agent, tx, shutdown, grill) = test_agent_with_grill();
         let history = agent.deploy_history_handle();
@@ -13304,6 +13198,143 @@ host = "remote.local"
             !grill.calls().iter().any(|(op, _)| op == "create"),
             "no container should be created for a scheduled job at deploy time"
         );
+    }
+
+    #[tokio::test]
+    async fn failed_rollout_retains_every_owner_until_cleanup_is_confirmed() {
+        for strategy in ["rolling", "blue-green"] {
+            for auto_rollback in [true, false] {
+                for fault in [
+                    "kill error",
+                    "kill ignored",
+                    "kill stalled",
+                    "inspection",
+                    "record",
+                    "identity",
+                ] {
+                    let root = tempfile::tempdir().unwrap();
+                    let records = root.path().join("records");
+                    let (mut agent, tx, shutdown, grill) = test_agent_with_grill();
+                    agent.set_volumes_dir(root.path().join("volumes"));
+                    agent.set_records_dir(records.clone());
+                    grill.set_pid(std::process::id());
+                    let new_id = InstanceId("default__web-g1-0".into());
+                    let record = crate::grill::records::record_path(&records, &new_id.0);
+                    let identity = agent.instance_identity_dir(&new_id);
+                    let history = agent.deploy_history_handle();
+                    let task = tokio::spawn(async move {
+                        agent.run().await;
+                        agent
+                    });
+                    expect_complete(&send_deploy(&tx, basic_config()).await);
+                    grill.set_state(&new_id, ContainerState::Failed);
+                    let config = Config::parse(&format!("[app.web]\nimage = 'web:v2'\nport = 8080\n[app.web.deploy]\nstrategy = '{strategy}'\nauto_rollback = {auto_rollback}\nhealth_timeout = '30s'\n")).unwrap();
+                    let (events, mut stream) = mpsc::channel(64);
+                    tx.send(AgentCommand::Deploy { config, events })
+                        .await
+                        .unwrap();
+                    let ApplyEvent::Accepted { operation_id } = stream.recv().await.unwrap() else {
+                        panic!("missing operation id")
+                    };
+                    tokio::time::timeout(std::time::Duration::from_secs(2), async {
+                        while !record.exists() {
+                            tokio::task::yield_now().await;
+                        }
+                    })
+                    .await
+                    .unwrap();
+                    let original_record = std::fs::read(&record).unwrap();
+                    match fault {
+                        "kill error" => grill.set_fail_kill(true),
+                        "kill ignored" => grill.set_ignore_kill(true),
+                        "kill stalled" => grill.block_kills(),
+                        "inspection" => grill.set_instance_inspection_failure(&new_id, true),
+                        "record" => {
+                            std::fs::remove_file(&record).unwrap();
+                            std::fs::create_dir(&record).unwrap();
+                        }
+                        _ => {
+                            crate::sesame::identity::cleanup_identity_dir(&identity).unwrap();
+                            std::fs::write(&identity, "blocked").unwrap();
+                        }
+                    }
+                    let (response, cancelled) = oneshot::channel();
+                    tx.send(AgentCommand::CancelDeploy {
+                        operation_id: operation_id.into(),
+                        response,
+                    })
+                    .await
+                    .unwrap();
+                    cancelled.await.unwrap().unwrap();
+                    let outcome = tokio::time::timeout(std::time::Duration::from_secs(6), async {
+                        let mut events = Vec::new();
+                        while let Some(event) = stream.recv().await {
+                            events.push(event);
+                        }
+                        events
+                    })
+                    .await;
+                    let (response, status) = oneshot::channel();
+                    tx.send(AgentCommand::Status { response }).await.unwrap();
+                    let retained =
+                        tokio::time::timeout(std::time::Duration::from_secs(1), status).await;
+                    let record_retained = record.exists();
+                    let claimed_rollback = history.read().await.iter().any(|entry| {
+                        entry.result == crate::meat::deploy_types::DeployResult::RolledBack
+                    });
+                    grill.set_fail_kill(false);
+                    grill.set_ignore_kill(false);
+                    grill.set_instance_inspection_failure(&new_id, false);
+                    grill.release_kills(4);
+                    if fault == "record" {
+                        std::fs::remove_dir(&record).unwrap();
+                        std::fs::write(&record, original_record).unwrap();
+                    }
+                    if fault == "identity" {
+                        std::fs::remove_file(&identity).unwrap();
+                    }
+                    grill.kill(&new_id).await.unwrap();
+                    let (response, retired) = oneshot::channel();
+                    tx.send(AgentCommand::Retire {
+                        app_name: "web".into(),
+                        namespace: "default".into(),
+                        response,
+                    })
+                    .await
+                    .unwrap();
+                    let recovery = retired.await.unwrap();
+                    shutdown.cancel();
+                    let agent = task.await.unwrap();
+                    let outcome = outcome.expect("rollback runtime cleanup must be bounded");
+                    let retained = retained
+                        .expect("rollback must leave the agent responsive")
+                        .unwrap();
+                    assert!(
+                        outcome
+                            .iter()
+                            .any(|event| matches!(event, ApplyEvent::Error { .. }))
+                    );
+                    assert_eq!(
+                        retained.len(),
+                        2,
+                        "{strategy}/{auto_rollback}/{fault} discarded a cleanup owner: {outcome:?}"
+                    );
+                    assert!(record_retained, "{fault} discarded adoption ownership");
+                    assert!(
+                        !claimed_rollback,
+                        "unconfirmed cleanup was recorded as rolled back"
+                    );
+                    assert!(recovery.is_ok(), "{recovery:?}");
+                    assert!(agent.supervisor.list_instances().is_empty());
+                    assert_eq!(agent.supervisor.port_allocator.allocated_count().await, 0);
+                    assert!(
+                        crate::grill::records::load_records(&records)
+                            .unwrap()
+                            .is_empty()
+                    );
+                }
+            }
+        }
     }
 
     #[tokio::test]
@@ -14392,7 +14423,7 @@ host = "remote.local"
     }
 
     #[tokio::test]
-    async fn rolling_record_failure_preserves_old_instances_and_reclaims_new_ports() {
+    async fn rolling_record_failure_retains_cleanup_ownership_until_directory_recovery() {
         for strategy in ["rolling", "blue-green"] {
             let (mut agent, _tx, _shutdown, grill) = test_agent_with_grill();
             let records = tempfile::tempdir().unwrap();
@@ -14418,7 +14449,7 @@ host = "remote.local"
             );
             assert_eq!(
                 agent.supervisor.port_allocator.allocated_count().await,
-                allocated_before
+                allocated_before + 1
             );
             let created: Vec<_> = grill
                 .calls()
@@ -14426,6 +14457,25 @@ host = "remote.local"
                 .filter(|(op, id)| op == "create" && id.0 != "default__web-0")
                 .collect();
             assert_eq!(created.len(), 1);
+            let owner = agent.supervisor.get_instance(&created[0].1).unwrap();
+            assert_eq!(owner.state, ContainerState::Stopped);
+            agent.set_records_dir(records.path().to_path_buf());
+            agent
+                .finish_retire_bookkeeping(&created[0].1)
+                .await
+                .unwrap();
+            assert_eq!(
+                agent.supervisor.port_allocator.allocated_count().await,
+                allocated_before
+            );
+            assert!(agent.supervisor.get_instance(&created[0].1).is_none());
+            assert!(
+                agent
+                    .supervisor
+                    .get_instance(&InstanceId("default__web-0".into()))
+                    .is_some()
+            );
+
             assert!(
                 grill
                     .calls()

@@ -1006,6 +1006,27 @@ each; 21.88s/39.58s), strict Clippy passes on both, and actual signed exec follo
 by redeployment passes on macOS/Linux (19.19s/10.53s). Cross-app ID collision
 admission remains separate.
 
+**Rollback/halt ownership (19 September):** The failing-first cancellation
+matrix reproduces a false RolledBack result and a missing replacement owner
+when kill fails. The command loop now reserves each replacement and its port
+before preparation; the worker records whether runtime creation was attempted.
+One shared abort path performs bounded kill/exit observation off the command
+loop, then checked artifact/backend/port retirement. Failures retain their owners
+and produce Failed history. Healthy halted replacements enter ordinary
+supervision. RolledBack requires successful cleanup with no old instance already
+retired; partial cutover reports Halted. Obsolete ignored-error cleanup methods,
+worker port allocation and rollback/halt command variants are removed.
+
+All 24 strategy/policy/fault combinations pass (17.11s). A separate case retains
+a healthy replacement after a partial halt and retires all remaining owners.
+The older blocked-record-directory fixture correctly observes an extra retained
+port; it now repairs the directory and verifies confirmed release. All 465
+native/464 Linux Bun tests pass (one explicit gate each; 23.35s/44.91s), along
+with all 29 actual HTTP/process integration tests (four separate gates each;
+1.22s/1.94s) and strict all-target/all-feature Clippy on both platforms. The
+preparation reservation is in memory: physical crash recovery before the first
+runtime record and cross-app fresh-ID collision guards remain open.
+
 ### C35 — Gate chaos capabilities per selected scenario
 
 **Priority:** P2. **Wave:** 4. **Book chapters:** 08, 15.
