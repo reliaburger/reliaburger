@@ -134,7 +134,9 @@ pub async fn pull_layer_from_peer(
     match streamed.and_then(|inner| inner) {
         Ok(()) => {}
         Err(e) => {
-            store.cancel_upload(&upload_id).await;
+            store.cancel_upload(&upload_id).await.map_err(|cleanup| {
+                PickleError::ReplicationFailed(format!("{e}; upload cleanup failed: {cleanup}"))
+            })?;
             return Err(e);
         }
     }

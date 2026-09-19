@@ -878,6 +878,18 @@ on macOS/Linux. Actual authenticated three-node placement verifies distinct
 ports and successful peer reads (19.96s native, 18.21s Linux). Strict Clippy
 passes on both platforms. Protocol/state remain 6/7; the HTTP field is additive.
 
+**Upload cleanup prerequisite (19 September):** Expired or failed upload
+sessions now enter an explicit Retiring state. They refuse new writers and
+remain owned until temporary-file deletion and directory sync succeed. The
+reaper skips active writers, retries failed deletions and continues through
+other expired uploads. Finalisation fences writes before its blocking commit;
+API/body/quota failures retain cleanup ownership, and P2P cleanup errors
+propagate. The original repeat-sweep regression fails before implementation.
+All 229 Pickle tests and two authenticated HTTP upload tests pass on macOS/Linux,
+with strict Clippy on both. The HTTP fixture proves failed deletion, continued
+cleanup of another upload, write refusal and later recovery. Process-death
+inventory and lease-owned repositories remain open.
+
 ### C35 — Gate chaos capabilities per selected scenario
 
 **Priority:** P2. **Wave:** 4. **Book chapters:** 08, 15.

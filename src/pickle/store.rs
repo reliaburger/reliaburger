@@ -329,12 +329,21 @@ impl BlobStore {
     }
 
     /// Cancel an upload session, cleaning up the temp file.
-    pub async fn cancel_upload(&self, upload_id: &str) {
-        if validate_upload_id(upload_id).is_err() {
-            return;
-        }
+    pub async fn cancel_upload(&self, upload_id: &str) -> Result<(), PickleError> {
+        validate_upload_id(upload_id)?;
         let path = self.upload_path(upload_id);
-        let _ = tokio::fs::remove_file(path).await;
+        match tokio::fs::remove_file(&path).await {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error.into()),
+        }
+        // Confirm durable retirement before the session owner is discarded.
+        match tokio::fs::File::open(self.base_dir.join("uploads")).await {
+            Ok(directory) => directory.sync_all().await?,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error.into()),
+        }
+        Ok(())
     }
 
     /// List all blob digests in the store.
@@ -568,7 +577,8 @@ mod tests {
             .write_upload_chunk(&upload_id, b"partial")
             .await
             .unwrap();
-        store.cancel_upload(&upload_id).await;
+        store.cancel_upload(&upload_id).await.unwrap();
+        store.cancel_upload(&upload_id).await.unwrap();
 
         // Writing to cancelled session should fail
         let result = store.write_upload_chunk(&upload_id, b"more").await;

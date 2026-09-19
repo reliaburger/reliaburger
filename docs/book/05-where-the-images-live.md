@@ -647,3 +647,26 @@ headers on this path. Our backoff therefore doesn't claim to honour a server's
 permanent denial and attempt limits; a stalled-response test advances time
 only after the real HTTP request reaches the fixture. The external registry
 qualification remains a separate check.
+
+
+### Keep failed upload cleanup on the list
+
+An upload times out. The reaper forgets its session, tries to remove the
+partial file, and ignores the filesystem error. Who retries tomorrow? Nobody.
+The next sweep has no record of that file.
+
+Upload sessions now have two explicit states: `Active` and `Retiring`. Expiry,
+a failed request body or a finalisation attempt fences future writers before
+cleanup starts. An existing writer retains its semaphore permit until its own
+operation ends. The reaper selects only retired or expired sessions whose
+writer has exited. It forgets each session after file removal and directory
+sync succeed; errors keep the owner available for another pass.
+
+The reaper visits every selected session, collecting failures instead of
+stopping at the first one. The HTTP test replaces one upload file with a
+directory, which makes deletion fail even when the test runs as root. That
+upload stays fenced while another expired upload disappears. Restore the file
+and the next pass finishes both physical cleanup and ownership retirement.
+The unit regression demonstrates the original loss: the second sweep returns
+nothing before the fix. Upload recovery after process death needs a separate
+startup owner because these session records live in memory.

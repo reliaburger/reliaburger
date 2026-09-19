@@ -2471,8 +2471,10 @@ async fn run_agent(cli: Cli) -> anyhow::Result<()> {
                 tokio::select! {
                     _ = sweep_shutdown.cancelled() => break,
                     _ = ticker.tick() => {
-                        for id in sweep_sessions.sweep(std::time::SystemTime::now()).await {
-                            sweep_store.cancel_upload(&id).await;
+                        for (id, error) in sweep_sessions.cleanup_expired(
+                            &sweep_store, std::time::SystemTime::now(),
+                        ).await {
+                            eprintln!("pickle: upload {id} cleanup will retry: {error}");
                         }
                     }
                 }
