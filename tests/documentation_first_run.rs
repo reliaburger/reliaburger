@@ -1544,3 +1544,85 @@ fn qualify_runc_catalogue(group: &str) {
         );
     }
 }
+
+#[tokio::test]
+async fn abandoned_registry_upload_is_reclaimed_after_bun_sigkill() {
+    let root = tempfile::tempdir().unwrap();
+    let node = write_portable_node_config(root.path());
+    let (mut bun, address) = spawn_bun_with_port_retry(false, || {
+        (
+            node.clone(),
+            reserve_address(),
+            root.path().join("upload-before.log"),
+        )
+    });
+    let endpoint = format!("http://{address}");
+    wait_for_relish(&mut bun, &["--endpoint", &endpoint, "status"]);
+    let client = reliaburger::relish::client::BunClient::new(&endpoint);
+    let registry = client
+        .capabilities()
+        .await
+        .unwrap()
+        .service_endpoints
+        .registry
+        .unwrap();
+    let http = client.registry_http_client(&registry).unwrap();
+    let started = http
+        .post(format!("{registry}/v2/abandoned/blobs/uploads/"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(started.status(), 202);
+    let location = started.headers()["location"].to_str().unwrap();
+    let id = location.rsplit('/').next().unwrap();
+    let path = root.path().join("images/uploads").join(id);
+    assert_eq!(
+        http.patch(format!("{registry}{location}"))
+            .body("partial")
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        202
+    );
+    assert_eq!(std::fs::read(&path).unwrap(), b"partial");
+    let mut competing = BunProcess::spawn(
+        &node,
+        "127.0.0.1:0".parse().unwrap(),
+        false,
+        root.path().join("upload-competing.log"),
+    );
+    let status = tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            if let Some(status) = competing.child.try_wait().unwrap() {
+                break status;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("competing Bun did not refuse the occupied upload directory");
+    assert!(!status.success());
+    let output = std::fs::read_to_string(&competing.log_path).unwrap();
+    assert!(
+        output.contains("registry upload directory is busy"),
+        "{output}"
+    );
+    assert!(!output.contains("API server listening"), "{output}");
+    assert_eq!(std::fs::read(&path).unwrap(), b"partial");
+    bun.child.kill().unwrap();
+    bun.child.wait().unwrap();
+    let (mut replacement, address) = spawn_bun_with_port_retry(false, || {
+        (
+            node.clone(),
+            reserve_address(),
+            root.path().join("upload-after.log"),
+        )
+    });
+    let endpoint = format!("http://{address}");
+    wait_for_relish(&mut replacement, &["--endpoint", &endpoint, "status"]);
+    assert!(
+        !path.exists(),
+        "restart lost the owner but retained the upload bytes"
+    );
+}

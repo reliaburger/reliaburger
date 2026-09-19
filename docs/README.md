@@ -45,6 +45,13 @@ adoption errors before serving the API. It preserves records and identity files
 for recovery; inspect the reported path or runtime error and retry once repaired.
 Do not delete ownership records to bypass the refusal while workloads may survive.
 
+Registry startup claims exclusive ownership of the configured image store's
+upload directory. Run only one Bun with that writable image store. A restart
+reclaims abandoned temporary uploads before serving; clients restart interrupted
+pushes. A busy owner, unexpected entry, symlinked upload directory or cleanup
+error refuses startup with context. Repair the reported condition rather than
+removing a live owner's lock file. Committed images are not part of this sweep.
+
 ## Release work
 
 The [0.1.0 plan](plans/2026-09-16-v0.1.0-release-plan.md) tracks packaging and

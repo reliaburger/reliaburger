@@ -670,3 +670,32 @@ and the next pass finishes both physical cleanup and ownership retirement.
 The unit regression demonstrates the original loss: the second sweep returns
 nothing before the fix. Upload recovery after process death needs a separate
 startup owner because these session records live in memory.
+
+
+### Recover uploads only after acquiring their directory
+
+Killing Bun destroys its upload-session map but leaves partial files on disk.
+The real restart test proves the gap: an upload accepts a chunk, Bun receives
+SIGKILL, and its replacement serves requests while the partial file remains.
+
+Before starting any registry or replication writer, Bun now acquires an
+exclusive file lock for the configured image store. The kernel releases it
+when the process exits, including an ungraceful exit. A second Bun using that
+same writable store refuses startup; it cannot sweep the first Bun's uploads.
+Self-upgrade closes the old descriptor during `exec`, so the replacement can
+acquire ownership again. The lock file itself remains in place.
+
+The owner reclaims regular temporary files whose names match our generated
+upload IDs, then syncs the upload directory before startup continues. Clients
+must restart interrupted uploads; we don't pretend to recover their lost
+session metadata. Unexpected names, non-regular entries, a redirected upload
+directory or an I/O error refuse startup. Recovery never follows a directory
+symlink to remove someone else's files.
+
+`UploadDirectoryOwner` keeps the open lock file alive. Its `#[must_use]`
+attribute asks the compiler to warn when a caller discards the guard; Bun holds
+it until registry shutdown. The blocking pool handles directory traversal,
+locking and sync operations, keeping those calls off the async executor.
+Tests cover competing owners, replacement, unknown entries, directory symlinks,
+and the actual Bun SIGKILL path. The separate live upgrade suite checks that
+rolling replacement and rollback can reacquire ownership.

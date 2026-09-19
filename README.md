@@ -43,6 +43,9 @@ implementation status in [progress.md](docs/progress.md).
 0.1.0 requires a fresh cluster; development state is refused. Rolling upgrades
 require matching explicit formats (currently protocol 6 and state 7). See the
 [compatibility policy](docs/releasing.md#cluster-compatibility).
+Registry upload recovery reclaims abandoned partial uploads after a crash and
+requires one Bun per writable image store; see the [startup contract](docs/README.md).
+
 Restart also refuses unreadable ownership records or uncertain runtime adoption,
 preserving records and workload identities for recovery. Node-local cron
 registrations survive restart. Cron skips missed or uncertain firings after a

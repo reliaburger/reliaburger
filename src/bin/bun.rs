@@ -750,6 +750,14 @@ async fn run_agent(cli: Cli) -> anyhow::Result<()> {
     .await
     .context("state compatibility check failed")??;
 
+    // Recover temporary uploads before any registry or replication writer starts.
+    let pickle_dir = storage_directory(&config.storage.images, "images").await?;
+    let blob_store = Arc::new(BlobStore::new(&pickle_dir));
+    let _upload_owner = blob_store
+        .claim_upload_directory()
+        .await
+        .context("cannot recover registry upload ownership")?;
+
     // Instance records + process log files ({data}/instances). Started
     // workloads are recorded here so a future bun process (crash restart or
     // self-upgrade exec) adopts them instead of restarting them.
@@ -2287,11 +2295,9 @@ async fn run_agent(cli: Cli) -> anyhow::Result<()> {
         });
     }
 
-    // Start the Pickle OCI registry server
-    let pickle_dir = storage_directory(&config.storage.images, "images").await?;
+    // Start the Pickle OCI registry server using the ownership claimed at startup.
     let node_raft_id = reliaburger::cluster::identity::raft_id_from_name(&node_name);
 
-    let blob_store = Arc::new(BlobStore::new(&pickle_dir));
     // Registry writes reuse the cluster's existing auth material (REG4):
     // the same token store and service token that guard the agent API. In
     // single-node/tokenless mode the empty-store bootstrap rule keeps writes

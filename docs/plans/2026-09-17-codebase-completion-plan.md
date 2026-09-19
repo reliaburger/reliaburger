@@ -890,6 +890,21 @@ with strict Clippy on both. The HTTP fixture proves failed deletion, continued
 cleanup of another upload, write refusal and later recovery. Process-death
 inventory and lease-owned repositories remain open.
 
+**Upload restart recovery (19 September):** Bun claims an exclusive directory
+owner before starting registry or replication writers. The lock lives through
+normal serving and releases on process death or exec. Startup reclaims only
+recognised regular upload files, syncs the directory, and refuses a competing
+owner, unknown entry, symlinked directory or I/O error. Interrupted pushes
+restart; committed image blobs are outside this sweep. The actual Bun SIGKILL
+regression fails before implementation. A symlink regression also fails before
+the refusal is added. All 25 store tests, 13 real first-run tests and strict
+Clippy pass on macOS/Linux (two explicit rootful gates on Linux); first-run
+suites take 33.31s/17.97s. The process fixture also proves a second Bun refuses
+before serving without altering the live upload. All three real Linux rolling
+upgrade, rollback and pause/recovery cases pass with the new owner (191.46s),
+proving replacement can reacquire the directory. Lease-owned repositories and
+explicit cleanup of managed volumes still remain.
+
 ### C35 — Gate chaos capabilities per selected scenario
 
 **Priority:** P2. **Wave:** 4. **Book chapters:** 08, 15.
