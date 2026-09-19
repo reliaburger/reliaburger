@@ -2334,7 +2334,7 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
         Ok(())
     }
 
-    async fn record_job_phase(
+    async fn record_observed_job_exit(
         &mut self,
         id: &InstanceId,
         phase: super::jobs::JobPhase,
@@ -2344,6 +2344,13 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
             .get_mut(&id.0)
             .ok_or_else(|| BunError::JobState(format!("missing attempt for {id}")))?;
         job.phase = phase;
+        // A short process can exit before a PID adoption record is available.
+        // Persist its positive exit observation with the outcome, rather than
+        // asking a replacement ProcessGrill to signal an unadoptable handle.
+        // OCI runtimes retain named container resources after process exit.
+        if job.runtime == crate::grill::records::RuntimeKind::Process {
+            job.runtime_absent = true;
+        }
         self.commit_jobs(next).await
     }
 
@@ -6922,7 +6929,7 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
                     Some(code) => super::jobs::JobPhase::Exited { code },
                     None => super::jobs::JobPhase::Unknown,
                 };
-                if let Err(error) = self.record_job_phase(&id, phase).await {
+                if let Err(error) = self.record_observed_job_exit(&id, phase).await {
                     eprintln!("bun: job outcome retained as uncertain for {id}: {error}");
                     continue;
                 }
@@ -8834,7 +8841,10 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
             }
             DeployOp::ConfirmJobSuccess { instance_id, reply } => {
                 let result = self
-                    .record_job_phase(&instance_id, super::jobs::JobPhase::Exited { code: 0 })
+                    .record_observed_job_exit(
+                        &instance_id,
+                        super::jobs::JobPhase::Exited { code: 0 },
+                    )
                     .await;
                 if result.is_ok()
                     && let Some(instance) = self.supervisor.get_instance_mut(&instance_id)
@@ -14677,6 +14687,45 @@ host = "remote.local"
         }
         shutdown.cancel();
         task.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn short_job_exit_without_an_adoption_record_keeps_absence_evidence() {
+        for code in [Some(0), Some(1), None] {
+            let records = tempfile::tempdir().unwrap();
+            let (mut agent, _, _, grill) = test_agent_with_grill();
+            agent.set_records_dir(records.path().to_path_buf());
+            expect_complete(
+                &drain_deploy(
+                    &mut agent,
+                    Config::parse("[job.work]\nimage = 'test:v1'\n").unwrap(),
+                )
+                .await,
+            );
+            assert!(
+                crate::grill::records::load_records(records.path())
+                    .unwrap()
+                    .is_empty()
+            );
+            let id = InstanceId("default__work-0".into());
+            grill.set_state(&id, ContainerState::Stopped);
+            grill.set_exit_code(&id, code);
+            agent.check_jobs().await;
+            assert!(super::super::jobs::load(records.path()).unwrap()[&id.0].runtime_absent);
+            let (mut replacement, _, _, runtime) = test_agent_with_grill();
+            replacement.set_records_dir(records.path().to_path_buf());
+            replacement.adopt_recorded_instances().await.unwrap();
+            runtime.set_fail_state(true);
+            replacement
+                .retire_workload("work", "default")
+                .await
+                .unwrap();
+            assert!(
+                runtime.calls().is_empty(),
+                "positive absence must not require an unadoptable runtime handle"
+            );
+            assert!(super::super::jobs::load(records.path()).unwrap().is_empty());
+        }
     }
 
     #[tokio::test]

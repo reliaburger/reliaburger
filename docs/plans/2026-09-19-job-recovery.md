@@ -56,3 +56,29 @@ The checkpoint is schema 1 and advances durable state to generation 10;
 protocol 8 and test-lease schema 4 remain unchanged. Pre-release clusters must
 be recreated. This does not close runtime discovery before the first adoption
 record, process-tree retirement, registry/volume leases or final V01–V04 gates.
+
+Short process exit follow-up
+----------------------------
+
+Hosted macOS CI on `0b700cd` failed the physical Bun/job-lease recovery test.
+Two isolated local runs and all 13 first-run tests under nextest passed, but the
+full CI-profile run reproduced it (3,755 passed, one failed, 52 explicit gates).
+New diagnostics showed cleanup repeatedly failing on the absent `cron-0` runtime,
+preventing retirement of the surviving ordinary job.
+
+The deterministic regression proves that an observed short-process exit could
+be checkpointed without positive absence when no PID adoption record existed.
+Commit that observation atomically with the outcome, including an observed exit
+whose code is unknown. Leave unobserved launch attempts uncertain and preserve
+OCI runtime cleanup obligations. This is not a solution to the pre-observation
+crash window or escaped-descendant containment. Keep the physical test's original
+deadline and retain its new failure diagnostics.
+
+The deterministic regression passes for observed success, failure and unknown
+exit codes. All 483 native / 482 Linux Bun tests pass (one explicit gate each),
+as do strict Clippy on both platforms, the Linux physical job recovery tests and
+all 13 native first-run tests in isolation. The full native library checkpoint
+passes 3,384 tests (five gates). Full native CI-profile qualification still fails
+one physical job-lease case: 3,761 pass and 52 are skipped. Its expanded diagnostic
+shows the cron attempt is **Unknown with runtime_absent=false**, confirming the
+separate unobserved-launch window. Do not mark V02 or C34 complete on this evidence.

@@ -1337,7 +1337,7 @@ async fn node_job_lease_reaps_a_surviving_process_after_bun_is_killed() {
         wait_for_bind(&mut restarted, address),
         BunStart::Ready(_)
     ));
-    tokio::time::timeout(Duration::from_secs(25), async {
+    let recovered = tokio::time::timeout(Duration::from_secs(25), async {
         loop {
             restarted.assert_running();
             let leases = reliaburger::testkit::lease::LocalLeaseStore::open(lease_path.clone())
@@ -1365,8 +1365,35 @@ async fn node_job_lease_reaps_a_surviving_process_after_bun_is_killed() {
             tokio::time::sleep(Duration::from_millis(100)).await;
         }
     })
-    .await
-    .expect("expired job lease did not recover after Bun was killed");
+    .await;
+    if recovered.is_err() {
+        let leases = reliaburger::testkit::lease::LocalLeaseStore::open(lease_path)
+            .await
+            .unwrap();
+        let lease_state = leases.get(&lease.lease_id).await.map(|lease| lease.state);
+        let process = reliaburger::grill::records::poll_adopted_process(
+            record.pid,
+            Some(record.pid_started_at),
+        );
+        let log = std::fs::read_to_string(root.path().join("job-restarted.log")).unwrap();
+        let recovery_lines = log
+            .lines()
+            .filter(|line| {
+                ["lease", "retir", "adopt", "ownership", "failed", "error"]
+                    .iter()
+                    .any(|word| line.contains(word))
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        let jobs: serde_json::Value = serde_json::from_slice(
+            &std::fs::read(records_dir.join("job-attempts.checkpoint")).unwrap(),
+        )
+        .unwrap();
+        let attempts: Vec<_> = jobs["jobs"].as_array().unwrap().iter().map(|job| serde_json::json!({"name": job["name"], "phase": job["phase"], "runtime_absent": job["runtime_absent"]})).collect();
+        panic!(
+            "expired job lease did not recover: state={lease_state:?}, process={process:?}, attempts={attempts:?}\n{recovery_lines}"
+        );
+    }
 }
 
 #[cfg(target_os = "linux")]

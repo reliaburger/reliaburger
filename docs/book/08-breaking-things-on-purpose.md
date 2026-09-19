@@ -1313,3 +1313,32 @@ A launch claim proves that execution was attempted; it cannot identify an
 unrecorded process. Recovery keeps that case unknown and refuses to claim
 cleanup from an empty inventory. Runtime discovery and complete process-tree
 identity remain separate release requirements.
+
+### A completed job can be too quick to record its PID
+
+A cron job runs `/bin/true`. By the time Bun tries to write its PID adoption
+record, the process has already exited. The job monitor observes that exit and
+persists its outcome. Then Bun crashes. On recovery there is no PID record to
+adopt, so asking the replacement process runtime to stop that job returns
+“container not found”. If cleanup stops there, another leased job can remain
+running indefinitely.
+
+The missing information was an observation we had already made. For process
+jobs, Bun now commits positive runtime absence alongside the observed outcome,
+in the same job checkpoint. Recovery can finish retirement without asking an
+empty runtime table to supply evidence it cannot have. This applies to an exit
+with code zero, a non-zero code, and an observed exit whose code is unavailable.
+The last case remains an unknown *outcome* and still needs explicit rerun.
+
+We don't infer absence merely because a PID file is missing. An attempt whose
+launch was interrupted before any exit observation remains uncertain. OCI
+runtimes also retain named container resources after their process exits, so
+they keep their existing retirement obligation. Atomic process identity and
+complete process-group cleanup are separate work; this change preserves an exit
+observation rather than strengthening what the runtime currently promises.
+
+A deterministic test finishes a job without creating an adoption record, reopens
+its checkpoint with a fresh runtime and retires it without a signal or status
+query. The real Bun crash test also prints the retained lease state, job phases
+and recovery errors on failure. That made a CI-only timeout reproducible under
+the full native test suite, instead of hiding it behind a longer deadline.
