@@ -26,6 +26,8 @@ pub const MAX_JOIN_TOKEN_TTL: Duration = Duration::from_secs(60 * 60);
 /// Errors from join operations.
 #[derive(Debug, thiserror::Error)]
 pub enum JoinError {
+    #[error("node identity is retired; fresh enrolment under a new identity is required")]
+    NodeRetired,
     #[error("invalid join token")]
     InvalidToken,
     #[error("join token has expired")]
@@ -344,6 +346,9 @@ pub fn check_join_token(
     requested_node_id: &str,
     state: &SecurityState,
 ) -> Result<[u8; 32], JoinError> {
+    if state.crl.retired_nodes.contains_key(requested_node_id) {
+        return Err(JoinError::NodeRetired);
+    }
     let join_token = state
         .join_tokens
         .iter()
@@ -385,6 +390,9 @@ pub fn sign_join_csr(
     state: &SecurityState,
     wrapping_ikm: &[u8],
 ) -> Result<JoinResult, JoinError> {
+    if state.crl.retired_nodes.contains_key(node_id) {
+        return Err(JoinError::NodeRetired);
+    }
     let node_ca = state.get_ca(CaRole::Node).ok_or(JoinError::NoNodeCa)?;
     let wrapped_key = node_ca
         .private_key_wrapped

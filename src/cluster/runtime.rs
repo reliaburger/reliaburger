@@ -1169,7 +1169,12 @@ async fn reconcile_council_once(
     disk_pressured: &BTreeSet<u64>,
 ) {
     let now = Instant::now();
-    let snapshot = membership_rx.borrow().clone();
+    let retired = council.security_state().await.crl.retired_nodes;
+    if retired.contains_key(&self_info.name) {
+        return;
+    }
+    let mut snapshot = membership_rx.borrow().clone();
+    snapshot.retain(|member| !retired.contains_key(&member.node_id.0));
     let directory = council_directory(&snapshot, self_id, self_info, port_offset, now);
 
     let metrics = council.metrics().borrow().clone();
@@ -1248,6 +1253,35 @@ async fn reconcile_council_once(
 
     if !council.is_leader().await {
         return;
+    }
+
+    // An operator's committed fence does not need SWIM's failure timeout.
+    // The membership write still passes the shared fault/decommission guard.
+    if !change_in_flight {
+        let retired_ids: BTreeSet<u64> = membership
+            .nodes()
+            .filter(|(_, node)| retired.contains_key(&node.name))
+            .map(|(id, _)| *id)
+            .collect();
+        if !voters.is_disjoint(&retired_ids) {
+            let next = voters.difference(&retired_ids).copied().collect();
+            let result =
+                tokio::time::timeout(config.op_timeout, council.change_membership_evicting(next))
+                    .await;
+            log_membership_op("remove retired voters", result);
+            return;
+        }
+        if let Some(id) = retired_ids.iter().next() {
+            execute_council_action(
+                council,
+                CouncilAction::RemoveLearner(*id),
+                &voters,
+                &directory,
+                config.op_timeout,
+            )
+            .await;
+            return;
+        }
     }
 
     // A pressured leader never plans its own removal; it waits for a follower

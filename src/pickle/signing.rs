@@ -547,6 +547,7 @@ mod tests {
 
     fn crl_revoking(serial: crate::sesame::types::SerialNumber) -> crate::sesame::types::Crl {
         crate::sesame::types::Crl {
+            retired_nodes: Default::default(),
             entries: vec![crate::sesame::types::CrlEntry {
                 serial,
                 issuer: crate::sesame::types::CaRole::Workload,

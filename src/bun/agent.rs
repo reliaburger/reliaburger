@@ -7465,9 +7465,13 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
             }
         };
 
-        // Re-read the state after the commit so the CA material reflects the
-        // committed serial counter, then sign the joiner's CSR.
-        let security_state = council.security_state().await;
+        // Confirm the identity still has authority after consuming the token.
+        let security_state = council
+            .security_state_linearizable()
+            .await
+            .map_err(|error| BunError::SecurityError {
+                reason: error.to_string(),
+            })?;
         let join_result =
             crate::sesame::join::sign_join_csr(csr_der, node_id, serial, &security_state, ikm)
                 .map_err(|e| BunError::SecurityError {

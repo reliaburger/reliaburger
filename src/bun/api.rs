@@ -439,6 +439,7 @@ pub fn router_with_upgrade(
         )
         .route("/v1/deploys/history/{app}", get(deploys_history_handler))
         .route("/v1/rollback/{app}/{namespace}", post(rollback_handler))
+        .route("/v1/nodes/decommission", post(node_decommission_handler))
         .route("/v1/placements/{node_id}", get(placements_handler))
         .route("/v1/test/leases/retired", post(test_lease_retired_handler))
         .route("/v1/images", get(images_handler))
@@ -473,9 +474,15 @@ pub fn router_with_upgrade(
             auth_state,
             crate::sesame::auth::auth_middleware,
         ))
-        .with_state(state);
+        .with_state(state.clone());
 
-    public.merge(auth_routes).merge(protected)
+    public
+        .merge(auth_routes)
+        .merge(protected)
+        .layer(axum::middleware::from_fn_with_state(
+            state,
+            refuse_retired_tls_peer,
+        ))
 }
 
 /// Liveness check.
@@ -2860,6 +2867,126 @@ pub(crate) async fn leader_api_url(
     )
 }
 
+/// Retire an identity only on an explicit, authenticated operator attestation.
+async fn node_decommission_handler(
+    auth: Option<axum::Extension<crate::sesame::auth::AuthContext>>,
+    State(state): State<ApiState>,
+    headers: HeaderMap,
+    Json(request): Json<crate::cluster::retirement::DecommissionRequest>,
+) -> Response {
+    use crate::council::{CouncilResponse, RaftRequest};
+    let Some(auth) = auth.as_deref() else {
+        return (
+            StatusCode::UNAUTHORIZED,
+            "an authenticated operator is required",
+        )
+            .into_response();
+    };
+    if let Err(response) =
+        crate::sesame::auth::authorize_user(Some(auth), crate::sesame::types::ApiRole::Admin)
+    {
+        return response;
+    }
+    if let Err(response) = crate::sesame::auth::require_unscoped(Some(auth)) {
+        return response;
+    }
+    if let Err(error) = request.validate() {
+        return (StatusCode::BAD_REQUEST, error).into_response();
+    }
+    let Some(council) = &state.council else {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            "decommissioning requires a cluster council",
+        )
+            .into_response();
+    };
+    if !confirmed_lease_leader(council).await {
+        return forward_test_lease_request(
+            &state,
+            council,
+            reqwest::Method::POST,
+            "/v1/nodes/decommission",
+            &headers,
+            Some(&request),
+        )
+        .await;
+    }
+    let (is_self, membership_log_id) = {
+        let metrics = council.metrics();
+        let metrics = metrics.borrow();
+        (
+            metrics
+                .membership_config
+                .membership()
+                .get_node(&metrics.id)
+                .is_some_and(|node| node.name == request.node_id),
+            *metrics.membership_config.log_id(),
+        )
+    };
+    if is_self {
+        return (
+            StatusCode::CONFLICT,
+            "stop or fence the target and retry through a surviving leader",
+        )
+            .into_response();
+    }
+    let write = council.write(RaftRequest::DecommissionNode {
+        node_id: request.node_id,
+        retired_by: auth.principal_id.clone(),
+        reason: request.reason,
+        retired_at_unix_ms: crate::testkit::lease::now_unix_millis(),
+        membership_log_id,
+    });
+    match tokio::time::timeout(std::time::Duration::from_secs(10), write).await {
+        Ok(Ok(CouncilResponse::NodeDecommissioned { retirement })) => {
+            Json(retirement).into_response()
+        }
+        Ok(Ok(CouncilResponse::Refused { reason })) => {
+            (StatusCode::CONFLICT, reason).into_response()
+        }
+        Ok(Ok(_)) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "unexpected decommission response",
+        )
+            .into_response(),
+        Ok(Err(error)) => (StatusCode::SERVICE_UNAVAILABLE, error.to_string()).into_response(),
+        Err(_) => (
+            StatusCode::GATEWAY_TIMEOUT,
+            "decommission outcome unknown; repeat the same request",
+        )
+            .into_response(),
+    }
+}
+
+/// Existing TLS connections must observe an identity retirement too.
+async fn refuse_retired_tls_peer(
+    State(state): State<ApiState>,
+    request: axum::extract::Request,
+    next: axum::middleware::Next,
+) -> Response {
+    if let (Some(council), Some(peer)) = (
+        &state.council,
+        request
+            .extensions()
+            .get::<crate::sesame::renewal::TlsPeerCertificate>(),
+    ) {
+        let security = council.security_state().await;
+        let retired = crate::sesame::cert::subject_uri_sans(&peer.0).is_ok_and(|uris| {
+            uris.iter()
+                .filter_map(|uri| crate::sesame::ca::node_id_from_spiffe_uri(uri))
+                .any(|node| security.crl.retired_nodes.contains_key(node))
+        });
+        if retired {
+            return (
+                StatusCode::FORBIDDEN,
+                "node identity is retired; fresh enrolment is required",
+            )
+                .into_response();
+        }
+    }
+    next.run(request).await
+}
+
 /// `GET /v1/placements/{node_id}` — the apps (and per-node replica
 /// counts) the leader has assigned to a node. Served from the Raft
 /// state machine; reconcilers poll this every couple of seconds.
@@ -2883,6 +3010,18 @@ async fn placements_handler(
             .into_response();
     }
     let desired = council.desired_state().await;
+    if desired
+        .security_state
+        .crl
+        .retired_nodes
+        .contains_key(&node_id)
+    {
+        return (
+            StatusCode::GONE,
+            "node identity is retired; fresh enrolment is required",
+        )
+            .into_response();
+    }
     let node = crate::meat::NodeId::new(&node_id);
 
     let mut apps = Vec::new();
@@ -9328,6 +9467,81 @@ schedule = "* * * * *"
         for server in servers {
             server.await.unwrap();
         }
+    }
+
+    #[tokio::test]
+    async fn decommission_requires_unscoped_operator_attestation_and_records_its_principal() {
+        let council = seeded_council("decommission").await;
+        let (admin, admin_key) = named_user_token("operator", crate::sesame::types::ApiRole::Admin);
+        let expected_principal =
+            crate::sesame::auth::authenticate(&admin_key, std::slice::from_ref(&admin))
+                .unwrap()
+                .principal_id;
+        let (mut scoped, scoped_key) =
+            named_user_token("scoped", crate::sesame::types::ApiRole::Admin);
+        scoped.scope.namespaces = Some(vec!["default".into()]);
+        let (deployer, deployer_key) =
+            named_user_token("deployer", crate::sesame::types::ApiRole::Deployer);
+        let (app, shutdown) = setup_with_auth_leases_events_and_council(
+            vec![admin, scoped, deployer],
+            Some("internal".into()),
+            crate::bun::readiness::ReadinessTracker::new(),
+            lease_static_capabilities(),
+            None,
+            None,
+            Some(council.clone()),
+        )
+        .await;
+        let body = serde_json::json!({"node_id":"worker", "workloads_stopped":true, "reason":"powered off for maintenance"}).to_string();
+        let path = "/v1/nodes/decommission";
+        for (key, expected) in [
+            (&scoped_key, StatusCode::FORBIDDEN),
+            (&deployer_key, StatusCode::FORBIDDEN),
+            (&"internal".into(), StatusCode::FORBIDDEN),
+            (&"unknown".into(), StatusCode::UNAUTHORIZED),
+        ] {
+            assert_eq!(
+                post_authenticated(app.clone(), path, key, &body, None)
+                    .await
+                    .0,
+                expected
+            );
+        }
+        for body in [
+            r#"{"node_id":"worker","workloads_stopped":false,"reason":"maintenance"}"#,
+            r#"{"node_id":"worker","workloads_stopped":true,"reason":" "}"#,
+        ] {
+            assert_eq!(
+                post_authenticated(app.clone(), path, &admin_key, body, None)
+                    .await
+                    .0,
+                StatusCode::BAD_REQUEST
+            );
+        }
+        let (status, bytes) = post_authenticated(app.clone(), path, &admin_key, &body, None).await;
+        assert_eq!(
+            status,
+            StatusCode::OK,
+            "{}",
+            String::from_utf8_lossy(&bytes)
+        );
+        let record: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(record["retired_by"], expected_principal);
+        assert_eq!(record["node_id"], "worker");
+        let (status, again) = post_authenticated(app.clone(), path, &admin_key, &body, None).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(
+            serde_json::from_slice::<serde_json::Value>(&again).unwrap(),
+            record
+        );
+        assert_eq!(
+            get_authenticated(app, "/v1/placements/worker", "internal")
+                .await
+                .0,
+            StatusCode::GONE
+        );
+        shutdown.cancel();
+        council.shutdown().await.unwrap();
     }
 
     #[tokio::test]

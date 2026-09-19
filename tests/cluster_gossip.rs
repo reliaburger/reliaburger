@@ -498,6 +498,7 @@ async fn generated_security_model_protects_all_live_cluster_transports() {
         node.2.replace(replacement).await.unwrap();
     }
     let revoked = reliaburger::sesame::types::Crl {
+        retired_nodes: Default::default(),
         entries: (10..=12)
             .map(|serial| reliaburger::sesame::types::CrlEntry {
                 serial: SerialNumber(serial),

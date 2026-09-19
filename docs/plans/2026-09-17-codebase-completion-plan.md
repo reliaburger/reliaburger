@@ -1068,6 +1068,28 @@ case passes in 18.79s, and all three real rolling upgrade/pause-revert/cluster
 rollback cases pass in 177.58s. Operator-attested node identity retirement
 is approved as a separate feature; see the [protocol and operator plan](2026-09-19-lease-retirement.md).
 
+
+**Operator decommissioning (19 September):** `relish decommission-node` requires
+an unscoped administrator to attest external shutdown or fencing, with a reason.
+One Raft decision permanently retires the node identity, records the operator,
+original time, per-lease placement counts and any released node-fault sequence,
+and clears that node’s placement/fault obligations. Duplicate requests return
+the original evidence. Scheduling, endpoints, membership, new join tokens and
+renewal serial allocation reject retired identities. TLS checks every serial
+against identity retirement; existing API connections recheck replicated state.
+The command refuses stale/joint membership and loss of the remaining quorum.
+Returning machines need fresh state and credentials under a new node name.
+
+API, live TLS, renamed startup identity and node-fault regressions fail first.
+Snapshot recovery, stale decisions, faults on other nodes and duplicate requests
+are covered. Full library suites pass 3,351 macOS/3,405 Linux tests (five/19
+explicit gates), with strict Clippy, both binary suites, compatibility checks and
+13 renewal cases per platform. All four real cluster-failover cases pass
+(42.82s/43.27s), and all three Linux rolling upgrade/revert/rollback cases pass
+(176.56s). Generated init configs now retain their certificate’s node name.
+Protocol/state advance to 8/9; lease schema remains 4. The runbook documents the
+five-second caught-up security refresh and the need for external fencing.
+
 ### C35 — Gate chaos capabilities per selected scenario
 
 **Priority:** P2. **Wave:** 4. **Book chapters:** 08, 15.

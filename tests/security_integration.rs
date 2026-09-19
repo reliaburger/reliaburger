@@ -209,6 +209,7 @@ fn secret_rotation_finalize_drops_old_key() {
 #[test]
 fn crl_revoked_cert_rejected() {
     let crl = Crl {
+        retired_nodes: Default::default(),
         entries: vec![CrlEntry {
             serial: SerialNumber(42),
             issuer: CaRole::Node,
@@ -231,6 +232,7 @@ fn crl_revoked_cert_rejected() {
 #[test]
 fn crl_valid_cert_allowed() {
     let crl = Crl {
+        retired_nodes: Default::default(),
         entries: vec![CrlEntry {
             serial: SerialNumber(42),
             issuer: CaRole::Node,

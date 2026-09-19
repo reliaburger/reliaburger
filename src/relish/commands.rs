@@ -524,6 +524,7 @@ pub fn init_with_security(
     eprintln!("  Joiners must see the same root CA fingerprint from `relish join`.");
 
     let mut node_config = crate::config::node::NodeConfig::default();
+    node_config.node.name = Some(node_id.to_string());
     node_config.cluster.name = cluster_name.to_string();
     node_config.security.master_key_path = Some(secret_path.clone());
     node_config.security.bootstrap_path = Some(bootstrap_path.clone());
@@ -601,6 +602,46 @@ pub(super) fn node_identity_from_init(
         not_before: cert.not_before,
         not_after: cert.not_after,
     })
+}
+
+/// Retire a node identity after an operator has stopped or fenced its workloads.
+pub async fn decommission_node(
+    node_id: &str,
+    workloads_stopped: bool,
+    reason: &str,
+    output: OutputFormat,
+) -> Result<(), RelishError> {
+    let request = crate::cluster::retirement::DecommissionRequest {
+        node_id: node_id.into(),
+        workloads_stopped,
+        reason: reason.into(),
+    };
+    let retirement = BunClient::default_local()
+        .decommission_node(&request)
+        .await?;
+    match output {
+        OutputFormat::Human => {
+            let released: u128 = retirement
+                .released_placements
+                .values()
+                .map(|count| u128::from(*count))
+                .sum();
+            println!(
+                "retired node {} (operator: {}); resolved {released} placement obligations",
+                retirement.node_id, retirement.retired_by
+            );
+            println!("return requires fresh state and enrolment under a new node identity");
+        }
+        OutputFormat::Json => println!(
+            "{}",
+            serde_json::to_string_pretty(&retirement).map_err(RelishError::SerialiseJson)?
+        ),
+        OutputFormat::Yaml => print!(
+            "{}",
+            serde_yaml::to_string(&retirement).map_err(RelishError::SerialiseYaml)?
+        ),
+    }
+    Ok(())
 }
 
 /// List cluster nodes and their gossip state.

@@ -41,7 +41,7 @@ Install and usage details are in the [documentation](docs/README.md), and
 implementation status in [progress.md](docs/progress.md).
 
 0.1.0 requires a fresh cluster; development state is refused. Rolling upgrades
-require matching explicit formats (currently protocol 6 and state 7). See the
+require matching explicit formats (currently protocol 8 and state 9). See the
 [compatibility policy](docs/releasing.md#cluster-compatibility).
 Registry upload recovery reclaims abandoned partial uploads after a crash and
 requires one Bun per writable image store; see the [startup contract](docs/README.md).
@@ -56,8 +56,12 @@ names must be lowercase DNS labels; invalid names are refused before deployment.
 Rollback and halt retain replacement ownership until runtime and artifact
 cleanup are confirmed. Cluster test leases also retain former placement owners
 through rescheduling and leader changes; an unavailable worker keeps cleanup
-pending until it confirms retirement. Node-local cron registrations survive restart. Cron skips missed or uncertain firings after a
-crash; it does not promise catch-up or exactly-once job execution.
+pending until it confirms retirement. After stopping or fencing that machine, an
+administrator can use `relish decommission-node` to release its obligations and
+permanently retire its identity. Returning machines need fresh enrolment under a
+new name; see the [operator procedure](docs/README.md#decommissioning-a-node).
+Node-local cron registrations survive restart. Cron skips missed or uncertain
+firings after a crash; it does not promise catch-up or exactly-once job execution.
 
 ## Quick start
 

@@ -711,3 +711,100 @@ async fn worker_keeps_its_identity_after_malformed_or_oversized_success_response
         fixture.council.shutdown().await.unwrap();
     }
 }
+
+#[tokio::test]
+async fn decommission_rejects_existing_connections_and_requires_fresh_enrolment() {
+    use reliaburger::council::CouncilResponse;
+    let hierarchy = ca::generate_ca_hierarchy("retirement", &IKM).unwrap();
+    let council = council(&hierarchy, true).await;
+    let (leaf, _, _) = ca::issue_node_cert(
+        "old-worker",
+        SerialNumber(10),
+        &hierarchy.node.signing_keypair,
+        &hierarchy.node.certificate_params,
+    )
+    .unwrap();
+    let peer = TlsPeerCertificate(leaf.into());
+    let (old_request, _) = request("old-worker");
+    let connected = router(council.clone(), Some(peer.clone()));
+    assert_eq!(
+        post(connected.clone(), &old_request, Some("internal-token"))
+            .await
+            .status(),
+        StatusCode::OK
+    );
+    let membership_log_id = *council.metrics().borrow().membership_config.log_id();
+    assert!(matches!(
+        council
+            .write(RaftRequest::DecommissionNode {
+                node_id: "old-worker".into(),
+                retired_by: "operator".into(),
+                reason: "externally fenced".into(),
+                retired_at_unix_ms: 30,
+                membership_log_id
+            })
+            .await
+            .unwrap(),
+        CouncilResponse::NodeDecommissioned { .. }
+    ));
+    let serial = council.security_state().await.next_serial;
+    assert_eq!(
+        post(connected, &old_request, Some("internal-token"))
+            .await
+            .status(),
+        StatusCode::FORBIDDEN
+    );
+    assert!(matches!(
+        renewal::issue_renewal(&council, &peer, &old_request).await,
+        Err(RenewalError::Identity(_))
+    ));
+    assert_eq!(council.security_state().await.next_serial, serial);
+    let state = council.security_state_linearizable().await.unwrap();
+    let old_csr = BASE64.decode(&old_request.csr_b64).unwrap();
+    assert!(matches!(
+        reliaburger::sesame::join::sign_join_csr(
+            &old_csr,
+            "old-worker",
+            SerialNumber(serial),
+            &state,
+            &IKM
+        ),
+        Err(reliaburger::sesame::join::JoinError::NodeRetired)
+    ));
+    let (token_text, token) =
+        reliaburger::sesame::join::create_join_token(Duration::from_secs(60), "replacement-worker")
+            .unwrap();
+    council
+        .write(RaftRequest::CreateJoinToken(token.clone()))
+        .await
+        .unwrap();
+    let state = council.security_state_linearizable().await.unwrap();
+    assert!(
+        reliaburger::sesame::join::check_join_token(&token_text, "replacement-worker", &state)
+            .is_ok()
+    );
+    let issued_serial = match council
+        .write(RaftRequest::ConsumeJoinTokenForIssue {
+            token_hash: token.token_hash,
+        })
+        .await
+        .unwrap()
+    {
+        CouncilResponse::JoinTokenConsumed { serial } => serial,
+        other => panic!("unexpected join result: {other:?}"),
+    };
+    let (csr, private_key) = ca::create_node_csr("replacement-worker").unwrap();
+    let fresh = reliaburger::sesame::join::sign_join_csr(
+        &csr,
+        "replacement-worker",
+        SerialNumber(issued_serial),
+        &state,
+        &IKM,
+    )
+    .unwrap();
+    let enrolled = reliaburger::sesame::join::JoinBundle::from_result(&fresh)
+        .into_identity(private_key)
+        .unwrap();
+    assert_eq!(enrolled.node_id, "replacement-worker");
+    council.shutdown().await.unwrap();
+}

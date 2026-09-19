@@ -400,6 +400,10 @@ pub struct JoinToken {
 /// The cluster's certificate revocation list, distributed via gossip.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Crl {
+    /// Permanent identity retirements, retained across certificate rotation.
+    #[serde(default)]
+    pub retired_nodes:
+        std::collections::BTreeMap<String, crate::cluster::retirement::NodeRetirement>,
     /// Revoked certificate entries.
     pub entries: Vec<CrlEntry>,
     /// Monotonically increasing version, incremented on every update.
@@ -411,6 +415,7 @@ pub struct Crl {
 impl Default for Crl {
     fn default() -> Self {
         Self {
+            retired_nodes: Default::default(),
             entries: Vec::new(),
             version: 0,
             updated_at: SystemTime::UNIX_EPOCH,

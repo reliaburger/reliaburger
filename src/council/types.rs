@@ -269,6 +269,16 @@ pub enum RaftRequest {
         lease_id: String,
         placement: crate::testkit::lease::LeasedPlacement,
     },
+    /// Permanently retire an operator-fenced node and resolve its lease duties.
+    DecommissionNode {
+        node_id: String,
+        retired_by: String,
+        reason: String,
+        retired_at_unix_ms: u64,
+        membership_log_id: Option<openraft::LogId<u64>>,
+    },
+    /// Allocate a renewal serial only while the node identity remains active.
+    AllocateNodeSerial { node_id: String },
 }
 
 // ---------------------------------------------------------------------------
@@ -309,6 +319,10 @@ pub enum CouncilResponse {
     /// the token: it carries the serial allocated for the node certificate
     /// (PKI5). A racer that finds the token already consumed gets `Refused`.
     JoinTokenConsumed { serial: u64 },
+    /// Original immutable operator decision, including repeat requests.
+    NodeDecommissioned {
+        retirement: Box<crate::cluster::retirement::NodeRetirement>,
+    },
 }
 
 // ---------------------------------------------------------------------------

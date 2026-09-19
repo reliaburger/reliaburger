@@ -118,7 +118,10 @@ impl CouncilNode {
     ///
     /// Returns `ForwardToLeader` if this node is not the leader.
     pub async fn write(&self, request: RaftRequest) -> Result<CouncilResponse, CouncilError> {
-        let _membership = if matches!(&request, RaftRequest::ReserveNodeFault { .. }) {
+        let _membership = if matches!(
+            &request,
+            RaftRequest::ReserveNodeFault { .. } | RaftRequest::DecommissionNode { .. }
+        ) {
             Some(self.node_fault_membership.lock().await)
         } else {
             None
@@ -185,6 +188,15 @@ impl CouncilNode {
     /// Use `change_membership()` to promote learners to voters.
     pub async fn add_learner(&self, id: u64, info: CouncilNodeInfo) -> Result<(), CouncilError> {
         let _guard = self.guard_membership_change().await?;
+        if self
+            .security_state()
+            .await
+            .crl
+            .retired_nodes
+            .contains_key(&info.name)
+        {
+            return Err(CouncilError::WriteFailed("node identity is retired".into()));
+        }
         self.raft
             .add_learner(id, info, true)
             .await
@@ -199,6 +211,7 @@ impl CouncilNode {
     /// learners (retained, not removed).
     pub async fn change_membership(&self, members: BTreeSet<u64>) -> Result<(), CouncilError> {
         let _guard = self.guard_membership_change().await?;
+        self.refuse_retired_voters(&members).await?;
         self.raft
             .change_membership(ChangeMembers::ReplaceAllVoters(members), true)
             .await
@@ -217,10 +230,26 @@ impl CouncilNode {
         members: BTreeSet<u64>,
     ) -> Result<(), CouncilError> {
         let _guard = self.guard_membership_change().await?;
+        self.refuse_retired_voters(&members).await?;
         self.raft
             .change_membership(ChangeMembers::ReplaceAllVoters(members), false)
             .await
             .map_err(|e| CouncilError::WriteFailed(e.to_string()))?;
+        Ok(())
+    }
+
+    async fn refuse_retired_voters(&self, members: &BTreeSet<u64>) -> Result<(), CouncilError> {
+        let security = self.security_state().await;
+        let metrics = self.metrics().borrow().clone();
+        if members.iter().any(|id| {
+            metrics
+                .membership_config
+                .membership()
+                .get_node(id)
+                .is_some_and(|node| security.crl.retired_nodes.contains_key(&node.name))
+        }) {
+            return Err(CouncilError::WriteFailed("node identity is retired".into()));
+        }
         Ok(())
     }
 

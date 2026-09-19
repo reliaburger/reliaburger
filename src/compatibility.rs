@@ -15,10 +15,10 @@ pub struct Compatibility {
     pub state: u32,
 }
 
-/// Supported formats; durable lease placement retirement requires protocol seven/state eight.
+/// Supported formats; operator identity retirement requires protocol eight/state nine.
 pub const CURRENT: Compatibility = Compatibility {
-    protocol: 7,
-    state: 8,
+    protocol: 8,
+    state: 9,
 };
 
 /// Name of the durable format stamp at the root of a node's data directory.

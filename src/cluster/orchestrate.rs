@@ -140,7 +140,14 @@ pub fn spawn_leader_scheduler(
             }
 
             let desired = council.desired_state().await;
-            let members = membership_rx.borrow().clone();
+            let mut members = membership_rx.borrow().clone();
+            members.retain(|member| {
+                !desired
+                    .security_state
+                    .crl
+                    .retired_nodes
+                    .contains_key(&member.node_id.0)
+            });
             let reports = aggregated_rx.borrow().clone();
 
             // Publish the cluster endpoint catalogue every tick the backends
@@ -339,6 +346,18 @@ fn plan_scheduling_pass_with_dns(
 ) -> Vec<crate::meat::types::SchedulingDecision> {
     use crate::meat::scheduler::Scheduler;
 
+    for node_id in cache.node_ids() {
+        if desired
+            .security_state
+            .crl
+            .retired_nodes
+            .contains_key(&node_id.0)
+            && let Some(mut node) = cache.get_node(&node_id).cloned()
+        {
+            node.ready = false;
+            cache.set_node(node);
+        }
+    }
     let mut decisions = Vec::new();
     // A stable order so a pass is deterministic (HashMap iteration isn't).
     let mut app_ids: Vec<_> = desired.apps.keys().cloned().collect();
@@ -2116,6 +2135,38 @@ image = "busybox:latest"
     }
 
     /// A cordoned (upgrade) node receives nothing.
+    #[test]
+    fn decommissioned_node_is_not_scheduled_from_stale_reports() {
+        let mut cache = ClusterStateCache::new();
+        cache.set_node(sched_node("old-worker", 4000, BTreeMap::new()));
+        cache.set_node(sched_node("replacement", 4000, BTreeMap::new()));
+        let mut desired = DesiredState::default();
+        desired.security_state.crl.retired_nodes.insert(
+            "old-worker".into(),
+            crate::cluster::retirement::NodeRetirement {
+                node_id: "old-worker".into(),
+                retired_by: "operator".into(),
+                reason: "powered off".into(),
+                retired_at_unix_ms: 30,
+                released_placements: Default::default(),
+                released_node_fault: None,
+            },
+        );
+        let app = AppId::new("web", "default");
+        let mut spec = app_spec(100, 1);
+        spec.replicas = Replicas::DaemonSet;
+        desired.apps.insert(app, spec);
+        let alive = HashSet::from([NodeId::new("old-worker"), NodeId::new("replacement")]);
+        let decisions =
+            plan_scheduling_pass(&mut cache, &desired, &alive, &mut QuotaLedger::default());
+        assert_eq!(decisions.len(), 1);
+        assert_eq!(decisions[0].placements.len(), 1);
+        assert_eq!(
+            decisions[0].placements[0].node_id,
+            NodeId::new("replacement")
+        );
+    }
+
     #[test]
     fn cordoned_node_receives_no_placement() {
         let mut cache = ClusterStateCache::new();

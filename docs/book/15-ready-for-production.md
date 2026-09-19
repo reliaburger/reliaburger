@@ -3215,7 +3215,8 @@ snapshot. We require a quorum-confirmed read before publishing placements or
 answering lease inspection. Followers forward inspection with the caller's
 credentials and a one-hop marker; a loop or unavailable quorum returns an
 error. HTTP 202 means cleanup is pending. HTTP 204 means every recorded owner
-has confirmed retirement and the remaining resource records are gone.
+has confirmed retirement or been explicitly decommissioned, and the remaining
+resource records are gone.
 
 The tests move a workload between owners, restore a Raft snapshot, replay
 acknowledgements and reject late scheduling. A worker test drops a response,
@@ -3223,5 +3224,46 @@ returns a runtime error and breaks checkpoint persistence before allowing a
 successful acknowledgement. A real three-node fixture pauses the owner,
 changes leader, then resumes it with an empty journal. Cleanup must remain
 pending through the outage and finish only after that worker retires its real
-process. Operator-attested decommissioning is a separate path: it will record
+process. Operator-attested decommissioning is a separate path: it records
 who retired an identity after stopping or fencing that machine's workloads.
+
+### When a worker will never come back
+
+Worker A has been powered off for maintenance, but its lease still awaits a
+retirement acknowledgement. Waiting forever keeps the ownership record honest,
+but gives the operator no way to finish. We need a second kind of evidence:
+an explicit statement that the operator has stopped or fenced those workloads.
+
+`relish decommission-node worker-a --workloads-stopped --reason "powered off"`
+records that decision. An unscoped administrator must submit it; an ordinary
+node's shared service credential cannot. Raft stores the authenticated operator,
+reason, timestamp and the number of placement obligations released per lease.
+It clears those obligations and removes desired placements and service endpoints
+in the same state transition. Repeated requests return the original record.
+They don't manufacture a second decision or change its author.
+
+The record also retires the node identity permanently. Otherwise, an old disk
+could come back with an old certificate and resume work that the cluster has
+already forgotten. The existing live certificate revocation handle now checks
+node identities as well as serials, so obtaining another serial for the same
+identity cannot undo retirement. Enrolment, renewal, membership admission and
+scheduling all consult the durable fence. Existing API connections check their
+TLS peer identity again for each request. A returning machine needs fresh state,
+fresh credentials and a new node name.
+
+Membership changes need their own fence. The retirement request carries the
+membership log position the leader observed; Raft refuses it if that position
+has changed or a joint membership change or another node's fault is in progress.
+An outstanding fault on the retired node is resolved by the same operator
+attestation, with its sequence recorded in the retirement audit; the allocation
+counter remains intact, so late activation cannot reuse it. Raft also
+refuses a decision that would leave fewer than the current quorum outside the
+retired set. The council reconciler removes retired voters together, then removes
+retired learners. This avoids accidentally promoting a retired peer from gossip
+or getting stuck while two retired voters wait for one another's removal.
+
+None of this stops a disconnected computer. The operator must do that first.
+The durable record says *operator-attested retirement*, which is different from
+Bun observing runtime exit. The tests preserve that distinction: authenticating
+with an admin token alone is insufficient without the explicit attestation,
+while runtime acknowledgements still require the system identity.

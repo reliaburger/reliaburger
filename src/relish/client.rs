@@ -1479,6 +1479,37 @@ impl BunClient {
         Ok(json["output"].as_str().unwrap_or("").to_string())
     }
 
+    /// Permanently retire a node after explicit external workload fencing.
+    pub async fn decommission_node(
+        &self,
+        request: &crate::cluster::retirement::DecommissionRequest,
+    ) -> Result<crate::cluster::retirement::NodeRetirement, RelishError> {
+        request.validate().map_err(|reason| RelishError::ApiError {
+            status: 0,
+            body: reason.into(),
+        })?;
+        let body = serde_json::to_string(request).map_err(|error| RelishError::ApiError {
+            status: 0,
+            body: error.to_string(),
+        })?;
+        let response = self.post_json("/v1/nodes/decommission", body).await?;
+        let retirement: crate::cluster::retirement::NodeRetirement =
+            serde_json::from_value(response).map_err(|error| RelishError::ApiError {
+                status: 0,
+                body: format!("invalid decommission response: {error}"),
+            })?;
+        if retirement.node_id != request.node_id
+            || retirement.retired_by.is_empty()
+            || retirement.retired_at_unix_ms == 0
+        {
+            return Err(RelishError::ApiError {
+                status: 0,
+                body: "decommission response does not confirm this identity".into(),
+            });
+        }
+        Ok(retirement)
+    }
+
     /// Get cluster node membership.
     pub async fn nodes(&self) -> Result<Vec<NodeStatus>, RelishError> {
         let url = format!("{}/v1/cluster/nodes", self.base_url);

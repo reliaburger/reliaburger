@@ -1205,6 +1205,7 @@ mod tests {
         let catalog = catalog_with(Some(sig));
         // The signing leaf cert has serial 100; revoke it.
         let crl = crate::sesame::types::Crl {
+            retired_nodes: Default::default(),
             entries: vec![crate::sesame::types::CrlEntry {
                 serial: crate::sesame::types::SerialNumber(100),
                 issuer: crate::sesame::types::CaRole::Workload,

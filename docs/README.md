@@ -984,6 +984,7 @@ The bun agent exposes a local HTTP API on port 9117:
 | `GET` | `/v1/test/leases/{id}` | Inspect an owned lease (or inspect any lease as unscoped Admin) |
 | `POST` | `/v1/test/leases/{id}/renew` | Renew an active owned lease within the server TTL ceiling |
 | `DELETE` | `/v1/test/leases/{id}` | Start cleanup; 202 while owners remain, 204 after confirmed retirement |
+| `POST` | `/v1/nodes/decommission` | Unscoped Admin attestation; permanently retire a stopped/fenced identity and resolve its cluster lease duties |
 | `POST` | `/v1/test/leases/retired` | Internal system-only acknowledgement of an exact lease/application/node retirement |
 | `POST` | `/v1/deploys/operations/{id}/cancel` | Request node-local cooperative deploy cancellation (Deployer, all target scopes) |
 | `POST` | `/v1/apply` | Deploy workloads (TOML body) |
@@ -1034,6 +1035,40 @@ pass, failure, panic or timeout. Container cases use the official BusyBox
 `sha256:9532d8c39891ca2ecde4d30d7710e01fb739c87a8b9299685c63704296b16028`.
 The same immutable reference is accepted by the provisioned runc and Apple
 Container gates; ProcessGrill cases keep using the node's installed Bun.
+
+### Decommissioning a node
+
+If a worker cannot return to confirm cleanup, first stop Bun and all of its
+workloads and fault helpers, or fence the machine outside the cluster. An
+unscoped administrator can then permanently retire it:
+
+```bash
+relish --endpoint https://surviving-node:9117 decommission-node worker-a \
+  --workloads-stopped --reason "powered off for maintenance"
+```
+
+The command records the authenticated operator, reason and original timestamp,
+resolves that node's outstanding cluster lease placements and any node-chaos
+cleanup obligation, and fences future scheduling. It returns the same record on
+retry. A disconnected machine is not stopped by this command: `--workloads-stopped` is your attestation of external
+shutdown or fencing. Returning machines require a new node name, fresh data and
+identity directories, and a newly issued join token for that name. The retired
+identity cannot be reinstated or renewed. Ordinary application data volumes are
+not deleted by decommissioning; recover or reattach them separately after fencing.
+
+Send the request to a surviving member with quorum. The current leader cannot
+retire itself; stop or fence it and let the surviving voters elect a leader.
+Retirement refuses an in-flight membership change, a fault still owned by
+another node, or removal of the remaining quorum. Add replacement voters before
+reducing a small council further. Without quorum, use the documented disaster-recovery
+procedure instead of treating decommissioning as a consensus bypass.
+
+Identity retirement propagates through the existing replicated security state
+and live revocation refresh (up to five seconds on caught-up nodes). New TLS
+handshakes then reject any certificate naming that identity, regardless of its
+serial. API requests on existing connections also check the replicated record.
+Partitions cannot receive the update until they reconnect, which is another
+reason external fencing is required before this command.
 
 The `workload-identity` group deploys a leased container and reads its public
 certificate bundle through namespace-scoped exec on the owning node. It checks

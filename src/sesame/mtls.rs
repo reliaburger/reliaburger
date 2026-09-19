@@ -91,6 +91,18 @@ impl CrlHandle {
     /// Check every certificate in a presented chain against the CRL.
     fn check_chain(&self, chain: &[&CertificateDer<'_>]) -> Result<(), rustls::Error> {
         for der in chain {
+            if let Some(node_id) = node_id_from_leaf(der)
+                && self
+                    .inner
+                    .read()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                    .retired_nodes
+                    .contains_key(&node_id)
+            {
+                return Err(rustls::Error::InvalidCertificate(
+                    rustls::CertificateError::Revoked,
+                ));
+            }
             let serial = cert::serial_from_der(der).map_err(cert_error_to_rustls)?;
             self.check(serial).map_err(cert_error_to_rustls)?;
         }
@@ -775,6 +787,7 @@ mod tests {
 
     fn crl_with(serial: u64) -> Crl {
         Crl {
+            retired_nodes: Default::default(),
             entries: vec![CrlEntry {
                 serial: SerialNumber(serial),
                 issuer: crate::sesame::types::CaRole::Node,
@@ -924,6 +937,45 @@ mod tests {
         try_handshake(server, client)
             .await
             .expect_err("a workload cert must not authenticate as a node");
+    }
+
+    #[tokio::test]
+    async fn retired_node_identity_refuses_every_serial_and_allows_fresh_enrolment() {
+        let hierarchy = test_hierarchy("retirement");
+        let server_id = identity_from(&hierarchy, "leader", 10);
+        let old_id = identity_from(&hierarchy, "retired-worker", 11);
+        let renewed_id = identity_from(&hierarchy, "retired-worker", 12);
+        let fresh_id = identity_from(&hierarchy, "replacement-worker", 13);
+        let handle = CrlHandle::default();
+        let server = build_mtls_server_config(&server_id, handle.clone()).unwrap();
+        let client = build_mtls_client_config(&old_id, CrlHandle::default()).unwrap();
+        try_handshake(server.clone(), client.clone()).await.unwrap();
+        let mut json = serde_json::to_value(Crl::default()).unwrap();
+        json["retired_nodes"] = serde_json::json!({
+            "retired-worker": {
+                "node_id": "retired-worker", "retired_by": "token:operator",
+                "reason": "powered off for maintenance", "retired_at_unix_ms": 100,
+                "released_placements": {"run1": 2}
+            }
+        });
+        handle.update(serde_json::from_value(json).unwrap());
+        assert!(
+            try_handshake(server.clone(), client).await.is_err(),
+            "the retired identity must stop authenticating even without a serial revocation"
+        );
+        let renewed = build_mtls_client_config(&renewed_id, CrlHandle::default()).unwrap();
+        assert!(
+            try_handshake(server.clone(), renewed).await.is_err(),
+            "a different certificate serial must not revive the same identity"
+        );
+        let fresh = build_mtls_client_config(&fresh_id, CrlHandle::default()).unwrap();
+        try_handshake(server, fresh).await.unwrap();
+        let old_server = build_mtls_server_config(&old_id, CrlHandle::default()).unwrap();
+        let informed_client = build_mtls_client_config(&fresh_id, handle).unwrap();
+        assert!(
+            try_handshake(old_server, informed_client).await.is_err(),
+            "a retired server identity must be refused too"
+        );
     }
 
     #[tokio::test]

@@ -215,6 +215,20 @@ impl StateMachineInner {
                         "node fault safety requires a stable current council membership",
                     );
                 }
+                if reservation
+                    .request
+                    .target_node
+                    .as_ref()
+                    .is_some_and(|node| {
+                        self.state
+                            .security_state
+                            .crl
+                            .retired_nodes
+                            .contains_key(node)
+                    })
+                {
+                    return refuse("node identity is retired");
+                }
                 // Pressure may starve a voter just as effectively as a transport
                 // fault. Drain alone only withdraws scheduler readiness.
                 let quorum_effect = !matches!(
@@ -258,6 +272,18 @@ impl StateMachineInner {
                     .retain(|key, _| !key.starts_with(&prefix));
             }
             RaftRequest::SchedulingDecision(decision) => {
+                if decision.placements.iter().any(|placement| {
+                    self.state
+                        .security_state
+                        .crl
+                        .retired_nodes
+                        .contains_key(&placement.node_id.0)
+                }) {
+                    return Some(CouncilResponse::Refused {
+                        reason: "placement targets a retired node identity".into(),
+                    });
+                }
+
                 if decision.app_id.namespace.starts_with("rbtest-") {
                     let resource = crate::testkit::lease::LeasedResource::App {
                         app_id: decision.app_id.clone(),
@@ -363,6 +389,17 @@ impl StateMachineInner {
                 self.state.security_state = *ss.clone();
             }
             RaftRequest::CreateJoinToken(jt) => {
+                if self
+                    .state
+                    .security_state
+                    .crl
+                    .retired_nodes
+                    .contains_key(&jt.node_id)
+                {
+                    return Some(CouncilResponse::Refused {
+                        reason: "node identity is retired".into(),
+                    });
+                }
                 // Prune consumed tokens and cap the list so it can't grow
                 // without bound over a long-lived cluster (O5). Pruning keys on
                 // `consumed` (replicated state) and a fixed cap, not wall-clock
@@ -406,6 +443,17 @@ impl StateMachineInner {
                         reason: "join token not found".to_string(),
                     });
                 };
+                if self
+                    .state
+                    .security_state
+                    .crl
+                    .retired_nodes
+                    .contains_key(&token.node_id)
+                {
+                    return Some(CouncilResponse::Refused {
+                        reason: "node identity is retired".into(),
+                    });
+                }
                 if token.consumed {
                     return Some(CouncilResponse::Refused {
                         reason: "join token already consumed".to_string(),
@@ -674,6 +722,19 @@ impl StateMachineInner {
                 self.state.permissions.remove(name);
             }
             RaftRequest::PublishEndpoints(catalog) => {
+                if catalog.services.values().any(|service| {
+                    service.backends.iter().any(|backend| {
+                        self.state
+                            .security_state
+                            .crl
+                            .retired_nodes
+                            .contains_key(&backend.node_id)
+                    })
+                }) {
+                    return Some(CouncilResponse::Refused {
+                        reason: "endpoint catalogue targets a retired node identity".into(),
+                    });
+                }
                 // Wholesale replacement: the leader is the single source of
                 // truth for the catalogue, so a later publish always wins.
                 self.state.endpoint_catalog = *catalog.clone();
@@ -910,6 +971,139 @@ impl StateMachineInner {
                     attempts,
                     last_error: None,
                 };
+            }
+            RaftRequest::DecommissionNode {
+                node_id,
+                retired_by,
+                reason,
+                retired_at_unix_ms,
+                membership_log_id,
+            } => {
+                use crate::cluster::retirement::{
+                    DecommissionRequest, MAX_RETIRED_NODES, NodeRetirement,
+                };
+                let request = DecommissionRequest {
+                    node_id: node_id.clone(),
+                    workloads_stopped: true,
+                    reason: reason.clone(),
+                };
+                if request.validate().is_err()
+                    || retired_by.is_empty()
+                    || retired_by.len() > 256
+                    || *retired_at_unix_ms == 0
+                {
+                    return Some(CouncilResponse::Refused {
+                        reason: "invalid node retirement record".into(),
+                    });
+                }
+                if let Some(retirement) = self.state.security_state.crl.retired_nodes.get(node_id) {
+                    return Some(CouncilResponse::NodeDecommissioned {
+                        retirement: Box::new(retirement.clone()),
+                    });
+                }
+                if self.state.security_state.crl.retired_nodes.len() >= MAX_RETIRED_NODES {
+                    return Some(CouncilResponse::Refused {
+                        reason: "retired identity limit reached".into(),
+                    });
+                }
+                let membership = self.state.last_membership.membership();
+                if self.state.last_membership.log_id() != membership_log_id
+                    || membership.get_joint_config().len() > 1
+                {
+                    return Some(CouncilResponse::Refused {
+                        reason: "membership changed; retry decommissioning".into(),
+                    });
+                }
+                if self
+                    .state
+                    .node_fault_reservations
+                    .active
+                    .as_ref()
+                    .is_some_and(|active| {
+                        active.request.target_node.as_deref() != Some(node_id.as_str())
+                    })
+                {
+                    return Some(CouncilResponse::Refused {
+                        reason: "decommissioning waits for another node's fault reversal".into(),
+                    });
+                }
+                for voters in membership.get_joint_config() {
+                    let remaining = voters
+                        .iter()
+                        .filter(|id| {
+                            membership.get_node(id).is_some_and(|node| {
+                                node.name != *node_id
+                                    && !self
+                                        .state
+                                        .security_state
+                                        .crl
+                                        .retired_nodes
+                                        .contains_key(&node.name)
+                            })
+                        })
+                        .count();
+                    if !voters.is_empty() && remaining < voters.len() / 2 + 1 {
+                        return Some(CouncilResponse::Refused { reason: "decommissioning would remove the remaining quorum; add replacement voters first".into() });
+                    }
+                }
+                let mut released_placements = std::collections::BTreeMap::new();
+                for (lease_id, lease) in &mut self.state.test_leases {
+                    let before = lease.placements.len();
+                    lease.placements.retain(|owner| owner.node_id.0 != *node_id);
+                    let released = before - lease.placements.len();
+                    if released > 0 {
+                        released_placements.insert(lease_id.clone(), released as u64);
+                    }
+                }
+                for placements in self.state.scheduling.values_mut() {
+                    placements.retain(|placement| placement.node_id.0 != *node_id);
+                }
+                for service in self.state.endpoint_catalog.services.values_mut() {
+                    service
+                        .backends
+                        .retain(|backend| backend.node_id != *node_id);
+                }
+                let released_node_fault = self
+                    .state
+                    .node_fault_reservations
+                    .active
+                    .take()
+                    .map(|active| active.sequence);
+                let retirement = NodeRetirement {
+                    node_id: node_id.clone(),
+                    retired_by: retired_by.clone(),
+                    reason: reason.clone(),
+                    retired_at_unix_ms: *retired_at_unix_ms,
+                    released_placements,
+                    released_node_fault,
+                };
+                self.state
+                    .security_state
+                    .crl
+                    .retired_nodes
+                    .insert(node_id.clone(), retirement.clone());
+                self.state.security_state.crl.version += 1;
+                self.state.security_state.crl.updated_at = std::time::SystemTime::UNIX_EPOCH
+                    + std::time::Duration::from_millis(*retired_at_unix_ms);
+                return Some(CouncilResponse::NodeDecommissioned {
+                    retirement: Box::new(retirement),
+                });
+            }
+            RaftRequest::AllocateNodeSerial { node_id } => {
+                if self
+                    .state
+                    .security_state
+                    .crl
+                    .retired_nodes
+                    .contains_key(node_id)
+                {
+                    return Some(CouncilResponse::Refused {
+                        reason: "node identity is retired".into(),
+                    });
+                }
+                let serial = self.state.security_state.next_serial;
+                self.state.security_state.next_serial += 1;
+                return Some(CouncilResponse::SerialAllocated { serial });
             }
             RaftRequest::TestLeasePlacementRetired {
                 lease_id,
@@ -4001,6 +4195,259 @@ mod tests {
                 MAX_LEASED_PLACEMENTS
             );
         }
+    }
+
+    #[test]
+    fn decommission_resolves_only_the_fenced_nodes_fault_obligation() {
+        use crate::smoker::{
+            reservation::NodeFaultReservation,
+            types::{FaultRequest, FaultType},
+        };
+        let mut inner = StateMachineInner::default();
+        inner.state.node_fault_reservations.last_sequence = 1;
+        inner.state.node_fault_reservations.active = Some(NodeFaultReservation {
+            sequence: 1,
+            boot_id: "old-boot".into(),
+            cleanup_after_unix_ms: 100,
+            request: FaultRequest {
+                fault_type: FaultType::NodeKill {
+                    kill_containers: false,
+                },
+                target_service: String::new(),
+                namespace: None,
+                target_instance: None,
+                target_node: Some("old-worker".into()),
+                duration: std::time::Duration::from_secs(30),
+                injected_by: "operator".into(),
+                reason: None,
+                include_leader: true,
+                override_safety: true,
+                acknowledged: true,
+            },
+        });
+        let retire = |node: &str| RaftRequest::DecommissionNode {
+            node_id: node.into(),
+            retired_by: "operator".into(),
+            reason: "powered off".into(),
+            retired_at_unix_ms: 30,
+            membership_log_id: None,
+        };
+        assert!(matches!(
+            inner.apply_request(&retire("other-worker")),
+            Some(CouncilResponse::Refused { .. })
+        ));
+        assert!(inner.state.node_fault_reservations.active.is_some());
+        let response = inner.apply_request(&retire("old-worker"));
+        assert!(
+            matches!(response, Some(CouncilResponse::NodeDecommissioned { .. })),
+            "{response:?}"
+        );
+        assert!(inner.state.node_fault_reservations.active.is_none());
+        assert_eq!(inner.state.node_fault_reservations.last_sequence, 1);
+        let record =
+            serde_json::to_value(&inner.state.security_state.crl.retired_nodes["old-worker"])
+                .unwrap();
+        assert_eq!(record["released_node_fault"], 1);
+    }
+
+    #[test]
+    fn decommission_refuses_stale_membership_and_quorum_loss_without_mutation() {
+        let mut inner = StateMachineInner::default();
+        let members: std::collections::BTreeMap<_, _> = (1..=3)
+            .map(|id| {
+                (
+                    id,
+                    CouncilNodeInfo::new("127.0.0.1:9000".parse().unwrap(), format!("node-{id}")),
+                )
+            })
+            .collect();
+        inner.state.last_membership = StoredMembership::new(
+            Some(log_id(1, 1)),
+            Membership::new(vec![std::collections::BTreeSet::from([1, 2, 3])], members),
+        );
+        let request = |node: &str, observed| RaftRequest::DecommissionNode {
+            node_id: node.into(),
+            retired_by: "operator".into(),
+            reason: "powered off".into(),
+            retired_at_unix_ms: 30,
+            membership_log_id: observed,
+        };
+        assert!(matches!(
+            inner.apply_request(&request("node-3", None)),
+            Some(CouncilResponse::Refused { .. })
+        ));
+        assert!(inner.state.security_state.crl.retired_nodes.is_empty());
+        assert!(matches!(
+            inner.apply_request(&request("node-3", Some(log_id(1, 1)))),
+            Some(CouncilResponse::NodeDecommissioned { .. })
+        ));
+        assert!(matches!(
+            inner.apply_request(&request("node-2", Some(log_id(1, 1)))),
+            Some(CouncilResponse::Refused { .. })
+        ));
+        assert_eq!(inner.state.security_state.crl.retired_nodes.len(), 1);
+        // A repeat keeps its original outcome even after membership has moved.
+        assert!(matches!(
+            inner.apply_request(&request("node-3", None)),
+            Some(CouncilResponse::NodeDecommissioned { .. })
+        ));
+    }
+
+    #[test]
+    fn decommission_fences_join_tokens_and_renewal_serials_at_commit_time() {
+        let mut inner = StateMachineInner::default();
+        let (_, token) = crate::sesame::join::create_join_token(
+            std::time::Duration::from_secs(60),
+            "old-worker",
+        )
+        .unwrap();
+        inner.apply_request(&RaftRequest::CreateJoinToken(token.clone()));
+        inner.apply_request(&RaftRequest::DecommissionNode {
+            node_id: "old-worker".into(),
+            retired_by: "operator".into(),
+            reason: "powered off".into(),
+            retired_at_unix_ms: 30,
+            membership_log_id: None,
+        });
+        for request in [
+            RaftRequest::CreateJoinToken(token.clone()),
+            RaftRequest::ConsumeJoinTokenForIssue {
+                token_hash: token.token_hash,
+            },
+            RaftRequest::AllocateNodeSerial {
+                node_id: "old-worker".into(),
+            },
+        ] {
+            assert!(matches!(
+                inner.apply_request(&request),
+                Some(CouncilResponse::Refused { .. })
+            ));
+        }
+        assert_eq!(inner.state.security_state.next_serial, 0);
+        assert!(!inner.state.security_state.join_tokens[0].consumed);
+        let (_, fresh) = crate::sesame::join::create_join_token(
+            std::time::Duration::from_secs(60),
+            "fresh-worker",
+        )
+        .unwrap();
+        assert!(
+            inner
+                .apply_request(&RaftRequest::CreateJoinToken(fresh.clone()))
+                .is_none()
+        );
+        assert!(matches!(
+            inner.apply_request(&RaftRequest::ConsumeJoinTokenForIssue {
+                token_hash: fresh.token_hash
+            }),
+            Some(CouncilResponse::JoinTokenConsumed { .. })
+        ));
+    }
+
+    #[tokio::test]
+    async fn decommission_resolves_all_node_owners_and_survives_snapshot_restoration() {
+        use crate::testkit::lease::LeasedPlacement;
+        let mut sm = CouncilStateMachine::new();
+        let mut requests = Vec::new();
+        for lease_id in ["run1", "run2"] {
+            let app_id = AppId::new("web", format!("rbtest-{lease_id}"));
+            requests.extend([
+                RaftRequest::TestLeaseCreate(test_lease(lease_id, 100)),
+                RaftRequest::TestLeaseAppSpec {
+                    lease_id: lease_id.into(),
+                    observed_at_unix_ms: 20,
+                    app_id: app_id.clone(),
+                    spec: Box::new(default_spec()),
+                },
+                RaftRequest::SchedulingDecision(SchedulingDecision {
+                    app_id: app_id.clone(),
+                    placements: ["retired-worker", "surviving-worker"]
+                        .into_iter()
+                        .map(|node| Placement {
+                            node_id: NodeId::new(node),
+                            resources: Resources::new(1, 1, 0),
+                        })
+                        .collect(),
+                }),
+            ]);
+        }
+        requests.push(RaftRequest::TestLeaseBeginCleanup {
+            lease_id: "run1".into(),
+        });
+        requests.push(RaftRequest::AppDelete {
+            app_id: AppId::new("web", "rbtest-run1"),
+        });
+        for (index, request) in requests.into_iter().enumerate() {
+            let response = sm
+                .apply(vec![normal_entry(1, index as u64 + 1, request)])
+                .await
+                .unwrap();
+            assert!(!matches!(response[0], CouncilResponse::Refused { .. }));
+        }
+        let request: RaftRequest = serde_json::from_value(serde_json::json!({
+            "DecommissionNode": {"node_id":"retired-worker", "retired_by":"token:operator",
+                "reason":"powered off for maintenance", "retired_at_unix_ms":30,
+                "membership_log_id":null}
+        }))
+        .expect("Raft must expose durable node decommissioning");
+        let response = sm
+            .apply(vec![normal_entry(1, 20, request.clone())])
+            .await
+            .unwrap();
+        assert!(!matches!(response[0], CouncilResponse::Refused { .. }));
+        let mut builder = sm.get_snapshot_builder().await;
+        let snapshot = builder.build_snapshot().await.unwrap();
+        let mut restored = CouncilStateMachine::new();
+        restored
+            .install_snapshot(&snapshot.meta, snapshot.snapshot)
+            .await
+            .unwrap();
+        let mut inner = restored.inner.write().await;
+        for lease_id in ["run1", "run2"] {
+            let lease = &inner.state.test_leases[lease_id];
+            assert_eq!(lease.placements.len(), 1);
+            assert_eq!(
+                lease.placements.first().unwrap().node_id,
+                NodeId::new("surviving-worker")
+            );
+        }
+        let record = serde_json::to_value(&inner.state.security_state.crl).unwrap()["retired_nodes"]["retired-worker"].clone();
+        assert_eq!(record["retired_by"], "token:operator");
+        assert_eq!(
+            record["released_placements"],
+            serde_json::json!({"run1":1,"run2":1})
+        );
+        inner.apply_request(&request);
+        assert_eq!(
+            serde_json::to_value(&inner.state.security_state.crl).unwrap()["retired_nodes"]["retired-worker"],
+            record
+        );
+        let app_id = AppId::new("web", "rbtest-run2");
+        let schedule = |node| {
+            RaftRequest::SchedulingDecision(SchedulingDecision {
+                app_id: app_id.clone(),
+                placements: vec![Placement {
+                    node_id: NodeId::new(node),
+                    resources: Resources::new(1, 1, 0),
+                }],
+            })
+        };
+        assert!(matches!(
+            inner.apply_request(&schedule("retired-worker")),
+            Some(CouncilResponse::Refused { .. })
+        ));
+        assert!(
+            inner
+                .apply_request(&schedule("replacement-worker"))
+                .is_none()
+        );
+        assert!(
+            inner.state.test_leases["run2"]
+                .placements
+                .contains(&LeasedPlacement {
+                    app_id,
+                    node_id: NodeId::new("replacement-worker"),
+                })
+        );
     }
 
     #[tokio::test]

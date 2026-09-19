@@ -78,7 +78,9 @@ pub async fn issue_renewal(
         .wrapping_ikm()
         .ok_or_else(|| RenewalError::Unavailable("no wrapping key available".into()))?;
     let serial = match council
-        .write(RaftRequest::AllocateSerial)
+        .write(RaftRequest::AllocateNodeSerial {
+            node_id: node_id.clone(),
+        })
         .await
         .map_err(|error| RenewalError::Unavailable(error.to_string()))?
     {
@@ -141,8 +143,12 @@ fn validate_peer(peer: &TlsPeerCertificate, state: &SecurityState) -> Result<Str
             "expected exactly one node URI".into(),
         ));
     };
-    ca::node_id_from_spiffe_uri(uri)
+    let node_id = ca::node_id_from_spiffe_uri(uri)
         .filter(|node| !node.is_empty())
         .map(str::to_owned)
-        .ok_or_else(|| RenewalError::Identity("certificate does not identify a node".into()))
+        .ok_or_else(|| RenewalError::Identity("certificate does not identify a node".into()))?;
+    if state.crl.retired_nodes.contains_key(&node_id) {
+        return Err(RenewalError::Identity("node identity is retired".into()));
+    }
+    Ok(node_id)
 }

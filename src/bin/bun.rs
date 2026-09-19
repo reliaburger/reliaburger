@@ -169,6 +169,14 @@ fn cluster_params_from_config(
         None
     };
 
+    if let Some(identity) = &identity
+        && identity.snapshot().node_id != node_name
+    {
+        anyhow::bail!(
+            "configured node name differs from its certificate identity; fresh enrolment is required"
+        );
+    }
+
     Ok(reliaburger::cluster::runtime::ClusterParams {
         node_name,
         gossip_addr,
@@ -3266,6 +3274,18 @@ mod tests {
             err.to_string().contains("relish join"),
             "joiner error should point at `relish join`, got: {err}"
         );
+    }
+
+    #[test]
+    fn changing_a_node_name_requires_fresh_enrolment() {
+        let dir = tempfile::tempdir().unwrap();
+        reliaburger::relish::commands::init(dir.path(), "secure-test", "old-worker").unwrap();
+        let mut config = NodeConfig::from_file(&dir.path().join("reliaburger.toml")).unwrap();
+        config.node.name = Some("fresh-worker".into());
+        let error = cluster_params_from_config(&config)
+            .err()
+            .expect("renaming the config must not reuse the old identity");
+        assert!(error.to_string().contains("identity"));
     }
 
     #[test]

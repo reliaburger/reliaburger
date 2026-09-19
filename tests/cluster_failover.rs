@@ -123,6 +123,16 @@ async fn start_node_with_scheduler(
     root: &CancellationToken,
     schedule: bool,
 ) -> NodeHarness {
+    start_node_for_test(index, seeds, root, schedule, None).await
+}
+
+async fn start_node_for_test(
+    index: usize,
+    seeds: Vec<SocketAddr>,
+    root: &CancellationToken,
+    schedule: bool,
+    operator: Option<reliaburger::sesame::types::ApiToken>,
+) -> NodeHarness {
     let name = format!("fo{index}");
     let gossip_port = BASE_PORT + (index as u16) * 10;
     let raft_port = gossip_port + 1;
@@ -234,6 +244,36 @@ async fn start_node_with_scheduler(
     let listener = tokio::net::TcpListener::bind(local(api_port))
         .await
         .unwrap();
+    let membership_table = Arc::new(RwLock::new(Vec::new()));
+    let table = membership_table.clone();
+    let mut table_directory = directory_rx.clone();
+    let table_shutdown = shutdown.clone();
+    let table_task = tokio::spawn(async move {
+        loop {
+            let snapshot = table_directory
+                .borrow()
+                .endpoints
+                .iter()
+                .map(|(node_id, endpoints)| api::NodeMembershipInfo {
+                    node_id: node_id.clone(),
+                    address: endpoints.api_address,
+                })
+                .collect();
+            *table.write().await = snapshot;
+            tokio::select! {
+                _ = table_shutdown.cancelled() => break,
+                result = table_directory.changed() => if result.is_err() { break; },
+            }
+        }
+    });
+    let token_store = match operator {
+        Some(operator) => {
+            let store = reliaburger::sesame::auth::new_token_store();
+            store.write().await.push(operator);
+            Some(store)
+        }
+        None => None,
+    };
     let router = api::router(
         cmd_tx,
         None,
@@ -242,10 +282,10 @@ async fn start_node_with_scheduler(
         None,
         None,
         Some(Arc::clone(&council)),
-        None,
+        token_store,
         Some(RETIREMENT_SERVICE_TOKEN.into()),
         None,
-        Some(Arc::new(RwLock::new(Vec::new()))),
+        Some(membership_table),
         None,
         api_port,
         None,
@@ -270,7 +310,7 @@ async fn start_node_with_scheduler(
         directory_rx,
         api_port,
         _runtime: cluster_runtime,
-        _tasks: TestTasks::new(shutdown, vec![agent_task, api_task]),
+        _tasks: TestTasks::new(shutdown, vec![agent_task, api_task, table_task]),
     }
 }
 
@@ -747,4 +787,171 @@ async fn lease_retirement_waits_for_paused_worker_across_leader_change() {
     );
     root.cancel();
     resumed.await.unwrap();
+}
+
+/// An unreachable worker's duties can be resolved by the operator without
+/// admitting its old identity when gossip or membership catches up later.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+#[ignore = "requires RELIABURGER_CLUSTER_TESTS=1 and a multi-core host"]
+async fn decommissioned_worker_releases_cleanup_and_stays_retired_after_leader_change() {
+    use reliaburger::cluster::retirement::DecommissionRequest;
+    use reliaburger::meat::{Placement, Resources, SchedulingDecision};
+    use reliaburger::testkit::lease::{
+        LeaseError, TestLease, cleanup_cluster_lease, now_unix_millis,
+    };
+    assert!(cluster_tests_enabled());
+    let operator = reliaburger::sesame::token::create_token(
+        "operator",
+        reliaburger::sesame::types::ApiRole::Admin,
+        Default::default(),
+        None,
+    )
+    .unwrap();
+    let root = CancellationToken::new();
+    let mut nodes =
+        vec![start_node_for_test(300, vec![], &root, false, Some(operator.token.clone())).await];
+    for index in 301..303 {
+        nodes.push(
+            start_node_for_test(
+                index,
+                vec![local(BASE_PORT + 3000)],
+                &root,
+                false,
+                Some(operator.token.clone()),
+            )
+            .await,
+        );
+    }
+    wait_until("three voters", Duration::from_secs(60), async || {
+        nodes[0].voter_count() == 3
+    })
+    .await;
+    let now = now_unix_millis();
+    let lease = TestLease::new(
+        "decommission".into(),
+        "operator".into(),
+        "operator".into(),
+        "rbtest-decommission".into(),
+        now,
+        now + 600_000,
+    )
+    .unwrap();
+    let app_id = AppId::new("cleanup", &lease.namespace);
+    let mut spec = ported_service_spec(8182);
+    spec.namespace = Some(lease.namespace.clone());
+    for request in [
+        RaftRequest::TestLeaseCreate(lease.clone()),
+        RaftRequest::TestLeaseAppSpec {
+            lease_id: lease.lease_id.clone(),
+            observed_at_unix_ms: now,
+            app_id: app_id.clone(),
+            spec: Box::new(spec),
+        },
+        RaftRequest::SchedulingDecision(SchedulingDecision {
+            app_id,
+            placements: vec![Placement {
+                node_id: NodeId::new(&nodes[2].name),
+                resources: Resources::new(500, 1024 * 1024, 0),
+            }],
+        }),
+    ] {
+        assert!(!matches!(
+            nodes[0].council.write(request).await.unwrap(),
+            reliaburger::council::CouncilResponse::Refused { .. }
+        ));
+    }
+    wait_until("worker workload", Duration::from_secs(30), async || {
+        nodes[2]
+            .resolve("cleanup")
+            .await
+            .is_some_and(|view| view.total_backends == 1)
+    })
+    .await;
+    // This is the operator's external shutdown, before the attestation.
+    nodes[2].shutdown.cancel();
+    nodes[2].council.shutdown().await.unwrap();
+    tokio::time::timeout(Duration::from_secs(10), nodes[2].cmd_tx.closed())
+        .await
+        .unwrap();
+    assert!(matches!(
+        cleanup_cluster_lease(&nodes[0].council, &lease.lease_id, None).await,
+        Err(LeaseError::CleanupPending)
+    ));
+    let request = DecommissionRequest {
+        node_id: nodes[2].name.clone(),
+        workloads_stopped: true,
+        reason: "stopped for maintenance".into(),
+    };
+    // Use the real client and a follower to cover credential-preserving forwarding.
+    let client = reliaburger::relish::client::BunClient::new_with_token(
+        &format!("http://127.0.0.1:{}", nodes[1].api_port),
+        Some(&operator.plaintext),
+    );
+    let record = client.decommission_node(&request).await.unwrap();
+    assert_eq!(record.released_placements.get(&lease.lease_id), Some(&1));
+    assert_eq!(client.decommission_node(&request).await.unwrap(), record);
+    cleanup_cluster_lease(&nodes[0].council, &lease.lease_id, None)
+        .await
+        .unwrap();
+    wait_until(
+        "retired voter removed",
+        Duration::from_secs(30),
+        async || !nodes[0].voter_ids().contains(&nodes[2].raft_id),
+    )
+    .await;
+    assert!(
+        nodes[0]
+            .council
+            .add_learner(
+                nodes[2].raft_id,
+                reliaburger::council::CouncilNodeInfo::new(
+                    local(BASE_PORT + 3020 + 1),
+                    nodes[2].name.clone()
+                )
+            )
+            .await
+            .unwrap_err()
+            .to_string()
+            .contains("retired")
+    );
+    nodes.push(
+        start_node_for_test(
+            303,
+            vec![local(BASE_PORT + 3000)],
+            &root,
+            false,
+            Some(operator.token.clone()),
+        )
+        .await,
+    );
+    wait_until(
+        "fresh replacement voter",
+        Duration::from_secs(60),
+        async || nodes[0].voter_count() == 3 && nodes[0].voter_ids().contains(&nodes[3].raft_id),
+    )
+    .await;
+    nodes[0].shutdown.cancel();
+    nodes[0].council.shutdown().await.unwrap();
+    let mut leader = None;
+    wait_until(
+        "successor after decommission",
+        Duration::from_secs(60),
+        async || {
+            for index in [1, 3] {
+                if nodes[index].is_leader().await {
+                    leader = Some(index);
+                    return true;
+                }
+            }
+            false
+        },
+    )
+    .await;
+    let state = nodes[leader.unwrap()].council.desired_state().await;
+    assert_eq!(
+        state.security_state.crl.retired_nodes[&nodes[2].name],
+        record
+    );
+    assert!(!state.test_leases.contains_key(&lease.lease_id));
+    root.cancel();
 }

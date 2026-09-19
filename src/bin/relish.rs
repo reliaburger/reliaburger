@@ -154,6 +154,17 @@ enum Command {
     },
     /// List cluster nodes and their gossip state.
     Nodes,
+    /// Permanently retire a stopped or fenced node; return requires fresh enrolment.
+    DecommissionNode {
+        /// Old cluster identity to retire permanently.
+        node_id: String,
+        /// Confirm the node's workloads have been stopped or fenced externally.
+        #[arg(long, required = true)]
+        workloads_stopped: bool,
+        /// Why the node was stopped or fenced.
+        #[arg(long)]
+        reason: String,
+    },
     /// Show council (Raft) composition and status, or recover from full loss.
     Council {
         #[command(subcommand)]
@@ -1133,6 +1144,11 @@ async fn main() -> ExitCode {
             },
         ),
         Command::Nodes => commands::nodes(cli.output).await,
+        Command::DecommissionNode {
+            node_id,
+            workloads_stopped,
+            reason,
+        } => commands::decommission_node(&node_id, workloads_stopped, &reason, cli.output).await,
         Command::Council { ref action } => match action {
             None => commands::council(cli.output).await,
             Some(CouncilCommand::Recover {
@@ -1705,6 +1721,45 @@ mod tests {
             output: cli.output,
             token: cli.token,
         })
+    }
+
+    #[test]
+    fn decommission_requires_explicit_workload_attestation_and_reason() {
+        assert!(
+            Cli::try_parse_from([
+                "relish",
+                "decommission-node",
+                "worker",
+                "--reason",
+                "maintenance"
+            ])
+            .is_err()
+        );
+        assert!(
+            Cli::try_parse_from([
+                "relish",
+                "decommission-node",
+                "worker",
+                "--workloads-stopped"
+            ])
+            .is_err()
+        );
+        assert!(matches!(
+            Cli::try_parse_from([
+                "relish",
+                "decommission-node",
+                "worker",
+                "--workloads-stopped",
+                "--reason",
+                "maintenance"
+            ])
+            .unwrap()
+            .command,
+            Some(Command::DecommissionNode {
+                workloads_stopped: true,
+                ..
+            })
+        ));
     }
 
     #[test]

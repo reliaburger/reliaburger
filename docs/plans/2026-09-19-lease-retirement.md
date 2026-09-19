@@ -1,8 +1,8 @@
 # Confirm cluster lease retirement before forgetting ownership
 
-Status: confirmed cleanup approved by the user, with operator decommissioning
-as an explicit alternative to a node acknowledgement. Confirmed cleanup is
-implemented and qualified; operator decommissioning remains the next feature.
+Status: confirmed cleanup and operator decommissioning are implemented and
+qualified in separate commits, under the user-approved permanent retirement
+policy. Returning machines require fresh enrolment under a new node identity.
 
 The regression in `src/council/state_machine.rs` demonstrates the defect: an
 application moves from one worker to another, cleanup deletes desired state,
@@ -44,11 +44,14 @@ stopped. The decommission operation therefore requires an unscoped operator
 administrator to explicitly attest that the node's workloads have been stopped
 or fenced outside the cluster.
 
-Implement this as a separate commit after ordinary confirmed retirement:
+The separate operator feature provides:
 
 - Commit a durable retired-node record with the node identity, operator and
   reason. In the same state transition, resolve every cluster lease placement
-  awaiting that node and fence new scheduling to it.
+  awaiting that node and fence new scheduling to it. Resolve a node-chaos
+  obligation owned by that same fenced identity, retain the allocation counter
+  and record the released sequence in the operator audit. A fault on another
+  node still blocks the membership-affecting operation.
 - Reject attempts by the retired identity to renew or resume membership/work.
   Rejoining requires fresh state, credentials and a new node identity. A stale
   acknowledgement cannot undo retirement or affect a replacement node.
@@ -64,8 +67,10 @@ Implement this as a separate commit after ordinary confirmed retirement:
 
 ## Compatibility and operational impact
 
-The proposal changes protocol generation 6 to 7, durable state generation 7 to
-8, and lease schema 3 to 4. It requires fresh development clusters. Existing
+Confirmed retirement changes protocol generation 6 to 7, durable state generation
+7 to 8, and lease schema 3 to 4. The subsequent operator retirement feature adds
+permanent identity records and fenced serial allocation, advancing protocol/state
+to 8/9 while retaining lease schema 4. It requires fresh development clusters. Existing
 incompatible state is refused without migration or deletion. This follows the
 user-approved pre-release policy; it makes no compatibility promise between
 these development snapshots. Compatible binaries retain the existing explicit
@@ -98,5 +103,15 @@ The actual three-node paused-worker/leader-change case passes on macOS (19.50s).
 Full library suites pass 3,343 macOS and 3,397 Linux tests; strict Clippy and
 both actual-binary compatibility cases pass on both platforms. The Linux
 three-node case passes in 18.79s. All three actual rolling upgrade/pause-revert/
-cluster rollback tests pass in 177.58s. Operator decommissioning is approved
-but remains a separate implementation commit.
+cluster rollback tests pass in 177.58s.
+
+Operator retirement adds failing-first admission, TLS, renamed-identity and
+node-fault regressions. It covers snapshot restoration, duplicate decisions,
+stale membership and quorum refusal, enrolment/renewal fencing and existing API
+connections. Full library suites pass 3,351 macOS/3,405 Linux tests (five/19
+explicit gates), with strict all-target/all-feature Clippy, both binary suites,
+actual compatibility checks and 13 renewal tests per platform. All four real
+cluster-failover cases pass on macOS/Linux (42.82s/43.27s), including retirement
+through a follower, cleanup completion, old-identity admission refusal, fresh
+replacement enrolment and a subsequent leader change. All three Linux rolling
+upgrade/revert/rollback cases pass in 176.56s.
