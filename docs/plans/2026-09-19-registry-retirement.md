@@ -60,3 +60,15 @@ copy, and an actual failed deletion cannot finish after repair. They now pass
 with all 243 Pickle and 82 Raft state-machine tests on macOS/Linux, plus strict
 Clippy on both. Reapproval still refuses a newly referenced blob and deletion
 of the final advertised copy. No schema changed.
+
+## Unconfirmed cluster acceptance repair completed
+
+The real Raft regression reproduces HTTP 202 before the fix. Unknown/failed
+cluster writes now return 503. After electing the node, retry returns 201 and
+publishes the tag in the authoritative catalogue. Successful state-machine
+writes return Applied with a log index; treating only generic Ok as success was
+also incorrect and is covered by this regression. All 244 Pickle tests and
+strict all-target/all-feature Clippy pass on macOS/Linux. Local copies remain
+available for retry after refusal. Authenticated leader forwarding, including
+workers without a local council handle, remains step 3; it is not implemented
+by this status-code repair.

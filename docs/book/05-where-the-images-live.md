@@ -463,7 +463,20 @@ There was a subtler memory hole behind that hard cap. The pull *enforced* the ca
 
 ### Honest push semantics
 
-The last one is about telling the truth. A push commits locally and to Raft, then the heal loop drives it up to `[images] redundancy` copies afterwards. So what should a push *report*? Not "durable" — it isn't yet. The manifest PUT now returns `201 Created` with an `OCI-Replication: pending` header when the commit is authoritative but replication is still owed, and a distinct `202 Accepted` with `OCI-Replication: raft-uncommitted` when a council member's Raft proposal failed (the bytes are stored, but the cluster catalogue doesn't know yet). A caller reading headers can tell acceptance from durability.
+A push commits locally and to Raft, then the heal loop drives it up to
+`[images] redundancy` copies afterwards. The manifest PUT returns `201 Created`
+with `OCI-Replication: pending` only after authoritative acceptance. A failed or
+timed-out Raft proposal returns `503 Service Unavailable`; the client must retry.
+An earlier version returned 202 with a custom `raft-uncommitted` header. Generic
+OCI clients could treat that success-class response as a completed push without
+reading our header. The status itself now communicates the missing authority.
+
+The regression uses a real Raft node: an uninitialised council refuses the push,
+then election followed by the same push succeeds and exposes the tag in cluster
+state. It also checks the actual `CouncilResponse::Applied { log_index }` response
+from the state machine. Accepting only its generic `Ok` variant would reject
+successful commits. Rust's `|` pattern lets the match accept both success forms;
+other response variants remain explicit failures.
 
 The GC arbiter got stricter too. It used to recheck only sole-copy protection at deletion time. Now it rechecks against the *full catalogue reference set* immediately before approving: a blob any manifest still references — its config, a layer, or the manifest blob itself — is never approved for deletion, even if the nominating node saw it as an orphan when it built the report. A fresh push can re-reference a blob between nomination and approval; this serialised recheck is the last chance to refuse, and it takes it.
 
@@ -934,7 +947,7 @@ finish before publication. Another submits a stale collection report after the
 manifest commit. Four simultaneous pushes must all survive reopening the on-disk
 catalogue. A failed GC catalogue write must delete no bytes, and repair followed
 by retry must finish collection. Authoritative cluster acceptance remains a
-separate Raft decision; local-only acceptance still requires the caller to retry.
+separate Raft decision; an unconfirmed cluster commit returns a retryable error.
 
 ### A collection decision must survive a failed deletion
 

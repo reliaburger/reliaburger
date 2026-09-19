@@ -202,33 +202,13 @@ impl PickleState {
     }
 }
 
-/// The durability a push achieved (REG7/D11).
-///
-/// The registry commits a push locally and to Raft, then the heal loop
-/// drives it up to the configured replica count. A push therefore reports
-/// what it *actually* achieved at commit time, never a durable-redundancy
-/// success it hasn't reached yet:
-///
-/// - `Authoritative` — committed to the cluster's Raft catalogue (or
-///   locally in single-node mode). Replication to the configured replica
-///   count is still pending and the heal loop will complete it.
-/// - `RaftUncommitted` — this node is a council member but the Raft
-///   proposal failed; the bytes are stored and the local catalogue is
-///   persisted, but the cluster catalogue does **not** yet know the push.
-///   The caller must retry to obtain authoritative acceptance.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum CommitOutcome {
-    Authoritative,
-    RaftUncommitted,
-}
-
 /// Persist local ownership before publication. The blocking task owns the write
 /// guard through persistence, even when the HTTP caller is cancelled.
 pub(crate) async fn record_commit(
     state: &PickleState,
     manifest: ImageManifest,
     tag: String,
-) -> Result<CommitOutcome, super::types::PickleError> {
+) -> Result<(), super::types::PickleError> {
     use super::types::PickleError;
     let commit = ManifestCommit {
         manifest,
@@ -265,20 +245,28 @@ pub(crate) async fn record_commit(
         )
         .await
         {
-            Ok(Ok(crate::council::CouncilResponse::Ok)) => {}
+            Ok(Ok(
+                crate::council::CouncilResponse::Ok
+                | crate::council::CouncilResponse::Applied { .. },
+            )) => {}
             Ok(Ok(response)) => {
                 return Err(PickleError::ReplicationFailed(format!(
                     "manifest commit refused: {response:?}"
                 )));
             }
             Ok(Err(error)) => {
-                eprintln!("pickle: local manifest persisted but Raft commit failed: {error}");
-                return Ok(CommitOutcome::RaftUncommitted);
+                return Err(PickleError::ReplicationFailed(format!(
+                    "local manifest persisted but Raft commit failed: {error}"
+                )));
             }
-            Err(_) => return Ok(CommitOutcome::RaftUncommitted),
+            Err(_) => {
+                return Err(PickleError::ReplicationFailed(
+                    "manifest commit timed out; retry to establish cluster acceptance".into(),
+                ));
+            }
         }
     }
-    Ok(CommitOutcome::Authoritative)
+    Ok(())
 }
 
 impl PickleState {
@@ -1168,16 +1156,14 @@ async fn manifest_put(
         )
             .into_response();
     }
-    let outcome = match record_commit(state, manifest, reference.to_string()).await {
-        Ok(outcome) => outcome,
-        Err(error) => {
-            return oci_error(
-                StatusCode::INTERNAL_SERVER_ERROR,
-                "UNKNOWN",
-                error.to_string(),
-            );
-        }
-    };
+    if let Err(error) = record_commit(state, manifest, reference.to_string()).await {
+        let status = if matches!(error, super::types::PickleError::ReplicationFailed(_)) {
+            StatusCode::SERVICE_UNAVAILABLE
+        } else {
+            StatusCode::INTERNAL_SERVER_ERROR
+        };
+        return oci_error(status, "UNKNOWN", error.to_string());
+    }
 
     let mut headers = HeaderMap::new();
     headers.insert(
@@ -1187,30 +1173,13 @@ async fn manifest_put(
             .parse()
             .expect("ASCII header value"),
     );
-    // Honest push semantics (REG7/D11): the manifest is committed, but
-    // replication to the configured replica count is driven by the heal
-    // loop afterwards. Advertise that so a client (or an operator reading
-    // headers) never mistakes acceptance for full redundancy. A Raft
-    // proposal that failed on a council member is reported distinctly —
-    // the push is accepted locally but is not yet authoritative.
-    match outcome {
-        CommitOutcome::Authoritative => {
-            headers.insert(
-                "oci-replication",
-                "pending".parse().expect("ASCII header value"),
-            );
-            (StatusCode::CREATED, headers).into_response()
-        }
-        CommitOutcome::RaftUncommitted => {
-            headers.insert(
-                "oci-replication",
-                "raft-uncommitted".parse().expect("ASCII header value"),
-            );
-            // 202 Accepted: stored and persisted, but not yet in the
-            // authoritative cluster catalogue — not a clean 201.
-            (StatusCode::ACCEPTED, headers).into_response()
-        }
-    }
+    // Cluster metadata is committed. Blob redundancy still converges through
+    // the heal loop, so acceptance must not claim that replication has finished.
+    headers.insert(
+        "oci-replication",
+        axum::http::HeaderValue::from_static("pending"),
+    );
+    (StatusCode::CREATED, headers).into_response()
 }
 
 /// `GET /v2/{name}/manifests/{reference}` — pull a manifest.
@@ -1447,6 +1416,72 @@ mod tests {
             StatusCode::BAD_REQUEST
         );
         assert!(!store.has_blob(&digest));
+    }
+
+    #[tokio::test]
+    async fn a_manifest_push_requires_a_committed_cluster_catalogue() {
+        use crate::council::CouncilNode;
+        use crate::council::network::{InMemoryRaftNetworkFactory, InMemoryRaftRouter};
+        use crate::council::types::{CouncilConfig, CouncilNodeInfo};
+        let (mut state, directory) = test_state();
+        let network = InMemoryRaftRouter::new();
+        let council = Arc::new(
+            CouncilNode::new(
+                state.node_raft_id,
+                CouncilConfig::default(),
+                InMemoryRaftNetworkFactory::new(state.node_raft_id, network.clone()),
+                crate::council::log_store::MemLogStore::new(),
+                crate::council::state_machine::CouncilStateMachine::new(),
+                None,
+            )
+            .await
+            .unwrap(),
+        );
+        network
+            .register(state.node_raft_id, council.raft().clone())
+            .await;
+        state.council = Some(council.clone());
+        state.persist_path = Some(directory.path().join("catalog.json"));
+        let app = test_router(state.clone());
+        let config = push_blob(&app, "ordinary", b"config").await;
+        let body = manifest_body(&config, 6);
+        let response = put_manifest(&app, "/v2/ordinary/manifests/latest", body.clone()).await;
+        // OCI clients must receive a retryable error, not a success-class
+        // response that only a custom replication header contradicts.
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert!(council.manifest_catalog().await.manifests.is_empty());
+        assert!(state.store.has_blob(&config));
+        council
+            .initialize(std::collections::BTreeMap::from([(
+                state.node_raft_id,
+                CouncilNodeInfo {
+                    addr: "127.0.0.1:19001".parse().unwrap(),
+                    name: "registry".into(),
+                },
+            )]))
+            .await
+            .unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            while !council.is_leader().await {
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap();
+        assert_eq!(
+            put_manifest(&app, "/v2/ordinary/manifests/latest", body)
+                .await
+                .status(),
+            StatusCode::CREATED
+        );
+        assert!(
+            council
+                .manifest_catalog()
+                .await
+                .get_manifest_by_tag("ordinary", "latest")
+                .is_some()
+        );
+        council.shutdown().await.unwrap();
     }
 
     #[tokio::test]
