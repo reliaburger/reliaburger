@@ -383,6 +383,14 @@ amount * multiplier is unchecked. The debug CLI exits 101 for --since 1844674407
 
 **Completion test:** Boundary and overflow inputs in debug/release return ordinary invalid-flag errors; valid epoch and duration inputs preserve semantics.
 
+**Fault CLI follow-up (19 September):** The separate fault/test duration parser
+also multiplied minutes/hours without checking and narrowed `u128` nanoseconds
+with a truncating cast. Both boundary regressions fail before the fix.
+`checked_mul` and `u64::try_from` preserve accepted units and reject overflow
+before any request. All 19 fault-command tests pass on macOS/Linux, with strict
+all-target/all-feature Clippy on both. This closes the additional numeric bug;
+H06's library/grammar evaluation remains separate.
+
 ### C18 — Find a free port before reporting exhaustion
 
 **Priority:** P2. **Wave:** 3. **Book chapters:** 01.

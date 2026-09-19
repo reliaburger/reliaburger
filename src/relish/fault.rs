@@ -34,14 +34,24 @@ pub fn parse_duration(s: &str) -> Result<Duration, RelishError> {
             status: 0,
             body: format!("invalid duration: {s}"),
         })?;
-        return Ok(Duration::from_secs(mins * 60));
+        let seconds = mins.checked_mul(60).ok_or_else(|| RelishError::ApiError {
+            status: 0,
+            body: format!("duration {s} exceeds the supported seconds range"),
+        })?;
+        return Ok(Duration::from_secs(seconds));
     }
     if let Some(rest) = s.strip_suffix('h') {
         let hours: u64 = rest.parse().map_err(|_| RelishError::ApiError {
             status: 0,
             body: format!("invalid duration: {s}"),
         })?;
-        return Ok(Duration::from_secs(hours * 3600));
+        let seconds = hours
+            .checked_mul(3600)
+            .ok_or_else(|| RelishError::ApiError {
+                status: 0,
+                body: format!("duration {s} exceeds the supported seconds range"),
+            })?;
+        return Ok(Duration::from_secs(seconds));
     }
     // Try parsing as plain seconds
     let secs: u64 = s.parse().map_err(|_| RelishError::ApiError {
@@ -54,7 +64,10 @@ pub fn parse_duration(s: &str) -> Result<Duration, RelishError> {
 /// Parse a delay string like "200ms", "1s" into nanoseconds.
 pub fn parse_delay_ns(s: &str) -> Result<u64, RelishError> {
     let d = parse_duration(s)?;
-    Ok(d.as_nanos() as u64)
+    u64::try_from(d.as_nanos()).map_err(|_| RelishError::ApiError {
+        status: 0,
+        body: format!("delay {s} exceeds the supported nanoseconds range"),
+    })
 }
 
 /// Parse a percentage string like "10%" into a u8.
@@ -585,6 +598,29 @@ async fn inject_and_print(request: &FaultRequest) -> Result<(), RelishError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn duration_units_reject_overflow_at_the_seconds_boundary() {
+        for (suffix, multiplier) in [("m", 60_u64), ("h", 3600)] {
+            let maximum = u64::MAX / multiplier;
+            assert_eq!(
+                parse_duration(&format!("{maximum}{suffix}")).unwrap(),
+                Duration::from_secs(maximum * multiplier)
+            );
+            assert!(parse_duration(&format!("{}{suffix}", maximum + 1)).is_err());
+        }
+    }
+
+    #[test]
+    fn delay_rejects_overflow_at_the_nanoseconds_boundary() {
+        let maximum = u64::MAX / 1_000_000;
+        assert_eq!(
+            parse_delay_ns(&format!("{maximum}ms")).unwrap(),
+            maximum * 1_000_000
+        );
+        assert!(parse_delay_ns(&format!("{}ms", maximum + 1)).is_err());
+        assert!(parse_delay_ns(&format!("{}s", u64::MAX)).is_err());
+    }
 
     #[test]
     fn parse_duration_seconds() {

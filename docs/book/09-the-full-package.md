@@ -987,3 +987,20 @@ wired `cluster::orchestrate::spawn_autoscaler` remains the sole long-lived loop;
 its pure decision functions and existing tests stay in `meat::autoscaler`.
 Leaving an unused alternative around would give the next reader two conflicting
 answers to the same lifecycle question.
+
+
+### Keep duration units inside their destination type
+
+A fault duration written in minutes must fit in the seconds field we send.
+A delay must fit in a narrower nanosecond field. Those are separate limits.
+`u64::MAX` seconds is representable as a Rust `Duration`, but multiplying it by
+one billion doesn't fit in a `u64` nanosecond counter.
+
+`checked_mul` returns `Some(product)` when multiplication fits and `None` when
+it doesn't. We turn `None` into a CLI error before submitting the request.
+`u64::try_from(duration.as_nanos())` checks the separate conversion from Rust's
+`u128` nanosecond total. An `as u64` cast would truncate the high bits and submit
+a different delay. Tests exercise the largest accepted value and its immediate
+successor for minutes, hours and milliseconds converted to nanoseconds. The
+original code panics on the multiplication in a debug build and silently
+truncates the delay; both failures reproduce before the repair.
