@@ -18,6 +18,7 @@ pub mod health;
 pub mod probe;
 pub mod readiness;
 pub mod restart;
+mod schedules;
 pub mod snapshot_worker;
 pub mod supervisor;
 pub mod testapp;
@@ -34,6 +35,10 @@ use crate::grill::{GrillError, InstanceId};
 /// Errors from Bun agent operations.
 #[derive(Debug, thiserror::Error)]
 pub enum BunError {
+    /// A schedule mutation cannot establish durable ownership.
+    #[error("scheduled-job state is unavailable: {0}")]
+    ScheduleState(String),
+
     /// Startup cannot establish the complete ownership inventory.
     #[error("cannot restore workload ownership: {0}")]
     AdoptionState(String),

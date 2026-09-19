@@ -50,6 +50,7 @@ const RUN_BEFORE_TIMEOUT_SECS: u64 = 600;
 /// cron tick runs every second but a schedule matches to minute resolution, so
 /// we only fire when the stamp changes — otherwise a `* * * * *` job would fire
 /// sixty times a minute.
+#[derive(Debug, Clone, PartialEq)]
 struct ScheduledJob {
     name: String,
     namespace: String,
@@ -1529,6 +1530,8 @@ pub struct BunAgent<G: Grill> {
     /// Jobs carrying a `schedule`, registered on apply and fired by the cron
     /// tick. Keyed by (name, namespace) so a re-apply replaces the entry.
     scheduled_jobs: std::collections::HashMap<(String, String), ScheduledJob>,
+    /// A failed or cancelled write must be resolved by reloading at startup.
+    scheduled_jobs_store_uncertain: bool,
     /// Sink for container log lines. When set, each started instance spawns a
     /// forwarder that streams its output here (drained into the LogStore).
     log_tx: Option<mpsc::Sender<crate::ketchup::types::LogRecord>>,
@@ -1659,6 +1662,7 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
             deployed_specs: std::collections::HashMap::new(),
             next_deploy_gen: 1,
             scheduled_jobs: std::collections::HashMap::new(),
+            scheduled_jobs_store_uncertain: false,
             log_tx: None,
             events: None,
             capacity_cpu_millicores: 0,
@@ -1757,6 +1761,7 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
             deployed_specs: std::collections::HashMap::new(),
             next_deploy_gen: 1,
             scheduled_jobs: std::collections::HashMap::new(),
+            scheduled_jobs_store_uncertain: false,
             log_tx: None,
             events: None,
             capacity_cpu_millicores: 0,
@@ -2360,11 +2365,51 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
         let mut adopted_count = 0;
 
         let records_dir = dir.clone();
-        let records =
-            tokio::task::spawn_blocking(move || crate::grill::records::load_records(&records_dir))
-                .await
-                .map_err(|error| BunError::AdoptionState(error.to_string()))?
+        let (records, schedules) = tokio::task::spawn_blocking(move || {
+            let records = crate::grill::records::load_records(&records_dir)?;
+            let schedules = super::schedules::load(&records_dir)?;
+            Ok::<_, std::io::Error>((records, schedules))
+        })
+        .await
+        .map_err(|error| BunError::AdoptionState(error.to_string()))?
+        .map_err(|error| BunError::AdoptionState(error.to_string()))?;
+        let mut restored = std::collections::HashMap::new();
+        for stored in schedules {
+            let namespace = stored.spec.namespace.as_deref().unwrap_or("default");
+            if namespace != stored.namespace
+                || stored.name.is_empty()
+                || stored.last_fired_minute.is_some_and(|minute| minute < 0)
+            {
+                return Err(BunError::AdoptionState(
+                    "invalid scheduled-job identity or firing stamp".into(),
+                ));
+            }
+            let mut config = Config::default();
+            config.job.insert(stored.name.clone(), stored.spec.clone());
+            config
+                .validate()
                 .map_err(|error| BunError::AdoptionState(error.to_string()))?;
+            let expression = stored.spec.schedule.as_deref().ok_or_else(|| {
+                BunError::AdoptionState("recorded cron job has no schedule".into())
+            })?;
+            let schedule = crate::meat::cron::CronSchedule::parse(expression)
+                .map_err(|error| BunError::AdoptionState(error.to_string()))?;
+            let key = (stored.name.clone(), stored.namespace.clone());
+            let job = ScheduledJob {
+                name: stored.name,
+                namespace: stored.namespace,
+                spec: stored.spec,
+                schedule,
+                last_fired_minute: stored.last_fired_minute,
+            };
+            if restored.insert(key, job).is_some() {
+                return Err(BunError::AdoptionState(
+                    "duplicate scheduled-job identity".into(),
+                ));
+            }
+        }
+        self.scheduled_jobs = restored;
+        self.scheduled_jobs_store_uncertain = false;
         for record in records {
             if record.runtime != self.supervisor.grill().runtime_kind() {
                 return Err(BunError::AdoptionState(format!(
@@ -2897,6 +2942,15 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
             .validate_workload_names()
             .map_err(|error| error.to_string())?;
         for (name, spec) in &config.app {
+            let namespace = spec.namespace.as_deref().unwrap_or("default");
+            if self
+                .scheduled_jobs
+                .contains_key(&(name.clone(), namespace.to_string()))
+            {
+                return Err(format!(
+                    "workload {namespace}/{name} belongs to a registered cron job; stop it before deploying an app with that name"
+                ));
+            }
             self.supervisor
                 .admit_workload_kind(
                     name,
@@ -2971,8 +3025,16 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
         }
         // Register any cron-scheduled jobs so the event loop fires them
         // on their schedule rather than at deploy time (E).
-        if register_schedule {
-            self.register_scheduled_jobs(&config);
+        if register_schedule && let Err(error) = self.register_scheduled_jobs(&config).await {
+            let message = error.to_string();
+            operation
+                .finish(
+                    crate::bun::deploy_operations::DeployOperationOutcome::Failed,
+                    message.clone(),
+                )
+                .await;
+            let _ = events.send(ApplyEvent::Error { message }).await;
+            return;
         }
 
         // Forward deploy events to the caller, mirroring errors into the
@@ -6343,13 +6405,55 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
             .schedule_next(instance_id, now);
     }
 
-    /// Register (or refresh) the cron-scheduled jobs from an applied config.
-    ///
-    /// A job with a `schedule` is not run at deploy time; it's parked here and
-    /// fired by [`fire_due_jobs`](Self::fire_due_jobs) when its cron matches.
-    /// Re-applying an unchanged schedule preserves its last-fired stamp so the
-    /// same minute doesn't fire twice; a parse failure is logged and skipped.
-    fn register_scheduled_jobs(&mut self, config: &Config) {
+    /// Replace the schedule inventory only after its checkpoint is durable.
+    async fn commit_scheduled_jobs(
+        &mut self,
+        next: std::collections::HashMap<(String, String), ScheduledJob>,
+    ) -> Result<(), BunError> {
+        if self.scheduled_jobs_store_uncertain {
+            return Err(BunError::ScheduleState(
+                "a previous write is uncertain; restart Bun to reload the checkpoint".into(),
+            ));
+        }
+        if next == self.scheduled_jobs {
+            return Ok(());
+        }
+        if let Some(directory) = self.records_dir.clone() {
+            let records = next
+                .values()
+                .map(|job| super::schedules::RecordedSchedule {
+                    name: job.name.clone(),
+                    namespace: job.namespace.clone(),
+                    spec: job.spec.clone(),
+                    last_fired_minute: job.last_fired_minute,
+                })
+                .collect();
+            // spawn_blocking can finish after its caller is cancelled. Fence
+            // scheduling before the await until memory and disk agree again.
+            self.scheduled_jobs_store_uncertain = true;
+            // Keep both old and proposed owners reachable if writing fails or
+            // is cancelled. Retirement must not mistake either set for absent.
+            for (key, job) in &next {
+                self.scheduled_jobs
+                    .entry(key.clone())
+                    .or_insert_with(|| job.clone());
+            }
+            tokio::task::spawn_blocking(move || super::schedules::persist(&directory, records))
+                .await
+                .map_err(|error| BunError::ScheduleState(error.to_string()))?
+                .map_err(|error| BunError::ScheduleState(error.to_string()))?;
+        }
+        self.scheduled_jobs = next;
+        self.scheduled_jobs_store_uncertain = false;
+        Ok(())
+    }
+
+    /// Persist registrations and retire schedules removed by an explicit apply.
+    async fn register_scheduled_jobs(&mut self, config: &Config) -> Result<(), BunError> {
+        if config.job.is_empty() {
+            return Ok(());
+        }
+        let mut next = self.scheduled_jobs.clone();
         for (name, spec) in &config.job {
             let namespace = spec
                 .namespace
@@ -6357,32 +6461,26 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
                 .unwrap_or_else(|| "default".to_string());
             let key = (name.clone(), namespace.clone());
             let Some(expression) = spec.schedule.as_deref() else {
-                self.scheduled_jobs.remove(&key);
+                next.remove(&key);
                 continue;
             };
-            match crate::meat::cron::CronSchedule::parse(expression) {
-                Ok(schedule) => {
-                    let last_fired_minute = self
-                        .scheduled_jobs
-                        .get(&key)
-                        .filter(|existing| existing.schedule == schedule)
-                        .and_then(|existing| existing.last_fired_minute);
-                    self.scheduled_jobs.insert(
-                        key,
-                        ScheduledJob {
-                            name: name.clone(),
-                            namespace,
-                            schedule,
-                            spec: spec.clone(),
-                            last_fired_minute,
-                        },
-                    );
-                }
-                Err(error) => {
-                    eprintln!("cron: job {name} has invalid schedule {expression:?}: {error}");
-                }
-            }
+            let schedule = crate::meat::cron::CronSchedule::parse(expression)
+                .map_err(|error| BunError::ScheduleState(error.to_string()))?;
+            let last_fired_minute = next
+                .get(&key)
+                .and_then(|existing| existing.last_fired_minute);
+            next.insert(
+                key,
+                ScheduledJob {
+                    name: name.clone(),
+                    namespace,
+                    schedule,
+                    spec: spec.clone(),
+                    last_fired_minute,
+                },
+            );
         }
+        self.commit_scheduled_jobs(next).await
     }
 
     /// Fire every scheduled job whose cron matches the current UTC minute.
@@ -6392,15 +6490,28 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
     /// its epoch-minute stamp). Firing reuses the normal job deploy path with
     /// the `schedule` cleared, so the job actually runs this time.
     async fn fire_due_jobs(&mut self) {
-        if self.scheduled_jobs.is_empty() {
+        if self.scheduled_jobs.is_empty() || self.scheduled_jobs_store_uncertain {
             return;
         }
         let now = time::OffsetDateTime::now_utc();
         let minute_stamp = now.unix_timestamp().div_euclid(60);
 
         let mut due: Vec<(String, String, JobSpec)> = Vec::new();
-        for job in self.scheduled_jobs.values_mut() {
-            if job.last_fired_minute == Some(minute_stamp) {
+        let mut next = self.scheduled_jobs.clone();
+        let active = self.deploy_operations.snapshot().await.active_deploys;
+        for job in next.values_mut() {
+            if active.iter().any(|operation| {
+                operation
+                    .targets
+                    .iter()
+                    .any(|target| target.name == job.name && target.namespace == job.namespace)
+            }) {
+                continue;
+            }
+            if job
+                .last_fired_minute
+                .is_some_and(|previous| previous >= minute_stamp)
+            {
                 continue;
             }
             if job.schedule.matches(now) {
@@ -6411,6 +6522,13 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
             }
         }
 
+        if due.is_empty() {
+            return;
+        }
+        if let Err(error) = self.commit_scheduled_jobs(next).await {
+            eprintln!("cron: firing refused: {error}");
+            return;
+        }
         for (name, namespace, spec) in due {
             self.record_event(
                 crate::bun::events::EventKind::Deploy,
@@ -6831,10 +6949,13 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
     async fn stop_app(&mut self, app_name: &str, namespace: &str) -> Result<(), BunError> {
         // A schedule exists before its first instance. Retire future firings
         // even when there is no running process (or runtime cleanup fails).
-        let had_schedule = self
-            .scheduled_jobs
+        let mut next = self.scheduled_jobs.clone();
+        let had_schedule = next
             .remove(&(app_name.to_string(), namespace.to_string()))
             .is_some();
+        if had_schedule {
+            self.commit_scheduled_jobs(next).await?;
+        }
         // Get instance IDs for this app
         let instances: Vec<InstanceId> = self
             .supervisor
@@ -10308,6 +10429,253 @@ mod tests {
         );
         assert_eq!(instances[0].namespace, "rbtest-keep");
         assert_eq!(instances[0].state, "running");
+    }
+
+    #[tokio::test]
+    async fn cron_registration_and_stop_survive_agent_replacement() {
+        let directory = tempfile::tempdir().unwrap();
+        let records = directory.path().join("instances");
+        let (mut agent, tx, _shutdown) = test_agent();
+        agent.set_records_dir(records.clone());
+        agent.set_volumes_dir(directory.path().join("volumes"));
+        let task = tokio::spawn(async move { agent.run().await });
+        for namespace in ["red", "blue"] {
+            let config = Config::parse(&format!(
+                "[job.backup]\nimage = 'test:v1'\nschedule = '0 0 30 2 *'\nnamespace = '{namespace}'\n"
+            )).unwrap();
+            expect_complete(&send_deploy(&tx, config).await);
+        }
+        let (response, stopped) = oneshot::channel();
+        tx.send(AgentCommand::Stop {
+            app_name: "backup".into(),
+            namespace: "red".into(),
+            response,
+        })
+        .await
+        .unwrap();
+        stopped.await.unwrap().unwrap();
+        task.abort();
+        assert!(task.await.unwrap_err().is_cancelled());
+
+        let (mut replacement, tx, shutdown) = test_agent();
+        replacement.set_records_dir(records);
+        replacement.set_volumes_dir(directory.path().join("volumes"));
+        replacement.adopt_recorded_instances().await.unwrap();
+        let task = tokio::spawn(async move { replacement.run().await });
+        let conflicting =
+            Config::parse("[app.backup]\nimage = 'test:v1'\nnamespace = 'blue'\n").unwrap();
+        let events = send_deploy(&tx, conflicting).await;
+        assert!(events.iter().any(|event| matches!(event, ApplyEvent::Error { message } if message.contains("registered cron job"))));
+        for (namespace, exists) in [("red", false), ("blue", true)] {
+            let (response, stopped) = oneshot::channel();
+            tx.send(AgentCommand::Stop {
+                app_name: "backup".into(),
+                namespace: namespace.into(),
+                response,
+            })
+            .await
+            .unwrap();
+            let result = stopped.await.unwrap();
+            assert_eq!(result.is_ok(), exists, "{namespace}: {result:?}");
+        }
+        shutdown.cancel();
+        task.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn cron_claim_is_durable_before_launch_and_is_not_repeated_after_crash() {
+        let seconds = time::OffsetDateTime::now_utc().second();
+        if seconds >= 50 {
+            tokio::time::sleep(std::time::Duration::from_secs(u64::from(61 - seconds))).await;
+        }
+        let directory = tempfile::tempdir().unwrap();
+        let records = directory.path().join("instances");
+        let (mut agent, tx, _shutdown, grill) = test_agent_with_grill();
+        agent.set_records_dir(records.clone());
+        agent.set_volumes_dir(directory.path().join("volumes"));
+        grill.block_creates();
+        let task = tokio::spawn(async move { agent.run().await });
+        let config =
+            Config::parse("[job.once]\nimage = 'test:v1'\nschedule = '* * * * *'\n").unwrap();
+        expect_complete(&send_deploy(&tx, config).await);
+        tokio::time::timeout(std::time::Duration::from_secs(3), grill.wait_for_creates(1))
+            .await
+            .unwrap();
+        let checkpoint: serde_json::Value = serde_json::from_slice(
+            &std::fs::read(records.join("scheduled-jobs.checkpoint")).unwrap(),
+        )
+        .unwrap();
+        let claimed = checkpoint["jobs"][0]["last_fired_minute"].as_i64().unwrap();
+        assert_eq!(
+            claimed,
+            time::OffsetDateTime::now_utc()
+                .unix_timestamp()
+                .div_euclid(60)
+        );
+        task.abort();
+        assert!(task.await.unwrap_err().is_cancelled());
+        grill.release_creates(1);
+
+        let (mut replacement, _tx, shutdown, runtime) = test_agent_with_grill();
+        replacement.set_records_dir(records);
+        replacement.set_volumes_dir(directory.path().join("volumes"));
+        replacement.adopt_recorded_instances().await.unwrap();
+        let task = tokio::spawn(async move { replacement.run().await });
+        tokio::time::sleep(std::time::Duration::from_millis(2200)).await;
+        shutdown.cancel();
+        task.await.unwrap();
+        assert_eq!(
+            claimed,
+            time::OffsetDateTime::now_utc()
+                .unix_timestamp()
+                .div_euclid(60),
+            "fixture crossed the minute boundary"
+        );
+        assert!(
+            !runtime
+                .calls()
+                .iter()
+                .any(|(operation, _)| operation == "create"),
+            "recovery repeated a claimed firing"
+        );
+    }
+
+    #[tokio::test]
+    async fn failed_cron_stop_retains_checkpoint_and_fences_later_changes() {
+        let directory = tempfile::tempdir().unwrap();
+        let records = directory.path().join("instances");
+        let (mut agent, tx, shutdown) = test_agent();
+        agent.set_records_dir(records.clone());
+        agent.set_volumes_dir(directory.path().join("volumes"));
+        let task = tokio::spawn(async move { agent.run().await });
+        let config =
+            Config::parse("[job.backup]\nimage = 'test:v1'\nschedule = '0 0 30 2 *'\n").unwrap();
+        expect_complete(&send_deploy(&tx, config.clone()).await);
+        let saved = directory.path().join("saved");
+        std::fs::rename(&records, &saved).unwrap();
+        std::fs::write(&records, "blocked").unwrap();
+        let (response, stopped) = oneshot::channel();
+        tx.send(AgentCommand::Stop {
+            app_name: "backup".into(),
+            namespace: "default".into(),
+            response,
+        })
+        .await
+        .unwrap();
+        assert!(stopped.await.unwrap().is_err());
+        std::fs::remove_file(&records).unwrap();
+        std::fs::rename(&saved, &records).unwrap();
+        let events = send_deploy(&tx, config).await;
+        assert!(events.iter().any(|event| matches!(event, ApplyEvent::Error { message } if message.contains("previous write is uncertain"))));
+        shutdown.cancel();
+        task.await.unwrap();
+        let (mut replacement, _tx, _shutdown) = test_agent();
+        replacement.set_records_dir(records);
+        replacement.set_volumes_dir(directory.path().join("volumes"));
+        replacement.adopt_recorded_instances().await.unwrap();
+        assert!(
+            replacement
+                .scheduled_jobs
+                .contains_key(&("backup".into(), "default".into()))
+        );
+    }
+
+    #[tokio::test]
+    async fn cron_checkpoint_corruption_refuses_startup() {
+        let job = serde_json::json!({"name":"backup", "namespace":"default", "spec":{"image":"test:v1", "schedule":"* * * * *"}, "last_fired_minute":null});
+        let mut wrong_namespace = job.clone();
+        wrong_namespace["namespace"] = "other".into();
+        let mut invalid_schedule = job.clone();
+        invalid_schedule["spec"]["schedule"] = "bad".into();
+        let mut invalid_stamp = job.clone();
+        invalid_stamp["last_fired_minute"] = (-1).into();
+        for contents in [
+            "{broken".to_string(),
+            serde_json::json!({"schema":999,"jobs":[]}).to_string(),
+            serde_json::json!({"schema":1,"jobs":[job.clone(),job]}).to_string(),
+            serde_json::json!({"schema":1,"jobs":[wrong_namespace]}).to_string(),
+            serde_json::json!({"schema":1,"jobs":[invalid_schedule]}).to_string(),
+            serde_json::json!({"schema":1,"jobs":[invalid_stamp]}).to_string(),
+        ] {
+            let directory = tempfile::tempdir().unwrap();
+            let path = directory.path().join("scheduled-jobs.checkpoint");
+            std::fs::write(&path, &contents).unwrap();
+            let (mut agent, _tx, _shutdown) = test_agent();
+            agent.set_records_dir(directory.path().to_path_buf());
+            agent.set_volumes_dir(directory.path().join("volumes"));
+            assert!(
+                agent.adopt_recorded_instances().await.is_err(),
+                "invalid checkpoint was accepted: {contents}"
+            );
+            assert_eq!(std::fs::read_to_string(path).unwrap(), contents);
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn cron_checkpoint_refuses_symlinks_and_nonregular_files() {
+        let directory = tempfile::tempdir().unwrap();
+        let checkpoint = directory.path().join("scheduled-jobs.checkpoint");
+        let source = directory.path().join("source");
+        std::fs::write(&source, r#"{"schema":1,"jobs":[]}"#).unwrap();
+        for kind in 0..3 {
+            match kind {
+                0 => std::os::unix::fs::symlink(&source, &checkpoint).unwrap(),
+                1 => nix::unistd::mkfifo(&checkpoint, nix::sys::stat::Mode::S_IRUSR).unwrap(),
+                _ => std::fs::create_dir(&checkpoint).unwrap(),
+            }
+            let (mut agent, _tx, _shutdown) = test_agent();
+            agent.set_records_dir(directory.path().to_path_buf());
+            agent.set_volumes_dir(directory.path().join("volumes"));
+            assert!(
+                tokio::time::timeout(
+                    std::time::Duration::from_secs(2),
+                    agent.adopt_recorded_instances()
+                )
+                .await
+                .unwrap()
+                .is_err()
+            );
+            if kind == 2 {
+                std::fs::remove_dir(&checkpoint).unwrap();
+            } else {
+                std::fs::remove_file(&checkpoint).unwrap();
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn cron_registration_refuses_when_ownership_cannot_be_persisted() {
+        let directory = tempfile::tempdir().unwrap();
+        let records = directory.path().join("instances");
+        std::fs::write(&records, "not a directory").unwrap();
+        let (mut agent, tx, shutdown) = test_agent();
+        agent.set_records_dir(records);
+        agent.set_volumes_dir(directory.path().join("volumes"));
+        let task = tokio::spawn(async move { agent.run().await });
+        let config =
+            Config::parse("[job.backup]\nimage = 'test:v1'\nschedule = '0 0 30 2 *'\n").unwrap();
+        let events = send_deploy(&tx, config).await;
+        let (response, stopped) = oneshot::channel();
+        tx.send(AgentCommand::Stop {
+            app_name: "backup".into(),
+            namespace: "default".into(),
+            response,
+        })
+        .await
+        .unwrap();
+        assert!(
+            matches!(stopped.await.unwrap(), Err(BunError::ScheduleState(_))),
+            "an uncertain new registration must retain ownership"
+        );
+        shutdown.cancel();
+        task.await.unwrap();
+        assert!(
+            events
+                .iter()
+                .any(|event| matches!(event, ApplyEvent::Error { .. })),
+            "schedule was acknowledged without durable ownership: {events:?}"
+        );
     }
 
     #[tokio::test]

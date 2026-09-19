@@ -757,11 +757,25 @@ Bun tests (one explicit gate, 34.83s), 441 native Bun tests (one gate, 20.68s),
 and strict Linux/macOS Clippy pass. Durable retry budgets and recovery from
 later create/start errors remain separate work.
 
-Job schedule registrations and last-fired stamps are currently in-memory;
-adoption resets job retries to the generic restart policy. Persist the intended
-schedule and retry budget, with restart/no-duplicate-firing tests. Durable test
-leases establish cleanup ownership; they do not yet repair those execution
-continuity contracts.
+**Durable cron recovery (19 September):** Registrations, explicit retirement and
+last-fired UTC minutes now use a private, atomically replaced checkpoint. Bun
+loads the complete validated schedule inventory before serving. Each firing is
+claimed durably before launch; it waits for any existing deployment operation
+first. Failed or cancelled writes fence scheduling and retain every possible
+owner until startup reload. Recovered schedules reserve their workload names.
+The agreed 0.1.0 policy skips missed or uncertain firings: no catch-up or
+exactly-once guarantee. The pre-launch crash window can skip an occurrence.
+Three original regressions fail before implementation; a later test also
+reproduces the registration-worker race. All 446 Linux Bun tests (36.07s) and
+447 native Bun tests (21.25s; one explicit gate each), the real Bun SIGKILL
+registration/retirement test (0.27s), both actual-binary compatibility tests
+(0.01s), and strict Linux/macOS Clippy pass. Durable state advances to generation
+7; protocol 6 and lease schema 3 remain unchanged.
+
+Adoption still resets job retries to the generic restart policy. Persist the
+job execution intent and retry budget, with restart and failure tests. Durable
+test leases establish cleanup ownership; they do not by themselves repair
+execution continuity.
 Discovery of resources created before their initial runtime adoption record,
 and cluster-lease completion before every former placement confirms retirement,
 still need implementation and qualification. Controlled reconciler interruption

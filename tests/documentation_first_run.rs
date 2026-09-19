@@ -1127,6 +1127,52 @@ fn qualify_process_catalogue(group: &str) {
 }
 
 #[test]
+fn cron_registration_and_retirement_survive_bun_sigkill() {
+    let root = tempfile::tempdir().unwrap();
+    let node = write_portable_node_config(root.path());
+    let (mut bun, address) = spawn_bun_with_port_retry(false, || {
+        (
+            node.clone(),
+            reserve_address(),
+            root.path().join("cron-before.log"),
+        )
+    });
+    let endpoint = format!("http://{address}");
+    wait_for_relish(&mut bun, &["--endpoint", &endpoint, "status"]);
+    let config = root.path().join("jobs.toml");
+    std::fs::write(&config, "[job.keep]\nimage = 'proc-grill:image-ignored'\ncommand = ['/bin/true']\nschedule = '0 0 30 2 *'\n[job.remove]\nimage = 'proc-grill:image-ignored'\ncommand = ['/bin/true']\nschedule = '0 0 30 2 *'\n").unwrap();
+    assert_success(
+        &run_relish(&["--endpoint", &endpoint, "apply", config.to_str().unwrap()]),
+        "register cron jobs",
+    );
+    assert_success(
+        &run_relish(&["--endpoint", &endpoint, "stop", "remove"]),
+        "retire cron before its first firing",
+    );
+    bun.child.kill().unwrap();
+    bun.child.wait().unwrap();
+    let (mut replacement, address) = spawn_bun_with_port_retry(false, || {
+        (
+            node.clone(),
+            reserve_address(),
+            root.path().join("cron-after.log"),
+        )
+    });
+    let endpoint = format!("http://{address}");
+    wait_for_relish(&mut replacement, &["--endpoint", &endpoint, "status"]);
+    assert_success(
+        &run_relish(&["--endpoint", &endpoint, "stop", "keep"]),
+        "retire recovered cron registration",
+    );
+    assert!(
+        !run_relish(&["--endpoint", &endpoint, "stop", "remove"])
+            .status
+            .success(),
+        "retired schedule returned after Bun was killed"
+    );
+}
+
+#[test]
 fn corrupt_workload_ownership_refuses_startup_before_the_api_listens() {
     let root = tempfile::tempdir().unwrap();
     let config = write_portable_node_config(root.path());

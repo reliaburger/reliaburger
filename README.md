@@ -41,10 +41,12 @@ Install and usage details are in the [documentation](docs/README.md), and
 implementation status in [progress.md](docs/progress.md).
 
 0.1.0 requires a fresh cluster; development state is refused. Rolling upgrades
-require matching explicit formats (currently protocol 6 and state 6). See the
+require matching explicit formats (currently protocol 6 and state 7). See the
 [compatibility policy](docs/releasing.md#cluster-compatibility).
 Restart also refuses unreadable ownership records or uncertain runtime adoption,
-preserving records and workload identities for recovery.
+preserving records and workload identities for recovery. Node-local cron
+registrations survive restart. Cron skips missed or uncertain firings after a
+crash; it does not promise catch-up or exactly-once job execution.
 
 ## Quick start
 

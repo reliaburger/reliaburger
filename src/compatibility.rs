@@ -15,10 +15,10 @@ pub struct Compatibility {
     pub state: u32,
 }
 
-/// Supported formats; scoped node-job leases require generation six.
+/// Supported formats; durable cron registrations require state generation seven.
 pub const CURRENT: Compatibility = Compatibility {
     protocol: 6,
-    state: 6,
+    state: 7,
 };
 
 /// Name of the durable format stamp at the root of a node's data directory.

@@ -30,6 +30,13 @@ that is down retains its record until it can run cleanup again. These leases
 support job-only manifests and use server-selected namespaces. Ordinary jobs
 remain node-local; this does not introduce cluster job scheduling.
 
+Cron registrations and their latest claimed UTC minute persist before apply,
+stop or launch is acknowledged. Bun restores them before serving the API.
+Missed minutes are skipped; a crash after recording a firing but before launch
+can skip that occurrence too. There is no catch-up or exactly-once execution
+promise. Job retries are separate. An uncertain checkpoint write fences further
+cron changes and firings until Bun restarts and reloads its durable state.
+
 Startup refuses unreadable or malformed workload ownership records and runtime
 adoption errors before serving the API. It preserves records and identity files
 for recovery; inspect the reported path or runtime error and retry once repaired.
@@ -44,7 +51,7 @@ returns an error with the log path; `--yes` still configures without starting a
 background node. The public installer remains in development.
 
 0.1.0 requires a fresh cluster; development state is refused. Rolling upgrades
-require matching explicit formats (currently protocol 6 and state 6). See the
+require matching explicit formats (currently protocol 6 and state 7). See the
 [compatibility policy](releasing.md#cluster-compatibility).
 
 Reporting refuses messages over 1 MiB or containing more than 100 events;

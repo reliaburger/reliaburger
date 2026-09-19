@@ -1165,3 +1165,45 @@ error and a stalled kill. Each fails against the old driver. After the repair,
 each keeps ownership and completes the same pending retry once the fault is
 removed. This preserves the retry count in memory; persisting job retry budgets
 across a Bun restart is separate work.
+
+### Remember the schedule before promising to run it
+
+You register a nightly backup, restart Bun before midnight, and expect the
+backup still to exist. An in-memory cron map couldn't honour that expectation.
+We now checkpoint the complete node-local schedule inventory before acknowledging
+a registration or stop. The same checkpoint records the claimed UTC minute
+before launching a due occurrence. Startup validates it before serving the API.
+
+For 0.1.0 we deliberately skip missed or uncertain firings. If Bun dies after
+recording a claim but before launching the process, that occurrence can be
+skipped. Restart won't launch it again merely because the current minute still
+matches. Job retries are a separate policy, so this isn't a promise that an
+application's side effects happen exactly once. A clock moving backwards also
+cannot replay an already claimed minute. Changing a schedule retains its most
+recent claim; stopping it explicitly retires that registration.
+
+The checkpoint stores job specifications and minute stamps, not the cron
+parser's private representation. On startup we validate the specifications,
+parse their expressions and reject duplicate or mismatched identities, corrupt
+JSON and unknown schemas. The file is private, replaced atomically and synced
+with its directory. Blocking filesystem work runs on `spawn_blocking`.
+
+Cancellation needs care here. Dropping the future waiting for a blocking write
+doesn't stop the writer. Before awaiting it, Bun fences cron work and keeps
+both the previous and proposed owners reachable. Only a completed durable write
+lets it replace the in-memory inventory and clear that fence. On error, restart
+must reload the checkpoint; neither an uncertain new registration nor an
+uncertain deletion may be mistaken for an absent job. Unrelated app stops can
+still proceed.
+
+A due occurrence also waits for an existing deployment operation for that name
+to finish before claiming its minute. Otherwise the first health tick can race
+the registration worker, record the occurrence, then have its own launch
+refused as busy. Our blocked-runtime fixture caught that ordering problem.
+
+Tests replace the agent before a schedule's first run, keep namespace-specific
+retirement durable, reject failed writes and corrupt state, and interrupt a
+firing after its checkpoint but before runtime creation finishes. An actual
+Bun/Relish fixture kills Bun and verifies that acknowledged registrations and
+stops survive. These changes advance durable state to generation 7; protocol 6
+and test-lease schema 3 remain unchanged.
