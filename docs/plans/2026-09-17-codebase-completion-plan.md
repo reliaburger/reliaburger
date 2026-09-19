@@ -935,6 +935,17 @@ Linux placement cases pass (154.71s). The VM has Buildah, so the two absence tes
 run successfully as separate child processes with an empty PATH rather than
 being skipped or changing installed tools.
 
+**Rollout runtime retirement (19 September):** Rolling and blue-green workers
+now share normal Stop's bounded signal/observation helpers. Failed, ignored or
+stalled kills and inspection errors refuse finalisation. An initial regression
+shows a failed kill still producing Complete; a stronger regression then exposes
+untracked already-started replacements. The failure path now registers those
+replacements for ordinary Stop/Retire while preserving the old owner. All eight
+strategy/fault combinations verify both generations and later successful cleanup
+(8.22s). The complete Bun suites pass 456 native/455 Linux cases (one explicit
+gate each, 21.40s/37.39s), with strict Clippy on both. Rollout artifact-finalisation,
+halt and rollback cleanup remain separate open work.
+
 ### C35 — Gate chaos capabilities per selected scenario
 
 **Priority:** P2. **Wave:** 4. **Book chapters:** 08, 15.

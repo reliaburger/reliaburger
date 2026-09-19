@@ -46,6 +46,7 @@ pub struct MockGrill {
     fail_create: Arc<AtomicBool>,
     fail_start: Arc<AtomicBool>,
     fail_state: Arc<AtomicBool>,
+    inspection_failures: Arc<Mutex<std::collections::HashSet<InstanceId>>>,
 }
 
 impl Default for MockGrill {
@@ -76,6 +77,7 @@ impl Default for MockGrill {
             fail_create: Arc::default(),
             fail_start: Arc::default(),
             fail_state: Arc::default(),
+            inspection_failures: Arc::default(),
         }
     }
 }
@@ -109,6 +111,16 @@ impl MockGrill {
     /// Make runtime state inspection fail without proving absence.
     pub fn set_fail_state(&self, value: bool) {
         self.fail_state.store(value, Ordering::SeqCst);
+    }
+
+    /// Fail state inspection only for the named instance.
+    pub fn set_instance_inspection_failure(&self, instance: &InstanceId, fail: bool) {
+        let mut failures = self.inspection_failures.lock().unwrap();
+        if fail {
+            failures.insert(instance.clone());
+        } else {
+            failures.remove(instance);
+        }
     }
 
     /// Return a clone of all recorded calls.
@@ -349,7 +361,9 @@ impl super::Grill for MockGrill {
             .lock()
             .unwrap()
             .push(("state".to_string(), instance.clone()));
-        if self.fail_state.load(Ordering::SeqCst) {
+        if self.fail_state.load(Ordering::SeqCst)
+            || self.inspection_failures.lock().unwrap().contains(instance)
+        {
             return Err(GrillError::StartFailed {
                 instance: instance.clone(),
                 reason: "injected state inspection failure".into(),
@@ -418,7 +432,9 @@ impl super::Grill for MockGrill {
             .lock()
             .unwrap()
             .push(("adopt".to_string(), instance.clone()));
-        if self.fail_state.load(Ordering::SeqCst) {
+        if self.fail_state.load(Ordering::SeqCst)
+            || self.inspection_failures.lock().unwrap().contains(instance)
+        {
             return Err(GrillError::StateUnavailable {
                 instance: instance.clone(),
                 reason: "simulated adoption inspection failure".into(),

@@ -99,7 +99,7 @@ async fn drain_and_stop_instance<G: Grill>(
     grill: &G,
     id: &InstanceId,
     drain_timeout: std::time::Duration,
-) {
+) -> Result<(), BunError> {
     let cmd = crate::wrapper::draining::DrainCommand {
         app_name: String::new(),
         instance_id: id.0.clone(),
@@ -108,16 +108,63 @@ async fn drain_and_stop_instance<G: Grill>(
     drains.start_drain(&cmd).await;
     drains.wait_drained(&id.0).await;
 
-    let _ = grill.stop(id).await;
-    let deadline = Instant::now() + drain_timeout;
-    while Instant::now() < deadline {
-        if matches!(grill.state(id).await, Ok(ContainerState::Stopped)) {
-            return;
-        }
-        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    stop_runtime_instance(grill, id, drain_timeout).await
+}
+
+/// Stop one instance, requiring observed exit even after force-kill.
+async fn stop_runtime_instance<G: Grill>(
+    grill: &G,
+    id: &InstanceId,
+    grace: std::time::Duration,
+) -> Result<(), BunError> {
+    let signal_timeout = std::time::Duration::from_secs(2);
+    tokio::time::timeout(signal_timeout, grill.stop(id))
+        .await
+        .map_err(|_| BunError::StopUnconfirmed {
+            instance_id: id.clone(),
+            reason: "graceful stop request timed out",
+        })??;
+    if observe_runtime_exit(grill, id, grace).await? {
+        return Ok(());
     }
-    if !matches!(grill.state(id).await, Ok(ContainerState::Stopped)) {
-        let _ = grill.kill(id).await;
+    kill_runtime_instance(grill, id).await
+}
+
+/// Preserve ownership until both force-kill and observed runtime exit succeed.
+async fn kill_runtime_instance<G: Grill>(grill: &G, id: &InstanceId) -> Result<(), BunError> {
+    let signal_timeout = std::time::Duration::from_secs(2);
+    tokio::time::timeout(signal_timeout, grill.kill(id))
+        .await
+        .map_err(|_| BunError::StopUnconfirmed {
+            instance_id: id.clone(),
+            reason: "force-kill request timed out",
+        })??;
+    if observe_runtime_exit(grill, id, signal_timeout).await? {
+        return Ok(());
+    }
+    Err(BunError::StopUnconfirmed {
+        instance_id: id.clone(),
+        reason: "runtime did not confirm exit after force-kill",
+    })
+}
+
+/// Bound the whole observation loop, including a stalled runtime query.
+async fn observe_runtime_exit<G: Grill>(
+    grill: &G,
+    id: &InstanceId,
+    wait: std::time::Duration,
+) -> Result<bool, BunError> {
+    let observation = async {
+        loop {
+            if grill.state(id).await? == ContainerState::Stopped {
+                return Ok::<(), BunError>(());
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        }
+    };
+    match tokio::time::timeout(wait, observation).await {
+        Ok(result) => result.map(|()| true),
+        Err(_) => Ok(false),
     }
 }
 
@@ -630,6 +677,11 @@ enum DeployOp {
         instance: Box<RollingInstance>,
         reply: oneshot::Sender<Result<(), BunError>>,
     },
+    /// Keep a started replacement reachable through ordinary Stop after a failed cut-over.
+    RetainRollingInstance {
+        instance: Box<RollingInstance>,
+        reply: oneshot::Sender<Result<(), BunError>>,
+    },
     /// Roll a failed rolling redeploy back: kill and clean up the new
     /// instances, release their ports, drop their identity dirs, record it.
     RollbackRollingDeploy {
@@ -1036,6 +1088,20 @@ impl DeployOps {
         };
         self.call(
             |reply| DeployOp::RegisterRollingInstance {
+                instance: Box::new(instance),
+                reply,
+            },
+            Err(missing),
+        )
+        .await
+    }
+
+    async fn retain_rolling_instance(&self, instance: RollingInstance) -> Result<(), BunError> {
+        let missing = BunError::InstanceNotFound {
+            instance_id: instance.instance_id.clone(),
+        };
+        self.call(
+            |reply| DeployOp::RetainRollingInstance {
                 instance: Box::new(instance),
                 reply,
             },
@@ -8136,55 +8202,12 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
         id: &InstanceId,
         grace: std::time::Duration,
     ) -> Result<(), BunError> {
-        let signal_timeout = std::time::Duration::from_secs(2);
-        tokio::time::timeout(signal_timeout, self.supervisor.grill().stop(id))
-            .await
-            .map_err(|_| BunError::StopUnconfirmed {
-                instance_id: id.clone(),
-                reason: "graceful stop request timed out",
-            })??;
-        if self.wait_for_runtime_exit(id, grace).await? {
-            return Ok(());
-        }
-        self.kill_and_wait_for_exit(id).await
+        stop_runtime_instance(self.supervisor.grill(), id, grace).await
     }
 
     /// Preserve ownership until both force-kill and observed runtime exit succeed.
     async fn kill_and_wait_for_exit(&self, id: &InstanceId) -> Result<(), BunError> {
-        let signal_timeout = std::time::Duration::from_secs(2);
-        tokio::time::timeout(signal_timeout, self.supervisor.grill().kill(id))
-            .await
-            .map_err(|_| BunError::StopUnconfirmed {
-                instance_id: id.clone(),
-                reason: "force-kill request timed out",
-            })??;
-        if self.wait_for_runtime_exit(id, signal_timeout).await? {
-            return Ok(());
-        }
-        Err(BunError::StopUnconfirmed {
-            instance_id: id.clone(),
-            reason: "runtime did not confirm exit after force-kill",
-        })
-    }
-
-    /// Bound the whole observation loop, including a stalled runtime query.
-    async fn wait_for_runtime_exit(
-        &self,
-        id: &InstanceId,
-        wait: std::time::Duration,
-    ) -> Result<bool, BunError> {
-        let observation = async {
-            loop {
-                if self.supervisor.grill().state(id).await? == ContainerState::Stopped {
-                    return Ok::<(), BunError>(());
-                }
-                tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-            }
-        };
-        match tokio::time::timeout(wait, observation).await {
-            Ok(result) => result.map(|()| true),
-            Err(_) => Ok(false),
-        }
+        kill_runtime_instance(self.supervisor.grill(), id).await
     }
 
     /// Add one freshly-healthy replacement to the service map and rebuild the
@@ -8520,6 +8543,54 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
                     );
                 }
                 let _ = reply.send(result);
+            }
+            DeployOp::RetainRollingInstance { instance, reply } => {
+                let id = instance.instance_id.clone();
+                if !self.supervisor.instances.contains_key(&id) {
+                    let health_config = instance.spec.health.as_ref().zip(instance.spec.port).map(
+                        |(health, port)| {
+                            crate::bun::health::HealthCheckConfig::from_spec(health, port)
+                        },
+                    );
+                    let now = Instant::now();
+                    if let Some(config) = &health_config {
+                        self.supervisor
+                            .register_health(id.clone(), config.clone(), now);
+                    }
+                    let container_ip = self.supervisor.grill().container_ip(&id).await;
+                    self.supervisor.instances.insert(
+                        id.clone(),
+                        super::supervisor::WorkloadInstance {
+                            id: id.clone(),
+                            app_name: instance.app_name.clone(),
+                            namespace: instance.namespace.clone(),
+                            state: ContainerState::Running,
+                            health_counters: Default::default(),
+                            restart_count: 0,
+                            last_restart: None,
+                            host_port: instance.host_port,
+                            container_ip,
+                            created_at: now,
+                            restart_policy: Default::default(),
+                            health_config,
+                            is_job: false,
+                            retry_pending: false,
+                            image: instance.spec.image.clone().unwrap_or_default(),
+                            oci_spec: Some(instance.oci_spec),
+                            identity: None,
+                            identity_mount: None,
+                        },
+                    );
+                }
+                let ids = self
+                    .supervisor
+                    .app_instances
+                    .entry((instance.app_name, instance.namespace))
+                    .or_default();
+                if !ids.contains(&id) {
+                    ids.push(id);
+                }
+                let _ = reply.send(Ok(()));
             }
             DeployOp::RollbackRollingDeploy {
                 app_name,
@@ -9333,13 +9404,35 @@ impl<G: Grill + Clone + 'static> DeployWorker<G> {
                     // Drain and stop the old instance on this spawned deploy
                     // task (M7), then send only the fast bookkeeping to the
                     // command loop — the wait no longer stalls every command.
-                    drain_and_stop_instance(
+                    if let Err(error) = drain_and_stop_instance(
                         &self.drains,
                         &self.grill,
                         &old_id,
                         deploy_config.drain_timeout,
                     )
-                    .await;
+                    .await
+                    {
+                        let retention = self
+                            .retain_started_replacements(
+                                app_name, namespace, spec, &new_ids, &new_ports, &new_specs,
+                            )
+                            .await;
+                        let _ = events
+                            .send(ApplyEvent::Error {
+                                message: format!(
+                                    "old instance retirement unconfirmed: {error}; {}",
+                                    match retention {
+                                        Ok(()) =>
+                                            "started replacements retained for cleanup".to_string(),
+                                        Err(error) => format!(
+                                            "could not retain replacement ownership: {error}"
+                                        ),
+                                    }
+                                ),
+                            })
+                            .await;
+                        return std::ops::ControlFlow::Break(());
+                    }
                     self.ops.finish_retire(&old_id).await;
                     retired += 1;
                     continue;
@@ -9564,13 +9657,33 @@ impl<G: Grill + Clone + 'static> DeployWorker<G> {
                     message: format!("stopping old instance {}", old_id.0),
                 })
                 .await;
-            drain_and_stop_instance(
+            if let Err(error) = drain_and_stop_instance(
                 &self.drains,
                 &self.grill,
                 old_id,
                 deploy_config.drain_timeout,
             )
-            .await;
+            .await
+            {
+                let retention = self
+                    .retain_started_replacements(
+                        app_name, namespace, spec, &new_ids, &new_ports, &new_specs,
+                    )
+                    .await;
+                let _ = events
+                    .send(ApplyEvent::Error {
+                        message: format!(
+                            "old instance retirement unconfirmed: {error}; {}",
+                            match retention {
+                                Ok(()) => "started replacements retained for cleanup".to_string(),
+                                Err(error) =>
+                                    format!("could not retain replacement ownership: {error}"),
+                            }
+                        ),
+                    })
+                    .await;
+                return std::ops::ControlFlow::Break(());
+            }
         }
 
         self.ops
@@ -9597,6 +9710,35 @@ impl<G: Grill + Clone + 'static> DeployWorker<G> {
         }
 
         std::ops::ControlFlow::Continue(())
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn retain_started_replacements(
+        &self,
+        app_name: &str,
+        namespace: &str,
+        spec: &AppSpec,
+        ids: &[InstanceId],
+        ports: &std::collections::HashMap<InstanceId, Option<u16>>,
+        specs: &std::collections::HashMap<InstanceId, crate::grill::oci::OciSpec>,
+    ) -> Result<(), BunError> {
+        for id in ids {
+            let oci_spec = specs.get(id).ok_or_else(|| BunError::DeployFailed {
+                app_name: app_name.into(),
+                reason: format!("missing launch ownership for {id}"),
+            })?;
+            self.ops
+                .retain_rolling_instance(RollingInstance {
+                    instance_id: id.clone(),
+                    app_name: app_name.into(),
+                    namespace: namespace.into(),
+                    spec: spec.clone(),
+                    oci_spec: oci_spec.clone(),
+                    host_port: ports.get(id).copied().flatten(),
+                })
+                .await?;
+        }
+        Ok(())
     }
 
     /// Blue-green redeploy: start the whole new ("green") fleet in parallel to
@@ -9855,13 +9997,33 @@ impl<G: Grill + Clone + 'static> DeployWorker<G> {
                 .await;
         }
         for old_id in &existing {
-            drain_and_stop_instance(
+            if let Err(error) = drain_and_stop_instance(
                 &self.drains,
                 &self.grill,
                 old_id,
                 deploy_config.drain_timeout,
             )
-            .await;
+            .await
+            {
+                let retention = self
+                    .retain_started_replacements(
+                        app_name, namespace, spec, &new_ids, &new_ports, &new_specs,
+                    )
+                    .await;
+                let _ = events
+                    .send(ApplyEvent::Error {
+                        message: format!(
+                            "old instance retirement unconfirmed: {error}; {}",
+                            match retention {
+                                Ok(()) => "started replacements retained for cleanup".to_string(),
+                                Err(error) =>
+                                    format!("could not retain replacement ownership: {error}"),
+                            }
+                        ),
+                    })
+                    .await;
+                return std::ops::ControlFlow::Break(());
+            }
         }
         self.ops
             .finalise_rolling_deploy(
@@ -12954,6 +13116,90 @@ host = "remote.local"
     }
 
     #[tokio::test]
+    async fn rollout_retains_old_owner_when_runtime_retirement_is_unconfirmed() {
+        for strategy in ["rolling", "blue-green"] {
+            for fault in [
+                "kill error",
+                "kill ignored",
+                "inspection error",
+                "kill stalled",
+            ] {
+                let volumes = tempfile::tempdir().unwrap();
+                let (mut agent, tx, shutdown, grill) = test_agent_with_grill();
+                agent.set_volumes_dir(volumes.path().to_path_buf());
+                let task = tokio::spawn(async move {
+                    agent.run().await;
+                    agent
+                });
+                expect_complete(&send_deploy(&tx, basic_config()).await);
+                let old_id = InstanceId("default__web-0".into());
+                grill.set_ignore_stop(true);
+                grill.set_state(&old_id, ContainerState::Running);
+                match fault {
+                    "kill error" => grill.set_fail_kill(true),
+                    "kill ignored" => grill.set_ignore_kill(true),
+                    "kill stalled" => grill.block_kills(),
+                    _ => grill.set_instance_inspection_failure(&old_id, true),
+                }
+                let config = Config::parse(&format!("[app.web]\nimage = 'web:v2'\nport = 8080\n[app.web.deploy]\nstrategy = '{strategy}'\ndrain_timeout = '0s'\nhealth_timeout = '100ms'\n")).unwrap();
+                let events = tokio::time::timeout(
+                    std::time::Duration::from_secs(10),
+                    send_deploy(&tx, config),
+                )
+                .await
+                .expect("runtime retirement must have a deadline");
+                let (response, result) = oneshot::channel();
+                tx.send(AgentCommand::Status { response }).await.unwrap();
+                let retained = result.await.unwrap();
+                grill.set_fail_kill(false);
+                grill.set_ignore_kill(false);
+                grill.set_instance_inspection_failure(&old_id, false);
+                grill.set_ignore_stop(false);
+                grill.release_kills(1);
+                grill.kill(&old_id).await.unwrap();
+                let (response, retired) = oneshot::channel();
+                tx.send(AgentCommand::Retire {
+                    app_name: "web".into(),
+                    namespace: "default".into(),
+                    response,
+                })
+                .await
+                .unwrap();
+                assert!(retired.await.unwrap().is_ok());
+                let (response, status) = oneshot::channel();
+                tx.send(AgentCommand::Status { response }).await.unwrap();
+                assert!(
+                    status.await.unwrap().is_empty(),
+                    "recovery left a replacement unowned"
+                );
+                shutdown.cancel();
+                task.await.unwrap();
+                assert!(
+                    !events
+                        .iter()
+                        .any(|event| matches!(event, ApplyEvent::Complete { .. })),
+                    "{strategy} accepted {fault}: {events:?}"
+                );
+                assert!(
+                    events
+                        .iter()
+                        .any(|event| matches!(event, ApplyEvent::Error { .. })),
+                    "missing retirement failure"
+                );
+                assert_eq!(
+                    retained.len(),
+                    2,
+                    "{strategy} must retain both the old owner and the started replacement after {fault}"
+                );
+                assert!(
+                    retained.iter().any(|instance| instance.id == old_id.0),
+                    "{strategy} forgot the unconfirmed owner after {fault}"
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
     async fn blue_green_redeploy_swaps_to_the_green_fleet() {
         let (mut agent, tx, shutdown, _grill) = test_agent_with_grill();
         let agent_handle = tokio::spawn(async move {
@@ -14289,7 +14535,8 @@ host = "remote.local"
         drains.decrement_connections(&id.0).await;
         tokio::time::timeout(std::time::Duration::from_secs(2), &mut retire)
             .await
-            .expect("retire did not complete after the request drained");
+            .expect("retire did not complete after the request drained")
+            .unwrap();
         let calls = grill.calls();
         assert!(
             calls.iter().any(|(op, i)| op == "stop" && i == &id),
@@ -14345,7 +14592,8 @@ host = "remote.local"
         drains.decrement_websocket(&id.0).await;
         tokio::time::timeout(std::time::Duration::from_secs(2), &mut retire)
             .await
-            .expect("retire did not complete after the WebSocket closed");
+            .expect("retire did not complete after the WebSocket closed")
+            .unwrap();
         assert!(
             grill.calls().iter().any(|(op, i)| op == "stop" && i == &id),
             "retire must stop the drained instance once the WebSocket closed"

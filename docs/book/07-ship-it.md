@@ -1112,3 +1112,26 @@ an unfinished JSON body; another fixture withholds one agent retirement reply.
 The first must receive another poll, and the second must retire a different
 owner while keeping the stalled owner's journal entry. Both stalled before the
 repair. Neither test treats elapsed time as proof that the original work stopped.
+
+### A successful signal isn't a successful retirement
+
+A failed force-kill exposed a gap between two stop paths. Normal Stop waited for
+observed exit. Rolling and blue-green deployments ignored the signal result and
+continued to finalise, even when the old process remained alive. The deployment
+then reported Complete and removed its old instance from supervision.
+
+Both callers now share the same runtime stop helper. It bounds the stop request,
+waits for exit, and, if necessary, bounds force-kill and waits again. Inspection
+errors propagate through `Result`; a successful kill call without an observed
+Stopped state isn't enough. The deploy worker emits an error before finalisation,
+keeping old and already-started new instances owned for inspection and cleanup.
+Before ending the failed operation, the command loop adds the replacements to
+ordinary supervision, so Stop and Retire can find both generations.
+Their traffic remains subject to the existing drain state.
+
+The command-channel regression runs rolling and blue-green replacements with
+failed, ignored and stalled kills, plus an inspection error only on the old
+instance. It checks the deployment events, both retained generations, and successful
+Retire after the fault clears. Ordinary Stop
+still uses this helper too, so the two paths cannot drift apart again. Artifact
+removal during rollout finalisation and rollback is a separate remaining task.

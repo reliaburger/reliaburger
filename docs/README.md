@@ -22,7 +22,10 @@ ownership for retry. A busy root filesystem stays mounted; Stopped is reported
 only after cleanup completes. Short rootful jobs retain their actual exit codes,
 including when they finish before the first startup observation. Normal
 Stop/Retire also refuse to forget ownership until identity-directory cleanup and adoption-record removal
-succeed and their directories are synced; failed cleanup can be retried.
+succeed and their directories are synced; failed cleanup can be retried. Rolling
+and blue-green retirement also require observed runtime exit. If a signal or
+inspection fails, the deployment reports an error and retains both generations
+for ordinary Stop/Retire cleanup.
 
 `relish test --filter jobs` creates durable leases on the receiving node for
 batch jobs and cron registrations. Keep using the same node endpoint for a

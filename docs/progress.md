@@ -114,7 +114,8 @@ Buildah-absence cases execute in isolated child environments on the equipped VM.
   - [x] Keep failed/expired uploads fenced until deletion and directory sync succeed. Claim exclusive upload-directory ownership on startup, reclaim recognised abandoned files and refuse uncertain inventory. Actual SIGKILL, competing-owner and cluster-upgrade tests pass.
   - [x] Wait for durable lease absence after HTTP 202; an empty runtime inventory cannot override pending ownership.
   - [x] Keep normal Stop/Retire ownership when identity or adoption-record removal fails. Sync both parent directories and retry; full library checkpoints pass 3,308 macOS/3,362 Linux tests with strict Clippy.
-  - [ ] Confirm runtime exit and propagate artifact-cleanup errors on every rolling/blue-green finalisation, halt and rollback path. A new failing-first runtime-retirement fix is being qualified; it is not yet committed.
+  - [x] Require observed runtime exit on rolling/blue-green retirement. Failed, ignored/stalled kills or inspection errors preserve both generations; a later Retire cleans up. Both regressions fail first, all eight fault/strategy cases pass, and the full Bun suites plus strict Clippy pass on both platforms.
+  - [ ] Propagate artifact-cleanup errors on rolling/blue-green finalisation, halt and rollback paths.
   - [ ] Record every former cluster placement owner and wait for exact retirement acknowledgements. The [concrete protocol proposal](plans/2026-09-19-lease-retirement.md) awaits explicit approval required by automatic approval review; its core draft is preserved separately and is not wired into the current binary.
   - [ ] Persist ordinary-job execution intent and retry budgets across Bun replacement. Crash retry versus explicit rerun remains a pending user decision.
   - [ ] Bind registry repositories/uploads to leases and fence concurrent commits against cleanup; preserve shared image layers.
