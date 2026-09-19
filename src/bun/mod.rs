@@ -43,6 +43,13 @@ pub enum BunError {
     #[error("cannot restore workload ownership: {0}")]
     AdoptionState(String),
 
+    /// Runtime exit was confirmed, but durable ownership cleanup must retry.
+    #[error("cannot retire artifacts for {instance_id}: {reason}")]
+    RetirementState {
+        instance_id: InstanceId,
+        reason: String,
+    },
+
     /// An error from the container runtime.
     #[error(transparent)]
     Grill(#[from] GrillError),

@@ -3149,3 +3149,24 @@ The regression serves 202 and an empty runtime inventory while keeping the lease
 present. Previously that passed. Now it stays unknown; a second case removes the
 lease after two polls and confirms cleanup. This distinguishes accepting work
 from finishing it without making an unavailable worker block the CLI forever.
+
+### Retirement includes its durable files
+
+Suppose the process has stopped but Bun cannot unlink its adoption record. A
+warning followed by successful lease cleanup loses the live owner that could
+retry the unlink. Identity directories have the same problem: clearing an
+in-memory path doesn't remove its key material or unmount its backing storage.
+
+Normal Stop and Retire now wait for identity-directory cleanup, then adoption
+record removal, before forgetting ownership. Both removals sync their parent
+directories, including retries after an uncertain sync. Filesystem errors retain
+the tracked instance and its port so the next attempt can finish. The blocking
+filesystem work runs through `spawn_blocking`; Bun awaits its result before
+clearing the instance's identity fields. Ordinary application data volumes are
+outside this cleanup.
+
+The command-channel regression replaces an adoption record with a directory,
+then separately replaces the identity directory with a file. Each fault must
+refuse retirement and retain the owner. Removing the fault lets the next command
+finish. Rolling deployment cleanup has separate call paths and still needs its
+own error-propagation audit.

@@ -75,7 +75,8 @@ config for a secure multi-node cluster. The [documentation](docs/README.md)
 has the full secure-cluster walkthrough. Rootful Linux networking retains address
 ownership across restarts and refuses subnet exhaustion. Runc retirement keeps
 resource ownership when OCI deletion, rootfs unmount or network cleanup fails,
-and retries before reporting Stopped. With rootful Linux DNS
+and retries before reporting Stopped. Normal Stop/Retire also preserve ownership
+when identity-directory or adoption-record removal fails. With rootful Linux DNS
 enabled, short
 service names resolve in the calling workload's namespace. Host tools use explicit
 names such as `redis.payments.internal`; unknown sources cannot inherit a node's

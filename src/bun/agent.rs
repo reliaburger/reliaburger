@@ -7051,9 +7051,10 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
             }
         }
 
-        // Stopped for good: nothing left to adopt after a restart.
+        // Keep durable ownership until identity and record retirement succeed.
+        // A failed cleanup must remain retryable through Stop or Retire.
         for id in &instances {
-            self.remove_instance_record(id);
+            self.retire_instance_artifacts(id).await?;
         }
 
         // Remove backends and unregister from the service map
@@ -7061,9 +7062,6 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
         for id in &instances {
             let _ = self.service_map.remove_backend(&service_id, &id.0);
             self.clear_egress(id).await;
-            // Key material must not outlive the instance (PKI7): remove
-            // the identity dir and unmount its tmpfs backing.
-            self.cleanup_instance_identity(id);
         }
         self.remove_backend_ebpf(&service_id).await;
         let _ = self.service_map.unregister(&service_id);
@@ -7219,6 +7217,37 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
         crate::sesame::identity::prepare_identity_dir(&dir).map_err(|e| BunError::SecurityError {
             reason: format!("failed to prepare identity dir for {instance_id}: {e}"),
         })
+    }
+
+    /// Retire durable artifacts before allowing the caller to forget an owner.
+    async fn retire_instance_artifacts(
+        &mut self,
+        instance_id: &InstanceId,
+    ) -> Result<(), BunError> {
+        let identity_dir = self.instance_identity_dir(instance_id);
+        let records_dir = self.records_dir.clone();
+        let id = instance_id.0.clone();
+        let cleanup = tokio::task::spawn_blocking(move || {
+            crate::sesame::identity::cleanup_identity_dir(&identity_dir)?;
+            if let Some(directory) = records_dir {
+                crate::grill::records::remove_record(&directory, &id)?;
+            }
+            Ok::<(), std::io::Error>(())
+        })
+        .await
+        .map_err(|error| BunError::RetirementState {
+            instance_id: instance_id.clone(),
+            reason: error.to_string(),
+        })?;
+        cleanup.map_err(|error| BunError::RetirementState {
+            instance_id: instance_id.clone(),
+            reason: error.to_string(),
+        })?;
+        if let Some(instance) = self.supervisor.get_instance_mut(instance_id) {
+            instance.identity = None;
+            instance.identity_mount = None;
+        }
+        Ok(())
     }
 
     /// Remove an instance's identity directory (and drop the in-memory
@@ -12393,6 +12422,8 @@ host = "remote.local"
     #[tokio::test]
     async fn stop_command_stops_instances() {
         let (mut agent, tx, shutdown) = test_agent();
+        let volumes = tempfile::tempdir().unwrap();
+        agent.set_volumes_dir(volumes.path().to_path_buf());
 
         let agent_handle = tokio::spawn(async move {
             agent.run().await;
@@ -12521,6 +12552,79 @@ host = "remote.local"
 
         shutdown.cancel();
         agent_handle.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn retirement_retains_ownership_until_durable_artifacts_are_removed() {
+        for block_identity in [false, true] {
+            let root = tempfile::tempdir().unwrap();
+            let records = root.path().join("records");
+            std::fs::create_dir(&records).unwrap();
+            let (mut agent, tx, shutdown) = test_agent();
+            agent.set_records_dir(records.clone());
+            agent.set_volumes_dir(root.path().join("volumes"));
+            let id = InstanceId("default__web-0".into());
+            let identity = agent.instance_identity_dir(&id);
+            let task = tokio::spawn(async move {
+                agent.run().await;
+                agent
+            });
+            expect_complete(&send_deploy(&tx, basic_config()).await);
+            let record = crate::grill::records::record_path(&records, &id.0);
+            if block_identity {
+                crate::sesame::identity::cleanup_identity_dir(&identity).unwrap();
+                std::fs::write(&identity, "blocked identity cleanup").unwrap();
+                std::fs::write(&record, "owned until cleanup succeeds").unwrap();
+            } else {
+                std::fs::create_dir(&record).unwrap();
+            }
+            let (response, result) = oneshot::channel();
+            tx.send(AgentCommand::Retire {
+                app_name: "web".into(),
+                namespace: "default".into(),
+                response,
+            })
+            .await
+            .unwrap();
+            let outcome = result.await.unwrap();
+            let durable_owner_retained = record.exists();
+            let (response, status) = oneshot::channel();
+            tx.send(AgentCommand::Status { response }).await.unwrap();
+            let retained = status.await.unwrap();
+            // Restore the injected filesystem fault before stopping the fixture.
+            if block_identity {
+                std::fs::remove_file(&identity).unwrap();
+            } else {
+                std::fs::remove_dir(&record).unwrap();
+            }
+            let (response, result) = oneshot::channel();
+            tx.send(AgentCommand::Retire {
+                app_name: "web".into(),
+                namespace: "default".into(),
+                response,
+            })
+            .await
+            .unwrap();
+            let retry = result.await.unwrap();
+            shutdown.cancel();
+            let agent = task.await.unwrap();
+            assert!(
+                outcome.is_err(),
+                "retirement succeeded despite failed artifact removal"
+            );
+            assert!(
+                durable_owner_retained,
+                "failed artifact cleanup discarded the adoption record"
+            );
+            assert_eq!(
+                retained.len(),
+                1,
+                "uncertain cleanup lost runtime ownership"
+            );
+            assert!(retry.is_ok(), "{retry:?}");
+            assert!(agent.supervisor.list_instances().is_empty());
+            assert!(!record.exists());
+        }
     }
 
     #[tokio::test]
@@ -14074,6 +14178,8 @@ host = "remote.local"
     #[tokio::test]
     async fn stop_escalates_to_kill_when_process_ignores_sigterm() {
         let (mut agent, _tx, _shutdown, grill) = test_agent_with_grill();
+        let volumes = tempfile::tempdir().unwrap();
+        agent.set_volumes_dir(volumes.path().to_path_buf());
 
         let (ev_tx, mut ev_rx) = mpsc::channel(64);
         agent.deploy(basic_config(), &ev_tx).await;
@@ -14104,6 +14210,8 @@ host = "remote.local"
     #[tokio::test]
     async fn stop_reports_stopped_after_exit_without_kill() {
         let (mut agent, _tx, _shutdown, grill) = test_agent_with_grill();
+        let volumes = tempfile::tempdir().unwrap();
+        agent.set_volumes_dir(volumes.path().to_path_buf());
 
         let (ev_tx, mut ev_rx) = mpsc::channel(64);
         agent.deploy(basic_config(), &ev_tx).await;

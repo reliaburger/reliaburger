@@ -913,6 +913,19 @@ the fix and covers both unavailable-owner and later-completion outcomes. All
 127 testkit tests pass on macOS/Linux (2.15s/2.47s), with strict Clippy on both. Durable
 cluster placement-owner history and retirement acknowledgement remain open.
 
+**Normal artifact retirement (19 September):** Stop/Retire now propagate identity
+and adoption-record removal failures before forgetting the tracked instance or
+releasing its port. Identity retirement precedes record deletion; both parent
+directories are synced, including retry after an uncertain sync. Blocking I/O
+runs off the command-loop runtime. The command-channel regression fails first,
+then covers each filesystem fault and successful retry. Three older Linux tests
+now own temporary volume roots instead of relying on inaccessible production
+paths. Full library qualification passes 3,308 tests on macOS (five explicit
+gates, 39.61s) and 3,362 on Linux (19 explicit gates, 69.38s), with strict Clippy
+on both. Rolling deploy
+rollback/halt/finalisation still use separate best-effort
+artifact cleanup paths; their error propagation remains open.
+
 ### C35 — Gate chaos capabilities per selected scenario
 
 **Priority:** P2. **Wave:** 4. **Book chapters:** 08, 15.

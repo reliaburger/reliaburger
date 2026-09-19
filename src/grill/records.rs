@@ -100,12 +100,18 @@ pub fn write_record(records_dir: &Path, record: &InstanceRecord) -> std::io::Res
     Ok(())
 }
 
-/// Remove an instance's record. Missing records are fine (idempotent).
+/// Remove an instance's record and sync its directory. Missing records are fine.
 pub fn remove_record(records_dir: &Path, instance_id: &str) -> std::io::Result<()> {
     match std::fs::remove_file(record_path(records_dir, instance_id)) {
-        Ok(()) => Ok(()),
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
-        Err(e) => Err(e),
+        Ok(()) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => return Err(error),
+    }
+    // A retry after a failed directory sync must sync even if unlink already ran.
+    match std::fs::File::open(records_dir) {
+        Ok(directory) => directory.sync_all(),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(error),
     }
 }
 

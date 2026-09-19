@@ -20,7 +20,9 @@ and checkpoint errors stop the export and prevent disk-pressure pruning.
 Runc retirement reports OCI, mount and network cleanup failures and retains
 ownership for retry. A busy root filesystem stays mounted; Stopped is reported
 only after cleanup completes. Short rootful jobs retain their actual exit codes,
-including when they finish before the first startup observation.
+including when they finish before the first startup observation. Normal
+Stop/Retire also refuse to forget ownership until identity-directory cleanup and adoption-record removal
+succeed and their directories are synced; failed cleanup can be retried.
 
 `relish test --filter jobs` creates durable leases on the receiving node for
 batch jobs and cron registrations. Keep using the same node endpoint for a
