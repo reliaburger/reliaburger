@@ -365,18 +365,6 @@ async fn serve_tls(
     }
 }
 
-/// Run the Wrapper proxy on the configured ports. Convenience wrapper
-/// around [`bind_proxy`] + [`BoundProxy::serve`]; blocks until the
-/// shutdown token is cancelled.
-pub async fn run_proxy(
-    config: WrapperConfig,
-    routing_table: Arc<RwLock<RoutingTable>>,
-    shutdown: CancellationToken,
-) -> Result<(), WrapperError> {
-    let bound = bind_proxy(config, routing_table, shutdown).await?;
-    bound.serve().await
-}
-
 /// The main proxy handler. Routes every incoming request.
 async fn proxy_handler(
     State(state): State<Arc<ProxyState>>,

@@ -1181,6 +1181,27 @@ These public helpers have no production callers; some describe a different lifec
 
 **Completion test:** For each helper, delete it or identify its supported caller and tests. Keep wire compatibility; do not wire obsolete implementations merely to make them used.
 
+**Completed inventory (19 September):**
+
+| Entry point | Disposition and evidence |
+| --- | --- |
+| `wrapper::proxy::run_proxy` | Remove the unused wrapper. Bun and proxy tests use `bind_proxy`/`BoundProxy::serve`, preserving readiness and task ownership. |
+| `meat::autoscaler::run_autoscale_loop` | Remove the unused alternative that advanced its tracker before confirmed Raft mutation. `cluster::orchestrate::spawn_autoscaler` owns the production loop and the tested pure decision functions remain. |
+| `smoker::resource::calculate_memory_pressure_bytes` | Remove the uncalled/untested allocation calculator. Bun's supported workload path changes/restores cgroup limits; node pressure has its own owned helper. |
+| `onion::dns::run_dns_responder` | Retain as a documented standalone library entry point, called by `tests/dns.rs` and `tests/ebpf.rs`. Bun uses the bound responder for readiness. |
+| `pickle::pull::image_available_locally` | Retain the read-only verified-blob query. Missing/corrupt-blob unit tests and `tests/pickle_cluster.rs` cover its contract; it does not select the runtime pull path. |
+| `BunClient::renew_test_lease` | Retain the supported owner-authenticated endpoint; the actual node-job recovery case in `tests/documentation_first_run.rs` calls it. The catalogue reserves a bounded case/teardown lifetime rather than running a renewal loop. |
+| `TestContext::wait_for` / `wait_for_cluster`; `Deadline` | Retain: node-job, deployment and cluster cases call them. Context tests cover stalled collection; the runner constructs one absolute case deadline and separate bounded teardown. |
+| `FaultRegistry::next_expiry` / `count_by_node`; `FaultType::requires_cgroups` | Retain explicitly documented, unit-tested library queries/classification. They are not Bun's expiry scheduler, capability admission or Raft node-experiment reservation. `count_by_service` also has a Bun caller. |
+| `extend_grace_period` / `unseal_with_age` | Retain tested model/cryptographic primitives, explicitly excluding signed-certificate extension and supported CA restoration. Operator recovery remains F04. |
+| Mislocated CA API documentation | Already corrected by C15/H01; no further implementation is needed. |
+
+The full Linux library checkpoint passes 3,340 tests (19 explicit gates,
+67.65s), plus 14 DNS integration tests (2.01s) and 16 Pickle cluster tests
+(0.67s). Native autoscaler (21), Wrapper (94) and Smoker (114) suites and strict
+Linux/macOS Clippy pass. This completes the helper disposition, not the deferred
+operator features.
+
 ### H03 — Resolve inert configuration and wire fields explicitly
 
 **Priority:** P2. **Wave:** 5. **Book chapters:** 02, 03, 14.

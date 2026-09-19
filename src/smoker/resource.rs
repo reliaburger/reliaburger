@@ -222,37 +222,6 @@ pub fn read_cgroup_memory_max(cgroup_path: &Path) -> Result<u64, ResourceFaultEr
         .map_err(|e| ResourceFaultError::CgroupError(format!("failed to parse memory.max: {e}")))
 }
 
-/// Calculate how many bytes to allocate for a memory pressure fault.
-///
-/// Returns the number of bytes to `mlock` to push the container to
-/// the target percentage of its memory limit.
-#[cfg(target_os = "linux")]
-pub fn calculate_memory_pressure_bytes(
-    cgroup_path: &Path,
-    target_percent: u8,
-    oom: bool,
-) -> Result<u64, ResourceFaultError> {
-    let limit = read_cgroup_memory_max(cgroup_path)?;
-    if limit == u64::MAX {
-        return Err(ResourceFaultError::CgroupError(
-            "no memory limit set on cgroup, cannot calculate pressure target".into(),
-        ));
-    }
-
-    if oom {
-        // Allocate beyond the limit to trigger OOM
-        Ok(limit + 64 * 1024 * 1024) // limit + 64 MiB
-    } else {
-        let current = read_cgroup_memory_current(cgroup_path)?;
-        let target_usage = (limit * target_percent as u64) / 100;
-        if target_usage <= current {
-            Ok(0) // already at or above target
-        } else {
-            Ok(target_usage - current)
-        }
-    }
-}
-
 /// Non-Linux stub — returns UnsupportedPlatform for all operations.
 #[cfg(not(target_os = "linux"))]
 pub fn apply_disk_io_throttle(

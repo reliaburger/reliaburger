@@ -2979,3 +2979,25 @@ The regression serves an empty indexed result and an empty local fallback on
 the first read, then publishes the expected line. That reproduces the race
 without depending on task scheduling. A second case never publishes the line
 and must fail at the deadline. Neither test treats empty output as success.
+
+
+### Follow the caller before calling code unfinished
+
+The release audit listed unused public helpers. A symbol search was the start,
+not the conclusion. The old autoscaler loop and proxy wrapper had no callers;
+we removed them. A memory-allocation sizing helper also had no callers or tests,
+and didn't describe the cgroup-limit path Bun actually uses, so it went too.
+
+Other helpers have narrower jobs. `image_available_locally` is a tested,
+read-only verified-blob query; it doesn't pull an image or prove a runtime can
+launch it. `renew_test_lease` now has an actual node-job recovery caller. The
+catalogue runner requests enough lease lifetime for its bounded case and cleanup
+rather than maintaining a hidden renewal task. Its wait helpers share the case's
+absolute deadline. Expiry and per-node count queries in the fault registry are
+library observations, not scheduling or cluster admission.
+
+We record those callers and tests in the completion plan. The age unsealing
+primitive still doesn't constitute a CA recovery workflow, and changing an
+identity model's grace period cannot extend a signed certificate. Those operator
+features remain explicitly planned. Passing a helper's unit test must never
+silently promote the feature around it to supported.

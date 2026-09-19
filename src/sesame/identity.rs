@@ -546,7 +546,11 @@ pub fn rotation_state(identity: &WorkloadIdentity, now: SystemTime) -> RotationS
     }
 }
 
-/// Extend the grace period when the council is unreachable.
+/// Update the library identity model's grace period.
+///
+/// This is not wired into Bun's renewal loop and cannot extend a certificate's
+/// signed validity. A supported operator grace/recovery workflow remains
+/// separate work; callers must not treat this model update as renewed trust.
 ///
 /// Returns `true` if the grace period was extended, `false` if
 /// already at the maximum (issued_at + 5 hours).

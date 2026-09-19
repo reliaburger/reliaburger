@@ -446,11 +446,9 @@ fn effective_replicas(spec: &AppSpec, override_replicas: Option<u32>, alive_coun
 /// `AutoscaleOverride` to Raft when a scale is warranted. The scheduler
 /// then re-places at the new replica count.
 ///
-/// The library's `run_autoscale_loop` takes a *synchronous*
-/// `app_provider` closure, which can't read async Raft desired state or
-/// the rollup store; this task drives the same pure functions
-/// (`AutoscaleConfig::from_spec`, `evaluate`, `AutoscaleTracker`)
-/// directly instead.
+/// This task reads async Raft state and metrics, then drives the pure
+/// `AutoscaleConfig::from_spec`, `evaluate` and `AutoscaleTracker` functions.
+/// Tracker changes follow confirmed Raft writes, so refusal can be retried.
 pub fn spawn_autoscaler(
     council: Arc<CouncilNode>,
     rollup_store: Arc<tokio::sync::RwLock<crate::mayo::rollup_store::RollupStore>>,

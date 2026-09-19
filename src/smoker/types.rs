@@ -281,7 +281,9 @@ impl FaultType {
         )
     }
 
-    /// Whether this fault type requires Linux cgroups.
+    /// Library classification of fault types that require Linux cgroups.
+    /// This does not establish admission: Bun checks live runtime capabilities
+    /// and the target's actual cgroup when applying a fault.
     pub fn requires_cgroups(&self) -> bool {
         matches!(
             self,

@@ -155,7 +155,7 @@ All three optional fields have sensible defaults. Most users will only set metri
 
 The evaluation logic above — `compute_desired`, the hysteresis, the cooldown — was a library nobody spawned. The July 2026 review found `run_autoscale_loop` had no caller: `AutoscaleDecision`s were computed by tests and nothing else. An autoscaler that never runs is a thermostat with no wires.
 
-Wiring it revealed a small design mismatch worth explaining. `run_autoscale_loop` takes a *synchronous* `app_provider` closure — `Fn() -> Vec<(AppId, ...)>` — to list the apps to consider. But the apps live in the Raft desired state, which you read with an `async` call, and the metrics live in the rollup store, also async. A sync closure can't `await`. Rather than contort a shared cache to feed the sync closure, the leader task drives the same *pure* functions directly: `AutoscaleConfig::from_spec`, `evaluate`, and the `AutoscaleTracker`. The tested logic is reused; only the plumbing around it is new. When a library's shape doesn't fit the wiring, reach for its tested internals rather than bending the wiring to the shape.
+Wiring it revealed a small design mismatch worth explaining. `run_autoscale_loop` took a *synchronous* `app_provider` closure — `Fn() -> Vec<(AppId, ...)>` — to list the apps to consider. But the apps live in the Raft desired state, which you read with an `async` call, and the metrics live in the rollup store, also async. A sync closure can't `await`. Rather than contort a shared cache to feed the sync closure, the leader task drives the same *pure* functions directly: `AutoscaleConfig::from_spec`, `evaluate`, and the `AutoscaleTracker`. The tested logic is reused; only the plumbing around it is new. When a library's shape doesn't fit the wiring, reach for its tested internals rather than bending the wiring to the shape.
 
 The loop lives where every leader-only loop in Reliaburger lives — spawned once, checking leadership each tick, no start/stop dance. Each cycle: read the desired apps, keep only those with an `[autoscale]` section, query the rollup store for each app's recent metric, run `evaluate`, and on a decision commit an `AutoscaleOverride` to Raft.
 
@@ -979,3 +979,11 @@ it doesn't overlap an API or ingress port, and Lima exposes it only on loopback.
 The context lets the test catalogue use the host address rather than guessing a
 guest port from the API URL. Chapter 15 follows that distinction through IPv6,
 TLS server names and credential-free workload probes.
+
+
+For 0.1.0, we delete that obsolete loop. It had no callers or tests, and it
+advanced the tracker before learning whether a decision had reached Raft. The
+wired `cluster::orchestrate::spawn_autoscaler` remains the sole long-lived loop;
+its pure decision functions and existing tests stay in `meat::autoscaler`.
+Leaving an unused alternative around would give the next reader two conflicting
+answers to the same lifecycle question.

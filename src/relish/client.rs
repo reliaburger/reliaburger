@@ -948,7 +948,11 @@ impl BunClient {
         parse_typed_response(response).await
     }
 
-    /// Renew an active test resource lease.
+    /// Renew an active test resource lease as its authenticated owner.
+    ///
+    /// The node-local job recovery integration test uses this endpoint. The
+    /// catalogue runner instead requests a lease covering its bounded case
+    /// deadline plus teardown; it does not spawn a background renewal loop.
     pub async fn renew_test_lease(
         &self,
         lease_id: &str,

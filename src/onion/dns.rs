@@ -381,7 +381,11 @@ impl SourceAcl {
     }
 }
 
-/// Run the DNS responder until the cancellation token is triggered.
+/// Run a standalone DNS responder until its cancellation token is triggered.
+///
+/// This convenience entry point serves standalone users and the DNS/eBPF
+/// integration tests. Bun uses [`BoundDnsResponder`] directly so socket
+/// binding can participate in its startup readiness checks.
 ///
 /// Reads the service map from a watch channel — the agent publishes a
 /// snapshot whenever the map changes, so lookups here never contend

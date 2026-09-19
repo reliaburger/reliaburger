@@ -1160,3 +1160,11 @@ field would let callers believe they had configured a resource boundary. Neither
 field was part of the node TOML or a serialised routing record, so this changes
 only the unreleased Rust library API. Existing routing and proxy tests still
 exercise the supported behaviour.
+
+
+The helper inventory also removes the unused `run_proxy` convenience wrapper.
+Bun uses `bind_proxy` and `BoundProxy::serve`: binding is a fallible startup step,
+and serving is the owned long-lived task. DNS keeps its standalone
+`run_dns_responder` wrapper because the DNS and eBPF integration tests exercise
+that public entry point. Its documentation now names that role and distinguishes
+it from Bun's readiness-aware binding path.

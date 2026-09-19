@@ -122,8 +122,8 @@ The subsequent cron checkpoint changes require their own hosted validation.
 
 ### Engineering follow-ups
 
-- [x] **H01** Reconcile scheduler/quota/scrape wiring and weights, roadmap test locations, cleanup evidence and disabled-auth chaos policy with their callers. Mark completed historical bug groups done while retaining C30/C33/C34/H02. Repair eleven Rustdoc errors; all-feature public documentation now builds with warnings denied, all 74 relative links in the changed Markdown pass, and the four documented diagnostic CLI help interfaces are verified.
-- [ ] **H02** (P3) Remove or deliberately expose unused helper entry points.
+- [x] **H01** Reconcile scheduler/quota/scrape wiring and weights, roadmap test locations, cleanup evidence and disabled-auth chaos policy with their callers. Mark completed historical bug groups done while retaining C30/C34 and future operator workflows. Repair eleven Rustdoc errors; all-feature public documentation now builds with warnings denied, all 74 relative links in the changed Markdown pass, and the four documented diagnostic CLI help interfaces are verified.
+- [x] **H02** Remove the obsolete proxy/autoscaler wrappers and unused memory-pressure allocation calculator. Record callers, tests and explicit library-only contracts for retained DNS, Pickle, lease, deadline, fault-query and crypto/model helpers. CA recovery remains F04; misplaced CA documentation was already C15/H01. All 3,340 Linux library tests (19 explicit gates, 67.65s), 14 DNS and 16 Pickle integration tests, native autoscaler/Wrapper/Smoker suites and strict Linux/macOS Clippy pass.
 - [x] **H03** Resolve inert fields: remove the unused node `release_url` (use the CLI's `--url`), Wrapper thread-count/strategy fields and local gossip timestamp counter. Preserve the legacy timestamp wire slot as explicitly reserved and ignored. The URL regression fails first; legacy bytes and stale-incarnation ordering are covered. All 174 Linux configuration-filtered, 154 gossip and 94 Wrapper tests, corresponding native suites and strict Linux/macOS Clippy pass. The earlier actual-bound-port startup repair remains verified. Remote resource/image propagation is F01.
 - [ ] **H04** (P3) Use typed alert and scheduler error contracts.
 - [ ] **H05** (P3) Split modules along existing ownership boundaries.
@@ -2650,15 +2650,7 @@ blocking calls).
 - [x] **Bootstrap, GitOps and disk-pressure export errors** — fresh council failures propagate, unavailable sync queues return 503 without consuming delivery IDs, and failed exports are logged (`3d302de`, `b7735ba`, `7acb36b`).
 - [x] **HTTP health-probe pooling and attribution** — pooled requests retain deadlines and distinguish local client errors from workload refusal (`3c78b09`).
 - [x] **The listed startup/testapp/client-construction panics** — storage errors propagate, occupied testapp ports return errors, and invalid client trust configuration fails explicitly (`a805575`, `d70699d`, `e346aec`). This is not a claim that all public panic paths are eliminated.
-- [ ] **Unwired library-only helpers** (current backlog: H02/F04) (delete or wire): `src/wrapper/proxy.rs:343`
-  `run_proxy`; `src/onion/dns.rs:364-375` `run_dns_responder`; `src/sesame/identity.rs:543-551`
-  `extend_grace_period` (so `RotationState::GracePeriod` and the documented 4-hour grace
-  extension are unreachable; failed rotation marches to `Expired` with an `eprintln`);
-  `src/sesame/secret.rs:197-221` `unseal_with_age` (the sealed root-CA backup `relish init`
-  writes has no restore path); `src/meat/autoscaler.rs:278-316` `run_autoscale_loop` (still
-  contains the DEP8 bug the wired path fixed); `src/pickle/pull.rs:193`
-  `image_available_locally`; `src/relish/client.rs:707` `renew_test_lease`; various
-  smoker helpers (`resource.rs:230`, `types.rs:285`, `registry.rs:155,188`).
+- [x] **Unwired library-only helper inventory** — H02 removes obsolete alternatives and records supported library callers/tests. It does not implement the F04 CA recovery/rotation workflows.
 - [x] **Dead wire/config fields** — H03 removes unused Wrapper settings and node release URLs, and explicitly reserves the unchanged legacy gossip timestamp slot. See the current ledger for test evidence.
 - [ ] **Remote resource/image propagation** (current backlog: F01) — remote cached-image and GPU capacity evidence remains planned; resolving inert API fields does not implement it.
 - [x] **Authorisation matrix checks methods as well as paths** (`e5f4208`), and dashboard desired counts come from desired state (`afee562`, `f1882be`).
@@ -2763,4 +2755,4 @@ and a handful of test cases whose assertions are too loose to catch the bug they
 - [x] **Relish liveness, client configuration, streamed UTF-8 and offline export errors** — health validates the response; invalid trust settings return errors; split UTF-8 survives SSE framing; explicit offline export validates paths and reports checkpoint failures (`6ee50a6`, `e346aec`, `a057634`, `df91a67`, `cfb483f`).
 - [x] **Remaining CLI robustness** — C17 rejects duration overflow, C23 reports encoded certificate expiry, C39 rejects invalid development paths before mutation, and C15/H01 correct the misplaced CA API documentation. Their regressions and verification are recorded above.
 - [x] **Cluster collection, deadlines, deployment history and ingress acceptance** — incomplete collection fails, waits share the case deadline, history must contain both tested versions, and ingress polls exact responses using credential-free clients and isolated hosts (`c6163b8`, `265aa99`, `6b3400f`). Expired queued capabilities refresh (`3f97aea`); three live ingress cases passed.
-- [ ] **Remaining test-harness robustness** — C29, C31–C33 and C35–C36 are complete; H01 now describes cleanup evidence and disabled-auth workload/node policy accurately. C30 catalogue fixtures, C34 remaining resource ownership and H02 helper disposition remain open.
+- [ ] **Remaining test-harness robustness** — C29, C31–C33 and C35–C36 are complete; H01 now describes cleanup evidence and disabled-auth workload/node policy accurately. C30 catalogue fixtures and C34 remaining resource ownership stay open; H02 now records every helper disposition.
