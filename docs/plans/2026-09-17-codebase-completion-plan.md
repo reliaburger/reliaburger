@@ -1294,6 +1294,14 @@ The doctest command passes with zero doctests, so its green status does not esta
 
 **Completion test:** Small configuration/client examples compile and exercise public behaviour; document Rust ownership/error types at their first use in the book.
 
+**Completed (19 September):** Executable Rustdoc blocks on
+`Config::parse` and `validate_endpoint` cover parse/semantic validation,
+unknown-key refusal, remote HTTPS/local HTTP and typed remote-plaintext refusal.
+Both execute without network access. Chapter 15 explains raw strings, optional
+borrowed values and enum assertions. Both examples execute successfully on native Rust 1.98 and Linux Rust 1.97
+with default and no-default features. All-feature public documentation builds
+with Rustdoc warnings denied (46.81s).
+
 ### H08 — Identify and eliminate leaked test processes
 
 **Priority:** P2. **Wave:** 5. **Book chapters:** 15.

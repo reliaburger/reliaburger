@@ -3014,3 +3014,22 @@ other four cross-node cases still query real log stores, and those fixture
 handlers now surface storage errors instead of returning empty arrays. We also
 print node failures when the row count is wrong. A future CI failure should
 say which assumption failed, not send us guessing from a zero.
+
+### Make the public examples executable
+
+`cargo test --doc` used to pass without running any examples. It now executes
+small examples on `Config::parse` and `validate_endpoint`. The first parses and
+validates a workload, then checks that a misspelt key is refused. The second
+accepts remote HTTPS and local development HTTP, but checks the typed refusal
+for remote plaintext. Neither example contacts a cluster.
+
+Rustdoc compiles ordinary fenced Rust blocks in `///` comments as tests. We use
+`expect` in these examples to make a failed assumption fail the test visibly;
+application code can propagate the same `Result` with `?`. The configuration
+uses a raw string, `r#"..."#`, so TOML quotes need no escaping. Its image is an
+`Option<String>` because some workload forms have no image. `as_deref()` borrows
+that optional owned string as `Option<&str>` for the assertion; it doesn't move
+the image out of the configuration. `Some(...)` is the present-value variant.
+The endpoint example uses `matches!` to check an enum variant rather than error
+message wording. These examples teach the public contract and fail when it
+drifts.

@@ -230,6 +230,20 @@ fn pick_endpoint(cli_flag: Option<&Option<String>>, env: Option<String>) -> Opti
 /// standalone development. User-info is rejected because embedding
 /// credentials in URLs leaks them through shell history, process listings and
 /// logs.
+///
+/// ```
+/// use reliaburger::relish::client::{validate_endpoint, EndpointError};
+///
+/// validate_endpoint("https://bun.example:9117").expect("remote HTTPS endpoint");
+/// validate_endpoint("http://127.0.0.1:9117").expect("local development endpoint");
+/// assert!(matches!(
+///     validate_endpoint("http://bun.example:9117"),
+///     Err(EndpointError::RemotePlaintext)
+/// ));
+/// ```
+///
+/// This checks the URL only; it does not open a connection, authenticate a
+/// caller or establish that the node is healthy.
 pub fn validate_endpoint(value: &str) -> Result<(), EndpointError> {
     let parsed = url::Url::parse(value)?;
     if !parsed.username().is_empty() || parsed.password().is_some() {

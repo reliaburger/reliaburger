@@ -138,7 +138,7 @@ validation. Superseded `f9c0e2c` workflows were cancelled for runner capacity.
 - [ ] **H04** (P3) Use typed alert and scheduler error contracts.
 - [ ] **H05** (P3) Split modules along existing ownership boundaries.
 - [ ] **H06** (P3) Evaluate shared DNS and duration parsers.
-- [ ] **H07** (P3) Add useful public API doctests.
+- [x] **H07** Execute public configuration and endpoint-validation examples: parsing plus semantic validation, unknown-key refusal and typed remote-plaintext refusal. Two doctests pass on native Rust 1.98 and Linux Rust 1.97 with default/no-default features; all-feature Rustdoc builds with warnings denied. Chapter 15 explains the Rust syntax and test contract.
 - [x] **H08** Require nextest 0.9.145 and pin it in CI. The captured leak named the subprocess-free metrics backfill test; upstream 0.9.145 fixes sibling capture-pipe inheritance on macOS. With that runner, all 3,433 default and 3,393 no-default tests pass without leaks (70.80s / 63.02s). The existing 100 ms leak deadline is unchanged and future leaks now fail the gate. Older runners refuse with exit 92; both READMEs and the book explain the requirement.
 - [ ] **H09** (P3) Complete node-pressure diagnostic hygiene.
 - [x] **H10** Reuse the enforcement check’s capability for readiness within one health tick. Later ticks/reports remain fresh, and repairs retain their verification read. The call-count regression fails first and passes in portable/eBPF builds; all 437 native Bun tests (one explicit gate, 20.15s), real hook-loss fencing plus readiness withdrawal (1.37s) and strict native/Linux Clippy pass.
@@ -1712,7 +1712,7 @@ verification alone; its separate gossip-rejoin deadline remains unfinished.
 
 - [ ] Ownership-based module splits (O1) (current backlog: H05)
 - [ ] Library-backed DNS/duration parsing where compatibility tests justify it (O2) (current backlog: H06)
-- [ ] Public API doctests (O3) (current backlog: H07)
+- [x] Public API doctests (O3) — H07 adds and executes configuration/client endpoint examples in both Linux feature configurations and on macOS.
 - [ ] Production TC DNS fast-path evaluation if profiling justifies it (O4) (current backlog: F09)
 - [x] Audit shipped/planned/experimental claims (O5, Phase 16 Sections D–G). Mechanical drift prevention and new findings remain ongoing work.
 
