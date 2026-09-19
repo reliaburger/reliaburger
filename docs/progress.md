@@ -130,6 +130,14 @@ All five pass on Linux/macOS (0.52s/0.14s), along with strict Clippy. The build
 workflow at that head passed; the repaired fixture needs current-head hosted
 validation. Superseded `f9c0e2c` workflows were cancelled for runner capacity.
 
+Both CI and Build & Release pass at `a7da1e5`. At `230751b`, the repaired
+minimum-Rust fixture and all other source jobs except the still-running coverage
+job pass. These are historical checkpoints, not final-candidate qualification.
+The source/build workflows now give each PR one concurrency group, cancelling
+superseded revisions while preserving independent main/tag runs and separating
+reusable source CI from its release caller. YAML syntax and group expressions
+are checked; hosted cancellation behaviour still requires subsequent runs.
+
 ### Engineering follow-ups
 
 - [x] **H01** Reconcile scheduler/quota/scrape wiring and weights, roadmap test locations, cleanup evidence and disabled-auth chaos policy with their callers. Mark completed historical bug groups done while retaining C30/C34 and future operator workflows. Repair eleven Rustdoc errors; all-feature public documentation now builds with warnings denied, all 74 relative links in the changed Markdown pass, and the four documented diagnostic CLI help interfaces are verified.

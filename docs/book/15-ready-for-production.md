@@ -3044,3 +3044,20 @@ the image out of the configuration. `Some(...)` is the present-value variant.
 The endpoint example uses `matches!` to check an enum variant rather than error
 message wording. These examples teach the public contract and fail when it
 drifts.
+
+### Give the current revision the runners
+
+Several successive fixes left older PR builds competing with the current
+revision. Source CI and native builds now cancel their superseded PR runs.
+Each workflow has its own fixed concurrency prefix and uses the pull-request
+number as its group. Main and tag runs use their unique run ID instead, so a
+later source push cannot interrupt release validation or publication.
+
+The prefixes also matter when the release workflow calls source CI. GitHub
+associates a reusable workflow's context with its caller; using the same group
+for both can make a release cancel or wait on itself. The
+[workflow concurrency reference](https://docs.github.com/en/actions/reference/workflows-and-actions/workflow-syntax#concurrency)
+and [reusable workflow reference](https://docs.github.com/en/actions/reference/workflows-and-actions/reusing-workflow-configurations)
+spell out those rules. Cancelling an obsolete run is queue management, not a
+passing test result. We still require the complete gate set for the final
+candidate revision.

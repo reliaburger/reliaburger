@@ -7,6 +7,12 @@ on:
   pull_request:
     branches: [main, "codex/**"]
 
+# PR updates supersede earlier checks. Main/tag runs each retain their own group.
+# Fixed prefixes also keep reusable source CI separate from its release caller.
+concurrency:
+  group: source-ci-${{ github.event.pull_request.number || github.run_id }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
 permissions:
   contents: read
 
