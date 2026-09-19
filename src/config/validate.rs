@@ -8,6 +8,30 @@ use super::error::ConfigError;
 use super::node::NodeConfig;
 use super::types::parse_resource_value;
 
+/// Whether a workload or namespace is a non-empty lowercase DNS label.
+pub(crate) fn valid_workload_label(value: &str) -> bool {
+    let bytes = value.as_bytes();
+    let edge = |byte: u8| byte.is_ascii_lowercase() || byte.is_ascii_digit();
+    !bytes.is_empty()
+        && bytes.len() <= 63
+        && edge(bytes[0])
+        && edge(bytes[bytes.len() - 1])
+        && bytes.iter().all(|byte| edge(*byte) || *byte == b'-')
+}
+
+fn validate_label(value: &str, context: &str, field: &str) -> Result<(), ConfigError> {
+    if valid_workload_label(value) {
+        return Ok(());
+    }
+    Err(ConfigError::Validation {
+        field: field.into(),
+        context: context.into(),
+        reason: format!(
+            "{value:?} must be a lowercase DNS label of 1–63 bytes, with letters or digits at both ends and only letters, digits or hyphens within"
+        ),
+    })
+}
+
 impl Config {
     /// Validate the parsed configuration.
     ///
@@ -37,10 +61,23 @@ impl Config {
         Ok(())
     }
 
-    /// Refuse app/job names that would share the runtime identity namespace.
+    /// Validate identity labels and refuse app/job runtime identity collisions.
     pub(crate) fn validate_workload_names(&self) -> Result<(), ConfigError> {
+        for name in self.namespace.keys() {
+            validate_label(name, "namespace declaration", "name")?;
+        }
+        for (name, job) in &self.job {
+            validate_label(name, "job", "name")?;
+            validate_label(
+                job.namespace.as_deref().unwrap_or("default"),
+                name,
+                "namespace",
+            )?;
+        }
         for (name, app) in &self.app {
+            validate_label(name, "app", "name")?;
             let namespace = app.namespace.as_deref().unwrap_or("default");
+            validate_label(namespace, name, "namespace")?;
             if let Some(job) = self.job.get(name)
                 && job.namespace.as_deref().unwrap_or("default") == namespace
             {
@@ -572,6 +609,85 @@ mod tests {
         config.job.get_mut("web").unwrap().namespace = Some("batch".into());
         config.validate().unwrap();
         config.validate_against(&[]).unwrap();
+    }
+
+    #[test]
+    fn workload_labels_reject_unsafe_or_ambiguous_names() {
+        let oversized = "a".repeat(64);
+        for label in [
+            "",
+            ".",
+            "..",
+            "../outside",
+            "a/b",
+            "a\\b",
+            "a__b",
+            "Bad",
+            "a b",
+            "-a",
+            "a-",
+            "é",
+            oversized.as_str(),
+        ] {
+            for target in [
+                "app",
+                "job",
+                "app namespace",
+                "job namespace",
+                "declared namespace",
+            ] {
+                let mut config = Config::default();
+                match target {
+                    "app" => {
+                        config.app.insert(label.into(), minimal_app());
+                    }
+                    "job" => {
+                        config
+                            .job
+                            .insert(label.into(), toml::from_str("image = 'job:v1'").unwrap());
+                    }
+                    "app namespace" => {
+                        let mut spec = minimal_app();
+                        spec.namespace = Some(label.into());
+                        config.app.insert("web".into(), spec);
+                    }
+                    "job namespace" => {
+                        let mut spec: super::super::job::JobSpec =
+                            toml::from_str("image = 'job:v1'").unwrap();
+                        spec.namespace = Some(label.into());
+                        config.job.insert("batch".into(), spec);
+                    }
+                    _ => {
+                        config
+                            .namespace
+                            .insert(label.into(), toml::from_str("").unwrap());
+                    }
+                }
+                assert!(config.validate().is_err(), "accepted {target}: {label:?}");
+                assert!(
+                    config.validate_against(&[]).is_err(),
+                    "accepted {target}: {label:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn workload_labels_accept_dns_label_boundaries() {
+        for label in [
+            "a".to_owned(),
+            "0".to_owned(),
+            "web-g17".to_owned(),
+            "a".repeat(63),
+        ] {
+            let mut config = config_with_app(&label, minimal_app());
+            config.app.get_mut(&label).unwrap().namespace = Some(label.clone());
+            config
+                .namespace
+                .insert(label.clone(), toml::from_str("").unwrap());
+            config.validate().unwrap();
+            config.validate_against(&[]).unwrap();
+        }
     }
 
     #[test]

@@ -983,6 +983,16 @@ exec preserves generation one and then deploys generation two on macOS/Linux
 (19.17s/10.35s). Unsupported/inconsistent legacy adoption identities and
 cross-app canonical ID collisions are separately tracked under C34.
 
+**Workload label admission (19 September):** Configuration accepted an empty app
+name and Bun created a runtime instance for uppercase `Bad`; both regressions
+fail first. App/job names, their namespaces and declared namespaces now require
+1–63-byte lowercase DNS labels before resource allocation. Trace shares the
+same predicate. Boundary, separator, traversal-shaped, whitespace and Unicode
+cases pass. Full library suites pass 3,322 macOS/3,376 Linux tests (five/19
+explicit gates; 38.79s/70.52s), alongside strict Clippy on both platforms.
+Recovery identity validation and global instance-ID collision refusal remain
+separate open work.
+
 ### C35 — Gate chaos capabilities per selected scenario
 
 **Priority:** P2. **Wave:** 4. **Book chapters:** 08, 15.

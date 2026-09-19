@@ -995,13 +995,7 @@ async fn trace_handler(
 }
 
 fn valid_trace_label(value: &str) -> bool {
-    let bytes = value.as_bytes();
-    let edge = |byte: u8| byte.is_ascii_lowercase() || byte.is_ascii_digit();
-    !bytes.is_empty()
-        && bytes.len() <= 63
-        && edge(bytes[0])
-        && edge(bytes[bytes.len() - 1])
-        && bytes.iter().all(|byte| edge(*byte) || *byte == b'-')
+    crate::config::valid_workload_label(value)
 }
 
 fn filter_desired_apps_for_scope(

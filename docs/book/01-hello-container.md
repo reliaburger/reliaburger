@@ -2937,3 +2937,32 @@ cannot receive the same reservation. Adopted ports outside the range still do
 not consume its capacity. A regression reserves 63,999 of 64,000 candidates and
 repeatedly allocates and releases the final free port; the concurrent allocation
 tests check uniqueness too.
+
+
+### Check names before creating their resources
+
+The deployment regression submits an app named `Bad`. Before the repair, Bun
+creates `default__Bad-0` and reports success. Configuration also accepts an empty
+name. That's a problem because the names become parts of DNS names, instance IDs
+and filesystem paths; our identity format already assumes lowercase DNS labels.
+
+Admission now enforces that assumption for app names, job names, their namespaces
+and namespace declarations. Each label contains 1–63 ASCII bytes, starts and ends
+with a lowercase letter or digit, and contains only those characters or hyphens.
+An explicit empty namespace is invalid; omitting it still selects `default`.
+We reject invalid labels rather than normalising them, which could merge two
+names that the caller intended to keep separate.
+
+The shared predicate borrows a `&str` and calls `as_bytes()`. This gives us a
+borrowed byte slice without allocating another string. A small closure checks
+letters and digits; the interior permits `b'-'`, Rust's byte literal for a
+hyphen. Checking length before indexing relies on `&&` short-circuiting: an
+empty slice never reaches either endpoint lookup. Trace already used these
+rules and now calls the same predicate.
+
+Both configuration entry points and Bun's command admission use the check.
+The tests cover separators, traversal-shaped strings, uppercase, whitespace,
+Unicode and length boundaries. The runtime regression uses harmless invalid
+labels and asserts that the mock receives no create call. Stored ownership
+records still need their own recovery validation; accepting a new configuration
+and interpreting old on-disk ownership are different entry points.

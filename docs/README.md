@@ -50,6 +50,11 @@ and attempt budget. Explicit stop cancels pending attempts. Durable job retry
 budgets across Bun replacement remain a release blocker. An uncertain checkpoint write fences further
 cron changes and firings until Bun restarts and reloads its durable state.
 
+App and job names, their namespaces and namespace declarations must be lowercase
+DNS labels: 1–63 ASCII letters/digits/hyphens, with a letter or digit at each end.
+Omit a namespace to use `default`; an explicitly empty namespace is invalid.
+Bun rejects invalid labels before allocating runtime resources.
+
 Startup refuses unreadable or malformed workload ownership records and runtime
 adoption errors before serving the API. It preserves records and identity files
 for recovery; inspect the reported path or runtime error and retry once repaired.

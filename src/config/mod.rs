@@ -16,6 +16,7 @@ pub mod permission;
 pub mod process_workloads;
 pub mod types;
 mod validate;
+pub(crate) use validate::valid_workload_label;
 
 use std::collections::BTreeMap;
 use std::path::Path;

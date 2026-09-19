@@ -13945,6 +13945,33 @@ host = "remote.local"
     }
 
     #[tokio::test]
+    async fn workload_labels_are_refused_before_runtime_mutation() {
+        for (name, namespace) in [("Bad", "default"), ("web", "bad__namespace")] {
+            let (mut agent, tx, shutdown, grill) = test_agent_with_grill();
+            let mut config = basic_config();
+            let mut spec = config.app.remove("web").unwrap();
+            spec.namespace = Some(namespace.into());
+            config.app.insert(name.into(), spec);
+            let handle = tokio::spawn(async move { agent.run().await });
+            let events = send_deploy(&tx, config).await;
+            shutdown.cancel();
+            handle.await.unwrap();
+            assert!(
+                events
+                    .iter()
+                    .any(|event| matches!(event, ApplyEvent::Error { .. })),
+                "invalid label was deployed: {events:?}"
+            );
+            assert!(
+                !grill
+                    .calls()
+                    .iter()
+                    .any(|(operation, _)| operation == "create")
+            );
+        }
+    }
+
+    #[tokio::test]
     async fn deploy_mixed_apps_and_jobs() {
         let (mut agent, tx, shutdown) = test_agent();
 
