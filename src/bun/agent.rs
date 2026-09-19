@@ -569,14 +569,17 @@ enum DeployOp {
         spec: Box<AppSpec>,
         reply: oneshot::Sender<Result<(), BunError>>,
     },
-    /// Active (non-terminal) instance ids for an app in a namespace.
-    ListExistingActive {
+    /// Every owned instance id, including terminal instances awaiting cleanup.
+    ListExistingOwned {
         app_name: String,
         namespace: String,
         reply: oneshot::Sender<Vec<InstanceId>>,
     },
     /// Reserve and return the next rolling-redeploy generation counter.
-    NextDeployGen { reply: oneshot::Sender<u64> },
+    NextDeployGen {
+        app_name: String,
+        reply: oneshot::Sender<Result<u64, BunError>>,
+    },
     /// Create supervisor-tracked instances for a fresh app deploy.
     SupervisorDeployApp {
         app_name: String,
@@ -848,9 +851,9 @@ impl DeployOps {
         .await
     }
 
-    async fn list_existing_active(&self, app_name: &str, namespace: &str) -> Vec<InstanceId> {
+    async fn list_existing_owned(&self, app_name: &str, namespace: &str) -> Vec<InstanceId> {
         self.call(
-            |reply| DeployOp::ListExistingActive {
+            |reply| DeployOp::ListExistingOwned {
                 app_name: app_name.to_string(),
                 namespace: namespace.to_string(),
                 reply,
@@ -860,9 +863,18 @@ impl DeployOps {
         .await
     }
 
-    async fn next_deploy_gen(&self) -> u64 {
-        self.call(|reply| DeployOp::NextDeployGen { reply }, 0)
-            .await
+    async fn next_deploy_gen(&self, app_name: &str) -> Result<u64, BunError> {
+        self.call(
+            |reply| DeployOp::NextDeployGen {
+                app_name: app_name.into(),
+                reply,
+            },
+            Err(BunError::DeployFailed {
+                app_name: app_name.into(),
+                reason: "agent loop closed before reserving rollout identity".into(),
+            }),
+        )
+        .await
     }
 
     async fn supervisor_deploy_app(
@@ -1620,7 +1632,7 @@ pub struct BunAgent<G: Grill> {
     deployed_specs: std::collections::HashMap<(String, String), AppSpec>,
     /// Monotonic counter tagging each rolling-redeploy's new instance IDs.
     /// A wall-clock generation collided when two redeploys landed in the
-    /// same second; this never repeats within a process.
+    /// same second; reservations advance beyond both this counter and all restored owners.
     next_deploy_gen: u64,
     /// Jobs carrying a `schedule`, registered on apply and fired by the cron
     /// tick. Keyed by (name, namespace) so a re-apply replaces the entry.
@@ -8373,7 +8385,7 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
                 }
                 let _ = reply.send(result);
             }
-            DeployOp::ListExistingActive {
+            DeployOp::ListExistingOwned {
                 app_name,
                 namespace,
                 reply,
@@ -8383,21 +8395,40 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
                     .list_instances()
                     .iter()
                     .filter(|i| !i.is_job && i.app_name == app_name && i.namespace == namespace)
-                    .filter(|i| {
-                        !matches!(
-                            i.state,
-                            crate::grill::state::ContainerState::Stopped
-                                | crate::grill::state::ContainerState::Failed
-                        )
-                    })
                     .map(|i| i.id.clone())
                     .collect();
                 let _ = reply.send(ids);
             }
-            DeployOp::NextDeployGen { reply } => {
-                let deploy_gen = self.next_deploy_gen;
-                self.next_deploy_gen += 1;
-                let _ = reply.send(deploy_gen);
+            DeployOp::NextDeployGen { app_name, reply } => {
+                // Adoption restores owners, not the previous process's counter.
+                // Use the structured app name to distinguish an ordinary app
+                // named `worker-g9` from generation 9 of an app named `worker`.
+                let highest_owned = self
+                    .supervisor
+                    .list_instances()
+                    .iter()
+                    .filter_map(|instance| {
+                        let prefix = format!("{}__{}-g", instance.namespace, instance.app_name);
+                        let suffix = instance.id.0.strip_prefix(&prefix)?;
+                        let (generation, _) = suffix.split_once('-')?;
+                        generation.parse::<u64>().ok()
+                    })
+                    .max()
+                    .unwrap_or(0);
+                let next = highest_owned
+                    .checked_add(1)
+                    .and_then(|after_owned| self.next_deploy_gen.max(after_owned).checked_add(1));
+                let result = match next {
+                    Some(next) => {
+                        self.next_deploy_gen = next;
+                        Ok(next - 1)
+                    }
+                    None => Err(BunError::DeployFailed {
+                        app_name,
+                        reason: "rollout generation exhausted; ownership preserved".into(),
+                    }),
+                };
+                let _ = reply.send(result);
             }
             DeployOp::SupervisorDeployApp {
                 app_name,
@@ -8952,7 +8983,7 @@ impl<G: Grill + Clone + 'static> DeployWorker<G> {
                 return;
             }
 
-            let existing = self.ops.list_existing_active(app_name, namespace).await;
+            let existing = self.ops.list_existing_owned(app_name, namespace).await;
 
             if !existing.is_empty() {
                 // Dispatch on deploy strategy (E): blue-green stands up the
@@ -8979,7 +9010,7 @@ impl<G: Grill + Clone + 'static> DeployWorker<G> {
                 }
                 all_ids.extend(
                     self.ops
-                        .list_existing_active(app_name, namespace)
+                        .list_existing_owned(app_name, namespace)
                         .await
                         .iter()
                         .map(|id| id.0.clone()),
@@ -9383,7 +9414,17 @@ impl<G: Grill + Clone + 'static> DeployWorker<G> {
             .map(crate::meat::deploy_types::DeployConfig::from_spec)
             .unwrap_or_default();
 
-        let deploy_gen = self.ops.next_deploy_gen().await;
+        let deploy_gen = match self.ops.next_deploy_gen(app_name).await {
+            Ok(generation) => generation,
+            Err(error) => {
+                let _ = events
+                    .send(ApplyEvent::Error {
+                        message: error.to_string(),
+                    })
+                    .await;
+                return std::ops::ControlFlow::Break(());
+            }
+        };
         let replica_count = match spec.replicas {
             crate::config::types::Replicas::Fixed(n) => n,
             crate::config::types::Replicas::DaemonSet => 1,
@@ -9860,7 +9901,17 @@ impl<G: Grill + Clone + 'static> DeployWorker<G> {
             .as_ref()
             .map(crate::meat::deploy_types::DeployConfig::from_spec)
             .unwrap_or_default();
-        let deploy_gen = self.ops.next_deploy_gen().await;
+        let deploy_gen = match self.ops.next_deploy_gen(app_name).await {
+            Ok(generation) => generation,
+            Err(error) => {
+                let _ = events
+                    .send(ApplyEvent::Error {
+                        message: error.to_string(),
+                    })
+                    .await;
+                return std::ops::ControlFlow::Break(());
+            }
+        };
         let replica_count = match spec.replicas {
             crate::config::types::Replicas::Fixed(n) => n,
             crate::config::types::Replicas::DaemonSet => 1,
@@ -14153,6 +14204,88 @@ host = "remote.local"
                 },
             },
             rootless_network: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn redeploy_after_adoption_never_reuses_an_owned_generation() {
+        for (runtime_id, generation) in [("default__web-g1-0", 1), ("default__web-g17-0", 17)] {
+            let records = tempfile::tempdir().unwrap();
+            let (mut agent, _tx, _shutdown, grill) = test_agent_with_grill();
+            agent.set_records_dir(records.path().to_path_buf());
+            let record = adoption_record(runtime_id, "web", false);
+            crate::grill::records::write_record(records.path(), &record).unwrap();
+            grill.set_adopt_result(&InstanceId(runtime_id.into()), true);
+            grill.set_pid(std::process::id());
+            assert_eq!(agent.adopt_recorded_instances().await.unwrap(), 1);
+            let events = drain_deploy(&mut agent, basic_config()).await;
+            let expected = format!("default__web-g{}-0", generation + 1);
+            let created: Vec<_> = grill
+                .calls()
+                .into_iter()
+                .filter(|(call, _)| call == "create")
+                .map(|(_, id)| id.0)
+                .collect();
+            let persisted = crate::grill::records::load_records(records.path()).unwrap();
+            agent.stop_app("web", "default").await.unwrap();
+            expect_complete(&events);
+            assert_eq!(
+                created,
+                vec![expected.clone()],
+                "adoption must advance rollout identity"
+            );
+            assert_eq!(persisted.len(), 1);
+            assert_eq!(persisted[0].instance_id, expected);
+        }
+    }
+
+    #[tokio::test]
+    async fn exhausted_rollout_generation_refuses_without_mutating_the_old_instance() {
+        let (mut agent, _tx, _shutdown, grill) = test_agent_with_grill();
+        expect_complete(&drain_deploy(&mut agent, basic_config()).await);
+        agent.next_deploy_gen = u64::MAX;
+        let before = grill.calls().len();
+        let events = drain_deploy(&mut agent, basic_config()).await;
+        let calls = grill.calls();
+        agent.stop_app("web", "default").await.unwrap();
+        assert!(events.iter().any(|event| matches!(event, ApplyEvent::Error { message } if message.contains("generation exhausted"))), "{events:?}");
+        assert_eq!(calls.len(), before);
+    }
+
+    #[tokio::test]
+    async fn redeploy_does_not_overwrite_a_stopped_or_failed_cleanup_owner() {
+        for state in [ContainerState::Stopped, ContainerState::Failed] {
+            let records = tempfile::tempdir().unwrap();
+            let (mut agent, _tx, _shutdown, grill) = test_agent_with_grill();
+            agent.set_records_dir(records.path().to_path_buf());
+            grill.set_pid(std::process::id());
+            expect_complete(&drain_deploy(&mut agent, basic_config()).await);
+            let old = InstanceId("default__web-0".into());
+            let path = crate::grill::records::record_path(records.path(), &old.0);
+            let original = std::fs::read(&path).unwrap();
+            std::fs::remove_file(&path).unwrap();
+            std::fs::create_dir(&path).unwrap();
+            assert!(agent.stop_app("web", "default").await.is_err());
+            agent.supervisor.get_instance_mut(&old).unwrap().state = state;
+            let events = drain_deploy(&mut agent, basic_config()).await;
+            let owned = agent.supervisor.list_instances().len();
+            let old_creates = grill
+                .calls()
+                .iter()
+                .filter(|(call, id)| call == "create" && id == &old)
+                .count();
+            std::fs::remove_dir(&path).unwrap();
+            std::fs::write(&path, original).unwrap();
+            agent.retire_workload("web", "default").await.unwrap();
+            assert!(
+                !events
+                    .iter()
+                    .any(|event| matches!(event, ApplyEvent::Complete { .. })),
+                "{state}: {events:?}"
+            );
+            assert_eq!(owned, 2, "must retain both owners after cleanup fails");
+            assert_eq!(old_creates, 1, "the original identity was created twice");
+            assert_eq!(agent.supervisor.port_allocator.allocated_count().await, 0);
         }
     }
 

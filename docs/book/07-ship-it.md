@@ -1191,3 +1191,28 @@ stepped rolling replacement, rolling surplus retirement and blue-green cut-over.
 Late health replies also use the existing state check, so they cannot revive a
 Stopping owner. This command-channel ordering protects one Bun lifetime; durable
 intent before initial runtime creation remains separate release work.
+
+### An upgrade must not reset instance identity
+
+Suppose `default__web-g1-0` survives Bun's binary replacement. The new Bun adopts
+it, but its in-memory deployment counter starts at one again. The next rollout
+used to create `default__web-g1-0` a second time, overwriting the very ownership
+it needed to retire. A counter that is unique within one process isn't enough.
+
+Generation reservation now advances beyond both the counter and every restored
+owner's generation. It uses each owner's stored namespace and app name when
+reading the suffix, so an ordinary app called `worker-g9` isn't mistaken for
+generation nine of `worker`. Checked arithmetic returns a deployment error on
+exhaustion; it cannot wrap to a previously used identity or panic the command
+loop. A closed command channel also returns an error instead of generation zero.
+
+Stopped and Failed entries still count as owners. A failed artifact deletion can
+leave either state behind, so filtering them out made a subsequent apply take
+the fresh-deploy path and overwrite the original ID. Replacement now retires
+these entries through the same checked path as a running old instance.
+
+Three failing-first regressions cover adoption followed by another rollout,
+counter exhaustion and replacement while a terminal owner's record cannot be
+removed. The real binary-upgrade test now rolls an app once before exec, checks
+that its PID survives the swap, then rolls it again and requires generation two.
+This tests recovery where it matters: at the next mutation after adoption.

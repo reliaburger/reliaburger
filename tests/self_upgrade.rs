@@ -388,6 +388,8 @@ async fn single_node_upgrade_preserves_running_containers() {
     assert_eq!(harness.version().await.as_deref(), Some("v0.1.0"));
 
     harness.deploy_testapp("web", 46011).await;
+    // Preserve an actual canary generation across exec, then replace it again.
+    harness.deploy_testapp("web", 46012).await;
     let pid_before = harness.workload_pid("web").await.expect("workload pid");
 
     let directive = harness.directive("v0.2.0", "up-1");
@@ -402,7 +404,7 @@ async fn single_node_upgrade_preserves_running_containers() {
         pid_before, pid_after,
         "workload was restarted by the upgrade"
     );
-    let response = reqwest::get("http://127.0.0.1:46011/").await;
+    let response = reqwest::get("http://127.0.0.1:46012/").await;
     assert!(
         response.is_ok(),
         "workload stopped serving after the upgrade"
@@ -413,6 +415,27 @@ async fn single_node_upgrade_preserves_running_containers() {
     assert_eq!(target, Path::new("bun-v0.2.0"));
     assert!(!harness.data_dir.join("upgrade/marker.json").exists());
 
+    harness.deploy_testapp("web", 46013).await;
+    let status: serde_json::Value = harness
+        .client
+        .get(harness.url("/v1/status"))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let web = status
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|instance| instance["app_name"] == "web")
+        .unwrap();
+    assert_eq!(
+        web["id"], "default__web-g2-0",
+        "replacement reused an adopted generation: {status}"
+    );
+    assert_ne!(harness.workload_pid("web").await, Some(pid_after));
     harness.shutdown().await;
 }
 

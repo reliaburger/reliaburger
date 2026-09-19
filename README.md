@@ -80,7 +80,8 @@ when identity-directory or adoption-record removal fails. Rolling and blue-green
 deployments refuse completion if runtime exit is uncertain and keep both
 generations available for cleanup. Rollout finalisation also retains ownership
 when identity or adoption-record removal fails, so cleanup can be retried.
-Retirement also fences automatic restarts before signalling the old runtime. With rootful Linux DNS
+Retirement also fences automatic restarts before signalling the old runtime.
+Rollout identities advance past adopted generations after Bun replacement. With rootful Linux DNS
 enabled, short
 service names resolve in the calling workload's namespace. Host tools use explicit
 names such as `redis.payments.internal`; unknown sources cannot inherit a node's

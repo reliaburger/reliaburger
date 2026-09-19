@@ -971,6 +971,18 @@ The regression covers stepped rolling, rolling surplus and blue-green paths.
 All 458 native/457 Linux Bun tests pass (one explicit gate each, 21.88s/37.95s),
 with strict all-target/all-feature Clippy on both platforms.
 
+**Rollout identity recovery (19 September):** Three regressions reproduce
+post-adoption generation reuse, counter overflow and fresh-deploy replacement of
+a terminal owner whose adoption record cannot be deleted. Allocation now advances
+past restored owners and checked process-local reservations, refusing exhaustion
+or a closed agent channel. Replacement includes Stopped/Failed owners until
+checked retirement succeeds. Structured app names disambiguate generation
+suffixes. The full Bun suites pass 461 native/460 Linux tests (one explicit gate each,
+21.68s/37.80s), with strict all-target/all-feature Clippy on both. Actual signed
+exec preserves generation one and then deploys generation two on macOS/Linux
+(19.17s/10.35s). Unsupported/inconsistent legacy adoption identities and
+cross-app canonical ID collisions are separately tracked under C34.
+
 ### C35 — Gate chaos capabilities per selected scenario
 
 **Priority:** P2. **Wave:** 4. **Book chapters:** 08, 15.
