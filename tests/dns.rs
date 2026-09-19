@@ -532,3 +532,123 @@ async fn udp_and_tcp_short_names_follow_live_source_identity() {
     shutdown.cancel();
     task.await.unwrap();
 }
+
+#[tokio::test]
+async fn malformed_questions_cannot_receive_an_internal_answer() {
+    let valid = build_query_with_id("redis.internal", QTYPE_A, [0x56, 0x78]);
+    let base = build_query_with_id("redis.internal", QTYPE_A, [0x12, 0x34]);
+    let mut corpus = Vec::new();
+    for end in 0..base.len() {
+        corpus.push(("truncated packet", base[..end].to_vec()));
+    }
+    let mut trailing = base.clone();
+    trailing.push(0);
+    corpus.push(("unclaimed trailing data", trailing));
+    let mut looped = base[..12].to_vec();
+    looped.extend_from_slice(&[0xc0, 0x0c, 0, 1, 0, 1]);
+    corpus.push(("compression loop", looped));
+    let mut missing_opt = base.clone();
+    missing_opt[11] = 1;
+    corpus.push(("missing additional record", missing_opt));
+    let mut truncated = base.clone();
+    truncated.pop();
+    corpus.push(("truncated class", truncated));
+    for (name, offset, value) in [
+        ("response instead of query", 2, 0x81),
+        ("unsupported opcode", 2, 0x09),
+        ("two questions", 5, 2),
+        ("no question", 5, 0),
+        ("claimed answer", 7, 1),
+    ] {
+        let mut query = base.clone();
+        query[offset] = value;
+        corpus.push((name, query));
+    }
+    let mut wrong_class = base.clone();
+    *wrong_class.last_mut().unwrap() = 3;
+    corpus.push(("non-IN class", wrong_class));
+    let mut single_label = base[..12].to_vec();
+    single_label.push(14);
+    single_label.extend_from_slice(b"redis.internal");
+    single_label.extend_from_slice(&[0, 0, 1, 0, 1]);
+    corpus.push(("literal dot inside label", single_label));
+    let long_name = format!("{}.internal", vec!["a".repeat(63); 4].join("."));
+    corpus.push(("overlong name", build_query(&long_name, QTYPE_A)));
+
+    for (name, invalid) in corpus {
+        let harness = DnsHarness::start(unroutable_upstream(), map_with("redis")).await;
+        let socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        socket.send_to(&invalid, harness.addr).await.unwrap();
+        socket.send_to(&valid, harness.addr).await.unwrap();
+        let mut bytes = [0; 1500];
+        let (length, _) =
+            tokio::time::timeout(Duration::from_secs(2), socket.recv_from(&mut bytes))
+                .await
+                .unwrap()
+                .unwrap();
+        assert!(length >= 12);
+        assert_eq!(&bytes[..2], &valid[..2], "answered {name}");
+        assert_eq!(&bytes[6..8], &[0, 1], "valid query after {name} failed");
+    }
+}
+
+#[tokio::test]
+async fn edns_question_preserves_the_service_answer_and_negotiates_payload_size() {
+    let harness = DnsHarness::start(unroutable_upstream(), map_with("redis")).await;
+    let mut query = build_query("ReDiS.internal", QTYPE_A);
+    query[11] = 1;
+    query.extend_from_slice(&[0, 0, 41, 4, 208, 0, 0, 0, 0, 0, 0]);
+    let response = harness.query(&query).await.unwrap();
+    assert_eq!(&response[..2], &query[..2]);
+    assert_eq!(&response[4..12], &[0, 1, 0, 1, 0, 0, 0, 1]);
+    assert_eq!(rcode(&response), 0);
+    let vip = VirtualIP::from_service_id(&ServiceId::new("default", "redis"));
+    assert_eq!(
+        &response[response.len() - 15..response.len() - 11],
+        &vip.0.octets()
+    );
+    assert_eq!(
+        &response[response.len() - 11..],
+        &[0, 0, 41, 4, 208, 0, 0, 0, 0, 0, 0]
+    );
+}
+
+#[tokio::test]
+async fn tcp_refuses_a_truncated_question_and_keeps_the_listener_available() {
+    let (_map_tx, map_rx) = watch::channel(map_with("redis"));
+    let (_fault_tx, fault_rx) = watch::channel(DnsFaultState::default());
+    let shutdown = CancellationToken::new();
+    let responder = BoundDnsResponder::bind(DnsConfig {
+        listen_addr: "127.0.0.1:0".parse().unwrap(),
+        ..DnsConfig::default()
+    })
+    .await
+    .unwrap();
+    let address = responder.local_addr().unwrap();
+    let task = tokio::spawn(responder.run(map_rx, fault_rx, shutdown.clone()));
+    for malformed in [true, false] {
+        let mut query = build_query("redis.default.internal", QTYPE_A);
+        if malformed {
+            query.pop();
+        }
+        let mut socket = tokio::net::TcpStream::connect(address).await.unwrap();
+        socket
+            .write_all(&(query.len() as u16).to_be_bytes())
+            .await
+            .unwrap();
+        socket.write_all(&query).await.unwrap();
+        let mut response = Vec::new();
+        tokio::time::timeout(Duration::from_secs(2), socket.read_to_end(&mut response))
+            .await
+            .unwrap()
+            .unwrap();
+        if malformed {
+            assert!(response.is_empty(), "malformed query received a response");
+        } else {
+            assert!(response.len() > 14);
+            assert_eq!(&response[8..10], &[0, 1]);
+        }
+    }
+    shutdown.cancel();
+    task.await.unwrap();
+}

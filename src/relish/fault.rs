@@ -600,6 +600,37 @@ mod tests {
     use super::*;
 
     #[test]
+    fn duration_grammar_keeps_unitless_seconds_without_expanding_units() {
+        for (input, millis) in [
+            ("60", 60_000),
+            ("1ms", 1),
+            ("1s", 1_000),
+            ("1m", 60_000),
+            ("1h", 3_600_000),
+            (" 1m ", 60_000),
+        ] {
+            assert_eq!(
+                parse_duration(input).unwrap(),
+                Duration::from_millis(millis)
+            );
+        }
+        for input in ["1d", "1w", "1h30m", "1.5s", "1us", "1µs", "秒", ""] {
+            assert!(
+                parse_duration(input).is_err(),
+                "unexpected duration syntax: {input}"
+            );
+        }
+    }
+
+    proptest::proptest! {
+        #[test]
+        fn arbitrary_duration_text_never_panics(input in ".{0,128}") {
+            let _ = parse_duration(&input);
+            let _ = parse_delay_ns(&input);
+        }
+    }
+
+    #[test]
     fn duration_units_reject_overflow_at_the_seconds_boundary() {
         for (suffix, multiplier) in [("m", 60_u64), ("h", 3600)] {
             let maximum = u64::MAX / multiplier;

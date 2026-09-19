@@ -1004,3 +1004,20 @@ a different delay. Tests exercise the largest accepted value and its immediate
 successor for minutes, hours and milliseconds converted to nanoseconds. The
 original code panics on the multiplication in a debug build and silently
 truncates the delay; both failures reproduce before the repair.
+
+
+### Similar duration strings can mean different things
+
+`relish fault --duration 60` means sixty seconds. `relish logs --since 60`
+means epoch second sixty. The log filter also accepts `1d`; the fault/test
+parser does not. Combining these parsers would change the CLI contract.
+
+We evaluated humantime 2.3.0 against a twelve-input corpus. It rejects a bare
+`60` and accepts compound, fractional and extra-unit forms that our commands
+currently reject. Keeping today's syntax would still require our own admission
+wrapper and the same checked conversion to nanoseconds. For 0.1.0 we retain the
+small duration parsers. Their compatibility table, numeric boundary tests and
+arbitrary-text property test make that decision executable. Hickory replaces
+the DNS codec because complete wire decoding removes a second parser's worth
+of boundary and compression handling; the duration evaluation doesn't show
+the same benefit.

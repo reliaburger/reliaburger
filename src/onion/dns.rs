@@ -20,6 +20,9 @@ use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::sync::Arc;
 use std::time::Duration;
 
+use hickory_proto::op::{Message, MessageType, OpCode, ResponseCode};
+use hickory_proto::rr::{DNSClass, RData, Record, rdata::A};
+use hickory_proto::serialize::binary::{BinDecodable, BinDecoder};
 use serde::{Deserialize, Serialize};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, UdpSocket};
@@ -702,155 +705,92 @@ async fn forward_upstream(
 ///
 /// Returns the name as a lowercase dotted string, or `None` if the
 /// packet is malformed.
+/// Decode the complete packet before admitting its one Internet-class question.
+/// The codec owns name lengths, compression and record boundaries; Onion owns
+/// which operations and service-name representations it supports.
+fn decode_query(packet: &[u8]) -> Option<Message> {
+    if packet.len() < 12 || packet[3] & 0x40 != 0 {
+        return None;
+    }
+    let mut decoder = BinDecoder::new(packet);
+    let message = Message::read(&mut decoder).ok()?;
+    if !decoder.is_empty()
+        || message.metadata.message_type != MessageType::Query
+        || message.metadata.op_code != OpCode::Query
+        || message.metadata.response_code != ResponseCode::NoError
+        || message.metadata.truncation
+        || message.queries.len() != 1
+        || !message.answers.is_empty()
+        || !message.authorities.is_empty()
+        || !message.additionals.is_empty()
+        || message.signature.is_some()
+        || message
+            .edns
+            .as_ref()
+            .is_some_and(|edns| edns.version() != 0)
+    {
+        return None;
+    }
+    let question = &message.queries[0];
+    if question.query_class != DNSClass::IN
+        || question.name.is_root()
+        // A literal dot is part of one DNS label, never a namespace separator.
+        || question.name.iter().any(|label| label.contains(&b'.'))
+    {
+        return None;
+    }
+    Some(message)
+}
+
 fn parse_query(packet: &[u8]) -> Option<(String, u16)> {
-    // DNS header is 12 bytes
-    if packet.len() < 13 {
-        return None;
-    }
-
-    let mut pos = 12; // skip header
-    let mut name = String::new();
-
-    loop {
-        if pos >= packet.len() {
-            return None;
-        }
-
-        let label_len = packet[pos] as usize;
-        pos += 1;
-
-        if label_len == 0 {
-            break; // end of name
-        }
-
-        if label_len > 63 || pos + label_len > packet.len() {
-            return None; // invalid label
-        }
-
-        if !name.is_empty() {
-            name.push('.');
-        }
-
-        for &b in &packet[pos..pos + label_len] {
-            name.push(b.to_ascii_lowercase() as char);
-        }
-
-        pos += label_len;
-    }
-
-    if name.is_empty() {
-        return None;
-    }
-
-    // QTYPE follows the name terminator
-    if pos + 2 > packet.len() {
-        return None;
-    }
-    let qtype = u16::from_be_bytes([packet[pos], packet[pos + 1]]);
-
-    Some((name, qtype))
+    let message = decode_query(packet)?;
+    let question = &message.queries[0];
+    Some((
+        question
+            .name
+            .to_ascii()
+            .trim_end_matches('.')
+            .to_ascii_lowercase(),
+        question.query_type.into(),
+    ))
 }
 
-/// Build a minimal DNS A record response for a VIP.
+/// Encode a bounded answer with a validated question and optional EDNS0.
+fn build_response(query: &[u8], rcode: u8, vip: Option<VirtualIP>) -> Vec<u8> {
+    let Some(query) = decode_query(query) else {
+        return Vec::new();
+    };
+    let mut response = Message::response(query.metadata.id, OpCode::Query);
+    response.metadata.authoritative = true;
+    response.metadata.recursion_desired = query.metadata.recursion_desired;
+    response.metadata.response_code = ResponseCode::from(0, rcode);
+    if let Some(vip) = vip {
+        response.add_answer(Record::from_rdata(
+            query.queries[0].name.clone(),
+            0,
+            RData::A(A(vip.0)),
+        ));
+    }
+    response.queries = query.queries;
+    if query.edns.is_some() {
+        let mut edns = hickory_proto::op::Edns::new();
+        edns.set_max_payload(MAX_PACKET as u16);
+        response.set_edns(edns);
+    }
+    response.to_vec().unwrap_or_else(|error| {
+        eprintln!("onion-dns: cannot encode response: {error}");
+        Vec::new()
+    })
+}
+
+/// Build an authoritative, zero-TTL IPv4 answer.
 fn build_a_response(query: &[u8], vip: VirtualIP) -> Vec<u8> {
-    if query.len() < 12 {
-        return Vec::new();
-    }
-
-    let mut response = Vec::with_capacity(query.len() + 16);
-
-    // Copy the query ID
-    response.extend_from_slice(&query[..2]);
-
-    // Flags: QR=1 (response), AA=1 (authoritative), RCODE=0
-    response.push(0x84); // QR=1, Opcode=0, AA=1, TC=0, RD=0
-    response.push(0x00); // RA=0, Z=0, RCODE=0
-
-    // QDCOUNT=1 (copy from query)
-    response.extend_from_slice(&query[4..6]);
-    // ANCOUNT=1
-    response.push(0x00);
-    response.push(0x01);
-    // NSCOUNT=0
-    response.push(0x00);
-    response.push(0x00);
-    // ARCOUNT=0
-    response.push(0x00);
-    response.push(0x00);
-
-    // Copy the question section from the query
-    let question_end = find_question_end(query);
-    if question_end > 12 {
-        response.extend_from_slice(&query[12..question_end]);
-    }
-
-    // Answer section: pointer to name in question (compression)
-    response.push(0xC0); // pointer
-    response.push(0x0C); // offset 12 (start of question name)
-
-    // TYPE = A (1)
-    response.push(0x00);
-    response.push(0x01);
-    // CLASS = IN (1)
-    response.push(0x00);
-    response.push(0x01);
-    // TTL = 0 (always re-resolve; map is always current)
-    response.extend_from_slice(&[0x00, 0x00, 0x00, 0x00]);
-    // RDLENGTH = 4
-    response.push(0x00);
-    response.push(0x04);
-    // RDATA = IPv4 address
-    response.extend_from_slice(&vip.0.octets());
-
-    response
+    build_response(query, 0, Some(vip))
 }
 
-/// Build an answerless response with the given RCODE.
-///
-/// RCODE 0 with ANCOUNT=0 is the "name exists, no records of that
-/// type" answer (used for AAAA on IPv4-only names); 2 is SERVFAIL,
-/// 3 NXDOMAIN, 4 NOTIMP.
+/// Build an authoritative answerless response with the given RCODE.
 fn build_status_response(query: &[u8], rcode: u8) -> Vec<u8> {
-    if query.len() < 12 {
-        return Vec::new();
-    }
-
-    let mut response = Vec::with_capacity(query.len());
-
-    response.extend_from_slice(&query[..2]); // ID
-    response.push(0x84); // QR=1, AA=1
-    response.push(rcode & 0x0F); // RA=0, Z=0, RCODE
-    response.extend_from_slice(&query[4..6]); // QDCOUNT
-    response.extend_from_slice(&[0x00, 0x00]); // ANCOUNT=0
-    response.extend_from_slice(&[0x00, 0x00]); // NSCOUNT=0
-    response.extend_from_slice(&[0x00, 0x00]); // ARCOUNT=0
-
-    let question_end = find_question_end(query);
-    if question_end > 12 {
-        response.extend_from_slice(&query[12..question_end]);
-    }
-
-    response
-}
-
-/// Find the end of the question section in a DNS packet.
-fn find_question_end(packet: &[u8]) -> usize {
-    let mut pos = 12;
-
-    // Skip the query name
-    while pos < packet.len() {
-        let label_len = packet[pos] as usize;
-        pos += 1;
-        if label_len == 0 {
-            break;
-        }
-        pos += label_len;
-    }
-
-    // Skip QTYPE (2 bytes) and QCLASS (2 bytes)
-    pos += 4;
-
-    pos.min(packet.len())
+    build_response(query, rcode, None)
 }
 
 #[cfg(test)]

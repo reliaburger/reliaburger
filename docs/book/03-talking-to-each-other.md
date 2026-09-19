@@ -1168,3 +1168,39 @@ and serving is the owned long-lived task. DNS keeps its standalone
 `run_dns_responder` wrapper because the DNS and eBPF integration tests exercise
 that public entry point. Its documentation now names that role and distinguishes
 it from Bun's readiness-aware binding path.
+
+
+### Give the DNS codec the whole packet
+
+Send a question whose QCLASS is missing its last byte. Our old decoder still
+answered it. It read the name and QTYPE, then assumed the rest of the packet
+was sound. It also trusted header counts and joined labels without preserving
+the difference between a separator and a literal dot inside one label.
+
+The replacement uses Hickory's protocol codec, with its standard-library
+feature and no resolver or DNSSEC engine. The codec checks names, compression
+and record boundaries. We require the decoder to consume the complete packet;
+unclaimed trailing bytes are an error. Onion then admits one normal IN-class
+question, checks the source identity and applies the existing namespace rules.
+Unsupported operations, malformed records and unsupported name forms are
+refused before either an internal answer or upstream forwarding.
+
+`Message::read(&mut decoder).ok()?` deserves a look. `&mut` lends the decoder
+exclusively while the codec advances its cursor. `.ok()` turns a decoding error
+into `None`, and `?` returns that absence to the caller. Here absence means the
+network task drops the malformed request. It never means an empty successful
+answer. This parser doesn't use an `unwrap()` on network data.
+
+The same library encodes responses. That removes our separate walk to find
+the end of a question, which would need its own compression handling. Internal
+answers still have zero TTL, A records resolve to the service VIP, and known
+names queried for AAAA still receive an empty successful response. EDNS0
+queries receive an OPT response advertising our bounded UDP payload size.
+This doesn't implement DNSSEC, general authoritative hosting or TCP recursion.
+
+The wire corpus includes every truncation of a valid query, wrong counts,
+response/opcode misuse, non-IN classes, overlong names, a compression loop,
+unclaimed bytes, missing additional records and a literal dot inside a label.
+A valid request sent immediately afterwards must still succeed. A TCP case
+checks that malformed input closes only that connection. The existing live
+namespace, fault, forwarding and TCP/UDP tests retain their original assertions.

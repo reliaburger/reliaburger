@@ -1342,6 +1342,37 @@ Historical O2 asked for evaluation, not a blind dependency migration; parsers cu
 
 **Completion test:** Compatibility/fuzz corpus and measured complexity justify adopting a library or explicitly retaining the current parser. Numeric overflow still gets the immediate C17 fix.
 
+**Completed (19 September):** An actual UDP regression shows the old DNS parser
+answering a truncated QCLASS. Adopt `hickory-proto` 0.26.3 with only its `std`
+feature for complete packet decoding and response encoding. Onion retains
+one-question/IN-class admission, source ACLs and namespace policy. The change
+removes about 60 lines of custom codec logic, replaces the separate question-end
+walker, checks trailing bytes and supports EDNS0 response negotiation. The
+lockfile adds one package; its minimum Rust is 1.88, below our 1.97 floor.
+
+The wire corpus covers all truncations, wrong header counts, non-query
+operations, wrong classes, overlong names, literal label dots, a compression
+loop, unclaimed bytes and missing additional records. Valid requests still
+succeed after each malformed packet. TCP connection refusal, EDNS0 and the
+existing namespace/fault/forwarding behaviour are tested separately.
+
+For durations, an executed twelve-input comparison with humantime 2.3.0 confirms
+that it rejects bare seconds while accepting days, weeks, compound values,
+fractions and microseconds outside the fault/test grammar. `--since` has a
+third contract: bare numbers are epoch seconds. Retain the small parsers, with
+an explicit compatibility table and arbitrary-text property test; a library
+wrapper would still need the existing grammar admission and C17's checked
+conversion. This is an evaluated retention decision, not a pending rewrite.
+
+Primary references: [Hickory protocol source](https://github.com/hickory-dns/hickory-dns),
+[humantime 2.3.0 syntax](https://docs.rs/humantime/2.3.0/humantime/fn.parse_duration.html)
+and [DNS wire format](https://www.rfc-editor.org/rfc/rfc1035.html#section-4.1).
+Validation: the original UDP regression fails before implementation; 29 DNS
+unit tests and 17 live wire tests pass on macOS/Linux. The native library
+checkpoint passes 3,302 tests with five explicit gates (38.52s). Duration
+compatibility/property tests and strict Linux/macOS Clippy pass. `make audit`
+passes for the updated 708-package lockfile with the existing dated exceptions.
+
 ### H07 — Add useful public API doctests
 
 **Priority:** P3. **Wave:** 5. **Book chapters:** 01, 09, 15.
