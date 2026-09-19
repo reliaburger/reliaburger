@@ -59,7 +59,11 @@ cron changes and firings until Bun restarts and reloads its durable state.
 App and job names, their namespaces and namespace declarations must be lowercase
 DNS labels: 1–63 ASCII letters/digits/hyphens, with a letter or digit at each end.
 Omit a namespace to use `default`; an explicitly empty namespace is invalid.
-Bun rejects invalid labels before allocating runtime resources.
+Bun rejects invalid labels before allocating runtime resources. It also refuses
+fresh app/job IDs that belong to another workload, including stopped cleanup
+owners. For example, `worker-g1` cannot claim replica zero while generation one
+of `worker` owns that ID in the same namespace. Use another name or retire the
+existing owner first; runtime IDs are not silently renamed.
 
 Startup refuses unreadable or malformed workload ownership records and runtime
 adoption errors before serving the API. It preserves records and identity files

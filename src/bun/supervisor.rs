@@ -380,6 +380,27 @@ impl<G: Grill> WorkloadSupervisor<G> {
         Ok(())
     }
 
+    /// Keep textual IDs from replacing a different structured workload owner.
+    fn admit_instance_identity(
+        &self,
+        id: &InstanceId,
+        name: &str,
+        namespace: &str,
+    ) -> Result<(), BunError> {
+        if let Some(owner) = self.instances.get(id)
+            && (owner.app_name != name || owner.namespace != namespace)
+        {
+            return Err(BunError::DeployFailed {
+                app_name: name.into(),
+                reason: format!(
+                    "instance {id} is still owned by {}/{}; choose a different workload name or retire the existing owner",
+                    owner.namespace, owner.app_name,
+                ),
+            });
+        }
+        Ok(())
+    }
+
     /// Deploy an app, creating workload instances in Pending state.
     ///
     /// Creates one instance per replica. For `DaemonSet` mode, creates
@@ -405,6 +426,12 @@ impl<G: Grill> WorkloadSupervisor<G> {
             Replicas::Fixed(n) => n,
             Replicas::DaemonSet => 1,
         };
+
+        // Preflight the whole fleet before reserving a port for any replica.
+        for index in 0..replica_count {
+            let id = crate::grill::InstanceIdentity::new(namespace, app_name, index).instance_id();
+            self.admit_instance_identity(&id, app_name, namespace)?;
+        }
 
         // Build every replica into locals FIRST, committing nothing to
         // `self` until they all succeed (M24). If a later replica's port
@@ -521,6 +548,7 @@ impl<G: Grill> WorkloadSupervisor<G> {
         self.admit_rootless_limits(job_name, spec.memory.is_some() || spec.cpu.is_some())?;
 
         let instance_id = crate::grill::InstanceIdentity::new(namespace, job_name, 0).instance_id();
+        self.admit_instance_identity(&instance_id, job_name, namespace)?;
 
         let instance = WorkloadInstance {
             id: instance_id.clone(),

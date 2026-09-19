@@ -1027,6 +1027,18 @@ with all 29 actual HTTP/process integration tests (four separate gates each;
 preparation reservation is in memory: physical crash recovery before the first
 runtime record and cross-app fresh-ID collision guards remain open.
 
+**Cross-app instance-ID collision guard (19 September):** The failing-first
+regression creates generation one of `worker`, then applies a fresh `worker-g1`
+app. Both resolve to `default__worker-g1-0`; the old path overwrites the owner
+and reports Complete. Fresh app admission now checks every replica ID before
+allocating ports, and job admission checks its single ID. Foreign structured
+owners are retained regardless of lifecycle state. The app/job × Running/Stopped
+matrix verifies errors, unchanged records/ports and no runtime mutation. Rolling
+reservations already refuse occupied IDs. Names ending in generation-like suffixes
+remain valid but cannot claim another owner's ID; the encoding and compatibility
+formats are unchanged. All 466 native/465 Linux Bun tests pass (one explicit gate
+each; 22.82s/42.29s), with strict all-target/all-feature Clippy on both platforms.
+
 ### C35 — Gate chaos capabilities per selected scenario
 
 **Priority:** P2. **Wave:** 4. **Book chapters:** 08, 15.

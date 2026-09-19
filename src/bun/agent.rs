@@ -13990,6 +13990,58 @@ host = "remote.local"
     }
 
     #[tokio::test]
+    async fn fresh_workloads_cannot_replace_another_apps_generation_owner() {
+        for kind in ["app", "job"] {
+            for state in [ContainerState::Running, ContainerState::Stopped] {
+                let (mut agent, _tx, _shutdown, grill) = test_agent_with_grill();
+                let records = tempfile::tempdir().unwrap();
+                agent.set_records_dir(records.path().to_path_buf());
+                grill.set_pid(std::process::id());
+                for image in ["worker:v1", "worker:v2"] {
+                    let config =
+                        Config::parse(&format!("[app.worker]\nimage = '{image}'\nport = 8080\n"))
+                            .unwrap();
+                    expect_complete(&drain_deploy(&mut agent, config).await);
+                }
+                let id = InstanceId("default__worker-g1-0".into());
+                agent.supervisor.get_instance_mut(&id).unwrap().state = state;
+                grill.set_state(&id, state);
+                let original_port = agent.supervisor.get_instance(&id).unwrap().host_port;
+                let original_records = crate::grill::records::load_records(records.path()).unwrap();
+                let original_ports = agent.supervisor.port_allocator.allocated_count().await;
+                let calls_before = grill.calls().len();
+                let collision =
+                    Config::parse(&format!("[{kind}.worker-g1]\nimage = 'intruder:v1'\n")).unwrap();
+                let events = drain_deploy(&mut agent, collision).await;
+                assert!(
+                    matches!(events.last(), Some(ApplyEvent::Error { .. })),
+                    "{kind}/{state:?}: {events:?}"
+                );
+                let owner = agent.supervisor.get_instance(&id).unwrap();
+                assert_eq!(owner.app_name, "worker");
+                assert_eq!(owner.image, "worker:v2");
+                assert_eq!(owner.host_port, original_port);
+                assert_eq!(
+                    agent.supervisor.port_allocator.allocated_count().await,
+                    original_ports
+                );
+                assert_eq!(
+                    crate::grill::records::load_records(records.path()).unwrap(),
+                    original_records
+                );
+                assert!(
+                    !grill.calls()[calls_before..]
+                        .iter()
+                        .any(|(operation, _)| matches!(
+                            operation.as_str(),
+                            "create" | "start" | "stop" | "kill"
+                        ))
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
     async fn workload_labels_are_refused_before_runtime_mutation() {
         for (name, namespace) in [("Bad", "default"), ("web", "bad__namespace")] {
             let (mut agent, tx, shutdown, grill) = test_agent_with_grill();

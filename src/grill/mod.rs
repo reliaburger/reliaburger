@@ -78,7 +78,10 @@ impl fmt::Display for InstanceId {
 /// separator can never appear inside a namespace or app name — both are
 /// DNS-1123 labels, which allow only `[a-z0-9-]` — so parsing the
 /// namespace back out is unambiguous even when the app name itself
-/// contains a hyphen.
+/// contains a hyphen. Generation-like app suffixes can still produce the same
+/// string as another app's canary (for example `worker-g1` and generation 1 of
+/// `worker`). Allocation must check the inventory's structured owner before
+/// claiming an ID; parsing the text alone cannot disambiguate those tuples.
 #[derive(Debug, Clone, Hash, Eq, PartialEq)]
 pub struct InstanceIdentity {
     /// Namespace the app runs in.

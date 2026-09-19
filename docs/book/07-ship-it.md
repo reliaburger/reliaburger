@@ -1256,3 +1256,26 @@ fault is repaired. Additional cases keep a healthy replacement after a partial
 halt, then retire every owner through the ordinary path. A blocked record
 directory keeps the replacement's port until directory recovery and confirmed
 artifact removal; releasing it early would forget part of that ownership.
+
+
+### Two valid names can still claim the same ID
+
+Generation one of `worker` uses `default__worker-g1-0`. A fresh app named
+`worker-g1` would use that same string for replica zero. Both names satisfy the
+label rules. Before the repair, applying the fresh app overwrites the running
+owner and reports success.
+
+Fresh app admission now checks every proposed replica ID before reserving any
+ports. Job admission checks its ID too. If an existing entry belongs to another
+structured app or namespace, admission refuses and keeps its runtime, port and
+record untouched. The check includes stopped cleanup owners. The rolling
+reservation path already refuses any occupied ID, so the guard works in both
+allocation directions.
+
+We keep the existing identity encoding for this release. A generation-like name
+is allowed, but it can't be allocated while its textual ID belongs to another
+workload; use another name or retire that owner first. Changing the encoding
+would require a separate compatibility decision. The regression drives a real
+Bun deployment worker with a mock runtime, rolls `worker` to generation one,
+and attempts both fresh app and job collisions against Running and Stopped
+owners. It checks refusal, unchanged records and ports, and no runtime mutation.
