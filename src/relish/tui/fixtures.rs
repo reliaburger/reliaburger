@@ -61,6 +61,7 @@ impl TestScenario {
                 data.nodes.push(NodeStatus {
                     node_id: format!("node-{}", index + 1),
                     address: format!("10.0.0.{}:9118", index + 1),
+                    api_address: None,
                     state: "alive".into(),
                     incarnation: 1,
                     is_council: true,

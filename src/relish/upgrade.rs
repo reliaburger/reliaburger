@@ -17,10 +17,6 @@ use super::client::BunClient;
 /// Default release metadata endpoint; `relish upgrade check --url` overrides it.
 pub use crate::upgrade::metadata::DEFAULT_RELEASE_URL;
 
-/// Default bun API port, used when deriving node API addresses from
-/// gossip addresses. Override per node with `--node-address id=host:port`.
-const DEFAULT_API_PORT: u16 = 9117;
-
 /// Assumed duration of one node's swap+verify, for `plan` estimates.
 const SECONDS_PER_NODE: u64 = 45;
 
@@ -131,6 +127,9 @@ pub async fn start(client: &BunClient, args: StartArgs) -> Result<(), RelishErro
     let cluster = client.upgrade_cluster().await;
     match cluster {
         Ok(_) => {
+            let nodes = client.nodes().await?;
+            let overrides = parse_overrides(&args.node_addresses)?;
+            let node_list = build_node_list(&nodes, &overrides)?;
             // Cluster flow: push the blob to the leader's registry, then
             // record the plan; the orchestrator walks the fleet.
             let registry = args
@@ -139,9 +138,6 @@ pub async fn start(client: &BunClient, args: StartArgs) -> Result<(), RelishErro
                 .unwrap_or_else(|| default_registry_for(client.base_url()));
             push_blob(client, &registry, &bytes, &binary_sha256).await?;
 
-            let nodes = client.nodes().await?;
-            let overrides = parse_overrides(&args.node_addresses)?;
-            let node_list = build_node_list(&nodes, &overrides);
             let request = serde_json::json!({
                 "target_version": target_version,
                 "binary_sha256": binary_sha256,
@@ -250,7 +246,7 @@ pub async fn rollback(
             let overrides = parse_overrides(&node_addresses)?;
             let request = serde_json::json!({
                 "target_version": version,
-                "nodes": build_node_list(&nodes, &overrides),
+                "nodes": build_node_list(&nodes, &overrides)?,
             });
             client.upgrade_cluster_rollback(&request).await?;
             println!("cluster rollback to {version} started");
@@ -529,12 +525,12 @@ fn parse_overrides(overrides: &[String]) -> Result<Vec<(String, String)>, Relish
 
 /// Build the start-request node list from gossip membership.
 ///
-/// API addresses are the gossip IP + the default API port unless
-/// overridden — gossip doesn't (yet) advertise API ports.
+/// Use each node's resolved API address unless explicitly overridden.
+/// Missing address evidence refuses the operation before an upgrade starts.
 fn build_node_list(
     nodes: &[crate::bun::agent::NodeStatus],
     overrides: &[(String, String)],
-) -> Vec<serde_json::Value> {
+) -> Result<Vec<serde_json::Value>, RelishError> {
     nodes
         .iter()
         .map(|node| {
@@ -542,10 +538,18 @@ fn build_node_list(
                 .iter()
                 .find(|(id, _)| *id == node.node_id)
                 .map(|(_, address)| address.clone())
-                .unwrap_or_else(|| {
-                    let host = node.address.split(':').next().unwrap_or("127.0.0.1");
-                    format!("{host}:{DEFAULT_API_PORT}")
-                });
+                .or_else(|| {
+                    node.api_address
+                        .filter(|address| address.port() != 0 && !address.ip().is_unspecified())
+                        .map(|address| address.to_string())
+                })
+                .ok_or_else(|| RelishError::ApiError {
+                    status: 0,
+                    body: format!(
+                        "node {} has no advertised API endpoint; use --node-address to supply one",
+                        node.node_id
+                    ),
+                })?;
             let role = if node.is_leader {
                 "Leader"
             } else if node.is_council {
@@ -553,11 +557,11 @@ fn build_node_list(
             } else {
                 "Worker"
             };
-            serde_json::json!({
+            Ok(serde_json::json!({
                 "node_id": node.node_id,
                 "address": address,
                 "role": role,
-            })
+            }))
         })
         .collect()
 }
@@ -644,11 +648,12 @@ mod tests {
     }
 
     #[test]
-    fn build_node_list_derives_addresses_and_roles() {
+    fn build_node_list_uses_advertised_addresses_overrides_and_roles() {
         let nodes = vec![
             crate::bun::agent::NodeStatus {
                 node_id: "n1".to_string(),
                 address: "10.0.0.1:9443".to_string(),
+                api_address: None,
                 state: "alive".to_string(),
                 incarnation: 1,
                 is_council: false,
@@ -657,7 +662,8 @@ mod tests {
             },
             crate::bun::agent::NodeStatus {
                 node_id: "n2".to_string(),
-                address: "10.0.0.2:9443".to_string(),
+                address: "[2001:db8::2]:9443".to_string(),
+                api_address: Some("[2001:db8::2]:19443".parse().unwrap()),
                 state: "alive".to_string(),
                 incarnation: 1,
                 is_council: true,
@@ -667,11 +673,12 @@ mod tests {
         ];
         let overrides = vec![("n1".to_string(), "10.0.0.1:8000".to_string())];
 
-        let list = build_node_list(&nodes, &overrides);
+        assert!(build_node_list(&nodes, &[]).is_err());
+        let list = build_node_list(&nodes, &overrides).unwrap();
 
         assert_eq!(list[0]["address"], "10.0.0.1:8000"); // override wins
         assert_eq!(list[0]["role"], "Worker");
-        assert_eq!(list[1]["address"], "10.0.0.2:9117"); // derived
+        assert_eq!(list[1]["address"], "[2001:db8::2]:19443"); // advertised
         assert_eq!(list[1]["role"], "Leader");
     }
 

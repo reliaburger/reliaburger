@@ -1621,6 +1621,31 @@ async fn capacity_refusal_from_the_live_scheduler_forwards_without_committing_an
         .iter()
         .find(|node| !*node.thinks_leader.borrow())
         .unwrap();
+    tokio::time::timeout(Duration::from_secs(20), async {
+        loop {
+            let peers = follower.client.nodes().await.unwrap();
+            if peers.len() == 3 && peers.iter().all(|peer| peer.api_address.is_some()) {
+                let expected = [("cap1", 26344), ("cap2", 26348), ("cap3", 26352)];
+                for (id, port) in expected {
+                    let peer = peers.iter().find(|peer| peer.node_id == id).unwrap();
+                    assert_eq!(peer.api_address, Some(local(port)));
+                    // Every node requires the original bearer identity. A successful
+                    // read also proves that each advertised endpoint is serving.
+                    follower
+                        .client
+                        .for_node(peer)
+                        .unwrap()
+                        .status()
+                        .await
+                        .unwrap();
+                }
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    })
+    .await
+    .unwrap();
     let lease = follower
         .client
         .create_test_lease(120, Some("rbtest-capacity-contract"))

@@ -313,9 +313,9 @@ impl TestContext {
     /// A `BunClient` for every node in the cluster, paired with its node id.
     ///
     /// `/v1/status` is node-local, so a case that reasons about cluster-wide
-    /// placement fans out with this. Each node's API address is its gossip IP
-    /// with the entry node's API port and scheme — every `bun` serves its API
-    /// on the same port, so the entry client's port is the right one to reuse.
+    /// placement fans out with this. Each node must supply its own resolved API
+    /// endpoint. Missing evidence fails collection; it never guesses a port or
+    /// silently omits a node. The entry client's credentials and CA are reused.
     pub async fn node_clients(&self) -> Result<Vec<(String, BunClient)>, String> {
         if self
             .lease_id
@@ -332,20 +332,16 @@ impl TestContext {
         if nodes.is_empty() {
             return Ok(vec![("local".to_string(), self.client.clone())]);
         }
-        let scheme = self.client.scheme();
-        let port = self.api_port();
-        let clients = nodes
+        nodes
             .into_iter()
-            .filter_map(|node| {
-                let ip = node.address.rsplit_once(':').map(|(ip, _)| ip)?;
-                Some((
-                    node.node_id,
-                    self.client
-                        .with_base_url(&format!("{scheme}://{ip}:{port}")),
-                ))
+            .map(|node| {
+                let client = self
+                    .client
+                    .for_node(&node)
+                    .map_err(|error| error.to_string())?;
+                Ok((node.node_id, client))
             })
-            .collect();
-        Ok(clients)
+            .collect()
     }
 
     /// Every instance of `app` in this namespace, gathered across all nodes.
@@ -535,17 +531,6 @@ impl TestContext {
             .build()
             .map_err(|error| error.to_string())?;
         Ok((endpoint, client))
-    }
-
-    /// The API port the entry node serves on, reused for every node.
-    fn api_port(&self) -> u16 {
-        self.client
-            .base_url()
-            .rsplit(':')
-            .next()
-            .map(|tail| tail.trim_end_matches('/'))
-            .and_then(|port| port.parse().ok())
-            .unwrap_or(9117)
     }
 
     /// Poll this app's instances until `predicate` holds, or fail at the
@@ -775,6 +760,55 @@ mod tests {
             capabilities: ClusterCapabilities::default(),
             timeout: Duration::from_millis(200),
             deadline: Deadline::after(Duration::from_millis(200)).unwrap(),
+        }
+    }
+
+    #[tokio::test]
+    async fn node_clients_use_each_advertised_api_endpoint() {
+        let router = axum::Router::new().route("/v1/cluster/nodes", axum::routing::get(|| async {
+            axum::Json(serde_json::json!([
+                {"node_id":"one", "address":"127.0.0.1:7946", "api_address":"127.0.0.1:19117",
+                 "state":"alive", "incarnation":1, "is_council":true, "is_leader":true, "labels":{}},
+                {"node_id":"two", "address":"[::1]:7947", "api_address":"[::1]:29117",
+                 "state":"alive", "incarnation":1, "is_council":true, "is_leader":false, "labels":{}}
+            ]))
+        }));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let mut context = context("rbtest-endpoints");
+        context.client = BunClient::new(&format!("http://{}", listener.local_addr().unwrap()));
+        let server = tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
+        let clients = context.node_clients().await.unwrap();
+        server.abort();
+        assert_eq!(clients.len(), 2);
+        assert_eq!(clients[0].1.base_url(), "http://127.0.0.1:19117");
+        assert_eq!(clients[1].1.base_url(), "http://[::1]:29117");
+    }
+
+    #[tokio::test]
+    async fn node_clients_refuse_missing_or_unusable_peer_endpoints() {
+        for endpoint in [
+            serde_json::Value::Null,
+            serde_json::json!("0.0.0.0:9117"),
+            serde_json::json!("127.0.0.1:0"),
+            serde_json::json!("not-an-address"),
+        ] {
+            let router = axum::Router::new().route("/v1/cluster/nodes", axum::routing::get(move || {
+                let endpoint = endpoint.clone();
+                async move { axum::Json(serde_json::json!([
+                    {"node_id":"broken", "address":"127.0.0.1:7946", "api_address":endpoint,
+                     "state":"alive", "incarnation":1, "is_council":true, "is_leader":true, "labels":{}}
+                ])) }
+            }));
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let mut context = context("rbtest-endpoints");
+            context.client = BunClient::new(&format!("http://{}", listener.local_addr().unwrap()));
+            let server = tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
+            let result = context.node_clients().await;
+            server.abort();
+            assert!(
+                result.is_err(),
+                "missing peer evidence must not yield a guessed or empty inventory"
+            );
         }
     }
 

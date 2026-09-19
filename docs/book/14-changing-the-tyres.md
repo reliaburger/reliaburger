@@ -877,3 +877,13 @@ then ignored it. Existing `deny_unknown_fields` parsing now rejects the obsolete
 key by name. Remove it from development node configurations and pass the CLI
 option when using a different endpoint. A failing-first parsing regression checks
 that the unused setting can no longer appear to succeed.
+
+
+### Locate the API before uploading
+
+The gossip port identifies a membership listener, not the upgrade API. A
+cluster plan now takes each node's API address from the resolved peer directory.
+This supports different ports on one host and bracketed IPv6 addresses. If
+membership lacks an address, the CLI refuses before uploading; an operator can
+supply an explicit `--node-address id=host:port`. Reusing port 9117 for every
+node could send an upgrade to the wrong process.

@@ -389,6 +389,28 @@ impl BunClient {
         }
     }
 
+    /// Address one discovered node using its API endpoint and this client's identity.
+    ///
+    /// Gossip addresses and the entry node's port are not API-address evidence.
+    pub fn for_node(&self, node: &NodeStatus) -> Result<Self, RelishError> {
+        let address = node
+            .api_address
+            .filter(|address| address.port() != 0 && !address.ip().is_unspecified())
+            .ok_or_else(|| RelishError::ApiError {
+                status: 0,
+                body: format!(
+                    "node {} has no usable advertised API endpoint",
+                    node.node_id
+                ),
+            })?;
+        let endpoint = format!("{}://{address}", self.scheme());
+        validate_endpoint(&endpoint).map_err(|error| RelishError::ApiError {
+            status: 0,
+            body: format!("node {} API endpoint is invalid: {error}", node.node_id),
+        })?;
+        Ok(self.with_base_url(&endpoint))
+    }
+
     /// Use another bearer credential with this connection's existing trust roots and forwards.
     pub fn with_token(&self, token: &str) -> Self {
         let mut client = Self::build(&self.base_url, Some(token), self.ca_pem.as_deref());

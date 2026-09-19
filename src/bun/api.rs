@@ -3718,7 +3718,18 @@ async fn nodes_handler(State(state): State<ApiState>) -> Response {
     }
 
     match resp_rx.await {
-        Ok(nodes) => Json(serde_json::json!(nodes)).into_response(),
+        Ok(mut nodes) => {
+            if let Some(membership) = &state.membership {
+                let members = membership.read().await;
+                for node in &mut nodes {
+                    node.api_address = members
+                        .iter()
+                        .find(|member| member.node_id.0 == node.node_id)
+                        .map(|member| member.address);
+                }
+            }
+            Json(nodes).into_response()
+        }
         Err(_) => (
             StatusCode::INTERNAL_SERVER_ERROR,
             Json(serde_json::json!({ "error": "agent dropped response" })),
@@ -11510,6 +11521,68 @@ schedule = "* * * * *"
 
         assert_eq!(response.status(), StatusCode::NOT_FOUND);
         shutdown.cancel();
+    }
+
+    #[tokio::test]
+    async fn nodes_endpoint_advertises_only_resolved_peer_api_addresses() {
+        let (tx, mut rx) = mpsc::channel(1);
+        let worker = tokio::spawn(async move {
+            let Some(AgentCommand::Nodes { response }) = rx.recv().await else {
+                panic!("expected membership request");
+            };
+            response
+                .send(
+                    ["one", "unknown"]
+                        .into_iter()
+                        .map(|id| super::super::agent::NodeStatus {
+                            node_id: id.to_string(),
+                            address: "127.0.0.1:7946".to_string(),
+                            api_address: None,
+                            state: "alive".to_string(),
+                            incarnation: 1,
+                            is_council: true,
+                            is_leader: false,
+                            labels: Default::default(),
+                        })
+                        .collect(),
+                )
+                .unwrap();
+        });
+        let membership = Arc::new(RwLock::new(vec![NodeMembershipInfo {
+            node_id: crate::meat::NodeId::new("one"),
+            address: "[::1]:19117".parse().unwrap(),
+        }]));
+        let app = router(
+            tx,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            Some(membership),
+            None,
+            9117,
+            None,
+        );
+        let response = app
+            .oneshot(
+                axum::http::Request::builder()
+                    .uri("/v1/cluster/nodes")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let nodes: Vec<crate::bun::agent::NodeStatus> = serde_json::from_slice(&body).unwrap();
+        assert_eq!(nodes[0].api_address, Some("[::1]:19117".parse().unwrap()));
+        assert_eq!(nodes[1].api_address, None);
+        worker.await.unwrap();
     }
 
     #[tokio::test]

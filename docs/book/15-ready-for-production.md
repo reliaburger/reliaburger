@@ -3112,3 +3112,26 @@ request through a follower: an oversized app must return the typed refusal
 without entering desired state; a small app must actually run. That fixture
 also supplies the reconciler's internal service identity, just as authenticated
 production nodes do.
+
+
+### One address per node
+
+Run three nodes on your laptop, each with a different API port. A test that
+combines every gossip IP with the entry node's API port contacts the same
+process three times. Its supposed cluster inventory can look perfectly healthy.
+
+The membership response now carries each node's resolved `api_address` from
+the peer directory. `Option<SocketAddr>` means the address can be absent; it
+never means “guess 9117”. The shared client constructor returns a `Result`,
+so a caller must handle missing or unusable evidence. Formatting `SocketAddr`
+also supplies the brackets IPv6 URLs require. Retargeting the existing client
+preserves its bearer identity and configured trust roots.
+
+Testkit, diagnostics and trace collection use this constructor. An absent
+address fails inventory collection instead of silently dropping that peer.
+Standalone inventory still uses the explicit entry connection. Upgrade plans
+use the same advertised addresses, with explicit per-node overrides retained,
+and validate the target list before uploading the binary. Unit HTTP fixtures
+cover different ports, IPv6, absent addresses, invalid addresses and unresolved
+members. The authenticated three-node placement fixture checks the actual
+advertised ports and contacts each endpoint with the original credentials.

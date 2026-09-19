@@ -1,6 +1,5 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::future::Future;
-use std::net::{IpAddr, SocketAddr};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use crate::bun::agent::{CouncilStatus, NodeStatus};
@@ -139,6 +138,7 @@ pub async fn collect(client: &BunClient, app: Option<&str>) -> Result<WtfInputs,
             let status = NodeStatus {
                 node_id: local_node_id,
                 address: client.base_url().to_string(),
+                api_address: None,
                 state: "alive".to_string(),
                 incarnation: 0,
                 is_council: false,
@@ -157,6 +157,7 @@ pub async fn collect(client: &BunClient, app: Option<&str>) -> Result<WtfInputs,
             let status = NodeStatus {
                 node_id: local_node_id,
                 address: client.base_url().to_string(),
+                api_address: None,
                 state: "alive".to_string(),
                 incarnation: 0,
                 is_council: false,
@@ -300,22 +301,7 @@ fn capability_identity(report: Option<&ClusterCapabilityReport>) -> (String, boo
 }
 
 pub(crate) fn node_client(entry: &BunClient, node: &NodeStatus) -> Result<BunClient, String> {
-    let entry_url = url::Url::parse(entry.base_url())
-        .map_err(|error| format!("invalid entry endpoint: {error}"))?;
-    let api_port = entry_url
-        .port_or_known_default()
-        .ok_or_else(|| "entry endpoint has no API port".to_string())?;
-    let address = node.address.parse::<SocketAddr>().map_err(|error| {
-        format!(
-            "node {} advertised an invalid address: {error}",
-            node.node_id
-        )
-    })?;
-    let host = match address.ip() {
-        IpAddr::V4(ip) => ip.to_string(),
-        IpAddr::V6(ip) => format!("[{ip}]"),
-    };
-    Ok(entry.with_base_url(&format!("{}://{host}:{api_port}", entry.scheme())))
+    entry.for_node(node).map_err(|error| error.to_string())
 }
 
 fn leader_client<'a>(
@@ -911,6 +897,7 @@ mod tests {
         NodeStatus {
             node_id: "node-1".to_string(),
             address: address.to_string(),
+            api_address: None,
             state: "alive".to_string(),
             incarnation: 1,
             is_council: true,
@@ -920,14 +907,19 @@ mod tests {
     }
 
     #[test]
-    fn node_client_reuses_auth_scheme_and_api_port_for_ipv4_and_ipv6() {
+    fn node_client_reuses_auth_and_scheme_with_each_ipv4_or_ipv6_api_port() {
         let entry = BunClient::new_with_token("https://127.0.0.1:9443", Some("secret"));
 
-        let ipv4 = node_client(&entry, &node("10.0.0.8:7946")).unwrap();
-        let ipv6 = node_client(&entry, &node("[2001:db8::8]:7946")).unwrap();
+        let mut v4_node = node("10.0.0.8:7946");
+        v4_node.api_address = Some("10.0.0.8:19443".parse().unwrap());
+        let mut v6_node = node("[2001:db8::8]:7946");
+        v6_node.api_address = Some("[2001:db8::8]:29443".parse().unwrap());
+        let ipv4 = node_client(&entry, &v4_node).unwrap();
+        let ipv6 = node_client(&entry, &v6_node).unwrap();
 
-        assert_eq!(ipv4.base_url(), "https://10.0.0.8:9443");
-        assert_eq!(ipv6.base_url(), "https://[2001:db8::8]:9443");
+        assert_eq!(ipv4.base_url(), "https://10.0.0.8:19443");
+        assert_eq!(ipv6.base_url(), "https://[2001:db8::8]:29443");
+        assert!(node_client(&entry, &node("10.0.0.8:7946")).is_err());
     }
 
     #[test]
@@ -1184,6 +1176,7 @@ mod tests {
                         Json(vec![NodeStatus {
                             node_id: "node-a".into(),
                             address: address.to_string(),
+                            api_address: Some(address),
                             state: "alive".into(),
                             incarnation: 0,
                             is_council: stale_council_flag,

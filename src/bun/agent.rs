@@ -1313,6 +1313,10 @@ pub struct NodeStatus {
     pub node_id: String,
     /// Node address (gossip endpoint).
     pub address: String,
+    /// Agent API endpoint supplied by the cluster's resolved peer directory.
+    /// Missing evidence must not be replaced with a guessed port by clients.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub api_address: Option<std::net::SocketAddr>,
     /// Current SWIM state: "alive", "suspect", "dead", or "left".
     pub state: String,
     /// SWIM incarnation number.
@@ -2874,6 +2878,7 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
                 NodeStatus {
                     node_id: name,
                     address: m.address.to_string(),
+                    api_address: None,
                     state: m.state.to_string(),
                     incarnation: m.incarnation,
                     is_council,
@@ -13396,6 +13401,7 @@ host = "remote.local"
         let status = NodeStatus {
             node_id: "node-1".to_string(),
             address: "192.168.1.1:9116".to_string(),
+            api_address: None,
             state: "alive".to_string(),
             incarnation: 42,
             is_council: true,

@@ -859,6 +859,17 @@ address without a release/rebind gap. The updated bootstrap regression fails
 against the old reporting line. Five bootstrap tests (0.62s), the endpoint test
 (0.06s) and strict Linux Clippy pass.
 
+**Peer API addressing (19 September):** Membership now exposes each node's
+resolved API socket address. Testkit and diagnostic/trace clients preserve the
+entry client's authentication and CA while targeting that address; missing,
+unspecified, zero-port or malformed evidence fails instead of guessing a port
+or silently omitting a member. Upgrade plans honour explicit overrides and
+validate membership endpoints before uploading. The original HTTP regression
+fails first. Both API endpoint tests, 126 testkit tests and 332 Relish tests pass
+on macOS/Linux. Actual authenticated three-node placement verifies distinct
+ports and successful peer reads (19.96s native, 18.21s Linux). Strict Clippy
+passes on both platforms. Protocol/state remain 6/7; the HTTP field is additive.
+
 ### C35 — Gate chaos capabilities per selected scenario
 
 **Priority:** P2. **Wave:** 4. **Book chapters:** 08, 15.
