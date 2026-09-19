@@ -601,6 +601,13 @@ impl BunClient {
         let status = response.status().as_u16();
         if !response.status().is_success() {
             let body = response.text().await.unwrap_or_default();
+            if capacity_probe
+                && status == 422
+                && let Ok(refusal) =
+                    serde_json::from_str::<crate::cluster::capacity::SchedulingRefusal>(&body)
+            {
+                return Err(RelishError::SchedulingRejected(refusal.error));
+            }
             return Err(RelishError::ApiError { status, body });
         }
 
@@ -2638,6 +2645,64 @@ mod tests {
             Some("https://env.example:9117".to_string())
         );
         assert_eq!(pick_endpoint(None, None), None);
+    }
+
+    #[tokio::test]
+    async fn capacity_refusal_uses_the_code_not_human_wording() {
+        let router = axum::Router::new().route("/v1/apply", axum::routing::post(|| async {
+            (axum::http::StatusCode::UNPROCESSABLE_ENTITY, axum::Json(serde_json::json!({
+                "error": {"code": "no_eligible_nodes", "app_id": {"name": "capacity-0", "namespace": "rbtest-capacity"}}
+            })))
+        }));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let client = BunClient::new(&format!("http://{}", listener.local_addr().unwrap()));
+        let server = tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
+        let config = Config::parse(
+            "[app.capacity-0]\nimage = \"busybox\"\nnamespace = \"rbtest-capacity\"\n",
+        )
+        .unwrap();
+        let error = client
+            .apply_capacity_with_lease(&config, "lease-capacity")
+            .await
+            .unwrap_err();
+        server.abort();
+        assert!(matches!(error, RelishError::SchedulingRejected(
+            crate::meat::scheduler::ScheduleError::NoEligibleNodes { app_id }
+        ) if app_id == crate::meat::AppId::new("capacity-0", "rbtest-capacity")));
+    }
+
+    #[tokio::test]
+    async fn malformed_capacity_refusals_remain_api_failures() {
+        for payload in [
+            serde_json::json!({"error":"no eligible nodes"}),
+            serde_json::json!({"error":{"code":"no_eligible_nodes"}}),
+            serde_json::json!({"error":{"code":"mystery", "app_id":{"name":"a", "namespace":"default"}}}),
+        ] {
+            let router = axum::Router::new().route(
+                "/v1/apply",
+                axum::routing::post(move || {
+                    let payload = payload.clone();
+                    async move {
+                        (
+                            axum::http::StatusCode::UNPROCESSABLE_ENTITY,
+                            axum::Json(payload),
+                        )
+                    }
+                }),
+            );
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let client = BunClient::new(&format!("http://{}", listener.local_addr().unwrap()));
+            let server = tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
+            let config = Config::parse("[app.a]\nimage = \"busybox\"\n").unwrap();
+            let result = client
+                .apply_capacity_with_lease(&config, "lease-capacity")
+                .await;
+            server.abort();
+            assert!(matches!(
+                result,
+                Err(RelishError::ApiError { status: 422, .. })
+            ));
+        }
     }
 
     #[tokio::test]

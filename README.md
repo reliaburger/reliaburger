@@ -179,7 +179,8 @@ See the [laptop quickstart](docs/quickstart.md) for prerequisites, single-node
 setup, retries and development qualification. The public release is still pending.
 
 See the [diagnostics guide](docs/manual/07_diagnostics.md) for test prerequisites,
-profiles and interpreting results.
+profiles and interpreting results. Capacity benchmarks require live scheduler
+admission and observed running workloads; missing evidence fails the measurement.
 
 ## Getting to 0.1.0
 

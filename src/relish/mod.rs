@@ -125,6 +125,10 @@ pub enum RelishError {
     #[error("API error (status {status}): {body}")]
     ApiError { status: u16, body: String },
 
+    /// Explicit refusal from the live scheduler's capacity admission check.
+    #[error("scheduler refused placement: {0}")]
+    SchedulingRejected(crate::meat::scheduler::ScheduleError),
+
     /// File already exists (init refuses to overwrite).
     #[error("{path} already exists (refusing to overwrite)")]
     FileExists { path: String },

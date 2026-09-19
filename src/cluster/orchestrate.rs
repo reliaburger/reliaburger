@@ -90,10 +90,11 @@ pub fn spawn_leader_scheduler(
     dns_required: bool,
     reconstruction_config: crate::config::node::ReconstructionSection,
     shutdown: CancellationToken,
-) {
+) -> super::capacity::CapacityAdmission {
     use crate::reconstruction::controller::ReconstructionController;
     use crate::reconstruction::types::ReconstructionPhase;
 
+    let (admission, mut capacity_requests) = super::capacity::admission_channel();
     tokio::spawn(async move {
         let mut reconstruction = ReconstructionController::new(reconstruction_config);
         let mut was_leader = false;
@@ -103,10 +104,11 @@ pub fn spawn_leader_scheduler(
         let mut last_published: Option<crate::onion::catalog::EndpointCatalog> = None;
         let mut tick = tokio::time::interval(RECONCILE_INTERVAL);
         loop {
-            tokio::select! {
+            let capacity_request = tokio::select! {
                 _ = shutdown.cancelled() => break,
-                _ = tick.tick() => {}
-            }
+                _ = tick.tick() => None,
+                Some(request) = capacity_requests.recv() => Some(request),
+            };
 
             let is_leader = council.is_leader().await;
             // Leadership edges drive the reconstruction state machine.
@@ -202,6 +204,52 @@ pub fn spawn_leader_scheduler(
                 dns_required,
             );
 
+            if let Some(request) = capacity_request {
+                use super::capacity::CapacityAdmissionError;
+                use crate::meat::scheduler::{ScheduleError, Scheduler};
+
+                let ready = reports.stale_nodes.is_empty()
+                    && members
+                        .iter()
+                        .all(|member| member.state == NodeState::Alive)
+                    && cache.node_count() == alive.len()
+                    && cache.nodes().all(|node| {
+                        node.ready
+                            && (!dns_required || node.capabilities.dns.can_resolve_internal())
+                    });
+                let result = if !ready {
+                    Err(CapacityAdmissionError::Unavailable(
+                        "every member needs fresh, ready placement evidence".into(),
+                    ))
+                } else if desired.apps.contains_key(&request.app_id) {
+                    Err(CapacityAdmissionError::Rejected(
+                        ScheduleError::InvalidSpec {
+                            reason: "capacity admission requires a new app".into(),
+                        },
+                    ))
+                } else if let Err(error) = quotas.try_admit(
+                    &request.app_id.namespace,
+                    &scheduler_resources(&request.spec),
+                    1,
+                    true,
+                ) {
+                    Err(CapacityAdmissionError::Rejected(
+                        ScheduleError::QuotaExceeded {
+                            namespace: request.app_id.namespace.clone(),
+                            detail: error.to_string(),
+                        },
+                    ))
+                } else {
+                    Scheduler::new(cache)
+                        .with_dns_required(dns_required)
+                        .schedule_app(&request.app_id, &request.spec)
+                        .map(|_| ())
+                        .map_err(CapacityAdmissionError::Rejected)
+                };
+                let _ = request.response.send(result);
+                continue;
+            }
+
             for decision in decisions {
                 // Revalidate against the LATEST membership before the async
                 // Raft write: a node that died between planning and commit
@@ -237,6 +285,7 @@ pub fn spawn_leader_scheduler(
             }
         }
     });
+    admission
 }
 
 /// Plan placements for one scheduling tick against a single mutable

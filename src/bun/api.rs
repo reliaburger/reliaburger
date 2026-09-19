@@ -2141,6 +2141,7 @@ const CAPACITY_PROBE_HEADER: &str = "x-reliaburger-capacity-probe";
 
 async fn apply_handler(
     auth: Option<axum::Extension<crate::sesame::auth::AuthContext>>,
+    capacity_admission: Option<axum::Extension<crate::cluster::capacity::CapacityAdmission>>,
     State(state): State<ApiState>,
     headers: HeaderMap,
     body: String,
@@ -2201,6 +2202,22 @@ async fn apply_handler(
             .into_response();
     }
     if capacity_probe {
+        if config.app.len() != 1
+            || !config.job.is_empty()
+            || !config.namespace.is_empty()
+            || !config.permission.is_empty()
+            || !config.build.is_empty()
+            || config
+                .app
+                .values()
+                .any(|spec| spec.replicas != crate::config::Replicas::Fixed(1))
+        {
+            return (
+                StatusCode::BAD_REQUEST,
+                "capacity probe requires exactly one new app with one replica",
+            )
+                .into_response();
+        }
         let Some(auth) = auth.as_deref() else {
             return (StatusCode::UNAUTHORIZED, "authentication required").into_response();
         };
@@ -2381,8 +2398,16 @@ async fn apply_handler(
             body,
             lease_id,
             headers,
+            capacity_admission.map(|extension| extension.0),
         )
         .await;
+    }
+    if capacity_probe {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            "capacity admission requires a live cluster scheduler",
+        )
+            .into_response();
     }
 
     let lease_operation = if let (Some(lease_id), Some(owner_id)) =
@@ -2496,6 +2521,7 @@ async fn cluster_apply(
     raw_body: String,
     lease_id: Option<String>,
     caller_headers: HeaderMap,
+    capacity_admission: Option<crate::cluster::capacity::CapacityAdmission>,
 ) -> Response {
     // Follower? Forward to the leader rather than half-failing.
     if !council.is_leader().await {
@@ -2569,6 +2595,44 @@ async fn cluster_apply(
             Json(serde_json::json!({ "error": e.to_string() })),
         )
             .into_response();
+    }
+
+    if caller_headers.contains_key(CAPACITY_PROBE_HEADER) {
+        use crate::cluster::capacity::{CapacityAdmissionError, SchedulingRefusal};
+        let Some(admission) = capacity_admission else {
+            return (
+                StatusCode::SERVICE_UNAVAILABLE,
+                "capacity admission is unavailable",
+            )
+                .into_response();
+        };
+        let Some((name, spec)) = config.app.iter().next() else {
+            return StatusCode::BAD_REQUEST.into_response();
+        };
+        let app_id = crate::meat::AppId::new(name, spec.namespace.as_deref().unwrap_or("default"));
+        let outcome = admission.check(&app_id, spec).await;
+        if !council.is_leader().await {
+            return unavailable_response("leadership changed during capacity admission".into());
+        }
+        let active_lease = council.desired_state().await.test_leases;
+        if !lease_id
+            .as_ref()
+            .and_then(|id| active_lease.get(id))
+            .is_some_and(|lease| lease.is_active_at(crate::testkit::lease::now_unix_millis()))
+        {
+            return lease_error_response(crate::testkit::lease::LeaseError::NotActive);
+        }
+        match outcome {
+            Ok(()) => {}
+            Err(CapacityAdmissionError::Rejected(error)) => {
+                return (
+                    StatusCode::UNPROCESSABLE_ENTITY,
+                    Json(SchedulingRefusal { error }),
+                )
+                    .into_response();
+            }
+            Err(error) => return unavailable_response(error.to_string()),
+        }
     }
 
     let (event_tx, event_rx) = mpsc::channel::<ApplyEvent>(32);
@@ -6790,6 +6854,7 @@ async fn rollback_handler(
             raw,
             None,
             HeaderMap::new(),
+            None,
         )
         .await;
     }
@@ -9152,7 +9217,13 @@ schedule = "* * * * *"
             &lease.namespace,
         )
         .await;
-        assert_eq!(status, StatusCode::OK, "{}", String::from_utf8_lossy(&body));
+        assert_eq!(
+            status,
+            StatusCode::SERVICE_UNAVAILABLE,
+            "{}",
+            String::from_utf8_lossy(&body)
+        );
+        assert!(String::from_utf8_lossy(&body).contains("live cluster scheduler"));
         admin_shutdown.cancel();
     }
 

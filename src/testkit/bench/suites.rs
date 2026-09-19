@@ -69,7 +69,7 @@ impl SuiteKind {
                 Capability::NodeKill,
             ],
             Self::ImageDistribution => &[Capability::ContainerRuntime, Capability::MultiNode],
-            Self::ClusterCapacity => &[Capability::ContainerRuntime],
+            Self::ClusterCapacity => &[Capability::ContainerRuntime, Capability::CouncilQuorum],
         }
     }
 }
@@ -553,10 +553,44 @@ async fn image_distribution(context: &SuiteContext) -> Result<BenchMetric, Strin
     )
 }
 
+async fn wait_capacity_workloads(
+    context: &SuiteContext,
+    apps: &[crate::meat::AppId],
+) -> Result<(), String> {
+    context
+        .deadline
+        .run("capacity workloads becoming running", async {
+            loop {
+                let statuses = context
+                    .client
+                    .cluster_status()
+                    .await
+                    .map_err(|error| format!("cannot establish running capacity: {error}"))?;
+                if apps.iter().all(|app| {
+                    statuses
+                        .iter()
+                        .filter(|row| {
+                            row.instance.app_name == app.name
+                                && row.instance.namespace == app.namespace
+                                && row.instance.state == "running"
+                        })
+                        .count()
+                        == 1
+                }) {
+                    return Ok(());
+                }
+                tokio::time::sleep(Duration::from_millis(100)).await;
+            }
+        })
+        .await
+        .map_err(|error| error.to_string())?
+}
+
 async fn cluster_capacity(context: &SuiteContext) -> Result<BenchMetric, String> {
     let mut lease_id = context.lease_id.clone();
     let mut namespace = context.namespace.clone();
     let mut placed = 0usize;
+    let mut running_apps = Vec::new();
     while placed < CAPACITY_HARD_LIMIT {
         if placed > 0 && placed.is_multiple_of(CAPACITY_APPS_PER_LEASE) {
             namespace = format!("{}-{}", context.namespace, placed / CAPACITY_APPS_PER_LEASE);
@@ -578,8 +612,16 @@ async fn cluster_capacity(context: &SuiteContext) -> Result<BenchMetric, String>
             .apply_capacity_with_lease(&config, &lease_id)
             .await
         {
-            Ok(_) => placed += 1,
-            Err(error) if error.to_string().contains("no eligible nodes") => {
+            Ok(_) => {
+                let app_id = crate::meat::AppId::new(&app, &namespace);
+                wait_capacity_workloads(context, std::slice::from_ref(&app_id)).await?;
+                running_apps.push(app_id);
+                placed += 1;
+            }
+            Err(crate::relish::RelishError::SchedulingRejected(
+                crate::meat::scheduler::ScheduleError::NoEligibleNodes { app_id },
+            )) if app_id == crate::meat::AppId::new(&app, &namespace) => {
+                wait_capacity_workloads(context, &running_apps).await?;
                 return metric(
                     "cluster_capacity",
                     placed as f64,
@@ -589,7 +631,7 @@ async fn cluster_capacity(context: &SuiteContext) -> Result<BenchMetric, String>
                     [
                         (
                             "method",
-                            "leased-minimal-apps-until-no-eligible-nodes".to_string(),
+                            "running-leased-apps-until-typed-scheduler-refusal".to_string(),
                         ),
                         ("cpu_request", "1m".to_string()),
                         ("memory_request", "1Mi".to_string()),
@@ -717,6 +759,132 @@ fn network_command(url: &str) -> Vec<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn capacity_does_not_score_an_untyped_error_message_as_saturation() {
+        let router = axum::Router::new().route(
+            "/v1/apply",
+            axum::routing::post(|| async {
+                (
+                    axum::http::StatusCode::FORBIDDEN,
+                    "no eligible nodes: this is an auth failure",
+                )
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let client = BunClient::new(&format!("http://{}", listener.local_addr().unwrap()));
+        let server = tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
+        let context = SuiteContext {
+            client: client.clone(),
+            capabilities: ClusterCapabilities::default(),
+            namespace: "rbtest-capacity".into(),
+            lease_id: "lease-capacity".into(),
+            leases: BenchLeaseOwner::new(client, 30),
+            chaos: ChaosGuard::default(),
+            timeout: Duration::from_secs(3),
+            deadline: Deadline::after(Duration::from_secs(3)).unwrap(),
+            options: SuiteOptions {
+                quick: false,
+                capacity: true,
+                disruptive: false,
+                yes: true,
+            },
+        };
+        let result = execute(SuiteKind::ClusterCapacity, context).await;
+        server.abort();
+        assert!(
+            result.is_err(),
+            "an auth failure became a successful capacity measurement: {result:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn capacity_counts_only_running_workloads_and_rechecks_them_at_saturation() {
+        use axum::response::IntoResponse;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        for mode in ["running", "pending", "malformed", "disappeared"] {
+            let applies = Arc::new(AtomicUsize::new(0));
+            let reads = Arc::new(AtomicUsize::new(0));
+            let apply_count = applies.clone();
+            let status_count = reads.clone();
+            let router = axum::Router::new()
+                .route("/v1/apply", axum::routing::post(move || {
+                    let count = apply_count.fetch_add(1, Ordering::SeqCst);
+                    async move {
+                        if count == 0 {
+                            let event = crate::bun::agent::ApplyEvent::Complete {
+                                created: 1, instances: vec!["capacity-0-0".into()],
+                            };
+                            return ([("content-type", "text/event-stream")],
+                                format!("data: {}\n\n", serde_json::to_string(&event).unwrap())).into_response();
+                        }
+                        (axum::http::StatusCode::UNPROCESSABLE_ENTITY, axum::Json(serde_json::json!({
+                            "error": {"code": "no_eligible_nodes", "app_id": {
+                                "name": "capacity-1", "namespace": "rbtest-capacity"
+                            }}
+                        }))).into_response()
+                    }
+                }))
+                .route("/v1/status", axum::routing::get(move |uri: axum::http::Uri| {
+                    assert_eq!(uri.query(), Some("cluster=true"));
+                    let count = status_count.fetch_add(1, Ordering::SeqCst);
+                    async move {
+                        let rows = if mode == "malformed" { serde_json::json!({}) }
+                        else if mode == "pending" || count == 0 || (mode == "disappeared" && count > 1) {
+                            serde_json::json!([])
+                        } else {
+                            serde_json::json!([{
+                                "node":"worker", "id":"capacity-0-0", "app_name":"capacity-0",
+                                "namespace":"rbtest-capacity", "state":"running", "restart_count":0,
+                                "host_port":null, "exit_code":null, "pid":42
+                            }])
+                        };
+                        axum::Json(rows)
+                    }
+                }));
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let client = BunClient::new(&format!("http://{}", listener.local_addr().unwrap()));
+            let server = tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
+            let context = SuiteContext {
+                client: client.clone(),
+                capabilities: ClusterCapabilities::default(),
+                namespace: "rbtest-capacity".into(),
+                lease_id: "lease-capacity".into(),
+                leases: BenchLeaseOwner::new(client, 30),
+                chaos: ChaosGuard::default(),
+                timeout: Duration::from_secs(1),
+                deadline: Deadline::after(Duration::from_secs(1)).unwrap(),
+                options: SuiteOptions {
+                    quick: false,
+                    capacity: true,
+                    disruptive: false,
+                    yes: true,
+                },
+            };
+            let result = execute(SuiteKind::ClusterCapacity, context).await;
+            server.abort();
+            if mode == "running" {
+                assert_eq!(result.unwrap().value, 1.0);
+                assert!(
+                    reads.load(Ordering::SeqCst) >= 3,
+                    "must recheck after saturation"
+                );
+            } else {
+                assert!(
+                    result.is_err(),
+                    "{mode} became a capacity success: {result:?}"
+                );
+                if mode != "disappeared" {
+                    assert_eq!(
+                        applies.load(Ordering::SeqCst),
+                        1,
+                        "must wait for running before another app"
+                    );
+                }
+            }
+        }
+    }
 
     #[test]
     fn median_sorts_and_averages_the_middle_pair() {

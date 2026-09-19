@@ -1007,7 +1007,11 @@ after success, error, panic or timeout. Use `--quick --output json` for a
 baseline and `--compare <file>` for a strict direction-aware comparison.
 Leader reconstruction needs `--disruptive --yes`; capacity saturation needs
 `--capacity --yes`. Server policy still decides whether either operation may
-run.
+run. Capacity requires a live council scheduler and complete ready-node evidence.
+Each leased app must become running before it counts. Only a typed scheduler
+refusal for the next app ends the measurement successfully, followed by a final
+running check for every counted app. Missing evidence, expired leases, runtime
+failures and the hard safety limit fail the suite.
 
 `relish wtf` collects bounded evidence from every expected node using the same
 authenticated client identity. It diagnoses node and council health,

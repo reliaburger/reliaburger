@@ -65,5 +65,8 @@ relish bench --capacity --yes            # saturate the cluster with leased apps
 refuses to compare unlike topology, runtime or workload parameters rather than
 inventing a number. The two risky suites gate behind an explicit `--yes`:
 `--disruptive` kills the observed leader, and `--capacity` fills the cluster.
+Capacity needs the live council scheduler. It counts workloads only after they
+run, stops on a typed placement refusal, and rechecks all counted workloads.
+An API failure, incomplete evidence or deadline expiry is a failed measurement.
 Once a suite has started, a timeout, API error or uncertain cleanup fails the
 run (non-zero exit) instead of becoming a green skip.

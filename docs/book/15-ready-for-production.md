@@ -3069,3 +3069,46 @@ and [reusable workflow reference](https://docs.github.com/en/actions/reference/w
 spell out those rules. Cancelling an obsolete run is queue management, not a
 passing test result. We still require the complete gate set for the final
 candidate revision.
+
+### Capacity is an observation, not a failed string match
+
+An HTTP 403 containing the words "no eligible nodes" used to pass the capacity
+benchmark with a value of zero. The error was a permissions failure, yet its
+text looked like the end of a successful experiment. There was a second gap:
+cluster apply acknowledges desired-state writes before any worker starts the
+container. Counting those acknowledgements measures how many configurations
+we submitted, not how many workloads ran.
+
+Capacity applies now ask the actual leader scheduling loop for admission.
+A bounded `mpsc` channel carries requests; each request owns a `oneshot` sender
+for exactly one reply. Dropping that sender before replying is an unavailable
+observation. It cannot become a scheduling refusal. Queueing and response share
+a five-second deadline. The normal scheduling pass supplies current placement
+reservations and namespace quota usage, and incomplete or unready membership
+prevents a saturation claim. The check does not commit a placement. Other
+work can change capacity before deployment, which is why runtime observation
+is still required.
+
+The refusal schema contains `ScheduleError`, tagged with a stable JSON `code`.
+`#[serde(tag = "code", rename_all = "snake_case")]` tells Serde to encode the
+enum's variant name as that field. Its other fields carry structured context,
+including the app's namespace and name. `deny_unknown_fields` rejects an
+unexpected shape. Rust's `match` then selects the specific
+`NoEligibleNodes { app_id }` variant, and a guard requires that ID to equal the
+app we just submitted. Human-readable error wording can change independently.
+Authentication failures, unknown codes and missing IDs stay errors.
+
+The API requires a live lease and authorised capacity operation, forwards the
+request to the leader, and rechecks leadership and lease activity after the
+scheduler reply. The benchmark counts an app only after the complete cluster
+status endpoint observes its one running instance. Before returning a result,
+it rechecks all counted apps. A malformed status body, a disappeared workload,
+an exhausted deadline or the hard safety limit fails the measurement. Cleanup
+still has its own required outcome.
+
+The HTTP regressions cover both original errors and the distinction between
+pending, running and missing workloads. A real three-node test sends the
+request through a follower: an oversized app must return the typed refusal
+without entering desired state; a small app must actually run. That fixture
+also supplies the reconciler's internal service identity, just as authenticated
+production nodes do.

@@ -15,7 +15,8 @@ use super::score::score_nodes;
 use super::types::{AppId, Placement, Resources, SchedulingDecision};
 
 /// Scheduling errors.
-#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error, serde::Serialize, serde::Deserialize)]
+#[serde(tag = "code", rename_all = "snake_case", deny_unknown_fields)]
 pub enum ScheduleError {
     #[error("no eligible nodes for app {app_id:?}")]
     NoEligibleNodes { app_id: AppId },

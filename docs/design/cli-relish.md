@@ -1395,6 +1395,16 @@ with a dedicated acknowledgement header; Bun requires a durable lease, Admin,
 `saturate_capacity` and the protected-cluster mutation gate before accepting
 it. A plain leased apply cannot accidentally enter the capacity path.
 
+Capacity admission asks the current leader's scheduler through a bounded
+request channel. It requires one new app with one replica, complete fresh
+ready-node evidence and applicable namespace quota. A typed
+`no_eligible_nodes` refusal (HTTP 422) names the rejected app. Missing scheduler
+evidence, leadership loss and lease expiry cannot produce this result.
+The benchmark waits for each accepted workload to run and rechecks every
+counted workload before returning a measurement. API text is never a success
+criterion. Standalone nodes have no council admission loop and cannot provide
+this measurement.
+
 #### Kubernetes Migration
 
 **`relish import -f <path>`**

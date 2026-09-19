@@ -173,8 +173,9 @@ async fn start_node_with_auth(
     }
 
     // Leader scheduler + autoscaler (fast interval for the test).
+    let mut capacity_admission = None;
     if let Some(council) = &council {
-        spawn_leader_scheduler(
+        capacity_admission = Some(spawn_leader_scheduler(
             Arc::clone(council),
             membership_rx.clone(),
             aggregated_rx,
@@ -187,7 +188,7 @@ async fn start_node_with_auth(
                 large_cluster_node_count: 5000,
             },
             shutdown.clone(),
-        );
+        ));
         reliaburger::cluster::orchestrate::spawn_autoscaler(
             Arc::clone(council),
             Arc::clone(&rollup_store),
@@ -203,7 +204,8 @@ async fn start_node_with_auth(
             metrics_rx,
             directory_rx,
             2, // api_port - raft_port
-            None,
+            auth.as_ref()
+                .map(|_| "placement-test-internal-service-identity".to_string()),
             cmd_tx.clone(),
             shutdown.clone(),
             reliaburger::cluster::ClusterHttp::plaintext(),
@@ -225,6 +227,8 @@ async fn start_node_with_auth(
                 safety_class: reliaburger::testkit::safety::ClusterSafetyClass::Development,
                 allowed_operations: std::collections::BTreeSet::from([
                     reliaburger::testkit::safety::OperationPermission::AlterNodeState,
+                    reliaburger::testkit::safety::OperationPermission::ProvisionIsolatedWorkloads,
+                    reliaburger::testkit::safety::OperationPermission::SaturateCapacity,
                 ]),
                 ..reliaburger::testkit::safety::ClusterTestPolicy::default()
             },
@@ -278,6 +282,10 @@ async fn start_node_with_auth(
             api_port,
             None,
         )
+    };
+    let app = match capacity_admission {
+        Some(admission) => app.layer(axum::Extension(admission)),
+        None => app,
     };
     let sd = shutdown.clone();
     let api_task = tokio::spawn(async move {
@@ -1562,5 +1570,159 @@ async fn follower_apply_preserves_user_authority_for_administrative_manifests() 
             .unwrap()
             .starts_with("text/plain")
     );
+    shutdown.cancel();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 6)]
+#[ignore = "slow multi-node placement acceptance; run with make test-cluster"]
+async fn capacity_refusal_from_the_live_scheduler_forwards_without_committing_an_app() {
+    use reliaburger::meat::scheduler::ScheduleError;
+    use reliaburger::relish::RelishError;
+    let created = reliaburger::sesame::token::create_token(
+        "capacity-admin",
+        reliaburger::sesame::types::ApiRole::Admin,
+        Default::default(),
+        None,
+    )
+    .unwrap();
+    let auth = NodeFaultAuth {
+        token: created.token,
+        plaintext: created.plaintext,
+    };
+    let shutdown = CancellationToken::new();
+    let n1 = start_node_with_auth("cap1", 26341, vec![], &shutdown, Some(auth.clone())).await;
+    let n2 = start_node_with_auth(
+        "cap2",
+        26345,
+        vec![local(26341)],
+        &shutdown,
+        Some(auth.clone()),
+    )
+    .await;
+    let n3 = start_node_with_auth("cap3", 26349, vec![local(26341)], &shutdown, Some(auth)).await;
+    let nodes = [&n1, &n2, &n3];
+    assert!(
+        wait_until(Duration::from_secs(40), || nodes.iter().any(|node| {
+            *node.thinks_leader.borrow()
+                && node.handle.council.as_ref().is_some_and(|council| {
+                    council
+                        .metrics()
+                        .borrow()
+                        .membership_config
+                        .membership()
+                        .voter_ids()
+                        .count()
+                        == 3
+                })
+        }))
+        .await
+    );
+    let follower = nodes
+        .iter()
+        .find(|node| !*node.thinks_leader.borrow())
+        .unwrap();
+    let lease = follower
+        .client
+        .create_test_lease(120, Some("rbtest-capacity-contract"))
+        .await
+        .unwrap();
+    let mut config = reliaburger::config::Config::parse(&format!(
+        "[app.capacity]\nimage = \"proc-grill:image-ignored\"\ncommand = [\"sleep\", \"300\"]\ncpu = \"100000m\"\nmemory = \"1Mi\"\nnamespace = \"{}\"\n", lease.namespace
+    )).unwrap();
+    let app_id = reliaburger::meat::AppId::new("capacity", &lease.namespace);
+    tokio::time::timeout(Duration::from_secs(20), async {
+        loop {
+            match follower
+                .client
+                .apply_capacity_with_lease(&config, &lease.lease_id)
+                .await
+            {
+                Err(RelishError::SchedulingRejected(ScheduleError::NoEligibleNodes {
+                    app_id: rejected,
+                })) => {
+                    assert_eq!(rejected, app_id);
+                    break;
+                }
+                Err(RelishError::ApiError { status: 503, .. }) => {
+                    tokio::time::sleep(Duration::from_millis(100)).await;
+                }
+                other => panic!("expected typed scheduling refusal, got {other:?}"),
+            }
+        }
+    })
+    .await
+    .unwrap();
+    let leader = nodes
+        .iter()
+        .find(|node| *node.thinks_leader.borrow())
+        .unwrap();
+    assert!(
+        !leader
+            .handle
+            .council
+            .as_ref()
+            .unwrap()
+            .desired_state()
+            .await
+            .apps
+            .contains_key(&app_id)
+    );
+    assert!(follower.client.cluster_status().await.unwrap().is_empty());
+
+    // ProcessGrill deliberately refuses resource limits. The oversized spec
+    // exercises scheduler refusal before deployment; the runnable fixture uses
+    // this runtime's supported contract. Real capacity benchmarks require OCI.
+    let spec = config.app.get_mut("capacity").unwrap();
+    spec.cpu = None;
+    spec.memory = None;
+    follower
+        .client
+        .apply_capacity_with_lease(&config, &lease.lease_id)
+        .await
+        .unwrap();
+    let running = tokio::time::timeout(Duration::from_secs(20), async {
+        loop {
+            let rows = follower.client.cluster_status().await.unwrap();
+            if rows
+                .iter()
+                .filter(|row| {
+                    row.instance.app_name == "capacity"
+                        && row.instance.namespace == lease.namespace
+                        && row.instance.state == "running"
+                })
+                .count()
+                == 1
+            {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+    })
+    .await;
+    if running.is_err() {
+        for node in nodes {
+            eprintln!(
+                "{}: status {:?}; deploys {:?}",
+                node.name,
+                node.client.status().await,
+                node.client.deploy_operations().await
+            );
+        }
+    }
+    running.expect("accepted workload must actually run");
+    assert!(matches!(
+        follower
+            .client
+            .apply_capacity_with_lease(&config, &lease.lease_id)
+            .await,
+        Err(RelishError::SchedulingRejected(
+            ScheduleError::InvalidSpec { .. }
+        ))
+    ));
+    follower
+        .client
+        .release_test_lease(&lease.lease_id)
+        .await
+        .unwrap();
     shutdown.cancel();
 }

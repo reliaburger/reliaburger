@@ -1155,20 +1155,21 @@ async fn run_agent(cli: Cli) -> anyhow::Result<()> {
         tokio::sync::watch::Receiver<Vec<reliaburger::mustard::membership::MembershipSnapshot>>,
     > = None;
 
+    let mut capacity_admission = None;
     // L1 orchestration: the leader schedules desired apps into
     // placements, every node keeps a fresh peer-API table, and every
     // node reconciles its instances against its assignments.
     if let Some((membership_rx, metrics_rx, aggregated_rx, directory_rx)) = orchestration {
         upgrade_membership_rx = Some(membership_rx.clone());
         if let Some(council) = &api_council {
-            reliaburger::cluster::orchestrate::spawn_leader_scheduler(
+            capacity_admission = Some(reliaburger::cluster::orchestrate::spawn_leader_scheduler(
                 Arc::clone(council),
                 membership_rx.clone(),
                 aggregated_rx,
                 config.dns.enabled,
                 config.reconstruction.clone(),
                 shutdown.clone(),
-            );
+            ));
             // L3: leader-only autoscale loop, feeding on the same rollup
             // store /v1/metrics/cluster serves.
             if let Some(rollup_store) = &api_rollup_store {
@@ -2147,6 +2148,10 @@ async fn run_agent(cli: Cli) -> anyhow::Result<()> {
         Some(local_test_leases),
         jwt_verifier,
     );
+    let app = match capacity_admission {
+        Some(admission) => app.layer(axum::Extension(admission)),
+        None => app,
+    };
     let app = match &api_identity {
         Some(identity) => app.layer(axum::Extension(identity.clone())),
         None => app,

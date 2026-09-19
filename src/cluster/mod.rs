@@ -13,6 +13,7 @@
 //! reporting tree are layered on in follow-up changes.
 
 pub mod applied;
+pub mod capacity;
 pub mod directory;
 pub mod http;
 pub mod identity;

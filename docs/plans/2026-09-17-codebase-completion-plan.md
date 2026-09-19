@@ -1272,12 +1272,34 @@ Evidence: `src/relish/client.rs:alerts`; `src/testkit/bench/suites.rs`.
 share a required alert envelope and an enum for API phases. Missing lists,
 malformed entries and unknown phases fail collection; valid empty lists and
 labelled firing responses retain their wire format. The original HTTP regression
-fails before the fix. Scheduler/capacity work remains open: the benchmark also
-counts accepted desired-state writes before observing placement, while the
-leader logs scheduler refusals instead of returning them in the apply response.
-A typed wrapper around the existing substring check would not fix this.
+fails before the fix. The capacity investigation also found that the benchmark
+counted accepted desired-state writes before observing placement, while the
+leader logged scheduler refusals instead of returning them in the apply response.
+A typed wrapper around the old substring check would not fix that.
 All 330 Relish tests, 19 evaluator tests and 118 API tests pass on both native
 macOS and Linux; strict all-target/all-feature Clippy passes on both.
+
+**Scheduler/capacity contract completed separately on PR #167.** Capacity applies
+require one new one-replica app and ask the live leader loop through a bounded
+channel. The check uses current scheduling reservations and quota usage; missing,
+stale, unready or interrupted evidence is unavailable, never saturation. HTTP
+422 carries a shared typed refusal; the client and benchmark match its code and
+app ID. The API rechecks leadership and lease activity before returning it.
+Accepted writes count only after complete cluster status observes the workload
+running, with a final check of every counted app. The benchmark requires council
+admission; standalone nodes cannot provide it. Deadlines and hard limits fail.
+
+The original typed-refusal and false-success regressions fail first (11 pass,
+two fail, 2.15s). All 15 capacity-filtered, 64 cluster, 124 testkit, 332 Relish and
+118 API tests pass on Linux. The real three-node fixture verifies follower
+forwarding, refusal without a desired-state write, accepted ProcessGrill
+placement and refusal to reuse an existing app (17.86s native/21.26s Linux).
+Its accepted workload declares no resource limits because ProcessGrill correctly
+refuses limits it cannot enforce. This fixture is not OCI saturation evidence.
+The final native library checkpoint passes 3,295 tests, with five explicit gates
+(47.27s), after the separate TCP cancellation fixture repair. Strict Linux/macOS
+Clippy passes. Protocol/state remain 6/7; the API contract is additive and old
+or malformed refusal payloads remain failures.
 
 **Completion test:** Shared schemas and stable error codes survive message wording changes; malformed or partial responses cannot score a successful benchmark.
 
