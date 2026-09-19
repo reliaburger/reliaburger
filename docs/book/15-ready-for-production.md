@@ -3001,3 +3001,16 @@ primitive still doesn't constitute a CA recovery workflow, and changing an
 identity model's grace period cannot extend a signed certificate. Those operator
 features remain explicitly planned. Passing a helper's unit test must never
 silently promote the feature around it to supported.
+
+A later hosted minimum-Rust run passed 3,658 tests and failed the cross-node
+log partial-result fixture: its supposedly healthy peer contributed no rows.
+That fixture put a cold DataFusion query behind the same two-second deadline
+used to observe an unreachable peer. It mixed storage setup cost with transport
+failure, and its test server even converted storage errors into empty results.
+
+The partial-failure case now serves three fixed log entries over real HTTP.
+Its two-second deadline and exact failed-peer assertions stay unchanged. The
+other four cross-node cases still query real log stores, and those fixture
+handlers now surface storage errors instead of returning empty arrays. We also
+print node failures when the row count is wrong. A future CI failure should
+say which assumption failed, not send us guessing from a zero.

@@ -122,6 +122,14 @@ The subsequent cron checkpoint changes require their own hosted validation.
 
 - [x] **C55** Bound cross-node log response bodies and own cancellation. Both stalled-body and detached-request regressions fail first. Full-body timeout and JoinSet ownership pass 13 native query tests (0.12s), 62 Linux Ketchup tests (one explicit gate, 0.44s), all five cross-node tests on Linux/macOS (0.52s/0.14s) and strict Linux/macOS Clippy. The CI fixture correction is separate.
 
+Hosted minimum-Rust CI at `9747fba` passed 3,658 tests but failed the cross-node
+log partial-result fixture (zero healthy rows). Its transport-only case now
+serves fixed entries without cold SQL planning under the two-second deadline;
+the other four cases retain real storage and report storage errors explicitly.
+All five pass on Linux/macOS (0.52s/0.14s), along with strict Clippy. The build
+workflow at that head passed; the repaired fixture needs current-head hosted
+validation. Superseded `f9c0e2c` workflows were cancelled for runner capacity.
+
 ### Engineering follow-ups
 
 - [x] **H01** Reconcile scheduler/quota/scrape wiring and weights, roadmap test locations, cleanup evidence and disabled-auth chaos policy with their callers. Mark completed historical bug groups done while retaining C30/C34 and future operator workflows. Repair eleven Rustdoc errors; all-feature public documentation now builds with warnings denied, all 74 relative links in the changed Markdown pass, and the four documented diagnostic CLI help interfaces are verified.

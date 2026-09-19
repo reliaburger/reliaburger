@@ -1166,6 +1166,16 @@ Ketchup tests (one explicit gate, 0.44s), all five cross-node tests on Linux
 (0.52s) and macOS (0.14s), and strict Linux/macOS Clippy. The independent
 partial-failure fixture correction is recorded separately.
 
+**Separate CI fixture correction:** Hosted minimum-Rust CI at `9747fba`
+passes 3,658 tests and fails `partial_results_when_node_unreachable`, whose
+healthy fixture returns zero rows. That two-second partial-transport test no
+longer includes cold DataFusion query planning: it serves fixed entries over
+actual HTTP, keeps its original deadline and checks the exact failed peer.
+The other four cases retain real storage, now surfacing query errors instead
+of silently returning empty rows. All five pass on Linux (0.52s) and macOS
+(0.14s); strict Linux/macOS Clippy passes. Hosted validation of the repair
+remains separate. The build workflow at `9747fba` passed.
+
 ## Engineering follow-ups
 
 ### H01 — Remove stale wiring claims and validate documentation
