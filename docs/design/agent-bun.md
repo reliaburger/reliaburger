@@ -767,8 +767,6 @@ pub struct UpgradeConfig {
     pub external_signing_key: Option<String>,
     /// Number of previous binary versions to retain on disk.
     pub retain_versions: u32,   // default: 3
-    /// Release metadata endpoint URL.
-    pub release_url: String,    // default: https://releases.reliaburger.dev/metadata.json
 }
 ```
 
@@ -1277,7 +1275,6 @@ join = ["10.0.1.5:9443"]
 | `[process_workloads]` | `allow_globs` | `false` | bool | Allow glob patterns in `allowed_binaries`. |
 | `[upgrades]` | `external_signing_key` | (none) | `"ed25519:..."` | External signing key for dual-signature verification. Required for network upgrades. |
 | `[upgrades]` | `retain_versions` | `3` | 1-10 | Number of previous binary versions to keep on disk. |
-| `[upgrades]` | `release_url` | `"https://releases.reliaburger.dev/metadata.json"` | URL | Release metadata endpoint for version checks. |
 | `[testing]` | `external_probe_allowlist` | `[]` | exact `host:port` strings | External destinations `relish trace` may probe after its independent Admin, operation and protected-cluster checks; an empty list permits none. Wildcards and CIDRs do not match. |
 
 ---
@@ -1785,3 +1782,7 @@ Bun Restart
 9. **Self-upgrade rollback detection timeout:** Currently, if the new Bun exits within 30 seconds or fails to rejoin gossip within 60 seconds, it auto-reverts. Are these timeouts appropriate for all environments? Should they be configurable in `node.toml`?
 
 10. **nftables vs pure eBPF for perimeter rules:** The current design uses nftables for perimeter enforcement (cluster boundary, management access, egress allowlists) and eBPF for inter-app rules. Could perimeter rules also move to eBPF, eliminating the nftables dependency entirely? This would simplify the dependency tree but may lose nftables' mature logging and accounting features.
+
+Release metadata lookup belongs to the CLI: use `relish upgrade check --url`
+to override its compiled default. Node TOML rejects the obsolete `release_url`
+key, which never controlled that lookup.

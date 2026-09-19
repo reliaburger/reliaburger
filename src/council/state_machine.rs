@@ -30,7 +30,7 @@ const SNAP_CHECKSUM_KEY: &str = "checksum";
 
 /// Snapshot format version this binary writes. Bump it when the persisted
 /// layout changes incompatibly; loading rejects versions it doesn't know.
-const SNAPSHOT_FORMAT_VERSION: u32 = 1;
+const SNAPSHOT_FORMAT_VERSION: u32 = crate::compatibility::CURRENT.state;
 
 /// Errors opening or validating the persisted snapshot store.
 ///
@@ -51,9 +51,7 @@ pub enum SnapshotStoreError {
     ChecksumMismatch { stored: String, computed: String },
     #[error("snapshot records format version {version} but no checksum")]
     MissingChecksum { version: u32 },
-    #[error(
-        "snapshot format version {found} is not supported (this binary supports up to {supported})"
-    )]
+    #[error("snapshot format version {found} is not supported (this binary requires {supported})")]
     UnsupportedVersion { found: u32, supported: u32 },
     #[error("snapshot version marker is malformed: expected 4 bytes, found {found}")]
     MalformedVersion { found: usize },
@@ -197,6 +195,46 @@ impl StateMachineInner {
     /// the generic `Applied` response.
     fn apply_request(&mut self, request: &RaftRequest) -> Option<CouncilResponse> {
         match request {
+            RaftRequest::ReserveNodeFault {
+                reservation,
+                membership_log_id,
+                unavailable_voters,
+            } => {
+                let membership = self.state.last_membership.membership();
+                let voters: std::collections::BTreeSet<_> = membership.voter_ids().collect();
+                let refuse = |reason: &str| {
+                    Some(CouncilResponse::Refused {
+                        reason: reason.into(),
+                    })
+                };
+                if self.state.last_membership.log_id() != membership_log_id
+                    || membership.get_joint_config().len() != 1
+                    || voters.is_empty()
+                {
+                    return refuse(
+                        "node fault safety requires a stable current council membership",
+                    );
+                }
+                // Pressure may starve a voter just as effectively as a transport
+                // fault. Drain alone only withdraws scheduler readiness.
+                let quorum_effect = !matches!(
+                    reservation.request.fault_type,
+                    crate::smoker::types::FaultType::NodeDrain
+                );
+                if quorum_effect
+                    && unavailable_voters.intersection(&voters).count() + 1 > (voters.len() - 1) / 2
+                {
+                    return refuse("node fault would risk council quorum");
+                }
+                if let Err(reason) = self.state.node_fault_reservations.reserve(reservation) {
+                    return Some(CouncilResponse::Refused { reason });
+                }
+            }
+            RaftRequest::ReleaseNodeFault { sequence } => {
+                if let Err(reason) = self.state.node_fault_reservations.release(*sequence) {
+                    return Some(CouncilResponse::Refused { reason });
+                }
+            }
             RaftRequest::AppSpec { app_id, spec } => {
                 if crate::testkit::lease::valid_test_namespace(&app_id.namespace) {
                     return Some(CouncilResponse::Refused {
@@ -339,6 +377,18 @@ impl StateMachineInner {
                 return Some(CouncilResponse::JoinTokenConsumed { serial });
             }
             RaftRequest::CreateApiToken(token) => {
+                if token.name.starts_with("rbtest-")
+                    || self
+                        .state
+                        .security_state
+                        .api_tokens
+                        .iter()
+                        .any(|existing| existing.name == token.name)
+                {
+                    return Some(CouncilResponse::Refused {
+                        reason: "token name already exists or requires a test lease".into(),
+                    });
+                }
                 self.state.security_state.api_tokens.push(token.clone());
             }
             RaftRequest::RevokeApiToken { name } => {
@@ -589,6 +639,11 @@ impl StateMachineInner {
                 self.state.endpoint_catalog = *catalog.clone();
             }
             RaftRequest::TestLeaseCreate(lease) => {
+                if lease.scope != crate::testkit::lease::LeaseScope::Applications {
+                    return Some(CouncilResponse::Refused {
+                        reason: "node job leases must remain on their owning node".to_string(),
+                    });
+                }
                 if let Err(error) = lease.validate() {
                     return Some(CouncilResponse::Refused {
                         reason: error.to_string(),
@@ -704,6 +759,78 @@ impl StateMachineInner {
                 }
                 self.state.namespaces.insert(name.clone(), *spec.clone());
             }
+            RaftRequest::TestLeaseApiToken {
+                lease_id,
+                owner_id,
+                observed_at_unix_ms,
+                token,
+            } => {
+                let Some(lease) = self.state.test_leases.get(lease_id) else {
+                    return Some(CouncilResponse::Refused {
+                        reason: "lease not found".into(),
+                    });
+                };
+                let resource = match lease.token_resource(token, owner_id, *observed_at_unix_ms) {
+                    Ok(resource) => resource,
+                    Err(error) => {
+                        return Some(CouncilResponse::Refused {
+                            reason: error.to_string(),
+                        });
+                    }
+                };
+                let name_owned = self.state.test_leases.values().any(|lease| lease.resources.iter().any(|resource| {
+                    matches!(resource, crate::testkit::lease::LeasedResource::ApiToken { name, .. } if name == &token.name)
+                }));
+                if name_owned
+                    || self
+                        .state
+                        .security_state
+                        .api_tokens
+                        .iter()
+                        .any(|existing| existing.name == token.name)
+                {
+                    return Some(CouncilResponse::Refused {
+                        reason: "token name already exists or is lease-owned".into(),
+                    });
+                }
+                if let Some(lease) = self.state.test_leases.get_mut(lease_id) {
+                    lease.resources.insert(resource);
+                }
+                self.state.security_state.api_tokens.push(*token.clone());
+            }
+            RaftRequest::TestLeaseRevokeApiToken {
+                lease_id,
+                name,
+                fingerprint,
+            } => {
+                let resource = crate::testkit::lease::LeasedResource::ApiToken {
+                    name: name.clone(),
+                    fingerprint: *fingerprint,
+                };
+                if !self.state.test_leases.get(lease_id).is_some_and(|lease| {
+                    matches!(
+                        lease.state,
+                        crate::testkit::lease::TestLeaseState::Cleaning { .. }
+                    ) && lease.resources.contains(&resource)
+                }) {
+                    return Some(CouncilResponse::Refused {
+                        reason: "token is not owned by this cleaning lease".into(),
+                    });
+                }
+                if self.state.security_state.api_tokens.iter().any(|token| {
+                    &token.name == name
+                        && (crate::testkit::lease::token_fingerprint(token) != *fingerprint
+                            || token.role == crate::sesame::types::ApiRole::Admin)
+                }) {
+                    return Some(CouncilResponse::Refused {
+                        reason: "owned token has been replaced; refusing to revoke it".into(),
+                    });
+                }
+                self.state
+                    .security_state
+                    .api_tokens
+                    .retain(|token| &token.name != name);
+            }
             RaftRequest::TestLeaseRenew {
                 lease_id,
                 owner_id,
@@ -769,6 +896,19 @@ impl StateMachineInner {
                 let remaining: Vec<String> = resources
                     .iter()
                     .filter_map(|resource| match resource {
+                        crate::testkit::lease::LeasedResource::Job { job_id } => {
+                            Some(format!("node job {job_id}"))
+                        }
+                        crate::testkit::lease::LeasedResource::ApiToken { name, .. }
+                            if self
+                                .state
+                                .security_state
+                                .api_tokens
+                                .iter()
+                                .any(|token| &token.name == name) =>
+                        {
+                            Some(format!("token {name}"))
+                        }
                         crate::testkit::lease::LeasedResource::App { app_id }
                             if self.state.apps.contains_key(app_id) =>
                         {
@@ -967,25 +1107,33 @@ impl CouncilStateMachine {
     /// desired and security state.
     #[allow(clippy::result_large_err)]
     pub fn snapshot_present(db: &Database) -> Result<bool, SnapshotStoreError> {
-        // Materialise the table so the read doesn't error on a fresh store.
-        let wtx = db.begin_write()?;
-        {
-            wtx.open_table(SNAPSHOT)?;
-        }
-        wtx.commit()?;
         let rtx = db.begin_read()?;
-        let t = rtx.open_table(SNAPSHOT)?;
-        Ok(t.get(SNAP_DATA_KEY)?.is_some())
+        let table = match rtx.open_table(SNAPSHOT) {
+            Ok(table) => table,
+            Err(redb::TableError::TableDoesNotExist(_)) => return Ok(false),
+            Err(error) => return Err(error.into()),
+        };
+        Ok(table.get(SNAP_DATA_KEY)?.is_some())
     }
 
     #[allow(clippy::result_large_err)]
     pub fn with_store(db: Arc<Database>) -> Result<Self, SnapshotStoreError> {
-        // Materialise the table so reads on a fresh store don't error.
-        let wtx = db.begin_write()?;
-        {
-            wtx.open_table(SNAPSHOT)?;
+        // Only a genuinely empty store needs a write before validation.
+        let table_exists = {
+            let rtx = db.begin_read()?;
+            match rtx.open_table(SNAPSHOT) {
+                Ok(_) => true,
+                Err(redb::TableError::TableDoesNotExist(_)) => false,
+                Err(error) => return Err(error.into()),
+            }
+        };
+        if !table_exists {
+            let wtx = db.begin_write()?;
+            {
+                wtx.open_table(SNAPSHOT)?;
+            }
+            wtx.commit()?;
         }
-        wtx.commit()?;
 
         let mut inner = StateMachineInner::default();
         {
@@ -994,13 +1142,12 @@ impl CouncilStateMachine {
             if let Some(data) = t.get(SNAP_DATA_KEY)? {
                 let bytes = data.value().to_vec();
                 match read_snapshot_version(&t)? {
-                    // Legacy pre-envelope snapshot: no version, no checksum.
-                    // Load it as before; the next persist rewrites it in the
-                    // enveloped format (version + checksum, one transaction).
-                    None => eprintln!(
-                        "council: snapshot has no version/checksum envelope (pre-12b format); \
-                         loading as legacy, it will be rewritten on the next snapshot"
-                    ),
+                    None => {
+                        return Err(SnapshotStoreError::UnsupportedVersion {
+                            found: 0,
+                            supported: SNAPSHOT_FORMAT_VERSION,
+                        });
+                    }
                     Some(SNAPSHOT_FORMAT_VERSION) => verify_snapshot_checksum(&t, &bytes)?,
                     Some(found) => {
                         return Err(SnapshotStoreError::UnsupportedVersion {
@@ -1290,6 +1437,120 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn node_fault_capacity_survives_snapshot_and_leader_term_changes() {
+        use crate::smoker::reservation::NodeFaultReservation;
+        use crate::smoker::types::{FaultRequest, FaultType};
+        let mut sm = CouncilStateMachine::new();
+        sm.apply(vec![openraft::Entry {
+            log_id: log_id(1, 1),
+            payload: EntryPayload::Membership(Membership::new(
+                vec![std::collections::BTreeSet::from([1, 2, 3])],
+                None::<std::collections::BTreeSet<u64>>,
+            )),
+        }])
+        .await
+        .unwrap();
+        let grant = NodeFaultReservation {
+            sequence: 1,
+            boot_id: "boot-a".into(),
+            cleanup_after_unix_ms: 1,
+            request: FaultRequest {
+                fault_type: FaultType::NodeKill {
+                    kill_containers: false,
+                },
+                target_node: Some("node-a".into()),
+                target_service: String::new(),
+                target_instance: None,
+                namespace: None,
+                duration: std::time::Duration::from_secs(1),
+                injected_by: "operator".into(),
+                reason: None,
+                include_leader: true,
+                override_safety: true,
+                acknowledged: true,
+            },
+        };
+        let reserve = |reservation: NodeFaultReservation, membership_log_id, unavailable_voters| {
+            RaftRequest::ReserveNodeFault {
+                reservation: Box::new(reservation),
+                membership_log_id,
+                unavailable_voters,
+            }
+        };
+        let stale = sm
+            .apply(vec![normal_entry(
+                1,
+                2,
+                reserve(grant.clone(), None, Default::default()),
+            )])
+            .await
+            .unwrap();
+        assert!(matches!(stale[0], CouncilResponse::Refused { .. }));
+        let risk = sm
+            .apply(vec![normal_entry(
+                1,
+                3,
+                reserve(grant.clone(), Some(log_id(1, 1)), [2].into()),
+            )])
+            .await
+            .unwrap();
+        assert!(matches!(risk[0], CouncilResponse::Refused { .. }));
+        let admitted = sm
+            .apply(vec![normal_entry(
+                1,
+                4,
+                reserve(grant.clone(), Some(log_id(1, 1)), Default::default()),
+            )])
+            .await
+            .unwrap();
+        assert!(matches!(admitted[0], CouncilResponse::Applied { .. }));
+        let mut builder = sm.get_snapshot_builder().await;
+        let snapshot = builder.build_snapshot().await.unwrap();
+        let mut restored = CouncilStateMachine::new();
+        restored
+            .install_snapshot(&snapshot.meta, snapshot.snapshot)
+            .await
+            .unwrap();
+        let mut other = grant.clone();
+        other.sequence = 2;
+        other.request.target_node = Some("node-b".into());
+        let refused = restored
+            .apply(vec![normal_entry(
+                2,
+                5,
+                reserve(other.clone(), Some(log_id(1, 1)), Default::default()),
+            )])
+            .await
+            .unwrap();
+        assert!(matches!(refused[0], CouncilResponse::Refused { .. }));
+        assert_eq!(
+            restored
+                .desired_state()
+                .await
+                .node_fault_reservations
+                .active,
+            Some(grant)
+        );
+        restored
+            .apply(vec![normal_entry(
+                2,
+                6,
+                RaftRequest::ReleaseNodeFault { sequence: 1 },
+            )])
+            .await
+            .unwrap();
+        let admitted = restored
+            .apply(vec![normal_entry(
+                2,
+                7,
+                reserve(other, Some(log_id(1, 1)), Default::default()),
+            )])
+            .await
+            .unwrap();
+        assert!(matches!(admitted[0], CouncilResponse::Applied { .. }));
+    }
+
+    #[tokio::test]
     async fn apply_app_spec_adds_to_state() {
         let mut sm = CouncilStateMachine::new();
         let app_id = AppId::new("web", "prod");
@@ -1485,12 +1746,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn legacy_snapshot_without_envelope_still_loads_and_is_rewritten() {
-        // Fixture: a snapshot exactly as a pre-envelope binary wrote it —
-        // raw `DesiredState` JSON under "data" plus the counter under
-        // "index", no version or checksum keys. Existing dev clusters and
-        // the Lima rigs carry this format; it must keep loading (with a
-        // warning), and the next persist must upgrade it in place.
+    async fn legacy_snapshot_without_envelope_is_refused_and_preserved() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("legacy.redb");
         let app_id = AppId::new("web", "prod");
@@ -1517,21 +1773,15 @@ mod tests {
         }
 
         let db = std::sync::Arc::new(Database::create(&path).unwrap());
-        let mut sm = CouncilStateMachine::with_store(db.clone()).expect("legacy snapshot loads");
-        let state = sm.desired_state().await;
-        assert_eq!(
-            state.apps.get(&app_id).unwrap().image,
-            Some("legacy:v1".to_string())
-        );
-        assert_eq!(sm.snapshot_last_applied().await, Some(log_id(1, 3)));
-
-        // The next snapshot persist rewrites the store in the new format.
-        let mut builder = sm.get_snapshot_builder().await;
-        builder.build_snapshot().await.unwrap();
+        assert!(matches!(
+            CouncilStateMachine::with_store(db.clone()),
+            Err(SnapshotStoreError::UnsupportedVersion { found: 0, .. })
+        ));
         let rtx = db.begin_read().unwrap();
-        let t = rtx.open_table(SNAPSHOT).unwrap();
-        assert!(t.get(SNAP_VERSION_KEY).unwrap().is_some());
-        assert!(t.get(SNAP_CHECKSUM_KEY).unwrap().is_some());
+        let table = rtx.open_table(SNAPSHOT).unwrap();
+        assert_eq!(table.get(SNAP_DATA_KEY).unwrap().unwrap().value(), payload);
+        assert!(table.get(SNAP_VERSION_KEY).unwrap().is_none());
+        assert!(table.get(SNAP_CHECKSUM_KEY).unwrap().is_none());
     }
 
     #[tokio::test]
@@ -3158,6 +3408,196 @@ mod tests {
         );
     }
 
+    fn leased_token() -> crate::sesame::types::ApiToken {
+        crate::sesame::types::ApiToken {
+            name: "rbtest-run1-scope".into(),
+            token_hash: vec![1; 32],
+            token_salt: vec![2; 16],
+            role: crate::sesame::types::ApiRole::Deployer,
+            scope: crate::sesame::types::TokenScope {
+                apps: None,
+                namespaces: Some(vec!["rbtest-run1".into()]),
+            },
+            expires_at: Some(
+                std::time::SystemTime::UNIX_EPOCH + std::time::Duration::from_millis(100),
+            ),
+            created_at: std::time::SystemTime::UNIX_EPOCH,
+        }
+    }
+
+    fn leased_token_request(token: crate::sesame::types::ApiToken) -> RaftRequest {
+        RaftRequest::TestLeaseApiToken {
+            lease_id: "run1".into(),
+            owner_id: "token:ci".into(),
+            observed_at_unix_ms: 20,
+            token: Box::new(token),
+        }
+    }
+
+    #[test]
+    fn leased_token_refuses_invalid_authority_scope_expiry_and_existing_names() {
+        let mut inner = StateMachineInner::default();
+        inner.apply_request(&RaftRequest::TestLeaseCreate(test_lease("run1", 100)));
+        let mut invalid = Vec::new();
+        let mut token = leased_token();
+        token.role = crate::sesame::types::ApiRole::Admin;
+        invalid.push(token);
+        let mut token = leased_token();
+        token.scope.namespaces = None;
+        invalid.push(token);
+        let mut token = leased_token();
+        token.scope.namespaces = Some(vec!["outside".into()]);
+        invalid.push(token);
+        let mut token = leased_token();
+        token.expires_at = None;
+        invalid.push(token);
+        let mut token = leased_token();
+        token.expires_at =
+            Some(std::time::SystemTime::UNIX_EPOCH + std::time::Duration::from_millis(101));
+        invalid.push(token);
+        let mut token = leased_token();
+        token.expires_at = Some(std::time::SystemTime::UNIX_EPOCH);
+        invalid.push(token);
+        let mut token = leased_token();
+        token.name = "operator-token".into();
+        invalid.push(token);
+        for token in invalid {
+            assert!(matches!(
+                inner.apply_request(&leased_token_request(token)),
+                Some(CouncilResponse::Refused { .. })
+            ));
+            assert!(inner.state.security_state.api_tokens.is_empty());
+            assert!(inner.state.test_leases["run1"].resources.is_empty());
+        }
+        for (owner, observed) in [("other", 20), ("token:ci", 100)] {
+            assert!(matches!(
+                inner.apply_request(&RaftRequest::TestLeaseApiToken {
+                    lease_id: "run1".into(),
+                    owner_id: owner.into(),
+                    observed_at_unix_ms: observed,
+                    token: Box::new(leased_token()),
+                }),
+                Some(CouncilResponse::Refused { .. })
+            ));
+        }
+        inner.state.security_state.api_tokens.push(leased_token());
+        assert!(matches!(
+            inner.apply_request(&leased_token_request(leased_token())),
+            Some(CouncilResponse::Refused { .. })
+        ));
+        assert!(inner.state.test_leases["run1"].resources.is_empty());
+    }
+
+    #[test]
+    fn leased_token_expiry_does_not_extend_on_renewal_and_revocation_does_not_release_ownership() {
+        let mut inner = StateMachineInner::default();
+        inner.apply_request(&RaftRequest::TestLeaseCreate(test_lease("run1", 100)));
+        inner.apply_request(&leased_token_request(leased_token()));
+        inner.apply_request(&RaftRequest::TestLeaseRenew {
+            lease_id: "run1".into(),
+            owner_id: "token:ci".into(),
+            renewed_at_unix_ms: 30,
+            expires_at_unix_ms: 200,
+        });
+        assert_eq!(
+            inner.state.security_state.api_tokens[0].expires_at,
+            leased_token().expires_at
+        );
+        inner.apply_request(&RaftRequest::RevokeApiToken {
+            name: leased_token().name,
+        });
+        assert!(inner.state.security_state.api_tokens.is_empty());
+        assert!(matches!(
+            inner.apply_request(&leased_token_request(leased_token())),
+            Some(CouncilResponse::Refused { .. })
+        ));
+        let mut replacement = leased_token();
+        replacement.name = "rbtest-run1-next".into();
+        assert!(!matches!(
+            inner.apply_request(&leased_token_request(replacement)),
+            Some(CouncilResponse::Refused { .. })
+        ));
+    }
+
+    #[tokio::test]
+    async fn leased_token_snapshot_preserves_cleanup_fences_and_exact_credential() {
+        let mut sm = CouncilStateMachine::new();
+        sm.apply(vec![
+            normal_entry(1, 1, RaftRequest::TestLeaseCreate(test_lease("run1", 100))),
+            normal_entry(1, 2, leased_token_request(leased_token())),
+        ])
+        .await
+        .unwrap();
+        let state = sm.desired_state().await;
+        let resource = state.test_leases["run1"]
+            .resources
+            .iter()
+            .next()
+            .unwrap()
+            .clone();
+        let crate::testkit::lease::LeasedResource::ApiToken { name, fingerprint } = resource else {
+            panic!("wrong resource")
+        };
+        let mut builder = sm.get_snapshot_builder().await;
+        let snapshot = builder.build_snapshot().await.unwrap();
+        let mut restored = CouncilStateMachine::new();
+        restored
+            .install_snapshot(&snapshot.meta, snapshot.snapshot)
+            .await
+            .unwrap();
+        let mut inner = restored.inner.write().await;
+        let cleanup = RaftRequest::TestLeaseRevokeApiToken {
+            lease_id: "run1".into(),
+            name: name.clone(),
+            fingerprint,
+        };
+        assert!(matches!(
+            inner.apply_request(&cleanup),
+            Some(CouncilResponse::Refused { .. })
+        ));
+        inner.apply_request(&RaftRequest::TestLeaseBeginCleanup {
+            lease_id: "run1".into(),
+        });
+        assert!(matches!(
+            inner.apply_request(&leased_token_request(leased_token())),
+            Some(CouncilResponse::Refused { .. })
+        ));
+        assert!(matches!(
+            inner.apply_request(&RaftRequest::TestLeaseFinishCleanup {
+                lease_id: "run1".into()
+            }),
+            Some(CouncilResponse::Refused { .. })
+        ));
+        // Even corrupt/external replacement state must never cause name-only deletion.
+        inner.state.security_state.api_tokens[0].token_hash = vec![3; 32];
+        assert!(matches!(
+            inner.apply_request(&cleanup),
+            Some(CouncilResponse::Refused { .. })
+        ));
+        assert_eq!(
+            inner.state.security_state.api_tokens[0].token_hash,
+            vec![3; 32]
+        );
+        inner.state.security_state.api_tokens[0] = leased_token();
+        assert!(!matches!(
+            inner.apply_request(&cleanup),
+            Some(CouncilResponse::Refused { .. })
+        ));
+        assert!(inner.state.security_state.api_tokens.is_empty());
+        assert!(!matches!(
+            inner.apply_request(&cleanup),
+            Some(CouncilResponse::Refused { .. })
+        ));
+        assert!(matches!(
+            inner.apply_request(&RaftRequest::CreateApiToken(leased_token())),
+            Some(CouncilResponse::Refused { .. })
+        ));
+        inner.apply_request(&RaftRequest::TestLeaseFinishCleanup {
+            lease_id: "run1".into(),
+        });
+        assert!(inner.state.test_leases.is_empty());
+    }
+
     fn test_lease(id: &str, expires_at_unix_ms: u64) -> crate::testkit::lease::TestLease {
         crate::testkit::lease::TestLease::new(
             id.to_string(),
@@ -3168,6 +3608,32 @@ mod tests {
             expires_at_unix_ms,
         )
         .unwrap()
+    }
+
+    #[tokio::test]
+    async fn node_job_leases_never_enter_replicated_state() {
+        let mut sm = CouncilStateMachine::new();
+        let suffix = "0123456789abcdef0123456789abcdef";
+        let lease = crate::testkit::lease::TestLease::new_scoped(
+            format!("node-jobs-{suffix}"),
+            "owner".into(),
+            "owner".into(),
+            format!("rbtest-node-{suffix}"),
+            10,
+            100,
+            crate::testkit::lease::LeaseScope::NodeJobs,
+        )
+        .unwrap();
+        let responses = sm
+            .apply(vec![normal_entry(
+                1,
+                1,
+                RaftRequest::TestLeaseCreate(lease),
+            )])
+            .await
+            .unwrap();
+        assert!(matches!(responses[0], CouncilResponse::Refused { .. }));
+        assert!(sm.inner.read().await.state.test_leases.is_empty());
     }
 
     #[tokio::test]
@@ -3549,12 +4015,9 @@ mod tests {
         assert!(reloaded.test_leases.is_empty());
     }
 
-    /// The same rule end to end through the persisted store: a legacy
-    /// pre-envelope snapshot without the tracker fields loads through
-    /// `with_store` (the #83 envelope loader), and the trackers start
-    /// from their defaults.
+    /// Missing tracker fields do not authorise migration of development state.
     #[tokio::test]
-    async fn pre_12b2_persisted_snapshot_loads_through_the_envelope_loader() {
+    async fn pre_12b2_persisted_snapshot_is_refused() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("pre12b2.redb");
         let app_id = AppId::new("web", "prod");
@@ -3582,12 +4045,10 @@ mod tests {
         }
 
         let db = std::sync::Arc::new(Database::create(&path).unwrap());
-        let sm = CouncilStateMachine::with_store(db).expect("pre-12b.2 snapshot loads");
-        let state = sm.desired_state().await;
-        assert!(state.apps.contains_key(&app_id));
-        assert_eq!(state.batch_state.next_batch_id, 1);
-        assert_eq!(state.build_state.next_build_id, 1);
-        assert!(state.test_leases.is_empty());
+        assert!(matches!(
+            CouncilStateMachine::with_store(db),
+            Err(SnapshotStoreError::UnsupportedVersion { found: 0, .. })
+        ));
     }
 
     /// O5: the CRL is replicated in every snapshot and scanned on every TLS

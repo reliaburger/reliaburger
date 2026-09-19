@@ -82,6 +82,13 @@ impl CommandOutcome {
 /// Errors from Relish CLI operations.
 #[derive(Debug, thiserror::Error)]
 pub enum RelishError {
+    /// A legacy command was removed because its ownership contract was unsafe.
+    #[error("{command} is retired; use {replacement}")]
+    RetiredCommand {
+        command: String,
+        replacement: String,
+    },
+
     /// Configuration parse or validation failure.
     #[error("{0}")]
     Config(#[from] ConfigError),
@@ -117,6 +124,10 @@ pub enum RelishError {
     /// The API returned an error.
     #[error("API error (status {status}): {body}")]
     ApiError { status: u16, body: String },
+
+    /// Explicit refusal from the live scheduler's capacity admission check.
+    #[error("scheduler refused placement: {0}")]
+    SchedulingRejected(crate::meat::scheduler::ScheduleError),
 
     /// File already exists (init refuses to overwrite).
     #[error("{path} already exists (refusing to overwrite)")]

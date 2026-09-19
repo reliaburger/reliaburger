@@ -14,7 +14,7 @@ use tokio::sync::RwLock;
 
 use reliaburger::ketchup::log_store::LogStore;
 use reliaburger::ketchup::query::fan_out_query;
-use reliaburger::ketchup::types::{LogQuery, LogStream};
+use reliaburger::ketchup::types::{LogEntry, LogQuery, LogStream};
 
 /// Pair each server URL with a stable node id, as the API layer does.
 fn nodes(urls: &[String]) -> Vec<(String, String)> {
@@ -53,7 +53,7 @@ fn test_router(store: Arc<RwLock<LogStore>>) -> Router {
                             query.tail,
                         )
                         .await
-                        .unwrap_or_default();
+                        .expect("test log-store query failed");
                     Json(entries)
                 }
             },
@@ -229,8 +229,23 @@ async fn grep_filter_across_nodes() {
 /// into a silent empty success (OBS6).
 #[tokio::test]
 async fn partial_results_when_node_unreachable() {
-    let (s1, _d1) = store_with_entries(&[1, 2, 3], "node1").await;
-    let url1 = start_server(test_router(s1)).await;
+    // This case tests partial transport failure, not cold DataFusion planning
+    // under its two-second request budget. Other cases exercise real storage.
+    let entries: Vec<_> = (1..=3)
+        .map(|timestamp| LogEntry {
+            timestamp,
+            stream: LogStream::Stdout,
+            line: format!("node1 ts={timestamp}"),
+        })
+        .collect();
+    let router = Router::new().route(
+        "/v1/logs/entries/{app}/{namespace}",
+        get(move || {
+            let entries = entries.clone();
+            async move { Json(entries) }
+        }),
+    );
+    let url1 = start_server(router).await;
 
     // node2 URL points to a port nothing is listening on
     let url2 = "http://127.0.0.1:1".to_string();
@@ -253,7 +268,12 @@ async fn partial_results_when_node_unreachable() {
     .unwrap();
 
     // Entries from node1, and node2 is a reported partial failure.
-    assert_eq!(result.entries.len(), 3);
+    assert_eq!(
+        result.entries.len(),
+        3,
+        "node failures: {:?}",
+        result.failures
+    );
     assert!(result.entries[0].line.contains("node1"));
     assert_eq!(result.failures.len(), 1);
     assert_eq!(result.failures[0].node_id, "node2");

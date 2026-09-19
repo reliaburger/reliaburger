@@ -280,7 +280,7 @@ pub(crate) async fn record_commit(
 /// — REG8). Axum can't put a wildcard *before* a fixed suffix like
 /// `/blobs/…`, so instead of one route per shape we capture the whole path
 /// after `/v2/` with a trailing wildcard and split off the OCI operation
-/// suffix ourselves in [`dispatch_v2`]. The repository name is then
+/// suffix ourselves in `dispatch_v2`. The repository name is then
 /// whatever precedes that suffix, however many segments it spans.
 pub fn router(state: PickleState) -> Router {
     let writers = Arc::new(tokio::sync::Semaphore::new(MAX_CONCURRENT_WRITES));
@@ -621,7 +621,7 @@ async fn blob_upload_patch(
     // so an abandoned push can't dribble chunks into a stale temp forever.
     let now = std::time::SystemTime::now();
     if !state.sessions.touch(upload_id, 0, now).await {
-        state.store.cancel_upload(upload_id).await;
+        discard_upload(state, upload_id).await;
         return oci_error(
             StatusCode::BAD_REQUEST,
             "BLOB_UPLOAD_UNKNOWN",
@@ -659,6 +659,17 @@ async fn blob_upload_patch(
     }
 }
 
+/// The calling request owns the writer; retain a fenced session on cleanup error.
+async fn discard_upload(state: &PickleState, upload_id: &str) {
+    state.sessions.retire(upload_id).await;
+    match state.store.cancel_upload(upload_id).await {
+        Ok(()) => {
+            state.sessions.complete(upload_id).await;
+        }
+        Err(error) => eprintln!("pickle: upload {upload_id} cleanup will retry: {error}"),
+    }
+}
+
 /// Consume one request incrementally. On failure discard its partial upload.
 #[allow(clippy::result_large_err)]
 async fn stream_upload(
@@ -692,8 +703,7 @@ async fn stream_upload(
         Err(_) => Err(StatusCode::REQUEST_TIMEOUT.into_response()),
     };
     if result.is_err() {
-        state.store.cancel_upload(upload_id).await;
-        state.sessions.complete(upload_id).await;
+        discard_upload(state, upload_id).await;
     }
     result
 }
@@ -730,7 +740,7 @@ async fn blob_upload_complete(
         .touch(upload_id, 0, std::time::SystemTime::now())
         .await
     {
-        state.store.cancel_upload(upload_id).await;
+        discard_upload(state, upload_id).await;
         return oci_error(
             StatusCode::BAD_REQUEST,
             "BLOB_UPLOAD_UNKNOWN",
@@ -756,8 +766,7 @@ async fn blob_upload_complete(
     match state.store.upload_size(upload_id).await {
         Ok(incoming) => {
             if let Err(response) = state.enforce_quota(name, incoming).await {
-                state.store.cancel_upload(upload_id).await;
-                state.sessions.complete(upload_id).await;
+                discard_upload(state, upload_id).await;
                 return response;
             }
         }
@@ -767,12 +776,16 @@ async fn blob_upload_complete(
         Err(_) => return StatusCode::NOT_FOUND.into_response(),
     }
 
+    state.sessions.retire(upload_id).await;
     let result = state
         .store
         .complete_upload_guarded(upload_id, &digest, Some(writer))
         .await;
-    // Whatever the outcome, the session is finished (REG8).
-    state.sessions.complete(upload_id).await;
+    if result.is_ok() {
+        state.sessions.complete(upload_id).await;
+    } else {
+        discard_upload(state, upload_id).await;
+    }
     match result {
         Ok(()) => {
             let mut headers = HeaderMap::new();

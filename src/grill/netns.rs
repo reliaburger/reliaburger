@@ -63,8 +63,8 @@ pub struct ContainerNetwork {
     pub rootless: bool,
 }
 
-/// Handle to an active port mapping. Drop or call `shutdown()` to
-/// remove the mapping.
+/// Handle to an active port mapping. Call `shutdown()` to remove the mapping.
+/// Dropping a rootful handle alone leaves kernel state for runtime recovery.
 pub struct PortMapHandle {
     /// Cancellation token that stops the TCP proxy (rootless) or
     /// signals that the map element should be removed (root).
@@ -204,6 +204,29 @@ pub fn host_veth_name(instance_id: &InstanceId) -> String {
 // Namespace lifecycle
 // ---------------------------------------------------------------------------
 
+/// Describe resources before mutation, so failed or cancelled setup can be
+/// retired using the persisted address reservation.
+pub(crate) fn planned_container_network(
+    instance: &InstanceId,
+    node_index: u16,
+    index: u16,
+) -> Result<ContainerNetwork, NetnsError> {
+    if node_index == 0 || node_index > MAX_NODE_INDEX || index >= MAX_CONTAINERS_PER_NODE {
+        return Err(NetnsError::SetupFailed {
+            instance: instance.0.clone(),
+            reason: "address is outside the node container subnet".into(),
+        });
+    }
+    Ok(ContainerNetwork {
+        namespace_path: namespace_path(instance),
+        container_ip: container_ip(node_index, index),
+        gateway_ip: gateway_ip(node_index),
+        host_veth: host_veth_name(instance),
+        container_veth: "eth0".into(),
+        rootless: false,
+    })
+}
+
 /// Create a network namespace, veth pair, assign IPs, and set the
 /// default route inside the namespace.
 ///
@@ -217,6 +240,7 @@ pub async fn setup_container_network(
     container_index: u16,
     rootless: bool,
 ) -> Result<ContainerNetwork, NetnsError> {
+    planned_container_network(instance_id, node_index, container_index)?;
     let ns_path = namespace_path(instance_id);
     let c_ip = container_ip(node_index, container_index);
     let gw_ip = gateway_ip(node_index);
@@ -372,6 +396,87 @@ pub async fn setup_container_network(
     })
 }
 
+/// Recover an existing rootful network only when the live container owns it.
+/// The address comes from the kernel, not a guessed allocation or stale record.
+pub async fn adopt_container_network(
+    instance_id: &InstanceId,
+    container_pid: u32,
+) -> Result<Option<ContainerNetwork>, NetnsError> {
+    use std::os::unix::fs::MetadataExt;
+    let failure = |reason: String| NetnsError::SetupFailed {
+        instance: instance_id.0.clone(),
+        reason,
+    };
+    let path = namespace_path(instance_id);
+    let expected = match tokio::fs::metadata(&path).await {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(failure(format!("inspect adopted network: {error}"))),
+    };
+    let live = tokio::fs::metadata(format!("/proc/{container_pid}/ns/net"))
+        .await
+        .map_err(|error| failure(format!("inspect container network namespace: {error}")))?;
+    if (expected.dev(), expected.ino()) != (live.dev(), live.ino()) {
+        return Err(failure(
+            "container no longer owns its recorded network namespace".into(),
+        ));
+    }
+    let output = tokio::time::timeout(
+        std::time::Duration::from_secs(2),
+        tokio::process::Command::new("ip")
+            .args([
+                "-j",
+                "-n",
+                &format!("rb-{}", instance_id.0),
+                "address",
+                "show",
+                "dev",
+                "eth0",
+            ])
+            .kill_on_drop(true)
+            .output(),
+    )
+    .await
+    .map_err(|_| failure("adopted network inspection exceeded 2s".into()))?
+    .map_err(|error| failure(format!("inspect adopted network address: {error}")))?;
+    if !output.status.success() {
+        return Err(failure(
+            "ip could not inspect the adopted network address".into(),
+        ));
+    }
+    let interfaces: serde_json::Value = serde_json::from_slice(&output.stdout)
+        .map_err(|error| failure(format!("invalid adopted network address response: {error}")))?;
+    let addresses: Vec<_> = interfaces
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|interface| interface.get("addr_info")?.as_array())
+        .flatten()
+        .filter(|address| address["family"] == "inet" && address["prefixlen"] == 23)
+        .filter_map(|address| address["local"].as_str()?.parse::<Ipv4Addr>().ok())
+        .collect();
+    let [container_ip] = addresses.as_slice() else {
+        return Err(failure(
+            "adopted network must have exactly one IPv4 /23 address".into(),
+        ));
+    };
+    let [first, second, third, fourth] = container_ip.octets();
+    let host = u16::from(third & 1) * 256 + u16::from(fourth);
+    if first != 10 || !(2..=510).contains(&host) {
+        return Err(failure(
+            "adopted network address is outside the container range".into(),
+        ));
+    }
+    Ok(Some(ContainerNetwork {
+        namespace_path: path,
+        container_ip: *container_ip,
+        gateway_ip: Ipv4Addr::new(10, second, third & !1, 1),
+        host_veth: host_veth_name(instance_id),
+        container_veth: "eth0".into(),
+        rootless: false,
+    }))
+}
+
 /// Add a port mapping from a host port to a container port.
 ///
 /// In root mode, adds an nftables DNAT rule. In rootless mode, spawns
@@ -454,6 +559,39 @@ pub async fn add_port_mapping(
     }
 }
 
+/// Remove any surviving owned DNAT entries before an address is reusable.
+/// This also recovers mappings installed before a cancelled setup published its handle.
+pub(crate) async fn retire_address_forwarding(address: Ipv4Addr) -> Result<(), String> {
+    async fn remaining(address: Ipv4Addr) -> Result<Vec<u16>, String> {
+        let output = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            tokio::process::Command::new("nft")
+                .args(["-j", "list", "ruleset"])
+                .kill_on_drop(true)
+                .output(),
+        )
+        .await
+        .map_err(|_| "nftables retirement observation timed out".to_string())?
+        .map_err(|e| format!("cannot inspect address forwarding: {e}"))?;
+        if !output.status.success() {
+            return Err(format!(
+                "cannot inspect address forwarding: {}",
+                String::from_utf8_lossy(&output.stderr)
+            ));
+        }
+        portmap::ports_for_address(&output.stdout, address)
+    }
+    for port in remaining(address).await? {
+        NftCommandExecutor
+            .run(&portmap::element_delete(port))
+            .await?;
+    }
+    if !remaining(address).await?.is_empty() {
+        return Err("container address still has an owned forwarding entry".into());
+    }
+    Ok(())
+}
+
 /// Remove a network namespace, veth pair, and clean up.
 pub async fn teardown_container_network(network: &ContainerNetwork) -> Result<(), NetnsError> {
     let ns_name = network
@@ -470,9 +608,25 @@ pub async fn teardown_container_network(network: &ContainerNetwork) -> Result<()
     )
     .await;
 
-    // Delete the network namespace
+    // An already absent resource is fine; command success alone is not proof.
     let _ = run_cmd_raw("ip", &["netns", "del", ns_name], "delete network namespace").await;
-
+    for path in [
+        network.namespace_path.clone(),
+        PathBuf::from("/sys/class/net").join(&network.host_veth),
+    ] {
+        match tokio::fs::try_exists(&path).await {
+            Ok(false) => {}
+            result => {
+                return Err(NetnsError::TeardownFailed {
+                    instance: ns_name.into(),
+                    reason: format!(
+                        "cannot confirm resource removal at {}: {result:?}",
+                        path.display()
+                    ),
+                });
+            }
+        }
+    }
     Ok(())
 }
 
@@ -669,11 +823,16 @@ async fn run_cmd(
 
 /// Run a command, returning a descriptive error string on failure.
 async fn run_cmd_raw(program: &str, args: &[&str], description: &str) -> Result<(), String> {
-    let output = tokio::process::Command::new(program)
-        .args(args)
-        .output()
-        .await
-        .map_err(|e| format!("{description}: failed to execute {program}: {e}"))?;
+    let output = tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        tokio::process::Command::new(program)
+            .args(args)
+            .kill_on_drop(true)
+            .output(),
+    )
+    .await
+    .map_err(|_| format!("{description}: {program} exceeded five seconds"))?
+    .map_err(|e| format!("{description}: failed to execute {program}: {e}"))?;
 
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
@@ -690,6 +849,42 @@ async fn run_cmd_raw(program: &str, args: &[&str], description: &str) -> Result<
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn teardown_reports_a_namespace_that_remains_present() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp
+            .path()
+            .join(format!("rb-owned-test-{}", std::process::id()));
+        std::fs::write(&path, b"still present").unwrap();
+        let network = ContainerNetwork {
+            namespace_path: path.clone(),
+            container_ip: Ipv4Addr::LOCALHOST,
+            gateway_ip: Ipv4Addr::LOCALHOST,
+            host_veth: format!("rbtest{}", std::process::id()),
+            container_veth: "eth0".into(),
+            rootless: false,
+        };
+        assert!(teardown_container_network(&network).await.is_err());
+        std::fs::remove_file(&path).unwrap();
+        teardown_container_network(&network).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn invalid_address_indices_refuse_before_any_network_setup() {
+        let instance = InstanceId("invalid-subnet-test".into());
+        for (node, index) in [(1, 509), (1, u16::MAX), (0, 0), (u16::MAX, 0)] {
+            let error = setup_container_network(&instance, node, index, false)
+                .await
+                .err()
+                .unwrap();
+            assert!(
+                error
+                    .to_string()
+                    .contains("outside the node container subnet")
+            );
+        }
+    }
 
     // -- IP address calculation -----------------------------------------------
 
@@ -951,6 +1146,33 @@ mod tests {
             !listing.contains("18080"),
             "shutdown should delete the element: {listing}"
         );
+        // Simulate cancellation before the mapping handle reaches its owner.
+        drop(add_port_mapping(&network, 18081, 80).await.unwrap());
+        let other = portmap::PortMapEntry {
+            host_port: 18082,
+            container_ip: container_ip(98, 1),
+            container_port: 80,
+        };
+        NftCommandExecutor
+            .run(&portmap::element_add(&other))
+            .await
+            .unwrap();
+        retire_address_forwarding(network.container_ip)
+            .await
+            .unwrap();
+        let listing = list_map_elements().await;
+        assert!(
+            !listing.contains("18081"),
+            "orphaned forwarding survived retirement"
+        );
+        assert!(
+            listing.contains("18082"),
+            "retirement removed another owner's forwarding"
+        );
+        NftCommandExecutor
+            .run(&portmap::element_delete(18082))
+            .await
+            .unwrap();
 
         teardown_container_network(&network)
             .await

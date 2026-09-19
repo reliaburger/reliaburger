@@ -76,7 +76,7 @@ async fn volume_is_isolated_per_app(ctx: TestContext) -> Result<(), String> {
 
 /// Writing past the declared size fails — where loop-mount enforcement is
 /// active. Skips (rather than passing hollowly) where it isn't.
-async fn volume_size_limit_is_enforced(ctx: TestContext) -> Result<(), String> {
+async fn volume_size_limit_is_enforced(ctx: TestContext) -> crate::testkit::registry::CaseResult {
     let app = "vol-quota";
     ctx.apply(&idle_with_volume(&ctx, app, Some("4Mi"))).await?;
     ctx.wait_running_cluster(app, 1).await?;

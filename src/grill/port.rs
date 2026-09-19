@@ -74,9 +74,11 @@ impl PortAllocator {
         }
 
         let mut rng = rand::thread_rng();
-        // Cap retries to avoid spinning when the pool is nearly exhausted.
-        for _ in 0..1000 {
-            let port = rng.gen_range(self.range_start..self.range_end);
+        // Visit every candidate once from a random starting point. Repeated
+        // random guesses can miss the last free port and falsely exhaust.
+        let first = rng.gen_range(0..self.total_ports());
+        for offset in 0..self.total_ports() {
+            let port = self.range_start + ((first + offset) % self.total_ports()) as u16;
             if allocated.insert(port) {
                 return Ok(port);
             }
@@ -133,6 +135,18 @@ impl PortAllocator {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn last_free_port_is_found_even_in_a_nearly_full_pool() {
+        let allocator = PortAllocator::new(1000, 65000);
+        for port in 1000..64999 {
+            allocator.reserve(port).await.unwrap();
+        }
+        for _ in 0..16 {
+            assert_eq!(allocator.allocate().await.unwrap(), 64999);
+            allocator.release(64999).await.unwrap();
+        }
+    }
 
     #[tokio::test]
     async fn allocate_returns_port_in_range() {

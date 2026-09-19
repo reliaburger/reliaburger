@@ -305,22 +305,33 @@ pub fn prepare_identity_dir(dir: &Path) -> Result<(), IdentityError> {
 /// Remove an instance's identity directory, unmounting its tmpfs backing
 /// first when present. Key material must not outlive the instance (PKI7).
 pub fn cleanup_identity_dir(dir: &Path) -> std::io::Result<()> {
-    if !dir.exists() {
-        return Ok(());
+    match std::fs::symlink_metadata(dir) {
+        Ok(_) => {
+            #[cfg(target_os = "linux")]
+            if is_mount_point(dir) {
+                let status = std::process::Command::new("umount").arg(dir).status()?;
+                if !status.success() {
+                    return Err(std::io::Error::other(format!(
+                        "umount {} failed",
+                        dir.display()
+                    )));
+                }
+            }
+            std::fs::remove_dir_all(dir)?;
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => return Err(error),
     }
-
-    #[cfg(target_os = "linux")]
-    if is_mount_point(dir) {
-        let status = std::process::Command::new("umount").arg(dir).status()?;
-        if !status.success() {
-            return Err(std::io::Error::other(format!(
-                "umount {} failed",
-                dir.display()
-            )));
+    // Retry the directory sync after an uncertain earlier removal too. Losing
+    // the adoption record must not allow key material to reappear after a crash.
+    if let Some(parent) = dir.parent() {
+        match std::fs::File::open(parent) {
+            Ok(directory) => directory.sync_all()?,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error),
         }
     }
-
-    std::fs::remove_dir_all(dir)
+    Ok(())
 }
 
 /// Owner-only directory permissions (no-op off Unix).
@@ -546,7 +557,11 @@ pub fn rotation_state(identity: &WorkloadIdentity, now: SystemTime) -> RotationS
     }
 }
 
-/// Extend the grace period when the council is unreachable.
+/// Update the library identity model's grace period.
+///
+/// This is not wired into Bun's renewal loop and cannot extend a certificate's
+/// signed validity. A supported operator grace/recovery workflow remains
+/// separate work; callers must not treat this model update as renewed trust.
 ///
 /// Returns `true` if the grace period was extended, `false` if
 /// already at the maximum (issued_at + 5 hours).

@@ -134,7 +134,9 @@ pub async fn pull_layer_from_peer(
     match streamed.and_then(|inner| inner) {
         Ok(()) => {}
         Err(e) => {
-            store.cancel_upload(&upload_id).await;
+            store.cancel_upload(&upload_id).await.map_err(|cleanup| {
+                PickleError::ReplicationFailed(format!("{e}; upload cleanup failed: {cleanup}"))
+            })?;
             return Err(e);
         }
     }
@@ -185,11 +187,12 @@ fn find_peer_for_layer<'a>(holders: &BTreeSet<u64>, peers: &'a [Peer]) -> Option
     peers.iter().find(|p| holders.contains(&p.node_id))
 }
 
-/// Resolve an image: check the local Pickle store, then fall back
-/// to external pull.
+/// Check whether the local catalogued image has every verified blob.
 ///
-/// Returns `true` if the image was found locally (no external fetch needed).
-/// Returns `false` if the caller should fall back to the original pull path.
+/// This read-only library query performs no external pull and promises no
+/// runtime image availability. It is exercised by the Pickle cluster tests;
+/// runtime preparation uses the image store's separate pull/verification path.
+/// Returns `false` for a missing manifest, missing blob or corrupt blob.
 pub fn image_available_locally(
     repository: &str,
     tag: &str,

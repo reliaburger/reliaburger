@@ -33,10 +33,20 @@ pub struct MockGrill {
     block_create: Arc<AtomicBool>,
     create_started: Arc<tokio::sync::Semaphore>,
     create_release: Arc<tokio::sync::Semaphore>,
+    /// Deterministic gate for testing unfinished deployment rollback.
+    block_kill: Arc<AtomicBool>,
+    kill_started: Arc<tokio::sync::Semaphore>,
+    kill_release: Arc<tokio::sync::Semaphore>,
     /// When set, `stop` records the call but does NOT transition the instance
     /// to `Stopped` — the process ignores SIGTERM. Lets tests prove the
     /// exit-aware stop path escalates to SIGKILL (DEP6).
     ignore_stop: Arc<Mutex<bool>>,
+    ignore_kill: Arc<AtomicBool>,
+    fail_kill: Arc<AtomicBool>,
+    fail_create: Arc<AtomicBool>,
+    fail_start: Arc<AtomicBool>,
+    fail_state: Arc<AtomicBool>,
+    inspection_failures: Arc<Mutex<std::collections::HashSet<InstanceId>>>,
 }
 
 impl Default for MockGrill {
@@ -58,7 +68,16 @@ impl Default for MockGrill {
             block_create: Arc::new(AtomicBool::new(false)),
             create_started: Arc::new(tokio::sync::Semaphore::new(0)),
             create_release: Arc::new(tokio::sync::Semaphore::new(0)),
+            block_kill: Arc::new(AtomicBool::new(false)),
+            kill_started: Arc::new(tokio::sync::Semaphore::new(0)),
+            kill_release: Arc::new(tokio::sync::Semaphore::new(0)),
             ignore_stop: Arc::default(),
+            ignore_kill: Arc::default(),
+            fail_kill: Arc::default(),
+            fail_create: Arc::default(),
+            fail_start: Arc::default(),
+            fail_state: Arc::default(),
+            inspection_failures: Arc::default(),
         }
     }
 }
@@ -67,6 +86,41 @@ impl MockGrill {
     /// Create a new MockGrill.
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Keep reporting the existing state after an acknowledged kill.
+    pub fn set_ignore_kill(&self, value: bool) {
+        self.ignore_kill.store(value, Ordering::SeqCst);
+    }
+
+    /// Make force-kill requests fail without changing runtime state.
+    pub fn set_fail_kill(&self, value: bool) {
+        self.fail_kill.store(value, Ordering::SeqCst);
+    }
+
+    /// Fail creation after recording the attempted runtime mutation.
+    pub fn set_fail_create(&self, value: bool) {
+        self.fail_create.store(value, Ordering::SeqCst);
+    }
+
+    /// Fail start after recording the attempted runtime mutation.
+    pub fn set_fail_start(&self, value: bool) {
+        self.fail_start.store(value, Ordering::SeqCst);
+    }
+
+    /// Make runtime state inspection fail without proving absence.
+    pub fn set_fail_state(&self, value: bool) {
+        self.fail_state.store(value, Ordering::SeqCst);
+    }
+
+    /// Fail state inspection only for the named instance.
+    pub fn set_instance_inspection_failure(&self, instance: &InstanceId, fail: bool) {
+        let mut failures = self.inspection_failures.lock().unwrap();
+        if fail {
+            failures.insert(instance.clone());
+        } else {
+            failures.remove(instance);
+        }
     }
 
     /// Return a clone of all recorded calls.
@@ -189,6 +243,29 @@ impl MockGrill {
         self.create_release.add_permits(count);
     }
 
+    /// Hold future `kill()` calls until [`Self::release_kills`] is called.
+    #[allow(dead_code)]
+    pub fn block_kills(&self) {
+        self.block_kill.store(true, Ordering::SeqCst);
+    }
+
+    /// Wait until `count` blocked `kill()` calls have started.
+    #[allow(dead_code)]
+    pub async fn wait_for_kills(&self, count: u32) {
+        let permits = Arc::clone(&self.kill_started)
+            .acquire_many_owned(count)
+            .await
+            .unwrap();
+        permits.forget();
+    }
+
+    /// Release held kills and allow subsequent calls through.
+    #[allow(dead_code)]
+    pub fn release_kills(&self, count: usize) {
+        self.block_kill.store(false, Ordering::SeqCst);
+        self.kill_release.add_permits(count);
+    }
+
     /// Make `stop()` a no-op on state, simulating a process that ignores
     /// SIGTERM. The exit-aware stop path must then escalate to SIGKILL.
     #[allow(dead_code)]
@@ -212,6 +289,12 @@ impl super::Grill for MockGrill {
                 .expect("create gate closed");
             permit.forget();
         }
+        if self.fail_create.load(Ordering::SeqCst) {
+            return Err(GrillError::StartFailed {
+                instance: instance.clone(),
+                reason: "injected create failure".into(),
+            });
+        }
         Ok(())
     }
 
@@ -220,6 +303,12 @@ impl super::Grill for MockGrill {
             .lock()
             .unwrap()
             .push(("start".to_string(), instance.clone()));
+        if self.fail_start.load(Ordering::SeqCst) {
+            return Err(GrillError::StartFailed {
+                instance: instance.clone(),
+                reason: "injected start failure".into(),
+            });
+        }
         Ok(())
     }
 
@@ -247,10 +336,23 @@ impl super::Grill for MockGrill {
             .lock()
             .unwrap()
             .push(("kill".to_string(), instance.clone()));
-        self.state_overrides
-            .lock()
-            .unwrap()
-            .insert(instance.clone(), ContainerState::Stopped);
+        if self.block_kill.load(Ordering::SeqCst) {
+            self.kill_started.add_permits(1);
+            let permit = self.kill_release.acquire().await.unwrap();
+            permit.forget();
+        }
+        if self.fail_kill.load(Ordering::SeqCst) {
+            return Err(GrillError::StartFailed {
+                instance: instance.clone(),
+                reason: "injected kill failure".into(),
+            });
+        }
+        if !self.ignore_kill.load(Ordering::SeqCst) {
+            self.state_overrides
+                .lock()
+                .unwrap()
+                .insert(instance.clone(), ContainerState::Stopped);
+        }
         Ok(())
     }
 
@@ -259,6 +361,14 @@ impl super::Grill for MockGrill {
             .lock()
             .unwrap()
             .push(("state".to_string(), instance.clone()));
+        if self.fail_state.load(Ordering::SeqCst)
+            || self.inspection_failures.lock().unwrap().contains(instance)
+        {
+            return Err(GrillError::StartFailed {
+                instance: instance.clone(),
+                reason: "injected state inspection failure".into(),
+            });
+        }
         let overrides = self.state_overrides.lock().unwrap();
         if let Some(&state) = overrides.get(instance) {
             return Ok(state);
@@ -322,6 +432,14 @@ impl super::Grill for MockGrill {
             .lock()
             .unwrap()
             .push(("adopt".to_string(), instance.clone()));
+        if self.fail_state.load(Ordering::SeqCst)
+            || self.inspection_failures.lock().unwrap().contains(instance)
+        {
+            return Err(GrillError::StateUnavailable {
+                instance: instance.clone(),
+                reason: "simulated adoption inspection failure".into(),
+            });
+        }
         Ok(self
             .adopt_results
             .lock()

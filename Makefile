@@ -68,6 +68,11 @@ audit: ## Fail on new RustSec findings or an expired advisory exception
 		echo "dependency advisory exceptions expired on 2026-11-18; review .cargo/audit.toml" >&2; \
 		exit 1; \
 	fi
+	@active=$$($(CARGO) tree --locked --all-features --target all -i rkyv --prefix none --format '{p}') || exit 1; \
+	if [ -n "$$active" ]; then \
+		echo "rkyv advisory exception requires an inactive dependency; review .cargo/audit.toml" >&2; \
+		exit 1; \
+	fi
 	$(CARGO) audit
 
 examples: build ## Dry-run every example config with relish

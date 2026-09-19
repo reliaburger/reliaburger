@@ -35,6 +35,7 @@ struct Node {
     client: BunClient,
     handle: ClusterHandle,
     thinks_leader: watch::Receiver<bool>,
+    token_store: Option<reliaburger::sesame::auth::TokenStore>,
     rollup_store: Arc<RwLock<reliaburger::mayo::rollup_store::RollupStore>>,
     _runtime: runtime::ClusterRuntime,
     _tasks: TestTasks,
@@ -107,6 +108,7 @@ async fn start_node_with_auth(
     .await
     .unwrap();
 
+    let partition_blocklists = handle.partition_blocklists.clone();
     let council = handle.council.clone();
     let membership_rx = handle.membership_rx.clone();
     let metrics_rx = handle.raft_metrics_rx.clone();
@@ -129,6 +131,7 @@ async fn start_node_with_auth(
         handle,
         "default".to_string(),
     );
+    agent.set_volumes_dir(reconciler_state_dir.join("volumes"));
     agent.set_node_capacity(8000, 16384);
     agent.set_readiness_tracker(readiness.clone());
     // Several agents share this host; don't spawn nft against the real
@@ -139,7 +142,7 @@ async fn start_node_with_auth(
         true,
         readiness.clone(),
         shutdown.clone(),
-        async move { agent.run().await },
+        move |ready| async move { agent.run_with_readiness(ready).await },
     );
     let mut tasks = vec![agent_task];
 
@@ -171,8 +174,9 @@ async fn start_node_with_auth(
     }
 
     // Leader scheduler + autoscaler (fast interval for the test).
+    let mut capacity_admission = None;
     if let Some(council) = &council {
-        spawn_leader_scheduler(
+        capacity_admission = Some(spawn_leader_scheduler(
             Arc::clone(council),
             membership_rx.clone(),
             aggregated_rx,
@@ -185,7 +189,7 @@ async fn start_node_with_auth(
                 large_cluster_node_count: 5000,
             },
             shutdown.clone(),
-        );
+        ));
         reliaburger::cluster::orchestrate::spawn_autoscaler(
             Arc::clone(council),
             Arc::clone(&rollup_store),
@@ -201,7 +205,8 @@ async fn start_node_with_auth(
             metrics_rx,
             directory_rx,
             2, // api_port - raft_port
-            None,
+            auth.as_ref()
+                .map(|_| "placement-test-internal-service-identity".to_string()),
             cmd_tx.clone(),
             shutdown.clone(),
             reliaburger::cluster::ClusterHttp::plaintext(),
@@ -213,14 +218,18 @@ async fn start_node_with_auth(
     let listener = tokio::net::TcpListener::bind(local(api_port))
         .await
         .unwrap();
-    let app = if let Some(auth) = &auth {
-        let token_store = Arc::new(RwLock::new(vec![auth.token.clone()]));
+    let token_store = auth
+        .as_ref()
+        .map(|auth| Arc::new(RwLock::new(vec![auth.token.clone()])));
+    let app = if auth.is_some() {
         let static_capabilities = reliaburger::bun::capabilities::StaticCapabilities {
             cluster_mode: true,
             test_policy: reliaburger::testkit::safety::ClusterTestPolicy {
                 safety_class: reliaburger::testkit::safety::ClusterSafetyClass::Development,
                 allowed_operations: std::collections::BTreeSet::from([
                     reliaburger::testkit::safety::OperationPermission::AlterNodeState,
+                    reliaburger::testkit::safety::OperationPermission::ProvisionIsolatedWorkloads,
+                    reliaburger::testkit::safety::OperationPermission::SaturateCapacity,
                 ]),
                 ..reliaburger::testkit::safety::ClusterTestPolicy::default()
             },
@@ -234,8 +243,8 @@ async fn start_node_with_auth(
             None,
             None,
             council.clone(),
-            Some(token_store),
-            None,
+            token_store.clone(),
+            Some("placement-test-internal-service-identity".into()),
             None,
             Some(Arc::clone(&membership_table)),
             None,
@@ -274,6 +283,10 @@ async fn start_node_with_auth(
             api_port,
             None,
         )
+    };
+    let app = match capacity_admission {
+        Some(admission) => app.layer(axum::Extension(admission)),
+        None => app,
     };
     let sd = shutdown.clone();
     let api_task = tokio::spawn(async move {
@@ -324,10 +337,11 @@ async fn start_node_with_auth(
             council,
             snapshot_rx: mpsc::channel(1).1,
             wrapping_ikm: None,
-            partition_blocklists: Default::default(),
+            partition_blocklists,
             crl_handle: Default::default(),
         },
         thinks_leader: leader_rx,
+        token_store,
         rollup_store,
         _runtime: cluster_runtime,
         _tasks: TestTasks::new(shutdown.clone(), tasks),
@@ -821,7 +835,7 @@ async fn fault_injection_rejected_when_quorum_at_risk() {
     );
     let msg = format!("{}", rejected.unwrap_err()).to_lowercase();
     assert!(
-        msg.contains("quorum"),
+        msg.contains("quorum") || msg.contains("capacity is reserved"),
         "rejection should cite the quorum rail, got: {msg}"
     );
 
@@ -878,16 +892,31 @@ async fn partition_isolates_a_node_for_real() {
     let n3 = start_node_with_auth("q3", 18649, vec![local(18641)], &shutdown, Some(auth)).await;
     let nodes = [&n1, &n2, &n3];
 
-    // Everyone sees everyone Alive before we cut the wire.
+    // Gossip can converge before Raft has elected a stable three-voter council.
+    // The reservation endpoint correctly refuses during that bootstrap window.
     let converged = wait_until(Duration::from_secs(30), || {
         nodes.iter().all(|obs| {
             ["q1", "q2", "q3"]
                 .iter()
                 .all(|t| peer_state(obs, t) == Some(NodeState::Alive))
+                && obs.handle.council.as_ref().is_some_and(|council| {
+                    let metrics = council.metrics().borrow().clone();
+                    metrics.current_leader.is_some()
+                        && metrics.membership_config.membership().voter_ids().count() == 3
+                        && metrics
+                            .membership_config
+                            .membership()
+                            .get_joint_config()
+                            .len()
+                            == 1
+                })
         })
     })
     .await;
-    assert!(converged, "cluster never fully converged to Alive");
+    assert!(
+        converged,
+        "gossip and the three-voter council never fully converged"
+    );
 
     // Cut q3 off from q1 and q2. The partition is injected ON q3, whose
     // agent holds the real blocklist handles; the transport drops traffic
@@ -1049,11 +1078,26 @@ async fn authenticated_node_kill_fails_and_restores_a_real_cluster_member() {
     unsafe_second_kill.target_node = Some(other.name.clone());
     let refused = other.client.inject_fault(&unsafe_second_kill).await;
     assert!(
-        refused
-            .as_ref()
-            .is_err_and(|error| error.to_string().to_lowercase().contains("quorum")),
+        refused.as_ref().is_err_and(|error| match error {
+            reliaburger::relish::RelishError::ApiError { status: 400, body } =>
+                body.to_lowercase().contains("quorum"),
+            reliaburger::relish::RelishError::ApiError { status: 409, body } =>
+                body.contains("capacity is reserved") || body.contains("quorum"),
+            reliaburger::relish::RelishError::ApiError { status: 503, body } =>
+                body == "node fault safety cannot map the council leader to live membership"
+                    || body == "node fault safety requires a known council leader",
+            _ => false,
+        }),
         "second voter failure must be refused after {target_name} is down: {refused:?}",
         target_name = target.name
+    );
+    assert!(
+        other.client.list_faults().await.unwrap().is_empty(),
+        "a refused second voter fault must leave no active effect"
+    );
+    assert!(
+        source.client.list_faults().await.unwrap().is_empty(),
+        "a refused second voter fault must not mutate the routing node"
     );
 
     target
@@ -1169,4 +1213,542 @@ async fn ingress_reaches_nodes_without_local_replicas() {
         converged,
         "all three ingress nodes must see the single healthy replica"
     );
+}
+
+/// C06: requests sent through different APIs share one committed reservation.
+/// A leader failure retains that ownership until target-side reversal is proven.
+#[tokio::test(flavor = "multi_thread", worker_threads = 6)]
+#[ignore = "slow multi-node reservation acceptance; run with make test-cluster"]
+async fn concurrent_node_kills_and_leader_change_preserve_reserved_capacity() {
+    use reliaburger::mustard::state::NodeState;
+    use reliaburger::sesame::types::{ApiRole, TokenScope};
+    use reliaburger::smoker::types::{FaultRequest, FaultType};
+    let created = reliaburger::sesame::token::create_token(
+        "reservation-admin",
+        ApiRole::Admin,
+        TokenScope::default(),
+        None,
+    )
+    .unwrap();
+    let auth = NodeFaultAuth {
+        token: created.token,
+        plaintext: created.plaintext,
+    };
+    let shutdown = CancellationToken::new();
+    let n1 =
+        start_node_with_auth("reservation1", 20341, vec![], &shutdown, Some(auth.clone())).await;
+    let n2 = start_node_with_auth(
+        "reservation2",
+        20345,
+        vec![local(20341)],
+        &shutdown,
+        Some(auth.clone()),
+    )
+    .await;
+    let n3 = start_node_with_auth(
+        "reservation3",
+        20349,
+        vec![local(20341)],
+        &shutdown,
+        Some(auth),
+    )
+    .await;
+    let nodes = [&n1, &n2, &n3];
+    assert!(
+        wait_until(Duration::from_secs(60), || nodes.iter().all(|node| {
+            nodes
+                .iter()
+                .all(|peer| peer_state(node, &peer.name) == Some(NodeState::Alive))
+                && node.handle.council.as_ref().is_some_and(|council| {
+                    let metrics = council.metrics().borrow().clone();
+                    metrics.current_leader.is_some()
+                        && metrics.membership_config.membership().voter_ids().count() == 3
+                        && metrics
+                            .membership_config
+                            .membership()
+                            .get_joint_config()
+                            .len()
+                            == 1
+                })
+        }))
+        .await,
+        "three voters must converge before fault admission"
+    );
+    let leader = nodes
+        .iter()
+        .find(|node| *node.thinks_leader.borrow())
+        .copied()
+        .unwrap();
+    let followers: Vec<_> = nodes
+        .iter()
+        .filter(|node| node.name != leader.name)
+        .copied()
+        .collect();
+    let request = |target: &Node, duration| FaultRequest {
+        fault_type: FaultType::NodeKill {
+            kill_containers: false,
+        },
+        target_service: String::new(),
+        namespace: None,
+        target_instance: None,
+        target_node: Some(target.name.clone()),
+        duration,
+        injected_by: "untrusted-body".into(),
+        reason: Some("concurrent reservation acceptance".into()),
+        include_leader: true,
+        override_safety: true,
+        acknowledged: true,
+    };
+    let first = request(followers[0], Duration::from_secs(30));
+    let second = request(followers[1], Duration::from_secs(30));
+    let (left, right) = tokio::join!(
+        followers[0].client.inject_fault(&first),
+        followers[1].client.inject_fault(&second),
+    );
+    assert_eq!(
+        usize::from(left.is_ok()) + usize::from(right.is_ok()),
+        1,
+        "exactly one competing kill may be admitted: {left:?}, {right:?}"
+    );
+    assert_eq!(
+        nodes
+            .iter()
+            .filter(|node| node.handle.partition_blocklists.node_gate.is_quiesced())
+            .count(),
+        1,
+        "exactly one transport gate may close, regardless of HTTP outcomes"
+    );
+    let (target, summary) = match (left, right) {
+        (Ok(summary), Err(_)) => (followers[0], summary),
+        (Err(_), Ok(summary)) => (followers[1], summary),
+        _ => unreachable!("checked one admission"),
+    };
+    let council = leader.handle.council.as_ref().unwrap();
+    let reservation = council
+        .desired_state()
+        .await
+        .node_fault_reservations
+        .active
+        .unwrap();
+    assert_eq!(
+        reservation.request.target_node.as_deref(),
+        Some(target.name.as_str())
+    );
+    target
+        .client
+        .clear_fault(summary.id, Some(&target.name), true)
+        .await
+        .unwrap();
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+    loop {
+        if council
+            .desired_state()
+            .await
+            .node_fault_reservations
+            .active
+            .is_none()
+            && nodes.iter().all(|observer| {
+                nodes
+                    .iter()
+                    .all(|peer| peer_state(observer, &peer.name) == Some(NodeState::Alive))
+            })
+        {
+            break;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "manual reversal must release the fenced reservation"
+        );
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+
+    let old_leader = nodes
+        .iter()
+        .find(|node| *node.thinks_leader.borrow())
+        .copied()
+        .unwrap();
+    let sender = nodes
+        .iter()
+        .find(|node| node.name != old_leader.name)
+        .copied()
+        .unwrap();
+    sender
+        .client
+        .inject_fault(&request(old_leader, Duration::from_secs(12)))
+        .await
+        .unwrap();
+    let mut inherited = None;
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(8);
+    while tokio::time::Instant::now() < deadline {
+        for node in nodes.iter().filter(|node| node.name != old_leader.name) {
+            if *node.thinks_leader.borrow() {
+                inherited = node
+                    .handle
+                    .council
+                    .as_ref()
+                    .unwrap()
+                    .desired_state()
+                    .await
+                    .node_fault_reservations
+                    .active;
+                if inherited.is_some() {
+                    break;
+                }
+            }
+        }
+        if inherited.is_some() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    let inherited = inherited.expect("new leader must inherit the outstanding reservation");
+    assert!(inherited.sequence > reservation.sequence);
+    assert_eq!(
+        inherited.request.target_node.as_deref(),
+        Some(old_leader.name.as_str())
+    );
+    let refused = sender
+        .client
+        .inject_fault(&request(sender, Duration::from_secs(5)))
+        .await;
+    assert!(
+        refused.is_err(),
+        "leader change must not free fault capacity"
+    );
+    assert!(sender.client.list_faults().await.unwrap().is_empty());
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(40);
+    loop {
+        let current = nodes
+            .iter()
+            .find(|node| *node.thinks_leader.borrow())
+            .copied();
+        if let Some(current) = current {
+            let state = current
+                .handle
+                .council
+                .as_ref()
+                .unwrap()
+                .desired_state()
+                .await;
+            if state.node_fault_reservations.active.is_none()
+                && peer_state(current, &old_leader.name) == Some(NodeState::Alive)
+            {
+                break;
+            }
+        }
+        if tokio::time::Instant::now() >= deadline {
+            let faults = old_leader.client.list_faults().await;
+            let views: Vec<_> = nodes
+                .iter()
+                .map(|node| {
+                    (
+                        node.name.clone(),
+                        *node.thinks_leader.borrow(),
+                        peer_state(node, &old_leader.name),
+                        node.handle.partition_blocklists.node_gate.is_quiesced(),
+                    )
+                })
+                .collect();
+            panic!(
+                "expiry and confirmed reversal must recover capacity after election; faults={faults:?}, views={views:?}"
+            );
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    shutdown.cancel();
+    for node in nodes {
+        node.handle.council.as_ref().unwrap().shutdown().await.ok();
+    }
+}
+
+/// Administrative apply must retain the user's authority at the leader.
+#[tokio::test(flavor = "multi_thread", worker_threads = 6)]
+#[ignore = "multi-node apply forwarding acceptance; run with make test-cluster"]
+async fn follower_apply_preserves_user_authority_for_administrative_manifests() {
+    use reliaburger::sesame::types::{ApiRole, TokenScope};
+    let created = reliaburger::sesame::token::create_token(
+        "apply-admin",
+        ApiRole::Admin,
+        TokenScope::default(),
+        None,
+    )
+    .unwrap();
+    let auth = NodeFaultAuth {
+        token: created.token,
+        plaintext: created.plaintext,
+    };
+    let shutdown = CancellationToken::new();
+    let n1 = start_node_with_auth("apply1", 20401, vec![], &shutdown, Some(auth.clone())).await;
+    let n2 = start_node_with_auth(
+        "apply2",
+        20405,
+        vec![local(20401)],
+        &shutdown,
+        Some(auth.clone()),
+    )
+    .await;
+    let n3 = start_node_with_auth(
+        "apply3",
+        20409,
+        vec![local(20401)],
+        &shutdown,
+        Some(auth.clone()),
+    )
+    .await;
+    let nodes = [&n1, &n2, &n3];
+    assert!(
+        wait_until(Duration::from_secs(60), || nodes.iter().all(|node| {
+            node.handle.council.as_ref().is_some_and(|council| {
+                let metrics = council.metrics().borrow().clone();
+                metrics.current_leader.is_some()
+                    && metrics.membership_config.membership().voter_ids().count() == 3
+            })
+        }))
+        .await
+    );
+    let follower = nodes
+        .iter()
+        .find(|node| !*node.thinks_leader.borrow())
+        .unwrap();
+    let manifest = "[namespace.release]\nmax_apps = 2\n[permission.ci]\nactions = [\"deploy\"]\napps = [\"web\"]\nnamespaces = [\"release\"]\n";
+    let response = reqwest::Client::new()
+        .post(format!("{}/v1/apply", follower.client.base_url()))
+        .bearer_auth(&auth.plaintext)
+        .body(manifest)
+        .timeout(Duration::from_secs(10))
+        .send()
+        .await
+        .unwrap();
+    let status = response.status();
+    let content_type = response
+        .headers()
+        .get("content-type")
+        .unwrap()
+        .to_str()
+        .unwrap()
+        .to_owned();
+    let body = response.text().await.unwrap();
+    assert!(status.is_success(), "{status}: {body}");
+    assert!(content_type.starts_with("text/event-stream"));
+    assert!(body.contains("committed to the cluster"), "{body}");
+    assert!(!body.contains("error"), "{body}");
+    let leader = nodes
+        .iter()
+        .find(|node| *node.thinks_leader.borrow())
+        .unwrap();
+    let state = leader
+        .handle
+        .council
+        .as_ref()
+        .unwrap()
+        .desired_state()
+        .await;
+    assert_eq!(state.namespaces["release"].max_apps, Some(2));
+    assert!(state.permissions.contains_key("ci"));
+
+    // A follower can temporarily lag credential revocation. The leader's
+    // refusal must retain its HTTP status and plain-text body at the client.
+    let replacement = reliaburger::sesame::token::create_token(
+        "replacement-admin",
+        ApiRole::Admin,
+        TokenScope::default(),
+        None,
+    )
+    .unwrap();
+    *leader.token_store.as_ref().unwrap().write().await = vec![replacement.token];
+    let response = reqwest::Client::new()
+        .post(format!("{}/v1/apply", follower.client.base_url()))
+        .bearer_auth(&auth.plaintext)
+        .body(manifest)
+        .timeout(Duration::from_secs(10))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), reqwest::StatusCode::UNAUTHORIZED);
+    assert!(
+        response.headers()["content-type"]
+            .to_str()
+            .unwrap()
+            .starts_with("text/plain")
+    );
+    shutdown.cancel();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 6)]
+#[ignore = "slow multi-node placement acceptance; run with make test-cluster"]
+async fn capacity_refusal_from_the_live_scheduler_forwards_without_committing_an_app() {
+    use reliaburger::meat::scheduler::ScheduleError;
+    use reliaburger::relish::RelishError;
+    let created = reliaburger::sesame::token::create_token(
+        "capacity-admin",
+        reliaburger::sesame::types::ApiRole::Admin,
+        Default::default(),
+        None,
+    )
+    .unwrap();
+    let auth = NodeFaultAuth {
+        token: created.token,
+        plaintext: created.plaintext,
+    };
+    let shutdown = CancellationToken::new();
+    let n1 = start_node_with_auth("cap1", 26341, vec![], &shutdown, Some(auth.clone())).await;
+    let n2 = start_node_with_auth(
+        "cap2",
+        26345,
+        vec![local(26341)],
+        &shutdown,
+        Some(auth.clone()),
+    )
+    .await;
+    let n3 = start_node_with_auth("cap3", 26349, vec![local(26341)], &shutdown, Some(auth)).await;
+    let nodes = [&n1, &n2, &n3];
+    assert!(
+        wait_until(Duration::from_secs(40), || nodes.iter().any(|node| {
+            *node.thinks_leader.borrow()
+                && node.handle.council.as_ref().is_some_and(|council| {
+                    council
+                        .metrics()
+                        .borrow()
+                        .membership_config
+                        .membership()
+                        .voter_ids()
+                        .count()
+                        == 3
+                })
+        }))
+        .await
+    );
+    let follower = nodes
+        .iter()
+        .find(|node| !*node.thinks_leader.borrow())
+        .unwrap();
+    tokio::time::timeout(Duration::from_secs(20), async {
+        loop {
+            let peers = follower.client.nodes().await.unwrap();
+            if peers.len() == 3 && peers.iter().all(|peer| peer.api_address.is_some()) {
+                let expected = [("cap1", 26344), ("cap2", 26348), ("cap3", 26352)];
+                for (id, port) in expected {
+                    let peer = peers.iter().find(|peer| peer.node_id == id).unwrap();
+                    assert_eq!(peer.api_address, Some(local(port)));
+                    // Every node requires the original bearer identity. A successful
+                    // read also proves that each advertised endpoint is serving.
+                    follower
+                        .client
+                        .for_node(peer)
+                        .unwrap()
+                        .status()
+                        .await
+                        .unwrap();
+                }
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    })
+    .await
+    .unwrap();
+    let lease = follower
+        .client
+        .create_test_lease(120, Some("rbtest-capacity-contract"))
+        .await
+        .unwrap();
+    let mut config = reliaburger::config::Config::parse(&format!(
+        "[app.capacity]\nimage = \"proc-grill:image-ignored\"\ncommand = [\"sleep\", \"300\"]\ncpu = \"100000m\"\nmemory = \"1Mi\"\nnamespace = \"{}\"\n", lease.namespace
+    )).unwrap();
+    let app_id = reliaburger::meat::AppId::new("capacity", &lease.namespace);
+    tokio::time::timeout(Duration::from_secs(20), async {
+        loop {
+            match follower
+                .client
+                .apply_capacity_with_lease(&config, &lease.lease_id)
+                .await
+            {
+                Err(RelishError::SchedulingRejected(ScheduleError::NoEligibleNodes {
+                    app_id: rejected,
+                })) => {
+                    assert_eq!(rejected, app_id);
+                    break;
+                }
+                Err(RelishError::ApiError { status: 503, .. }) => {
+                    tokio::time::sleep(Duration::from_millis(100)).await;
+                }
+                other => panic!("expected typed scheduling refusal, got {other:?}"),
+            }
+        }
+    })
+    .await
+    .unwrap();
+    let leader = nodes
+        .iter()
+        .find(|node| *node.thinks_leader.borrow())
+        .unwrap();
+    assert!(
+        !leader
+            .handle
+            .council
+            .as_ref()
+            .unwrap()
+            .desired_state()
+            .await
+            .apps
+            .contains_key(&app_id)
+    );
+    assert!(follower.client.cluster_status().await.unwrap().is_empty());
+
+    // ProcessGrill deliberately refuses resource limits. The oversized spec
+    // exercises scheduler refusal before deployment; the runnable fixture uses
+    // this runtime's supported contract. Real capacity benchmarks require OCI.
+    let spec = config.app.get_mut("capacity").unwrap();
+    spec.cpu = None;
+    spec.memory = None;
+    follower
+        .client
+        .apply_capacity_with_lease(&config, &lease.lease_id)
+        .await
+        .unwrap();
+    let running = tokio::time::timeout(Duration::from_secs(20), async {
+        loop {
+            let rows = follower.client.cluster_status().await.unwrap();
+            if rows
+                .iter()
+                .filter(|row| {
+                    row.instance.app_name == "capacity"
+                        && row.instance.namespace == lease.namespace
+                        && row.instance.state == "running"
+                })
+                .count()
+                == 1
+            {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+    })
+    .await;
+    if running.is_err() {
+        for node in nodes {
+            eprintln!(
+                "{}: status {:?}; deploys {:?}",
+                node.name,
+                node.client.status().await,
+                node.client.deploy_operations().await
+            );
+        }
+    }
+    running.expect("accepted workload must actually run");
+    assert!(matches!(
+        follower
+            .client
+            .apply_capacity_with_lease(&config, &lease.lease_id)
+            .await,
+        Err(RelishError::SchedulingRejected(
+            ScheduleError::InvalidSpec { .. }
+        ))
+    ));
+    follower
+        .client
+        .release_test_lease(&lease.lease_id)
+        .await
+        .unwrap();
+    shutdown.cancel();
 }

@@ -10,7 +10,7 @@ use std::sync::Arc;
 
 use tokio::sync::RwLock;
 
-use reliaburger::mayo::query_fanout::merge_cluster_results;
+use reliaburger::mayo::query_fanout::{merge_cluster_results, merge_owned_rollups};
 use reliaburger::mayo::rollup::MetricsQueryRow;
 use reliaburger::mayo::rollup_generator::RollupGenerator;
 use reliaburger::mayo::rollup_store::RollupStore;
@@ -307,16 +307,6 @@ async fn backfill_after_reassignment_neither_drops_nor_double_counts() {
         assert!(store_b.ingest(rollup));
     }
     store_b.flush().await.unwrap();
-    let to_rows = |rows: Vec<(u64, String, String, f64)>| {
-        rows.into_iter()
-            .map(|(ts, name, labels, val)| MetricsQueryRow {
-                timestamp: ts,
-                metric_name: name,
-                labels,
-                value: val,
-            })
-            .collect::<Vec<_>>()
-    };
     // A as it stood before the reassignment-back above: minutes 5700, 5760.
     let dir_a2 = tempfile::tempdir().unwrap();
     let mut store_a2 = RollupStore::new(dir_a2.path().to_path_buf());
@@ -325,31 +315,27 @@ async fn backfill_after_reassignment_neither_drops_nor_double_counts() {
         store_a2.ingest(&rollup);
     }
     store_a2.flush().await.unwrap();
-    let merged = merge_cluster_results(vec![
-        to_rows(
-            store_a2
-                .query_cluster_metric("cpu_usage", 0, u64::MAX)
-                .await
-                .unwrap(),
-        ),
-        to_rows(
-            store_b
-                .query_cluster_metric("cpu_usage", 0, u64::MAX)
-                .await
-                .unwrap(),
-        ),
+    let merged = merge_owned_rollups(vec![
+        store_a2
+            .query_owned_rows(Some("cpu_usage"), 0, u64::MAX)
+            .await
+            .unwrap(),
+        store_b
+            .query_owned_rows(Some("cpu_usage"), 0, u64::MAX)
+            .await
+            .unwrap(),
     ]);
+    assert!(merged.warnings.is_empty());
     let by_minute: std::collections::BTreeMap<u64, f64> =
-        merged.iter().map(|r| (r.timestamp, r.value)).collect();
+        merged.data.iter().map(|r| (r.timestamp, r.value)).collect();
     // The blob backfill served all five minutes on key 5700 (value 6.0 after
     // the merge) and left 5820-5940 with no row at all. Per-minute emission
-    // keeps every minute present at its true value; only the two minutes both
-    // aggregators hold overlap (inherent to reassignment without handoff).
+    // keeps every minute present; ownership dedup removes overlapping copies.
     assert_eq!(by_minute[&5820], 1.0);
     assert_eq!(by_minute[&5880], 1.0);
     assert_eq!(by_minute[&5940], 1.0);
-    assert_eq!(by_minute[&5700], 2.0, "known cross-aggregator overlap");
-    assert_eq!(by_minute[&5760], 2.0, "known cross-aggregator overlap");
+    assert_eq!(by_minute[&5700], 1.0, "overlap must contribute once");
+    assert_eq!(by_minute[&5760], 1.0, "overlap must contribute once");
 }
 
 /// Multiple metrics with labels produce separate entries in the rollup.

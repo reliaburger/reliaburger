@@ -65,7 +65,7 @@ Collection runs every 10 seconds. Each sample is a `(timestamp, metric_name, lab
 
 Not everything comes from system stats. Your apps might expose custom metrics via a `/metrics` endpoint in the Prometheus text format. Reliaburger scrapes these automatically.
 
-The `prometheus-parse` crate handles the parsing. When an app has a health check configured, we probe `/metrics` on the same port. If it responds with valid Prometheus text, we ingest it alongside the system metrics. Same Arrow schema, same SQL queries.
+The `prometheus-parse` crate handles the parsing. Configure `(job, url)` targets in `[metrics]` using `scrape_targets`; Bun's scrape task calls `scrape_once` at `scrape_interval_secs`. A health check does not automatically register a scrape target. Valid samples enter the same Arrow schema and SQL queries as system metrics. An empty target list starts no scrape task.
 
 ## Alert evaluation
 
@@ -314,23 +314,37 @@ The lesson: don't build config for things that have obvious defaults. Ship the d
 
 ### "How far back do we look?" is not "how stale may this be?"
 
-The evaluator needs one number per metric, so something has to turn a table of readings into that number. The first version queried the last 120 seconds and took the newest row per metric *name*:
+Node A reports 95% CPU. A second later, node B reports 10%. If we keep only
+one reading per metric name, B's healthy reading hides A's problem. The regression
+`healthy_series_cannot_hide_another_nodes_alert` reproduces exactly that failure.
 
-```rust
-for (_ts, name, _labels, val) in rows {
-    values.entry(name).or_insert(val);   // DESC order, so first = newest
-}
-```
+The evaluator now keeps each `MetricKey`: the metric name plus its sorted label
+map. Its state belongs to `(rule_name, labels)`. Two nodes, or two namespaces
+running an app with the same name, have independent pending timers, firing
+states and recoveries. `BTreeMap` gives the labels a stable order; deriving `Ord`
+and `PartialOrd` on our private `AlertInstance` lets Rust compare those compound
+keys without hand-written comparison code. We reuse the existing metric type
+rather than inventing another representation at the query boundary.
 
-Two problems hide in those three lines, and both are the same mistake: treating a query bound as an answer.
+Freshness remains a separate decision. `QUERY_WINDOW_SECS` bounds the query;
+`MAX_VALUE_AGE_SECS` decides whether a returned reading is usable. Memory and disk
+percentages require fresh numerator and denominator readings with identical
+labels. Invalid labels and non-finite values provide no recovery evidence.
+Missing data cancels an inconclusive pending timer but leaves a firing alert
+active. Only a healthy reading from that same series resolves it.
 
-The `_ts` is discarded, so the 120-second window is doing double duty. It's the range we search, and by accident it's also the freshness guarantee — a metric that stopped being emitted 110 seconds ago is still evaluated as though it were live. Those are different questions with different right answers, so they now have different names: `QUERY_WINDOW_SECS` for how far back to look, `MAX_VALUE_AGE_SECS` for how stale an answer may be. Naming the second one made it a decision rather than a leftover.
+Labels travel with API statuses, dashboard rows and webhook notifications.
+PagerDuty's deduplication key includes a SHA-256 digest of the canonical label
+JSON, so resolving A cannot close B's incident. Diagnostic collection also keeps
+the labels when deduplicating repeated reports of the same incident. App-scoped
+diagnostic collection remains explicitly unsupported; not every metric carries
+an application identity.
 
-The `_labels` is discarded too, so distinct labelled series collapse into whichever one happened to be newest. For a single node's own gauges that's harmless. For the derived percentages it isn't: `node_memory_usage_percent` divided a `used` from one series by a `total` from another, and could produce a number that belonged to neither. The values are now keyed by `(name, labels)` and the percentages computed *within* a label set before anything collapses.
-
-There's a smaller lesson in the collapse itself. When two series tie on timestamp, the old code picked whichever row the query returned first — deterministic in practice, arbitrary in principle, and a lovely source of a test that passes on your machine and fails in CI. Ties now break on the label string. If a rule can go either way, pick the way that doesn't depend on row order.
-
-What we *didn't* do is worth recording: the evaluator still takes one value per metric name. Giving each labelled series its own alert state is the honest fix, and it changes what an alert is keyed on — rule, or rule-and-series? That ripples into state storage, transition detection and webhook dedup keys. It's a real change, not a tidy-up, so it's written down as open rather than half-done and quietly declared finished.
+The tests exercise independent pending, firing and recovery transitions, missing
+and stale data, namespace collisions and notification identities. One writes two
+labelled series to a real Parquet-backed store and queries them through the same
+path the production evaluator uses. Keeping labels in a unit-test map wouldn't
+help if the SQL path discarded them first.
 
 ### Server-rendered HTML with meta refresh beats React
 
@@ -401,3 +415,214 @@ including a custom store whose agent is stopped. A second regression exports
 twice and verifies that the saved checkpoint suppresses the second copy.
 Destinations must be UTF-8 because the object-store interface takes text;
 rejecting an invalid path is safer than silently exporting to a different one.
+
+### Preserve each archive generation
+
+A local flush counter can restart at zero after retention removes every file.
+That makes `logs_000000.parquet` a reusable filename, not a permanent identity.
+Previously the checkpoint noticed new bytes, but the remote write still replaced
+the old object. We now put the full SHA-256 digest in both the checkpoint identity
+and the archive filename. The `.parquet` extension remains at the end so existing
+SQL archive queries discover both generations.
+
+The regression uses actual Parquet files and DataFusion. It exports one batch,
+saves and reloads the checkpoint, removes the local file, restarts the store and
+exports a second batch under the same local name. Querying the archive must return
+both rows. Checking only the number of successful uploads missed the original bug.
+
+Old short-hash checkpoints cannot establish that an immutable object exists.
+Surviving source files are therefore exported again under the new names. Existing
+legacy archive objects are left untouched; a mixed legacy/new archive can contain
+duplicate rows for that migration batch. We prefer that explicit migration
+limitation to deleting an old object whose provenance we cannot establish.
+
+### An acknowledgement belongs to one destination
+
+Exporting to archive A doesn't mean the same bytes exist in archive B. The
+checkpoint now includes a scope derived from the destination URL and node prefix.
+Changing either clears its acknowledgements. We store a hash of the scope rather
+than the URL itself, so a checkpoint doesn't copy credentials embedded in a URL.
+This hash identifies the export context; it is not an authentication mechanism.
+
+An old checkpoint without a scope is also untrusted for skipping uploads. The
+immutable names from the previous fix make repeated exports safe. Keeping one
+active scope is deliberately simple: switching back to an earlier destination
+may repeat writes, but it cannot mistake another archive's receipt for this one.
+
+The pruner checks the scope as well as the content identity. Our regression
+exports to a working destination, switches to an unwritable destination, then
+forces disk pressure. The source must survive. Another test changes both the
+destination and node prefix across checkpoint reloads and queries every archive.
+
+### Own the whole export transaction
+
+Sharing a checkpoint pathname didn't serialise its writers. The periodic task,
+disk-pressure task, API handler and offline CLI could each load an old snapshot
+and later replace a newer one. They now call the same transaction: acquire a
+non-blocking file lock, load the latest checkpoint, export, then persist it before
+returning success. A competing writer gets a busy error and can retry. Corrupt or
+unreadable state is an error, not an empty receipt.
+
+The lock is a separate persistent file. Replacing the JSON atomically must not
+replace the inode that other processes lock. Checkpoint writes use a private
+unique temporary file, sync its contents, rename it, and sync the parent directory.
+Disk-pressure cleanup stops if export or checkpoint persistence fails. The agent
+reports the error through its existing export-error path instead of discarding it.
+
+The blocking persistence closure takes ownership of the lock with `move`. A
+closure is Rust's anonymous function; `move` transfers captured values into it.
+Here that matters if the async caller is cancelled: the blocking filesystem write
+can finish while still holding its lock. Dropping the caller must not admit the
+next writer before the old rename finishes. On return, the committed snapshot
+replaces the caller's borrowed checkpoint; stale caller state never drives uploads.
+
+Regressions exercise a held lock, stale snapshots, corrupt checkpoint data,
+agent exports and the offline CLI's non-zero error result. Actual power-loss and
+storage-device durability qualification remains part of the release recovery gate.
+
+### Report source failures
+
+A directory whose name ends in `.parquet` used to look like an empty successful
+export: the read failed and the loop continued. We now reject non-regular entries
+and invalid filenames, and propagate directory and file I/O errors with their
+source path. The only skipped read error is `NotFound`, because retention can
+remove an immutable file between enumeration and opening it.
+
+Directory enumeration and file reads use Tokio's asynchronous filesystem API.
+The directory regression runs on both supported host platforms. The invalid-byte
+filename regression is Linux-only: macOS APFS rejects that filename when creating
+the fixture, before our exporter can inspect it. That platform boundary belongs
+in the test definition rather than a silent successful early return.
+
+### Retention counts successful removals
+
+Metrics and rollup pruning previously ignored `remove_file` errors and incremented
+the deletion count anyway. A directory named `blocked.parquet` was enough to make
+both stores claim they had reclaimed a file that still existed. They now increment
+only after a successful removal and return filesystem failures with the affected
+path. A concurrent `NotFound` is harmless but does not count as our deletion;
+a not-yet-created store directory remains an empty store. Directory enumeration
+errors also reach the caller. A failed pass can have removed earlier files, so
+callers must treat its error as incomplete retention, not an all-or-nothing rollback.
+Both store regressions verify that the failed candidate's contents survive.
+
+### Keep receipts for live source generations
+
+An export checkpoint is evidence that a current source file reached its configured
+destination. It need not be a permanent catalogue of the archive. After a complete
+successful scan, we retain only IDs read from current source files. The same locked,
+durable transaction commits this compacted set. Failed scans leave the previous
+checkpoint intact.
+
+This bounds receipt count by live source generations rather than export history;
+unlimited source retention still means unlimited live receipts. Archived objects
+remain immutable and untouched. If an old source reappears, writing its content
+hash key again is safe. A 32-generation retention/restart regression keeps one
+receipt throughout, skips an immediate duplicate export, and queries all 32
+archived generations afterwards. Destination and pruning tests still apply to
+the smaller checkpoint.
+
+Local rollup receipts prevent repeated ingestion by one aggregator. Cluster query
+merging also retains the original worker/minute/series key, so reassignment to
+another aggregator cannot double-count overlapping history. Chapter 11 explains
+the owned-row endpoint and its persistence and HTTP regressions.
+
+
+### A worker does not need a listening socket
+
+During Linux upgrade qualification, one node could not bind its API. A reporting
+worker on another node had taken that port with an ephemeral listener. Why was
+it listening? The same transport type had been used for both ends of reporting,
+even though workers only send snapshots and rollups.
+
+`TcpReportingSender` implements the existing `ReportingTransport` trait with the
+same framing, TLS connector and node fault gate. Its receive method returns
+`None` immediately. It owns no listener or accept task. The aggregator keeps the
+full transport because it actually receives reports. This also removes two
+unused sockets and tasks from every node.
+
+The transport regression checks fault-gated delivery and the absence of an
+inbound stream. The integration test sends reports from two outbound-only
+workers to a real TCP aggregator. Upgrade tests also bound HTTP requests, so a
+socket that accepts connections without answering cannot hide the failure
+behind an unbounded read. These checks fix the observed listener collision;
+they do not establish that every upgrade failure has the same cause.
+
+
+### Qualifying the parser behind an archive
+
+A dependency advisory named Thrift, which our Parquet reader uses for metadata.
+Updating that crate is only part of the repair. Parquet also has a private
+compact-protocol decoder. Its integer loop kept shifting until an input byte
+said to stop, and used a wrapping shift. Sixty-four continuation bytes could
+therefore turn malformed metadata back into a plausible value.
+
+The regression writes a real one-row Parquet file, changes the metadata integer,
+updates the footer length and asks the public reader to open it. The untouched
+file must work; the malformed one must return an error. This checks the parsing
+path we actually ship, rather than merely comparing dependency version numbers.
+
+We keep the query engine on DataFusion 45 and use Thrift 0.23 with a small,
+reviewable patch to Parquet 54.3.1. The upstream source, licence, archive checksum
+and exact patch live under `vendor/parquet`. Cargo's `[patch.crates-io]` section
+makes every dependent crate use that same parser. It is a temporary maintained
+dependency, with removal criteria recorded beside it.
+
+The decoder now visits only the bit positions that fit the wire integer. Each
+step also checks that the final byte's payload fits the remaining bits. Lengths
+and 32-bit integers get a 32-bit budget; 64-bit values get 64 bits. Unknown-field
+skipping uses these same methods, so adding an unfamiliar field cannot bypass
+the check. We also reject list counts larger than the remaining metadata before
+allocation, and replace a truncated-double indexing panic with an EOF error.
+
+The tests include a valid maximum-width integer to make sure refusal hasn't
+become indiscriminate. Normal metric, rollup and log persistence/query tests
+remain part of qualification. A dependency scan is useful evidence. A parser
+regression is different evidence, and we need both.
+
+### A log query owns its response bodies
+
+A peer can send `200 OK` and then stop sending the JSON body. Timing only
+`request.send()` doesn't protect us: that future completes when the headers
+arrive. The query can still wait indefinitely while reading the entries. We
+wrap the whole request and body-read future in the node's existing timeout.
+Expiry contributes a named node failure; responsive nodes' entries still count.
+
+Cancellation has another ownership trap. Dropping a Tokio `JoinHandle` detaches
+its task, so dropping a vector of handles doesn't stop the network requests.
+We use `JoinSet` instead. This collection owns its spawned tasks and aborts them
+when the set is dropped. `join_next().await` yields one completed task at a time:
+`None` means the set is empty, while `Some` contains either the task's result or
+a task failure. We retain both sorts of failure in the fan-out result.
+
+Two socket fixtures reproduce the old mistakes. One sends headers and the
+first byte of a body, then stalls. The other waits until those headers have
+been sent before cancelling the parent query and checks that the peer sees its
+connection close. The fixture accepts either EOF or a TCP reset after
+cancellation: macOS can reset a connection when its client discards unread
+response bytes. Both prove closure. Other I/O errors still fail, and the
+original two-second observation deadline remains. A caller's timeout is useful
+only if the work it owns ends too.
+
+### An empty alert list needs evidence
+
+Suppose a node returns `200 OK` with `{}`. Does that mean there are no alerts?
+The old client used a missing-field fallback and answered yes. The diagnostic
+collector could then present a healthy result without having received an alert
+inventory at all.
+
+Bun and Relish now share `AlertsResponse`, whose `alerts` field contains
+`Vec<AlertStatus>`. Serde must find that list and decode each required field.
+`AlertPhase` is an enum with `Inactive`, `Pending` and `Firing` variants;
+`#[serde(rename_all = "lowercase")]` keeps their existing JSON spellings.
+An unknown phase fails decoding instead of disappearing from the report.
+The evaluator's separate `AlertState` still owns its evaluation timestamps;
+the API carries the small serialisable snapshot consumers need.
+
+The client, TUI and `wtf` collector carry these typed statuses all the way
+through. A malformed inventory stays a collection error. An explicit
+`{"alerts": []}` is valid evidence of an empty inventory. Labels remain
+optional for older responses, and pending/firing timestamps remain optional;
+neither changes whether the required rule, phase, severity and description
+can be decoded. HTTP fixtures exercise both refusals and a labelled firing
+response, preserving the existing wire values without contacting a cluster.

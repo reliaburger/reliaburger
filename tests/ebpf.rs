@@ -589,6 +589,7 @@ async fn agent_drop_fault_refuses_vip_with_eperm() {
     let (resp_tx, resp_rx) = oneshot::channel();
     cmd_tx
         .send(AgentCommand::InjectFault {
+            reservation: None,
             request: FaultRequest {
                 fault_type: FaultType::Drop { probability: 100 },
                 target_service: "faulty".into(),
@@ -1047,6 +1048,13 @@ async fn dns_responder_resolves_internal_name() {
         listen_addr: "127.0.0.1:15353".parse().unwrap(),
         upstream: "8.8.8.8:53".parse().unwrap(),
         upstream_timeout: Duration::from_secs(2),
+        source_namespaces: tokio::sync::watch::channel(
+            reliaburger::onion::dns::DnsSourceNamespaces::from_bindings([(
+                "127.0.0.1".parse().unwrap(),
+                "default".into(),
+            )]),
+        )
+        .1,
         ..reliaburger::onion::dns::DnsConfig::default()
     };
 
@@ -1102,6 +1110,13 @@ async fn dns_responder_non_internal_times_out() {
         listen_addr: "127.0.0.1:15354".parse().unwrap(),
         upstream: "192.0.2.1:53".parse().unwrap(), // TEST-NET, unreachable
         upstream_timeout: Duration::from_millis(500),
+        source_namespaces: tokio::sync::watch::channel(
+            reliaburger::onion::dns::DnsSourceNamespaces::from_bindings([(
+                "127.0.0.1".parse().unwrap(),
+                "default".into(),
+            )]),
+        )
+        .1,
         ..reliaburger::onion::dns::DnsConfig::default()
     };
 
@@ -1665,7 +1680,9 @@ async fn live_egress_hook_loss_stops_protected_workload() {
         shutdown.clone(),
     );
     agent.set_onion_ebpf(Arc::clone(&ebpf)).await;
-    tokio::spawn(async move { agent.run().await });
+    let readiness = reliaburger::bun::readiness::ReadinessTracker::new();
+    agent.set_readiness_tracker(readiness.clone());
+    let owner = tokio::spawn(async move { agent.run().await });
 
     let config = Config::parse(
         r#"
@@ -1685,6 +1702,13 @@ async fn live_egress_hook_loss_stops_protected_workload() {
         .unwrap();
     while event_rx.recv().await.is_some() {}
 
+    assert!(
+        readiness
+            .capability_snapshot()
+            .await
+            .egress
+            .can_enforce_allowlist()
+    );
     ebpf.lock().await.detach();
     tokio::time::timeout(std::time::Duration::from_secs(4), async {
         loop {
@@ -1692,6 +1716,11 @@ async fn live_egress_hook_loss_stops_protected_workload() {
                 .calls()
                 .iter()
                 .any(|(operation, _)| operation == "stop")
+                && !readiness
+                    .capability_snapshot()
+                    .await
+                    .egress
+                    .can_enforce_allowlist()
             {
                 break;
             }
@@ -1702,6 +1731,7 @@ async fn live_egress_hook_loss_stops_protected_workload() {
     .expect("agent did not stop the workload after hook loss");
 
     shutdown.cancel();
+    owner.await.unwrap();
 }
 
 /// Fail closed: a pre-start programming error (here: an allowlist that

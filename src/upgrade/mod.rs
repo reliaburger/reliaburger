@@ -10,6 +10,7 @@
 //! Detailed design: `docs/plans/2026-07-06-plan-self-upgrade.md` and
 //! `docs/design/agent-bun.md` §5.5.
 
+mod compatibility;
 pub mod error;
 pub mod keys;
 pub mod manager;
@@ -17,6 +18,7 @@ pub mod marker;
 pub mod metadata;
 pub mod orchestrator;
 pub mod plan;
+pub mod rejoin;
 pub mod signing;
 pub mod store;
 pub mod types;

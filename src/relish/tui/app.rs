@@ -138,7 +138,7 @@ mod tests {
     use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
     use super::*;
-    use crate::bun::agent::InstanceStatus;
+    use crate::bun::agent::{ClusterInstanceStatus, InstanceStatus};
     use crate::relish::tui::data::ProviderError;
     use crate::relish::tui::fixtures::TestScenario;
 
@@ -157,15 +157,18 @@ mod tests {
     #[test]
     fn error_preserves_stale_data() {
         let mut app = TuiApp::new();
-        app.data.instances.push(InstanceStatus {
-            id: "one".into(),
-            app_name: "web".into(),
-            namespace: "default".into(),
-            state: "running".into(),
-            restart_count: 0,
-            host_port: None,
-            exit_code: None,
-            pid: None,
+        app.data.instances.push(ClusterInstanceStatus {
+            node: "node-1".into(),
+            instance: InstanceStatus {
+                id: "one".into(),
+                app_name: "web".into(),
+                namespace: "default".into(),
+                state: "running".into(),
+                restart_count: 0,
+                host_port: None,
+                exit_code: None,
+                pid: None,
+            },
         });
         app.update(Msg::Data(DataUpdate::Status(Err(
             ProviderError::Unreachable("gone".into()),

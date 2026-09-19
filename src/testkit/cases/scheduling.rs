@@ -38,7 +38,9 @@ async fn schedule_fixed_replicas_across_nodes(ctx: TestContext) -> Result<(), St
 
 /// An app with a required placement label runs only on a node carrying that
 /// label. Skips if no node advertises a label to target.
-async fn schedule_respects_required_placement_label(ctx: TestContext) -> Result<(), String> {
+async fn schedule_respects_required_placement_label(
+    ctx: TestContext,
+) -> crate::testkit::registry::CaseResult {
     let nodes = ctx
         .client
         .nodes()
@@ -89,10 +91,11 @@ async fn schedule_respects_required_placement_label(ctx: TestContext) -> Result<
         return unknown("the running replica was not visible on any reachable node");
     }
     if hosting != vec![target_node.clone()] {
-        return Err(format!(
+        return Err((format!(
             "app pinned to {key}={value} must run only on the labelled node {target_node}, \
              found on {hosting:?}"
-        ));
+        ))
+        .into());
     }
     Ok(())
 }
@@ -106,7 +109,9 @@ async fn schedule_respects_required_placement_label(ctx: TestContext) -> Result<
 /// refusal reason for quota. The old case expected the second `apply` to
 /// error, a rejection that doesn't exist, and then accepted *any* error
 /// (including a network blip) as proof of enforcement.
-async fn schedule_rejects_app_exceeding_namespace_quota(ctx: TestContext) -> Result<(), String> {
+async fn schedule_rejects_app_exceeding_namespace_quota(
+    ctx: TestContext,
+) -> crate::testkit::registry::CaseResult {
     let quota = format!(
         "[namespace.\"{ns}\"]\nmax_apps = 1\n\n{app}",
         ns = ctx.namespace,
@@ -141,9 +146,10 @@ async fn schedule_rejects_app_exceeding_namespace_quota(ctx: TestContext) -> Res
         if let Some(granted) = scheduled_replicas(&evidence, "quota-b")
             && granted > 0
         {
-            return Err(format!(
+            return Err((format!(
                 "quota-b acquired {granted} scheduled replica(s) despite max_apps = 1"
-            ));
+            ))
+            .into());
         }
         // Wait until quota-a is scheduled and quota-b is visible in desired
         // state — then the scheduler has demonstrably considered both.
@@ -171,9 +177,10 @@ async fn schedule_rejects_app_exceeding_namespace_quota(ctx: TestContext) -> Res
     if let Some(granted) = scheduled_replicas(&evidence, "quota-b")
         && granted > 0
     {
-        return Err(format!(
+        return Err((format!(
             "quota-b was granted {granted} replica(s) after a settle window despite max_apps = 1"
-        ));
+        ))
+        .into());
     }
 
     // The first app must be untouched by the unschedulable second.

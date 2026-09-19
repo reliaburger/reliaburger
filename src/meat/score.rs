@@ -1,8 +1,8 @@
 /// Phase 2: Score.
 ///
-/// Ranks candidate nodes on a 0–130 scale. Higher is better.
+/// Ranks candidate nodes on a 0–150 scale. Higher is better.
 /// The score is a weighted sum of several dimensions:
-/// - Spread (40): penalise nodes already running the same app
+/// - Spread (60): penalise nodes already running the same app
 /// - Bin-packing (50): prefer fuller nodes to maximise density
 /// - Preferred labels (20): prefer nodes matching soft constraints
 /// - Stability (5): prefer longer-running nodes

@@ -258,10 +258,9 @@ pub struct BackendPool {
     pub rr_counter: std::sync::atomic::AtomicU64,
 }
 
-// NOTE: only unweighted `RoundRobin` is implemented today. The shipped enum
-// (`src/wrapper/types.rs`) has just `RoundRobin` and `LeastConnections`, and
-// `select_backend` never consults `lb_strategy` — it always does unweighted
-// round-robin. Weighting, `LeastConnections`, and `ConsistentHash` are planned.
+// Design sketch only: the shipped route has no strategy field or enum.
+// Both selectors use unweighted round-robin. Weighting, LeastConnections
+// and ConsistentHash need implementation before a setting is exposed.
 #[derive(Clone, Copy)]
 pub enum LoadBalanceStrategy {
     /// Unweighted round-robin. The only strategy actually used.
@@ -473,7 +472,7 @@ Every inbound HTTPS request follows this path:
 7.  Backend selection from BackendPool:
     a. Filter to locally_healthy == true
     b. If pool empty: respond 502 Bad Gateway
-    c. Select backend by unweighted round-robin (the only strategy implemented; lb_strategy is not consulted)
+    c. Select backend by unweighted round-robin (the only strategy implemented; no strategy setting is exposed)
 8.  Proxy the request:
     a. Add X-Forwarded-For and X-Forwarded-Proto headers (the only headers Wrapper injects today). X-Real-IP and X-Request-ID are planned, not yet added.
     b. Forward the request to backend_addr

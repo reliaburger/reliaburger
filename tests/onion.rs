@@ -40,9 +40,13 @@ impl TestHarness {
         let port_allocator = PortAllocator::new(42000, 43000);
         let agent_shutdown = shutdown.clone();
         let mut agent = BunAgent::new(grill, port_allocator, cmd_rx, agent_shutdown);
+        let volumes = tempfile::tempdir().unwrap();
+        agent.set_volumes_dir(volumes.path().to_path_buf());
 
         let agent_task = tokio::spawn(async move {
             agent.run().await;
+            drop(agent);
+            drop(volumes);
         });
 
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();

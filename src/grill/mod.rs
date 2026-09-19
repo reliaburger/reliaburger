@@ -15,7 +15,10 @@ pub mod image;
 pub mod mock;
 #[cfg(target_os = "linux")]
 pub mod netns;
+#[cfg(target_os = "linux")]
+mod network_leases;
 pub mod oci;
+pub(crate) mod oci_pull;
 pub mod port;
 pub mod portmap;
 pub mod process;
@@ -75,7 +78,10 @@ impl fmt::Display for InstanceId {
 /// separator can never appear inside a namespace or app name — both are
 /// DNS-1123 labels, which allow only `[a-z0-9-]` — so parsing the
 /// namespace back out is unambiguous even when the app name itself
-/// contains a hyphen.
+/// contains a hyphen. Generation-like app suffixes can still produce the same
+/// string as another app's canary (for example `worker-g1` and generation 1 of
+/// `worker`). Allocation must check the inventory's structured owner before
+/// claiming an ID; parsing the text alone cannot disambiguate those tuples.
 #[derive(Debug, Clone, Hash, Eq, PartialEq)]
 pub struct InstanceIdentity {
     /// Namespace the app runs in.
@@ -158,9 +164,9 @@ impl InstanceIdentity {
     ///
     /// The legacy format is inherently ambiguous when an app name's last
     /// hyphenated segment looks like `g{digits}` (e.g. an app literally
-    /// named `worker-g5`). Adoption doesn't rely on this: it rebuilds the
-    /// identity from the record's separate `namespace`/`app_name` fields,
-    /// so this heuristic only ever matters for a bare container-name parse.
+    /// named `worker-g5`). Adoption instead checks the canonical ID against
+    /// the record's separate `namespace`/`app_name` fields and refuses legacy
+    /// aliases, so this heuristic only matters for a bare container-name parse.
     pub fn parse_legacy(suffix: &str, namespace: &str) -> Option<Self> {
         let (head, ordinal_part) = suffix.rsplit_once('-')?;
         let ordinal: u32 = ordinal_part.parse().ok()?;
@@ -204,6 +210,20 @@ pub enum GrillError {
 
     #[error("container {instance} failed to start: {reason}")]
     StartFailed {
+        instance: InstanceId,
+        reason: String,
+    },
+
+    /// A stop signal or exit wait could not be completed safely.
+    #[error("container {instance} failed to stop: {reason}")]
+    StopFailed {
+        instance: InstanceId,
+        reason: String,
+    },
+
+    /// Runtime inspection could not establish the instance's current state.
+    #[error("container {instance} state unavailable: {reason}")]
+    StateUnavailable {
         instance: InstanceId,
         reason: String,
     },

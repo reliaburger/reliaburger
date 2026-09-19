@@ -22,7 +22,7 @@ use crate::onion::service_id::ServiceId;
 use crate::onion::service_map::ServiceMap;
 use crate::onion::types::ServiceEntry;
 
-use super::types::{LoadBalanceStrategy, RateLimitConfig, RouteInfo, TlsMode};
+use super::types::{RateLimitConfig, RouteInfo, TlsMode};
 
 /// A single backend server.
 #[derive(Debug, Clone)]
@@ -54,8 +54,6 @@ pub struct PathRoute {
     pub app_name: String,
     /// Active backends (new requests go here).
     pub backends: Vec<Backend>,
-    /// Load balancing strategy.
-    pub lb_strategy: LoadBalanceStrategy,
     /// Round-robin counter.
     rr_counter: AtomicU64,
     /// Whether WebSocket upgrade is enabled.
@@ -422,7 +420,6 @@ fn build_path_route(
         namespace: namespace.to_string(),
         app_name: app_name.to_string(),
         backends,
-        lb_strategy: LoadBalanceStrategy::default(),
         rr_counter: AtomicU64::new(0),
         websocket: ingress.websocket.unwrap_or(false),
         rate_limit,

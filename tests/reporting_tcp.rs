@@ -16,7 +16,7 @@ use reliaburger::config::node::ReportingTreeSection;
 use reliaburger::grill::state::ContainerState;
 use reliaburger::meat::NodeId;
 use reliaburger::reporting::aggregator::ReportAggregator;
-use reliaburger::reporting::transport::TcpReportingTransport;
+use reliaburger::reporting::transport::{TcpReportingSender, TcpReportingTransport};
 use reliaburger::reporting::worker::{
     AgentSnapshot, CollectSnapshotRequest, InstanceSnapshot, ReportWorker,
 };
@@ -95,11 +95,9 @@ async fn tcp_reporting_two_workers_report_to_one_aggregator() {
     // Council list both workers see: the single aggregator.
     let council = vec![(NodeId::new("agg"), agg_addr)];
 
-    // Two workers on their own real TCP sockets, each with a fake agent.
+    // Two outbound-only workers, each with a fake agent.
     for name in ["w1", "w2"] {
-        let transport = TcpReportingTransport::bind(local(0), shutdown.clone())
-            .await
-            .unwrap();
+        let transport = TcpReportingSender::new(None, Default::default());
         let (snap_tx, snap_rx) = mpsc::channel(16);
         tasks.push(spawn_fake_agent(snap_rx, shutdown.clone()));
         let (_council_tx, council_rx) = watch::channel(council.clone());

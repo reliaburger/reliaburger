@@ -197,7 +197,7 @@ pub struct OidcSigningConfig {
     pub public_key_der: Vec<u8>,
     /// Key ID for the JWKS entry.
     pub key_id: String,
-    /// The issuer URL (e.g., "https://prod.reliaburger.dev").
+    /// The issuer URL (e.g., "<https://prod.reliaburger.dev>").
     pub issuer: String,
 }
 
@@ -310,6 +310,17 @@ pub enum AgeKeyScope {
     ClusterWide,
     /// Namespace-scoped keypair.
     Namespace(String),
+}
+
+/// Public recipient and generation for encrypting new cluster secrets.
+///
+/// This response deliberately contains no wrapped or plaintext private key.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SecretPublicKey {
+    /// age X25519 recipient string.
+    pub public_key: String,
+    /// Generation selected from the node's applied cluster state.
+    pub generation: u64,
 }
 
 /// An age keypair used for encrypting/decrypting secrets.

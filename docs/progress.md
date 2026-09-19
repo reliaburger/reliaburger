@@ -23,71 +23,180 @@ for every item below. IDs are scoped to that plan, not the older C1/M1 review ID
 The [audit record](qualification/2026-09-17-code-audit.md) separates local defect
 reproductions from inspected source and previous acceptance evidence.
 
-These are work packages, not 72 mandatory features for 0.1.0. Correctness fixes
-need explicit release dispositions; optional refactors and future capabilities
-remain separate. Older unchecked groups below point into this current ledger.
+The work packages distinguish release correctness, optional refactors and future
+capabilities. Correctness fixes need explicit release dispositions. Older unchecked groups below point into this current ledger.
+
+The 18 September portable Linux no-default CI run found an API port reservation
+race in the bootstrap harness. Bun now reports its actual bound API address;
+bootstrap and endpoint qualification bind port zero and discover that address.
+The reporting regression fails before the fix; five real-process bootstrap tests
+(0.62s), the service-endpoint probe (0.06s) and strict Linux Clippy pass. Latest
+hosted feature-matrix validation remains separate.
+
+The placement journal advances durable state to generation 5 (protocol 5).
+Hosted CI at `806b1f6` passed runtime, cluster and upgrade acceptance but caught
+one integration fixture still expecting state 4 in both portable matrices.
+The real `bun --compatibility` query now compares the typed response with
+`CURRENT`; both actual-binary compatibility/refusal tests pass (0.04s).
+CI and Build & Release pass at `d7897fc`; qualification of subsequent
+job-lease changes remains separate. Both hosted workflows also pass at
+`969e3d4`, including the later runtime inspection and restart-cleanup fixes.
+The subsequent cron checkpoint changes require their own hosted validation.
+
+Coverage at `df45d79` reproduced a DNS port-zero collision: UDP selected a port
+already occupied by TCP. Automatic allocation now retries up to 16 times;
+explicit port conflicts still refuse. All 18 DNS wire tests and strict Clippy
+pass on macOS/Linux. That hosted run passed its other CI gates; coverage of the
+repaired head remains pending.
+The native full suite also reproduced an HTTP keep-alive error in the request-ID
+echo fixture. Its backend now uses axum and both server tasks are joined; the
+full native suite and explicit Linux regression pass, with strict Clippy.
+Integration-agent volume roots are now private to each fixture and retained
+through shutdown. All 46 affected ordinary integration tests and strict Clippy
+pass on macOS/Linux; ten live Linux placement cases pass (154.71s). The two
+Buildah-absence cases execute in isolated child environments on the equipped VM.
 
 ### Correctness and behavioural contracts
 
-- [ ] **C01** (P1) Preserve every exported log generation.
-- [ ] **C02** (P1) Scope export acknowledgements to their destination.
-- [ ] **C03** (P1) Make export checkpoints durable and serialised.
-- [ ] **C04** (P1) Report non-transient export read failures.
-- [ ] **C05** (P1) Persist new instances during rolling deployments.
-- [ ] **C06** (P1) Reserve node-fault capacity across the cluster.
-- [ ] **C07** (P1) Define and enforce mixed-version compatibility.
-- [ ] **C08** (P1) Publish readiness after resources are acquired.
-- [ ] **C09** (P1) Bound lease cleanup lock acquisition.
-- [ ] **C10** (P1) Record fault ownership before injection can be cancelled.
-- [ ] **C11** (P1) Persist standalone leases through directory-sync failures.
-- [ ] **C12** (P1) Sweep pressure leftovers even after disabling pressure.
-- [ ] **C13** (P1) Issue certificates with exact validity timestamps.
-- [ ] **C14** (P1) Renew and hot-reload every served certificate class.
-- [ ] **C15** (P2) Make ingress serials unique across nodes and restarts.
-- [ ] **C16** (P2) Reject invalid certificate inputs without panicking.
-- [ ] **C17** (P2) Reject overflowing CLI durations.
-- [ ] **C18** (P2) Find a free port before reporting exhaustion.
-- [ ] **C19** (P2) Count only successful metric-file pruning.
-- [ ] **C20** (P1) Deduplicate rollup ownership at query merge.
-- [ ] **C21** (P2) Bound and chunk reporting payloads.
-- [ ] **C22** (P2) Bound export checkpoint growth safely.
-- [ ] **C23** (P2) Distinguish expired certificates from renewal warnings.
-- [ ] **C24** (P2) Keep unknown council membership out of quorum arithmetic.
-- [ ] **C25** (P2) Identify diagnostic filesystems by identity.
-- [ ] **C26** (P2) Match diagnostic instance and VIP evidence exactly.
-- [ ] **C27** (P2) Preserve watch-mode failures and exit outcomes.
-- [ ] **C28** (P2) Make TUI status reflect the cluster.
-- [ ] **C29** (P1) Fail benchmark comparisons when required metrics vanish.
-- [ ] **C30** (P1) Replace unconditional unknown catalogue cases with real evidence.
-- [ ] **C31** (P2) Give concurrent test runs distinct namespaces.
-- [ ] **C32** (P2) Use typed case outcomes and validated runner configuration.
-- [ ] **C33** (P2) Discover actual registry and ingress test endpoints.
-- [ ] **C34** (P2) Define lease ownership for the remaining test resources.
-- [ ] **C35** (P2) Gate chaos capabilities per selected scenario.
-- [ ] **C36** (P1) Target and clean up the legacy chaos command precisely.
-- [ ] **C37** (P1) Require rejoin before committing the local upgrade marker.
-- [ ] **C38** (P2) Make blocked deployment replacement explicit.
-- [ ] **C39** (P2) Handle development CLI paths without unwraps.
-- [ ] **C40** (P2) Own replaced rootless proxy processes.
-- [ ] **C41** (P2) Return a non-zero managed-status result for unhealthy nodes.
-- [ ] **C42** (P2) Key alert state by labelled series.
-- [ ] **C43** (P2) Resolve short service names in the caller namespace.
+- [x] **C01** Preserve every exported log generation with full content-hash object names. Five real Parquet export/query tests and ten exporter unit tests pass; the restart/name-reuse regression fails before the fix. Legacy archive objects remain untouched (migration duplicates documented in chapter 6).
+- [x] **C02** Scope export acknowledgements and pruning proof to the destination URL and node prefix. Seven archive integration tests, ten exporter unit tests and eleven disk-pressure tests pass, including changed destinations/prefixes after restart and failed-export preservation.
+- [x] **C03** Serialise all exporters with a cross-process lock, reload before export, and atomically persist a private checkpoint with file/directory sync before acknowledgement or pruning. Stale-state, busy-lock, corrupt-state, atomic-replacement and rename-failure regressions pass, plus API/offline CLI checks; physical crash/durability qualification remains V02.
+- [x] **C04** Report directory, entry and file-read failures with context; reject non-regular/invalid-name candidates and skip only concurrent NotFound reads. Eleven archive integration tests, twelve exporter unit tests and eleven pressure tests pass on macOS; the invalid-byte filename regression is explicitly Linux-only.
+- [x] **C05** Persist replacement launch details before health publication, including private durable records, rollback record/port cleanup and Apple launcher provenance. All 94 agent unit tests and ten record tests pass; regressions inspect records during rollout, adopt after restart and refuse failed record writes in both deployment strategies. Runtime crash-injection qualification remains V02.
+- [x] **C06** Reserve one durable cluster-wide node-experiment slot through Raft; bind grants to the exact request, process identity and increasing sequence. Expiry initiates fencing and confirmed reversal, never automatic release. Membership changes wait for reversal behind a committed barrier. Snapshots retain ownership; stale activation and release refuse. Protocol 4/state 3 require fresh development clusters. The 3,236-test Linux library checkpoint, all 152 final gossip tests, strict all-target/all-feature Clippy, two compatibility tests, real concurrent kills/leader failover (27.93s), legacy quorum refusal (13.29s), manual node recovery (15.80s) and privileged pressure cleanup pass. Separate gossip fixes cover both isolated bootstrap and partial peer rediscovery. Rust 1.98 also passes strict all-target/all-feature Clippy after boxing the helpers' HTTP error values; the earlier Linux checks used Rust 1.97.
+- [x] **C07** Require explicit matching protocol/state generations for joining, gossip, Raft, reporting and signed upgrade/rollback preflight. Fresh state is stamped durably; development data, snapshots and backups are refused without migration. The 3,451-test portable checkpoint passes, followed by 149 final gossip tests, 12 backup tests, 11 join/security integration tests and strict Clippy. All three final Linux rolling-upgrade/rollback/pause-resume cases pass in 198.90s with the separately tracked harness timing/convergence corrections; sustained qualification remains V02.
+- [x] **C08** Publish readiness only after each owner explicitly acknowledges acquired resources; catch startup panics and fence signals by attempt. Eight readiness and 94 agent tests pass, all-target/all-feature Clippy passes, and the live three-node placement regression passes (20.89s).
+- [x] **C09** Refuse busy cleanup immediately with a retryable conflict, leaving the lease intact while the reaper visits other expired leases. The real-reaper starvation regression fails before the fix; the full lease unit-test module passes.
+- [x] **C10** Record pending fault ownership before sending, retain unknown receipts after lost responses, and remove receipts only after confirmed exact-ID reversal. All nine chaos guard/preflight tests pass, including accepted-but-cancelled injection (previously reported NotRequired) and cancelled cleanup followed by retry.
+- [x] **C11** Persist leases with private unique files and file/directory sync; retain transaction ownership across caller cancellation and fence mutations after uncertain persistence. Thirteen lease tests pass, including the previously failing temporary-symlink regression and cancellation/restart evidence. Physical crash and injected filesystem-sync qualification remain V02.
+- [x] **C12** Sweep existing owned pressure cgroups before the disabled-policy refusal, without enabling new faults. The privileged Linux regression fails before the fix; both real cgroup/helper and CPU/memory-pressure acceptance tests pass in the test VM (2.30s).
+- [x] **C13** Use one whole-second issuance instant and checked lifetime arithmetic for CA, node and general leaf certificates; derive stored CA validity from signing parameters. The 90-second certificate regression fails before the fix, and all CA unit tests pass.
+- [x] **C14** Renew and hot-reload every served certificate class. Functional coverage is complete; sustained certificate/storage qualification remains V02. Hosted CI exposed a missing renewal-route audit entry and a scanner that mistook middleware layers for HTTP methods; both are repaired, with all eight route/scope audit tests passing (0.19s).
+  - [x] Serve the ingress leaf with its original root-signed intermediate. A root-only real TLS client fails with UnknownIssuer before the fix, then passes (0.02s).
+  - [x] Renew cached ingress leaves at their X.509 validity midpoint, recover after idle expiry and bound leaves by issuer validity. Twelve ingress TLS tests, 16 CA tests and the real renewal test (17.04s) pass.
+  - [x] Reload operator certificate/key files once per second as validated pairs; keep the previous pair only while valid. Three real reload/input tests pass, including partial/malformed replacement and an existing HTTP connection (3.27s).
+  - [x] Disable ingress session resumption so reconnects validate the current certificate. The real TLS 1.2/1.3 matrix fails with Resumed before the fix and passes afterwards (0.02s).
+  - [x] Retire API/registry/ingress TLS connections within one hour, with 30 seconds for HTTP draining and a deadline that survives WebSocket upgrades. Three deadline regressions, real upgraded ingress retirement/reconnect (0.12s), Bun API in-flight draining (0.05s), reload and ingress tests pass.
+  - [x] Persist node identities as private atomic snapshots with key/chain/node/serial validation and signed validity dates. Seventeen persistence tests cover failed replacement, concurrent reads, corrupt snapshots and incomplete installation. The full Linux library checkpoint passes (3,255 tests; 19 explicit privileged gates), alongside 29 managed-bootstrap, 11 security and two API TLS tests.
+  - [x] Provide a shared live node credential handle that validates and persists replacements before publishing them to existing TLS configurations. Five real TLS/replacement tests pass (6.15s), including expired-client refusal on optional mTLS, and cancellation after persistence still publishes the committed identity (0.04s). Strict all-target/all-feature Clippy passes on Linux Rust 1.97 and macOS Rust 1.98.
+  - [x] Wire the live handle into Bun's API/registry, Raft/reporting clients and servers, internal HTTPS clients and diagnostics. Seven live tests pass (6.54s), including reused HTTPS clients with service-token preservation and current diagnostic metadata. The real three-node test replaces all identities, revokes every old leaf and proves Raft replication plus fresh reporting (15.18s). Bun's generated-identity startup test passes (0.16s).
+  - [x] Bound locally issued and CSR-signed node leaves by the real issuer validity, including reconstructed Node CAs from cluster state; refuse expired and future issuers. Both failing-first regressions pass (0.01s), alongside 274 Sesame tests (one privileged gate), seven live identity tests and strict Linux/macOS Clippy.
+  - [x] Add leader-only node CSR renewal requiring both the service principal and the actual TLS peer leaf. Quorum-backed reads recheck identity, expiry and leaf/issuer revocation around committed serial allocation; CSR identity must match. Seven renewal tests pass (0.24s), Bun’s real TLS peer-attribution and draining tests pass (0.05s), and strict Linux/macOS Clippy passes.
+  - [x] Start automatic renewal at the signed lifetime midpoint, persist before publishing, report live worker health and retry directly through leader changes. Twelve endpoint/worker regressions pass (12.13s), including failed-save recovery, redirect and oversized-response refusal, cancellation and stopped-owner diagnostics. The real three-node leader-failure test passes (20.40s); actual Bun automatically renews and reuses the persisted leaf after restart (3.64s). Seven live TLS tests, all 23 Bun tests and strict Linux/macOS Clippy pass.
+- [x] **C15** Replace the process counter with positive 20-byte serials carrying 158 bits of operating-system randomness. Issuance refuses randomness failure; ingress serials remain outside the 64-bit node revocation contract. Separate processes using one CA reproduce duplicate serials before the fix and pass after it, including restart and concurrent peers. All ten ingress TLS tests, 265 Sesame tests and strict Linux all-target/all-feature Clippy pass (one existing privileged Sesame test is gated).
+- [x] **C16** Return contextual errors for invalid DNS/common-name SANs and a root role passed to intermediate issuance. Both former panic paths have failing-before regressions; all 16 CA tests pass.
+- [x] **C17** Reject overflowing relative durations with checked multiplication and parse units at UTF-8 boundaries. The overflow regression fails before the fix; all 34 CLI command tests pass, including multibyte invalid input. A later parser audit also reproduces overflowing fault minute/hour values and truncated nanosecond delays. Checked multiplication and fallible narrowing now reject both before a request; all 19 fault-command tests pass on macOS/Linux, with strict Clippy on both.
+- [x] **C18** Scan candidates once from a random starting point, preserving concurrency and out-of-range adoption semantics. The nearly-full-pool regression fails before the fix; all 16 allocator tests pass.
+- [x] **C19** Count successful metric/rollup deletions only, expose removal and directory-enumeration errors with paths, and ignore concurrent NotFound without counting it. Both failing-removal regressions fail before the fix; all 171 Mayo tests pass.
+- [x] **C20** Retain worker/minute/series identity through an owned-rollup endpoint and deduplicate before summing; conflicting copies and legacy/malformed peers remain explicit unknown evidence. The HTTP double-count regression fails before the fix; Mayo, real Parquet restart/retry, four aggregation integration tests and endpoint scope/authority tests pass. Oversized queries refuse rather than silently truncate.
+- [x] **C21** Choose explicit admission refusal: preflight the 1 MiB/100-event limits, bound the receiver to 16 connections and 16 queued reports, and acknowledge queue admission under protocol 3 (state 2). Workers expose failures; normal rollup failures request five-minute backfill, with older gaps explicit. Three admission/shutdown regressions fail before the fix. All 3,217 Linux library tests pass (19 privileged gates), plus strict all-target/all-feature Clippy, three TCP/TLS, one reporting-tree, two startup-compatibility and eleven security integration tests. Chunking and event production remain F06.
+- [x] **C22** Compact receipts to current source generations only after a successful scan, in the existing locked durable transaction. The 32-generation retention/restart regression fails before the fix and preserves all archive rows after it; 12 archive integration, 12 exporter unit and 11 disk-pressure tests pass. Receipt count follows live source retention.
+- [x] **C23** Treat encoded expiry as critical regardless of stale rotation labels; require positive healthy rotation evidence to suppress near-expiry warnings and describe short-lived validity accurately. Both diagnostic regressions fail before the fix; all 17 diagnosis tests pass.
+- [x] **C24** Require observed configured voters for quorum arithmetic; unavailable/empty council responses and degraded membership remain unknown instead of using stale gossip flags. The public collector regression fails before the fix; all 25 diagnostic collector/engine tests pass, including observed quorum loss.
+- [x] **C25** Report node-local Unix device identity without paths and coalesce only matching identities; preserve separate legacy observations and the busiest complete shared-device reading. The HTTP regression fails before the fix; all 26 diagnostic collector/engine and seven local diagnostic tests pass, including real sibling-path identity.
+- [x] **C26** Track exact CPU sample identities and compare parsed DNS answer IPs, excluding resolver/name/target text. Both substring regressions fail before the fix; local diagnostics, agent trace and pure trace tests pass, including equivalent IPv6 addresses.
+- [x] **C27** Render collection failures as unknown and continue polling; handle interruption during collection and retain the last meaningful exit outcome. The real-process regression fails before the fix, then recovers on the next 30-second interval and exits 2 on SIGINT; all four command rendering/outcome tests pass.
+- [x] **C28** (P2) Make TUI status reflect the cluster.
+- [x] **C29** Include missing baseline metrics in the shared comparison verdict and name missing/new observations in human output. The regression fails before the fix; all benchmark tests pass, including informational and added-only comparisons.
+- [ ] **C30** (P1) Replace unconditional unknown catalogue cases with real evidence. Secret/config evidence is implemented: scoped readers can fetch the public age recipient and generation without private material; both encryption cases now inspect decrypted variables in the actual owning container. Two API regressions and the real catalogue fail before implementation. Public-key/route tests, 117 testkit tests, strict Linux/macOS Clippy and the actual TLS/runc three-case catalogue pass; all three cleanup outcomes are confirmed (65.36s). Workload SPIFFE observation is also implemented: the container’s public bundle must validate against configured CA anchors and identify exactly its cluster/namespace/app. The real TLS/runc group and rejection with Node-CA-only trust pass with confirmed cleanup (51.73s), alongside 117 testkit tests (0.62s) and strict Linux/macOS Clippy. Runnable registry deployment remains.
+- [x] **C31** Generate 128-bit random run IDs instead of second-resolution timestamps. The 1,024-invocation concurrent regression fails before the fix; all six command tests and the existing lease collision/refusal test pass. Fixed namespaces retain server ownership checks.
+- [x] **C32** Replace magic-string verdicts with `CaseError::{Failed, Unknown}` and reject invalid runner timeouts, parallelism and namespace inputs before side effects. The workload-prefix regression fails before the fix; all 108 testkit tests and all-target/all-feature Clippy pass, including checked deadline overflow and direct-library invalid inputs.
+- [x] **C33** Publish actual bound service origins and use explicit managed host forwards, including an authenticated registry forward configurable with `--registry-port`. Parse IPv6 and configured ports without guessing; refuse missing/unsafe origins. Workload clients preserve Host/SNI through forwards with normal certificate hostname verification and no API credentials. The malformed-IPv6 regression fails before the fix. The 3,241-test library checkpoint, 13 final endpoint tests, 29 managed-cluster tests, real ephemeral Bun listener probes (0.11s), managed-status integration (5.66s) and strict all-target/all-feature Clippy pass. Exact-candidate VM qualification remains V03/V04.
+- [ ] **C34** Finish durable ownership and confirmed cleanup for every supported test resource. The [completion plan's C34 record](plans/2026-09-17-codebase-completion-plan.md#c34--define-lease-ownership-for-the-remaining-test-resources) preserves the per-change regressions, platform results and historical format generations. Current committed formats are protocol 6/state 7 and lease schema 3.
+  - [x] Bind test tokens to their exact authenticated lease owner and fingerprint; reclaim them through Raft after client or leader failure.
+  - [x] Persist node-local job leases and reserved namespaces; reclaim cron registrations and observed runtime retirement after Bun/client death. Catalogue completion requires an observed zero exit and bounded log publication.
+  - [x] Persist cron registration, explicit retirement and pre-launch minute claims. Recovery skips missed/uncertain occurrences without catch-up, as agreed.
+  - [x] Fence in-flight deploy/cron workers against stop, retirement and overlapping replacement; stop cancels Pending retries.
+  - [x] Require observed cleanup before retrying failed create/start/restart. Preserve ownership on failure and enforce in-memory backoff and retry budgets.
+  - [x] Refuse uncertain startup adoption and invalid process selectors. Preserve inspection failures in ProcessGrill, runc and Apple; retain runc ownership through OCI, rootfs and network cleanup failures.
+  - [x] Persist Pending placement ownership before queueing Deploy; retain it through uncertain convergence and retirement. Resolve peers through advertised per-node API endpoints.
+  - [x] Keep failed/expired uploads fenced until deletion and directory sync succeed. Claim exclusive upload-directory ownership on startup, reclaim recognised abandoned files and refuse uncertain inventory. Actual SIGKILL, competing-owner and cluster-upgrade tests pass.
+  - [x] Wait for durable lease absence after HTTP 202; an empty runtime inventory cannot override pending ownership.
+  - [x] Keep normal Stop/Retire ownership when identity or adoption-record removal fails. Sync both parent directories and retry; full library checkpoints pass 3,308 macOS/3,362 Linux tests with strict Clippy.
+  - [x] Require observed runtime exit on rolling/blue-green retirement. Failed, ignored/stalled kills or inspection errors preserve both generations; a later Retire cleans up. Both regressions fail first, all eight fault/strategy cases pass, and the full Bun suites plus strict Clippy pass on both platforms.
+  - [x] Propagate artifact-cleanup errors on rolling/blue-green finalisation; retain the entire retired fleet as stopped if one artifact fails. Both regressions fail first, all 457 native/456 Linux Bun tests pass (one explicit gate each), and strict Clippy passes on both platforms.
+  - [x] Propagate runtime/artifact cleanup failures on halt and rollback. Reserve replacement ownership and ports before preparation; use bounded off-loop kill/exit observation and checked artifact removal, retaining failures. The 24-case regression fails first, then passes; healthy halted replacements remain supervised and directory recovery releases retained ports. All 465 native/464 Linux Bun tests, 29 real HTTP/process integration tests per platform and strict Clippy pass. Recovery before the first durable runtime record remains open below.
+  - [x] Fence the periodic restart driver before off-loop rollout retirement starts. A blocked-kill regression fails first, then verifies stepped rolling, surplus and blue-green paths. All 458 native/457 Linux Bun tests and strict Clippy pass.
+  - [x] Prevent rollout generation reuse after adoption and preserve stopped/failed cleanup owners when applying replacements. Three failing-first regressions, all 461 native/460 Linux Bun tests and strict Clippy pass. Actual signed exec preserves a generation-one workload, then redeploys generation two on macOS/Linux (19.17s/10.35s).
+  - [x] Reject invalid app/job names and namespace labels before runtime mutation. Configuration and actual command-admission regressions fail first; lowercase DNS label boundaries pass. Full library suites pass 3,322 macOS/3,376 Linux tests (five/19 explicit gates), with strict Clippy on both.
+  - [x] Validate the full recorded identity inventory before recovery mutations. Refuse legacy aliases, unsafe labels and inconsistent app/namespace/replica/spec fields without runtime calls or record deletion. The alias regression fails first; valid generation-like app names still adopt. All 463 native/462 Linux Bun tests, strict Clippy and actual signed exec/redeployment pass (19.19s/10.53s).
+  - [x] Reject cross-app instance-ID collisions before replacing an owner. A fresh `worker-g1` app overwrites generation one of `worker` before the fix. Fresh app and job admission now preserves foreign Running/Stopped owners, records and ports without runtime calls; the whole replica fleet is checked before port allocation. All 466 native/465 Linux Bun tests and strict Clippy pass.
+  - [ ] Record every former cluster placement owner and wait for exact retirement acknowledgements. The [concrete protocol proposal](plans/2026-09-19-lease-retirement.md) awaits explicit approval required by automatic approval review; its core draft is preserved separately and is not wired into the current binary.
+  - [ ] Persist ordinary-job execution intent and retry budgets across Bun replacement. Crash retry versus explicit rerun remains a pending user decision.
+  - [ ] Bind registry repositories/uploads to leases and fence concurrent commits against cleanup; preserve shared image layers.
+  - [ ] Define ownership and retirement for managed test volumes/mounts without deleting ordinary application data volumes on Stop or rebalance.
+  - [ ] Establish atomic process identity and complete process-tree retirement.
+  - [ ] Recover runtime/discovery resources created before their first adoption record, including physical process-death qualification.
+  Node effects use C06/C10. Image-distribution benchmarks report uncontrolled cache state rather than evicting arbitrary images.
+- [x] **C35** Select exact chaos scenario names and require only their capability/operation union. The complete five-case suite still refuses unavailable pressure or saturation authority; selected node failures need neither. Thirteen chaos and six CLI tests pass, covering unknown/empty selections, consent, protected clusters and exact fault cleanup.
+- [x] **C36** Retire legacy partition/isolation and blanket-heal mutations in favour of the guarded catalogue. Every old mutation returns an explicit migration error before contacting a node, with or without acknowledgement; the unreachable-node regression fails before the fix and passes afterwards. Read-only status remains available.
+- [x] **C37** Require a fresh direct gossip acknowledgement before committing the local upgrade marker, with an enforced rejoin deadline. All 28 gossip and 115 upgrade unit tests pass; a real isolated replacement serves locally, retains its marker, reverts after five seconds and adopts the same workload PID (33.97s). Coordinator rejoin checks remain independent.
+- [x] **C38** Retain target ownership through worker completion and rollback; include ID/age/phase in conflicts and refuse app/job runtime-name collisions. Add scoped, idempotent node-local cancellation and `relish cancel-deploy`: health waits interrupt, in-flight mutations finish, and only observed cancellation followed by worker completion becomes Cancelled. Cluster desired state and completed work remain explicit caller responsibilities. The ownership and kind-overwrite regressions fail before their fixes; all 3,227 Linux library tests pass (19 privileged gates), strict all-target/all-feature Clippy passes, and the real CLI waits for terminal evidence and refuses unknown success.
+- [x] **C39** Validate development cluster names, ownership, resources, runtimes and saved addresses before Lima operations; reject unsupported path encodings and quote checkout paths and test filters. Missing VMs preserve state and stop mutations. Five real CLI regressions pass on macOS and six on Linux (including a non-UTF-8 checkout), with strict all-target/all-feature Clippy. Zero-node and corrupt-ownership regressions fail before the fix.
+- [x] **C40** Serialise rootless helper replacement and adoption, stop/reap displaced owners, preserve a successor's socket and reject conflicting repeat-adoption records. Startup cancellation kills unpublished helpers; asynchronous socket checks and the forwarding handshake share a two-second deadline. The cancellation regression fails before the fix. All 248 Linux runtime tests pass (12 privileged tests remain explicitly gated), with strict Linux all-target/all-feature Clippy.
+- [x] **C41** Collect structured observations for every owned VM and return exit 1 for missing/stopped VMs, unhealthy APIs or unknown evidence. The real CLI regression fails before the fix and passes all three cases afterwards (11.94s); status remains read-only and reports all owned nodes.
+- [x] **C42** Preserve labelled metric identities through queries, independent alert timers, API/dashboard/diagnostic output and webhook incident keys. Healthy or missing data from another series cannot resolve an alert; derived percentages require fresh components from the same labels. The masking and diagnostic-collapse regressions fail before the fix. All 181 Mayo tests pass with and without default features, plus 48 dashboard and 27 diagnostic tests and strict all-target/all-feature Clippy.
+- [x] **C43** Resolve short DNS names from runtime-owned source namespaces; unknown or ambiguous sources receive REFUSED on UDP and TCP. Remove the node-default override, restore verified network/source ownership during runc adoption, advance the allocation counter and withdraw bindings at teardown. The unknown-source regression fails before the fix. All 3,197 Linux library tests pass (18 explicit privileged gates), with 28 DNS unit tests, 14 wire tests and strict Linux Clippy. Two real containers resolve the same short name in different namespaces (8.78s); real adoption preserves and retires the binding without reusing its address (3.48s).
+- [x] **C44** Remove unused reporting worker listeners, preserve TLS/framing and bound upgrade-harness HTTP requests. Six transport unit tests and three real TCP/TLS integration tests pass. Linux qualification reproduced an ephemeral listener occupying another node's API port; the focused upgrade/rollback rerun passes in 74.61s, but an intermittent upgrade stall remains under V02 (one of three full-suite cases failed).
+
+- [x] **C45** Poll readiness publication alongside its subsystem owner, avoiding a fair-lock deadlock in both supervision loops. Both contention regressions fail before the fix; all ten readiness tests pass afterwards, including retired-attempt fencing and panic/restart behaviour. All three Linux upgrade/rollback/pause-resume cases pass in 177.50s after the repair; sustained qualification remains V02.
+
+- [x] **C46** Preserve authorised namespace/service identities through DNS fault publication and lookup; overlapping owners retain the latest expiry, and clearing one preserves the others. Missing namespaces and individual-instance DNS targets refuse without leaving registry entries. The cross-namespace wire regression fails before the fix; 32 DNS-filtered library tests, 14 wire tests, both final agent regressions and strict Linux all-target/all-feature Clippy pass.
+
+- [x] **C47** Persist exclusive ownership of the 509-address rootful pool before network mutation; serialise each instance lifecycle, refuse exhaustion and retain reservations on uncertain cleanup. Reuse requires confirmed namespace/veth removal and inspection/removal of owned nftables forwarding. Corrupt or conflicting journals and adoption refuse. The exhaustion regression fails before the fix; 255 runtime tests and strict Linux Clippy pass, plus real cancellation/restart recovery (0.32s), adoption/duplicate-create/reuse (4.32s), failed setup (2.26s) and orphaned forwarding retirement (0.16s). Abandoned reservations remain occupied until explicit runtime cleanup; physical crash qualification remains V02.
+
+- [x] **C48** Confine both upload Location responses to the declared registry origin before PATCH or PUT; refuse changed schemes/hosts/ports, URL credentials and fragments. Stop on POST/PATCH errors. The two-server credential-leak regression fails before the fix; all six OCI unit tests, authenticated uploads through the real Pickle API using relative and same-origin absolute locations (0.20s), and strict all-target/all-feature Clippy pass. Found while validating C33 endpoint discovery.
+
+- [x] **C49** Reject zero and overflowing token lifetimes before hashing or committing credentials. Both public API regressions fail before the fix and pass afterwards, covering multiplication overflow, clock overflow, normal expiry and explicit non-expiring tokens. Token unit tests and strict Linux/macOS Clippy pass. Found during C34 ownership work.
+
+- [x] **C50** Enforce scope and configured Deploy/HostExec permission checks for all app/job targets before any part of a manifest applies. Three admission regressions fail before the fix; all 113 API tests, eight route audits and strict Linux/macOS Clippy pass. Mixed manifests refuse before app commits or job commands.
+- [x] **C51** Require an unscoped user administrator for ordinary permission/quota declarations before any mixed-manifest mutation. Followers preserve caller credentials and upstream status/content type. Both admission and forwarding regressions fail before their fixes; 114 API tests (14.25s), real three-node acceptance with leader-side credential revocation (13.93s) and strict Linux/macOS Clippy pass. Lease-owned test namespaces retain their bounded exception.
+- [x] **C52** Require unscoped user administrators for token create/list/revoke, join-token creation, secret rotation and image signing. The scoped-credential escalation regression fails before the fix; six token API tests (2.33s), 114 API tests, 33 authentication tests, eight route audits and strict Linux/macOS Clippy pass. App- and namespace-scoped callers refuse before mutation; unrestricted token management still works.
+
+- [x] **C53** Require an unscoped administrator to inspect or release another credential's lease. Both API regressions fail before the fix; eight token/lease API tests (2.29s), 48 lease-filtered library tests (one explicit gate, 1.89s) and strict Linux/macOS Clippy pass. Exact scoped owners and unrestricted operator overrides retain access.
+
+- [x] **C54** Bound transient direct upstream registry reads to four attempts and one deadline (30 seconds for manifest/config, 120 seconds per layer), retaining permanent failures and digest-verified atomic publication. Hosted CI at `af32c3f` passed 42 privileged checks but failed the pinned pull with “Rate exceeded”. Three hermetic regressions fail first; all 33 image-store tests pass (7.62s), including stalled-request expiry and permanent denial, alongside strict Linux/macOS Clippy. The exact real privileged pinned-image test passes (1.93s). A later CI configuration-blob connection failure exposed missing transport retries. The interrupted-body regression fails first; manifest/config/layer retries then pass all 35 image tests on macOS/Linux with strict Clippy, and the real cold rootless port-adoption gate passes (4.65s). C56 tracks the independently discovered configuration/manifest integrity gap.
+
+- [x] **C55** Bound cross-node log response bodies and own cancellation. Both stalled-body and detached-request regressions fail first. Full-body timeout and JoinSet ownership pass 13 native query tests (0.12s), 62 Linux Ketchup tests (one explicit gate, 0.44s), all five cross-node tests on Linux/macOS (0.52s/0.14s) and strict Linux/macOS Clippy. The CI fixture correction is separate. A later native library run exposed a valid TCP reset on cancellation (3,294 passed, one fixture failed, five gates). The closure fixture now accepts EOF or ConnectionReset, retaining its deadline and rejecting every other result. All 13 query tests pass on macOS/Linux (0.12s each); the following native checkpoint passes 3,295 tests with five explicit gates (47.27s).
+
+- [x] **C56** Verify upstream raw manifests, requested index digests, selected platform descriptors and configuration bytes before cache publication. Direct/pull-through regressions fail first; forged headers, changed valid JSON, wrong configuration content and descriptor sizes are refused. Both consumers share the verified fetch path, and Pickle preserves the exact verified bytes without a second fetch. All 38 image and 232 Pickle tests pass on macOS/Linux, alongside strict Clippy. The real cold rootless port-adoption gate passes (3.51s).
+
+- [x] **C57** Validate upstream layer sizes before cache accounting or allocation, and require downloaded/cached bytes to match their descriptor length. Four regressions fail first, including a capacity-overflow panic when an untrusted size reaches `Vec::with_capacity`. All 42 image and 232 Pickle tests pass on macOS/Linux with strict Clippy; the real cold rootless pull and port-adoption gate passes (3.39s).
+
+- [x] **C58** Give Pickle upstream HEAD, manifest/configuration and layer reads the direct puller's bounded retry policy. Four HTTP regressions fail first; denial/integrity controls remain terminal. All 47 image and 232 Pickle tests pass on macOS/Linux, including interrupted bodies, original deadlines and four-attempt limits, with strict Clippy on both.
+
+
+Hosted minimum-Rust CI at `9747fba` passed 3,658 tests but failed the cross-node
+log partial-result fixture (zero healthy rows). Its transport-only case now
+serves fixed entries without cold SQL planning under the two-second deadline;
+the other four cases retain real storage and report storage errors explicitly.
+All five pass on Linux/macOS (0.52s/0.14s), along with strict Clippy. The build
+workflow at that head passed; the repaired fixture needs current-head hosted
+validation. Superseded `f9c0e2c` workflows were cancelled for runner capacity.
+
+Both CI and Build & Release pass at `a7da1e5`. At `230751b`, both workflows also pass, including the repaired
+minimum-Rust fixture and coverage. These are historical checkpoints, not final-candidate qualification.
+The source/build workflows now give each PR one concurrency group, cancelling
+superseded revisions while preserving independent main/tag runs and separating
+reusable source CI from its release caller. YAML syntax and group expressions
+are checked. Hosted CI for `d358bbc` was automatically cancelled when
+`48ce34f` superseded it; the completed build for `d358bbc` passed.
 
 ### Engineering follow-ups
 
-- [ ] **H01** (P2) Remove stale wiring claims and validate documentation.
-- [ ] **H02** (P3) Remove or deliberately expose unused helper entry points.
-- [ ] **H03** (P2) Resolve inert configuration and wire fields explicitly.
-- [ ] **H04** (P3) Use typed alert and scheduler error contracts.
+- [x] **H01** Reconcile scheduler/quota/scrape wiring and weights, roadmap test locations, cleanup evidence and disabled-auth chaos policy with their callers. Mark completed historical bug groups done while retaining C30/C34 and future operator workflows. Repair eleven Rustdoc errors; all-feature public documentation now builds with warnings denied, all 74 relative links in the changed Markdown pass, and the four documented diagnostic CLI help interfaces are verified.
+- [x] **H02** Remove the obsolete proxy/autoscaler wrappers and unused memory-pressure allocation calculator. Record callers, tests and explicit library-only contracts for retained DNS, Pickle, lease, deadline, fault-query and crypto/model helpers. CA recovery remains F04; misplaced CA documentation was already C15/H01. All 3,340 Linux library tests (19 explicit gates, 67.65s), 14 DNS and 16 Pickle integration tests, native autoscaler/Wrapper/Smoker suites and strict Linux/macOS Clippy pass.
+- [x] **H03** Resolve inert fields: remove the unused node `release_url` (use the CLI's `--url`), Wrapper thread-count/strategy fields and local gossip timestamp counter. Preserve the legacy timestamp wire slot as explicitly reserved and ignored. The URL regression fails first; legacy bytes and stale-incarnation ordering are covered. All 174 Linux configuration-filtered, 154 gossip and 94 Wrapper tests, corresponding native suites and strict Linux/macOS Clippy pass. The earlier actual-bound-port startup repair remains verified. Remote resource/image propagation is F01.
+- [x] **H04** Use typed alert and scheduler error contracts. Alert responses now use a shared required envelope and enum through Bun, Relish, the TUI and diagnostics. The malformed-HTTP regression fails first; valid empty and labelled firing inventories retain their wire format. All 330 Relish tests, 19 evaluator tests and 118 API tests pass on native macOS and Linux, together with strict Clippy on both. Capacity now uses a bounded request to the live leader scheduler, a shared typed refusal naming the next app, and complete cluster status before counting or returning workloads. Missing/unready evidence, malformed responses, wrong IDs, expired leases and ordinary API errors cannot score saturation. Both original HTTP regressions fail first. All 15 capacity-filtered, 64 cluster, 124 testkit, 332 Relish and 118 API tests pass on Linux; real three-node follower refusal/non-mutation and accepted ProcessGrill placement pass on macOS/Linux (17.86s/21.26s). The final native library checkpoint passes 3,295 tests with five explicit gates (47.27s), after the separately committed TCP-reset fixture correction. Strict Linux/macOS Clippy passes. This does not claim a full OCI saturation run or final candidate qualification.
 - [ ] **H05** (P3) Split modules along existing ownership boundaries.
-- [ ] **H06** (P3) Evaluate shared DNS and duration parsers.
-- [ ] **H07** (P3) Add useful public API doctests.
-- [ ] **H08** (P2) Identify and eliminate leaked test processes.
-- [ ] **H09** (P3) Complete node-pressure diagnostic hygiene.
-- [ ] **H10** (P3) Reuse one egress observation per health tick.
-- [ ] **H11** (P2) Declare and test the actual Rust/toolchain baseline.
+- [x] **H06** Evaluate shared DNS and duration parsers. A real UDP regression reproduces an answer to truncated QCLASS. Hickory now decodes complete packets and encodes responses; Onion retains operation, source and namespace admission. Malformed/trailing/compressed-loop questions refuse, while EDNS0, A/AAAA, fault and namespace behaviour are covered. All 29 DNS unit and 17 wire tests pass on macOS/Linux; the native library checkpoint passes 3,302 tests with five gates (38.52s), with strict Clippy on both. An executed humantime comparison justifies retaining the distinct duration grammars; compatibility and arbitrary-text property tests cover that decision. C17 separately fixes numeric overflow. `make audit` passes for the updated lockfile.
+- [x] **H07** Execute public configuration and endpoint-validation examples: parsing plus semantic validation, unknown-key refusal and typed remote-plaintext refusal. Two doctests pass on native Rust 1.98 and Linux Rust 1.97 with default/no-default features; all-feature Rustdoc builds with warnings denied. Chapter 15 explains the Rust syntax and test contract.
+- [x] **H08** Require nextest 0.9.145 and pin it in CI. The captured leak named the subprocess-free metrics backfill test; upstream 0.9.145 fixes sibling capture-pipe inheritance on macOS. With that runner, all 3,433 default and 3,393 no-default tests pass without leaks (70.80s / 63.02s). The existing 100 ms leak deadline is unchanged and future leaks now fail the gate. Older runners refuse with exit 92; both READMEs and the book explain the requirement.
+- [x] **H09** Complete node-pressure diagnostic hygiene. Continuous bounded stderr draining repairs the reproduced readiness deadlock and preserves failure/timeout prefixes with truncation evidence. Four real privileged Linux cases pass (6.41s), including process/thread death and stale-cgroup reclamation; 114 Smoker tests (three explicit gates) and strict Linux/macOS Clippy pass. A delayed-exec regression reproduces creator-thread death before signal installation while its process stays alive. Bun now records the creator TID without an intervening await; the helper checks that task after arming the signal and before applying pressure. All four privileged cases pass again (6.69s), including this refusal and cleanup, with strict Linux/macOS Clippy.
+- [x] **H10** Reuse the enforcement check’s capability for readiness within one health tick. Later ticks/reports remain fresh, and repairs retain their verification read. The call-count regression fails first and passes in portable/eBPF builds; all 437 native Bun tests (one explicit gate, 20.15s), real hook-loss fencing plus readiness withdrawal (1.37s) and strict native/Linux Clippy pass.
+- [x] **H11** Declare Rust 1.97, pin release/CI builds to 1.98.0 and add a locked minimum-compiler CI job for both feature configurations, including stacked PR triggers. Linux 1.97 checks every target/feature and passes 3,155 default plus 3,115 no-default library tests; macOS 1.98 passes 3,413 default plus 3,373 no-default portable tests. The no-default process leak remains H08. Build/rebuild policy and both READMEs are updated.
 
-- [ ] **H12** (P2) Resolve the active Thrift dependency alert and qualify its parsing path before publication.
+- [x] **H12** Upgrade to Thrift 0.23 and patch Parquet's independent compact decoder with bounded integer/allocation checks and error-returning truncated reads. The public-reader regression fails against unpatched Parquet; six boundary tests, all 3,433 portable tests, strict all-target/all-feature Clippy and `make audit` pass. The portable run retains one H08 leak report. Upstream source, checksum, licences and exact patch are committed; DataFusion/Arrow versions remain unchanged.
 
 ### Missing capabilities and longer-term scope
 
@@ -96,7 +205,7 @@ remain separate. Older unchecked groups below point into this current ledger.
 - [ ] **F03** (feature) Finish upstream image trust and worker key separation.
 - [ ] **F04** (feature) Add supported CA recovery and rotation operations.
 - [ ] **F05** (feature) Complete namespace-scoped identity and token lifecycle.
-- [ ] **F06** (feature) Complete the metrics/query and reporting architecture.
+- [ ] **F06** (feature) Complete the metrics/query and reporting architecture, including event production and versioned chunking beyond C21’s explicit admission limits.
 - [ ] **F07** (feature) Finish cross-node views and log-stream capabilities.
 - [ ] **F08** (feature) Complete WebSocket ingress parity and certificate automation.
 - [ ] **F09** (feature) Implement packet-level delay/bandwidth faults if retained.
@@ -106,11 +215,20 @@ remain separate. Older unchecked groups below point into this current ledger.
 
 ### Acceptance and release gates
 
-- [ ] **V01** (gate) Qualify the complete live three-node catalogue.
-- [ ] **V02** (gate) Qualify sustained TLS, storage and upgrade recovery.
+Release signing preparation: a replacement 0.1.0 public identity is committed
+and its matching private key is configured as `RELIABURGER_RELEASE_KEY` in
+repository Actions. Local signature verification and all five packaging tests
+pass. This is preparation only; signed candidate qualification remains V03.
+
+- [ ] **V01** (gate) Qualify the complete live three-node catalogue. Hosted multi-node CI caught a valid fail-closed missing-leader refusal that the chaos test accepted only as a quorum error. The test now recognises the two explicit leader-evidence refusals and checks that neither surviving node acquires a fault; real Linux reversal/recovery passes in 16.37s. The legacy partition test also waits for a known leader and stable three-voter membership, preserving the valid refusal during bootstrap; its real isolation/recovery case passes in 15.04s. C06 concurrent reservation safety now has live acceptance; the complete catalogue remains open.
+- [ ] **V02** (gate) Qualify sustained TLS, storage and upgrade recovery. A broad Linux run exposed ETXTBSY when launching a newly written verified upgrade probe (3,276 pass, one fails, 19 explicit gates). The probe now retries only ETXTBSY within the original ten-second query deadline. The concurrent preparation regression and the full Linux library checkpoint pass (3,281 tests, 19 explicit gates; 50.55s), together with strict Linux/macOS Clippy. The stress regression also passed before the repair; the earlier full-suite failure is the defect evidence. The upgrade harness now gives large debug-binary uploads a bounded 60-second budget while retaining five-second status requests; the previous shared deadline failed before replacement began. Rollback preflight also waits for the restarted leader to see every target alive, preserving the server's refusal while its membership is incomplete. All three cases pass in 198.90s; sustained/cold-candidate qualification remains open.
+  Cluster-upgrade CI at `78119fd` refused debug-binary uploads with HTTP 413. The harness now strips symbols from a private fixture before signing; all three real Linux upgrade/rollback/pause-resume cases pass in 200.22s. This repairs the harness and does not close sustained qualification.
 - [ ] **V03** (gate) Publish and install the exact signed candidate.
+  - [x] Preserve a complete signed candidate with source/run identity and per-file hashes; promote only the qualified bytes, checking tag/provenance and uploaded digests without rebuilding. All 17 packaging/candidate tests pass on macOS/Linux. Manual workflow execution awaits merge to main; no tag or release was created.
+  - [x] Add explicit HTTPS candidate mirrors to both installers and managed setup without rewriting assets or bypassing checksums/signatures. Local candidate verification needs no release tag. Installer/CLI regressions fail first; 18 packaging tests, 32 managed tests and 85 CLI tests pass on Linux/macOS with strict Clippy. The built CLI refuses invalid mirrors before creating state. The full library checkpoint passes 3,338 macOS/3,392 Linux tests (five/19 explicit gates).
+  - [ ] Qualify hosted candidate creation, staged HTTPS delivery and actual signed installation before promotion.
 - [ ] **V04** (gate) Measure repeated cold installs on the advertised host matrix.
-- [ ] **V05** (gate) Review dependency exceptions before their deadline.
+- [x] **V05** Review all exceptions against the current RustSec database and [record their reachability and migration dispositions](qualification/2026-09-18-dependency-exceptions.md). Remove rustls-pemfile and its exception; retain four explicitly until 18 November 2026. `make audit` also refuses an active rkyv graph or failed inspection. The failing-first gate regression passes on Linux and macOS, and the real audit passes across 707 locked packages. Twelve TLS unit, 17 client, seven ingress and three file-reload tests plus strict Linux/macOS Clippy validate the parser migration. This review does not waive later dependency/feature changes or candidate qualification.
 
 ## Current release checklist
 
@@ -1648,8 +1766,8 @@ verification alone; its separate gossip-rejoin deadline remains unfinished.
 ### Optional
 
 - [ ] Ownership-based module splits (O1) (current backlog: H05)
-- [ ] Library-backed DNS/duration parsing where compatibility tests justify it (O2) (current backlog: H06)
-- [ ] Public API doctests (O3) (current backlog: H07)
+- [x] Library-backed DNS parsing and evaluated retention of duration grammars (O2; H06)
+- [x] Public API doctests (O3) — H07 adds and executes configuration/client endpoint examples in both Linux feature configurations and on macOS.
 - [ ] Production TC DNS fast-path evaluation if profiling justifies it (O4) (current backlog: F09)
 - [x] Audit shipped/planned/experimental claims (O5, Phase 16 Sections D–G). Mechanical drift prevention and new findings remain ongoing work.
 
@@ -1926,10 +2044,9 @@ work, not by `M1`.
   was unreachable and every non-`.internal` query SERVFAILed — a failure that reads as "DNS is
   broken" rather than "your upstream is v6". The forward socket now binds the upstream's
   address family, proven against real v4 and v6 loopback resolvers.
-  **Residual:** a bare `<app>.internal` still resolves in the node's `default_namespace`
-  rather than the caller's. Fixing it needs a source-IP→namespace map the userspace responder
-  doesn't have (the limitation is already documented on `DnsConfig::default_namespace`), and
-  eBPF connect enforcement remains the primary control here
+  **Closed by C43:** bare names now require a runtime-owned source namespace on both
+  transports. Unknown/ambiguous sources fail explicitly; qualified names remain available.
+  Network admission/enforcement remains separate from DNS naming.
 - [x] `O20` stale/misleading docs and dead code sweep — one genuine bug, one leak, two
   honesty fixes, one deletion, one already-fine:
   - [x] **Bug:** the gossip datagram was bincode-deserialised before its HMAC was checked (it
@@ -2500,9 +2617,9 @@ blocking calls).
   minutes it already holds and keeps the rest; no wire change (bincode discriminants are
   pinned), and the worker clears the backfill flag only after every send succeeds
   (partial-failure re-sends are idempotent). The silent-lost-push half was fixed in the
-  main Medium PR. _Residuals: minutes held by **both** aggregators still overlap at query
-  merge (inherent to reassignment without handoff), and a node whose single rollup exceeds
-  `MAX_REPORT_SIZE` (1 MiB) still can't push — chunking is untracked work._
+  main Medium PR. C20 now deduplicates worker/minute/series ownership across
+  aggregators at query merge. A single rollup exceeding `MAX_REPORT_SIZE` (1 MiB)
+  still cannot be pushed; bounded chunking is tracked as C21.
 - [x] **Placement reconciler orphans instances on a failed stop** —
   `src/cluster/orchestrate.rs:847-857` fires `AgentCommand::Stop` with the response oneshot
   dropped and unconditionally does `applied.remove(...)` even if the send/stop failed, so no
@@ -2594,35 +2711,15 @@ blocking calls).
 ### Low — hygiene, minor bugs, stale docs
 
 - [x] **TUI log switching and viewport sizing** — subscription generations reject late lines/errors; both log views use the actual terminal height (`90d7081`, `cfd6d81`; reducer and viewport regressions).
-- [ ] **Stale TODO / doc drift** (current backlog: H01) — `src/meat/filter.rs:41` `TODO(wiring)` is stale
-  (`apply_upgrade_cordon` *is* wired via `orchestrate.rs:172`, `bin/bun.rs:1001`), delete it;
-  `src/meat/score.rs:3-8` doc claims a "0–130 scale, Spread (40)" but constants give
-  `WEIGHT_SPREAD = 60`, max 150; `src/mayo/scrape.rs:114-122` "there is no scrape loop yet"
-  is stale (loop at bin/bun.rs:1400-1416); `src/meat/quota.rs:204-207` and
-  `src/mustard/dissemination.rs:180-189` carry stale/left-in editing notes;
-  `docs/roadmap.md:686` Phase 15 "Tests (write first)" names 7 integration tests that live
-  only as in-module unit tests, and roadmap.md has no Phase 16 section at all.
+- [x] **Stale TODO / doc drift** — H01 updates cordon/quota/scrape comments against their production callers, corrects the scheduler weights in source and chapter 2, and gives Phase 15's actual test locations plus a Phase 16 roadmap entry. Current tests already cover the dissemination code; no editing note remains there.
 - [x] **Bootstrap, GitOps and disk-pressure export errors** — fresh council failures propagate, unavailable sync queues return 503 without consuming delivery IDs, and failed exports are logged (`3d302de`, `b7735ba`, `7acb36b`).
 - [x] **HTTP health-probe pooling and attribution** — pooled requests retain deadlines and distinguish local client errors from workload refusal (`3c78b09`).
 - [x] **The listed startup/testapp/client-construction panics** — storage errors propagate, occupied testapp ports return errors, and invalid client trust configuration fails explicitly (`a805575`, `d70699d`, `e346aec`). This is not a claim that all public panic paths are eliminated.
-- [ ] **Unwired library-only helpers** (current backlog: H02/F04) (delete or wire): `src/wrapper/proxy.rs:343`
-  `run_proxy`; `src/onion/dns.rs:364-375` `run_dns_responder`; `src/sesame/identity.rs:543-551`
-  `extend_grace_period` (so `RotationState::GracePeriod` and the documented 4-hour grace
-  extension are unreachable; failed rotation marches to `Expired` with an `eprintln`);
-  `src/sesame/secret.rs:197-221` `unseal_with_age` (the sealed root-CA backup `relish init`
-  writes has no restore path); `src/meat/autoscaler.rs:278-316` `run_autoscale_loop` (still
-  contains the DEP8 bug the wired path fixed); `src/pickle/pull.rs:193`
-  `image_available_locally`; `src/relish/client.rs:707` `renew_test_lease`; various
-  smoker helpers (`resource.rs:230`, `types.rs:285`, `registry.rs:155,188`).
-- [ ] **Dead wire/config fields** (current backlog: H03) — `src/mustard/message.rs:171` `lamport` is stamped and
-  shipped "for causal ordering" but never read (conflict resolution is incarnation-only);
-  `src/wrapper/types.rs:136-142` `LoadBalanceStrategy::LeastConnections` is populated but
-  `select_backend` is unconditionally round-robin; `src/wrapper/types.rs:99`
-  `worker_threads` is mapped but never read; `MembershipSnapshot.resources` / `cached_images`
-  are unpopulated for remote peers, so council resource-eligibility (`selection.rs:113-120`)
-  and image-locality scoring (`score.rs:103-111`) are inert in production.
+- [x] **Unwired library-only helper inventory** — H02 removes obsolete alternatives and records supported library callers/tests. It does not implement the F04 CA recovery/rotation workflows.
+- [x] **Dead wire/config fields** — H03 removes unused Wrapper settings and node release URLs, and explicitly reserves the unchanged legacy gossip timestamp slot. See the current ledger for test evidence.
+- [ ] **Remote resource/image propagation** (current backlog: F01) — remote cached-image and GPU capacity evidence remains planned; resolving inert API fields does not implement it.
 - [x] **Authorisation matrix checks methods as well as paths** (`e5f4208`), and dashboard desired counts come from desired state (`afee562`, `f1882be`).
-- [ ] **Remaining minor-correctness group** (current backlog: C01–C04/C13/C18–C19/C22) — premature port exhaustion, hand-written certificate-date conversion, prune counts after failed deletion, and growing export checkpoint history remain. The September audit also identifies archive overwrite and destination-scope defects.
+- [x] **Remaining minor-correctness group** — C01–C04, C13, C18–C19 and C22 are implemented and verified on this branch: archive preservation/scope/durability, bounded port allocation, precise certificate validity, truthful prune counts and bounded export receipts. See their current-ledger evidence above.
 - [x] **Native Apple mounts and publication** — bind/config mounts, process identity, working directory, read-only root and published ports are translated and live-tested (`bbe9c9b`). Broader runtime parity remains experimental.
 - [ ] **Planned capability boundaries** (current backlog: F06/F08) — PromQL, remote read, extra rollup tiers and live WebSocket drain-close remain unimplemented. Labelling them planned completed the documentation task, not these features.
 
@@ -2706,8 +2803,8 @@ and a handful of test cases whose assertions are too loose to catch the bug they
 - [x] **Scope/quota cases accept any error as success** — the scope case now passes only
   on the AUTH1 refusal itself (`ApiError { 403 }` with "token scope does not allow" in
   the body — status alone is insufficient, a role failure is also 403); transport errors
-  become `unknown`, other errors fail, and a `token_revoke` failure no longer clobbers a
-  genuine verdict. The quota case's premise was wrong — **quota is enforced at
+  become `unknown` and other errors fail. C34 now uses a read-only scope probe
+  and server-owned token cleanup, independent of client survival. The quota case's premise was wrong — **quota is enforced at
   scheduling time** (the placement pass skips and logs; no council refusal reason
   exists), so the second apply *succeeds* — rewritten to assert the real observable:
   quota-b stays at `scheduled_replicas == 0` (via `desired_apps` evidence, with a settle
@@ -2721,6 +2818,6 @@ and a handful of test cases whose assertions are too loose to catch the bug they
 **Low — hygiene and minor bugs from the deep pass:**
 
 - [x] **Relish liveness, client configuration, streamed UTF-8 and offline export errors** — health validates the response; invalid trust settings return errors; split UTF-8 survives SSE framing; explicit offline export validates paths and reports checkpoint failures (`6ee50a6`, `e346aec`, `a057634`, `df91a67`, `cfb483f`).
-- [ ] **Remaining CLI robustness** (current backlog: C17/C23/C39/H01) — `parse_since` still multiplies unchecked (reproduced exit 101 for `18446744073709551615d`); development VM commands retain non-UTF-8 path unwraps; diagnostic certificate wording and misplaced API docs need correction.
+- [x] **Remaining CLI robustness** — C17 rejects duration overflow, C23 reports encoded certificate expiry, C39 rejects invalid development paths before mutation, and C15/H01 correct the misplaced CA API documentation. Their regressions and verification are recorded above.
 - [x] **Cluster collection, deadlines, deployment history and ingress acceptance** — incomplete collection fails, waits share the case deadline, history must contain both tested versions, and ingress polls exact responses using credential-free clients and isolated hosts (`c6163b8`, `265aa99`, `6b3400f`). Expired queued capabilities refresh (`3f97aea`); three live ingress cases passed.
-- [ ] **Remaining test-harness robustness** (current backlog: C29–C36/H01–H02) — registry URLs still split on `:` (breaking IPv6 and ignoring configured registry ports), teardown prose overstates client guarantees, unused helpers remain, and fully disabled-auth workload faults retain different semantics from node faults. Broader runner/lease/verdict defects are tracked in the completion plan.
+- [ ] **Remaining test-harness robustness** — C29, C31–C33 and C35–C36 are complete; H01 now describes cleanup evidence and disabled-auth workload/node policy accurately. C30 catalogue fixtures and C34 remaining resource ownership stay open; H02 now records every helper disposition.

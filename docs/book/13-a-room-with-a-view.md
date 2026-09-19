@@ -232,3 +232,19 @@ wasted space on a tall one. Each entry occupies one row, with long lines clipped
 horizontally, so wrapping can't push the tail below the viewport. Home clamps to
 the oldest available page instead of skipping beyond the buffer. Tests render
 both log views at short and tall sizes and check the newest and oldest entries.
+
+### Keep the node attached to every replica
+
+The terminal used to fetch the connected node's instances. An application whose
+only replica ran elsewhere disappeared from the list. The provider now requests
+cluster status and carries `ClusterInstanceStatus` through the message and state
+types. That wrapper keeps node identity beside the existing instance fields;
+renderers borrow the nested instance and the detail table displays its node.
+Applications still group by both name and namespace.
+
+An HTTP fixture returns a remote-only replica only for the cluster request, and
+a second fixture returns an incomplete-cluster error. The UI preserves its last
+successful data on that error and displays the failure. Screen snapshots cover
+the node column and the explicit connected-node scope of logs and deployment
+history. Those views don't acquire cluster-wide coverage merely because the
+application list does.

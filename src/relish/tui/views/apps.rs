@@ -12,16 +12,19 @@ pub fn aggregate(app: &TuiApp) -> Vec<(String, String, usize, usize, String, u32
     let mut rows: BTreeMap<(String, String), AppAggregate> = BTreeMap::new();
     for instance in &app.data.instances {
         let entry = rows
-            .entry((instance.app_name.clone(), instance.namespace.clone()))
+            .entry((
+                instance.instance.app_name.clone(),
+                instance.instance.namespace.clone(),
+            ))
             .or_insert((0, 0, "running".into(), 0, Vec::new()));
         entry.1 += 1;
-        if instance.state == "running" {
+        if instance.instance.state == "running" {
             entry.0 += 1;
         } else {
-            entry.2 = instance.state.clone();
+            entry.2 = instance.instance.state.clone();
         }
-        entry.3 += instance.restart_count;
-        if let Some(port) = instance.host_port {
+        entry.3 += instance.instance.restart_count;
+        if let Some(port) = instance.instance.host_port {
             entry.4.push(port.to_string());
         }
     }

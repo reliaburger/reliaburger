@@ -88,7 +88,7 @@ fn endpoint_environment_rejects_remote_plaintext_before_dispatch() {
 }
 
 #[test]
-fn offline_log_export_reports_a_checkpoint_write_failure() {
+fn offline_log_export_refuses_an_unreadable_checkpoint_before_upload() {
     let dir = tempfile::tempdir().unwrap();
     let source = dir.path().join("source");
     let dest = dir.path().join("dest");
@@ -108,8 +108,12 @@ fn offline_log_export_reports_a_checkpoint_write_failure() {
         .unwrap();
     assert_eq!(output.status.code(), Some(1));
     assert_eq!(
-        std::fs::read(dest.join("local/logs.parquet")).unwrap(),
+        std::fs::read(source.join("logs.parquet")).unwrap(),
         b"exported bytes"
+    );
+    assert!(
+        !dest.exists(),
+        "invalid checkpoint must be refused before upload"
     );
     assert!(String::from_utf8_lossy(&output.stderr).contains("checkpoint"));
     assert!(
@@ -169,4 +173,63 @@ fn offline_log_export_rejects_a_missing_source() {
         .unwrap();
     assert!(!output.status.success());
     assert!(output.stdout.is_empty());
+}
+
+#[tokio::test]
+async fn cancel_deploy_waits_for_terminal_evidence_and_refuses_unknown_success() {
+    use axum::{
+        Json, Router,
+        routing::{get, post},
+    };
+    for outcome in ["cancelled", "unknown"] {
+        let accepted = serde_json::json!({
+            "id": "deploy-test", "phase": "deploying_apps", "outcome": null,
+            "started_at": 1, "phase_changed_at": 1, "finished_at": null,
+            "cancellation_requested_at": 2, "targets": [], "current_target": null,
+            "message": "cancellation requested",
+        });
+        let mut finished = accepted.clone();
+        finished["phase"] = "finished".into();
+        finished["outcome"] = outcome.into();
+        finished["finished_at"] = 3.into();
+        finished["message"] = "worker finished".into();
+        let app = Router::new()
+            .route(
+                "/v1/deploys/operations/deploy-test/cancel",
+                post(move || async move { (axum::http::StatusCode::ACCEPTED, Json(accepted)) }),
+            )
+            .route(
+                "/v1/deploys/operations",
+                get(move || async move {
+                    Json(serde_json::json!({"active_deploys": [], "history": [finished]}))
+                }),
+            );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let endpoint = format!("http://{}", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let output = tokio::time::timeout(
+            std::time::Duration::from_secs(60),
+            tokio::process::Command::new(env!("CARGO_BIN_EXE_relish"))
+                .args(["--output", "json", "cancel-deploy", "deploy-test"])
+                .env("RELIABURGER_ENDPOINT", endpoint)
+                .env_remove("RELIABURGER_TOKEN")
+                .env_remove("RELIABURGER_CA_CERT")
+                .kill_on_drop(true)
+                .output(),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        server.abort();
+        let _ = server.await;
+        assert_eq!(
+            output.status.success(),
+            outcome == "cancelled",
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let record: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+        assert_eq!(record["outcome"], outcome);
+        assert_eq!(record["phase"], "finished");
+    }
 }

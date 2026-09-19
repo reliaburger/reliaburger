@@ -18,6 +18,16 @@ struct BunProcess {
 
 impl BunProcess {
     fn spawn(config: &Path, address: SocketAddr, clustered: bool, log_path: PathBuf) -> Self {
+        Self::spawn_runtime(config, address, clustered, log_path, "process")
+    }
+
+    fn spawn_runtime(
+        config: &Path,
+        address: SocketAddr,
+        clustered: bool,
+        log_path: PathBuf,
+        runtime: &str,
+    ) -> Self {
         let log = std::fs::File::create(&log_path).unwrap();
         let mut command = Command::new(env!("CARGO_BIN_EXE_bun"));
         command
@@ -26,7 +36,7 @@ impl BunProcess {
             .arg("--listen")
             .arg(address.to_string())
             .arg("--runtime")
-            .arg("process")
+            .arg(runtime)
             .stdout(Stdio::from(log.try_clone().unwrap()))
             .stderr(Stdio::from(log));
         if clustered {
@@ -84,7 +94,7 @@ fn reserve_ports() -> [u16; 3] {
 /// How a freshly spawned bun came up.
 enum BunStart {
     /// The API answered on its address; every earlier bind succeeded.
-    Ready,
+    Ready(SocketAddr),
     /// Bun exited with "Address already in use": between reserving a port
     /// and bun binding it, another process on the runner grabbed it.
     PortRace,
@@ -102,8 +112,20 @@ fn wait_for_bind(bun: &mut BunProcess, address: SocketAddr) -> BunStart {
             }
             panic!("bun exited before binding its listeners ({status}):\n{log}");
         }
-        if TcpStream::connect_timeout(&address, Duration::from_millis(100)).is_ok() {
-            return BunStart::Ready;
+        let bound_address = if address.port() == 0 {
+            std::fs::read_to_string(&bun.log_path)
+                .unwrap_or_default()
+                .lines()
+                .find_map(|line| line.strip_prefix("bun: API server listening on "))
+                .and_then(|address| address.parse::<SocketAddr>().ok())
+                .filter(|address| address.port() != 0)
+        } else {
+            Some(address)
+        };
+        if let Some(address) = bound_address
+            && TcpStream::connect_timeout(&address, Duration::from_millis(100)).is_ok()
+        {
+            return BunStart::Ready(address);
         }
         assert!(Instant::now() < deadline, "bun never listened on {address}");
         std::thread::sleep(Duration::from_millis(25));
@@ -119,16 +141,27 @@ fn wait_for_bind(bun: &mut BunProcess, address: SocketAddr) -> BunStart {
 /// the exact "Address already in use" exit. `build` reserves fresh ports,
 /// writes the config and returns `(config, api_address, log_path)`; on the
 /// race it runs again, so nothing from the lost attempt is reused.
-fn spawn_bun_with_port_retry<F>(clustered: bool, mut build: F) -> (BunProcess, SocketAddr)
+fn spawn_bun_with_port_retry<F>(clustered: bool, build: F) -> (BunProcess, SocketAddr)
+where
+    F: FnMut() -> (PathBuf, SocketAddr, PathBuf),
+{
+    spawn_bun_with_runtime_port_retry(clustered, "process", build)
+}
+
+fn spawn_bun_with_runtime_port_retry<F>(
+    clustered: bool,
+    runtime: &str,
+    mut build: F,
+) -> (BunProcess, SocketAddr)
 where
     F: FnMut() -> (PathBuf, SocketAddr, PathBuf),
 {
     const ATTEMPTS: usize = 3;
     for attempt in 1..=ATTEMPTS {
         let (config, address, log_path) = build();
-        let mut bun = BunProcess::spawn(&config, address, clustered, log_path);
+        let mut bun = BunProcess::spawn_runtime(&config, address, clustered, log_path, runtime);
         match wait_for_bind(&mut bun, address) {
-            BunStart::Ready => return (bun, address),
+            BunStart::Ready(address) => return (bun, address),
             BunStart::PortRace => {
                 let log = std::fs::read_to_string(&bun.log_path).unwrap_or_default();
                 assert!(
@@ -348,7 +381,7 @@ fn secure_cluster_first_run_initialises_authenticates_and_deploys() {
         std::fs::write(&node_path, toml::to_string_pretty(&node).unwrap()).unwrap();
         (
             node_path.clone(),
-            reserve_address(),
+            "127.0.0.1:0".parse().unwrap(),
             root.path().join("cluster-bun.log"),
         )
     });
@@ -420,7 +453,7 @@ command = [{testapp:?}, "--port", "0"]
     ]);
     assert_success(&apply, "authenticated clustered apply");
 
-    wait_for_relish_output(
+    let status = wait_for_relish_output(
         &mut bun,
         &[
             "--endpoint",
@@ -429,9 +462,18 @@ command = [{testapp:?}, "--port", "0"]
             ca,
             "--token",
             token,
+            "--output",
+            "json",
             "status",
         ],
-        "cluster-hello",
+        "\"state\": \"running\"",
+    );
+    let rows: serde_json::Value = serde_json::from_slice(&status.stdout).unwrap();
+    assert!(
+        rows.as_array()
+            .unwrap()
+            .iter()
+            .any(|row| { row["app_name"] == "cluster-hello" && row["state"] == "running" })
     );
 }
 
@@ -579,8 +621,9 @@ fn post_bootstrap_join_tokens_enrol_two_distinct_nodes_and_fail_closed() {
     }
     assert_ne!(issued[0], issued[1]);
 
+    use rustls::pki_types::{CertificateDer, pem::PemObject};
     let root_ca = std::fs::read(&ca_path).unwrap();
-    let root_ca_der = rustls_pemfile::certs(&mut root_ca.as_slice())
+    let root_ca_der = CertificateDer::pem_slice_iter(&root_ca)
         .next()
         .unwrap()
         .unwrap();
@@ -805,4 +848,781 @@ command = ["true"]
     ]);
     assert_eq!(join.status.code(), Some(1));
     assert!(String::from_utf8_lossy(&join.stderr).contains("join failed"));
+}
+
+#[test]
+fn secure_bun_renews_a_due_node_leaf_and_reuses_it_after_restart() {
+    use reliaburger::sesame::{bootstrap, ca, crypto, identity_store, types::CaRole};
+    let root = tempfile::tempdir().unwrap();
+    let cluster_dir = root.path().join("cluster");
+    assert_success(
+        &run_relish(&[
+            "init",
+            cluster_dir.to_str().unwrap(),
+            "--cluster-name",
+            "renewal-startup",
+            "--node-id",
+            "node-01",
+        ]),
+        "initialise renewal fixture",
+    );
+    let node_path = cluster_dir.join("reliaburger.toml");
+    let mut node = reliaburger::config::NodeConfig::from_file(&node_path).unwrap();
+    node.node.name = Some("node-01".into());
+    node.network.advertise_address = Some("127.0.0.1".into());
+    node.storage.data = root.path().join("data");
+    node.storage.images = root.path().join("images");
+    node.storage.logs = root.path().join("logs");
+    node.storage.metrics = root.path().join("metrics");
+    node.storage.volumes = root.path().join("volumes");
+    node.images.registry_port = 0;
+    let identity_dir = node.security.identity_dir.as_ref().unwrap().clone();
+    let mut identity = identity_store::load(&identity_dir).unwrap().unwrap();
+    let original_serial = identity.serial;
+    let master =
+        bootstrap::load_master_key(node.security.master_key_path.as_ref().unwrap()).unwrap();
+    let state =
+        bootstrap::load_bootstrap_state(node.security.bootstrap_path.as_ref().unwrap()).unwrap();
+    let issuer = state.get_ca(CaRole::Node).unwrap();
+    let ca_key = rustls::pki_types::PrivateKeyDer::try_from(
+        crypto::unwrap_key(&master, issuer.private_key_wrapped.as_ref().unwrap()).unwrap(),
+    )
+    .unwrap();
+    let ca_key =
+        rcgen::KeyPair::from_der_and_sign_algo(&ca_key, &rcgen::PKCS_ECDSA_P256_SHA256).unwrap();
+    let issuer_params = rcgen::CertificateParams::from_ca_cert_der(
+        &rustls::pki_types::CertificateDer::from(issuer.certificate_der.clone()),
+    )
+    .unwrap();
+    let issuer = issuer_params.self_signed(&ca_key).unwrap();
+    let key = rcgen::KeyPair::generate().unwrap();
+    let mut params = rcgen::CertificateParams::default();
+    params.serial_number = Some(identity.serial.0.into());
+    params.subject_alt_names = vec![rcgen::SanType::URI(
+        ca::node_spiffe_uri("node-01").try_into().unwrap(),
+    )];
+    params.extended_key_usages = vec![
+        rcgen::ExtendedKeyUsagePurpose::ServerAuth,
+        rcgen::ExtendedKeyUsagePurpose::ClientAuth,
+    ];
+    let now = time::OffsetDateTime::now_utc();
+    params.not_before = now - time::Duration::seconds(300);
+    params.not_after = now + time::Duration::seconds(120);
+    identity.certificate_der = params
+        .signed_by(&key, &issuer, &ca_key)
+        .unwrap()
+        .der()
+        .to_vec();
+    identity.private_key_der = key.serialize_der();
+    identity_store::save(&identity_dir, &identity).unwrap();
+    let (mut bun, address) = spawn_bun_with_port_retry(true, || {
+        let [gossip, raft, reporting] = reserve_ports();
+        node.cluster.gossip_port = gossip;
+        node.cluster.raft_port = raft;
+        node.cluster.reporting_port = reporting;
+        std::fs::write(&node_path, toml::to_string_pretty(&node).unwrap()).unwrap();
+        (
+            node_path.clone(),
+            reserve_address(),
+            root.path().join("renewal-bun.log"),
+        )
+    });
+    let deadline = Instant::now() + WAIT;
+    let renewed = loop {
+        bun.assert_running();
+        let current = identity_store::load(&identity_dir).unwrap().unwrap();
+        if current.serial.0 > original_serial.0 {
+            break current;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "Bun did not renew its due node certificate: {}",
+            std::fs::read_to_string(&bun.log_path).unwrap_or_default()
+        );
+        std::thread::sleep(Duration::from_millis(50));
+    };
+    assert!(renewed.not_after > std::time::SystemTime::now() + Duration::from_secs(24 * 3600));
+    let endpoint = format!("https://{address}");
+    let ca = cluster_dir.join("identity/root-ca.crt");
+    wait_for_relish(
+        &mut bun,
+        &[
+            "--endpoint",
+            &endpoint,
+            "--ca-cert",
+            ca.to_str().unwrap(),
+            "status",
+        ],
+    );
+    drop(bun);
+    let mut restarted = BunProcess::spawn(
+        &node_path,
+        address,
+        true,
+        root.path().join("renewal-restart.log"),
+    );
+    wait_for_relish(
+        &mut restarted,
+        &[
+            "--endpoint",
+            &endpoint,
+            "--ca-cert",
+            ca.to_str().unwrap(),
+            "status",
+        ],
+    );
+    let after_restart = identity_store::load(&identity_dir).unwrap().unwrap();
+    assert_eq!(after_restart.certificate_der, renewed.certificate_der);
+}
+
+#[test]
+fn secure_catalogue_scoped_token_uses_explicit_ca_and_server_owned_cleanup() {
+    qualify_process_catalogue("workload-identity");
+}
+
+#[test]
+fn secure_catalogue_node_jobs_have_durable_ownership_and_confirmed_cleanup() {
+    qualify_process_catalogue("jobs");
+}
+
+fn qualify_process_catalogue(group: &str) {
+    let root = tempfile::tempdir().unwrap();
+    let cluster_dir = root.path().join("cluster");
+    assert_success(
+        &run_relish(&[
+            "init",
+            cluster_dir.to_str().unwrap(),
+            "--cluster-name",
+            "token-lease",
+            "--node-id",
+            "node-01",
+        ]),
+        "initialise scoped-token fixture",
+    );
+    let node_path = cluster_dir.join("reliaburger.toml");
+    let mut node = reliaburger::config::NodeConfig::from_file(&node_path).unwrap();
+    node.node.name = Some("node-01".into());
+    node.network.advertise_address = Some("127.0.0.1".into());
+    node.storage.data = root.path().join("data");
+    node.storage.images = root.path().join("images");
+    node.storage.logs = root.path().join("logs");
+    node.storage.metrics = root.path().join("metrics");
+    node.storage.volumes = root.path().join("volumes");
+    node.images.registry_port = 0;
+    node.process_workloads.allowed_binaries =
+        vec!["/bin/sh".into(), "/bin/sleep".into(), "/bin/true".into()];
+    node.testing.safety_class = reliaburger::testkit::safety::ClusterSafetyClass::Development;
+    node.testing
+        .allowed_operations
+        .insert(reliaburger::testkit::safety::OperationPermission::ProvisionIsolatedWorkloads);
+    let (mut bun, address) = spawn_bun_with_port_retry(true, || {
+        let [gossip, raft, reporting] = reserve_ports();
+        node.cluster.gossip_port = gossip;
+        node.cluster.raft_port = raft;
+        node.cluster.reporting_port = reporting;
+        std::fs::write(&node_path, toml::to_string_pretty(&node).unwrap()).unwrap();
+        (
+            node_path.clone(),
+            reserve_address(),
+            root.path().join("token-lease-bun.log"),
+        )
+    });
+    let endpoint = format!("https://{address}");
+    let ca = cluster_dir.join("identity/root-ca.crt");
+    let ca = ca.to_str().unwrap();
+    wait_for_relish(
+        &mut bun,
+        &["--endpoint", &endpoint, "--ca-cert", ca, "status"],
+    );
+    let token = run_relish(&[
+        "--endpoint",
+        &endpoint,
+        "--ca-cert",
+        ca,
+        "token",
+        "create",
+        "--name",
+        "test-admin",
+        "--role",
+        "admin",
+    ]);
+    assert_success(&token, "create catalogue admin");
+    let token = String::from_utf8(token.stdout).unwrap();
+    let token = token.trim();
+    let deadline = Instant::now() + WAIT;
+    // The auth-store refresh is asynchronous; wait until anonymous management
+    // is refused, so the probe cannot accidentally run in bootstrap mode.
+    loop {
+        let anonymous = run_relish(&["--endpoint", &endpoint, "--ca-cert", ca, "token", "list"]);
+        if !anonymous.status.success() {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "auth store did not adopt the admin token"
+        );
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    let output = run_relish(&[
+        "--endpoint",
+        &endpoint,
+        "--ca-cert",
+        ca,
+        "--token",
+        token,
+        "--output",
+        "json",
+        "test",
+        "--filter",
+        group,
+        "--timeout",
+        if group == "jobs" { "90s" } else { "15s" },
+    ]);
+    let report: serde_json::Value =
+        serde_json::from_slice(&output.stdout).unwrap_or_else(|error| {
+            panic!(
+                "invalid catalogue JSON: {error}; stdout={}; stderr={}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            )
+        });
+    if group == "jobs" {
+        assert_success(&output, "qualify node-local jobs catalogue");
+        let results = report["results"].as_array().unwrap();
+        assert_eq!(results.len(), 3, "{report}");
+        for case in results {
+            assert_eq!(case["outcome"]["status"], "pass", "{case}");
+            assert_eq!(case["cleanup"]["status"], "confirmed", "{case}");
+        }
+        let leases =
+            std::fs::read_to_string(node.storage.data.join("node-test-leases.json")).unwrap();
+        assert!(!leases.contains("node-jobs-"), "{leases}");
+        return;
+    }
+    let case = report["results"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|case| case["name"] == "namespace_scoped_token_is_rejected_elsewhere")
+        .unwrap();
+    assert_eq!(case["outcome"]["status"], "pass", "{case}");
+    assert_eq!(case["cleanup"]["status"], "confirmed", "{case}");
+    let listed = run_relish(&[
+        "--endpoint",
+        &endpoint,
+        "--ca-cert",
+        ca,
+        "--token",
+        token,
+        "token",
+        "list",
+    ]);
+    assert_success(&listed, "inspect token cleanup");
+    let listed = String::from_utf8(listed.stdout).unwrap();
+    assert!(listed.contains("test-admin"));
+    assert!(
+        !listed.contains("rbtest-"),
+        "test token survived cleanup: {listed}"
+    );
+}
+
+#[test]
+fn cron_registration_and_retirement_survive_bun_sigkill() {
+    let root = tempfile::tempdir().unwrap();
+    let node = write_portable_node_config(root.path());
+    let (mut bun, address) = spawn_bun_with_port_retry(false, || {
+        (
+            node.clone(),
+            reserve_address(),
+            root.path().join("cron-before.log"),
+        )
+    });
+    let endpoint = format!("http://{address}");
+    wait_for_relish(&mut bun, &["--endpoint", &endpoint, "status"]);
+    let config = root.path().join("jobs.toml");
+    std::fs::write(&config, "[job.keep]\nimage = 'proc-grill:image-ignored'\ncommand = ['/bin/true']\nschedule = '0 0 30 2 *'\n[job.remove]\nimage = 'proc-grill:image-ignored'\ncommand = ['/bin/true']\nschedule = '0 0 30 2 *'\n").unwrap();
+    assert_success(
+        &run_relish(&["--endpoint", &endpoint, "apply", config.to_str().unwrap()]),
+        "register cron jobs",
+    );
+    assert_success(
+        &run_relish(&["--endpoint", &endpoint, "stop", "remove"]),
+        "retire cron before its first firing",
+    );
+    bun.child.kill().unwrap();
+    bun.child.wait().unwrap();
+    let (mut replacement, address) = spawn_bun_with_port_retry(false, || {
+        (
+            node.clone(),
+            reserve_address(),
+            root.path().join("cron-after.log"),
+        )
+    });
+    let endpoint = format!("http://{address}");
+    wait_for_relish(&mut replacement, &["--endpoint", &endpoint, "status"]);
+    assert_success(
+        &run_relish(&["--endpoint", &endpoint, "stop", "keep"]),
+        "retire recovered cron registration",
+    );
+    assert!(
+        !run_relish(&["--endpoint", &endpoint, "stop", "remove"])
+            .status
+            .success(),
+        "retired schedule returned after Bun was killed"
+    );
+}
+
+#[test]
+fn corrupt_workload_ownership_refuses_startup_before_the_api_listens() {
+    let root = tempfile::tempdir().unwrap();
+    let config = write_portable_node_config(root.path());
+    let data = root.path().join("data");
+    reliaburger::compatibility::ensure_state_compatible(&data).unwrap();
+    let records = data.join("instances");
+    std::fs::create_dir_all(&records).unwrap();
+    let record = records.join("default__web-0.json");
+    std::fs::write(&record, b"{incomplete").unwrap();
+    let log = root.path().join("corrupt-ownership.log");
+    let mut bun = BunProcess::spawn(&config, "127.0.0.1:0".parse().unwrap(), false, log.clone());
+    let deadline = Instant::now() + WAIT;
+    let status = loop {
+        if let Some(status) = bun.child.try_wait().unwrap() {
+            break status;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "Bun did not refuse corrupt ownership"
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    };
+    assert!(!status.success());
+    assert_eq!(std::fs::read(&record).unwrap(), b"{incomplete");
+    let output = std::fs::read_to_string(log).unwrap();
+    assert!(
+        output.contains("cannot restore workload ownership"),
+        "{output}"
+    );
+    assert!(!output.contains("API server listening"), "{output}");
+}
+
+#[tokio::test]
+async fn node_job_lease_reaps_a_surviving_process_after_bun_is_killed() {
+    let root = tempfile::tempdir().unwrap();
+    let cluster_dir = root.path().join("cluster");
+    assert_success(
+        &run_relish(&[
+            "init",
+            cluster_dir.to_str().unwrap(),
+            "--cluster-name",
+            "token-lease",
+            "--node-id",
+            "node-01",
+        ]),
+        "initialise scoped-token fixture",
+    );
+    let node_path = cluster_dir.join("reliaburger.toml");
+    let mut node = reliaburger::config::NodeConfig::from_file(&node_path).unwrap();
+    node.node.name = Some("node-01".into());
+    node.network.advertise_address = Some("127.0.0.1".into());
+    node.storage.data = root.path().join("data");
+    node.storage.images = root.path().join("images");
+    node.storage.logs = root.path().join("logs");
+    node.storage.metrics = root.path().join("metrics");
+    node.storage.volumes = root.path().join("volumes");
+    node.images.registry_port = 0;
+    node.process_workloads.allowed_binaries =
+        vec!["/bin/sh".into(), "/bin/sleep".into(), "/bin/true".into()];
+    node.testing.safety_class = reliaburger::testkit::safety::ClusterSafetyClass::Development;
+    node.testing
+        .allowed_operations
+        .insert(reliaburger::testkit::safety::OperationPermission::ProvisionIsolatedWorkloads);
+    let (mut bun, address) = spawn_bun_with_port_retry(true, || {
+        let [gossip, raft, reporting] = reserve_ports();
+        node.cluster.gossip_port = gossip;
+        node.cluster.raft_port = raft;
+        node.cluster.reporting_port = reporting;
+        std::fs::write(&node_path, toml::to_string_pretty(&node).unwrap()).unwrap();
+        (
+            node_path.clone(),
+            reserve_address(),
+            root.path().join("token-lease-bun.log"),
+        )
+    });
+    let endpoint = format!("https://{address}");
+    let ca = cluster_dir.join("identity/root-ca.crt");
+    let ca = ca.to_str().unwrap();
+    wait_for_relish(
+        &mut bun,
+        &["--endpoint", &endpoint, "--ca-cert", ca, "status"],
+    );
+    let token = run_relish(&[
+        "--endpoint",
+        &endpoint,
+        "--ca-cert",
+        ca,
+        "token",
+        "create",
+        "--name",
+        "test-admin",
+        "--role",
+        "admin",
+    ]);
+    assert_success(&token, "create catalogue admin");
+    let token = String::from_utf8(token.stdout).unwrap();
+    let token = token.trim();
+    let deadline = Instant::now() + WAIT;
+    // The auth-store refresh is asynchronous; wait until anonymous management
+    // is refused, so the probe cannot accidentally run in bootstrap mode.
+    loop {
+        let anonymous = run_relish(&["--endpoint", &endpoint, "--ca-cert", ca, "token", "list"]);
+        if !anonymous.status.success() {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "auth store did not adopt the admin token"
+        );
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    let ca_bytes = std::fs::read(ca).unwrap();
+    let client =
+        reliaburger::relish::client::BunClient::new_with_ca(&endpoint, Some(token), &ca_bytes)
+            .unwrap();
+    let lease = client.create_node_job_lease(60).await.unwrap();
+    let manifest = reliaburger::config::Config::parse(&format!(
+        "[job.survivor]\nimage = 'proc-grill:image-ignored'\ncommand = ['/bin/sleep', '45']\nnamespace = '{}'\n[job.cron]\nimage = 'proc-grill:image-ignored'\ncommand = ['/bin/true']\nschedule = '* * * * *'\nnamespace = '{}'\n",
+        lease.namespace, lease.namespace,
+    )).unwrap();
+    client
+        .apply_with_lease(&manifest, &lease.lease_id)
+        .await
+        .unwrap();
+    let records_dir = node.storage.data.join("instances");
+    let record = reliaburger::grill::records::load_records(&records_dir)
+        .unwrap()
+        .into_iter()
+        .find(|record| record.app_name == "survivor" && record.namespace == lease.namespace)
+        .unwrap();
+    assert!(record.is_job);
+    assert!(reliaburger::grill::records::is_live(&record));
+    client.renew_test_lease(&lease.lease_id, 3).await.unwrap();
+    bun.child.kill().unwrap();
+    bun.child.wait().unwrap();
+    assert!(
+        reliaburger::grill::records::is_live(&record),
+        "job did not survive Bun's crash"
+    );
+    let lease_path = node.storage.data.join("node-test-leases.json");
+    let persisted = reliaburger::testkit::lease::LocalLeaseStore::open(lease_path.clone())
+        .await
+        .unwrap();
+    assert_eq!(
+        persisted
+            .get(&lease.lease_id)
+            .await
+            .unwrap()
+            .resources
+            .len(),
+        2
+    );
+    drop(persisted);
+    tokio::time::sleep(Duration::from_millis(3100)).await;
+    let mut restarted = BunProcess::spawn(
+        &node_path,
+        address,
+        true,
+        root.path().join("job-restarted.log"),
+    );
+    assert!(matches!(
+        wait_for_bind(&mut restarted, address),
+        BunStart::Ready(_)
+    ));
+    tokio::time::timeout(Duration::from_secs(25), async {
+        loop {
+            restarted.assert_running();
+            let leases = reliaburger::testkit::lease::LocalLeaseStore::open(lease_path.clone())
+                .await
+                .unwrap();
+            if leases.get(&lease.lease_id).await.is_none() {
+                assert!(
+                    !reliaburger::grill::records::is_live(&record),
+                    "cleanup acknowledged a live process"
+                );
+                assert!(
+                    reliaburger::grill::records::load_records(&records_dir)
+                        .unwrap()
+                        .iter()
+                        .all(|record| record.namespace != lease.namespace)
+                );
+                let instances = client.status().await.unwrap();
+                assert!(
+                    instances
+                        .iter()
+                        .all(|instance| instance.namespace != lease.namespace)
+                );
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+    })
+    .await
+    .expect("expired job lease did not recover after Bun was killed");
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+#[ignore = "requires rootful runc, networking tools and registry access"]
+fn runc_catalogue_decrypts_secrets_using_only_the_public_key_api() {
+    qualify_runc_catalogue("secrets-config");
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+#[ignore = "requires rootful runc, networking tools and registry access"]
+fn runc_catalogue_verifies_workload_spiffe_certificates() {
+    qualify_runc_catalogue("workload-identity");
+}
+
+#[cfg(target_os = "linux")]
+fn qualify_runc_catalogue(group: &str) {
+    assert!(
+        nix::unistd::geteuid().is_root(),
+        "run this qualification as root"
+    );
+    let root = tempfile::tempdir().unwrap();
+    let cluster_dir = root.path().join("cluster");
+    assert_success(
+        &run_relish(&[
+            "init",
+            cluster_dir.to_str().unwrap(),
+            "--cluster-name",
+            "identity-catalogue",
+            "--node-id",
+            "node-01",
+        ]),
+        "initialise catalogue fixture",
+    );
+    let node_path = cluster_dir.join("reliaburger.toml");
+    let mut node = reliaburger::config::NodeConfig::from_file(&node_path).unwrap();
+    node.node.name = Some("node-01".into());
+    node.network.advertise_address = Some("127.0.0.1".into());
+    node.storage.data = root.path().join("data");
+    node.storage.images = root.path().join("images");
+    node.storage.logs = root.path().join("logs");
+    node.storage.metrics = root.path().join("metrics");
+    node.storage.volumes = root.path().join("volumes");
+    node.images.registry_port = 0;
+    node.testing.safety_class = reliaburger::testkit::safety::ClusterSafetyClass::Development;
+    node.testing
+        .allowed_operations
+        .insert(reliaburger::testkit::safety::OperationPermission::ProvisionIsolatedWorkloads);
+    let (mut bun, address) = spawn_bun_with_runtime_port_retry(true, "runc", || {
+        let [gossip, raft, reporting] = reserve_ports();
+        node.cluster.gossip_port = gossip;
+        node.cluster.raft_port = raft;
+        node.cluster.reporting_port = reporting;
+        std::fs::write(&node_path, toml::to_string_pretty(&node).unwrap()).unwrap();
+        (
+            node_path.clone(),
+            reserve_address(),
+            root.path().join("secrets-bun.log"),
+        )
+    });
+    let endpoint = format!("https://{address}");
+    let ca = cluster_dir.join("identity/root-ca.crt");
+    let ca = ca.to_str().unwrap();
+    wait_for_relish(
+        &mut bun,
+        &["--endpoint", &endpoint, "--ca-cert", ca, "status"],
+    );
+    let token = run_relish(&[
+        "--endpoint",
+        &endpoint,
+        "--ca-cert",
+        ca,
+        "token",
+        "create",
+        "--name",
+        "catalogue-test-admin",
+        "--role",
+        "admin",
+    ]);
+    assert_success(&token, "create catalogue administrator");
+    let token = String::from_utf8(token.stdout).unwrap();
+    let deadline = Instant::now() + WAIT;
+    while run_relish(&["--endpoint", &endpoint, "--ca-cert", ca, "token", "list"])
+        .status
+        .success()
+    {
+        assert!(
+            Instant::now() < deadline,
+            "authentication never left bootstrap"
+        );
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    let output = run_relish(&[
+        "--endpoint",
+        &endpoint,
+        "--ca-cert",
+        ca,
+        "--token",
+        token.trim(),
+        "--output",
+        "json",
+        "test",
+        "--filter",
+        group,
+        "--timeout",
+        "90s",
+        "--parallel",
+        "1",
+    ]);
+    let report: serde_json::Value =
+        serde_json::from_slice(&output.stdout).unwrap_or_else(|error| {
+            panic!(
+                "invalid catalogue report: {error}; stdout={}; stderr={}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+        });
+    let results = report["results"].as_array().unwrap();
+    assert_eq!(results.len(), 3, "{report}");
+    for case in results {
+        assert_eq!(case["outcome"]["status"], "pass", "{report}");
+        assert_eq!(case["cleanup"]["status"], "confirmed", "{report}");
+    }
+    assert_success(&output, "qualify runtime catalogue");
+    if group == "workload-identity" {
+        // A Node CA can authenticate the API, but cannot validate a workload
+        // leaf issued by the separate Workload CA. The mounted bundle must
+        // never be promoted into the client's own trust anchors.
+        let node_ca = cluster_dir.join("identity/node-ca.crt");
+        let output = run_relish(&[
+            "--endpoint",
+            &endpoint,
+            "--ca-cert",
+            node_ca.to_str().unwrap(),
+            "--token",
+            token.trim(),
+            "--output",
+            "json",
+            "test",
+            "--filter",
+            "workload-identity",
+            "--timeout",
+            "90s",
+            "--parallel",
+            "1",
+        ]);
+        let report: serde_json::Value =
+            serde_json::from_slice(&output.stdout).unwrap_or_else(|error| {
+                panic!(
+                    "negative trust probe returned no report: {error}; stderr={}",
+                    String::from_utf8_lossy(&output.stderr)
+                )
+            });
+        let results = report["results"].as_array().unwrap();
+        assert_eq!(results.len(), 3, "{report}");
+        let certificate = results
+            .iter()
+            .find(|case| case["name"] == "workload_receives_spiffe_certificate")
+            .unwrap();
+        assert_eq!(certificate["outcome"]["status"], "fail", "{report}");
+        assert!(
+            certificate["outcome"]["reason"]
+                .as_str()
+                .unwrap()
+                .contains("workload certificate chain is invalid"),
+            "{report}"
+        );
+        for case in results {
+            assert_eq!(case["cleanup"]["status"], "confirmed", "{report}");
+        }
+        assert!(
+            !output.status.success(),
+            "untrusted workload certificate passed"
+        );
+    }
+}
+
+#[tokio::test]
+async fn abandoned_registry_upload_is_reclaimed_after_bun_sigkill() {
+    let root = tempfile::tempdir().unwrap();
+    let node = write_portable_node_config(root.path());
+    let (mut bun, address) = spawn_bun_with_port_retry(false, || {
+        (
+            node.clone(),
+            reserve_address(),
+            root.path().join("upload-before.log"),
+        )
+    });
+    let endpoint = format!("http://{address}");
+    wait_for_relish(&mut bun, &["--endpoint", &endpoint, "status"]);
+    let client = reliaburger::relish::client::BunClient::new(&endpoint);
+    let registry = client
+        .capabilities()
+        .await
+        .unwrap()
+        .service_endpoints
+        .registry
+        .unwrap();
+    let http = client.registry_http_client(&registry).unwrap();
+    let started = http
+        .post(format!("{registry}/v2/abandoned/blobs/uploads/"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(started.status(), 202);
+    let location = started.headers()["location"].to_str().unwrap();
+    let id = location.rsplit('/').next().unwrap();
+    let path = root.path().join("images/uploads").join(id);
+    assert_eq!(
+        http.patch(format!("{registry}{location}"))
+            .body("partial")
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        202
+    );
+    assert_eq!(std::fs::read(&path).unwrap(), b"partial");
+    let mut competing = BunProcess::spawn(
+        &node,
+        "127.0.0.1:0".parse().unwrap(),
+        false,
+        root.path().join("upload-competing.log"),
+    );
+    let status = tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            if let Some(status) = competing.child.try_wait().unwrap() {
+                break status;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("competing Bun did not refuse the occupied upload directory");
+    assert!(!status.success());
+    let output = std::fs::read_to_string(&competing.log_path).unwrap();
+    assert!(
+        output.contains("registry upload directory is busy"),
+        "{output}"
+    );
+    assert!(!output.contains("API server listening"), "{output}");
+    assert_eq!(std::fs::read(&path).unwrap(), b"partial");
+    bun.child.kill().unwrap();
+    bun.child.wait().unwrap();
+    let (mut replacement, address) = spawn_bun_with_port_retry(false, || {
+        (
+            node.clone(),
+            reserve_address(),
+            root.path().join("upload-after.log"),
+        )
+    });
+    let endpoint = format!("http://{address}");
+    wait_for_relish(&mut replacement, &["--endpoint", &endpoint, "status"]);
+    assert!(
+        !path.exists(),
+        "restart lost the owner but retained the upload bytes"
+    );
 }

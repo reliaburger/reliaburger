@@ -839,25 +839,52 @@ impl MayoStore {
             return Ok(0);
         }
         let mut deleted = 0;
-        if let Ok(entries) = std::fs::read_dir(&self.data_dir) {
-            for entry in entries.flatten() {
-                let path = entry.path();
-                if !path.extension().is_some_and(|e| e == "parquet") {
-                    continue;
-                }
-                let newest = file_max_timestamp(&path).unwrap_or_else(|| {
-                    std::fs::metadata(&path)
-                        .and_then(|m| m.modified())
-                        .map(|t| {
-                            t.duration_since(SystemTime::UNIX_EPOCH)
-                                .unwrap_or_default()
-                                .as_secs()
-                        })
-                        .unwrap_or(u64::MAX)
-                });
-                if newest < before {
-                    let _ = std::fs::remove_file(&path);
-                    deleted += 1;
+        let entries = match std::fs::read_dir(&self.data_dir) {
+            Ok(entries) => entries,
+            // A new store has no directory until its first flush.
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(0),
+            Err(error) => {
+                return Err(MayoError::Io(std::io::Error::new(
+                    error.kind(),
+                    format!("list metrics {}: {error}", self.data_dir.display()),
+                )));
+            }
+        };
+        for entry in entries {
+            let path = entry
+                .map_err(|error| {
+                    MayoError::Io(std::io::Error::new(
+                        error.kind(),
+                        format!(
+                            "read metrics directory {}: {error}",
+                            self.data_dir.display()
+                        ),
+                    ))
+                })?
+                .path();
+            if !path.extension().is_some_and(|e| e == "parquet") {
+                continue;
+            }
+            let newest = file_max_timestamp(&path).unwrap_or_else(|| {
+                std::fs::metadata(&path)
+                    .and_then(|m| m.modified())
+                    .map(|t| {
+                        t.duration_since(SystemTime::UNIX_EPOCH)
+                            .unwrap_or_default()
+                            .as_secs()
+                    })
+                    .unwrap_or(u64::MAX)
+            });
+            if newest < before {
+                match std::fs::remove_file(&path) {
+                    Ok(()) => deleted += 1,
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                    Err(error) => {
+                        return Err(MayoError::Io(std::io::Error::new(
+                            error.kind(),
+                            format!("prune {}: {error}", path.display()),
+                        )));
+                    }
                 }
             }
         }
@@ -896,6 +923,22 @@ pub(crate) fn file_max_timestamp(path: &Path) -> Option<u64> {
 mod tests {
     use super::*;
     use crate::mayo::types::MetricKey;
+
+    #[test]
+    fn prune_reports_failed_deletions_and_preserves_survivors() {
+        let (store, dir) = test_store();
+        let blocked = dir.path().join("blocked.parquet");
+        std::fs::create_dir(&blocked).unwrap();
+        std::fs::write(blocked.join("survivor"), b"preserve").unwrap();
+        let error = store
+            .prune(u64::MAX)
+            .expect_err("failed removal must not count as deletion");
+        assert!(error.to_string().contains("blocked.parquet"), "{error}");
+        assert_eq!(
+            std::fs::read(blocked.join("survivor")).unwrap(),
+            b"preserve"
+        );
+    }
 
     fn test_store() -> (MayoStore, tempfile::TempDir) {
         let dir = tempfile::tempdir().unwrap();

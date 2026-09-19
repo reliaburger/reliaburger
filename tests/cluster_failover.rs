@@ -172,6 +172,7 @@ async fn start_node(index: usize, seeds: Vec<SocketAddr>, root: &CancellationTok
         handle,
         "default".to_string(),
     );
+    agent.set_volumes_dir(reconciler_state_dir.join("volumes"));
     agent.set_node_capacity(8000, 16384);
     agent.set_readiness_tracker(readiness.clone());
     // Co-located test agents must not touch the shared host firewall.
@@ -181,7 +182,7 @@ async fn start_node(index: usize, seeds: Vec<SocketAddr>, root: &CancellationTok
         true,
         readiness,
         shutdown.clone(),
-        async move { agent.run().await },
+        move |ready| async move { agent.run_with_readiness(ready).await },
     );
 
     // Leader scheduler with a fast learning period, so a fresh leader

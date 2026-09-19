@@ -479,6 +479,13 @@ pub fn build_cluster_http_client_with_bearer(
         .with_custom_certificate_verifier(verifier)
         .with_client_auth_cert(chain, key)
         .map_err(|e| MtlsError::ConfigFailed(e.to_string()))?;
+    cluster_http_client(tls, bearer)
+}
+
+fn cluster_http_client(
+    tls: ClientConfig,
+    bearer: Option<&str>,
+) -> Result<reqwest::Client, MtlsError> {
     let mut builder = reqwest::Client::builder().use_preconfigured_tls(tls);
     if let Some(headers) = bearer_default_headers(bearer)? {
         builder = builder.default_headers(headers);
@@ -573,8 +580,56 @@ pub fn build_mtls_client_config_bound(
     Ok(Arc::new(config))
 }
 
+/// Build a required-mTLS listener using this node's live credentials.
+pub fn build_live_mtls_server_config(
+    identity: &super::credentials::LiveNodeIdentity,
+    crl: CrlHandle,
+) -> Result<Arc<ServerConfig>, MtlsError> {
+    let mut config = (*build_mtls_server_config(&identity.snapshot(), crl)?).clone();
+    config.cert_resolver = Arc::new(identity.clone());
+    Ok(Arc::new(config))
+}
+
+/// Build an optional-mTLS API or registry listener using live credentials.
+pub fn build_live_api_server_config(
+    identity: &super::credentials::LiveNodeIdentity,
+    crl: CrlHandle,
+) -> Result<Arc<ServerConfig>, MtlsError> {
+    let mut config = (*build_api_server_config(&identity.snapshot(), crl)?).clone();
+    config.cert_resolver = Arc::new(identity.clone());
+    Ok(Arc::new(config))
+}
+
+/// Build a cluster client using live credentials and optional peer-node binding.
+pub fn build_live_mtls_client_config(
+    identity: &super::credentials::LiveNodeIdentity,
+    crl: CrlHandle,
+    expected_node_id: Option<&str>,
+) -> Result<Arc<ClientConfig>, MtlsError> {
+    let initial = match expected_node_id {
+        Some(node) => build_mtls_client_config_bound(&identity.snapshot(), crl, node)?,
+        None => build_mtls_client_config(&identity.snapshot(), crl)?,
+    };
+    let mut config = (*initial).clone();
+    config.client_auth_cert_resolver = Arc::new(identity.clone());
+    // A resumed session can retain an earlier client identity. Every reconnect
+    // must select the current leaf and re-check the peer against the live CRL.
+    config.resumption = rustls::client::Resumption::disabled();
+    Ok(Arc::new(config))
+}
+
+/// Build an internal HTTPS client using live credentials and an optional service token.
+pub fn build_live_cluster_http_client(
+    identity: &super::credentials::LiveNodeIdentity,
+    crl: CrlHandle,
+    bearer: Option<&str>,
+) -> Result<reqwest::Client, MtlsError> {
+    let tls = (*build_live_mtls_client_config(identity, crl, None)?).clone();
+    cluster_http_client(tls, bearer)
+}
+
 /// The certificate chain this node presents, plus its private key.
-fn identity_chain_and_key(
+pub(super) fn identity_chain_and_key(
     identity: &NodeIdentity,
 ) -> Result<(Vec<CertificateDer<'static>>, PrivateKeyDer<'static>), MtlsError> {
     let chain = vec![

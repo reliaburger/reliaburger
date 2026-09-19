@@ -281,7 +281,9 @@ impl FaultType {
         )
     }
 
-    /// Whether this fault type requires Linux cgroups.
+    /// Library classification of fault types that require Linux cgroups.
+    /// This does not establish admission: Bun checks live runtime capabilities
+    /// and the target's actual cgroup when applying a fault.
     pub fn requires_cgroups(&self) -> bool {
         matches!(
             self,
@@ -479,7 +481,7 @@ pub fn monotonic_now_ns() -> u64 {
 /// A fault injection request, sent from the CLI/API to the agent.
 ///
 /// The agent assigns an ID and converts this into a `FaultRule`.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct FaultRequest {
     /// What kind of fault to inject.
     pub fault_type: FaultType,

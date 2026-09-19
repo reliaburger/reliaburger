@@ -34,6 +34,7 @@ struct AppleEntry {
 #[derive(Clone)]
 pub struct AppleContainerGrill {
     entries: Arc<Mutex<HashMap<InstanceId, AppleEntry>>>,
+    container_program: std::path::PathBuf,
 }
 
 impl AppleContainerGrill {
@@ -41,6 +42,7 @@ impl AppleContainerGrill {
     pub fn new() -> Self {
         Self {
             entries: Arc::new(Mutex::new(HashMap::new())),
+            container_program: "container".into(),
         }
     }
 
@@ -48,20 +50,8 @@ impl AppleContainerGrill {
     ///
     /// Apple Container VMs get their IP via vmnet. The inspect output
     /// contains the IP in various possible JSON paths.
-    async fn discover_container_ip(instance: &InstanceId) -> Result<Ipv4Addr, GrillError> {
-        let output = Self::container_command(&["inspect", &instance.0], instance).await?;
-
-        if !output.status.success() {
-            return Err(GrillError::NotFound {
-                instance: instance.clone(),
-            });
-        }
-
-        let inspect: serde_json::Value =
-            serde_json::from_slice(&output.stdout).map_err(|e| GrillError::StartFailed {
-                instance: instance.clone(),
-                reason: format!("failed to parse container inspect: {e}"),
-            })?;
+    async fn discover_container_ip(&self, instance: &InstanceId) -> Result<Ipv4Addr, GrillError> {
+        let inspect = self.inspect_container(instance).await?;
 
         Self::parse_container_ip(&inspect).ok_or_else(|| GrillError::StartFailed {
             instance: instance.clone(),
@@ -129,13 +119,63 @@ impl AppleContainerGrill {
         }
     }
 
+    /// Inspect one named container, retaining errors unless absence is explicit.
+    async fn inspect_container(
+        &self,
+        instance: &InstanceId,
+    ) -> Result<serde_json::Value, GrillError> {
+        let unavailable = |reason: String| GrillError::StateUnavailable {
+            instance: instance.clone(),
+            reason,
+        };
+        let output = tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            self.container_command(&["inspect", &instance.0], instance),
+        )
+        .await
+        .map_err(|_| unavailable("container inspection timed out".into()))?
+        .map_err(|error| unavailable(error.to_string()))?;
+        if !output.status.success() {
+            return Err(unavailable(format!(
+                "container inspect failed: {}",
+                String::from_utf8_lossy(&output.stderr).trim()
+            )));
+        }
+        let document: serde_json::Value = serde_json::from_slice(&output.stdout)
+            .map_err(|error| unavailable(format!("invalid container inspection: {error}")))?;
+        // Apple's CLI returns an empty array for a name absent from a successful
+        // daemon inventory. A command failure never establishes that absence.
+        let root = match document {
+            serde_json::Value::Array(mut entries) if entries.len() == 1 => entries.remove(0),
+            serde_json::Value::Array(entries) if entries.is_empty() => {
+                return Err(GrillError::NotFound {
+                    instance: instance.clone(),
+                });
+            }
+            serde_json::Value::Object(_) => document,
+            _ => {
+                return Err(unavailable(
+                    "expected exactly one inspected container".into(),
+                ));
+            }
+        };
+        if root["configuration"]["id"].as_str() != Some(instance.0.as_str()) {
+            return Err(unavailable(
+                "inspected container identity does not match".into(),
+            ));
+        }
+        Ok(root)
+    }
+
     /// Run a container CLI command and return its output.
     async fn container_command(
+        &self,
         args: &[&str],
         instance: &InstanceId,
     ) -> Result<std::process::Output, GrillError> {
-        tokio::process::Command::new("container")
+        tokio::process::Command::new(&self.container_program)
             .args(args)
+            .kill_on_drop(true)
             .output()
             .await
             .map_err(|e| GrillError::StartFailed {
@@ -284,14 +324,16 @@ impl super::Grill for AppleContainerGrill {
         instance: &InstanceId,
         record: &super::records::InstanceRecord,
     ) -> Result<bool, GrillError> {
-        // The container must still exist and be running for adoption to make
-        // sense; otherwise the caller reschedules through the normal path.
         match self.state(instance).await {
             Ok(ContainerState::Running) => {}
-            Ok(_) => return Ok(false),
-            // NotFound: the VM is gone. Anything else is a real error, but
-            // adoption is best-effort, so decline rather than wedge startup.
-            Err(_) => return Ok(false),
+            Ok(ContainerState::Stopped) | Err(GrillError::NotFound { .. }) => return Ok(false),
+            Ok(state) => {
+                return Err(GrillError::StateUnavailable {
+                    instance: instance.clone(),
+                    reason: format!("container cannot be adopted while {state:?}"),
+                });
+            }
+            Err(error) => return Err(error),
         }
 
         let mut entries = self.entries.lock().await;
@@ -308,7 +350,7 @@ impl super::Grill for AppleContainerGrill {
         // Re-discover the IP the same way `start()` does; a failure here is
         // non-fatal (the container is adopted, service discovery re-resolves
         // it on the next inspect).
-        if let Ok(ip) = Self::discover_container_ip(instance).await {
+        if let Ok(ip) = self.discover_container_ip(instance).await {
             let mut entries = self.entries.lock().await;
             if let Some(entry) = entries.get_mut(instance) {
                 entry.container_ip = Some(ip);
@@ -326,7 +368,7 @@ impl super::Grill for AppleContainerGrill {
         let args = Self::create_command_args(instance, spec)?;
 
         let args_refs: Vec<&str> = args.iter().map(|s| s.as_str()).collect();
-        let output = Self::container_command(&args_refs, instance).await?;
+        let output = self.container_command(&args_refs, instance).await?;
 
         if !output.status.success() {
             let stderr = String::from_utf8_lossy(&output.stderr);
@@ -350,7 +392,9 @@ impl super::Grill for AppleContainerGrill {
     }
 
     async fn start(&self, instance: &InstanceId) -> Result<(), GrillError> {
-        let output = Self::container_command(&["start", &instance.0], instance).await?;
+        let output = self
+            .container_command(&["start", &instance.0], instance)
+            .await?;
 
         if !output.status.success() {
             let stderr = String::from_utf8_lossy(&output.stderr);
@@ -361,7 +405,7 @@ impl super::Grill for AppleContainerGrill {
         }
 
         // Discover the container's IP address from its VM's network interface
-        if let Ok(ip) = Self::discover_container_ip(instance).await {
+        if let Ok(ip) = self.discover_container_ip(instance).await {
             let mut entries = self.entries.lock().await;
             if let Some(entry) = entries.get_mut(instance) {
                 entry.container_ip = Some(ip);
@@ -372,7 +416,9 @@ impl super::Grill for AppleContainerGrill {
     }
 
     async fn stop(&self, instance: &InstanceId) -> Result<(), GrillError> {
-        let output = Self::container_command(&["stop", &instance.0], instance).await?;
+        let output = self
+            .container_command(&["stop", &instance.0], instance)
+            .await?;
 
         if !output.status.success() {
             let stderr = String::from_utf8_lossy(&output.stderr);
@@ -386,7 +432,9 @@ impl super::Grill for AppleContainerGrill {
     }
 
     async fn kill(&self, instance: &InstanceId) -> Result<(), GrillError> {
-        let output = Self::container_command(&["kill", &instance.0], instance).await?;
+        let output = self
+            .container_command(&["kill", &instance.0], instance)
+            .await?;
 
         if !output.status.success() {
             let stderr = String::from_utf8_lossy(&output.stderr);
@@ -400,7 +448,9 @@ impl super::Grill for AppleContainerGrill {
     }
 
     async fn logs(&self, instance: &InstanceId) -> Result<String, GrillError> {
-        let output = Self::container_command(&["logs", &instance.0], instance).await?;
+        let output = self
+            .container_command(&["logs", &instance.0], instance)
+            .await?;
         Ok(String::from_utf8_lossy(&output.stdout).into_owned())
     }
 
@@ -415,7 +465,7 @@ impl super::Grill for AppleContainerGrill {
         let args = Self::exec_command_args(instance, command);
         let args: Vec<&str> = args.iter().map(String::as_str).collect();
 
-        let output = Self::container_command(&args, instance).await?;
+        let output = self.container_command(&args, instance).await?;
         let mut result = String::from_utf8_lossy(&output.stdout).into_owned();
         if !output.status.success() {
             let stderr = String::from_utf8_lossy(&output.stderr);
@@ -434,7 +484,7 @@ impl super::Grill for AppleContainerGrill {
         instance: &InstanceId,
         lines_tx: tokio::sync::mpsc::Sender<String>,
     ) {
-        let mut child = match tokio::process::Command::new("container")
+        let mut child = match tokio::process::Command::new(&self.container_program)
             .args(["logs", "--follow", &instance.0])
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::null())
@@ -458,25 +508,13 @@ impl super::Grill for AppleContainerGrill {
     }
 
     async fn state(&self, instance: &InstanceId) -> Result<ContainerState, GrillError> {
-        let output = Self::container_command(&["inspect", &instance.0], instance).await?;
-
-        if !output.status.success() {
-            return Err(GrillError::NotFound {
-                instance: instance.clone(),
-            });
-        }
-
-        let inspect_json: serde_json::Value =
-            serde_json::from_slice(&output.stdout).map_err(|e| GrillError::StartFailed {
-                instance: instance.clone(),
-                reason: format!("failed to parse container inspect: {e}"),
-            })?;
-
+        let inspect_json = self.inspect_container(instance).await?;
         Self::parse_state(&inspect_json, instance)
     }
 
     async fn exit_code(&self, instance: &InstanceId) -> Option<i32> {
-        let output = Self::container_command(&["inspect", &instance.0], instance)
+        let output = self
+            .container_command(&["inspect", &instance.0], instance)
             .await
             .ok()?;
         if !output.status.success() {
@@ -508,6 +546,123 @@ mod tests {
     use super::*;
     #[allow(unused_imports)]
     use crate::grill::Grill;
+
+    #[tokio::test]
+    async fn adoption_requires_positive_runtime_evidence() {
+        use std::os::unix::fs::PermissionsExt;
+        let directory = tempfile::tempdir().unwrap();
+        let program = directory.path().join("container-fixture");
+        std::fs::write(
+            &program,
+            "#!/bin/sh\ndir=${0%/*}\ncat \"$dir/output\"\nexit \"$(cat \"$dir/status\")\"\n",
+        )
+        .unwrap();
+        std::fs::set_permissions(&program, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let id = InstanceId("apple-evidence".into());
+        let record = serde_json::from_value(serde_json::json!({
+            "schema": 2, "instance_id": id.0, "namespace": "default",
+            "app_name": "apple-evidence", "replica_index": 0,
+            "is_job": false, "image": "unused", "runtime": "Apple",
+            "pid": 0, "pid_started_at": 0,
+            "oci_spec": {
+                "root": {"path": "unused", "readonly": true},
+                "process": {"args": [], "env": [], "cwd": "/", "user": {"uid": 0, "gid": 0}},
+                "mounts": [], "linux": {"namespaces": []}
+            }
+        }))
+        .unwrap();
+        for (status, output) in [
+            (1, "daemon unavailable"),
+            (0, "invalid json"),
+            (0, r#"[{"status":"running"}]"#),
+            (
+                0,
+                r#"[{"configuration":{"id":"apple-evidence"},"status":"unknown"}]"#,
+            ),
+            (
+                0,
+                r#"[{"configuration":{"id":"apple-evidence"},"status":"paused"}]"#,
+            ),
+            (
+                0,
+                r#"[{"configuration":{"id":"apple-evidence"},"status":"created"}]"#,
+            ),
+            (
+                0,
+                r#"[{"configuration":{"id":"someone-else"},"status":"running"}]"#,
+            ),
+            (0, r#"[{"status":"running"},{"status":"stopped"}]"#),
+        ] {
+            std::fs::write(directory.path().join("output"), output).unwrap();
+            std::fs::write(directory.path().join("status"), status.to_string()).unwrap();
+            let mut grill = AppleContainerGrill::new();
+            grill.container_program = program.clone();
+            assert!(
+                grill.adopt(&id, &record).await.is_err(),
+                "uncertain inspection was accepted: {status}: {output}"
+            );
+            assert!(grill.entries.lock().await.is_empty());
+        }
+        for (output, expected) in [
+            ("[]", false),
+            (
+                r#"[{"configuration":{"id":"apple-evidence"},"status":"stopped"}]"#,
+                false,
+            ),
+            (
+                r#"[{"configuration":{"id":"apple-evidence"},"status":"running"}]"#,
+                true,
+            ),
+        ] {
+            std::fs::write(directory.path().join("output"), output).unwrap();
+            std::fs::write(directory.path().join("status"), "0").unwrap();
+            let mut grill = AppleContainerGrill::new();
+            grill.container_program = program.clone();
+            assert_eq!(
+                grill.adopt(&id, &record).await.unwrap(),
+                expected,
+                "{output}"
+            );
+            assert_eq!(grill.entries.lock().await.contains_key(&id), expected);
+        }
+    }
+
+    #[tokio::test]
+    async fn stalled_inspection_times_out_and_reaps_the_cli() {
+        use std::os::unix::fs::PermissionsExt;
+        let directory = tempfile::tempdir().unwrap();
+        let program = directory.path().join("container-fixture");
+        std::fs::write(
+            &program,
+            "#!/bin/sh\ndir=${0%/*}\necho $$ > \"$dir/pid\"\nexec sleep 60\n",
+        )
+        .unwrap();
+        std::fs::set_permissions(&program, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let mut grill = AppleContainerGrill::new();
+        grill.container_program = program;
+        let started = tokio::time::Instant::now();
+        let error = grill
+            .state(&InstanceId("stalled-inspection".into()))
+            .await
+            .unwrap_err();
+        assert!(
+            error.to_string().contains("inspection timed out"),
+            "{error}"
+        );
+        assert!(started.elapsed() < std::time::Duration::from_secs(15));
+        let pid = std::fs::read_to_string(directory.path().join("pid"))
+            .unwrap()
+            .trim()
+            .parse()
+            .unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            while super::super::records::process_start_time(pid).is_some() {
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("timed-out container CLI was left alive");
+    }
 
     #[test]
     fn create_preserves_mounts_identity_ports_and_process_settings() {
@@ -643,7 +798,9 @@ mod tests {
         }
         .await;
         let _ = grill.kill(&id).await;
-        let _ = AppleContainerGrill::container_command(&["rm", "-f", &id.0], &id).await;
+        let _ = AppleContainerGrill::new()
+            .container_command(&["rm", "-f", &id.0], &id)
+            .await;
         result.unwrap();
     }
 
@@ -743,7 +900,9 @@ mod tests {
 
         let grill = AppleContainerGrill::new();
         let id = InstanceId("apple-pinned-workload-0".to_string());
-        let _ = AppleContainerGrill::container_command(&["rm", "-f", &id.0], &id).await;
+        let _ = AppleContainerGrill::new()
+            .container_command(&["rm", "-f", &id.0], &id)
+            .await;
         let spec = crate::grill::oci::OciSpec {
             port_mapping: None,
             root: crate::grill::oci::OciRoot {
@@ -797,7 +956,9 @@ mod tests {
         .await;
 
         let _ = grill.kill(&id).await;
-        let _ = AppleContainerGrill::container_command(&["rm", "-f", &id.0], &id).await;
+        let _ = AppleContainerGrill::new()
+            .container_command(&["rm", "-f", &id.0], &id)
+            .await;
         result.unwrap_or_else(|reason| panic!("{reason}"));
     }
 
@@ -834,7 +995,9 @@ mod tests {
 
         // Best-effort cleanup of any leftover from an earlier aborted run, so
         // the test is idempotent (Apple keeps stopped containers around).
-        let _ = AppleContainerGrill::container_command(&["rm", "-f", &id.0], &id).await;
+        let _ = AppleContainerGrill::new()
+            .container_command(&["rm", "-f", &id.0], &id)
+            .await;
 
         // One grill starts the container; a FRESH grill (as after a bun
         // exec, with empty in-memory state) adopts it.
@@ -871,7 +1034,9 @@ mod tests {
         );
 
         // A vanished container declines adoption.
-        let _ = AppleContainerGrill::container_command(&["rm", "-f", &id.0], &id).await;
+        let _ = AppleContainerGrill::new()
+            .container_command(&["rm", "-f", &id.0], &id)
+            .await;
         let after_removal = AppleContainerGrill::new()
             .adopt(&id, &record)
             .await

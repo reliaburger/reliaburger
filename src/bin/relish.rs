@@ -193,9 +193,9 @@ enum Command {
     },
     /// Show ingress routing table.
     Routes,
-    /// Run chaos testing scenarios or manage fault injections.
+    /// Show legacy chaos status (mutations retired; use test --chaos).
     Chaos {
-        /// Scenario or action: council-partition, worker-isolation, status, heal.
+        /// Action: status. Old mutation actions return a migration error.
         action: String,
         /// Confirm that a partition action is intentional.
         #[arg(long)]
@@ -218,6 +218,11 @@ enum Command {
         /// Show the plan without deploying (exits 0 even with no agent).
         #[arg(long)]
         dry_run: bool,
+    },
+    /// Cancel a node-local deploy and wait for its current work to finish.
+    CancelDeploy {
+        /// Operation ID from the apply stream or deploy-operation API.
+        operation_id: String,
     },
     /// Show deploy history for an app.
     History {
@@ -383,9 +388,15 @@ enum Command {
         api_port: Option<u16>,
         #[arg(long, requires = "quickstart")]
         ingress_port: Option<u16>,
+        /// Host port forwarded to the managed Pickle registry (default: 15050).
+        #[arg(long, requires = "quickstart")]
+        registry_port: Option<u16>,
         /// Use explicitly supplied Linux binaries for development before a release exists.
         #[arg(long, requires = "quickstart")]
         development_binaries: Option<PathBuf>,
+        /// HTTPS directory containing unchanged signed release candidate assets.
+        #[arg(long, requires = "quickstart", conflicts_with = "development_binaries")]
+        release_mirror: Option<String>,
 
         /// Accept the default answer to every question (non-interactive).
         #[arg(long)]
@@ -403,7 +414,7 @@ enum Command {
     },
     /// Run the built-in integration test suite against the cluster.
     Test {
-        /// Comma-separated groups, e.g. "scheduling,firewall". Omit for all.
+        /// Comma-separated groups, or exact scenario names with --chaos. Omit for all.
         #[arg(long)]
         filter: Option<String>,
         /// Maximum concurrently running tests.
@@ -1361,6 +1372,9 @@ async fn main() -> ExitCode {
             } => reliaburger::relish::fault::scenario(path, *dry_run, *speed, *acknowledge).await,
         },
         Command::Deploy { ref path, dry_run } => commands::deploy(path, cli.output, dry_run).await,
+        Command::CancelDeploy { ref operation_id } => {
+            commands::cancel_deploy(operation_id, cli.output).await
+        }
         Command::History {
             ref app,
             ref namespace,
@@ -1538,7 +1552,9 @@ async fn main() -> ExitCode {
             nodes,
             api_port,
             ingress_port,
+            registry_port,
             development_binaries,
+            release_mirror,
             yes,
             ref dir,
             ref release_url,
@@ -1551,7 +1567,9 @@ async fn main() -> ExitCode {
                         nodes: nodes.unwrap_or(3),
                         api_port: api_port.unwrap_or(19117),
                         ingress_port: ingress_port.unwrap_or(18080),
+                        registry_port: registry_port.unwrap_or(15050),
                         development_binaries,
+                        release_mirror,
                     },
                 )
                 .await
@@ -2114,6 +2132,41 @@ mod tests {
     }
 
     #[test]
+    fn parse_release_mirror_requires_managed_signed_quickstart() {
+        assert!(
+            parse(&[
+                "relish",
+                "setup",
+                "--quickstart",
+                "--release-mirror",
+                "https://example.com/candidate/"
+            ])
+            .is_ok()
+        );
+        assert!(
+            parse(&[
+                "relish",
+                "setup",
+                "--release-mirror",
+                "https://example.com/candidate/"
+            ])
+            .is_err()
+        );
+        assert!(
+            parse(&[
+                "relish",
+                "setup",
+                "--quickstart",
+                "--release-mirror",
+                "https://example.com/candidate/",
+                "--development-binaries",
+                "/tmp/binaries"
+            ])
+            .is_err()
+        );
+    }
+
+    #[test]
     fn parse_managed_quickstart_and_explicit_destroy() {
         assert!(parse(&["relish", "setup", "--quickstart", "--nodes", "3"]).is_ok());
         assert!(parse(&["relish", "local", "status"]).is_ok());
@@ -2361,6 +2414,15 @@ mod tests {
             Command::Logs { since, .. } => assert_eq!(since.as_deref(), Some("1h")),
             _ => panic!("expected Logs command"),
         }
+    }
+
+    #[test]
+    fn parse_cancel_deploy_requires_an_operation_id() {
+        let cli = parse(&["relish", "cancel-deploy", "deploy-123"]).unwrap();
+        assert!(
+            matches!(cli.command, Command::CancelDeploy { operation_id } if operation_id == "deploy-123")
+        );
+        assert!(parse(&["relish", "cancel-deploy"]).is_err());
     }
 
     #[test]

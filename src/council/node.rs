@@ -48,6 +48,8 @@ pub struct CouncilNode {
     #[allow(dead_code)]
     raft_id: u64,
     state_machine: CouncilStateMachine,
+    /// Order grant proposals against membership transitions on this leader.
+    node_fault_membership: tokio::sync::Mutex<()>,
     /// Master secret for unwrapping CA private keys (in-memory only).
     wrapping_ikm: Option<[u8; 32]>,
 }
@@ -92,6 +94,7 @@ impl CouncilNode {
             raft,
             raft_id,
             state_machine,
+            node_fault_membership: tokio::sync::Mutex::new(()),
             wrapping_ikm,
         })
     }
@@ -115,6 +118,11 @@ impl CouncilNode {
     ///
     /// Returns `ForwardToLeader` if this node is not the leader.
     pub async fn write(&self, request: RaftRequest) -> Result<CouncilResponse, CouncilError> {
+        let _membership = if matches!(&request, RaftRequest::ReserveNodeFault { .. }) {
+            Some(self.node_fault_membership.lock().await)
+        } else {
+            None
+        };
         let result = self.raft.client_write(request).await;
         match result {
             Ok(resp) => Ok(resp.data),
@@ -149,11 +157,34 @@ impl CouncilNode {
         self.state_machine.desired_state().await
     }
 
+    /// Establish an applied log barrier before inspecting fault ownership.
+    /// A timed-out grant write may still commit. A following no-op must apply
+    /// first, so dropping the caller's future cannot hide that reservation.
+    async fn guard_membership_change(
+        &self,
+    ) -> Result<tokio::sync::MutexGuard<'_, ()>, CouncilError> {
+        let guard = self.node_fault_membership.lock().await;
+        self.write(RaftRequest::Noop).await?;
+        if self
+            .desired_state()
+            .await
+            .node_fault_reservations
+            .active
+            .is_some()
+        {
+            return Err(CouncilError::WriteFailed(
+                "membership change waits for node fault reversal".into(),
+            ));
+        }
+        Ok(guard)
+    }
+
     /// Add a learner node to the cluster.
     ///
     /// The learner receives log replication but does not vote.
     /// Use `change_membership()` to promote learners to voters.
     pub async fn add_learner(&self, id: u64, info: CouncilNodeInfo) -> Result<(), CouncilError> {
+        let _guard = self.guard_membership_change().await?;
         self.raft
             .add_learner(id, info, true)
             .await
@@ -167,6 +198,7 @@ impl CouncilNode {
     /// `add_learner()`). Nodes not in `members` are demoted to
     /// learners (retained, not removed).
     pub async fn change_membership(&self, members: BTreeSet<u64>) -> Result<(), CouncilError> {
+        let _guard = self.guard_membership_change().await?;
         self.raft
             .change_membership(ChangeMembers::ReplaceAllVoters(members), true)
             .await
@@ -184,6 +216,7 @@ impl CouncilNode {
         &self,
         members: BTreeSet<u64>,
     ) -> Result<(), CouncilError> {
+        let _guard = self.guard_membership_change().await?;
         self.raft
             .change_membership(ChangeMembers::ReplaceAllVoters(members), false)
             .await
@@ -194,6 +227,7 @@ impl CouncilNode {
     /// Remove a learner from the membership entirely. The node must not be
     /// a voter; demote it first via `change_membership`.
     pub async fn remove_learner(&self, id: u64) -> Result<(), CouncilError> {
+        let _guard = self.guard_membership_change().await?;
         self.raft
             .change_membership(ChangeMembers::RemoveNodes(BTreeSet::from([id])), false)
             .await
@@ -441,6 +475,73 @@ mod tests {
         }
         // Initialise on node 1.
         nodes[0].initialize(members).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn membership_changes_wait_for_node_fault_reversal() {
+        use crate::smoker::{
+            reservation::NodeFaultReservation,
+            types::{FaultRequest, FaultType},
+        };
+        let (nodes, _router) = create_cluster(3).await;
+        init_cluster(&nodes).await;
+        let leader = find_leader(&nodes).await;
+        let membership_log_id = *leader.metrics().borrow().membership_config.log_id();
+        let reservation = NodeFaultReservation {
+            sequence: 1,
+            boot_id: "test-boot".into(),
+            cleanup_after_unix_ms: 1,
+            request: FaultRequest {
+                fault_type: FaultType::NodeKill {
+                    kill_containers: false,
+                },
+                target_service: String::new(),
+                namespace: None,
+                target_instance: None,
+                target_node: Some("node-a".into()),
+                duration: Duration::from_secs(30),
+                injected_by: "operator".into(),
+                reason: None,
+                include_leader: true,
+                override_safety: true,
+                acknowledged: true,
+            },
+        };
+        let admitted = leader
+            .write(RaftRequest::ReserveNodeFault {
+                reservation: Box::new(reservation),
+                membership_log_id,
+                unavailable_voters: Default::default(),
+            })
+            .await
+            .unwrap();
+        assert!(matches!(admitted, CouncilResponse::Applied { .. }));
+        let error = leader
+            .change_membership([leader.raft_id].into())
+            .await
+            .expect_err("a reservation must fence membership changes too");
+        assert!(error.to_string().contains("node fault"));
+        assert_eq!(
+            leader
+                .metrics()
+                .borrow()
+                .membership_config
+                .membership()
+                .voter_ids()
+                .count(),
+            3
+        );
+        leader
+            .write(RaftRequest::ReleaseNodeFault { sequence: 1 })
+            .await
+            .unwrap();
+        leader
+            .change_membership([leader.raft_id].into())
+            .await
+            .unwrap();
+        for node in &nodes {
+            node.shutdown().await.unwrap();
+        }
     }
 
     #[tokio::test]

@@ -161,6 +161,8 @@ impl FaultRegistry {
     }
 
     /// The earliest expiry timestamp among active faults, if any.
+    /// This read-only library query does not schedule reversal; Bun's tick
+    /// drains expired faults and tracks their actual cleanup separately.
     pub fn next_expiry(&self) -> Option<u64> {
         self.faults.iter().map(|f| f.expires_at_ns).min()
     }
@@ -193,7 +195,9 @@ impl FaultRegistry {
             .count()
     }
 
-    /// Count faults targeting a specific node.
+    /// Read-only library count of faults targeting a specific node.
+    /// This is not the cluster-wide node-experiment admission gate; Raft's
+    /// durable reservation owns that decision.
     pub fn count_by_node(&self, node: &str) -> usize {
         self.faults
             .iter()

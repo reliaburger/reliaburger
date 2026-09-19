@@ -255,6 +255,14 @@ impl UpgradeManager {
             is_network,
         )?;
 
+        super::compatibility::check_binary(
+            bytes.clone(),
+            self.store.symlink_path().parent().ok_or_else(|| {
+                UpgradeError::IncompatibleBinary("binary directory is missing".into())
+            })?,
+        )
+        .await?;
+
         // First upgrade from an un-versioned install: adopt the running
         // binary into the store so rollback has something to return to.
         self.adopt_running_binary_if_missing()?;
@@ -373,7 +381,7 @@ impl UpgradeManager {
     /// Prepare a rollback to `version` (default: the newest installed
     /// version older than the running one). No download, no signature
     /// re-check — the binary was verified when it was first staged.
-    pub fn prepare_rollback(
+    pub async fn prepare_rollback(
         &self,
         version: Option<BinaryVersion>,
         pre_upgrade_instances: Vec<InstanceInventory>,
@@ -422,6 +430,15 @@ impl UpgradeManager {
                 envelope.external.is_some(),
             )?;
         }
+
+        let bytes = std::fs::read(self.store.binary_path(&target))?;
+        super::compatibility::check_binary(
+            bytes,
+            self.store.binary_path(&target).parent().ok_or_else(|| {
+                UpgradeError::IncompatibleBinary("binary directory is missing".into())
+            })?,
+        )
+        .await?;
 
         let stem = self
             .store
@@ -743,7 +760,21 @@ mod tests {
         }
     }
 
+    fn compatible_binary(label: &[u8]) -> Vec<u8> {
+        let formats = serde_json::to_string(&crate::compatibility::CURRENT).unwrap();
+        let mut binary = format!("#!/bin/sh\nprintf '%s' '{formats}'\n# ").into_bytes();
+        binary.extend_from_slice(label);
+        binary.push(b'\n');
+        binary
+    }
+
     fn directive_for(fixture: &Fixture, bytes: &[u8], id: &str) -> UpgradeDirective {
+        let executable = if bytes.starts_with(b"#!/") {
+            bytes.to_vec()
+        } else {
+            compatible_binary(bytes)
+        };
+        let bytes = executable.as_slice();
         let path = fixture.binary_dir.join("incoming-binary");
         std::fs::write(&path, bytes).unwrap();
         UpgradeDirective {
@@ -765,6 +796,23 @@ mod tests {
             pid: 4242,
             full_id: "default__web-0".to_string(),
         }]
+    }
+
+    #[tokio::test]
+    async fn signed_incompatible_binary_is_refused_before_staging() {
+        let fixture = fixture();
+        let directive = directive_for(
+            &fixture,
+            b"#!/bin/sh\nprintf '%s' '{\"protocol\":1,\"state\":1}'\n",
+            "incompatible",
+        );
+        assert!(fixture.manager.prepare(&directive, vec![]).await.is_err());
+        assert!(!fixture.manager.upgrade_in_flight());
+        assert!(!fixture.manager.store().binary_path(&v("0.2.0")).exists());
+        assert_eq!(
+            fixture.manager.store().current_target().unwrap(),
+            v("0.1.0")
+        );
     }
 
     #[tokio::test]
@@ -790,6 +838,45 @@ mod tests {
         let marker = status.in_flight.unwrap();
         assert_eq!(marker.phase, MarkerPhase::Staged);
         assert_eq!(marker.pre_upgrade_instances, inventory());
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn verified_upgrade_probes_survive_concurrent_process_creation() {
+        let shutdown = tokio_util::sync::CancellationToken::new();
+        let mut churn = Vec::new();
+        for _ in 0..4 {
+            let shutdown = shutdown.clone();
+            churn.push(tokio::spawn(async move {
+                while !shutdown.is_cancelled() {
+                    let status = tokio::process::Command::new("true")
+                        .kill_on_drop(true)
+                        .status()
+                        .await
+                        .unwrap();
+                    assert!(status.success());
+                }
+            }));
+        }
+        let results = futures_util::future::join_all((0..32).map(|_| async {
+            let fixture = fixture();
+            let directive = directive_for(&fixture, b"concurrent probe", "concurrent");
+            fixture
+                .manager
+                .prepare(&directive, vec![])
+                .await
+                .map(|prepared| {
+                    assert!(prepared.is_some());
+                    assert!(fixture.manager.upgrade_in_flight());
+                })
+        }))
+        .await;
+        shutdown.cancel();
+        for task in churn {
+            task.await.unwrap();
+        }
+        for result in results {
+            result.unwrap();
+        }
     }
 
     #[tokio::test]
@@ -964,8 +1051,52 @@ mod tests {
         let err = fixture
             .manager
             .prepare_rollback(Some(v("0.0.9")), vec![])
+            .await
             .unwrap_err();
         assert!(matches!(err, UpgradeError::UnknownVersion { .. }));
+    }
+
+    #[tokio::test]
+    async fn rollback_refuses_a_development_binary_without_a_marker() {
+        let fixture = fixture();
+        let stub = SignatureEnvelope {
+            schema: 1,
+            sha256: String::new(),
+            embedded: String::new(),
+            external: None,
+        };
+        fixture
+            .manager
+            .store()
+            .stage(
+                &v("0.0.9"),
+                b"#!/bin/sh\nprintf '%s' '{\"protocol\":1,\"state\":1}'\n",
+                &stub,
+            )
+            .unwrap();
+        assert!(matches!(
+            fixture.manager.prepare_rollback(None, vec![]).await,
+            Err(UpgradeError::IncompatibleBinary(_))
+        ));
+        assert!(!fixture.manager.upgrade_in_flight());
+        assert_eq!(
+            fixture.manager.store().current_target().unwrap(),
+            v("0.1.0")
+        );
+    }
+
+    #[tokio::test]
+    async fn compatibility_query_timeout_leaves_no_marker_or_candidate() {
+        let fixture = fixture();
+        let directive = directive_for(&fixture, b"#!/bin/sh\nexec sleep 30\n", "stalled");
+        let started = std::time::Instant::now();
+        assert!(matches!(
+            fixture.manager.prepare(&directive, vec![]).await,
+            Err(UpgradeError::IncompatibleBinary(_))
+        ));
+        assert!(started.elapsed() < std::time::Duration::from_secs(15));
+        assert!(!fixture.manager.upgrade_in_flight());
+        assert!(!fixture.manager.store().binary_path(&v("0.2.0")).exists());
     }
 
     #[tokio::test]
@@ -981,7 +1112,9 @@ mod tests {
             external: None,
         };
         for version in ["0.1.0", "0.2.0", "0.3.0"] {
-            store.stage(&v(version), b"x", &stub).unwrap();
+            store
+                .stage(&v(version), &compatible_binary(b"rollback"), &stub)
+                .unwrap();
         }
         store.activate(&v("0.3.0")).unwrap();
 
@@ -998,7 +1131,7 @@ mod tests {
         )
         .unwrap();
 
-        let prepared = manager.prepare_rollback(None, vec![]).unwrap();
+        let prepared = manager.prepare_rollback(None, vec![]).await.unwrap();
         assert_eq!(prepared.target_version(), &v("0.2.0"));
     }
 
@@ -1060,7 +1193,7 @@ mod tests {
         )
         .unwrap();
 
-        let err = manager.prepare_rollback(None, vec![]).unwrap_err();
+        let err = manager.prepare_rollback(None, vec![]).await.unwrap_err();
         assert!(
             matches!(err, UpgradeError::HashMismatch { .. }),
             "got: {err:?}"
@@ -1089,7 +1222,8 @@ mod tests {
         )
         .unwrap();
 
-        let bytes = b"new binary";
+        let executable = compatible_binary(b"new binary");
+        let bytes = executable.as_slice();
         let path = binary_dir.join("incoming");
         std::fs::write(&path, bytes).unwrap();
         let directive = UpgradeDirective {
@@ -1114,7 +1248,8 @@ mod tests {
     #[tokio::test]
     async fn network_provenance_local_file_still_requires_external_signature() {
         let fixture = fixture();
-        let bytes = b"downloaded binary";
+        let executable = compatible_binary(b"downloaded binary");
+        let bytes = executable.as_slice();
         let path = fixture.binary_dir.join("staged-download");
         std::fs::write(&path, bytes).unwrap();
 

@@ -1,11 +1,10 @@
 //! Building and pushing a tiny synthetic OCI image, for the image-registry
 //! cases.
 //!
-//! The dev nodes have no image builder and a loopback-only registry, so the
-//! harness constructs an image itself — a config blob, one gzipped tar layer,
+//! The harness needs no image builder: it constructs an image itself — a config blob, one gzipped tar layer,
 //! and a manifest tying them together — and speaks the raw `/v2` protocol to
 //! push it. The construction is pure and unit-tested here; the push runs
-//! against a live registry, so it's exercised only at acceptance.
+//! against a live registry and is covered by the registry-upload integration test.
 
 use flate2::Compression;
 use flate2::write::GzEncoder;
@@ -91,12 +90,20 @@ pub fn build_synthetic_image(salt: &str) -> SyntheticImage {
 
 /// Resolve a `Location` header (which may be a path or a full URL) against the
 /// registry base.
-fn resolve_location(base: &str, location: &str) -> String {
-    if location.starts_with("http://") || location.starts_with("https://") {
-        location.to_string()
-    } else {
-        format!("{base}{location}")
+fn resolve_location(base: &str, location: &str) -> Result<String, String> {
+    let base =
+        url::Url::parse(base).map_err(|error| format!("invalid registry origin: {error}"))?;
+    let resolved = base
+        .join(location)
+        .map_err(|error| format!("invalid upload location: {error}"))?;
+    if resolved.origin() != base.origin()
+        || !resolved.username().is_empty()
+        || resolved.password().is_some()
+        || resolved.fragment().is_some()
+    {
+        return Err("upload location must remain within the declared registry origin".into());
     }
+    Ok(resolved.into())
 }
 
 /// Push one blob through the `/v2` monolithic-upload dance: POST to start,
@@ -113,12 +120,15 @@ async fn push_blob(
         .send()
         .await
         .map_err(|e| format!("blob upload POST failed: {e}"))?;
+    if !start.status().is_success() {
+        return Err(format!("blob upload POST returned {}", start.status()));
+    }
     let location = start
         .headers()
         .get("location")
         .and_then(|v| v.to_str().ok())
         .map(|l| resolve_location(base, l))
-        .ok_or_else(|| "upload POST returned no Location".to_string())?;
+        .ok_or_else(|| "upload POST returned no Location".to_string())??;
 
     let patched = http
         .patch(&location)
@@ -126,11 +136,15 @@ async fn push_blob(
         .send()
         .await
         .map_err(|e| format!("blob PATCH failed: {e}"))?;
+    if !patched.status().is_success() {
+        return Err(format!("blob PATCH returned {}", patched.status()));
+    }
     let location = patched
         .headers()
         .get("location")
         .and_then(|v| v.to_str().ok())
         .map(|l| resolve_location(base, l))
+        .transpose()?
         .unwrap_or(location);
 
     let separator = if location.contains('?') { '&' } else { '?' };
@@ -197,6 +211,71 @@ pub async fn fetch_manifest(
 mod tests {
     use super::*;
 
+    #[tokio::test]
+    async fn upload_locations_cannot_forward_credentials_to_another_origin() {
+        use axum::{
+            Router,
+            http::{HeaderMap, StatusCode, header::LOCATION},
+            routing::{patch, post},
+        };
+        let captured = std::sync::Arc::new(tokio::sync::Mutex::new(None));
+        let observed = captured.clone();
+        let attacker = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let attacker_address = attacker.local_addr().unwrap();
+        let attack_router = Router::new().route(
+            "/steal",
+            patch(move |headers: HeaderMap| {
+                let observed = observed.clone();
+                async move {
+                    *observed.lock().await = headers.get("authorization").cloned();
+                    StatusCode::BAD_REQUEST
+                }
+            }),
+        );
+        let attack_task =
+            tokio::spawn(async move { axum::serve(attacker, attack_router).await.unwrap() });
+        let registry = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let registry_address = registry.local_addr().unwrap();
+        let router = Router::new().route(
+            "/v2/test/blobs/uploads/",
+            post(move || async move {
+                (
+                    StatusCode::ACCEPTED,
+                    [(LOCATION, format!("http://{attacker_address}/steal"))],
+                )
+            }),
+        );
+        let registry_task =
+            tokio::spawn(async move { axum::serve(registry, router).await.unwrap() });
+        let mut headers = reqwest::header::HeaderMap::new();
+        headers.insert(
+            reqwest::header::AUTHORIZATION,
+            "Bearer private-registry-token".parse().unwrap(),
+        );
+        let http = reqwest::Client::builder()
+            .no_proxy()
+            .default_headers(headers)
+            .timeout(std::time::Duration::from_secs(3))
+            .build()
+            .unwrap();
+        let result = push_image(
+            &http,
+            &format!("http://{registry_address}"),
+            "test",
+            "v1",
+            &build_synthetic_image("scope"),
+        )
+        .await;
+        let leaked = captured.lock().await.is_some();
+        attack_task.abort();
+        registry_task.abort();
+        assert!(
+            !leaked,
+            "upload Location forwarded the registry bearer to another origin"
+        );
+        assert!(result.unwrap_err().contains("origin"));
+    }
+
     #[test]
     fn a_synthetic_image_has_well_formed_digests() {
         let image = build_synthetic_image("a");
@@ -241,14 +320,34 @@ mod tests {
     }
 
     #[test]
+    fn upload_locations_reject_protocol_relative_origins_downgrades_and_credentials() {
+        for location in [
+            "//other.example/upload",
+            "http://registry.example/upload",
+            "https://registry.example:444/upload",
+            "https://user:secret@registry.example/upload",
+            "/upload#fragment",
+        ] {
+            assert!(
+                resolve_location("https://registry.example", location).is_err(),
+                "accepted {location}"
+            );
+        }
+        assert_eq!(
+            resolve_location("https://registry.example", "upload?session=one").unwrap(),
+            "https://registry.example/upload?session=one"
+        );
+    }
+
+    #[test]
     fn a_relative_location_resolves_against_the_base() {
         assert_eq!(
-            resolve_location("http://127.0.0.1:5050", "/v2/x/blobs/uploads/1"),
+            resolve_location("http://127.0.0.1:5050", "/v2/x/blobs/uploads/1").unwrap(),
             "http://127.0.0.1:5050/v2/x/blobs/uploads/1"
         );
         assert_eq!(
-            resolve_location("http://127.0.0.1:5050", "http://host/abs"),
-            "http://host/abs"
+            resolve_location("http://127.0.0.1:5050", "http://127.0.0.1:5050/abs").unwrap(),
+            "http://127.0.0.1:5050/abs"
         );
     }
 }

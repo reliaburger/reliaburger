@@ -96,6 +96,7 @@ pub struct BoundProxy {
     http_listener: TcpListener,
     https_listener: TcpListener,
     tls_acceptor: tokio_rustls::TlsAcceptor,
+    file_cert_resolver: Option<Arc<super::tls::FileCertResolver>>,
     /// Bounds concurrent TLS handshakes so a slow-handshake flood can't
     /// pile up tasks (ING2).
     handshake_limit: Arc<Semaphore>,
@@ -166,11 +167,18 @@ pub async fn bind_proxy_with_tls(
     // An operator disk cert always wins. Otherwise, if the cluster Ingress CA
     // resolver is wired, serve per-SNI cluster-signed certs; failing both, a
     // self-signed `localhost` cert (dev / no-cluster).
+    let mut file_cert_resolver = None;
     let tls_config = match (&config.tls_cert_path, &config.tls_key_path) {
         (Some(cert), Some(key)) => {
-            let (certs, key) = super::tls::load_certs_from_disk(cert, key)
-                .map_err(|e| WrapperError::ProxyFailed(format!("failed to load TLS files: {e}")))?;
-            super::tls::build_tls_config(certs, key).map_err(|e| {
+            let resolver = Arc::new(
+                super::tls::FileCertResolver::load(cert, key)
+                    .await
+                    .map_err(|e| {
+                        WrapperError::ProxyFailed(format!("failed to load TLS files: {e}"))
+                    })?,
+            );
+            file_cert_resolver = Some(Arc::clone(&resolver));
+            super::tls::build_tls_config_with_resolver(resolver).map_err(|e| {
                 WrapperError::ProxyFailed(format!("failed to build TLS config: {e}"))
             })?
         }
@@ -200,6 +208,7 @@ pub async fn bind_proxy_with_tls(
         http_listener,
         https_listener,
         tls_acceptor,
+        file_cert_resolver,
         handshake_limit: Arc::new(Semaphore::new(config.max_tls_handshakes)),
         handshake_timeout: config.tls_handshake_timeout,
         state,
@@ -262,7 +271,14 @@ impl BoundProxy {
             self.shutdown.clone(),
         );
 
-        tokio::try_join!(http, https)?;
+        let reload = async {
+            match self.file_cert_resolver {
+                Some(resolver) => resolver.run(self.shutdown.clone()).await,
+                None => self.shutdown.cancelled().await,
+            }
+            Ok::<(), WrapperError>(())
+        };
+        tokio::try_join!(http, https, reload)?;
         Ok(())
     }
 }
@@ -309,6 +325,7 @@ async fn serve_tls(
                     Err(infallible) => match infallible {},
                 };
                 let acceptor = acceptor.clone();
+                let connection_shutdown = shutdown.clone();
                 tokio::spawn(async move {
                     // Hold the handshake permit only until the handshake
                     // resolves; the request itself is bounded separately.
@@ -322,31 +339,30 @@ async fn serve_tls(
                         // handshake failed or timed out; drop the connection
                         _ => return,
                     };
+                    use crate::sesame::connection::{
+                        LifetimeLimitedIo, MAX_TLS_CONNECTION_LIFETIME, TLS_CONNECTION_DRAIN_GRACE,
+                    };
+                    let tls_stream = LifetimeLimitedIo::new(tls_stream, MAX_TLS_CONNECTION_LIFETIME);
                     let hyper_service = hyper_util::service::TowerToHyperService::new(service);
-                    let _ = hyper_util::server::conn::auto::Builder::new(
+                    let builder = hyper_util::server::conn::auto::Builder::new(
                         hyper_util::rt::TokioExecutor::new(),
-                    )
-                    .serve_connection_with_upgrades(
-                        hyper_util::rt::TokioIo::new(tls_stream),
-                        hyper_service,
-                    )
-                    .await;
+                    );
+                    let connection = builder.serve_connection_with_upgrades(
+                        hyper_util::rt::TokioIo::new(tls_stream), hyper_service,
+                    );
+                    tokio::pin!(connection);
+                    let drain_after = MAX_TLS_CONNECTION_LIFETIME.saturating_sub(TLS_CONNECTION_DRAIN_GRACE);
+                    tokio::select! {
+                        _ = &mut connection => return,
+                        _ = connection_shutdown.cancelled() => {},
+                        _ = tokio::time::sleep(drain_after) => {},
+                    }
+                    connection.as_mut().graceful_shutdown();
+                    let _ = tokio::time::timeout(TLS_CONNECTION_DRAIN_GRACE, connection).await;
                 });
             }
         }
     }
-}
-
-/// Run the Wrapper proxy on the configured ports. Convenience wrapper
-/// around [`bind_proxy`] + [`BoundProxy::serve`]; blocks until the
-/// shutdown token is cancelled.
-pub async fn run_proxy(
-    config: WrapperConfig,
-    routing_table: Arc<RwLock<RoutingTable>>,
-    shutdown: CancellationToken,
-) -> Result<(), WrapperError> {
-    let bound = bind_proxy(config, routing_table, shutdown).await?;
-    bound.serve().await
 }
 
 /// The main proxy handler. Routes every incoming request.
@@ -942,27 +958,21 @@ mod tests {
     async fn proxy_sets_real_ip_and_request_id() {
         use crate::onion::types::BackendInstance;
         use std::net::Ipv4Addr;
-        use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
         // Backend echoes the request head back in the body so the test can
         // inspect the headers the proxy forwarded.
         let backend = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let backend_port = backend.local_addr().unwrap().port();
-        tokio::spawn(async move {
-            while let Ok((mut sock, _)) = backend.accept().await {
-                tokio::spawn(async move {
-                    let mut buf = vec![0u8; 4096];
-                    let n = sock.read(&mut buf).await.unwrap_or(0);
-                    let head = String::from_utf8_lossy(&buf[..n]).to_string();
-                    let resp = format!(
-                        "HTTP/1.1 200 OK\r\nContent-Length: {}\r\n\r\n{}",
-                        head.len(),
-                        head
-                    );
-                    let _ = sock.write_all(resp.as_bytes()).await;
-                });
-            }
-        });
+        let echo = axum::Router::new().route(
+            "/",
+            axum::routing::get(|headers: axum::http::HeaderMap| async move {
+                headers
+                    .iter()
+                    .map(|(name, value)| format!("{name}: {}\r\n", value.to_str().unwrap()))
+                    .collect::<String>()
+            }),
+        );
+        let backend_task = tokio::spawn(async move { axum::serve(backend, echo).await.unwrap() });
 
         let mut service_map = crate::onion::service_map::ServiceMap::new();
         service_map
@@ -1008,8 +1018,8 @@ mod tests {
         .await
         .unwrap();
         let http_port = bound.http_addr.port();
-        tokio::spawn(async move {
-            bound.serve().await.ok();
+        let proxy_task = tokio::spawn(async move {
+            bound.serve().await.unwrap();
         });
 
         let client = reqwest::Client::new();
@@ -1061,6 +1071,9 @@ mod tests {
         assert_eq!(echoed.matches("x-request-id:").count(), 1);
 
         shutdown.cancel();
+        proxy_task.await.unwrap();
+        backend_task.abort();
+        let _ = backend_task.await;
     }
 
     /// §5.5: a new request routed to a backend whose drain has expired gets a

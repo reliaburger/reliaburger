@@ -202,6 +202,9 @@ pub struct AlertObservation {
 /// Current filesystem usage for one node and storage domain.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct DiskObservation {
+    /// Node-local filesystem identity. Absent on older or unsupported reporters.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub filesystem_id: Option<String>,
     /// Node identifier.
     pub node_id: String,
     /// Configured storage domains sharing this filesystem.

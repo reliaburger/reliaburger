@@ -50,6 +50,7 @@ const RUN_BEFORE_TIMEOUT_SECS: u64 = 600;
 /// cron tick runs every second but a schedule matches to minute resolution, so
 /// we only fire when the stamp changes — otherwise a `* * * * *` job would fire
 /// sixty times a minute.
+#[derive(Debug, Clone, PartialEq)]
 struct ScheduledJob {
     name: String,
     namespace: String,
@@ -98,7 +99,7 @@ async fn drain_and_stop_instance<G: Grill>(
     grill: &G,
     id: &InstanceId,
     drain_timeout: std::time::Duration,
-) {
+) -> Result<(), BunError> {
     let cmd = crate::wrapper::draining::DrainCommand {
         app_name: String::new(),
         instance_id: id.0.clone(),
@@ -107,16 +108,63 @@ async fn drain_and_stop_instance<G: Grill>(
     drains.start_drain(&cmd).await;
     drains.wait_drained(&id.0).await;
 
-    let _ = grill.stop(id).await;
-    let deadline = Instant::now() + drain_timeout;
-    while Instant::now() < deadline {
-        if matches!(grill.state(id).await, Ok(ContainerState::Stopped)) {
-            return;
-        }
-        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    stop_runtime_instance(grill, id, drain_timeout).await
+}
+
+/// Stop one instance, requiring observed exit even after force-kill.
+async fn stop_runtime_instance<G: Grill>(
+    grill: &G,
+    id: &InstanceId,
+    grace: std::time::Duration,
+) -> Result<(), BunError> {
+    let signal_timeout = std::time::Duration::from_secs(2);
+    tokio::time::timeout(signal_timeout, grill.stop(id))
+        .await
+        .map_err(|_| BunError::StopUnconfirmed {
+            instance_id: id.clone(),
+            reason: "graceful stop request timed out",
+        })??;
+    if observe_runtime_exit(grill, id, grace).await? {
+        return Ok(());
     }
-    if !matches!(grill.state(id).await, Ok(ContainerState::Stopped)) {
-        let _ = grill.kill(id).await;
+    kill_runtime_instance(grill, id).await
+}
+
+/// Preserve ownership until both force-kill and observed runtime exit succeed.
+async fn kill_runtime_instance<G: Grill>(grill: &G, id: &InstanceId) -> Result<(), BunError> {
+    let signal_timeout = std::time::Duration::from_secs(2);
+    tokio::time::timeout(signal_timeout, grill.kill(id))
+        .await
+        .map_err(|_| BunError::StopUnconfirmed {
+            instance_id: id.clone(),
+            reason: "force-kill request timed out",
+        })??;
+    if observe_runtime_exit(grill, id, signal_timeout).await? {
+        return Ok(());
+    }
+    Err(BunError::StopUnconfirmed {
+        instance_id: id.clone(),
+        reason: "runtime did not confirm exit after force-kill",
+    })
+}
+
+/// Bound the whole observation loop, including a stalled runtime query.
+async fn observe_runtime_exit<G: Grill>(
+    grill: &G,
+    id: &InstanceId,
+    wait: std::time::Duration,
+) -> Result<bool, BunError> {
+    let observation = async {
+        loop {
+            if grill.state(id).await? == ContainerState::Stopped {
+                return Ok::<(), BunError>(());
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        }
+    };
+    match tokio::time::timeout(wait, observation).await {
+        Ok(result) => result.map(|()| true),
+        Err(_) => Ok(false),
     }
 }
 
@@ -258,6 +306,13 @@ pub enum AgentCommand {
         namespace: String,
         response: oneshot::Sender<Result<(), BunError>>,
     },
+    /// Stop and retire an app removed from desired state or a resource lease.
+    /// Successful retirement also releases its status and port ownership.
+    Retire {
+        app_name: String,
+        namespace: String,
+        response: oneshot::Sender<Result<(), BunError>>,
+    },
     /// Get status of all instances.
     Status {
         response: oneshot::Sender<Vec<InstanceStatus>>,
@@ -283,6 +338,11 @@ pub enum AgentCommand {
     /// Snapshot active and recent real deploy operations.
     DeployOperations {
         response: oneshot::Sender<crate::bun::deploy_operations::DeployOperationSnapshot>,
+    },
+    /// Request cancellation of an operation owned by this node.
+    CancelDeploy {
+        operation_id: crate::bun::deploy_operations::DeployOperationId,
+        response: oneshot::Sender<Option<crate::bun::deploy_operations::DeployOperation>>,
     },
     /// Get logs for an app.
     Logs {
@@ -336,6 +396,7 @@ pub enum AgentCommand {
     },
     /// Inject a network partition (chaos testing).
     InjectPartition {
+        reservation: Option<crate::smoker::reservation::NodeFaultReservation>,
         peers: Vec<String>,
         duration_secs: u64,
         injected_by: String,
@@ -400,8 +461,20 @@ pub enum AgentCommand {
     Routes {
         response: oneshot::Sender<Vec<crate::wrapper::types::RouteInfo>>,
     },
-    /// Inject a fault (Smoker).
+    /// Prepare the canonical request and identify this target process.
+    PrepareNodeFault {
+        request: crate::smoker::types::FaultRequest,
+        response: oneshot::Sender<Result<(String, crate::smoker::types::FaultRequest), BunError>>,
+    },
+    /// Fence delayed activation and confirm reversal before releasing capacity.
+    FenceNodeFault {
+        only_if_finished: bool,
+        reservation: crate::smoker::reservation::NodeFaultReservation,
+        response: oneshot::Sender<Result<(), BunError>>,
+    },
+    /// Apply a workload fault, or a node fault carrying a committed grant.
     InjectFault {
+        reservation: Option<crate::smoker::reservation::NodeFaultReservation>,
         request: crate::smoker::types::FaultRequest,
         response: oneshot::Sender<Result<crate::smoker::types::FaultSummary, BunError>>,
     },
@@ -462,6 +535,7 @@ pub enum AgentCommand {
     /// Commits on success; flags revert and exits on failure.
     UpgradeVerify {
         marker: crate::upgrade::marker::UpgradeMarker,
+        rejoin: Result<(), String>,
         response: oneshot::Sender<Result<bool, BunError>>,
     },
 }
@@ -488,21 +562,24 @@ enum DeployOp {
         spec: Box<AppSpec>,
         reply: oneshot::Sender<Result<Option<String>, String>>,
     },
-    /// Record the deployed spec for the Brioche UI.
+    /// Admit the app kind before recording the deployed spec for the Brioche UI.
     StoreDeployedSpec {
         app_name: String,
         namespace: String,
         spec: Box<AppSpec>,
-        reply: oneshot::Sender<()>,
+        reply: oneshot::Sender<Result<(), BunError>>,
     },
-    /// Active (non-terminal) instance ids for an app in a namespace.
-    ListExistingActive {
+    /// Every owned instance id, including terminal instances awaiting cleanup.
+    ListExistingOwned {
         app_name: String,
         namespace: String,
         reply: oneshot::Sender<Vec<InstanceId>>,
     },
     /// Reserve and return the next rolling-redeploy generation counter.
-    NextDeployGen { reply: oneshot::Sender<u64> },
+    NextDeployGen {
+        app_name: String,
+        reply: oneshot::Sender<Result<u64, BunError>>,
+    },
     /// Create supervisor-tracked instances for a fresh app deploy.
     SupervisorDeployApp {
         app_name: String,
@@ -582,6 +659,14 @@ enum DeployOp {
         is_job: bool,
         reply: oneshot::Sender<()>,
     },
+    /// Claim replacement ownership before allocating identity or runtime resources.
+    ReserveRollingInstance {
+        instance_id: InstanceId,
+        app_name: String,
+        namespace: String,
+        spec: Box<AppSpec>,
+        reply: oneshot::Sender<Result<Option<u16>, BunError>>,
+    },
     /// Fast pre-create bookkeeping for a rolling-redeploy instance: fail closed
     /// on undecryptable secrets, prepare its identity dir, build the OCI spec.
     PrepareRollingInstance {
@@ -593,43 +678,15 @@ enum DeployOp {
         index: u32,
         reply: oneshot::Sender<Result<crate::grill::oci::OciSpec, BunError>>,
     },
-    /// Lift an instance's egress enforcement.
-    ClearEgress {
-        instance_id: InstanceId,
-        reply: oneshot::Sender<()>,
-    },
-    /// Post-start bookkeeping for a healthy rolling instance: log forwarder,
-    /// on-disk record, provision identity.
+    /// Persist a started replacement before health wait or traffic publication.
     RegisterRollingInstance {
-        instance_id: InstanceId,
-        app_name: String,
-        namespace: String,
-        reply: oneshot::Sender<()>,
+        instance: Box<RollingInstance>,
+        reply: oneshot::Sender<Result<(), BunError>>,
     },
-    /// Roll a failed rolling redeploy back: kill and clean up the new
-    /// instances, release their ports, drop their identity dirs, record it.
-    RollbackRollingDeploy {
-        app_name: String,
-        namespace: String,
-        spec: Box<AppSpec>,
-        new_ids: Vec<InstanceId>,
-        new_prepared: Vec<InstanceId>,
-        new_ports: std::collections::HashMap<InstanceId, Option<u16>>,
-        replica_count: u32,
-        reply: oneshot::Sender<()>,
-    },
-    /// Halt a failed rolling deploy without reverting (`auto_rollback = false`):
-    /// keep the healthy new + surviving old instances, tear down only the
-    /// incomplete one, record a `Halted` result.
-    HaltRollingDeploy {
-        app_name: String,
-        namespace: String,
-        spec: Box<AppSpec>,
-        new_ids: Vec<InstanceId>,
-        new_prepared: Vec<InstanceId>,
-        new_ports: std::collections::HashMap<InstanceId, Option<u16>>,
-        replica_count: u32,
-        reply: oneshot::Sender<()>,
+    /// Keep a started replacement reachable through ordinary Stop after a failed cut-over.
+    RetainRollingInstance {
+        instance: Box<RollingInstance>,
+        reply: oneshot::Sender<Result<(), BunError>>,
     },
     /// Forget the already-stopped old instances and register the healthy new
     /// ones: service map, health config, backends, kernel networking, ingress,
@@ -645,7 +702,7 @@ enum DeployOp {
         new_ips: std::collections::HashMap<InstanceId, Option<std::net::Ipv4Addr>>,
         new_specs: std::collections::HashMap<InstanceId, crate::grill::oci::OciSpec>,
         now: Instant,
-        reply: oneshot::Sender<()>,
+        reply: oneshot::Sender<Result<(), BunError>>,
     },
     /// Publish one freshly-healthy replacement as a routable backend (M7).
     ///
@@ -668,7 +725,12 @@ enum DeployOp {
     /// every command for its duration per retired instance.
     FinishRetire {
         old_id: InstanceId,
-        reply: oneshot::Sender<()>,
+        reply: oneshot::Sender<Result<(), BunError>>,
+    },
+    /// Fence restarts before the worker starts draining or signalling an old instance.
+    BeginRetire {
+        old_id: InstanceId,
+        reply: oneshot::Sender<Result<(), BunError>>,
     },
     /// Append an entry to the deploy history.
     PushDeployHistory {
@@ -692,6 +754,16 @@ enum DeployOp {
         namespace: String,
         reply: oneshot::Sender<()>,
     },
+}
+
+/// Launch data owned by the deploy worker before supervisor registration.
+struct RollingInstance {
+    instance_id: InstanceId,
+    app_name: String,
+    namespace: String,
+    spec: AppSpec,
+    oci_spec: crate::grill::oci::OciSpec,
+    host_port: Option<u16>,
 }
 
 /// The fast pre-create outputs the loop hands back for a fresh instance.
@@ -736,7 +808,12 @@ impl DeployOps {
         .await
     }
 
-    async fn store_deployed_spec(&self, app_name: &str, namespace: &str, spec: &AppSpec) {
+    async fn store_deployed_spec(
+        &self,
+        app_name: &str,
+        namespace: &str,
+        spec: &AppSpec,
+    ) -> Result<(), BunError> {
         self.call(
             |reply| DeployOp::StoreDeployedSpec {
                 app_name: app_name.to_string(),
@@ -744,14 +821,17 @@ impl DeployOps {
                 spec: Box::new(spec.clone()),
                 reply,
             },
-            (),
+            Err(BunError::DeployFailed {
+                app_name: app_name.into(),
+                reason: "agent shutting down".into(),
+            }),
         )
         .await
     }
 
-    async fn list_existing_active(&self, app_name: &str, namespace: &str) -> Vec<InstanceId> {
+    async fn list_existing_owned(&self, app_name: &str, namespace: &str) -> Vec<InstanceId> {
         self.call(
-            |reply| DeployOp::ListExistingActive {
+            |reply| DeployOp::ListExistingOwned {
                 app_name: app_name.to_string(),
                 namespace: namespace.to_string(),
                 reply,
@@ -761,9 +841,18 @@ impl DeployOps {
         .await
     }
 
-    async fn next_deploy_gen(&self) -> u64 {
-        self.call(|reply| DeployOp::NextDeployGen { reply }, 0)
-            .await
+    async fn next_deploy_gen(&self, app_name: &str) -> Result<u64, BunError> {
+        self.call(
+            |reply| DeployOp::NextDeployGen {
+                app_name: app_name.into(),
+                reply,
+            },
+            Err(BunError::DeployFailed {
+                app_name: app_name.into(),
+                reason: "agent loop closed before reserving rollout identity".into(),
+            }),
+        )
+        .await
     }
 
     async fn supervisor_deploy_app(
@@ -951,6 +1040,28 @@ impl DeployOps {
     }
 
     #[allow(clippy::too_many_arguments)]
+    async fn reserve_rolling_instance(
+        &self,
+        instance_id: &InstanceId,
+        app_name: &str,
+        namespace: &str,
+        spec: &AppSpec,
+    ) -> Result<Option<u16>, BunError> {
+        self.call(
+            |reply| DeployOp::ReserveRollingInstance {
+                instance_id: instance_id.clone(),
+                app_name: app_name.into(),
+                namespace: namespace.into(),
+                spec: Box::new(spec.clone()),
+                reply,
+            },
+            Err(BunError::InstanceNotFound {
+                instance_id: instance_id.clone(),
+            }),
+        )
+        .await
+    }
+
     async fn prepare_rolling_instance(
         &self,
         instance_id: &InstanceId,
@@ -977,85 +1088,30 @@ impl DeployOps {
         .await
     }
 
-    async fn clear_egress(&self, instance_id: &InstanceId) {
-        self.call(
-            |reply| DeployOp::ClearEgress {
-                instance_id: instance_id.clone(),
-                reply,
-            },
-            (),
-        )
-        .await
-    }
-
-    async fn register_rolling_instance(
-        &self,
-        instance_id: &InstanceId,
-        app_name: &str,
-        namespace: &str,
-    ) {
+    async fn register_rolling_instance(&self, instance: RollingInstance) -> Result<(), BunError> {
+        let missing = BunError::InstanceNotFound {
+            instance_id: instance.instance_id.clone(),
+        };
         self.call(
             |reply| DeployOp::RegisterRollingInstance {
-                instance_id: instance_id.clone(),
-                app_name: app_name.to_string(),
-                namespace: namespace.to_string(),
+                instance: Box::new(instance),
                 reply,
             },
-            (),
+            Err(missing),
         )
         .await
     }
 
-    #[allow(clippy::too_many_arguments)]
-    async fn rollback_rolling_deploy(
-        &self,
-        app_name: &str,
-        namespace: &str,
-        spec: &AppSpec,
-        new_ids: Vec<InstanceId>,
-        new_prepared: Vec<InstanceId>,
-        new_ports: std::collections::HashMap<InstanceId, Option<u16>>,
-        replica_count: u32,
-    ) {
+    async fn retain_rolling_instance(&self, instance: RollingInstance) -> Result<(), BunError> {
+        let missing = BunError::InstanceNotFound {
+            instance_id: instance.instance_id.clone(),
+        };
         self.call(
-            |reply| DeployOp::RollbackRollingDeploy {
-                app_name: app_name.to_string(),
-                namespace: namespace.to_string(),
-                spec: Box::new(spec.clone()),
-                new_ids,
-                new_prepared,
-                new_ports,
-                replica_count,
+            |reply| DeployOp::RetainRollingInstance {
+                instance: Box::new(instance),
                 reply,
             },
-            (),
-        )
-        .await
-    }
-
-    #[allow(clippy::too_many_arguments)]
-    async fn halt_rolling_deploy(
-        &self,
-        app_name: &str,
-        namespace: &str,
-        spec: &AppSpec,
-        new_ids: Vec<InstanceId>,
-        new_prepared: Vec<InstanceId>,
-        new_ports: std::collections::HashMap<InstanceId, Option<u16>>,
-        replica_count: u32,
-    ) {
-        self.call(
-            |reply| DeployOp::HaltRollingDeploy {
-                app_name: app_name.to_string(),
-                namespace: namespace.to_string(),
-                spec: Box::new(spec.clone()),
-                new_ids,
-                new_prepared,
-                new_ports,
-                replica_count,
-                reply,
-            },
-            (),
+            Err(missing),
         )
         .await
     }
@@ -1072,7 +1128,7 @@ impl DeployOps {
         new_ips: std::collections::HashMap<InstanceId, Option<std::net::Ipv4Addr>>,
         new_specs: std::collections::HashMap<InstanceId, crate::grill::oci::OciSpec>,
         now: Instant,
-    ) {
+    ) -> Result<(), BunError> {
         self.call(
             |reply| DeployOp::FinaliseRollingDeploy {
                 app_name: app_name.to_string(),
@@ -1086,7 +1142,10 @@ impl DeployOps {
                 now,
                 reply,
             },
-            (),
+            Err(BunError::DeployFailed {
+                app_name: app_name.into(),
+                reason: "agent loop closed before finalisation".into(),
+            }),
         )
         .await
     }
@@ -1116,15 +1175,32 @@ impl DeployOps {
         .await
     }
 
+    async fn begin_retire(&self, old_id: &InstanceId) -> Result<(), BunError> {
+        self.call(
+            |reply| DeployOp::BeginRetire {
+                old_id: old_id.clone(),
+                reply,
+            },
+            Err(BunError::RetirementState {
+                instance_id: old_id.clone(),
+                reason: "agent loop closed before retirement began".into(),
+            }),
+        )
+        .await
+    }
+
     /// Bookkeeping-only op sent after the worker has already drained+stopped
     /// the instance off the loop (M7).
-    async fn finish_retire(&self, old_id: &InstanceId) {
+    async fn finish_retire(&self, old_id: &InstanceId) -> Result<(), BunError> {
         self.call(
             |reply| DeployOp::FinishRetire {
                 old_id: old_id.clone(),
                 reply,
             },
-            (),
+            Err(BunError::RetirementState {
+                instance_id: old_id.clone(),
+                reason: "agent loop closed before retirement".into(),
+            }),
         )
         .await
     }
@@ -1275,6 +1351,10 @@ pub struct NodeStatus {
     pub node_id: String,
     /// Node address (gossip endpoint).
     pub address: String,
+    /// Agent API endpoint supplied by the cluster's resolved peer directory.
+    /// Missing evidence must not be replaced with a guessed port by clients.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub api_address: Option<std::net::SocketAddr>,
     /// Current SWIM state: "alive", "suspect", "dead", or "left".
     pub state: String,
     /// SWIM incarnation number.
@@ -1390,6 +1470,8 @@ pub struct BunAgent<G: Grill> {
     shutdown: CancellationToken,
     /// Process-wide long-lived-task evidence shared with the API and reporter.
     readiness: Option<crate::bun::readiness::ReadinessTracker>,
+    #[cfg(test)]
+    egress_observation_count: std::sync::atomic::AtomicUsize,
     /// Hard per-node concurrency bound for workload connectivity traces.
     trace_slots: std::sync::Arc<tokio::sync::Semaphore>,
     volumes_dir: PathBuf,
@@ -1401,6 +1483,7 @@ pub struct BunAgent<G: Grill> {
     /// Smoker duration limits (`[smoker]`): default + maximum fault lifetime.
     smoker_config: crate::smoker::config::SmokerConfig,
     /// Reference-counted node drains, independent from binary-upgrade drains.
+    node_fault_fence: crate::smoker::reservation::NodeFaultFence,
     node_drain_gate: crate::smoker::node_fault::NodeDrainGate,
     /// Owned helper processes and cgroups for node-scoped capacity pressure.
     node_pressure: crate::smoker::node_pressure::NodePressureController,
@@ -1455,7 +1538,7 @@ pub struct BunAgent<G: Grill> {
     /// every apply/clear/expire and the responder returns NXDOMAIN for any
     /// service in the set. See [`crate::onion::dns::DnsFaultState`].
     dns_faults_tx: tokio::sync::watch::Sender<crate::onion::dns::DnsFaultState>,
-    /// Wrapper routing table (shared with the proxy via Arc<RwLock>).
+    /// Wrapper routing table (shared with the proxy via `Arc<RwLock<_>>`).
     routing_table: std::sync::Arc<tokio::sync::RwLock<crate::wrapper::routing::RoutingTable>>,
     /// Ingress configs for deployed apps (app_name → IngressSpec).
     /// Ingress specs keyed by `(namespace, app_name)` so same-named apps
@@ -1484,11 +1567,13 @@ pub struct BunAgent<G: Grill> {
     deployed_specs: std::collections::HashMap<(String, String), AppSpec>,
     /// Monotonic counter tagging each rolling-redeploy's new instance IDs.
     /// A wall-clock generation collided when two redeploys landed in the
-    /// same second; this never repeats within a process.
+    /// same second; reservations advance beyond both this counter and all restored owners.
     next_deploy_gen: u64,
     /// Jobs carrying a `schedule`, registered on apply and fired by the cron
     /// tick. Keyed by (name, namespace) so a re-apply replaces the entry.
     scheduled_jobs: std::collections::HashMap<(String, String), ScheduledJob>,
+    /// A failed or cancelled write must be resolved by reloading at startup.
+    scheduled_jobs_store_uncertain: bool,
     /// Sink for container log lines. When set, each started instance spawns a
     /// forwarder that streams its output here (drained into the LogStore).
     log_tx: Option<mpsc::Sender<crate::ketchup::types::LogRecord>>,
@@ -1567,12 +1652,15 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
             command_rx,
             shutdown,
             readiness: None,
+            #[cfg(test)]
+            egress_observation_count: std::sync::atomic::AtomicUsize::new(0),
             trace_slots: std::sync::Arc::new(tokio::sync::Semaphore::new(MAX_CONCURRENT_TRACES)),
             volumes_dir: crate::config::node::StorageSection::default().volumes,
             cluster: None,
             trust_domain: "default".to_string(),
             fault_registry: crate::smoker::registry::FaultRegistry::new(),
             smoker_config: crate::smoker::config::SmokerConfig::default(),
+            node_fault_fence: crate::smoker::reservation::NodeFaultFence::default(),
             node_drain_gate: crate::smoker::node_fault::NodeDrainGate::new(),
             node_pressure: crate::smoker::node_pressure::NodePressureController::default(),
             #[cfg(all(feature = "ebpf", target_os = "linux"))]
@@ -1616,6 +1704,7 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
             deployed_specs: std::collections::HashMap::new(),
             next_deploy_gen: 1,
             scheduled_jobs: std::collections::HashMap::new(),
+            scheduled_jobs_store_uncertain: false,
             log_tx: None,
             events: None,
             capacity_cpu_millicores: 0,
@@ -1651,12 +1740,15 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
             command_rx,
             shutdown,
             readiness: None,
+            #[cfg(test)]
+            egress_observation_count: std::sync::atomic::AtomicUsize::new(0),
             trace_slots: std::sync::Arc::new(tokio::sync::Semaphore::new(MAX_CONCURRENT_TRACES)),
             volumes_dir: crate::config::node::StorageSection::default().volumes,
             cluster: Some(cluster),
             trust_domain,
             fault_registry: crate::smoker::registry::FaultRegistry::new(),
             smoker_config: crate::smoker::config::SmokerConfig::default(),
+            node_fault_fence: crate::smoker::reservation::NodeFaultFence::default(),
             node_drain_gate: crate::smoker::node_fault::NodeDrainGate::new(),
             node_pressure: crate::smoker::node_pressure::NodePressureController::default(),
             #[cfg(all(feature = "ebpf", target_os = "linux"))]
@@ -1711,6 +1803,7 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
             deployed_specs: std::collections::HashMap::new(),
             next_deploy_gen: 1,
             scheduled_jobs: std::collections::HashMap::new(),
+            scheduled_jobs_store_uncertain: false,
             log_tx: None,
             events: None,
             capacity_cpu_millicores: 0,
@@ -1799,9 +1892,8 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
     /// Republish the current `DnsNxdomain` fault set to the DNS responder.
     ///
     /// Rebuilt from the fault registry so it always reflects reality after an
-    /// apply, clear, or expiry. Keyed by bare service name (`target_service`),
-    /// which is how the resolver checks it. Cheap: the set is tiny and this
-    /// only runs when a fault changes.
+    /// apply, clear, or expiry. Namespace-qualified identities prevent an
+    /// authorised fault in one tenant from affecting another tenant's service.
     fn publish_dns_faults(&self) {
         let faults = self
             .fault_registry
@@ -1812,7 +1904,15 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
                     crate::smoker::types::FaultType::DnsNxdomain
                 )
             })
-            .map(|rule| (rule.target_service.clone(), rule.expires_at_ns));
+            .filter_map(|rule| {
+                Some((
+                    crate::onion::service_id::ServiceId::new(
+                        rule.namespace.as_ref()?,
+                        &rule.target_service,
+                    ),
+                    rule.expires_at_ns,
+                ))
+            });
         let _ = self
             .dns_faults_tx
             .send(crate::onion::dns::DnsFaultState::from_faults(faults));
@@ -2173,9 +2273,15 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
         let Some(instance) = self.supervisor.get_instance(instance_id) else {
             return;
         };
-        let Some(pid) = self.supervisor.grill().pid(instance_id).await else {
-            return;
+        let runtime = self.supervisor.grill().runtime_kind();
+        // Apple workloads live in VMs. Record the launcher for provenance;
+        // Apple adoption checks the named container, never this host PID.
+        let pid = if runtime == crate::grill::records::RuntimeKind::Apple {
+            Some(std::process::id())
+        } else {
+            self.supervisor.grill().pid(instance_id).await
         };
+        let Some(pid) = pid else { return };
         let Some(pid_started_at) = crate::grill::records::process_start_time(pid) else {
             return;
         };
@@ -2186,7 +2292,6 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
         let replica_index = crate::grill::InstanceIdentity::parse(&instance_id.0)
             .map(|ident| ident.ordinal)
             .unwrap_or(0);
-        let runtime = self.supervisor.grill().runtime_kind();
         let rootless_network = self
             .supervisor
             .grill()
@@ -2220,13 +2325,58 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
         }
     }
 
-    /// Remove an instance's adoption record (instance stopped for good).
-    fn remove_instance_record(&self, instance_id: &InstanceId) {
-        if let Some(dir) = &self.records_dir
-            && let Err(e) = crate::grill::records::remove_record(dir, &instance_id.0)
-        {
-            eprintln!("bun: warning: failed to remove instance record for {instance_id}: {e}");
+    /// Persist launch evidence while the replacement is still owned by its
+    /// rolling worker, before health wait or traffic publication.
+    async fn persist_rolling_instance(&self, instance: &RollingInstance) -> Result<(), BunError> {
+        let Some(directory) = self.records_dir.clone() else {
+            return Ok(());
+        };
+        let fail = |reason: String| BunError::DeployFailed {
+            app_name: instance.app_name.clone(),
+            reason,
+        };
+        let grill = self.supervisor.grill();
+        let runtime = grill.runtime_kind();
+        let pid = if runtime == crate::grill::records::RuntimeKind::Apple {
+            Some(std::process::id())
+        } else {
+            grill.pid(&instance.instance_id).await
         }
+        .ok_or_else(|| {
+            fail(
+                "runtime did not expose a process identity for durable replacement adoption".into(),
+            )
+        })?;
+        let pid_started_at = crate::grill::records::process_start_time(pid).ok_or_else(|| {
+            fail("replacement process exited before its identity could be recorded".into())
+        })?;
+        let identity = crate::grill::InstanceIdentity::parse(&instance.instance_id.0)
+            .ok_or_else(|| fail("replacement has an invalid instance identity".into()))?;
+        let record = crate::grill::records::InstanceRecord {
+            schema: 2,
+            instance_id: instance.instance_id.0.clone(),
+            namespace: instance.namespace.clone(),
+            app_name: instance.app_name.clone(),
+            replica_index: identity.ordinal,
+            is_job: false,
+            image: instance.spec.image.clone().unwrap_or_default(),
+            runtime,
+            pid,
+            pid_started_at,
+            runc_container_id: matches!(runtime, crate::grill::records::RuntimeKind::Runc)
+                .then(|| instance.instance_id.0.clone()),
+            log_stem: grill.log_stem(&instance.instance_id).await,
+            host_port: instance.host_port,
+            app_spec: Some(instance.spec.clone()),
+            oci_spec: instance.oci_spec.clone(),
+            rootless_network: grill.rootless_network_record(&instance.instance_id).await,
+        };
+        tokio::task::spawn_blocking(move || {
+            crate::grill::records::write_record(&directory, &record)
+        })
+        .await
+        .map_err(|error| fail(format!("persist replacement record: {error}")))?
+        .map_err(|error| fail(format!("persist replacement record: {error}")))
     }
 
     /// Adopt still-running workloads recorded by a previous bun process.
@@ -2235,70 +2385,145 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
     /// are seeded into the supervisor as Running so they don't get
     /// double-started. Records whose process is gone are deleted (the
     /// instance reschedules through the normal path). Returns the number
-    /// of instances adopted.
+    /// of instances adopted. Any uncertain observation refuses startup and
+    /// preserves durable records and identity material for recovery.
     ///
     /// Restart backoff counters start fresh for adopted instances, and
     /// cluster routing is rebuilt by the normal reconcile paths.
-    pub async fn adopt_recorded_instances(&mut self) -> usize {
+    pub async fn adopt_recorded_instances(&mut self) -> Result<usize, BunError> {
         let Some(dir) = self.records_dir.clone() else {
-            return 0;
+            return Ok(0);
         };
         let now = Instant::now();
         let mut adopted_count = 0;
 
-        for record in crate::grill::records::load_records(&dir) {
-            // The runtime knows the still-running container by the id it was
-            // started under, which is what the record stores. The supervisor
-            // and everything downstream key on the canonical id: for a fresh
-            // record they're the same; for a legacy record (this node
-            // upgraded across the identity change with workloads running) the
-            // canonical id is rebuilt from the record's structured fields so
-            // the adopted instance lands under a namespace-safe key.
+        let records_dir = dir.clone();
+        let (records, schedules) = tokio::task::spawn_blocking(move || {
+            let records = crate::grill::records::load_records(&records_dir)?;
+            let schedules = super::schedules::load(&records_dir)?;
+            Ok::<_, std::io::Error>((records, schedules))
+        })
+        .await
+        .map_err(|error| BunError::AdoptionState(error.to_string()))?
+        .map_err(|error| BunError::AdoptionState(error.to_string()))?;
+        // Validate the entire inventory before adopting or deleting any owner.
+        for record in &records {
+            let base = crate::grill::InstanceIdentity::new(
+                &record.namespace,
+                &record.app_name,
+                record.replica_index,
+            );
+            let generation = record
+                .instance_id
+                .strip_prefix(&format!("{}__{}-g", record.namespace, record.app_name))
+                .and_then(|suffix| suffix.strip_suffix(&format!("-{}", record.replica_index)))
+                .and_then(|value| value.parse::<u64>().ok());
+            let matches_generation = generation.is_some_and(|generation| {
+                crate::grill::InstanceIdentity::canary(
+                    &record.namespace,
+                    &record.app_name,
+                    generation,
+                    record.replica_index,
+                )
+                .instance_id()
+                .0 == record.instance_id
+            });
+            if !crate::config::valid_workload_label(&record.namespace)
+                || !crate::config::valid_workload_label(&record.app_name)
+                || (base.instance_id().0 != record.instance_id && !matches_generation)
+                || record
+                    .app_spec
+                    .as_ref()
+                    .and_then(|spec| spec.namespace.as_ref())
+                    .is_some_and(|namespace| namespace != &record.namespace)
+            {
+                return Err(BunError::AdoptionState(format!(
+                    "unsupported or inconsistent workload identity in record {:?}; the record and runtime are preserved",
+                    record.instance_id,
+                )));
+            }
+            if record.runtime != self.supervisor.grill().runtime_kind() {
+                return Err(BunError::AdoptionState(format!(
+                    "instance {} belongs to {:?}, but the selected runtime is {:?}",
+                    record.instance_id,
+                    record.runtime,
+                    self.supervisor.grill().runtime_kind(),
+                )));
+            }
+        }
+        let mut restored = std::collections::HashMap::new();
+        for stored in schedules {
+            let namespace = stored.spec.namespace.as_deref().unwrap_or("default");
+            if namespace != stored.namespace
+                || stored.name.is_empty()
+                || stored.last_fired_minute.is_some_and(|minute| minute < 0)
+            {
+                return Err(BunError::AdoptionState(
+                    "invalid scheduled-job identity or firing stamp".into(),
+                ));
+            }
+            let mut config = Config::default();
+            config.job.insert(stored.name.clone(), stored.spec.clone());
+            config
+                .validate()
+                .map_err(|error| BunError::AdoptionState(error.to_string()))?;
+            let expression = stored.spec.schedule.as_deref().ok_or_else(|| {
+                BunError::AdoptionState("recorded cron job has no schedule".into())
+            })?;
+            let schedule = crate::meat::cron::CronSchedule::parse(expression)
+                .map_err(|error| BunError::AdoptionState(error.to_string()))?;
+            let key = (stored.name.clone(), stored.namespace.clone());
+            let job = ScheduledJob {
+                name: stored.name,
+                namespace: stored.namespace,
+                spec: stored.spec,
+                schedule,
+                last_fired_minute: stored.last_fired_minute,
+            };
+            if restored.insert(key, job).is_some() {
+                return Err(BunError::AdoptionState(
+                    "duplicate scheduled-job identity".into(),
+                ));
+            }
+        }
+        self.scheduled_jobs = restored;
+        self.scheduled_jobs_store_uncertain = false;
+        for record in records {
+            // Startup preflight proved that runtime, record and supervisor
+            // share the same identity. Never invent an alias for an old owner.
             let runtime_id = InstanceId(record.instance_id.clone());
-            let instance_id =
-                if crate::grill::InstanceIdentity::parse(&record.instance_id).is_some() {
-                    runtime_id.clone()
-                } else {
-                    let mut ident = crate::grill::InstanceIdentity::new(
-                        &record.namespace,
-                        &record.app_name,
-                        record.replica_index,
-                    );
-                    // Preserve a legacy canary generation if the id carried one.
-                    if let Some(legacy) = crate::grill::InstanceIdentity::parse_legacy(
-                        &record.instance_id,
-                        &record.namespace,
-                    ) && legacy.app == record.app_name
-                    {
-                        ident.generation = legacy.generation;
-                    }
-                    ident.instance_id()
-                };
+            let instance_id = runtime_id.clone();
             // Never clobber an instance the current process already tracks.
             if self.supervisor.get_instance(&instance_id).is_some() {
                 continue;
             }
 
-            let adopted = matches!(
-                self.supervisor.grill().adopt(&runtime_id, &record).await,
-                Ok(true)
-            );
+            let adopted = tokio::time::timeout(
+                std::time::Duration::from_secs(10),
+                self.supervisor.grill().adopt(&runtime_id, &record),
+            )
+            .await
+            .map_err(|_| {
+                BunError::AdoptionState(format!("runtime adoption timed out for {runtime_id}"))
+            })??;
             if !adopted {
-                let _ = crate::grill::records::remove_record(&dir, &record.instance_id);
-                // The instance is gone for good — its key material goes
-                // with it (PKI7). The identity dir was created under the id
-                // the container ran as (the runtime id), which for a legacy
-                // record differs from the canonical supervisor key.
+                let records_dir = dir.clone();
                 let identity_dir = self.instance_identity_dir(&runtime_id);
-                if let Err(e) = crate::sesame::identity::cleanup_identity_dir(&identity_dir) {
-                    eprintln!("bun: warning: failed to remove identity dir for {runtime_id}: {e}");
-                }
+                // Keep the record if identity retirement fails, so the next
+                // startup retries instead of forgetting incomplete cleanup.
+                tokio::task::spawn_blocking(move || {
+                    crate::sesame::identity::cleanup_identity_dir(&identity_dir)?;
+                    crate::grill::records::remove_record(&records_dir, &record.instance_id)
+                })
+                .await
+                .map_err(|error| BunError::AdoptionState(error.to_string()))?
+                .map_err(|error| BunError::AdoptionState(error.to_string()))?;
                 continue;
             }
 
             // The surviving instance still holds its port.
             if let Some(port) = record.host_port {
-                let _ = self.supervisor.port_allocator.reserve(port).await;
+                self.supervisor.port_allocator.reserve(port).await?;
             }
 
             // Rebuild the health check from the recorded app spec.
@@ -2316,7 +2541,7 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
             // its per-instance directory, so an adopted instance keeps
             // rotating on time instead of coming back with
             // `identity: None` (D9). The directory was created under the
-            // runtime id, so a legacy record still finds its keys. An
+            // runtime id, which is also the supervisor key. An
             // unprovisioned directory loads as `None` and the rotation loop
             // provisions afresh.
             let identity_dir = self.instance_identity_dir(&runtime_id);
@@ -2344,6 +2569,7 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
                 restart_policy: super::restart::RestartPolicy::default(),
                 health_config,
                 is_job: record.is_job,
+                retry_pending: false,
                 image: record.image.clone(),
                 oci_spec: Some(record.oci_spec.clone()),
                 identity,
@@ -2374,7 +2600,7 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
         // instances that died while bun was down — are stale key material.
         self.sweep_orphaned_identity_dirs();
 
-        adopted_count
+        Ok(adopted_count)
     }
 
     /// Spawn a background forwarder that streams a started instance's log lines
@@ -2416,11 +2642,24 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
 
     /// Run the agent event loop until shutdown is requested.
     pub async fn run(&mut self) {
+        self.run_loop(None).await;
+    }
+
+    /// Run the agent, acknowledging readiness after initial capability collection.
+    pub async fn run_with_readiness(&mut self, ready: super::readiness::ReadySignal) {
+        self.run_loop(Some(ready)).await;
+    }
+
+    async fn run_loop(&mut self, ready: Option<super::readiness::ReadySignal>) {
         let mut health_interval = tokio::time::interval(std::time::Duration::from_secs(1));
 
         if let Some(readiness) = self.readiness.clone() {
             let (capabilities, _) = self.live_egress_report_state().await;
             readiness.set_capabilities(capabilities).await;
+        }
+
+        if let Some(ready) = ready {
+            ready.ready();
         }
 
         loop {
@@ -2439,11 +2678,7 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
                     self.handle_snapshot_request(req).await;
                 }
                 _ = health_interval.tick() => {
-                    self.enforce_live_egress_or_stop().await;
-                    if let Some(readiness) = self.readiness.clone() {
-                        let (capabilities, _) = self.live_egress_report_state().await;
-                        readiness.set_capabilities(capabilities).await;
-                    }
+                    self.refresh_egress_readiness().await;
                     self.run_health_checks().await;
                     self.check_jobs().await;
                     self.fire_due_jobs().await;
@@ -2456,6 +2691,19 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
                     self.check_identity_rotation().await;
                 }
             }
+        }
+    }
+
+    /// Enforce the current kernel boundary and publish this tick's capabilities.
+    async fn refresh_egress_readiness(&mut self) {
+        let egress = self.enforce_live_egress_or_stop().await;
+        if let Some(readiness) = self.readiness.clone() {
+            readiness
+                .set_capabilities(crate::meat::cluster_state::NodeCapabilities {
+                    egress,
+                    dns: self.supervisor.dns_capability(),
+                })
+                .await;
         }
     }
 
@@ -2574,6 +2822,9 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
         crate::meat::cluster_state::NodeCapabilities,
         std::collections::HashSet<InstanceId>,
     ) {
+        #[cfg(test)]
+        self.egress_observation_count
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let Some(handle) = self.onion_ebpf.as_ref() else {
             return (
                 crate::meat::cluster_state::NodeCapabilities {
@@ -2613,6 +2864,9 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
         crate::meat::cluster_state::NodeCapabilities,
         std::collections::HashSet<InstanceId>,
     ) {
+        #[cfg(test)]
+        self.egress_observation_count
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         (
             crate::meat::cluster_state::NodeCapabilities {
                 dns: self.supervisor.dns_capability(),
@@ -2667,6 +2921,7 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
                 NodeStatus {
                     node_id: name,
                     address: m.address.to_string(),
+                    api_address: None,
                     state: m.state.to_string(),
                     incarnation: m.incarnation,
                     is_council,
@@ -2729,130 +2984,217 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
         }
     }
 
+    fn validate_deploy_names(&self, config: &Config) -> Result<(), String> {
+        use crate::bun::deploy_operations::DeployTargetKind;
+        config
+            .validate_workload_names()
+            .map_err(|error| error.to_string())?;
+        for (name, spec) in &config.app {
+            let namespace = spec.namespace.as_deref().unwrap_or("default");
+            if self
+                .scheduled_jobs
+                .contains_key(&(name.clone(), namespace.to_string()))
+            {
+                return Err(format!(
+                    "workload {namespace}/{name} belongs to a registered cron job; stop it before deploying an app with that name"
+                ));
+            }
+            self.supervisor
+                .admit_workload_kind(
+                    name,
+                    spec.namespace.as_deref().unwrap_or("default"),
+                    DeployTargetKind::App,
+                )
+                .map_err(|error| error.to_string())?;
+        }
+        for (name, spec) in &config.job {
+            self.supervisor
+                .admit_workload_kind(
+                    name,
+                    spec.namespace.as_deref().unwrap_or("default"),
+                    DeployTargetKind::Job,
+                )
+                .map_err(|error| error.to_string())?;
+        }
+        Ok(())
+    }
+
+    /// Admit and track either an operator apply or one cron firing through
+    /// worker completion, including rollback and cancellation.
+    async fn begin_deploy(
+        &mut self,
+        config: Config,
+        events: mpsc::Sender<ApplyEvent>,
+        register_schedule: bool,
+    ) {
+        if let Err(message) = self.validate_deploy_names(&config) {
+            let _ = events.send(ApplyEvent::Error { message }).await;
+            return;
+        }
+        let operation = match self.deploy_operations.start(&config).await {
+            Ok(operation) => operation,
+            Err(error) => {
+                let message = format!("deploy refused: {error}");
+                self.record_event(
+                    crate::bun::events::EventKind::Deploy,
+                    crate::bun::events::EventSeverity::Critical,
+                    None,
+                    None,
+                    message.clone(),
+                )
+                .await;
+                let _ = events.send(ApplyEvent::Error { message }).await;
+                return;
+            }
+        };
+        let _ = events
+            .send(ApplyEvent::Accepted {
+                operation_id: operation.id().to_string(),
+            })
+            .await;
+        if self.draining.load(std::sync::atomic::Ordering::Relaxed) {
+            let message = "node is draining for a binary upgrade; retry shortly".to_string();
+            self.record_event(
+                crate::bun::events::EventKind::Deploy,
+                crate::bun::events::EventSeverity::Critical,
+                None,
+                None,
+                "deploy refused while node is draining".to_string(),
+            )
+            .await;
+            operation
+                .finish(
+                    crate::bun::deploy_operations::DeployOperationOutcome::Failed,
+                    message.clone(),
+                )
+                .await;
+            let _ = events.send(ApplyEvent::Error { message }).await;
+            return;
+        }
+        // Register any cron-scheduled jobs so the event loop fires them
+        // on their schedule rather than at deploy time (E).
+        if register_schedule && let Err(error) = self.register_scheduled_jobs(&config).await {
+            let message = error.to_string();
+            operation
+                .finish(
+                    crate::bun::deploy_operations::DeployOperationOutcome::Failed,
+                    message.clone(),
+                )
+                .await;
+            let _ = events.send(ApplyEvent::Error { message }).await;
+            return;
+        }
+
+        // Forward deploy events to the caller, mirroring errors into the
+        // event store. The deploy itself runs on its own task so a slow
+        // pull or a rolling health wait can't wedge this loop
+        // (DEP4/codex-M3); it drives its authoritative steps back
+        // through `deploy_ops_tx`.
+        let (forward_tx, mut forward_rx) = mpsc::channel(64);
+        let event_store = self.events.clone();
+        let observed_operation = operation.clone();
+        let worker = DeployWorker {
+            grill: self.supervisor.grill().clone(),
+            ops: DeployOps {
+                tx: self.deploy_ops_tx.clone(),
+            },
+            drains: self.drains.clone(),
+            operation: Some(operation),
+        };
+        let worker_task = tokio::spawn(async move {
+            worker.run_deploy(config, forward_tx).await;
+        });
+        tokio::spawn(async move {
+            use crate::bun::deploy_operations::DeployOperationOutcome;
+            let mut outcome = DeployOperationOutcome::Unknown;
+            let mut message = "deploy worker ended without a terminal event".to_string();
+            let mut completion = None;
+            let mut events = Some(events);
+            while let Some(event) = forward_rx.recv().await {
+                match &event {
+                    ApplyEvent::Complete { created, .. } => {
+                        if outcome != DeployOperationOutcome::Failed {
+                            outcome = DeployOperationOutcome::Completed;
+                            message = format!("deploy completed ({created} instances)");
+                            // Success becomes visible only after all trailing
+                            // bookkeeping and the worker itself have finished.
+                            completion = Some(event);
+                        }
+                        continue;
+                    }
+                    ApplyEvent::Error { message: error } => {
+                        outcome = DeployOperationOutcome::Failed;
+                        message = error.clone();
+                        completion = None;
+                        if let Some(store) = &event_store {
+                            let timestamp = SystemTime::now()
+                                .duration_since(SystemTime::UNIX_EPOCH)
+                                .unwrap_or_default()
+                                .as_secs();
+                            store.write().await.record(
+                                timestamp,
+                                crate::bun::events::EventKind::Deploy,
+                                crate::bun::events::EventSeverity::Critical,
+                                None,
+                                None,
+                                None,
+                                error.clone(),
+                            );
+                        }
+                    }
+                    _ => {}
+                }
+                // A stalled or disconnected observer cannot hold the
+                // worker's outcome hostage. Close a full stream; its
+                // client sees an incomplete stream and can query the ID.
+                if let Some(sender) = &events
+                    && sender.try_send(event).is_err()
+                {
+                    events = None;
+                }
+            }
+            if let Err(error) = worker_task.await {
+                outcome = DeployOperationOutcome::Unknown;
+                message = format!("deploy worker ended unexpectedly: {error}");
+                completion = None;
+            } else if observed_operation.cancellation_observed() {
+                outcome = DeployOperationOutcome::Cancelled;
+                message = "deploy cancelled; in-flight work has finished".into();
+                completion = None;
+            }
+            // Error events can precede rollback. Release target ownership
+            // only after the worker has completed every mutation.
+            observed_operation.finish(outcome, message.clone()).await;
+            if let Some(sender) = events {
+                if let Some(event) = completion {
+                    let _ = sender.try_send(event);
+                } else if outcome == DeployOperationOutcome::Unknown {
+                    let _ = sender.try_send(ApplyEvent::Error { message });
+                }
+            }
+        });
+    }
+
     /// Handle a single command.
     async fn handle_command(&mut self, cmd: AgentCommand) {
         match cmd {
             AgentCommand::Deploy { config, events } => {
-                let operation = match self.deploy_operations.start(&config).await {
-                    Ok(operation) => operation,
-                    Err(error) => {
-                        let message = format!("deploy refused: {error}");
-                        self.record_event(
-                            crate::bun::events::EventKind::Deploy,
-                            crate::bun::events::EventSeverity::Critical,
-                            None,
-                            None,
-                            message.clone(),
-                        )
-                        .await;
-                        let _ = events.send(ApplyEvent::Error { message }).await;
-                        return;
-                    }
-                };
-                let _ = events
-                    .send(ApplyEvent::Accepted {
-                        operation_id: operation.id().to_string(),
-                    })
-                    .await;
-                if self.draining.load(std::sync::atomic::Ordering::Relaxed) {
-                    let message =
-                        "node is draining for a binary upgrade; retry shortly".to_string();
-                    self.record_event(
-                        crate::bun::events::EventKind::Deploy,
-                        crate::bun::events::EventSeverity::Critical,
-                        None,
-                        None,
-                        "deploy refused while node is draining".to_string(),
-                    )
-                    .await;
-                    operation
-                        .finish(
-                            crate::bun::deploy_operations::DeployOperationOutcome::Failed,
-                            message.clone(),
-                        )
-                        .await;
-                    let _ = events.send(ApplyEvent::Error { message }).await;
-                    return;
-                }
-                // Register any cron-scheduled jobs so the event loop fires them
-                // on their schedule rather than at deploy time (E).
-                self.register_scheduled_jobs(&config);
-
-                // Forward deploy events to the caller, mirroring errors into the
-                // event store. The deploy itself runs on its own task so a slow
-                // pull or a rolling health wait can't wedge this loop
-                // (DEP4/codex-M3); it drives its authoritative steps back
-                // through `deploy_ops_tx`.
-                let (forward_tx, mut forward_rx) = mpsc::channel(64);
-                let event_store = self.events.clone();
-                let observed_operation = operation.clone();
-                tokio::spawn(async move {
-                    while let Some(event) = forward_rx.recv().await {
-                        match &event {
-                            ApplyEvent::Complete { created, .. } => {
-                                observed_operation
-                                    .finish(
-                                        crate::bun::deploy_operations::DeployOperationOutcome::Completed,
-                                        format!("deploy completed ({created} instances)"),
-                                    )
-                                    .await;
-                            }
-                            ApplyEvent::Error { message } => {
-                                observed_operation
-                                    .finish(
-                                        crate::bun::deploy_operations::DeployOperationOutcome::Failed,
-                                        message.clone(),
-                                    )
-                                    .await;
-                                if let Some(store) = &event_store {
-                                    let timestamp = SystemTime::now()
-                                        .duration_since(SystemTime::UNIX_EPOCH)
-                                        .unwrap_or_default()
-                                        .as_secs();
-                                    store.write().await.record(
-                                        timestamp,
-                                        crate::bun::events::EventKind::Deploy,
-                                        crate::bun::events::EventSeverity::Critical,
-                                        None,
-                                        None,
-                                        None,
-                                        message.clone(),
-                                    );
-                                }
-                            }
-                            _ => {}
-                        }
-                        // A disconnected SSE client doesn't cancel the deploy or
-                        // its evidence. Keep draining the worker to a terminal
-                        // outcome even when this send fails.
-                        let _ = events.send(event).await;
-                    }
-                    observed_operation
-                        .finish(
-                            crate::bun::deploy_operations::DeployOperationOutcome::Unknown,
-                            "deploy worker ended without a terminal event",
-                        )
-                        .await;
-                });
-                let worker = DeployWorker {
-                    grill: self.supervisor.grill().clone(),
-                    port_allocator: self.supervisor.port_allocator(),
-                    ops: DeployOps {
-                        tx: self.deploy_ops_tx.clone(),
-                    },
-                    drains: self.drains.clone(),
-                    operation: Some(operation),
-                };
-                tokio::spawn(async move {
-                    worker.run_deploy(config, forward_tx).await;
-                });
+                self.begin_deploy(config, events, true).await;
             }
             AgentCommand::Stop {
                 app_name,
                 namespace,
                 response,
             } => {
-                let result = self.stop_app(&app_name, &namespace).await;
+                let result = self.stop_workload_when_idle(&app_name, &namespace).await;
+                let _ = response.send(result);
+            }
+            AgentCommand::Retire {
+                app_name,
+                namespace,
+                response,
+            } => {
+                let result = self.retire_workload(&app_name, &namespace).await;
                 let _ = response.send(result);
             }
             AgentCommand::Status { response } => {
@@ -2922,6 +3264,16 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
                     .filter(|image| !image.is_empty())
                     .collect();
                 let _ = response.send(images);
+            }
+            AgentCommand::CancelDeploy {
+                operation_id,
+                response,
+            } => {
+                let operation = self
+                    .deploy_operations
+                    .request_cancellation(&operation_id)
+                    .await;
+                let _ = response.send(operation);
             }
             AgentCommand::DeployOperations { response } => {
                 let _ = response.send(self.deploy_operations.snapshot().await);
@@ -3015,25 +3367,36 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
                 let _ = response.send(result);
             }
             AgentCommand::InjectPartition {
+                reservation,
                 peers,
                 duration_secs,
                 injected_by,
                 response,
             } => {
-                // Legacy chaos API — create a partition fault in the registry
-                let request = crate::smoker::types::FaultRequest {
-                    fault_type: crate::smoker::types::FaultType::CouncilPartition,
-                    target_service: peers.join(","),
-                    namespace: None,
-                    target_instance: None,
-                    target_node: None,
-                    duration: std::time::Duration::from_secs(duration_secs),
-                    injected_by,
-                    reason: Some("legacy chaos partition".into()),
-                    include_leader: false,
-                    override_safety: false,
-                    acknowledged: false,
+                let Some(grant) = reservation else {
+                    let _ = response.send(Err(BunError::FaultRejected {
+                        reason: "partitions require a committed cluster reservation".into(),
+                    }));
+                    return;
                 };
+                let request = grant.request.clone();
+                if request.target_service != peers.join(",")
+                    || request.duration != std::time::Duration::from_secs(duration_secs)
+                    || request.injected_by != injected_by
+                    || !matches!(
+                        request.fault_type,
+                        crate::smoker::types::FaultType::CouncilPartition
+                    )
+                {
+                    let _ = response.send(Err(BunError::FaultRejected {
+                        reason: "partition grant does not match the operation".into(),
+                    }));
+                    return;
+                }
+                if let Err(reason) = self.node_fault_fence.activate(&grant, &request) {
+                    let _ = response.send(Err(BunError::FaultRejected { reason }));
+                    return;
+                }
                 // Safety rails apply to the legacy path too (M1): a partition
                 // that would strand quorum must be refused, not waved through
                 // just because it came in on the old chaos API.
@@ -3048,6 +3411,7 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
                     return;
                 }
                 let rule = self.fault_registry.insert(&request);
+                self.node_fault_fence.active = Some((grant.sequence, rule.id));
                 // L15: actually partition. Resolve each peer (by name)
                 // to its gossip address from membership, then block both
                 // the gossip and Raft transports to it — the old code
@@ -3164,7 +3528,35 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
                     );
                 });
             }
+            AgentCommand::PrepareNodeFault {
+                mut request,
+                response,
+            } => {
+                let result = crate::smoker::config::effective_duration(
+                    request.duration,
+                    false,
+                    &self.smoker_config,
+                )
+                .map(|duration| {
+                    request.duration = duration;
+                    (self.node_fault_fence.boot_id.clone(), request)
+                })
+                .map_err(|reason| BunError::FaultRejected { reason });
+                let _ = response.send(result);
+            }
+            AgentCommand::FenceNodeFault {
+                only_if_finished,
+                reservation,
+                response,
+            } => {
+                let result = self
+                    .fence_node_fault(&reservation, only_if_finished)
+                    .await
+                    .map_err(|reason| BunError::FaultRejected { reason });
+                let _ = response.send(result);
+            }
             AgentCommand::InjectFault {
+                reservation,
                 mut request,
                 response,
             } => {
@@ -3178,6 +3570,19 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
                 ) {
                     Ok(effective) => request.duration = effective,
                     Err(reason) => {
+                        let _ = response.send(Err(BunError::FaultRejected { reason }));
+                        return;
+                    }
+                }
+
+                if request.fault_type.is_node_targeted() {
+                    let result = reservation
+                        .as_ref()
+                        .ok_or_else(|| {
+                            "node faults require a committed cluster reservation".to_string()
+                        })
+                        .and_then(|grant| self.node_fault_fence.activate(grant, &request));
+                    if let Err(reason) = result {
                         let _ = response.send(Err(BunError::FaultRejected { reason }));
                         return;
                     }
@@ -3204,6 +3609,9 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
                 // be applied must not report success (the old code
                 // recorded everything, injecting nothing).
                 let rule = self.fault_registry.insert(&request);
+                if let Some(grant) = &reservation {
+                    self.node_fault_fence.active = Some((grant.sequence, rule.id));
+                }
                 match self.apply_fault(&rule).await {
                     Ok(()) => {
                         let summary = crate::smoker::types::FaultSummary::from(&rule);
@@ -3370,8 +3778,12 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
             AgentCommand::UpgradeRollback { version, response } => {
                 self.handle_upgrade_rollback(version, response).await;
             }
-            AgentCommand::UpgradeVerify { marker, response } => {
-                self.handle_upgrade_verify(marker, response).await;
+            AgentCommand::UpgradeVerify {
+                marker,
+                rejoin,
+                response,
+            } => {
+                self.handle_upgrade_verify(marker, rejoin, response).await;
             }
         }
     }
@@ -3443,7 +3855,7 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
         self.draining
             .store(true, std::sync::atomic::Ordering::Relaxed);
         let inventory = self.upgrade_inventory().await;
-        let prepared = match manager.prepare_rollback(version, inventory) {
+        let prepared = match manager.prepare_rollback(version, inventory).await {
             Ok(prepared) => prepared,
             Err(e) => {
                 self.draining
@@ -3473,6 +3885,7 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
     async fn handle_upgrade_verify(
         &mut self,
         marker: crate::upgrade::marker::UpgradeMarker,
+        rejoin: Result<(), String>,
         response: oneshot::Sender<Result<bool, BunError>>,
     ) {
         let Some(manager) = self.upgrade.clone() else {
@@ -3480,11 +3893,25 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
             return;
         };
 
+        if let Err(reason) = rejoin {
+            match manager.mark_revert_pending(&marker, &reason) {
+                Ok(()) => {
+                    let _ = response.send(Ok(false));
+                    eprintln!("bun: {reason}; restarting into the previous binary");
+                    std::process::exit(1);
+                }
+                Err(error) => {
+                    let _ = response.send(Err(BunError::Upgrade(error)));
+                }
+            }
+            return;
+        }
+
         // In cluster mode, workload placement is the cluster's decision:
         // the scheduler may legitimately move an app off this node while it
         // bounces, so a missing pre-upgrade instance is NOT an upgrade
-        // failure. We surviving the boot-grace period (this command runs on
-        // the new binary) is the liveness proof; genuine boot failures are
+        // failure. Boot grace and fresh gossip acknowledgement provide
+        // separate local and cluster liveness proofs; boot failures are
         // caught by the crash-loop budget, which reverts before we ever get
         // here. Single-node keeps the strict check as a local safety net —
         // there is no cluster to reschedule, so a vanished workload really
@@ -3814,6 +4241,12 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
                 })
             }
             FaultType::DnsNxdomain => {
+                if rule.namespace.as_deref().is_none_or(str::is_empty) {
+                    return Err("DNS faults require an explicit namespace".into());
+                }
+                if rule.target_instance.is_some() {
+                    return Err("DNS faults target a namespace-qualified service, not an individual instance".into());
+                }
                 // DNS resolution lives in the userspace responder
                 // (src/onion/dns.rs), so this fault does too. Republish the
                 // faulted-service set and the responder starts returning
@@ -4157,6 +4590,66 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
         "8:0".to_string()
     }
 
+    /// Serialise the fence with activation and retain ownership if cleanup fails.
+    async fn fence_node_fault(
+        &mut self,
+        grant: &crate::smoker::reservation::NodeFaultReservation,
+        only_if_finished: bool,
+    ) -> Result<(), String> {
+        if only_if_finished
+            && (!self.node_fault_fence.consumed(grant)
+                || (grant.boot_id == self.node_fault_fence.boot_id
+                    && self.node_fault_fence.active.is_some_and(|(sequence, id)| {
+                        sequence == grant.sequence && self.fault_registry.get(id).is_some()
+                    })))
+        {
+            return Err("node fault activation or reversal is still pending".into());
+        }
+        if let Some(id) = self.node_fault_fence.fence(grant) {
+            if matches!(
+                grant.request.fault_type,
+                crate::smoker::types::FaultType::CouncilPartition
+            ) {
+                // The single node-experiment slot owns these transport lists.
+                // Peer addresses may have changed since activation; removing
+                // only today's addresses cannot prove the old entries are gone.
+                self.clear_partition().await;
+            }
+            if matches!(
+                grant.request.fault_type,
+                crate::smoker::types::FaultType::NodePressure { .. }
+            ) {
+                self.node_pressure.clear(id).await?;
+            }
+            if let Some(rule) = self.fault_registry.get(id).cloned() {
+                if !matches!(
+                    rule.fault_type,
+                    crate::smoker::types::FaultType::NodePressure { .. }
+                ) {
+                    self.reverse_fault(&rule).await;
+                }
+                self.fault_registry.remove(id);
+            }
+            // A failed apply or expiry may have removed its registry entry;
+            // inspect pressure helpers independently before acknowledging.
+        }
+        if matches!(
+            grant.request.fault_type,
+            crate::smoker::types::FaultType::NodePressure { .. }
+        ) {
+            self.node_pressure.confirm_no_helpers().await?;
+        }
+        if self
+            .node_fault_fence
+            .active
+            .is_some_and(|(sequence, _)| sequence <= grant.sequence)
+            && self.node_fault_fence.boot_id == grant.boot_id
+        {
+            self.node_fault_fence.active = None;
+        }
+        Ok(())
+    }
+
     /// Reverse a cleared or expired fault's persistent effect.
     ///
     /// eBPF network faults are undone by `delete_fault_bpf_entry`; this handles
@@ -4224,6 +4717,12 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
             FaultReversal::NodeQuiesce => {
                 if let Some(cluster) = &self.cluster {
                     cluster.partition_blocklists.node_gate.restore();
+                    eprintln!(
+                        "smoker: reversed node fault {} on {:?}; transports quiesced={}",
+                        rule.id,
+                        rule.target_node,
+                        cluster.partition_blocklists.node_gate.is_quiesced()
+                    );
                 }
             }
             FaultReversal::NodePressure => {
@@ -4854,6 +5353,58 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
         Ok(())
     }
 
+    async fn reserve_rolling_instance(
+        &mut self,
+        id: &InstanceId,
+        app_name: &str,
+        namespace: &str,
+        spec: &AppSpec,
+    ) -> Result<Option<u16>, BunError> {
+        if let Some(owner) = self.supervisor.get_instance(id) {
+            return Err(BunError::DeployFailed {
+                app_name: app_name.into(),
+                reason: format!(
+                    "instance {id} is still owned by {}/{}",
+                    owner.namespace, owner.app_name
+                ),
+            });
+        }
+        let host_port = if spec.port.is_some() {
+            Some(self.supervisor.port_allocator.allocate().await?)
+        } else {
+            None
+        };
+        self.supervisor.instances.insert(
+            id.clone(),
+            super::supervisor::WorkloadInstance {
+                id: id.clone(),
+                app_name: app_name.into(),
+                namespace: namespace.into(),
+                state: ContainerState::Preparing,
+                health_counters: Default::default(),
+                restart_count: 0,
+                last_restart: None,
+                host_port,
+                container_ip: None,
+                created_at: Instant::now(),
+                restart_policy: Default::default(),
+                health_config: None,
+                is_job: false,
+                retry_pending: false,
+                image: spec.image.clone().unwrap_or_default(),
+                oci_spec: None,
+                identity: None,
+                identity_mount: None,
+            },
+        );
+        self.supervisor
+            .app_instances
+            .entry((app_name.into(), namespace.into()))
+            .or_default()
+            .push(id.clone());
+        Ok(host_port)
+    }
+
     /// Fast pre-create bookkeeping for a rolling-redeploy instance: fail closed
     /// on undecryptable secrets, prepare its identity dir, build the OCI spec.
     /// The spawned task then creates and starts it off the loop.
@@ -4880,7 +5431,7 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
             eprintln!("bun: warning: {e}");
         }
         let cgroup_path = crate::grill::cgroup::cgroup_path(namespace, app_name, index);
-        Self::oci_spec_with_secrets(
+        let oci_spec = Self::oci_spec_with_secrets(
             app_name,
             namespace,
             spec,
@@ -4890,99 +5441,15 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
             Some(&self.volumes_dir),
             None,
             identities,
-        )
-    }
-
-    /// Roll a failed rolling redeploy back: kill and clean up the new
-    /// instances (grill-created but never supervisor-tracked), release their
-    /// ports and identity dirs, and record the rollback in history.
-    #[allow(clippy::too_many_arguments)]
-    async fn rollback_rolling_deploy(
-        &mut self,
-        app_name: &str,
-        namespace: &str,
-        spec: &AppSpec,
-        new_ids: &[InstanceId],
-        new_prepared: &[InstanceId],
-        new_ports: &std::collections::HashMap<InstanceId, Option<u16>>,
-        replica_count: u32,
-    ) {
-        for new_id in new_ids {
-            let _ = self.supervisor.grill().kill(new_id).await;
-            self.clear_egress(new_id).await;
-            if let Some(port) = new_ports.get(new_id).copied().flatten() {
-                let _ = self.supervisor.port_allocator.release(port).await;
-            }
-        }
-        for new_id in new_prepared {
-            self.cleanup_instance_identity(new_id);
-        }
-        let entry = crate::meat::deploy_types::DeployHistoryEntry {
-            id: crate::meat::deploy_types::DeployId(
-                SystemTime::now()
-                    .duration_since(SystemTime::UNIX_EPOCH)
-                    .unwrap_or_default()
-                    .as_secs(),
-            ),
-            app_id: crate::meat::types::AppId::new(app_name, namespace),
-            image: spec.image.clone().unwrap_or_default(),
-            result: crate::meat::deploy_types::DeployResult::RolledBack,
-            created_at: SystemTime::now(),
-            completed_at: SystemTime::now(),
-            steps_completed: 0,
-            steps_total: replica_count as usize,
-            spec: Some(Box::new(spec.clone())),
-        };
-        self.deploy_history.write().await.push(entry);
-    }
-
-    /// Halt a failed rolling deploy without reverting (`auto_rollback = false`).
-    ///
-    /// Unlike [`rollback_rolling_deploy`], the healthy new instances that were
-    /// already published stay in service alongside the surviving old ones — the
-    /// operator inspects the mixed state and decides. Only the incomplete
-    /// instance (prepared but never made healthy, so not in `new_ids`) is torn
-    /// down, so a failed replacement can't leak its container, port or identity
-    /// dir.
-    #[allow(clippy::too_many_arguments)]
-    async fn halt_rolling_deploy(
-        &mut self,
-        app_name: &str,
-        namespace: &str,
-        spec: &AppSpec,
-        new_ids: &[InstanceId],
-        new_prepared: &[InstanceId],
-        new_ports: &std::collections::HashMap<InstanceId, Option<u16>>,
-        replica_count: u32,
-    ) {
-        for prepared in new_prepared {
-            if new_ids.contains(prepared) {
-                continue; // healthy and serving — leave it running
-            }
-            let _ = self.supervisor.grill().kill(prepared).await;
-            self.clear_egress(prepared).await;
-            if let Some(port) = new_ports.get(prepared).copied().flatten() {
-                let _ = self.supervisor.port_allocator.release(port).await;
-            }
-            self.cleanup_instance_identity(prepared);
-        }
-        let entry = crate::meat::deploy_types::DeployHistoryEntry {
-            id: crate::meat::deploy_types::DeployId(
-                SystemTime::now()
-                    .duration_since(SystemTime::UNIX_EPOCH)
-                    .unwrap_or_default()
-                    .as_secs(),
-            ),
-            app_id: crate::meat::types::AppId::new(app_name, namespace),
-            image: spec.image.clone().unwrap_or_default(),
-            result: crate::meat::deploy_types::DeployResult::Halted,
-            created_at: SystemTime::now(),
-            completed_at: SystemTime::now(),
-            steps_completed: new_ids.len(),
-            steps_total: replica_count as usize,
-            spec: Some(Box::new(spec.clone())),
-        };
-        self.deploy_history.write().await.push(entry);
+        )?;
+        let owner = self
+            .supervisor
+            .get_instance_mut(instance_id)
+            .ok_or_else(|| BunError::InstanceNotFound {
+                instance_id: instance_id.clone(),
+            })?;
+        owner.oci_spec = Some(oci_spec.clone());
+        Ok(oci_spec)
     }
 
     /// Forget the old instances and register the healthy new ones after a
@@ -5004,11 +5471,16 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
         new_ips: &std::collections::HashMap<InstanceId, Option<std::net::Ipv4Addr>>,
         mut new_specs: std::collections::HashMap<InstanceId, crate::grill::oci::OciSpec>,
         now: Instant,
-    ) {
+    ) -> Result<(), BunError> {
         // DEP5: the worker routed traffic to the fresh instances (published
         // backends) before draining and stopping the old ones, so by the time
         // this op runs the cut-over has already happened. What's left is to
         // tear the old bookkeeping down and install the new.
+        // A failed first cleanup must not leave another exited old instance
+        // eligible for the crash-restart driver.
+        for old_id in existing {
+            self.retain_stopped_instance(old_id);
+        }
         let service_id = crate::onion::service_id::ServiceId::new(namespace, app_name);
         // M7: publishing backends and retiring old instances now happen
         // incrementally as the rollout steps, so by the time we get here both
@@ -5034,15 +5506,9 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
         }
 
         for old_id in existing {
-            // NET6: lift the retiring instance's egress enforcement.
-            self.clear_egress(old_id).await;
-            self.cleanup_instance_identity(old_id);
+            self.finish_retire_bookkeeping(old_id).await?;
         }
-        self.supervisor.remove_app(app_name, namespace).await;
         self.remove_backend_ebpf(&service_id).await;
-        for old_id in existing {
-            self.remove_instance_record(old_id);
-        }
         let _ = self.service_map.unregister(&service_id);
 
         for new_id in new_ids {
@@ -5056,6 +5522,11 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
                 self.supervisor
                     .register_health(new_id.clone(), cfg.clone(), now);
             }
+            let (identity, identity_mount) = self
+                .supervisor
+                .get_instance_mut(new_id)
+                .map(|owner| (owner.identity.take(), owner.identity_mount.take()))
+                .unwrap_or_default();
             self.supervisor.instances.insert(
                 new_id.clone(),
                 super::supervisor::WorkloadInstance {
@@ -5072,10 +5543,11 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
                     restart_policy: crate::bun::restart::RestartPolicy::default(),
                     health_config,
                     is_job: false,
+                    retry_pending: false,
                     image: spec.image.clone().unwrap_or_default(),
                     oci_spec: new_specs.remove(new_id),
-                    identity: None,
-                    identity_mount: None,
+                    identity,
+                    identity_mount,
                 },
             );
         }
@@ -5133,6 +5605,7 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
             spec: Some(Box::new(spec.clone())),
         };
         self.deploy_history.write().await.push(entry);
+        Ok(())
     }
 
     /// Post-start bookkeeping for a job instance (the loop side of the former
@@ -5495,7 +5968,12 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
     /// affected workload. Keeping it running would turn its allowlist into a
     /// label rather than a control.
     #[cfg(all(feature = "ebpf", target_os = "linux"))]
-    async fn enforce_live_egress_or_stop(&mut self) {
+    async fn enforce_live_egress_or_stop(
+        &mut self,
+    ) -> crate::sesame::egress::EgressEnforcementCapability {
+        #[cfg(test)]
+        self.egress_observation_count
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         use crate::sesame::egress;
 
         let unbound: std::collections::HashSet<InstanceId> = self
@@ -5525,7 +6003,7 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
                 self.egress_bindings.keys().cloned().collect();
             affected.extend(unbound);
             self.stop_instances_after_egress_loss(affected).await;
-            return;
+            return Default::default();
         };
         let expected: std::collections::HashSet<u64> =
             self.egress_bindings.values().map(|b| b.cgroup_id).collect();
@@ -5546,7 +6024,7 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
             if capability.can_enforce_allowlist() {
                 self.egress_affected_workloads.clear();
             }
-            return;
+            return capability;
         }
 
         let plan = egress::plan_live_egress_health(capability, &expected, &kernel_enforced);
@@ -5565,7 +6043,7 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
         }
         if fence.is_empty() && unbound.is_empty() {
             self.egress_affected_workloads.clear();
-            return;
+            return capability;
         }
 
         let mut affected_ids: std::collections::HashSet<InstanceId> = self
@@ -5576,6 +6054,7 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
             .collect();
         affected_ids.extend(unbound);
         self.stop_instances_after_egress_loss(affected_ids).await;
+        capability
     }
 
     #[cfg(all(feature = "ebpf", target_os = "linux"))]
@@ -5607,7 +6086,14 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
 
     /// Portable builds cannot have live egress bindings.
     #[cfg(not(all(feature = "ebpf", target_os = "linux")))]
-    async fn enforce_live_egress_or_stop(&mut self) {}
+    async fn enforce_live_egress_or_stop(
+        &mut self,
+    ) -> crate::sesame::egress::EgressEnforcementCapability {
+        #[cfg(test)]
+        self.egress_observation_count
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        Default::default()
+    }
 
     /// Periodically re-resolve DNS-based egress allowlists and reprogram the
     /// eBPF egress maps when an app's destination IPs change (L16). Rate-
@@ -5937,45 +6423,82 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
             .schedule_next(instance_id, now);
     }
 
-    /// Register (or refresh) the cron-scheduled jobs from an applied config.
-    ///
-    /// A job with a `schedule` is not run at deploy time; it's parked here and
-    /// fired by [`fire_due_jobs`](Self::fire_due_jobs) when its cron matches.
-    /// Re-applying an unchanged schedule preserves its last-fired stamp so the
-    /// same minute doesn't fire twice; a parse failure is logged and skipped.
-    fn register_scheduled_jobs(&mut self, config: &Config) {
+    /// Replace the schedule inventory only after its checkpoint is durable.
+    async fn commit_scheduled_jobs(
+        &mut self,
+        next: std::collections::HashMap<(String, String), ScheduledJob>,
+    ) -> Result<(), BunError> {
+        if self.scheduled_jobs_store_uncertain {
+            return Err(BunError::ScheduleState(
+                "a previous write is uncertain; restart Bun to reload the checkpoint".into(),
+            ));
+        }
+        if next == self.scheduled_jobs {
+            return Ok(());
+        }
+        if let Some(directory) = self.records_dir.clone() {
+            let records = next
+                .values()
+                .map(|job| super::schedules::RecordedSchedule {
+                    name: job.name.clone(),
+                    namespace: job.namespace.clone(),
+                    spec: job.spec.clone(),
+                    last_fired_minute: job.last_fired_minute,
+                })
+                .collect();
+            // spawn_blocking can finish after its caller is cancelled. Fence
+            // scheduling before the await until memory and disk agree again.
+            self.scheduled_jobs_store_uncertain = true;
+            // Keep both old and proposed owners reachable if writing fails or
+            // is cancelled. Retirement must not mistake either set for absent.
+            for (key, job) in &next {
+                self.scheduled_jobs
+                    .entry(key.clone())
+                    .or_insert_with(|| job.clone());
+            }
+            tokio::task::spawn_blocking(move || super::schedules::persist(&directory, records))
+                .await
+                .map_err(|error| BunError::ScheduleState(error.to_string()))?
+                .map_err(|error| BunError::ScheduleState(error.to_string()))?;
+        }
+        self.scheduled_jobs = next;
+        self.scheduled_jobs_store_uncertain = false;
+        Ok(())
+    }
+
+    /// Persist registrations and retire schedules removed by an explicit apply.
+    async fn register_scheduled_jobs(&mut self, config: &Config) -> Result<(), BunError> {
+        if config.job.is_empty() {
+            return Ok(());
+        }
+        let mut next = self.scheduled_jobs.clone();
         for (name, spec) in &config.job {
-            let Some(expression) = spec.schedule.as_deref() else {
-                continue;
-            };
             let namespace = spec
                 .namespace
                 .clone()
                 .unwrap_or_else(|| "default".to_string());
-            match crate::meat::cron::CronSchedule::parse(expression) {
-                Ok(schedule) => {
-                    let key = (name.clone(), namespace.clone());
-                    let last_fired_minute = self
-                        .scheduled_jobs
-                        .get(&key)
-                        .filter(|existing| existing.schedule == schedule)
-                        .and_then(|existing| existing.last_fired_minute);
-                    self.scheduled_jobs.insert(
-                        key,
-                        ScheduledJob {
-                            name: name.clone(),
-                            namespace,
-                            schedule,
-                            spec: spec.clone(),
-                            last_fired_minute,
-                        },
-                    );
-                }
-                Err(error) => {
-                    eprintln!("cron: job {name} has invalid schedule {expression:?}: {error}");
-                }
-            }
+            let key = (name.clone(), namespace.clone());
+            let Some(expression) = spec.schedule.as_deref() else {
+                next.remove(&key);
+                continue;
+            };
+            let schedule = crate::meat::cron::CronSchedule::parse(expression)
+                .map_err(|error| BunError::ScheduleState(error.to_string()))?;
+            let last_fired_minute = next
+                .get(&key)
+                .and_then(|existing| existing.last_fired_minute);
+            next.insert(
+                key,
+                ScheduledJob {
+                    name: name.clone(),
+                    namespace,
+                    schedule,
+                    spec: spec.clone(),
+                    last_fired_minute,
+                },
+            );
         }
+        self.commit_scheduled_jobs(next).await
     }
 
     /// Fire every scheduled job whose cron matches the current UTC minute.
@@ -5985,15 +6508,28 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
     /// its epoch-minute stamp). Firing reuses the normal job deploy path with
     /// the `schedule` cleared, so the job actually runs this time.
     async fn fire_due_jobs(&mut self) {
-        if self.scheduled_jobs.is_empty() {
+        if self.scheduled_jobs.is_empty() || self.scheduled_jobs_store_uncertain {
             return;
         }
         let now = time::OffsetDateTime::now_utc();
         let minute_stamp = now.unix_timestamp().div_euclid(60);
 
         let mut due: Vec<(String, String, JobSpec)> = Vec::new();
-        for job in self.scheduled_jobs.values_mut() {
-            if job.last_fired_minute == Some(minute_stamp) {
+        let mut next = self.scheduled_jobs.clone();
+        let active = self.deploy_operations.snapshot().await.active_deploys;
+        for job in next.values_mut() {
+            if active.iter().any(|operation| {
+                operation
+                    .targets
+                    .iter()
+                    .any(|target| target.name == job.name && target.namespace == job.namespace)
+            }) {
+                continue;
+            }
+            if job
+                .last_fired_minute
+                .is_some_and(|previous| previous >= minute_stamp)
+            {
                 continue;
             }
             if job.schedule.matches(now) {
@@ -6004,6 +6540,13 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
             }
         }
 
+        if due.is_empty() {
+            return;
+        }
+        if let Err(error) = self.commit_scheduled_jobs(next).await {
+            eprintln!("cron: firing refused: {error}");
+            return;
+        }
         for (name, namespace, spec) in due {
             self.record_event(
                 crate::bun::events::EventKind::Deploy,
@@ -6016,28 +6559,15 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
 
             let mut config = Config::default();
             config.job.insert(name, spec);
-            self.spawn_scheduled_job_deploy(config);
+            self.spawn_scheduled_job_deploy(config).await;
         }
     }
 
-    /// Spawn a one-off deploy of a cron-fired job on its own task, draining the
-    /// event stream. Mirrors the worker construction in the deploy command path.
-    fn spawn_scheduled_job_deploy(&self, config: Config) {
+    /// Admit a cron firing without changing the registered schedule.
+    async fn spawn_scheduled_job_deploy(&mut self, config: Config) {
         let (events_tx, mut events_rx) = mpsc::channel::<ApplyEvent>(64);
         tokio::spawn(async move { while events_rx.recv().await.is_some() {} });
-
-        let worker = DeployWorker {
-            grill: self.supervisor.grill().clone(),
-            port_allocator: self.supervisor.port_allocator(),
-            ops: DeployOps {
-                tx: self.deploy_ops_tx.clone(),
-            },
-            drains: self.drains.clone(),
-            operation: None,
-        };
-        tokio::spawn(async move {
-            worker.run_deploy(config, events_tx).await;
-        });
+        self.begin_deploy(config, events_tx, false).await;
     }
 
     /// Monitor running job instances for process exit.
@@ -6069,6 +6599,7 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
 
                 // Transition Running → Stopping → Stopped
                 if let Some(instance) = self.supervisor.get_instance_mut(&id) {
+                    instance.retry_pending = exit_code != Some(0);
                     if let Ok(s) = instance.state.transition_to(ContainerState::Stopping) {
                         instance.state = s;
                     }
@@ -6119,6 +6650,7 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
                             && let Ok(s) = instance.state.transition_to(ContainerState::Failed)
                         {
                             instance.state = s;
+                            instance.retry_pending = false;
                         }
                         if let Some(instance) = self.supervisor.get_instance(&id) {
                             self.record_event(
@@ -6130,56 +6662,6 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
                             )
                             .await;
                         }
-                    }
-                }
-            }
-        }
-
-        // Retry stopped failed jobs waiting for backoff
-        let stopped_jobs: Vec<InstanceId> = self
-            .supervisor
-            .list_instances()
-            .iter()
-            .filter(|i| i.is_job && i.state == ContainerState::Stopped && i.restart_count > 0)
-            .map(|i| i.id.clone())
-            .collect();
-
-        for id in stopped_jobs {
-            match self.supervisor.maybe_restart(&id, now).await {
-                Ok(true) => {
-                    // Now in Pending — drive_pending_restarts will handle it
-                    if let Some(instance) = self.supervisor.get_instance(&id) {
-                        self.record_event(
-                            crate::bun::events::EventKind::Restart,
-                            crate::bun::events::EventSeverity::Warning,
-                            Some(instance.app_name.clone()),
-                            Some(instance.namespace.clone()),
-                            format!(
-                                "instance {} restarted (attempt {})",
-                                id.0, instance.restart_count
-                            ),
-                        )
-                        .await;
-                    }
-                }
-                Ok(false) => {
-                    // Still in backoff
-                }
-                Err(_) => {
-                    if let Some(instance) = self.supervisor.get_instance_mut(&id)
-                        && let Ok(s) = instance.state.transition_to(ContainerState::Failed)
-                    {
-                        instance.state = s;
-                    }
-                    if let Some(instance) = self.supervisor.get_instance(&id) {
-                        self.record_event(
-                            crate::bun::events::EventKind::JobFailed,
-                            crate::bun::events::EventSeverity::Warning,
-                            Some(instance.app_name.clone()),
-                            Some(instance.namespace.clone()),
-                            format!("job {} failed", instance.app_name),
-                        )
-                        .await;
                     }
                 }
             }
@@ -6213,6 +6695,7 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
 
             // The process exited unexpectedly. Mark it Stopped, then restart.
             if let Some(instance) = self.supervisor.get_instance_mut(&id) {
+                instance.retry_pending = true;
                 if let Ok(s) = instance.state.transition_to(ContainerState::Stopping) {
                     instance.state = s;
                 }
@@ -6236,6 +6719,76 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
     /// this method picks it up and drives it through the startup
     /// sequence again using the stored OCI spec.
     async fn drive_pending_restarts(&mut self) {
+        // Partial startup can have changed the runtime even when its call
+        // failed. Keep ownership until cleanup is observed; then apply the
+        // same budget and backoff as any other failed execution.
+        let retrying: Vec<_> = self
+            .supervisor
+            .list_instances()
+            .iter()
+            .filter(|instance| {
+                instance.retry_pending
+                    && matches!(
+                        instance.state,
+                        ContainerState::Stopping | ContainerState::Stopped
+                    )
+            })
+            .map(|instance| (instance.id.clone(), instance.state))
+            .collect();
+        for (id, state) in retrying {
+            if state == ContainerState::Stopping {
+                if let Err(error) = self.kill_and_wait_for_exit(&id).await {
+                    eprintln!("bun: failed restart of {id} awaits runtime cleanup: {error}");
+                    continue;
+                }
+                if let Some(instance) = self.supervisor.get_instance_mut(&id) {
+                    let Ok(stopped) = instance.state.transition_to(ContainerState::Stopped) else {
+                        continue;
+                    };
+                    instance.state = stopped;
+                }
+            }
+            match self.supervisor.maybe_restart(&id, Instant::now()).await {
+                Ok(true) => {
+                    if let Some(instance) = self.supervisor.get_instance(&id) {
+                        self.record_event(
+                            crate::bun::events::EventKind::Restart,
+                            crate::bun::events::EventSeverity::Warning,
+                            Some(instance.app_name.clone()),
+                            Some(instance.namespace.clone()),
+                            format!(
+                                "instance {id} restarted (attempt {})",
+                                instance.restart_count
+                            ),
+                        )
+                        .await;
+                    }
+                }
+                Ok(false) => {}
+                Err(BunError::RestartLimitExceeded { .. }) => {
+                    if let Some(instance) = self.supervisor.get_instance_mut(&id)
+                        && let Ok(failed) = instance.state.transition_to(ContainerState::Failed)
+                    {
+                        instance.state = failed;
+                        instance.retry_pending = false;
+                    }
+                    if let Some(instance) = self.supervisor.get_instance(&id) {
+                        self.record_event(
+                            crate::bun::events::EventKind::JobFailed,
+                            crate::bun::events::EventSeverity::Warning,
+                            Some(instance.app_name.clone()),
+                            Some(instance.namespace.clone()),
+                            format!(
+                                "workload {} exhausted its restart budget",
+                                instance.app_name
+                            ),
+                        )
+                        .await;
+                    }
+                }
+                Err(error) => eprintln!("bun: cannot retry {id}: {error}"),
+            }
+        }
         #[allow(clippy::type_complexity)]
         let pending_restarts: Vec<(
             InstanceId,
@@ -6266,7 +6819,10 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
             // create is rejected (ProcessGrill: stale-Running entry) or fails
             // (runc/apple: container still exists), leaving the instance wedged
             // in Preparing and the old process leaked.
-            let _ = self.supervisor.grill().kill(&id).await;
+            if let Err(error) = self.kill_and_wait_for_exit(&id).await {
+                eprintln!("bun: restart of {id} awaits runtime cleanup: {error}");
+                continue;
+            }
 
             // Pending → Preparing
             if let Some(instance) = self.supervisor.get_instance_mut(&id) {
@@ -6276,13 +6832,8 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
                 }
             }
 
-            if self
-                .supervisor
-                .grill()
-                .create(&id, &oci_spec)
-                .await
-                .is_err()
-            {
+            if let Err(error) = self.supervisor.grill().create(&id, &oci_spec).await {
+                self.record_failed_restart(&id, &error.to_string()).await;
                 continue;
             }
 
@@ -6338,7 +6889,8 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
                 }
             }
 
-            if self.supervisor.grill().start(&id).await.is_err() {
+            if let Err(error) = self.supervisor.grill().start(&id).await {
+                self.record_failed_restart(&id, &error.to_string()).await;
                 continue;
             }
             // Re-wire the restarted instance: stream its logs and keep it routable.
@@ -6375,8 +6927,89 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
         }
     }
 
+    /// Retain a partially created runtime for observed cleanup and bounded retry.
+    async fn record_failed_restart(&mut self, id: &InstanceId, reason: &str) {
+        if let Some(instance) = self.supervisor.get_instance_mut(id)
+            && let Ok(stopping) = instance.state.transition_to(ContainerState::Stopping)
+        {
+            instance.state = stopping;
+            instance.retry_pending = true;
+        }
+        if let Some(instance) = self.supervisor.get_instance(id) {
+            self.record_event(
+                crate::bun::events::EventKind::Restart,
+                crate::bun::events::EventSeverity::Warning,
+                Some(instance.app_name.clone()),
+                Some(instance.namespace.clone()),
+                format!("restart of {id} failed and awaits cleanup: {reason}"),
+            )
+            .await;
+        }
+    }
+
+    /// Refuse user/cleanup stops while a deploy can still mutate the target.
+    async fn stop_workload_when_idle(
+        &mut self,
+        app_name: &str,
+        namespace: &str,
+    ) -> Result<(), BunError> {
+        // Worker completion releases ownership only after its last runtime
+        // mutation. Refuse before retiring a schedule or claiming a stop.
+        // Both command admission and cron firing run on this same event loop.
+        if let Some(operation) = self
+            .deploy_operations
+            .snapshot()
+            .await
+            .active_deploys
+            .into_iter()
+            .find(|operation| {
+                operation
+                    .targets
+                    .iter()
+                    .any(|target| target.name == app_name && target.namespace == namespace)
+            })
+        {
+            return Err(BunError::WorkloadBusy {
+                app_name: app_name.to_owned(),
+                namespace: namespace.to_owned(),
+                operation_id: operation.id,
+            });
+        }
+        self.stop_app(app_name, namespace).await
+    }
+
+    /// Forget ownership only after stop has confirmed every instance's exit.
+    async fn retire_workload(&mut self, app_name: &str, namespace: &str) -> Result<(), BunError> {
+        match self.stop_workload_when_idle(app_name, namespace).await {
+            Ok(()) | Err(BunError::AppNotFound { .. }) => {}
+            Err(error) => return Err(error),
+        }
+        let instances: Vec<_> = self
+            .supervisor
+            .list_instances()
+            .into_iter()
+            .filter(|instance| instance.app_name == app_name && instance.namespace == namespace)
+            .map(|instance| instance.id.clone())
+            .collect();
+        for id in instances {
+            self.supervisor.retire_instance(&id).await;
+        }
+        self.deployed_specs
+            .remove(&(app_name.to_string(), namespace.to_string()));
+        Ok(())
+    }
+
     /// Stop an app's instances.
     async fn stop_app(&mut self, app_name: &str, namespace: &str) -> Result<(), BunError> {
+        // A schedule exists before its first instance. Retire future firings
+        // even when there is no running process (or runtime cleanup fails).
+        let mut next = self.scheduled_jobs.clone();
+        let had_schedule = next
+            .remove(&(app_name.to_string(), namespace.to_string()))
+            .is_some();
+        if had_schedule {
+            self.commit_scheduled_jobs(next).await?;
+        }
         // Get instance IDs for this app
         let instances: Vec<InstanceId> = self
             .supervisor
@@ -6386,7 +7019,7 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
             .map(|i| i.id.clone())
             .collect();
 
-        if instances.is_empty() {
+        if instances.is_empty() && !had_schedule {
             return Err(BunError::AppNotFound {
                 app_name: app_name.to_string(),
                 namespace: namespace.to_string(),
@@ -6394,15 +7027,27 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
         }
 
         // Stop via supervisor (moves the tracked state to Stopping).
-        self.supervisor.stop_app(app_name, namespace).await?;
+        if !instances.is_empty() {
+            self.supervisor.stop_app(app_name, namespace).await?;
+        }
 
         // DEP6: SIGTERM, wait for the runtime to confirm exit, escalate to
         // SIGKILL on timeout. Only then do we record Stopped. Recording it
         // before the process exits let container and supervisor state
         // diverge — a "stopped" app whose process was still serving traffic.
+        let mut first_error = None;
         for id in &instances {
-            self.stop_and_wait_for_exit(id, std::time::Duration::from_secs(STOP_GRACE_SECS))
-                .await;
+            if let Err(error) = self
+                .stop_and_wait_for_exit(id, std::time::Duration::from_secs(STOP_GRACE_SECS))
+                .await
+            {
+                first_error.get_or_insert(error);
+            }
+        }
+        // Try every replica, but preserve ownership and enforcement until all
+        // exits are confirmed. A later stop can retry the incomplete cleanup.
+        if let Some(error) = first_error {
+            return Err(error);
         }
 
         // Transition Stopping → Stopped now the exit is confirmed.
@@ -6419,9 +7064,10 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
             }
         }
 
-        // Stopped for good: nothing left to adopt after a restart.
+        // Keep durable ownership until identity and record retirement succeed.
+        // A failed cleanup must remain retryable through Stop or Retire.
         for id in &instances {
-            self.remove_instance_record(id);
+            self.retire_instance_artifacts(id).await?;
         }
 
         // Remove backends and unregister from the service map
@@ -6429,9 +7075,6 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
         for id in &instances {
             let _ = self.service_map.remove_backend(&service_id, &id.0);
             self.clear_egress(id).await;
-            // Key material must not outlive the instance (PKI7): remove
-            // the identity dir and unmount its tmpfs backing.
-            self.cleanup_instance_identity(id);
         }
         self.remove_backend_ebpf(&service_id).await;
         let _ = self.service_map.unregister(&service_id);
@@ -6589,17 +7232,35 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
         })
     }
 
-    /// Remove an instance's identity directory (and drop the in-memory
-    /// identity), so key material never outlives the instance (PKI7).
-    fn cleanup_instance_identity(&mut self, instance_id: &InstanceId) {
-        let dir = self.instance_identity_dir(instance_id);
-        if let Err(e) = crate::sesame::identity::cleanup_identity_dir(&dir) {
-            eprintln!("bun: warning: failed to remove identity dir for {instance_id}: {e}");
+    /// Retire durable artifacts before allowing the caller to forget an owner.
+    async fn retire_instance_artifacts(
+        &mut self,
+        instance_id: &InstanceId,
+    ) -> Result<(), BunError> {
+        let identity_dir = self.instance_identity_dir(instance_id);
+        let records_dir = self.records_dir.clone();
+        let id = instance_id.0.clone();
+        let cleanup = tokio::task::spawn_blocking(move || {
+            crate::sesame::identity::cleanup_identity_dir(&identity_dir)?;
+            if let Some(directory) = records_dir {
+                crate::grill::records::remove_record(&directory, &id)?;
+            }
+            Ok::<(), std::io::Error>(())
+        })
+        .await
+        .map_err(|error| BunError::RetirementState {
+            instance_id: instance_id.clone(),
+            reason: error.to_string(),
+        })?;
+        cleanup.map_err(|error| BunError::RetirementState {
+            instance_id: instance_id.clone(),
+            reason: error.to_string(),
+        })?;
+        if let Some(instance) = self.supervisor.get_instance_mut(instance_id) {
+            instance.identity = None;
+            instance.identity_mount = None;
         }
-        if let Some(inst) = self.supervisor.get_instance_mut(instance_id) {
-            inst.identity = None;
-            inst.identity_mount = None;
-        }
+        Ok(())
     }
 
     /// Remove identity directories that don't belong to any tracked
@@ -7469,31 +8130,18 @@ impl<G: Grill + Clone + 'static> PreparedTrace<G> {
 }
 
 impl<G: Grill + Clone + 'static> BunAgent<G> {
-    /// Stop one instance and wait for it to actually exit (DEP6).
-    ///
-    /// SIGTERM first, then poll the runtime until the container reports
-    /// `Stopped` or `grace` elapses, then SIGKILL whatever is still running.
-    /// Returns only once the runtime confirms the exit (or the kill lands),
-    /// so the supervisor never records `Stopped` for a process that is still
-    /// alive — container and supervisor state stay in step.
-    async fn stop_and_wait_for_exit(&self, id: &InstanceId, grace: std::time::Duration) {
-        let _ = self.supervisor.grill().stop(id).await;
-        let deadline = Instant::now() + grace;
-        while Instant::now() < deadline {
-            if matches!(
-                self.supervisor.grill().state(id).await,
-                Ok(ContainerState::Stopped)
-            ) {
-                return;
-            }
-            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-        }
-        if !matches!(
-            self.supervisor.grill().state(id).await,
-            Ok(ContainerState::Stopped)
-        ) {
-            let _ = self.supervisor.grill().kill(id).await;
-        }
+    /// Stop one instance, requiring observed exit even after force-kill.
+    async fn stop_and_wait_for_exit(
+        &self,
+        id: &InstanceId,
+        grace: std::time::Duration,
+    ) -> Result<(), BunError> {
+        stop_runtime_instance(self.supervisor.grill(), id, grace).await
+    }
+
+    /// Preserve ownership until both force-kill and observed runtime exit succeed.
+    async fn kill_and_wait_for_exit(&self, id: &InstanceId) -> Result<(), BunError> {
+        kill_runtime_instance(self.supervisor.grill(), id).await
     }
 
     /// Add one freshly-healthy replacement to the service map and rebuild the
@@ -7528,15 +8176,32 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
     /// this only lifts egress, cleans identity, and drops the record and
     /// supervisor entry. Interleaving it with replacement is what gives
     /// `max_surge` and `max_unavailable` their meaning.
-    async fn finish_retire_bookkeeping(&mut self, old_id: &InstanceId) {
-        // NET6: lift the retiring instance's egress enforcement.
+    async fn finish_retire_bookkeeping(&mut self, old_id: &InstanceId) -> Result<(), BunError> {
+        // The worker already observed exit. Preserve a stopped cleanup owner,
+        // so a filesystem failure cannot make the restart driver revive it.
+        let service_id = self.supervisor.get_instance(old_id).map(|owner| {
+            crate::onion::service_id::ServiceId::new(&owner.namespace, &owner.app_name)
+        });
+        self.retain_stopped_instance(old_id);
+        self.retire_instance_artifacts(old_id).await?;
         self.clear_egress(old_id).await;
-        self.cleanup_instance_identity(old_id);
-        self.remove_instance_record(old_id);
-        // Drop it from the supervisor in this same turn. A stopped instance
-        // still listed there looks exactly like a crashed one to the restart
-        // driver, which gets a chance to run between two retirement ops.
         self.supervisor.retire_instance(old_id).await;
+        if let Some(service_id) = service_id {
+            let _ = self.service_map.remove_backend(&service_id, &old_id.0);
+            self.sync_backend_ebpf(&service_id).await;
+            self.sync_firewall_ebpf().await;
+            self.rebuild_routing_table().await;
+        }
+        Ok(())
+    }
+
+    /// Retain cleanup ownership after observed runtime exit without restarting it.
+    fn retain_stopped_instance(&mut self, old_id: &InstanceId) {
+        if let Some(instance) = self.supervisor.get_instance_mut(old_id) {
+            instance.state = ContainerState::Stopped;
+            instance.retry_pending = false;
+        }
+        self.supervisor.health_checker_mut().unregister(old_id);
     }
 
     /// Gracefully stop all instances.
@@ -7616,10 +8281,17 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
                 spec,
                 reply,
             } => {
-                self.deployed_specs.insert((app_name, namespace), *spec);
-                let _ = reply.send(());
+                let result = self.supervisor.admit_workload_kind(
+                    &app_name,
+                    &namespace,
+                    crate::bun::deploy_operations::DeployTargetKind::App,
+                );
+                if result.is_ok() {
+                    self.deployed_specs.insert((app_name, namespace), *spec);
+                }
+                let _ = reply.send(result);
             }
-            DeployOp::ListExistingActive {
+            DeployOp::ListExistingOwned {
                 app_name,
                 namespace,
                 reply,
@@ -7628,22 +8300,41 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
                     .supervisor
                     .list_instances()
                     .iter()
-                    .filter(|i| i.app_name == app_name && i.namespace == namespace)
-                    .filter(|i| {
-                        !matches!(
-                            i.state,
-                            crate::grill::state::ContainerState::Stopped
-                                | crate::grill::state::ContainerState::Failed
-                        )
-                    })
+                    .filter(|i| !i.is_job && i.app_name == app_name && i.namespace == namespace)
                     .map(|i| i.id.clone())
                     .collect();
                 let _ = reply.send(ids);
             }
-            DeployOp::NextDeployGen { reply } => {
-                let deploy_gen = self.next_deploy_gen;
-                self.next_deploy_gen += 1;
-                let _ = reply.send(deploy_gen);
+            DeployOp::NextDeployGen { app_name, reply } => {
+                // Adoption restores owners, not the previous process's counter.
+                // Use the structured app name to distinguish an ordinary app
+                // named `worker-g9` from generation 9 of an app named `worker`.
+                let highest_owned = self
+                    .supervisor
+                    .list_instances()
+                    .iter()
+                    .filter_map(|instance| {
+                        let prefix = format!("{}__{}-g", instance.namespace, instance.app_name);
+                        let suffix = instance.id.0.strip_prefix(&prefix)?;
+                        let (generation, _) = suffix.split_once('-')?;
+                        generation.parse::<u64>().ok()
+                    })
+                    .max()
+                    .unwrap_or(0);
+                let next = highest_owned
+                    .checked_add(1)
+                    .and_then(|after_owned| self.next_deploy_gen.max(after_owned).checked_add(1));
+                let result = match next {
+                    Some(next) => {
+                        self.next_deploy_gen = next;
+                        Ok(next - 1)
+                    }
+                    None => Err(BunError::DeployFailed {
+                        app_name,
+                        reason: "rollout generation exhausted; ownership preserved".into(),
+                    }),
+                };
+                let _ = reply.send(result);
             }
             DeployOp::SupervisorDeployApp {
                 app_name,
@@ -7787,6 +8478,18 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
                 while drain.recv().await.is_some() {}
                 let _ = reply.send(());
             }
+            DeployOp::ReserveRollingInstance {
+                instance_id,
+                app_name,
+                namespace,
+                spec,
+                reply,
+            } => {
+                let result = self
+                    .reserve_rolling_instance(&instance_id, &app_name, &namespace, &spec)
+                    .await;
+                let _ = reply.send(result);
+            }
             DeployOp::PrepareRollingInstance {
                 instance_id,
                 app_name,
@@ -7808,63 +8511,45 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
                     .await;
                 let _ = reply.send(result);
             }
-            DeployOp::ClearEgress { instance_id, reply } => {
-                self.clear_egress(&instance_id).await;
-                let _ = reply.send(());
+            DeployOp::RegisterRollingInstance { instance, reply } => {
+                let result = self.persist_rolling_instance(&instance).await;
+                if result.is_ok() {
+                    self.spawn_log_forwarder(
+                        &instance.instance_id,
+                        &instance.app_name,
+                        &instance.namespace,
+                    );
+                }
+                let _ = reply.send(result);
             }
-            DeployOp::RegisterRollingInstance {
-                instance_id,
-                app_name,
-                namespace,
-                reply,
-            } => {
-                self.spawn_log_forwarder(&instance_id, &app_name, &namespace);
-                self.persist_instance_record(&instance_id).await;
-                let _ = reply.send(());
-            }
-            DeployOp::RollbackRollingDeploy {
-                app_name,
-                namespace,
-                spec,
-                new_ids,
-                new_prepared,
-                new_ports,
-                replica_count,
-                reply,
-            } => {
-                self.rollback_rolling_deploy(
-                    &app_name,
-                    &namespace,
-                    &spec,
-                    &new_ids,
-                    &new_prepared,
-                    &new_ports,
-                    replica_count,
-                )
-                .await;
-                let _ = reply.send(());
-            }
-            DeployOp::HaltRollingDeploy {
-                app_name,
-                namespace,
-                spec,
-                new_ids,
-                new_prepared,
-                new_ports,
-                replica_count,
-                reply,
-            } => {
-                self.halt_rolling_deploy(
-                    &app_name,
-                    &namespace,
-                    &spec,
-                    &new_ids,
-                    &new_prepared,
-                    &new_ports,
-                    replica_count,
-                )
-                .await;
-                let _ = reply.send(());
+            DeployOp::RetainRollingInstance { instance, reply } => {
+                let id = instance.instance_id.clone();
+                let container_ip = self.supervisor.grill().container_ip(&id).await;
+                let result = match self.supervisor.get_instance_mut(&id) {
+                    Some(owner)
+                        if owner.app_name == instance.app_name
+                            && owner.namespace == instance.namespace =>
+                    {
+                        owner.state = ContainerState::Running;
+                        owner.container_ip = container_ip;
+                        owner.retry_pending = false;
+                        owner.oci_spec = Some(instance.oci_spec);
+                        let health_config =
+                            instance.spec.health.as_ref().zip(instance.spec.port).map(
+                                |(health, port)| {
+                                    crate::bun::health::HealthCheckConfig::from_spec(health, port)
+                                },
+                            );
+                        owner.health_config = health_config.clone();
+                        if let Some(config) = health_config {
+                            self.supervisor
+                                .register_health(id.clone(), config, Instant::now());
+                        }
+                        Ok(())
+                    }
+                    _ => Err(BunError::InstanceNotFound { instance_id: id }),
+                };
+                let _ = reply.send(result);
             }
             DeployOp::FinaliseRollingDeploy {
                 app_name,
@@ -7878,12 +8563,13 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
                 now,
                 reply,
             } => {
-                self.finalise_rolling_deploy(
-                    &app_name, &namespace, &spec, &existing, &new_ids, &new_ports, &new_ips,
-                    new_specs, now,
-                )
-                .await;
-                let _ = reply.send(());
+                let result = self
+                    .finalise_rolling_deploy(
+                        &app_name, &namespace, &spec, &existing, &new_ids, &new_ports, &new_ips,
+                        new_specs, now,
+                    )
+                    .await;
+                let _ = reply.send(result);
             }
             DeployOp::PublishNewBackend {
                 app_name,
@@ -7905,9 +8591,25 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
                 .await;
                 let _ = reply.send(());
             }
+            DeployOp::BeginRetire { old_id, reply } => {
+                let result = match self.supervisor.get_instance_mut(&old_id) {
+                    Some(instance) => {
+                        instance.retry_pending = false;
+                        if instance.state.can_transition_to(ContainerState::Stopping) {
+                            instance.state = ContainerState::Stopping;
+                        }
+                        self.supervisor.health_checker_mut().unregister(&old_id);
+                        Ok(())
+                    }
+                    None => Err(BunError::InstanceNotFound {
+                        instance_id: old_id,
+                    }),
+                };
+                let _ = reply.send(result);
+            }
             DeployOp::FinishRetire { old_id, reply } => {
-                self.finish_retire_bookkeeping(&old_id).await;
-                let _ = reply.send(());
+                let result = self.finish_retire_bookkeeping(&old_id).await;
+                let _ = reply.send(result);
             }
             DeployOp::PushDeployHistory { entry, reply } => {
                 self.deploy_history.write().await.push(*entry);
@@ -7965,7 +8667,6 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
 /// supervisor / service-map / networking state.
 struct DeployWorker<G: Grill> {
     grill: G,
-    port_allocator: PortAllocator,
     ops: DeployOps,
     /// Shared drain tracker, so the worker can drain-and-stop a retiring
     /// instance off the command loop (M7) rather than sending the whole wait
@@ -7975,9 +8676,47 @@ struct DeployWorker<G: Grill> {
 }
 
 impl<G: Grill + Clone + 'static> DeployWorker<G> {
+    async fn report_cancellation(&self, events: &mpsc::Sender<ApplyEvent>) -> bool {
+        if self
+            .operation
+            .as_ref()
+            .is_some_and(|operation| operation.cancellation_requested())
+        {
+            let _ = events
+                .send(ApplyEvent::Error {
+                    message: "deploy cancellation requested; finishing owned cleanup".into(),
+                })
+                .await;
+            return true;
+        }
+        false
+    }
+
+    async fn wait_for_deploy_health(
+        &self,
+        id: &InstanceId,
+        spec: &AppSpec,
+        container_ip: Option<std::net::Ipv4Addr>,
+        wait: std::time::Duration,
+    ) -> Result<(), String> {
+        let health = wait_instance_healthy(&self.grill, id, spec, container_ip, wait);
+        if let Some(operation) = &self.operation {
+            tokio::select! {
+                biased;
+                _ = operation.cancelled() => Err("deploy cancellation requested; finishing owned cleanup".into()),
+                result = health => result,
+            }
+        } else {
+            health.await
+        }
+    }
+
     /// Deploy all apps and jobs from a config, streaming progress events. The
     /// mirror of the former `BunAgent::deploy`, but off the command loop.
     async fn run_deploy(self, config: Config, events: mpsc::Sender<ApplyEvent>) {
+        if self.report_cancellation(&events).await {
+            return;
+        }
         let now = Instant::now();
         let mut all_ids: Vec<String> = Vec::new();
         // Jobs already run as `run_before` prerequisites, so the regular jobs
@@ -8009,6 +8748,9 @@ impl<G: Grill + Clone + 'static> DeployWorker<G> {
         }
 
         for (app_name, spec) in &config.app {
+            if self.report_cancellation(&events).await {
+                return;
+            }
             let namespace = spec.namespace.as_deref().unwrap_or("default");
 
             // run_before (E): jobs declaring `run_before = ["app.<name>"]` must
@@ -8041,6 +8783,9 @@ impl<G: Grill + Clone + 'static> DeployWorker<G> {
                     return;
                 }
                 ran_prereqs.insert(job_name.clone());
+            }
+            if self.report_cancellation(&events).await {
+                return;
             }
 
             if let Some(operation) = &self.operation {
@@ -8075,11 +8820,20 @@ impl<G: Grill + Clone + 'static> DeployWorker<G> {
                 }
             };
 
-            self.ops
+            if let Err(error) = self
+                .ops
                 .store_deployed_spec(app_name, namespace, spec)
-                .await;
+                .await
+            {
+                let _ = events
+                    .send(ApplyEvent::Error {
+                        message: error.to_string(),
+                    })
+                    .await;
+                return;
+            }
 
-            let existing = self.ops.list_existing_active(app_name, namespace).await;
+            let existing = self.ops.list_existing_owned(app_name, namespace).await;
 
             if !existing.is_empty() {
                 // Dispatch on deploy strategy (E): blue-green stands up the
@@ -8106,7 +8860,7 @@ impl<G: Grill + Clone + 'static> DeployWorker<G> {
                 }
                 all_ids.extend(
                     self.ops
-                        .list_existing_active(app_name, namespace)
+                        .list_existing_owned(app_name, namespace)
                         .await
                         .iter()
                         .map(|id| id.0.clone()),
@@ -8220,6 +8974,9 @@ impl<G: Grill + Clone + 'static> DeployWorker<G> {
         }
 
         for (job_name, spec) in &config.job {
+            if self.report_cancellation(&events).await {
+                return;
+            }
             // Already run to completion as a run_before prerequisite above, or a
             // cron-scheduled job that fires on its schedule rather than now.
             if ran_prereqs.contains(job_name) || spec.schedule.is_some() {
@@ -8288,6 +9045,9 @@ impl<G: Grill + Clone + 'static> DeployWorker<G> {
             all_ids.extend(ids.iter().map(|id| id.0.clone()));
         }
 
+        if self.report_cancellation(&events).await {
+            return;
+        }
         if let Some(operation) = &self.operation {
             operation
                 .advance(
@@ -8504,7 +9264,17 @@ impl<G: Grill + Clone + 'static> DeployWorker<G> {
             .map(crate::meat::deploy_types::DeployConfig::from_spec)
             .unwrap_or_default();
 
-        let deploy_gen = self.ops.next_deploy_gen().await;
+        let deploy_gen = match self.ops.next_deploy_gen(app_name).await {
+            Ok(generation) => generation,
+            Err(error) => {
+                let _ = events
+                    .send(ApplyEvent::Error {
+                        message: error.to_string(),
+                    })
+                    .await;
+                return std::ops::ControlFlow::Break(());
+            }
+        };
         let replica_count = match spec.replicas {
             crate::config::types::Replicas::Fixed(n) => n,
             crate::config::types::Replicas::DaemonSet => 1,
@@ -8518,6 +9288,7 @@ impl<G: Grill + Clone + 'static> DeployWorker<G> {
         let mut new_ips: std::collections::HashMap<InstanceId, Option<std::net::Ipv4Addr>> =
             std::collections::HashMap::new();
         let mut new_prepared: Vec<InstanceId> = Vec::new();
+        let mut runtime_attempted = std::collections::HashSet::new();
         let mut new_failed = false;
 
         // M7: drive the rollout through `plan_rolling_step` rather than
@@ -8533,6 +9304,10 @@ impl<G: Grill + Clone + 'static> DeployWorker<G> {
         let mut retired: usize = 0;
         let mut next_replica_index: u32 = 0;
         loop {
+            if self.report_cancellation(events).await {
+                new_failed = true;
+                break;
+            }
             let step = crate::meat::deploy_types::plan_rolling_step(
                 replica_count,
                 new_ids.len() as u32,
@@ -8571,14 +9346,52 @@ impl<G: Grill + Clone + 'static> DeployWorker<G> {
                     // Drain and stop the old instance on this spawned deploy
                     // task (M7), then send only the fast bookkeeping to the
                     // command loop — the wait no longer stalls every command.
-                    drain_and_stop_instance(
-                        &self.drains,
-                        &self.grill,
-                        &old_id,
-                        deploy_config.drain_timeout,
-                    )
-                    .await;
-                    self.ops.finish_retire(&old_id).await;
+                    if let Err(error) = self
+                        .retire_old_instance(&old_id, deploy_config.drain_timeout)
+                        .await
+                    {
+                        let retention = self
+                            .retain_started_replacements(
+                                app_name, namespace, spec, &new_ids, &new_ports, &new_specs,
+                            )
+                            .await;
+                        let _ = events
+                            .send(ApplyEvent::Error {
+                                message: format!(
+                                    "old instance retirement unconfirmed: {error}; {}",
+                                    match retention {
+                                        Ok(()) =>
+                                            "started replacements retained for cleanup".to_string(),
+                                        Err(error) => format!(
+                                            "could not retain replacement ownership: {error}"
+                                        ),
+                                    }
+                                ),
+                            })
+                            .await;
+                        return std::ops::ControlFlow::Break(());
+                    }
+                    if let Err(error) = self.ops.finish_retire(&old_id).await {
+                        let retention = self
+                            .retain_started_replacements(
+                                app_name, namespace, spec, &new_ids, &new_ports, &new_specs,
+                            )
+                            .await;
+                        let detail = match retention {
+                            Ok(()) => "started replacements retained for cleanup".into(),
+                            Err(error) => {
+                                format!("could not retain replacement ownership: {error}")
+                            }
+                        };
+                        let _ = events
+                            .send(ApplyEvent::Error {
+                                message: format!(
+                                    "old instance artifact retirement failed: {error}; {detail}"
+                                ),
+                            })
+                            .await;
+                        return std::ops::ControlFlow::Break(());
+                    }
                     retired += 1;
                     continue;
                 }
@@ -8595,23 +9408,24 @@ impl<G: Grill + Clone + 'static> DeployWorker<G> {
                 })
                 .await;
 
-            let host_port = if spec.port.is_some() {
-                match self.port_allocator.allocate().await {
-                    Ok(p) => Some(p),
-                    Err(e) => {
-                        let _ = events
-                            .send(ApplyEvent::Error {
-                                message: format!("port allocation failed: {e}"),
-                            })
-                            .await;
-                        new_failed = true;
-                        break;
-                    }
+            let host_port = match self
+                .ops
+                .reserve_rolling_instance(&new_id, app_name, namespace, spec)
+                .await
+            {
+                Ok(port) => port,
+                Err(error) => {
+                    let _ = events
+                        .send(ApplyEvent::Error {
+                            message: error.to_string(),
+                        })
+                        .await;
+                    new_failed = true;
+                    break;
                 }
-            } else {
-                None
             };
 
+            new_ports.insert(new_id.clone(), host_port);
             new_prepared.push(new_id.clone());
             let oci_spec = match self
                 .ops
@@ -8631,6 +9445,7 @@ impl<G: Grill + Clone + 'static> DeployWorker<G> {
             };
             let cgroup_path = crate::grill::cgroup::cgroup_path(namespace, app_name, i);
 
+            runtime_attempted.insert(new_id.clone());
             if let Err(e) = self.grill.create(&new_id, &oci_spec).await {
                 let _ = events
                     .send(ApplyEvent::Error {
@@ -8651,7 +9466,6 @@ impl<G: Grill + Clone + 'static> DeployWorker<G> {
                         message: format!("failed to program egress for {}: {e}", new_id.0),
                     })
                     .await;
-                let _ = self.grill.stop(&new_id).await;
                 new_failed = true;
                 break;
             }
@@ -8661,13 +9475,29 @@ impl<G: Grill + Clone + 'static> DeployWorker<G> {
                         message: format!("failed to start {}: {e}", new_id.0),
                     })
                     .await;
-                self.ops.clear_egress(&new_id).await;
                 new_failed = true;
                 break;
             }
-            self.ops
-                .register_rolling_instance(&new_id, app_name, namespace)
-                .await;
+            if let Err(error) = self
+                .ops
+                .register_rolling_instance(RollingInstance {
+                    instance_id: new_id.clone(),
+                    app_name: app_name.to_string(),
+                    namespace: namespace.to_string(),
+                    spec: spec.clone(),
+                    oci_spec: oci_spec.clone(),
+                    host_port,
+                })
+                .await
+            {
+                let _ = events
+                    .send(ApplyEvent::Error {
+                        message: error.to_string(),
+                    })
+                    .await;
+                new_failed = true;
+                break;
+            }
 
             let container_ip = self.grill.container_ip(&new_id).await;
 
@@ -8679,7 +9509,10 @@ impl<G: Grill + Clone + 'static> DeployWorker<G> {
             // health check the operator configured, not merely because its
             // process came up.
             let wait = effective_health_wait(&deploy_config);
-            match wait_instance_healthy(&self.grill, &new_id, spec, container_ip, wait).await {
+            match self
+                .wait_for_deploy_health(&new_id, spec, container_ip, wait)
+                .await
+            {
                 Ok(()) => {
                     let _ = events
                         .send(ApplyEvent::Progress {
@@ -8692,8 +9525,6 @@ impl<G: Grill + Clone + 'static> DeployWorker<G> {
                 }
                 Err(message) => {
                     let _ = events.send(ApplyEvent::Error { message }).await;
-                    let _ = self.grill.kill(&new_id).await;
-                    self.ops.clear_egress(&new_id).await;
                     new_failed = true;
                     break;
                 }
@@ -8721,49 +9552,21 @@ impl<G: Grill + Clone + 'static> DeployWorker<G> {
         }
 
         if new_failed {
-            if deploy_config.auto_rollback {
-                self.ops
-                    .rollback_rolling_deploy(
-                        app_name,
-                        namespace,
-                        spec,
-                        new_ids,
-                        new_prepared,
-                        new_ports,
-                        replica_count,
-                    )
-                    .await;
-                let _ = events
-                    .send(ApplyEvent::Error {
-                        message: "rolled back — old instances preserved".to_string(),
-                    })
-                    .await;
-            } else {
-                // auto_rollback = false: halt without reverting. Keep the
-                // healthy new instances and the surviving old ones in place for
-                // the operator to inspect; tear down only the incomplete one.
-                let new_live = new_ids.len();
-                let old_live = existing.len().saturating_sub(retired);
-                self.ops
-                    .halt_rolling_deploy(
-                        app_name,
-                        namespace,
-                        spec,
-                        new_ids,
-                        new_prepared,
-                        new_ports,
-                        replica_count,
-                    )
-                    .await;
-                let _ = events
-                    .send(ApplyEvent::Error {
-                        message: format!(
-                            "deploy halted (auto_rollback = false): {new_live} new and \
-                             {old_live} old instance(s) left running for inspection"
-                        ),
-                    })
-                    .await;
-            }
+            self.abort_rollout(
+                app_name,
+                namespace,
+                spec,
+                &new_ids,
+                &new_prepared,
+                &runtime_attempted,
+                &new_ports,
+                &new_specs,
+                deploy_config.auto_rollback,
+                retired,
+                replica_count,
+                events,
+            )
+            .await;
             return std::ops::ControlFlow::Break(());
         }
 
@@ -8779,28 +9582,62 @@ impl<G: Grill + Clone + 'static> DeployWorker<G> {
                     message: format!("stopping old instance {}", old_id.0),
                 })
                 .await;
-            drain_and_stop_instance(
-                &self.drains,
-                &self.grill,
-                old_id,
-                deploy_config.drain_timeout,
-            )
-            .await;
+            if let Err(error) = self
+                .retire_old_instance(old_id, deploy_config.drain_timeout)
+                .await
+            {
+                let retention = self
+                    .retain_started_replacements(
+                        app_name, namespace, spec, &new_ids, &new_ports, &new_specs,
+                    )
+                    .await;
+                let _ = events
+                    .send(ApplyEvent::Error {
+                        message: format!(
+                            "old instance retirement unconfirmed: {error}; {}",
+                            match retention {
+                                Ok(()) => "started replacements retained for cleanup".to_string(),
+                                Err(error) =>
+                                    format!("could not retain replacement ownership: {error}"),
+                            }
+                        ),
+                    })
+                    .await;
+                return std::ops::ControlFlow::Break(());
+            }
         }
 
-        self.ops
+        if let Err(error) = self
+            .ops
             .finalise_rolling_deploy(
                 app_name,
                 namespace,
                 spec,
                 outstanding,
                 new_ids.clone(),
-                new_ports,
+                new_ports.clone(),
                 new_ips,
-                new_specs,
+                new_specs.clone(),
                 now,
             )
-            .await;
+            .await
+        {
+            let retention = self
+                .retain_started_replacements(
+                    app_name, namespace, spec, &new_ids, &new_ports, &new_specs,
+                )
+                .await;
+            let detail = match retention {
+                Ok(()) => "started replacements retained for cleanup".into(),
+                Err(error) => format!("could not retain replacement ownership: {error}"),
+            };
+            let _ = events
+                .send(ApplyEvent::Error {
+                    message: format!("rollout finalisation failed: {error}; {detail}"),
+                })
+                .await;
+            return std::ops::ControlFlow::Break(());
+        }
 
         for new_id in &new_ids {
             let _ = events
@@ -8812,6 +9649,130 @@ impl<G: Grill + Clone + 'static> DeployWorker<G> {
         }
 
         std::ops::ControlFlow::Continue(())
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn abort_rollout(
+        &self,
+        app_name: &str,
+        namespace: &str,
+        spec: &AppSpec,
+        healthy: &[InstanceId],
+        prepared: &[InstanceId],
+        runtime_attempted: &std::collections::HashSet<InstanceId>,
+        ports: &std::collections::HashMap<InstanceId, Option<u16>>,
+        specs: &std::collections::HashMap<InstanceId, crate::grill::oci::OciSpec>,
+        auto_rollback: bool,
+        retired: usize,
+        replica_count: u32,
+        events: &mpsc::Sender<ApplyEvent>,
+    ) {
+        let mut errors = Vec::new();
+        if !auto_rollback
+            && let Err(error) = self
+                .retain_started_replacements(app_name, namespace, spec, healthy, ports, specs)
+                .await
+        {
+            errors.push(error.to_string());
+        }
+        for id in prepared {
+            if !auto_rollback && healthy.contains(id) {
+                continue;
+            }
+            let cleanup = async {
+                self.ops.begin_retire(id).await?;
+                // A failed create may already own runtime resources. Only a
+                // reservation that never attempted create proves their absence.
+                if runtime_attempted.contains(id) {
+                    kill_runtime_instance(&self.grill, id).await?;
+                }
+                self.ops.finish_retire(id).await
+            }
+            .await;
+            if let Err(error) = cleanup {
+                errors.push(format!("{id}: {error}"));
+            }
+        }
+        let (result, message) = if !errors.is_empty() {
+            (
+                crate::meat::deploy_types::DeployResult::Failed,
+                format!(
+                    "rollout cleanup incomplete; remaining owners retained: {}",
+                    errors.join("; ")
+                ),
+            )
+        } else if auto_rollback && retired == 0 {
+            (
+                crate::meat::deploy_types::DeployResult::RolledBack,
+                "rolled back — old instances preserved".to_string(),
+            )
+        } else {
+            (
+                crate::meat::deploy_types::DeployResult::Halted,
+                format!(
+                    "deploy halted: {} healthy new instance(s) left running; {retired} old instance(s) already retired",
+                    if auto_rollback { 0 } else { healthy.len() }
+                ),
+            )
+        };
+        self.ops
+            .push_deploy_history(crate::meat::deploy_types::DeployHistoryEntry {
+                id: crate::meat::deploy_types::DeployId(
+                    SystemTime::now()
+                        .duration_since(SystemTime::UNIX_EPOCH)
+                        .unwrap_or_default()
+                        .as_secs(),
+                ),
+                app_id: crate::meat::types::AppId::new(app_name, namespace),
+                image: spec.image.clone().unwrap_or_default(),
+                result,
+                created_at: SystemTime::now(),
+                completed_at: SystemTime::now(),
+                steps_completed: healthy.len(),
+                steps_total: replica_count as usize,
+                spec: Some(Box::new(spec.clone())),
+            })
+            .await;
+        let _ = events.send(ApplyEvent::Error { message }).await;
+    }
+
+    /// Publish retirement intent before runtime exit can trigger the restart driver.
+    async fn retire_old_instance(
+        &self,
+        id: &InstanceId,
+        drain_timeout: std::time::Duration,
+    ) -> Result<(), BunError> {
+        self.ops.begin_retire(id).await?;
+        drain_and_stop_instance(&self.drains, &self.grill, id, drain_timeout).await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn retain_started_replacements(
+        &self,
+        app_name: &str,
+        namespace: &str,
+        spec: &AppSpec,
+        ids: &[InstanceId],
+        ports: &std::collections::HashMap<InstanceId, Option<u16>>,
+        specs: &std::collections::HashMap<InstanceId, crate::grill::oci::OciSpec>,
+    ) -> Result<(), BunError> {
+        for id in ids {
+            let oci_spec = specs.get(id).ok_or_else(|| BunError::DeployFailed {
+                app_name: app_name.into(),
+                reason: format!("missing launch ownership for {id}"),
+            })?;
+            self.ops
+                .retain_rolling_instance(RollingInstance {
+                    instance_id: id.clone(),
+                    app_name: app_name.into(),
+                    namespace: namespace.into(),
+                    spec: spec.clone(),
+                    oci_spec: oci_spec.clone(),
+                    host_port: ports.get(id).copied().flatten(),
+                })
+                .await?;
+        }
+        Ok(())
     }
 
     /// Blue-green redeploy: start the whole new ("green") fleet in parallel to
@@ -8843,7 +9804,17 @@ impl<G: Grill + Clone + 'static> DeployWorker<G> {
             .as_ref()
             .map(crate::meat::deploy_types::DeployConfig::from_spec)
             .unwrap_or_default();
-        let deploy_gen = self.ops.next_deploy_gen().await;
+        let deploy_gen = match self.ops.next_deploy_gen(app_name).await {
+            Ok(generation) => generation,
+            Err(error) => {
+                let _ = events
+                    .send(ApplyEvent::Error {
+                        message: error.to_string(),
+                    })
+                    .await;
+                return std::ops::ControlFlow::Break(());
+            }
+        };
         let replica_count = match spec.replicas {
             crate::config::types::Replicas::Fixed(n) => n,
             crate::config::types::Replicas::DaemonSet => 1,
@@ -8857,12 +9828,17 @@ impl<G: Grill + Clone + 'static> DeployWorker<G> {
         let mut new_ips: std::collections::HashMap<InstanceId, Option<std::net::Ipv4Addr>> =
             std::collections::HashMap::new();
         let mut new_prepared: Vec<InstanceId> = Vec::new();
+        let mut runtime_attempted = std::collections::HashSet::new();
         let mut new_failed = false;
 
         // Start and health check the entire green fleet before touching blue.
         // Unlike the rolling planner, nothing retires here and nothing is
         // published to routing yet: green comes up dark, alongside blue.
         for i in 0..replica_count {
+            if self.report_cancellation(events).await {
+                new_failed = true;
+                break;
+            }
             let new_id = crate::grill::InstanceIdentity::canary(namespace, app_name, deploy_gen, i)
                 .instance_id();
             let _ = events
@@ -8871,23 +9847,24 @@ impl<G: Grill + Clone + 'static> DeployWorker<G> {
                 })
                 .await;
 
-            let host_port = if spec.port.is_some() {
-                match self.port_allocator.allocate().await {
-                    Ok(p) => Some(p),
-                    Err(e) => {
-                        let _ = events
-                            .send(ApplyEvent::Error {
-                                message: format!("port allocation failed: {e}"),
-                            })
-                            .await;
-                        new_failed = true;
-                        break;
-                    }
+            let host_port = match self
+                .ops
+                .reserve_rolling_instance(&new_id, app_name, namespace, spec)
+                .await
+            {
+                Ok(port) => port,
+                Err(error) => {
+                    let _ = events
+                        .send(ApplyEvent::Error {
+                            message: error.to_string(),
+                        })
+                        .await;
+                    new_failed = true;
+                    break;
                 }
-            } else {
-                None
             };
 
+            new_ports.insert(new_id.clone(), host_port);
             new_prepared.push(new_id.clone());
             let oci_spec = match self
                 .ops
@@ -8907,6 +9884,7 @@ impl<G: Grill + Clone + 'static> DeployWorker<G> {
             };
             let cgroup_path = crate::grill::cgroup::cgroup_path(namespace, app_name, i);
 
+            runtime_attempted.insert(new_id.clone());
             if let Err(e) = self.grill.create(&new_id, &oci_spec).await {
                 let _ = events
                     .send(ApplyEvent::Error {
@@ -8926,7 +9904,6 @@ impl<G: Grill + Clone + 'static> DeployWorker<G> {
                         message: format!("failed to program egress for {}: {e}", new_id.0),
                     })
                     .await;
-                let _ = self.grill.stop(&new_id).await;
                 new_failed = true;
                 break;
             }
@@ -8936,13 +9913,29 @@ impl<G: Grill + Clone + 'static> DeployWorker<G> {
                         message: format!("failed to start {}: {e}", new_id.0),
                     })
                     .await;
-                self.ops.clear_egress(&new_id).await;
                 new_failed = true;
                 break;
             }
-            self.ops
-                .register_rolling_instance(&new_id, app_name, namespace)
-                .await;
+            if let Err(error) = self
+                .ops
+                .register_rolling_instance(RollingInstance {
+                    instance_id: new_id.clone(),
+                    app_name: app_name.to_string(),
+                    namespace: namespace.to_string(),
+                    spec: spec.clone(),
+                    oci_spec: oci_spec.clone(),
+                    host_port,
+                })
+                .await
+            {
+                let _ = events
+                    .send(ApplyEvent::Error {
+                        message: error.to_string(),
+                    })
+                    .await;
+                new_failed = true;
+                break;
+            }
 
             let container_ip = self.grill.container_ip(&new_id).await;
 
@@ -8951,7 +9944,10 @@ impl<G: Grill + Clone + 'static> DeployWorker<G> {
             // otherwise a green fleet that starts but can't serve replaces a
             // blue fleet that can.
             let wait = effective_health_wait(&deploy_config);
-            match wait_instance_healthy(&self.grill, &new_id, spec, container_ip, wait).await {
+            match self
+                .wait_for_deploy_health(&new_id, spec, container_ip, wait)
+                .await
+            {
                 Ok(()) => {
                     let _ = events
                         .send(ApplyEvent::Progress {
@@ -8964,8 +9960,6 @@ impl<G: Grill + Clone + 'static> DeployWorker<G> {
                 }
                 Err(message) => {
                     let _ = events.send(ApplyEvent::Error { message }).await;
-                    let _ = self.grill.kill(&new_id).await;
-                    self.ops.clear_egress(&new_id).await;
                     new_failed = true;
                     break;
                 }
@@ -8977,47 +9971,25 @@ impl<G: Grill + Clone + 'static> DeployWorker<G> {
             new_ids.push(new_id);
         }
 
+        if !new_failed && self.report_cancellation(events).await {
+            new_failed = true;
+        }
         if new_failed {
-            // Green never took over routing, so blue is still live regardless of
-            // auto_rollback. Rollback tears green down; halt leaves it up for
-            // inspection. Either way blue keeps serving.
-            if deploy_config.auto_rollback {
-                self.ops
-                    .rollback_rolling_deploy(
-                        app_name,
-                        namespace,
-                        spec,
-                        new_ids,
-                        new_prepared,
-                        new_ports,
-                        replica_count,
-                    )
-                    .await;
-                let _ = events
-                    .send(ApplyEvent::Error {
-                        message: "rolled back — blue fleet preserved".to_string(),
-                    })
-                    .await;
-            } else {
-                self.ops
-                    .halt_rolling_deploy(
-                        app_name,
-                        namespace,
-                        spec,
-                        new_ids,
-                        new_prepared,
-                        new_ports,
-                        replica_count,
-                    )
-                    .await;
-                let _ = events
-                    .send(ApplyEvent::Error {
-                        message: "deploy halted (auto_rollback = false): green fleet left running \
-                                  for inspection"
-                            .to_string(),
-                    })
-                    .await;
-            }
+            self.abort_rollout(
+                app_name,
+                namespace,
+                spec,
+                &new_ids,
+                &new_prepared,
+                &runtime_attempted,
+                &new_ports,
+                &new_specs,
+                deploy_config.auto_rollback,
+                0,
+                replica_count,
+                events,
+            )
+            .await;
             return std::ops::ControlFlow::Break(());
         }
 
@@ -9040,27 +10012,61 @@ impl<G: Grill + Clone + 'static> DeployWorker<G> {
                 .await;
         }
         for old_id in &existing {
-            drain_and_stop_instance(
-                &self.drains,
-                &self.grill,
-                old_id,
-                deploy_config.drain_timeout,
-            )
-            .await;
+            if let Err(error) = self
+                .retire_old_instance(old_id, deploy_config.drain_timeout)
+                .await
+            {
+                let retention = self
+                    .retain_started_replacements(
+                        app_name, namespace, spec, &new_ids, &new_ports, &new_specs,
+                    )
+                    .await;
+                let _ = events
+                    .send(ApplyEvent::Error {
+                        message: format!(
+                            "old instance retirement unconfirmed: {error}; {}",
+                            match retention {
+                                Ok(()) => "started replacements retained for cleanup".to_string(),
+                                Err(error) =>
+                                    format!("could not retain replacement ownership: {error}"),
+                            }
+                        ),
+                    })
+                    .await;
+                return std::ops::ControlFlow::Break(());
+            }
         }
-        self.ops
+        if let Err(error) = self
+            .ops
             .finalise_rolling_deploy(
                 app_name,
                 namespace,
                 spec,
                 existing,
                 new_ids.clone(),
-                new_ports,
+                new_ports.clone(),
                 new_ips,
-                new_specs,
+                new_specs.clone(),
                 now,
             )
-            .await;
+            .await
+        {
+            let retention = self
+                .retain_started_replacements(
+                    app_name, namespace, spec, &new_ids, &new_ports, &new_specs,
+                )
+                .await;
+            let detail = match retention {
+                Ok(()) => "started replacements retained for cleanup".into(),
+                Err(error) => format!("could not retain replacement ownership: {error}"),
+            };
+            let _ = events
+                .send(ApplyEvent::Error {
+                    message: format!("rollout finalisation failed: {error}; {detail}"),
+                })
+                .await;
+            return std::ops::ControlFlow::Break(());
+        }
 
         for new_id in &new_ids {
             let _ = events
@@ -9120,15 +10126,20 @@ fn trace_probe_step(
     use crate::onion::trace::{TraceEvidence, TraceStep, TraceVerdict};
     match probe {
         Ok(probe) => {
+            let expected_answer = expected_value.is_none_or(|expected| {
+                expected
+                    .parse::<std::net::IpAddr>()
+                    .is_ok_and(|address| probe.dns_answers().contains(&address))
+            });
             let mut details = vec![format!("fixed workload probe target: {target}")];
             details.extend(probe.lines);
             let verdict = if probe.status == 0 {
                 if let Some(expected) = expected_value
-                    && !details.iter().any(|line| line.contains(expected))
+                    && !expected_answer
                 {
                     TraceVerdict::Fail {
                         reason: format!(
-                            "probe succeeded but its answer did not contain expected value {expected}"
+                            "probe succeeded but its DNS answers did not include exact address {expected}"
                         ),
                     }
                 } else {
@@ -9328,6 +10339,65 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn trace_requires_an_exact_dns_answer_not_server_or_name_text() {
+        let (mut agent, tx, shutdown, grill) = test_agent_with_grill();
+        let handle = tokio::spawn(async move { agent.run().await });
+        expect_complete(
+            &send_deploy(
+                &tx,
+                Config::parse(
+                    r#"
+            [app.source]
+            image = "source:v1"
+            [app.destination]
+            image = "destination:v1"
+            port = 8080
+        "#,
+                )
+                .unwrap(),
+            )
+            .await,
+        );
+        let vip = crate::onion::vip::VirtualIP::from_qualified("default__destination");
+        let mut verdicts = Vec::new();
+        for answer in [
+            format!(
+                "Server: resolver\nAddress: {vip}#53\nName: destination.default.internal\nAddress: 127.0.0.1"
+            ),
+            format!("Name: {vip}.invalid\nAddress: {vip}0"),
+        ] {
+            grill.set_exec_outputs([
+                format!("{answer}\n__RB_TRACE_DNS_STATUS__=0\n"),
+                "__RB_TRACE_TCP_STATUS__=0\n".into(),
+            ]);
+            let (response, receiver) = oneshot::channel();
+            tx.send(AgentCommand::Trace {
+                request: crate::onion::trace::TraceRequest {
+                    source: "source".into(),
+                    source_namespace: "default".into(),
+                    destination: "destination".into(),
+                    destination_namespace: "default".into(),
+                    port: None,
+                },
+                internal_destination: true,
+                source_node: "node-a".into(),
+                response,
+            })
+            .await
+            .unwrap();
+            verdicts.push(receiver.await.unwrap().unwrap().steps[0].verdict.clone());
+        }
+        shutdown.cancel();
+        handle.await.unwrap();
+        assert!(
+            verdicts
+                .iter()
+                .all(|verdict| matches!(verdict, crate::onion::trace::TraceVerdict::Fail { .. })),
+            "{verdicts:?}"
+        );
+    }
+
+    #[tokio::test]
     async fn trace_concurrency_is_bounded_without_queueing_more_workload_processes() {
         let (mut agent, tx, shutdown, grill) = test_agent_with_grill();
         let handle = tokio::spawn(async move { agent.run().await });
@@ -9444,17 +10514,68 @@ mod tests {
         handle.await.unwrap();
     }
 
-    fn test_agent() -> (
-        BunAgent<MockGrill>,
-        mpsc::Sender<AgentCommand>,
-        CancellationToken,
-    ) {
+    #[tokio::test]
+    async fn health_tick_reuses_egress_evidence_but_later_reports_refresh_it() {
+        use std::sync::atomic::Ordering;
+        let (mut agent, _tx, _shutdown) = test_agent();
+        let readiness = crate::bun::readiness::ReadinessTracker::new();
+        agent.set_readiness_tracker(readiness.clone());
+        readiness
+            .set_capabilities(crate::meat::cluster_state::NodeCapabilities {
+                egress: crate::sesame::egress::EgressEnforcementCapability {
+                    connect_ipv4: true,
+                    connect_ipv6: true,
+                    udp_ipv4: true,
+                    udp_ipv6: true,
+                    pre_start: true,
+                },
+                ..Default::default()
+            })
+            .await;
+        agent.refresh_egress_readiness().await;
+        assert!(
+            !readiness
+                .capability_snapshot()
+                .await
+                .egress
+                .can_enforce_allowlist()
+        );
+        assert_eq!(agent.egress_observation_count.load(Ordering::Relaxed), 1);
+        agent.refresh_egress_readiness().await;
+        assert_eq!(agent.egress_observation_count.load(Ordering::Relaxed), 2);
+        let (capabilities, _) = agent.live_egress_report_state().await;
+        assert!(!capabilities.egress.can_enforce_allowlist());
+        assert_eq!(agent.egress_observation_count.load(Ordering::Relaxed), 3);
+    }
+
+    struct TestAgent {
+        agent: BunAgent<MockGrill>,
+        // Fields drop in declaration order: keep filesystem ownership through
+        // agent teardown, including when the fixture moves into a spawned task.
+        _volumes: tempfile::TempDir,
+    }
+
+    impl std::ops::Deref for TestAgent {
+        type Target = BunAgent<MockGrill>;
+
+        fn deref(&self) -> &Self::Target {
+            &self.agent
+        }
+    }
+
+    impl std::ops::DerefMut for TestAgent {
+        fn deref_mut(&mut self) -> &mut Self::Target {
+            &mut self.agent
+        }
+    }
+
+    fn test_agent() -> (TestAgent, mpsc::Sender<AgentCommand>, CancellationToken) {
         let (agent, tx, shutdown, _grill) = test_agent_with_grill();
         (agent, tx, shutdown)
     }
 
     fn test_agent_with_grill() -> (
-        BunAgent<MockGrill>,
+        TestAgent,
         mpsc::Sender<AgentCommand>,
         CancellationToken,
         MockGrill,
@@ -9464,7 +10585,13 @@ mod tests {
         let grill = MockGrill::new();
         let grill_handle = grill.clone();
         let port_allocator = PortAllocator::new(30000, 31000);
-        let agent = BunAgent::new(grill, port_allocator, rx, shutdown.clone());
+        let mut agent = BunAgent::new(grill, port_allocator, rx, shutdown.clone());
+        let volumes = tempfile::tempdir().unwrap();
+        agent.set_volumes_dir(volumes.path().to_path_buf());
+        let agent = TestAgent {
+            agent,
+            _volumes: volumes,
+        };
         (agent, tx, shutdown, grill_handle)
     }
 
@@ -9513,7 +10640,6 @@ mod tests {
         async fn deploy(&mut self, config: Config, events: &mpsc::Sender<ApplyEvent>) {
             let worker = DeployWorker {
                 grill: self.supervisor.grill().clone(),
-                port_allocator: self.supervisor.port_allocator(),
                 ops: DeployOps {
                     tx: self.deploy_ops_tx.clone(),
                 },
@@ -9538,6 +10664,387 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[tokio::test]
+    async fn lease_cleanup_retires_owned_instances_without_erasing_another_namespace() {
+        use crate::testkit::lease::{
+            LeasedResource, LocalLeaseStore, TestLease, cleanup_local_lease,
+        };
+        let (mut agent, tx, shutdown) = test_agent();
+        let volumes = tempfile::tempdir().unwrap();
+        agent.set_volumes_dir(volumes.path().to_path_buf());
+        let task = tokio::spawn(async move { agent.run().await });
+        for namespace in ["rbtest-cleanup", "rbtest-keep"] {
+            let config = Config::parse(&format!(
+                "[app.web]\nimage = 'test:v1'\nnamespace = '{namespace}'\n"
+            ))
+            .unwrap();
+            expect_complete(&send_deploy(&tx, config).await);
+        }
+        let store = LocalLeaseStore::in_memory();
+        let mut lease = TestLease::new(
+            "cleanup".into(),
+            "owner".into(),
+            "owner".into(),
+            "rbtest-cleanup".into(),
+            1,
+            2,
+        )
+        .unwrap();
+        lease.resources.insert(LeasedResource::App {
+            app_id: crate::meat::AppId::new("web", "rbtest-cleanup"),
+        });
+        store.create(lease).await.unwrap();
+        cleanup_local_lease(&store, &tx, "cleanup", Some("owner"))
+            .await
+            .unwrap();
+        let (response, result) = oneshot::channel();
+        tx.send(AgentCommand::Status { response }).await.unwrap();
+        let instances = result.await.unwrap();
+        shutdown.cancel();
+        task.await.unwrap();
+        assert!(store.get("cleanup").await.is_none());
+        assert_eq!(
+            instances.len(),
+            1,
+            "cleanup must retire its status record too"
+        );
+        assert_eq!(instances[0].namespace, "rbtest-keep");
+        assert_eq!(instances[0].state, "running");
+    }
+
+    #[tokio::test]
+    async fn cron_registration_and_stop_survive_agent_replacement() {
+        let directory = tempfile::tempdir().unwrap();
+        let records = directory.path().join("instances");
+        let (mut agent, tx, _shutdown) = test_agent();
+        agent.set_records_dir(records.clone());
+        agent.set_volumes_dir(directory.path().join("volumes"));
+        let task = tokio::spawn(async move { agent.run().await });
+        for namespace in ["red", "blue"] {
+            let config = Config::parse(&format!(
+                "[job.backup]\nimage = 'test:v1'\nschedule = '0 0 30 2 *'\nnamespace = '{namespace}'\n"
+            )).unwrap();
+            expect_complete(&send_deploy(&tx, config).await);
+        }
+        let (response, stopped) = oneshot::channel();
+        tx.send(AgentCommand::Stop {
+            app_name: "backup".into(),
+            namespace: "red".into(),
+            response,
+        })
+        .await
+        .unwrap();
+        stopped.await.unwrap().unwrap();
+        task.abort();
+        assert!(task.await.unwrap_err().is_cancelled());
+
+        let (mut replacement, tx, shutdown) = test_agent();
+        replacement.set_records_dir(records);
+        replacement.set_volumes_dir(directory.path().join("volumes"));
+        replacement.adopt_recorded_instances().await.unwrap();
+        let task = tokio::spawn(async move { replacement.run().await });
+        let conflicting =
+            Config::parse("[app.backup]\nimage = 'test:v1'\nnamespace = 'blue'\n").unwrap();
+        let events = send_deploy(&tx, conflicting).await;
+        assert!(events.iter().any(|event| matches!(event, ApplyEvent::Error { message } if message.contains("registered cron job"))));
+        for (namespace, exists) in [("red", false), ("blue", true)] {
+            let (response, stopped) = oneshot::channel();
+            tx.send(AgentCommand::Stop {
+                app_name: "backup".into(),
+                namespace: namespace.into(),
+                response,
+            })
+            .await
+            .unwrap();
+            let result = stopped.await.unwrap();
+            assert_eq!(result.is_ok(), exists, "{namespace}: {result:?}");
+        }
+        shutdown.cancel();
+        task.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn cron_claim_is_durable_before_launch_and_is_not_repeated_after_crash() {
+        let seconds = time::OffsetDateTime::now_utc().second();
+        if seconds >= 50 {
+            tokio::time::sleep(std::time::Duration::from_secs(u64::from(61 - seconds))).await;
+        }
+        let directory = tempfile::tempdir().unwrap();
+        let records = directory.path().join("instances");
+        let (mut agent, tx, _shutdown, grill) = test_agent_with_grill();
+        agent.set_records_dir(records.clone());
+        agent.set_volumes_dir(directory.path().join("volumes"));
+        grill.block_creates();
+        let task = tokio::spawn(async move { agent.run().await });
+        let config =
+            Config::parse("[job.once]\nimage = 'test:v1'\nschedule = '* * * * *'\n").unwrap();
+        expect_complete(&send_deploy(&tx, config).await);
+        tokio::time::timeout(std::time::Duration::from_secs(3), grill.wait_for_creates(1))
+            .await
+            .unwrap();
+        let checkpoint: serde_json::Value = serde_json::from_slice(
+            &std::fs::read(records.join("scheduled-jobs.checkpoint")).unwrap(),
+        )
+        .unwrap();
+        let claimed = checkpoint["jobs"][0]["last_fired_minute"].as_i64().unwrap();
+        assert_eq!(
+            claimed,
+            time::OffsetDateTime::now_utc()
+                .unix_timestamp()
+                .div_euclid(60)
+        );
+        task.abort();
+        assert!(task.await.unwrap_err().is_cancelled());
+        grill.release_creates(1);
+
+        let (mut replacement, _tx, shutdown, runtime) = test_agent_with_grill();
+        replacement.set_records_dir(records);
+        replacement.set_volumes_dir(directory.path().join("volumes"));
+        replacement.adopt_recorded_instances().await.unwrap();
+        let task = tokio::spawn(async move { replacement.run().await });
+        tokio::time::sleep(std::time::Duration::from_millis(2200)).await;
+        shutdown.cancel();
+        task.await.unwrap();
+        assert_eq!(
+            claimed,
+            time::OffsetDateTime::now_utc()
+                .unix_timestamp()
+                .div_euclid(60),
+            "fixture crossed the minute boundary"
+        );
+        assert!(
+            !runtime
+                .calls()
+                .iter()
+                .any(|(operation, _)| operation == "create"),
+            "recovery repeated a claimed firing"
+        );
+    }
+
+    #[tokio::test]
+    async fn failed_cron_stop_retains_checkpoint_and_fences_later_changes() {
+        let directory = tempfile::tempdir().unwrap();
+        let records = directory.path().join("instances");
+        let (mut agent, tx, shutdown) = test_agent();
+        agent.set_records_dir(records.clone());
+        agent.set_volumes_dir(directory.path().join("volumes"));
+        let task = tokio::spawn(async move { agent.run().await });
+        let config =
+            Config::parse("[job.backup]\nimage = 'test:v1'\nschedule = '0 0 30 2 *'\n").unwrap();
+        expect_complete(&send_deploy(&tx, config.clone()).await);
+        let saved = directory.path().join("saved");
+        std::fs::rename(&records, &saved).unwrap();
+        std::fs::write(&records, "blocked").unwrap();
+        let (response, stopped) = oneshot::channel();
+        tx.send(AgentCommand::Stop {
+            app_name: "backup".into(),
+            namespace: "default".into(),
+            response,
+        })
+        .await
+        .unwrap();
+        assert!(stopped.await.unwrap().is_err());
+        std::fs::remove_file(&records).unwrap();
+        std::fs::rename(&saved, &records).unwrap();
+        let events = send_deploy(&tx, config).await;
+        assert!(events.iter().any(|event| matches!(event, ApplyEvent::Error { message } if message.contains("previous write is uncertain"))));
+        shutdown.cancel();
+        task.await.unwrap();
+        let (mut replacement, _tx, _shutdown) = test_agent();
+        replacement.set_records_dir(records);
+        replacement.set_volumes_dir(directory.path().join("volumes"));
+        replacement.adopt_recorded_instances().await.unwrap();
+        assert!(
+            replacement
+                .scheduled_jobs
+                .contains_key(&("backup".into(), "default".into()))
+        );
+    }
+
+    #[tokio::test]
+    async fn cron_checkpoint_corruption_refuses_startup() {
+        let job = serde_json::json!({"name":"backup", "namespace":"default", "spec":{"image":"test:v1", "schedule":"* * * * *"}, "last_fired_minute":null});
+        let mut wrong_namespace = job.clone();
+        wrong_namespace["namespace"] = "other".into();
+        let mut invalid_schedule = job.clone();
+        invalid_schedule["spec"]["schedule"] = "bad".into();
+        let mut invalid_stamp = job.clone();
+        invalid_stamp["last_fired_minute"] = (-1).into();
+        for contents in [
+            "{broken".to_string(),
+            serde_json::json!({"schema":999,"jobs":[]}).to_string(),
+            serde_json::json!({"schema":1,"jobs":[job.clone(),job]}).to_string(),
+            serde_json::json!({"schema":1,"jobs":[wrong_namespace]}).to_string(),
+            serde_json::json!({"schema":1,"jobs":[invalid_schedule]}).to_string(),
+            serde_json::json!({"schema":1,"jobs":[invalid_stamp]}).to_string(),
+        ] {
+            let directory = tempfile::tempdir().unwrap();
+            let path = directory.path().join("scheduled-jobs.checkpoint");
+            std::fs::write(&path, &contents).unwrap();
+            let (mut agent, _tx, _shutdown) = test_agent();
+            agent.set_records_dir(directory.path().to_path_buf());
+            agent.set_volumes_dir(directory.path().join("volumes"));
+            assert!(
+                agent.adopt_recorded_instances().await.is_err(),
+                "invalid checkpoint was accepted: {contents}"
+            );
+            assert_eq!(std::fs::read_to_string(path).unwrap(), contents);
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn cron_checkpoint_refuses_symlinks_and_nonregular_files() {
+        let directory = tempfile::tempdir().unwrap();
+        let checkpoint = directory.path().join("scheduled-jobs.checkpoint");
+        let source = directory.path().join("source");
+        std::fs::write(&source, r#"{"schema":1,"jobs":[]}"#).unwrap();
+        for kind in 0..3 {
+            match kind {
+                0 => std::os::unix::fs::symlink(&source, &checkpoint).unwrap(),
+                1 => nix::unistd::mkfifo(&checkpoint, nix::sys::stat::Mode::S_IRUSR).unwrap(),
+                _ => std::fs::create_dir(&checkpoint).unwrap(),
+            }
+            let (mut agent, _tx, _shutdown) = test_agent();
+            agent.set_records_dir(directory.path().to_path_buf());
+            agent.set_volumes_dir(directory.path().join("volumes"));
+            assert!(
+                tokio::time::timeout(
+                    std::time::Duration::from_secs(2),
+                    agent.adopt_recorded_instances()
+                )
+                .await
+                .unwrap()
+                .is_err()
+            );
+            if kind == 2 {
+                std::fs::remove_dir(&checkpoint).unwrap();
+            } else {
+                std::fs::remove_file(&checkpoint).unwrap();
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn cron_registration_refuses_when_ownership_cannot_be_persisted() {
+        let directory = tempfile::tempdir().unwrap();
+        let records = directory.path().join("instances");
+        std::fs::write(&records, "not a directory").unwrap();
+        let (mut agent, tx, shutdown) = test_agent();
+        agent.set_records_dir(records);
+        agent.set_volumes_dir(directory.path().join("volumes"));
+        let task = tokio::spawn(async move { agent.run().await });
+        let config =
+            Config::parse("[job.backup]\nimage = 'test:v1'\nschedule = '0 0 30 2 *'\n").unwrap();
+        let events = send_deploy(&tx, config).await;
+        let (response, stopped) = oneshot::channel();
+        tx.send(AgentCommand::Stop {
+            app_name: "backup".into(),
+            namespace: "default".into(),
+            response,
+        })
+        .await
+        .unwrap();
+        assert!(
+            matches!(stopped.await.unwrap(), Err(BunError::ScheduleState(_))),
+            "an uncertain new registration must retain ownership"
+        );
+        shutdown.cancel();
+        task.await.unwrap();
+        assert!(
+            events
+                .iter()
+                .any(|event| matches!(event, ApplyEvent::Error { .. })),
+            "schedule was acknowledged without durable ownership: {events:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn reapplying_a_job_without_schedule_retires_only_its_previous_cron() {
+        let (mut agent, tx, shutdown) = test_agent();
+        let task = tokio::spawn(async move {
+            agent.run().await;
+            agent
+        });
+        for namespace in ["red", "blue"] {
+            let config = Config::parse(&format!(
+                "[job.backup]\nimage = 'test:v1'\nschedule = '0 0 30 2 *'\nnamespace = '{namespace}'\n"
+            )).unwrap();
+            expect_complete(&send_deploy(&tx, config).await);
+        }
+        let config = Config::parse("[job.backup]\nimage = 'test:v2'\nnamespace = 'red'\n").unwrap();
+        expect_complete(&send_deploy(&tx, config).await);
+        shutdown.cancel();
+        let agent = task.await.unwrap();
+        assert!(
+            !agent
+                .scheduled_jobs
+                .contains_key(&("backup".into(), "red".into())),
+            "removing schedule from the applied job must retire its old cron"
+        );
+        assert!(
+            agent
+                .scheduled_jobs
+                .contains_key(&("backup".into(), "blue".into()))
+        );
+    }
+
+    #[tokio::test]
+    async fn stopping_a_scheduled_job_before_its_first_run_retires_only_its_namespace() {
+        let (tx, rx) = mpsc::channel(32);
+        let shutdown = CancellationToken::new();
+        let mut agent = BunAgent::new(
+            crate::grill::mock::MockGrill::new(),
+            PortAllocator::new(30000, 31000),
+            rx,
+            shutdown.clone(),
+        );
+        let task = tokio::spawn(async move {
+            agent.run().await;
+            agent
+        });
+        for namespace in ["red", "blue"] {
+            // February 30 never matches, so this tests the pre-first-run path
+            // without depending on which minute CI happens to execute it.
+            let config = Config::parse(&format!(
+                "[job.backup]\nimage = \"busybox:latest\"\ncommand = [\"true\"]\nschedule = \"0 0 30 2 *\"\nnamespace = \"{namespace}\"\n"
+            )).unwrap();
+            let events = send_deploy(&tx, config).await;
+            assert!(
+                events
+                    .iter()
+                    .any(|event| matches!(event, ApplyEvent::Complete { .. })),
+                "{events:?}"
+            );
+        }
+        let (response, result) = oneshot::channel();
+        tx.send(AgentCommand::Stop {
+            app_name: "backup".into(),
+            namespace: "red".into(),
+            response,
+        })
+        .await
+        .unwrap();
+        let stopped = result.await.unwrap();
+        shutdown.cancel();
+        let agent = task.await.unwrap();
+        assert!(
+            stopped.is_ok(),
+            "stopping a registered schedule failed: {stopped:?}"
+        );
+        assert!(
+            !agent
+                .scheduled_jobs
+                .contains_key(&("backup".into(), "red".into()))
+        );
+        assert!(
+            agent
+                .scheduled_jobs
+                .contains_key(&("backup".into(), "blue".into()))
+        );
+        assert!(agent.supervisor.list_instances().is_empty());
     }
 
     /// Send a Deploy command and collect all events. Returns the list
@@ -9959,6 +11466,269 @@ interval = 1
     }
 
     #[tokio::test]
+    async fn cancellation_waits_for_in_flight_create_before_releasing_ownership() {
+        let (mut agent, tx, shutdown, grill) = test_agent_with_grill();
+        let task = tokio::spawn(async move { agent.run().await });
+        grill.block_creates();
+        let (events, mut stream) = mpsc::channel(64);
+        tx.send(AgentCommand::Deploy {
+            config: basic_config(),
+            events,
+        })
+        .await
+        .unwrap();
+        let ApplyEvent::Accepted { operation_id } = stream.recv().await.unwrap() else {
+            panic!("no ID")
+        };
+        tokio::time::timeout(std::time::Duration::from_secs(2), grill.wait_for_creates(1))
+            .await
+            .unwrap();
+        let (response, result) = oneshot::channel();
+        tx.send(AgentCommand::CancelDeploy {
+            operation_id: operation_id.clone().into(),
+            response,
+        })
+        .await
+        .unwrap();
+        let receipt = result.await.unwrap().unwrap();
+        assert!(receipt.cancellation_requested_at.is_some());
+        assert!(receipt.outcome.is_none());
+        let conflict = send_deploy(&tx, basic_config()).await;
+        assert!(conflict.iter().any(|event| matches!(event, ApplyEvent::Error { message } if message.contains(&operation_id))));
+        grill.release_creates(1);
+        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            while stream.recv().await.is_some() {}
+        })
+        .await
+        .unwrap();
+        let (response, result) = oneshot::channel();
+        tx.send(AgentCommand::DeployOperations { response })
+            .await
+            .unwrap();
+        assert_eq!(
+            result.await.unwrap().history[0].outcome,
+            Some(crate::bun::deploy_operations::DeployOperationOutcome::Cancelled)
+        );
+        expect_complete(&send_deploy(&tx, basic_config()).await);
+        shutdown.cancel();
+        task.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn cancellation_interrupts_health_wait_and_holds_ownership_through_rollback() {
+        for strategy in ["rolling", "blue-green"] {
+            let port = spawn_health_responder(500).await;
+            let (mut agent, tx, shutdown, grill) = test_agent_with_grill();
+            let task = tokio::spawn(async move { agent.run().await });
+            expect_complete(&send_deploy(&tx, no_health_config(port)).await);
+            let mut config = health_gated_config(port, strategy);
+            config
+                .app
+                .get_mut("web")
+                .unwrap()
+                .deploy
+                .as_mut()
+                .unwrap()
+                .health_timeout = Some("30s".into());
+            let (events, mut stream) = mpsc::channel(64);
+            tx.send(AgentCommand::Deploy { config, events })
+                .await
+                .unwrap();
+            let ApplyEvent::Accepted { operation_id } = stream.recv().await.unwrap() else {
+                panic!("no ID")
+            };
+            let canary =
+                crate::grill::InstanceIdentity::canary("default", "web", 1, 0).instance_id();
+            tokio::time::timeout(std::time::Duration::from_secs(2), async {
+                while !grill
+                    .calls()
+                    .iter()
+                    .any(|(call, id)| call == "start" && id == &canary)
+                {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .unwrap();
+            grill.block_kills();
+            let (response, result) = oneshot::channel();
+            tx.send(AgentCommand::CancelDeploy {
+                operation_id: operation_id.clone().into(),
+                response,
+            })
+            .await
+            .unwrap();
+            assert!(
+                result
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .cancellation_requested_at
+                    .is_some()
+            );
+            tokio::time::timeout(std::time::Duration::from_secs(2), grill.wait_for_kills(1))
+                .await
+                .expect("cancellation did not interrupt the 30-second health wait");
+            let (response, result) = oneshot::channel();
+            tx.send(AgentCommand::DeployOperations { response })
+                .await
+                .unwrap();
+            let snapshot = result.await.unwrap();
+            grill.release_kills(1);
+            assert!(
+                snapshot
+                    .active_deploys
+                    .iter()
+                    .any(|op| op.id.as_str() == operation_id)
+            );
+            tokio::time::timeout(std::time::Duration::from_secs(2), async {
+                while stream.recv().await.is_some() {}
+            })
+            .await
+            .unwrap();
+            let (response, result) = oneshot::channel();
+            tx.send(AgentCommand::DeployOperations { response })
+                .await
+                .unwrap();
+            assert_eq!(
+                result.await.unwrap().history[0].outcome,
+                Some(crate::bun::deploy_operations::DeployOperationOutcome::Cancelled)
+            );
+            expect_complete(&send_deploy(&tx, no_health_config(port)).await);
+            shutdown.cancel();
+            task.await.unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn app_deploy_does_not_roll_over_an_existing_job() {
+        let (mut agent, tx, shutdown, grill) = test_agent_with_grill();
+        let task = tokio::spawn(async move { agent.run().await });
+        let job = Config::parse("[job.web]\nimage = 'job:v1'\n").unwrap();
+        expect_complete(&send_deploy(&tx, job).await);
+        let events = send_deploy(&tx, basic_config()).await;
+        let calls_before_shutdown = grill.calls();
+        shutdown.cancel();
+        task.await.unwrap();
+        assert!(
+            events
+                .iter()
+                .any(|event| matches!(event, ApplyEvent::Error { .. })),
+            "an app rollout accepted a live job as its previous generation"
+        );
+        assert!(
+            !calls_before_shutdown
+                .iter()
+                .any(|(call, _)| call == "stop" || call == "kill"),
+            "the conflicting deploy changed the existing job"
+        );
+    }
+
+    #[tokio::test]
+    async fn failed_deploy_keeps_target_ownership_until_rollback_finishes() {
+        for strategy in ["rolling", "blue-green"] {
+            let port = spawn_health_responder(500).await;
+            let (mut agent, tx, shutdown, grill) = test_agent_with_grill();
+            let task = tokio::spawn(async move { agent.run().await });
+            expect_complete(&send_deploy(&tx, no_health_config(port)).await);
+            grill.block_kills();
+            let (events, mut event_rx) = mpsc::channel(64);
+            tx.send(AgentCommand::Deploy {
+                config: health_gated_config(port, strategy),
+                events,
+            })
+            .await
+            .unwrap();
+            let operation_id = match event_rx.recv().await.unwrap() {
+                ApplyEvent::Accepted { operation_id } => operation_id,
+                event => panic!("expected acceptance, got {event:?}"),
+            };
+            tokio::time::timeout(std::time::Duration::from_secs(3), async {
+                while let Some(event) = event_rx.recv().await {
+                    if matches!(event, ApplyEvent::Error { .. }) {
+                        break;
+                    }
+                }
+                grill.wait_for_kills(1).await;
+            })
+            .await
+            .expect("failed replacement did not enter cleanup");
+            let (response, result) = oneshot::channel();
+            tx.send(AgentCommand::DeployOperations { response })
+                .await
+                .unwrap();
+            let snapshot = result.await.unwrap();
+            // Release the fixture even when the assertion below fails.
+            grill.release_kills(1);
+            assert!(
+                snapshot
+                    .active_deploys
+                    .iter()
+                    .any(|op| op.id.as_str() == operation_id),
+                "{strategy} released target ownership while rollback still owned its runtime mutation"
+            );
+            assert!(
+                !snapshot
+                    .history
+                    .iter()
+                    .any(|op| op.id.as_str() == operation_id)
+            );
+            while event_rx.recv().await.is_some() {}
+            let (response, result) = oneshot::channel();
+            tx.send(AgentCommand::DeployOperations { response })
+                .await
+                .unwrap();
+            let snapshot = result.await.unwrap();
+            assert_eq!(
+                snapshot
+                    .history
+                    .iter()
+                    .find(|op| op.id.as_str() == operation_id)
+                    .unwrap()
+                    .outcome,
+                Some(crate::bun::deploy_operations::DeployOperationOutcome::Failed)
+            );
+            expect_complete(&send_deploy(&tx, no_health_config(port)).await);
+            shutdown.cancel();
+            task.await.unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn stalled_event_consumer_cannot_pin_deployment_ownership() {
+        let (mut agent, tx, shutdown, _) = test_agent_with_grill();
+        let task = tokio::spawn(async move { agent.run().await });
+        // Acceptance fills this queue. Keep its receiver alive without reading.
+        let (events, _event_rx) = mpsc::channel(1);
+        tx.send(AgentCommand::Deploy {
+            config: basic_config(),
+            events,
+        })
+        .await
+        .unwrap();
+        let outcome = tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            loop {
+                let (response, result) = oneshot::channel();
+                tx.send(AgentCommand::DeployOperations { response })
+                    .await
+                    .unwrap();
+                let snapshot = result.await.unwrap();
+                if let Some(operation) = snapshot.history.first() {
+                    break operation.outcome;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await;
+        shutdown.cancel();
+        task.await.unwrap();
+        assert_eq!(
+            outcome.expect("client backpressure prevented terminal history"),
+            Some(crate::bun::deploy_operations::DeployOperationOutcome::Completed)
+        );
+    }
+
+    #[tokio::test]
     async fn deploy_operations_track_live_phase_conflicts_and_disconnected_clients() {
         let (tx, rx) = mpsc::channel(32);
         let shutdown = CancellationToken::new();
@@ -10214,7 +11984,9 @@ interval = 1
         let shutdown = CancellationToken::new();
         let grill = crate::grill::process::ProcessGrill::new();
         let port_allocator = PortAllocator::new(30000, 31000);
+        let volumes = tempfile::tempdir().unwrap();
         let mut agent = BunAgent::new(grill, port_allocator, rx, shutdown);
+        agent.set_volumes_dir(volumes.path().to_path_buf());
 
         let config = Config::parse(&format!(
             "[app.web]\nimage = \"proc-grill:ignored\"\ncommand = [\"sleep\", \"60\"]\nport = {port}\n\n[app.web.health]\npath = \"/healthz\"\n\n[app.web.deploy]\nhealth_timeout = \"5s\"\n",
@@ -10254,13 +12026,290 @@ interval = 1
         agent.stop_app("web", "default").await.unwrap();
     }
 
+    async fn restart_preserves_uncertain_cleanup(inject: fn(&MockGrill)) {
+        let (mut agent, _tx, _shutdown, grill) = test_agent_with_grill();
+        let directory = tempfile::tempdir().unwrap();
+        agent.set_volumes_dir(directory.path().join("volumes"));
+        let records = directory.path().join("instances");
+        agent.set_records_dir(records.clone());
+        let config = Config::parse("[app.restart]\nimage = \"mock:image\"\nport = 8080\n").unwrap();
+        let (events, _received) = mpsc::channel(256);
+        agent.deploy(config, &events).await;
+        let id = agent.supervisor.list_instances()[0].id.clone();
+        let port = agent.supervisor.get_instance(&id).unwrap().host_port;
+        assert!(port.is_some());
+        std::fs::create_dir_all(&records).unwrap();
+        let record = crate::grill::records::record_path(&records, &id.0);
+        std::fs::write(&record, "retained ownership").unwrap();
+        agent.supervisor.get_instance_mut(&id).unwrap().state = ContainerState::Unhealthy;
+        assert!(
+            agent
+                .supervisor
+                .maybe_restart(&id, Instant::now())
+                .await
+                .unwrap()
+        );
+        let before = grill.calls().len();
+        inject(&grill);
+        tokio::time::timeout(
+            std::time::Duration::from_secs(6),
+            agent.drive_pending_restarts(),
+        )
+        .await
+        .expect("restart cleanup stalled the agent");
+        assert_eq!(
+            agent.supervisor.get_instance(&id).unwrap().state,
+            ContainerState::Pending
+        );
+        assert_eq!(agent.supervisor.get_instance(&id).unwrap().host_port, port);
+        assert_eq!(
+            std::fs::read_to_string(&record).unwrap(),
+            "retained ownership"
+        );
+        assert!(
+            !grill.calls()[before..]
+                .iter()
+                .any(|(operation, _)| operation == "create" || operation == "start")
+        );
+
+        grill.set_fail_kill(false);
+        grill.set_ignore_kill(false);
+        grill.set_fail_state(false);
+        grill.release_kills(1);
+        agent.drive_pending_restarts().await;
+        assert_eq!(
+            agent.supervisor.get_instance(&id).unwrap().state,
+            ContainerState::Running
+        );
+        assert_eq!(agent.supervisor.get_instance(&id).unwrap().restart_count, 1);
+        agent.stop_app("restart", "default").await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn restart_retains_owner_after_failed_kill() {
+        restart_preserves_uncertain_cleanup(|grill| grill.set_fail_kill(true)).await;
+    }
+
+    #[tokio::test]
+    async fn restart_retains_owner_after_unconfirmed_kill() {
+        restart_preserves_uncertain_cleanup(|grill| grill.set_ignore_kill(true)).await;
+    }
+
+    #[tokio::test]
+    async fn restart_retains_owner_after_failed_observation() {
+        restart_preserves_uncertain_cleanup(|grill| grill.set_fail_state(true)).await;
+    }
+
+    #[tokio::test]
+    async fn restart_retains_owner_after_stalled_kill() {
+        restart_preserves_uncertain_cleanup(MockGrill::block_kills).await;
+    }
+
+    async fn failed_restart_fixture() -> (TestAgent, MockGrill, InstanceId, tempfile::TempDir) {
+        let (mut agent, _tx, _shutdown, grill) = test_agent_with_grill();
+        let directory = tempfile::tempdir().unwrap();
+        agent.set_volumes_dir(directory.path().join("volumes"));
+        let config = Config::parse("[app.retry]\nimage = \"mock:image\"\nport = 8080\n").unwrap();
+        let (events, _received) = mpsc::channel(256);
+        agent.deploy(config, &events).await;
+        let id = agent.supervisor.list_instances()[0].id.clone();
+        agent.supervisor.get_instance_mut(&id).unwrap().state = ContainerState::Unhealthy;
+        assert!(
+            agent
+                .supervisor
+                .maybe_restart(&id, Instant::now())
+                .await
+                .unwrap()
+        );
+        (agent, grill, id, directory)
+    }
+
+    async fn failed_restart_recovers(inject: fn(&MockGrill)) {
+        let (mut agent, grill, id, _directory) = failed_restart_fixture().await;
+        let port = agent.supervisor.get_instance(&id).unwrap().host_port;
+        inject(&grill);
+        agent.drive_pending_restarts().await;
+        assert_eq!(
+            agent.supervisor.get_instance(&id).unwrap().state,
+            ContainerState::Stopping
+        );
+        assert_eq!(agent.supervisor.get_instance(&id).unwrap().host_port, port);
+        let creates = grill
+            .calls()
+            .iter()
+            .filter(|(op, _)| op == "create")
+            .count();
+        grill.set_fail_kill(true);
+        agent.drive_pending_restarts().await;
+        assert_eq!(
+            agent.supervisor.get_instance(&id).unwrap().state,
+            ContainerState::Stopping
+        );
+        assert_eq!(
+            grill
+                .calls()
+                .iter()
+                .filter(|(op, _)| op == "create")
+                .count(),
+            creates
+        );
+        grill.set_fail_kill(false);
+        agent.drive_pending_restarts().await;
+        assert_eq!(
+            agent.supervisor.get_instance(&id).unwrap().state,
+            ContainerState::Stopped
+        );
+        assert_eq!(agent.supervisor.get_instance(&id).unwrap().restart_count, 1);
+        assert_eq!(
+            grill
+                .calls()
+                .iter()
+                .filter(|(op, _)| op == "create")
+                .count(),
+            creates
+        );
+        grill.set_fail_create(false);
+        grill.set_fail_start(false);
+        agent.supervisor.get_instance_mut(&id).unwrap().last_restart =
+            Some(Instant::now() - std::time::Duration::from_secs(600));
+        agent.drive_pending_restarts().await;
+        assert_eq!(
+            agent.supervisor.get_instance(&id).unwrap().state,
+            ContainerState::Running
+        );
+        assert_eq!(agent.supervisor.get_instance(&id).unwrap().restart_count, 2);
+        agent.stop_app("retry", "default").await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn restart_create_failure_recovers_after_cleanup_and_backoff() {
+        failed_restart_recovers(|grill| grill.set_fail_create(true)).await;
+    }
+
+    #[tokio::test]
+    async fn restart_start_failure_recovers_after_cleanup_and_backoff() {
+        failed_restart_recovers(|grill| grill.set_fail_start(true)).await;
+    }
+
+    #[tokio::test]
+    async fn restart_start_failures_exhaust_job_budget() {
+        let (mut agent, grill, id, _directory) = failed_restart_fixture().await;
+        let instance = agent.supervisor.get_instance_mut(&id).unwrap();
+        instance.is_job = true;
+        instance.restart_policy = crate::bun::restart::RestartPolicy::for_job(2);
+        grill.set_fail_start(true);
+        for _ in 0..4 {
+            agent.supervisor.get_instance_mut(&id).unwrap().last_restart =
+                Some(Instant::now() - std::time::Duration::from_secs(600));
+            agent.drive_pending_restarts().await;
+        }
+        let instance = agent.supervisor.get_instance(&id).unwrap();
+        assert_eq!(instance.state, ContainerState::Failed);
+        assert_eq!(instance.restart_count, 2);
+        assert_eq!(
+            grill.calls().iter().filter(|(op, _)| op == "start").count(),
+            3
+        );
+    }
+
+    #[tokio::test]
+    async fn explicit_stop_cancels_failed_restart_recovery() {
+        let (mut agent, grill, id, _directory) = failed_restart_fixture().await;
+        grill.set_fail_start(true);
+        agent.drive_pending_restarts().await;
+        agent.stop_app("retry", "default").await.unwrap();
+        assert_eq!(
+            agent.supervisor.get_instance(&id).unwrap().state,
+            ContainerState::Stopped
+        );
+        let calls = grill.calls().len();
+        agent.drive_pending_restarts().await;
+        assert_eq!(grill.calls().len(), calls);
+    }
+
+    #[tokio::test]
+    async fn explicit_stop_cancels_pending_restart_before_creation() {
+        let (mut agent, grill, id, _directory) = failed_restart_fixture().await;
+        agent.stop_app("retry", "default").await.unwrap();
+        assert_eq!(
+            agent.supervisor.get_instance(&id).unwrap().state,
+            ContainerState::Stopped
+        );
+        let calls = grill.calls().len();
+        agent.drive_pending_restarts().await;
+        assert_eq!(grill.calls().len(), calls);
+    }
+
+    #[tokio::test]
+    async fn real_process_restart_recovers_when_executable_returns() {
+        use std::os::unix::fs::PermissionsExt;
+        let directory = tempfile::tempdir().unwrap();
+        let program = directory.path().join("worker");
+        let install = || {
+            std::fs::write(&program, "#!/bin/sh\nexec sleep 60\n").unwrap();
+            std::fs::set_permissions(&program, std::fs::Permissions::from_mode(0o700)).unwrap();
+        };
+        install();
+        let (_tx, rx) = mpsc::channel(32);
+        let grill = crate::grill::process::ProcessGrill::new();
+        let mut agent = BunAgent::new(
+            grill.clone(),
+            PortAllocator::new(30000, 31000),
+            rx,
+            CancellationToken::new(),
+        );
+        agent.set_volumes_dir(directory.path().join("volumes"));
+        let config = Config::parse(&format!(
+            "[app.retry]\nimage = 'proc-grill:ignored'\ncommand = [{:?}]\n",
+            program.to_str().unwrap()
+        ))
+        .unwrap();
+        let (events, _received) = mpsc::channel(256);
+        agent.deploy(config, &events).await;
+        let id = agent.supervisor.list_instances()[0].id.clone();
+        grill.kill(&id).await.unwrap();
+        std::fs::remove_file(&program).unwrap();
+        agent.check_apps().await;
+        agent.drive_pending_restarts().await;
+        assert_eq!(
+            agent.supervisor.get_instance(&id).unwrap().state,
+            ContainerState::Stopping
+        );
+        agent.drive_pending_restarts().await;
+        assert_eq!(
+            agent.supervisor.get_instance(&id).unwrap().state,
+            ContainerState::Stopped
+        );
+        install();
+        agent.supervisor.get_instance_mut(&id).unwrap().last_restart =
+            Some(Instant::now() - std::time::Duration::from_secs(600));
+        agent.drive_pending_restarts().await;
+        assert_eq!(grill.state(&id).await.unwrap(), ContainerState::Running);
+        assert_eq!(agent.supervisor.get_instance(&id).unwrap().restart_count, 2);
+        // A second crash during backoff must stay eligible for a later tick.
+        grill.kill(&id).await.unwrap();
+        agent.check_apps().await;
+        assert_eq!(
+            agent.supervisor.get_instance(&id).unwrap().state,
+            ContainerState::Stopped
+        );
+        agent.supervisor.get_instance_mut(&id).unwrap().last_restart =
+            Some(Instant::now() - std::time::Duration::from_secs(600));
+        agent.drive_pending_restarts().await;
+        assert_eq!(grill.state(&id).await.unwrap(), ContainerState::Running);
+        assert_eq!(agent.supervisor.get_instance(&id).unwrap().restart_count, 3);
+        agent.stop_app("retry", "default").await.unwrap();
+    }
+
     #[tokio::test]
     async fn redeployed_instance_restarts_after_a_crash() {
         let (_tx, rx) = mpsc::channel(32);
         let shutdown = CancellationToken::new();
         let grill = crate::grill::process::ProcessGrill::new();
         let port_allocator = PortAllocator::new(30000, 31000);
+        let volumes = tempfile::tempdir().unwrap();
         let mut agent = BunAgent::new(grill, port_allocator, rx, shutdown);
+        agent.set_volumes_dir(volumes.path().to_path_buf());
 
         let config = Config::parse(
             "[app.web]\nimage = \"proc-grill:ignored\"\ncommand = [\"sleep\", \"60\"]\n",
@@ -10585,6 +12634,8 @@ host = "remote.local"
     #[tokio::test]
     async fn stop_command_stops_instances() {
         let (mut agent, tx, shutdown) = test_agent();
+        let volumes = tempfile::tempdir().unwrap();
+        agent.set_volumes_dir(volumes.path().to_path_buf());
 
         let agent_handle = tokio::spawn(async move {
             agent.run().await;
@@ -10716,6 +12767,79 @@ host = "remote.local"
     }
 
     #[tokio::test]
+    async fn retirement_retains_ownership_until_durable_artifacts_are_removed() {
+        for block_identity in [false, true] {
+            let root = tempfile::tempdir().unwrap();
+            let records = root.path().join("records");
+            std::fs::create_dir(&records).unwrap();
+            let (mut agent, tx, shutdown) = test_agent();
+            agent.set_records_dir(records.clone());
+            agent.set_volumes_dir(root.path().join("volumes"));
+            let id = InstanceId("default__web-0".into());
+            let identity = agent.instance_identity_dir(&id);
+            let task = tokio::spawn(async move {
+                agent.run().await;
+                agent
+            });
+            expect_complete(&send_deploy(&tx, basic_config()).await);
+            let record = crate::grill::records::record_path(&records, &id.0);
+            if block_identity {
+                crate::sesame::identity::cleanup_identity_dir(&identity).unwrap();
+                std::fs::write(&identity, "blocked identity cleanup").unwrap();
+                std::fs::write(&record, "owned until cleanup succeeds").unwrap();
+            } else {
+                std::fs::create_dir(&record).unwrap();
+            }
+            let (response, result) = oneshot::channel();
+            tx.send(AgentCommand::Retire {
+                app_name: "web".into(),
+                namespace: "default".into(),
+                response,
+            })
+            .await
+            .unwrap();
+            let outcome = result.await.unwrap();
+            let durable_owner_retained = record.exists();
+            let (response, status) = oneshot::channel();
+            tx.send(AgentCommand::Status { response }).await.unwrap();
+            let retained = status.await.unwrap();
+            // Restore the injected filesystem fault before stopping the fixture.
+            if block_identity {
+                std::fs::remove_file(&identity).unwrap();
+            } else {
+                std::fs::remove_dir(&record).unwrap();
+            }
+            let (response, result) = oneshot::channel();
+            tx.send(AgentCommand::Retire {
+                app_name: "web".into(),
+                namespace: "default".into(),
+                response,
+            })
+            .await
+            .unwrap();
+            let retry = result.await.unwrap();
+            shutdown.cancel();
+            let agent = task.await.unwrap();
+            assert!(
+                outcome.is_err(),
+                "retirement succeeded despite failed artifact removal"
+            );
+            assert!(
+                durable_owner_retained,
+                "failed artifact cleanup discarded the adoption record"
+            );
+            assert_eq!(
+                retained.len(),
+                1,
+                "uncertain cleanup lost runtime ownership"
+            );
+            assert!(retry.is_ok(), "{retry:?}");
+            assert!(agent.supervisor.list_instances().is_empty());
+            assert!(!record.exists());
+        }
+    }
+
+    #[tokio::test]
     async fn stop_unknown_app_errors() {
         let (mut agent, tx, shutdown) = test_agent();
 
@@ -10844,6 +12968,41 @@ host = "remote.local"
 
         shutdown.cancel();
         agent_handle.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn halted_rollout_keeps_healthy_replacements_in_ordinary_supervision() {
+        for strategy in ["rolling", "blue-green"] {
+            let (mut agent, _tx, _shutdown, grill) = test_agent_with_grill();
+            let records = tempfile::tempdir().unwrap();
+            agent.set_records_dir(records.path().to_path_buf());
+            grill.set_pid(std::process::id());
+            let config =
+                Config::parse("[app.web]\nimage = 'web:v1'\nport = 8080\nreplicas = 2\n").unwrap();
+            expect_complete(&drain_deploy(&mut agent, config).await);
+            let failed = InstanceId("default__web-g1-1".into());
+            grill.set_state(&failed, ContainerState::Failed);
+            let replacement = Config::parse(&format!("[app.web]\nimage = 'web:v2'\nport = 8080\nreplicas = 2\n[app.web.deploy]\nstrategy = '{strategy}'\nauto_rollback = false\nhealth_timeout = '1s'\n")).unwrap();
+            let outcome = drain_deploy(&mut agent, replacement).await;
+            assert!(
+                matches!(outcome.last(), Some(ApplyEvent::Error { message }) if message.contains("halted")),
+                "{outcome:?}"
+            );
+            let healthy = InstanceId("default__web-g1-0".into());
+            let owner = agent.supervisor.get_instance(&healthy).unwrap();
+            assert_eq!(owner.state, ContainerState::Running);
+            assert!(owner.oci_spec.is_some());
+            assert!(agent.supervisor.get_instance(&failed).is_none());
+            assert!(crate::grill::records::record_path(records.path(), &healthy.0).exists());
+            agent.retire_workload("web", "default").await.unwrap();
+            assert!(agent.supervisor.instances.is_empty());
+            assert_eq!(agent.supervisor.port_allocator.allocated_count().await, 0);
+            assert!(
+                crate::grill::records::load_records(records.path())
+                    .unwrap()
+                    .is_empty()
+            );
+        }
     }
 
     #[tokio::test]
@@ -11039,6 +13198,391 @@ host = "remote.local"
             !grill.calls().iter().any(|(op, _)| op == "create"),
             "no container should be created for a scheduled job at deploy time"
         );
+    }
+
+    #[tokio::test]
+    async fn failed_rollout_retains_every_owner_until_cleanup_is_confirmed() {
+        for strategy in ["rolling", "blue-green"] {
+            for auto_rollback in [true, false] {
+                for fault in [
+                    "kill error",
+                    "kill ignored",
+                    "kill stalled",
+                    "inspection",
+                    "record",
+                    "identity",
+                ] {
+                    let root = tempfile::tempdir().unwrap();
+                    let records = root.path().join("records");
+                    let (mut agent, tx, shutdown, grill) = test_agent_with_grill();
+                    agent.set_volumes_dir(root.path().join("volumes"));
+                    agent.set_records_dir(records.clone());
+                    grill.set_pid(std::process::id());
+                    let new_id = InstanceId("default__web-g1-0".into());
+                    let record = crate::grill::records::record_path(&records, &new_id.0);
+                    let identity = agent.instance_identity_dir(&new_id);
+                    let history = agent.deploy_history_handle();
+                    let task = tokio::spawn(async move {
+                        agent.run().await;
+                        agent
+                    });
+                    expect_complete(&send_deploy(&tx, basic_config()).await);
+                    grill.set_state(&new_id, ContainerState::Failed);
+                    let config = Config::parse(&format!("[app.web]\nimage = 'web:v2'\nport = 8080\n[app.web.deploy]\nstrategy = '{strategy}'\nauto_rollback = {auto_rollback}\nhealth_timeout = '30s'\n")).unwrap();
+                    let (events, mut stream) = mpsc::channel(64);
+                    tx.send(AgentCommand::Deploy { config, events })
+                        .await
+                        .unwrap();
+                    let ApplyEvent::Accepted { operation_id } = stream.recv().await.unwrap() else {
+                        panic!("missing operation id")
+                    };
+                    tokio::time::timeout(std::time::Duration::from_secs(2), async {
+                        while !record.exists() {
+                            tokio::task::yield_now().await;
+                        }
+                    })
+                    .await
+                    .unwrap();
+                    let original_record = std::fs::read(&record).unwrap();
+                    match fault {
+                        "kill error" => grill.set_fail_kill(true),
+                        "kill ignored" => grill.set_ignore_kill(true),
+                        "kill stalled" => grill.block_kills(),
+                        "inspection" => grill.set_instance_inspection_failure(&new_id, true),
+                        "record" => {
+                            std::fs::remove_file(&record).unwrap();
+                            std::fs::create_dir(&record).unwrap();
+                        }
+                        _ => {
+                            crate::sesame::identity::cleanup_identity_dir(&identity).unwrap();
+                            std::fs::write(&identity, "blocked").unwrap();
+                        }
+                    }
+                    let (response, cancelled) = oneshot::channel();
+                    tx.send(AgentCommand::CancelDeploy {
+                        operation_id: operation_id.into(),
+                        response,
+                    })
+                    .await
+                    .unwrap();
+                    cancelled.await.unwrap().unwrap();
+                    let outcome = tokio::time::timeout(std::time::Duration::from_secs(6), async {
+                        let mut events = Vec::new();
+                        while let Some(event) = stream.recv().await {
+                            events.push(event);
+                        }
+                        events
+                    })
+                    .await;
+                    let (response, status) = oneshot::channel();
+                    tx.send(AgentCommand::Status { response }).await.unwrap();
+                    let retained =
+                        tokio::time::timeout(std::time::Duration::from_secs(1), status).await;
+                    let record_retained = record.exists();
+                    let claimed_rollback = history.read().await.iter().any(|entry| {
+                        entry.result == crate::meat::deploy_types::DeployResult::RolledBack
+                    });
+                    grill.set_fail_kill(false);
+                    grill.set_ignore_kill(false);
+                    grill.set_instance_inspection_failure(&new_id, false);
+                    grill.release_kills(4);
+                    if fault == "record" {
+                        std::fs::remove_dir(&record).unwrap();
+                        std::fs::write(&record, original_record).unwrap();
+                    }
+                    if fault == "identity" {
+                        std::fs::remove_file(&identity).unwrap();
+                    }
+                    grill.kill(&new_id).await.unwrap();
+                    let (response, retired) = oneshot::channel();
+                    tx.send(AgentCommand::Retire {
+                        app_name: "web".into(),
+                        namespace: "default".into(),
+                        response,
+                    })
+                    .await
+                    .unwrap();
+                    let recovery = retired.await.unwrap();
+                    shutdown.cancel();
+                    let agent = task.await.unwrap();
+                    let outcome = outcome.expect("rollback runtime cleanup must be bounded");
+                    let retained = retained
+                        .expect("rollback must leave the agent responsive")
+                        .unwrap();
+                    assert!(
+                        outcome
+                            .iter()
+                            .any(|event| matches!(event, ApplyEvent::Error { .. }))
+                    );
+                    assert_eq!(
+                        retained.len(),
+                        2,
+                        "{strategy}/{auto_rollback}/{fault} discarded a cleanup owner: {outcome:?}"
+                    );
+                    assert!(record_retained, "{fault} discarded adoption ownership");
+                    assert!(
+                        !claimed_rollback,
+                        "unconfirmed cleanup was recorded as rolled back"
+                    );
+                    assert!(recovery.is_ok(), "{recovery:?}");
+                    assert!(agent.supervisor.list_instances().is_empty());
+                    assert_eq!(agent.supervisor.port_allocator.allocated_count().await, 0);
+                    assert!(
+                        crate::grill::records::load_records(&records)
+                            .unwrap()
+                            .is_empty()
+                    );
+                }
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn rollout_retirement_fences_the_crash_restart_driver() {
+        for (strategy, replicas) in [("rolling", 1), ("rolling", 2), ("blue-green", 2)] {
+            let (mut agent, _tx, _shutdown, grill) = test_agent_with_grill();
+            let mut initial = basic_config();
+            initial.app.get_mut("web").unwrap().replicas = crate::config::Replicas::Fixed(replicas);
+            expect_complete(&drain_deploy(&mut agent, initial).await);
+            grill.set_ignore_stop(true);
+            grill.block_kills();
+            let config = Config::parse(&format!("[app.web]\nimage = 'web:v2'\nport = 8080\nreplicas = {replicas}\n[app.web.deploy]\nstrategy = '{strategy}'\ndrain_timeout = '0s'\n")).unwrap();
+            let (events, mut stream) = mpsc::channel(64);
+            agent.begin_deploy(config, events, true).await;
+            tokio::time::timeout(std::time::Duration::from_secs(2), async {
+                loop {
+                    tokio::select! {
+                        Some(op) = agent.deploy_ops_rx.recv() => agent.handle_deploy_op(op).await,
+                        () = grill.wait_for_kills(1) => break,
+                    }
+                }
+            })
+            .await
+            .unwrap();
+            let old_id = grill
+                .calls()
+                .into_iter()
+                .rev()
+                .find(|(call, _)| call == "kill")
+                .unwrap()
+                .1;
+            // Runtime exit can become observable before its request completes.
+            // Run the actual periodic restart driver at that exact boundary.
+            grill.set_state(&old_id, ContainerState::Stopped);
+            agent.check_apps().await;
+            let old = agent.supervisor.get_instance(&old_id).unwrap();
+            let observed = (old.state, old.restart_count, old.retry_pending);
+            grill.release_kills(1);
+            let outcome = tokio::time::timeout(std::time::Duration::from_secs(3), async {
+                let mut events = Vec::new();
+                loop {
+                    tokio::select! {
+                        Some(op) = agent.deploy_ops_rx.recv() => agent.handle_deploy_op(op).await,
+                        event = stream.recv() => match event {
+                            Some(event) => events.push(event),
+                            None => break events,
+                        }
+                    }
+                }
+            })
+            .await
+            .unwrap();
+            grill.set_ignore_stop(false);
+            agent.stop_app("web", "default").await.unwrap();
+            expect_complete(&outcome);
+            assert_eq!(
+                observed,
+                (ContainerState::Stopping, 0, false),
+                "{strategy} restarted a retiring instance"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn rollout_retains_old_owner_when_runtime_retirement_is_unconfirmed() {
+        for strategy in ["rolling", "blue-green"] {
+            for fault in [
+                "kill error",
+                "kill ignored",
+                "inspection error",
+                "kill stalled",
+            ] {
+                let volumes = tempfile::tempdir().unwrap();
+                let (mut agent, tx, shutdown, grill) = test_agent_with_grill();
+                agent.set_volumes_dir(volumes.path().to_path_buf());
+                let task = tokio::spawn(async move {
+                    agent.run().await;
+                    agent
+                });
+                expect_complete(&send_deploy(&tx, basic_config()).await);
+                let old_id = InstanceId("default__web-0".into());
+                grill.set_ignore_stop(true);
+                grill.set_state(&old_id, ContainerState::Running);
+                match fault {
+                    "kill error" => grill.set_fail_kill(true),
+                    "kill ignored" => grill.set_ignore_kill(true),
+                    "kill stalled" => grill.block_kills(),
+                    _ => grill.set_instance_inspection_failure(&old_id, true),
+                }
+                let config = Config::parse(&format!("[app.web]\nimage = 'web:v2'\nport = 8080\n[app.web.deploy]\nstrategy = '{strategy}'\ndrain_timeout = '0s'\nhealth_timeout = '100ms'\n")).unwrap();
+                let events = tokio::time::timeout(
+                    std::time::Duration::from_secs(10),
+                    send_deploy(&tx, config),
+                )
+                .await
+                .expect("runtime retirement must have a deadline");
+                let (response, result) = oneshot::channel();
+                tx.send(AgentCommand::Status { response }).await.unwrap();
+                let retained = result.await.unwrap();
+                grill.set_fail_kill(false);
+                grill.set_ignore_kill(false);
+                grill.set_instance_inspection_failure(&old_id, false);
+                grill.set_ignore_stop(false);
+                grill.release_kills(1);
+                grill.kill(&old_id).await.unwrap();
+                let (response, retired) = oneshot::channel();
+                tx.send(AgentCommand::Retire {
+                    app_name: "web".into(),
+                    namespace: "default".into(),
+                    response,
+                })
+                .await
+                .unwrap();
+                assert!(retired.await.unwrap().is_ok());
+                let (response, status) = oneshot::channel();
+                tx.send(AgentCommand::Status { response }).await.unwrap();
+                assert!(
+                    status.await.unwrap().is_empty(),
+                    "recovery left a replacement unowned"
+                );
+                shutdown.cancel();
+                task.await.unwrap();
+                assert!(
+                    !events
+                        .iter()
+                        .any(|event| matches!(event, ApplyEvent::Complete { .. })),
+                    "{strategy} accepted {fault}: {events:?}"
+                );
+                assert!(
+                    events
+                        .iter()
+                        .any(|event| matches!(event, ApplyEvent::Error { .. })),
+                    "missing retirement failure"
+                );
+                assert_eq!(
+                    retained.len(),
+                    2,
+                    "{strategy} must retain both the old owner and the started replacement after {fault}"
+                );
+                assert!(
+                    retained.iter().any(|instance| instance.id == old_id.0),
+                    "{strategy} forgot the unconfirmed owner after {fault}"
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn rollout_retains_owners_when_artifact_retirement_fails() {
+        for strategy in ["rolling", "blue-green"] {
+            for block_identity in [false, true] {
+                let root = tempfile::tempdir().unwrap();
+                let records = root.path().join("records");
+                let (mut agent, tx, shutdown, grill) = test_agent_with_grill();
+                agent.set_volumes_dir(root.path().join("volumes"));
+                agent.set_records_dir(records.clone());
+                grill.set_pid(std::process::id());
+                let artifacts: Vec<_> = (0..2)
+                    .map(|index| {
+                        let id = InstanceId(format!("default__web-{index}"));
+                        (
+                            agent.instance_identity_dir(&id),
+                            crate::grill::records::record_path(&records, &id.0),
+                        )
+                    })
+                    .collect();
+                let task = tokio::spawn(async move {
+                    agent.run().await;
+                    agent
+                });
+                let mut initial = basic_config();
+                initial.app.get_mut("web").unwrap().replicas = crate::config::Replicas::Fixed(2);
+                expect_complete(&send_deploy(&tx, initial).await);
+                let mut original_records = Vec::new();
+                // Block either possible first owner; HashMap iteration order
+                // must not decide whether this exercises the whole old fleet.
+                for (identity, record) in &artifacts {
+                    original_records.push(std::fs::read(record).unwrap());
+                    if block_identity {
+                        crate::sesame::identity::cleanup_identity_dir(identity).unwrap();
+                        std::fs::write(identity, "blocked identity cleanup").unwrap();
+                    } else {
+                        std::fs::remove_file(record).unwrap();
+                        std::fs::create_dir(record).unwrap();
+                    }
+                }
+                let config = Config::parse(&format!("[app.web]\nimage = 'web:v2'\nport = 8080\nreplicas = 2\n[app.web.deploy]\nstrategy = '{strategy}'\ndrain_timeout = '0s'\n")).unwrap();
+                let events = send_deploy(&tx, config).await;
+                let durable_owner_retained = artifacts.iter().all(|(_, record)| record.exists());
+                let (response, status) = oneshot::channel();
+                tx.send(AgentCommand::Status { response }).await.unwrap();
+                let retained = status.await.unwrap();
+                for ((identity, record), original_record) in artifacts.iter().zip(original_records)
+                {
+                    if block_identity {
+                        std::fs::remove_file(identity).unwrap();
+                    } else {
+                        std::fs::remove_dir(record).unwrap();
+                        std::fs::write(record, original_record).unwrap();
+                    }
+                }
+                let (response, retired) = oneshot::channel();
+                tx.send(AgentCommand::Retire {
+                    app_name: "web".into(),
+                    namespace: "default".into(),
+                    response,
+                })
+                .await
+                .unwrap();
+                let recovery = retired.await.unwrap();
+                shutdown.cancel();
+                let agent = task.await.unwrap();
+                assert!(
+                    !events
+                        .iter()
+                        .any(|event| matches!(event, ApplyEvent::Complete { .. })),
+                    "{strategy} ignored artifact failure: {events:?}"
+                );
+                assert!(durable_owner_retained);
+                assert_eq!(
+                    retained.len(),
+                    if strategy == "rolling" { 3 } else { 4 },
+                    "both generations need a cleanup owner"
+                );
+                if strategy == "blue-green" {
+                    assert!(
+                        retained
+                            .iter()
+                            .filter(|instance| !instance.id.contains("-g"))
+                            .all(|instance| instance.state == "stopped"),
+                        "every retired blue instance must be stopped: {retained:?}"
+                    );
+                }
+                assert!(
+                    retained
+                        .iter()
+                        .any(|instance| !instance.id.contains("-g") && instance.state == "stopped"),
+                    "the old instance must not be eligible for crash restart"
+                );
+                assert!(recovery.is_ok(), "{recovery:?}");
+                assert!(agent.supervisor.list_instances().is_empty());
+                assert!(
+                    crate::grill::records::load_records(&records)
+                        .unwrap()
+                        .is_empty()
+                );
+            }
+        }
     }
 
     #[tokio::test]
@@ -11446,6 +13990,85 @@ host = "remote.local"
     }
 
     #[tokio::test]
+    async fn fresh_workloads_cannot_replace_another_apps_generation_owner() {
+        for kind in ["app", "job"] {
+            for state in [ContainerState::Running, ContainerState::Stopped] {
+                let (mut agent, _tx, _shutdown, grill) = test_agent_with_grill();
+                let records = tempfile::tempdir().unwrap();
+                agent.set_records_dir(records.path().to_path_buf());
+                grill.set_pid(std::process::id());
+                for image in ["worker:v1", "worker:v2"] {
+                    let config =
+                        Config::parse(&format!("[app.worker]\nimage = '{image}'\nport = 8080\n"))
+                            .unwrap();
+                    expect_complete(&drain_deploy(&mut agent, config).await);
+                }
+                let id = InstanceId("default__worker-g1-0".into());
+                agent.supervisor.get_instance_mut(&id).unwrap().state = state;
+                grill.set_state(&id, state);
+                let original_port = agent.supervisor.get_instance(&id).unwrap().host_port;
+                let original_records = crate::grill::records::load_records(records.path()).unwrap();
+                let original_ports = agent.supervisor.port_allocator.allocated_count().await;
+                let calls_before = grill.calls().len();
+                let collision =
+                    Config::parse(&format!("[{kind}.worker-g1]\nimage = 'intruder:v1'\n")).unwrap();
+                let events = drain_deploy(&mut agent, collision).await;
+                assert!(
+                    matches!(events.last(), Some(ApplyEvent::Error { .. })),
+                    "{kind}/{state:?}: {events:?}"
+                );
+                let owner = agent.supervisor.get_instance(&id).unwrap();
+                assert_eq!(owner.app_name, "worker");
+                assert_eq!(owner.image, "worker:v2");
+                assert_eq!(owner.host_port, original_port);
+                assert_eq!(
+                    agent.supervisor.port_allocator.allocated_count().await,
+                    original_ports
+                );
+                assert_eq!(
+                    crate::grill::records::load_records(records.path()).unwrap(),
+                    original_records
+                );
+                assert!(
+                    !grill.calls()[calls_before..]
+                        .iter()
+                        .any(|(operation, _)| matches!(
+                            operation.as_str(),
+                            "create" | "start" | "stop" | "kill"
+                        ))
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn workload_labels_are_refused_before_runtime_mutation() {
+        for (name, namespace) in [("Bad", "default"), ("web", "bad__namespace")] {
+            let (mut agent, tx, shutdown, grill) = test_agent_with_grill();
+            let mut config = basic_config();
+            let mut spec = config.app.remove("web").unwrap();
+            spec.namespace = Some(namespace.into());
+            config.app.insert(name.into(), spec);
+            let handle = tokio::spawn(async move { agent.run().await });
+            let events = send_deploy(&tx, config).await;
+            shutdown.cancel();
+            handle.await.unwrap();
+            assert!(
+                events
+                    .iter()
+                    .any(|event| matches!(event, ApplyEvent::Error { .. })),
+                "invalid label was deployed: {events:?}"
+            );
+            assert!(
+                !grill
+                    .calls()
+                    .iter()
+                    .any(|(operation, _)| operation == "create")
+            );
+        }
+    }
+
+    #[tokio::test]
     async fn deploy_mixed_apps_and_jobs() {
         let (mut agent, tx, shutdown) = test_agent();
 
@@ -11593,6 +14216,7 @@ host = "remote.local"
         let status = NodeStatus {
             node_id: "node-1".to_string(),
             address: "192.168.1.1:9116".to_string(),
+            api_address: None,
             state: "alive".to_string(),
             incarnation: 42,
             is_council: true,
@@ -11708,6 +14332,235 @@ host = "remote.local"
     }
 
     #[tokio::test]
+    async fn redeploy_after_adoption_never_reuses_an_owned_generation() {
+        for (runtime_id, generation) in [("default__web-g1-0", 1), ("default__web-g17-0", 17)] {
+            let records = tempfile::tempdir().unwrap();
+            let (mut agent, _tx, _shutdown, grill) = test_agent_with_grill();
+            agent.set_records_dir(records.path().to_path_buf());
+            let record = adoption_record(runtime_id, "web", false);
+            crate::grill::records::write_record(records.path(), &record).unwrap();
+            grill.set_adopt_result(&InstanceId(runtime_id.into()), true);
+            grill.set_pid(std::process::id());
+            assert_eq!(agent.adopt_recorded_instances().await.unwrap(), 1);
+            let events = drain_deploy(&mut agent, basic_config()).await;
+            let expected = format!("default__web-g{}-0", generation + 1);
+            let created: Vec<_> = grill
+                .calls()
+                .into_iter()
+                .filter(|(call, _)| call == "create")
+                .map(|(_, id)| id.0)
+                .collect();
+            let persisted = crate::grill::records::load_records(records.path()).unwrap();
+            agent.stop_app("web", "default").await.unwrap();
+            expect_complete(&events);
+            assert_eq!(
+                created,
+                vec![expected.clone()],
+                "adoption must advance rollout identity"
+            );
+            assert_eq!(persisted.len(), 1);
+            assert_eq!(persisted[0].instance_id, expected);
+        }
+    }
+
+    #[tokio::test]
+    async fn exhausted_rollout_generation_refuses_without_mutating_the_old_instance() {
+        let (mut agent, _tx, _shutdown, grill) = test_agent_with_grill();
+        expect_complete(&drain_deploy(&mut agent, basic_config()).await);
+        agent.next_deploy_gen = u64::MAX;
+        let before = grill.calls().len();
+        let events = drain_deploy(&mut agent, basic_config()).await;
+        let calls = grill.calls();
+        agent.stop_app("web", "default").await.unwrap();
+        assert!(events.iter().any(|event| matches!(event, ApplyEvent::Error { message } if message.contains("generation exhausted"))), "{events:?}");
+        assert_eq!(calls.len(), before);
+    }
+
+    #[tokio::test]
+    async fn redeploy_does_not_overwrite_a_stopped_or_failed_cleanup_owner() {
+        for state in [ContainerState::Stopped, ContainerState::Failed] {
+            let records = tempfile::tempdir().unwrap();
+            let (mut agent, _tx, _shutdown, grill) = test_agent_with_grill();
+            agent.set_records_dir(records.path().to_path_buf());
+            grill.set_pid(std::process::id());
+            expect_complete(&drain_deploy(&mut agent, basic_config()).await);
+            let old = InstanceId("default__web-0".into());
+            let path = crate::grill::records::record_path(records.path(), &old.0);
+            let original = std::fs::read(&path).unwrap();
+            std::fs::remove_file(&path).unwrap();
+            std::fs::create_dir(&path).unwrap();
+            assert!(agent.stop_app("web", "default").await.is_err());
+            agent.supervisor.get_instance_mut(&old).unwrap().state = state;
+            let events = drain_deploy(&mut agent, basic_config()).await;
+            let owned = agent.supervisor.list_instances().len();
+            let old_creates = grill
+                .calls()
+                .iter()
+                .filter(|(call, id)| call == "create" && id == &old)
+                .count();
+            std::fs::remove_dir(&path).unwrap();
+            std::fs::write(&path, original).unwrap();
+            agent.retire_workload("web", "default").await.unwrap();
+            assert!(
+                !events
+                    .iter()
+                    .any(|event| matches!(event, ApplyEvent::Complete { .. })),
+                "{state}: {events:?}"
+            );
+            assert_eq!(owned, 2, "must retain both owners after cleanup fails");
+            assert_eq!(old_creates, 1, "the original identity was created twice");
+            assert_eq!(agent.supervisor.port_allocator.allocated_count().await, 0);
+        }
+    }
+
+    #[tokio::test]
+    async fn rolling_replacement_persists_its_launch_spec_for_adoption() {
+        let (mut agent, _tx, _shutdown, grill) = test_agent_with_grill();
+        let records = tempfile::tempdir().unwrap();
+        let volumes = tempfile::tempdir().unwrap();
+        agent.set_records_dir(records.path().to_path_buf());
+        agent.set_volumes_dir(volumes.path().to_path_buf());
+        grill.set_pid(std::process::id());
+        let (events, _receiver) = mpsc::channel(128);
+        agent.deploy(basic_config(), &events).await;
+        let mut replacement = basic_config();
+        replacement.app.get_mut("web").unwrap().image = Some("web:v2".to_string());
+        let (rolling_events, mut rolling_rx) = mpsc::channel(1);
+        let mut deployment = Box::pin(agent.deploy(replacement, &rolling_events));
+        let mut observed_during_rollout = false;
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            loop {
+                tokio::select! {
+                    Some(event) = rolling_rx.recv() => {
+                        if let ApplyEvent::Progress { message } = event
+                            && message.contains("healthy")
+                        {
+                            assert!(crate::grill::records::load_records(records.path()).unwrap().iter()
+                                .any(|record| record.image == "web:v2"));
+                            observed_during_rollout = true;
+                        }
+                    }
+                    _ = &mut deployment => break,
+                }
+            }
+        })
+        .await
+        .unwrap();
+        drop(deployment);
+        assert!(observed_during_rollout);
+        let persisted = crate::grill::records::load_records(records.path()).unwrap();
+        assert_eq!(
+            persisted.len(),
+            1,
+            "the replacement must retain an adoption record"
+        );
+        assert_eq!(persisted[0].image, "web:v2");
+        assert_eq!(
+            persisted[0].app_spec.as_ref().unwrap().image.as_deref(),
+            Some("web:v2")
+        );
+        let (mut restarted, _tx, _shutdown, runtime) = test_agent_with_grill();
+        restarted.set_records_dir(records.path().to_path_buf());
+        restarted.set_volumes_dir(volumes.path().to_path_buf());
+        let id = InstanceId(persisted[0].instance_id.clone());
+        runtime.set_adopt_result(&id, true);
+        assert_eq!(restarted.adopt_recorded_instances().await.unwrap(), 1);
+        assert!(restarted.supervisor.get_instance(&id).is_some());
+        assert!(
+            !runtime
+                .calls()
+                .iter()
+                .any(|(operation, _)| operation == "create")
+        );
+    }
+
+    #[tokio::test]
+    async fn rolling_record_failure_retains_cleanup_ownership_until_directory_recovery() {
+        for strategy in ["rolling", "blue-green"] {
+            let (mut agent, _tx, _shutdown, grill) = test_agent_with_grill();
+            let records = tempfile::tempdir().unwrap();
+            let volumes = tempfile::tempdir().unwrap();
+            agent.set_records_dir(records.path().to_path_buf());
+            agent.set_volumes_dir(volumes.path().to_path_buf());
+            grill.set_pid(std::process::id());
+            let initial = drain_deploy(&mut agent, basic_config()).await;
+            assert!(matches!(initial.last(), Some(ApplyEvent::Complete { .. })));
+            let allocated_before = agent.supervisor.port_allocator.allocated_count().await;
+            let blocked = tempfile::NamedTempFile::new().unwrap();
+            agent.set_records_dir(blocked.path().to_path_buf());
+            let replacement = Config::parse(&format!(
+                "[app.web]\nimage = \"web:v2\"\nport = 8080\n[app.web.deploy]\nstrategy = \"{strategy}\"\n"
+            )).unwrap();
+            let outcome = drain_deploy(&mut agent, replacement).await;
+            assert!(outcome.iter().any(|event| matches!(event, ApplyEvent::Error { message } if message.contains("persist replacement record"))), "{outcome:?}");
+            assert!(
+                agent
+                    .supervisor
+                    .get_instance(&InstanceId("default__web-0".into()))
+                    .is_some()
+            );
+            assert_eq!(
+                agent.supervisor.port_allocator.allocated_count().await,
+                allocated_before + 1
+            );
+            let created: Vec<_> = grill
+                .calls()
+                .into_iter()
+                .filter(|(op, id)| op == "create" && id.0 != "default__web-0")
+                .collect();
+            assert_eq!(created.len(), 1);
+            let owner = agent.supervisor.get_instance(&created[0].1).unwrap();
+            assert_eq!(owner.state, ContainerState::Stopped);
+            agent.set_records_dir(records.path().to_path_buf());
+            agent
+                .finish_retire_bookkeeping(&created[0].1)
+                .await
+                .unwrap();
+            assert_eq!(
+                agent.supervisor.port_allocator.allocated_count().await,
+                allocated_before
+            );
+            assert!(agent.supervisor.get_instance(&created[0].1).is_none());
+            assert!(
+                agent
+                    .supervisor
+                    .get_instance(&InstanceId("default__web-0".into()))
+                    .is_some()
+            );
+
+            assert!(
+                grill
+                    .calls()
+                    .contains(&("kill".to_string(), created[0].1.clone()))
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn apple_launches_persist_records_without_a_host_workload_pid() {
+        let (mut agent, _tx, _shutdown, grill) = test_agent_with_grill();
+        let records = tempfile::tempdir().unwrap();
+        let volumes = tempfile::tempdir().unwrap();
+        agent.set_records_dir(records.path().to_path_buf());
+        agent.set_volumes_dir(volumes.path().to_path_buf());
+        grill.set_runtime_kind(crate::grill::records::RuntimeKind::Apple);
+        let (events, _receiver) = mpsc::channel(128);
+        agent.deploy(basic_config(), &events).await;
+        assert_eq!(
+            crate::grill::records::load_records(records.path())
+                .unwrap()
+                .len(),
+            1
+        );
+        agent.deploy(basic_config(), &events).await;
+        let saved = crate::grill::records::load_records(records.path()).unwrap();
+        assert_eq!(saved.len(), 1);
+        assert_eq!(saved[0].runtime, crate::grill::records::RuntimeKind::Apple);
+        assert_eq!(saved[0].pid, std::process::id());
+        assert!(saved[0].instance_id.contains("-g"));
+    }
+
+    #[tokio::test]
     async fn started_rootless_instance_persists_network_recreation_state() {
         let (mut agent, _tx, _shutdown, grill) = test_agent_with_grill();
         let records = tempfile::tempdir().unwrap();
@@ -11733,10 +14586,129 @@ host = "remote.local"
         drop(events);
         while event_rx.recv().await.is_some() {}
 
-        let persisted = crate::grill::records::load_records(records.path());
+        let persisted = crate::grill::records::load_records(records.path()).unwrap();
         assert_eq!(persisted.len(), 1);
         assert_eq!(persisted[0].schema, 2);
         assert_eq!(persisted[0].rootless_network, Some(rootless_network));
+    }
+
+    #[tokio::test]
+    async fn adoption_refuses_conflicting_port_ownership() {
+        let (mut agent, _tx, _shutdown, grill) = test_agent_with_grill();
+        let records = tempfile::tempdir().unwrap();
+        agent.set_records_dir(records.path().to_path_buf());
+        for app in ["web", "api"] {
+            let record = adoption_record(&format!("default__{app}-0"), app, false);
+            crate::grill::records::write_record(records.path(), &record).unwrap();
+            grill.set_adopt_result(&InstanceId(record.instance_id), true);
+        }
+        assert!(agent.adopt_recorded_instances().await.is_err());
+        assert_eq!(agent.supervisor.list_instances().len(), 1);
+        assert_eq!(
+            crate::grill::records::load_records(records.path())
+                .unwrap()
+                .len(),
+            2
+        );
+    }
+
+    #[tokio::test]
+    async fn adoption_refuses_a_different_runtime_without_touching_the_record() {
+        let (mut agent, _tx, _shutdown, grill) = test_agent_with_grill();
+        let records = tempfile::tempdir().unwrap();
+        let mut record = adoption_record("default__web-0", "web", false);
+        record.runtime = crate::grill::records::RuntimeKind::Runc;
+        crate::grill::records::write_record(records.path(), &record).unwrap();
+        agent.set_records_dir(records.path().to_path_buf());
+        assert!(agent.adopt_recorded_instances().await.is_err());
+        assert!(grill.calls().is_empty());
+        assert_eq!(
+            crate::grill::records::load_records(records.path()).unwrap(),
+            vec![record]
+        );
+    }
+
+    #[tokio::test]
+    async fn adoption_retains_dead_owner_record_until_identity_cleanup_succeeds() {
+        let (mut agent, _tx, _shutdown, _grill) = test_agent_with_grill();
+        let records = tempfile::tempdir().unwrap();
+        let volumes = tempfile::tempdir().unwrap();
+        let record = adoption_record("default__web-0", "web", false);
+        crate::grill::records::write_record(records.path(), &record).unwrap();
+        agent.set_records_dir(records.path().to_path_buf());
+        agent.set_volumes_dir(volumes.path().to_path_buf());
+        let identity =
+            crate::sesame::identity::instance_identity_dir(volumes.path(), &record.instance_id);
+        std::fs::create_dir_all(identity.parent().unwrap()).unwrap();
+        std::fs::write(&identity, b"not a directory").unwrap();
+        assert!(agent.adopt_recorded_instances().await.is_err());
+        assert!(crate::grill::records::record_path(records.path(), &record.instance_id).exists());
+        std::fs::remove_file(identity).unwrap();
+        assert_eq!(agent.adopt_recorded_instances().await.unwrap(), 0);
+        assert!(
+            crate::grill::records::load_records(records.path())
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[tokio::test]
+    async fn uncertain_adoption_preserves_the_record_and_identity_for_retry() {
+        let (mut agent, _tx, _shutdown, grill) = test_agent_with_grill();
+        let records = tempfile::tempdir().unwrap();
+        let volumes = tempfile::tempdir().unwrap();
+        let record = adoption_record("default__web-0", "web", false);
+        crate::grill::records::write_record(records.path(), &record).unwrap();
+        write_test_identity(volumes.path(), &record.instance_id);
+        agent.set_records_dir(records.path().to_path_buf());
+        agent.set_volumes_dir(volumes.path().to_path_buf());
+        grill.set_fail_state(true);
+        assert!(agent.adopt_recorded_instances().await.is_err());
+        assert!(
+            crate::grill::records::record_path(records.path(), &record.instance_id).exists(),
+            "uncertain runtime inspection discarded durable ownership"
+        );
+        let identity =
+            crate::sesame::identity::instance_identity_dir(volumes.path(), &record.instance_id);
+        assert!(
+            crate::sesame::identity::load_identity(&identity)
+                .unwrap()
+                .is_some(),
+            "uncertain runtime inspection swept a surviving owner's identity"
+        );
+        grill.set_fail_state(false);
+        grill.set_adopt_result(&InstanceId(record.instance_id.clone()), true);
+        agent.adopt_recorded_instances().await.unwrap();
+        assert!(
+            agent
+                .supervisor
+                .get_instance(&InstanceId(record.instance_id))
+                .is_some()
+        );
+    }
+
+    #[tokio::test]
+    async fn corrupt_adoption_record_never_sweeps_its_workload_identity() {
+        let (mut agent, _tx, _shutdown, _grill) = test_agent_with_grill();
+        let records = tempfile::tempdir().unwrap();
+        let volumes = tempfile::tempdir().unwrap();
+        let instance = "default__web-0";
+        std::fs::write(
+            records.path().join(format!("{instance}.json")),
+            b"{incomplete",
+        )
+        .unwrap();
+        write_test_identity(volumes.path(), instance);
+        agent.set_records_dir(records.path().to_path_buf());
+        agent.set_volumes_dir(volumes.path().to_path_buf());
+        assert!(agent.adopt_recorded_instances().await.is_err());
+        let identity = crate::sesame::identity::instance_identity_dir(volumes.path(), instance);
+        assert!(
+            crate::sesame::identity::load_identity(&identity)
+                .unwrap()
+                .is_some(),
+            "unreadable ownership was incorrectly treated as absence"
+        );
     }
 
     #[tokio::test]
@@ -11750,7 +14722,7 @@ host = "remote.local"
         let id = InstanceId("default__web-0".to_string());
         grill.set_adopt_result(&id, true);
 
-        assert_eq!(agent.adopt_recorded_instances().await, 1);
+        assert_eq!(agent.adopt_recorded_instances().await.unwrap(), 1);
 
         let instance = agent.supervisor.get_instance(&id).unwrap();
         assert_eq!(instance.state, ContainerState::Running);
@@ -11763,40 +14735,63 @@ host = "remote.local"
     }
 
     #[tokio::test]
-    async fn legacy_record_adopts_under_a_canonical_key() {
-        // In-place upgrade across the identity change: an old bun left a
-        // record whose instance_id has no namespace prefix (`web-0`). The
-        // runtime still knows the container by that legacy id, but the
-        // supervisor must key the adopted instance canonically so it can't
-        // collide with a same-name app in another namespace (DEP1).
-        let (mut agent, _tx, _shutdown, grill) = test_agent_with_grill();
-        let dir = tempfile::tempdir().unwrap();
-        let record = adoption_record("web-0", "web", false); // legacy, bare id
-        crate::grill::records::write_record(dir.path(), &record).unwrap();
-        agent.set_records_dir(dir.path().to_path_buf());
+    async fn adoption_refuses_unsupported_or_inconsistent_identities_before_mutation() {
+        for (instance, app, namespace, ordinal) in [
+            ("web-0", "web", "default", 0),
+            ("web-g9-0", "web", "default", 0),
+            ("default__web-0", "other", "default", 0),
+            ("default__web-0", "web", "other", 0),
+            ("default__web-0", "web", "default", 1),
+            ("default__Bad-0", "Bad", "default", 0),
+            ("bad__namespace__web-0", "web", "bad__namespace", 0),
+            ("default__web-g01-0", "web", "default", 0),
+            ("payments__web-0", "web", "payments", 0),
+        ] {
+            let (mut agent, _tx, _shutdown, grill) = test_agent_with_grill();
+            let dir = tempfile::tempdir().unwrap();
+            let mut record = adoption_record(instance, app, false);
+            record.namespace = namespace.into();
+            record.replica_index = ordinal;
+            if namespace == "payments" {
+                record.app_spec.as_mut().unwrap().namespace = Some("other".into());
+            }
+            crate::grill::records::write_record(dir.path(), &record).unwrap();
+            agent.set_records_dir(dir.path().to_path_buf());
+            let runtime_id = InstanceId(instance.into());
+            grill.set_adopt_result(&runtime_id, true);
+            let result = agent.adopt_recorded_instances().await;
+            assert!(result.is_err(), "accepted {record:?}: {result:?}");
+            assert!(
+                grill.calls().is_empty(),
+                "invalid ownership reached the runtime"
+            );
+            assert!(agent.supervisor.instances.is_empty());
+            assert_eq!(
+                crate::grill::records::load_records(dir.path()).unwrap(),
+                vec![record]
+            );
+        }
+    }
 
-        // The runtime adopts by the id it ran under: the legacy one.
-        let runtime_id = InstanceId("web-0".to_string());
-        grill.set_adopt_result(&runtime_id, true);
-
-        assert_eq!(agent.adopt_recorded_instances().await, 1);
-
-        // But the supervisor keys it canonically.
-        let canonical = InstanceId("default__web-0".to_string());
-        let instance = agent
-            .supervisor
-            .get_instance(&canonical)
-            .expect("adopted under the canonical key");
-        assert_eq!(instance.namespace, "default");
-        assert_eq!(instance.app_name, "web");
-        // The legacy key resolves to nothing.
-        assert!(agent.supervisor.get_instance(&runtime_id).is_none());
-        // The runtime was asked to adopt the legacy container id, not to
-        // create or start a fresh one.
-        let calls = grill.calls();
-        assert!(calls.contains(&("adopt".to_string(), runtime_id.clone())));
-        assert!(!calls.contains(&("create".to_string(), runtime_id.clone())));
-        assert!(!calls.contains(&("start".to_string(), runtime_id)));
+    #[tokio::test]
+    async fn adoption_uses_structured_names_to_validate_generation_like_suffixes() {
+        for instance in ["default__worker-g9-0", "default__worker-g9-g17-0"] {
+            let (mut agent, _tx, _shutdown, grill) = test_agent_with_grill();
+            let dir = tempfile::tempdir().unwrap();
+            let record = adoption_record(instance, "worker-g9", false);
+            crate::grill::records::write_record(dir.path(), &record).unwrap();
+            agent.set_records_dir(dir.path().to_path_buf());
+            let id = InstanceId(instance.into());
+            grill.set_adopt_result(&id, true);
+            assert_eq!(agent.adopt_recorded_instances().await.unwrap(), 1);
+            let owner = agent.supervisor.get_instance(&id).unwrap();
+            assert_eq!(owner.app_name, "worker-g9");
+            assert_eq!(owner.namespace, "default");
+            assert_eq!(
+                crate::grill::records::load_records(dir.path()).unwrap(),
+                vec![record]
+            );
+        }
     }
 
     #[tokio::test]
@@ -11807,12 +14802,17 @@ host = "remote.local"
         let record = adoption_record("default__web-0", "web", false);
         crate::grill::records::write_record(dir.path(), &record).unwrap();
         agent.set_records_dir(dir.path().to_path_buf());
+        agent.set_volumes_dir(dir.path().join("volumes"));
 
-        assert_eq!(agent.adopt_recorded_instances().await, 0);
+        assert_eq!(agent.adopt_recorded_instances().await.unwrap(), 0);
 
         // The stale record is gone and nothing was seeded: the normal
         // reconcile path is free to reschedule the instance.
-        assert!(crate::grill::records::load_records(dir.path()).is_empty());
+        assert!(
+            crate::grill::records::load_records(dir.path())
+                .unwrap()
+                .is_empty()
+        );
         assert!(
             agent
                 .supervisor
@@ -11878,7 +14878,7 @@ host = "remote.local"
         let id = InstanceId("default__web-0".to_string());
         grill.set_adopt_result(&id, true);
 
-        assert_eq!(agent.adopt_recorded_instances().await, 1);
+        assert_eq!(agent.adopt_recorded_instances().await.unwrap(), 1);
 
         let instance = agent.supervisor.get_instance(&id).unwrap();
         let restored = instance
@@ -11940,7 +14940,7 @@ host = "remote.local"
         let id = InstanceId("default__web-0".to_string());
         grill.set_adopt_result(&id, true);
 
-        assert_eq!(agent.adopt_recorded_instances().await, 1);
+        assert_eq!(agent.adopt_recorded_instances().await.unwrap(), 1);
 
         assert_eq!(
             identity_dir_names(volumes.path()),
@@ -11959,7 +14959,7 @@ host = "remote.local"
 
         let id = InstanceId("default__web-0".to_string());
         grill.set_adopt_result(&id, true);
-        assert_eq!(agent.adopt_recorded_instances().await, 1);
+        assert_eq!(agent.adopt_recorded_instances().await.unwrap(), 1);
 
         let instance = agent.supervisor.get_instance(&id).unwrap();
         assert!(instance.health_config.is_some());
@@ -11975,7 +14975,7 @@ host = "remote.local"
 
         let id = InstanceId("default__web-0".to_string());
         grill.set_adopt_result(&id, true);
-        assert_eq!(agent.adopt_recorded_instances().await, 1);
+        assert_eq!(agent.adopt_recorded_instances().await.unwrap(), 1);
 
         // The adopted instance's port must not be handed out again.
         assert!(agent.supervisor.port_allocator.is_allocated(30123).await);
@@ -12000,7 +15000,7 @@ host = "remote.local"
         crate::grill::records::write_record(dir.path(), &record).unwrap();
         grill.set_adopt_result(&id, true);
 
-        assert_eq!(agent.adopt_recorded_instances().await, 0);
+        assert_eq!(agent.adopt_recorded_instances().await.unwrap(), 0);
     }
 
     // ---------------------------------------------------------------------
@@ -12013,6 +15013,8 @@ host = "remote.local"
     #[tokio::test]
     async fn stop_escalates_to_kill_when_process_ignores_sigterm() {
         let (mut agent, _tx, _shutdown, grill) = test_agent_with_grill();
+        let volumes = tempfile::tempdir().unwrap();
+        agent.set_volumes_dir(volumes.path().to_path_buf());
 
         let (ev_tx, mut ev_rx) = mpsc::channel(64);
         agent.deploy(basic_config(), &ev_tx).await;
@@ -12043,6 +15045,8 @@ host = "remote.local"
     #[tokio::test]
     async fn stop_reports_stopped_after_exit_without_kill() {
         let (mut agent, _tx, _shutdown, grill) = test_agent_with_grill();
+        let volumes = tempfile::tempdir().unwrap();
+        agent.set_volumes_dir(volumes.path().to_path_buf());
 
         let (ev_tx, mut ev_rx) = mpsc::channel(64);
         agent.deploy(basic_config(), &ev_tx).await;
@@ -12120,7 +15124,8 @@ host = "remote.local"
         drains.decrement_connections(&id.0).await;
         tokio::time::timeout(std::time::Duration::from_secs(2), &mut retire)
             .await
-            .expect("retire did not complete after the request drained");
+            .expect("retire did not complete after the request drained")
+            .unwrap();
         let calls = grill.calls();
         assert!(
             calls.iter().any(|(op, i)| op == "stop" && i == &id),
@@ -12176,7 +15181,8 @@ host = "remote.local"
         drains.decrement_websocket(&id.0).await;
         tokio::time::timeout(std::time::Duration::from_secs(2), &mut retire)
             .await
-            .expect("retire did not complete after the WebSocket closed");
+            .expect("retire did not complete after the WebSocket closed")
+            .unwrap();
         assert!(
             grill.calls().iter().any(|(op, i)| op == "stop" && i == &id),
             "retire must stop the drained instance once the WebSocket closed"
@@ -12387,6 +15393,193 @@ host = "remote.local"
     }
 
     #[tokio::test]
+    async fn dns_fault_refuses_unknown_namespace_or_instance_scope_without_recording_it() {
+        let (mut agent, _tx, _shutdown) = test_agent();
+        for (namespace, target_instance) in
+            [(None, None), (Some("red".into()), Some("redis-0".into()))]
+        {
+            let (response, result) = oneshot::channel();
+            agent
+                .handle_command(AgentCommand::InjectFault {
+                    reservation: None,
+                    request: crate::smoker::types::FaultRequest {
+                        fault_type: crate::smoker::types::FaultType::DnsNxdomain,
+                        target_service: "redis".into(),
+                        namespace,
+                        target_instance,
+                        target_node: None,
+                        duration: std::time::Duration::from_secs(60),
+                        injected_by: "test".into(),
+                        reason: None,
+                        include_leader: false,
+                        override_safety: false,
+                        acknowledged: true,
+                    },
+                    response,
+                })
+                .await;
+            assert!(result.await.unwrap().is_err());
+            assert_eq!(agent.fault_registry.iter().count(), 0);
+        }
+    }
+
+    #[tokio::test]
+    async fn dns_fault_keeps_its_namespace_and_each_owner_until_clear() {
+        use crate::onion::dns::{BoundDnsResponder, DnsConfig};
+        let (mut agent, _tx, shutdown) = test_agent();
+        let mut map = crate::onion::service_map::ServiceMap::new();
+        map.register_app("redis", "red", 6379, None).unwrap();
+        map.register_app("redis", "blue", 6379, None).unwrap();
+        let (_map_tx, map_rx) = tokio::sync::watch::channel(map);
+        let responder = BoundDnsResponder::bind(DnsConfig {
+            listen_addr: "127.0.0.1:0".parse().unwrap(),
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+        let address = responder.local_addr().unwrap();
+        let task = tokio::spawn(responder.run(map_rx, agent.dns_faults_watch(), shutdown.clone()));
+        async fn query(address: std::net::SocketAddr, name: &str) -> u8 {
+            let mut packet = vec![0x12, 0x34, 1, 0, 0, 1, 0, 0, 0, 0, 0, 0];
+            for label in name.split('.') {
+                packet.push(label.len() as u8);
+                packet.extend_from_slice(label.as_bytes());
+            }
+            packet.extend_from_slice(&[0, 0, 1, 0, 1]);
+            let socket = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+            socket.send_to(&packet, address).await.unwrap();
+            let mut answer = [0; 1500];
+            tokio::time::timeout(
+                std::time::Duration::from_secs(2),
+                socket.recv_from(&mut answer),
+            )
+            .await
+            .unwrap()
+            .unwrap();
+            answer[3] & 0xf
+        }
+        let mut owners = Vec::new();
+        for _ in 0..2 {
+            let (response, result) = oneshot::channel();
+            agent
+                .handle_command(AgentCommand::InjectFault {
+                    reservation: None,
+                    request: crate::smoker::types::FaultRequest {
+                        fault_type: crate::smoker::types::FaultType::DnsNxdomain,
+                        target_service: "redis".into(),
+                        namespace: Some("red".into()),
+                        target_instance: None,
+                        target_node: None,
+                        duration: std::time::Duration::from_secs(60),
+                        injected_by: "test".into(),
+                        reason: None,
+                        include_leader: false,
+                        override_safety: false,
+                        acknowledged: true,
+                    },
+                    response,
+                })
+                .await;
+            owners.push(result.await.unwrap().unwrap().id);
+        }
+        assert_eq!(query(address, "redis.red.internal").await, 3);
+        assert_eq!(query(address, "redis.blue.internal").await, 0);
+        for (index, id) in owners.into_iter().enumerate() {
+            let (response, result) = oneshot::channel();
+            agent
+                .handle_command(AgentCommand::ClearFault {
+                    fault_id: id,
+                    allow_workload_fault: true,
+                    allow_node_fault: false,
+                    allow_node_pressure: false,
+                    response,
+                })
+                .await;
+            result.await.unwrap().unwrap();
+            assert_eq!(
+                query(address, "redis.red.internal").await,
+                if index == 0 { 3 } else { 0 }
+            );
+            assert_eq!(query(address, "redis.blue.internal").await, 0);
+        }
+        shutdown.cancel();
+        task.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn node_fault_fence_reverses_before_acknowledging_and_blocks_late_activation() {
+        use crate::smoker::{
+            reservation::NodeFaultReservation,
+            types::{FaultRequest, FaultType},
+        };
+        let (mut agent, gate, _) = test_cluster_fault_agent().await;
+        let request = FaultRequest {
+            fault_type: FaultType::NodeKill {
+                kill_containers: false,
+            },
+            target_service: String::new(),
+            namespace: None,
+            target_instance: None,
+            target_node: Some("node-a".into()),
+            duration: std::time::Duration::from_secs(30),
+            injected_by: "operator".into(),
+            reason: None,
+            include_leader: true,
+            override_safety: true,
+            acknowledged: true,
+        };
+        let mut grant = NodeFaultReservation {
+            sequence: 1,
+            boot_id: agent.node_fault_fence.boot_id.clone(),
+            cleanup_after_unix_ms: 30_000,
+            request: request.clone(),
+        };
+        assert!(agent.fence_node_fault(&grant, true).await.is_err());
+        let (response, result) = oneshot::channel();
+        agent
+            .handle_command(AgentCommand::InjectFault {
+                reservation: Some(grant.clone()),
+                request: request.clone(),
+                response,
+            })
+            .await;
+        result.await.unwrap().unwrap();
+        assert!(gate.is_quiesced());
+        assert!(agent.fence_node_fault(&grant, true).await.is_err());
+        agent.fence_node_fault(&grant, false).await.unwrap();
+        assert!(!gate.is_quiesced());
+        assert!(agent.fault_registry.iter().next().is_none());
+        let (response, result) = oneshot::channel();
+        agent
+            .handle_command(AgentCommand::InjectFault {
+                reservation: Some(grant.clone()),
+                request: request.clone(),
+                response,
+            })
+            .await;
+        assert!(result.await.unwrap().is_err());
+        assert!(!gate.is_quiesced());
+        let old = grant.clone();
+        grant.sequence = 2;
+        let (response, result) = oneshot::channel();
+        agent
+            .handle_command(AgentCommand::InjectFault {
+                reservation: Some(grant.clone()),
+                request,
+                response,
+            })
+            .await;
+        result.await.unwrap().unwrap();
+        agent.fence_node_fault(&old, false).await.unwrap();
+        assert!(
+            gate.is_quiesced(),
+            "an old fence must not reverse a later operation"
+        );
+        agent.fence_node_fault(&grant, false).await.unwrap();
+        assert!(!gate.is_quiesced());
+    }
+
+    #[tokio::test]
     async fn node_drain_stops_scheduling_but_keeps_cluster_transports() {
         let (mut agent, gate, readiness) = test_cluster_fault_agent().await;
         let rule = register_fault(
@@ -12423,6 +15616,24 @@ host = "remote.local"
 
         let stored = agent.fault_registry.get(rule.id).cloned().unwrap();
         agent.reverse_fault(&stored).await;
+        assert!(!gate.is_quiesced());
+    }
+
+    #[tokio::test]
+    async fn node_fault_expiry_restores_the_transport_gate() {
+        let (mut agent, gate, _) = test_cluster_fault_agent().await;
+        let rule = register_fault(
+            &mut agent,
+            crate::smoker::types::FaultType::NodeKill {
+                kill_containers: false,
+            },
+            std::time::Duration::from_millis(1),
+        );
+        agent.apply_fault(&rule).await.unwrap();
+        assert!(gate.is_quiesced());
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        agent.expire_faults().await;
+        assert!(agent.fault_registry.is_empty());
         assert!(!gate.is_quiesced());
     }
 

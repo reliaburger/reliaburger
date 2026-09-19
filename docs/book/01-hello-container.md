@@ -30,7 +30,12 @@ $ cargo --version
 cargo 1.85.0 (d73d2caf9 2024-12-20)
 ```
 
-Your version numbers will probably be higher. That's fine — we just need 1.85 or later, because we're using the 2024 edition.
+Those example version strings show the compiler that introduced the 2024 edition.
+The current repository requires Rust 1.97 or later because language editions and
+compiler/library requirements are separate contracts. `Cargo.toml` declares
+`rust-version = "1.97"`, and CI tests the committed dependency graph on 1.97.0.
+Release builds pin 1.98.0; use `cargo +1.98.0 build --locked --bins` after installing
+that toolchain if you want the release compiler locally.
 
 ### Platform prerequisites
 
@@ -2910,3 +2915,54 @@ valid intermediate state. Our wall-clock acceptance test now waits for both a
 positive restart count and a live post-restart state within its existing
 deadline. Looking at the counter alone raced that transition and falsely called
 a scheduled restart stuck. A workload which really stays pending still fails.
+
+### Duration input must survive arithmetic and Unicode
+
+`relish logs --since 18446744073709551615d` used to overflow when converting
+days to seconds. We now use `checked_mul`, which returns `None` when the result
+cannot fit, and turn that into the existing CLI flag error. Parsing the final
+unit uses a Unicode character boundary rather than subtracting one byte from
+the string length. Invalid non-ASCII units therefore return an error too, rather
+than panicking while slicing a UTF-8 string. The regression covers overflowing
+minutes, hours and days as well as multibyte units; ordinary durations retain
+their existing saturating subtraction from the current epoch time.
+
+### Find the free port before declaring exhaustion
+
+If only one port is free in a large range, a thousand random guesses will usually
+miss it. That is not exhaustion. The allocator now chooses a random starting
+point and visits each candidate once, wrapping around the configured range.
+Its existing Tokio mutex covers the entire selection, so concurrent callers
+cannot receive the same reservation. Adopted ports outside the range still do
+not consume its capacity. A regression reserves 63,999 of 64,000 candidates and
+repeatedly allocates and releases the final free port; the concurrent allocation
+tests check uniqueness too.
+
+
+### Check names before creating their resources
+
+The deployment regression submits an app named `Bad`. Before the repair, Bun
+creates `default__Bad-0` and reports success. Configuration also accepts an empty
+name. That's a problem because the names become parts of DNS names, instance IDs
+and filesystem paths; our identity format already assumes lowercase DNS labels.
+
+Admission now enforces that assumption for app names, job names, their namespaces
+and namespace declarations. Each label contains 1–63 ASCII bytes, starts and ends
+with a lowercase letter or digit, and contains only those characters or hyphens.
+An explicit empty namespace is invalid; omitting it still selects `default`.
+We reject invalid labels rather than normalising them, which could merge two
+names that the caller intended to keep separate.
+
+The shared predicate borrows a `&str` and calls `as_bytes()`. This gives us a
+borrowed byte slice without allocating another string. A small closure checks
+letters and digits; the interior permits `b'-'`, Rust's byte literal for a
+hyphen. Checking length before indexing relies on `&&` short-circuiting: an
+empty slice never reaches either endpoint lookup. Trace already used these
+rules and now calls the same predicate.
+
+Both configuration entry points and Bun's command admission use the check.
+The tests cover separators, traversal-shaped strings, uppercase, whitespace,
+Unicode and length boundaries. The runtime regression uses harmless invalid
+labels and asserts that the mock receives no create call. Stored ownership
+records still need their own recovery validation; accepting a new configuration
+and interpreting old on-disk ownership are different entry points.

@@ -23,7 +23,14 @@ No sidecars. No add-on shopping list. No YAML archaeology. You get:
   rolling binary upgrades where workloads survive the swap.
 - **Security that's on by default.** Generated clusters require mTLS;
   joins are single-use-token, CSR-based; images can be signature-gated;
-  secrets are encrypted at rest.
+  secrets are encrypted at rest, with
+  [public encryption keys available over the API](docs/README.md#encrypting-secrets-without-cluster-files).
+  Cluster-signed ingress leaves renew on demand
+  before expiry, and operator certificate files reload without a restart.
+  Node leaves renew automatically through the current leader, and every node
+  transport observes replacements. TLS connections have bounded lifetimes.
+  `relish test --filter workload-identity` checks a container's SPIFFE certificate
+  against the configured cluster CA, alongside JWKS and token-scope checks.
 - **Batteries you'd otherwise deploy separately.** Built-in registry with
   P2P image distribution, time-series metrics with SQL, indexed logs,
   ingress with TLS and draining, web + terminal dashboards, and a fault
@@ -33,10 +40,30 @@ The full architectural vision lives in the [whitepaper](docs/whitepaper.md).
 Install and usage details are in the [documentation](docs/README.md), and
 implementation status in [progress.md](docs/progress.md).
 
+0.1.0 requires a fresh cluster; development state is refused. Rolling upgrades
+require matching explicit formats (currently protocol 6 and state 7). See the
+[compatibility policy](docs/releasing.md#cluster-compatibility).
+Registry upload recovery reclaims abandoned partial uploads after a crash and
+requires one Bun per writable image store; see the [startup contract](docs/README.md).
+Direct image pulls and Pickle verify pinned manifests, selected platform
+manifests and configuration bytes before accepting them into the cache.
+
+Restart also refuses unreadable ownership records or uncertain runtime adoption,
+preserving records and workload identities for recovery. Legacy aliases and
+inconsistent stored instance identities refuse startup without runtime mutation.
+Workload and namespace
+names must be lowercase DNS labels; invalid names are refused before deployment.
+Rollback and halt retain replacement ownership until runtime and artifact
+cleanup are confirmed. Node-local cron registrations survive restart. Cron skips missed or uncertain firings after a
+crash; it does not promise catch-up or exactly-once job execution.
+
 ## Quick start
 
+Source builds require Rust 1.97 or later; releases use Rust 1.98.0 and the
+committed lockfile.
+
 ```sh
-cargo build --bins
+cargo build --locked --bins
 
 # Run the node agent — no container runtime needed for the first taste
 target/debug/bun --runtime process
@@ -51,7 +78,25 @@ open http://localhost:9117/    # web dashboard
 With runc (Linux) or Apple Container (macOS) installed, the same flow runs
 real OCI images — and `relish init cluster` generates the PKI and mTLS
 config for a secure multi-node cluster. The [documentation](docs/README.md)
-has the full secure-cluster walkthrough.
+has the full secure-cluster walkthrough. Rootful Linux networking retains address
+ownership across restarts and refuses subnet exhaustion. Runc retirement keeps
+resource ownership when OCI deletion, rootfs unmount or network cleanup fails,
+and retries before reporting Stopped. Normal Stop/Retire also preserve ownership
+when identity-directory or adoption-record removal fails. Rolling and blue-green
+deployments refuse completion if runtime exit is uncertain and keep both
+generations available for cleanup. Rollout finalisation also retains ownership
+when identity or adoption-record removal fails, so cleanup can be retried.
+Retirement also fences automatic restarts before signalling the old runtime.
+Rollout identities advance past adopted generations after Bun replacement. With rootful Linux DNS
+enabled, short
+service names resolve in the calling workload's namespace. Host tools use explicit
+names such as `redis.payments.internal`; unknown sources cannot inherit a node's
+namespace.
+
+A blocked local rollout can be cancelled with `relish cancel-deploy <operation-id>`.
+The command waits for owned work to finish before you submit the correction;
+cluster users should also update the desired configuration. See the
+[deployment guide](docs/README.md).
 
 ## The manual is in the binary
 
@@ -106,8 +151,13 @@ repo layout live in the manual (`relish manual`, "Under the hood") and the
 
 ## Try it
 
+The managed quickstart records localhost ingress and authenticated registry
+forwards. See the [port options](docs/quickstart.md#resume-stop-and-remove).
+
 Use the source-based quick start above while we prepare the first release.
-From a checkout, you can run the portable tests and check the examples:
+From a checkout, install cargo-nextest 0.9.145 or newer (see
+[build prerequisites](docs/README.md#building)), then run the portable tests and
+check the examples:
 
 ```sh
 make test                    # run the portable nextest suite
@@ -144,7 +194,8 @@ See the [laptop quickstart](docs/quickstart.md) for prerequisites, single-node
 setup, retries and development qualification. The public release is still pending.
 
 See the [diagnostics guide](docs/manual/07_diagnostics.md) for test prerequisites,
-profiles and interpreting results.
+profiles and interpreting results. Capacity benchmarks require live scheduler
+admission and observed running workloads; missing evidence fails the measurement.
 
 ## Getting to 0.1.0
 
@@ -175,6 +226,10 @@ sets out the remaining work, in order:
    restart and recovery, and measure the full three-node start with empty
    caches before publishing the five-minute claim.
 
+The [candidate and promotion workflow](docs/releasing.md#metadata-and-publication)
+preserves signed assets and publishes only the qualified bytes. Hosted candidate
+creation and cold-install acceptance are still pending.
+
 Each step includes tests and updates to the documentation and book. Detailed
 acceptance gates and deferred features live in the release plan; implementation
 history remains in [progress.md](docs/progress.md).
@@ -183,6 +238,14 @@ The [17 September codebase audit and completion plan](docs/plans/2026-09-17-code
 reconciles the older TODOs, records remaining correctness gaps and separates
 release acceptance from deferred capabilities. The current checklist lives in
 [progress.md](docs/progress.md).
+
+Log exports now preserve content generations, scope receipts to the destination,
+and serialise durable checkpoint updates across agent and offline exports. Source
+and checkpoint errors stop the export and prevent disk-pressure pruning.
+
+Cluster-wide credential management and permission/quota declarations require
+an unscoped Admin. App and job manifests enforce the caller's scope and configured
+permissions before applying changes; see the [user guide](docs/README.md).
 
 ## Licence
 

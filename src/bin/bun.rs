@@ -28,6 +28,10 @@ use reliaburger::pickle::types::ManifestCatalog;
 #[derive(Parser)]
 #[command(name = "bun", version, about = "Reliaburger node agent")]
 struct Cli {
+    /// Print supported protocol and state formats without opening runtime state.
+    #[arg(long)]
+    compatibility: bool,
+
     /// Path to node configuration file.
     #[arg(long)]
     config: Option<PathBuf>,
@@ -84,6 +88,9 @@ enum Command {
         /// Bun PID used to close the parent-death-signal race.
         #[arg(long)]
         parent_pid: u32,
+        /// Kernel ID of the Bun thread which created this helper.
+        #[arg(long)]
+        parent_tid: u32,
         /// Total-node memory-usage target, recomputed after joining the cgroup.
         #[arg(long)]
         memory_percentage: u8,
@@ -244,12 +251,18 @@ fn node_identity_dir(config: &NodeConfig) -> std::path::PathBuf {
 /// Load this node's mTLS identity from disk, if one has been installed.
 fn load_node_identity(
     config: &NodeConfig,
-) -> anyhow::Result<Option<std::sync::Arc<reliaburger::sesame::identity_store::NodeIdentity>>> {
+) -> anyhow::Result<Option<reliaburger::sesame::credentials::LiveNodeIdentity>> {
     use anyhow::Context;
     let dir = node_identity_dir(config);
     let identity = reliaburger::sesame::identity_store::load(&dir)
         .with_context(|| format!("failed to load node identity from {}", dir.display()))?;
-    Ok(identity.map(std::sync::Arc::new))
+    identity
+        .map(|_| {
+            reliaburger::sesame::credentials::LiveNodeIdentity::load(&dir).with_context(|| {
+                format!("failed to load live node identity from {}", dir.display())
+            })
+        })
+        .transpose()
 }
 
 /// Serve an axum router over TLS, handshaking each connection in its own task
@@ -269,21 +282,42 @@ async fn serve_api_over_tls(
             accepted = listener.accept() => {
                 let Ok((tcp, _peer)) = accepted else { continue };
                 let acceptor = acceptor.clone();
+                let connection_shutdown = shutdown.clone();
                 let service = match make_service.call(()).await {
                     Ok(service) => service,
                     Err(infallible) => match infallible {},
                 };
                 tokio::spawn(async move {
-                    let Ok(tls) = acceptor.accept(tcp).await else { return };
+                    use reliaburger::sesame::connection::{
+                        LifetimeLimitedIo, MAX_TLS_CONNECTION_LIFETIME, TLS_CONNECTION_DRAIN_GRACE,
+                    };
+                    let Ok(Ok(tls)) = tokio::time::timeout(
+                        std::time::Duration::from_secs(10), acceptor.accept(tcp),
+                    ).await else { return };
+                    let service = match tls.get_ref().1.peer_certificates()
+                        .and_then(|certificates| certificates.first()) {
+                        Some(certificate) => service.layer(axum::Extension(
+                            reliaburger::sesame::renewal::TlsPeerCertificate(certificate.clone()),
+                        )),
+                        None => service,
+                    };
+                    let tls = LifetimeLimitedIo::new(tls, MAX_TLS_CONNECTION_LIFETIME);
                     let hyper_service = hyper_util::service::TowerToHyperService::new(service);
-                    let _ = hyper_util::server::conn::auto::Builder::new(
+                    let builder = hyper_util::server::conn::auto::Builder::new(
                         hyper_util::rt::TokioExecutor::new(),
-                    )
-                    .serve_connection_with_upgrades(
-                        hyper_util::rt::TokioIo::new(tls),
-                        hyper_service,
-                    )
-                    .await;
+                    );
+                    let connection = builder.serve_connection_with_upgrades(
+                        hyper_util::rt::TokioIo::new(tls), hyper_service,
+                    );
+                    tokio::pin!(connection);
+                    let drain_after = MAX_TLS_CONNECTION_LIFETIME.saturating_sub(TLS_CONNECTION_DRAIN_GRACE);
+                    tokio::select! {
+                        _ = &mut connection => return,
+                        _ = connection_shutdown.cancelled() => {},
+                        _ = tokio::time::sleep(drain_after) => {},
+                    }
+                    connection.as_mut().graceful_shutdown();
+                    let _ = tokio::time::timeout(TLS_CONNECTION_DRAIN_GRACE, connection).await;
                 });
             }
         }
@@ -377,6 +411,30 @@ async fn refresh_token_store(
     *store.write().await = tokens;
 }
 
+/// Reserve a port without accepting connections during cluster bootstrap.
+async fn reserve_api_socket(listen: &str) -> anyhow::Result<tokio::net::TcpSocket> {
+    let addresses = tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        tokio::net::lookup_host(listen),
+    )
+    .await
+    .context("timed out resolving Bun API address")??;
+    let mut last_error = std::io::Error::other("no addresses resolved");
+    for address in addresses {
+        let socket = if address.is_ipv4() {
+            tokio::net::TcpSocket::new_v4()?
+        } else {
+            tokio::net::TcpSocket::new_v6()?
+        };
+        socket.set_reuseaddr(true)?;
+        match socket.bind(address) {
+            Ok(()) => return Ok(socket),
+            Err(error) => last_error = error,
+        }
+    }
+    Err(last_error).with_context(|| format!("failed to bind Bun API on {listen}"))
+}
+
 /// Keep the public listener closed while a joining node receives Raft credentials.
 async fn await_api_credentials(
     store: &reliaburger::sesame::auth::TokenStore,
@@ -455,6 +513,7 @@ async fn build_ingress_cert_resolver(
     match reliaburger::wrapper::tls::IngressCertResolver::new(
         keypair,
         params,
+        rustls::pki_types::CertificateDer::from(ingress_ca.certificate_der.clone()),
         lifetime,
         routing_table,
         vec![default_cert],
@@ -493,6 +552,13 @@ async fn run_testapp(
 
 fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
+    if cli.compatibility {
+        println!(
+            "{}",
+            serde_json::to_string(&reliaburger::compatibility::CURRENT)?
+        );
+        return Ok(());
+    }
 
     // The helper must not construct Tokio's multi-thread runtime: those
     // threads would join the pressure cgroup too and blur ownership. Handle
@@ -500,6 +566,7 @@ fn main() -> anyhow::Result<()> {
     if let Some(Command::NodePressureHelper {
         cgroup,
         parent_pid,
+        parent_tid,
         memory_percentage,
         cpu_workers,
     }) = &cli.command
@@ -507,6 +574,7 @@ fn main() -> anyhow::Result<()> {
         return reliaburger::smoker::node_pressure::run_helper(
             cgroup,
             *parent_pid,
+            *parent_tid,
             *memory_percentage,
             *cpu_workers,
         )
@@ -675,6 +743,21 @@ async fn run_agent(cli: Cli) -> anyhow::Result<()> {
         fallback
     };
 
+    let compatibility_directory = data_base.clone();
+    tokio::task::spawn_blocking(move || {
+        reliaburger::compatibility::ensure_state_compatible(&compatibility_directory)
+    })
+    .await
+    .context("state compatibility check failed")??;
+
+    // Recover temporary uploads before any registry or replication writer starts.
+    let pickle_dir = storage_directory(&config.storage.images, "images").await?;
+    let blob_store = Arc::new(BlobStore::new(&pickle_dir));
+    let _upload_owner = blob_store
+        .claim_upload_directory()
+        .await
+        .context("cannot recover registry upload ownership")?;
+
     // Instance records + process log files ({data}/instances). Started
     // workloads are recorded here so a future bun process (crash restart or
     // self-upgrade exec) adopts them instead of restarting them.
@@ -772,6 +855,7 @@ async fn run_agent(cli: Cli) -> anyhow::Result<()> {
         readiness.register("dns", true).await;
     }
     let mut ingress_cluster_tls_ready = false;
+    let mut service_endpoints = reliaburger::bun::capabilities::ServiceEndpoints::default();
     if config.ingress.enabled {
         readiness.register("ingress", true).await;
     }
@@ -802,12 +886,10 @@ async fn run_agent(cli: Cli) -> anyhow::Result<()> {
         .name
         .clone()
         .unwrap_or_else(|| format!("node-{}", config.cluster.gossip_port));
-    let api_port: u16 = cli
-        .listen
-        .rsplit(':')
-        .next()
-        .and_then(|p| p.parse().ok())
-        .unwrap_or(9117);
+    // Reserve the actual port before publishing cluster endpoints, including
+    // when the OS selects port zero. Do not listen until credentials are ready.
+    let api_socket = reserve_api_socket(&cli.listen).await?;
+    let api_port = api_socket.local_addr()?.port();
 
     // Disk-pressure resignation signal (12b.2 T3): the disk-pressure loop below
     // publishes this node's own sustained-pressure verdict here; in cluster mode
@@ -824,9 +906,7 @@ async fn run_agent(cli: Cli) -> anyhow::Result<()> {
     let mut crl_refresh: Option<reliaburger::sesame::mtls::CrlHandle> = None;
     // This node's mTLS identity, when the cluster runs mTLS. Drives the API
     // listener TLS and the cluster HTTP client (peer calls over https).
-    let mut api_identity: Option<
-        std::sync::Arc<reliaburger::sesame::identity_store::NodeIdentity>,
-    > = None;
+    let mut api_identity: Option<reliaburger::sesame::credentials::LiveNodeIdentity> = None;
     // The leader-side rollup store, exposed at /v1/metrics/cluster.
     let mut api_rollup_store = None;
     // Gossip membership for the pickle replication loop (cluster only).
@@ -839,6 +919,7 @@ async fn run_agent(cli: Cli) -> anyhow::Result<()> {
     // ClusterHandle moves into the agent (spawned further down, once
     // the service token exists).
     let mut orchestration = None;
+    let mut upgrade_rejoin_rx = None;
     let mut agent = if cli.cluster {
         let mut params = cluster_params_from_config(&config)?;
         registry_cluster_advertise = Some(params.gossip_addr.ip());
@@ -878,6 +959,7 @@ async fn run_agent(cli: Cli) -> anyhow::Result<()> {
             reliaburger::cluster::runtime::start(params, agent_shutdown.clone())
                 .await
                 .map_err(|e| anyhow::anyhow!("failed to start cluster runtime: {e}"))?;
+        upgrade_rejoin_rx = Some(cluster_runtime.gossip_rejoined_rx.clone());
         api_rollup_store = Some(Arc::clone(&cluster_runtime.rollup_store));
         api_council = handle.council.clone();
         crl_refresh = Some(handle.crl_handle.clone());
@@ -910,9 +992,10 @@ async fn run_agent(cli: Cli) -> anyhow::Result<()> {
     // placement reconciler and upgrade orchestrator.
     let cluster_http = match &api_identity {
         Some(identity) => reliaburger::cluster::ClusterHttp::secure(
-            reliaburger::sesame::mtls::build_cluster_http_client(
+            reliaburger::sesame::mtls::build_live_cluster_http_client(
                 identity,
                 crl_refresh.clone().unwrap_or_default(),
+                None,
             )
             .map_err(|e| anyhow::anyhow!("failed to build cluster HTTP client: {e}"))?,
         ),
@@ -1080,20 +1163,21 @@ async fn run_agent(cli: Cli) -> anyhow::Result<()> {
         tokio::sync::watch::Receiver<Vec<reliaburger::mustard::membership::MembershipSnapshot>>,
     > = None;
 
+    let mut capacity_admission = None;
     // L1 orchestration: the leader schedules desired apps into
     // placements, every node keeps a fresh peer-API table, and every
     // node reconciles its instances against its assignments.
     if let Some((membership_rx, metrics_rx, aggregated_rx, directory_rx)) = orchestration {
         upgrade_membership_rx = Some(membership_rx.clone());
         if let Some(council) = &api_council {
-            reliaburger::cluster::orchestrate::spawn_leader_scheduler(
+            capacity_admission = Some(reliaburger::cluster::orchestrate::spawn_leader_scheduler(
                 Arc::clone(council),
                 membership_rx.clone(),
                 aggregated_rx,
                 config.dns.enabled,
                 config.reconstruction.clone(),
                 shutdown.clone(),
-            );
+            ));
             // L3: leader-only autoscale loop, feeding on the same rollup
             // store /v1/metrics/cluster serves.
             if let Some(rollup_store) = &api_rollup_store {
@@ -1225,12 +1309,17 @@ async fn run_agent(cli: Cli) -> anyhow::Result<()> {
                 recovery_deadline: std::time::Duration::from_secs(30),
                 shutdown_deadline: std::time::Duration::from_secs(5),
             },
-            move |attempt_shutdown| {
+            move |attempt_shutdown, ready| {
                 let refresh_store = Arc::clone(&refresh_store);
                 let refresh_council = Arc::clone(&refresh_council);
                 let refresh_crl = refresh_crl.clone();
                 async move {
+                    refresh_token_store(&refresh_store, &refresh_council).await;
+                    if let Some(crl) = &refresh_crl {
+                        crl.update(refresh_council.security_state().await.crl);
+                    }
                     let mut ticker = tokio::time::interval(std::time::Duration::from_secs(5));
+                    ready.ready();
                     loop {
                         tokio::select! {
                             _ = attempt_shutdown.cancelled() => break,
@@ -1266,7 +1355,7 @@ async fn run_agent(cli: Cli) -> anyhow::Result<()> {
     }
     // Adopt workloads that survived a previous bun process (restart or
     // self-upgrade exec) BEFORE the agent loop starts reconciling.
-    agent.adopt_recorded_instances().await;
+    agent.adopt_recorded_instances().await?;
     let deploy_history = agent.deploy_history_handle();
 
     // Onion DNS: start the .internal responder when [dns] enables it,
@@ -1282,7 +1371,15 @@ async fn run_agent(cli: Cli) -> anyhow::Result<()> {
             true,
             readiness.clone(),
             dns_shutdown.clone(),
-            bound_dns.run(service_map_rx, dns_faults_rx, dns_shutdown.clone()),
+            {
+                let owner_shutdown = dns_shutdown.clone();
+                move |ready| async move {
+                    ready.ready();
+                    bound_dns
+                        .run(service_map_rx, dns_faults_rx, owner_shutdown)
+                        .await;
+                }
+            },
         );
         tokio::spawn(async move {
             let outcome = server.await;
@@ -1332,6 +1429,8 @@ async fn run_agent(cli: Cli) -> anyhow::Result<()> {
         )
         .await
         .map_err(|e| anyhow::anyhow!("failed to bind ingress listeners: {e}"))?;
+        service_endpoints.ingress_http = Some(format!("http://{}", bound.http_addr));
+        service_endpoints.ingress_https = Some(format!("https://{}", bound.https_addr));
         println!(
             "bun: ingress listening on http {} / https {}",
             bound.http_addr, bound.https_addr
@@ -1341,7 +1440,9 @@ async fn run_agent(cli: Cli) -> anyhow::Result<()> {
             true,
             readiness.clone(),
             shutdown.clone(),
-            async move {
+            move |ready| async move {
+                ready.ready();
+
                 if let Err(e) = bound.serve().await {
                     eprintln!("bun: ingress proxy exited with error: {e}");
                 }
@@ -1359,8 +1460,8 @@ async fn run_agent(cli: Cli) -> anyhow::Result<()> {
         true,
         readiness.clone(),
         shutdown.clone(),
-        async move {
-            agent.run().await;
+        move |ready| async move {
+            agent.run_with_readiness(ready).await;
         },
     );
 
@@ -1619,16 +1720,11 @@ async fn run_agent(cli: Cli) -> anyhow::Result<()> {
             config.logs.export_interval_secs
         );
         tokio::spawn(async move {
-            use reliaburger::ketchup::export::{
-                CHECKPOINT_FILENAME, ExportCheckpoint, export_logs,
-            };
+            use reliaburger::ketchup::export::{ExportCheckpoint, export_logs};
             let mut tick = tokio::time::interval(export_interval);
             // Skip first tick (fires immediately)
             tick.tick().await;
-            let store_guard = export_store.read().await;
-            let checkpoint_path = store_guard.data_dir().join(CHECKPOINT_FILENAME);
-            let mut checkpoint = ExportCheckpoint::load(&checkpoint_path);
-            drop(store_guard);
+            let mut checkpoint = ExportCheckpoint::default();
             loop {
                 tokio::select! {
                     _ = export_shutdown.cancelled() => break,
@@ -1637,7 +1733,6 @@ async fn run_agent(cli: Cli) -> anyhow::Result<()> {
                         match export_logs(&data_dir, &export_dest, &node_id, &mut checkpoint).await {
                             Ok(result) if result.files_exported > 0 => {
                                 println!("bun: exported {} log file(s) to {}", result.files_exported, export_dest);
-                                checkpoint.save(&checkpoint_path).ok();
                             }
                             Err(e) => eprintln!("bun: log export error: {e}"),
                             _ => {}
@@ -1674,7 +1769,7 @@ async fn run_agent(cli: Cli) -> anyhow::Result<()> {
             use reliaburger::bun::disk_pressure::{
                 DiskPressureResignation, ResignationVerdict, check_and_relieve, dir_parquet_size,
             };
-            use reliaburger::ketchup::export::{CHECKPOINT_FILENAME, ExportCheckpoint};
+            use reliaburger::ketchup::export::ExportCheckpoint;
             let tick_period = std::time::Duration::from_secs(300);
             let mut tick = tokio::time::interval(tick_period);
             // Council resignation waits for two sustained ticks (~10 min) over
@@ -1684,16 +1779,14 @@ async fn run_agent(cli: Cli) -> anyhow::Result<()> {
             tick.tick().await; // skip first immediate tick
 
             let log_store_guard = dp_log_store.read().await;
-            let log_checkpoint_path = log_store_guard.data_dir().join(CHECKPOINT_FILENAME);
             let log_data_dir = log_store_guard.data_dir().to_path_buf();
             drop(log_store_guard);
-            let mut log_checkpoint = ExportCheckpoint::load(&log_checkpoint_path);
+            let mut log_checkpoint = ExportCheckpoint::default();
 
             let mayo_store_guard = dp_mayo_store.read().await;
-            let mayo_checkpoint_path = mayo_store_guard.data_dir().join(CHECKPOINT_FILENAME);
             let mayo_data_dir = mayo_store_guard.data_dir().to_path_buf();
             drop(mayo_store_guard);
-            let mut mayo_checkpoint = ExportCheckpoint::load(&mayo_checkpoint_path);
+            let mut mayo_checkpoint = ExportCheckpoint::default();
 
             loop {
                 tokio::select! {
@@ -1717,7 +1810,6 @@ async fn run_agent(cli: Cli) -> anyhow::Result<()> {
                                 "bun: disk pressure — pruned {} log file(s), reclaimed {} bytes",
                                 log_result.files_pruned, log_result.bytes_reclaimed
                             );
-                            log_checkpoint.save(&log_checkpoint_path).ok();
                         }
 
                         // Check metrics disk pressure
@@ -1738,7 +1830,6 @@ async fn run_agent(cli: Cli) -> anyhow::Result<()> {
                                 "bun: disk pressure — pruned {} metrics file(s), reclaimed {} bytes",
                                 metrics_result.files_pruned, metrics_result.bytes_reclaimed
                             );
-                            mayo_checkpoint.save(&mayo_checkpoint_path).ok();
                         }
 
                         // Rollup retention (E): drop aggregated rollups older
@@ -1798,8 +1889,10 @@ async fn run_agent(cli: Cli) -> anyhow::Result<()> {
     if no_tokens {
         refuse_open_non_loopback_bind(&cli.listen)?;
     }
-    let listener = tokio::net::TcpListener::bind(&cli.listen).await?;
-    println!("bun: API server listening on {}", cli.listen);
+    let listener = api_socket
+        .listen(1024)
+        .with_context(|| format!("failed to listen for Bun API on {}", cli.listen))?;
+    println!("bun: API server listening on {}", listener.local_addr()?);
 
     // L10: the catalog used to be `default()` on every boot — image
     // metadata evaporated on restart. Load the persisted copy; a
@@ -1869,17 +1962,24 @@ async fn run_agent(cli: Cli) -> anyhow::Result<()> {
     // A freshly swapped-in version must prove itself: after the boot grace
     // period, ask the agent to verify that every pre-upgrade workload
     // survived, then commit (or flag revert and exit).
-    // TODO(Phase 14, orchestration step): in cluster mode, also require
-    // gossip rejoin within upgrades.gossip_rejoin_secs before committing.
+    // Gossip proof is independent of local API health and restored membership.
     if let Some(marker) = upgrade_verify.take() {
         let verify_tx = cmd_tx.clone();
         let grace_secs = config.upgrades.boot_grace_secs;
+        let rejoin_secs = config.upgrades.gossip_rejoin_secs;
         tokio::spawn(async move {
-            tokio::time::sleep(std::time::Duration::from_secs(grace_secs)).await;
+            let (_, rejoin) = tokio::join!(
+                tokio::time::sleep(std::time::Duration::from_secs(grace_secs)),
+                reliaburger::upgrade::rejoin::wait_for_rejoin(
+                    upgrade_rejoin_rx,
+                    std::time::Duration::from_secs(rejoin_secs),
+                ),
+            );
             let (tx, rx) = tokio::sync::oneshot::channel();
             if verify_tx
                 .send(reliaburger::bun::agent::AgentCommand::UpgradeVerify {
                     marker,
+                    rejoin,
                     response: tx,
                 })
                 .await
@@ -1890,56 +1990,39 @@ async fn run_agent(cli: Cli) -> anyhow::Result<()> {
         });
     }
 
-    let local_test_leases = if api_council.is_some() {
-        // Cluster leases are Raft state. Don't let an old standalone file
-        // shadow or block the replicated source of truth after a mode change.
-        reliaburger::testkit::lease::LocalLeaseStore::in_memory()
+    // Cluster apps live in Raft; jobs always belong to the receiving node.
+    let local_lease_file = if api_council.is_some() {
+        "node-test-leases.json"
     } else {
-        reliaburger::testkit::lease::LocalLeaseStore::open(
-            config.storage.data.join("test-leases.json"),
-        )
-        .await
-        .map_err(|error| anyhow::anyhow!("failed to open test lease store: {error}"))?
+        "test-leases.json"
     };
-    let lease_reaper_handle = match &api_council {
-        Some(council) => reliaburger::testkit::lease::spawn_cluster_lease_reaper(
+    let local_test_leases = reliaburger::testkit::lease::LocalLeaseStore::open(
+        config.storage.data.join(local_lease_file),
+    )
+    .await
+    .map_err(|error| anyhow::anyhow!("failed to open test lease store: {error}"))?;
+    let local_lease_reaper = reliaburger::testkit::lease::spawn_local_lease_reaper(
+        local_test_leases.clone(),
+        cmd_tx.clone(),
+        shutdown.clone(),
+    );
+    let cluster_lease_reaper = api_council.as_ref().map(|council| {
+        reliaburger::testkit::lease::spawn_cluster_lease_reaper(
             Arc::clone(council),
             shutdown.clone(),
-        ),
-        None => reliaburger::testkit::lease::spawn_local_lease_reaper(
-            local_test_leases.clone(),
-            cmd_tx.clone(),
-            shutdown.clone(),
-        ),
+        )
+    });
+    let lease_reaper_handle = async move {
+        let _ = local_lease_reaper.await;
+        if let Some(handle) = cluster_lease_reaper {
+            let _ = handle.await;
+        }
     };
 
     // What this node can actually do, for `/v1/capabilities` (Phase 15).
     // Everything here is observed at startup rather than assumed: a
     // capability report that overstates is worse than none, because it turns
     // "this cluster can't" into "this test mysteriously fails".
-    let node_certificate = api_identity.as_ref().and_then(|identity| {
-        let rotation_state = if std::time::SystemTime::now() >= identity.not_after {
-            "expired"
-        } else {
-            // Node leaves are loaded at process start. We expose that fact
-            // rather than claiming the workload identity rotation loop also
-            // hot-reloads the API and cluster transports.
-            "restart_required"
-        };
-        match reliaburger::bun::diagnostics::public_certificate_metadata(
-            "node",
-            &identity.node_id,
-            &identity.certificate_der,
-            rotation_state,
-            false,
-        ) {
-            Ok(metadata) => Some(metadata),
-            Err(error) => {
-                eprintln!("bun: node certificate diagnostics unavailable: {error}");
-                None
-            }
-        }
-    });
     let diagnostic_storage_paths = [
         ("data", &config.storage.data),
         ("images", &config.storage.images),
@@ -1955,7 +2038,18 @@ async fn run_agent(cli: Cli) -> anyhow::Result<()> {
         },
     )
     .collect();
+    let mut registry_bind = reliaburger::pickle::capability::plan_registry_bind(
+        &config.images.registry_bind,
+        config.images.registry_port,
+        registry_cluster_advertise,
+    )
+    .map_err(|error| anyhow::anyhow!("invalid Pickle registry listener: {error}"))?;
+    let pickle_listener = tokio::net::TcpListener::bind(registry_bind.listen_addr).await?;
+    registry_bind.listen_addr = pickle_listener.local_addr()?;
+    let registry_addr = registry_bind.listen_addr;
+    service_endpoints.registry = Some(format!("{registry_scheme}://{registry_addr}"));
     let static_capabilities = reliaburger::bun::capabilities::StaticCapabilities {
+        service_endpoints,
         node_id: node_name.clone(),
         cluster_name: config.cluster.name.clone(),
         cluster_mode: cli.cluster,
@@ -2007,7 +2101,7 @@ async fn run_agent(cli: Cli) -> anyhow::Result<()> {
         registry_signatures_required: config.images.trust_policy.require_signatures,
         diagnostics: reliaburger::bun::diagnostics::DiagnosticStaticEvidence {
             storage_paths: diagnostic_storage_paths,
-            node_certificate,
+            node_certificate: None,
         },
         test_policy: config.testing.clone(),
     };
@@ -2062,6 +2156,54 @@ async fn run_agent(cli: Cli) -> anyhow::Result<()> {
         Some(local_test_leases),
         jwt_verifier,
     );
+    let app = match capacity_admission {
+        Some(admission) => app.layer(axum::Extension(admission)),
+        None => app,
+    };
+    let app = match &api_identity {
+        Some(identity) => app.layer(axum::Extension(identity.clone())),
+        None => app,
+    };
+    let app = match (
+        &api_identity,
+        &api_council,
+        &api_membership,
+        service_token.as_deref(),
+    ) {
+        (Some(identity), Some(council), Some(membership), Some(token)) => {
+            let (worker, monitor) = reliaburger::sesame::renewal_worker::NodeRenewalWorker::new(
+                identity.clone(),
+                crl_refresh.clone().unwrap_or_default(),
+                token,
+            )
+            .map_err(|error| anyhow::anyhow!("failed to prepare node renewal: {error}"))?;
+            let mut local_api = listener.local_addr()?;
+            if local_api.ip().is_unspecified() {
+                local_api.set_ip(if local_api.is_ipv6() {
+                    std::net::IpAddr::V6(std::net::Ipv6Addr::LOCALHOST)
+                } else {
+                    std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST)
+                });
+            }
+            let council = council.clone();
+            let membership = membership.clone();
+            let renewal_shutdown = shutdown.clone();
+            reliaburger::bun::readiness::spawn_owned(
+                "node-identity-renewal",
+                false,
+                readiness.clone(),
+                shutdown.clone(),
+                move |ready| async move {
+                    ready.ready();
+                    worker
+                        .run(council, membership, local_api, renewal_shutdown)
+                        .await;
+                },
+            );
+            app.layer(axum::Extension(monitor))
+        }
+        _ => app,
+    };
     let server_shutdown = shutdown.clone();
     // Serve the API over TLS when this node has an mTLS identity; the listener
     // accepts client certs optionally, so relish and browsers connect with a
@@ -2070,7 +2212,7 @@ async fn run_agent(cli: Cli) -> anyhow::Result<()> {
     let api_acceptor = match &api_identity {
         Some(identity) => {
             let crl = crl_refresh.clone().unwrap_or_default();
-            let cfg = reliaburger::sesame::mtls::build_api_server_config(identity, crl)
+            let cfg = reliaburger::sesame::mtls::build_live_api_server_config(identity, crl)
                 .map_err(|e| anyhow::anyhow!("failed to build API TLS config: {e}"))?;
             Some(tokio_rustls::TlsAcceptor::from(cfg))
         }
@@ -2081,7 +2223,9 @@ async fn run_agent(cli: Cli) -> anyhow::Result<()> {
         true,
         readiness.clone(),
         shutdown.clone(),
-        async move {
+        move |ready| async move {
+            ready.ready();
+
             match api_acceptor {
                 Some(acceptor) => {
                     serve_api_over_tls(listener, acceptor, app, server_shutdown).await
@@ -2151,17 +2295,9 @@ async fn run_agent(cli: Cli) -> anyhow::Result<()> {
         });
     }
 
-    // Start the Pickle OCI registry server
-    let mut registry_bind = reliaburger::pickle::capability::plan_registry_bind(
-        &config.images.registry_bind,
-        config.images.registry_port,
-        registry_cluster_advertise,
-    )
-    .map_err(|error| anyhow::anyhow!("invalid Pickle registry listener: {error}"))?;
-    let pickle_dir = storage_directory(&config.storage.images, "images").await?;
+    // Start the Pickle OCI registry server using the ownership claimed at startup.
     let node_raft_id = reliaburger::cluster::identity::raft_id_from_name(&node_name);
 
-    let blob_store = Arc::new(BlobStore::new(&pickle_dir));
     // Registry writes reuse the cluster's existing auth material (REG4):
     // the same token store and service token that guard the agent API. In
     // single-node/tokenless mode the empty-store bootstrap rule keeps writes
@@ -2209,7 +2345,7 @@ async fn run_agent(cli: Cli) -> anyhow::Result<()> {
     // as a bearer: Pickle authorises node-to-node writes by that token, not by
     // the client certificate, so it is required even under mTLS (M2).
     let registry_client = match &api_identity {
-        Some(identity) => reliaburger::sesame::mtls::build_cluster_http_client_with_bearer(
+        Some(identity) => reliaburger::sesame::mtls::build_live_cluster_http_client(
             identity,
             crl_refresh.clone().unwrap_or_default(),
             service_token.as_deref(),
@@ -2250,9 +2386,6 @@ async fn run_agent(cli: Cli) -> anyhow::Result<()> {
     }
 
     let pickle_app = reliaburger::pickle::api::router(pickle_state);
-    let pickle_listener = tokio::net::TcpListener::bind(registry_bind.listen_addr).await?;
-    registry_bind.listen_addr = pickle_listener.local_addr()?;
-    let registry_addr = registry_bind.listen_addr;
     // Describe the listener honestly (B3). A clustered listener authenticates
     // writes (service token or a Deployer bearer) and, on a routable bind,
     // reads too — regardless of TLS. Only the literal loopback standalone
@@ -2308,7 +2441,9 @@ async fn run_agent(cli: Cli) -> anyhow::Result<()> {
         false,
         readiness.clone(),
         shutdown.clone(),
-        async move {
+        move |ready| async move {
+            ready.ready();
+
             let mut ticker = tokio::time::interval(std::time::Duration::from_secs(5));
             loop {
                 tokio::select! {
@@ -2342,8 +2477,10 @@ async fn run_agent(cli: Cli) -> anyhow::Result<()> {
                 tokio::select! {
                     _ = sweep_shutdown.cancelled() => break,
                     _ = ticker.tick() => {
-                        for id in sweep_sessions.sweep(std::time::SystemTime::now()).await {
-                            sweep_store.cancel_upload(&id).await;
+                        for (id, error) in sweep_sessions.cleanup_expired(
+                            &sweep_store, std::time::SystemTime::now(),
+                        ).await {
+                            eprintln!("pickle: upload {id} cleanup will retry: {error}");
                         }
                     }
                 }
@@ -2358,7 +2495,7 @@ async fn run_agent(cli: Cli) -> anyhow::Result<()> {
     let pickle_acceptor = match (&api_identity, registry_over_tls) {
         (Some(identity), true) => {
             let crl = crl_refresh.clone().unwrap_or_default();
-            match reliaburger::sesame::mtls::build_api_server_config(identity, crl) {
+            match reliaburger::sesame::mtls::build_live_api_server_config(identity, crl) {
                 Ok(cfg) => Some(tokio_rustls::TlsAcceptor::from(cfg)),
                 Err(e) => {
                     eprintln!("bun: failed to build registry TLS config, serving plaintext: {e}");
@@ -2375,7 +2512,9 @@ async fn run_agent(cli: Cli) -> anyhow::Result<()> {
         true,
         readiness.clone(),
         shutdown.clone(),
-        async move {
+        move |ready| async move {
+            ready.ready();
+
             match pickle_acceptor {
                 Some(acceptor) => {
                     serve_api_over_tls(pickle_listener, acceptor, pickle_app, pickle_shutdown).await
@@ -2779,6 +2918,10 @@ async fn prepare_dns_runtime(
     }
 
     let (runtime, nameserver, freebind) = configure_workload_dns(runtime, config.listen_addr)?;
+    #[cfg(target_os = "linux")]
+    if let AnyGrill::Runc(grill) = &runtime {
+        config.source_namespaces = grill.dns_source_namespaces();
+    }
     if config.listen_addr.ip().is_unspecified() {
         config.listen_addr.set_ip(nameserver.into());
     }
@@ -3137,7 +3280,7 @@ mod tests {
             .identity
             .as_ref()
             .expect("normal init should produce loadable mTLS identity parameters");
-        assert_eq!(identity.node_id, "node-secure");
+        assert_eq!(identity.snapshot().node_id, "node-secure");
         enforce_mtls_mode(&config, &params).unwrap();
     }
 
@@ -3210,5 +3353,178 @@ mod tests {
         // require_mtls defaults to false — plaintext is allowed.
         let params = cluster_params_from_config(&config).unwrap();
         assert!(enforce_mtls_mode(&config, &params).is_ok());
+    }
+    #[tokio::test]
+    async fn api_tls_connection_drains_inflight_work_before_retiring() {
+        use reliaburger::sesame::connection::{
+            MAX_TLS_CONNECTION_LIFETIME, TLS_CONNECTION_DRAIN_GRACE,
+        };
+        use std::sync::Arc;
+        use std::time::Duration;
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let started = Arc::new(tokio::sync::Notify::new());
+        let finish = Arc::new(tokio::sync::Notify::new());
+        let route_started = started.clone();
+        let route_finish = finish.clone();
+        let router = axum::Router::new().route(
+            "/slow",
+            axum::routing::get(move || {
+                let started = route_started.clone();
+                let finish = route_finish.clone();
+                async move {
+                    started.notify_one();
+                    finish.notified().await;
+                    axum::http::StatusCode::NO_CONTENT
+                }
+            }),
+        );
+        let (certificate, key) = reliaburger::wrapper::tls::generate_self_signed_cert().unwrap();
+        let config =
+            reliaburger::wrapper::tls::build_tls_config(vec![certificate.clone()], key).unwrap();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let shutdown = tokio_util::sync::CancellationToken::new();
+        let mut tasks = tokio::task::JoinSet::new();
+        tasks.spawn(serve_api_over_tls(
+            listener,
+            tokio_rustls::TlsAcceptor::from(config),
+            router,
+            shutdown.clone(),
+        ));
+        let mut roots = rustls::RootCertStore::empty();
+        roots.add(certificate).unwrap();
+        let config = rustls::ClientConfig::builder_with_provider(Arc::new(
+            rustls::crypto::ring::default_provider(),
+        ))
+        .with_safe_default_protocol_versions()
+        .unwrap()
+        .with_root_certificates(roots)
+        .with_no_client_auth();
+        let connector = tokio_rustls::TlsConnector::from(Arc::new(config));
+        let mut stream = connector
+            .connect(
+                rustls::pki_types::ServerName::try_from("localhost").unwrap(),
+                tokio::net::TcpStream::connect(address).await.unwrap(),
+            )
+            .await
+            .unwrap();
+        stream
+            .write_all(b"GET /slow HTTP/1.1\r\nHost: localhost\r\n\r\n")
+            .await
+            .unwrap();
+        tokio::time::timeout(Duration::from_secs(3), started.notified())
+            .await
+            .unwrap();
+        tokio::time::pause();
+        tokio::time::advance(
+            MAX_TLS_CONNECTION_LIFETIME - TLS_CONNECTION_DRAIN_GRACE + Duration::from_secs(1),
+        )
+        .await;
+        tokio::task::yield_now().await;
+        tokio::time::resume();
+        finish.notify_one();
+        let mut headers = Vec::new();
+        tokio::time::timeout(Duration::from_secs(3), async {
+            while !headers.ends_with(b"\r\n\r\n") {
+                assert!(headers.len() < 4096);
+                headers.push(stream.read_u8().await.unwrap());
+            }
+        })
+        .await
+        .unwrap();
+        assert!(
+            headers.starts_with(b"HTTP/1.1 204"),
+            "inflight work must finish during the drain grace"
+        );
+        let retired = tokio::time::timeout(Duration::from_secs(3), stream.read_u8()).await;
+        assert!(
+            retired.is_ok(),
+            "the drained connection must close without waiting for another request"
+        );
+        assert!(retired.unwrap().is_err());
+        shutdown.cancel();
+    }
+    #[tokio::test]
+    async fn api_tls_exposes_only_the_certificate_from_the_actual_handshake() {
+        use reliaburger::sesame::{
+            ca, identity_store::NodeIdentity, mtls, renewal::TlsPeerCertificate,
+            types::SerialNumber,
+        };
+        let hierarchy = ca::generate_ca_hierarchy("peer-extension", b"test-ikm").unwrap();
+        let identity = |node: &str, serial| {
+            let (certificate_der, private_key_der, serial) = ca::issue_node_cert(
+                node,
+                SerialNumber(serial),
+                &hierarchy.node.signing_keypair,
+                &hierarchy.node.certificate_params,
+            )
+            .unwrap();
+            NodeIdentity {
+                node_id: node.into(),
+                certificate_der,
+                private_key_der,
+                serial,
+                ca_generation: 0,
+                node_ca_der: hierarchy.node.ca.certificate_der.clone(),
+                root_ca_der: hierarchy.root.ca.certificate_der.clone(),
+                not_before: std::time::SystemTime::UNIX_EPOCH,
+                not_after: std::time::SystemTime::UNIX_EPOCH,
+            }
+        };
+        let server = identity("server", 10);
+        let client = identity("client", 11);
+        let router = axum::Router::new().route(
+            "/peer",
+            axum::routing::get(
+                |peer: Option<axum::Extension<TlsPeerCertificate>>| async move {
+                    peer.map(|peer| {
+                        reliaburger::sesame::cert::serial_from_der(&peer.0.0)
+                            .unwrap()
+                            .0
+                            .to_string()
+                    })
+                    .unwrap_or_else(|| "anonymous".into())
+                },
+            ),
+        );
+        let config = mtls::build_api_server_config(&server, mtls::CrlHandle::default()).unwrap();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("https://{}/peer", listener.local_addr().unwrap());
+        let shutdown = tokio_util::sync::CancellationToken::new();
+        let mut tasks = tokio::task::JoinSet::new();
+        tasks.spawn(serve_api_over_tls(
+            listener,
+            tokio_rustls::TlsAcceptor::from(config),
+            router,
+            shutdown.clone(),
+        ));
+        let http = mtls::build_cluster_http_client(&client, mtls::CrlHandle::default()).unwrap();
+        assert_eq!(
+            http.get(&url)
+                .timeout(std::time::Duration::from_secs(5))
+                .send()
+                .await
+                .unwrap()
+                .text()
+                .await
+                .unwrap(),
+            "11"
+        );
+        let anonymous =
+            mtls::build_ca_pinned_client(server.node_ca_der, server.root_ca_der).unwrap();
+        assert_eq!(
+            anonymous
+                .get(&url)
+                .header("x-client-certificate", "11")
+                .header("x-node-id", "client")
+                .send()
+                .await
+                .unwrap()
+                .text()
+                .await
+                .unwrap(),
+            "anonymous"
+        );
+        shutdown.cancel();
     }
 }

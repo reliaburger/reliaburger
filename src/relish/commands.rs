@@ -174,7 +174,11 @@ fn parse_since(value: &str, now_epoch: u64) -> Result<u64, RelishError> {
         });
     }
 
-    let (number, unit) = value.split_at(value.len().saturating_sub(1));
+    let (number, unit) = value
+        .char_indices()
+        .next_back()
+        .map(|(index, _)| value.split_at(index))
+        .unwrap_or(("", ""));
     let multiplier = match unit {
         "s" => 1,
         "m" => 60,
@@ -191,7 +195,13 @@ fn parse_since(value: &str, now_epoch: u64) -> Result<u64, RelishError> {
         flag: "since".to_string(),
         reason: format!("{value:?} — use epoch seconds or a duration like 30s, 5m, 2h, 1d"),
     })?;
-    Ok(now_epoch.saturating_sub(amount * multiplier))
+    let seconds = amount
+        .checked_mul(multiplier)
+        .ok_or_else(|| RelishError::InvalidFlag {
+            flag: "since".to_string(),
+            reason: format!("duration {value:?} exceeds the supported seconds range"),
+        })?;
+    Ok(now_epoch.saturating_sub(seconds))
 }
 
 /// Parse a `--json-field` value of the form `key=value`.
@@ -296,12 +306,9 @@ pub async fn logs_export(
 }
 
 async fn logs_export_from(source: &Path, dest_str: &str, node_id: &str) -> Result<(), RelishError> {
-    use crate::ketchup::export::{CHECKPOINT_FILENAME, ExportCheckpoint, export_logs};
+    use crate::ketchup::export::{ExportCheckpoint, export_logs};
 
-    // X8: share Bun's one authoritative checkpoint, not a competing Relish
-    // copy. Whichever process exports last records into the same file, so a
-    // manual `relish logs-export` and the agent's export loop can't
-    // double-ship or skip each other's files.
+    // The exporter owns cross-process locking, reload and durable persistence.
     let _entries = tokio::fs::read_dir(source)
         .await
         .map_err(|error| RelishError::ApiError {
@@ -311,18 +318,13 @@ async fn logs_export_from(source: &Path, dest_str: &str, node_id: &str) -> Resul
                 source.display()
             ),
         })?;
-    let checkpoint_path = source.join(CHECKPOINT_FILENAME);
-    let mut checkpoint = ExportCheckpoint::load(&checkpoint_path);
+    let mut checkpoint = ExportCheckpoint::default();
 
     match export_logs(source, dest_str, node_id, &mut checkpoint).await {
         Ok(result) => {
             if result.files_exported == 0 {
                 println!("no new files to export");
             } else {
-                checkpoint.save(&checkpoint_path).map_err(|error| RelishError::ApiError {
-                    status: 0,
-                    body: format!("files exported but checkpoint could not be saved: {error}; a later export may repeat these files"),
-                })?;
                 println!(
                     "exported {} file(s) ({} bytes) to {}/{}",
                     result.files_exported, result.bytes_written, dest_str, node_id,
@@ -656,10 +658,9 @@ pub async fn chaos(action: &str, acknowledged: bool) -> Result<(), RelishError> 
             eprintln!("unknown chaos action: {other}");
             eprintln!();
             eprintln!("available actions:");
-            eprintln!("  council-partition   partition a council minority from the majority");
-            eprintln!("  worker-isolation    isolate a worker from all council members");
+            eprintln!("  use relish test --chaos for guarded recovery scenarios");
             eprintln!("  status              show active fault injections");
-            eprintln!("  heal                remove all fault injections");
+            eprintln!("  mutations and blanket heal are retired");
             Err(RelishError::ApiError {
                 status: 0,
                 body: format!("unknown chaos action: {other}"),
@@ -1029,6 +1030,58 @@ pub async fn deploy(path: &Path, output: OutputFormat, dry_run: bool) -> Result<
             Err(RelishError::AgentUnreachable)
         }
     }
+}
+
+/// Request cooperative cancellation and wait up to 30 seconds for terminal evidence.
+pub async fn cancel_deploy(operation_id: &str, output: OutputFormat) -> Result<(), RelishError> {
+    let client = BunClient::default_local();
+    let operation = tokio::time::timeout(std::time::Duration::from_secs(30), async {
+        let mut operation = client.cancel_deploy(operation_id).await?;
+        while operation.outcome.is_none() {
+            tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+            let snapshot = client.deploy_operations().await?;
+            operation = snapshot.active_deploys.into_iter().chain(snapshot.history)
+                .find(|operation| operation.id.as_str() == operation_id)
+                .ok_or_else(|| RelishError::ApiError { status: 404,
+                    body: format!("operation {operation_id} is no longer retained; cancellation outcome is unknown") })?;
+        }
+        Ok::<_, RelishError>(operation)
+    }).await.map_err(|_| RelishError::ApiError { status: 202,
+        body: format!("cancellation of {operation_id} is still pending; in-flight work retains ownership; query or retry the same ID") })??;
+    match output {
+        OutputFormat::Human => println!(
+            "{}: {:?}: {}",
+            operation.id,
+            operation
+                .outcome
+                .unwrap_or(crate::bun::deploy_operations::DeployOperationOutcome::Unknown),
+            operation.message
+        ),
+        OutputFormat::Json => println!(
+            "{}",
+            serde_json::to_string_pretty(&operation).map_err(RelishError::SerialiseJson)?
+        ),
+        OutputFormat::Yaml => print!(
+            "{}",
+            serde_yaml::to_string(&operation).map_err(RelishError::SerialiseYaml)?
+        ),
+    }
+    if matches!(
+        operation.outcome,
+        Some(
+            crate::bun::deploy_operations::DeployOperationOutcome::Unknown
+                | crate::bun::deploy_operations::DeployOperationOutcome::Failed
+        )
+    ) {
+        return Err(RelishError::ApiError {
+            status: 0,
+            body: format!(
+                "deployment ended with {:?}: {}",
+                operation.outcome, operation.message
+            ),
+        });
+    }
+    Ok(())
 }
 
 /// Show deploy history for an app in a namespace.
@@ -2060,6 +2113,19 @@ mod tests {
         assert_eq!(parse_since("5m", now).unwrap(), now - 300);
         assert_eq!(parse_since("2h", now).unwrap(), now - 7200);
         assert_eq!(parse_since("1d", now).unwrap(), now - 86_400);
+    }
+
+    #[test]
+    fn oversized_or_unicode_since_values_return_errors() {
+        for value in [
+            "18446744073709551615d",
+            "18446744073709551615h",
+            "18446744073709551615m",
+            "é",
+            "5☃",
+        ] {
+            assert!(parse_since(value, 1_750_000_000).is_err(), "{value}");
+        }
     }
 
     #[test]

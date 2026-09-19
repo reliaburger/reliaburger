@@ -222,6 +222,31 @@ For rootless containers, we use `slirp4netns`, the same tool Podman uses. It imp
 
 The `--disable-host-loopback` flag is important: it prevents the container from reaching services on the host's loopback. Without it, a compromised container could probe the host's `localhost`-only services.
 
+#### One userspace network needs one process owner
+
+Starting networking twice for an instance used to overwrite its `slirp4netns`
+handle in a map. The previous helper kept running. Dropping a Tokio `Child`
+doesn't kill its process, and we deliberately need that behaviour during Bun
+replacement. A plain map insertion cannot distinguish a handoff from a leak.
+
+Replacement now holds the async ownership lock while retiring the old helper,
+waiting for exit and installing its successor. Adoption of the same PID and
+start time keeps the existing handle; conflicting metadata is refused. When a
+different surviving helper takes over, retirement preserves its API socket.
+Otherwise the old owner's cleanup could unlink the new owner's socket.
+
+Startup has a stricter lifetime. `PendingSlirp` owns an `Option<Child>` and its
+`Drop` implementation requests termination if the future is cancelled. `take()`
+moves the child out only after socket readiness and host forwarding succeed.
+The published handle can then survive an intentional Bun handoff. This is why
+we don't set `kill_on_drop` on every helper indiscriminately.
+
+Socket checks use asynchronous filesystem calls, and one two-second deadline
+bounds both readiness and the forwarding handshake. Regression tests cancel a
+real helper during startup, stall its forwarding response, replace a failed
+network and adopt the same surviving process repeatedly. They check process
+exit and socket ownership, not just the number of handles in the map.
+
 ### Apple Container: the easy case
 
 Apple Container runs each container in a lightweight VM with its own vmnet interface. The network isolation comes for free. We just need to discover the IP:
@@ -507,18 +532,41 @@ That isn't the same as saying eBPF can never answer DNS. TC and XDP packet hooks
 
 So we run a userspace DNS responder instead. It lives in `src/onion/dns.rs`: a `tokio::select!` loop reading from a UDP socket, plus a TCP listener for large answers. Bun configures containers' `/etc/resolv.conf` to point at the responder, and it handles the rest. For `.internal` names, it looks up the service map and responds. For everything else, it forwards to the upstream resolver.
 
-Names are namespace-qualified: `<app>.<namespace>.internal`. A query for `api.payments.internal` resolves the `api` service in the `payments` namespace, and `api.default.internal` resolves the *other* `api` — each to its own VIP. A bare `<app>.internal` is a convenience: it resolves in the node's configured default namespace, because the userspace responder can't see which container asked (it has a source IP, not a cgroup). Mapping the stripped name to a `ServiceId` is a two-line match:
+Names are namespace-qualified: `<app>.<namespace>.internal`. A query for
+`api.payments.internal` resolves the `api` service in `payments`, and
+`api.default.internal` resolves the other `api`, each to its own VIP.
 
-```rust
-fn service_id_for(stripped: &str, default_namespace: &str) -> ServiceId {
-    match stripped.split_once('.') {
-        Some((app, namespace)) => ServiceId::new(namespace, app),
-        None => ServiceId::new(default_namespace, stripped),
-    }
-}
-```
+A short name needs a caller identity. Using the node's default namespace seems
+convenient until two tenants both run Redis. The responder now looks up the
+packet's source address in a snapshot owned by RuncGrill. Runc publishes an
+address/namespace binding when it creates the isolated network, before starting
+the workload. That includes jobs, init containers and apps without a service
+port. Removing a network withdraws the binding before teardown.
 
-`split_once('.')` returns `Some((before, after))` on the first dot or `None` if there isn't one — exactly the "qualified vs bare" distinction we want, in one call.
+The snapshot travels over a `watch` channel. `send_replace` keeps the latest
+value even before DNS subscribes; a receiver's `borrow` reads one consistent
+snapshot without contending with the runtime's network lock. Duplicate source
+addresses with conflicting namespaces resolve to no identity. Unknown sources
+get `REFUSED` for short names on both UDP and TCP. Host tools can use qualified
+names, and no internal query gets forwarded upstream.
+
+Adoption must restore this ownership too. Bun verifies that the recorded network
+namespace and the live container's namespace have the same filesystem identity,
+then reads the actual IPv4 address from the kernel. It restores the runtime's
+network owner, claims that address in the durable reservation journal, and
+republishes the DNS binding. Guessing the address from a restarted counter would let a new
+container inherit an old container's namespace identity.
+
+Fault lookup uses the same complete `ServiceId`. A fault authorised for
+`payments/redis` cannot affect `default/redis`; overlapping experiments retain
+independent ownership until clear or expiry, as Chapter 8 explains.
+
+Tests send real UDP and TCP queries while changing, removing and conflicting a
+source binding. Two real runc workloads in different namespaces resolve the same short name to
+different VIPs. A privileged adoption test checks the binding before start,
+after Bun replacement and after teardown. The old `dns.default_namespace`
+configuration field is rejected: an operator preference cannot establish which
+workload sent a packet.
 
 The cost is ~50 microseconds per DNS lookup (localhost UDP round trip). That's 10x faster than CoreDNS over the pod network, but it's not zero. Most applications cache DNS results anyway, so this hit happens once per connection lifetime, not per request.
 
@@ -663,6 +711,21 @@ One surprise: returning 0 from a `cgroup/connect4` hook gives `EPERM`, not `ECON
 ### connect4 has a sibling
 
 The name `cgroup/connect4` gives it away: this hook only sees IPv4 `connect()` calls. IPv6 connects go through a separate hook, `cgroup/connect6`, and for a long time we simply didn't attach one. For the VIP rewrite that's fine — VIPs live in `127.128.0.0/16` and are v4 by construction. For the egress policy that later grew inside this same program (Chapter 10), it was a hole you could drive a truck through: any dual-stack workload could bypass its entire allowlist by connecting over IPv6. Phase 12b added `onion_connect6` to the same object file and attaches it right next to connect4. It does no rewriting (there are no v6 VIPs to rewrite), it's pure policy.
+
+Each health tick checks those live hooks and the enforcement map. The result
+drives both workload fencing and the readiness capability published for that
+tick. Previously readiness immediately repeated the same probe, paying for
+another map read and potentially describing a different observation. The
+enforcement method now returns its capability value after handling affected
+workloads; readiness consumes that value directly.
+
+This isn't a cache across ticks or requests. The next tick observes the kernel
+again, and a separate cluster report also gets fresh evidence. Repairing a
+missing enforcement flag still requires a second map read to verify the repair.
+That read proves a change took effect; removing it would weaken the boundary.
+The regression counts observation calls rather than relying on a benchmark's
+timing. A real eBPF test detaches the hooks and requires both workload stop and
+withdrawn readiness capability within the existing four-second bound.
 
 One wrinkle worth knowing about: a dual-stack socket reaching an IPv4 server goes through *connect6* with a "v4-mapped" address, `::ffff:a.b.c.d`. The connect6 hook has to spot that pattern and judge the connection against the IPv4 policy, or the mapped form becomes yet another bypass. The kernel also insists that `user_ip6` is read in 32-bit chunks — the verifier rejects byte-wise loads from that context field.
 
@@ -1033,3 +1096,133 @@ port in the resulting backend, and install a remote route on an agent with no
 local instances. Removing that route without changing any endpoints must remove
 it from the routing table too. A healthy container is only half the story; the
 request still has to reach it.
+
+
+### A finite subnet needs durable ownership
+
+A /23 provides 510 usable addresses. The gateway takes one, so the rootful
+runtime has 509 container slots. Incrementing a `u16` counter does not enforce
+that boundary: it eventually chooses a broadcast address, spills into another
+subnet and wraps onto an occupied slot. Restarting the counter makes matters
+worse.
+
+`NetworkLeases` records each instance's index before any network command runs.
+The private `.network-leases.json` file also identifies its node subnet and
+format. Updates use a unique temporary file, file sync, atomic rename and
+directory sync. Every transaction reloads the journal under a process lock;
+corrupt data, duplicate indices, symlinks and a changed subnet refuse allocation.
+A full pool refuses before creating the instance's bundle. The low-level network
+setup function independently rejects indices outside the declared subnet.
+
+The transaction runs in `spawn_blocking`, which moves filesystem work off the
+async executor. It owns an `OwnedMutexGuard`, so cancelling the waiting future
+does not release that guard while the file write is still running. The OS file
+lock also needs explicit release in `Drop`: a concurrent fork can briefly inherit
+its file descriptor before exec, so closing only our descriptor can leave the
+lock busy. A guard's destructor is a useful place to express that ownership.
+
+Each instance also has a lifecycle mutex. Create, adoption, exit observation
+and teardown cannot race for that instance, while different instances can
+progress concurrently. The lock map stores `Weak` references: unlike `Arc`, a
+`Weak` does not keep the lock alive. `upgrade()` returns `Some(Arc<_>)` only while
+an owner still exists, and unused map entries can be discarded.
+
+Failed or cancelled setup leaves its reservation intact until cleanup confirms
+that the named namespace, host veth and owned host-port forwarding entries have
+disappeared. It inspects the actual nftables map, so a cancellation between
+installing a mapping and publishing its handle cannot hide a stale entry. Cleanup can
+reconstruct this plan from the journal even if Bun died before publishing an
+in-memory network handle. It retains the address on uncertain teardown. A new
+Bun adopts verified live kernel addresses into the same journal; a conflicting
+owner refuses. Operators must retain this journal with the runtime state and
+must not delete it to bypass exhaustion. Cancelled, unadopted plans can consume
+capacity until the runtime explicitly retires their owner; there is no expiry
+that silently reuses a possibly live address.
+
+Tests fill all 509 slots, reload the pool, retire one slot and reuse exactly
+that slot. Concurrent reservations remain distinct. Real rootful tests cancel
+a creation while its registry request is stalled, replace the runtime object,
+and show that the address is unavailable until recovered teardown succeeds.
+They also cover duplicate-create refusal, adoption, failed bundle preparation
+and reuse after namespace removal.
+
+
+### Configuration needs a consumer
+
+Wrapper uses unweighted round-robin across routable backends. Its old public
+`lb_strategy` field offered `LeastConnections`, but neither backend selector read
+it. We remove that field and enum for 0.1.0. A future strategy needs connection
+accounting and selection tests before it earns a setting.
+
+We also remove `WrapperConfig::worker_threads`. Wrapper runs on Bun's existing
+Tokio runtime; it doesn't create a separate four-thread runtime. Keeping an unused
+field would let callers believe they had configured a resource boundary. Neither
+field was part of the node TOML or a serialised routing record, so this changes
+only the unreleased Rust library API. Existing routing and proxy tests still
+exercise the supported behaviour.
+
+
+The helper inventory also removes the unused `run_proxy` convenience wrapper.
+Bun uses `bind_proxy` and `BoundProxy::serve`: binding is a fallible startup step,
+and serving is the owned long-lived task. DNS keeps its standalone
+`run_dns_responder` wrapper because the DNS and eBPF integration tests exercise
+that public entry point. Its documentation now names that role and distinguishes
+it from Bun's readiness-aware binding path.
+
+
+### Give the DNS codec the whole packet
+
+Send a question whose QCLASS is missing its last byte. Our old decoder still
+answered it. It read the name and QTYPE, then assumed the rest of the packet
+was sound. It also trusted header counts and joined labels without preserving
+the difference between a separator and a literal dot inside one label.
+
+The replacement uses Hickory's protocol codec, with its standard-library
+feature and no resolver or DNSSEC engine. The codec checks names, compression
+and record boundaries. We require the decoder to consume the complete packet;
+unclaimed trailing bytes are an error. Onion then admits one normal IN-class
+question, checks the source identity and applies the existing namespace rules.
+Unsupported operations, malformed records and unsupported name forms are
+refused before either an internal answer or upstream forwarding.
+
+`Message::read(&mut decoder).ok()?` deserves a look. `&mut` lends the decoder
+exclusively while the codec advances its cursor. `.ok()` turns a decoding error
+into `None`, and `?` returns that absence to the caller. Here absence means the
+network task drops the malformed request. It never means an empty successful
+answer. This parser doesn't use an `unwrap()` on network data.
+
+The same library encodes responses. That removes our separate walk to find
+the end of a question, which would need its own compression handling. Internal
+answers still have zero TTL, A records resolve to the service VIP, and known
+names queried for AAAA still receive an empty successful response. EDNS0
+queries receive an OPT response advertising our bounded UDP payload size.
+This doesn't implement DNSSEC, general authoritative hosting or TCP recursion.
+
+The wire corpus includes every truncation of a valid query, wrong counts,
+response/opcode misuse, non-IN classes, overlong names, a compression loop,
+unclaimed bytes, missing additional records and a literal dot inside a label.
+A valid request sent immediately afterwards must still succeed. A TCP case
+checks that malformed input closes only that connection. The existing live
+namespace, fault, forwarding and TCP/UDP tests retain their original assertions.
+
+### Port zero reserves one transport at a time
+
+Coverage CI caught a DNS startup failure despite asking the kernel for a free
+port. UDP and TCP have separate port allocators. The UDP socket selected a port
+that an unrelated TCP listener already owned. Binding the TCP half then failed.
+
+When the requested port is zero, the responder now retries that collision up to
+16 times. Each attempt keeps its UDP socket until TCP binds, or drops it before
+trying again. Explicit ports still fail on conflict; Bun cannot silently move a
+configured DNS service elsewhere. The wire tests also hold 64 successful pairs,
+check that both transports stay reserved, and verify that dropping a pair
+releases both sockets.
+
+### A test backend must honour HTTP too
+
+The request-ID regression used a tiny TCP echo server that read once, advertised
+HTTP/1.1 keep-alive and closed after one response. The proxy could reuse that
+connection before noticing its close, so the second assertion sometimes saw an
+empty error response. A full native suite reproduced the failure. The fixture
+now uses axum to parse requests and manage keep-alive, and joins its proxy and
+backend tasks. The production forwarding code hasn't changed.

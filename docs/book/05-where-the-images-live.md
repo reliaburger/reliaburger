@@ -597,3 +597,220 @@ ports. That character separates lower layers in overlayfs mount options. We
 encode it as `%3A` in rootfs directory components while preserving the original
 OCI reference for registry requests. A path regression covers both a pinned
 digest and a registry port; ordinary tag paths keep their existing layout.
+
+### An upload location is not permission to forward credentials
+
+The registry starts an upload by returning a `Location` header. Our catalogue
+client used to accept any absolute URL there, then reuse its authenticated HTTP
+client for PATCH and PUT. A response naming a different server could therefore
+send the administrator's bearer to that server. Disabling automatic redirects
+doesn't fix an explicit request made by our own code.
+
+We now resolve both relative and absolute upload locations with `url::Url`, then
+compare their origins. An origin includes the scheme, host and effective port:
+changing any of those refuses the next request. Credentials embedded in the URL
+and fragments are refused too. Query strings remain valid because registries can
+use them to identify an upload session. POST and PATCH error responses stop the
+upload before any location from that response is used.
+
+The regression runs two HTTP servers. The first supplies a location on the
+second; the second records whether it received an Authorization header. Before
+the fix it did. After the fix, the client reports an origin violation without
+contacting it. Separate cases cover protocol-relative URLs, TLS downgrades,
+changed ports, and valid relative and same-origin absolute locations.
+
+
+### Give a busy registry room to recover
+
+A privileged CI run reached the public registry successfully, then lost its
+pinned BusyBox pull to a `Rate exceeded` response. The other 42 runtime checks
+passed. A laptop making its first pull can hit the same path.
+
+External manifest/config reads and layer downloads retry recognised rate-limit
+and temporary gateway/service errors. They also retry interrupted requests and
+response streams, as described below. Each operation makes at most
+four attempts, with roughly one, two and four seconds between them and a small
+random delay to spread simultaneous nodes. One deadline covers every attempt:
+30 seconds for manifest/config retrieval and 120 seconds per layer. A stalled
+request cannot reset that budget. Authentication failures, missing images,
+malformed responses and digest mismatches still fail.
+
+The retry helper accepts a closure which creates a fresh future for each
+attempt. In Rust, `FnMut() -> F` means a callable that may update captured state
+and returns a value of type `F`; the `Future` bound says that value represents
+asynchronous work. Each layer attempt creates a new byte buffer, so a failed
+transfer's prefix cannot contaminate the next attempt. Only a complete,
+digest-verified layer reaches the atomic cache publication step.
+
+The pinned OCI client exposes structured error codes but discards response
+headers on this path. Our backoff therefore doesn't claim to honour a server's
+`Retry-After` value. Hermetic registry tests exercise transient recovery,
+permanent denial and attempt limits; a stalled-response test advances time
+only after the real HTTP request reaches the fixture. The external registry
+qualification remains a separate check.
+
+
+### Keep failed upload cleanup on the list
+
+An upload times out. The reaper forgets its session, tries to remove the
+partial file, and ignores the filesystem error. Who retries tomorrow? Nobody.
+The next sweep has no record of that file.
+
+Upload sessions now have two explicit states: `Active` and `Retiring`. Expiry,
+a failed request body or a finalisation attempt fences future writers before
+cleanup starts. An existing writer retains its semaphore permit until its own
+operation ends. The reaper selects only retired or expired sessions whose
+writer has exited. It forgets each session after file removal and directory
+sync succeed; errors keep the owner available for another pass.
+
+The reaper visits every selected session, collecting failures instead of
+stopping at the first one. The HTTP test replaces one upload file with a
+directory, which makes deletion fail even when the test runs as root. That
+upload stays fenced while another expired upload disappears. Restore the file
+and the next pass finishes both physical cleanup and ownership retirement.
+The unit regression demonstrates the original loss: the second sweep returns
+nothing before the fix. Upload recovery after process death needs a separate
+startup owner because these session records live in memory.
+
+
+### Recover uploads only after acquiring their directory
+
+Killing Bun destroys its upload-session map but leaves partial files on disk.
+The real restart test proves the gap: an upload accepts a chunk, Bun receives
+SIGKILL, and its replacement serves requests while the partial file remains.
+
+Before starting any registry or replication writer, Bun now acquires an
+exclusive file lock for the configured image store. The kernel releases it
+when the process exits, including an ungraceful exit. A second Bun using that
+same writable store refuses startup; it cannot sweep the first Bun's uploads.
+Self-upgrade closes the old descriptor during `exec`, so the replacement can
+acquire ownership again. The lock file itself remains in place.
+
+The owner reclaims regular temporary files whose names match our generated
+upload IDs, then syncs the upload directory before startup continues. Clients
+must restart interrupted uploads; we don't pretend to recover their lost
+session metadata. Unexpected names, non-regular entries, a redirected upload
+directory or an I/O error refuse startup. Recovery never follows a directory
+symlink to remove someone else's files.
+
+`UploadDirectoryOwner` keeps the open lock file alive. Its `#[must_use]`
+attribute asks the compiler to warn when a caller discards the guard; Bun holds
+it until registry shutdown. The blocking pool handles directory traversal,
+locking and sync operations, keeping those calls off the async executor.
+Tests cover competing owners, replacement, unknown entries, directory symlinks,
+and the actual Bun SIGKILL path. The separate live upgrade suite checks that
+rolling replacement and rollback can reacquire ownership.
+
+
+### A dropped connection has no HTTP status
+
+The rootless runtime CI gate failed while fetching an Alpine configuration blob:
+the connection failed before a complete response arrived. Our retry branch only
+looked for an HTTP status, so this failure escaped the retry policy altogether.
+
+Registry reads now also recognise request, timeout and response-stream errors.
+Reqwest labels interrupted byte streams as decode errors; the OCI client parses
+manifests separately, and ImageStore verifies layer digests. These errors are
+different from a complete malformed manifest or corrupt layer. The same four-attempt limit and original deadline apply.
+Retries preserve authentication and TLS verification and start layer buffers
+from empty.
+
+The local registry fixture sends part of a successful response, then breaks its
+body stream. The failing-first regression repeats that interruption for the
+manifest, configuration and layer paths and verifies the final unpacked bytes.
+A separate case sends complete malformed manifests or corrupt layers and requires immediate refusal;
+existing cases still check denied access, persistent rate limits and a stalled
+response. Passing those fixtures doesn't establish Docker Hub availability,
+so the real cold-image runtime gate remains part of qualification.
+
+
+The configuration-content case exposed a separate integrity gap: this path
+fetched but ignored the configuration bytes without verifying their descriptor
+digest. Inspecting the upstream client also showed that pinned manifest bytes
+need explicit verification, including each link through an image index. C56
+tracks that work; the transport retry change does not close it.
+
+
+### A digest header isn't proof
+
+Ask a registry for `image@sha256:...`. It can reply with different, perfectly
+valid JSON and repeat the requested digest in `Docker-Content-Digest`. Parsing
+that JSON proves nothing about its identity. Our first regression accepted the
+changed configuration; the pull-through regression accepted a changed index.
+Both responses carried plausible headers.
+
+ImageStore and Pickle now use one verified fetch path. It hashes the exact root
+bytes before parsing a pinned reference. If the root is an image index, the
+existing platform resolver selects a descriptor, and we verify the selected
+manifest's raw bytes against that descriptor's digest and size. Finally, we
+check the configuration bytes against the manifest's descriptor. Tag-based pulls
+compute their root digest locally too; a mutable tag itself isn't an immutable
+identity guarantee.
+
+`VerifiedImageManifest` owns the parsed manifest and its original `Vec<u8>`
+bytes. Keeping both avoids serialising JSON again, which can change whitespace
+or field ordering and therefore the digest. Pickle publishes those verified
+bytes directly instead of fetching the manifest a second time. There is no gap
+where metadata from one response can be paired with another response's bytes.
+
+Integrity failures use a terminal OCI error, so they don't enter the transient
+transport retry branch. The complete manifest/index/config fetch stays inside
+the caller's deadline. We still verify downloaded layers before publishing them.
+This proves content identity; it doesn't establish who built the image or make a
+mutable tag trustworthy.
+
+The HTTP fixtures exercise both consumers with changed root manifests, changed
+indices, changed selected manifests, wrong configuration bytes and incorrect
+descriptor sizes. Another case resolves an intact index and checks both the
+unpacked file and Pickle's exact manifest/configuration hashes. Complete corrupt
+configuration responses now join malformed manifests and corrupt layers in the
+no-retry regression. Actual upstream runtime tests remain a separate check of
+registry interoperability.
+
+
+### Valid bytes can still describe an invalid size
+
+A manifest can have the correct digest and still declare a layer size of `-1`.
+Our upstream adapter cast that signed number to `u64`, making it enormous, then
+passed the value to `Vec::with_capacity`. The regression reaches a capacity
+overflow panic before fetching the blob. Another manifest uses three large
+positive sizes whose sum cannot fit the cache's accounting field.
+
+We now validate every layer size and their sum before publishing upstream
+metadata. `u64::try_from` returns an error for a negative value; the old `as`
+cast silently changed its meaning. `checked_add` returns `None` if the sum would
+overflow, which becomes an ordinary pull error. The public blob-fetch method
+also checks that its unsigned descriptor fits OCI's signed size field.
+
+The receive buffer starts with `Vec::new()`, so a descriptor cannot demand an
+up-front allocation. It grows as bytes arrive; this change does not introduce a
+new maximum image size or convert the download path into a streaming disk writer.
+After transfer, the byte length must match the descriptor. Direct pulls make the
+same check for an existing cached blob before reusing it. SHA-256 verification
+remains a separate requirement.
+
+The fixtures sign no content and trust no digest header. They compute valid
+manifest digests over deliberately invalid size metadata, so identity checks
+cannot hide the size defect. Cold and warm cache cases verify the actual layer
+request count, and both direct and pull-through consumers refuse a length
+mismatch.
+
+### Give the cache the same deadline as a direct pull
+
+A node could retry a throttled direct pull successfully, then fail on the same
+response when Pickle fetched it for the cluster. The two consumers shared digest
+verification but only ImageStore used the retry helper. Pickle's freshness HEAD
+and layer fetch also lacked a deadline.
+
+Both now call the same crate-private helper in `grill::oci_pull`. Each HEAD and
+manifest/configuration read gets 30 seconds; each layer gets 120 seconds. Four
+attempts fit inside that original budget, including backoff. Integrity and
+authorisation errors remain terminal. A blob attempt owns a new empty buffer,
+so bytes from an interrupted response cannot prefix the next complete response.
+
+The tests exercise actual HTTP requests through the upstream adapter. They
+count throttled attempts, interrupt a response body, and stall each read type
+before advancing Tokio's clock past its budget. Separate denial and incorrect
+length cases prove that retries don't turn permanent failures into repeated
+downloads. This establishes the cache's read behaviour without depending on
+a public registry's availability.

@@ -4,6 +4,9 @@
 set -euo pipefail
 umask 077
 fail() { printf 'reliaburger: %s\n' "$*" >&2; exit 1; }
+release_base=${RELIABURGER_RELEASE_BASE_URL:-https://github.com/@REPOSITORY@/releases/download/@VERSION@}
+[[ "$release_base" =~ ^https://[^/?#@[:space:]\\]+(/[^?#@[:space:]\\]*)?$ ]] || fail 'release mirror must be an HTTPS URL without credentials, query or fragment'
+release_base=${release_base%/}
 command -v curl >/dev/null || fail 'curl is required'
 case "$(uname -s)-$(uname -m)" in
   Darwin-arm64) platform=macos-aarch64; expected=@MACOS_AARCH64@ ;;
@@ -27,7 +30,7 @@ staging=$(mktemp -d "$bin_dir/.install.XXXXXXXX")
 trap 'rm -rf "$staging"' EXIT
 trap 'exit 130' INT
 trap 'exit 143' TERM HUP
-url="https://github.com/@REPOSITORY@/releases/download/@VERSION@/relish-$platform"
+url="$release_base/relish-$platform"
 curl --fail --silent --show-error --location --proto '=https' --proto-redir '=https' \
   --tlsv1.2 --connect-timeout 15 --max-time 180 --retry 2 "$url" -o "$staging/relish"
 [ "$(checksum "$staging/relish")" = "$expected" ] || fail 'CLI checksum mismatch; existing installation was not changed'
@@ -40,4 +43,8 @@ if [ "${1:-}" = --install-only ]; then
   [ "$#" -eq 0 ] || fail '--install-only takes no further arguments'
   exit 0
 fi
-"$bin_dir/relish" setup --quickstart "$@"
+if [ -n "${RELIABURGER_RELEASE_BASE_URL:-}" ]; then
+  "$bin_dir/relish" setup --quickstart --release-mirror "$release_base" "$@"
+else
+  "$bin_dir/relish" setup --quickstart "$@"
+fi

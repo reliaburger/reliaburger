@@ -212,45 +212,49 @@ The original plan put the fault in the kernel: a `fault_dns_map` that the in-ker
 The fix is to put the fault where the code actually runs. The responder resolves `.internal` names; the fault belongs in that lookup. We give the responder a read-only handle to "which services are currently faulted", and it checks that handle before it answers:
 
 ```rust
-use std::collections::BTreeMap;
-
-/// Which services the Smoker is currently forcing NXDOMAIN for.
 #[derive(Debug, Clone, Default)]
 pub struct DnsFaultState {
-    /// App name → expiry (CLOCK_MONOTONIC nanoseconds). 0 means "no expiry".
-    faulted: BTreeMap<String, u64>,
+    faulted: HashMap<ServiceId, u64>,
 }
 
 impl DnsFaultState {
-    pub fn is_faulted(&self, app: &str, now_ns: u64) -> bool {
-        match self.faulted.get(app) {
-            Some(&expires_ns) => expires_ns == 0 || now_ns < expires_ns,
-            None => false,
-        }
+    pub fn is_faulted(&self, service: &ServiceId, now_ns: u64) -> bool {
+        self.faulted.get(service)
+            .is_some_and(|expires| *expires == 0 || now_ns < *expires)
     }
 }
 ```
 
-`BTreeMap` is Rust's ordered map (a balanced tree, like C++'s `std::map`); we use it rather than the hash-based `HashMap` because the set is tiny and an ordered map serialises and prints deterministically, which is easier to reason about. The `is_faulted` method returns `true` only while a fault is live: an entry whose deadline has already passed is treated as gone even if it's still sitting in the map. That's a belt-and-braces guard, and it's why the fault can't outlive its window even if a message goes missing.
+`ServiceId` carries both namespace and app name. The first userspace version
+used a bare `String`, losing the namespace that API authorisation had just
+checked. A fault against `red/redis` also broke `blue/redis`. The regression
+injects through the agent and sends real DNS packets; the supposedly unaffected
+blue service answered NXDOMAIN before the repair.
 
-How does the responder *get* this state? The same way it gets the service map: a `watch` channel. A `watch` channel in tokio is a single-writer, many-reader broadcast of the *latest* value — readers don't get a history, they get whatever's current, which is exactly right for "the set of faults right now". The agent owns the writer (`watch::Sender<DnsFaultState>`); the responder holds a `watch::Receiver<DnsFaultState>` and reads the newest value on each query with `borrow()`. When a fault is applied, cleared, or expires, the agent rebuilds the set from its fault registry and sends it:
+`HashMap` is enough here: this snapshot is neither serialised nor presented as
+an ordered list. `is_some_and` calls its closure only for a present entry. The
+closure borrows the stored expiry, so `*expires` reads the number behind that
+reference. An expired entry stops affecting answers even before the next agent
+tick removes it.
 
-```rust
-fn publish_dns_faults(&self) {
-    let faults = self
-        .fault_registry
-        .iter()
-        .filter(|rule| matches!(rule.fault_type, FaultType::DnsNxdomain))
-        .map(|rule| (rule.target_service.clone(), rule.expires_at_ns));
-    let _ = self.dns_faults_tx.send(DnsFaultState::from_faults(faults));
-}
-```
+The agent publishes snapshots on a Tokio `watch` channel after apply, clear and
+expiry. Each entry retains the rule's namespace. Missing namespaces and
+instance-only DNS targets are rejected before publication, because a service
+DNS name cannot honour an individual-instance restriction. The API supplies its
+authorised namespace; internal callers must do the same.
 
-The resolver check itself is three lines, sitting right after the source-ACL check and before the service-map lookup:
+Two experiments can fault the same service. The snapshot takes the latest expiry
+across their owners (or no deadline if an owner is explicitly indefinite).
+Clearing one experiment rebuilds that union from the remaining rules. Taking the
+last map insertion would let an earlier expiry erase the effect of a longer
+experiment, depending on iteration order.
+
+After resolving the caller's namespace, the responder checks the complete
+service identity:
 
 ```rust
 let now_ns = crate::smoker::types::monotonic_now_ns();
-if dns_faults.borrow().is_faulted(&service_id.name, now_ns) {
+if dns_faults.borrow().is_faulted(&service_id, now_ns) {
     return build_status_response(query, RCODE_NXDOMAIN);
 }
 ```
@@ -262,7 +266,8 @@ fault": it works wherever the responder runs, so `requires_ebpf()` returns
 `false` for it. Drop and partition need the connect hook. Delay and bandwidth
 need a future TC hook and are rejected on every current node. Second, reversal
 is free: clearing or expiring the DNS fault removes it from the registry, we
-republish the smaller set, and the name resolves again on the very next query.
+republish the remaining owners, and the name resolves again when its last owner
+is gone.
 No kernel map to clean up, because there never should have been one.
 
 ## Network security
@@ -767,3 +772,493 @@ relish dev test onion                         # eBPF fault enforcement (Lima)
 ```
 
 Phase 8 adds 222 tests, bringing the total to 1263.
+
+### Disabling pressure does not cancel cleanup responsibility
+
+After a Bun crash, an owned pressure helper may still exist. Setting both
+pressure limits to zero should prevent new experiments, but it must also stop
+the old one. The startup controller now sweeps an existing owned cgroup subtree
+before checking the enabled policy. With pressure disabled it neither creates a
+new subtree nor enables controllers, and still reports the capability unavailable.
+Rootless Bun cannot reclaim a rootful owner's cgroups and remains unsupported.
+
+The privileged Linux regression places a real child in an owned cgroup, configures
+a fresh controller with zero limits, then checks that the child exits, its cgroup
+disappears and a new pressure request is refused. It failed before the ordering
+change. Both this regression and the CPU/memory pressure acceptance passed in the
+Linux test VM.
+
+
+### Retiring the legacy scenario runner
+
+The early `chaos council-partition` command selected a node in its narrative but
+sent the fault through the entry client. Its cleanup then used blanket heal,
+which could reverse someone else's fault. Retrying that command more carefully
+would not establish ownership.
+
+For 0.1.0, `chaos council-partition`, `chaos worker-isolation` and `chaos heal`
+refuse before sending any request, even with acknowledgement. Use
+`relish test --chaos` for the guarded catalogue described in chapter 15. It
+routes to the selected node and keeps exact fault receipts through cancellation
+and cleanup. Existing faults can be inspected with `relish fault list` and
+reversed by their owned ID; `chaos status` remains read-only. An unreachable-node
+regression proves that the refusal does not depend on a server response.
+
+### Two requests, one quorum budget
+
+Two administrators ask different nodes to fail a voter. Each API sees three
+healthy voters and approves one failure. Both requests look safe on their own.
+Together, they remove the majority. Counting gossip observations cannot reserve
+capacity that another request is about to consume.
+
+Node experiments now acquire one cluster-wide reservation through Raft. For
+0.1.0 we deliberately allow only one node experiment at a time, including drains,
+pressure and the legacy council-partition endpoint. Pressure can starve a voter
+just as effectively as closing its socket. Draining only withdraws scheduling
+readiness, so it doesn't require spare voting capacity, but it still occupies
+the experiment slot. Workload faults keep their separate replica safety checks.
+
+The leader proposes the exact observed membership generation along with the
+unavailable voters. The state machine checks that the membership is still
+current and isn't in joint consensus, checks the quorum budget, then claims the
+slot in log order. `checked_add(1)` returns `Option<u64>`: `Some(next)` when the
+counter has room, `None` on overflow. Exhaustion refuses admission rather than
+wrapping round and reusing an old grant. A snapshot includes both the outstanding
+reservation and the last allocated number. Electing another leader doesn't free
+anything.
+
+A deadline is a cleanup trigger. It isn't proof that the effect stopped. Imagine
+an injection waiting in an agent's command queue while its reservation expires.
+If we simply freed the slot, another fault could begin before that delayed
+injection finally ran. Instead, the reaper asks the target to fence the grant
+and reverse its effect. Only a successful acknowledgement permits the Raft
+release. An unavailable target, failed pressure cleanup or uncertain response
+keeps capacity reserved. Manual reversal and failed activation can release early,
+but they pass through the same acknowledgement path.
+
+The target actor owns a random process identity and a sequence watermark. A
+grant names that process, its exact normalised request and its sequence. Before
+applying an effect, the actor consumes the sequence. A duplicate, changed request
+or grant for an earlier process is refused. Fencing advances the same watermark
+before reversing anything, so activation and cleanup have one serial owner. An
+old fence cannot clear a newer fault. After a restart, pressure cleanup also
+checks the owned cgroups for surviving helper processes before acknowledging;
+a different process identity alone wouldn't prove those helpers had died.
+
+The two coordination endpoints accept only the internal service identity.
+Operators still enter through the normal authenticated fault endpoints, which
+check their role, server policy and acknowledgement. The original request body
+cannot supply its own grant. Coordination has bounded response sizes and request
+deadlines. Losing an HTTP response may make the operation uncertain; it never
+makes another experiment safe to admit.
+
+Tests cover competing reservations, snapshot restoration into a later leader
+term, stale membership, insufficient quorum, sequence exhaustion, duplicate
+activation and delayed activation after a fence. The actor test verifies that
+transport gates reopen before cleanup is acknowledged and that an old fence
+leaves a newer fault running. The three-node acceptance case sends competing
+kills to different APIs, then fails the leader and checks that its successor
+inherits the reservation until reversal is confirmed.
+
+Membership changes share the admission ordering too. Before changing voters or
+learners, the leader commits a no-op and checks for an outstanding reservation.
+The no-op matters when an earlier caller timed out: dropping its Rust future
+doesn't undo a Raft proposal already queued. Once the barrier applies, that prior
+proposal's outcome is visible. A Tokio mutex orders local proposals and membership
+changes; Raft supplies the durable ordering across leader changes. The guard is
+released when it leaves scope. Membership changes resume after confirmed reversal.
+
+`GET /v1/chaos/status` includes the locally replicated reservation's sequence,
+target, fault type and cleanup deadline. A retained slot can therefore be
+inspected even when its target's fault list is unavailable. These fields describe
+ownership, not proof that the target is still running the fault.
+
+
+The reservation helpers return `Box<Response>` on failure. `Box<T>` owns a value
+on the heap while the surrounding `Result` carries its small pointer. Rust 1.98's
+Clippy check caught the large inline HTTP response even though the minimum Rust
+1.97 check passed. Boxing that error keeps the helper's error representation
+small without changing any HTTP status or body.
+
+### Stop the schedule before looking for a process
+
+You apply a backup job scheduled for tonight, then change your mind and stop
+it. There is no process yet. There is still a job to stop.
+
+Bun used to look only for workload instances and return “not found” before it
+consulted the cron registry. We now remove the exact `(name, namespace)`
+registration first, then stop any instances that exist. `HashMap::remove`
+returns `Some(value)` if it removed an entry and `None` otherwise; `is_some()`
+gives us the evidence that a schedule existed, even when the instance list
+is empty. A matching job in another namespace keeps its schedule.
+
+The regression sends Deploy and Stop through the running agent's command
+channel. It uses February 30 as a syntactically valid schedule that never
+fires, so CI's wall clock cannot turn the test into a different case. The old
+code returns `AppNotFound`; the repaired path succeeds and retains only the
+other namespace's registration. This closes pre-first-run retirement. Durable
+job leases remain C34 work; in-flight worker fencing is covered below.
+
+### A completed retry must stay completed
+
+A job fails once, retries, then succeeds. Its restart counter is still one.
+That counter tells us what happened earlier; it does not tell us whether the
+job needs another attempt. Using `restart_count > 0` to select stopped jobs
+made a successful retry run again. An operator's explicit stop had the same
+problem.
+
+Each instance now records whether a failed job is actually waiting for retry.
+A failed exit sets that flag. Starting the retry, observing success, exhausting
+the budget or accepting an explicit stop clears it. The backoff loop selects
+stopped jobs with pending retry intent, leaving their historical restart
+counts intact. This is local runtime state, not a promise that retry history
+survives a node crash; durable job ownership is separate work.
+
+Two tests drive the running agent through its command channel and use a mock
+runtime to report exits. Both first prove that a failure retries. One then
+reports exit zero; the other sends Stop. After several real ticks and the
+retry backoff, the instance must remain stopped with exactly one restart.
+Before the fix, both tests observed a second restart. Cleanup needs this
+property too: stopping a leased job cannot mean “until the next tick”.
+
+### Cron firings own their in-flight work
+
+A cron job used to construct a deployment worker directly. Ordinary apply
+registered an operation first, but cron skipped that step. While the runtime
+was still creating the container, Stop could report success and the worker
+could subsequently finish starting it.
+
+Both paths now use the same admission and worker-completion code. Each cron
+firing appears in the active deployment list, prevents overlapping deploys
+and retains its target until the worker and any rollback finish. Firing the
+job does not rewrite its registered schedule. The existing drain check and
+cooperative cancellation mechanism apply to cron workers too.
+
+A user or lease-cleanup stop refuses while a deployment still owns the target.
+The local HTTP API returns 409 with the operation ID; the caller can wait or
+cancel that operation before retrying. Internal emergency stops after loss of
+egress enforcement retain their immediate fail-closed path. Cluster stop
+still requests desired-state removal; its reconciliation contract is separate
+from this node-local runtime acknowledgement.
+
+The regression holds runtime creation at a barrier. It checks that cron owns
+an active operation, an overlapping deploy refuses and a local HTTP stop
+returns conflict. After releasing creation and observing worker completion,
+the same stop succeeds. No guessed sleep decides whether creation is finished.
+
+
+### Removing a schedule removes future firings
+
+You change a recurring backup into a one-off job by removing `schedule` and
+applying the manifest again. Keeping the old registration would launch the
+previous job specification at its next scheduled time, even though the new
+manifest no longer requests that behaviour.
+
+Registration now reconciles each named job in its namespace: a schedule adds
+or updates its entry, and an absent schedule removes that entry. The cron
+firing path deliberately skips registration when it launches one occurrence,
+so its temporary one-off specification does not remove the recurring job.
+The regression applies never-firing schedules in two namespaces, then removes
+one through the running agent's Deploy command. Only that namespace loses its
+registration.
+
+
+### A signal is not proof of exit
+
+A runtime can accept a kill request while the process is still alive. It can
+also fail to send the signal or fail to inspect the process. The old local
+stop path ignored those distinctions, recorded Stopped and deleted the
+adoption record after its grace period.
+
+Now a local stop bounds signal requests, waits for an observed Stopped state
+and repeats that observation after force-kill. A failed runtime call or an
+unconfirmed exit returns an error. Bun attempts every replica, but retains
+adoption records, workload identity and enforcement until all exits have been
+confirmed. A later request can retry cleanup. This protects the agent's
+contract with the runtime; runtime adapters must themselves report honest
+state, and their crash qualification remains separate.
+
+The Rust timeout returns a nested result: one failure means the deadline
+elapsed, while the inner failure comes from the runtime. `??` propagates both
+layers after we attach context to the timeout. The bounded observation loop
+returns `Result<bool, BunError>`: true means observed exit, false means the
+observation deadline expired, and Err means inspection failed. None of those
+failure paths may be treated as successful cleanup.
+
+The HTTP regressions inject a failed kill, an acknowledged kill without exit,
+an inspection error and a stalled kill. Each must return failure, retain its
+adoption record and remain Stopping. Restoring a confirmed stopped state and
+retrying must succeed and remove the record.
+
+
+### Retire a resource after stopping it
+
+An operator stopping a job still needs its completion history. A lease reaper
+removing a test app needs that app gone from the active ownership inventory.
+Those are different outcomes, even when both first stop the same process.
+
+The internal Retire command reuses the normal deployment-ownership fence and
+confirmed-exit stop path, then releases supervisor entries, host-port ownership
+and cached app specs. Local lease cleanup and removal of a cluster placement
+use Retire. Ordinary Stop keeps its existing status/history behaviour. Failed
+or busy stops preserve the resource so the owner can retry.
+
+The regression creates the same app in two test namespaces, releases one lease
+through the running agent and checks the status inventory. The released app
+must be absent; the other namespace must still have its running instance.
+This covers normal retirement. Durable cleanup across an unfinished deployment
+or a node crash still needs the separate ownership qualifications.
+
+
+### Give cleanup observations their remaining budget
+
+A namespace may be stopping correctly while the agent is too busy to answer a
+status request. The cleanup probe used to return Unknown on that first failed
+observation, even with most of its separate cleanup deadline still available.
+
+After the server accepts lease release, the probe now retries failed runtime
+observations within the original deadline. Only an observed empty namespace
+confirms cleanup. An uninterrupted failure still returns Unknown when the
+budget expires, with the last observation error attached. No new deadline is
+started on a retry.
+
+One HTTP regression returns 503 for the first status request and an empty
+inventory for the next. The probe must confirm cleanup after the second
+observation. Another keeps returning 503; that result must remain Unknown and
+finish within its bounded budget.
+
+
+### An inspection error is not an exit
+
+The agent now waits for runtime exit before confirming a stop. That only helps
+if the runtime tells the truth. ProcessGrill used to turn a failed child-status
+read into `Stopped`; its forced-stop path also discarded signal and wait errors.
+The runc adapter made the same status-read mistake. An unobservable process is
+not evidence that cleanup finished.
+
+Both adapters now preserve inspection errors. ProcessGrill propagates stop
+errors, bounds the forced-exit wait and reports an adopted process as stopping
+until a later observation establishes its exit. The shared adopted-process
+poller returns a `Result` rather than mapping permission and inspection failures
+to “gone”. Rootless helper shutdown propagates that uncertainty too.
+
+There was another ownership hole: stop, kill and drop could signal an adopted
+PID without rechecking its recorded start time. The explicit operations now
+refuse an unverified identity; drop leaves it alone. Tests model a stale record
+without waiting for an actual PID reuse, then confirm the unrelated process
+survives. Separate tests consume a child's kernel wait result outside the
+runtime and require inspection to fail while ownership remains recorded.
+
+These checks don't make a start-time comparison and a later PID signal atomic.
+Nor do they prove that a runc launcher’s exit means every container resource is
+gone. Kernel-backed process ownership, process-tree exit and complete runc
+cleanup remain part of the release recovery gate.
+
+
+### Keep the runc launcher until the workload exits
+
+`runc kill` can exit unsuccessfully. The adapter previously ignored both that
+status and command-launch errors, then killed its own `runc run` process and
+reported Stopped. That destroyed the process we were using to observe the
+workload's exit.
+
+Stop and force-stop now retain the CLI failure. After a successful force signal,
+the adapter waits for the foreground owner to exit instead of killing it.
+A successful signal followed by a live launcher is an error after a bounded
+wait. Ownership stays recorded. Naturally completed workloads remain safe to
+stop again: an observed exited launcher and absent OCI state permit idempotent
+cleanup, including recovery of a prepared network reservation.
+
+The tests give the adapter a private executable, without changing the process's
+PATH. One returns a signal failure; another acknowledges a signal without
+ending the launcher. Both must preserve that launcher and refuse completion.
+Real rootful recovery and container tests check the normal path separately.
+Complete host-resource teardown still needs its own error and cancellation
+proof before the release gate can close.
+
+The real adoption test found a second race: rootful `start` returned as soon as
+it spawned the CLI, before runc had created its OCI state. An immediate kill
+then correctly refused “container does not exist”. Startup now waits, within
+five seconds, for a running init PID or an already completed rootful launcher.
+Only the running observation publishes Running. Short batch jobs can finish
+between polls, so they retain their actual exit status instead of requiring an
+observation of a state that has already passed. The acceptance test runs both
+`exit 0` and `exit 7`, checks their distinct results, and retires each workload.
+Rootless startup still requires a live PID to attach its userspace network.
+
+### Cleanup is a retryable operation
+
+A container exits, but its root filesystem is still busy. Can we release its
+address and tell the test runner that cleanup succeeded? No. A lazy unmount
+hides a mount from the host's directory tree while existing users retain it.
+That isn't evidence that the resource has gone.
+
+Runc cleanup now returns a result. It confirms OCI state removal and launcher
+exit, stops the userspace network owner, requires a normal rootfs unmount, and
+removes forwarding and the network namespace before releasing the address
+reservation. A failure keeps the instance in Stopping and returns the reason.
+The next observation retries cleanup. Stopped is published only after these
+steps succeed; asking for an exit code cannot bypass this requirement.
+
+The userspace network handle also stays in its map while shutdown runs. The
+shutdown method takes `&mut self`, a mutable borrow, so an error or cancelled
+future doesn't consume the handle we need for another attempt. We remove it
+only after success. This matters in Rust: moving a handle out of the map before
+an `.await` gives the future ownership, and dropping that future then drops the
+handle too. Cancellation isn't an error return that the caller can catch.
+
+Controlled deletion failures exercise repeated observation and eventual
+recovery. A real overlay test holds an open directory on the mount, requires
+cleanup to refuse, then closes it and retries. The address and runtime record
+must remain owned throughout. These checks don't establish atomic process
+identity or close the crash window before the initial adoption record is
+persisted; those remain separate release work.
+
+### Collect a short job's exit before signalling it
+
+A cron job can finish between the agent publishing its instance and the test
+client requesting cleanup. On macOS, signalling the process group of an exited,
+unreaped child returns EPERM. We reproduced this in the actual job catalogue:
+all three cases passed their assertions, but cron cleanup failed. Twelve direct
+kernel probes produced the same error.
+
+`ProcessGrill` now calls `Child::try_wait()` before deciding whether stop or kill
+needs to send a signal. If the child has finished, it records the actual exit
+code and reports Stopped. If it is still running, normal signalling proceeds.
+Inspection errors and live-process signal errors still propagate. The state
+query uses the same helper, so these three paths agree about observed exit.
+
+The regression waits for exit without reaping the child, then invokes the
+runtime's public stop or kill method. `waitid` with `WNOWAIT` leaves the exit
+status available for the owner; `WNOHANG` makes that observation non-blocking.
+The fixture checks both exit 0 and exit 7. Calling the ordinary state method
+before stop would have reaped the child and hidden the bug.
+
+The test needs a small FFI call on macOS, where our `nix` version doesn't expose
+`waitid`. `MaybeUninit<siginfo_t>` reserves a buffer of the correct size without
+pretending it already contains a Rust value. We zero its bytes and only call
+`assume_init()` after the kernel reports success. The `unsafe` blocks state the
+buffer and process-ownership conditions that make those operations valid.
+Production code uses the safe `Child` interface.
+
+This repair establishes exit of the owned child. Complete descendant ownership
+and atomic identity checks remain separate release work; a child exit by itself
+doesn't prove that every process it ever started has disappeared.
+
+### A restart must finish retiring its predecessor
+
+A failed health check moves an instance into Pending for a retry. That says
+what the supervisor intends to do; it doesn't prove the old process has gone.
+The restart driver used to discard the result of `kill()` and immediately
+recreate the same runtime ID. A permission error or an acknowledged signal
+without an exit could therefore overwrite the runtime's ownership evidence.
+A stalled kill blocked the agent loop indefinitely.
+
+Retries now share the force-kill and exit-observation path used by explicit
+stops. The signal request and subsequent observation each have a two-second
+bound. Any error leaves the retry Pending, with its port, adoption record and
+restart count intact. The next tick can retry cleanup. Only confirmed exit
+allows create and start to run again.
+
+Four regressions inject a rejected kill, an ineffective kill, an inspection
+error and a stalled kill. Each fails against the old driver. After the repair,
+each keeps ownership and completes the same pending retry once the fault is
+removed. This preserves the retry count in memory; persisting job retry budgets
+across a Bun restart is separate work.
+
+### Remember the schedule before promising to run it
+
+You register a nightly backup, restart Bun before midnight, and expect the
+backup still to exist. An in-memory cron map couldn't honour that expectation.
+We now checkpoint the complete node-local schedule inventory before acknowledging
+a registration or stop. The same checkpoint records the claimed UTC minute
+before launching a due occurrence. Startup validates it before serving the API.
+
+For 0.1.0 we deliberately skip missed or uncertain firings. If Bun dies after
+recording a claim but before launching the process, that occurrence can be
+skipped. Restart won't launch it again merely because the current minute still
+matches. Job retries are a separate policy, so this isn't a promise that an
+application's side effects happen exactly once. A clock moving backwards also
+cannot replay an already claimed minute. Changing a schedule retains its most
+recent claim; stopping it explicitly retires that registration.
+
+The checkpoint stores job specifications and minute stamps, not the cron
+parser's private representation. On startup we validate the specifications,
+parse their expressions and reject duplicate or mismatched identities, corrupt
+JSON and unknown schemas. The file is private, replaced atomically and synced
+with its directory. Blocking filesystem work runs on `spawn_blocking`.
+
+Cancellation needs care here. Dropping the future waiting for a blocking write
+doesn't stop the writer. Before awaiting it, Bun fences cron work and keeps
+both the previous and proposed owners reachable. Only a completed durable write
+lets it replace the in-memory inventory and clear that fence. On error, restart
+must reload the checkpoint; neither an uncertain new registration nor an
+uncertain deletion may be mistaken for an absent job. Unrelated app stops can
+still proceed.
+
+A due occurrence also waits for an existing deployment operation for that name
+to finish before claiming its minute. Otherwise the first health tick can race
+the registration worker, record the occurrence, then have its own launch
+refused as busy. Our blocked-runtime fixture caught that ordering problem.
+
+Tests replace the agent before a schedule's first run, keep namespace-specific
+retirement durable, reject failed writes and corrupt state, and interrupt a
+firing after its checkpoint but before runtime creation finishes. An actual
+Bun/Relish fixture kills Bun and verifies that acknowledged registrations and
+stops survive. These changes advance durable state to generation 7; protocol 6
+and test-lease schema 3 remain unchanged.
+
+### A failed restart is still an owned operation
+
+Suppose a process crashes. Bun cleans up its old runtime, prepares a replacement,
+and asks the runtime to start it. The executable has disappeared. What happens
+next? Previously, the instance stayed in `Starting` forever. A failed create
+left it in `Preparing` instead. Neither state participated in retry selection.
+
+The failed call can also have changed the runtime before returning its error.
+We therefore move these attempts to `Stopping` and retain their ownership. The
+next tick must confirm runtime cleanup before moving to `Stopped`. Only then
+can the ordinary restart policy spend another attempt and move to `Pending`.
+Cleanup failures stay in `Stopping`; they do not authorise another create.
+
+A `retry_pending: bool` field distinguishes failure from an operator's stop or
+a job's successful completion. It applies to apps as well as jobs: an app that
+crashes during its backoff must still be eligible when that delay expires.
+Stopping explicitly clears this flag and moves a Pending attempt towards
+confirmed shutdown, so its non-zero restart count cannot resurrect it. A failed startup spends its existing
+attempt; the next attempt increments the counter through the same supervisor
+method used for runtime crashes. Jobs keep their finite limit.
+
+The regression tests inject create and start failures, withhold successful
+cleanup, then clear the faults. They check state, retained port, call ordering,
+backoff, recovery and exhausted job budgets. A real ProcessGrill test removes
+an executable between launches and restores it for a later attempt. It then
+crashes the recovered process during backoff and checks that retry eligibility
+survives. This proves recovery during one Bun lifetime; durable job execution
+intent and retry budgets across Bun replacement are a separate requirement.
+
+### Read the helper's complaint before its pipe fills
+
+A pressure helper can fail before it prints `ready`. Its stderr explains why,
+but waiting for readiness before reading stderr puts those two operations in
+the wrong order. A sufficiently long diagnostic fills the pipe. The child then
+blocks writing it and never reaches the readiness message.
+
+The controller now drains stderr while waiting for readiness. It retains the
+first 8 KiB, marks longer output as truncated and keeps draining the remainder
+without growing the buffer. Read errors remain separate evidence. Readiness
+itself is limited to 64 bytes, so a broken helper cannot allocate an unbounded
+line in its parent. On failure we kill and reap the helper, briefly allow the
+drain to reach EOF, then report the prefix already captured. A timeout no
+longer discards a useful partial message.
+
+The drain lives in a Tokio `JoinSet` owned by the pressure handle. Dropping the
+handle aborts the drain, including when an inherited pipe never closes. A
+`watch` channel publishes the latest bounded diagnostic; `send_replace` keeps
+that value available even after the writer finishes. This avoids detaching a
+background task or making cleanup depend on a descendant closing a pipe.
+
+A privileged fixture writes 256 KiB before reporting ready. Another writes a
+short error and stays alive; a third fills stderr and never reports ready.
+They check successful startup, retained failure text, explicit truncation,
+bounded completion and an empty cgroup inventory after cleanup.

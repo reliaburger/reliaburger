@@ -18,6 +18,7 @@ use tokio::sync::{mpsc, watch};
 use tokio_util::sync::CancellationToken;
 
 use crate::bun::agent::{AgentCommand, ApplyEvent};
+use crate::cluster::applied::{AppliedMap, AssignmentState};
 use crate::config::app::AppSpec;
 use crate::config::{Config, Replicas};
 use crate::council::node::CouncilNode;
@@ -31,6 +32,7 @@ use crate::reporting::aggregator::AggregatedState;
 /// How often the leader re-evaluates scheduling and nodes poll their
 /// assignments.
 const RECONCILE_INTERVAL: Duration = Duration::from_secs(2);
+const RECONCILE_IO_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// One app assigned to a node, as served by `/v1/placements/{node}`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -88,10 +90,11 @@ pub fn spawn_leader_scheduler(
     dns_required: bool,
     reconstruction_config: crate::config::node::ReconstructionSection,
     shutdown: CancellationToken,
-) {
+) -> super::capacity::CapacityAdmission {
     use crate::reconstruction::controller::ReconstructionController;
     use crate::reconstruction::types::ReconstructionPhase;
 
+    let (admission, mut capacity_requests) = super::capacity::admission_channel();
     tokio::spawn(async move {
         let mut reconstruction = ReconstructionController::new(reconstruction_config);
         let mut was_leader = false;
@@ -101,10 +104,11 @@ pub fn spawn_leader_scheduler(
         let mut last_published: Option<crate::onion::catalog::EndpointCatalog> = None;
         let mut tick = tokio::time::interval(RECONCILE_INTERVAL);
         loop {
-            tokio::select! {
+            let capacity_request = tokio::select! {
                 _ = shutdown.cancelled() => break,
-                _ = tick.tick() => {}
-            }
+                _ = tick.tick() => None,
+                Some(request) = capacity_requests.recv() => Some(request),
+            };
 
             let is_leader = council.is_leader().await;
             // Leadership edges drive the reconstruction state machine.
@@ -200,6 +204,52 @@ pub fn spawn_leader_scheduler(
                 dns_required,
             );
 
+            if let Some(request) = capacity_request {
+                use super::capacity::CapacityAdmissionError;
+                use crate::meat::scheduler::{ScheduleError, Scheduler};
+
+                let ready = reports.stale_nodes.is_empty()
+                    && members
+                        .iter()
+                        .all(|member| member.state == NodeState::Alive)
+                    && cache.node_count() == alive.len()
+                    && cache.nodes().all(|node| {
+                        node.ready
+                            && (!dns_required || node.capabilities.dns.can_resolve_internal())
+                    });
+                let result = if !ready {
+                    Err(CapacityAdmissionError::Unavailable(
+                        "every member needs fresh, ready placement evidence".into(),
+                    ))
+                } else if desired.apps.contains_key(&request.app_id) {
+                    Err(CapacityAdmissionError::Rejected(
+                        ScheduleError::InvalidSpec {
+                            reason: "capacity admission requires a new app".into(),
+                        },
+                    ))
+                } else if let Err(error) = quotas.try_admit(
+                    &request.app_id.namespace,
+                    &scheduler_resources(&request.spec),
+                    1,
+                    true,
+                ) {
+                    Err(CapacityAdmissionError::Rejected(
+                        ScheduleError::QuotaExceeded {
+                            namespace: request.app_id.namespace.clone(),
+                            detail: error.to_string(),
+                        },
+                    ))
+                } else {
+                    Scheduler::new(cache)
+                        .with_dns_required(dns_required)
+                        .schedule_app(&request.app_id, &request.spec)
+                        .map(|_| ())
+                        .map_err(CapacityAdmissionError::Rejected)
+                };
+                let _ = request.response.send(result);
+                continue;
+            }
+
             for decision in decisions {
                 // Revalidate against the LATEST membership before the async
                 // Raft write: a node that died between planning and commit
@@ -235,6 +285,7 @@ pub fn spawn_leader_scheduler(
             }
         }
     });
+    admission
 }
 
 /// Plan placements for one scheduling tick against a single mutable
@@ -444,11 +495,9 @@ fn effective_replicas(spec: &AppSpec, override_replicas: Option<u32>, alive_coun
 /// `AutoscaleOverride` to Raft when a scale is warranted. The scheduler
 /// then re-places at the new replica count.
 ///
-/// The library's `run_autoscale_loop` takes a *synchronous*
-/// `app_provider` closure, which can't read async Raft desired state or
-/// the rollup store; this task drives the same pure functions
-/// (`AutoscaleConfig::from_spec`, `evaluate`, `AutoscaleTracker`)
-/// directly instead.
+/// This task reads async Raft state and metrics, then drives the pure
+/// `AutoscaleConfig::from_spec`, `evaluate` and `AutoscaleTracker` functions.
+/// Tracker changes follow confirmed Raft writes, so refusal can be retried.
 pub fn spawn_autoscaler(
     council: Arc<CouncilNode>,
     rollup_store: Arc<tokio::sync::RwLock<crate::mayo::rollup_store::RollupStore>>,
@@ -717,19 +766,25 @@ fn build_cluster_cache(
     cache
 }
 
-/// Discard checkpoint entries whose expected instances did not survive restart.
-/// Retains adopted active workloads so they aren't needlessly redeployed.
+/// Recheck convergence after restart without forgetting owned resources.
+/// Missing or incomplete runtime inventory returns an assignment to Pending.
 pub fn retain_live_assignments(
-    applied: &mut crate::cluster::applied::AppliedMap,
+    applied: &mut AppliedMap,
     statuses: &[crate::bun::agent::InstanceStatus],
 ) {
-    applied.retain(|(name, namespace), fingerprint| {
-        let Ok(spec) = serde_json::from_str::<AppSpec>(fingerprint) else {
-            return false;
+    for ((name, namespace), state) in applied {
+        let AssignmentState::Applied { fingerprint } = state else {
+            continue;
         };
-        let Replicas::Fixed(expected) = spec.replicas else {
-            return false;
-        };
+        let expected = serde_json::from_str::<AppSpec>(fingerprint)
+            .ok()
+            .and_then(|spec| {
+                if let Replicas::Fixed(count) = spec.replicas {
+                    Some(count)
+                } else {
+                    None
+                }
+            });
         let active = statuses
             .iter()
             .filter(|instance| {
@@ -747,8 +802,22 @@ pub fn retain_live_assignments(
                     )
             })
             .count();
-        active == expected as usize
-    });
+        if expected.is_none_or(|expected| active != expected as usize) {
+            *state = AssignmentState::Pending;
+        }
+    }
+}
+
+async fn persist_placements(
+    path: Option<&std::path::Path>,
+    owned: &AppliedMap,
+) -> std::io::Result<()> {
+    let Some(path) = path else { return Ok(()) };
+    let path = path.to_path_buf();
+    let owned = owned.clone();
+    tokio::task::spawn_blocking(move || crate::cluster::applied::save(&path, &owned))
+        .await
+        .map_err(std::io::Error::other)?
 }
 
 /// Spawn the per-node placement reconciler.
@@ -771,24 +840,34 @@ pub fn spawn_placement_reconciler(
     cmd_tx: mpsc::Sender<AgentCommand>,
     shutdown: CancellationToken,
     cluster_http: crate::cluster::ClusterHttp,
-    // Where to persist the durable applied-state checkpoint (DEP3). `None`
-    // disables persistence (the reconciler is still correct, it just
-    // re-derives applied-state from scratch on every restart).
+    // Production nodes persist ownership before runtime mutation. `None` is
+    // for ephemeral embedded tests and cannot provide restart recovery.
     state_dir: Option<std::path::PathBuf>,
-) {
+) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
         let client = cluster_http.client().clone();
         let mut tick = tokio::time::interval(RECONCILE_INTERVAL);
         let checkpoint_path = state_dir
             .as_deref()
             .map(crate::cluster::applied::checkpoint_path);
-        // (name, namespace) → serialized assignment we last SUCCESSFULLY
-        // applied. Seeded from the durable checkpoint so a restart doesn't
-        // redeploy work that already converged (DEP3).
-        let mut applied: BTreeMap<(String, String), String> = checkpoint_path
-            .as_deref()
-            .map(crate::cluster::applied::load)
-            .unwrap_or_default();
+        let mut applied = loop {
+            let loaded = if let Some(path) = checkpoint_path.clone() {
+                tokio::task::spawn_blocking(move || crate::cluster::applied::load(&path))
+                    .await
+                    .map_err(std::io::Error::other)
+                    .and_then(|result| result)
+            } else {
+                Ok(AppliedMap::new())
+            };
+            match loaded {
+                Ok(owned) => break owned,
+                Err(error) => eprintln!("orchestrator: cannot load placement ownership: {error}"),
+            }
+            tokio::select! {
+                _ = shutdown.cancelled() => return,
+                _ = tokio::time::sleep(RECONCILE_INTERVAL) => {}
+            }
+        };
         let mut checkpoint_verified = false;
 
         loop {
@@ -814,8 +893,9 @@ pub fn spawn_placement_reconciler(
                     continue;
                 };
                 retain_live_assignments(&mut applied, &statuses);
-                if let Some(path) = &checkpoint_path {
-                    crate::cluster::applied::save(path, &applied);
+                if let Err(error) = persist_placements(checkpoint_path.as_deref(), &applied).await {
+                    eprintln!("orchestrator: cannot persist recovered ownership: {error}");
+                    continue;
                 }
                 checkpoint_verified = true;
             }
@@ -841,33 +921,40 @@ pub fn spawn_placement_reconciler(
             if let Some(token) = &service_token {
                 request = request.bearer_auth(token);
             }
-            // Bound the poll explicitly (O8): a leader that completes the TCP
-            // connect then stalls would otherwise block this reconciler tick
-            // indefinitely on TCP defaults, so the node stops converging while
-            // still alive. Treat a timeout like any other unreachable-leader
-            // error and retry next tick.
-            let sent = tokio::time::timeout(Duration::from_secs(10), request.send()).await;
-            let assignments: NodeAssignments = match sent {
-                Ok(Ok(response)) if response.status().is_success() => match response.json().await {
-                    Ok(a) => a,
-                    Err(_) => continue,
-                },
-                _ => continue, // leader unreachable / timed out; retry next tick
+            // The deadline covers both headers and body. An incomplete body
+            // must not prevent the next placement poll or graceful shutdown.
+            let poll = async {
+                request
+                    .send()
+                    .await?
+                    .error_for_status()?
+                    .json::<NodeAssignments>()
+                    .await
+            };
+            let polled = tokio::select! {
+                _ = shutdown.cancelled() => return,
+                result = tokio::time::timeout(RECONCILE_IO_TIMEOUT, poll) => result,
+            };
+            let assignments = match polled {
+                Ok(Ok(assignments)) => assignments,
+                _ => continue,
             };
 
-            // Install the replicated endpoint catalogue (12b.4). The agent
-            // ignores an unchanged one, so pushing every tick is cheap. Do
-            // this before converging placements: resolution shouldn't wait on
-            // a deploy that this tick happens to trigger.
-            let _ = cmd_tx
-                .send(AgentCommand::SyncClusterCatalog {
-                    catalog: Box::new(assignments.endpoint_catalog.clone()),
-                    ingress: assignments.ingress.clone(),
-                })
-                .await;
+            // Install routing before deployment, but do not wait indefinitely
+            // for a blocked agent queue. The next tick refreshes this snapshot.
+            let sync_catalogue = cmd_tx.send(AgentCommand::SyncClusterCatalog {
+                catalog: Box::new(assignments.endpoint_catalog.clone()),
+                ingress: assignments.ingress.clone(),
+            });
+            let synchronised = tokio::select! {
+                _ = shutdown.cancelled() => return,
+                result = tokio::time::timeout(RECONCILE_IO_TIMEOUT, sync_catalogue) => result,
+            };
+            if !matches!(synchronised, Ok(Ok(()))) {
+                continue;
+            }
 
             let mut seen: HashSet<(String, String)> = HashSet::new();
-            let mut changed = false;
             for assignment in &assignments.apps {
                 let key = (assignment.name.clone(), assignment.namespace.clone());
                 seen.insert(key.clone());
@@ -876,32 +963,46 @@ pub fn spawn_placement_reconciler(
                 // The local agent runs exactly this node's share.
                 spec.replicas = Replicas::Fixed(assignment.replicas);
                 let fingerprint = serde_json::to_string(&spec).unwrap_or_default();
-                if applied.get(&key) == Some(&fingerprint) {
+                if matches!(applied.get(&key), Some(AssignmentState::Applied { fingerprint: previous }) if previous == &fingerprint)
+                {
                     continue; // already converged; don't redeploy
                 }
 
                 let mut config = Config::default();
                 config.app.insert(assignment.name.clone(), spec);
 
-                // Drive the deploy and wait for its TERMINAL outcome
-                // (DEP3): the placement is applied only when the deploy
-                // reports `Complete`, not when the command is queued. A
-                // failed deploy leaves `applied` untouched, so the next
-                // tick retries it.
-                let (event_tx, event_rx) = mpsc::channel::<ApplyEvent>(32);
-                if cmd_tx
-                    .send(AgentCommand::Deploy {
-                        config,
-                        events: event_tx,
-                    })
-                    .await
-                    .is_err()
-                {
-                    continue; // agent gone; retry next tick
+                // The durable intent survives a crash after the agent accepts
+                // work but before we can observe its terminal outcome.
+                let mut next = applied.clone();
+                next.insert(key.clone(), AssignmentState::Pending);
+                if let Err(error) = persist_placements(checkpoint_path.as_deref(), &next).await {
+                    eprintln!("orchestrator: cannot record placement ownership: {error}");
+                    continue;
                 }
-                if deploy_succeeded(event_rx, DEPLOY_TERMINAL_TIMEOUT).await {
-                    applied.insert(key, fingerprint);
-                    changed = true;
+                applied = next;
+                let (event_tx, event_rx) = mpsc::channel::<ApplyEvent>(32);
+                let deploy = cmd_tx.send(AgentCommand::Deploy {
+                    config,
+                    events: event_tx,
+                });
+                let queued = tokio::select! {
+                    _ = shutdown.cancelled() => return,
+                    result = tokio::time::timeout(RECONCILE_IO_TIMEOUT, deploy) => result,
+                };
+                if !matches!(queued, Ok(Ok(()))) {
+                    continue;
+                }
+                let succeeded = tokio::select! {
+                    _ = shutdown.cancelled() => return,
+                    result = deploy_succeeded(event_rx, DEPLOY_TERMINAL_TIMEOUT) => result,
+                };
+                if succeeded {
+                    let mut next = applied.clone();
+                    next.insert(key, AssignmentState::Applied { fingerprint });
+                    match persist_placements(checkpoint_path.as_deref(), &next).await {
+                        Ok(()) => applied = next,
+                        Err(error) => eprintln!("orchestrator: cannot record convergence: {error}"),
+                    }
                 }
             }
 
@@ -914,46 +1015,55 @@ pub fn spawn_placement_reconciler(
                 .collect();
             for (name, namespace) in removed {
                 let (response_tx, response_rx) = tokio::sync::oneshot::channel();
-                if cmd_tx
-                    .send(AgentCommand::Stop {
-                        app_name: name.clone(),
-                        namespace: namespace.clone(),
-                        response: response_tx,
-                    })
-                    .await
-                    .is_err()
-                {
-                    // Agent gone; leave the key in `applied` so a later tick
-                    // retries the stop rather than orphaning the instance (DEP3).
-                    continue;
-                }
-                // Only forget the instance once the stop actually succeeded.
-                // Removing it unconditionally (as before) meant a failed or
-                // dropped stop was never retried — the instance kept running
-                // while the reconciler believed it was gone.
-                match response_rx.await {
-                    Ok(Ok(())) => {
-                        applied.remove(&(name, namespace));
-                        changed = true;
+                // Queueing and acknowledgement share one deadline. An unknown
+                // outcome keeps the journal entry and lets other owners progress.
+                let retire = async {
+                    cmd_tx
+                        .send(AgentCommand::Retire {
+                            app_name: name.clone(),
+                            namespace: namespace.clone(),
+                            response: response_tx,
+                        })
+                        .await
+                        .map_err(|_| "agent command channel closed")?;
+                    response_rx
+                        .await
+                        .map_err(|_| "agent dropped retirement response")
+                };
+                let retired = tokio::select! {
+                    _ = shutdown.cancelled() => return,
+                    result = tokio::time::timeout(RECONCILE_IO_TIMEOUT, retire) => result,
+                };
+                match retired {
+                    Ok(Ok(Ok(()))) => {
+                        let mut next = applied.clone();
+                        next.remove(&(name, namespace));
+                        match persist_placements(checkpoint_path.as_deref(), &next).await {
+                            Ok(()) => applied = next,
+                            Err(error) => {
+                                eprintln!("orchestrator: cannot record retirement: {error}")
+                            }
+                        }
                     }
-                    Ok(Err(e)) => {
+                    Ok(Ok(Err(e))) => {
                         eprintln!(
                             "orchestrator: stop of {name}/{namespace} failed, will retry: {e}"
                         );
                     }
+                    Ok(Err(error)) => {
+                        eprintln!(
+                            "orchestrator: retirement of {name}/{namespace}: {error}; will retry"
+                        );
+                    }
                     Err(_) => {
-                        eprintln!("orchestrator: stop of {name}/{namespace} dropped, will retry");
+                        eprintln!(
+                            "orchestrator: retirement of {name}/{namespace} exceeded ten seconds; ownership retained"
+                        );
                     }
                 }
             }
-
-            // Persist the durable checkpoint whenever the applied set moved,
-            // so a restart resumes from the converged state (DEP3).
-            if changed && let Some(path) = &checkpoint_path {
-                crate::cluster::applied::save(path, &applied);
-            }
         }
-    });
+    })
 }
 
 /// How long the reconciler waits for a deploy's terminal event before giving
@@ -1001,15 +1111,370 @@ mod tests {
     use std::collections::HashMap;
     use std::time::{Instant, SystemTime};
 
+    fn reconciler_for_deadline_test(
+        address: std::net::SocketAddr,
+        directory: &std::path::Path,
+        commands: mpsc::Sender<AgentCommand>,
+    ) -> tokio::task::JoinHandle<()> {
+        let (_, metrics_rx) = watch::channel(openraft::RaftMetrics::new_initial(1));
+        let (_, directory_rx) = watch::channel(crate::mustard::directory::NodeDirectory {
+            leader: Some(crate::mustard::message::LeaderHint {
+                node_id: NodeId::new("leader"),
+                term: 1,
+                api_address: address,
+                reporting_address: address,
+            }),
+            ..Default::default()
+        });
+        spawn_placement_reconciler(
+            "worker".into(),
+            metrics_rx,
+            directory_rx,
+            0,
+            None,
+            commands,
+            CancellationToken::new(),
+            crate::cluster::ClusterHttp::plaintext(),
+            Some(directory.to_path_buf()),
+        )
+    }
+
+    #[tokio::test]
+    async fn reconciliation_retries_a_stalled_placement_response_body() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let (requests, mut observed) = mpsc::channel(4);
+        let server = tokio::spawn(async move {
+            let mut connections = tokio::task::JoinSet::new();
+            loop {
+                let (mut socket, _) = listener.accept().await.unwrap();
+                let requests = requests.clone();
+                connections.spawn(async move {
+                    let mut request = [0; 4096];
+                    assert!(socket.read(&mut request).await.unwrap() > 0);
+                    socket.write_all(b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 1000\r\n\r\n{").await.unwrap();
+                    requests.send(()).await.unwrap();
+                    std::future::pending::<()>().await;
+                });
+            }
+        });
+        let root = tempfile::tempdir().unwrap();
+        let (commands, mut received) = mpsc::channel(8);
+        let reconciler = reconciler_for_deadline_test(address, root.path(), commands);
+        let AgentCommand::Status { response } = received.recv().await.unwrap() else {
+            panic!("expected recovery inventory");
+        };
+        response.send(vec![]).unwrap();
+        tokio::time::timeout(Duration::from_secs(3), observed.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        let retried = tokio::time::timeout(Duration::from_secs(12), observed.recv()).await;
+        reconciler.abort();
+        let _ = reconciler.await;
+        server.abort();
+        let _ = server.await;
+        assert!(
+            retried.is_ok(),
+            "a stalled body prevented the next placement poll"
+        );
+    }
+
+    #[tokio::test]
+    async fn reconciliation_retires_other_owners_after_an_agent_reply_stalls() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let router = axum::Router::new().route(
+            "/v1/placements/worker",
+            axum::routing::get(|| async { axum::Json(NodeAssignments::default()) }),
+        );
+        let server = tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
+        let root = tempfile::tempdir().unwrap();
+        let checkpoint = crate::cluster::applied::checkpoint_path(root.path());
+        let blocked = ("a-stalled".into(), "default".into());
+        let ready = ("b-ready".into(), "default".into());
+        crate::cluster::applied::save(
+            &checkpoint,
+            &BTreeMap::from([
+                (blocked.clone(), AssignmentState::Pending),
+                (ready.clone(), AssignmentState::Pending),
+            ]),
+        )
+        .unwrap();
+        let (commands, mut received) = mpsc::channel(8);
+        let reconciler = reconciler_for_deadline_test(address, root.path(), commands);
+        let mut withheld = None;
+        let progressed = tokio::time::timeout(Duration::from_secs(12), async {
+            loop {
+                match received.recv().await.unwrap() {
+                    AgentCommand::Status { response } => {
+                        response.send(vec![]).unwrap();
+                    }
+                    AgentCommand::Retire {
+                        app_name, response, ..
+                    } if app_name == blocked.0 => {
+                        withheld = Some(response);
+                    }
+                    AgentCommand::Retire {
+                        app_name, response, ..
+                    } => {
+                        assert_eq!(app_name, ready.0);
+                        response.send(Ok(())).unwrap();
+                        break;
+                    }
+                    _ => {}
+                }
+            }
+            loop {
+                let owned = crate::cluster::applied::load(&checkpoint).unwrap();
+                assert!(owned.contains_key(&blocked));
+                if !owned.contains_key(&ready) {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await;
+        reconciler.abort();
+        let _ = reconciler.await;
+        server.abort();
+        let _ = server.await;
+        drop(withheld);
+        assert!(
+            progressed.is_ok(),
+            "a stalled retirement blocked other owned resources"
+        );
+    }
+
+    #[tokio::test]
+    async fn placement_ownership_is_durable_before_deployment_is_queued() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let root = tempfile::tempdir().unwrap();
+        let checkpoint = crate::cluster::applied::checkpoint_path(root.path());
+        let refuse_next_write = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let refusal = Arc::clone(&refuse_next_write);
+        let journal = checkpoint.clone();
+        let assignments = NodeAssignments {
+            apps: vec![NodeAssignment {
+                name: "interrupted".into(),
+                namespace: "rbtest-interrupted".into(),
+                replicas: 1,
+                spec: spec_from_toml(
+                    r#"[app.interrupted]
+image = "proc-grill:image-ignored"
+command = ["sleep", "60"]
+namespace = "rbtest-interrupted"
+"#,
+                ),
+            }],
+            ..NodeAssignments::default()
+        };
+        let initial = assignments.clone();
+        let assignments = Arc::new(tokio::sync::RwLock::new(assignments));
+        let served = Arc::clone(&assignments);
+        let router = axum::Router::new().route(
+            "/v1/placements/worker",
+            axum::routing::get(move || {
+                let served = Arc::clone(&served);
+                let refusal = Arc::clone(&refusal);
+                let journal = journal.clone();
+                async move {
+                    if refusal.swap(false, std::sync::atomic::Ordering::SeqCst) {
+                        tokio::fs::remove_file(&journal).await.unwrap();
+                        tokio::fs::create_dir(&journal).await.unwrap();
+                    }
+                    axum::Json(served.read().await.clone())
+                }
+            }),
+        );
+        let server = tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
+        let (_metrics, metrics_rx) = watch::channel(openraft::RaftMetrics::new_initial(1));
+        let (_directory, directory_rx) = watch::channel(crate::mustard::directory::NodeDirectory {
+            leader: Some(crate::mustard::message::LeaderHint {
+                node_id: NodeId::new("leader"),
+                term: 1,
+                api_address: address,
+                reporting_address: address,
+            }),
+            ..Default::default()
+        });
+
+        let (commands, mut received) = mpsc::channel(8);
+        let shutdown = CancellationToken::new();
+        let reconciler = spawn_placement_reconciler(
+            "worker".into(),
+            metrics_rx.clone(),
+            directory_rx.clone(),
+            0,
+            None,
+            commands.clone(),
+            shutdown.clone(),
+            crate::cluster::ClusterHttp::plaintext(),
+            Some(root.path().to_path_buf()),
+        );
+        let (observed, events) = tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                match received.recv().await.unwrap() {
+                    AgentCommand::Status { response } => {
+                        response.send(vec![]).unwrap();
+                    }
+                    AgentCommand::Deploy { events, .. } => {
+                        let saved = crate::cluster::applied::load(&checkpoint).unwrap();
+                        break (saved, events);
+                    }
+                    _ => {}
+                }
+            }
+        })
+        .await
+        .unwrap();
+        assert!(
+            observed.contains_key(&("interrupted".into(), "rbtest-interrupted".into())),
+            "runtime work was queued before durable ownership existed"
+        );
+
+        assert_eq!(observed.values().next(), Some(&AssignmentState::Pending));
+        reconciler.abort();
+        assert!(reconciler.await.unwrap_err().is_cancelled());
+        drop(events);
+        *assignments.write().await = NodeAssignments::default();
+        let restarted = spawn_placement_reconciler(
+            "worker".into(),
+            metrics_rx.clone(),
+            directory_rx.clone(),
+            0,
+            None,
+            commands.clone(),
+            shutdown.clone(),
+            crate::cluster::ClusterHttp::plaintext(),
+            Some(root.path().to_path_buf()),
+        );
+        // Model a lost cleanup reply before allowing confirmed retirement.
+        for attempt in 0..2 {
+            tokio::time::timeout(Duration::from_secs(5), async {
+                loop {
+                    match received.recv().await.unwrap() {
+                        AgentCommand::Status { response } => {
+                            response.send(vec![]).unwrap();
+                        }
+                        AgentCommand::Retire {
+                            app_name,
+                            namespace,
+                            response,
+                        } => {
+                            assert_eq!(app_name, "interrupted");
+                            assert_eq!(namespace, "rbtest-interrupted");
+                            assert!(
+                                crate::cluster::applied::load(&checkpoint)
+                                    .unwrap()
+                                    .contains_key(&(app_name, namespace))
+                            );
+                            if attempt == 1 {
+                                response.send(Ok(())).unwrap();
+                            }
+                            break;
+                        }
+                        AgentCommand::Deploy { .. } => panic!("withdrawn work was redeployed"),
+                        _ => {}
+                    }
+                }
+            })
+            .await
+            .unwrap();
+        }
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while !crate::cluster::applied::load(&checkpoint)
+                .unwrap()
+                .is_empty()
+            {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap();
+        shutdown.cancel();
+        restarted.await.unwrap();
+        while received.try_recv().is_ok() {}
+
+        // Fail persistence after the leader's response but before Deploy.
+        *assignments.write().await = initial;
+        refuse_next_write.store(true, std::sync::atomic::Ordering::SeqCst);
+        let write_shutdown = CancellationToken::new();
+        let write_refused = spawn_placement_reconciler(
+            "worker".into(),
+            metrics_rx.clone(),
+            directory_rx.clone(),
+            0,
+            None,
+            commands.clone(),
+            write_shutdown.clone(),
+            crate::cluster::ClusterHttp::plaintext(),
+            Some(root.path().to_path_buf()),
+        );
+        tokio::time::timeout(Duration::from_secs(6), async {
+            let mut polls = 0;
+            while polls < 2 {
+                match received.recv().await.unwrap() {
+                    AgentCommand::Status { response } => {
+                        response.send(vec![]).unwrap();
+                    }
+                    AgentCommand::SyncClusterCatalog { .. } => polls += 1,
+                    AgentCommand::Deploy { .. } => {
+                        panic!("deployment bypassed failed ownership persistence")
+                    }
+                    _ => {}
+                }
+            }
+        })
+        .await
+        .unwrap();
+        write_shutdown.cancel();
+        write_refused.await.unwrap();
+        assert!(checkpoint.is_dir());
+        while let Ok(command) = received.try_recv() {
+            assert!(!matches!(command, AgentCommand::Deploy { .. }));
+        }
+
+        // Unreadable ownership must block new runtime work on restart.
+        let refused_shutdown = CancellationToken::new();
+        let refused = spawn_placement_reconciler(
+            "worker".into(),
+            metrics_rx,
+            directory_rx,
+            0,
+            None,
+            commands,
+            refused_shutdown.clone(),
+            crate::cluster::ClusterHttp::plaintext(),
+            Some(root.path().to_path_buf()),
+        );
+        assert!(
+            tokio::time::timeout(Duration::from_millis(2100), received.recv())
+                .await
+                .is_err()
+        );
+        assert!(
+            !refused.is_finished(),
+            "invalid ownership must retry without mutating resources"
+        );
+        refused_shutdown.cancel();
+        refused.await.unwrap();
+        server.abort();
+    }
+
     #[test]
-    fn restart_checkpoint_only_retains_assignments_with_live_instances() {
+    fn restart_inventory_invalidates_convergence_without_forgetting_ownership() {
         let mut spec = spec_from_toml(
             r#"[app.demo]
 image = "busybox:latest"
 "#,
         );
         spec.replicas = Replicas::Fixed(1);
-        let fingerprint = serde_json::to_string(&spec).unwrap();
+        let fingerprint = AssignmentState::Applied {
+            fingerprint: serde_json::to_string(&spec).unwrap(),
+        };
         let mut applied = BTreeMap::from([
             (("live".into(), "default".into()), fingerprint.clone()),
             (("gone".into(), "default".into()), fingerprint.clone()),
@@ -1038,12 +1503,25 @@ image = "busybox:latest"
             },
         ];
         retain_live_assignments(&mut applied, &statuses);
+        assert!(matches!(
+            applied[&("live".into(), "default".into())],
+            AssignmentState::Applied { .. }
+        ));
         assert_eq!(
-            applied.keys().cloned().collect::<Vec<_>>(),
-            vec![("live".into(), "default".into())]
+            applied[&("gone".into(), "default".into())],
+            AssignmentState::Pending
+        );
+        assert_eq!(
+            applied[&("stopped".into(), "default".into())],
+            AssignmentState::Pending
         );
         retain_live_assignments(&mut applied, &[]);
-        assert!(applied.is_empty());
+        assert_eq!(applied.len(), 3);
+        assert!(
+            applied
+                .values()
+                .all(|state| *state == AssignmentState::Pending)
+        );
     }
 
     // -- M14: reconciler deploy-wait timeout ---------------------------------

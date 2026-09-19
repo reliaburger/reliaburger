@@ -1,17 +1,22 @@
+# 0.9.145 fixes sibling capture-pipe inheritance on Apple platforms.
+nextest-version = "0.9.145"
+
 [store]
 dir = "target/nextest"
 
 [profile.default]
 retries = 0
+leak-timeout = { period = "100ms", result = "fail" }
 fail-fast = true
-status-level = "slow"
+status-level = "leak"
 final-status-level = "slow"
 slow-timeout = { period = "30s", terminate-after = 2 }
 
 [profile.ci]
 retries = 0
+leak-timeout = { period = "100ms", result = "fail" }
 fail-fast = false
-status-level = "slow"
+status-level = "leak"
 final-status-level = "slow"
 slow-timeout = { period = "30s", terminate-after = 2 }
 junit = { path = "junit.xml" }

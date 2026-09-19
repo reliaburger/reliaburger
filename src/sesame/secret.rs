@@ -193,7 +193,9 @@ pub fn seal_with_age(data: &[u8], public_key: &str) -> Result<Vec<u8>, SecretErr
     Ok(output)
 }
 
-/// Unseal data encrypted with `seal_with_age`.
+/// Unseal bytes encrypted with [`seal_with_age`].
+/// This cryptographic primitive does not restore a cluster CA or validate its
+/// state. A supported operator recovery workflow remains separate work.
 pub fn unseal_with_age(
     sealed: &[u8],
     identity: &age::x25519::Identity,

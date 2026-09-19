@@ -229,7 +229,21 @@ pub enum RaftRequest {
         name: String,
         spec: Box<crate::config::NamespaceSpec>,
     },
-    /// Extend an active lease. An expired lease cannot be revived.
+    /// Atomically mint a bounded test credential and record its exact ownership.
+    TestLeaseApiToken {
+        lease_id: String,
+        owner_id: String,
+        observed_at_unix_ms: u64,
+        token: Box<crate::sesame::types::ApiToken>,
+    },
+    /// Revoke only the exact credential owned by a cleaning lease.
+    TestLeaseRevokeApiToken {
+        lease_id: String,
+        name: String,
+        fingerprint: [u8; 32],
+    },
+    /// Extend an active lease. Existing token expiries are not extended.
+    /// An expired lease cannot be revived.
     TestLeaseRenew {
         lease_id: String,
         owner_id: String,
@@ -242,6 +256,14 @@ pub enum RaftRequest {
     TestLeaseFinishCleanup { lease_id: String },
     /// Retain bounded evidence explaining why cleanup must be retried.
     TestLeaseCleanupFailed { lease_id: String, reason: String },
+    /// Reserve node-chaos capacity against the exact observed voter configuration.
+    ReserveNodeFault {
+        reservation: Box<crate::smoker::reservation::NodeFaultReservation>,
+        membership_log_id: Option<openraft::LogId<u64>>,
+        unavailable_voters: std::collections::BTreeSet<u64>,
+    },
+    /// Release only after the target has fenced late activation and reversed effects.
+    ReleaseNodeFault { sequence: u64 },
 }
 
 // ---------------------------------------------------------------------------
@@ -367,6 +389,8 @@ pub struct DesiredState {
     /// leader resume cleanup after the issuing process dies.
     #[serde(default)]
     pub test_leases: std::collections::BTreeMap<String, crate::testkit::lease::TestLease>,
+    /// Durable ownership of the single cluster-wide node-chaos slot.
+    pub node_fault_reservations: crate::smoker::reservation::NodeFaultReservations,
     /// Log position of the last applied entry.
     pub last_applied_log: Option<openraft::LogId<u64>>,
     /// Last known membership configuration.
@@ -611,43 +635,26 @@ mod tests {
     }
 
     #[test]
-    fn pre_theme_snapshot_without_namespaces_loads_cleanly() {
-        // A snapshot serialised before T6 added `namespaces`/`permissions`
-        // has neither key. The `#[serde(default)]` on both must fill them
-        // with empty maps rather than fail to deserialise (the #83 loader
-        // is strict, so a missing-field error here would brick startup).
-        let legacy = serde_json::json!({
-            "apps": [],
-            "scheduling": [],
-            "config": {},
-            "last_applied_log": null,
-            "last_membership": { "log_id": null, "membership": { "configs": [], "nodes": {} } }
-        });
-        let state: DesiredState = serde_json::from_value(legacy).unwrap();
+    fn compatible_snapshot_may_omit_optional_namespace_and_endpoint_fields() {
+        let mut snapshot = serde_json::to_value(DesiredState::default()).unwrap();
+        for field in ["namespaces", "permissions", "endpoint_catalog"] {
+            snapshot.as_object_mut().unwrap().remove(field);
+        }
+        let state: DesiredState = serde_json::from_value(snapshot).unwrap();
         assert!(state.namespaces.is_empty());
         assert!(state.permissions.is_empty());
-        assert!(state.apps.is_empty());
-        // 12b.4: the endpoint catalogue is serde-default too, so a snapshot
-        // that predates it loads with an empty catalogue rather than failing.
         assert!(state.endpoint_catalog.is_empty());
     }
 
     #[test]
-    fn pre_theme_snapshot_without_endpoint_catalog_loads_cleanly() {
-        // A snapshot serialised after T6 but before 12b.4 has `namespaces`
-        // and `permissions` but no `endpoint_catalog`. The `#[serde(default)]`
-        // must fill it with an empty catalogue.
-        let legacy = serde_json::json!({
-            "apps": [],
-            "scheduling": [],
-            "config": {},
-            "namespaces": {},
-            "permissions": {},
-            "last_applied_log": null,
-            "last_membership": { "log_id": null, "membership": { "configs": [], "nodes": {} } }
-        });
-        let state: DesiredState = serde_json::from_value(legacy).unwrap();
-        assert!(state.endpoint_catalog.is_empty());
+    fn snapshot_must_not_forget_node_fault_ownership() {
+        let mut snapshot = serde_json::to_value(DesiredState::default()).unwrap();
+        snapshot
+            .as_object_mut()
+            .unwrap()
+            .remove("node_fault_reservations");
+        let error = serde_json::from_value::<DesiredState>(snapshot).unwrap_err();
+        assert!(error.to_string().contains("node_fault_reservations"));
     }
 
     #[test]

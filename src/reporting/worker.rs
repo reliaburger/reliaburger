@@ -147,7 +147,7 @@ impl<T: ReportingTransport> ReportWorker<T> {
             tokio::select! {
                 _ = self.shutdown.cancelled() => break,
                 _ = interval.tick() => {
-                    self.send_report().await;
+                    self.send_report_until_shutdown().await;
                 }
                 result = self.council_rx.changed(), if watch_open => {
                     match result {
@@ -156,7 +156,7 @@ impl<T: ReportingTransport> ReportWorker<T> {
                             // fresh leader's aggregator fills without waiting
                             // out the report interval.
                             if self.update_parent() {
-                                self.send_report().await;
+                                self.send_report_until_shutdown().await;
                             }
                         }
                         Err(_) => {
@@ -194,6 +194,13 @@ impl<T: ReportingTransport> ReportWorker<T> {
             .map(|(_, addr)| *addr)
     }
 
+    async fn send_report_until_shutdown(&self) {
+        tokio::select! {
+            _ = self.shutdown.cancelled() => {},
+            _ = self.send_report() => {},
+        }
+    }
+
     /// Collect state and send a report to the parent.
     async fn send_report(&self) {
         let parent = match self.parent_address {
@@ -203,7 +210,10 @@ impl<T: ReportingTransport> ReportWorker<T> {
 
         let snapshot = match self.collect_snapshot().await {
             Some(s) => s,
-            None => return, // agent didn't respond
+            None => {
+                eprintln!("report worker: snapshot collection failed or timed out");
+                return;
+            }
         };
 
         let capability_report = self.build_capability_report(&snapshot);
@@ -219,26 +229,20 @@ impl<T: ReportingTransport> ReportWorker<T> {
                 evidence,
             });
         let report = self.build_report(snapshot);
-        let _ = self
-            .transport
-            .send(parent, &ReportingMessage::Report(report))
-            .await;
-        let _ = self
-            .transport
-            .send(
-                parent,
-                &ReportingMessage::CapabilityReport(capability_report),
-            )
-            .await;
-        let _ = self
-            .transport
-            .send(parent, &ReportingMessage::DnsCapabilityReport(dns_report))
-            .await;
+        let mut messages = vec![
+            ReportingMessage::Report(report),
+            ReportingMessage::CapabilityReport(capability_report),
+            ReportingMessage::DnsCapabilityReport(dns_report),
+        ];
         if let Some(report) = readiness_report {
-            let _ = self
-                .transport
-                .send(parent, &ReportingMessage::NodeReadinessReport(report))
-                .await;
+            messages.push(ReportingMessage::NodeReadinessReport(report));
+        }
+        for message in messages {
+            if let Err(error) = self.transport.send(parent, &message).await {
+                eprintln!(
+                    "report worker: admission at {parent} failed; next tick collects fresh state: {error}"
+                );
+            }
         }
     }
 
@@ -247,14 +251,14 @@ impl<T: ReportingTransport> ReportWorker<T> {
         let (tx, rx) = oneshot::channel();
         let request = CollectSnapshotRequest { response: tx };
 
-        self.snapshot_tx.send(request).await.ok()?;
-
-        // Use a short timeout so we don't block the reporting loop
-        // if the agent is busy.
-        tokio::time::timeout(Duration::from_secs(2), rx)
-            .await
-            .ok()?
-            .ok()
+        // Queue admission and the response share one deadline.
+        tokio::time::timeout(Duration::from_secs(2), async {
+            self.snapshot_tx.send(request).await.ok()?;
+            rx.await.ok()
+        })
+        .await
+        .ok()
+        .flatten()
     }
 
     /// Build a StateReport from an agent snapshot.
@@ -436,6 +440,35 @@ mod tests {
                 }
             }
         });
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn full_snapshot_queue_does_not_prevent_worker_shutdown() {
+        let net = InMemoryReportingNetwork::new();
+        let transport = net.register(addr(1)).await;
+        let (snapshot_tx, _snapshot_rx) = mpsc::channel(1);
+        let (response, _rx) = oneshot::channel();
+        snapshot_tx
+            .send(CollectSnapshotRequest { response })
+            .await
+            .unwrap();
+        let (_council_tx, council_rx) = watch::channel(vec![(NodeId::new("c1"), addr(2))]);
+        let shutdown = CancellationToken::new();
+        let mut worker = ReportWorker::new(
+            NodeId::new("w1"),
+            transport,
+            test_config(),
+            snapshot_tx,
+            council_rx,
+            shutdown.clone(),
+        );
+        let task = tokio::spawn(async move { worker.run().await });
+        tokio::time::sleep(Duration::from_secs(2)).await;
+        shutdown.cancel();
+        tokio::time::timeout(Duration::from_millis(100), task)
+            .await
+            .expect("worker remained stuck admitting a snapshot request")
+            .unwrap();
     }
 
     #[tokio::test]
