@@ -1,4 +1,4 @@
-//! Verify the raw OCI digest chain before either image cache publishes it.
+//! Bound upstream reads and verify OCI digests before either cache publishes them.
 
 use oci_distribution::client::current_platform_resolver;
 use oci_distribution::errors::OciDistributionError;
@@ -133,4 +133,59 @@ pub(crate) async fn pull_verified_manifest(
         manifest_bytes,
         config_bytes,
     })
+}
+
+/// Retry only transient registry reads, retaining one deadline across attempts.
+pub(crate) async fn retry_registry_read<T, F>(
+    budget: std::time::Duration,
+    mut read: impl FnMut() -> F,
+) -> oci_distribution::errors::Result<T>
+where
+    F: std::future::Future<Output = oci_distribution::errors::Result<T>>,
+{
+    use oci_distribution::errors::{OciDistributionError, OciErrorCode};
+    use tokio::time::{Instant, sleep_until, timeout_at};
+
+    let deadline = Instant::now() + budget;
+    let mut attempt = 0;
+    loop {
+        let result = timeout_at(deadline, read()).await.map_err(|_| {
+            OciDistributionError::GenericError(Some("registry read deadline exceeded".into()))
+        })?;
+        let error = match result {
+            Ok(value) => return Ok(value),
+            Err(error) => error,
+        };
+        let transient = match &error {
+            OciDistributionError::RegistryError { envelope, .. } => {
+                !envelope.errors.is_empty()
+                    && envelope
+                        .errors
+                        .iter()
+                        .all(|error| error.code == OciErrorCode::Toomanyrequests)
+            }
+            OciDistributionError::ServerError { code, .. } => matches!(code, 429 | 502 | 503 | 504),
+            OciDistributionError::RequestError(error) => {
+                // Manifest parsing and layer digest checks happen separately. Reqwest
+                // decode errors here include interrupted response-byte streams.
+                error.is_request()
+                    || error.is_timeout()
+                    || error.is_body()
+                    || error.is_decode()
+                    || matches!(
+                        error.status().map(|status| status.as_u16()),
+                        Some(429 | 502 | 503 | 504)
+                    )
+            }
+            _ => false,
+        };
+        if !transient || attempt == 3 || Instant::now() >= deadline {
+            return Err(error);
+        }
+        // Jitter keeps simultaneous cold nodes from retrying in lockstep.
+        let delay =
+            std::time::Duration::from_millis((1000 << attempt) + u64::from(rand::random::<u8>()));
+        attempt += 1;
+        sleep_until((Instant::now() + delay).min(deadline)).await;
+    }
 }

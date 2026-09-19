@@ -37,9 +37,9 @@ F items are missing capabilities, not evidence of failures in supported behaviou
 [Audit evidence and reproducible probes](../qualification/2026-09-17-code-audit.md)
 record those distinctions and the hosted checks inspected.
 
-There are **86 tracked work packages**: 57 correctness/contract items, 12
+There are **87 tracked work packages**: 58 correctness/contract items, 12
 engineering follow-ups, 12 capability families and five acceptance/release gates.
-The correctness items include 28 P1 priorities; these are engineering priorities, not
+The correctness items include 29 P1 priorities; these are engineering priorities, not
 security severity ratings. A capability family can require several commits.
 
 ## What is already done
@@ -1306,7 +1306,7 @@ exact owners retain their existing access. Eight token/lease API tests (2.29s),
 48 lease-filtered library tests (one explicit gate, 1.89s) and strict
 Linux/macOS Clippy pass.
 
-### C54 — Bound retries for transient upstream registry failures
+### C54 — Bound retries for transient direct registry pulls
 
 **Priority:** P1. **Wave:** 4. **Book chapters:** 05.
 
@@ -1426,6 +1426,24 @@ cached lengths. All 42 image tests pass on macOS/Linux (7.63s/7.76s), all 232
 Pickle tests pass (9.54s/2.24s), strict all-target/all-feature Clippy passes on both,
 and a real cold rootless runc pull with port adoption passes in 3.39s. The four
 failing-first regressions include the observed capacity-overflow panic.
+
+### C58 — Bound and retry every pull-through upstream read
+
+**Priority:** P1. **Wave:** 4. **Book chapter:** 05.
+
+C54 repaired direct ImageStore reads; Pickle's upstream adapter still issued
+single attempts, with no timeout for freshness HEAD or layer bodies. Four
+HTTP regressions fail before the fix: transient metadata/body failures,
+persistent throttling and a stalled read. Denial and integrity controls pass.
+
+**Completion test:** Share the existing retry helper across both consumers.
+Keep one 30-second HEAD/manifest/config budget and 120 seconds per layer,
+four attempts maximum, fresh blob buffers and terminal permanent failures.
+
+**Completed:** All 47 image tests pass on macOS/Linux (7.74s/8.91s), all 232
+Pickle tests pass (9.17s/2.16s), and strict all-target/all-feature Clippy passes
+on both. HTTP fixtures cover each read type, interrupted streams, denial,
+incorrect lengths, attempt counts and the original deadline.
 
 ## Engineering follow-ups
 

@@ -794,3 +794,23 @@ manifest digests over deliberately invalid size metadata, so identity checks
 cannot hide the size defect. Cold and warm cache cases verify the actual layer
 request count, and both direct and pull-through consumers refuse a length
 mismatch.
+
+### Give the cache the same deadline as a direct pull
+
+A node could retry a throttled direct pull successfully, then fail on the same
+response when Pickle fetched it for the cluster. The two consumers shared digest
+verification but only ImageStore used the retry helper. Pickle's freshness HEAD
+and layer fetch also lacked a deadline.
+
+Both now call the same crate-private helper in `grill::oci_pull`. Each HEAD and
+manifest/configuration read gets 30 seconds; each layer gets 120 seconds. Four
+attempts fit inside that original budget, including backoff. Integrity and
+authorisation errors remain terminal. A blob attempt owns a new empty buffer,
+so bytes from an interrupted response cannot prefix the next complete response.
+
+The tests exercise actual HTTP requests through the upstream adapter. They
+count throttled attempts, interrupt a response body, and stall each read type
+before advancing Tokio's clock past its budget. Separate denial and incorrect
+length cases prove that retries don't turn permanent failures into repeated
+downloads. This establishes the cache's read behaviour without depending on
+a public registry's availability.

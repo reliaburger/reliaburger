@@ -860,9 +860,9 @@ External images (`docker.io`, `ghcr.io`, …) are served through a pull-through
 cache by default: the first pull fetches from upstream and commits under a
 `cache/<host>/<repo>` catalog entry; later pulls anywhere in the cluster are
 served peer-to-peer. Cluster-pushed images download from multiple peers in
-parallel (rarest layer first). Direct external pulls retry recognised rate-limit
+parallel (rarest layer first). Direct external pulls and Pickle upstream reads retry recognised rate-limit
 and temporary gateway/service errors up to four attempts. Retries share a
-30-second manifest/config budget or a 120-second budget per layer; authentication,
+30-second HEAD/manifest/config budget or a 120-second budget per layer; authentication,
 malformed responses and digest failures still fail. Operational constraints:
 
 - **`registry_port` must be uniform across the cluster** — peers derive each

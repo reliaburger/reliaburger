@@ -11,6 +11,7 @@ use std::collections::HashMap;
 use std::time::{Duration, SystemTime};
 
 use crate::grill::image::ImageReference;
+use crate::grill::oci_pull::{pull_verified_manifest, retry_registry_read};
 
 use super::types::{Digest, LayerDescriptor, ManifestCatalog, PickleError};
 
@@ -204,16 +205,16 @@ impl UpstreamRegistry for OciUpstream {
         Box::pin(async move {
             let reference = Self::oci_reference(image)?;
             let auth = self.auth_for(&image.registry);
-            let digest = self
-                .client
-                .fetch_manifest_digest(&reference, &auth)
-                .await
-                .map_err(|e| {
-                    PickleError::ReplicationFailed(format!(
-                        "upstream HEAD {} failed: {e}",
-                        image.full_reference()
-                    ))
-                })?;
+            let digest = retry_registry_read(Duration::from_secs(30), || {
+                self.client.fetch_manifest_digest(&reference, &auth)
+            })
+            .await
+            .map_err(|e| {
+                PickleError::ReplicationFailed(format!(
+                    "upstream HEAD {} failed: {e}",
+                    image.full_reference()
+                ))
+            })?;
             Digest::new(&digest)
                 .map_err(|e| PickleError::ReplicationFailed(format!("upstream digest: {e}")))
         })
@@ -226,12 +227,10 @@ impl UpstreamRegistry for OciUpstream {
         Box::pin(async move {
             let reference = Self::oci_reference(image)?;
             let auth = self.auth_for(&image.registry);
-            let verified = tokio::time::timeout(
-                Duration::from_secs(30),
-                crate::grill::oci_pull::pull_verified_manifest(&self.client, &reference, &auth),
-            )
+            let verified = retry_registry_read(Duration::from_secs(30), || {
+                pull_verified_manifest(&self.client, &reference, &auth)
+            })
             .await
-            .map_err(|_| PickleError::ReplicationFailed("upstream manifest read timed out".into()))?
             .map_err(|e| {
                 PickleError::ReplicationFailed(format!(
                     "upstream manifest {} failed: {e}",
@@ -296,17 +295,22 @@ impl UpstreamRegistry for OciUpstream {
                 size,
                 ..Default::default()
             };
-            // A descriptor is untrusted metadata, not an allocation budget.
-            let mut bytes = Vec::new();
-            self.client
-                .pull_blob(&reference, &descriptor, &mut bytes)
-                .await
-                .map_err(|e| {
-                    PickleError::ReplicationFailed(format!(
-                        "upstream blob {} failed: {e}",
-                        layer.digest
-                    ))
-                })?;
+            let bytes = retry_registry_read(Duration::from_secs(120), || async {
+                // Each attempt owns an empty buffer; partial responses cannot leak
+                // into the next attempt. Metadata is not an allocation budget.
+                let mut bytes = Vec::new();
+                self.client
+                    .pull_blob(&reference, &descriptor, &mut bytes)
+                    .await?;
+                Ok(bytes)
+            })
+            .await
+            .map_err(|e| {
+                PickleError::ReplicationFailed(format!(
+                    "upstream blob {} failed: {e}",
+                    layer.digest
+                ))
+            })?;
             if bytes.len() as u64 != layer.size {
                 return Err(PickleError::ReplicationFailed(format!(
                     "upstream layer size mismatch for {}: expected {}, received {}",

@@ -8,6 +8,8 @@ use std::path::{Path, PathBuf};
 
 use sha2::{Digest, Sha256};
 
+use super::oci_pull::retry_registry_read;
+
 /// A parsed OCI image reference.
 ///
 /// Normalises Docker Hub shorthand: `"alpine"` becomes
@@ -200,61 +202,6 @@ pub(crate) fn cached_blob_path(root: &Path, digest: &str) -> PathBuf {
         legacy
     } else {
         legacy.join("data")
-    }
-}
-
-/// Retry only transient registry reads, retaining one deadline across attempts.
-async fn retry_registry_read<T, F>(
-    budget: std::time::Duration,
-    mut read: impl FnMut() -> F,
-) -> oci_distribution::errors::Result<T>
-where
-    F: std::future::Future<Output = oci_distribution::errors::Result<T>>,
-{
-    use oci_distribution::errors::{OciDistributionError, OciErrorCode};
-    use tokio::time::{Instant, sleep_until, timeout_at};
-
-    let deadline = Instant::now() + budget;
-    let mut attempt = 0;
-    loop {
-        let result = timeout_at(deadline, read()).await.map_err(|_| {
-            OciDistributionError::GenericError(Some("registry read deadline exceeded".into()))
-        })?;
-        let error = match result {
-            Ok(value) => return Ok(value),
-            Err(error) => error,
-        };
-        let transient = match &error {
-            OciDistributionError::RegistryError { envelope, .. } => {
-                !envelope.errors.is_empty()
-                    && envelope
-                        .errors
-                        .iter()
-                        .all(|error| error.code == OciErrorCode::Toomanyrequests)
-            }
-            OciDistributionError::ServerError { code, .. } => matches!(code, 429 | 502 | 503 | 504),
-            OciDistributionError::RequestError(error) => {
-                // Manifest parsing and layer digest checks happen separately. Reqwest
-                // decode errors here include interrupted response-byte streams.
-                error.is_request()
-                    || error.is_timeout()
-                    || error.is_body()
-                    || error.is_decode()
-                    || matches!(
-                        error.status().map(|status| status.as_u16()),
-                        Some(429 | 502 | 503 | 504)
-                    )
-            }
-            _ => false,
-        };
-        if !transient || attempt == 3 || Instant::now() >= deadline {
-            return Err(error);
-        }
-        // Jitter keeps simultaneous cold nodes from retrying in lockstep.
-        let delay =
-            std::time::Duration::from_millis((1000 << attempt) + u64::from(rand::random::<u8>()));
-        attempt += 1;
-        sleep_until((Instant::now() + delay).min(deadline)).await;
     }
 }
 
@@ -1709,6 +1656,148 @@ mod tests {
             crate::pickle::store::compute_sha256(&manifest.config_bytes),
             manifest.config.digest
         );
+    }
+
+    #[tokio::test]
+    async fn pull_through_registry_retries_transient_metadata_reads() {
+        use crate::pickle::upstream::UpstreamRegistry;
+        for head in [true, false] {
+            let fixture = start_registry_fixture_with_fault(Some(registry_fault(
+                false,
+                StatusCode::TOO_MANY_REQUESTS,
+                "TOOMANYREQUESTS",
+                2,
+            )))
+            .await;
+            let upstream = crate::pickle::upstream::OciUpstream::insecure_http(Default::default());
+            let reference = ImageReference::parse(&fixture.reference).unwrap();
+            if head {
+                upstream.head_manifest_digest(&reference).await.unwrap();
+            } else {
+                upstream.fetch_manifest(&reference).await.unwrap();
+            }
+            assert_eq!(fixture.manifest_requests.load(Ordering::SeqCst), 3);
+        }
+    }
+
+    #[tokio::test]
+    async fn pull_through_registry_retries_interrupted_blobs_from_an_empty_buffer() {
+        use crate::pickle::upstream::UpstreamRegistry;
+        let mut fault = registry_fault(true, StatusCode::OK, "UNAVAILABLE", 1);
+        fault.disconnect = true;
+        let fixture = start_registry_fixture_with_fault(Some(fault)).await;
+        let upstream = crate::pickle::upstream::OciUpstream::insecure_http(Default::default());
+        let reference = ImageReference::parse(&fixture.reference).unwrap();
+        let manifest = upstream.fetch_manifest(&reference).await.unwrap();
+        let bytes = upstream
+            .fetch_blob(&reference, &manifest.layers[0])
+            .await
+            .unwrap();
+        assert_eq!(
+            crate::pickle::store::compute_sha256(&bytes),
+            manifest.layers[0].digest
+        );
+        assert_eq!(fixture.layer_requests.load(Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test]
+    async fn pull_through_registry_reads_keep_their_original_deadline() {
+        use crate::pickle::upstream::UpstreamRegistry;
+        for mode in ["head", "manifest", "layer"] {
+            let mut fault = registry_fault(
+                mode == "layer",
+                StatusCode::SERVICE_UNAVAILABLE,
+                "UNAVAILABLE",
+                1,
+            );
+            fault.delay = std::time::Duration::from_secs(3600);
+            let received = fault.received.clone();
+            let fixture = start_registry_fixture_with_fault(Some(fault)).await;
+            let upstream = crate::pickle::upstream::OciUpstream::insecure_http(Default::default());
+            let reference = ImageReference::parse(&fixture.reference).unwrap();
+            let layer = if mode == "layer" {
+                Some(upstream.fetch_manifest(&reference).await.unwrap().layers[0].clone())
+            } else {
+                None
+            };
+            let mut read = tokio::spawn(async move {
+                match mode {
+                    "head" => upstream.head_manifest_digest(&reference).await.map(|_| ()),
+                    "manifest" => upstream.fetch_manifest(&reference).await.map(|_| ()),
+                    _ => upstream
+                        .fetch_blob(&reference, &layer.unwrap())
+                        .await
+                        .map(|_| ()),
+                }
+            });
+            tokio::time::timeout(std::time::Duration::from_secs(5), received.notified())
+                .await
+                .unwrap();
+            tokio::time::pause();
+            tokio::time::advance(std::time::Duration::from_secs(if mode == "layer" {
+                121
+            } else {
+                31
+            }))
+            .await;
+            let outcome = tokio::time::timeout(std::time::Duration::from_secs(1), &mut read).await;
+            tokio::time::resume();
+            if outcome.is_err() {
+                read.abort();
+            }
+            let error = outcome
+                .expect("upstream read exceeded its original budget")
+                .unwrap()
+                .unwrap_err();
+            assert!(
+                error.to_string().contains("deadline exceeded"),
+                "{mode}: {error}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn pull_through_registry_persistent_throttling_has_four_attempts() {
+        use crate::pickle::upstream::UpstreamRegistry;
+        let fixture = start_registry_fixture_with_fault(Some(registry_fault(
+            false,
+            StatusCode::TOO_MANY_REQUESTS,
+            "TOOMANYREQUESTS",
+            usize::MAX,
+        )))
+        .await;
+        let upstream = crate::pickle::upstream::OciUpstream::insecure_http(Default::default());
+        let reference = ImageReference::parse(&fixture.reference).unwrap();
+        assert!(upstream.fetch_manifest(&reference).await.is_err());
+        assert_eq!(fixture.manifest_requests.load(Ordering::SeqCst), 4);
+    }
+
+    #[tokio::test]
+    async fn pull_through_registry_denial_and_integrity_errors_are_terminal() {
+        use crate::pickle::upstream::UpstreamRegistry;
+        let fixture = start_registry_fixture_with_fault(Some(registry_fault(
+            false,
+            StatusCode::FORBIDDEN,
+            "DENIED",
+            usize::MAX,
+        )))
+        .await;
+        let upstream = crate::pickle::upstream::OciUpstream::insecure_http(Default::default());
+        let reference = ImageReference::parse(&fixture.reference).unwrap();
+        assert!(upstream.fetch_manifest(&reference).await.is_err());
+        assert_eq!(fixture.manifest_requests.load(Ordering::SeqCst), 1);
+        let fixture =
+            start_registry_fixture_with_options(None, Some(RegistryIntegrityCase::WrongLayerSize))
+                .await;
+        let reference = ImageReference::parse(&fixture.reference).unwrap();
+        let manifest = upstream.fetch_manifest(&reference).await.unwrap();
+        assert!(
+            upstream
+                .fetch_blob(&reference, &manifest.layers[0])
+                .await
+                .is_err()
+        );
+        assert_eq!(fixture.layer_requests.load(Ordering::SeqCst), 1);
     }
 
     #[tokio::test]
