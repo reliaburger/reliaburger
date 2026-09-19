@@ -25,7 +25,8 @@ Stop/Retire also refuse to forget ownership until identity-directory cleanup and
 succeed and their directories are synced; failed cleanup can be retried. Rolling
 and blue-green retirement also require observed runtime exit. If a signal or
 inspection fails, the deployment reports an error and retains both generations
-for ordinary Stop/Retire cleanup.
+for ordinary Stop/Retire cleanup. Finalisation propagates identity and record
+cleanup errors too, retaining the old instance as stopped until cleanup succeeds.
 
 `relish test --filter jobs` creates durable leases on the receiving node for
 batch jobs and cron registrations. Keep using the same node endpoint for a

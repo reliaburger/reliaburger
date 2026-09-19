@@ -946,6 +946,21 @@ strategy/fault combinations verify both generations and later successful cleanup
 gate each, 21.40s/37.39s), with strict Clippy on both. Rollout artifact-finalisation,
 halt and rollback cleanup remain separate open work.
 
+**Rollout artifact finalisation (19 September):** Finalisation and per-step
+retirement now propagate identity/adoption-record errors before releasing ports
+or forgetting instances. Failed finalisation retains started replacements and
+marks every already-retired old instance Stopped before any fallible deletion.
+The original regression reports Complete despite the filesystem fault; a second,
+two-replica regression reproduces the next old instance remaining restartable.
+Both repairs cover rolling and blue-green, each filesystem fault, retained
+ownership and later successful Retire. The blanket app-removal helper, which
+ignored kill failures, is removed. Unit fixtures now retain private volume roots
+through agent teardown, including the two real ProcessGrill redeploy cases.
+The complete Bun suites pass 457 native/456 Linux tests (one explicit gate each,
+22.20s/37.40s), with strict all-target/all-feature Clippy on both.
+Rollback/halt and the restart-driver hand-off during off-loop retirement remain
+separate work.
+
 ### C35 — Gate chaos capabilities per selected scenario
 
 **Priority:** P2. **Wave:** 4. **Book chapters:** 08, 15.

@@ -582,44 +582,12 @@ impl<G: Grill> WorkloadSupervisor<G> {
         Ok(())
     }
 
-    /// Remove all instances of an app from the supervisor tracking.
+    /// Forget one confirmed retired instance without touching the rest of its app.
     ///
-    /// Kills running processes via the Grill and removes all state.
-    /// Used during redeploy to clear stale instances before creating fresh ones.
-    pub async fn remove_app(&mut self, app_name: &str, namespace: &str) {
-        let key = (app_name.to_string(), namespace.to_string());
-        let ids = match self.app_instances.remove(&key) {
-            Some(ids) => ids,
-            None => return,
-        };
-
-        for id in &ids {
-            // Force-kill the process (SIGKILL, immediate, sets state to Stopped)
-            let _ = self.grill.kill(id).await;
-            self.health_checker.unregister(id);
-            // Return the instance's host port to the pool before dropping it,
-            // otherwise the allocation leaks until the agent restarts.
-            if let Some(instance) = self.instances.get(id)
-                && let Some(port) = instance.host_port
-            {
-                let _ = self.port_allocator.release(port).await;
-            }
-            self.instances.remove(id);
-        }
-    }
-
-    /// Forget one retired instance without touching the rest of its app (M7).
-    ///
-    /// A rolling deploy retires old instances one at a time now, and an
-    /// instance that has been deliberately stopped but is still in
-    /// `instances` is indistinguishable from one that crashed — the restart
-    /// driver would bring it back. So retirement has to drop it here, in the
-    /// same command-loop turn that stopped it.
-    ///
-    /// The caller has already stopped the container; this releases the host
-    /// port, unregisters health checking and removes the bookkeeping, and
-    /// also drops the id from its app's instance list so a later
-    /// [`Self::remove_app`] doesn't try to kill it again.
+    /// The caller has already observed runtime exit and completed durable artifact
+    /// cleanup. This releases the host port, unregisters health checks and removes
+    /// the instance from both inventories. Until this call, a stopped instance can
+    /// retain ownership so failed cleanup remains retryable.
     pub async fn retire_instance(&mut self, id: &InstanceId) {
         self.health_checker.unregister(id);
         if let Some(instance) = self.instances.get(id) {
@@ -889,7 +857,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn remove_app_releases_allocated_ports() {
+    async fn retirement_releases_allocated_ports() {
         let mut sup = test_supervisor();
         let spec = app_spec_with_replicas(3, Some(8080));
         sup.deploy_app("web", "default", &spec, Instant::now())
@@ -901,7 +869,19 @@ mod tests {
             "each replica should allocate a port"
         );
 
-        sup.remove_app("web", "default").await;
+        let ids: Vec<_> = sup
+            .list_instances()
+            .iter()
+            .map(|instance| instance.id.clone())
+            .collect();
+        for id in ids {
+            sup.grill().kill(&id).await.unwrap();
+            assert_eq!(
+                sup.grill().state(&id).await.unwrap(),
+                ContainerState::Stopped
+            );
+            sup.retire_instance(&id).await;
+        }
         assert_eq!(
             sup.port_allocator.allocated_count().await,
             0,

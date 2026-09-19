@@ -1134,4 +1134,38 @@ failed, ignored and stalled kills, plus an inspection error only on the old
 instance. It checks the deployment events, both retained generations, and successful
 Retire after the fault clears. Ordinary Stop
 still uses this helper too, so the two paths cannot drift apart again. Artifact
-removal during rollout finalisation and rollback is a separate remaining task.
+removal needs its own acknowledgement too, as the next section explains.
+
+
+### Keep a stopped owner until its files are retired
+
+The old process can be gone while its identity directory or adoption record is
+still present. If finalisation only logs that error, the deploy reports success
+and loses the owner needed to retry cleanup. A later Bun could then encounter
+an apparently live adoption record from a completed rollout.
+
+Rolling and blue-green finalisation now return `Result<(), BunError>` through
+the command channel. `()` is Rust's unit type: successful cleanup has no payload,
+while the error variant explains which instance still owns unfinished work.
+The worker propagates that error instead of emitting Complete, and retains the
+started replacements in ordinary supervision alongside the old cleanup owner.
+
+Before removing files, the command loop marks every retired old instance Stopped,
+cancels pending retries and unregisters health checks. A two-replica regression
+caught why the whole fleet must change state before the first fallible deletion:
+otherwise a failure on the first owner leaves the next eligible for restart. We've already observed runtime
+exit. Keeping this entry must not make the restart driver revive it. Identity
+cleanup and adoption-record removal must both succeed before releasing its port
+and dropping the entry. We also removed the blanket app-removal helper, which
+ignored kill errors and could discard unrelated members of the same app.
+
+The regression blocks each filesystem operation for each deployment strategy,
+checks the stopped owner and replacement through the command channel, then
+clears the fault and retries Retire. Unit fixtures now own private temporary
+volume directories for their entire lifetime. A small test wrapper owns both
+Bun and its directory; Rust drops fields in declaration order, so the directory
+outlives the agent. `Deref` and `DerefMut` let existing tests borrow the wrapped
+agent without moving the directory guard away from it.
+
+Rollback and halt still need the same checked cleanup treatment. These checks
+do not establish crash recovery before the first adoption record exists.

@@ -78,7 +78,8 @@ resource ownership when OCI deletion, rootfs unmount or network cleanup fails,
 and retries before reporting Stopped. Normal Stop/Retire also preserve ownership
 when identity-directory or adoption-record removal fails. Rolling and blue-green
 deployments refuse completion if runtime exit is uncertain and keep both
-generations available for cleanup. With rootful Linux DNS
+generations available for cleanup. Rollout finalisation also retains ownership
+when identity or adoption-record removal fails, so cleanup can be retried. With rootful Linux DNS
 enabled, short
 service names resolve in the calling workload's namespace. Host tools use explicit
 names such as `redis.payments.internal`; unknown sources cannot inherit a node's

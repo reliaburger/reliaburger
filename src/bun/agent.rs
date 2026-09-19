@@ -721,7 +721,7 @@ enum DeployOp {
         new_ips: std::collections::HashMap<InstanceId, Option<std::net::Ipv4Addr>>,
         new_specs: std::collections::HashMap<InstanceId, crate::grill::oci::OciSpec>,
         now: Instant,
-        reply: oneshot::Sender<()>,
+        reply: oneshot::Sender<Result<(), BunError>>,
     },
     /// Publish one freshly-healthy replacement as a routable backend (M7).
     ///
@@ -744,7 +744,7 @@ enum DeployOp {
     /// every command for its duration per retired instance.
     FinishRetire {
         old_id: InstanceId,
-        reply: oneshot::Sender<()>,
+        reply: oneshot::Sender<Result<(), BunError>>,
     },
     /// Append an entry to the deploy history.
     PushDeployHistory {
@@ -1176,7 +1176,7 @@ impl DeployOps {
         new_ips: std::collections::HashMap<InstanceId, Option<std::net::Ipv4Addr>>,
         new_specs: std::collections::HashMap<InstanceId, crate::grill::oci::OciSpec>,
         now: Instant,
-    ) {
+    ) -> Result<(), BunError> {
         self.call(
             |reply| DeployOp::FinaliseRollingDeploy {
                 app_name: app_name.to_string(),
@@ -1190,7 +1190,10 @@ impl DeployOps {
                 now,
                 reply,
             },
-            (),
+            Err(BunError::DeployFailed {
+                app_name: app_name.into(),
+                reason: "agent loop closed before finalisation".into(),
+            }),
         )
         .await
     }
@@ -1222,13 +1225,16 @@ impl DeployOps {
 
     /// Bookkeeping-only op sent after the worker has already drained+stopped
     /// the instance off the loop (M7).
-    async fn finish_retire(&self, old_id: &InstanceId) {
+    async fn finish_retire(&self, old_id: &InstanceId) -> Result<(), BunError> {
         self.call(
             |reply| DeployOp::FinishRetire {
                 old_id: old_id.clone(),
                 reply,
             },
-            (),
+            Err(BunError::RetirementState {
+                instance_id: old_id.clone(),
+                reason: "agent loop closed before retirement".into(),
+            }),
         )
         .await
     }
@@ -5529,11 +5535,16 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
         new_ips: &std::collections::HashMap<InstanceId, Option<std::net::Ipv4Addr>>,
         mut new_specs: std::collections::HashMap<InstanceId, crate::grill::oci::OciSpec>,
         now: Instant,
-    ) {
+    ) -> Result<(), BunError> {
         // DEP5: the worker routed traffic to the fresh instances (published
         // backends) before draining and stopping the old ones, so by the time
         // this op runs the cut-over has already happened. What's left is to
         // tear the old bookkeeping down and install the new.
+        // A failed first cleanup must not leave another exited old instance
+        // eligible for the crash-restart driver.
+        for old_id in existing {
+            self.retain_stopped_instance(old_id);
+        }
         let service_id = crate::onion::service_id::ServiceId::new(namespace, app_name);
         // M7: publishing backends and retiring old instances now happen
         // incrementally as the rollout steps, so by the time we get here both
@@ -5559,15 +5570,9 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
         }
 
         for old_id in existing {
-            // NET6: lift the retiring instance's egress enforcement.
-            self.clear_egress(old_id).await;
-            self.cleanup_instance_identity(old_id);
+            self.finish_retire_bookkeeping(old_id).await?;
         }
-        self.supervisor.remove_app(app_name, namespace).await;
         self.remove_backend_ebpf(&service_id).await;
-        for old_id in existing {
-            self.remove_instance_record(old_id);
-        }
         let _ = self.service_map.unregister(&service_id);
 
         for new_id in new_ids {
@@ -5659,6 +5664,7 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
             spec: Some(Box::new(spec.clone())),
         };
         self.deploy_history.write().await.push(entry);
+        Ok(())
     }
 
     /// Post-start bookkeeping for a job instance (the loop side of the former
@@ -8242,15 +8248,23 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
     /// this only lifts egress, cleans identity, and drops the record and
     /// supervisor entry. Interleaving it with replacement is what gives
     /// `max_surge` and `max_unavailable` their meaning.
-    async fn finish_retire_bookkeeping(&mut self, old_id: &InstanceId) {
-        // NET6: lift the retiring instance's egress enforcement.
+    async fn finish_retire_bookkeeping(&mut self, old_id: &InstanceId) -> Result<(), BunError> {
+        // The worker already observed exit. Preserve a stopped cleanup owner,
+        // so a filesystem failure cannot make the restart driver revive it.
+        self.retain_stopped_instance(old_id);
+        self.retire_instance_artifacts(old_id).await?;
         self.clear_egress(old_id).await;
-        self.cleanup_instance_identity(old_id);
-        self.remove_instance_record(old_id);
-        // Drop it from the supervisor in this same turn. A stopped instance
-        // still listed there looks exactly like a crashed one to the restart
-        // driver, which gets a chance to run between two retirement ops.
         self.supervisor.retire_instance(old_id).await;
+        Ok(())
+    }
+
+    /// Retain cleanup ownership after observed runtime exit without restarting it.
+    fn retain_stopped_instance(&mut self, old_id: &InstanceId) {
+        if let Some(instance) = self.supervisor.get_instance_mut(old_id) {
+            instance.state = ContainerState::Stopped;
+            instance.retry_pending = false;
+        }
+        self.supervisor.health_checker_mut().unregister(old_id);
     }
 
     /// Gracefully stop all instances.
@@ -8648,12 +8662,13 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
                 now,
                 reply,
             } => {
-                self.finalise_rolling_deploy(
-                    &app_name, &namespace, &spec, &existing, &new_ids, &new_ports, &new_ips,
-                    new_specs, now,
-                )
-                .await;
-                let _ = reply.send(());
+                let result = self
+                    .finalise_rolling_deploy(
+                        &app_name, &namespace, &spec, &existing, &new_ids, &new_ports, &new_ips,
+                        new_specs, now,
+                    )
+                    .await;
+                let _ = reply.send(result);
             }
             DeployOp::PublishNewBackend {
                 app_name,
@@ -8676,8 +8691,8 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
                 let _ = reply.send(());
             }
             DeployOp::FinishRetire { old_id, reply } => {
-                self.finish_retire_bookkeeping(&old_id).await;
-                let _ = reply.send(());
+                let result = self.finish_retire_bookkeeping(&old_id).await;
+                let _ = reply.send(result);
             }
             DeployOp::PushDeployHistory { entry, reply } => {
                 self.deploy_history.write().await.push(*entry);
@@ -9433,7 +9448,27 @@ impl<G: Grill + Clone + 'static> DeployWorker<G> {
                             .await;
                         return std::ops::ControlFlow::Break(());
                     }
-                    self.ops.finish_retire(&old_id).await;
+                    if let Err(error) = self.ops.finish_retire(&old_id).await {
+                        let retention = self
+                            .retain_started_replacements(
+                                app_name, namespace, spec, &new_ids, &new_ports, &new_specs,
+                            )
+                            .await;
+                        let detail = match retention {
+                            Ok(()) => "started replacements retained for cleanup".into(),
+                            Err(error) => {
+                                format!("could not retain replacement ownership: {error}")
+                            }
+                        };
+                        let _ = events
+                            .send(ApplyEvent::Error {
+                                message: format!(
+                                    "old instance artifact retirement failed: {error}; {detail}"
+                                ),
+                            })
+                            .await;
+                        return std::ops::ControlFlow::Break(());
+                    }
                     retired += 1;
                     continue;
                 }
@@ -9686,19 +9721,37 @@ impl<G: Grill + Clone + 'static> DeployWorker<G> {
             }
         }
 
-        self.ops
+        if let Err(error) = self
+            .ops
             .finalise_rolling_deploy(
                 app_name,
                 namespace,
                 spec,
                 outstanding,
                 new_ids.clone(),
-                new_ports,
+                new_ports.clone(),
                 new_ips,
-                new_specs,
+                new_specs.clone(),
                 now,
             )
-            .await;
+            .await
+        {
+            let retention = self
+                .retain_started_replacements(
+                    app_name, namespace, spec, &new_ids, &new_ports, &new_specs,
+                )
+                .await;
+            let detail = match retention {
+                Ok(()) => "started replacements retained for cleanup".into(),
+                Err(error) => format!("could not retain replacement ownership: {error}"),
+            };
+            let _ = events
+                .send(ApplyEvent::Error {
+                    message: format!("rollout finalisation failed: {error}; {detail}"),
+                })
+                .await;
+            return std::ops::ControlFlow::Break(());
+        }
 
         for new_id in &new_ids {
             let _ = events
@@ -10025,19 +10078,37 @@ impl<G: Grill + Clone + 'static> DeployWorker<G> {
                 return std::ops::ControlFlow::Break(());
             }
         }
-        self.ops
+        if let Err(error) = self
+            .ops
             .finalise_rolling_deploy(
                 app_name,
                 namespace,
                 spec,
                 existing,
                 new_ids.clone(),
-                new_ports,
+                new_ports.clone(),
                 new_ips,
-                new_specs,
+                new_specs.clone(),
                 now,
             )
-            .await;
+            .await
+        {
+            let retention = self
+                .retain_started_replacements(
+                    app_name, namespace, spec, &new_ids, &new_ports, &new_specs,
+                )
+                .await;
+            let detail = match retention {
+                Ok(()) => "started replacements retained for cleanup".into(),
+                Err(error) => format!("could not retain replacement ownership: {error}"),
+            };
+            let _ = events
+                .send(ApplyEvent::Error {
+                    message: format!("rollout finalisation failed: {error}; {detail}"),
+                })
+                .await;
+            return std::ops::ControlFlow::Break(());
+        }
 
         for new_id in &new_ids {
             let _ = events
@@ -10519,17 +10590,34 @@ mod tests {
         assert_eq!(agent.egress_observation_count.load(Ordering::Relaxed), 3);
     }
 
-    fn test_agent() -> (
-        BunAgent<MockGrill>,
-        mpsc::Sender<AgentCommand>,
-        CancellationToken,
-    ) {
+    struct TestAgent {
+        agent: BunAgent<MockGrill>,
+        // Fields drop in declaration order: keep filesystem ownership through
+        // agent teardown, including when the fixture moves into a spawned task.
+        _volumes: tempfile::TempDir,
+    }
+
+    impl std::ops::Deref for TestAgent {
+        type Target = BunAgent<MockGrill>;
+
+        fn deref(&self) -> &Self::Target {
+            &self.agent
+        }
+    }
+
+    impl std::ops::DerefMut for TestAgent {
+        fn deref_mut(&mut self) -> &mut Self::Target {
+            &mut self.agent
+        }
+    }
+
+    fn test_agent() -> (TestAgent, mpsc::Sender<AgentCommand>, CancellationToken) {
         let (agent, tx, shutdown, _grill) = test_agent_with_grill();
         (agent, tx, shutdown)
     }
 
     fn test_agent_with_grill() -> (
-        BunAgent<MockGrill>,
+        TestAgent,
         mpsc::Sender<AgentCommand>,
         CancellationToken,
         MockGrill,
@@ -10539,7 +10627,13 @@ mod tests {
         let grill = MockGrill::new();
         let grill_handle = grill.clone();
         let port_allocator = PortAllocator::new(30000, 31000);
-        let agent = BunAgent::new(grill, port_allocator, rx, shutdown.clone());
+        let mut agent = BunAgent::new(grill, port_allocator, rx, shutdown.clone());
+        let volumes = tempfile::tempdir().unwrap();
+        agent.set_volumes_dir(volumes.path().to_path_buf());
+        let agent = TestAgent {
+            agent,
+            _volumes: volumes,
+        };
         (agent, tx, shutdown, grill_handle)
     }
 
@@ -11933,7 +12027,9 @@ interval = 1
         let shutdown = CancellationToken::new();
         let grill = crate::grill::process::ProcessGrill::new();
         let port_allocator = PortAllocator::new(30000, 31000);
+        let volumes = tempfile::tempdir().unwrap();
         let mut agent = BunAgent::new(grill, port_allocator, rx, shutdown);
+        agent.set_volumes_dir(volumes.path().to_path_buf());
 
         let config = Config::parse(&format!(
             "[app.web]\nimage = \"proc-grill:ignored\"\ncommand = [\"sleep\", \"60\"]\nport = {port}\n\n[app.web.health]\npath = \"/healthz\"\n\n[app.web.deploy]\nhealth_timeout = \"5s\"\n",
@@ -12052,12 +12148,7 @@ interval = 1
         restart_preserves_uncertain_cleanup(MockGrill::block_kills).await;
     }
 
-    async fn failed_restart_fixture() -> (
-        BunAgent<MockGrill>,
-        MockGrill,
-        InstanceId,
-        tempfile::TempDir,
-    ) {
+    async fn failed_restart_fixture() -> (TestAgent, MockGrill, InstanceId, tempfile::TempDir) {
         let (mut agent, _tx, _shutdown, grill) = test_agent_with_grill();
         let directory = tempfile::tempdir().unwrap();
         agent.set_volumes_dir(directory.path().join("volumes"));
@@ -12259,7 +12350,9 @@ interval = 1
         let shutdown = CancellationToken::new();
         let grill = crate::grill::process::ProcessGrill::new();
         let port_allocator = PortAllocator::new(30000, 31000);
+        let volumes = tempfile::tempdir().unwrap();
         let mut agent = BunAgent::new(grill, port_allocator, rx, shutdown);
+        agent.set_volumes_dir(volumes.path().to_path_buf());
 
         let config = Config::parse(
             "[app.web]\nimage = \"proc-grill:ignored\"\ncommand = [\"sleep\", \"60\"]\n",
@@ -13194,6 +13287,109 @@ host = "remote.local"
                 assert!(
                     retained.iter().any(|instance| instance.id == old_id.0),
                     "{strategy} forgot the unconfirmed owner after {fault}"
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn rollout_retains_owners_when_artifact_retirement_fails() {
+        for strategy in ["rolling", "blue-green"] {
+            for block_identity in [false, true] {
+                let root = tempfile::tempdir().unwrap();
+                let records = root.path().join("records");
+                let (mut agent, tx, shutdown, grill) = test_agent_with_grill();
+                agent.set_volumes_dir(root.path().join("volumes"));
+                agent.set_records_dir(records.clone());
+                grill.set_pid(std::process::id());
+                let artifacts: Vec<_> = (0..2)
+                    .map(|index| {
+                        let id = InstanceId(format!("default__web-{index}"));
+                        (
+                            agent.instance_identity_dir(&id),
+                            crate::grill::records::record_path(&records, &id.0),
+                        )
+                    })
+                    .collect();
+                let task = tokio::spawn(async move {
+                    agent.run().await;
+                    agent
+                });
+                let mut initial = basic_config();
+                initial.app.get_mut("web").unwrap().replicas = crate::config::Replicas::Fixed(2);
+                expect_complete(&send_deploy(&tx, initial).await);
+                let mut original_records = Vec::new();
+                // Block either possible first owner; HashMap iteration order
+                // must not decide whether this exercises the whole old fleet.
+                for (identity, record) in &artifacts {
+                    original_records.push(std::fs::read(record).unwrap());
+                    if block_identity {
+                        crate::sesame::identity::cleanup_identity_dir(identity).unwrap();
+                        std::fs::write(identity, "blocked identity cleanup").unwrap();
+                    } else {
+                        std::fs::remove_file(record).unwrap();
+                        std::fs::create_dir(record).unwrap();
+                    }
+                }
+                let config = Config::parse(&format!("[app.web]\nimage = 'web:v2'\nport = 8080\nreplicas = 2\n[app.web.deploy]\nstrategy = '{strategy}'\ndrain_timeout = '0s'\n")).unwrap();
+                let events = send_deploy(&tx, config).await;
+                let durable_owner_retained = artifacts.iter().all(|(_, record)| record.exists());
+                let (response, status) = oneshot::channel();
+                tx.send(AgentCommand::Status { response }).await.unwrap();
+                let retained = status.await.unwrap();
+                for ((identity, record), original_record) in artifacts.iter().zip(original_records)
+                {
+                    if block_identity {
+                        std::fs::remove_file(identity).unwrap();
+                    } else {
+                        std::fs::remove_dir(record).unwrap();
+                        std::fs::write(record, original_record).unwrap();
+                    }
+                }
+                let (response, retired) = oneshot::channel();
+                tx.send(AgentCommand::Retire {
+                    app_name: "web".into(),
+                    namespace: "default".into(),
+                    response,
+                })
+                .await
+                .unwrap();
+                let recovery = retired.await.unwrap();
+                shutdown.cancel();
+                let agent = task.await.unwrap();
+                assert!(
+                    !events
+                        .iter()
+                        .any(|event| matches!(event, ApplyEvent::Complete { .. })),
+                    "{strategy} ignored artifact failure: {events:?}"
+                );
+                assert!(durable_owner_retained);
+                assert_eq!(
+                    retained.len(),
+                    if strategy == "rolling" { 3 } else { 4 },
+                    "both generations need a cleanup owner"
+                );
+                if strategy == "blue-green" {
+                    assert!(
+                        retained
+                            .iter()
+                            .filter(|instance| !instance.id.contains("-g"))
+                            .all(|instance| instance.state == "stopped"),
+                        "every retired blue instance must be stopped: {retained:?}"
+                    );
+                }
+                assert!(
+                    retained
+                        .iter()
+                        .any(|instance| !instance.id.contains("-g") && instance.state == "stopped"),
+                    "the old instance must not be eligible for crash restart"
+                );
+                assert!(recovery.is_ok(), "{recovery:?}");
+                assert!(agent.supervisor.list_instances().is_empty());
+                assert!(
+                    crate::grill::records::load_records(&records)
+                        .unwrap()
+                        .is_empty()
                 );
             }
         }
