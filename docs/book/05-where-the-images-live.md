@@ -626,8 +626,9 @@ A privileged CI run reached the public registry successfully, then lost its
 pinned BusyBox pull to a `Rate exceeded` response. The other 42 runtime checks
 passed. A laptop making its first pull can hit the same path.
 
-External manifest/config reads and layer downloads now retry only recognised
-rate-limit or temporary gateway/service errors. Each operation makes at most
+External manifest/config reads and layer downloads retry recognised rate-limit
+and temporary gateway/service errors. They also retry interrupted requests and
+response streams, as described below. Each operation makes at most
 four attempts, with roughly one, two and four seconds between them and a small
 random delay to spread simultaneous nodes. One deadline covers every attempt:
 30 seconds for manifest/config retrieval and 120 seconds per layer. A stalled
@@ -699,3 +700,32 @@ locking and sync operations, keeping those calls off the async executor.
 Tests cover competing owners, replacement, unknown entries, directory symlinks,
 and the actual Bun SIGKILL path. The separate live upgrade suite checks that
 rolling replacement and rollback can reacquire ownership.
+
+
+### A dropped connection has no HTTP status
+
+The rootless runtime CI gate failed while fetching an Alpine configuration blob:
+the connection failed before a complete response arrived. Our retry branch only
+looked for an HTTP status, so this failure escaped the retry policy altogether.
+
+Registry reads now also recognise request, timeout and response-stream errors.
+Reqwest labels interrupted byte streams as decode errors; the OCI client parses
+manifests separately, and ImageStore verifies layer digests. These errors are
+different from a complete malformed manifest or corrupt layer. The same four-attempt limit and original deadline apply.
+Retries preserve authentication and TLS verification and start layer buffers
+from empty.
+
+The local registry fixture sends part of a successful response, then breaks its
+body stream. The failing-first regression repeats that interruption for the
+manifest, configuration and layer paths and verifies the final unpacked bytes.
+A separate case sends complete malformed manifests or corrupt layers and requires immediate refusal;
+existing cases still check denied access, persistent rate limits and a stalled
+response. Passing those fixtures doesn't establish Docker Hub availability,
+so the real cold-image runtime gate remains part of qualification.
+
+
+The configuration-content case exposed a separate integrity gap: this path
+fetched but ignored the configuration bytes without verifying their descriptor
+digest. Inspecting the upstream client also showed that pinned manifest bytes
+need explicit verification, including each link through an image index. C56
+tracks that work; the transport retry change does not close it.

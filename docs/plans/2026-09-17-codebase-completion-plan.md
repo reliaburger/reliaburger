@@ -37,7 +37,7 @@ F items are missing capabilities, not evidence of failures in supported behaviou
 [Audit evidence and reproducible probes](../qualification/2026-09-17-code-audit.md)
 record those distinctions and the hosted checks inspected.
 
-There are **84 tracked work packages**: 55 correctness/contract items, 12
+There are **85 tracked work packages**: 56 correctness/contract items, 12
 engineering follow-ups, 12 capability families and five acceptance/release gates.
 The correctness items include 28 P1 priorities; these are engineering priorities, not
 security severity ratings. A capability family can require several commits.
@@ -1273,6 +1273,17 @@ strict Linux/macOS Clippy and the exact real privileged pinned pull (1.93s).
 The pinned upstream client discards error-response headers, so this policy does
 not claim to honour `Retry-After`. Current-head hosted CI remains separate.
 
+**Registry transport retry follow-up (19 September):** Hosted privileged Linux
+at `b2001e4` failed on a Docker Hub configuration-blob request before the rootless
+port-adoption assertion. The retry policy handled selected HTTP status codes but
+not transport errors. A local interrupted-response regression reproduces the
+failure. The repair keeps the existing attempt/deadline bounds for request and
+response-stream failures, while malformed manifests, authentication refusals
+and layer digest failures remain terminal. All 35 image-store tests pass on
+macOS/Linux (7.70s/8.04s), with strict Clippy. The real rootless port-adoption
+gate passes from a fresh image store (4.65s). Its complete corrupt-configuration
+case exposed the separate C56 integrity gap.
+
 ### C55 — Bound log response bodies and own fan-out cancellation
 
 **Priority:** P1. **Wave:** 4. **Book chapter:** 06.
@@ -1307,6 +1318,23 @@ the fixture now accepts those two outcomes, retaining the original two-second
 deadline and rejecting every other result. All 13 query tests pass on macOS and
 Linux (0.12s each). The corrected native library checkpoint passes 3,295 tests,
 with five explicit gates (47.27s).
+
+### C56 — Verify upstream image identity before caching
+
+**Priority:** P1. **Wave:** 4. **Book chapter:** 05.
+
+The transport-retry regression exposed a separate failure: ImageStore accepts a
+complete configuration response whose bytes do not match the manifest's digest.
+The pinned OCI client's manifest/config convenience method also parses raw
+manifest bytes without proving the digest requested by the reference or selected
+index descriptor. Its reported digest can come from a response header.
+
+**Completion test:** Hash raw manifest bytes, preserve digest anchoring through
+platform-index resolution, and verify configuration content before publishing a
+manifest or rootfs. Exercise forged headers, changed root and child manifests,
+wrong configuration bytes, valid index resolution and both direct/pull-through
+consumers. Permanent integrity errors must not retry or leave accepted cache
+entries. Qualify actual upstream pulls independently of hermetic fixtures.
 
 ## Engineering follow-ups
 

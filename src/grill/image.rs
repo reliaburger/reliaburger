@@ -234,10 +234,16 @@ where
             }
             OciDistributionError::ServerError { code, .. } => matches!(code, 429 | 502 | 503 | 504),
             OciDistributionError::RequestError(error) => {
-                matches!(
-                    error.status().map(|status| status.as_u16()),
-                    Some(429 | 502 | 503 | 504)
-                )
+                // Manifest parsing and layer digest checks happen separately. Reqwest
+                // decode errors here include interrupted response-byte streams.
+                error.is_request()
+                    || error.is_timeout()
+                    || error.is_body()
+                    || error.is_decode()
+                    || matches!(
+                        error.status().map(|status| status.as_u16()),
+                        Some(429 | 502 | 503 | 504)
+                    )
             }
             _ => false,
         };
@@ -1190,9 +1196,17 @@ mod tests {
 
     // -- Hermetic OCI distribution fixture ------------------------------------
 
+    #[derive(Clone, Copy)]
+    enum RegistryFaultTarget {
+        Manifest,
+        Configuration,
+        Layer,
+    }
+
     #[derive(Clone)]
     struct RegistryFault {
-        layer: bool,
+        target: RegistryFaultTarget,
+        disconnect: bool,
         status: StatusCode,
         code: &'static str,
         remaining: Arc<AtomicUsize>,
@@ -1207,7 +1221,12 @@ mod tests {
         count: usize,
     ) -> RegistryFault {
         RegistryFault {
-            layer,
+            target: if layer {
+                RegistryFaultTarget::Layer
+            } else {
+                RegistryFaultTarget::Manifest
+            },
+            disconnect: false,
             status,
             code,
             remaining: Arc::new(AtomicUsize::new(count)),
@@ -1264,10 +1283,10 @@ mod tests {
         }
         if let Some(fault) = &state.fault
             && path
-                == if fault.layer {
-                    &state.layer_path
-                } else {
-                    &state.manifest_path
+                == match fault.target {
+                    RegistryFaultTarget::Manifest => &state.manifest_path,
+                    RegistryFaultTarget::Configuration => &state.config_path,
+                    RegistryFaultTarget::Layer => &state.layer_path,
                 }
             && fault
                 .remaining
@@ -1278,6 +1297,24 @@ mod tests {
         {
             fault.received.notify_one();
             tokio::time::sleep(fault.delay).await;
+            if fault.disconnect {
+                use futures_util::StreamExt;
+                let prefix = futures_util::stream::once(async {
+                    Ok::<_, std::io::Error>(axum::body::Bytes::from_static(b"partial response"))
+                });
+                let failure = futures_util::stream::once(async {
+                    tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+                    Err::<axum::body::Bytes, _>(std::io::Error::new(
+                        std::io::ErrorKind::ConnectionReset,
+                        "injected disconnect",
+                    ))
+                });
+                return Response::builder()
+                    .status(StatusCode::OK)
+                    .header(header::CONTENT_LENGTH, 1000)
+                    .body(Body::from_stream(prefix.chain(failure)))
+                    .unwrap();
+            }
             return Response::builder()
                 .status(fault.status)
                 .header(header::CONTENT_TYPE, "application/json")
@@ -1384,6 +1421,60 @@ mod tests {
             manifest_requests,
             shutdown,
             task,
+        }
+    }
+
+    #[tokio::test]
+    async fn registry_disconnect_retries_manifest_configuration_and_layer_reads() {
+        for target in [
+            RegistryFaultTarget::Manifest,
+            RegistryFaultTarget::Configuration,
+            RegistryFaultTarget::Layer,
+        ] {
+            let mut fault = registry_fault(false, StatusCode::OK, "UNAVAILABLE", 1);
+            fault.target = target;
+            fault.disconnect = true;
+            let fixture = start_registry_fixture_with_fault(Some(fault)).await;
+            let tmp = tempfile::tempdir().unwrap();
+            let store = ImageStore::new(tmp.path().to_path_buf());
+            let rootfs = store.pull_and_unpack(&fixture.reference).await.unwrap();
+            assert_eq!(
+                std::fs::read(rootfs.join("bin/sh")).unwrap(),
+                b"fixture shell"
+            );
+            assert_eq!(
+                fixture.manifest_requests.load(Ordering::SeqCst),
+                if matches!(target, RegistryFaultTarget::Layer) {
+                    1
+                } else {
+                    2
+                }
+            );
+            assert_eq!(
+                fixture.layer_requests.load(Ordering::SeqCst),
+                if matches!(target, RegistryFaultTarget::Layer) {
+                    2
+                } else {
+                    1
+                }
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn registry_complete_corrupt_responses_are_not_retried() {
+        for target in [RegistryFaultTarget::Manifest, RegistryFaultTarget::Layer] {
+            let mut fault = registry_fault(false, StatusCode::OK, "INVALID", usize::MAX);
+            fault.target = target;
+            let fixture = start_registry_fixture_with_fault(Some(fault)).await;
+            let tmp = tempfile::tempdir().unwrap();
+            let store = ImageStore::new(tmp.path().to_path_buf());
+            assert!(store.pull_and_unpack(&fixture.reference).await.is_err());
+            assert_eq!(fixture.manifest_requests.load(Ordering::SeqCst), 1);
+            assert_eq!(
+                fixture.layer_requests.load(Ordering::SeqCst),
+                usize::from(matches!(target, RegistryFaultTarget::Layer))
+            );
         }
     }
 
