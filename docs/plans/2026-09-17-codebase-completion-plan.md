@@ -1912,6 +1912,18 @@ The build/signing pipeline exists, but no 0.1.0 tag or public candidate has been
 
 **Completion test:** Use the authorised release key, verify relocated native/BPF artefacts, install downloaded bytes and promote the same bytes. Never create a tag merely to make a checklist green.
 
+**Candidate preservation implemented (19 September):** Manual main builds run
+source CI, produce/sign the complete matrix and preserve all assets with a
+source/run-bound inventory. A separate manual promotion checks the externally
+recorded qualification digest, exact version/tag commit, successful main build,
+complete inventory and every byte before upload, then checks uploaded digests
+before publishing. It never rebuilds or resigns; tag pushes no longer publish.
+The 17 packaging/candidate tests pass on macOS and Linux, including refused
+source/file/provenance substitutions. Both workflows pass actionlint 1.7.12.
+Hosted candidate execution, pre-publication
+transport for its final URLs and actual installation remain open; no tag or
+release was created by this change.
+
 ### V04 — Measure repeated cold installs on the advertised host matrix
 
 **Priority:** gate. **Wave:** 7. **Book chapters:** 09, 15.

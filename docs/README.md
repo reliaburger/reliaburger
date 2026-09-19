@@ -6,6 +6,10 @@ probes use declared service endpoints, including configured ports and IPv6.
 The source implementation is undergoing qualification; the signed public
 installer is pending release.
 
+Release candidates now have a separate [build and promotion procedure](releasing.md#metadata-and-publication).
+Promotion preserves qualified files instead of rebuilding at tag time. The first
+hosted candidate and cold-install qualification remain pending.
+
 User guide for building and running Reliaburger. For the full architectural vision, see the [whitepaper](whitepaper.md). For current implementation status, see [progress.md](progress.md).
 
 The [17 September codebase audit and completion plan](plans/2026-09-17-codebase-completion-plan.md)

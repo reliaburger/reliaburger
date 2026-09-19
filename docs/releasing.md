@@ -7,7 +7,7 @@ No public 0.1.0 release has been published by this work.
 ## What the workflow builds
 
 `.github/workflows/build.yml` builds the following native artefacts on pull
-requests, main and version tags:
+requests, main and manual candidate builds:
 
 | File | Build host | Use |
 | --- | --- | --- |
@@ -85,10 +85,55 @@ with their configured external key.
 
 ## Metadata and publication
 
-The tag must equal `v` plus the version in `Cargo.toml`. After source CI, native
-builds, packaging tests and PDF generation pass, the tag workflow signs all six
-binaries and attaches them, their envelopes, checksums, metadata and PDFs to a
-GitHub release.
+Candidate building and release publication are separate manual operations.
+After this workflow is on `main`, run:
+
+```sh
+gh workflow run build.yml --ref main
+```
+
+This reruns source CI and builds the native matrix and PDFs at one main commit.
+Only after those checks pass does it mirror the pinned guest images, sign all
+six binaries and upload `candidate-<commit>-<attempt>` as an Actions artefact.
+It creates no Git tag or GitHub release. PR and ordinary main builds never use
+the release signing secret.
+
+Download that artefact for qualification. Preserve its run ID, attempt, source
+commit and the `candidate.json` SHA-256 printed in the job summary alongside
+the qualification results. The record covers every binary, signature, metadata
+file, installer, PDF and guest image. Artefacts expire after 90 days; archive the
+qualified files, and don't expect promotion to rebuild an expired candidate.
+Rerunning the candidate run requires recording and qualifying its new attempt.
+
+Once all release gates pass, an operator creates the version tag at that exact
+candidate commit. The tag must equal `v` plus `Cargo.toml`'s version. Pushing a
+tag does not rebuild or publish anything. Promotion is explicit:
+
+```sh
+gh workflow run promote.yml --ref main \
+  -f tag=v0.1.0 -f candidate_run=RUN_ID -f qualified_digest=RECORDED_SHA256
+```
+
+The promotion workflow checks the tagged source, successful manual main build,
+repository, version and recorded manifest digest. It downloads the preserved
+candidate and requires an exact file inventory and matching lengths/hashes.
+It then uploads those unchanged files to a new draft, checks GitHub's stored
+asset digests and publishes. It neither compiles nor signs. An existing release
+refuses replacement; a failed upload/check leaves a draft for investigation,
+not an automatically repaired or overwritten release.
+
+The digest input must come from the qualification record. Copying a fresh digest
+from unqualified downloads defeats the gate. Workflow verification establishes
+identity and byte preservation; it cannot establish that somebody actually ran
+the cold-install and recovery tests. Those remain operator acceptance criteria.
+The complete hosted candidate and promotion paths have not yet been exercised.
+Pre-publication hosting/transport for the unchanged candidate's final release
+URLs also remains part of V03; downloading an Actions artefact alone does not
+qualify the public quickstart.
+
+GitHub documents the [default-branch requirement for manual workflows](https://docs.github.com/en/actions/how-tos/manage-workflow-runs/manually-run-a-workflow)
+and the [release asset digest fields](https://docs.github.com/en/rest/releases/releases).
+This PR must land before those manual workflows can run.
 
 - `metadata.json` selects **Bun** by platform, preserving the existing schema
   and upgrade reader.
@@ -110,7 +155,7 @@ publish a five-minute claim from a source build or a warmed VM.
 
 ## Guest images and bootstrap installer
 
-The release job mirrors the two dated Ubuntu images in
+The candidate job mirrors the two dated Ubuntu images in
 `scripts/release/guest-images.json`, verifying SHA-256 before publication. The
 CLI embeds that same manifest and verifies its downloaded image. Update the
 manifest deliberately when changing the guest baseline; don't introduce an

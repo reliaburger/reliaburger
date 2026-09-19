@@ -1021,3 +1021,30 @@ arbitrary-text property test make that decision executable. Hickory replaces
 the DNS codec because complete wire decoding removes a second parser's worth
 of boundary and compression handling; the duration evaluation doesn't show
 the same benefit.
+
+### Build once, qualify those bytes, publish those bytes
+
+Suppose our laptop test passes with one binary, then pushing a release tag
+builds it again. The source is unchanged. The compiler, linker or build input
+might not be. We've tested one executable and published another.
+
+The candidate workflow now builds and signs on a manually selected main commit,
+after source CI passes. It records every asset's size and SHA-256 in
+`candidate.json`, together with the source commit and workflow run/attempt.
+The qualification report keeps that record's digest. A later promotion downloads
+the saved candidate and checks it against the report before creating a draft.
+It also compares GitHub's uploaded asset digests before making the draft public.
+No compiler or signing key participates in promotion.
+
+The Python helper is deliberately separate from Rust's runtime upgrade verifier.
+It coordinates release files and GitHub provenance; the agent still verifies
+Ed25519 signatures before executing a replacement. A SHA-256 copied from an
+untrusted download is not an approval. Here the independently retained digest
+binds promotion to the bytes the operator qualified.
+
+Tests change each asset, remove it, add unexpected files and substitute a source
+commit, version, repository or run. They also reject failed/PR build provenance,
+symlinks, incomplete matrices, changed guest images and mismatched uploaded
+assets. A passing round trip preserves every original byte. This gives us a
+repeatable publication gate, not evidence that the first public installation
+has already passed; that still needs the real candidate and empty caches.

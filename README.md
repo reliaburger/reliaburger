@@ -226,6 +226,10 @@ sets out the remaining work, in order:
    restart and recovery, and measure the full three-node start with empty
    caches before publishing the five-minute claim.
 
+The [candidate and promotion workflow](docs/releasing.md#metadata-and-publication)
+preserves signed assets and publishes only the qualified bytes. Hosted candidate
+creation and cold-install acceptance are still pending.
+
 Each step includes tests and updates to the documentation and book. Detailed
 acceptance gates and deferred features live in the release plan; implementation
 history remains in [progress.md](docs/progress.md).
