@@ -23,7 +23,7 @@ for every item below. IDs are scoped to that plan, not the older C1/M1 review ID
 The [audit record](qualification/2026-09-17-code-audit.md) separates local defect
 reproductions from inspected source and previous acceptance evidence.
 
-These are work packages, not 83 mandatory features for 0.1.0. Correctness fixes
+These are work packages, not 84 mandatory features for 0.1.0. Correctness fixes
 need explicit release dispositions; optional refactors and future capabilities
 remain separate. Older unchecked groups below point into this current ledger.
 
@@ -119,6 +119,8 @@ The subsequent cron checkpoint changes require their own hosted validation.
 - [x] **C53** Require an unscoped administrator to inspect or release another credential's lease. Both API regressions fail before the fix; eight token/lease API tests (2.29s), 48 lease-filtered library tests (one explicit gate, 1.89s) and strict Linux/macOS Clippy pass. Exact scoped owners and unrestricted operator overrides retain access.
 
 - [x] **C54** Bound transient upstream registry reads to four attempts and one deadline (30 seconds for manifest/config, 120 seconds per layer), retaining permanent failures and digest-verified atomic publication. Hosted CI at `af32c3f` passed 42 privileged checks but failed the pinned pull with “Rate exceeded”. Three hermetic regressions fail first; all 33 image-store tests pass (7.62s), including stalled-request expiry and permanent denial, alongside strict Linux/macOS Clippy. The exact real privileged pinned-image test passes (1.93s).
+
+- [x] **C55** Bound cross-node log response bodies and own cancellation. Both stalled-body and detached-request regressions fail first. Full-body timeout and JoinSet ownership pass 13 native query tests (0.12s), 62 Linux Ketchup tests (one explicit gate, 0.44s), all five cross-node tests on Linux/macOS (0.52s/0.14s) and strict Linux/macOS Clippy. The CI fixture correction is separate.
 
 ### Engineering follow-ups
 

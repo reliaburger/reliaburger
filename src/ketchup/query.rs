@@ -103,7 +103,9 @@ fn build_entries_url(base: &str, app: &str, namespace: &str) -> Result<url::Url,
 /// `http://10.0.1.5:9117`). The query is sent to
 /// `GET /v1/logs/entries/{app}/{namespace}` with URL-encoded parameters, so
 /// a `grep` value containing `&` or `?` is transmitted intact rather than
-/// splitting into extra query parameters.
+/// splitting into extra query parameters. Each node's deadline includes headers
+/// and the complete response body. Dropping this query aborts its owned requests;
+/// a timed-out node is reported alongside results from responsive nodes.
 pub async fn fan_out_query(
     query: &LogQuery,
     nodes: &[(String, String)],
@@ -111,7 +113,7 @@ pub async fn fan_out_query(
     timeout: std::time::Duration,
     service_token: Option<&str>,
 ) -> Result<FanOutResult, KetchupError> {
-    let mut handles = Vec::new();
+    let mut handles = tokio::task::JoinSet::new();
 
     for (node_id, url) in nodes {
         let node_id = node_id.clone();
@@ -125,13 +127,13 @@ pub async fn fan_out_query(
         let end = query.end;
         let client = client.clone();
 
-        handles.push(tokio::spawn(async move {
+        handles.spawn(async move {
             // Build the target URL through `url::Url` so `app`/`namespace`
             // path segments are percent-encoded, and hand the query pairs to
             // reqwest's `.query()`, which encodes each value. A `grep` value
             // with `&` or `?` therefore travels as one parameter's data, not
             // as extra query syntax.
-            let outcome: Result<Vec<LogEntry>, String> = async {
+            let outcome: Result<Vec<LogEntry>, String> = tokio::time::timeout(timeout, async {
                 let req_url = build_entries_url(&base, &app, &namespace)
                     .map_err(|e| format!("bad url: {e}"))?;
 
@@ -153,25 +155,28 @@ pub async fn fan_out_query(
                     crate::sesame::auth::bearer_get(&client, req_url.as_str(), token.as_deref())
                         .query(&params);
 
-                match tokio::time::timeout(timeout, request.send()).await {
-                    Ok(Ok(r)) if r.status().is_success() => r
-                        .json::<Vec<LogEntry>>()
-                        .await
-                        .map_err(|e| format!("invalid json: {e}")),
-                    Ok(Ok(r)) => Err(format!("status {}", r.status().as_u16())),
-                    Ok(Err(e)) => Err(format!("request failed: {e}")),
-                    Err(_) => Err("timed out".to_string()),
+                let response = request
+                    .send()
+                    .await
+                    .map_err(|error| format!("request failed: {error}"))?;
+                if !response.status().is_success() {
+                    return Err(format!("status {}", response.status().as_u16()));
                 }
-            }
-            .await;
+                response
+                    .json::<Vec<LogEntry>>()
+                    .await
+                    .map_err(|error| format!("invalid json: {error}"))
+            })
+            .await
+            .unwrap_or_else(|_| Err("timed out".to_string()));
             (node_id, outcome)
-        }));
+        });
     }
 
     let mut sources = Vec::new();
     let mut failures = Vec::new();
-    for handle in handles {
-        match handle.await {
+    while let Some(result) = handles.join_next().await {
+        match result {
             Ok((node_id, Ok(entries))) => sources.push(NodeLogs { node_id, entries }),
             Ok((node_id, Err(reason))) => failures.push(NodeFailure { node_id, reason }),
             Err(e) => failures.push(NodeFailure {
@@ -205,6 +210,85 @@ mod tests {
             node_id: id.to_string(),
             entries,
         }
+    }
+
+    async fn stalled_body_server() -> (
+        String,
+        tokio::sync::oneshot::Receiver<()>,
+        tokio::task::JoinHandle<()>,
+    ) {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        let (headers, ready) = tokio::sync::oneshot::channel();
+        let task = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut request = Vec::new();
+            let mut buffer = [0; 1024];
+            while !request.windows(4).any(|bytes| bytes == b"\r\n\r\n") {
+                let count = socket.read(&mut buffer).await.unwrap();
+                assert!(count > 0);
+                request.extend_from_slice(&buffer[..count]);
+            }
+            socket.write_all(b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 100\r\n\r\n[").await.unwrap();
+            headers.send(()).unwrap();
+            assert_eq!(
+                socket.read(&mut buffer).await.unwrap(),
+                0,
+                "query retained its socket"
+            );
+        });
+        (url, ready, task)
+    }
+
+    #[tokio::test]
+    async fn node_deadline_includes_a_stalled_response_body() {
+        let (url, _ready, mut server) = stalled_body_server().await;
+        let client = reqwest::Client::new();
+        let result = tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            fan_out_query(
+                &log_query(None),
+                &[("stalled".into(), url)],
+                &client,
+                std::time::Duration::from_millis(100),
+                None,
+            ),
+        )
+        .await;
+        server.abort();
+        let _ = (&mut server).await;
+        let result = result.expect("headers escaped the query deadline").unwrap();
+        assert!(result.entries.is_empty());
+        assert_eq!(result.failures.len(), 1);
+        assert_eq!(result.failures[0].node_id, "stalled");
+        assert!(result.failures[0].reason.contains("timed out"));
+    }
+
+    #[tokio::test]
+    async fn cancelling_fan_out_releases_inflight_body_reads() {
+        let (url, ready, mut server) = stalled_body_server().await;
+        let task = tokio::spawn(async move {
+            fan_out_query(
+                &log_query(None),
+                &[("stalled".into(), url)],
+                &reqwest::Client::new(),
+                std::time::Duration::from_secs(30),
+                None,
+            )
+            .await
+        });
+        tokio::time::timeout(std::time::Duration::from_secs(2), ready)
+            .await
+            .unwrap()
+            .unwrap();
+        task.abort();
+        assert!(matches!(task.await, Err(error) if error.is_cancelled()));
+        let closed = tokio::time::timeout(std::time::Duration::from_secs(2), &mut server).await;
+        server.abort();
+        closed
+            .expect("cancelled query left a detached request")
+            .unwrap();
     }
 
     #[test]

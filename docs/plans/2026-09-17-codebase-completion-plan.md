@@ -37,9 +37,9 @@ F items are missing capabilities, not evidence of failures in supported behaviou
 [Audit evidence and reproducible probes](../qualification/2026-09-17-code-audit.md)
 record those distinctions and the hosted checks inspected.
 
-There are **83 tracked work packages**: 54 correctness/contract items, 12
+There are **84 tracked work packages**: 55 correctness/contract items, 12
 engineering follow-ups, 12 capability families and five acceptance/release gates.
-The correctness items include 27 P1 priorities; these are engineering priorities, not
+The correctness items include 28 P1 priorities; these are engineering priorities, not
 security severity ratings. A capability family can require several commits.
 
 ## What is already done
@@ -1148,6 +1148,23 @@ pass (7.62s), including stalled-request expiry and permanent denial, as do
 strict Linux/macOS Clippy and the exact real privileged pinned pull (1.93s).
 The pinned upstream client discards error-response headers, so this policy does
 not claim to honour `Retry-After`. Current-head hosted CI remains separate.
+
+### C55 — Bound log response bodies and own fan-out cancellation
+
+**Priority:** P1. **Wave:** 4. **Book chapter:** 06.
+
+Found while investigating the hosted `logs_cross_node` fixture failure at
+`9747fba`: `fan_out_query` timed only response headers, then read JSON without
+that deadline. Dropping its vector of task handles detached in-flight reads.
+Two socket regressions fail before the fix (11 pass, two fail, 2.06s).
+
+**Completed on PR #167:** A node's existing timeout now covers the request and body.
+A `JoinSet` owns child requests and aborts them when the caller disappears;
+completion still merges successful entries and records each failed node.
+Both regressions pass alongside all 13 native query tests (0.12s), 62 Linux
+Ketchup tests (one explicit gate, 0.44s), all five cross-node tests on Linux
+(0.52s) and macOS (0.14s), and strict Linux/macOS Clippy. The independent
+partial-failure fixture correction is recorded separately.
 
 ## Engineering follow-ups
 

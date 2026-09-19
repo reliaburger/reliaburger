@@ -579,3 +579,24 @@ The tests include a valid maximum-width integer to make sure refusal hasn't
 become indiscriminate. Normal metric, rollup and log persistence/query tests
 remain part of qualification. A dependency scan is useful evidence. A parser
 regression is different evidence, and we need both.
+
+### A log query owns its response bodies
+
+A peer can send `200 OK` and then stop sending the JSON body. Timing only
+`request.send()` doesn't protect us: that future completes when the headers
+arrive. The query can still wait indefinitely while reading the entries. We
+wrap the whole request and body-read future in the node's existing timeout.
+Expiry contributes a named node failure; responsive nodes' entries still count.
+
+Cancellation has another ownership trap. Dropping a Tokio `JoinHandle` detaches
+its task, so dropping a vector of handles doesn't stop the network requests.
+We use `JoinSet` instead. This collection owns its spawned tasks and aborts them
+when the set is dropped. `join_next().await` yields one completed task at a time:
+`None` means the set is empty, while `Some` contains either the task's result or
+a task failure. We retain both sorts of failure in the fan-out result.
+
+Two socket fixtures reproduce the old mistakes. One sends headers and the
+first byte of a body, then stalls. The other waits until those headers have
+been sent before cancelling the parent query and checks that the peer sees its
+connection close. A caller's timeout is useful only if the work it owns ends
+too.
