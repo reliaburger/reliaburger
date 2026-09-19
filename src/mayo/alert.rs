@@ -93,16 +93,40 @@ pub enum TransitionKind {
     Resolved,
 }
 
+/// Alert phase carried by the public API, without the evaluator's clock state.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum AlertPhase {
+    /// The condition is not currently met.
+    Inactive,
+    /// The condition is waiting for its configured duration.
+    Pending,
+    /// The condition has held long enough to alert.
+    Firing,
+}
+
+/// Complete response from the alert inventory endpoint.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AlertsResponse {
+    /// Observed statuses; a missing field is not evidence of an empty list.
+    pub alerts: Vec<AlertStatus>,
+}
+
 /// A snapshot of an alert for API responses.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AlertStatus {
     /// Labels identifying this independent alert instance.
     #[serde(default)]
     pub labels: BTreeMap<String, String>,
+    /// Name of the evaluated rule.
     pub rule_name: String,
-    pub state: String,
+    /// Observed phase of this labelled instance.
+    pub state: AlertPhase,
+    /// Severity configured by the rule.
     pub severity: AlertSeverity,
+    /// Human-readable explanation of the condition.
     pub description: String,
+    /// Unix seconds when the current pending or firing phase began.
     pub since: Option<u64>,
 }
 
@@ -206,7 +230,7 @@ impl AlertEvaluator {
     pub fn firing_alerts(&self) -> Vec<AlertStatus> {
         self.all_statuses()
             .into_iter()
-            .filter(|status| status.state == "firing")
+            .filter(|status| status.state == AlertPhase::Firing)
             .collect()
     }
 
@@ -264,15 +288,15 @@ fn status_for(
     labels: BTreeMap<String, String>,
     state: &AlertState,
 ) -> AlertStatus {
-    let (name, since) = match state {
-        AlertState::Inactive => ("inactive", None),
-        AlertState::Pending { since } => ("pending", Some(since)),
-        AlertState::Firing { since } => ("firing", Some(since)),
+    let (phase, since) = match state {
+        AlertState::Inactive => (AlertPhase::Inactive, None),
+        AlertState::Pending { since } => (AlertPhase::Pending, Some(since)),
+        AlertState::Firing { since } => (AlertPhase::Firing, Some(since)),
     };
     AlertStatus {
         rule_name: rule.name.clone(),
         labels,
-        state: name.into(),
+        state: phase,
         severity: rule.severity,
         description: rule.description.clone(),
         since: since
@@ -390,7 +414,7 @@ mod tests {
             evaluator
                 .all_statuses()
                 .iter()
-                .any(|status| status.labels == b.labels && status.state == "pending")
+                .any(|status| status.labels == b.labels && status.state == AlertPhase::Pending)
         );
         let second = evaluator.evaluate(&HashMap::from([(b.clone(), 96.0)]));
         assert_eq!(second.len(), 1);
@@ -427,7 +451,7 @@ mod tests {
         eval.evaluate(&make_values(&[("cpu", 95.0)]));
 
         let statuses = eval.all_statuses();
-        assert_eq!(statuses[0].state, "pending");
+        assert_eq!(statuses[0].state, AlertPhase::Pending);
     }
 
     #[test]
@@ -457,7 +481,7 @@ mod tests {
         assert_eq!(eval.firing_alerts().len(), 0);
 
         let statuses = eval.all_statuses();
-        assert_eq!(statuses[0].state, "inactive");
+        assert_eq!(statuses[0].state, AlertPhase::Inactive);
     }
 
     #[test]
@@ -469,10 +493,10 @@ mod tests {
         let mut eval = AlertEvaluator::new(vec![rule]);
 
         eval.evaluate(&make_values(&[("cpu", 95.0)])); // pending
-        assert_eq!(eval.all_statuses()[0].state, "pending");
+        assert_eq!(eval.all_statuses()[0].state, AlertPhase::Pending);
 
         eval.evaluate(&make_values(&[("cpu", 50.0)])); // recovery
-        assert_eq!(eval.all_statuses()[0].state, "inactive");
+        assert_eq!(eval.all_statuses()[0].state, AlertPhase::Inactive);
     }
 
     #[test]
@@ -496,12 +520,12 @@ mod tests {
         let mut eval = AlertEvaluator::new(vec![rule]);
 
         eval.evaluate(&make_values(&[("cpu", 95.0)])); // pending
-        assert_eq!(eval.all_statuses()[0].state, "pending");
+        assert_eq!(eval.all_statuses()[0].state, AlertPhase::Pending);
 
         // Data disappears while pending.
         let t = eval.evaluate(&HashMap::new());
         assert!(t.is_empty(), "pending→inactive is not a firing transition");
-        assert_eq!(eval.all_statuses()[0].state, "inactive");
+        assert_eq!(eval.all_statuses()[0].state, AlertPhase::Inactive);
     }
 
     #[test]
@@ -577,7 +601,7 @@ mod tests {
         let eval = AlertEvaluator::with_defaults();
         let statuses = eval.all_statuses();
         assert_eq!(statuses.len(), 5);
-        assert!(statuses.iter().all(|s| s.state == "inactive"));
+        assert!(statuses.iter().all(|s| s.state == AlertPhase::Inactive));
     }
 
     #[test]
@@ -599,7 +623,7 @@ mod tests {
         let status = AlertStatus {
             labels: BTreeMap::new(),
             rule_name: "test".to_string(),
-            state: "firing".to_string(),
+            state: AlertPhase::Firing,
             severity: AlertSeverity::Critical,
             description: "test".to_string(),
             since: Some(1000),

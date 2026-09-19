@@ -600,3 +600,26 @@ first byte of a body, then stalls. The other waits until those headers have
 been sent before cancelling the parent query and checks that the peer sees its
 connection close. A caller's timeout is useful only if the work it owns ends
 too.
+
+### An empty alert list needs evidence
+
+Suppose a node returns `200 OK` with `{}`. Does that mean there are no alerts?
+The old client used a missing-field fallback and answered yes. The diagnostic
+collector could then present a healthy result without having received an alert
+inventory at all.
+
+Bun and Relish now share `AlertsResponse`, whose `alerts` field contains
+`Vec<AlertStatus>`. Serde must find that list and decode each required field.
+`AlertPhase` is an enum with `Inactive`, `Pending` and `Firing` variants;
+`#[serde(rename_all = "lowercase")]` keeps their existing JSON spellings.
+An unknown phase fails decoding instead of disappearing from the report.
+The evaluator's separate `AlertState` still owns its evaluation timestamps;
+the API carries the small serialisable snapshot consumers need.
+
+The client, TUI and `wtf` collector carry these typed statuses all the way
+through. A malformed inventory stays a collection error. An explicit
+`{"alerts": []}` is valid evidence of an empty inventory. Labels remain
+optional for older responses, and pending/firing timestamps remain optional;
+neither changes whether the required rule, phase, severity and description
+can be decoded. HTTP fixtures exercise both refusals and a labelled firing
+response, preserving the existing wire values without contacting a cluster.

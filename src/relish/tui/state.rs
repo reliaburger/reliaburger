@@ -73,7 +73,7 @@ pub struct ClusterData {
     pub instances: Vec<ClusterInstanceStatus>,
     pub nodes: Vec<NodeStatus>,
     pub council: Option<CouncilStatus>,
-    pub alerts: Vec<serde_json::Value>,
+    pub alerts: Vec<crate::mayo::alert::AlertStatus>,
     pub routes: Vec<RouteInfo>,
     pub jobs: Vec<JobStatus>,
     pub events: VecDeque<ClusterEvent>,

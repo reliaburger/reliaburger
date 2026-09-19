@@ -6198,11 +6198,12 @@ async fn logs_export_handler(
 /// `GET /v1/alerts` — list all alert statuses.
 async fn alerts_handler(State(state): State<ApiState>) -> impl IntoResponse {
     let Some(alerts) = &state.alerts else {
-        return Json(serde_json::json!({"alerts": []}));
+        return Json(crate::mayo::alert::AlertsResponse { alerts: Vec::new() });
     };
     let evaluator = alerts.read().await;
-    let statuses = evaluator.all_statuses();
-    Json(serde_json::json!({"alerts": statuses}))
+    Json(crate::mayo::alert::AlertsResponse {
+        alerts: evaluator.all_statuses(),
+    })
 }
 
 /// `GET /v1/metrics/keys` — list all distinct metric names.

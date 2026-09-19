@@ -1260,7 +1260,16 @@ and cached-image propagation remain F01, not hidden behind these settings.
 
 Evidence: `src/relish/client.rs:alerts`; `src/testkit/bench/suites.rs`.
 
-Alerts are untyped JSON values; capacity benchmarking recognises a no-eligible-nodes error by substring.
+**Alert contract implemented on PR #167.** Bun, Relish, the TUI and `wtf`
+share a required alert envelope and an enum for API phases. Missing lists,
+malformed entries and unknown phases fail collection; valid empty lists and
+labelled firing responses retain their wire format. The original HTTP regression
+fails before the fix. Scheduler/capacity work remains open: the benchmark also
+counts accepted desired-state writes before observing placement, while the
+leader logs scheduler refusals instead of returning them in the apply response.
+A typed wrapper around the existing substring check would not fix this.
+All 330 Relish tests, 19 evaluator tests and 118 API tests pass on both native
+macOS and Linux; strict all-target/all-feature Clippy passes on both.
 
 **Completion test:** Shared schemas and stable error codes survive message wording changes; malformed or partial responses cannot score a successful benchmark.
 

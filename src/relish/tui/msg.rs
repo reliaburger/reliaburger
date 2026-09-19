@@ -33,7 +33,7 @@ pub enum DataUpdate {
     Status(Result<Vec<ClusterInstanceStatus>, ProviderError>),
     Nodes(Result<Vec<NodeStatus>, ProviderError>),
     Council(Result<CouncilStatus, ProviderError>),
-    Alerts(Result<Vec<serde_json::Value>, ProviderError>),
+    Alerts(Result<Vec<crate::mayo::alert::AlertStatus>, ProviderError>),
     Routes(Result<Vec<RouteInfo>, ProviderError>),
     Jobs(Result<Vec<JobStatus>, ProviderError>),
     EventsSeed(Result<Vec<ClusterEvent>, ProviderError>),

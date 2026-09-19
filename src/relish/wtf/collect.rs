@@ -37,7 +37,7 @@ struct NodeCollection {
     diagnostics: Result<LocalDiagnosticSnapshot, String>,
     events: Result<Vec<crate::bun::events::ClusterEvent>, String>,
     deploys: Result<DeployOperationSnapshot, String>,
-    alerts: Result<Vec<serde_json::Value>, String>,
+    alerts: Result<Vec<crate::mayo::alert::AlertStatus>, String>,
     faults: Result<Vec<crate::smoker::types::FaultSummary>, String>,
 }
 
@@ -606,21 +606,12 @@ fn collect_alerts(
         match &node.alerts {
             Ok(alerts) => {
                 for alert in alerts {
-                    if alert.get("state").and_then(serde_json::Value::as_str) != Some("firing") {
+                    if alert.state != crate::mayo::alert::AlertPhase::Firing {
                         continue;
                     }
-                    let rule = alert
-                        .get("rule_name")
-                        .and_then(serde_json::Value::as_str)
-                        .unwrap_or("unnamed alert");
-                    let description = alert
-                        .get("description")
-                        .and_then(serde_json::Value::as_str)
-                        .unwrap_or("no description");
-                    let labels: BTreeMap<String, String> = alert
-                        .get("labels")
-                        .and_then(|labels| serde_json::from_value(labels.clone()).ok())
-                        .unwrap_or_default();
+                    let rule = &alert.rule_name;
+                    let description = &alert.description;
+                    let labels = &alert.labels;
                     let message = if labels.is_empty() {
                         format!("{rule}: {description}")
                     } else {
@@ -1038,11 +1029,13 @@ mod tests {
 
     #[test]
     fn labelled_alerts_remain_distinct_across_collected_nodes() {
-        let alerts = ["hot-a", "hot-b"].map(|node| {
-            serde_json::json!({
-                "rule_name": "cpu", "description": "CPU high", "state": "firing",
-                "labels": {"node": node}
-            })
+        let alerts = ["hot-a", "hot-b"].map(|node| crate::mayo::alert::AlertStatus {
+            rule_name: "cpu".into(),
+            description: "CPU high".into(),
+            state: crate::mayo::alert::AlertPhase::Firing,
+            severity: crate::mayo::alert::AlertSeverity::Critical,
+            labels: BTreeMap::from([("node".into(), node.into())]),
+            since: Some(1),
         });
         let collected = ["reporter-a", "reporter-b"].map(|node| NodeCollection {
             node_id: node.into(),

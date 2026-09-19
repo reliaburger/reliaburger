@@ -754,10 +754,11 @@ impl BunClient {
         Ok(statuses)
     }
 
-    /// List alert statuses as their wire JSON representation.
-    pub async fn alerts(&self) -> Result<Vec<serde_json::Value>, RelishError> {
-        let value: serde_json::Value = self.get_typed_json("/v1/alerts").await?;
-        Ok(value["alerts"].as_array().cloned().unwrap_or_default())
+    /// List validated alert statuses; missing or malformed evidence is an error.
+    pub async fn alerts(&self) -> Result<Vec<crate::mayo::alert::AlertStatus>, RelishError> {
+        let response: crate::mayo::alert::AlertsResponse =
+            self.get_typed_json("/v1/alerts").await?;
+        Ok(response.alerts)
     }
 
     /// List run-to-completion workload instances.
@@ -2637,6 +2638,72 @@ mod tests {
             Some("https://env.example:9117".to_string())
         );
         assert_eq!(pick_endpoint(None, None), None);
+    }
+
+    #[tokio::test]
+    async fn alerts_refuse_missing_malformed_or_unknown_status_evidence() {
+        for payload in [
+            serde_json::json!({}),
+            serde_json::json!({"alerts": null}),
+            serde_json::json!({"alerts": {}}),
+            serde_json::json!({"alerts": [{}]}),
+            serde_json::json!({"alerts": [{"rule_name":"cpu", "state":"mystery", "severity":"Critical", "description":"hot", "since":1}]}),
+            serde_json::json!({"alerts": [{"rule_name":"cpu", "state":"firing", "description":"hot", "since":1}]}),
+        ] {
+            let body = payload.clone();
+            let app = axum::Router::new().route(
+                "/v1/alerts",
+                axum::routing::get(move || {
+                    let body = body.clone();
+                    async move { axum::Json(body) }
+                }),
+            );
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let client = BunClient::new(&format!("http://{}", listener.local_addr().unwrap()));
+            let server = tokio::spawn(async move {
+                axum::serve(listener, app).await.unwrap();
+            });
+            let result = client.alerts().await;
+            server.abort();
+            assert!(
+                result.is_err(),
+                "accepted invalid alert evidence: {payload}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn alerts_preserve_empty_inventory_and_labelled_firing_status() {
+        use crate::mayo::alert::{AlertPhase, AlertSeverity};
+
+        for payload in [
+            serde_json::json!({"alerts": []}),
+            serde_json::json!({"alerts": [{
+                "rule_name": "cpu", "state": "firing", "severity": "Critical",
+                "description": "hot", "since": 42, "labels": {"app": "web"}
+            }]}),
+        ] {
+            let body = payload.clone();
+            let app = axum::Router::new().route(
+                "/v1/alerts",
+                axum::routing::get(move || {
+                    let body = body.clone();
+                    async move { axum::Json(body) }
+                }),
+            );
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let client = BunClient::new(&format!("http://{}", listener.local_addr().unwrap()));
+            let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+            let alerts = client.alerts().await.unwrap();
+            server.abort();
+            assert_eq!(serde_json::to_value(&alerts).unwrap(), payload["alerts"]);
+            if let Some(alert) = alerts.first() {
+                assert_eq!(alert.state, AlertPhase::Firing);
+                assert_eq!(alert.severity, AlertSeverity::Critical);
+                assert_eq!(alert.labels["app"], "web");
+                assert_eq!(alert.since, Some(42));
+            }
+        }
     }
 
     #[test]

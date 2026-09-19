@@ -43,7 +43,9 @@ pub trait DataProvider: Send + Sync + 'static {
     ) -> impl Future<Output = Result<Vec<ClusterInstanceStatus>, ProviderError>> + Send;
     fn nodes(&self) -> impl Future<Output = Result<Vec<NodeStatus>, ProviderError>> + Send;
     fn council(&self) -> impl Future<Output = Result<CouncilStatus, ProviderError>> + Send;
-    fn alerts(&self) -> impl Future<Output = Result<Vec<serde_json::Value>, ProviderError>> + Send;
+    fn alerts(
+        &self,
+    ) -> impl Future<Output = Result<Vec<crate::mayo::alert::AlertStatus>, ProviderError>> + Send;
     fn routes(&self) -> impl Future<Output = Result<Vec<RouteInfo>, ProviderError>> + Send;
     fn jobs(&self) -> impl Future<Output = Result<Vec<JobStatus>, ProviderError>> + Send;
     fn recent_events(
@@ -90,7 +92,7 @@ impl DataProvider for HttpDataProvider {
     async fn council(&self) -> Result<CouncilStatus, ProviderError> {
         self.client.council().await.map_err(Into::into)
     }
-    async fn alerts(&self) -> Result<Vec<serde_json::Value>, ProviderError> {
+    async fn alerts(&self) -> Result<Vec<crate::mayo::alert::AlertStatus>, ProviderError> {
         self.client.alerts().await.map_err(Into::into)
     }
     async fn routes(&self) -> Result<Vec<RouteInfo>, ProviderError> {
@@ -154,7 +156,7 @@ impl DataProvider for MockDataProvider {
     async fn council(&self) -> Result<CouncilStatus, ProviderError> {
         Ok(self.scenario.data().council.unwrap_or_default())
     }
-    async fn alerts(&self) -> Result<Vec<serde_json::Value>, ProviderError> {
+    async fn alerts(&self) -> Result<Vec<crate::mayo::alert::AlertStatus>, ProviderError> {
         Ok(self.scenario.data().alerts)
     }
     async fn routes(&self) -> Result<Vec<RouteInfo>, ProviderError> {
