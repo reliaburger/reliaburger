@@ -921,3 +921,16 @@ no runtime operation was attempted and the record is unchanged. Valid ordinary
 and rolling IDs for `worker-g9` remain adoptable. The real signed-exec test then
 checks a surviving generation-one workload and a generation-two deployment
 through the replacement Bun.
+
+### Keep test port reservations until launch
+
+The isolated-replacement qualification once failed before the upgrade began:
+Bun repeatedly reported an occupied address. The harness had released its API
+and registry reservations before choosing Raft and reporting ports, allowing
+a later allocation to reuse an earlier number. We keep the fixed sockets alive
+together until the supervisor launches Bun. Rust releases each socket when its
+owning value is dropped, so retaining those values retains the reservations.
+Pickle uses port zero because this fixture never addresses its registry directly;
+the kernel chooses an available port at the actual bind. Replacements reuse the
+fixed API and cluster addresses, preserving the test's original observation and
+rejoin deadlines. A port allocation failure is not evidence about rollback.

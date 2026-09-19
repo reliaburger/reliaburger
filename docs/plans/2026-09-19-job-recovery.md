@@ -46,8 +46,11 @@ Actual Bun/Relish suites, both compatibility checks and all eleven CLI tests
 pass. The physical Bun SIGKILL/explicit-CLI-rerun test passes on both platforms;
 its final fixture discovers Bun's bound ephemeral API port rather than racing a
 released reservation. Actual signed exec/adoption passes on macOS (19.45s).
-The Linux node/cluster upgrade matrix is still running; final hosted and release
-candidate qualification are separate gates.
+The Linux node suite initially passed five cases but hit a registry-port
+collision in the isolated-replacement fixture before the upgrade began. The
+separate reservation repair passes that case on macOS/Linux (36.92s/26.22s).
+The completed cluster upgrade matrix is recorded under V02 in progress.md;
+final hosted and release-candidate qualification remain separate gates.
 
 The checkpoint is schema 1 and advances durable state to generation 10;
 protocol 8 and test-lease schema 4 remain unchanged. Pre-release clusters must

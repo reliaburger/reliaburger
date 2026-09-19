@@ -62,14 +62,11 @@ impl RealNodeHarness {
         install_version(&bin_dir, "v0.2.0");
         std::os::unix::fs::symlink("bun-v0.1.0", bin_dir.join("bun")).unwrap();
 
-        // Grab free ports for the API and the Pickle registry
-        // (bind-then-release; races are possible but rare enough for tests).
+        // Keep the API reservation while allocating the cluster transports;
+        // early release can select the same TCP port for two services. Pickle
+        // is not addressed by this fixture, so Bun can bind its actual port zero.
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let api = listener.local_addr().unwrap().to_string();
-        let registry_listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-        let registry_port = registry_listener.local_addr().unwrap().port();
-        drop(listener);
-        drop(registry_listener);
 
         let config_path = root.path().join("node.toml");
         std::fs::write(
@@ -85,7 +82,7 @@ volumes = "{root}/volumes"
 
 [images]
 registry_bind = "127.0.0.1"
-registry_port = {registry_port}
+registry_port = 0
 
 [upgrades]
 binary_dir = "{bin}"
@@ -105,7 +102,7 @@ retain_versions = 3
         )
         .unwrap();
 
-        if cluster {
+        let cluster_sockets = if cluster {
             // A real cluster-mode process with no reachable peer. Local API
             // health must not allow its replacement to commit an upgrade.
             use std::io::Write;
@@ -116,7 +113,10 @@ retain_versions = 3
                 "\n[cluster]\ngossip_port = {}\nraft_port = {}\nreporting_port = {}\n[network]\nadvertise_address = \"127.0.0.1\"",
                 gossip.local_addr().unwrap().port(), raft.local_addr().unwrap().port(),
                 reporting.local_addr().unwrap().port()).unwrap();
-        }
+            Some((gossip, raft, reporting))
+        } else {
+            None
+        };
 
         // The supervisor: spawn the symlink, respawn on exit. On a
         // successful upgrade the exec keeps the pid, so wait() simply keeps
@@ -126,6 +126,10 @@ retain_versions = 3
         let listen = api.clone();
         let supervisor_config = config_path.clone();
         let supervisor = tokio::spawn(async move {
+            // Release only once every fixed address is chosen and immediately
+            // before launch. Replacements deliberately reuse those addresses.
+            drop(listener);
+            drop(cluster_sockets);
             loop {
                 let mut command = tokio::process::Command::new(&symlink);
                 if cluster {

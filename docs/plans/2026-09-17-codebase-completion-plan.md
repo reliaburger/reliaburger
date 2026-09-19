@@ -804,8 +804,13 @@ intent, bounded retry restoration, observed outcomes, explicit rerun authority
 and stop/retirement ordering. Full library suites pass 3,362 macOS/3,416 Linux
 tests, with strict Clippy, binary/CLI/compatibility checks and actual Bun crash
 recovery on both. The signed macOS replacement test passes in 19.45s. Durable
-state is generation 10, with protocol 8 and lease schema 4. The Linux upgrade
-matrix and final hosted qualification remain separate acceptance work.
+state is generation 10, with protocol 8 and lease schema 4. All three Linux
+cluster upgrade/revert/rollback cases pass (176.05s); all six node cases pass
+across the original run and the separately repaired isolated-node fixture.
+That fixture reported an occupied registry address before upgrade: keep its
+fixed socket reservations together and let Pickle bind port zero. Its actual
+isolated replacement/revert case passes on macOS/Linux (36.92s/26.22s).
+Final hosted and candidate qualification remain separate acceptance work.
 Discovery of resources created before their initial runtime adoption record,
 and cluster-lease completion before every former placement confirms retirement,
 still need implementation and qualification. Controlled reconciler interruption
