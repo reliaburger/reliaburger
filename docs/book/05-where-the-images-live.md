@@ -850,3 +850,56 @@ and its shared content remain available. Durable state advances to generation
 11; fresh pre-release clusters avoid interpreting an older collapsed catalogue
 as complete ownership evidence. Repository leases and upload retirement are the
 next, separate boundary.
+
+### A test volume needs an owner before it exists
+
+Suppose a test creates a 32 MiB volume and Bun dies just after mounting its
+backing image. The test client has disappeared too. Deleting an application row
+won't unmount that filesystem. Deleting the directory underneath it is worse:
+we might remove the data while the mount is still live.
+
+For reserved test namespaces, `VolumeManager::prepare_test_storage` first writes
+a private ownership checkpoint under `.test-storage`. Each managed path records
+its backend and whether provisioning finished. We synchronise the checkpoint and
+its directory before creating the subvolume or image. An interrupted preparation
+stays incomplete on disk. Recovery refuses to format it again; lease retirement
+can inspect and remove what that attempt actually created. Reopening a completed
+volume preserves its data and verifies its backend. An existing directory without
+an ownership checkpoint is an error, not an invitation to adopt someone else's data.
+
+The checkpoint also owns the application's generated configuration directory.
+Host-source volumes remain outside that ownership. We reject symlinked parents,
+symlinked configuration files, overlapping volume/artifact paths, duplicate JSON
+keys and invalid identities. The `unique_volumes` deserialiser implements Serde's
+`Visitor<'de>` trait: `'de` is the lifetime of the input being decoded, and
+`visit_map` consumes entries one at a time. This lets us reject a duplicate before
+a `BTreeMap` silently replaces the earlier value. `#[serde(deserialize_with =
+"unique_volumes")]` selects that function when reading the journal; normal
+serialisation still produces a JSON object.
+
+Stopping an application is not permission to delete its storage. Scale-down,
+rescheduling and ordinary Stop all preserve it. The lease reaper sends a separate
+`RetireTestResources` command, which first confirms runtime retirement and only
+then retires storage. The checkpoint enters a retiring state before deletion.
+A loop volume must match its recorded image and unmount normally; a busy mount
+keeps the checkpoint and lease pending. Btrfs subvolumes use `btrfs subvolume
+delete`. Plain directories are removed only after checking for unexpected mounts.
+We delete the checkpoint last and synchronise the directory again. A retry can
+finish an interrupted deletion without treating missing files as lost ownership.
+
+Linux reports mounts through `/proc/self/mountinfo`. macOS uses
+[`getfsstat`](https://developer.apple.com/library/archive/documentation/System/Conceptual/ManPages_iPhoneOS/man2/getfsstat.2.html).
+The latter fills a caller-provided array. `MaybeUninit<statfs>` reserves correctly
+aligned storage without pretending it contains valid Rust values. We inspect
+only the records the syscall says it initialised. The `unsafe` blocks document
+that boundary; the rest of the cleanup path remains ordinary checked Rust.
+Filesystem commands run on `spawn_blocking` threads with deadlines. On Linux,
+parent-death signalling also prevents a provisioning helper from continuing after
+its Bun owner dies.
+
+For 0.1.0, disposable test volumes do not support snapshots. Manual mutation
+refuses and automatic snapshot discovery excludes their namespace. Unexpected
+snapshot storage keeps cleanup pending so an operator can investigate. Ordinary
+application snapshots keep their existing behaviour. Storage ownership doesn't
+solve the separate problem of recovering a runtime that died before its first
+adoption record; that remains part of the release's runtime recovery work.

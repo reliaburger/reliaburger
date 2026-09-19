@@ -592,6 +592,21 @@ Only apps and namespaces are leased. Jobs, images, tokens, mounts and node effec
 
 **Completion test:** Extend one resource family per commit with durable ownership, renewal bounds, leader/client-death cleanup and refusal to delete pre-existing resources.
 
+**Managed-storage family (19 September):** Durable per-application journals claim
+managed volumes and generated configuration before provisioning. An explicit
+lease retirement waits for runtime exit, then safely unmounts/removes only that
+storage before acknowledging the placement. Ordinary Stop/rebalance preserves
+data; host sources remain outside ownership. Corrupt, unowned, overlapping and
+symlinked paths refuse. Disposable test snapshots are unsupported. Full library
+checkpoints, final volume/lifecycle regressions, strict Clippy and binary
+compatibility pass on macOS/Linux. Four privileged Linux cases cover real ext4,
+Btrfs, busy/unknown mounts and physical owner death. Three-node expiry tests
+preserve former-placement data until cleanup and retain a failed owner's lease
+until repair. Protocol 8/state 12; lease schema 4. See the
+[implementation and qualification record](2026-09-19-managed-test-storage.md).
+Registry leases, atomic process identity and the pre-adoption runtime crash
+window remain open.
+
 **Ordinary-job recovery decision:** The user selected explicit rerun for a batch
 job whose outcome is unknown after Bun crashes. Recovery must persist/report
 that uncertainty rather than automatically repeat the execution. The durable

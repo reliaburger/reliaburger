@@ -3289,3 +3289,35 @@ now waits for the views the API actually consumes, matching voter membership
 and leader identity across peers and confirming quorum before submitting a new
 fault. Waiting for raw gossip alone was not enough. We keep the refusal intact
 and never retry an uncertain destructive request just to make a test pass.
+
+### Storage belongs in the cleanup acknowledgement
+
+A worker can stop its container and still leave a mounted test volume behind.
+Its retirement acknowledgement must cover both. The standalone lease reaper now
+asks the agent to retire test resources explicitly. A cluster worker uses the
+same command only for a committed cleaning lease; ordinary placement withdrawal
+keeps the data. It acknowledges the former placement after runtime retirement,
+storage retirement and the applied-placement checkpoint have all succeeded.
+
+The first regression creates identical application names in a test namespace
+and an ordinary namespace. Stop preserves the test's marker. Lease cleanup
+removes only the test directory. A second regression makes the runtime ignore
+termination and checks that both the marker and lease remain. After repairing
+the runtime, retrying the same cleanup removes them.
+
+The volume tests reopen checkpoints, interrupt provisioning before the first
+filesystem mutation, reject corrupt or duplicate claims, and preserve external
+files behind unsafe symlinks. Linux qualification creates real loop-backed ext4
+and Btrfs volumes. A process holds its working directory inside the loop mount to
+make unmount fail; retirement must remain pending. An unexpected nested mount
+also refuses. Another test kills the provisioning owner process, reopens its
+completed journal and retires the surviving mount. These tests exercise the
+storage boundary; they don't substitute for Bun's separate pre-adoption-record
+crash qualification.
+
+The three-node placement fixture adds managed storage to a leased application,
+scales it down, then injects an unexpected snapshot directory on one owner.
+The lease expires without a client cleanup request.
+Former placements must retain their data until lease cleanup. Unblocked owners
+can finish, but the lease must stay until the last worker's storage error is
+repaired. A neighbouring ordinary application directory remains intact.

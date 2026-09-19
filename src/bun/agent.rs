@@ -318,6 +318,12 @@ pub enum AgentCommand {
         namespace: String,
         response: oneshot::Sender<Result<(), BunError>>,
     },
+    /// Retire a cleaning lease's runtime and its disposable managed storage.
+    RetireTestResources {
+        app_name: String,
+        namespace: String,
+        response: oneshot::Sender<Result<(), BunError>>,
+    },
     /// Get status of all instances.
     Status {
         response: oneshot::Sender<Vec<InstanceStatus>>,
@@ -3528,6 +3534,14 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
                 let result = self.retire_workload(&app_name, &namespace).await;
                 let _ = response.send(result);
             }
+            AgentCommand::RetireTestResources {
+                app_name,
+                namespace,
+                response,
+            } => {
+                let result = self.retire_test_resources(&app_name, &namespace).await;
+                let _ = response.send(result);
+            }
             AgentCommand::Status { response } => {
                 let statuses = self.get_status().await;
                 let _ = response.send(statuses);
@@ -5570,39 +5584,8 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
                     .to_string(),
             });
         }
-        // Managed volumes must exist before the bind mounts reference them
-        // (runc fails create on a missing bind source, review M21).
-        let managed: Vec<crate::config::types::VolumeSpec> = spec
-            .volumes
-            .iter()
-            .filter(|v| v.source.is_none())
-            .cloned()
-            .collect();
-        if !managed.is_empty() {
-            let manager = crate::grill::volume::VolumeManager::new(self.volumes_dir.clone());
-            let volume_ns = namespace.to_string();
-            let volume_app = app_name.to_string();
-            tokio::task::spawn_blocking(move || {
-                for vol in &managed {
-                    manager.create_managed_volume(
-                        &volume_ns,
-                        &volume_app,
-                        &vol.path,
-                        vol.size.as_deref(),
-                    )?;
-                }
-                Ok::<(), crate::grill::volume::VolumeError>(())
-            })
-            .await
-            .map_err(|e| BunError::DeployFailed {
-                app_name: app_name.to_string(),
-                reason: format!("volume preparation task failed: {e}"),
-            })?
-            .map_err(|e| BunError::DeployFailed {
-                app_name: app_name.to_string(),
-                reason: format!("managed volume: {e}"),
-            })?;
-        }
+        // Claim test storage and provision every bind source before launch.
+        self.prepare_storage(app_name, namespace, spec).await?;
 
         // The per-instance identity dir must exist before create (PKI7).
         if let Err(e) = self.prepare_instance_identity(instance_id) {
@@ -5758,6 +5741,7 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
                 ),
             });
         }
+        self.prepare_storage(app_name, namespace, spec).await?;
         if let Err(e) = self.prepare_instance_identity(instance_id) {
             eprintln!("bun: warning: {e}");
         }
@@ -7383,6 +7367,69 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
             self.commit_jobs(jobs).await?;
         }
         Ok(())
+    }
+
+    async fn retire_test_resources(
+        &mut self,
+        app_name: &str,
+        namespace: &str,
+    ) -> Result<(), BunError> {
+        if !crate::testkit::lease::valid_test_namespace(namespace) {
+            return Err(BunError::RetirementState {
+                instance_id: InstanceId(format!("{namespace}/{app_name}")),
+                reason: "managed storage retirement requires an owned test namespace".into(),
+            });
+        }
+        self.retire_workload(app_name, namespace).await?;
+        let manager = crate::grill::volume::VolumeManager::new(self.volumes_dir.clone());
+        let namespace = namespace.to_string();
+        let app = app_name.to_string();
+        tokio::task::spawn_blocking(move || manager.retire_test_storage(&namespace, &app))
+            .await
+            .map_err(|error| BunError::DeployFailed {
+                app_name: app_name.into(),
+                reason: error.to_string(),
+            })?
+            .map_err(|error| BunError::DeployFailed {
+                app_name: app_name.into(),
+                reason: error.to_string(),
+            })
+    }
+
+    async fn prepare_storage(
+        &self,
+        app_name: &str,
+        namespace: &str,
+        spec: &AppSpec,
+    ) -> Result<(), BunError> {
+        let manager = crate::grill::volume::VolumeManager::new(self.volumes_dir.clone());
+        let namespace = namespace.to_string();
+        let app = app_name.to_string();
+        let spec = spec.clone();
+        tokio::task::spawn_blocking(move || {
+            if crate::testkit::lease::valid_test_namespace(&namespace) {
+                manager.prepare_test_storage(&namespace, &app, &spec)?;
+            } else {
+                for volume in spec.volumes.iter().filter(|volume| volume.source.is_none()) {
+                    manager.create_managed_volume(
+                        &namespace,
+                        &app,
+                        &volume.path,
+                        volume.size.as_deref(),
+                    )?;
+                }
+            }
+            Ok::<(), crate::grill::volume::VolumeError>(())
+        })
+        .await
+        .map_err(|error| BunError::DeployFailed {
+            app_name: app_name.into(),
+            reason: error.to_string(),
+        })?
+        .map_err(|error| BunError::DeployFailed {
+            app_name: app_name.into(),
+            reason: error.to_string(),
+        })
     }
 
     /// Stop an app's instances.
@@ -11128,6 +11175,117 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[tokio::test]
+    async fn lease_storage_waits_for_confirmed_runtime_retirement() {
+        use crate::testkit::lease::{
+            LeasedResource, LocalLeaseStore, TestLease, cleanup_local_lease,
+        };
+        let (mut agent, tx, shutdown, grill) = test_agent_with_grill();
+        let volumes = tempfile::tempdir().unwrap();
+        agent.set_volumes_dir(volumes.path().to_path_buf());
+        let task = tokio::spawn(async move { agent.run().await });
+        let config = Config::parse("[app.web]\nimage = 'test:v1'\nnamespace = 'rbtest-cleanup'\n[app.web.deploy]\ndrain_timeout = '0s'\n[[app.web.volumes]]\npath = '/data'\n").unwrap();
+        expect_complete(&send_deploy(&tx, config).await);
+        let marker = volumes.path().join("rbtest-cleanup/web/data/marker");
+        std::fs::write(&marker, "live").unwrap();
+        let store = LocalLeaseStore::in_memory();
+        let mut lease = TestLease::new(
+            "cleanup".into(),
+            "owner".into(),
+            "owner".into(),
+            "rbtest-cleanup".into(),
+            1,
+            2,
+        )
+        .unwrap();
+        lease.resources.insert(LeasedResource::App {
+            app_id: crate::meat::AppId::new("web", "rbtest-cleanup"),
+        });
+        store.create(lease).await.unwrap();
+        grill.set_ignore_stop(true);
+        grill.set_ignore_kill(true);
+        let refused = cleanup_local_lease(&store, &tx, "cleanup", Some("owner")).await;
+        assert!(refused.is_err());
+        assert!(store.get("cleanup").await.is_some());
+        assert_eq!(std::fs::read_to_string(&marker).unwrap(), "live");
+        assert!(
+            volumes
+                .path()
+                .join(".test-storage/rbtest-cleanup__web.checkpoint")
+                .exists()
+        );
+        grill.set_ignore_stop(false);
+        grill.set_ignore_kill(false);
+        cleanup_local_lease(&store, &tx, "cleanup", Some("owner"))
+            .await
+            .unwrap();
+        assert!(!marker.exists());
+        assert!(store.get("cleanup").await.is_none());
+        shutdown.cancel();
+        task.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn lease_retirement_removes_only_owned_test_volumes_after_stop_preserves_them() {
+        use crate::testkit::lease::{
+            LeasedResource, LocalLeaseStore, TestLease, cleanup_local_lease,
+        };
+        let (mut agent, tx, shutdown) = test_agent();
+        let volumes = tempfile::tempdir().unwrap();
+        agent.set_volumes_dir(volumes.path().to_path_buf());
+        let task = tokio::spawn(async move { agent.run().await });
+        for namespace in ["rbtest-cleanup", "default"] {
+            let config = Config::parse(&format!(
+                "[app.web]\nimage = 'test:v1'\nnamespace = '{namespace}'\n[[app.web.volumes]]\npath = '/data'\n"
+            )).unwrap();
+            expect_complete(&send_deploy(&tx, config).await);
+            std::fs::write(
+                volumes.path().join(namespace).join("web/data/marker"),
+                namespace,
+            )
+            .unwrap();
+        }
+        let (response, stopped) = oneshot::channel();
+        tx.send(AgentCommand::Stop {
+            app_name: "web".into(),
+            namespace: "rbtest-cleanup".into(),
+            response,
+        })
+        .await
+        .unwrap();
+        stopped.await.unwrap().unwrap();
+        assert!(
+            volumes
+                .path()
+                .join("rbtest-cleanup/web/data/marker")
+                .is_file()
+        );
+        let store = LocalLeaseStore::in_memory();
+        let mut lease = TestLease::new(
+            "cleanup".into(),
+            "owner".into(),
+            "owner".into(),
+            "rbtest-cleanup".into(),
+            1,
+            2,
+        )
+        .unwrap();
+        lease.resources.insert(LeasedResource::App {
+            app_id: crate::meat::AppId::new("web", "rbtest-cleanup"),
+        });
+        store.create(lease).await.unwrap();
+        let cleanup = cleanup_local_lease(&store, &tx, "cleanup", Some("owner")).await;
+        shutdown.cancel();
+        task.await.unwrap();
+        cleanup.unwrap();
+        assert!(!volumes.path().join("rbtest-cleanup/web/data").exists());
+        assert_eq!(
+            std::fs::read_to_string(volumes.path().join("default/web/data/marker")).unwrap(),
+            "default"
+        );
+        assert!(store.get("cleanup").await.is_none());
     }
 
     #[tokio::test]

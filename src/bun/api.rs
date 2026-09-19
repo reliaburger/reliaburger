@@ -4533,9 +4533,9 @@ fn snapshot_error_response(error: &crate::bun::BunError) -> Response {
         crate::bun::BunError::Snapshot(
             SnapshotError::NotFound { .. } | SnapshotError::NoVolumes { .. },
         ) => StatusCode::NOT_FOUND,
-        crate::bun::BunError::Snapshot(SnapshotError::UnsupportedFilesystem { .. }) => {
-            StatusCode::BAD_REQUEST
-        }
+        crate::bun::BunError::Snapshot(
+            SnapshotError::UnsupportedFilesystem { .. } | SnapshotError::TestStorage,
+        ) => StatusCode::BAD_REQUEST,
         _ => StatusCode::INTERNAL_SERVER_ERROR,
     };
     (

@@ -1058,12 +1058,21 @@ pub fn spawn_placement_reconciler(
                 // Queueing and acknowledgement share one deadline. An unknown
                 // outcome keeps ownership and lets other owners progress.
                 let retire = async {
-                    cmd_tx
-                        .send(AgentCommand::Retire {
+                    let command = if confirmations.is_empty() {
+                        AgentCommand::Retire {
                             app_name: name.clone(),
                             namespace: namespace.clone(),
                             response: response_tx,
-                        })
+                        }
+                    } else {
+                        AgentCommand::RetireTestResources {
+                            app_name: name.clone(),
+                            namespace: namespace.clone(),
+                            response: response_tx,
+                        }
+                    };
+                    cmd_tx
+                        .send(command)
                         .await
                         .map_err(|_| "agent command channel closed")?;
                     response_rx
@@ -1258,7 +1267,7 @@ mod tests {
                     command = received.recv() => match command.unwrap() {
                         AgentCommand::Status { response } => { response.send(vec![]).unwrap(); }
                         AgentCommand::SyncClusterCatalog { .. } => {}
-                        AgentCommand::Retire { app_name, namespace, response } => {
+                        AgentCommand::RetireTestResources { app_name, namespace, response } => {
                             assert_eq!((app_name.as_str(), namespace.as_str()), ("web", "rbtest-run1"));
                             assert_eq!(acknowledgements.load(Ordering::SeqCst), 0);
                             attempts += 1;

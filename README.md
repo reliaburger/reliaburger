@@ -41,12 +41,18 @@ Install and usage details are in the [documentation](docs/README.md), and
 implementation status in [progress.md](docs/progress.md).
 
 0.1.0 requires a fresh cluster; development state is refused. Rolling upgrades
-require matching explicit formats (currently protocol 8 and state 11). See the
+require matching explicit formats (currently protocol 8 and state 12). See the
 [compatibility policy](docs/releasing.md#cluster-compatibility).
 Registry upload recovery reclaims abandoned partial uploads after a crash and
 requires one Bun per writable image store; see the [startup contract](docs/README.md).
 Direct image pulls and Pickle verify pinned manifests, selected platform
 manifests and configuration bytes before accepting them into the cache.
+
+Lease-owned test volumes and generated configuration have durable provisioning
+records. Ordinary Stop and rescheduling keep their data; lease retirement removes
+it only after confirmed runtime cleanup. Failed unmounts keep cleanup pending.
+Host-source volumes and ordinary application data remain outside test ownership.
+Disposable test-volume snapshots are unsupported in 0.1.0.
 
 Restart also refuses unreadable ownership records or uncertain runtime adoption,
 preserving records and workload identities for recovery. Legacy aliases and

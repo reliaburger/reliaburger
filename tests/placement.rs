@@ -1775,3 +1775,219 @@ async fn capacity_refusal_from_the_live_scheduler_forwards_without_committing_an
         .unwrap();
     shutdown.cancel();
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 6)]
+#[ignore = "slow multi-node leased storage acceptance; run with make test-cluster"]
+async fn leased_storage_cleanup_waits_for_former_placements_and_failed_deletion() {
+    let created = reliaburger::sesame::token::create_token(
+        "storage-admin",
+        reliaburger::sesame::types::ApiRole::Admin,
+        Default::default(),
+        None,
+    )
+    .unwrap();
+    let auth = NodeFaultAuth {
+        token: created.token,
+        plaintext: created.plaintext,
+    };
+    let shutdown = CancellationToken::new();
+    let n1 = start_node_with_auth("storage1", 26841, vec![], &shutdown, Some(auth.clone())).await;
+    let n2 = start_node_with_auth(
+        "storage2",
+        26845,
+        vec![local(26841)],
+        &shutdown,
+        Some(auth.clone()),
+    )
+    .await;
+    let n3 =
+        start_node_with_auth("storage3", 26849, vec![local(26841)], &shutdown, Some(auth)).await;
+    let nodes = [&n1, &n2, &n3];
+    assert!(
+        wait_until(Duration::from_secs(40), || nodes.iter().any(|node| *node
+            .thinks_leader
+            .borrow()
+            && node
+                .handle
+                .council
+                .as_ref()
+                .unwrap()
+                .metrics()
+                .borrow()
+                .membership_config
+                .membership()
+                .voter_ids()
+                .count()
+                == 3))
+        .await
+    );
+    let leader = nodes
+        .iter()
+        .find(|node| *node.thinks_leader.borrow())
+        .unwrap();
+    let lease = leader
+        .client
+        .create_test_lease(120, Some("rbtest-storage-contract"))
+        .await
+        .unwrap();
+    let mut config = reliaburger::config::Config::parse(&format!("[app.web]\nimage = 'proc-grill:image-ignored'\ncommand = ['sleep', '120']\nreplicas = 3\nnamespace = '{}'\n[[app.web.volumes]]\npath = '/data'\n", lease.namespace)).unwrap();
+    leader
+        .client
+        .apply_with_lease(&config, &lease.lease_id)
+        .await
+        .unwrap();
+    let roots: Vec<_> = [
+        ("storage1", 26841),
+        ("storage2", 26845),
+        ("storage3", 26849),
+    ]
+    .into_iter()
+    .map(|(name, port)| std::env::temp_dir().join(format!("rb-placement-{name}-{port}/volumes")))
+    .collect();
+    tokio::time::timeout(Duration::from_secs(25), async {
+        loop {
+            let rows = leader.client.cluster_status().await.unwrap();
+            if rows
+                .iter()
+                .filter(|row| {
+                    row.instance.namespace == lease.namespace && row.instance.state == "running"
+                })
+                .count()
+                == 3
+            {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+    })
+    .await
+    .expect("three real leased processes must run");
+    let owned: Vec<_> = roots
+        .iter()
+        .filter(|root| root.join(&lease.namespace).join("web/data").exists())
+        .collect();
+    assert!(
+        owned.len() >= 2,
+        "the fixture must cover multiple placement owners"
+    );
+    for root in &owned {
+        std::fs::write(
+            root.join(&lease.namespace).join("web/data/marker"),
+            "preserve until lease retirement",
+        )
+        .unwrap();
+        std::fs::create_dir_all(root.join("default/ordinary/data")).unwrap();
+        std::fs::write(root.join("default/ordinary/data/keep"), "ordinary data").unwrap();
+    }
+    config.app.get_mut("web").unwrap().replicas = reliaburger::config::types::Replicas::Fixed(1);
+    leader
+        .client
+        .apply_with_lease(&config, &lease.lease_id)
+        .await
+        .unwrap();
+    tokio::time::timeout(Duration::from_secs(25), async {
+        loop {
+            let rows = leader.client.cluster_status().await.unwrap();
+            if rows
+                .iter()
+                .filter(|row| {
+                    row.instance.namespace == lease.namespace && row.instance.state == "running"
+                })
+                .count()
+                == 1
+            {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+    })
+    .await
+    .expect("scale-down must retire former runtimes");
+    for root in &owned {
+        assert!(
+            root.join(&lease.namespace).join("web/data/marker").exists(),
+            "rebalance deleted storage"
+        );
+    }
+    let blocked_root = owned[0];
+    let blocker = blocked_root
+        .join(".snapshots")
+        .join(&lease.namespace)
+        .join("web");
+    std::fs::create_dir_all(&blocker).unwrap();
+    // No DELETE or client heartbeat follows this renewal: the server reaper
+    // must own both expiry and eventual storage cleanup.
+    leader
+        .client
+        .renew_test_lease(&lease.lease_id, 3)
+        .await
+        .unwrap();
+    {
+        tokio::time::timeout(Duration::from_secs(20), async {
+            loop {
+                let state = leader
+                    .handle
+                    .council
+                    .as_ref()
+                    .unwrap()
+                    .desired_state()
+                    .await;
+                if state.test_leases.get(&lease.lease_id).is_some_and(|lease| {
+                    matches!(
+                        lease.state,
+                        reliaburger::testkit::lease::TestLeaseState::Cleaning { .. }
+                    )
+                }) && owned
+                    .iter()
+                    .skip(1)
+                    .all(|root| !root.join(&lease.namespace).join("web").exists())
+                {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(100)).await;
+            }
+        })
+        .await
+        .expect("unblocked owners must retire while one storage owner remains");
+    }
+    assert!(
+        blocked_root
+            .join(&lease.namespace)
+            .join("web/data/marker")
+            .exists()
+    );
+    std::fs::remove_dir(&blocker).unwrap();
+    tokio::time::timeout(Duration::from_secs(15), async {
+        loop {
+            if !leader
+                .handle
+                .council
+                .as_ref()
+                .unwrap()
+                .desired_state()
+                .await
+                .test_leases
+                .contains_key(&lease.lease_id)
+            {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+    })
+    .await
+    .expect("expiry must finish after the final storage owner is repaired");
+    for root in owned {
+        assert!(!root.join(&lease.namespace).join("web").exists());
+        assert!(
+            !root
+                .join(".test-storage")
+                .join(format!("{}__web.checkpoint", lease.namespace))
+                .exists()
+        );
+        assert_eq!(
+            std::fs::read_to_string(root.join("default/ordinary/data/keep")).unwrap(),
+            "ordinary data"
+        );
+    }
+    shutdown.cancel();
+}

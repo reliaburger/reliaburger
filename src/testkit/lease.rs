@@ -773,7 +773,7 @@ pub async fn cleanup_local_lease(
                 let (response_tx, response_rx) = tokio::sync::oneshot::channel();
                 let cleanup = async {
                     cmd_tx
-                        .send(crate::bun::agent::AgentCommand::Retire {
+                        .send(crate::bun::agent::AgentCommand::RetireTestResources {
                             app_name: app_id.name,
                             namespace: app_id.namespace,
                             response: response_tx,
@@ -1126,7 +1126,7 @@ mod tests {
             .await
             .unwrap()
             .unwrap();
-        let AgentCommand::Retire {
+        let AgentCommand::RetireTestResources {
             app_name,
             namespace,
             response,
@@ -1155,7 +1155,7 @@ mod tests {
                 .resources
                 .contains(&LeasedResource::Job { job_id })
         );
-        let AgentCommand::Retire { response, .. } = retry else {
+        let AgentCommand::RetireTestResources { response, .. } = retry else {
             panic!("expected retry")
         };
         response.send(Ok(())).unwrap();
