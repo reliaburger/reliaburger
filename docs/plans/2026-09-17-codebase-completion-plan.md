@@ -1090,6 +1090,16 @@ explicit gates), with strict Clippy, both binary suites, compatibility checks an
 Protocol/state advance to 8/9; lease schema remains 4. The runbook documents the
 five-second caught-up security refresh and the need for external fencing.
 
+
+**Placement harness cleanup (19 September):** Hosted CI at `ab11fa3` exposed a
+missing production task in the placement fixture. DELETE correctly returned
+202, but no cluster lease reaper existed to finish cleanup after worker
+acknowledgements. The exact capacity test fails locally before the repair
+(49.34s), then passes on macOS and Linux with one owned reaper per node, matching
+Bun. All ten Linux placement cases pass (42.69s). The macOS run passes nine,
+including the regression; a separate fault-admission convergence race remains
+under investigation and is not hidden by retries or a larger cleanup timeout.
+
 ### C35 — Gate chaos capabilities per selected scenario
 
 **Priority:** P2. **Wave:** 4. **Book chapters:** 08, 15.

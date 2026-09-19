@@ -3267,3 +3267,17 @@ The durable record says *operator-attested retirement*, which is different from
 Bun observing runtime exit. The tests preserve that distinction: authenticating
 with an admin token alone is insufficient without the explicit attestation,
 while runtime acknowledgements still require the system identity.
+
+### Run the cleanup owner in the fixture
+
+A placement test asked the real API to delete its lease, waited for HTTP 204,
+and timed out. The workers had acknowledged retirement. What was missing?
+Bun starts a cluster lease reaper on every node, but this fixture did not. The
+leader's reaper advances the persisted cleanup state after acknowledgements
+arrive. Wiring only the API and reconciler left nobody to finish that work.
+
+The fixture now starts the production reaper and gives its task to the existing
+shutdown guard. This matters for asynchronous acceptance tests: reproducing the
+request handler alone does not reproduce the full lifecycle. The regression
+keeps its bounded wait for durable lease absence; increasing that timeout would
+never create the missing owner.

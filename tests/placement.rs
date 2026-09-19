@@ -146,6 +146,16 @@ async fn start_node_with_auth(
     );
     let mut tasks = vec![agent_task];
 
+    // DELETE starts cleanup; the leader's reaper finishes it once workers
+    // acknowledge retirement. Match Bun's lifecycle rather than leaving the
+    // fixture permanently at HTTP 202 after the final acknowledgement.
+    if let Some(council) = &council {
+        tasks.push(reliaburger::testkit::lease::spawn_cluster_lease_reaper(
+            Arc::clone(council),
+            shutdown.clone(),
+        ));
+    }
+
     // Membership table (peer API addresses = gossip IP + offset 3).
     let membership_table: Arc<RwLock<Vec<NodeMembershipInfo>>> = Arc::new(RwLock::new(Vec::new()));
     {
