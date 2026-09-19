@@ -1421,6 +1421,14 @@ checkpoint passes 3,302 tests with five explicit gates (38.52s). Duration
 compatibility/property tests and strict Linux/macOS Clippy pass. `make audit`
 passes for the updated 708-package lockfile with the existing dated exceptions.
 
+**Automatic DNS port allocation (19 September):** Coverage at `df45d79`
+reproduces `AddrInUse` in the shared UDP/TCP wire test: UDP's ephemeral port
+selection does not reserve TCP. Port-zero binding now retries collisions up to
+16 times, dropping each failed UDP reservation; explicit port conflicts still
+refuse startup. The wire suite holds 64 successful pairs and checks both socket
+reservations and release. All 18 wire tests pass on macOS/Linux (2.01s/2.02s),
+with strict Clippy on both. Hosted coverage must rerun on the repaired head.
+
 ### H07 — Add useful public API doctests
 
 **Priority:** P3. **Wave:** 5. **Book chapters:** 01, 09, 15.

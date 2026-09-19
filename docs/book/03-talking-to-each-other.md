@@ -1204,3 +1204,16 @@ unclaimed bytes, missing additional records and a literal dot inside a label.
 A valid request sent immediately afterwards must still succeed. A TCP case
 checks that malformed input closes only that connection. The existing live
 namespace, fault, forwarding and TCP/UDP tests retain their original assertions.
+
+### Port zero reserves one transport at a time
+
+Coverage CI caught a DNS startup failure despite asking the kernel for a free
+port. UDP and TCP have separate port allocators. The UDP socket selected a port
+that an unrelated TCP listener already owned. Binding the TCP half then failed.
+
+When the requested port is zero, the responder now retries that collision up to
+16 times. Each attempt keeps its UDP socket until TCP binds, or drops it before
+trying again. Explicit ports still fail on conflict; Bun cannot silently move a
+configured DNS service elsewhere. The wire tests also hold 64 successful pairs,
+check that both transports stay reserved, and verify that dropping a pair
+releases both sockets.

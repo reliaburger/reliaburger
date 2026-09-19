@@ -44,6 +44,12 @@ job-lease changes remains separate. Both hosted workflows also pass at
 `969e3d4`, including the later runtime inspection and restart-cleanup fixes.
 The subsequent cron checkpoint changes require their own hosted validation.
 
+Coverage at `df45d79` reproduced a DNS port-zero collision: UDP selected a port
+already occupied by TCP. Automatic allocation now retries up to 16 times;
+explicit port conflicts still refuse. All 18 DNS wire tests and strict Clippy
+pass on macOS/Linux. That hosted run passed its other CI gates; coverage of the
+repaired head remains pending.
+
 ### Correctness and behavioural contracts
 
 - [x] **C01** Preserve every exported log generation with full content-hash object names. Five real Parquet export/query tests and ten exporter unit tests pass; the restart/name-reuse regression fails before the fix. Legacy archive objects remain untouched (migration duplicates documented in chapter 6).

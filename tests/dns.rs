@@ -328,6 +328,28 @@ async fn startup_binding_requires_both_udp_and_tcp() {
 }
 
 #[tokio::test]
+async fn automatic_dns_ports_reserve_both_transports_until_drop() {
+    let mut responders = Vec::new();
+    for _ in 0..64 {
+        let responder = BoundDnsResponder::bind(DnsConfig {
+            listen_addr: "127.0.0.1:0".parse().unwrap(),
+            ..DnsConfig::default()
+        })
+        .await
+        .unwrap();
+        let address = responder.local_addr().unwrap();
+        assert!(tokio::net::UdpSocket::bind(address).await.is_err());
+        assert!(tokio::net::TcpListener::bind(address).await.is_err());
+        responders.push(responder);
+    }
+    let address = responders.pop().unwrap().local_addr().unwrap();
+    // Dropping a successful pair releases both transport reservations.
+    let udp = tokio::net::UdpSocket::bind(address).await.unwrap();
+    let tcp = tokio::net::TcpListener::bind(address).await.unwrap();
+    drop((udp, tcp));
+}
+
+#[tokio::test]
 async fn bound_responder_answers_internal_query_over_tcp_on_the_same_port() {
     let (map_tx, map_rx) = watch::channel(map_with("redis"));
     let (_fault_tx, fault_rx) = watch::channel(DnsFaultState::default());

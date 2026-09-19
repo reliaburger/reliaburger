@@ -207,19 +207,33 @@ pub struct BoundDnsResponder {
 impl BoundDnsResponder {
     /// Bind both UDP and TCP on the configured address.
     pub async fn bind(mut config: DnsConfig) -> Result<Self, std::io::Error> {
-        let udp = Arc::new(UdpSocket::bind(config.listen_addr).await?);
-        // Port zero is useful for tests and embedded callers. Bind UDP first,
-        // then make TCP use the same kernel-selected port rather than letting
-        // each transport receive a different ephemeral port.
-        if config.listen_addr.port() == 0 {
-            config.listen_addr.set_port(udp.local_addr()?.port());
+        let requested = config.listen_addr;
+        for attempt in 0..16 {
+            let udp = Arc::new(UdpSocket::bind(requested).await?);
+            // UDP's ephemeral allocator does not reserve the same TCP port.
+            // Retry only automatic selection; explicit port conflicts remain
+            // startup errors. Each failed attempt drops its UDP reservation.
+            config.listen_addr = udp.local_addr()?;
+            let tcp = match TcpListener::bind(config.listen_addr).await {
+                Ok(tcp) => tcp,
+                Err(error)
+                    if requested.port() == 0
+                        && error.kind() == std::io::ErrorKind::AddrInUse
+                        && attempt < 15 =>
+                {
+                    continue;
+                }
+                Err(error) => return Err(error),
+            };
+            return Ok(Self {
+                config: Arc::new(config),
+                udp,
+                tcp,
+            });
         }
-        let tcp = TcpListener::bind(config.listen_addr).await?;
-        Ok(Self {
-            config: Arc::new(config),
-            udp,
-            tcp,
-        })
+        Err(std::io::Error::other(
+            "could not allocate a shared DNS port",
+        ))
     }
 
     /// Bind an IPv4 address that the kernel will add after startup.
