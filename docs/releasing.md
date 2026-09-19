@@ -42,8 +42,9 @@ host operating systems.
 startup and recovery refuse it rather than attempting an implicit migration.
 Do not copy a format stamp onto old data to bypass this check.
 
-`bun --compatibility` reports `{"protocol":4,"state":3}` without starting a node.
-`GET /v1/version` includes the same contract. Different product versions may
+Run `bun --compatibility` to read the binary's current `protocol` and `state`
+generations as JSON without starting a node. `GET /v1/version` includes the same
+contract. Different product versions may
 roll or roll back only when both generations match exactly. The agent verifies
 the signed executable and checks this contract before staging it. Joins and
 cluster transports also enforce compatibility; absent evidence is a refusal.
