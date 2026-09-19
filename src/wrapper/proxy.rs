@@ -958,27 +958,21 @@ mod tests {
     async fn proxy_sets_real_ip_and_request_id() {
         use crate::onion::types::BackendInstance;
         use std::net::Ipv4Addr;
-        use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
         // Backend echoes the request head back in the body so the test can
         // inspect the headers the proxy forwarded.
         let backend = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let backend_port = backend.local_addr().unwrap().port();
-        tokio::spawn(async move {
-            while let Ok((mut sock, _)) = backend.accept().await {
-                tokio::spawn(async move {
-                    let mut buf = vec![0u8; 4096];
-                    let n = sock.read(&mut buf).await.unwrap_or(0);
-                    let head = String::from_utf8_lossy(&buf[..n]).to_string();
-                    let resp = format!(
-                        "HTTP/1.1 200 OK\r\nContent-Length: {}\r\n\r\n{}",
-                        head.len(),
-                        head
-                    );
-                    let _ = sock.write_all(resp.as_bytes()).await;
-                });
-            }
-        });
+        let echo = axum::Router::new().route(
+            "/",
+            axum::routing::get(|headers: axum::http::HeaderMap| async move {
+                headers
+                    .iter()
+                    .map(|(name, value)| format!("{name}: {}\r\n", value.to_str().unwrap()))
+                    .collect::<String>()
+            }),
+        );
+        let backend_task = tokio::spawn(async move { axum::serve(backend, echo).await.unwrap() });
 
         let mut service_map = crate::onion::service_map::ServiceMap::new();
         service_map
@@ -1024,8 +1018,8 @@ mod tests {
         .await
         .unwrap();
         let http_port = bound.http_addr.port();
-        tokio::spawn(async move {
-            bound.serve().await.ok();
+        let proxy_task = tokio::spawn(async move {
+            bound.serve().await.unwrap();
         });
 
         let client = reqwest::Client::new();
@@ -1077,6 +1071,9 @@ mod tests {
         assert_eq!(echoed.matches("x-request-id:").count(), 1);
 
         shutdown.cancel();
+        proxy_task.await.unwrap();
+        backend_task.abort();
+        let _ = backend_task.await;
     }
 
     /// §5.5: a new request routed to a backend whose drain has expired gets a

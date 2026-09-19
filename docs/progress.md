@@ -49,6 +49,9 @@ already occupied by TCP. Automatic allocation now retries up to 16 times;
 explicit port conflicts still refuse. All 18 DNS wire tests and strict Clippy
 pass on macOS/Linux. That hosted run passed its other CI gates; coverage of the
 repaired head remains pending.
+The native full suite also reproduced an HTTP keep-alive error in the request-ID
+echo fixture. Its backend now uses axum and both server tasks are joined; the
+full native suite and explicit Linux regression pass, with strict Clippy.
 
 ### Correctness and behavioural contracts
 

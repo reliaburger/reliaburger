@@ -1429,6 +1429,14 @@ refuse startup. The wire suite holds 64 successful pairs and checks both socket
 reservations and release. All 18 wire tests pass on macOS/Linux (2.01s/2.02s),
 with strict Clippy on both. Hosted coverage must rerun on the repaired head.
 
+**Proxy echo fixture (19 September):** A full native run reproduces the
+request-ID test receiving an empty second response. Its handwritten backend
+advertised HTTP/1.1 persistence but closed after one read/response. The fixture
+now uses axum's HTTP parser/keep-alive and owns both server tasks. The full native
+suite passes 3,308 tests (five gates, 39.61s); the corrected Linux fixture passes
+explicitly (0.01s), and strict Clippy passes on both platforms. No production
+proxy behaviour changes.
+
 ### H07 — Add useful public API doctests
 
 **Priority:** P3. **Wave:** 5. **Book chapters:** 01, 09, 15.

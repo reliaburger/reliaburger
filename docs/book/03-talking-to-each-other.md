@@ -1217,3 +1217,12 @@ trying again. Explicit ports still fail on conflict; Bun cannot silently move a
 configured DNS service elsewhere. The wire tests also hold 64 successful pairs,
 check that both transports stay reserved, and verify that dropping a pair
 releases both sockets.
+
+### A test backend must honour HTTP too
+
+The request-ID regression used a tiny TCP echo server that read once, advertised
+HTTP/1.1 keep-alive and closed after one response. The proxy could reuse that
+connection before noticing its close, so the second assertion sometimes saw an
+empty error response. A full native suite reproduced the failure. The fixture
+now uses axum to parse requests and manage keep-alive, and joins its proxy and
+backend tasks. The production forwarding code hasn't changed.
