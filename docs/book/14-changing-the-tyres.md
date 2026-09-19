@@ -866,3 +866,14 @@ expires. Our stalled-command fixture verifies that the child disappears. The
 other fixture feeds daemon errors, malformed JSON, wrong identities and valid
 running/stopped/absent results through the public runtime interface. Neither
 test needs to stop the machine's actual container daemon to simulate failure.
+
+
+### Put the release endpoint where the lookup happens
+
+`relish upgrade check --url` selects the metadata endpoint. The CLI performs that
+lookup; Bun's node configuration doesn't control it. We remove the unused
+`[upgrades] release_url` field, which previously accepted an operator's URL and
+then ignored it. Existing `deny_unknown_fields` parsing now rejects the obsolete
+key by name. Remove it from development node configurations and pass the CLI
+option when using a different endpoint. A failing-first parsing regression checks
+that the unused setting can no longer appear to succeed.

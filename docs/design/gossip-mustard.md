@@ -263,7 +263,7 @@ struct MembershipUpdate {
     state: NodeState,
     /// Incarnation number of the node (for crdt-like conflict resolution).
     incarnation: u64,
-    /// Lamport timestamp for ordering.
+    /// Reserved legacy wire slot; current senders write zero, receivers ignore it.
     lamport: u64,
 }
 

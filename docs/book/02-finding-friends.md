@@ -376,7 +376,6 @@ pub struct MustardNode<T: MustardTransport> {
     pub dissemination: DisseminationQueue,
     pub config: GossipConfig,
     transport: T,
-    lamport: u64,
 }
 ```
 
@@ -2386,3 +2385,19 @@ retirement of explicit departures. Another regression keeps a live neighbour
 while reaping a different peer, then requires a rediscovery probe. This was found
 while testing node-fault expiry:
 the transport gates reopened correctly, but discovery had forgotten its way home.
+
+
+### Keep the wire slot, remove the imaginary clock
+
+Membership updates still carry a field named `lamport`. Earlier code incremented
+it locally but never merged a received timestamp or used it to resolve an update.
+That wasn't a Lamport clock. The actual conflict rules use incarnation and node
+state. For 0.1.0 we remove the unused local counter and send zero in the old slot.
+Receivers ignore that slot, including values from older senders.
+
+Why keep the field? Bincode serialises struct fields in order. Removing the last
+`u64` would change the message layout. The compatibility test compares an update's
+bytes with the legacy field sequence, then decodes them back. A second test sends
+a stale incarnation with the largest possible timestamp and checks that it cannot
+overrule current membership. This preserves the wire representation without
+claiming a causal-ordering feature we don't implement.

@@ -153,7 +153,7 @@ impl GossipPayload {
 /// A single membership update piggybacked on gossip messages.
 ///
 /// Carries the node's identity, its new state, the incarnation number
-/// for conflict resolution, and a Lamport timestamp for causal ordering.
+/// for conflict resolution, and a reserved legacy timestamp field.
 /// The address is included so that nodes learning about a peer through
 /// gossip (not direct contact) can reach it.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -166,7 +166,9 @@ pub struct MembershipUpdate {
     pub state: NodeState,
     /// Incarnation number for CRDT-like conflict resolution.
     pub incarnation: u64,
-    /// Lamport timestamp for ordering.
+    /// Reserved legacy timestamp, retained in its original wire position.
+    /// Receivers ignore it; current senders write zero. Membership ordering
+    /// uses incarnation and node state, not this value.
     pub lamport: u64,
 }
 
@@ -388,6 +390,31 @@ fn datagram_codec(limit: usize) -> impl bincode::Options {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn membership_update_preserves_legacy_timestamp_wire_slot() {
+        let update = super::MembershipUpdate {
+            node_id: crate::meat::types::NodeId::new("legacy-peer"),
+            address: "127.0.0.1:9443".parse().unwrap(),
+            state: super::NodeState::Alive,
+            incarnation: 7,
+            lamport: u64::MAX,
+        };
+        // The legacy sequence fixes field order and retains the final u64.
+        let bytes = bincode::serialize(&(
+            &update.node_id,
+            &update.address,
+            update.state,
+            update.incarnation,
+            update.lamport,
+        ))
+        .unwrap();
+        assert_eq!(bincode::serialize(&update).unwrap(), bytes);
+        assert_eq!(
+            bincode::deserialize::<super::MembershipUpdate>(&bytes).unwrap(),
+            update
+        );
+    }
+
     use super::*;
 
     #[test]

@@ -254,7 +254,6 @@ impl IngressSection {
             http_port: self.http_port,
             https_port: self.https_port,
             max_connections: self.max_connections,
-            worker_threads: 4,
             tls_cert_path: self.tls_cert.clone(),
             tls_key_path: self.tls_key.clone(),
             ..crate::wrapper::types::WrapperConfig::default()
@@ -310,10 +309,6 @@ pub struct UpgradeSection {
     pub external_signing_key: Option<String>,
     /// Number of previous binary versions to retain on disk for rollback.
     pub retain_versions: u32,
-    /// Default release-metadata endpoint. Reserved: `relish upgrade check`
-    /// currently takes its own `--url` (defaulting to a compiled-in constant)
-    /// and does not read this node-config value.
-    pub release_url: String,
     /// Directory holding the versioned binaries and the entry symlink.
     /// Defaults to the directory of the resolved current executable.
     pub binary_dir: Option<PathBuf>,
@@ -337,7 +332,6 @@ impl Default for UpgradeSection {
         Self {
             external_signing_key: None,
             retain_versions: 3,
-            release_url: crate::upgrade::metadata::DEFAULT_RELEASE_URL.to_string(),
             binary_dir: None,
             boot_grace_secs: 30,
             gossip_rejoin_secs: 60,
@@ -873,6 +867,15 @@ pub struct AlertDestination {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn node_config_rejects_ignored_release_endpoint() {
+        let error = NodeConfig::parse(
+            "[upgrades]\nrelease_url = 'https://example.invalid/metadata.json'\n",
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("release_url"));
+    }
 
     #[test]
     fn dns_rejects_node_default_namespace_override() {

@@ -124,7 +124,7 @@ The subsequent cron checkpoint changes require their own hosted validation.
 
 - [x] **H01** Reconcile scheduler/quota/scrape wiring and weights, roadmap test locations, cleanup evidence and disabled-auth chaos policy with their callers. Mark completed historical bug groups done while retaining C30/C33/C34/H02. Repair eleven Rustdoc errors; all-feature public documentation now builds with warnings denied, all 74 relative links in the changed Markdown pass, and the four documented diagnostic CLI help interfaces are verified.
 - [ ] **H02** (P3) Remove or deliberately expose unused helper entry points.
-- [ ] **H03** (P2) Resolve inert configuration and wire fields explicitly. Cluster ephemeral API ports are repaired: bind a socket before cluster startup, advertise its actual port and delay listening until authentication is ready. The real clustered first-run regression fails before the fix; all eight ordinary first-run tests (17.04s), five authentication tests, endpoint discovery and strict Linux/macOS Clippy pass. The strengthened running-workload assertion also passes (8.81s). The original inert configuration/wire-field inventory remains open.
+- [x] **H03** Resolve inert fields: remove the unused node `release_url` (use the CLI's `--url`), Wrapper thread-count/strategy fields and local gossip timestamp counter. Preserve the legacy timestamp wire slot as explicitly reserved and ignored. The URL regression fails first; legacy bytes and stale-incarnation ordering are covered. All 174 Linux configuration-filtered, 154 gossip and 94 Wrapper tests, corresponding native suites and strict Linux/macOS Clippy pass. The earlier actual-bound-port startup repair remains verified. Remote resource/image propagation is F01.
 - [ ] **H04** (P3) Use typed alert and scheduler error contracts.
 - [ ] **H05** (P3) Split modules along existing ownership boundaries.
 - [ ] **H06** (P3) Evaluate shared DNS and duration parsers.
@@ -2659,13 +2659,8 @@ blocking calls).
   contains the DEP8 bug the wired path fixed); `src/pickle/pull.rs:193`
   `image_available_locally`; `src/relish/client.rs:707` `renew_test_lease`; various
   smoker helpers (`resource.rs:230`, `types.rs:285`, `registry.rs:155,188`).
-- [ ] **Dead wire/config fields** (current backlog: H03) — `src/mustard/message.rs:171` `lamport` is stamped and
-  shipped "for causal ordering" but never read (conflict resolution is incarnation-only);
-  `src/wrapper/types.rs:136-142` `LoadBalanceStrategy::LeastConnections` is populated but
-  `select_backend` is unconditionally round-robin; `src/wrapper/types.rs:99`
-  `worker_threads` is mapped but never read; `MembershipSnapshot.resources` / `cached_images`
-  are unpopulated for remote peers, so council resource-eligibility (`selection.rs:113-120`)
-  and image-locality scoring (`score.rs:103-111`) are inert in production.
+- [x] **Dead wire/config fields** — H03 removes unused Wrapper settings and node release URLs, and explicitly reserves the unchanged legacy gossip timestamp slot. See the current ledger for test evidence.
+- [ ] **Remote resource/image propagation** (current backlog: F01) — remote cached-image and GPU capacity evidence remains planned; resolving inert API fields does not implement it.
 - [x] **Authorisation matrix checks methods as well as paths** (`e5f4208`), and dashboard desired counts come from desired state (`afee562`, `f1882be`).
 - [x] **Remaining minor-correctness group** — C01–C04, C13, C18–C19 and C22 are implemented and verified on this branch: archive preservation/scope/durability, bounded port allocation, precise certificate validity, truthful prune counts and bounded export receipts. See their current-ledger evidence above.
 - [x] **Native Apple mounts and publication** — bind/config mounts, process identity, working directory, read-only root and published ports are translated and live-tested (`bbe9c9b`). Broader runtime parity remains experimental.

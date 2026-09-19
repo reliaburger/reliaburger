@@ -14,7 +14,7 @@ use crate::upgrade::{BinaryVersion, metadata};
 use super::RelishError;
 use super::client::BunClient;
 
-/// Default release metadata endpoint (matches `upgrades.release_url`).
+/// Default release metadata endpoint; `relish upgrade check --url` overrides it.
 pub use crate::upgrade::metadata::DEFAULT_RELEASE_URL;
 
 /// Default bun API port, used when deriving node API addresses from

@@ -1193,6 +1193,19 @@ Several fields promise behaviour that no reader applies. Removing bincode fields
 
 **Startup follow-up completed (18 September):** Cluster startup advertised the requested API port before binding. A real `--listen 127.0.0.1:0` first-run regression failed with no eligible scheduler node. Bun now reserves a socket before cluster startup, publishes its actual port and starts listening only after credential/bootstrap checks. Eight ordinary first-run tests (17.04s), five bootstrap-authentication tests, service-endpoint discovery and strict Linux/macOS Clippy pass. The strengthened assertion of a running workload passes in 8.81s. The original inert-field inventory remains open.
 
+**Remaining inventory completed (19 September):** Remove the ignored
+`[upgrades] release_url` key; unknown-field parsing names it, and the supported
+override is `relish upgrade check --url`. Remove Wrapper's unused thread-count
+and load-balancing strategy fields from the unreleased Rust API. Its selectors
+remain unweighted round-robin on Bun's runtime. Remove the local gossip counter,
+but retain `MembershipUpdate.lamport` in the same wire position as a reserved,
+ignored field; new updates write zero. A legacy-layout byte fixture and a
+maximum-timestamp/stale-incarnation test preserve compatibility. The ignored-URL
+regression fails first. All 174 Linux configuration-filtered tests (0.01s),
+154 gossip tests (0.34s), 94 Wrapper tests (0.42s), corresponding native suites
+and strict Linux/macOS Clippy pass. Protocol/state remain 6/7. Remote resource
+and cached-image propagation remain F01, not hidden behind these settings.
+
 ### H04 — Use typed alert and scheduler error contracts
 
 **Priority:** P3. **Wave:** 5. **Book chapters:** 06, 15.

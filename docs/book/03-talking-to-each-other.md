@@ -1145,3 +1145,18 @@ a creation while its registry request is stalled, replace the runtime object,
 and show that the address is unavailable until recovered teardown succeeds.
 They also cover duplicate-create refusal, adoption, failed bundle preparation
 and reuse after namespace removal.
+
+
+### Configuration needs a consumer
+
+Wrapper uses unweighted round-robin across routable backends. Its old public
+`lb_strategy` field offered `LeastConnections`, but neither backend selector read
+it. We remove that field and enum for 0.1.0. A future strategy needs connection
+accounting and selection tests before it earns a setting.
+
+We also remove `WrapperConfig::worker_threads`. Wrapper runs on Bun's existing
+Tokio runtime; it doesn't create a separate four-thread runtime. Keeping an unused
+field would let callers believe they had configured a resource boundary. Neither
+field was part of the node TOML or a serialised routing record, so this changes
+only the unreleased Rust library API. Existing routing and proxy tests still
+exercise the supported behaviour.

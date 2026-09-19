@@ -95,8 +95,6 @@ pub struct WrapperConfig {
     pub https_port: u16,
     /// Maximum concurrent proxy connections (default: 10,000).
     pub max_connections: usize,
-    /// Number of tokio worker threads for the proxy runtime (default: 4).
-    pub worker_threads: usize,
     /// Path to a TLS certificate PEM file. If not set, a self-signed
     /// cert is generated on startup.
     pub tls_cert_path: Option<PathBuf>,
@@ -121,7 +119,6 @@ impl Default for WrapperConfig {
             http_port: 80,
             https_port: 443,
             max_connections: 10_000,
-            worker_threads: 4,
             tls_cert_path: None,
             tls_key_path: None,
             max_request_body_bytes: 10 * 1024 * 1024,
@@ -129,16 +126,6 @@ impl Default for WrapperConfig {
             tls_handshake_timeout: std::time::Duration::from_secs(10),
         }
     }
-}
-
-/// Load balancing strategy for a backend pool.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
-pub enum LoadBalanceStrategy {
-    /// Distribute requests evenly across healthy backends.
-    #[default]
-    RoundRobin,
-    /// Route to the backend with fewest active connections.
-    LeastConnections,
 }
 
 /// Rate limiting configuration for a route.

@@ -51,8 +51,6 @@ pub struct MustardNode<T: MustardTransport> {
     pub config: GossipConfig,
     /// Network transport.
     pub transport: T,
-    /// Lamport clock for causal ordering.
-    lamport: u64,
     /// Optional watch channel for publishing membership snapshots.
     /// Set when running inside the agent, None in standalone tests.
     membership_watch: Option<watch::Sender<Vec<MembershipSnapshot>>>,
@@ -127,7 +125,6 @@ impl<T: MustardTransport> MustardNode<T> {
             dissemination: DisseminationQueue::new(),
             config,
             transport,
-            lamport: 0,
             membership_watch: None,
             rejoin_watch: None,
             last_published_digest: Vec::new(),
@@ -343,7 +340,7 @@ impl<T: MustardTransport> MustardNode<T> {
                     address: member.address,
                     state: member.state,
                     incarnation: member.incarnation,
-                    lamport: self.lamport,
+                    lamport: 0,
                 },
             );
             updates.truncate(super::message::MAX_PIGGYBACK_UPDATES);
@@ -411,14 +408,13 @@ impl<T: MustardTransport> MustardNode<T> {
         }
 
         // Enqueue Left update for dissemination
-        self.tick_lamport();
         self.dissemination.enqueue(
             MembershipUpdate {
                 node_id: self.node_id.clone(),
                 address: self.address,
                 state: NodeState::Left,
                 incarnation: self.incarnation,
-                lamport: self.lamport,
+                lamport: 0,
             },
             self.membership.len(),
         );
@@ -551,7 +547,6 @@ impl<T: MustardTransport> MustardNode<T> {
 
         // No ACK at all — mark as suspect
         if self.membership.suspect(&target_id) {
-            self.tick_lamport();
             self.dissemination.enqueue(
                 MembershipUpdate {
                     node_id: target_id.clone(),
@@ -563,7 +558,7 @@ impl<T: MustardTransport> MustardNode<T> {
                     // peers (detection stops propagating) or wrongly overrides
                     // fresher Alive state.
                     incarnation: self.membership_incarnation_of(&target_id),
-                    lamport: self.lamport,
+                    lamport: 0,
                 },
                 self.membership.len(),
             );
@@ -626,14 +621,13 @@ impl<T: MustardTransport> MustardNode<T> {
 
         // Disseminate newly discovered nodes so the whole cluster learns
         if is_new {
-            self.tick_lamport();
             self.dissemination.enqueue(
                 MembershipUpdate {
                     node_id: message.sender.clone(),
                     address: from,
                     state: NodeState::Alive,
                     incarnation: message.incarnation,
-                    lamport: self.lamport,
+                    lamport: 0,
                 },
                 self.membership.len(),
             );
@@ -764,13 +758,12 @@ impl<T: MustardTransport> MustardNode<T> {
     /// stale Dead. Seeding from the seen value means a single refute wins.
     fn refute(&mut self, offending_incarnation: u64) {
         self.incarnation = self.incarnation.max(offending_incarnation) + 1;
-        self.tick_lamport();
         let update = MembershipUpdate {
             node_id: self.node_id.clone(),
             address: self.address,
             state: NodeState::Alive,
             incarnation: self.incarnation,
-            lamport: self.lamport,
+            lamport: 0,
         };
         // Apply the refutation to our own record too, not just the outbound
         // queue (O9). The claim we're refuting was applied a moment ago, so
@@ -802,7 +795,6 @@ impl<T: MustardTransport> MustardNode<T> {
 
         for (node_id, node_addr) in newly_dead {
             if self.membership.declare_dead(&node_id) {
-                self.tick_lamport();
                 let inc = self.membership_incarnation_of(&node_id);
                 self.dissemination.enqueue(
                     MembershipUpdate {
@@ -810,7 +802,7 @@ impl<T: MustardTransport> MustardNode<T> {
                         address: node_addr,
                         state: NodeState::Dead,
                         incarnation: inc,
-                        lamport: self.lamport,
+                        lamport: 0,
                     },
                     self.membership.len(),
                 );
@@ -937,10 +929,6 @@ impl<T: MustardTransport> MustardNode<T> {
                 Err(_) => return false,
             }
         }
-    }
-
-    fn tick_lamport(&mut self) {
-        self.lamport += 1;
     }
 
     fn membership_incarnation_of(&self, node_id: &NodeId) -> u64 {
