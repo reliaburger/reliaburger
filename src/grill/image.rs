@@ -446,16 +446,17 @@ impl ImageStore {
         let client = oci_distribution::Client::new(client_config);
         let auth = oci_distribution::secrets::RegistryAuth::Anonymous;
 
-        // Pull the manifest (handles multi-platform resolution automatically)
-        let (manifest, _digest, _config) =
-            retry_registry_read(std::time::Duration::from_secs(30), || {
-                client.pull_manifest_and_config(&oci_ref, &auth)
-            })
-            .await
-            .map_err(|e| ImageError::ManifestPull {
-                image: image_ref.full_reference(),
-                reason: e.to_string(),
-            })?;
+        // Verify the raw digest chain before publishing any cache metadata.
+        let verified = retry_registry_read(std::time::Duration::from_secs(30), || {
+            super::oci_pull::pull_verified_manifest(&client, &oci_ref, &auth)
+        })
+        .await
+        .map_err(|e| ImageError::ManifestPull {
+            image: image_ref.full_reference(),
+            reason: e.to_string(),
+        })?;
+
+        let manifest = verified.manifest;
 
         // Save the manifest for cache validation
         let manifest_path = self.manifest_path(&image_ref);
@@ -1235,8 +1236,20 @@ mod tests {
         }
     }
 
+    #[derive(Clone, Copy, Debug)]
+    enum RegistryIntegrityCase {
+        ChangedManifest,
+        ChangedConfiguration,
+        ChangedIndex,
+        ChangedChild,
+        ValidIndex,
+        WrongConfigurationSize,
+        WrongChildSize,
+    }
+
     #[derive(Clone)]
     struct RegistryState {
+        index: Option<(String, Vec<u8>)>,
         manifest_path: String,
         manifest: Vec<u8>,
         config_path: String,
@@ -1275,7 +1288,11 @@ mod tests {
                 .unwrap();
         }
 
-        if path == state.manifest_path {
+        let is_index = state
+            .index
+            .as_ref()
+            .is_some_and(|(index_path, _)| index_path == path);
+        if path == state.manifest_path || is_index {
             state.manifest_requests.fetch_add(1, Ordering::SeqCst);
         }
         if path == state.layer_path {
@@ -1322,7 +1339,12 @@ mod tests {
                 .unwrap();
         }
 
-        let (body, content_type) = if path == state.manifest_path {
+        let (body, content_type) = if is_index {
+            (
+                state.index.as_ref().unwrap().1.clone(),
+                "application/vnd.oci.image.index.v1+json",
+            )
+        } else if path == state.manifest_path {
             (
                 state.manifest.clone(),
                 "application/vnd.oci.image.manifest.v1+json",
@@ -1344,8 +1366,13 @@ mod tests {
                 .unwrap();
         };
 
-        Response::builder()
-            .status(StatusCode::OK)
+        let mut response = Response::builder().status(StatusCode::OK);
+        if path == state.manifest_path || is_index {
+            // Deliberately claim the requested digest even for changed bytes.
+            // A client must hash the response instead of trusting this header.
+            response = response.header("Docker-Content-Digest", path.rsplit('/').next().unwrap());
+        }
+        response
             .header(header::CONTENT_TYPE, content_type)
             .header(header::CONTENT_LENGTH, body.len())
             .body(Body::from(body))
@@ -1357,6 +1384,13 @@ mod tests {
     }
 
     async fn start_registry_fixture_with_fault(fault: Option<RegistryFault>) -> RegistryFixture {
+        start_registry_fixture_with_options(fault, None).await
+    }
+
+    async fn start_registry_fixture_with_options(
+        fault: Option<RegistryFault>,
+        integrity: Option<RegistryIntegrityCase>,
+    ) -> RegistryFixture {
         let dir = tempfile::tempdir().unwrap();
         let layer_path = dir.path().join("layer.tar.gz");
         create_test_layer_with_dirs(
@@ -1371,7 +1405,7 @@ mod tests {
             br#"{"architecture":"amd64","os":"linux","rootfs":{"type":"layers","diff_ids":[]}}"#
                 .to_vec();
         let config_digest = format!("sha256:{}", sha256_hex(&config));
-        let manifest = serde_json::to_vec(&serde_json::json!({
+        let mut manifest = serde_json::to_vec(&serde_json::json!({
             "schemaVersion": 2,
             "mediaType": "application/vnd.oci.image.manifest.v1+json",
             "config": {
@@ -1386,13 +1420,22 @@ mod tests {
             }],
         }))
         .unwrap();
+        if matches!(
+            integrity,
+            Some(RegistryIntegrityCase::WrongConfigurationSize)
+        ) {
+            let mut value: serde_json::Value = serde_json::from_slice(&manifest).unwrap();
+            value["config"]["size"] = serde_json::json!(config.len() + 1);
+            manifest = serde_json::to_vec(&value).unwrap();
+        }
         let manifest_digest = format!("sha256:{}", sha256_hex(&manifest));
 
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap();
         let layer_requests = Arc::new(AtomicUsize::new(0));
         let manifest_requests = Arc::new(AtomicUsize::new(0));
-        let state = RegistryState {
+        let mut state = RegistryState {
+            index: None,
             manifest_path: format!("/v2/fixture/manifests/{manifest_digest}"),
             manifest,
             config_path: format!("/v2/fixture/blobs/{config_digest}"),
@@ -1403,6 +1446,52 @@ mod tests {
             manifest_requests: Arc::clone(&manifest_requests),
             fault,
         };
+        let mut root_digest = manifest_digest.clone();
+        if matches!(
+            integrity,
+            Some(
+                RegistryIntegrityCase::ChangedIndex
+                    | RegistryIntegrityCase::ChangedChild
+                    | RegistryIntegrityCase::ValidIndex
+                    | RegistryIntegrityCase::WrongChildSize
+            )
+        ) {
+            let mut entries = Vec::new();
+            for os in ["linux", "darwin"] {
+                for architecture in ["amd64", "arm64"] {
+                    entries.push(serde_json::json!({
+                        "mediaType": "application/vnd.oci.image.manifest.v1+json",
+                        "digest": manifest_digest,
+                        "size": state.manifest.len() + usize::from(matches!(integrity, Some(RegistryIntegrityCase::WrongChildSize))),
+                        "platform": {"os": os, "architecture": architecture}
+                    }));
+                }
+            }
+            let index = serde_json::to_vec(&serde_json::json!({
+                "schemaVersion": 2,
+                "mediaType": "application/vnd.oci.image.index.v1+json",
+                "manifests": entries
+            }))
+            .unwrap();
+            root_digest = format!("sha256:{}", sha256_hex(&index));
+            state.index = Some((format!("/v2/fixture/manifests/{root_digest}"), index));
+        }
+        let change_manifest = |bytes: &mut Vec<u8>| {
+            let mut manifest: serde_json::Value = serde_json::from_slice(bytes).unwrap();
+            manifest["annotations"] =
+                serde_json::json!({"fixture": "changed without changing the requested digest"});
+            *bytes = serde_json::to_vec(&manifest).unwrap();
+        };
+        match integrity {
+            Some(RegistryIntegrityCase::ChangedManifest | RegistryIntegrityCase::ChangedChild) => {
+                change_manifest(&mut state.manifest)
+            }
+            Some(RegistryIntegrityCase::ChangedConfiguration) => state.config = b"{}".to_vec(),
+            Some(RegistryIntegrityCase::ChangedIndex) => {
+                change_manifest(&mut state.index.as_mut().unwrap().1)
+            }
+            _ => {}
+        }
         let app = axum::Router::new()
             .fallback(registry_response)
             .with_state(state);
@@ -1416,12 +1505,87 @@ mod tests {
         });
 
         RegistryFixture {
-            reference: format!("{address}/fixture@{manifest_digest}"),
+            reference: format!("{address}/fixture@{root_digest}"),
             layer_requests,
             manifest_requests,
             shutdown,
             task,
         }
+    }
+
+    #[tokio::test]
+    async fn upstream_image_identity_is_verified_before_cache_publication() {
+        for case in [
+            RegistryIntegrityCase::ChangedConfiguration,
+            RegistryIntegrityCase::ChangedManifest,
+            RegistryIntegrityCase::ChangedIndex,
+            RegistryIntegrityCase::ChangedChild,
+            RegistryIntegrityCase::WrongConfigurationSize,
+            RegistryIntegrityCase::WrongChildSize,
+        ] {
+            let fixture = start_registry_fixture_with_options(None, Some(case)).await;
+            let directory = tempfile::tempdir().unwrap();
+            let store = ImageStore::new(directory.path().to_path_buf());
+            let result = store.pull_and_unpack(&fixture.reference).await;
+            assert!(result.is_err(), "{case:?} was accepted: {result:?}");
+            assert_eq!(
+                fixture.layer_requests.load(Ordering::SeqCst),
+                0,
+                "unverified metadata reached layer fetch"
+            );
+            let reference = ImageReference::parse(&fixture.reference).unwrap();
+            assert!(!store.manifest_path(&reference).exists());
+            assert!(!store.rootfs_path(&reference).exists());
+        }
+    }
+
+    #[tokio::test]
+    async fn upstream_pull_through_verifies_the_requested_digest_chain() {
+        use crate::pickle::upstream::UpstreamRegistry;
+        for case in [
+            RegistryIntegrityCase::ChangedIndex,
+            RegistryIntegrityCase::ChangedChild,
+            RegistryIntegrityCase::ChangedManifest,
+            RegistryIntegrityCase::ChangedConfiguration,
+            RegistryIntegrityCase::WrongConfigurationSize,
+            RegistryIntegrityCase::WrongChildSize,
+        ] {
+            let fixture = start_registry_fixture_with_options(None, Some(case)).await;
+            let upstream = crate::pickle::upstream::OciUpstream::insecure_http(Default::default());
+            let reference = ImageReference::parse(&fixture.reference).unwrap();
+            let result = upstream.fetch_manifest(&reference).await;
+            assert!(
+                result.is_err(),
+                "{case:?} was accepted by pull-through: {result:?}"
+            );
+            assert_eq!(fixture.layer_requests.load(Ordering::SeqCst), 0);
+        }
+    }
+
+    #[tokio::test]
+    async fn upstream_index_resolution_preserves_verified_child_bytes() {
+        use crate::pickle::upstream::UpstreamRegistry;
+        let fixture =
+            start_registry_fixture_with_options(None, Some(RegistryIntegrityCase::ValidIndex))
+                .await;
+        let directory = tempfile::tempdir().unwrap();
+        let store = ImageStore::new(directory.path().to_path_buf());
+        let rootfs = store.pull_and_unpack(&fixture.reference).await.unwrap();
+        assert_eq!(
+            std::fs::read(rootfs.join("bin/sh")).unwrap(),
+            b"fixture shell"
+        );
+        let upstream = crate::pickle::upstream::OciUpstream::insecure_http(Default::default());
+        let reference = ImageReference::parse(&fixture.reference).unwrap();
+        let manifest = upstream.fetch_manifest(&reference).await.unwrap();
+        assert_eq!(
+            crate::pickle::store::compute_sha256(&manifest.manifest_bytes),
+            manifest.digest
+        );
+        assert_eq!(
+            crate::pickle::store::compute_sha256(&manifest.config_bytes),
+            manifest.config.digest
+        );
     }
 
     #[tokio::test]
@@ -1463,7 +1627,11 @@ mod tests {
 
     #[tokio::test]
     async fn registry_complete_corrupt_responses_are_not_retried() {
-        for target in [RegistryFaultTarget::Manifest, RegistryFaultTarget::Layer] {
+        for target in [
+            RegistryFaultTarget::Manifest,
+            RegistryFaultTarget::Configuration,
+            RegistryFaultTarget::Layer,
+        ] {
             let mut fault = registry_fault(false, StatusCode::OK, "INVALID", usize::MAX);
             fault.target = target;
             let fixture = start_registry_fixture_with_fault(Some(fault)).await;

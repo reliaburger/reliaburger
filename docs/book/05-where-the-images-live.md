@@ -729,3 +729,40 @@ fetched but ignored the configuration bytes without verifying their descriptor
 digest. Inspecting the upstream client also showed that pinned manifest bytes
 need explicit verification, including each link through an image index. C56
 tracks that work; the transport retry change does not close it.
+
+
+### A digest header isn't proof
+
+Ask a registry for `image@sha256:...`. It can reply with different, perfectly
+valid JSON and repeat the requested digest in `Docker-Content-Digest`. Parsing
+that JSON proves nothing about its identity. Our first regression accepted the
+changed configuration; the pull-through regression accepted a changed index.
+Both responses carried plausible headers.
+
+ImageStore and Pickle now use one verified fetch path. It hashes the exact root
+bytes before parsing a pinned reference. If the root is an image index, the
+existing platform resolver selects a descriptor, and we verify the selected
+manifest's raw bytes against that descriptor's digest and size. Finally, we
+check the configuration bytes against the manifest's descriptor. Tag-based pulls
+compute their root digest locally too; a mutable tag itself isn't an immutable
+identity guarantee.
+
+`VerifiedImageManifest` owns the parsed manifest and its original `Vec<u8>`
+bytes. Keeping both avoids serialising JSON again, which can change whitespace
+or field ordering and therefore the digest. Pickle publishes those verified
+bytes directly instead of fetching the manifest a second time. There is no gap
+where metadata from one response can be paired with another response's bytes.
+
+Integrity failures use a terminal OCI error, so they don't enter the transient
+transport retry branch. The complete manifest/index/config fetch stays inside
+the caller's deadline. We still verify downloaded layers before publishing them.
+This proves content identity; it doesn't establish who built the image or make a
+mutable tag trustworthy.
+
+The HTTP fixtures exercise both consumers with changed root manifests, changed
+indices, changed selected manifests, wrong configuration bytes and incorrect
+descriptor sizes. Another case resolves an intact index and checks both the
+unpacked file and Pickle's exact manifest/configuration hashes. Complete corrupt
+configuration responses now join malformed manifests and corrupt layers in the
+no-retry regression. Actual upstream runtime tests remain a separate check of
+registry interoperability.

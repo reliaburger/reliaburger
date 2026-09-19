@@ -57,7 +57,9 @@ Do not delete ownership records to bypass the refusal while workloads may surviv
 
 External image reads retry interrupted connections and response streams within
 the same four-attempt and overall time limits as temporary registry errors.
-Configuration and manifest digest verification remains tracked in C56.
+Both direct pulls and Pickle verify raw pinned manifests, platform-index links
+and configuration descriptors before cache publication. Digest headers alone
+are not trusted; integrity failures stop the pull without retries.
 
 Registry startup claims exclusive ownership of the configured image store's
 upload directory. Run only one Bun with that writable image store. A restart

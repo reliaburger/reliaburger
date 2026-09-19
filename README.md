@@ -45,6 +45,8 @@ require matching explicit formats (currently protocol 6 and state 7). See the
 [compatibility policy](docs/releasing.md#cluster-compatibility).
 Registry upload recovery reclaims abandoned partial uploads after a crash and
 requires one Bun per writable image store; see the [startup contract](docs/README.md).
+Direct image pulls and Pickle verify pinned manifests, selected platform
+manifests and configuration bytes before accepting them into the cache.
 
 Restart also refuses unreadable ownership records or uncertain runtime adoption,
 preserving records and workload identities for recovery. Node-local cron

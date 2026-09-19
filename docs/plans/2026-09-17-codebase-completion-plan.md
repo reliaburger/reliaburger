@@ -1336,6 +1336,17 @@ wrong configuration bytes, valid index resolution and both direct/pull-through
 consumers. Permanent integrity errors must not retry or leave accepted cache
 entries. Qualify actual upstream pulls independently of hermetic fixtures.
 
+**Completed:** Both failing-first consumers now share a raw-byte verifier. It
+checks pinned roots, selected child digests/sizes and configuration digests/sizes;
+Pickle keeps the exact verified bytes and removes its second manifest fetch.
+The complete operation retains a 30-second deadline; integrity refusals are
+terminal. All 38 image tests pass on macOS/Linux (7.68s/7.77s), all 232 Pickle
+tests pass (10.00s/2.27s), and strict all-target/all-feature Clippy passes on both.
+The actual cold Docker Hub pull through rootless runc and published-port adoption
+passes in 3.51s. Tests cover forged digest headers, changed valid root/index/child
+JSON, incorrect configuration bytes and descriptor sizes, intact index resolution,
+and complete corrupt configuration responses without retries.
+
 ## Engineering follow-ups
 
 ### H01 — Remove stale wiring claims and validate documentation

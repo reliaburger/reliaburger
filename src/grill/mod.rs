@@ -18,6 +18,7 @@ pub mod netns;
 #[cfg(target_os = "linux")]
 mod network_leases;
 pub mod oci;
+pub(crate) mod oci_pull;
 pub mod port;
 pub mod portmap;
 pub mod process;

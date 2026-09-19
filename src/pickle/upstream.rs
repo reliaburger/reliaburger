@@ -226,18 +226,22 @@ impl UpstreamRegistry for OciUpstream {
         Box::pin(async move {
             let reference = Self::oci_reference(image)?;
             let auth = self.auth_for(&image.registry);
-            let (manifest, digest, config_json) = self
-                .client
-                .pull_manifest_and_config(&reference, &auth)
-                .await
-                .map_err(|e| {
-                    PickleError::ReplicationFailed(format!(
-                        "upstream manifest {} failed: {e}",
-                        image.full_reference()
-                    ))
-                })?;
-
-            let config_bytes = config_json.into_bytes();
+            let verified = tokio::time::timeout(
+                Duration::from_secs(30),
+                crate::grill::oci_pull::pull_verified_manifest(&self.client, &reference, &auth),
+            )
+            .await
+            .map_err(|_| PickleError::ReplicationFailed("upstream manifest read timed out".into()))?
+            .map_err(|e| {
+                PickleError::ReplicationFailed(format!(
+                    "upstream manifest {} failed: {e}",
+                    image.full_reference()
+                ))
+            })?;
+            let manifest = verified.manifest;
+            let digest = verified.digest;
+            let config_bytes = verified.config_bytes;
+            let manifest_bytes = verified.manifest_bytes;
             let config = LayerDescriptor {
                 digest: Digest::new(&manifest.config.digest).map_err(|e| {
                     PickleError::ReplicationFailed(format!("upstream config digest: {e}"))
@@ -262,33 +266,6 @@ impl UpstreamRegistry for OciUpstream {
             let digest = Digest::new(&digest).map_err(|e| {
                 PickleError::ReplicationFailed(format!("upstream manifest digest: {e}"))
             })?;
-
-            // Re-fetch the resolved manifest raw, pinned by digest.
-            // `pull_manifest_and_config` hands back a parsed struct;
-            // re-serialising it would hash to a different digest, and
-            // the cache must store the exact bytes the digest names.
-            let raw_reference = oci_distribution::Reference::with_digest(
-                image.registry.clone(),
-                image.repository.clone(),
-                digest.as_str().to_string(),
-            );
-            let (manifest_bytes, _) = self
-                .client
-                .pull_manifest_raw(
-                    &raw_reference,
-                    &auth,
-                    &[
-                        oci_distribution::manifest::OCI_IMAGE_MEDIA_TYPE,
-                        oci_distribution::manifest::IMAGE_MANIFEST_MEDIA_TYPE,
-                    ],
-                )
-                .await
-                .map_err(|e| {
-                    PickleError::ReplicationFailed(format!(
-                        "upstream raw manifest {} failed: {e}",
-                        image.full_reference()
-                    ))
-                })?;
 
             Ok(UpstreamManifest {
                 digest,
