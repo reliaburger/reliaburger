@@ -2480,6 +2480,51 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
         .await
         .map_err(|error| BunError::AdoptionState(error.to_string()))?
         .map_err(|error| BunError::AdoptionState(error.to_string()))?;
+        // Validate the entire inventory before adopting or deleting any owner.
+        for record in &records {
+            let base = crate::grill::InstanceIdentity::new(
+                &record.namespace,
+                &record.app_name,
+                record.replica_index,
+            );
+            let generation = record
+                .instance_id
+                .strip_prefix(&format!("{}__{}-g", record.namespace, record.app_name))
+                .and_then(|suffix| suffix.strip_suffix(&format!("-{}", record.replica_index)))
+                .and_then(|value| value.parse::<u64>().ok());
+            let matches_generation = generation.is_some_and(|generation| {
+                crate::grill::InstanceIdentity::canary(
+                    &record.namespace,
+                    &record.app_name,
+                    generation,
+                    record.replica_index,
+                )
+                .instance_id()
+                .0 == record.instance_id
+            });
+            if !crate::config::valid_workload_label(&record.namespace)
+                || !crate::config::valid_workload_label(&record.app_name)
+                || (base.instance_id().0 != record.instance_id && !matches_generation)
+                || record
+                    .app_spec
+                    .as_ref()
+                    .and_then(|spec| spec.namespace.as_ref())
+                    .is_some_and(|namespace| namespace != &record.namespace)
+            {
+                return Err(BunError::AdoptionState(format!(
+                    "unsupported or inconsistent workload identity in record {:?}; the record and runtime are preserved",
+                    record.instance_id,
+                )));
+            }
+            if record.runtime != self.supervisor.grill().runtime_kind() {
+                return Err(BunError::AdoptionState(format!(
+                    "instance {} belongs to {:?}, but the selected runtime is {:?}",
+                    record.instance_id,
+                    record.runtime,
+                    self.supervisor.grill().runtime_kind(),
+                )));
+            }
+        }
         let mut restored = std::collections::HashMap::new();
         for stored in schedules {
             let namespace = stored.spec.namespace.as_deref().unwrap_or("default");
@@ -2518,41 +2563,10 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
         self.scheduled_jobs = restored;
         self.scheduled_jobs_store_uncertain = false;
         for record in records {
-            if record.runtime != self.supervisor.grill().runtime_kind() {
-                return Err(BunError::AdoptionState(format!(
-                    "instance {} belongs to {:?}, but the selected runtime is {:?}",
-                    record.instance_id,
-                    record.runtime,
-                    self.supervisor.grill().runtime_kind(),
-                )));
-            }
-            // The runtime knows the still-running container by the id it was
-            // started under, which is what the record stores. The supervisor
-            // and everything downstream key on the canonical id: for a fresh
-            // record they're the same; for a legacy record (this node
-            // upgraded across the identity change with workloads running) the
-            // canonical id is rebuilt from the record's structured fields so
-            // the adopted instance lands under a namespace-safe key.
+            // Startup preflight proved that runtime, record and supervisor
+            // share the same identity. Never invent an alias for an old owner.
             let runtime_id = InstanceId(record.instance_id.clone());
-            let instance_id =
-                if crate::grill::InstanceIdentity::parse(&record.instance_id).is_some() {
-                    runtime_id.clone()
-                } else {
-                    let mut ident = crate::grill::InstanceIdentity::new(
-                        &record.namespace,
-                        &record.app_name,
-                        record.replica_index,
-                    );
-                    // Preserve a legacy canary generation if the id carried one.
-                    if let Some(legacy) = crate::grill::InstanceIdentity::parse_legacy(
-                        &record.instance_id,
-                        &record.namespace,
-                    ) && legacy.app == record.app_name
-                    {
-                        ident.generation = legacy.generation;
-                    }
-                    ident.instance_id()
-                };
+            let instance_id = runtime_id.clone();
             // Never clobber an instance the current process already tracks.
             if self.supervisor.get_instance(&instance_id).is_some() {
                 continue;
@@ -2601,7 +2615,7 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
             // its per-instance directory, so an adopted instance keeps
             // rotating on time instead of coming back with
             // `identity: None` (D9). The directory was created under the
-            // runtime id, so a legacy record still finds its keys. An
+            // runtime id, which is also the supervisor key. An
             // unprovisioned directory loads as `None` and the rotation loop
             // provisions afresh.
             let identity_dir = self.instance_identity_dir(&runtime_id);
@@ -14619,40 +14633,63 @@ host = "remote.local"
     }
 
     #[tokio::test]
-    async fn legacy_record_adopts_under_a_canonical_key() {
-        // In-place upgrade across the identity change: an old bun left a
-        // record whose instance_id has no namespace prefix (`web-0`). The
-        // runtime still knows the container by that legacy id, but the
-        // supervisor must key the adopted instance canonically so it can't
-        // collide with a same-name app in another namespace (DEP1).
-        let (mut agent, _tx, _shutdown, grill) = test_agent_with_grill();
-        let dir = tempfile::tempdir().unwrap();
-        let record = adoption_record("web-0", "web", false); // legacy, bare id
-        crate::grill::records::write_record(dir.path(), &record).unwrap();
-        agent.set_records_dir(dir.path().to_path_buf());
+    async fn adoption_refuses_unsupported_or_inconsistent_identities_before_mutation() {
+        for (instance, app, namespace, ordinal) in [
+            ("web-0", "web", "default", 0),
+            ("web-g9-0", "web", "default", 0),
+            ("default__web-0", "other", "default", 0),
+            ("default__web-0", "web", "other", 0),
+            ("default__web-0", "web", "default", 1),
+            ("default__Bad-0", "Bad", "default", 0),
+            ("bad__namespace__web-0", "web", "bad__namespace", 0),
+            ("default__web-g01-0", "web", "default", 0),
+            ("payments__web-0", "web", "payments", 0),
+        ] {
+            let (mut agent, _tx, _shutdown, grill) = test_agent_with_grill();
+            let dir = tempfile::tempdir().unwrap();
+            let mut record = adoption_record(instance, app, false);
+            record.namespace = namespace.into();
+            record.replica_index = ordinal;
+            if namespace == "payments" {
+                record.app_spec.as_mut().unwrap().namespace = Some("other".into());
+            }
+            crate::grill::records::write_record(dir.path(), &record).unwrap();
+            agent.set_records_dir(dir.path().to_path_buf());
+            let runtime_id = InstanceId(instance.into());
+            grill.set_adopt_result(&runtime_id, true);
+            let result = agent.adopt_recorded_instances().await;
+            assert!(result.is_err(), "accepted {record:?}: {result:?}");
+            assert!(
+                grill.calls().is_empty(),
+                "invalid ownership reached the runtime"
+            );
+            assert!(agent.supervisor.instances.is_empty());
+            assert_eq!(
+                crate::grill::records::load_records(dir.path()).unwrap(),
+                vec![record]
+            );
+        }
+    }
 
-        // The runtime adopts by the id it ran under: the legacy one.
-        let runtime_id = InstanceId("web-0".to_string());
-        grill.set_adopt_result(&runtime_id, true);
-
-        assert_eq!(agent.adopt_recorded_instances().await.unwrap(), 1);
-
-        // But the supervisor keys it canonically.
-        let canonical = InstanceId("default__web-0".to_string());
-        let instance = agent
-            .supervisor
-            .get_instance(&canonical)
-            .expect("adopted under the canonical key");
-        assert_eq!(instance.namespace, "default");
-        assert_eq!(instance.app_name, "web");
-        // The legacy key resolves to nothing.
-        assert!(agent.supervisor.get_instance(&runtime_id).is_none());
-        // The runtime was asked to adopt the legacy container id, not to
-        // create or start a fresh one.
-        let calls = grill.calls();
-        assert!(calls.contains(&("adopt".to_string(), runtime_id.clone())));
-        assert!(!calls.contains(&("create".to_string(), runtime_id.clone())));
-        assert!(!calls.contains(&("start".to_string(), runtime_id)));
+    #[tokio::test]
+    async fn adoption_uses_structured_names_to_validate_generation_like_suffixes() {
+        for instance in ["default__worker-g9-0", "default__worker-g9-g17-0"] {
+            let (mut agent, _tx, _shutdown, grill) = test_agent_with_grill();
+            let dir = tempfile::tempdir().unwrap();
+            let record = adoption_record(instance, "worker-g9", false);
+            crate::grill::records::write_record(dir.path(), &record).unwrap();
+            agent.set_records_dir(dir.path().to_path_buf());
+            let id = InstanceId(instance.into());
+            grill.set_adopt_result(&id, true);
+            assert_eq!(agent.adopt_recorded_instances().await.unwrap(), 1);
+            let owner = agent.supervisor.get_instance(&id).unwrap();
+            assert_eq!(owner.app_name, "worker-g9");
+            assert_eq!(owner.namespace, "default");
+            assert_eq!(
+                crate::grill::records::load_records(dir.path()).unwrap(),
+                vec![record]
+            );
+        }
     }
 
     #[tokio::test]

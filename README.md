@@ -49,7 +49,9 @@ Direct image pulls and Pickle verify pinned manifests, selected platform
 manifests and configuration bytes before accepting them into the cache.
 
 Restart also refuses unreadable ownership records or uncertain runtime adoption,
-preserving records and workload identities for recovery. Workload and namespace
+preserving records and workload identities for recovery. Legacy aliases and
+inconsistent stored instance identities refuse startup without runtime mutation.
+Workload and namespace
 names must be lowercase DNS labels; invalid names are refused before deployment.
 Node-local cron
 registrations survive restart. Cron skips missed or uncertain firings after a

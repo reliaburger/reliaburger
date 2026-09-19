@@ -887,3 +887,37 @@ This supports different ports on one host and bracketed IPv6 addresses. If
 membership lacks an address, the CLI refuses before uploading; an operator can
 supply an explicit `--node-address id=host:port`. Reusing port 9117 for every
 node could send an upgrade to the wrong process.
+
+
+### Keep one identity across restart
+
+An old record says `web-0`, but the replacement Bun invents
+`default__web-0` for its supervisor map. Adoption can appear to work: the
+runtime still finds `web-0`. Later, retirement looks up the new name and misses
+the owner. Two names for one running workload are a recovery bug.
+
+Startup now checks the complete ownership inventory before adopting anything,
+removing stale records or sweeping identity directories. Each stored namespace
+and app name must satisfy the same label rules as deployment admission. The
+stored instance ID must exactly match those fields and its replica index,
+including an optional canonical deployment generation. An explicitly recorded
+app-spec namespace must agree too. Runtime selection is checked in the same
+preflight pass.
+
+We use the structured app name to resolve an ambiguity: an ordinary app named
+`worker-g9` and generation nine of an app named `worker` can have the same
+textual suffix. A heuristic split on `-g` cannot decide which owner a record
+means. The stored fields can. This validation preserves valid generation-like
+app names without silently relabelling them.
+
+Unsupported legacy aliases and inconsistent records refuse startup. The record,
+identity files and runtime remain untouched. This follows 0.1.0's fresh-cluster
+policy; we don't promise an implicit migration from development snapshots.
+Global collisions between two newly allocated IDs still need admission guards.
+
+The regression first demonstrates that Bun adopts the legacy alias. After the
+repair, it checks legacy, mismatched and invalid-label records and asserts that
+no runtime operation was attempted and the record is unchanged. Valid ordinary
+and rolling IDs for `worker-g9` remain adoptable. The real signed-exec test then
+checks a surviving generation-one workload and a generation-two deployment
+through the replacement Bun.

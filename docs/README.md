@@ -59,6 +59,9 @@ Startup refuses unreadable or malformed workload ownership records and runtime
 adoption errors before serving the API. It preserves records and identity files
 for recovery; inspect the reported path or runtime error and retry once repaired.
 Do not delete ownership records to bypass the refusal while workloads may survive.
+Startup also refuses legacy aliases and records whose canonical ID disagrees with
+its app, namespace, replica or explicit app-spec namespace. It validates the whole
+inventory before adopting or cleaning any instance, preserving unsupported owners.
 
 External image reads retry interrupted connections and response streams within
 the same four-attempt and overall time limits as temporary registry errors.

@@ -993,6 +993,19 @@ explicit gates; 38.79s/70.52s), alongside strict Clippy on both platforms.
 Recovery identity validation and global instance-ID collision refusal remain
 separate open work.
 
+**Recovery identity preflight (19 September):** A failing-first regression proves
+that the old alias path adopts `web-0` into a different supervisor key, leaving
+runtime retirement and record deletion looking up the wrong ID. Startup now
+validates the whole inventory before adoption, stale-record removal or identity
+sweeping. Canonical IDs must agree with valid structured labels, replica index,
+optional generation and an explicit app-spec namespace; runtime kind is also
+checked before mutation. Legacy aliases refuse without runtime calls or deletion,
+in accordance with the fresh-cluster policy. Ordinary `worker-g9` and its rolling
+IDs remain valid. All 463 native/462 Linux Bun tests pass (one explicit gate
+each; 21.88s/39.58s), strict Clippy passes on both, and actual signed exec followed
+by redeployment passes on macOS/Linux (19.19s/10.53s). Cross-app ID collision
+admission remains separate.
+
 ### C35 — Gate chaos capabilities per selected scenario
 
 **Priority:** P2. **Wave:** 4. **Book chapters:** 08, 15.

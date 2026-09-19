@@ -161,9 +161,9 @@ impl InstanceIdentity {
     ///
     /// The legacy format is inherently ambiguous when an app name's last
     /// hyphenated segment looks like `g{digits}` (e.g. an app literally
-    /// named `worker-g5`). Adoption doesn't rely on this: it rebuilds the
-    /// identity from the record's separate `namespace`/`app_name` fields,
-    /// so this heuristic only ever matters for a bare container-name parse.
+    /// named `worker-g5`). Adoption instead checks the canonical ID against
+    /// the record's separate `namespace`/`app_name` fields and refuses legacy
+    /// aliases, so this heuristic only matters for a bare container-name parse.
     pub fn parse_legacy(suffix: &str, namespace: &str) -> Option<Self> {
         let (head, ordinal_part) = suffix.rsplit_once('-')?;
         let ordinal: u32 = ordinal_part.parse().ok()?;

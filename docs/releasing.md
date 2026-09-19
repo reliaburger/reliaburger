@@ -40,7 +40,10 @@ host operating systems.
 
 0.1.0 requires fresh clusters. Preserve pre-release development data separately;
 startup and recovery refuse it rather than attempting an implicit migration.
-Do not copy a format stamp onto old data to bypass this check.
+Do not copy a format stamp onto old data to bypass this check. Bun also refuses
+legacy workload-ID aliases and inconsistent ownership records without touching
+their runtimes or deleting their records. Canonical identity must agree with the
+recorded app, namespace and replica; startup does not rename surviving owners.
 
 Run `bun --compatibility` to read the binary's current `protocol` and `state`
 generations as JSON without starting a node. `GET /v1/version` includes the same
