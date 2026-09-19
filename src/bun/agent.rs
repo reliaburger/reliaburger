@@ -6298,6 +6298,9 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         use crate::sesame::egress;
 
+        // Pending/preparing work cannot execute yet. The deployment driver
+        // installs policy before entering Initialising or Starting; monitoring
+        // must not race that installation while an image is still being pulled.
         let unbound: std::collections::HashSet<InstanceId> = self
             .supervisor
             .list_instances()
@@ -6305,7 +6308,10 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
             .filter(|instance| {
                 !matches!(
                     instance.state,
-                    ContainerState::Stopped | ContainerState::Failed
+                    ContainerState::Pending
+                        | ContainerState::Preparing
+                        | ContainerState::Stopped
+                        | ContainerState::Failed
                 )
             })
             .filter(|instance| !self.egress_bindings.contains_key(&instance.id))
@@ -6506,7 +6512,9 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
             .filter(|i| {
                 !matches!(
                     i.state,
-                    crate::grill::state::ContainerState::Stopped
+                    crate::grill::state::ContainerState::Pending
+                        | crate::grill::state::ContainerState::Preparing
+                        | crate::grill::state::ContainerState::Stopped
                         | crate::grill::state::ContainerState::Failed
                 )
             })
@@ -11023,6 +11031,66 @@ mod tests {
             crate::onion::trace::TraceVerdict::Unknown { .. }
         ));
         handle.await.unwrap();
+    }
+
+    #[cfg(all(feature = "ebpf", target_os = "linux"))]
+    #[tokio::test]
+    async fn egress_health_waits_for_preparation_but_fences_unbound_execution() {
+        for stage in [
+            ContainerState::Pending,
+            ContainerState::Preparing,
+            ContainerState::Initialising,
+            ContainerState::Starting,
+            ContainerState::HealthWait,
+            ContainerState::Running,
+            ContainerState::Unhealthy,
+            ContainerState::Stopping,
+        ] {
+            let (mut agent, _tx, _shutdown) = test_agent();
+            let mut spec = Config::parse("[app.web]\nimage = 'mock:image'\n")
+                .unwrap()
+                .app
+                .remove("web")
+                .unwrap();
+            let ids = agent
+                .supervisor
+                .deploy_app("web", "default", &spec, Instant::now())
+                .await
+                .unwrap();
+            spec.egress = Config::parse(
+                "[app.web]\nimage = 'mock:image'\n[app.web.egress]\nallow = ['203.0.113.9:443']\n",
+            )
+            .unwrap()
+            .app
+            .remove("web")
+            .unwrap()
+            .egress;
+            agent
+                .deployed_specs
+                .insert(("web".into(), "default".into()), spec);
+            agent.supervisor.get_instance_mut(&ids[0]).unwrap().state = stage;
+            // Missing kernel ownership is expected before pre-start programming,
+            // but must remain a fail-closed condition from init/start onwards.
+            agent.enforce_live_egress_or_stop().await;
+            let actual = agent.supervisor.get_instance(&ids[0]).unwrap().state;
+            if matches!(stage, ContainerState::Pending | ContainerState::Preparing) {
+                assert_eq!(
+                    actual, stage,
+                    "preparation was stopped before policy installation"
+                );
+                assert!(agent.egress_affected_workloads.is_empty());
+            } else {
+                assert!(
+                    matches!(actual, ContainerState::Stopping | ContainerState::Stopped),
+                    "{stage:?} remained {actual:?}"
+                );
+                assert!(
+                    agent
+                        .egress_affected_workloads
+                        .contains(&("web".into(), "default".into()))
+                );
+            }
+        }
     }
 
     #[tokio::test]

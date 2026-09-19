@@ -1506,7 +1506,7 @@ async fn egress_programmed_before_start_via_cgroup_path() {
         shutdown.clone(),
     );
     agent.set_onion_ebpf(Arc::clone(&ebpf)).await;
-    tokio::spawn(async move { agent.run().await });
+    let agent_task = tokio::spawn(async move { agent.run().await });
 
     let config = Config::parse(
         r#"
@@ -1527,7 +1527,12 @@ async fn egress_programmed_before_start_via_cgroup_path() {
         })
         .await
         .unwrap();
-    while ev_rx.recv().await.is_some() {}
+    while let Some(event) = ev_rx.recv().await {
+        assert!(
+            !matches!(event, reliaburger::bun::agent::ApplyEvent::Error { .. }),
+            "pre-start deployment failed: {event:?}"
+        );
+    }
 
     // The agent created the cgroup directory and programmed enforcement
     // against its inode before ever calling start.
@@ -1563,6 +1568,7 @@ async fn egress_programmed_before_start_via_cgroup_path() {
         let _ = egress::delete_cgroup_egress_state(&mut e.bpf, cgroup_id);
     }
     shutdown.cancel();
+    agent_task.await.unwrap();
 }
 
 /// A newly prepared cgroup may reuse an inode whose old map entries survived

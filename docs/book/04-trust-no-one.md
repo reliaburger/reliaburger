@@ -1343,3 +1343,28 @@ The catalogue goes further: it fetches through TLS, seals two different age
 ciphertexts for the same value, deploys them into a leased OCI workload and
 reads their plaintext from the actual container. Unicode and newline bytes
 must survive; a neighbouring unencrypted value must remain unchanged.
+
+### A health check must distinguish preparation from execution
+
+A deploy can spend seconds pulling an image. Its instance already exists in the
+supervisor, and its egress policy already exists in desired state, but no process
+can execute yet. Our live security check treated that expected interval as a
+lost policy and stopped the deployment. Hosted Linux qualification exposed the
+race; a deterministic regression reproduced a Pending instance becoming Stopped.
+
+Both live monitoring and the reconciliation sweep now allow Pending and Preparing
+instances to reach the existing pre-start policy installation step. From
+Initialising and Starting onwards, an absent binding still fences the workload.
+Existing bindings remain checked during preparation too, so preparing a new
+instance does not excuse losing an already-installed policy. The deployment
+driver must complete policy installation before changing to an execution state.
+
+The test exercises all eight nonterminal lifecycle states through the agent. It
+preserves the two preparation states and requires stopping in each execution or
+shutdown state without kernel ownership. The privileged pre-start test also
+checks the real cgroup map entries and create-before-start ordering. Its failure
+now includes deployment errors, and it joins its agent before finishing.
+
+The eight-state regression fails before the repair and passes afterwards with
+all 483 Linux Bun tests (one explicit gate). Strict Clippy passes on both
+platforms, and all 24 actual privileged eBPF tests pass in 5.90 seconds.

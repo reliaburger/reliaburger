@@ -43,6 +43,16 @@ job-lease changes remains separate. Both hosted workflows also pass at
 `969e3d4`, including the later runtime inspection and restart-cleanup fixes.
 The subsequent cron checkpoint changes require their own hosted validation.
 
+Hosted privileged Linux CI at `a5c1890` exposed an egress health-check race:
+a Pending/Preparing workload was fenced before its pre-start policy could be
+installed. A deterministic eight-state regression reproduces the premature stop.
+Live monitoring and the sweep now defer missing-binding checks until execution
+can begin, retaining checks on existing bindings. All 483 Linux Bun tests pass
+(one gate), strict Clippy passes on both platforms, and all 24 actual privileged
+eBPF tests pass (5.90s), including policy loss and pre-start failure cases.
+Latest hosted qualification and the unrelated process-launch recovery gap remain
+open under V02.
+
 Coverage at `df45d79` reproduced a DNS port-zero collision: UDP selected a port
 already occupied by TCP. Automatic allocation now retries up to 16 times;
 explicit port conflicts still refuse. All 18 DNS wire tests and strict Clippy

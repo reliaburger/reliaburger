@@ -2180,3 +2180,17 @@ sentence in the old proposal shipped unchanged.
 | [2026-08-08-audit-post-phase15.md](2026-08-08-audit-post-phase15.md) | Historical review/design; implementation recorded in phases 1–16; residuals consolidated above. |
 | [2026-08-08-doc-consistency-audit.md](2026-08-08-doc-consistency-audit.md) | Historical review/design; implementation recorded in phases 1–16; residuals consolidated above. |
 | [2026-09-16-v0.1.0-release-plan.md](2026-09-16-v0.1.0-release-plan.md) | Active release contract; corrected overflow claim; completion work here, final gates V01–V05. |
+
+
+### V02 follow-up: egress preparation race (20 September)
+
+Hosted CI at a5c1890 passed 49 of 50 privileged Linux cases. The pre-start egress
+case failed because live monitoring treated a Pending/Preparing instance as an
+already-running workload with lost policy. The deterministic regression fails
+before the repair (Pending becomes Stopped). Live checks and the kernel sweep
+now defer missing-binding checks for those two states; Initialising, Starting,
+HealthWait, Running, Unhealthy and Stopping still require enforcement. Existing
+bindings remain monitored regardless of preparation. All 483 Linux Bun tests
+pass (one gate), strict Clippy passes on macOS/Linux, and all 24 privileged eBPF
+cases pass in 5.90s using the newly built binary. V02 stays open for the separate
+physical process-launch gap and final candidate qualification.
