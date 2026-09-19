@@ -1695,12 +1695,23 @@ joined its cgroup, muddying process ownership and wasting memory in a programme
 which only needs to park.
 
 Linux gives us one more safety net: `prctl(PR_SET_PDEATHSIG, SIGKILL)` asks the
-kernel to kill the helper when its Bun parent dies. `prctl` is a C system call,
-so Rust requires an `unsafe` block. The block's safety comment explains the
-invariant: the call changes process metadata and doesn't dereference Rust
-memory. We then read `getppid()` to close the small race where Bun could die
-before the parent-death signal was installed. A fresh Bun sweeps any empty
-`fault-*` cgroups left by a hard crash.
+kernel to kill the helper when the thread which created it exits. That thread
+can be a Tokio worker; Linux doesn't wait for the whole Bun process to die.
+The [Linux interface documentation](https://man7.org/linux/man-pages/man2/PR_SET_PDEATHSIG.2const.html)
+also explains that an earlier death doesn't produce a retroactive signal.
+`prctl` is a C system call, so Rust requires an `unsafe` block. The block's
+safety comment explains the invariant: the call changes process metadata and
+doesn't dereference Rust memory. `getppid()` detects process reparenting, but
+cannot prove a creator thread still exists inside a live parent process.
+That startup gap needs a separate thread-identity check.
+
+The privileged acceptance fixture launches the real Bun helper from a Python
+thread, waits for readiness and then lets that thread finish while its process
+stays alive. The helper must exit through SIGKILL. A second case kills the
+whole parent. Both require an empty kernel cgroup membership list, followed by
+successful startup reclamation of the old directory. Early helper death never
+releases the capacity reservation by itself: cleanup must still inspect the
+owned cgroups.
 
 None of this is enabled by merely running as root. The server policy needs the
 independent `saturate_capacity` operation plus non-zero CPU or memory ceilings;

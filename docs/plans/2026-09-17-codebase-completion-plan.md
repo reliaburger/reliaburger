@@ -1337,7 +1337,16 @@ symptom, not a blanket exemption for application process-ownership defects.
 
 Evidence: `src/smoker/node_pressure.rs:helper startup`.
 
-The legacy 100 ms stderr drain and parent-death commentary remain after the functional startup fix.
+**Diagnostic repair implemented on PR #167.** The noisy-helper regression
+fails before the fix. Continuous draining retains an 8 KiB prefix and explicit
+truncation/read-error evidence, bounds readiness to 64 bytes, and owns the drain
+through a JoinSet. Timeout retains partial diagnostics. Four privileged Linux
+cases pass (6.41s), including actual Bun parent-process and creator-thread death
+plus stale-cgroup reclamation; 114 Smoker tests (three explicit gates) and strict
+Linux/macOS Clippy pass. Linux signals on creator-thread death, not just whole
+parent-process death. A separate startup gap remains: `getppid()` alone cannot
+detect a creator thread which died before the signal was installed while its
+process remains alive. Add and verify that thread identity before pressure.
 
 **Completion test:** Helper failures preserve bounded complete stderr; validate and document the actual Linux parent/thread-death semantics and assert cleanup on owner termination.
 

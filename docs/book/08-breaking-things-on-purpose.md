@@ -1236,3 +1236,29 @@ an executable between launches and restores it for a later attempt. It then
 crashes the recovered process during backoff and checks that retry eligibility
 survives. This proves recovery during one Bun lifetime; durable job execution
 intent and retry budgets across Bun replacement are a separate requirement.
+
+### Read the helper's complaint before its pipe fills
+
+A pressure helper can fail before it prints `ready`. Its stderr explains why,
+but waiting for readiness before reading stderr puts those two operations in
+the wrong order. A sufficiently long diagnostic fills the pipe. The child then
+blocks writing it and never reaches the readiness message.
+
+The controller now drains stderr while waiting for readiness. It retains the
+first 8 KiB, marks longer output as truncated and keeps draining the remainder
+without growing the buffer. Read errors remain separate evidence. Readiness
+itself is limited to 64 bytes, so a broken helper cannot allocate an unbounded
+line in its parent. On failure we kill and reap the helper, briefly allow the
+drain to reach EOF, then report the prefix already captured. A timeout no
+longer discards a useful partial message.
+
+The drain lives in a Tokio `JoinSet` owned by the pressure handle. Dropping the
+handle aborts the drain, including when an inherited pipe never closes. A
+`watch` channel publishes the latest bounded diagnostic; `send_replace` keeps
+that value available even after the writer finishes. This avoids detaching a
+background task or making cleanup depend on a descendant closing a pipe.
+
+A privileged fixture writes 256 KiB before reporting ready. Another writes a
+short error and stays alive; a third fills stderr and never reports ready.
+They check successful startup, retained failure text, explicit truncation,
+bounded completion and an empty cgroup inventory after cleanup.
