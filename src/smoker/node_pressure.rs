@@ -222,6 +222,10 @@ impl NodePressureController {
             let cgroup = Path::new(NODE_PRESSURE_CGROUP_ROOT).join(id.to_string());
             let (_memory_ceiling_bytes, cores) = prepare_fault_cgroup(&cgroup, memory_percentage)?;
 
+            // No await may move this task to another worker between recording
+            // the creator and spawn: Linux ties PDEATHSIG to this exact thread.
+            // SAFETY: gettid reads the caller's kernel thread ID without pointers.
+            let parent_tid = unsafe { libc::gettid() };
             let mut command = tokio::process::Command::new(executable);
             command
                 .arg("__node-pressure-helper")
@@ -229,6 +233,8 @@ impl NodePressureController {
                 .arg(&cgroup)
                 .arg("--parent-pid")
                 .arg(std::process::id().to_string())
+                .arg("--parent-tid")
+                .arg(parent_tid.to_string())
                 .arg("--memory-percentage")
                 .arg(memory_percentage.to_string())
                 .arg("--cpu-workers")
@@ -605,6 +611,7 @@ pub fn parse_linux_meminfo(meminfo: &str) -> Result<(u64, u64), String> {
 pub fn run_helper(
     cgroup: &Path,
     parent_pid: u32,
+    parent_tid: u32,
     memory_percentage: u8,
     cpu_workers: usize,
 ) -> Result<(), String> {
@@ -626,6 +633,15 @@ pub fn run_helper(
     let actual_parent = unsafe { libc::getppid() } as u32;
     if actual_parent == 1 || actual_parent != parent_pid {
         return Err("node-pressure helper lost its Bun parent before startup".to_string());
+    }
+    // getppid still names a live process when only its creator thread died.
+    // After arming the signal, require that task to remain in the parent group.
+    let parent_thread = PathBuf::from(format!("/proc/{parent_pid}/task/{parent_tid}"));
+    if !parent_thread
+        .try_exists()
+        .map_err(|error| format!("cannot inspect Bun parent thread: {error}"))?
+    {
+        return Err("node-pressure helper lost its Bun parent thread before startup".to_string());
     }
     std::fs::write(cgroup.join("cgroup.procs"), std::process::id().to_string())
         .map_err(|error| format!("failed to join pressure cgroup: {error}"))?;
@@ -688,6 +704,7 @@ pub fn run_helper(
 pub fn run_helper(
     _cgroup: &Path,
     _parent_pid: u32,
+    _parent_tid: u32,
     _memory_percentage: u8,
     _cpu_workers: usize,
 ) -> Result<(), String> {

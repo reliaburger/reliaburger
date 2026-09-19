@@ -1703,12 +1703,20 @@ also explains that an earlier death doesn't produce a retroactive signal.
 safety comment explains the invariant: the call changes process metadata and
 doesn't dereference Rust memory. `getppid()` detects process reparenting, but
 cannot prove a creator thread still exists inside a live parent process.
-That startup gap needs a separate thread-identity check.
+Bun therefore records the kernel thread ID immediately before spawning, with
+no `.await` between those operations. An await could resume the Rust task on a
+different Tokio worker, making the recorded ID describe the wrong creator.
+After installing the signal, the helper requires `/proc/PID/task/TID` to exist
+inside that same parent process. Missing or unreadable evidence stops startup
+before the helper joins a pressure cgroup.
 
 The privileged acceptance fixture launches the real Bun helper from a Python
 thread, waits for readiness and then lets that thread finish while its process
 stays alive. The helper must exit through SIGKILL. A second case kills the
-whole parent. Both require an empty kernel cgroup membership list, followed by
+whole parent. A third delays exec until the creator thread has already exited,
+while the parent process stays alive. Before the identity check this helper
+stays alive indefinitely; afterwards it refuses before applying pressure.
+All cases require an empty kernel cgroup membership list, followed by
 successful startup reclamation of the old directory. Early helper death never
 releases the capacity reservation by itself: cleanup must still inspect the
 owned cgroups.

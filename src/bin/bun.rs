@@ -88,6 +88,9 @@ enum Command {
         /// Bun PID used to close the parent-death-signal race.
         #[arg(long)]
         parent_pid: u32,
+        /// Kernel ID of the Bun thread which created this helper.
+        #[arg(long)]
+        parent_tid: u32,
         /// Total-node memory-usage target, recomputed after joining the cgroup.
         #[arg(long)]
         memory_percentage: u8,
@@ -563,6 +566,7 @@ fn main() -> anyhow::Result<()> {
     if let Some(Command::NodePressureHelper {
         cgroup,
         parent_pid,
+        parent_tid,
         memory_percentage,
         cpu_workers,
     }) = &cli.command
@@ -570,6 +574,7 @@ fn main() -> anyhow::Result<()> {
         return reliaburger::smoker::node_pressure::run_helper(
             cgroup,
             *parent_pid,
+            *parent_tid,
             *memory_percentage,
             *cpu_workers,
         )

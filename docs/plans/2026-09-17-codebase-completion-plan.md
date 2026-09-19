@@ -1344,9 +1344,12 @@ through a JoinSet. Timeout retains partial diagnostics. Four privileged Linux
 cases pass (6.41s), including actual Bun parent-process and creator-thread death
 plus stale-cgroup reclamation; 114 Smoker tests (three explicit gates) and strict
 Linux/macOS Clippy pass. Linux signals on creator-thread death, not just whole
-parent-process death. A separate startup gap remains: `getppid()` alone cannot
-detect a creator thread which died before the signal was installed while its
-process remains alive. Add and verify that thread identity before pressure.
+parent-process death. A separate delayed-exec regression reproduces the startup
+gap where `getppid()` still names a live process after the creator thread dies.
+The separate fix records its kernel TID immediately before spawn, without an
+await, then requires that task inside the same parent after arming the signal
+and before pressure. All four privileged cases pass again (6.69s), including
+this refusal and cleanup; strict Linux/macOS Clippy passes. H09 is complete.
 
 **Completion test:** Helper failures preserve bounded complete stderr; validate and document the actual Linux parent/thread-death semantics and assert cleanup on owner termination.
 

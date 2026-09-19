@@ -278,14 +278,20 @@ import os, subprocess, sys, threading
 child = None
 def start():
     global child
-    child = subprocess.Popen([sys.argv[1], '__node-pressure-helper',
+    command = [sys.argv[1], '__node-pressure-helper',
         '--cgroup', sys.argv[2], '--parent-pid', str(os.getpid()),
-        '--memory-percentage', '0', '--cpu-workers', '0'],
+        '--parent-tid', str(threading.get_native_id()),
+        '--memory-percentage', '0', '--cpu-workers', '0']
+    if sys.argv[3] == 'before':
+        command = ['/bin/sh', '-c', 'sleep 0.25; exec "$@"', 'delayed-helper'] + command
+    child = subprocess.Popen(command,
         stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+    if sys.argv[3] == 'before':
+        return
     if child.stdout.readline().strip() != 'ready':
         print(child.stderr.read(), file=sys.stderr)
         os._exit(2)
-if sys.argv[3] == 'thread':
+if sys.argv[3] in ('thread', 'before'):
     thread = threading.Thread(target=start)
     thread.start()
     thread.join()
@@ -295,13 +301,17 @@ if sys.argv[3] == 'thread':
         child.kill()
         child.wait()
         raise
-    assert result == -9, result
+    if sys.argv[3] == 'before':
+        assert result != 0, result
+        assert 'lost its Bun parent thread' in child.stderr.read()
+    else:
+        assert result == -9, result
     # This parent process remains alive to observe its creator thread's death.
 else:
     start()
     os._exit(0)
 "#;
-    for (index, mode) in ["thread", "process"].iter().enumerate() {
+    for (index, mode) in ["thread", "process", "before"].iter().enumerate() {
         let mut controller = NodePressureController::default();
         assert!(controller.configure(
             NodePressureLimits {
