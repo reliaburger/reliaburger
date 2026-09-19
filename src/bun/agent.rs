@@ -300,6 +300,11 @@ pub enum AgentCommand {
         config: Config,
         events: mpsc::Sender<ApplyEvent>,
     },
+    /// Explicit operator authorisation to rerun unknown node-local jobs.
+    RerunJobs {
+        config: Config,
+        events: mpsc::Sender<ApplyEvent>,
+    },
     /// Stop all instances of an app in a namespace.
     Stop {
         app_name: String,
@@ -551,6 +556,11 @@ pub enum AgentCommand {
 /// back as one of these ops. Each carries a `oneshot` the loop replies on, so
 /// the task drives the sequence while the loop applies it.
 enum DeployOp {
+    /// A prerequisite's observed success must be durable before its dependent app runs.
+    ConfirmJobSuccess {
+        instance_id: InstanceId,
+        reply: oneshot::Sender<Result<(), BunError>>,
+    },
     /// A bounded probe completes off-loop; only the agent mutates health state.
     HealthProbeResult {
         instance_id: InstanceId,
@@ -589,6 +599,7 @@ enum DeployOp {
     },
     /// Create supervisor-tracked instances for a job deploy.
     SupervisorDeployJob {
+        rerun_unknown: bool,
         job_name: String,
         namespace: String,
         spec: Box<JobSpec>,
@@ -873,14 +884,29 @@ impl DeployOps {
         .await
     }
 
+    async fn confirm_job_success(&self, instance_id: &InstanceId) -> Result<(), BunError> {
+        self.call(
+            |reply| DeployOp::ConfirmJobSuccess {
+                instance_id: instance_id.clone(),
+                reply,
+            },
+            Err(BunError::JobState(
+                "agent unavailable before job success was persisted".into(),
+            )),
+        )
+        .await
+    }
+
     async fn supervisor_deploy_job(
         &self,
         job_name: &str,
         namespace: &str,
         spec: &JobSpec,
+        rerun_unknown: bool,
     ) -> Result<Vec<InstanceId>, BunError> {
         self.call(
             |reply| DeployOp::SupervisorDeployJob {
+                rerun_unknown,
                 job_name: job_name.to_string(),
                 namespace: namespace.to_string(),
                 spec: Box::new(spec.clone()),
@@ -1593,6 +1619,8 @@ pub struct BunAgent<G: Grill> {
     /// crash restart or a self-upgrade exec) can adopt them instead of
     /// restarting them. `None` disables recording and adoption.
     records_dir: Option<PathBuf>,
+    recorded_jobs: BTreeMap<String, super::jobs::RecordedJob>,
+    job_store_uncertain: bool,
     /// Self-upgrade manager. `None` when upgrades are not configured
     /// (upgrade commands then answer with an error).
     upgrade: Option<crate::upgrade::manager::UpgradeManager>,
@@ -1711,6 +1739,8 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
             capacity_memory_mb: 0,
             trust_policy: crate::config::node::TrustPolicySection::default(),
             records_dir: None,
+            recorded_jobs: BTreeMap::new(),
+            job_store_uncertain: false,
             upgrade: None,
             draining: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             identity_retry_ticks: 0,
@@ -1810,6 +1840,8 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
             capacity_memory_mb: 0,
             trust_policy: crate::config::node::TrustPolicySection::default(),
             records_dir: None,
+            recorded_jobs: BTreeMap::new(),
+            job_store_uncertain: false,
             upgrade: None,
             draining: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             identity_retry_ticks: 0,
@@ -2265,6 +2297,186 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
         Ok(())
     }
 
+    /// Keep job evidence durable before runtime mutation or retry admission.
+    async fn commit_jobs(
+        &mut self,
+        next: BTreeMap<String, super::jobs::RecordedJob>,
+    ) -> Result<(), BunError> {
+        if self.job_store_uncertain {
+            return Err(BunError::JobState(
+                "a previous write is uncertain; restart Bun to reload it".into(),
+            ));
+        }
+        if next == self.recorded_jobs {
+            return Ok(());
+        }
+        if let Some(directory) = self.records_dir.clone() {
+            self.job_store_uncertain = true;
+            for (id, job) in &next {
+                self.recorded_jobs
+                    .entry(id.clone())
+                    .or_insert_with(|| job.clone());
+            }
+            let records = next.clone();
+            tokio::task::spawn_blocking(move || super::jobs::persist(&directory, records))
+                .await
+                .map_err(|error| BunError::JobState(error.to_string()))?
+                .map_err(|error| BunError::JobState(error.to_string()))?;
+        }
+        self.recorded_jobs = next;
+        self.job_store_uncertain = false;
+        Ok(())
+    }
+
+    async fn record_job_phase(
+        &mut self,
+        id: &InstanceId,
+        phase: super::jobs::JobPhase,
+    ) -> Result<(), BunError> {
+        let mut next = self.recorded_jobs.clone();
+        let job = next
+            .get_mut(&id.0)
+            .ok_or_else(|| BunError::JobState(format!("missing attempt for {id}")))?;
+        job.phase = phase;
+        self.commit_jobs(next).await
+    }
+
+    async fn record_job_runtime_absent(&mut self, id: &InstanceId) -> Result<(), BunError> {
+        let mut jobs = self.recorded_jobs.clone();
+        if let Some(job) = jobs.get_mut(&id.0) {
+            job.runtime_absent = true;
+        }
+        self.commit_jobs(jobs).await
+    }
+
+    /// A new run may replace terminal evidence only after old runtime cleanup.
+    async fn prepare_job_run(
+        &mut self,
+        name: &str,
+        namespace: &str,
+        spec: &JobSpec,
+        rerun_unknown: bool,
+    ) -> Result<Vec<InstanceId>, BunError> {
+        use super::jobs::{JobPhase, RecordedJob};
+        let id = crate::grill::InstanceIdentity::new(namespace, name, 0).instance_id();
+        let refuse = |reason: &str| BunError::JobState(format!("{namespace}/{name}: {reason}"));
+        if self.job_store_uncertain {
+            return Err(refuse("checkpoint is uncertain; restart Bun"));
+        }
+        if let Some(instance) = self.supervisor.get_instance(&id) {
+            if !instance.is_job || instance.app_name != name || instance.namespace != namespace {
+                return Err(refuse("instance id belongs to another workload"));
+            }
+            if !rerun_unknown
+                && !matches!(
+                    instance.state,
+                    ContainerState::Stopped | ContainerState::Failed
+                )
+            {
+                return Err(refuse(
+                    "previous job still owns its runtime; stop it before applying again",
+                ));
+            }
+        }
+        let previous = self.recorded_jobs.get(&id.0).cloned();
+        let next_cron_occurrence = self
+            .scheduled_jobs
+            .contains_key(&(name.into(), namespace.into()))
+            && previous.as_ref().is_some_and(|job| job.runtime_absent);
+        if previous
+            .as_ref()
+            .is_some_and(|job| matches!(job.phase, JobPhase::Unknown | JobPhase::Launching))
+            && !rerun_unknown
+            && !next_cron_occurrence
+        {
+            return Err(refuse(
+                "previous outcome is unknown; use apply --rerun-jobs for an explicit rerun",
+            ));
+        }
+        let generation = match &previous {
+            Some(job) => job
+                .generation
+                .checked_add(1)
+                .ok_or_else(|| refuse("job generation exhausted"))?,
+            None => 1,
+        };
+        if let Some(job) = &previous {
+            if !job.runtime_absent {
+                self.kill_and_wait_for_exit(&id).await?;
+            }
+            self.record_job_runtime_absent(&id).await?;
+            self.retire_instance_artifacts(&id).await?;
+            self.supervisor.retire_instance(&id).await;
+        }
+        let ids = self
+            .supervisor
+            .deploy_job(name, namespace, spec, Instant::now())
+            .await?;
+        let mut next = self.recorded_jobs.clone();
+        next.insert(
+            id.0.clone(),
+            RecordedJob {
+                name: name.into(),
+                namespace: namespace.into(),
+                spec: spec.clone(),
+                runtime: self.supervisor.grill().runtime_kind(),
+                generation,
+                restart_count: 0,
+                phase: JobPhase::Launching,
+                runtime_absent: false,
+            },
+        );
+        self.commit_jobs(next).await?;
+        Ok(ids)
+    }
+
+    /// Retrying spends the budget before create/start, after retiring the old record.
+    async fn claim_job_retry(&mut self, id: &InstanceId) -> Result<(), BunError> {
+        use super::jobs::{JobPhase, MAX_RETRIES};
+        let count = self
+            .supervisor
+            .get_instance(id)
+            .ok_or_else(|| BunError::InstanceNotFound {
+                instance_id: id.clone(),
+            })?
+            .restart_count;
+        let mut next = self.recorded_jobs.clone();
+        let job = next
+            .get_mut(&id.0)
+            .ok_or_else(|| BunError::JobState(format!("missing attempt for {id}")))?;
+        if count > MAX_RETRIES
+            || count < job.restart_count
+            || matches!(
+                job.phase,
+                JobPhase::Unknown
+                    | JobPhase::Stopping
+                    | JobPhase::Stopped
+                    | JobPhase::Exited { code: 0 }
+            )
+        {
+            return Err(BunError::JobState(format!(
+                "automatic retry refused for {id}"
+            )));
+        }
+        job.restart_count = count;
+        job.phase = JobPhase::Launching;
+        job.runtime_absent = false;
+        self.commit_jobs(next).await
+    }
+
+    fn job_state_label(&self, instance: &WorkloadInstance) -> String {
+        if (instance.is_job && self.job_store_uncertain)
+            || self
+                .recorded_jobs
+                .get(&instance.id.0)
+                .is_some_and(|job| job.phase == super::jobs::JobPhase::Unknown)
+        {
+            "unknown".into()
+        } else {
+            instance.state.to_string()
+        }
+    }
+
     /// Write (or refresh) the instance record used for adoption after a bun
     /// restart or self-upgrade exec. Best-effort: a failed record write must
     /// never fail a deploy, but it is logged.
@@ -2388,8 +2600,8 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
     /// of instances adopted. Any uncertain observation refuses startup and
     /// preserves durable records and identity material for recovery.
     ///
-    /// Restart backoff counters start fresh for adopted instances, and
-    /// cluster routing is rebuilt by the normal reconcile paths.
+    /// Jobs restore durable retry budgets and retain unknown outcomes. App
+    /// backoff starts fresh; normal reconciliation rebuilds cluster routing.
     pub async fn adopt_recorded_instances(&mut self) -> Result<usize, BunError> {
         let Some(dir) = self.records_dir.clone() else {
             return Ok(0);
@@ -2398,16 +2610,40 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
         let mut adopted_count = 0;
 
         let records_dir = dir.clone();
-        let (records, schedules) = tokio::task::spawn_blocking(move || {
+        let (records, schedules, jobs) = tokio::task::spawn_blocking(move || {
             let records = crate::grill::records::load_records(&records_dir)?;
             let schedules = super::schedules::load(&records_dir)?;
-            Ok::<_, std::io::Error>((records, schedules))
+            let jobs = super::jobs::load(&records_dir)?;
+            Ok::<_, std::io::Error>((records, schedules, jobs))
         })
         .await
         .map_err(|error| BunError::AdoptionState(error.to_string()))?
         .map_err(|error| BunError::AdoptionState(error.to_string()))?;
+        for job in jobs.values() {
+            if job.runtime != self.supervisor.grill().runtime_kind() {
+                return Err(BunError::AdoptionState(
+                    "job attempt belongs to another runtime".into(),
+                ));
+            }
+        }
         // Validate the entire inventory before adopting or deleting any owner.
         for record in &records {
+            if record.is_job && !jobs.contains_key(&record.instance_id) {
+                return Err(BunError::AdoptionState(format!(
+                    "job {} has no durable attempt",
+                    record.instance_id
+                )));
+            }
+            if let Some(job) = jobs.get(&record.instance_id)
+                && (!record.is_job
+                    || record.namespace != job.namespace
+                    || record.app_name != job.name
+                    || record.image != job.spec.image.clone().unwrap_or_default())
+            {
+                return Err(BunError::AdoptionState(
+                    "job record conflicts with attempt ownership".into(),
+                ));
+            }
             let base = crate::grill::InstanceIdentity::new(
                 &record.namespace,
                 &record.app_name,
@@ -2488,6 +2724,10 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
         }
         self.scheduled_jobs = restored;
         self.scheduled_jobs_store_uncertain = false;
+        self.recorded_jobs = jobs.clone();
+        self.job_store_uncertain = false;
+        let mut recovered_jobs = jobs;
+        let mut adopted_jobs = std::collections::HashSet::new();
         for record in records {
             // Startup preflight proved that runtime, record and supervisor
             // share the same identity. Never invent an alias for an old owner.
@@ -2495,6 +2735,9 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
             let instance_id = runtime_id.clone();
             // Never clobber an instance the current process already tracks.
             if self.supervisor.get_instance(&instance_id).is_some() {
+                if record.is_job {
+                    adopted_jobs.insert(instance_id.0.clone());
+                }
                 continue;
             }
 
@@ -2507,6 +2750,15 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
                 BunError::AdoptionState(format!("runtime adoption timed out for {runtime_id}"))
             })??;
             if !adopted {
+                if let Some(job) = recovered_jobs.get_mut(&runtime_id.0) {
+                    job.runtime_absent = true;
+                    if job.phase == super::jobs::JobPhase::Launching {
+                        job.phase = super::jobs::JobPhase::Unknown;
+                    }
+                    // Preserve the positive observation before deleting the
+                    // only record that let this runtime prove absence.
+                    self.commit_jobs(recovered_jobs.clone()).await?;
+                }
                 let records_dir = dir.clone();
                 let identity_dir = self.instance_identity_dir(&runtime_id);
                 // Keep the record if identity retirement fails, so the next
@@ -2521,6 +2773,15 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
                 continue;
             }
 
+            let recorded_job = recovered_jobs.get(&runtime_id.0);
+            if let Some(job) = recorded_job {
+                if matches!(job.phase, super::jobs::JobPhase::Exited { .. }) || job.runtime_absent {
+                    return Err(BunError::AdoptionState(format!(
+                        "job {runtime_id} has conflicting live and terminal evidence"
+                    )));
+                }
+                adopted_jobs.insert(runtime_id.0.clone());
+            }
             // The surviving instance still holds its port.
             if let Some(port) = record.host_port {
                 self.supervisor.port_allocator.reserve(port).await?;
@@ -2559,14 +2820,27 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
                 id: instance_id.clone(),
                 app_name: record.app_name.clone(),
                 namespace: record.namespace.clone(),
-                state: ContainerState::Running,
+                state: if recorded_job.is_some_and(|job| {
+                    matches!(
+                        job.phase,
+                        super::jobs::JobPhase::Stopping | super::jobs::JobPhase::Stopped
+                    )
+                }) {
+                    ContainerState::Stopping
+                } else {
+                    ContainerState::Running
+                },
                 health_counters: super::health::HealthCounters::new(),
-                restart_count: 0,
+                restart_count: recorded_job.map_or(0, |job| job.restart_count),
                 last_restart: None,
                 host_port: record.host_port,
                 container_ip: None,
                 created_at: now,
-                restart_policy: super::restart::RestartPolicy::default(),
+                restart_policy: if record.is_job {
+                    super::restart::RestartPolicy::for_job(super::jobs::MAX_RETRIES)
+                } else {
+                    super::restart::RestartPolicy::default()
+                },
                 health_config,
                 is_job: record.is_job,
                 retry_pending: false,
@@ -2590,6 +2864,50 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
             // Logs are captured under the runtime id (the container's name).
             self.spawn_log_forwarder(&runtime_id, &record.app_name, &record.namespace);
             adopted_count += 1;
+        }
+
+        for (id, job) in &mut recovered_jobs {
+            if !adopted_jobs.contains(id) && job.phase == super::jobs::JobPhase::Launching {
+                job.phase = super::jobs::JobPhase::Unknown;
+            }
+        }
+        self.commit_jobs(recovered_jobs).await?;
+        // Keep terminal/unknown evidence visible even after its runtime is gone.
+        for (id, job) in self.recorded_jobs.clone() {
+            let instance_id = InstanceId(id);
+            if self.supervisor.get_instance(&instance_id).is_some() {
+                continue;
+            }
+            self.supervisor
+                .deploy_job(&job.name, &job.namespace, &job.spec, now)
+                .await?;
+            let cgroup = crate::grill::cgroup::cgroup_path(&job.namespace, &job.name, 0);
+            let spec = generate_job_oci_spec(
+                &job.name,
+                &job.namespace,
+                &job.spec,
+                &cgroup.to_string_lossy(),
+                None,
+            );
+            if let Some(instance) = self.supervisor.get_instance_mut(&instance_id) {
+                instance.restart_count = job.restart_count;
+                instance.restart_policy =
+                    super::restart::RestartPolicy::for_job(super::jobs::MAX_RETRIES);
+                instance.state = match job.phase {
+                    super::jobs::JobPhase::Unknown => ContainerState::Failed,
+                    super::jobs::JobPhase::Exited { code }
+                        if code != 0 && job.restart_count >= super::jobs::MAX_RETRIES =>
+                    {
+                        ContainerState::Failed
+                    }
+                    super::jobs::JobPhase::Stopping => ContainerState::Stopping,
+                    _ => ContainerState::Stopped,
+                };
+                instance.retry_pending = matches!(job.phase, super::jobs::JobPhase::Exited { code } if code != 0)
+                    && job.restart_count < super::jobs::MAX_RETRIES;
+                instance.oci_spec = Some(spec);
+                instance.last_restart = Some(now);
+            }
         }
 
         if adopted_count > 0 {
@@ -3026,7 +3344,16 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
         config: Config,
         events: mpsc::Sender<ApplyEvent>,
         register_schedule: bool,
+        rerun_unknown_jobs: bool,
     ) {
+        if rerun_unknown_jobs && let Err(message) = super::jobs::validate_rerun(&config) {
+            let _ = events
+                .send(ApplyEvent::Error {
+                    message: message.into(),
+                })
+                .await;
+            return;
+        }
         if let Err(message) = self.validate_deploy_names(&config) {
             let _ = events.send(ApplyEvent::Error { message }).await;
             return;
@@ -3094,6 +3421,7 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
         let event_store = self.events.clone();
         let observed_operation = operation.clone();
         let worker = DeployWorker {
+            rerun_unknown_jobs,
             grill: self.supervisor.grill().clone(),
             ops: DeployOps {
                 tx: self.deploy_ops_tx.clone(),
@@ -3179,7 +3507,10 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
     async fn handle_command(&mut self, cmd: AgentCommand) {
         match cmd {
             AgentCommand::Deploy { config, events } => {
-                self.begin_deploy(config, events, true).await;
+                self.begin_deploy(config, events, true, false).await;
+            }
+            AgentCommand::RerunJobs { config, events } => {
+                self.begin_deploy(config, events, true, true).await;
             }
             AgentCommand::Stop {
                 app_name,
@@ -6567,7 +6898,7 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
     async fn spawn_scheduled_job_deploy(&mut self, config: Config) {
         let (events_tx, mut events_rx) = mpsc::channel::<ApplyEvent>(64);
         tokio::spawn(async move { while events_rx.recv().await.is_some() {} });
-        self.begin_deploy(config, events_tx, false).await;
+        self.begin_deploy(config, events_tx, false, false).await;
     }
 
     /// Monitor running job instances for process exit.
@@ -6584,7 +6915,14 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
             .supervisor
             .list_instances()
             .iter()
-            .filter(|i| i.is_job && i.state == ContainerState::Running)
+            .filter(|i| {
+                i.is_job
+                    && i.state == ContainerState::Running
+                    && self
+                        .recorded_jobs
+                        .get(&i.id.0)
+                        .is_some_and(|job| job.phase == super::jobs::JobPhase::Launching)
+            })
             .map(|i| i.id.clone())
             .collect();
 
@@ -6596,10 +6934,18 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
 
             if grill_state == ContainerState::Stopped {
                 let exit_code = self.supervisor.grill().exit_code(&id).await;
+                let phase = match exit_code {
+                    Some(code) => super::jobs::JobPhase::Exited { code },
+                    None => super::jobs::JobPhase::Unknown,
+                };
+                if let Err(error) = self.record_job_phase(&id, phase).await {
+                    eprintln!("bun: job outcome retained as uncertain for {id}: {error}");
+                    continue;
+                }
 
                 // Transition Running → Stopping → Stopped
                 if let Some(instance) = self.supervisor.get_instance_mut(&id) {
-                    instance.retry_pending = exit_code != Some(0);
+                    instance.retry_pending = exit_code.is_some_and(|code| code != 0);
                     if let Ok(s) = instance.state.transition_to(ContainerState::Stopping) {
                         instance.state = s;
                     }
@@ -6608,6 +6954,17 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
                     }
                 }
 
+                if exit_code.is_none() {
+                    self.record_event(
+                        crate::bun::events::EventKind::JobFailed,
+                        crate::bun::events::EventSeverity::Warning,
+                        None,
+                        None,
+                        format!("job {id} outcome unknown; explicit rerun required"),
+                    )
+                    .await;
+                    continue;
+                }
                 if exit_code == Some(0) {
                     // Job completed successfully — stays in Stopped
                     if let Some(instance) = self.supervisor.get_instance(&id) {
@@ -6728,6 +7085,7 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
             .iter()
             .filter(|instance| {
                 instance.retry_pending
+                    && (!instance.is_job || !self.job_store_uncertain)
                     && matches!(
                         instance.state,
                         ContainerState::Stopping | ContainerState::Stopped
@@ -6800,7 +7158,11 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
             .supervisor
             .list_instances()
             .iter()
-            .filter(|i| i.state == ContainerState::Pending && i.restart_count > 0)
+            .filter(|i| {
+                i.state == ContainerState::Pending
+                    && i.restart_count > 0
+                    && (!i.is_job || !self.job_store_uncertain)
+            })
             .filter_map(|i| {
                 i.oci_spec.as_ref().map(|spec| {
                     (
@@ -6822,6 +7184,25 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
             if let Err(error) = self.kill_and_wait_for_exit(&id).await {
                 eprintln!("bun: restart of {id} awaits runtime cleanup: {error}");
                 continue;
+            }
+
+            if self
+                .supervisor
+                .get_instance(&id)
+                .is_some_and(|instance| instance.is_job)
+            {
+                if let Err(error) = self.record_job_runtime_absent(&id).await {
+                    eprintln!("bun: job retry cannot persist runtime absence for {id}: {error}");
+                    continue;
+                }
+                if let Err(error) = self.retire_instance_artifacts(&id).await {
+                    eprintln!("bun: job retry retains artifacts for {id}: {error}");
+                    continue;
+                }
+                if let Err(error) = self.claim_job_retry(&id).await {
+                    eprintln!("bun: job retry refused for {id}: {error}");
+                    continue;
+                }
             }
 
             // Pending → Preparing
@@ -6996,6 +7377,11 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
         }
         self.deployed_specs
             .remove(&(app_name.to_string(), namespace.to_string()));
+        let mut jobs = self.recorded_jobs.clone();
+        jobs.retain(|_, job| job.name != app_name || job.namespace != namespace);
+        if jobs.len() != self.recorded_jobs.len() {
+            self.commit_jobs(jobs).await?;
+        }
         Ok(())
     }
 
@@ -7024,6 +7410,21 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
                 app_name: app_name.to_string(),
                 namespace: namespace.to_string(),
             });
+        }
+
+        let owns_job = instances
+            .iter()
+            .any(|id| self.recorded_jobs.contains_key(&id.0));
+        let mut jobs = self.recorded_jobs.clone();
+        for id in &instances {
+            if let Some(job) = jobs.get_mut(&id.0)
+                && job.phase != super::jobs::JobPhase::Unknown
+            {
+                job.phase = super::jobs::JobPhase::Stopping;
+            }
+        }
+        if owns_job {
+            self.commit_jobs(jobs).await?;
         }
 
         // Stop via supervisor (moves the tracked state to Stopping).
@@ -7062,6 +7463,19 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
                         instance.state = s;
                     });
             }
+        }
+
+        let mut jobs = self.recorded_jobs.clone();
+        for id in &instances {
+            if let Some(job) = jobs.get_mut(&id.0) {
+                if job.phase != super::jobs::JobPhase::Unknown {
+                    job.phase = super::jobs::JobPhase::Stopped;
+                }
+                job.runtime_absent = true;
+            }
+        }
+        if owns_job {
+            self.commit_jobs(jobs).await?;
         }
 
         // Keep durable ownership until identity and record retirement succeed.
@@ -7625,12 +8039,16 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
         let mut statuses = Vec::new();
         for instance in self.supervisor.list_instances() {
             let pid = self.supervisor.grill().pid(&instance.id).await;
-            let exit_code = self.supervisor.grill().exit_code(&instance.id).await;
+            let exit_code = match self.recorded_jobs.get(&instance.id.0).map(|job| &job.phase) {
+                Some(super::jobs::JobPhase::Exited { code }) => Some(*code),
+                Some(super::jobs::JobPhase::Unknown) => None,
+                _ => self.supervisor.grill().exit_code(&instance.id).await,
+            };
             statuses.push(InstanceStatus {
                 id: instance.id.0.clone(),
                 app_name: instance.app_name.clone(),
                 namespace: instance.namespace.clone(),
-                state: instance.state.to_string(),
+                state: self.job_state_label(instance),
                 restart_count: instance.restart_count,
                 host_port: instance.host_port,
                 exit_code,
@@ -7650,7 +8068,7 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
                 namespace: instance.namespace.clone(),
                 instance_id: instance.id.0.clone(),
                 image: instance.image.clone(),
-                state: instance.state.to_string(),
+                state: self.job_state_label(instance),
                 restart_count: instance.restart_count,
                 age_seconds: instance.created_at.elapsed().as_secs(),
             })
@@ -8140,11 +8558,25 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
         id: &InstanceId,
         grace: std::time::Duration,
     ) -> Result<(), BunError> {
+        if self
+            .recorded_jobs
+            .get(&id.0)
+            .is_some_and(|job| job.runtime_absent)
+        {
+            return Ok(());
+        }
         stop_runtime_instance(self.supervisor.grill(), id, grace).await
     }
 
     /// Preserve ownership until both force-kill and observed runtime exit succeed.
     async fn kill_and_wait_for_exit(&self, id: &InstanceId) -> Result<(), BunError> {
+        if self
+            .recorded_jobs
+            .get(&id.0)
+            .is_some_and(|job| job.runtime_absent)
+        {
+            return Ok(());
+        }
         kill_runtime_instance(self.supervisor.grill(), id).await
     }
 
@@ -8353,16 +8785,32 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
                     .await;
                 let _ = reply.send(result);
             }
+            DeployOp::ConfirmJobSuccess { instance_id, reply } => {
+                let result = self
+                    .record_job_phase(&instance_id, super::jobs::JobPhase::Exited { code: 0 })
+                    .await;
+                if result.is_ok()
+                    && let Some(instance) = self.supervisor.get_instance_mut(&instance_id)
+                {
+                    instance.retry_pending = false;
+                    if instance.state.can_transition_to(ContainerState::Stopping) {
+                        instance.state = ContainerState::Stopping;
+                    }
+                    if instance.state.can_transition_to(ContainerState::Stopped) {
+                        instance.state = ContainerState::Stopped;
+                    }
+                }
+                let _ = reply.send(result);
+            }
             DeployOp::SupervisorDeployJob {
+                rerun_unknown,
                 job_name,
                 namespace,
                 spec,
                 reply,
             } => {
-                let now = Instant::now();
                 let result = self
-                    .supervisor
-                    .deploy_job(&job_name, &namespace, &spec, now)
+                    .prepare_job_run(&job_name, &namespace, &spec, rerun_unknown)
                     .await;
                 let _ = reply.send(result);
             }
@@ -8670,6 +9118,7 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
 /// loop as a `DeployOp` through `ops`, so the loop stays the single owner of
 /// supervisor / service-map / networking state.
 struct DeployWorker<G: Grill> {
+    rerun_unknown_jobs: bool,
     grill: G,
     ops: DeployOps,
     /// Shared drain tracker, so the worker can drain-and-stop a retiring
@@ -9008,7 +9457,7 @@ impl<G: Grill + Clone + 'static> DeployWorker<G> {
 
             let ids = match self
                 .ops
-                .supervisor_deploy_job(job_name, namespace, spec)
+                .supervisor_deploy_job(job_name, namespace, spec, self.rerun_unknown_jobs)
                 .await
             {
                 Ok(ids) => ids,
@@ -9201,7 +9650,7 @@ impl<G: Grill + Clone + 'static> DeployWorker<G> {
     ) -> Result<(), BunError> {
         let ids = self
             .ops
-            .supervisor_deploy_job(job_name, namespace, spec)
+            .supervisor_deploy_job(job_name, namespace, spec, self.rerun_unknown_jobs)
             .await?;
         for id in &ids {
             self.drive_job(id, job_name, namespace, spec).await?;
@@ -9214,6 +9663,7 @@ impl<G: Grill + Clone + 'static> DeployWorker<G> {
                 if state == ContainerState::Stopped {
                     let exit_code = self.grill.exit_code(id).await;
                     if exit_code == Some(0) {
+                        self.ops.confirm_job_success(id).await?;
                         break;
                     }
                     return Err(BunError::DeployFailed {
@@ -10642,7 +11092,17 @@ mod tests {
         /// those ops inline until the deploy's events channel closes. Keeps the
         /// direct-`deploy` unit tests working without standing up a full loop.
         async fn deploy(&mut self, config: Config, events: &mpsc::Sender<ApplyEvent>) {
+            self.deploy_with_rerun(config, events, false).await;
+        }
+
+        async fn deploy_with_rerun(
+            &mut self,
+            config: Config,
+            events: &mpsc::Sender<ApplyEvent>,
+            rerun_unknown_jobs: bool,
+        ) {
             let worker = DeployWorker {
+                rerun_unknown_jobs,
                 grill: self.supervisor.grill().clone(),
                 ops: DeployOps {
                     tx: self.deploy_ops_tx.clone(),
@@ -12197,10 +12657,21 @@ interval = 1
 
     #[tokio::test]
     async fn restart_start_failures_exhaust_job_budget() {
-        let (mut agent, grill, id, _directory) = failed_restart_fixture().await;
-        let instance = agent.supervisor.get_instance_mut(&id).unwrap();
-        instance.is_job = true;
-        instance.restart_policy = crate::bun::restart::RestartPolicy::for_job(2);
+        let (mut agent, _, _, grill) = test_agent_with_grill();
+        let directory = tempfile::tempdir().unwrap();
+        agent.set_records_dir(directory.path().to_path_buf());
+        grill.set_pid(std::process::id());
+        expect_complete(
+            &drain_deploy(
+                &mut agent,
+                Config::parse("[job.retry]\nimage = 'test:v1'\n").unwrap(),
+            )
+            .await,
+        );
+        let id = InstanceId("default__retry-0".into());
+        grill.set_state(&id, ContainerState::Stopped);
+        grill.set_exit_code(&id, Some(1));
+        agent.check_jobs().await;
         grill.set_fail_start(true);
         for _ in 0..4 {
             agent.supervisor.get_instance_mut(&id).unwrap().last_restart =
@@ -12209,10 +12680,10 @@ interval = 1
         }
         let instance = agent.supervisor.get_instance(&id).unwrap();
         assert_eq!(instance.state, ContainerState::Failed);
-        assert_eq!(instance.restart_count, 2);
+        assert_eq!(instance.restart_count, 3);
         assert_eq!(
             grill.calls().iter().filter(|(op, _)| op == "start").count(),
-            3
+            4
         );
     }
 
@@ -13352,7 +13823,7 @@ host = "remote.local"
             grill.block_kills();
             let config = Config::parse(&format!("[app.web]\nimage = 'web:v2'\nport = 8080\nreplicas = {replicas}\n[app.web.deploy]\nstrategy = '{strategy}'\ndrain_timeout = '0s'\n")).unwrap();
             let (events, mut stream) = mpsc::channel(64);
-            agent.begin_deploy(config, events, true).await;
+            agent.begin_deploy(config, events, true, false).await;
             tokio::time::timeout(std::time::Duration::from_secs(2), async {
                 loop {
                     tokio::select! {
@@ -13949,6 +14420,346 @@ host = "remote.local"
             command = ["echo", "done"]
         "#;
         Config::parse(toml_str).unwrap()
+    }
+
+    #[tokio::test]
+    async fn uncertain_job_checkpoint_does_not_block_unrelated_app_retirement() {
+        let records = tempfile::tempdir().unwrap();
+        let (mut agent, _, _, grill) = test_agent_with_grill();
+        agent.set_records_dir(records.path().to_path_buf());
+        grill.set_pid(std::process::id());
+        expect_complete(&drain_deploy(&mut agent, basic_config()).await);
+        std::fs::create_dir(records.path().join(super::super::jobs::CHECKPOINT_FILE)).unwrap();
+        let events = drain_deploy(
+            &mut agent,
+            Config::parse("[job.work]\nimage = 'test:v1'\n").unwrap(),
+        )
+        .await;
+        assert!(matches!(events.last(), Some(ApplyEvent::Error { .. })));
+        agent.retire_workload("web", "default").await.unwrap();
+        assert!(
+            agent
+                .supervisor
+                .get_instance(&InstanceId("default__web-0".into()))
+                .is_none()
+        );
+        assert!(agent.job_store_uncertain);
+        assert_eq!(agent.get_job_status()[0].state, "unknown");
+    }
+
+    #[tokio::test]
+    async fn job_launch_refuses_uncertain_checkpoint_without_runtime_mutation() {
+        let records = tempfile::tempdir().unwrap();
+        std::fs::create_dir(records.path().join(super::super::jobs::CHECKPOINT_FILE)).unwrap();
+        let (mut agent, _, _, grill) = test_agent_with_grill();
+        agent.set_records_dir(records.path().to_path_buf());
+        let config = Config::parse("[job.work]\nimage = 'test:v1'\n").unwrap();
+        let events = drain_deploy(&mut agent, config.clone()).await;
+        assert!(matches!(events.last(), Some(ApplyEvent::Error { .. })));
+        assert!(
+            !grill
+                .calls()
+                .iter()
+                .any(|(op, _)| op == "create" || op == "start")
+        );
+        std::fs::remove_dir(records.path().join(super::super::jobs::CHECKPOINT_FILE)).unwrap();
+        let events = drain_deploy(&mut agent, config).await;
+        assert!(
+            matches!(events.last(), Some(ApplyEvent::Error { message }) if message.contains("uncertain"))
+        );
+        assert!(!grill.calls().iter().any(|(op, _)| op == "start"));
+    }
+
+    #[tokio::test]
+    async fn job_attempt_precedes_create_and_missing_record_stays_unknown() {
+        let records = tempfile::tempdir().unwrap();
+        let (mut agent, tx, shutdown, grill) = test_agent_with_grill();
+        agent.set_records_dir(records.path().to_path_buf());
+        grill.block_creates();
+        let task = tokio::spawn(async move { agent.run().await });
+        let (events, mut results) = mpsc::channel(32);
+        tx.send(AgentCommand::Deploy {
+            config: Config::parse("[job.work]\nimage = 'test:v1'\n").unwrap(),
+            events,
+        })
+        .await
+        .unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(5), grill.wait_for_creates(1))
+            .await
+            .unwrap();
+        let checkpoint = super::super::jobs::load(records.path()).unwrap();
+        assert_eq!(
+            checkpoint["default__work-0"].phase,
+            super::super::jobs::JobPhase::Launching
+        );
+        assert!(
+            crate::grill::records::load_records(records.path())
+                .unwrap()
+                .is_empty()
+        );
+        // A separate directory captures exactly this physical crash window.
+        let crashed = tempfile::tempdir().unwrap();
+        super::super::jobs::persist(crashed.path(), checkpoint).unwrap();
+        for _ in 0..2 {
+            let (mut replacement, _, _, runtime) = test_agent_with_grill();
+            replacement.set_records_dir(crashed.path().to_path_buf());
+            replacement.adopt_recorded_instances().await.unwrap();
+            assert_eq!(replacement.get_job_status()[0].state, "unknown");
+            replacement.drive_pending_restarts().await;
+            assert!(runtime.calls().is_empty());
+        }
+        grill.release_creates(1);
+        while let Some(event) = results.recv().await {
+            if matches!(
+                event,
+                ApplyEvent::Complete { .. } | ApplyEvent::Error { .. }
+            ) {
+                break;
+            }
+        }
+        shutdown.cancel();
+        task.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn job_observed_exit_and_stop_survive_replacement() {
+        for code in [0, 1] {
+            let records = tempfile::tempdir().unwrap();
+            let (mut agent, _, _, grill) = test_agent_with_grill();
+            agent.set_records_dir(records.path().to_path_buf());
+            grill.set_pid(std::process::id());
+            expect_complete(
+                &drain_deploy(
+                    &mut agent,
+                    Config::parse("[job.work]\nimage = 'test:v1'\n").unwrap(),
+                )
+                .await,
+            );
+            let id = InstanceId("default__work-0".into());
+            grill.set_state(&id, ContainerState::Stopped);
+            grill.set_exit_code(&id, Some(code));
+            agent.check_jobs().await;
+            let (mut replacement, _, _, runtime) = test_agent_with_grill();
+            replacement.set_records_dir(records.path().to_path_buf());
+            replacement.adopt_recorded_instances().await.unwrap();
+            assert_eq!(replacement.get_status().await[0].exit_code, Some(code));
+            assert_eq!(
+                replacement
+                    .supervisor
+                    .get_instance(&id)
+                    .unwrap()
+                    .retry_pending,
+                code != 0
+            );
+            replacement.stop_app("work", "default").await.unwrap();
+            let (mut stopped, _, _, _) = test_agent_with_grill();
+            stopped.set_records_dir(records.path().to_path_buf());
+            stopped.adopt_recorded_instances().await.unwrap();
+            assert!(!stopped.supervisor.get_instance(&id).unwrap().retry_pending);
+            assert_eq!(stopped.get_job_status()[0].state, "stopped");
+            assert!(!runtime.calls().iter().any(|(op, _)| op == "start"));
+        }
+    }
+
+    #[tokio::test]
+    async fn job_explicit_rerun_retires_old_owner_and_claims_a_new_generation() {
+        let records = tempfile::tempdir().unwrap();
+        let (mut agent, _, _, grill) = test_agent_with_grill();
+        agent.set_records_dir(records.path().to_path_buf());
+        grill.set_pid(std::process::id());
+        let config = Config::parse("[job.work]\nimage = 'test:v1'\n").unwrap();
+        expect_complete(&drain_deploy(&mut agent, config.clone()).await);
+        let id = InstanceId("default__work-0".into());
+        grill.set_state(&id, ContainerState::Stopped);
+        grill.set_exit_code(&id, None);
+        agent.check_jobs().await;
+        let (mut replacement, _, _, runtime) = test_agent_with_grill();
+        replacement.set_records_dir(records.path().to_path_buf());
+        replacement.adopt_recorded_instances().await.unwrap();
+        let (events, mut results) = mpsc::channel(32);
+        replacement.deploy_with_rerun(config, &events, true).await;
+        drop(events);
+        let mut all = Vec::new();
+        while let Some(event) = results.recv().await {
+            all.push(event);
+        }
+        expect_complete(&all);
+        let job = &super::super::jobs::load(records.path()).unwrap()[&id.0];
+        assert_eq!(job.generation, 2);
+        assert_eq!(job.restart_count, 0);
+        assert_eq!(job.phase, super::super::jobs::JobPhase::Launching);
+        assert_eq!(
+            runtime
+                .calls()
+                .iter()
+                .filter(|(op, _)| op == "start")
+                .count(),
+            1
+        );
+        replacement
+            .retire_workload("work", "default")
+            .await
+            .unwrap();
+        assert!(super::super::jobs::load(records.path()).unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn job_adoption_persists_absence_before_retiring_runtime_evidence() {
+        let records = tempfile::tempdir().unwrap();
+        let volumes = tempfile::tempdir().unwrap();
+        let (mut agent, _, _, grill) = test_agent_with_grill();
+        agent.set_records_dir(records.path().to_path_buf());
+        grill.set_pid(std::process::id());
+        expect_complete(&drain_deploy(&mut agent, job_config()).await);
+        let id = "default__migrate-0";
+        let identity = crate::sesame::identity::instance_identity_dir(volumes.path(), id);
+        std::fs::create_dir_all(identity.parent().unwrap()).unwrap();
+        std::fs::write(&identity, b"blocked retirement").unwrap();
+        let (mut replacement, _, _, _) = test_agent_with_grill();
+        replacement.set_records_dir(records.path().to_path_buf());
+        replacement.set_volumes_dir(volumes.path().to_path_buf());
+        assert!(replacement.adopt_recorded_instances().await.is_err());
+        let checkpoint = super::super::jobs::load(records.path()).unwrap();
+        assert!(checkpoint[id].runtime_absent);
+        assert_eq!(checkpoint[id].phase, super::super::jobs::JobPhase::Unknown);
+        assert!(crate::grill::records::record_path(records.path(), id).exists());
+        std::fs::remove_file(identity).unwrap();
+        replacement.adopt_recorded_instances().await.unwrap();
+        assert_eq!(replacement.get_job_status()[0].state, "unknown");
+    }
+
+    #[tokio::test]
+    async fn job_checkpoint_rejects_corruption_before_adopting_any_runtime() {
+        for contents in ["{", "{\"schema\":99,\"jobs\":[]}"] {
+            let records = tempfile::tempdir().unwrap();
+            std::fs::write(
+                records.path().join(super::super::jobs::CHECKPOINT_FILE),
+                contents,
+            )
+            .unwrap();
+            let (mut agent, _, _, grill) = test_agent_with_grill();
+            agent.set_records_dir(records.path().to_path_buf());
+            assert!(agent.adopt_recorded_instances().await.is_err());
+            assert!(grill.calls().is_empty());
+        }
+    }
+
+    #[tokio::test]
+    async fn job_checkpoint_rejects_unsafe_and_ambiguous_files() {
+        for fault in ["duplicate", "budget", "symlink", "oversized"] {
+            let records = tempfile::tempdir().unwrap();
+            let (mut agent, _, _, grill) = test_agent_with_grill();
+            agent.set_records_dir(records.path().to_path_buf());
+            grill.set_pid(std::process::id());
+            expect_complete(&drain_deploy(&mut agent, job_config()).await);
+            let path = records.path().join(super::super::jobs::CHECKPOINT_FILE);
+            let original = std::fs::read(&path).unwrap();
+            match fault {
+                "duplicate" | "budget" => {
+                    let mut value: serde_json::Value = serde_json::from_slice(&original).unwrap();
+                    if fault == "duplicate" {
+                        let duplicate = value["jobs"][0].clone();
+                        value["jobs"].as_array_mut().unwrap().push(duplicate);
+                    } else {
+                        value["jobs"][0]["restart_count"] = serde_json::json!(4);
+                    }
+                    std::fs::write(&path, serde_json::to_vec(&value).unwrap()).unwrap();
+                }
+                "symlink" => {
+                    let target = records.path().join("foreign.checkpoint");
+                    std::fs::rename(&path, &target).unwrap();
+                    std::os::unix::fs::symlink(target, &path).unwrap();
+                }
+                "oversized" => std::fs::OpenOptions::new()
+                    .write(true)
+                    .open(&path)
+                    .unwrap()
+                    .set_len(17 * 1024 * 1024)
+                    .unwrap(),
+                _ => unreachable!(),
+            }
+            let (mut replacement, _, _, runtime) = test_agent_with_grill();
+            replacement.set_records_dir(records.path().to_path_buf());
+            assert!(
+                replacement.adopt_recorded_instances().await.is_err(),
+                "{fault}"
+            );
+            assert!(runtime.calls().is_empty(), "{fault}");
+            assert_eq!(
+                crate::grill::records::load_records(records.path())
+                    .unwrap()
+                    .len(),
+                1
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn job_retry_budget_survives_adoption() {
+        let records = tempfile::tempdir().unwrap();
+        let (mut agent, _, _, grill) = test_agent_with_grill();
+        agent.set_records_dir(records.path().to_path_buf());
+        grill.set_pid(std::process::id());
+        let config = Config::parse("[job.work]\nimage = 'test:v1'\n").unwrap();
+        expect_complete(&drain_deploy(&mut agent, config).await);
+        let id = InstanceId("default__work-0".into());
+        // Exercise the real retry driver so durable state must precede launch.
+        agent.supervisor.get_instance_mut(&id).unwrap().state = ContainerState::Pending;
+        agent
+            .supervisor
+            .get_instance_mut(&id)
+            .unwrap()
+            .restart_count = 3;
+        agent.drive_pending_restarts().await;
+        assert_eq!(
+            agent.supervisor.get_instance(&id).unwrap().state,
+            ContainerState::Running
+        );
+        let (mut replacement, _, _, runtime) = test_agent_with_grill();
+        replacement.set_records_dir(records.path().to_path_buf());
+        runtime.set_adopt_result(&id, true);
+        replacement.adopt_recorded_instances().await.unwrap();
+        let restored = replacement.supervisor.get_instance(&id).unwrap();
+        assert_eq!(restored.restart_count, 3);
+        assert_eq!(restored.restart_policy.max_restarts, Some(3));
+        runtime.set_state(&id, ContainerState::Stopped);
+        runtime.set_exit_code(&id, Some(1));
+        replacement.check_jobs().await;
+        replacement.drive_pending_restarts().await;
+        assert!(!runtime.calls().iter().any(|(op, _)| op == "start"));
+    }
+
+    #[tokio::test]
+    async fn job_unknown_exit_requires_explicit_rerun() {
+        let records = tempfile::tempdir().unwrap();
+        let (mut agent, _, _, grill) = test_agent_with_grill();
+        agent.set_records_dir(records.path().to_path_buf());
+        grill.set_pid(std::process::id());
+        expect_complete(
+            &drain_deploy(
+                &mut agent,
+                Config::parse("[job.work]\nimage = 'test:v1'\n").unwrap(),
+            )
+            .await,
+        );
+        let id = InstanceId("default__work-0".into());
+        grill.set_state(&id, ContainerState::Stopped);
+        grill.set_exit_code(&id, None);
+        agent.check_jobs().await;
+        assert_eq!(agent.get_job_status()[0].state, "unknown");
+        assert!(!agent.supervisor.get_instance(&id).unwrap().retry_pending);
+        let (mut replacement, _, _, _) = test_agent_with_grill();
+        replacement.set_records_dir(records.path().to_path_buf());
+        replacement.adopt_recorded_instances().await.unwrap();
+        assert_eq!(replacement.get_job_status()[0].state, "unknown");
+        let events = drain_deploy(
+            &mut replacement,
+            Config::parse("[job.work]\nimage = 'test:v1'\n").unwrap(),
+        )
+        .await;
+        assert!(
+            matches!(events.last(), Some(ApplyEvent::Error { message }) if message.contains("rerun"))
+        );
     }
 
     #[tokio::test]

@@ -60,6 +60,9 @@ enum Command {
         /// Show the plan without deploying (exits 0 even with no agent).
         #[arg(long)]
         dry_run: bool,
+        /// Explicitly rerun jobs with unknown outcomes on the selected node.
+        #[arg(long, conflicts_with = "dry_run")]
+        rerun_jobs: bool,
     },
     /// Show cluster and app status.
     Status,
@@ -1083,7 +1086,17 @@ async fn main() -> ExitCode {
 
     let result = match command {
         Command::Tui => reliaburger::relish::tui::run().await,
-        Command::Apply { ref path, dry_run } => commands::apply(path, cli.output, dry_run).await,
+        Command::Apply {
+            ref path,
+            dry_run,
+            rerun_jobs,
+        } => {
+            if rerun_jobs {
+                commands::rerun_jobs(path).await
+            } else {
+                commands::apply(path, cli.output, dry_run).await
+            }
+        }
         Command::Status => commands::status(cli.output).await,
         Command::Dashboard { port, no_open } => {
             reliaburger::relish::dashboard::run(port, no_open).await
@@ -1724,6 +1737,22 @@ mod tests {
     }
 
     #[test]
+    fn job_rerun_requires_an_explicit_flag_and_conflicts_with_dry_run() {
+        let cli = Cli::try_parse_from(["relish", "apply", "jobs.toml", "--rerun-jobs"]).unwrap();
+        assert!(matches!(
+            cli.command,
+            Some(Command::Apply {
+                rerun_jobs: true,
+                ..
+            })
+        ));
+        assert!(
+            Cli::try_parse_from(["relish", "apply", "jobs.toml", "--rerun-jobs", "--dry-run"])
+                .is_err()
+        );
+    }
+
+    #[test]
     fn decommission_requires_explicit_workload_attestation_and_reason() {
         assert!(
             Cli::try_parse_from([
@@ -2016,7 +2045,7 @@ mod tests {
     fn parse_apply_command() {
         let cli = parse(&["relish", "apply", "config.toml"]).unwrap();
         assert!(
-            matches!(cli.command, Command::Apply { ref path, dry_run: false } if path.to_str() == Some("config.toml"))
+            matches!(cli.command, Command::Apply { ref path, dry_run: false, rerun_jobs: false } if path.to_str() == Some("config.toml"))
         );
     }
 

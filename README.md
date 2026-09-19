@@ -41,7 +41,7 @@ Install and usage details are in the [documentation](docs/README.md), and
 implementation status in [progress.md](docs/progress.md).
 
 0.1.0 requires a fresh cluster; development state is refused. Rolling upgrades
-require matching explicit formats (currently protocol 8 and state 9). See the
+require matching explicit formats (currently protocol 8 and state 10). See the
 [compatibility policy](docs/releasing.md#cluster-compatibility).
 Registry upload recovery reclaims abandoned partial uploads after a crash and
 requires one Bun per writable image store; see the [startup contract](docs/README.md).
@@ -62,6 +62,9 @@ permanently retire its identity. Returning machines need fresh enrolment under a
 new name; see the [operator procedure](docs/README.md#decommissioning-a-node).
 Node-local cron registrations survive restart. Cron skips missed or uncertain
 firings after a crash; it does not promise catch-up or exactly-once job execution.
+Job attempts retain their retry budget across Bun replacement. Unknown outcomes
+require an explicit `relish apply jobs.toml --rerun-jobs`; ordinary apply cannot
+silently replay them. See the [job recovery policy](docs/README.md).
 
 ## Quick start
 

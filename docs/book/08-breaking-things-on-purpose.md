@@ -1262,3 +1262,54 @@ A privileged fixture writes 256 KiB before reporting ready. Another writes a
 short error and stays alive; a third fills stderr and never reports ready.
 They check successful startup, retained failure text, explicit truncation,
 bounded completion and an empty cgroup inventory after cleanup.
+
+### A job's missing answer is not a failed answer
+
+Imagine a database migration fails twice, then Bun replaces itself while the
+third attempt is still running. The old adoption code reconstructed every
+workload with a zero retry counter and the default app policy. Apps restart
+forever. Jobs must not. That combination quietly gave the migration a fresh,
+unlimited budget each time Bun restarted.
+
+We now persist a job attempt before calling the runtime. Its checkpoint includes
+the namespace, specification, run generation and consumed retry count. Each retry
+retires the previous runtime record before claiming the next attempt. An atomic
+file replacement and directory sync make the claim durable before create/start.
+The small runtime adoption record still identifies the actual process; the job
+checkpoint supplies the execution policy that process belongs to.
+
+The outcome is a Rust enum, `JobPhase`, with separate variants for launch intent,
+an observed exit code, an unknown result and operator stopping/stopped states.
+An enum forces each recovery path to consider those different kinds of evidence.
+Likewise, `Option<i32>` distinguishes `Some(0)`, an observed successful exit, from
+`None`, no exit status. Treating `None` as a non-zero code used to replay an
+execution whose effects might already have happened.
+
+On recovery, Bun adopts a surviving process with the original retry count and
+finite budget. A missing process with no recorded exit becomes `unknown` and
+stays that way across further restarts. A known failure can use the remaining
+budget; a known success cannot. A prerequisite job records success before its
+dependent application starts. Checkpoint write failures fence job mutations
+until Bun reloads the file, including writes whose rename may have succeeded
+before the final directory sync failed.
+
+An operator can use `relish apply jobs.toml --rerun-jobs` to request a new run.
+The file must contain only non-scheduled jobs, and the API applies the existing
+role, workload scope and deployment permission checks. The internal service
+credential cannot provide this override. Ordinary apply and GitOps never set it.
+The old runtime must still pass checked retirement; an explicit rerun does not
+make an unverified process disappear. Stop preserves an unknown business outcome,
+while lease retirement may forget the checkpoint after all cleanup is confirmed.
+
+The tests check the journal before a blocked create call, break persistence,
+restore observed and unknown outcomes, and exhaust the retry budget. A real
+binary test fails one attempt, kills Bun while its retry runs, adopts the same
+PID, then lets that process exit. The replacement cannot reap the old parent's
+exit status, so it reports unknown. Another Bun restart preserves that result.
+Only the explicit CLI rerun appends another execution to the workload's log.
+
+There is still a separate boundary before the first runtime adoption record.
+A launch claim proves that execution was attempted; it cannot identify an
+unrecorded process. Recovery keeps that case unknown and refuses to claim
+cleanup from an empty inventory. Runtime discovery and complete process-tree
+identity remain separate release requirements.

@@ -594,9 +594,10 @@ Only apps and namespaces are leased. Jobs, images, tokens, mounts and node effec
 
 **Ordinary-job recovery decision:** The user selected explicit rerun for a batch
 job whose outcome is unknown after Bun crashes. Recovery must persist/report
-that uncertainty rather than automatically repeat the execution. Durable intent
-and retry-budget implementation remains open; this decision does not mark it
-complete or change the separately agreed cron skip policy.
+that uncertainty rather than automatically repeat the execution. The durable
+intent and retry-budget implementation is recorded in the
+[job recovery plan](2026-09-19-job-recovery.md); the separately agreed cron skip
+policy remains unchanged.
 
 **Token family completed on PR #167:** Atomic Raft issuance binds a non-admin
 credential to the exact authenticated lease owner, its namespace and expiry.
@@ -797,10 +798,14 @@ registration/retirement test (0.27s), both actual-binary compatibility tests
 (0.01s), and strict Linux/macOS Clippy pass. Durable state advances to generation
 7; protocol 6 and lease schema 3 remain unchanged.
 
-Adoption still resets job retries to the generic restart policy. Persist the
-job execution intent and retry budget, with restart and failure tests. Durable
-test leases establish cleanup ownership; they do not by themselves repair
-execution continuity.
+**Ordinary-job recovery completed (19 September):** The
+[job recovery record](2026-09-19-job-recovery.md) documents durable pre-launch
+intent, bounded retry restoration, observed outcomes, explicit rerun authority
+and stop/retirement ordering. Full library suites pass 3,362 macOS/3,416 Linux
+tests, with strict Clippy, binary/CLI/compatibility checks and actual Bun crash
+recovery on both. The signed macOS replacement test passes in 19.45s. Durable
+state is generation 10, with protocol 8 and lease schema 4. The Linux upgrade
+matrix and final hosted qualification remain separate acceptance work.
 Discovery of resources created before their initial runtime adoption record,
 and cluster-lease completion before every former placement confirms retirement,
 still need implementation and qualification. Controlled reconciler interruption

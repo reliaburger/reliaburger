@@ -56,11 +56,26 @@ Cron registrations and their latest claimed UTC minute persist before apply,
 stop or launch is acknowledged. Bun restores them before serving the API.
 Missed minutes are skipped; a crash after recording a firing but before launch
 can skip that occurrence too. There is no catch-up or exactly-once execution
-promise. Job retries are separate. During one Bun lifetime, failed restart preparation
-or launch requires confirmed cleanup, then retries under the existing backoff
-and attempt budget. Explicit stop cancels pending attempts. Durable job retry
-budgets across Bun replacement remain a release blocker. An uncertain checkpoint write fences further
+promise. Job retries are separate. An uncertain checkpoint write fences further
 cron changes and firings until Bun restarts and reloads its durable state.
+
+Jobs record execution intent and their three-retry budget before launching.
+Bun replacement restores that budget. An observed failure can retry after
+confirmed cleanup; an unknown exit status stays `unknown`, including across
+further restarts. Ordinary apply cannot repeat an uncertain execution. After
+checking its external effects, explicitly request a new run on the same node:
+
+```sh
+relish apply jobs.toml --rerun-jobs
+```
+
+The manifest must contain only non-scheduled jobs. The API requires the existing
+user deployment authority and workload scope; internal service credentials
+cannot authorise a rerun. The old runtime must still pass confirmed retirement.
+Explicit stop cancels pending retries but preserves an unknown outcome. A failed
+job checkpoint write blocks further job mutations until Bun reloads its state;
+unrelated apps can still stop. Pre-adoption runtime discovery remains a separate
+release blocker; the [recovery plan](plans/2026-09-19-job-recovery.md) records it.
 
 App and job names, their namespaces and namespace declarations must be lowercase
 DNS labels: 1–63 ASCII letters/digits/hyphens, with a letter or digit at each end.
@@ -108,7 +123,7 @@ development configurations. Ingress currently uses unweighted round-robin on
 Bun's shared runtime, with no separate strategy or worker-thread setting.
 
 0.1.0 requires a fresh cluster; development state is refused. Rolling upgrades
-require matching explicit formats (currently protocol 8 and state 9). See the
+require matching explicit formats (currently protocol 8 and state 10). See the
 [compatibility policy](releasing.md#cluster-compatibility).
 
 Reporting refuses messages over 1 MiB or containing more than 100 events;

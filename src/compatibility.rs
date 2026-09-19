@@ -15,10 +15,10 @@ pub struct Compatibility {
     pub state: u32,
 }
 
-/// Supported formats; operator identity retirement requires protocol eight/state nine.
+/// Supported formats; durable job attempts require protocol eight/state ten.
 pub const CURRENT: Compatibility = Compatibility {
     protocol: 8,
-    state: 9,
+    state: 10,
 };
 
 /// Name of the durable format stamp at the root of a node's data directory.

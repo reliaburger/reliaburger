@@ -2245,6 +2245,29 @@ async fn apply_handler(
             .into_response();
     }
 
+    let rerun_jobs = match headers.get("x-reliaburger-rerun-jobs") {
+        None => false,
+        Some(value) if value.as_bytes() == b"acknowledged" => true,
+        Some(_) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                "x-reliaburger-rerun-jobs must equal acknowledged",
+            )
+                .into_response();
+        }
+    };
+    if rerun_jobs {
+        if let Err(error) = crate::bun::jobs::validate_rerun(&config) {
+            return (StatusCode::BAD_REQUEST, error).into_response();
+        }
+        if let Err(response) = crate::sesame::auth::authorize_user(
+            auth.as_deref(),
+            crate::sesame::types::ApiRole::Deployer,
+        ) {
+            return response;
+        }
+    }
+
     let lease_id = match headers.get("x-reliaburger-test-lease") {
         Some(value) => match value.to_str() {
             Ok(value) if !value.is_empty() => Some(value.to_string()),
@@ -2523,15 +2546,18 @@ async fn apply_handler(
     };
 
     let (agent_event_tx, mut agent_event_rx) = mpsc::channel::<ApplyEvent>(32);
-    if state
-        .cmd_tx
-        .send(AgentCommand::Deploy {
+    let command = if rerun_jobs {
+        AgentCommand::RerunJobs {
             config,
             events: agent_event_tx,
-        })
-        .await
-        .is_err()
-    {
+        }
+    } else {
+        AgentCommand::Deploy {
+            config,
+            events: agent_event_tx,
+        }
+    };
+    if state.cmd_tx.send(command).await.is_err() {
         return (
             StatusCode::INTERNAL_SERVER_ERROR,
             Json(serde_json::json!({ "error": "agent unavailable" })),
@@ -10790,6 +10816,71 @@ schedule = "* * * * *"
         let desired = council.desired_state().await;
         assert!(desired.permissions.contains_key("ci"));
         assert_eq!(desired.namespaces["default"].max_apps, Some(1000));
+        council.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn explicit_job_rerun_preserves_authority_and_refuses_mixed_manifests() {
+        let (app, council, mut commands) = workload_admission_fixture("rerun-admission").await;
+        let manifest = "[job.work]\nimage = 'test:v1'\nnamespace = 'team'\n";
+        let mut scoped = deployer_context();
+        scoped.scoped_namespaces = Some(vec!["other".into()]);
+        let mut system = deployer_context();
+        system.token_name = crate::sesame::auth::SYSTEM_PRINCIPAL.into();
+        for (auth, header, body, expected) in [
+            (
+                scoped,
+                "acknowledged",
+                manifest.to_string(),
+                StatusCode::FORBIDDEN,
+            ),
+            (
+                system,
+                "acknowledged",
+                manifest.to_string(),
+                StatusCode::FORBIDDEN,
+            ),
+            (
+                deployer_context(),
+                "true",
+                manifest.to_string(),
+                StatusCode::BAD_REQUEST,
+            ),
+            (
+                deployer_context(),
+                "acknowledged",
+                format!("{manifest}[app.web]\nimage = 'test:v1'\n"),
+                StatusCode::BAD_REQUEST,
+            ),
+            (
+                deployer_context(),
+                "acknowledged",
+                format!("{manifest}schedule = '* * * * *'\n"),
+                StatusCode::BAD_REQUEST,
+            ),
+        ] {
+            let mut request = axum::http::Request::post("/v1/apply")
+                .header("x-reliaburger-rerun-jobs", header)
+                .body(Body::from(body))
+                .unwrap();
+            request.extensions_mut().insert(auth);
+            assert_eq!(
+                app.clone().oneshot(request).await.unwrap().status(),
+                expected
+            );
+            assert!(commands.try_recv().is_err());
+            assert!(council.desired_state().await.apps.is_empty());
+        }
+        let mut request = axum::http::Request::post("/v1/apply")
+            .header("x-reliaburger-rerun-jobs", "acknowledged")
+            .body(Body::from(manifest))
+            .unwrap();
+        request.extensions_mut().insert(deployer_context());
+        assert_eq!(app.oneshot(request).await.unwrap().status(), StatusCode::OK);
+        assert!(
+            matches!(commands.recv().await, Some(AgentCommand::RerunJobs { config, .. }) if config.job.len() == 1)
+        );
+        assert!(council.desired_state().await.apps.is_empty());
         council.shutdown().await.unwrap();
     }
 

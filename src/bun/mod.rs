@@ -15,6 +15,7 @@ pub mod disk_pressure;
 pub mod events;
 pub mod gpu;
 pub mod health;
+pub(crate) mod jobs;
 pub mod probe;
 pub mod readiness;
 pub mod restart;
@@ -35,6 +36,10 @@ use crate::grill::{GrillError, InstanceId};
 /// Errors from Bun agent operations.
 #[derive(Debug, thiserror::Error)]
 pub enum BunError {
+    /// Durable job execution evidence cannot be established.
+    #[error("job state is unavailable: {0}")]
+    JobState(String),
+
     /// A schedule mutation cannot establish durable ownership.
     #[error("scheduled-job state is unavailable: {0}")]
     ScheduleState(String),

@@ -578,7 +578,7 @@ impl BunClient {
     /// stderr as they arrive; the final `Complete` event is returned
     /// as an `ApplyResult`.
     pub async fn apply(&self, config: &Config) -> Result<ApplyResult, RelishError> {
-        self.apply_request(config, None, false).await
+        self.apply_request(config, None, false, false).await
     }
 
     /// Deploy apps under a server-owned Phase 15 resource lease.
@@ -587,7 +587,8 @@ impl BunClient {
         config: &Config,
         lease_id: &str,
     ) -> Result<ApplyResult, RelishError> {
-        self.apply_request(config, Some(lease_id), false).await
+        self.apply_request(config, Some(lease_id), false, false)
+            .await
     }
 
     /// Deploy a deliberately saturating app under both lease and capacity policy.
@@ -596,7 +597,17 @@ impl BunClient {
         config: &Config,
         lease_id: &str,
     ) -> Result<ApplyResult, RelishError> {
-        self.apply_request(config, Some(lease_id), true).await
+        self.apply_request(config, Some(lease_id), true, false)
+            .await
+    }
+
+    /// Explicitly rerun unknown jobs on this node after retiring their old runtime.
+    pub async fn apply_rerunning_jobs(&self, config: &Config) -> Result<ApplyResult, RelishError> {
+        crate::bun::jobs::validate_rerun(config).map_err(|error| RelishError::ApiError {
+            status: 400,
+            body: error.into(),
+        })?;
+        self.apply_request(config, None, false, true).await
     }
 
     async fn apply_request(
@@ -604,6 +615,7 @@ impl BunClient {
         config: &Config,
         lease_id: Option<&str>,
         capacity_probe: bool,
+        rerun_jobs: bool,
     ) -> Result<ApplyResult, RelishError> {
         let url = format!("{}/v1/apply", self.base_url);
         let toml_str = toml::to_string_pretty(config).map_err(|e| RelishError::ApiError {
@@ -612,6 +624,9 @@ impl BunClient {
         })?;
 
         let mut request = self.http()?.post(&url).body(toml_str);
+        if rerun_jobs {
+            request = request.header("x-reliaburger-rerun-jobs", "acknowledged");
+        }
         if let Some(lease_id) = lease_id {
             request = request.header("x-reliaburger-test-lease", lease_id);
         }

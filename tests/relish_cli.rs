@@ -233,3 +233,19 @@ async fn cancel_deploy_waits_for_terminal_evidence_and_refuses_unknown_success()
         assert_eq!(record["phase"], "finished");
     }
 }
+
+#[test]
+fn job_rerun_rejects_non_job_manifests_before_contacting_the_agent() {
+    let directory = tempfile::tempdir().unwrap();
+    let manifest = directory.path().join("apps.toml");
+    std::fs::write(&manifest, "[app.web]\nimage = 'test:v1'\n").unwrap();
+    let output = run(&[
+        "--endpoint",
+        "http://127.0.0.1:1",
+        "apply",
+        manifest.to_str().unwrap(),
+        "--rerun-jobs",
+    ]);
+    assert!(!output.status.success());
+    assert!(String::from_utf8_lossy(&output.stderr).contains("only non-scheduled jobs"));
+}

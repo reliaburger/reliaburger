@@ -27,6 +27,21 @@ pub async fn apply(path: &Path, output: OutputFormat, dry_run: bool) -> Result<(
     apply_with_client(path, output, dry_run, &BunClient::default_local()).await
 }
 
+/// Explicitly rerun a node-local job manifest, including unknown prior outcomes.
+pub async fn rerun_jobs(path: &Path) -> Result<(), RelishError> {
+    let config = Config::from_file(path)?;
+    config.validate()?;
+    let result = BunClient::default_local()
+        .apply_rerunning_jobs(&config)
+        .await?;
+    println!(
+        "started {} job instance(s): {}",
+        result.created,
+        result.instances.join(", ")
+    );
+    Ok(())
+}
+
 async fn apply_with_client(
     path: &Path,
     output: OutputFormat,
