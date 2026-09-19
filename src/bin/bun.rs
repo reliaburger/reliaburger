@@ -2393,7 +2393,7 @@ async fn run_agent(cli: Cli) -> anyhow::Result<()> {
         ));
     }
 
-    let pickle_app = reliaburger::pickle::api::router(pickle_state);
+    let pickle_app = reliaburger::pickle::api::router(pickle_state.clone());
     // Describe the listener honestly (B3). A clustered listener authenticates
     // writes (service token or a Deployer bearer) and, on a routable bind,
     // reads too — regardless of TLS. Only the literal loopback standalone
@@ -2543,15 +2543,11 @@ async fn run_agent(cli: Cli) -> anyhow::Result<()> {
     // let the arbiter (Raft in cluster mode, the local catalog's same
     // rule otherwise) approve, then delete only what was approved.
     {
-        use reliaburger::council::types::{CouncilResponse, RaftRequest};
-        use reliaburger::pickle::gc::{
-            GcConfig, delete_approved, gc_candidates, referenced_digests,
-        };
+        use reliaburger::pickle::gc::{GcConfig, gc_candidates};
 
         let gc_store = Arc::clone(&blob_store);
         let gc_catalog = Arc::clone(&pickle_catalog);
-        let gc_council = api_council.clone();
-        let gc_persist = catalog_path.clone();
+        let gc_registry = pickle_state;
         let gc_shutdown = shutdown.clone();
         let gc_config = GcConfig {
             retain_days: config.images.gc_retain_days,
@@ -2609,51 +2605,13 @@ async fn run_agent(cli: Cli) -> anyhow::Result<()> {
                     continue;
                 };
 
-                // Arbitration: Raft serialises cluster-wide; single-node
-                // applies the identical rule to the local catalog.
-                let approved = match &gc_council {
-                    Some(council) => {
-                        match council.write(RaftRequest::GcReport(report.clone())).await {
-                            Ok(CouncilResponse::GcApproved { approved }) => {
-                                // Mirror the holder removal locally too.
-                                let mirror = reliaburger::pickle::types::GcReport {
-                                    node_id: report.node_id,
-                                    deleted_layers: approved.clone(),
-                                };
-                                let _ = gc_catalog.write().await.apply_gc_report(&mirror);
-                                approved
-                            }
-                            Ok(_) => Vec::new(),
-                            Err(e) => {
-                                eprintln!(
-                                    "bun: gc arbitration unavailable ({e}); deleting nothing"
-                                );
-                                Vec::new()
-                            }
-                        }
+                let deleted = match gc_registry.collect_garbage(report).await {
+                    Ok(deleted) => deleted,
+                    Err(error) => {
+                        eprintln!("bun: GC retained blobs after failed transaction: {error}");
+                        continue;
                     }
-                    None => gc_catalog.write().await.apply_gc_report(&report),
                 };
-
-                if approved.is_empty() {
-                    continue;
-                }
-
-                // Persist the catalog change, then phase 2: delete.
-                let snapshot = gc_catalog.read().await.clone();
-                let persist = gc_persist.clone();
-                let store = Arc::clone(&gc_store);
-                let deleted = tokio::task::spawn_blocking(move || {
-                    if let Err(e) = snapshot.persist_to(&persist) {
-                        eprintln!("bun: gc failed to persist catalog: {e}");
-                    }
-                    // Re-check against the freshly-snapshotted catalogue so a
-                    // blob re-referenced since arbitration is never deleted.
-                    let referenced = referenced_digests(&snapshot);
-                    delete_approved(&store, &approved, &referenced)
-                })
-                .await
-                .unwrap_or_default();
                 if !deleted.is_empty() {
                     println!("bun: gc removed {} blob(s)", deleted.len());
                 }

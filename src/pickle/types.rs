@@ -417,31 +417,16 @@ impl ManifestCatalog {
     /// Single-node mode has no Raft to remember the catalog, and even
     /// cluster nodes want their local holder view back after a restart.
     pub fn persist_to(&self, path: &std::path::Path) -> Result<(), PickleError> {
-        use std::io::Write as _;
-
         let json = serde_json::to_vec_pretty(self)
-            .map_err(|e| PickleError::CatalogPersist(e.to_string()))?;
-
-        let parent = path.parent().unwrap_or_else(|| std::path::Path::new("."));
-        std::fs::create_dir_all(parent).map_err(|e| PickleError::CatalogPersist(e.to_string()))?;
-
-        let tmp = parent.join(format!("catalog.{:032x}.json.tmp", rand::random::<u128>()));
-        {
-            let mut file = std::fs::File::create(&tmp)
-                .map_err(|e| PickleError::CatalogPersist(e.to_string()))?;
-            file.write_all(&json)
-                .map_err(|e| PickleError::CatalogPersist(e.to_string()))?;
-            file.sync_all()
-                .map_err(|e| PickleError::CatalogPersist(e.to_string()))?;
-        }
-        if let Err(e) = std::fs::rename(&tmp, path) {
-            let _ = std::fs::remove_file(&tmp);
-            return Err(PickleError::CatalogPersist(e.to_string()));
-        }
-        if let Ok(dir) = std::fs::File::open(parent) {
-            let _ = dir.sync_all();
-        }
-        Ok(())
+            .map_err(|error| PickleError::CatalogPersist(error.to_string()))?;
+        let parent = path
+            .parent()
+            .filter(|parent| !parent.as_os_str().is_empty())
+            .unwrap_or_else(|| std::path::Path::new("."));
+        std::fs::create_dir_all(parent)
+            .map_err(|error| PickleError::CatalogPersist(error.to_string()))?;
+        crate::sesame::identity::atomic_write_mode(path, &json, Some(0o600))
+            .map_err(|error| PickleError::CatalogPersist(error.to_string()))
     }
 
     /// Load a catalog previously written by [`Self::persist_to`]. A missing

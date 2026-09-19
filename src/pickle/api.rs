@@ -215,63 +215,127 @@ impl PickleState {
 /// - `RaftUncommitted` — this node is a council member but the Raft
 ///   proposal failed; the bytes are stored and the local catalogue is
 ///   persisted, but the cluster catalogue does **not** yet know the push.
-///   The push is reported as accepted-but-not-durable, not a clean success.
+///   The caller must retry to obtain authoritative acceptance.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum CommitOutcome {
     Authoritative,
     RaftUncommitted,
 }
 
-/// Record a committed manifest: apply to the local catalog, persist it
-/// to disk, and — when this node is a council member — propose it to
-/// Raft so the cluster-wide catalog tracks the real holder.
-///
-/// Returns the [`CommitOutcome`] so the caller can reflect it honestly
-/// (D11). A failed Raft proposal on a council member is surfaced, not
-/// silently swallowed: the local catalogue is still persisted (so a
-/// restart and the heal loop can recover), but the push did not reach the
-/// authoritative catalogue.
+/// Persist local ownership before publication. The blocking task owns the write
+/// guard through persistence, even when the HTTP caller is cancelled.
 pub(crate) async fn record_commit(
     state: &PickleState,
     manifest: ImageManifest,
     tag: String,
-) -> CommitOutcome {
+) -> Result<CommitOutcome, super::types::PickleError> {
+    use super::types::PickleError;
     let commit = ManifestCommit {
         manifest,
         tag,
         holder_nodes: std::collections::BTreeSet::from([state.node_raft_id]),
     };
-
-    let snapshot = {
-        let mut catalog = state.catalog.write().await;
-        catalog.apply_manifest_commit(&commit);
-        state.persist_path.as_ref().map(|_| catalog.clone())
-    };
-    if let (Some(path), Some(snapshot)) = (state.persist_path.clone(), snapshot) {
-        // File IO off the runtime; the catalog is small (KBs).
-        let _ = tokio::task::spawn_blocking(move || {
-            if let Err(e) = snapshot.persist_to(&path) {
-                eprintln!("pickle: failed to persist catalog: {e}");
+    let mut catalog = Arc::clone(&state.catalog).write_owned().await;
+    let store = Arc::clone(&state.store);
+    let persist = state.persist_path.clone();
+    let local_commit = commit.clone();
+    tokio::task::spawn_blocking(move || {
+        // GC uses this same guard through physical deletion. A blob validated
+        // before waiting for the guard may have been collected in the meantime.
+        for digest in local_commit.manifest.referenced_digests() {
+            if !store.has_blob(digest) {
+                return Err(PickleError::MissingLayer(digest.clone()));
             }
-        })
-        .await;
-    }
+        }
+        let mut next = catalog.clone();
+        next.apply_manifest_commit(&local_commit);
+        if let Some(path) = persist {
+            next.persist_to(&path)?;
+        }
+        *catalog = next;
+        Ok(())
+    })
+    .await
+    .map_err(|error| PickleError::CatalogPersist(error.to_string()))??;
 
     if let Some(council) = &state.council {
-        if let Err(e) = council
-            .write(crate::council::types::RaftRequest::ManifestCommit(commit))
-            .await
+        match tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            council.write(crate::council::types::RaftRequest::ManifestCommit(commit)),
+        )
+        .await
         {
-            eprintln!(
-                "pickle: manifest commit not written to raft ({e}); \
-                 local catalog persisted, replication will reconcile"
-            );
-            return CommitOutcome::RaftUncommitted;
+            Ok(Ok(crate::council::CouncilResponse::Ok)) => {}
+            Ok(Ok(response)) => {
+                return Err(PickleError::ReplicationFailed(format!(
+                    "manifest commit refused: {response:?}"
+                )));
+            }
+            Ok(Err(error)) => {
+                eprintln!("pickle: local manifest persisted but Raft commit failed: {error}");
+                return Ok(CommitOutcome::RaftUncommitted);
+            }
+            Err(_) => return Ok(CommitOutcome::RaftUncommitted),
         }
-        return CommitOutcome::Authoritative;
     }
-    // Single-node mode: the local catalogue *is* authoritative.
-    CommitOutcome::Authoritative
+    Ok(CommitOutcome::Authoritative)
+}
+
+impl PickleState {
+    /// Arbitrate collection, then persist and delete under the manifest writer
+    /// guard. A persistence error deletes nothing and is safe to retry.
+    pub async fn collect_garbage(
+        &self,
+        report: super::types::GcReport,
+    ) -> Result<Vec<Digest>, super::types::PickleError> {
+        use super::types::PickleError;
+        let authoritative = if let Some(council) = &self.council {
+            let response = tokio::time::timeout(
+                std::time::Duration::from_secs(10),
+                council.write(crate::council::types::RaftRequest::GcReport(report.clone())),
+            )
+            .await
+            .map_err(|_| PickleError::ReplicationFailed("GC arbitration timed out".into()))?
+            .map_err(|error| PickleError::ReplicationFailed(error.to_string()))?;
+            match response {
+                crate::council::CouncilResponse::GcApproved { approved } => Some(approved),
+                response => {
+                    return Err(PickleError::ReplicationFailed(format!(
+                        "GC arbitration refused: {response:?}"
+                    )));
+                }
+            }
+        } else {
+            None
+        };
+        let mut catalog = Arc::clone(&self.catalog).write_owned().await;
+        let store = Arc::clone(&self.store);
+        let persist = self.persist_path.clone();
+        tokio::task::spawn_blocking(move || {
+            let mut next = catalog.clone();
+            let approved = match authoritative {
+                Some(approved) => {
+                    next.apply_gc_report(&super::types::GcReport {
+                        node_id: report.node_id,
+                        deleted_layers: approved.clone(),
+                    });
+                    approved
+                }
+                None => next.apply_gc_report(&report),
+            };
+            if approved.is_empty() {
+                return Ok(Vec::new());
+            }
+            if let Some(path) = persist {
+                next.persist_to(&path)?;
+            }
+            *catalog = next;
+            let referenced = super::gc::referenced_digests(&catalog);
+            Ok(super::gc::delete_approved(&store, &approved, &referenced))
+        })
+        .await
+        .map_err(|error| PickleError::CatalogPersist(error.to_string()))?
+    }
 }
 
 /// Build the OCI Distribution API router.
@@ -1104,7 +1168,16 @@ async fn manifest_put(
         )
             .into_response();
     }
-    let outcome = record_commit(state, manifest, reference.to_string()).await;
+    let outcome = match record_commit(state, manifest, reference.to_string()).await {
+        Ok(outcome) => outcome,
+        Err(error) => {
+            return oci_error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "UNKNOWN",
+                error.to_string(),
+            );
+        }
+    };
 
     let mut headers = HeaderMap::new();
     headers.insert(
@@ -1374,6 +1447,189 @@ mod tests {
             StatusCode::BAD_REQUEST
         );
         assert!(!store.has_blob(&digest));
+    }
+
+    #[tokio::test]
+    async fn failed_catalogue_persistence_does_not_acknowledge_or_publish_a_manifest() {
+        let (mut state, directory) = test_state();
+        let blocked = directory.path().join("catalog.json");
+        std::fs::create_dir(&blocked).unwrap();
+        state.persist_path = Some(blocked.clone());
+        let catalog = state.catalog.clone();
+        let app = test_router(state);
+        let config = b"config";
+        let digest = push_blob(&app, "myapp", config).await;
+        let body = serde_json::to_vec(&serde_json::json!({
+            "schemaVersion": 2,
+            "mediaType": "application/vnd.oci.image.manifest.v1+json",
+            "config": {"digest": digest.as_str(), "size": config.len()},
+            "layers": []
+        }))
+        .unwrap();
+        let response = put_manifest(&app, "/v2/myapp/manifests/latest", body.clone()).await;
+        assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        assert!(
+            catalog
+                .read()
+                .await
+                .get_manifest_by_tag("myapp", "latest")
+                .is_none()
+        );
+        std::fs::remove_dir(&blocked).unwrap();
+        let response = put_manifest(&app, "/v2/myapp/manifests/latest", body).await;
+        assert_eq!(response.status(), StatusCode::CREATED);
+        assert!(
+            ManifestCatalog::load_from(&blocked)
+                .unwrap()
+                .get_manifest_by_tag("myapp", "latest")
+                .is_some()
+        );
+    }
+
+    fn manifest_body(config: &Digest, size: usize) -> Vec<u8> {
+        serde_json::to_vec(&serde_json::json!({
+            "schemaVersion": 2,
+            "mediaType": "application/vnd.oci.image.manifest.v1+json",
+            "config": {"digest": config.as_str(), "size": size},
+            "layers": []
+        }))
+        .unwrap()
+    }
+
+    #[tokio::test]
+    async fn garbage_collection_persistence_failure_retains_blobs_until_retry() {
+        let (mut state, directory) = test_state();
+        let blocked = directory.path().join("catalog.json");
+        std::fs::create_dir(&blocked).unwrap();
+        state.persist_path = Some(blocked.clone());
+        let digest = compute_sha256(b"orphan");
+        state.store.write_blob(b"orphan", &digest).unwrap();
+        let report = super::super::types::GcReport {
+            node_id: state.node_raft_id,
+            deleted_layers: vec![digest.clone()],
+        };
+        assert!(state.collect_garbage(report.clone()).await.is_err());
+        assert!(state.store.has_blob(&digest));
+        std::fs::remove_dir(&blocked).unwrap();
+        assert_eq!(
+            state.collect_garbage(report).await.unwrap(),
+            vec![digest.clone()]
+        );
+        assert!(!state.store.has_blob(&digest));
+        assert!(
+            ManifestCatalog::load_from(&blocked)
+                .unwrap()
+                .manifests
+                .is_empty()
+        );
+    }
+
+    #[tokio::test]
+    async fn push_rechecks_blobs_after_waiting_for_garbage_collection() {
+        let (mut state, directory) = test_state();
+        state.persist_path = Some(directory.path().join("catalog.json"));
+        let app = test_router(state.clone());
+        let config = push_blob(&app, "myapp", b"config").await;
+        let body = manifest_body(&config, 6);
+        let manifest = compute_sha256(&body);
+        let guard = state.catalog.write().await;
+        let mut gc = Box::pin(state.collect_garbage(super::super::types::GcReport {
+            node_id: state.node_raft_id,
+            deleted_layers: vec![config.clone()],
+        }));
+        assert!(futures_util::poll!(gc.as_mut()).is_pending());
+        let push =
+            tokio::spawn(
+                async move { put_manifest(&app, "/v2/myapp/manifests/latest", body).await },
+            );
+        tokio::time::timeout(std::time::Duration::from_secs(3), async {
+            while !state.store.has_blob(&manifest) {
+                tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .unwrap();
+        // The HTTP path has validated and stored the manifest. FIFO lock
+        // admission lets already-queued GC finish before its catalogue commit.
+        drop(guard);
+        assert_eq!(gc.await.unwrap(), vec![config]);
+        assert_eq!(
+            push.await.unwrap().status(),
+            StatusCode::INTERNAL_SERVER_ERROR
+        );
+        assert!(
+            state
+                .catalog
+                .read()
+                .await
+                .get_manifest_by_tag("myapp", "latest")
+                .is_none()
+        );
+    }
+
+    #[tokio::test]
+    async fn stale_collection_report_preserves_a_committed_manifest_and_shared_config() {
+        let (state, _directory) = test_state();
+        let app = test_router(state.clone());
+        let config = push_blob(&app, "ordinary", b"shared").await;
+        let body = manifest_body(&config, 6);
+        let manifest = compute_sha256(&body);
+        assert_eq!(
+            put_manifest(&app, "/v2/ordinary/manifests/latest", body)
+                .await
+                .status(),
+            StatusCode::CREATED
+        );
+        let deleted = state
+            .collect_garbage(super::super::types::GcReport {
+                node_id: state.node_raft_id,
+                deleted_layers: vec![config.clone(), manifest.clone()],
+            })
+            .await
+            .unwrap();
+        assert!(deleted.is_empty());
+        assert!(state.store.has_blob(&config));
+        assert!(state.store.has_blob(&manifest));
+    }
+
+    #[tokio::test]
+    async fn simultaneous_pushes_leave_every_acknowledged_tag_on_disk() {
+        let (mut state, directory) = test_state();
+        let path = directory.path().join("catalog.json");
+        state.persist_path = Some(path.clone());
+        let app = test_router(state.clone());
+        let config = push_blob(&app, "ordinary", b"shared").await;
+        let body = manifest_body(&config, 6);
+        let guard = state.catalog.write().await;
+        let tasks: Vec<_> = (0..4)
+            .map(|index| {
+                let app = app.clone();
+                let body = body.clone();
+                tokio::spawn(async move {
+                    put_manifest(&app, &format!("/v2/ordinary/manifests/tag-{index}"), body).await
+                })
+            })
+            .collect();
+        drop(guard);
+        for task in tasks {
+            assert_eq!(task.await.unwrap().status(), StatusCode::CREATED);
+        }
+        let reloaded = ManifestCatalog::load_from(&path).unwrap();
+        for index in 0..4 {
+            assert!(
+                reloaded
+                    .get_manifest_by_tag("ordinary", &format!("tag-{index}"))
+                    .is_some()
+            );
+        }
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            assert_eq!(
+                std::fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+                0o600
+            );
+        }
     }
 
     fn test_state() -> (PickleState, tempfile::TempDir) {

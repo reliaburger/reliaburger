@@ -106,7 +106,11 @@ Registry catalogue metadata now belongs to a repository and manifest digest.
 Pushing identical bytes into another repository preserves independent tags;
 retiring one repository's final tag leaves the other copy and shared layers
 referenced. Content signatures remain available across repository copies and
-restart. Repository/upload lease cleanup is still tracked separately in C34.
+restart. A manifest push persists its catalogue before acknowledging success;
+filesystem failures refuse the push. Push publication and GC deletion share a
+transaction guard, so collection cannot delete a layer between its final check
+and publication. Repository/upload lease cleanup and authoritative forwarding
+are still tracked separately in C34.
 
 Registry startup claims exclusive ownership of the configured image store's
 upload directory. Run only one Bun with that writable image store. A restart

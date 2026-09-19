@@ -899,8 +899,17 @@ cases. Both compatibility checks and strict Clippy pass. Durable state advances
 to generation 11; protocol 8 and lease schema 4 remain unchanged. This is a
 prerequisite, not completion of repository/upload lease cleanup.
 
-Remaining resource contracts, each in its own commit: registry uploads/repositories,
-and managed volume/mount cleanup. Node effects already use C06 reservations
+**Catalogue transaction prerequisite (20 September):** Failed local persistence
+now refuses a manifest push instead of acknowledging it. Publication and GC hold
+one owned write guard through durable persistence and physical deletion, with
+fresh blob checks before commit. Five transaction regressions, all 240 Pickle
+and 24 Linux registry integration tests pass; native full-library/registry cases
+and strict Clippy on both platforms pass. See the
+[registry retirement plan](2026-09-19-registry-retirement.md) for remaining work.
+
+Remaining resource contracts, each in its own commit: registry uploads/repositories
+and process identity/pre-adoption recovery. Managed volume/mount cleanup is
+implemented and qualified as recorded above. Node effects already use C06 reservations
 and C10 exact-fault receipts. Image distribution currently reports uncontrolled
 cache state and never evicts arbitrary images; any future cold-cache mode needs
 exclusive ownership before eviction.

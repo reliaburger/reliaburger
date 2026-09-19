@@ -903,3 +903,35 @@ snapshot storage keeps cleanup pending so an operator can investigate. Ordinary
 application snapshots keep their existing behaviour. Storage ownership doesn't
 solve the separate problem of recovering a runtime that died before its first
 adoption record; that remains part of the release's runtime recovery work.
+
+### A successful push must survive a catalogue write failure
+
+Imagine `catalog.json` has become unwritable. The original registry handler
+updated its in-memory catalogue, printed the persistence error and still returned
+`201 Created`. The image appeared until Bun restarted. That is not a successful
+push.
+
+Manifest commits now acquire an owned Tokio write guard, build the next
+catalogue, persist it and only then publish it in memory. `write_owned()` differs
+from borrowing a guard with `write()`: the guard owns an `Arc` reference to the
+lock, so we can move it into `spawn_blocking`. If the HTTP caller disappears,
+the blocking task still owns the guard until its filesystem transaction finishes.
+Another request cannot persist an older snapshot over it. The catalogue uses a
+private temporary file, atomic replacement and checked file/directory syncs.
+Persistence errors reach the caller and the pull-through cache.
+
+Garbage collection uses the same guard through persistence and physical blob
+deletion. A manifest handler also rechecks its required blobs after acquiring
+the guard. Why twice? Its initial HTTP validation might have happened before a
+queued collector removed an unreferenced layer. Publishing after that deletion
+would acknowledge an image we could no longer run. If a push commits first,
+collection's fresh reference check preserves its blobs. If collection wins,
+the push must refuse and the client must upload the missing bytes again.
+
+The tests drive both orderings through the real handlers. One queues collection,
+waits until a push has validated and stored its raw manifest, then lets collection
+finish before publication. Another submits a stale collection report after the
+manifest commit. Four simultaneous pushes must all survive reopening the on-disk
+catalogue. A failed GC catalogue write must delete no bytes, and repair followed
+by retry must finish collection. Authoritative cluster acceptance remains a
+separate Raft decision; local-only acceptance still requires the caller to retry.

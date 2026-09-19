@@ -431,7 +431,7 @@ impl ClusterSource {
             // repositories are exempt from require_signatures.
             signature: None,
         };
-        super::api::record_commit(&self.state, image_manifest, image.tag.clone()).await;
+        super::api::record_commit(&self.state, image_manifest, image.tag.clone()).await?;
 
         Ok(Some(layer_paths))
     }
