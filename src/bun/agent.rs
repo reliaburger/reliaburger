@@ -746,6 +746,11 @@ enum DeployOp {
         old_id: InstanceId,
         reply: oneshot::Sender<Result<(), BunError>>,
     },
+    /// Fence restarts before the worker starts draining or signalling an old instance.
+    BeginRetire {
+        old_id: InstanceId,
+        reply: oneshot::Sender<Result<(), BunError>>,
+    },
     /// Append an entry to the deploy history.
     PushDeployHistory {
         entry: Box<crate::meat::deploy_types::DeployHistoryEntry>,
@@ -1219,6 +1224,20 @@ impl DeployOps {
                 reply,
             },
             (),
+        )
+        .await
+    }
+
+    async fn begin_retire(&self, old_id: &InstanceId) -> Result<(), BunError> {
+        self.call(
+            |reply| DeployOp::BeginRetire {
+                old_id: old_id.clone(),
+                reply,
+            },
+            Err(BunError::RetirementState {
+                instance_id: old_id.clone(),
+                reason: "agent loop closed before retirement began".into(),
+            }),
         )
         .await
     }
@@ -8690,6 +8709,22 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
                 .await;
                 let _ = reply.send(());
             }
+            DeployOp::BeginRetire { old_id, reply } => {
+                let result = match self.supervisor.get_instance_mut(&old_id) {
+                    Some(instance) => {
+                        instance.retry_pending = false;
+                        if instance.state.can_transition_to(ContainerState::Stopping) {
+                            instance.state = ContainerState::Stopping;
+                        }
+                        self.supervisor.health_checker_mut().unregister(&old_id);
+                        Ok(())
+                    }
+                    None => Err(BunError::InstanceNotFound {
+                        instance_id: old_id,
+                    }),
+                };
+                let _ = reply.send(result);
+            }
             DeployOp::FinishRetire { old_id, reply } => {
                 let result = self.finish_retire_bookkeeping(&old_id).await;
                 let _ = reply.send(result);
@@ -9419,13 +9454,9 @@ impl<G: Grill + Clone + 'static> DeployWorker<G> {
                     // Drain and stop the old instance on this spawned deploy
                     // task (M7), then send only the fast bookkeeping to the
                     // command loop — the wait no longer stalls every command.
-                    if let Err(error) = drain_and_stop_instance(
-                        &self.drains,
-                        &self.grill,
-                        &old_id,
-                        deploy_config.drain_timeout,
-                    )
-                    .await
+                    if let Err(error) = self
+                        .retire_old_instance(&old_id, deploy_config.drain_timeout)
+                        .await
                     {
                         let retention = self
                             .retain_started_replacements(
@@ -9692,13 +9723,9 @@ impl<G: Grill + Clone + 'static> DeployWorker<G> {
                     message: format!("stopping old instance {}", old_id.0),
                 })
                 .await;
-            if let Err(error) = drain_and_stop_instance(
-                &self.drains,
-                &self.grill,
-                old_id,
-                deploy_config.drain_timeout,
-            )
-            .await
+            if let Err(error) = self
+                .retire_old_instance(old_id, deploy_config.drain_timeout)
+                .await
             {
                 let retention = self
                     .retain_started_replacements(
@@ -9763,6 +9790,16 @@ impl<G: Grill + Clone + 'static> DeployWorker<G> {
         }
 
         std::ops::ControlFlow::Continue(())
+    }
+
+    /// Publish retirement intent before runtime exit can trigger the restart driver.
+    async fn retire_old_instance(
+        &self,
+        id: &InstanceId,
+        drain_timeout: std::time::Duration,
+    ) -> Result<(), BunError> {
+        self.ops.begin_retire(id).await?;
+        drain_and_stop_instance(&self.drains, &self.grill, id, drain_timeout).await
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -10050,13 +10087,9 @@ impl<G: Grill + Clone + 'static> DeployWorker<G> {
                 .await;
         }
         for old_id in &existing {
-            if let Err(error) = drain_and_stop_instance(
-                &self.drains,
-                &self.grill,
-                old_id,
-                deploy_config.drain_timeout,
-            )
-            .await
+            if let Err(error) = self
+                .retire_old_instance(old_id, deploy_config.drain_timeout)
+                .await
             {
                 let retention = self
                     .retain_started_replacements(
@@ -13206,6 +13239,67 @@ host = "remote.local"
             !grill.calls().iter().any(|(op, _)| op == "create"),
             "no container should be created for a scheduled job at deploy time"
         );
+    }
+
+    #[tokio::test]
+    async fn rollout_retirement_fences_the_crash_restart_driver() {
+        for (strategy, replicas) in [("rolling", 1), ("rolling", 2), ("blue-green", 2)] {
+            let (mut agent, _tx, _shutdown, grill) = test_agent_with_grill();
+            let mut initial = basic_config();
+            initial.app.get_mut("web").unwrap().replicas = crate::config::Replicas::Fixed(replicas);
+            expect_complete(&drain_deploy(&mut agent, initial).await);
+            grill.set_ignore_stop(true);
+            grill.block_kills();
+            let config = Config::parse(&format!("[app.web]\nimage = 'web:v2'\nport = 8080\nreplicas = {replicas}\n[app.web.deploy]\nstrategy = '{strategy}'\ndrain_timeout = '0s'\n")).unwrap();
+            let (events, mut stream) = mpsc::channel(64);
+            agent.begin_deploy(config, events, true).await;
+            tokio::time::timeout(std::time::Duration::from_secs(2), async {
+                loop {
+                    tokio::select! {
+                        Some(op) = agent.deploy_ops_rx.recv() => agent.handle_deploy_op(op).await,
+                        () = grill.wait_for_kills(1) => break,
+                    }
+                }
+            })
+            .await
+            .unwrap();
+            let old_id = grill
+                .calls()
+                .into_iter()
+                .rev()
+                .find(|(call, _)| call == "kill")
+                .unwrap()
+                .1;
+            // Runtime exit can become observable before its request completes.
+            // Run the actual periodic restart driver at that exact boundary.
+            grill.set_state(&old_id, ContainerState::Stopped);
+            agent.check_apps().await;
+            let old = agent.supervisor.get_instance(&old_id).unwrap();
+            let observed = (old.state, old.restart_count, old.retry_pending);
+            grill.release_kills(1);
+            let outcome = tokio::time::timeout(std::time::Duration::from_secs(3), async {
+                let mut events = Vec::new();
+                loop {
+                    tokio::select! {
+                        Some(op) = agent.deploy_ops_rx.recv() => agent.handle_deploy_op(op).await,
+                        event = stream.recv() => match event {
+                            Some(event) => events.push(event),
+                            None => break events,
+                        }
+                    }
+                }
+            })
+            .await
+            .unwrap();
+            grill.set_ignore_stop(false);
+            agent.stop_app("web", "default").await.unwrap();
+            expect_complete(&outcome);
+            assert_eq!(
+                observed,
+                (ContainerState::Stopping, 0, false),
+                "{strategy} restarted a retiring instance"
+            );
+        }
     }
 
     #[tokio::test]

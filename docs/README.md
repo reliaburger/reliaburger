@@ -27,6 +27,8 @@ and blue-green retirement also require observed runtime exit. If a signal or
 inspection fails, the deployment reports an error and retains both generations
 for ordinary Stop/Retire cleanup. Finalisation propagates identity and record
 cleanup errors too, retaining the old instance as stopped until cleanup succeeds.
+Before signalling an old instance, the rollout fences the periodic restart and
+health tasks so they cannot revive it during retirement.
 
 `relish test --filter jobs` creates durable leases on the receiving node for
 batch jobs and cron registrations. Keep using the same node endpoint for a

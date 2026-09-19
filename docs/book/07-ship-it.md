@@ -1169,3 +1169,25 @@ agent without moving the directory guard away from it.
 
 Rollback and halt still need the same checked cleanup treatment. These checks
 do not establish crash recovery before the first adoption record exists.
+
+### Tell the restart task before asking the runtime to stop
+
+There's a smaller window before artifact cleanup begins. Runtime exit can
+become visible while the worker is still waiting for its stop or kill request
+to return. If supervision still says Running, the periodic crash detector sees
+an unexpected exit and queues a restart. We've just asked that instance to stop.
+
+The deploy worker now sends a `BeginRetire` command first and awaits its reply.
+The command loop marks the owner Stopping, disables retries and unregisters
+health checks. Only then does the worker drain traffic and signal the runtime.
+Stopping describes intent; it doesn't claim the process has exited. The later
+observation and artifact acknowledgements still have to succeed.
+
+The regression holds a kill request in flight, makes runtime exit observable,
+and invokes the actual restart task before allowing retirement to finish.
+Before the fix, it moves the old instance to Pending and increments its restart
+count. Afterwards, the owner stays Stopping with no retry. The same check covers
+stepped rolling replacement, rolling surplus retirement and blue-green cut-over.
+Late health replies also use the existing state check, so they cannot revive a
+Stopping owner. This command-channel ordering protects one Bun lifetime; durable
+intent before initial runtime creation remains separate release work.

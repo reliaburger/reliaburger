@@ -961,6 +961,16 @@ The complete Bun suites pass 457 native/456 Linux tests (one explicit gate each,
 Rollback/halt and the restart-driver hand-off during off-loop retirement remain
 separate work.
 
+**Rollout restart ordering (19 September):** A deterministic regression holds
+a kill request in flight, exposes the old runtime's exit and runs the periodic
+crash detector. Before the fix, the detector queues Pending and increments the
+restart count. The worker now awaits an explicit command-loop retirement intent
+before draining/signalling: Stopping, retry disabled, health unregistered.
+Observed exit and durable artifact cleanup remain separate acknowledgements.
+The regression covers stepped rolling, rolling surplus and blue-green paths.
+All 458 native/457 Linux Bun tests pass (one explicit gate each, 21.88s/37.95s),
+with strict all-target/all-feature Clippy on both platforms.
+
 ### C35 — Gate chaos capabilities per selected scenario
 
 **Priority:** P2. **Wave:** 4. **Book chapters:** 08, 15.

@@ -117,7 +117,8 @@ Buildah-absence cases execute in isolated child environments on the equipped VM.
   - [x] Require observed runtime exit on rolling/blue-green retirement. Failed, ignored/stalled kills or inspection errors preserve both generations; a later Retire cleans up. Both regressions fail first, all eight fault/strategy cases pass, and the full Bun suites plus strict Clippy pass on both platforms.
   - [x] Propagate artifact-cleanup errors on rolling/blue-green finalisation; retain the entire retired fleet as stopped if one artifact fails. Both regressions fail first, all 457 native/456 Linux Bun tests pass (one explicit gate each), and strict Clippy passes on both platforms.
   - [ ] Propagate runtime/artifact cleanup failures on halt and rollback, retaining every incomplete owner.
-  - [ ] Fence the periodic restart driver before off-loop rollout retirement starts.
+  - [x] Fence the periodic restart driver before off-loop rollout retirement starts. A blocked-kill regression fails first, then verifies stepped rolling, surplus and blue-green paths. All 458 native/457 Linux Bun tests and strict Clippy pass.
+  - [ ] Prevent rollout generation reuse after adoption and preserve stopped/failed cleanup owners when applying replacements.
   - [ ] Record every former cluster placement owner and wait for exact retirement acknowledgements. The [concrete protocol proposal](plans/2026-09-19-lease-retirement.md) awaits explicit approval required by automatic approval review; its core draft is preserved separately and is not wired into the current binary.
   - [ ] Persist ordinary-job execution intent and retry budgets across Bun replacement. Crash retry versus explicit rerun remains a pending user decision.
   - [ ] Bind registry repositories/uploads to leases and fence concurrent commits against cleanup; preserve shared image layers.
