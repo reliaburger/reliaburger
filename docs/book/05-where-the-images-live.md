@@ -935,3 +935,21 @@ manifest commit. Four simultaneous pushes must all survive reopening the on-disk
 catalogue. A failed GC catalogue write must delete no bytes, and repair followed
 by retry must finish collection. Authoritative cluster acceptance remains a
 separate Raft decision; local-only acceptance still requires the caller to retry.
+
+### A collection decision must survive a failed deletion
+
+Suppose two nodes hold an unreferenced layer. Raft approves node A's deletion
+and removes A from the holder set, then its filesystem refuses the unlink.
+On retry, the catalogue lists only B. That does not make A's leftover bytes the
+last copy: B is still the protected holder. The old collector confused those
+cases and retained A's extra copy indefinitely.
+
+Nomination now protects a sole holder only when it names the local node.
+Arbitration can approve A again while another advertised holder remains, even
+if A was already removed from the set. It still checks every manifest reference
+on every attempt. A push between the first approval and retry protects the layer,
+and B cannot delete the last advertised copy. Three failing-first tests exercise
+reloaded approval, nomination and an actual failed file deletion followed by
+repair. All 243 Pickle and 82 Raft state-machine tests pass on macOS/Linux, with
+strict Clippy on both. The ownership decision is unchanged in shape; no new
+state format is needed.

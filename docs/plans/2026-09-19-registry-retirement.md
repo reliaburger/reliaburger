@@ -51,3 +51,12 @@ tests pass on Linux; the native full library suite passes 3,384 tests and native
 CI-profile registry cases pass. Strict all-target/all-feature Clippy passes on
 both platforms. Full native CI still fails the separately tracked job launch
 recovery window; these registry checks do not close C34 or V02. No schema changed.
+
+## GC retry repair completed
+
+Step 5 is implemented. All three regressions fail before the repair: a repeated
+approval is refused after reload, nomination protects the wrong node's extra
+copy, and an actual failed deletion cannot finish after repair. They now pass
+with all 243 Pickle and 82 Raft state-machine tests on macOS/Linux, plus strict
+Clippy on both. Reapproval still refuses a newly referenced blob and deletion
+of the final advertised copy. No schema changed.

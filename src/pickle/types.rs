@@ -375,11 +375,14 @@ impl ManifestCatalog {
             {
                 Some((_, holders)) => {
                     let others = holders.iter().filter(|&&n| n != report.node_id).count();
-                    if others >= 1 && holders.remove(&report.node_id) {
+                    if others >= 1 {
+                        // Approval may already have removed this holder before
+                        // a failed deletion or crash. Reapprove its extra copy,
+                        // while preserving the other advertised holder.
+                        holders.remove(&report.node_id);
                         approved.push(digest.clone());
                     }
-                    // Sole copy (or the node isn't a holder): rejected —
-                    // the layer stays where it is.
+                    // Without another advertised holder, keep the layer.
                 }
                 None => {
                     // Orphan: not tracked in the catalog, nothing to lose.
@@ -709,6 +712,40 @@ mod tests {
             catalog.layer_holders(layer.as_str()),
             BTreeSet::from([1, 2])
         );
+    }
+
+    #[test]
+    fn gc_reapproval_preserves_the_last_holder_and_rechecks_new_references() {
+        let mut catalog = ManifestCatalog::default();
+        let manifest = test_manifest("ordinary", "mfst1");
+        let layer = manifest.layers[0].digest.clone();
+        catalog.apply_update_locations(&UpdateLayerLocations {
+            updates: vec![(layer.clone(), BTreeSet::from([1, 2]))],
+        });
+        let report = GcReport {
+            node_id: 1,
+            deleted_layers: vec![layer.clone()],
+        };
+        assert_eq!(catalog.apply_gc_report(&report), vec![layer.clone()]);
+        // Simulate restart after approval but before physical deletion.
+        let mut catalog: ManifestCatalog =
+            serde_json::from_slice(&serde_json::to_vec(&catalog).unwrap()).unwrap();
+        assert_eq!(catalog.apply_gc_report(&report), vec![layer.clone()]);
+        assert!(
+            catalog
+                .apply_gc_report(&GcReport {
+                    node_id: 2,
+                    deleted_layers: vec![layer.clone()]
+                })
+                .is_empty()
+        );
+        catalog.apply_manifest_commit(&ManifestCommit {
+            manifest,
+            tag: "latest".into(),
+            holder_nodes: BTreeSet::from([2]),
+        });
+        assert!(catalog.apply_gc_report(&report).is_empty());
+        assert_eq!(catalog.layer_holders(layer.as_str()), BTreeSet::from([2]));
     }
 
     #[test]

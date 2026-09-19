@@ -1525,6 +1525,49 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn garbage_collection_retries_failed_deletion_after_reloading_its_decision() {
+        let (mut state, directory) = test_state();
+        let path = directory.path().join("catalog.json");
+        state.persist_path = Some(path.clone());
+        let digest = compute_sha256(b"extra");
+        let blob = state.store.blob_path(&digest);
+        // A directory at the blob path deterministically refuses file deletion,
+        // including when privileged qualification runs as root.
+        std::fs::create_dir_all(&blob).unwrap();
+        state.catalog.write().await.apply_update_locations(
+            &super::super::types::UpdateLayerLocations {
+                updates: vec![(
+                    digest.clone(),
+                    std::collections::BTreeSet::from([state.node_raft_id, 99]),
+                )],
+            },
+        );
+        let report = super::super::types::GcReport {
+            node_id: state.node_raft_id,
+            deleted_layers: vec![digest.clone()],
+        };
+        assert!(
+            state
+                .collect_garbage(report.clone())
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        state.catalog = Arc::new(RwLock::new(ManifestCatalog::load_from(&path).unwrap()));
+        assert_eq!(
+            state.catalog.read().await.layer_holders(digest.as_str()),
+            std::collections::BTreeSet::from([99])
+        );
+        std::fs::remove_dir(&blob).unwrap();
+        state.store.write_blob(b"extra", &digest).unwrap();
+        assert_eq!(
+            state.collect_garbage(report).await.unwrap(),
+            vec![digest.clone()]
+        );
+        assert!(!state.store.has_blob(&digest));
+    }
+
+    #[tokio::test]
     async fn push_rechecks_blobs_after_waiting_for_garbage_collection() {
         let (mut state, directory) = test_state();
         state.persist_path = Some(directory.path().join("catalog.json"));
