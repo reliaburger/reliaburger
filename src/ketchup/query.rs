@@ -232,11 +232,13 @@ mod tests {
             }
             socket.write_all(b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 100\r\n\r\n[").await.unwrap();
             headers.send(()).unwrap();
-            assert_eq!(
-                socket.read(&mut buffer).await.unwrap(),
-                0,
-                "query retained its socket"
-            );
+            // Cancelling a body with unread response bytes may reset TCP rather
+            // than send FIN. Both prove closure; other errors remain failures.
+            match socket.read(&mut buffer).await {
+                Ok(0) => {}
+                Err(error) if error.kind() == std::io::ErrorKind::ConnectionReset => {}
+                other => panic!("query did not close its socket: {other:?}"),
+            }
         });
         (url, ready, task)
     }

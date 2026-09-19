@@ -1176,6 +1176,14 @@ of silently returning empty rows. All five pass on Linux (0.52s) and macOS
 (0.14s); strict Linux/macOS Clippy passes. Hosted validation of the repair
 remains separate. The build workflow at `9747fba` passed.
 
+**Cancellation fixture correction:** A later full native run passes 3,294 tests
+and fails one fixture because macOS returns `ConnectionReset` when the cancelled
+client discards unread response bytes. EOF and reset both prove socket closure;
+the fixture now accepts those two outcomes, retaining the original two-second
+deadline and rejecting every other result. All 13 query tests pass on macOS and
+Linux (0.12s each). The corrected native library checkpoint passes 3,295 tests,
+with five explicit gates (47.27s).
+
 ## Engineering follow-ups
 
 ### H01 — Remove stale wiring claims and validate documentation

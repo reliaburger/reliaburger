@@ -598,8 +598,11 @@ a task failure. We retain both sorts of failure in the fan-out result.
 Two socket fixtures reproduce the old mistakes. One sends headers and the
 first byte of a body, then stalls. The other waits until those headers have
 been sent before cancelling the parent query and checks that the peer sees its
-connection close. A caller's timeout is useful only if the work it owns ends
-too.
+connection close. The fixture accepts either EOF or a TCP reset after
+cancellation: macOS can reset a connection when its client discards unread
+response bytes. Both prove closure. Other I/O errors still fail, and the
+original two-second observation deadline remains. A caller's timeout is useful
+only if the work it owns ends too.
 
 ### An empty alert list needs evidence
 
