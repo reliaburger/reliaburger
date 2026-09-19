@@ -1207,3 +1207,32 @@ firing after its checkpoint but before runtime creation finishes. An actual
 Bun/Relish fixture kills Bun and verifies that acknowledged registrations and
 stops survive. These changes advance durable state to generation 7; protocol 6
 and test-lease schema 3 remain unchanged.
+
+### A failed restart is still an owned operation
+
+Suppose a process crashes. Bun cleans up its old runtime, prepares a replacement,
+and asks the runtime to start it. The executable has disappeared. What happens
+next? Previously, the instance stayed in `Starting` forever. A failed create
+left it in `Preparing` instead. Neither state participated in retry selection.
+
+The failed call can also have changed the runtime before returning its error.
+We therefore move these attempts to `Stopping` and retain their ownership. The
+next tick must confirm runtime cleanup before moving to `Stopped`. Only then
+can the ordinary restart policy spend another attempt and move to `Pending`.
+Cleanup failures stay in `Stopping`; they do not authorise another create.
+
+A `retry_pending: bool` field distinguishes failure from an operator's stop or
+a job's successful completion. It applies to apps as well as jobs: an app that
+crashes during its backoff must still be eligible when that delay expires.
+Stopping explicitly clears this flag and moves a Pending attempt towards
+confirmed shutdown, so its non-zero restart count cannot resurrect it. A failed startup spends its existing
+attempt; the next attempt increments the counter through the same supervisor
+method used for runtime crashes. Jobs keep their finite limit.
+
+The regression tests inject create and start failures, withhold successful
+cleanup, then clear the faults. They check state, retained port, call ordering,
+backoff, recovery and exhausted job budgets. A real ProcessGrill test removes
+an executable between launches and restores it for a later attempt. It then
+crashes the recovered process during backoff and checks that retry eligibility
+survives. This proves recovery during one Bun lifetime; durable job execution
+intent and retry budgets across Bun replacement are a separate requirement.

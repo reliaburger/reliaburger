@@ -2522,7 +2522,7 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
                 restart_policy: super::restart::RestartPolicy::default(),
                 health_config,
                 is_job: record.is_job,
-                job_retry_pending: false,
+                retry_pending: false,
                 image: record.image.clone(),
                 oci_spec: Some(record.oci_spec.clone()),
                 identity,
@@ -5526,7 +5526,7 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
                     restart_policy: crate::bun::restart::RestartPolicy::default(),
                     health_config,
                     is_job: false,
-                    job_retry_pending: false,
+                    retry_pending: false,
                     image: spec.image.clone().unwrap_or_default(),
                     oci_spec: new_specs.remove(new_id),
                     identity: None,
@@ -6581,7 +6581,7 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
 
                 // Transition Running → Stopping → Stopped
                 if let Some(instance) = self.supervisor.get_instance_mut(&id) {
-                    instance.job_retry_pending = exit_code != Some(0);
+                    instance.retry_pending = exit_code != Some(0);
                     if let Ok(s) = instance.state.transition_to(ContainerState::Stopping) {
                         instance.state = s;
                     }
@@ -6632,7 +6632,7 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
                             && let Ok(s) = instance.state.transition_to(ContainerState::Failed)
                         {
                             instance.state = s;
-                            instance.job_retry_pending = false;
+                            instance.retry_pending = false;
                         }
                         if let Some(instance) = self.supervisor.get_instance(&id) {
                             self.record_event(
@@ -6644,57 +6644,6 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
                             )
                             .await;
                         }
-                    }
-                }
-            }
-        }
-
-        // Retry stopped failed jobs waiting for backoff
-        let stopped_jobs: Vec<InstanceId> = self
-            .supervisor
-            .list_instances()
-            .iter()
-            .filter(|i| i.is_job && i.state == ContainerState::Stopped && i.job_retry_pending)
-            .map(|i| i.id.clone())
-            .collect();
-
-        for id in stopped_jobs {
-            match self.supervisor.maybe_restart(&id, now).await {
-                Ok(true) => {
-                    // Now in Pending — drive_pending_restarts will handle it
-                    if let Some(instance) = self.supervisor.get_instance(&id) {
-                        self.record_event(
-                            crate::bun::events::EventKind::Restart,
-                            crate::bun::events::EventSeverity::Warning,
-                            Some(instance.app_name.clone()),
-                            Some(instance.namespace.clone()),
-                            format!(
-                                "instance {} restarted (attempt {})",
-                                id.0, instance.restart_count
-                            ),
-                        )
-                        .await;
-                    }
-                }
-                Ok(false) => {
-                    // Still in backoff
-                }
-                Err(_) => {
-                    if let Some(instance) = self.supervisor.get_instance_mut(&id)
-                        && let Ok(s) = instance.state.transition_to(ContainerState::Failed)
-                    {
-                        instance.state = s;
-                        instance.job_retry_pending = false;
-                    }
-                    if let Some(instance) = self.supervisor.get_instance(&id) {
-                        self.record_event(
-                            crate::bun::events::EventKind::JobFailed,
-                            crate::bun::events::EventSeverity::Warning,
-                            Some(instance.app_name.clone()),
-                            Some(instance.namespace.clone()),
-                            format!("job {} failed", instance.app_name),
-                        )
-                        .await;
                     }
                 }
             }
@@ -6728,6 +6677,7 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
 
             // The process exited unexpectedly. Mark it Stopped, then restart.
             if let Some(instance) = self.supervisor.get_instance_mut(&id) {
+                instance.retry_pending = true;
                 if let Ok(s) = instance.state.transition_to(ContainerState::Stopping) {
                     instance.state = s;
                 }
@@ -6751,6 +6701,76 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
     /// this method picks it up and drives it through the startup
     /// sequence again using the stored OCI spec.
     async fn drive_pending_restarts(&mut self) {
+        // Partial startup can have changed the runtime even when its call
+        // failed. Keep ownership until cleanup is observed; then apply the
+        // same budget and backoff as any other failed execution.
+        let retrying: Vec<_> = self
+            .supervisor
+            .list_instances()
+            .iter()
+            .filter(|instance| {
+                instance.retry_pending
+                    && matches!(
+                        instance.state,
+                        ContainerState::Stopping | ContainerState::Stopped
+                    )
+            })
+            .map(|instance| (instance.id.clone(), instance.state))
+            .collect();
+        for (id, state) in retrying {
+            if state == ContainerState::Stopping {
+                if let Err(error) = self.kill_and_wait_for_exit(&id).await {
+                    eprintln!("bun: failed restart of {id} awaits runtime cleanup: {error}");
+                    continue;
+                }
+                if let Some(instance) = self.supervisor.get_instance_mut(&id) {
+                    let Ok(stopped) = instance.state.transition_to(ContainerState::Stopped) else {
+                        continue;
+                    };
+                    instance.state = stopped;
+                }
+            }
+            match self.supervisor.maybe_restart(&id, Instant::now()).await {
+                Ok(true) => {
+                    if let Some(instance) = self.supervisor.get_instance(&id) {
+                        self.record_event(
+                            crate::bun::events::EventKind::Restart,
+                            crate::bun::events::EventSeverity::Warning,
+                            Some(instance.app_name.clone()),
+                            Some(instance.namespace.clone()),
+                            format!(
+                                "instance {id} restarted (attempt {})",
+                                instance.restart_count
+                            ),
+                        )
+                        .await;
+                    }
+                }
+                Ok(false) => {}
+                Err(BunError::RestartLimitExceeded { .. }) => {
+                    if let Some(instance) = self.supervisor.get_instance_mut(&id)
+                        && let Ok(failed) = instance.state.transition_to(ContainerState::Failed)
+                    {
+                        instance.state = failed;
+                        instance.retry_pending = false;
+                    }
+                    if let Some(instance) = self.supervisor.get_instance(&id) {
+                        self.record_event(
+                            crate::bun::events::EventKind::JobFailed,
+                            crate::bun::events::EventSeverity::Warning,
+                            Some(instance.app_name.clone()),
+                            Some(instance.namespace.clone()),
+                            format!(
+                                "workload {} exhausted its restart budget",
+                                instance.app_name
+                            ),
+                        )
+                        .await;
+                    }
+                }
+                Err(error) => eprintln!("bun: cannot retry {id}: {error}"),
+            }
+        }
         #[allow(clippy::type_complexity)]
         let pending_restarts: Vec<(
             InstanceId,
@@ -6794,13 +6814,8 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
                 }
             }
 
-            if self
-                .supervisor
-                .grill()
-                .create(&id, &oci_spec)
-                .await
-                .is_err()
-            {
+            if let Err(error) = self.supervisor.grill().create(&id, &oci_spec).await {
+                self.record_failed_restart(&id, &error.to_string()).await;
                 continue;
             }
 
@@ -6856,7 +6871,8 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
                 }
             }
 
-            if self.supervisor.grill().start(&id).await.is_err() {
+            if let Err(error) = self.supervisor.grill().start(&id).await {
+                self.record_failed_restart(&id, &error.to_string()).await;
                 continue;
             }
             // Re-wire the restarted instance: stream its logs and keep it routable.
@@ -6890,6 +6906,26 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
                     instance.state = s;
                 }
             }
+        }
+    }
+
+    /// Retain a partially created runtime for observed cleanup and bounded retry.
+    async fn record_failed_restart(&mut self, id: &InstanceId, reason: &str) {
+        if let Some(instance) = self.supervisor.get_instance_mut(id)
+            && let Ok(stopping) = instance.state.transition_to(ContainerState::Stopping)
+        {
+            instance.state = stopping;
+            instance.retry_pending = true;
+        }
+        if let Some(instance) = self.supervisor.get_instance(id) {
+            self.record_event(
+                crate::bun::events::EventKind::Restart,
+                crate::bun::events::EventSeverity::Warning,
+                Some(instance.app_name.clone()),
+                Some(instance.namespace.clone()),
+                format!("restart of {id} failed and awaits cleanup: {reason}"),
+            )
+            .await;
         }
     }
 
@@ -11818,6 +11854,207 @@ interval = 1
     #[tokio::test]
     async fn restart_retains_owner_after_stalled_kill() {
         restart_preserves_uncertain_cleanup(MockGrill::block_kills).await;
+    }
+
+    async fn failed_restart_fixture() -> (
+        BunAgent<MockGrill>,
+        MockGrill,
+        InstanceId,
+        tempfile::TempDir,
+    ) {
+        let (mut agent, _tx, _shutdown, grill) = test_agent_with_grill();
+        let directory = tempfile::tempdir().unwrap();
+        agent.set_volumes_dir(directory.path().join("volumes"));
+        let config = Config::parse("[app.retry]\nimage = \"mock:image\"\nport = 8080\n").unwrap();
+        let (events, _received) = mpsc::channel(256);
+        agent.deploy(config, &events).await;
+        let id = agent.supervisor.list_instances()[0].id.clone();
+        agent.supervisor.get_instance_mut(&id).unwrap().state = ContainerState::Unhealthy;
+        assert!(
+            agent
+                .supervisor
+                .maybe_restart(&id, Instant::now())
+                .await
+                .unwrap()
+        );
+        (agent, grill, id, directory)
+    }
+
+    async fn failed_restart_recovers(inject: fn(&MockGrill)) {
+        let (mut agent, grill, id, _directory) = failed_restart_fixture().await;
+        let port = agent.supervisor.get_instance(&id).unwrap().host_port;
+        inject(&grill);
+        agent.drive_pending_restarts().await;
+        assert_eq!(
+            agent.supervisor.get_instance(&id).unwrap().state,
+            ContainerState::Stopping
+        );
+        assert_eq!(agent.supervisor.get_instance(&id).unwrap().host_port, port);
+        let creates = grill
+            .calls()
+            .iter()
+            .filter(|(op, _)| op == "create")
+            .count();
+        grill.set_fail_kill(true);
+        agent.drive_pending_restarts().await;
+        assert_eq!(
+            agent.supervisor.get_instance(&id).unwrap().state,
+            ContainerState::Stopping
+        );
+        assert_eq!(
+            grill
+                .calls()
+                .iter()
+                .filter(|(op, _)| op == "create")
+                .count(),
+            creates
+        );
+        grill.set_fail_kill(false);
+        agent.drive_pending_restarts().await;
+        assert_eq!(
+            agent.supervisor.get_instance(&id).unwrap().state,
+            ContainerState::Stopped
+        );
+        assert_eq!(agent.supervisor.get_instance(&id).unwrap().restart_count, 1);
+        assert_eq!(
+            grill
+                .calls()
+                .iter()
+                .filter(|(op, _)| op == "create")
+                .count(),
+            creates
+        );
+        grill.set_fail_create(false);
+        grill.set_fail_start(false);
+        agent.supervisor.get_instance_mut(&id).unwrap().last_restart =
+            Some(Instant::now() - std::time::Duration::from_secs(600));
+        agent.drive_pending_restarts().await;
+        assert_eq!(
+            agent.supervisor.get_instance(&id).unwrap().state,
+            ContainerState::Running
+        );
+        assert_eq!(agent.supervisor.get_instance(&id).unwrap().restart_count, 2);
+        agent.stop_app("retry", "default").await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn restart_create_failure_recovers_after_cleanup_and_backoff() {
+        failed_restart_recovers(|grill| grill.set_fail_create(true)).await;
+    }
+
+    #[tokio::test]
+    async fn restart_start_failure_recovers_after_cleanup_and_backoff() {
+        failed_restart_recovers(|grill| grill.set_fail_start(true)).await;
+    }
+
+    #[tokio::test]
+    async fn restart_start_failures_exhaust_job_budget() {
+        let (mut agent, grill, id, _directory) = failed_restart_fixture().await;
+        let instance = agent.supervisor.get_instance_mut(&id).unwrap();
+        instance.is_job = true;
+        instance.restart_policy = crate::bun::restart::RestartPolicy::for_job(2);
+        grill.set_fail_start(true);
+        for _ in 0..4 {
+            agent.supervisor.get_instance_mut(&id).unwrap().last_restart =
+                Some(Instant::now() - std::time::Duration::from_secs(600));
+            agent.drive_pending_restarts().await;
+        }
+        let instance = agent.supervisor.get_instance(&id).unwrap();
+        assert_eq!(instance.state, ContainerState::Failed);
+        assert_eq!(instance.restart_count, 2);
+        assert_eq!(
+            grill.calls().iter().filter(|(op, _)| op == "start").count(),
+            3
+        );
+    }
+
+    #[tokio::test]
+    async fn explicit_stop_cancels_failed_restart_recovery() {
+        let (mut agent, grill, id, _directory) = failed_restart_fixture().await;
+        grill.set_fail_start(true);
+        agent.drive_pending_restarts().await;
+        agent.stop_app("retry", "default").await.unwrap();
+        assert_eq!(
+            agent.supervisor.get_instance(&id).unwrap().state,
+            ContainerState::Stopped
+        );
+        let calls = grill.calls().len();
+        agent.drive_pending_restarts().await;
+        assert_eq!(grill.calls().len(), calls);
+    }
+
+    #[tokio::test]
+    async fn explicit_stop_cancels_pending_restart_before_creation() {
+        let (mut agent, grill, id, _directory) = failed_restart_fixture().await;
+        agent.stop_app("retry", "default").await.unwrap();
+        assert_eq!(
+            agent.supervisor.get_instance(&id).unwrap().state,
+            ContainerState::Stopped
+        );
+        let calls = grill.calls().len();
+        agent.drive_pending_restarts().await;
+        assert_eq!(grill.calls().len(), calls);
+    }
+
+    #[tokio::test]
+    async fn real_process_restart_recovers_when_executable_returns() {
+        use std::os::unix::fs::PermissionsExt;
+        let directory = tempfile::tempdir().unwrap();
+        let program = directory.path().join("worker");
+        let install = || {
+            std::fs::write(&program, "#!/bin/sh\nexec sleep 60\n").unwrap();
+            std::fs::set_permissions(&program, std::fs::Permissions::from_mode(0o700)).unwrap();
+        };
+        install();
+        let (_tx, rx) = mpsc::channel(32);
+        let grill = crate::grill::process::ProcessGrill::new();
+        let mut agent = BunAgent::new(
+            grill.clone(),
+            PortAllocator::new(30000, 31000),
+            rx,
+            CancellationToken::new(),
+        );
+        agent.set_volumes_dir(directory.path().join("volumes"));
+        let config = Config::parse(&format!(
+            "[app.retry]\nimage = 'proc-grill:ignored'\ncommand = [{:?}]\n",
+            program.to_str().unwrap()
+        ))
+        .unwrap();
+        let (events, _received) = mpsc::channel(256);
+        agent.deploy(config, &events).await;
+        let id = agent.supervisor.list_instances()[0].id.clone();
+        grill.kill(&id).await.unwrap();
+        std::fs::remove_file(&program).unwrap();
+        agent.check_apps().await;
+        agent.drive_pending_restarts().await;
+        assert_eq!(
+            agent.supervisor.get_instance(&id).unwrap().state,
+            ContainerState::Stopping
+        );
+        agent.drive_pending_restarts().await;
+        assert_eq!(
+            agent.supervisor.get_instance(&id).unwrap().state,
+            ContainerState::Stopped
+        );
+        install();
+        agent.supervisor.get_instance_mut(&id).unwrap().last_restart =
+            Some(Instant::now() - std::time::Duration::from_secs(600));
+        agent.drive_pending_restarts().await;
+        assert_eq!(grill.state(&id).await.unwrap(), ContainerState::Running);
+        assert_eq!(agent.supervisor.get_instance(&id).unwrap().restart_count, 2);
+        // A second crash during backoff must stay eligible for a later tick.
+        grill.kill(&id).await.unwrap();
+        agent.check_apps().await;
+        assert_eq!(
+            agent.supervisor.get_instance(&id).unwrap().state,
+            ContainerState::Stopped
+        );
+        agent.supervisor.get_instance_mut(&id).unwrap().last_restart =
+            Some(Instant::now() - std::time::Duration::from_secs(600));
+        agent.drive_pending_restarts().await;
+        assert_eq!(grill.state(&id).await.unwrap(), ContainerState::Running);
+        assert_eq!(agent.supervisor.get_instance(&id).unwrap().restart_count, 3);
+        agent.stop_app("retry", "default").await.unwrap();
     }
 
     #[tokio::test]

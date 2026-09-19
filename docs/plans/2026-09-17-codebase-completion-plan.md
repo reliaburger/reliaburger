@@ -754,8 +754,19 @@ keeps the instance Pending with its port, record and in-memory retry count;
 a later tick retries without creating a replacement first. All four regressions
 fail before implementation and pass with subsequent recovery. All 440 Linux
 Bun tests (one explicit gate, 34.83s), 441 native Bun tests (one gate, 20.68s),
-and strict Linux/macOS Clippy pass. Durable retry budgets and recovery from
-later create/start errors remain separate work.
+and strict Linux/macOS Clippy pass.
+
+**Restart startup recovery (19 September):** Create/start failures now retain
+ownership in Stopping until cleanup is observed. Then the shared retry path
+honours backoff and spends the next bounded attempt. Apps crashing during
+backoff retain retry eligibility; explicit stop also cancels Pending attempts.
+Four original startup regressions and the Pending-stop regression fail before
+implementation. All 452 Linux Bun tests (37.77s), 453 native Bun tests (21.15s;
+one explicit gate each), 33 lifecycle transition tests and strict Linux/macOS
+Clippy pass. A real process fixture removes/restores an executable and checks
+recovery plus another crash during backoff. The initial sandboxed native run
+could not bind test listeners; validation passed with loopback access enabled.
+Durable retry budgets across Bun replacement remain separate work.
 
 **Durable cron recovery (19 September):** Registrations, explicit retirement and
 last-fired UTC minutes now use a private, atomically replaced checkpoint. Bun

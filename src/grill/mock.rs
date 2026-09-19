@@ -43,6 +43,8 @@ pub struct MockGrill {
     ignore_stop: Arc<Mutex<bool>>,
     ignore_kill: Arc<AtomicBool>,
     fail_kill: Arc<AtomicBool>,
+    fail_create: Arc<AtomicBool>,
+    fail_start: Arc<AtomicBool>,
     fail_state: Arc<AtomicBool>,
 }
 
@@ -71,6 +73,8 @@ impl Default for MockGrill {
             ignore_stop: Arc::default(),
             ignore_kill: Arc::default(),
             fail_kill: Arc::default(),
+            fail_create: Arc::default(),
+            fail_start: Arc::default(),
             fail_state: Arc::default(),
         }
     }
@@ -90,6 +94,16 @@ impl MockGrill {
     /// Make force-kill requests fail without changing runtime state.
     pub fn set_fail_kill(&self, value: bool) {
         self.fail_kill.store(value, Ordering::SeqCst);
+    }
+
+    /// Fail creation after recording the attempted runtime mutation.
+    pub fn set_fail_create(&self, value: bool) {
+        self.fail_create.store(value, Ordering::SeqCst);
+    }
+
+    /// Fail start after recording the attempted runtime mutation.
+    pub fn set_fail_start(&self, value: bool) {
+        self.fail_start.store(value, Ordering::SeqCst);
     }
 
     /// Make runtime state inspection fail without proving absence.
@@ -263,6 +277,12 @@ impl super::Grill for MockGrill {
                 .expect("create gate closed");
             permit.forget();
         }
+        if self.fail_create.load(Ordering::SeqCst) {
+            return Err(GrillError::StartFailed {
+                instance: instance.clone(),
+                reason: "injected create failure".into(),
+            });
+        }
         Ok(())
     }
 
@@ -271,6 +291,12 @@ impl super::Grill for MockGrill {
             .lock()
             .unwrap()
             .push(("start".to_string(), instance.clone()));
+        if self.fail_start.load(Ordering::SeqCst) {
+            return Err(GrillError::StartFailed {
+                instance: instance.clone(),
+                reason: "injected start failure".into(),
+            });
+        }
         Ok(())
     }
 

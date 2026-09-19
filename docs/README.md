@@ -34,7 +34,10 @@ Cron registrations and their latest claimed UTC minute persist before apply,
 stop or launch is acknowledged. Bun restores them before serving the API.
 Missed minutes are skipped; a crash after recording a firing but before launch
 can skip that occurrence too. There is no catch-up or exactly-once execution
-promise. Job retries are separate. An uncertain checkpoint write fences further
+promise. Job retries are separate. During one Bun lifetime, failed restart preparation
+or launch requires confirmed cleanup, then retries under the existing backoff
+and attempt budget. Explicit stop cancels pending attempts. Durable job retry
+budgets across Bun replacement remain a release blocker. An uncertain checkpoint write fences further
 cron changes and firings until Bun restarts and reloads its durable state.
 
 Startup refuses unreadable or malformed workload ownership records and runtime
