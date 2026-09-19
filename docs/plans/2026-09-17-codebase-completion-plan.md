@@ -37,7 +37,7 @@ F items are missing capabilities, not evidence of failures in supported behaviou
 [Audit evidence and reproducible probes](../qualification/2026-09-17-code-audit.md)
 record those distinctions and the hosted checks inspected.
 
-There are **85 tracked work packages**: 56 correctness/contract items, 12
+There are **86 tracked work packages**: 57 correctness/contract items, 12
 engineering follow-ups, 12 capability families and five acceptance/release gates.
 The correctness items include 28 P1 priorities; these are engineering priorities, not
 security severity ratings. A capability family can require several commits.
@@ -1402,6 +1402,30 @@ The actual cold Docker Hub pull through rootless runc and published-port adoptio
 passes in 3.51s. Tests cover forged digest headers, changed valid root/index/child
 JSON, incorrect configuration bytes and descriptor sizes, intact index resolution,
 and complete corrupt configuration responses without retries.
+
+### C57 — Validate upstream layer lengths and allocation metadata
+
+**Priority:** P1. **Wave:** 4. **Book chapter:** 05.
+
+A digest-correct manifest can contain negative layer sizes or a total that
+exceeds cache accounting's `u64`. The upstream adapter casts signed sizes to
+unsigned descriptors and uses an untrusted descriptor for `Vec::with_capacity`.
+Four HTTP-fixture regressions fail: invalid size totals are accepted, direct and
+pull-through downloads ignore declared lengths, and the public blob-fetch path
+panics with capacity overflow on `u64::MAX`.
+
+**Completion test:** Refuse negative and overflowing totals before publication,
+check conversion before fetching a blob, allocate from actual response bytes,
+and validate both downloads and cached layer lengths. Keep digest checks intact.
+Run all image/Pickle tests, strict Clippy on Linux/macOS and an actual cold pull.
+
+**Completed:** The shared verified manifest path rejects negative and overflowing
+layer totals. Blob fetch validates signed/unsigned conversion, grows buffers from
+actual received bytes and checks their declared length. Direct pulls also check
+cached lengths. All 42 image tests pass on macOS/Linux (7.63s/7.76s), all 232
+Pickle tests pass (9.54s/2.24s), strict all-target/all-feature Clippy passes on both,
+and a real cold rootless runc pull with port adoption passes in 3.39s. The four
+failing-first regressions include the observed capacity-overflow panic.
 
 ## Engineering follow-ups
 

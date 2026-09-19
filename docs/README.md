@@ -77,7 +77,9 @@ External image reads retry interrupted connections and response streams within
 the same four-attempt and overall time limits as temporary registry errors.
 Both direct pulls and Pickle verify raw pinned manifests, platform-index links
 and configuration descriptors before cache publication. Digest headers alone
-are not trusted; integrity failures stop the pull without retries.
+are not trusted; integrity failures stop the pull without retries. Upstream layer
+sizes must be non-negative, fit accounting bounds and match the downloaded or
+cached bytes. Descriptor values are never used as an up-front allocation budget.
 
 Registry startup claims exclusive ownership of the configured image store's
 upload directory. Run only one Bun with that writable image store. A restart

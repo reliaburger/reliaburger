@@ -766,3 +766,31 @@ unpacked file and Pickle's exact manifest/configuration hashes. Complete corrupt
 configuration responses now join malformed manifests and corrupt layers in the
 no-retry regression. Actual upstream runtime tests remain a separate check of
 registry interoperability.
+
+
+### Valid bytes can still describe an invalid size
+
+A manifest can have the correct digest and still declare a layer size of `-1`.
+Our upstream adapter cast that signed number to `u64`, making it enormous, then
+passed the value to `Vec::with_capacity`. The regression reaches a capacity
+overflow panic before fetching the blob. Another manifest uses three large
+positive sizes whose sum cannot fit the cache's accounting field.
+
+We now validate every layer size and their sum before publishing upstream
+metadata. `u64::try_from` returns an error for a negative value; the old `as`
+cast silently changed its meaning. `checked_add` returns `None` if the sum would
+overflow, which becomes an ordinary pull error. The public blob-fetch method
+also checks that its unsigned descriptor fits OCI's signed size field.
+
+The receive buffer starts with `Vec::new()`, so a descriptor cannot demand an
+up-front allocation. It grows as bytes arrive; this change does not introduce a
+new maximum image size or convert the download path into a streaming disk writer.
+After transfer, the byte length must match the descriptor. Direct pulls make the
+same check for an existing cached blob before reusing it. SHA-256 verification
+remains a separate requirement.
+
+The fixtures sign no content and trust no digest header. They compute valid
+manifest digests over deliberately invalid size metadata, so identity checks
+cannot hide the size defect. Cold and warm cache cases verify the actual layer
+request count, and both direct and pull-through consumers refuse a length
+mismatch.

@@ -107,6 +107,15 @@ pub(crate) async fn pull_verified_manifest(
             }
         }
     };
+    // Cache accounting sums layer lengths as u64. Validate before any cast,
+    // allocation or publication, even when the raw manifest digest is valid.
+    manifest.layers.iter().try_fold(0_u64, |total, layer| {
+        let size = u64::try_from(layer.size)
+            .map_err(|_| invalid(format!("negative upstream layer size for {}", layer.digest)))?;
+        total
+            .checked_add(size)
+            .ok_or_else(|| invalid("upstream layer sizes overflow cache accounting"))
+    })?;
     let mut config_bytes = Vec::new();
     client
         .pull_blob(reference, &manifest.config, &mut config_bytes)

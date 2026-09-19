@@ -284,13 +284,20 @@ impl UpstreamRegistry for OciUpstream {
     ) -> UpstreamFuture<'a, Vec<u8>> {
         Box::pin(async move {
             let reference = Self::oci_reference(image)?;
+            let size = i64::try_from(layer.size).map_err(|_| {
+                PickleError::ReplicationFailed(format!(
+                    "upstream layer size is out of range for {}",
+                    layer.digest
+                ))
+            })?;
             let descriptor = oci_distribution::manifest::OciDescriptor {
                 digest: layer.digest.as_str().to_string(),
                 media_type: layer.media_type.clone(),
-                size: layer.size as i64,
+                size,
                 ..Default::default()
             };
-            let mut bytes = Vec::with_capacity(layer.size as usize);
+            // A descriptor is untrusted metadata, not an allocation budget.
+            let mut bytes = Vec::new();
             self.client
                 .pull_blob(&reference, &descriptor, &mut bytes)
                 .await
@@ -300,6 +307,14 @@ impl UpstreamRegistry for OciUpstream {
                         layer.digest
                     ))
                 })?;
+            if bytes.len() as u64 != layer.size {
+                return Err(PickleError::ReplicationFailed(format!(
+                    "upstream layer size mismatch for {}: expected {}, received {}",
+                    layer.digest,
+                    layer.size,
+                    bytes.len(),
+                )));
+            }
             Ok(bytes)
         })
     }

@@ -161,6 +161,8 @@ Buildah-absence cases execute in isolated child environments on the equipped VM.
 
 - [x] **C56** Verify upstream raw manifests, requested index digests, selected platform descriptors and configuration bytes before cache publication. Direct/pull-through regressions fail first; forged headers, changed valid JSON, wrong configuration content and descriptor sizes are refused. Both consumers share the verified fetch path, and Pickle preserves the exact verified bytes without a second fetch. All 38 image and 232 Pickle tests pass on macOS/Linux, alongside strict Clippy. The real cold rootless port-adoption gate passes (3.51s).
 
+- [x] **C57** Validate upstream layer sizes before cache accounting or allocation, and require downloaded/cached bytes to match their descriptor length. Four regressions fail first, including a capacity-overflow panic when an untrusted size reaches `Vec::with_capacity`. All 42 image and 232 Pickle tests pass on macOS/Linux with strict Clippy; the real cold rootless pull and port-adoption gate passes (3.39s).
+
 Hosted minimum-Rust CI at `9747fba` passed 3,658 tests but failed the cross-node
 log partial-result fixture (zero healthy rows). Its transport-only case now
 serves fixed entries without cold SQL planning under the two-second deadline;

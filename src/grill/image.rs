@@ -474,8 +474,23 @@ impl ImageStore {
         for layer in &manifest.layers {
             let digest = &layer.digest;
             let blob_path = self.blob_path(digest);
-
+            let expected_size = u64::try_from(layer.size).map_err(|_| ImageError::LayerPull {
+                digest: digest.clone(),
+                reason: "negative layer size".into(),
+            })?;
+            let verify_size = |actual: u64| -> Result<(), ImageError> {
+                if actual != expected_size {
+                    return Err(ImageError::LayerPull {
+                        digest: digest.clone(),
+                        reason: format!(
+                            "layer size mismatch: expected {expected_size}, received {actual}"
+                        ),
+                    });
+                }
+                Ok(())
+            };
             if blob_path.exists() {
+                verify_size(tokio::fs::metadata(&blob_path).await?.len())?;
                 continue;
             }
 
@@ -505,6 +520,8 @@ impl ImageStore {
                     actual: computed,
                 });
             }
+
+            verify_size(blob_data.len() as u64)?;
 
             // Write atomically (temp + rename) so a crash mid-write can't leave
             // a truncated blob at the final path that a later pull treats as a
@@ -1245,6 +1262,9 @@ mod tests {
         ValidIndex,
         WrongConfigurationSize,
         WrongChildSize,
+        NegativeLayerSize,
+        OverflowingLayerSizes,
+        WrongLayerSize,
     }
 
     #[derive(Clone)]
@@ -1428,6 +1448,30 @@ mod tests {
             value["config"]["size"] = serde_json::json!(config.len() + 1);
             manifest = serde_json::to_vec(&value).unwrap();
         }
+        if matches!(
+            integrity,
+            Some(
+                RegistryIntegrityCase::NegativeLayerSize
+                    | RegistryIntegrityCase::OverflowingLayerSizes
+                    | RegistryIntegrityCase::WrongLayerSize
+            )
+        ) {
+            let mut value: serde_json::Value = serde_json::from_slice(&manifest).unwrap();
+            match integrity.unwrap() {
+                RegistryIntegrityCase::NegativeLayerSize => {
+                    value["layers"][0]["size"] = serde_json::json!(-1)
+                }
+                RegistryIntegrityCase::WrongLayerSize => {
+                    value["layers"][0]["size"] = serde_json::json!(layer.len() + 1)
+                }
+                _ => {
+                    value["layers"][0]["size"] = serde_json::json!(i64::MAX);
+                    let layer = value["layers"][0].clone();
+                    value["layers"] = serde_json::json!([layer, layer, layer]);
+                }
+            }
+            manifest = serde_json::to_vec(&value).unwrap();
+        }
         let manifest_digest = format!("sha256:{}", sha256_hex(&manifest));
 
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -1511,6 +1555,85 @@ mod tests {
             shutdown,
             task,
         }
+    }
+
+    #[tokio::test]
+    async fn upstream_layer_sizes_refuse_negative_and_overflowing_totals() {
+        use crate::pickle::upstream::UpstreamRegistry;
+        for case in [
+            RegistryIntegrityCase::NegativeLayerSize,
+            RegistryIntegrityCase::OverflowingLayerSizes,
+        ] {
+            let fixture = start_registry_fixture_with_options(None, Some(case)).await;
+            let upstream = crate::pickle::upstream::OciUpstream::insecure_http(Default::default());
+            let reference = ImageReference::parse(&fixture.reference).unwrap();
+            assert!(
+                upstream.fetch_manifest(&reference).await.is_err(),
+                "accepted {case:?}"
+            );
+            let directory = tempfile::tempdir().unwrap();
+            let store = ImageStore::new(directory.path().to_path_buf());
+            assert!(store.pull_and_unpack(&fixture.reference).await.is_err());
+            assert_eq!(fixture.layer_requests.load(Ordering::SeqCst), 0);
+            assert!(!store.manifest_path(&reference).exists());
+        }
+    }
+
+    #[tokio::test]
+    async fn upstream_layer_sizes_do_not_allocate_from_untrusted_descriptors() {
+        use crate::pickle::upstream::UpstreamRegistry;
+        let fixture = start_registry_fixture().await;
+        let upstream = crate::pickle::upstream::OciUpstream::insecure_http(Default::default());
+        let reference = ImageReference::parse(&fixture.reference).unwrap();
+        let manifest = upstream.fetch_manifest(&reference).await.unwrap();
+        let mut layer = manifest.layers[0].clone();
+        layer.size = u64::MAX;
+        assert!(upstream.fetch_blob(&reference, &layer).await.is_err());
+        assert_eq!(fixture.layer_requests.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn upstream_layer_sizes_match_direct_downloads_and_cached_blobs() {
+        for warm_cache in [false, true] {
+            let directory = tempfile::tempdir().unwrap();
+            let store = ImageStore::new(directory.path().to_path_buf());
+            if warm_cache {
+                let valid = start_registry_fixture().await;
+                store.pull_and_unpack(&valid.reference).await.unwrap();
+            }
+            let fixture = start_registry_fixture_with_options(
+                None,
+                Some(RegistryIntegrityCase::WrongLayerSize),
+            )
+            .await;
+            assert!(
+                store.pull_and_unpack(&fixture.reference).await.is_err(),
+                "accepted wrong layer size with warm_cache={warm_cache}"
+            );
+            let reference = ImageReference::parse(&fixture.reference).unwrap();
+            assert!(!store.rootfs_path(&reference).exists());
+            assert_eq!(
+                fixture.layer_requests.load(Ordering::SeqCst),
+                usize::from(!warm_cache)
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn upstream_layer_sizes_match_pull_through_downloads() {
+        use crate::pickle::upstream::UpstreamRegistry;
+        let fixture =
+            start_registry_fixture_with_options(None, Some(RegistryIntegrityCase::WrongLayerSize))
+                .await;
+        let upstream = crate::pickle::upstream::OciUpstream::insecure_http(Default::default());
+        let reference = ImageReference::parse(&fixture.reference).unwrap();
+        let manifest = upstream.fetch_manifest(&reference).await.unwrap();
+        assert!(
+            upstream
+                .fetch_blob(&reference, &manifest.layers[0])
+                .await
+                .is_err()
+        );
     }
 
     #[tokio::test]
