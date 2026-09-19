@@ -35,6 +35,7 @@ struct Node {
     client: BunClient,
     handle: ClusterHandle,
     thinks_leader: watch::Receiver<bool>,
+    membership_table: Arc<RwLock<Vec<NodeMembershipInfo>>>,
     token_store: Option<reliaburger::sesame::auth::TokenStore>,
     rollup_store: Arc<RwLock<reliaburger::mayo::rollup_store::RollupStore>>,
     _runtime: runtime::ClusterRuntime,
@@ -351,6 +352,7 @@ async fn start_node_with_auth(
             crl_handle: Default::default(),
         },
         thinks_leader: leader_rx,
+        membership_table,
         token_store,
         rollup_store,
         _runtime: cluster_runtime,
@@ -1225,6 +1227,68 @@ async fn ingress_reaches_nodes_without_local_replicas() {
     );
 }
 
+/// Wait for the same live evidence that the fault API actually reads. The
+/// membership-table task can lag the underlying gossip watch after reversal.
+async fn wait_for_fault_admission_views(nodes: &[&Node]) -> usize {
+    tokio::time::timeout(Duration::from_secs(60), async {
+        loop {
+            let leader_id = nodes[0]
+                .handle
+                .council
+                .as_ref()
+                .unwrap()
+                .metrics()
+                .borrow()
+                .current_leader;
+            let mut ready = leader_id.is_some();
+            for node in nodes {
+                let council = node.handle.council.as_ref().unwrap();
+                let metrics = council.metrics().borrow().clone();
+                let membership = metrics.membership_config.membership();
+                let table = node.membership_table.read().await;
+                ready &= metrics.current_leader == leader_id
+                    && membership.voter_ids().count() == nodes.len()
+                    && membership.get_joint_config().len() == 1
+                    && nodes.iter().all(|peer| {
+                        peer_state(node, &peer.name)
+                            == Some(reliaburger::mustard::state::NodeState::Alive)
+                            && table.iter().any(|member| member.node_id.0 == peer.name)
+                    });
+                drop(table);
+                ready &= council
+                    .desired_state()
+                    .await
+                    .node_fault_reservations
+                    .active
+                    .is_none();
+            }
+            if ready {
+                let index = nodes
+                    .iter()
+                    .position(|node| {
+                        Some(reliaburger::cluster::identity::raft_id_from_name(
+                            &node.name,
+                        )) == leader_id
+                    })
+                    .unwrap();
+                if nodes[index]
+                    .handle
+                    .council
+                    .as_ref()
+                    .unwrap()
+                    .is_leader()
+                    .await
+                {
+                    return index;
+                }
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    })
+    .await
+    .expect("all fault-admission views must converge with no active reservation")
+}
+
 /// C06: requests sent through different APIs share one committed reservation.
 /// A leader failure retains that ownership until target-side reversal is proven.
 #[tokio::test(flavor = "multi_thread", worker_threads = 6)]
@@ -1264,31 +1328,7 @@ async fn concurrent_node_kills_and_leader_change_preserve_reserved_capacity() {
     )
     .await;
     let nodes = [&n1, &n2, &n3];
-    assert!(
-        wait_until(Duration::from_secs(60), || nodes.iter().all(|node| {
-            nodes
-                .iter()
-                .all(|peer| peer_state(node, &peer.name) == Some(NodeState::Alive))
-                && node.handle.council.as_ref().is_some_and(|council| {
-                    let metrics = council.metrics().borrow().clone();
-                    metrics.current_leader.is_some()
-                        && metrics.membership_config.membership().voter_ids().count() == 3
-                        && metrics
-                            .membership_config
-                            .membership()
-                            .get_joint_config()
-                            .len()
-                            == 1
-                })
-        }))
-        .await,
-        "three voters must converge before fault admission"
-    );
-    let leader = nodes
-        .iter()
-        .find(|node| *node.thinks_leader.borrow())
-        .copied()
-        .unwrap();
+    let leader = nodes[wait_for_fault_admission_views(&nodes).await];
     let followers: Vec<_> = nodes
         .iter()
         .filter(|node| node.name != leader.name)
@@ -1349,34 +1389,7 @@ async fn concurrent_node_kills_and_leader_change_preserve_reserved_capacity() {
         .clear_fault(summary.id, Some(&target.name), true)
         .await
         .unwrap();
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
-    loop {
-        if council
-            .desired_state()
-            .await
-            .node_fault_reservations
-            .active
-            .is_none()
-            && nodes.iter().all(|observer| {
-                nodes
-                    .iter()
-                    .all(|peer| peer_state(observer, &peer.name) == Some(NodeState::Alive))
-            })
-        {
-            break;
-        }
-        assert!(
-            tokio::time::Instant::now() < deadline,
-            "manual reversal must release the fenced reservation"
-        );
-        tokio::time::sleep(Duration::from_millis(100)).await;
-    }
-
-    let old_leader = nodes
-        .iter()
-        .find(|node| *node.thinks_leader.borrow())
-        .copied()
-        .unwrap();
+    let old_leader = nodes[wait_for_fault_admission_views(&nodes).await];
     let sender = nodes
         .iter()
         .find(|node| node.name != old_leader.name)

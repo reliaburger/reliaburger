@@ -1100,6 +1100,16 @@ Bun. All ten Linux placement cases pass (42.69s). The macOS run passes nine,
 including the regression; a separate fault-admission convergence race remains
 under investigation and is not hidden by retries or a larger cleanup timeout.
 
+
+**Fault fixture convergence (19 September):** The expanded macOS placement run
+caught a second race: raw gossip had recovered after fault reversal, but the
+API membership cache had not. The next destructive request correctly failed
+its safety check because it could not map the current leader to a live member.
+Before either admission, the fixture now waits for all API caches, stable voter
+sets, a shared leader, cleared reservations and that leader's quorum check.
+It does not retry fault injections or relax the API's safety refusal. All ten
+placement cases pass on macOS/Linux (28.48s/42.44s), with strict Clippy on both.
+
 ### C35 — Gate chaos capabilities per selected scenario
 
 **Priority:** P2. **Wave:** 4. **Book chapters:** 08, 15.

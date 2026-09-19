@@ -3281,3 +3281,11 @@ shutdown guard. This matters for asynchronous acceptance tests: reproducing the
 request handler alone does not reproduce the full lifecycle. The regression
 keeps its bounded wait for durable lease absence; increasing that timeout would
 never create the missing owner.
+
+The broader run caught another asynchronous boundary. Gossip reported all nodes
+alive after reversing a fault, but the API’s separate membership table had not
+caught up. A second injection therefore met a valid safety refusal. The fixture
+now waits for the views the API actually consumes, matching voter membership
+and leader identity across peers and confirming quorum before submitting a new
+fault. Waiting for raw gossip alone was not enough. We keep the refusal intact
+and never retry an uncertain destructive request just to make a test pass.
