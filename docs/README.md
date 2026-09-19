@@ -108,7 +108,7 @@ development configurations. Ingress currently uses unweighted round-robin on
 Bun's shared runtime, with no separate strategy or worker-thread setting.
 
 0.1.0 requires a fresh cluster; development state is refused. Rolling upgrades
-require matching explicit formats (currently protocol 6 and state 7). See the
+require matching explicit formats (currently protocol 8 and state 9). See the
 [compatibility policy](releasing.md#cluster-compatibility).
 
 Reporting refuses messages over 1 MiB or containing more than 100 events;
