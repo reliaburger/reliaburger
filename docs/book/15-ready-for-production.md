@@ -3135,3 +3135,17 @@ and validate the target list before uploading the binary. Unit HTTP fixtures
 cover different ports, IPv6, absent addresses, invalid addresses and unresolved
 members. The authenticated three-node placement fixture checks the actual
 advertised ports and contacts each endpoint with the original credentials.
+
+### Accepted cleanup still needs evidence
+
+A DELETE can return HTTP 202 while a worker is unavailable. That's a promise to
+keep trying. It isn't evidence that the worker has stopped. Relish now polls the
+lease endpoint until the ownership record disappears, with a single 30-second
+limit covering the request and every poll. The test runner's shorter remaining
+teardown deadline can cancel that wait. Either timeout reports unknown cleanup.
+It still checks runtime absence independently after the server confirms release.
+
+The regression serves 202 and an empty runtime inventory while keeping the lease
+present. Previously that passed. Now it stays unknown; a second case removes the
+lease after two polls and confirms cleanup. This distinguishes accepting work
+from finishing it without making an unavailable worker block the CLI forever.

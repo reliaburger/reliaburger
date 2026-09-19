@@ -1012,20 +1012,49 @@ impl BunClient {
         parse_typed_response(response).await
     }
 
-    /// Release a lease and wait for server-confirmed cleanup.
+    /// Release a lease and wait up to 30 seconds for server-confirmed cleanup.
+    /// An accepted request keeps polling durable ownership until it disappears.
     pub async fn release_test_lease(&self, lease_id: &str) -> Result<(), RelishError> {
-        let response = self
-            .http()?
-            .delete(format!("{}/v1/test/leases/{lease_id}", self.base_url))
-            .send()
-            .await
-            .map_err(classify_error)?;
-        let status = response.status().as_u16();
-        if !response.status().is_success() {
-            let body = response.text().await.unwrap_or_default();
-            return Err(RelishError::ApiError { status, body });
-        }
-        Ok(())
+        tokio::time::timeout(std::time::Duration::from_secs(30), async {
+            let url = format!("{}/v1/test/leases/{lease_id}", self.base_url);
+            let response = self
+                .http()?
+                .delete(&url)
+                .send()
+                .await
+                .map_err(classify_error)?;
+            match response.status() {
+                reqwest::StatusCode::NO_CONTENT => return Ok(()),
+                reqwest::StatusCode::ACCEPTED => {}
+                status => {
+                    return Err(RelishError::ApiError {
+                        status: status.as_u16(),
+                        body: response.text().await.unwrap_or_default(),
+                    });
+                }
+            }
+            loop {
+                let response = self
+                    .http()?
+                    .get(&url)
+                    .send()
+                    .await
+                    .map_err(classify_error)?;
+                match response.status() {
+                    reqwest::StatusCode::NOT_FOUND => return Ok(()),
+                    reqwest::StatusCode::OK => {}
+                    status => {
+                        return Err(RelishError::ApiError {
+                            status: status.as_u16(),
+                            body: response.text().await.unwrap_or_default(),
+                        });
+                    }
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+            }
+        })
+        .await
+        .map_err(|_| RelishError::RequestTimeout)?
     }
 
     /// Fetch metrics recorded for one app.

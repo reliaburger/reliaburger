@@ -813,6 +813,65 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn accepted_lease_cleanup_waits_for_durable_absence() {
+        use axum::{
+            http::StatusCode,
+            routing::{delete, get},
+        };
+        use std::sync::{
+            Arc,
+            atomic::{AtomicUsize, Ordering},
+        };
+        for disappears in [false, true] {
+            let polls = Arc::new(AtomicUsize::new(0));
+            let observed = polls.clone();
+            let router = axum::Router::new()
+                .route(
+                    "/v1/test/leases/owned",
+                    delete(|| async { StatusCode::ACCEPTED }).get(move || {
+                        let count = observed.fetch_add(1, Ordering::SeqCst);
+                        async move {
+                            if disappears && count > 0 {
+                                StatusCode::NOT_FOUND
+                            } else {
+                                StatusCode::OK
+                            }
+                        }
+                    }),
+                )
+                .route(
+                    "/v1/cluster/nodes",
+                    get(|| async { axum::Json(Vec::<crate::bun::agent::NodeStatus>::new()) }),
+                )
+                .route(
+                    "/v1/status",
+                    get(|| async { axum::Json(Vec::<crate::bun::agent::InstanceStatus>::new()) }),
+                );
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let mut ctx = context("rbtest-cleanup");
+            ctx.client = BunClient::new_with_token(
+                &format!("http://{}", listener.local_addr().unwrap()),
+                None,
+            );
+            ctx.lease_id = Some("owned".into());
+            let server = tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
+            let outcome = ctx
+                .teardown(Deadline::after(Duration::from_millis(450)).unwrap())
+                .await;
+            server.abort();
+            if disappears {
+                assert_eq!(outcome, CleanupOutcome::Confirmed);
+                assert!(polls.load(Ordering::SeqCst) >= 2);
+            } else {
+                assert!(
+                    matches!(outcome, CleanupOutcome::Unknown { .. }),
+                    "{outcome:?}"
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
     async fn lease_cleanup_keeps_unreachable_runtime_evidence_unknown_at_the_deadline() {
         let (client, server) = status_server(false).await;
         let mut ctx = context("rbtest-unreachable");

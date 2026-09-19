@@ -905,6 +905,14 @@ upgrade, rollback and pause/recovery cases pass with the new owner (191.46s),
 proving replacement can reacquire the directory. Lease-owned repositories and
 explicit cleanup of managed volumes still remain.
 
+**Lease release confirmation (19 September):** Relish distinguishes HTTP 202
+from completed cleanup. It polls durable lease ownership until 404, within one
+30-second deadline (or the runner's shorter deadline). Empty runtime inventory
+cannot override a still-present lease. The actual HTTP regression fails before
+the fix and covers both unavailable-owner and later-completion outcomes. All
+127 testkit tests pass on macOS/Linux (2.15s/2.47s), with strict Clippy on both. Durable
+cluster placement-owner history and retirement acknowledgement remain open.
+
 ### C35 — Gate chaos capabilities per selected scenario
 
 **Priority:** P2. **Wave:** 4. **Book chapters:** 08, 15.
