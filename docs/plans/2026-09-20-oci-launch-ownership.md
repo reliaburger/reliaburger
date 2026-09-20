@@ -171,3 +171,50 @@ still awaits discovery/Apple recovery and full qualification. Complete these rem
 6. Switch production selection and complete agent launch-inventory recovery only
    after these paths pass actual Bun-death, missing-adoption-record, short-job,
    rootful/rootless and rolling-upgrade qualification.
+
+## Keep kernel policy across Bun death
+
+The real loader-death regression now demonstrates a release blocker. A probe in
+an isolated cgroup receives `PermissionDenied` while the loader is alive, then
+connects to the same local listener after SIGKILL. Bun owns the same loader path.
+The current objects are unpinned and their cgroup links close with Bun's file
+descriptors. Surviving containers can therefore outlive enforcement.
+
+Complete this before production OCI selection:
+
+- [x] Retain all four cgroup links and their maps in a private, versioned bpffs
+  directory. Publish original cgroup identity and ownership metadata first; hold
+  an exclusive node-level claim throughout loading and mutation. Unknown or
+  conflicting pinned state must refuse recovery.
+- [x] Reopen the same maps and replace attached programs without a detach gap.
+  Validate link type, target cgroup and program/map ownership before updating.
+  Observe actual kernel link state when reporting enforcement capability.
+- [x] Keep ordinary ephemeral loaders available for isolated tests. Build an
+  explicitly persistent object for the owned loader; avoid changing the default
+  loader into a source of global pins.
+- [ ] Reconcile retained egress, namespace and service maps against original
+  runtime intent and adoption records before serving recovered workloads. Do not
+  erase policy merely because the new Bun has not rebuilt its in-memory bindings.
+  The current adoption path restores supervisor records without egress bindings;
+  its later live check would stop these workloads and its sweep can scrub their
+  retained policy. Persist policy ownership before programming and restore it
+  before adoption, including launches with no adoption record.
+- [x] Qualify actual loader SIGKILL and retained-map recovery. The previously
+  failing isolated-cgroup probe now remains denied during absence and after
+  recovery, then connects only after explicit policy removal. All 32 physical
+  kernel cases pass (6.85s), including conflicting owners, cgroup mismatch,
+  partial preparation, missing active pins, interrupted retirement, wrong map
+  layout and same-layout foreign map identity. Strict Linux/macOS Clippy passes.
+  Format 1 pins are opt-in; production loading is unchanged.
+- [ ] Qualify actual Bun SIGKILL, blocked traffic during absence,
+  restoration with the same maps, partial startup, conflicting identities,
+  repeated restart and upgrade, plus positive per-workload cleanup. Wire production
+  selection only after that evidence passes and advance the state format.
+- [ ] Distinguish host reboot from loader death. bpffs objects disappear at boot,
+  while normal-storage ownership survives. Use positive boot identity and runtime
+  absence evidence before reinitialising; missing pins during the same boot must
+  continue to refuse recovery.
+
+The frozen-map repair is complete and remains separate: it proves live cleanup
+propagates kernel failures and retains its owner. It does not prove kernel policy
+survives process death. Apple daemon-command recovery also remains open.

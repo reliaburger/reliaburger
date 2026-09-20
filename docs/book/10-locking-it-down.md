@@ -1084,3 +1084,54 @@ allowed, so merely logging the failure would not preserve the requested policy.
 The stopped workloads retain their cleanup obligations if the kernel still
 refuses removal. This repair concerns live cleanup; proving policy lifetime and
 restoration across actual Bun death remains a separate release gate.
+
+### Let the policy outlive the agent
+
+Kill Bun while a container keeps running. Does its allowlist still apply? Our
+first isolated-cgroup test answered that with an unwanted successful connection.
+The loader's file descriptors owned the kernel attachments. SIGKILL closed them,
+so the kernel detached the programs even though the container remained alive.
+
+A pinned BPF object has another reference in bpffs, the kernel's BPF filesystem.
+Closing the process's descriptor no longer removes that object. We need to pin
+both the maps (the policy data) and the links (the attachments that enforce it).
+Pinning just one half doesn't solve the problem.
+
+The explicit owned loader uses a private bpffs directory and a separate private
+ownership directory on normal storage. It records the original cgroup identity,
+paths and format version before creating kernel resources. A file lock prevents
+two processes from recovering the same owner at once. The ordinary loader stays
+ephemeral for tests that expect dropping it to destroy their private resources.
+Bun integration also needs workload reconciliation; adding pins alone is not a
+complete restart protocol.
+
+Recovery opens the existing maps and checks their layout, capacity and flags.
+Each retained link must target the original cgroup and hook, and its program must
+refer to the same map IDs as the replacement. `BPF_LINK_UPDATE` replaces the
+program on that link while retaining the attachment. Its compare-and-replace
+flag names the previous program, so an unexpected concurrent replacement fails
+instead of overwriting somebody else's change. There is no deliberate detach
+window and we don't rebuild the policy from an empty map.
+
+Rust's `OwnedFd` owns a file descriptor and closes it on drop. `AsRawFd` borrows
+its integer value for a syscall; it doesn't transfer ownership. The small kernel
+adapter uses `#[repr(C)]` structures, explicit padding and documented `unsafe`
+blocks because the kernel expects a particular byte layout. A successful syscall
+that creates a descriptor is the only place we construct a new `OwnedFd` from a
+raw integer. Constructing two owners for one descriptor would let one close the
+other's resource.
+
+The ownership journal distinguishes `Preparing`, `Active`, `Retiring` and
+`Retired`. Missing attachments during preparation can be completed before any
+workload is admitted. Missing attachments from an active owner are an error.
+Explicit retirement records its intent before unlinking resources, removes links
+before maps and supports resuming an interrupted removal. A retired owner cannot
+be activated again. Ordinary handle destruction preserves the pins.
+
+The physical tests use a private cgroup and a local listener outside it. They
+probe before loader death, while it is absent and after recovery, then explicitly
+remove policy and check that connectivity returns. Separate cases exercise
+conflicting owners, changed cgroup identity, partial startup, missing active pins
+and interrupted retirement. These tests establish the loader contract. Actual
+Bun restart and upgrade must also prove that the new agent doesn't erase retained
+policy before it has accounted for every original workload.

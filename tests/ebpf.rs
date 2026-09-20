@@ -106,7 +106,7 @@ async fn ebpf_load_and_attach() {
     assert!(ebpf.connect6_attached());
     assert!(ebpf.sendmsg4_attached());
     assert!(ebpf.sendmsg6_attached());
-    ebpf.detach();
+    ebpf.detach().unwrap();
 }
 
 #[tokio::test]
@@ -160,7 +160,7 @@ async fn ebpf_backend_map_write_and_read() {
     );
     assert_eq!(value.backends[0].host_port, 30891u16.to_be());
 
-    ebpf.detach();
+    ebpf.detach().unwrap();
 }
 
 #[tokio::test]
@@ -205,7 +205,7 @@ async fn ebpf_backend_map_remove() {
             .is_none()
     );
 
-    ebpf.detach();
+    ebpf.detach().unwrap();
 }
 
 #[tokio::test]
@@ -265,7 +265,7 @@ async fn ebpf_service_map_sync_multiple() {
             .is_some()
     );
 
-    ebpf.detach();
+    ebpf.detach().unwrap();
 }
 
 // ---------------------------------------------------------------------------
@@ -332,7 +332,7 @@ async fn ebpf_connect_to_vip_rewrites_destination() {
         }
     }
 
-    ebpf.detach();
+    ebpf.detach().unwrap();
 }
 
 #[tokio::test]
@@ -376,7 +376,7 @@ async fn ebpf_connect_to_vip_no_backends_refused() {
         "expected EPERM from BPF deny, got: {err}"
     );
 
-    ebpf.detach();
+    ebpf.detach().unwrap();
 }
 
 #[tokio::test]
@@ -404,7 +404,7 @@ async fn ebpf_connect_non_vip_passes_through() {
         result.err()
     );
 
-    ebpf.detach();
+    ebpf.detach().unwrap();
 }
 
 // ---------------------------------------------------------------------------
@@ -736,7 +736,7 @@ async fn partition_fault_blocks_its_source_cgroup_and_clears() {
         Some(ErrorKind::PermissionDenied),
         "source remained partitioned after deleting the owned key"
     );
-    ebpf.detach();
+    ebpf.detach().unwrap();
 }
 
 // ---------------------------------------------------------------------------
@@ -848,7 +848,7 @@ async fn egress_denied_by_default_allowed_when_listed() {
 
     // Lift enforcement so the harness's own connections are unaffected.
     egress::clear_egress_enforced(&mut ebpf.bpf, cgroup_id).expect("clear enforcement");
-    ebpf.detach();
+    ebpf.detach().unwrap();
 }
 
 /// NET6: clearing a cgroup's egress must delete its allow entries, not just
@@ -926,7 +926,7 @@ async fn egress_cleanup_deletes_destinations_not_just_the_flag() {
         );
     }
 
-    ebpf.detach();
+    ebpf.detach().unwrap();
 }
 
 // ---------------------------------------------------------------------------
@@ -1022,7 +1022,7 @@ async fn namespace_isolation_denies_cross_namespace_by_default() {
     // Forget the namespace mapping so the harness's own connections aren't
     // caught by a lingering isolation identity on a reused cgroup.
     firewall::delete_cgroup_namespace_entry(&mut ebpf.bpf, src_cgroup).ok();
-    ebpf.detach();
+    ebpf.detach().unwrap();
 }
 
 // ---------------------------------------------------------------------------
@@ -1220,7 +1220,7 @@ async fn connect6_denies_unlisted_and_allows_listed_ipv6() {
     // Lift enforcement before asserting, so a failure never leaves the
     // harness cgroup restricted.
     egress::delete_cgroup_egress_state(&mut ebpf.bpf, cgroup_id).expect("scrub");
-    ebpf.detach();
+    ebpf.detach().unwrap();
 
     assert!(ok.is_ok(), "listed IPv6 destination should connect: {ok:?}");
     assert_eq!(
@@ -1306,7 +1306,7 @@ async fn v4_only_allowlist_no_longer_bypassed_over_ipv6() {
     );
 
     egress::delete_cgroup_egress_state(&mut ebpf.bpf, cgroup_id).expect("scrub");
-    ebpf.detach();
+    ebpf.detach().unwrap();
 
     assert!(
         v4_ok.is_ok(),
@@ -1380,7 +1380,7 @@ async fn cidr_egress_allowed_via_lpm_trie() {
     );
 
     egress::delete_cgroup_egress_state(&mut ebpf.bpf, cgroup_id).expect("scrub");
-    ebpf.detach();
+    ebpf.detach().unwrap();
 
     assert!(
         inside_cidr.is_ok(),
@@ -1461,7 +1461,7 @@ async fn sweep_scrubs_orphaned_cgroup_state() {
             .contains(&orphan)
     );
 
-    ebpf.detach();
+    ebpf.detach().unwrap();
 }
 
 // ---------------------------------------------------------------------------
@@ -1715,7 +1715,7 @@ async fn live_egress_hook_loss_stops_protected_workload() {
             .egress
             .can_enforce_allowlist()
     );
-    ebpf.lock().await.detach();
+    ebpf.lock().await.detach().unwrap();
     tokio::time::timeout(std::time::Duration::from_secs(4), async {
         loop {
             if grill
@@ -1909,7 +1909,7 @@ fn egress_cleanup_refuses_a_frozen_destination_map_and_keeps_enforcement() {
     let result = egress::delete_cgroup_egress_state(&mut ebpf.bpf, cgroup);
     let still_allowed = egress::egress_allowed(&mut ebpf.bpf, key).unwrap();
     let still_enforced = egress::egress_enforced(&mut ebpf.bpf, cgroup).unwrap();
-    ebpf.detach();
+    ebpf.detach().unwrap();
     assert!(result.is_err(), "cleanup ignored a kernel deletion refusal");
     assert!(
         still_allowed && still_enforced,
@@ -1928,7 +1928,7 @@ fn egress_cleanup_refuses_a_frozen_enforcement_flag() {
     freeze_egress_map(&ebpf, "egress_enabled_map");
     let result = egress::delete_cgroup_egress_state(&mut ebpf.bpf, cgroup);
     let still_enforced = egress::egress_enforced(&mut ebpf.bpf, cgroup).unwrap();
-    ebpf.detach();
+    ebpf.detach().unwrap();
     assert!(
         result.is_err(),
         "cleanup ignored a kernel enforcement deletion refusal"
@@ -2027,7 +2027,7 @@ async fn agent_retirement_keeps_its_record_when_kernel_egress_cleanup_fails() {
     let retained_instances = status.await.unwrap();
     shutdown.cancel();
     task.await.unwrap();
-    ebpf.lock().await.detach();
+    ebpf.lock().await.detach().unwrap();
     assert!(result.is_err(), "retirement accepted failed kernel cleanup");
     assert!(
         retained_record,
@@ -2043,4 +2043,319 @@ async fn agent_retirement_keeps_its_record_when_kernel_egress_cleanup_fails() {
         1,
         "retirement forgot its stopped cleanup owner"
     );
+}
+
+struct OwnedPolicyFixture {
+    root: tempfile::TempDir,
+    cgroup: PathBuf,
+    pin: PathBuf,
+    child: Option<std::process::Child>,
+}
+
+impl OwnedPolicyFixture {
+    fn new() -> Self {
+        let root = tempfile::tempdir().unwrap();
+        let suffix = root
+            .path()
+            .file_name()
+            .unwrap()
+            .to_str()
+            .unwrap()
+            .trim_start_matches('.');
+        let cgroup = PathBuf::from(format!("/sys/fs/cgroup/rbtest-egress-owner-{suffix}"));
+        let pin = PathBuf::from(format!("/sys/fs/bpf/rbtest-egress-owner-{suffix}"));
+        std::fs::create_dir(&cgroup).unwrap();
+        std::fs::create_dir(cgroup.join("probe")).unwrap();
+        Self {
+            root,
+            cgroup,
+            pin,
+            child: None,
+        }
+    }
+
+    fn load(&self) -> Result<OnionEbpf, reliaburger::onion::types::OnionError> {
+        OnionEbpf::load_owned(
+            None,
+            &self.cgroup,
+            &self.root.path().join("ownership"),
+            &self.pin,
+        )
+    }
+
+    fn stop_child(&mut self) {
+        if let Some(mut child) = self.child.take() {
+            let _ = child.kill();
+            child.wait().unwrap();
+        }
+    }
+}
+
+impl Drop for OwnedPolicyFixture {
+    fn drop(&mut self) {
+        self.stop_child();
+        // Private test infrastructure only. Release the loader before the fixture
+        // so no live process retains its exclusive claim during cleanup.
+        if self.root.path().join("ownership/owner.json").exists()
+            && let Err(error) = OnionEbpf::retire_owned_state(
+                &self.cgroup,
+                &self.root.path().join("ownership"),
+                &self.pin,
+            )
+        {
+            eprintln!("test kernel ownership cleanup failed: {error}");
+        }
+        let _ = std::fs::remove_dir(&self.pin);
+        let _ = std::fs::remove_dir(self.cgroup.join("probe"));
+        let _ = std::fs::remove_dir(&self.cgroup);
+    }
+}
+
+#[test]
+#[ignore = "requires Linux root and RELIABURGER_EBPF_TESTS=1"]
+fn egress_policy_survives_actual_loader_process_death() {
+    use std::process::Command;
+    assert!(ebpf_tests_enabled());
+    let mut owned = OwnedPolicyFixture::new();
+    let root = owned.root.path().to_owned();
+    let cgroup = owned.cgroup.clone();
+    let leaf = cgroup.join("probe");
+    let pin = owned.pin.clone();
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let fixture = |mode: &str| {
+        let mut command = Command::new(std::env::current_exe().unwrap());
+        command
+            .args([
+                "--exact",
+                "egress_owner_process_fixture",
+                "--ignored",
+                "--nocapture",
+            ])
+            .env("RELIABURGER_EGRESS_OWNER_FIXTURE", root.as_path())
+            .env("RELIABURGER_EGRESS_OWNER_CGROUP", &cgroup)
+            .env("RELIABURGER_EGRESS_OWNER_MODE", mode)
+            .env("RELIABURGER_EGRESS_OWNER_PORT", port.to_string());
+        command
+    };
+    owned.child = Some(
+        fixture("owner")
+            .env("RELIABURGER_EGRESS_OWNER_PINS", &pin)
+            .spawn()
+            .unwrap(),
+    );
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    while !root.as_path().join("ready").exists() {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "loader never became ready"
+        );
+        assert!(
+            owned.child.as_mut().unwrap().try_wait().unwrap().is_none(),
+            "loader exited before readiness"
+        );
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    assert!(fixture("probe").status().unwrap().success());
+    let before = std::fs::read_to_string(root.as_path().join("result")).unwrap();
+    owned.stop_child();
+    assert!(fixture("probe").status().unwrap().success());
+    let after = std::fs::read_to_string(root.as_path().join("result")).unwrap();
+    let mut recovered =
+        OnionEbpf::load_owned(None, &cgroup, &root.as_path().join("ownership"), &pin).unwrap();
+    assert!(fixture("probe").status().unwrap().success());
+    let restored = std::fs::read_to_string(root.as_path().join("result")).unwrap();
+    let id = reliaburger::sesame::egress::cgroup_id_of_path(&leaf).unwrap();
+    reliaburger::sesame::egress::delete_cgroup_egress_state(&mut recovered.bpf, id).unwrap();
+    assert!(fixture("probe").status().unwrap().success());
+    let removed = std::fs::read_to_string(root.as_path().join("result")).unwrap();
+    recovered.retire_owned().unwrap();
+    drop(recovered);
+    assert_eq!(std::fs::read_dir(&pin).unwrap().count(), 0);
+    assert_eq!(
+        restored, "PermissionDenied",
+        "recovery discarded the retained policy"
+    );
+    assert_eq!(
+        removed, "connected",
+        "recovered maps did not control the live policy"
+    );
+    assert_eq!(
+        before, "PermissionDenied",
+        "the live loader did not enforce the policy"
+    );
+    assert_eq!(
+        after, "PermissionDenied",
+        "the policy disappeared when its loader died"
+    );
+}
+
+#[test]
+#[ignore = "subprocess fixture for actual egress owner death"]
+fn egress_owner_process_fixture() {
+    let Some(root) = std::env::var_os("RELIABURGER_EGRESS_OWNER_FIXTURE") else {
+        return;
+    };
+    let root = PathBuf::from(root);
+    let cgroup = PathBuf::from(std::env::var_os("RELIABURGER_EGRESS_OWNER_CGROUP").unwrap());
+    let leaf = cgroup.join("probe");
+    if std::env::var("RELIABURGER_EGRESS_OWNER_MODE").unwrap() == "probe" {
+        std::fs::write(leaf.join("cgroup.procs"), std::process::id().to_string()).unwrap();
+        let port: u16 = std::env::var("RELIABURGER_EGRESS_OWNER_PORT")
+            .unwrap()
+            .parse()
+            .unwrap();
+        let result = match TcpStream::connect_timeout(
+            &std::net::SocketAddr::from(([127, 0, 0, 1], port)),
+            Duration::from_secs(2),
+        ) {
+            Ok(_) => "connected".to_string(),
+            Err(error) => format!("{:?}", error.kind()),
+        };
+        std::fs::write(root.join("result"), result).unwrap();
+        return;
+    }
+    let pin = PathBuf::from(std::env::var_os("RELIABURGER_EGRESS_OWNER_PINS").unwrap());
+    let mut ebpf = OnionEbpf::load_owned(None, &cgroup, &root.join("ownership"), &pin).unwrap();
+    let id = reliaburger::sesame::egress::cgroup_id_of_path(&leaf).unwrap();
+    reliaburger::sesame::egress::set_egress_enforced(&mut ebpf.bpf, id).unwrap();
+    std::fs::write(root.join("ready"), "ready").unwrap();
+    loop {
+        std::thread::park();
+    }
+}
+
+#[test]
+#[ignore = "requires Linux root and RELIABURGER_EBPF_TESTS=1"]
+fn persistent_policy_refuses_conflicting_owners_and_retired_state() {
+    assert!(ebpf_tests_enabled());
+    let owned = OwnedPolicyFixture::new();
+    let mut loader = owned.load().unwrap();
+    assert!(
+        loader.detach().is_err(),
+        "ephemeral detach accepted a persistent owner"
+    );
+    assert!(loader.is_attached());
+    assert!(
+        owned.load().is_err(),
+        "two loaders acquired one ownership claim"
+    );
+    assert!(
+        OnionEbpf::load_owned(
+            None,
+            &owned.cgroup,
+            &owned.root.path().join("foreign"),
+            &owned.pin
+        )
+        .is_err()
+    );
+    drop(loader);
+    assert!(
+        OnionEbpf::load_owned(
+            None,
+            &owned.cgroup.join("probe"),
+            &owned.root.path().join("ownership"),
+            &owned.pin
+        )
+        .is_err()
+    );
+    loader = owned.load().unwrap();
+    assert!(
+        loader.is_attached()
+            && loader.connect6_attached()
+            && loader.sendmsg4_attached()
+            && loader.sendmsg6_attached()
+    );
+    loader.retire_owned().unwrap();
+    assert!(!loader.is_attached());
+    drop(loader);
+    assert!(owned.load().is_err(), "retired ownership was reused");
+    OnionEbpf::retire_owned_state(
+        &owned.cgroup,
+        &owned.root.path().join("ownership"),
+        &owned.pin,
+    )
+    .unwrap();
+    assert_eq!(std::fs::read_dir(&owned.pin).unwrap().count(), 0);
+}
+
+#[test]
+#[ignore = "requires Linux root and RELIABURGER_EBPF_TESTS=1"]
+fn persistent_policy_recovers_partial_startup_and_interrupted_retirement() {
+    assert!(ebpf_tests_enabled());
+    let owned = OwnedPolicyFixture::new();
+    let loader = owned.load().unwrap();
+    drop(loader);
+    let manifest_path = owned.root.path().join("ownership/owner.json");
+    let mut manifest: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&manifest_path).unwrap()).unwrap();
+    manifest["phase"] = "Preparing".into();
+    std::fs::write(&manifest_path, serde_json::to_vec(&manifest).unwrap()).unwrap();
+    std::fs::remove_file(owned.pin.join("onion_sendmsg4_link")).unwrap();
+    std::fs::remove_file(owned.pin.join("onion_sendmsg6_link")).unwrap();
+    let loader = owned.load().unwrap();
+    assert!(loader.is_attached() && loader.sendmsg4_attached() && loader.sendmsg6_attached());
+    std::fs::remove_file(owned.pin.join("onion_sendmsg6_link")).unwrap();
+    assert!(
+        !loader.sendmsg6_attached(),
+        "missing pin still advertised durable enforcement"
+    );
+    drop(loader);
+    assert!(
+        owned.load().is_err(),
+        "active ownership silently recreated a missing link"
+    );
+    manifest["phase"] = "Retiring".into();
+    std::fs::write(&manifest_path, serde_json::to_vec(&manifest).unwrap()).unwrap();
+    assert!(
+        owned.load().is_err(),
+        "interrupted retirement allowed reactivation"
+    );
+    OnionEbpf::retire_owned_state(
+        &owned.cgroup,
+        &owned.root.path().join("ownership"),
+        &owned.pin,
+    )
+    .unwrap();
+    assert_eq!(std::fs::read_dir(&owned.pin).unwrap().count(), 0);
+}
+
+#[test]
+#[ignore = "requires Linux root and RELIABURGER_EBPF_TESTS=1"]
+fn persistent_policy_refuses_wrong_map_layout_and_foreign_map_identity() {
+    assert!(ebpf_tests_enabled());
+    for foreign_name in ["backend_map", "egress_map"] {
+        let owned = OwnedPolicyFixture::new();
+        let loader = owned.load().unwrap();
+        drop(loader);
+        let foreign_cgroup = owned.cgroup.join("foreign");
+        std::fs::create_dir(&foreign_cgroup).unwrap();
+        let mut foreign = OnionEbpf::load_embedded(&foreign_cgroup).unwrap();
+        let path = owned.pin.join("egress_map");
+        std::fs::remove_file(&path).unwrap();
+        foreign.bpf.map(foreign_name).unwrap().pin(&path).unwrap();
+        let error = owned
+            .load()
+            .err()
+            .expect("foreign map accepted")
+            .to_string();
+        foreign.detach().unwrap();
+        drop(foreign);
+        std::fs::remove_dir(&foreign_cgroup).unwrap();
+        assert!(
+            error.contains(if foreign_name == "backend_map" {
+                "incompatible ABI"
+            } else {
+                "expected maps"
+            }),
+            "{error}"
+        );
+        OnionEbpf::retire_owned_state(
+            &owned.cgroup,
+            &owned.root.path().join("ownership"),
+            &owned.pin,
+        )
+        .unwrap();
+        assert_eq!(std::fs::read_dir(&owned.pin).unwrap().count(), 0);
+    }
 }

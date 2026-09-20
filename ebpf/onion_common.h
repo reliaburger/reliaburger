@@ -11,6 +11,12 @@
 #include <bpf/bpf_helpers.h>
 #include <bpf/bpf_endian.h>
 
+#ifdef RELIABURGER_PERSISTENT_MAPS
+#define RELIABURGER_MAP_PINNING __uint(pinning, 1);
+#else
+#define RELIABURGER_MAP_PINNING
+#endif
+
 /* ---------- Constants --------------------------------------------------- */
 
 #define MAX_BACKENDS        32

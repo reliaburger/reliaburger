@@ -299,8 +299,10 @@ in the [OCI ownership plan](docs/plans/2026-09-20-oci-launch-ownership.md).
 
 Egress cleanup now retains the stopped workload's binding and adoption record
 until the kernel confirms removal. Failed policy rewrites stop affected workloads;
-repeated cleanup failures remain retryable. Actual Bun-death policy lifetime and
-restoration are still part of release qualification.
+repeated cleanup failures remain retryable. An opt-in persistent kernel loader
+now keeps policy through actual loader SIGKILL and recovers the same maps without
+a detach window. All 32 physical kernel cases pass. Bun adoption, host-reboot
+reconciliation and production selection remain release gates.
 
 Log exports now preserve content generations, scope receipts to the destination,
 and serialise durable checkpoint updates across agent and offline exports. Source

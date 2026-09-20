@@ -24,11 +24,15 @@ fn compile_ebpf() {
     let out_dir = std::env::var("OUT_DIR").unwrap();
     let ebpf_dir = Path::new("ebpf");
 
-    let programs = ["onion_connect.bpf.c", "onion_dns.bpf.c"];
+    let programs = [
+        ("onion_connect.bpf.c", "onion_connect.bpf.o", false),
+        ("onion_dns.bpf.c", "onion_dns.bpf.o", false),
+        ("onion_connect.bpf.c", "onion_connect_owned.bpf.o", true),
+    ];
 
-    for program in &programs {
+    for (program, object, persistent) in programs {
         let src = ebpf_dir.join(program);
-        let obj = Path::new(&out_dir).join(program.replace(".c", ".o"));
+        let obj = Path::new(&out_dir).join(object);
 
         println!("cargo:rerun-if-changed={}", src.display());
 
@@ -48,7 +52,11 @@ fn compile_ebpf() {
             }
         );
 
-        let status = Command::new("clang")
+        let mut compiler = Command::new("clang");
+        if persistent {
+            compiler.arg("-DRELIABURGER_PERSISTENT_MAPS=1");
+        }
+        let status = compiler
             .args([
                 "-O2",
                 "-target",

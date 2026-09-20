@@ -127,6 +127,8 @@ jobs:
         run: |
           sudo apt-get update -qq
           sudo apt-get install -y -qq btrfs-progs buildah busybox-static clang iproute2 libbpf-dev linux-headers-$(uname -r) llvm nftables runc slirp4netns uidmap
+      - name: Mount persistent BPF storage for kernel recovery tests
+        run: mountpoint -q /sys/fs/bpf || sudo mount -t bpf bpf /sys/fs/bpf
       - name: Permit rootless runc on Ubuntu AppArmor hosts
         run: |
           if sysctl kernel.apparmor_restrict_unprivileged_userns >/dev/null 2>&1; then
