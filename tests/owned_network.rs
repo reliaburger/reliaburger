@@ -250,6 +250,44 @@ async fn teardown_refuses_unknown_deletion_even_when_resources_currently_appear_
 #[ignore = "requires root, ip and ping; creates two isolated container networks"]
 async fn same_node_containers_have_independent_host_and_peer_routes() {
     assert!(nix::unistd::geteuid().is_root());
+    if std::env::var_os("RELIABURGER_ISOLATED_PEER_ROUTES").is_none() {
+        // Host forwarding policy belongs to the operator. Exercise routes in a
+        // private network and mount tree without relaxing an unrelated firewall.
+        let output = tokio::time::timeout(
+            Duration::from_secs(30),
+            tokio::process::Command::new("unshare")
+                .args([
+                    "--net",
+                    "--mount",
+                    "--propagation",
+                    "private",
+                    "/bin/sh",
+                    "-ec",
+                    "mount -t tmpfs tmpfs /run; mkdir /run/netns; ip link set lo up; exec \"$@\"",
+                    "peer-route-fixture",
+                ])
+                .arg(std::env::current_exe().unwrap())
+                .args([
+                    "--ignored",
+                    "--exact",
+                    "same_node_containers_have_independent_host_and_peer_routes",
+                    "--nocapture",
+                ])
+                .env("RELIABURGER_ISOLATED_PEER_ROUTES", "1")
+                .kill_on_drop(true)
+                .output(),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert!(
+            output.status.success(),
+            "isolated peer routes failed: {} {}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        return;
+    }
     let mut networks = Vec::new();
     let exercise = async {
         for index in 0..2 {

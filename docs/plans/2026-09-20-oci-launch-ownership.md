@@ -683,3 +683,24 @@ all 31 selected ownership/compatibility cases pass on macOS/Linux, alongside
 Protocol remains 14; state 27 and OCI intent schema 4 require fresh development
 clusters. This qualifies controller-task loss and adapter recovery, not actual
 Bun process death or complete discovery reconstruction.
+
+## Isolate routing qualification from the host firewall
+
+Hosted privileged Linux at `e2f7131` passes 107 cases and fails the bidirectional
+peer-route probe: the host reaches the container, but the peer ping loses its
+packet. A local disposable-namespace experiment reproduces that exact failure
+with a DROP forwarding policy (one dropped packet); ACCEPT passes all probes.
+The hosted log does not identify its blocking rule, so this is a demonstrated
+fixture dependency rather than proof of that runner's exact firewall state.
+
+The route fixture now creates a private outer network namespace, mount tree and
+`/run` before creating its two container networks. It preserves the same route
+and packet assertions and never changes the real host's forwarding policy.
+Qualification must pass under both ACCEPT and DROP outer policies and verify
+that each policy remains unchanged. Direct-host forwarding requirements are
+documented separately; this repair does not add firewall interoperability.
+
+Both outer-policy checks pass (0.07s each) with unchanged policy and zero packets
+through the outer forwarding chain. All four privileged network cases pass
+(1.19s), as do both refusal contracts and strict all-target/all-feature Linux
+Clippy and formatting. Hosted confirmation belongs to the next PR run.

@@ -1343,3 +1343,22 @@ cleanup refuses rather than freeing the address. Complete service reconstruction
 remote catalogue acknowledgements and in-flight proxy requests remain separate
 work before selecting this adapter in production. State format 27 and OCI intent
 version 4 reject older development state that lacks this distinction.
+
+
+## A routing test needs its own router
+
+The host can ping each container, but one container cannot ping its neighbour.
+Our explicit /32 routes are correct. A DROP policy on the host's forwarding
+chain can produce exactly this result: host-originated traffic does not pass
+through the same chain as traffic travelling between the two interfaces.
+
+The route regression now runs its host and both container namespaces inside a
+private outer network namespace. It also gets a private mount tree and `/run`,
+so its named namespace mounts cannot escape into the real host. The original
+host-to-container and bidirectional peer probes are unchanged. Running the test
+inside another namespace with a DROP policy must pass while leaving that outer
+policy untouched.
+
+This isolates the routing claim. It does not promise that Bun overrides an
+operator's firewall. Direct Linux installations must permit the required
+forwarding; the managed VM path gives us a dedicated host configuration.

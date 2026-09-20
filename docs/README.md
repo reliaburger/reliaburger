@@ -312,6 +312,13 @@ refuses new creation. Addresses become reusable only after confirmed network
 teardown and nftables forwarding inspection; retain `.network-leases.json` with the runtime bundle state across
 restarts. Uncertain teardown keeps its reservation for explicit cleanup.
 
+On a direct Linux host, its firewall must permit forwarding between Reliaburger's
+container interfaces and the required destinations. Bun enables IPv4 forwarding
+but does not override another firewall's DROP rules or policy. A host can reach
+both containers while container-to-container traffic is still blocked. Use the
+managed VM quickstart for a dedicated host configuration; check existing Docker
+or operator firewall rules when diagnosing direct-host connectivity.
+
 ### macOS containers: managed Linux VMs
 
 For 0.1.0, run containers through the [managed laptop quickstart](quickstart.md):
