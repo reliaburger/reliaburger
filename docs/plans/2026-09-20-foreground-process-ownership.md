@@ -105,9 +105,9 @@ security boundary against hostile same-user processes.
 - [ ] Bind a queued start request to the generation observed before mutation.
   Cancelling its caller must not let a delayed blocking worker activate a newer
   preparation after the old generation has been cancelled and replaced.
-- [ ] Make first-run fixture readiness require the launched Bun's own API
-  announcement. A foreign listener currently bypasses the port-race retry and
-  caused a reporting-bind failure in the full native first-run run.
+- [x] Require the launched Bun's own API announcement before first-run readiness.
+  A foreign-listener regression fails before the correction; all sixteen portable
+  first-run cases and strict Clippy pass on macOS/Linux afterwards.
 - [ ] Qualify actual Bun death at the preparation/activation/adoption boundaries,
   helper loss, short jobs, cron and complete group retirement on macOS/Linux.
   Re-run the runtime, agent, job-recovery and upgrade suites.

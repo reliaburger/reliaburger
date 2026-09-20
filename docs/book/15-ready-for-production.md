@@ -3399,3 +3399,20 @@ borrow lets callers retain their registry client, while `dyn` dispatches through
 the implementation chosen at runtime. The same path uses a real upstream reader
 in production and controlled fixtures in tests. Refused or interrupted staging
 leaves its registered lease ownership available for the server's reaper.
+
+
+### A listening port can belong to the wrong process
+
+A first-run fixture reserved an API address, closed the reservation and launched
+Bun. Another test took that port in the gap. The readiness probe connected to
+that other listener and announced success while its own Bun was failing a
+reporting-port bind. The retry existed, but the false readiness result bypassed
+it.
+
+The fixture now requires the launched child's own API-listener announcement,
+parses its `SocketAddr`, checks that it matches the requested address (unless the
+OS chose an ephemeral port), and only then probes TCP. An occupied-port test
+fails before the change: the first attempt incorrectly succeeds. After the fix,
+Bun's bind failure triggers a fresh reservation and the second attempt proves
+readiness. This keeps port-allocation races separate from product startup errors;
+an unrelated error still fails the test.

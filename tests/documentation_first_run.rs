@@ -112,16 +112,14 @@ fn wait_for_bind(bun: &mut BunProcess, address: SocketAddr) -> BunStart {
             }
             panic!("bun exited before binding its listeners ({status}):\n{log}");
         }
-        let bound_address = if address.port() == 0 {
-            std::fs::read_to_string(&bun.log_path)
-                .unwrap_or_default()
-                .lines()
-                .find_map(|line| line.strip_prefix("bun: API server listening on "))
-                .and_then(|address| address.parse::<SocketAddr>().ok())
-                .filter(|address| address.port() != 0)
-        } else {
-            Some(address)
-        };
+        // A connection to a reserved address may reach the process that stole
+        // it. Only this child's own announcement proves its binds succeeded.
+        let bound_address = std::fs::read_to_string(&bun.log_path)
+            .unwrap_or_default()
+            .lines()
+            .find_map(|line| line.strip_prefix("bun: API server listening on "))
+            .and_then(|bound| bound.parse::<SocketAddr>().ok())
+            .filter(|bound| bound.port() != 0 && (address.port() == 0 || *bound == address));
         if let Some(address) = bound_address
             && TcpStream::connect_timeout(&address, Duration::from_millis(100)).is_ok()
         {
@@ -312,6 +310,37 @@ fn standalone_first_run_reaches_a_running_workload() {
     let top = run_relish(&["--endpoint", &endpoint, "top"]);
     assert_success(&top, "documented standalone top");
     assert!(String::from_utf8_lossy(&top.stdout).contains("hello"));
+}
+
+#[test]
+fn spawn_retries_when_a_foreign_listener_answers_on_the_requested_api_port() {
+    let root = tempfile::tempdir().unwrap();
+    let foreign = TcpListener::bind("127.0.0.1:0").unwrap();
+    let occupied = foreign.local_addr().unwrap();
+    let mut attempts = 0;
+    let (mut bun, address) = spawn_bun_with_port_retry(false, || {
+        attempts += 1;
+        (
+            write_portable_node_config(root.path()),
+            if attempts == 1 {
+                occupied
+            } else {
+                reserve_address()
+            },
+            root.path().join(format!("foreign-listener-{attempts}.log")),
+        )
+    });
+    assert_eq!(
+        attempts, 2,
+        "a foreign listener was mistaken for the launched Bun"
+    );
+    assert_ne!(address, occupied);
+    bun.assert_running();
+    assert!(
+        std::fs::read_to_string(&bun.log_path)
+            .unwrap()
+            .contains(&format!("bun: API server listening on {address}"))
+    );
 }
 
 #[test]
