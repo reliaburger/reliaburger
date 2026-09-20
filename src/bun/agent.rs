@@ -1520,7 +1520,9 @@ pub struct PartitionBlocklists {
 
 #[cfg(all(feature = "ebpf", target_os = "linux"))]
 use super::egress_owners::{EgressBinding, PolicyPhase};
+mod discovery_ownership;
 mod egress_ownership;
+use discovery_ownership::DiscoveryOwnership;
 
 /// An immutable, owned connectivity trace that can run outside the agent
 /// command loop. Workload probes have explicit timeouts, but even a bounded
@@ -1604,6 +1606,8 @@ pub struct BunAgent<G: Grill> {
     cgroup_ns_bpf_keys: std::collections::HashSet<u64>,
     /// Onion service map: app names → VIPs + backends.
     service_map: crate::onion::service_map::ServiceMap,
+    /// Exclusive publication checkpoint, or a fence after an uncertain write.
+    discovery_ownership: DiscoveryOwnership,
     /// Cluster-wide endpoint catalogue (12b.4), replicated from the leader.
     /// Overlaid onto the local `service_map` when publishing the DNS/routing
     /// snapshot so this node resolves services whose backends live elsewhere.
@@ -1770,6 +1774,7 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
             #[cfg(all(feature = "ebpf", target_os = "linux"))]
             cgroup_ns_bpf_keys: std::collections::HashSet::new(),
             service_map: crate::onion::service_map::ServiceMap::new(),
+            discovery_ownership: DiscoveryOwnership::default(),
             cluster_catalog: crate::onion::catalog::EndpointCatalog::new(),
             service_map_tx: tokio::sync::watch::channel(
                 crate::onion::service_map::ServiceMap::new(),
@@ -1864,6 +1869,7 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
             #[cfg(all(feature = "ebpf", target_os = "linux"))]
             cgroup_ns_bpf_keys: std::collections::HashSet::new(),
             service_map: crate::onion::service_map::ServiceMap::new(),
+            discovery_ownership: DiscoveryOwnership::default(),
             cluster_catalog: crate::onion::catalog::EndpointCatalog::new(),
             service_map_tx: tokio::sync::watch::channel(
                 crate::onion::service_map::ServiceMap::new(),
@@ -2166,15 +2172,26 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
 
     /// Require successful kernel publication before acknowledging deployment.
     async fn publish_backend_ebpf(
-        &self,
+        &mut self,
         id: &crate::onion::service_id::ServiceId,
     ) -> Result<(), BunError> {
-        self.publish_backend_snapshot(id, &self.service_map).await
+        let services = self.service_map.clone();
+        self.publish_backend_snapshot(id, &services).await
+    }
+
+    /// Journal attempted routing before acknowledging its kernel publication.
+    async fn publish_backend_snapshot(
+        &mut self,
+        id: &crate::onion::service_id::ServiceId,
+        services: &crate::onion::service_map::ServiceMap,
+    ) -> Result<(), BunError> {
+        self.persist_discovery_publication(id, services).await?;
+        self.publish_backend_kernel(id, services).await
     }
 
     /// Publish a validated candidate before exposing it to userspace readers.
     #[cfg(all(feature = "ebpf", target_os = "linux"))]
-    async fn publish_backend_snapshot(
+    async fn publish_backend_kernel(
         &self,
         id: &crate::onion::service_id::ServiceId,
         services: &crate::onion::service_map::ServiceMap,
@@ -2195,7 +2212,7 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
     }
 
     #[cfg(not(all(feature = "ebpf", target_os = "linux")))]
-    async fn publish_backend_snapshot(
+    async fn publish_backend_kernel(
         &self,
         _id: &crate::onion::service_id::ServiceId,
         _services: &crate::onion::service_map::ServiceMap,
@@ -2888,6 +2905,7 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
         .await
         .map_err(|error| BunError::AdoptionState(error.to_string()))?
         .map_err(|error| BunError::AdoptionState(error.to_string()))?;
+        self.require_discovery_recovery(!records.is_empty(), false)?;
         for job in jobs.values() {
             if job.runtime != self.supervisor.grill().runtime_kind() {
                 return Err(BunError::AdoptionState(
@@ -2997,6 +3015,12 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
         self.job_store_uncertain = false;
         let mut recovered_jobs = jobs;
         let launch_inventory = self.supervisor.grill().launch_inventory().await?;
+        self.require_discovery_recovery(
+            !records.is_empty(),
+            launch_inventory
+                .as_ref()
+                .is_some_and(|launches| !launches.is_empty()),
+        )?;
         self.restore_egress_owners(&records, launch_inventory.as_deref())
             .await?;
         if let Some(launches) = &launch_inventory {
@@ -11996,6 +12020,118 @@ mod tests {
         assert_eq!(entry.backends.len(), 1);
         assert_eq!(entry.backends[0].instance_id, "default__web-0");
         assert!(entry.backends[0].healthy);
+    }
+
+    #[tokio::test]
+    async fn fresh_discovery_refuses_adoption_without_original_inventory() {
+        let (mut original, _, _, grill) = test_agent_with_grill();
+        let records = tempfile::tempdir().unwrap();
+        original.set_records_dir(records.path().to_owned());
+        grill.set_pid(std::process::id());
+        expect_complete(&drain_deploy(&mut original, basic_config()).await);
+        let (mut replacement, _, _, recovered) = test_agent_with_grill();
+        replacement.set_records_dir(records.path().to_owned());
+        replacement
+            .enable_fresh_discovery_ownership(&records.path().join("discovery"))
+            .await
+            .unwrap();
+        let result = replacement.adopt_recorded_instances().await;
+        assert!(
+            matches!(result, Err(BunError::AdoptionState(_))),
+            "missing discovery recovery was accepted: {result:?}"
+        );
+        assert!(
+            !recovered
+                .calls()
+                .iter()
+                .any(|(operation, _)| operation == "adopt" || operation == "kill"),
+            "runtime recovery ran before original discovery reconciliation"
+        );
+        assert!(crate::grill::records::record_path(records.path(), "default__web-0").exists());
+    }
+
+    #[tokio::test]
+    async fn durable_publication_records_the_exact_service_before_acknowledgement() {
+        let (mut agent, _commands, _shutdown) = test_agent();
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("discovery");
+        agent.enable_fresh_discovery_ownership(&path).await.unwrap();
+        expect_complete(&drain_deploy(&mut agent, basic_config()).await);
+        let service = crate::onion::service_id::ServiceId::new("default", "web");
+        let expected = agent.service_map.resolve(&service).unwrap().clone();
+        drop(agent);
+        let journal = crate::bun::discovery_owners::DiscoveryJournal::open(&path).unwrap();
+        let entries = &journal.inventory().services;
+        assert_eq!(
+            entries.len(),
+            1,
+            "acknowledged routing has no durable service owner"
+        );
+        assert_eq!(
+            serde_json::to_value(&entries[0].entry).unwrap(),
+            serde_json::to_value(&expected).unwrap()
+        );
+        assert_eq!(
+            entries[0].phase,
+            crate::bun::discovery_owners::ServicePhase::Owned
+        );
+    }
+
+    #[tokio::test]
+    async fn later_publication_preserves_unretired_discovery_allocations() {
+        let (mut agent, _commands, _shutdown) = test_agent();
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("discovery");
+        agent.enable_fresh_discovery_ownership(&path).await.unwrap();
+        expect_complete(&drain_deploy(&mut agent, basic_config()).await);
+        let service = crate::onion::service_id::ServiceId::new("default", "web");
+        let original = agent.service_map.resolve(&service).unwrap().clone();
+        agent.stop_app("web", "default").await.unwrap();
+        assert!(agent.service_map.resolve(&service).is_none());
+        let config = Config::parse("[app.other]\nimage = 'mock:image'\nport = 8081\n").unwrap();
+        expect_complete(&drain_deploy(&mut agent, config).await);
+        drop(agent);
+        let journal = crate::bun::discovery_owners::DiscoveryJournal::open(&path).unwrap();
+        assert_eq!(journal.inventory().services.len(), 2);
+        let retained = journal
+            .inventory()
+            .services
+            .iter()
+            .find(|owner| owner.entry.app_name == "web")
+            .unwrap();
+        assert_eq!(retained.entry.vip, original.vip);
+        assert_eq!(
+            retained.phase,
+            crate::bun::discovery_owners::ServicePhase::Owned
+        );
+    }
+
+    #[tokio::test]
+    async fn failed_discovery_checkpoint_refuses_launch_and_fences_later_publication() {
+        let (mut agent, _commands, _shutdown, grill) = test_agent_with_grill();
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("discovery");
+        agent.enable_fresh_discovery_ownership(&path).await.unwrap();
+        let checkpoint = path.join("discovery.json");
+        std::fs::remove_file(&checkpoint).unwrap();
+        std::fs::create_dir(&checkpoint).unwrap();
+        let events = drain_deploy(&mut agent, basic_config()).await;
+        assert!(
+            events
+                .iter()
+                .any(|event| matches!(event, ApplyEvent::Error { .. })),
+            "deployment acknowledged a failed discovery checkpoint"
+        );
+        assert!(
+            !grill
+                .calls()
+                .iter()
+                .any(|(operation, _)| operation == "create" || operation == "start")
+        );
+        std::fs::remove_dir(&checkpoint).unwrap();
+        // Repairing the path does not establish what an interrupted write published.
+        let service = crate::onion::service_id::ServiceId::new("default", "web");
+        assert!(agent.publish_backend_ebpf(&service).await.is_err());
     }
 
     #[tokio::test]

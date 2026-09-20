@@ -84,7 +84,7 @@ pub struct DiscoveryJournal {
     #[cfg(test)]
     write_pause: Option<(
         tokio::sync::oneshot::Sender<()>,
-        std::sync::mpsc::Receiver<()>,
+        tokio::sync::oneshot::Receiver<()>,
     )>,
 }
 
@@ -196,7 +196,7 @@ impl DiscoveryJournal {
         #[cfg(test)]
         if let Some((entered, resume)) = self.write_pause.take() {
             let _ = entered.send(());
-            resume.recv().map_err(io::Error::other)?;
+            resume.blocking_recv().map_err(io::Error::other)?;
         }
         write_checkpoint(&self.directory, &next)?;
         self.inventory = next;
@@ -384,7 +384,7 @@ mod tests {
         let path = root.path().join("owners");
         let mut journal = DiscoveryJournal::open_async(&path).await.unwrap();
         let (entered, waiting) = tokio::sync::oneshot::channel();
-        let (resume, paused) = std::sync::mpsc::channel();
+        let (resume, paused) = tokio::sync::oneshot::channel();
         let (heartbeat, observed) = std::sync::mpsc::channel();
         journal.write_pause = Some((entered, paused));
         // A separate thread releases even a broken inline implementation, so
@@ -413,7 +413,7 @@ mod tests {
         let path = root.path().join("owners");
         let mut journal = DiscoveryJournal::open_async(&path).await.unwrap();
         let (entered, waiting) = tokio::sync::oneshot::channel();
-        let (resume, paused) = std::sync::mpsc::channel();
+        let (resume, paused) = tokio::sync::oneshot::channel();
         journal.write_pause = Some((entered, paused));
         let mut write = tokio::spawn(journal.persist(inventory()));
         waiting.await.unwrap();

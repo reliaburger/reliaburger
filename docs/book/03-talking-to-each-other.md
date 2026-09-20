@@ -1615,3 +1615,36 @@ This does not move backend ownership back into a possibly stalled downstream
 reader. The pump releases its request guard when it finishes; the response owns
 the pump's final result until the client can observe it. Completion of cleanup
 and successful delivery are different facts, and both need honest reporting.
+
+### Put the journal before publication
+
+The checkpoint store cannot protect a publication nobody records. Bun now has an
+opt-in fresh-agent integration: before acknowledging a backend snapshot, it
+persists the exact service allocation and attempted backends, then writes the
+kernel map. DNS and Wrapper still receive only the confirmed candidate. A storage
+failure therefore stops initial deployment before runtime creation; the agent
+refuses later publication even if somebody repairs the path underneath it.
+
+The owner is an enum with three states: Disabled, Ready and Uncertain. Starting a
+write uses `std::mem::replace` to move the Ready journal into its blocking worker
+and leave Uncertain in the agent. Only acknowledged success returns Ready. This
+makes cancellation fail closed without losing the worker's exclusive claim.
+Disappearing from a new snapshot does not prove retirement: the next checkpoint
+retains earlier service allocations until a separate confirmed cleanup can remove
+them. Tests reopen the store after agent drop, reject a broken checkpoint before
+launch, and retain an old service through publication of a different one.
+
+Integrating the journal also exposed a useful Rust distinction. `Send` means a
+value can move between threads; `Sync` means threads can safely share references
+to it. Bun's async methods can hold `&self` across an await, so its fields must
+support that sharing. Our test-only std mpsc receiver did not. A Tokio one-shot
+receiver keeps the same pause/resume test but is safe to share; its blocking wait
+still runs only in the blocking writer. The original responsiveness and cancelled
+waiter tests remain part of qualification.
+
+This entry point accepts a fresh journal only. Existing ownership, instance
+records or runtime launches require full reconciliation before adoption. The
+fresh-only recovery gate refuses those inputs before adopting, killing or deleting
+runtime evidence. Production selection, original runtime-reference correlation,
+withdrawal authorisation and remote acknowledgements remain unfinished. Enabling
+this publication producer is not permission to claim those recovery guarantees.
