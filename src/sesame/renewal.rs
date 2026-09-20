@@ -105,7 +105,12 @@ pub async fn issue_renewal(
     Ok(join::JoinBundle::from_result(&result))
 }
 
-fn validate_peer(peer: &TlsPeerCertificate, state: &SecurityState) -> Result<String, RenewalError> {
+/// Validate the current node identity, chain, validity and retirement state
+/// before authorising a control request on a potentially long-lived connection.
+pub(crate) fn validate_peer(
+    peer: &TlsPeerCertificate,
+    state: &SecurityState,
+) -> Result<String, RenewalError> {
     let node_ca = state
         .get_ca(CaRole::Node)
         .ok_or_else(|| RenewalError::Unavailable("Node CA is unavailable".into()))?;

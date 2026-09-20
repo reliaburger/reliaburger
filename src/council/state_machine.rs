@@ -332,12 +332,39 @@ impl StateMachineInner {
                 self.state.config.insert(key.clone(), value.clone());
             }
             RaftRequest::ManifestCommit(commit) => {
+                if self
+                    .state
+                    .security_state
+                    .crl
+                    .retired_nodes
+                    .keys()
+                    .any(|name| {
+                        let id = crate::cluster::identity::raft_id_from_name(name);
+                        commit.manifest.pushed_by == id || commit.holder_nodes.contains(&id)
+                    })
+                {
+                    return Some(CouncilResponse::Refused {
+                        reason: "registry writer identity is retired".into(),
+                    });
+                }
                 self.state.manifest_catalog.apply_manifest_commit(commit);
             }
             RaftRequest::UpdateLayerLocations(update) => {
                 self.state.manifest_catalog.apply_update_locations(update);
             }
             RaftRequest::GcReport(report) => {
+                if self
+                    .state
+                    .security_state
+                    .crl
+                    .retired_nodes
+                    .keys()
+                    .any(|name| crate::cluster::identity::raft_id_from_name(name) == report.node_id)
+                {
+                    return Some(CouncilResponse::Refused {
+                        reason: "registry writer identity is retired".into(),
+                    });
+                }
                 // The state machine is the deletion arbiter (M2): apply
                 // runs serialised through the Raft log, so two nodes
                 // racing to delete the last two copies of a layer get
@@ -4335,6 +4362,38 @@ mod tests {
             inner.apply_request(&request("node-3", None)),
             Some(CouncilResponse::NodeDecommissioned { .. })
         ));
+    }
+
+    #[test]
+    fn decommission_fences_registry_proposals_at_commit_time() {
+        let mut inner = StateMachineInner::default();
+        inner.apply_request(&RaftRequest::DecommissionNode {
+            node_id: "old-writer".into(),
+            retired_by: "operator".into(),
+            reason: "powered off".into(),
+            retired_at_unix_ms: 30,
+            membership_log_id: None,
+        });
+        let id = crate::cluster::identity::raft_id_from_name("old-writer");
+        let mut commit = test_manifest_commit();
+        commit.manifest.pushed_by = id;
+        commit.holder_nodes = std::collections::BTreeSet::from([id]);
+        for request in [
+            RaftRequest::ManifestCommit(commit),
+            RaftRequest::GcReport(crate::pickle::types::GcReport {
+                node_id: id,
+                deleted_layers: vec![test_digest("orphan")],
+            }),
+        ] {
+            assert!(
+                matches!(
+                    inner.apply_request(&request),
+                    Some(CouncilResponse::Refused { .. })
+                ),
+                "an in-flight proposal was accepted after its writer retired"
+            );
+        }
+        assert!(inner.state.manifest_catalog.manifests.is_empty());
     }
 
     #[test]

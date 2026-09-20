@@ -368,6 +368,14 @@ pub fn router_with_upgrade(
             "/v1/cluster/renew",
             post(node_renewal_handler).layer(axum::extract::DefaultBodyLimit::max(16 * 1024)),
         )
+        .route(
+            "/v1/registry/propose",
+            post(registry_proposal_handler)
+                .layer(axum::extract::DefaultBodyLimit::max(
+                    crate::pickle::authority::MAX_REGISTRY_PROPOSAL_BYTES,
+                ))
+                .layer(axum::middleware::from_fn(registry_proposal_deadline)),
+        )
         .route("/v1/diagnostics", get(diagnostics_handler))
         .route("/v1/diagnostics/apps", get(desired_apps_handler))
         .route("/v1/trace", post(trace_handler))
@@ -4210,6 +4218,75 @@ async fn node_renewal_handler(
                 .into_response()
         }
         Err(_) => (StatusCode::GATEWAY_TIMEOUT, "node renewal timed out").into_response(),
+    }
+}
+
+/// Include request-body extraction in the control-operation deadline.
+async fn registry_proposal_deadline(
+    request: axum::extract::Request,
+    next: axum::middleware::Next,
+) -> Response {
+    match tokio::time::timeout(std::time::Duration::from_secs(10), next.run(request)).await {
+        Ok(response) => response,
+        Err(_) => (
+            StatusCode::REQUEST_TIMEOUT,
+            "registry proposal deadline exceeded",
+        )
+            .into_response(),
+    }
+}
+
+/// A follower refuses instead of forwarding a request under its own identity.
+async fn registry_proposal_handler(
+    auth: Option<axum::Extension<crate::sesame::auth::AuthContext>>,
+    peer: Option<axum::Extension<crate::sesame::renewal::TlsPeerCertificate>>,
+    State(state): State<ApiState>,
+    Json(proposal): Json<crate::pickle::authority::RegistryProposal>,
+) -> Response {
+    if let Err(response) = crate::sesame::auth::require_system(auth.as_deref()) {
+        return response;
+    }
+    if let Err(error) = proposal.compatibility.require_current() {
+        return (StatusCode::CONFLICT, error.to_string()).into_response();
+    }
+    let Some(peer) = peer else {
+        return (
+            StatusCode::FORBIDDEN,
+            "registry proposals require a TLS node certificate",
+        )
+            .into_response();
+    };
+    let Some(council) = &state.council else {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            "no registry council available",
+        )
+            .into_response();
+    };
+    let result = tokio::time::timeout(std::time::Duration::from_secs(10), async {
+        let security = council
+            .security_state_linearizable()
+            .await
+            .map_err(|error| (StatusCode::SERVICE_UNAVAILABLE, error.to_string()))?;
+        let node_id = crate::sesame::renewal::validate_peer(&peer, &security)
+            .map_err(|error| (StatusCode::FORBIDDEN, error.to_string()))?;
+        let request = proposal
+            .mutation
+            .request_for_node(&node_id)
+            .map_err(|error| (StatusCode::FORBIDDEN, error.to_string()))?;
+        council
+            .write(request)
+            .await
+            .map_err(|error| (StatusCode::SERVICE_UNAVAILABLE, error.to_string()))
+    })
+    .await;
+    match result {
+        Ok(Ok(crate::council::CouncilResponse::Refused { reason })) => {
+            (StatusCode::CONFLICT, reason).into_response()
+        }
+        Ok(Ok(response)) => Json(response).into_response(),
+        Ok(Err(error)) => error.into_response(),
+        Err(_) => (StatusCode::GATEWAY_TIMEOUT, "registry proposal timed out").into_response(),
     }
 }
 

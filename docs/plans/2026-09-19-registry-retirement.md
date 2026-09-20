@@ -15,6 +15,9 @@ Implement each independently reviewable repair in its own commit.
    upload sessions to that repository and principal, and fence admission and
    manifest commits after cleanup starts. Conditional Raft commits must check
    lease authority at application time, not only in an earlier HTTP check.
+   Restrict leased image references to workloads belonging to the same lease;
+   ordinary workloads must not acquire an undeclared dependency that cleanup
+   would later remove. Apply this check to declarative apps and node-local jobs.
 3. Supply authenticated leader forwarding for authoritative registry mutations.
    Followers must never report a local-only proposal as a durable cluster push.
    Keep single-node durability explicit and retain uncertainty after a timeout.
@@ -72,3 +75,37 @@ strict all-target/all-feature Clippy pass on macOS/Linux. Local copies remain
 available for retry after refusal. Authenticated leader forwarding, including
 workers without a local council handle, remains step 3; it is not implemented
 by this status-code repair.
+
+## Authoritative forwarding completed
+
+Every clustered Bun now has a registry forwarder independently of whether it
+has a local council handle. It attempts the local council, then resolves the
+advertised leader endpoint when forwarding is required. The dedicated client
+uses live node credentials and refuses HTTP redirects. Local-only mode remains
+explicit; loss of the cluster leader cannot silently turn a worker into a
+standalone registry.
+
+The restricted `/v1/registry/propose` endpoint accepts only manifest and GC
+operations with explicit compatibility. It requires the service principal and
+an actual TLS peer leaf. A fresh quorum-backed security view validates the
+certificate and retirement state, and the proposed holder IDs must match that
+node. A follower refuses; it cannot replace the sender's identity by forwarding
+again. Raft also fences retired writers at application time, closing the race
+between TLS authorisation and committed node retirement. Requests and responses
+are limited to 8 MiB; deadlines include request-body extraction, consensus,
+networking and response streaming.
+
+The route absence, commit-after-retirement and fresh-worker stale-term
+regressions fail before their fixes. All four real TLS integration cases pass on
+macOS and Linux (10.02s each), covering worker/follower manifest pushes, current
+credentials, foreign/revoked leaves, forged holders, a three-node Raft election,
+an isolated old leader and lost quorum. Oversized and stalled request/response
+bodies refuse within their limits. The election fixture discovers and
+quorum-confirms the actual leader before injecting faults; it does not assume
+its bootstrap node still leads after TLS setup.
+
+All 248 Pickle, 83 Raft state-machine and eight authorisation-audit tests pass,
+as do the 13 renewal, 17 registry cluster, five integrity and two upload cases.
+Strict all-target/all-feature Clippy passes on macOS/Linux. Protocol 8/state 12
+and lease schema 4 remain unchanged. Repository ownership/retirement and the
+complete live catalogue remain open.

@@ -62,6 +62,7 @@ fn registry_state(root: &std::path::Path) -> reliaburger::pickle::api::PickleSta
         catalog: Default::default(),
         node_raft_id: 1,
         council: None,
+        forwarder: None,
         persist_path: None,
         auth: Some(reliaburger::sesame::auth::AuthState::new(
             Default::default(),

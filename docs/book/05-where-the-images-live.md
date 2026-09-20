@@ -966,3 +966,40 @@ reloaded approval, nomination and an actual failed file deletion followed by
 repair. All 243 Pickle and 82 Raft state-machine tests pass on macOS/Linux, with
 strict Clippy on both. The ownership decision is unchanged in shape; no new
 state format is needed.
+
+### The node receiving a push might not lead the catalogue
+
+A client can reach a perfectly healthy registry on a follower. Saving the blobs
+there does not make its manifest visible in Raft. The receiving node now sends
+its proposal directly to the advertised leader when the local council cannot
+commit it. A worker without a council uses the same path. If the leader is
+unavailable, the client gets a retryable error and the stored bytes remain
+available for its next attempt.
+
+The internal request contains a `RegistryMutation` enum with two alternatives:
+a manifest commit or a garbage-collection proposal. It cannot carry an arbitrary
+Raft command. The larger manifest lives in `Box<ManifestCommit>`: `Box` owns a
+heap allocation, so the small GC alternative does not reserve space for every
+manifest field. Serialisation still produces the same manifest fields on the
+wire; this is a Rust memory-layout choice.
+
+The leader requires both the internal service credential and the node certificate
+presented on that TLS connection. It checks current revocations and derives the
+allowed holder ID from the certificate. A request body cannot nominate another
+node's holdings for deletion. If an operator retires the writer while a proposal
+is in flight, the Raft state machine refuses it too. Checking only before the
+write would leave an ordering gap.
+
+The client refuses redirects, bounds the response and includes streaming in its
+deadline. The server bounds the request body and places its deadline outside JSON
+extraction, so a sender cannot hold the handler indefinitely by trickling JSON.
+A timed-out proposal remains uncertain: it might have committed after the caller
+stopped waiting. Retrying is how the client establishes acceptance.
+
+The tests push through a worker and a follower using real TLS, then inspect the
+leader's catalogue. A three-node Raft fixture isolates its old leader, elects a
+replacement and updates the advertised route. Forwarding succeeds through the
+new leader and refuses after the remaining quorum is lost. Separate tests cover
+wrong credentials, forged holdings, certificate revocation and bounded streams.
+Repository lease ownership and cleanup still need their own conditional commits;
+forwarding alone cannot establish those obligations.

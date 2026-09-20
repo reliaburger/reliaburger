@@ -298,6 +298,7 @@ async fn start_registry_with_council(
         catalog: Arc::clone(&catalog),
         node_raft_id: 1,
         council,
+        forwarder: None,
         persist_path: None,
         auth: None,
         require_read_auth: false,

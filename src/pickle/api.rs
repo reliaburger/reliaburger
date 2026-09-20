@@ -40,6 +40,8 @@ pub struct PickleState {
     /// Council handle for proposing catalog changes to Raft (cluster
     /// council members only; `None` single-node).
     pub council: Option<Arc<crate::council::CouncilNode>>,
+    /// Present on every clustered node, including workers without a council.
+    pub forwarder: Option<super::authority::RegistryForwarder>,
     /// Where to persist the catalog after each mutation, so image
     /// metadata survives restarts. `None` disables persistence (tests).
     pub persist_path: Option<std::path::PathBuf>,
@@ -238,35 +240,53 @@ pub(crate) async fn record_commit(
     .await
     .map_err(|error| PickleError::CatalogPersist(error.to_string()))??;
 
-    if let Some(council) = &state.council {
-        match tokio::time::timeout(
-            std::time::Duration::from_secs(10),
-            council.write(crate::council::types::RaftRequest::ManifestCommit(commit)),
-        )
-        .await
-        {
-            Ok(Ok(
-                crate::council::CouncilResponse::Ok
-                | crate::council::CouncilResponse::Applied { .. },
-            )) => {}
-            Ok(Ok(response)) => {
-                return Err(PickleError::ReplicationFailed(format!(
-                    "manifest commit refused: {response:?}"
-                )));
-            }
-            Ok(Err(error)) => {
-                return Err(PickleError::ReplicationFailed(format!(
-                    "local manifest persisted but Raft commit failed: {error}"
-                )));
-            }
-            Err(_) => {
-                return Err(PickleError::ReplicationFailed(
-                    "manifest commit timed out; retry to establish cluster acceptance".into(),
-                ));
-            }
+    match state
+        .propose(super::authority::RegistryMutation::Manifest(Box::new(
+            commit,
+        )))
+        .await?
+    {
+        None
+        | Some(
+            crate::council::CouncilResponse::Ok | crate::council::CouncilResponse::Applied { .. },
+        ) => {}
+        Some(response) => {
+            return Err(PickleError::ReplicationFailed(format!(
+                "manifest commit refused: {response:?}"
+            )));
         }
     }
+
     Ok(())
+}
+
+impl PickleState {
+    async fn propose(
+        &self,
+        mutation: super::authority::RegistryMutation,
+    ) -> Result<Option<crate::council::CouncilResponse>, super::types::PickleError> {
+        if let Some(forwarder) = &self.forwarder {
+            return forwarder
+                .write(self.council.as_ref(), mutation)
+                .await
+                .map(Some);
+        }
+        let Some(council) = &self.council else {
+            return Ok(None);
+        };
+        tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            council.write(mutation.request()),
+        )
+        .await
+        .map_err(|_| {
+            super::types::PickleError::ReplicationFailed(
+                "registry proposal timed out; retry to establish acceptance".into(),
+            )
+        })?
+        .map(Some)
+        .map_err(|error| super::types::PickleError::ReplicationFailed(error.to_string()))
+    }
 }
 
 impl PickleState {
@@ -277,24 +297,19 @@ impl PickleState {
         report: super::types::GcReport,
     ) -> Result<Vec<Digest>, super::types::PickleError> {
         use super::types::PickleError;
-        let authoritative = if let Some(council) = &self.council {
-            let response = tokio::time::timeout(
-                std::time::Duration::from_secs(10),
-                council.write(crate::council::types::RaftRequest::GcReport(report.clone())),
-            )
-            .await
-            .map_err(|_| PickleError::ReplicationFailed("GC arbitration timed out".into()))?
-            .map_err(|error| PickleError::ReplicationFailed(error.to_string()))?;
-            match response {
-                crate::council::CouncilResponse::GcApproved { approved } => Some(approved),
-                response => {
-                    return Err(PickleError::ReplicationFailed(format!(
-                        "GC arbitration refused: {response:?}"
-                    )));
-                }
+        let authoritative = match self
+            .propose(super::authority::RegistryMutation::GarbageCollection(
+                report.clone(),
+            ))
+            .await?
+        {
+            Some(crate::council::CouncilResponse::GcApproved { approved }) => Some(approved),
+            None => None,
+            Some(response) => {
+                return Err(PickleError::ReplicationFailed(format!(
+                    "GC arbitration refused: {response:?}"
+                )));
             }
-        } else {
-            None
         };
         let mut catalog = Arc::clone(&self.catalog).write_owned().await;
         let store = Arc::clone(&self.store);
@@ -1718,6 +1733,7 @@ mod tests {
             catalog: Arc::new(RwLock::new(ManifestCatalog::default())),
             node_raft_id: 7,
             council: None,
+            forwarder: None,
             persist_path: None,
             auth: None,
             require_read_auth: false,
@@ -2482,6 +2498,7 @@ mod tests {
             catalog: Arc::new(RwLock::new(ManifestCatalog::default())),
             node_raft_id: 7,
             council: None,
+            forwarder: None,
             persist_path: None,
             auth: None,
             require_read_auth: false,
@@ -2527,6 +2544,7 @@ mod tests {
             catalog: Arc::new(RwLock::new(ManifestCatalog::default())),
             node_raft_id: 7,
             council: None,
+            forwarder: None,
             persist_path: None,
             auth: None,
             require_read_auth: false,
@@ -2599,6 +2617,7 @@ mod tests {
             catalog: Arc::new(RwLock::new(ManifestCatalog::default())),
             node_raft_id: 7,
             council: None,
+            forwarder: None,
             persist_path: None,
             auth: None,
             require_read_auth: false,

@@ -907,6 +907,16 @@ and 24 Linux registry integration tests pass; native full-library/registry cases
 and strict Clippy on both platforms pass. See the
 [registry retirement plan](2026-09-19-registry-retirement.md) for remaining work.
 
+**Authoritative forwarding prerequisite (20 September):** Clustered registry
+writers use a bounded, non-redirecting service/node-TLS proposal path to the
+advertised leader, including fresh workers and followers. The leader validates
+current peer authority against a quorum read; Raft refuses retired holders at
+application time. Four real TLS integration cases pass on macOS/Linux (10.02s),
+including three-node election, old-leader refusal, lost quorum and request-body
+limits. All 248 Pickle, 83 state-machine and eight route-audit tests, existing
+registry/renewal integrations and strict Clippy pass. No schema changed. The
+[registry retirement plan](2026-09-19-registry-retirement.md) records details.
+
 Remaining resource contracts, each in its own commit: registry uploads/repositories
 and process identity/pre-adoption recovery. Managed volume/mount cleanup is
 implemented and qualified as recorded above. Node effects already use C06 reservations

@@ -47,7 +47,8 @@ Registry upload recovery reclaims abandoned partial uploads after a crash and
 requires one Bun per writable image store; see the [startup contract](docs/README.md).
 Manifest pushes persist their local catalogue before acknowledgement and refuse
 filesystem failures. Publication and garbage collection serialise their final
-blob checks and deletion. Unconfirmed Raft commits return 503 for client retry;
+blob checks and deletion. Clustered workers and followers forward writes to the
+authenticated leader; unconfirmed Raft commits return 503 for client retry;
 201 confirms catalogue acceptance, with blob replication potentially still pending.
 Direct image pulls and Pickle verify pinned manifests, selected platform
 manifests and configuration bytes before accepting them into the cache.

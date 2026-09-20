@@ -37,6 +37,7 @@ impl Registry {
             catalog: Arc::new(RwLock::new(ManifestCatalog::default())),
             node_raft_id,
             council: None,
+            forwarder: None,
             persist_path: None,
             auth: None,
             require_read_auth: false,
@@ -439,6 +440,7 @@ async fn start_authenticated_registry(deployer_plaintext: &mut String) -> Regist
         catalog: Arc::new(RwLock::new(ManifestCatalog::default())),
         node_raft_id: 1,
         council: None,
+        forwarder: None,
         persist_path: None,
         auth: Some(auth),
         require_read_auth: false,
@@ -610,6 +612,7 @@ async fn a_peer_committed_manifest_is_visible_through_the_authoritative_catalogu
         catalog: Arc::new(RwLock::new(ManifestCatalog::default())), // empty local
         node_raft_id: 1,
         council: Some(council.clone()),
+        forwarder: None,
         persist_path: None,
         auth: None,
         require_read_auth: false,

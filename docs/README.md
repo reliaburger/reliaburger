@@ -107,12 +107,14 @@ Pushing identical bytes into another repository preserves independent tags;
 retiring one repository's final tag leaves the other copy and shared layers
 referenced. Content signatures remain available across repository copies and
 restart. A manifest push persists its catalogue before acknowledging success;
-filesystem failures refuse the push. Unconfirmed Raft commits return 503 and
+filesystem failures refuse the push. Clustered workers and followers forward
+manifest and GC proposals to the advertised leader over authenticated node TLS.
+The leader checks current identity and quorum; retired nodes cannot commit.
+Unconfirmed Raft commits return 503 and
 require a client retry; 201 confirms catalogue acceptance, while blob replication
 may still be pending. Push publication and GC deletion share a
 transaction guard, so collection cannot delete a layer between its final check
-and publication. Repository/upload lease cleanup and authoritative forwarding
-are still tracked separately in C34.
+and publication. Repository/upload lease cleanup remains open in C34.
 
 Registry startup claims exclusive ownership of the configured image store's
 upload directory. Run only one Bun with that writable image store. A restart
