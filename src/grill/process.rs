@@ -27,6 +27,8 @@ use tokio::process::Command;
 use tokio::sync::Mutex;
 
 use super::oci::OciSpec;
+use super::process_control::ProcessControl;
+use super::process_owner::OwnerPhase;
 use super::records::{self, InstanceRecord};
 use super::state::ContainerState;
 use super::{GrillError, InstanceId};
@@ -131,6 +133,13 @@ fn signal_child_group(pid: u32, signal: nix::sys::signal::Signal) -> std::io::Re
     }
 }
 
+fn owner_error(instance: &InstanceId, error: impl std::fmt::Display) -> GrillError {
+    GrillError::StateUnavailable {
+        instance: instance.clone(),
+        reason: error.to_string(),
+    }
+}
+
 fn log_file(stem: &Path, suffix: &str) -> PathBuf {
     let mut name = stem
         .file_name()
@@ -150,6 +159,8 @@ pub struct ProcessGrill {
     processes: Arc<Mutex<HashMap<InstanceId, ProcessEntry>>>,
     /// When set, stdout/stderr go to files here instead of pipes.
     log_dir: Option<PathBuf>,
+    /// Durable owner authority for persistent production workloads.
+    control: Option<ProcessControl>,
 }
 
 impl ProcessGrill {
@@ -158,6 +169,7 @@ impl ProcessGrill {
         Self {
             processes: Arc::new(Mutex::new(HashMap::new())),
             log_dir: None,
+            control: None,
         }
     }
 
@@ -167,6 +179,18 @@ impl ProcessGrill {
         Self {
             processes: Arc::new(Mutex::new(HashMap::new())),
             log_dir: Some(log_dir),
+            control: None,
+        }
+    }
+
+    /// Create a persistent runtime backed by the foreground owner in `bun`.
+    /// Every launch is discoverable before an agent adoption record exists.
+    pub fn with_owner(log_dir: PathBuf, executable: PathBuf) -> Self {
+        let control = ProcessControl::new(log_dir.join("process-owners"), executable);
+        Self {
+            processes: Arc::new(Mutex::new(HashMap::new())),
+            log_dir: Some(log_dir),
+            control: Some(control),
         }
     }
 
@@ -185,6 +209,24 @@ impl ProcessGrill {
         instance: &InstanceId,
         stdout: bool,
     ) -> Result<Vec<u8>, GrillError> {
+        if let Some(control) = &self.control {
+            let stem = control
+                .log_stem(instance)
+                .map_err(|error| owner_error(instance, error))?;
+            control
+                .status(instance)
+                .await
+                .map_err(|error| owner_error(instance, error))?;
+            let path = log_file(&stem, if stdout { "stdout" } else { "stderr" });
+            return tokio::task::spawn_blocking(move || match std::fs::read(path) {
+                Ok(bytes) => Ok(bytes),
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(Vec::new()),
+                Err(error) => Err(error),
+            })
+            .await
+            .map_err(|error| owner_error(instance, error))?
+            .map_err(|error| owner_error(instance, error));
+        }
         let procs = self.processes.lock().await;
         let entry = procs.get(instance).ok_or_else(|| GrillError::NotFound {
             instance: instance.clone(),
@@ -210,6 +252,14 @@ impl Default for ProcessGrill {
 
 impl super::Grill for ProcessGrill {
     async fn create(&self, instance: &InstanceId, spec: &OciSpec) -> Result<(), GrillError> {
+        if let Some(control) = &self.control {
+            return control.prepare(instance, spec).await.map_err(|error| {
+                GrillError::StartFailed {
+                    instance: instance.clone(),
+                    reason: error.to_string(),
+                }
+            });
+        }
         let mut procs = self.processes.lock().await;
         // Allow re-creation of stopped instances (needed for restart)
         if let Some(existing) = procs.get(instance)
@@ -239,6 +289,15 @@ impl super::Grill for ProcessGrill {
     }
 
     async fn start(&self, instance: &InstanceId) -> Result<(), GrillError> {
+        if let Some(control) = &self.control {
+            return control
+                .start(instance)
+                .await
+                .map_err(|error| GrillError::StartFailed {
+                    instance: instance.clone(),
+                    reason: error.to_string(),
+                });
+        }
         let mut procs = self.processes.lock().await;
         let entry = procs
             .get_mut(instance)
@@ -365,6 +424,15 @@ impl super::Grill for ProcessGrill {
     }
 
     async fn stop(&self, instance: &InstanceId) -> Result<(), GrillError> {
+        if let Some(control) = &self.control {
+            return control
+                .signal(instance, false)
+                .await
+                .map_err(|error| GrillError::StopFailed {
+                    instance: instance.clone(),
+                    reason: error.to_string(),
+                });
+        }
         let mut procs = self.processes.lock().await;
         let entry = procs
             .get_mut(instance)
@@ -397,6 +465,15 @@ impl super::Grill for ProcessGrill {
     }
 
     async fn kill(&self, instance: &InstanceId) -> Result<(), GrillError> {
+        if let Some(control) = &self.control {
+            return control
+                .signal(instance, true)
+                .await
+                .map_err(|error| GrillError::StopFailed {
+                    instance: instance.clone(),
+                    reason: error.to_string(),
+                });
+        }
         let mut procs = self.processes.lock().await;
         let entry = procs
             .get_mut(instance)
@@ -441,6 +518,18 @@ impl super::Grill for ProcessGrill {
     }
 
     async fn state(&self, instance: &InstanceId) -> Result<ContainerState, GrillError> {
+        if let Some(control) = &self.control {
+            let record = control
+                .status(instance)
+                .await
+                .map_err(|error| owner_error(instance, error))?;
+            return Ok(match record.phase {
+                OwnerPhase::Prepared => ContainerState::Pending,
+                OwnerPhase::Retiring { .. } => ContainerState::Stopping,
+                OwnerPhase::Running { .. } => ContainerState::Running,
+                OwnerPhase::Retired { .. } | OwnerPhase::Cancelled => ContainerState::Stopped,
+            });
+        }
         let mut procs = self.processes.lock().await;
         let entry = procs
             .get_mut(instance)
@@ -479,6 +568,30 @@ impl super::Grill for ProcessGrill {
         instance: &InstanceId,
         record: &InstanceRecord,
     ) -> Result<bool, GrillError> {
+        if let Some(control) = &self.control {
+            let owner = control
+                .status(instance)
+                .await
+                .map_err(|error| owner_error(instance, error))?;
+            if owner
+                .launch
+                .as_ref()
+                .is_none_or(|launch| launch.spec != record.oci_spec)
+            {
+                return Err(owner_error(
+                    instance,
+                    "process launch conflicts with adoption record",
+                ));
+            }
+            return match owner.phase {
+                OwnerPhase::Running { .. } => Ok(true),
+                OwnerPhase::Retired { .. } | OwnerPhase::Cancelled => Ok(false),
+                OwnerPhase::Prepared | OwnerPhase::Retiring { .. } => Err(owner_error(
+                    instance,
+                    "unactivated process preparation requires recovery",
+                )),
+            };
+        }
         let (running, _) =
             poll_adopted_process(record.pid, Some(record.pid_started_at)).map_err(|error| {
                 GrillError::StateUnavailable {
@@ -509,6 +622,12 @@ impl super::Grill for ProcessGrill {
     }
 
     async fn pid(&self, instance: &InstanceId) -> Option<u32> {
+        if let Some(control) = &self.control {
+            return match control.status(instance).await.ok()?.phase {
+                OwnerPhase::Running { pid } => Some(pid),
+                _ => None,
+            };
+        }
         let procs = self.processes.lock().await;
         let entry = procs.get(instance)?;
         entry
@@ -519,11 +638,20 @@ impl super::Grill for ProcessGrill {
     }
 
     async fn log_stem(&self, instance: &InstanceId) -> Option<PathBuf> {
+        if let Some(control) = &self.control {
+            return control.log_stem(instance).ok();
+        }
         let procs = self.processes.lock().await;
         procs.get(instance).and_then(|e| e.log_stem.clone())
     }
 
     async fn exit_code(&self, instance: &InstanceId) -> Option<i32> {
+        if let Some(control) = &self.control {
+            return match control.status(instance).await.ok()?.phase {
+                OwnerPhase::Retired { exit_code } => exit_code,
+                _ => None,
+            };
+        }
         let procs = self.processes.lock().await;
         let entry = procs.get(instance)?;
         entry.exit_code
@@ -536,7 +664,11 @@ impl super::Grill for ProcessGrill {
 
     async fn exec(&self, instance: &InstanceId, command: &[String]) -> Result<String, GrillError> {
         // Verify the instance exists and is running
-        {
+        if self.control.is_some() {
+            if self.state(instance).await? != ContainerState::Running {
+                return Err(owner_error(instance, "instance is not running"));
+            }
+        } else {
             let procs = self.processes.lock().await;
             let entry = procs.get(instance).ok_or_else(|| GrillError::NotFound {
                 instance: instance.clone(),
@@ -583,7 +715,12 @@ impl super::Grill for ProcessGrill {
         lines_tx: tokio::sync::mpsc::Sender<String>,
     ) {
         // Snapshot how this instance's logs are captured.
-        let (stdout_buf, log_stem) = {
+        let (stdout_buf, log_stem) = if let Some(control) = &self.control {
+            (
+                Arc::new(Mutex::new(Vec::new())),
+                control.log_stem(instance).ok(),
+            )
+        } else {
             let procs = self.processes.lock().await;
             match procs.get(instance) {
                 Some(entry) => (entry.stdout_buf.clone(), entry.log_stem.clone()),
@@ -631,7 +768,18 @@ impl super::Grill for ProcessGrill {
             }
 
             // Check if the process has exited and no more data is coming
-            {
+            if self.control.is_some() {
+                match self.state(instance).await {
+                    Ok(ContainerState::Stopped) if no_new_data => {
+                        if !partial_line.is_empty() {
+                            let _ = lines_tx.send(std::mem::take(&mut partial_line)).await;
+                        }
+                        return;
+                    }
+                    Err(_) => return,
+                    _ => {}
+                }
+            } else {
                 let procs = self.processes.lock().await;
                 if let Some(entry) = procs.get(instance) {
                     let exited = entry.state == ContainerState::Stopped

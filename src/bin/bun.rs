@@ -62,6 +62,9 @@ enum Command {
         /// Private execution-generation directory.
         #[arg(long)]
         directory: PathBuf,
+        /// Exact generation selected before launching the helper.
+        #[arg(long)]
+        generation: Option<String>,
     },
     /// Internal workload activation gate; never executes before durable ownership.
     #[command(name = "__process-exec-gate", hide = true)]
@@ -583,8 +586,15 @@ fn main() -> anyhow::Result<()> {
     }
 
     match &cli.command {
-        Some(Command::ProcessOwner { directory }) => {
-            return reliaburger::grill::process_owner::run_owner(directory).map_err(Into::into);
+        Some(Command::ProcessOwner {
+            directory,
+            generation,
+        }) => {
+            return reliaburger::grill::process_owner::run_owner_generation(
+                directory,
+                generation.as_deref(),
+            )
+            .map_err(Into::into);
         }
         Some(Command::ProcessExecutionGate { directory }) => {
             return reliaburger::grill::process_owner::run_execution_gate(directory)

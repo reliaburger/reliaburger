@@ -55,9 +55,16 @@ security boundary against hostile same-user processes.
 - [ ] Persist agent/runtime launch intent and an unpredictable generation before
   starting the owner; retain the record across caller cancellation. Keep Unix
   socket paths short and private even when the data-directory path is long.
-- [ ] Wire ProcessGrill start, status, stop, kill, logs and adoption through the
-  owner. Never fall back to signalling a recorded PID. Preserve output and
-  terminal evidence across Bun death and upgrade.
+- [x] Add the explicit `ProcessGrill::with_owner` adapter for start, status, stop,
+  kill, logs and adoption through the owner. Three recovery regressions fail
+  against the old adapter before implementation. Nine adapter regressions and
+  all nine owner tests pass on macOS/Linux. Coverage includes long paths,
+  cancelled launch callers, stale delayed helpers, damaged intent and owner
+  loss. Positive absence evidence permits recovery after failed socket cleanup;
+  a missing Running owner never permits a recovered-PID signal.
+- [ ] Select the owned adapter in production Bun only alongside complete
+  pre-adoption reconciliation. Qualify atomic first-intent publication and
+  distinguish the latest job attempt from older completed runtime generations.
 - [ ] Discover generations before an agent adoption record exists, distinguish
   provably unactivated preparation from uncertain activated owners, and join
   recovered state to app/job cleanup obligations. Advance state compatibility
@@ -66,6 +73,6 @@ security boundary against hostile same-user processes.
   helper loss, short jobs, cron and complete group retirement on macOS/Linux.
   Re-run the runtime, agent, job-recovery and upgrade suites.
 
-The first checked item is a foundation only. ProcessGrill still uses its
-existing launch/adoption path until the integration items land. C34 and the
+The helper and explicit runtime adapter are implemented. Bun still selects its
+existing launch/adoption path until the production integration items land. C34 and the
 0.1.0 release qualification gates remain open.

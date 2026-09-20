@@ -445,8 +445,34 @@ The actual-binary tests exercise these transitions, including stale clients,
 duplicate owners and failed completion writes. One test explicitly releases the
 parent while its child still has 30 seconds to run, then requires retirement
 within two seconds. It would fail if we merely waited for the child to finish
-naturally. This helper is the foundation: wiring ProcessGrill and recovery into
-it remains tracked in the [foreground ownership plan](../plans/2026-09-20-foreground-process-ownership.md).
+naturally.
+
+The persistent ProcessGrill adapter now has an explicit `with_owner` constructor.
+It writes the command, environment, OCI specification and a random generation
+capability before starting the helper. A fresh adapter reads that inventory
+without needing the later agent PID record. It sends bounded socket requests to
+the owner; it never recovers signal authority from the recorded PID.
+
+Cancelling preparation must also fence a delayed launcher. The client takes the
+same owner lock, records cancellation, and releases it. A helper that starts
+later reloads the record and refuses. When a replacement generation is prepared,
+its random capability changes; an old helper carries its original capability
+on the command line and cannot activate the replacement.
+
+There is another small crash window after all children are gone: removing the
+control socket and writing the final completion record are separate operations.
+The owner first persists a retirement record with positive absence evidence.
+If it dies during socket cleanup, a fresh adapter can finish that cleanup under
+the owner lock. A record that still says Running provides no such permission.
+The adapter reports uncertainty even if the socket has disappeared.
+
+Filesystem operations run through `spawn_blocking`, which moves blocking work
+off Tokio's executor threads. Cancelling the caller doesn't abort that worker,
+so its generation record and lock remain owned until the operation finishes.
+Socket requests use Tokio's existing reactor with a deadline covering connection,
+write and read. The explicit adapter and its recovery tests are implemented;
+Bun's production selection and pre-adoption reconciliation remain in the
+[foreground ownership plan](../plans/2026-09-20-foreground-process-ownership.md).
 
 Two fields in the app config:
 

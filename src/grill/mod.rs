@@ -22,6 +22,7 @@ pub(crate) mod oci_pull;
 pub mod port;
 pub mod portmap;
 pub mod process;
+mod process_control;
 pub mod process_owner;
 pub mod process_workload;
 pub mod records;
@@ -54,7 +55,7 @@ pub use state::ContainerState;
 /// [`InstanceIdentity::instance_id`] rather than formatting by hand — the
 /// raw string is opaque to everything that keys on it (the supervisor
 /// map, on-disk records, container ids, netns names, identity dirs).
-#[derive(Debug, Clone, Hash, Eq, PartialEq)]
+#[derive(Debug, Clone, Hash, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct InstanceId(pub String);
 
 impl fmt::Display for InstanceId {

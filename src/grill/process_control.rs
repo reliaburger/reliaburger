@@ -1,0 +1,410 @@
+//! Durable client of the foreground owner. All filesystem/socket operations run
+//! on blocking workers; cancellation never cancels an in-flight mutation.
+
+use std::fs::{File, OpenOptions};
+use std::io;
+use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt};
+use std::path::{Path, PathBuf};
+use std::process::Stdio;
+use std::time::{Duration, Instant};
+
+use ring::rand::{SecureRandom, SystemRandom};
+
+use super::InstanceId;
+use super::oci::OciSpec;
+use super::process_owner::{self, OwnerPhase, OwnerRecord, ProcessLaunch};
+
+#[derive(Debug, Clone)]
+pub(crate) struct ProcessControl {
+    root: PathBuf,
+    executable: PathBuf,
+}
+
+impl ProcessControl {
+    pub(crate) fn new(root: PathBuf, executable: PathBuf) -> Self {
+        Self { root, executable }
+    }
+
+    fn directory(&self, id: &InstanceId) -> io::Result<PathBuf> {
+        if id.0.is_empty()
+            || id.0.len() > 200
+            || !id
+                .0
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || b"_-".contains(&byte))
+        {
+            return Err(io::Error::other("invalid process instance identity"));
+        }
+        Ok(self.root.join(&id.0))
+    }
+
+    fn load(&self, id: &InstanceId) -> io::Result<OwnerRecord> {
+        let directory = self.directory(id)?;
+        validate_directory(&self.root)?;
+        validate_directory(&directory)?;
+        let record = process_owner::load(&directory)?;
+        let launch = record
+            .launch
+            .as_ref()
+            .ok_or_else(|| io::Error::other("missing process launch intent"))?;
+        if launch.instance_id != *id
+            || record.command != command(&launch.spec)
+            || record.environment != environment(&launch.spec)
+        {
+            return Err(io::Error::other(
+                "process intent conflicts with instance or command",
+            ));
+        }
+        Ok(record)
+    }
+
+    async fn run<T: Send + 'static>(
+        &self,
+        id: &InstanceId,
+        operation: impl FnOnce(Self, InstanceId) -> io::Result<T> + Send + 'static,
+    ) -> io::Result<T> {
+        let this = self.clone();
+        let id = id.clone();
+        tokio::task::spawn_blocking(move || operation(this, id))
+            .await
+            .map_err(io::Error::other)?
+    }
+
+    pub(crate) async fn prepare(&self, id: &InstanceId, spec: &OciSpec) -> io::Result<()> {
+        let spec = spec.clone();
+        self.run(id, move |this, id| {
+            let directory = this.directory(&id)?;
+            if let Some(parent) = this.root.parent() {
+                std::fs::create_dir_all(parent)?;
+            }
+            create_directory(&this.root)?;
+            create_directory(&directory)?;
+            let _operation = operation_lock(&directory)?;
+            let _owner = wait_for_owner_lock(&directory)?;
+            match this.load(&id) {
+                Ok(previous) => {
+                    if !matches!(
+                        previous.phase,
+                        OwnerPhase::Retired { .. } | OwnerPhase::Cancelled
+                    ) {
+                        return Err(io::Error::other(
+                            "previous process generation has not retired",
+                        ));
+                    }
+                    remove_control_socket(&directory, &previous)?;
+                }
+                Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+                Err(error) => return Err(error),
+            }
+            let mut nonce = [0u8; 16];
+            SystemRandom::new()
+                .fill(&mut nonce)
+                .map_err(|_| io::Error::other("cannot generate process capability"))?;
+            let record = OwnerRecord {
+                schema: 2,
+                nonce: hex::encode(nonce),
+                command: command(&spec),
+                environment: environment(&spec),
+                phase: OwnerPhase::Prepared,
+                launch: Some(ProcessLaunch {
+                    instance_id: id,
+                    spec,
+                }),
+            };
+            process_owner::persist(&directory, &record)
+        })
+        .await
+    }
+
+    pub(crate) async fn start(&self, id: &InstanceId) -> io::Result<()> {
+        self.run(id, |this, id| {
+            let directory = this.directory(&id)?;
+            let _operation = operation_lock(&directory)?;
+            let record = this.load(&id)?;
+            if !matches!(record.phase, OwnerPhase::Prepared) {
+                return Err(io::Error::other("process generation is not prepared"));
+            }
+            let output = OpenOptions::new()
+                .create(true)
+                .append(true)
+                .mode(0o600)
+                .custom_flags(nix::libc::O_NOFOLLOW)
+                .open(directory.join("owner.log"))?;
+            let mut child = tokio::process::Command::new(&this.executable)
+                .args(["__process-owner", "--directory"])
+                .arg(&directory)
+                .arg("--generation")
+                .arg(&record.nonce)
+                .process_group(0)
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(output)
+                .kill_on_drop(false)
+                .spawn()?;
+            // Tokio owns only the helper's reaping, never its workload child.
+            // Dropping/cancelling Bun's caller must not kill the durable owner.
+            tokio::spawn(async move {
+                let _ = child.wait().await;
+            });
+            let deadline = Instant::now() + Duration::from_secs(15);
+            loop {
+                let current = this.load(&id)?;
+                if current.nonce != record.nonce {
+                    return Err(io::Error::other("process launch generation changed"));
+                }
+                match current.phase {
+                    OwnerPhase::Running { .. }
+                    | OwnerPhase::Retiring { .. }
+                    | OwnerPhase::Retired { .. } => return Ok(()),
+                    OwnerPhase::Cancelled => {
+                        return Err(io::Error::other("process launch was cancelled"));
+                    }
+                    OwnerPhase::Prepared => {}
+                }
+                if Instant::now() >= deadline {
+                    return Err(io::Error::new(
+                        io::ErrorKind::TimedOut,
+                        "process owner did not start; launch intent retained",
+                    ));
+                }
+                std::thread::sleep(Duration::from_millis(10));
+            }
+        })
+        .await
+    }
+
+    pub(crate) async fn status(&self, id: &InstanceId) -> io::Result<OwnerRecord> {
+        self.run(id, |this, id| {
+            let record = this.finish_retirement(&id)?;
+            if !matches!(record.phase, OwnerPhase::Running { .. }) { return Ok(record); }
+            let result = request(&this.directory(&id)?, &record, "status");
+            // The owner may commit completion and remove its socket between
+            // reading the record and connecting. Re-read that positive proof.
+            let current = this.finish_retirement(&id)?;
+            if current.nonce != record.nonce { return Err(io::Error::other("process generation changed during inspection")); }
+            if matches!(current.phase, OwnerPhase::Retired { .. }) { return Ok(current); }
+            let response = result?;
+            let phase: OwnerPhase = serde_json::from_value(response.get("phase").cloned()
+                .ok_or_else(|| io::Error::other("owner returned no phase"))?)?;
+            if !matches!((phase, &record.phase), (OwnerPhase::Running { pid: live }, OwnerPhase::Running { pid: recorded }) if live == *recorded) {
+                return Err(io::Error::other("owner returned conflicting process identity"));
+            }
+            Ok(current)
+        }).await
+    }
+
+    pub(crate) async fn signal(&self, id: &InstanceId, force: bool) -> io::Result<()> {
+        self.run(id, move |this, id| {
+            let directory = this.directory(&id)?;
+            let _operation = operation_lock(&directory)?;
+            let mut record = this.finish_retirement(&id)?;
+            if matches!(record.phase, OwnerPhase::Prepared)
+                && let Ok(_owner) = process_owner::lock_owner(&directory)
+            {
+                record = this.load(&id)?;
+                if matches!(record.phase, OwnerPhase::Prepared) {
+                    // Locking fences a helper still waiting to start. Its
+                    // subsequent reload sees Cancelled, never user code.
+                    record.phase = OwnerPhase::Cancelled;
+                    process_owner::persist(&directory, &record)?;
+                    remove_control_socket(&directory, &record)?;
+                    return Ok(());
+                }
+            }
+            if matches!(
+                record.phase,
+                OwnerPhase::Retired { .. } | OwnerPhase::Cancelled
+            ) {
+                return Ok(());
+            }
+            let result = request(
+                &directory,
+                &record,
+                if force { "kill" } else { "terminate" },
+            );
+            let current = this.finish_retirement(&id)?;
+            if current.nonce != record.nonce {
+                return Err(io::Error::other(
+                    "process generation changed during signalling",
+                ));
+            }
+            if matches!(current.phase, OwnerPhase::Retired { .. }) {
+                return Ok(());
+            }
+            if result?["accepted"] != true {
+                return Err(io::Error::other("owner did not accept signal"));
+            }
+            Ok(())
+        })
+        .await
+    }
+
+    fn finish_retirement(&self, id: &InstanceId) -> io::Result<OwnerRecord> {
+        let directory = self.directory(id)?;
+        let mut record = self.load(id)?;
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while matches!(record.phase, OwnerPhase::Retiring { .. }) {
+            match process_owner::lock_owner(&directory) {
+                Ok(_owner) => {
+                    record = self.load(id)?;
+                    if matches!(record.phase, OwnerPhase::Retiring { .. }) {
+                        process_owner::complete_retirement(&directory, &mut record)?;
+                    }
+                    return Ok(record);
+                }
+                Err(error)
+                    if error.kind() == io::ErrorKind::WouldBlock && Instant::now() < deadline =>
+                {
+                    std::thread::sleep(Duration::from_millis(10));
+                    record = self.load(id)?;
+                }
+                Err(error) => return Err(error),
+            }
+        }
+        Ok(record)
+    }
+
+    pub(crate) fn log_stem(&self, id: &InstanceId) -> io::Result<PathBuf> {
+        Ok(self.directory(id)?.join("output"))
+    }
+}
+
+fn command(spec: &OciSpec) -> Vec<String> {
+    if spec.process.args.is_empty() {
+        vec!["sleep".into(), "86400".into()]
+    } else {
+        spec.process.args.clone()
+    }
+}
+
+fn environment(spec: &OciSpec) -> std::collections::BTreeMap<String, String> {
+    spec.process
+        .env
+        .iter()
+        .filter_map(|value| value.split_once('='))
+        .map(|(key, value)| (key.to_owned(), value.to_owned()))
+        .collect()
+}
+
+fn validate_directory(path: &Path) -> io::Result<()> {
+    use std::os::unix::fs::MetadataExt;
+    let metadata = std::fs::symlink_metadata(path)?;
+    if !metadata.is_dir()
+        || metadata.uid() != nix::unistd::geteuid().as_raw()
+        || metadata.mode() & 0o077 != 0
+    {
+        return Err(io::Error::other(
+            "invalid private process ownership directory",
+        ));
+    }
+    Ok(())
+}
+
+fn create_directory(path: &Path) -> io::Result<()> {
+    match std::fs::DirBuilder::new().mode(0o700).create(path) {
+        Ok(()) => {
+            File::open(path)?.sync_all()?;
+            if let Some(parent) = path.parent() {
+                File::open(parent)?.sync_all()?;
+            }
+        }
+        Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {}
+        Err(error) => return Err(error),
+    }
+    validate_directory(path)
+}
+
+fn operation_lock(directory: &Path) -> io::Result<File> {
+    let file = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .mode(0o600)
+        .custom_flags(nix::libc::O_NOFOLLOW)
+        .open(directory.join("client.lock"))?;
+    let deadline = Instant::now() + Duration::from_secs(2);
+    loop {
+        match file.try_lock() {
+            Ok(()) => break,
+            Err(std::fs::TryLockError::WouldBlock) if Instant::now() < deadline => {
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            Err(std::fs::TryLockError::WouldBlock) => {
+                return Err(io::Error::new(
+                    io::ErrorKind::WouldBlock,
+                    "process operation is busy",
+                ));
+            }
+            Err(std::fs::TryLockError::Error(error)) => return Err(error),
+        }
+    }
+    Ok(file)
+}
+
+fn wait_for_owner_lock(directory: &Path) -> io::Result<File> {
+    let deadline = Instant::now() + Duration::from_secs(2);
+    loop {
+        match process_owner::lock_owner(directory) {
+            Ok(lock) => return Ok(lock),
+            Err(error)
+                if error.kind() == io::ErrorKind::WouldBlock && Instant::now() < deadline =>
+            {
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            Err(error) => return Err(error),
+        }
+    }
+}
+
+fn remove_control_socket(directory: &Path, record: &OwnerRecord) -> io::Result<()> {
+    let socket = process_owner::socket_path(directory, record);
+    let parent = socket
+        .parent()
+        .ok_or_else(|| io::Error::other("invalid socket path"))?;
+    match process_owner::validate_socket_directory(parent) {
+        Ok(()) => {
+            process_owner::remove_socket(&socket)?;
+            std::fs::remove_dir(parent)
+        }
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(error),
+    }
+}
+
+fn request(directory: &Path, record: &OwnerRecord, action: &str) -> io::Result<serde_json::Value> {
+    let path = process_owner::socket_path(directory, record);
+    process_owner::validate_socket_directory(
+        path.parent()
+            .ok_or_else(|| io::Error::other("invalid socket path"))?,
+    )?;
+    let request = format!(
+        "{}\n",
+        serde_json::json!({"nonce": record.nonce, "action": action})
+    );
+    // This function runs on a blocking worker, but the socket uses the existing
+    // Tokio reactor so a full Unix listen backlog cannot block connect forever.
+    let bytes = tokio::runtime::Handle::current().block_on(async move {
+        use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt};
+        tokio::time::timeout(Duration::from_secs(2), async move {
+            let mut socket = tokio::net::UnixStream::connect(path).await?;
+            socket.write_all(request.as_bytes()).await?;
+            let mut bytes = Vec::new();
+            tokio::io::BufReader::new(socket)
+                .take(4097)
+                .read_until(b'\n', &mut bytes)
+                .await?;
+            if bytes.len() > 4096 || bytes.last() != Some(&b'\n') {
+                return Err(io::Error::other("invalid process owner response size"));
+            }
+            Ok(bytes)
+        })
+        .await
+        .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "process owner request timed out"))?
+    })?;
+    let response: serde_json::Value = serde_json::from_slice(&bytes)?;
+    if let Some(error) = response.get("error") {
+        return Err(io::Error::other(format!("process owner refused: {error}")));
+    }
+    Ok(response)
+}

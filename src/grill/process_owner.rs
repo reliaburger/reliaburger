@@ -10,7 +10,7 @@ use std::io::{self, BufRead, BufReader, Read, Write};
 use std::os::unix::fs::OpenOptionsExt;
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::os::unix::process::CommandExt;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::time::Duration;
 
@@ -26,10 +26,17 @@ const RECORD_LIMIT: u64 = 1024 * 1024;
 pub enum OwnerPhase {
     /// No gate has been authorised to execute user code.
     Prepared,
+    /// Preparation was cancelled while holding the exclusive owner lock.
+    Cancelled,
     /// The child identity was persisted before its execution gate opened.
     Running {
         /// Informational PID; only the live owner may use it for signalling.
         pid: u32,
+    },
+    /// Every supported child is gone; only the control socket needs retirement.
+    Retiring {
+        /// Actual root exit code retained while metadata cleanup completes.
+        exit_code: Option<i32>,
     },
     /// The owner observed root exit and confirmed every supported child absent.
     Retired {
@@ -52,9 +59,36 @@ pub struct OwnerRecord {
     pub environment: BTreeMap<String, String>,
     /// Last durably confirmed execution phase.
     pub phase: OwnerPhase,
+    /// Production runtime intent, persisted before starting any owner helper.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub launch: Option<ProcessLaunch>,
 }
 
-fn load(directory: &Path) -> io::Result<OwnerRecord> {
+/// Workload identity and complete runtime input for discovery before adoption.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ProcessLaunch {
+    /// Runtime instance identity whose directory contains this record.
+    pub instance_id: super::InstanceId,
+    /// Runtime specification retained across Bun death.
+    pub spec: super::oci::OciSpec,
+}
+
+/// Short private socket location independent of the node's data path length.
+pub(crate) fn socket_path(directory: &Path, record: &OwnerRecord) -> PathBuf {
+    if record.launch.is_some() {
+        PathBuf::from(format!(
+            "/tmp/rbp-{}-{}",
+            nix::unistd::geteuid(),
+            record.nonce
+        ))
+        .join("control.sock")
+    } else {
+        directory.join("control.sock")
+    }
+}
+
+pub(crate) fn load(directory: &Path) -> io::Result<OwnerRecord> {
     let file = OpenOptions::new()
         .read(true)
         .custom_flags(nix::libc::O_NOFOLLOW | nix::libc::O_NONBLOCK)
@@ -68,7 +102,7 @@ fn load(directory: &Path) -> io::Result<OwnerRecord> {
         return Err(io::Error::other("process owner record exceeds size limit"));
     }
     let record: OwnerRecord = serde_json::from_slice(&bytes)?;
-    if record.schema != 1
+    if !matches!(record.schema, 1 | 2)
         || record.nonce.is_empty()
         || record.nonce.len() > 128
         || record
@@ -78,15 +112,22 @@ fn load(directory: &Path) -> io::Result<OwnerRecord> {
     {
         return Err(io::Error::other("invalid process owner record"));
     }
+    if (record.schema == 2) != record.launch.is_some()
+        || (record.schema == 2
+            && (record.nonce.len() != 32
+                || !record.nonce.bytes().all(|byte| byte.is_ascii_hexdigit())))
+    {
+        return Err(io::Error::other("invalid process launch generation"));
+    }
     Ok(record)
 }
 
-fn persist(directory: &Path, record: &OwnerRecord) -> io::Result<()> {
-    crate::sesame::identity::atomic_write_mode(
-        &directory.join("owner.json"),
-        &serde_json::to_vec(record)?,
-        Some(0o600),
-    )
+pub(crate) fn persist(directory: &Path, record: &OwnerRecord) -> io::Result<()> {
+    let bytes = serde_json::to_vec(record)?;
+    if bytes.len() as u64 > RECORD_LIMIT {
+        return Err(io::Error::other("process owner record exceeds size limit"));
+    }
+    crate::sesame::identity::atomic_write_mode(&directory.join("owner.json"), &bytes, Some(0o600))
 }
 
 /// Run the internal owner on a single thread, before constructing any runtime.
@@ -94,6 +135,23 @@ fn persist(directory: &Path, record: &OwnerRecord) -> io::Result<()> {
 /// The directory must already contain its private launch record. A duplicate
 /// helper refuses the live lock or a non-prepared generation before launching.
 pub fn run_owner(directory: &Path) -> io::Result<()> {
+    run_owner_generation(directory, None)
+}
+
+/// Run only the generation selected by the launching runtime. Delayed helpers
+/// cannot accidentally activate a replacement after cancellation or restart.
+pub fn run_owner_generation(directory: &Path, generation: Option<&str>) -> io::Result<()> {
+    let lock = lock_owner(directory)?;
+    let mut record = load(directory)?;
+    if generation.is_some_and(|generation| generation != record.nonce)
+        || (record.schema == 2 && generation.is_none())
+    {
+        return Err(io::Error::other("process owner generation mismatch"));
+    }
+    run_locked_owner(directory, &mut record, lock)
+}
+
+pub(crate) fn lock_owner(directory: &Path) -> io::Result<File> {
     let lock = OpenOptions::new()
         .read(true)
         .write(true)
@@ -102,16 +160,39 @@ pub fn run_owner(directory: &Path) -> io::Result<()> {
         .mode(0o600)
         .custom_flags(nix::libc::O_NOFOLLOW)
         .open(directory.join("owner.lock"))?;
-    lock.try_lock()
-        .map_err(|error| io::Error::other(format!("process owner is busy: {error}")))?;
-    let mut record = load(directory)?;
+    lock.try_lock().map_err(|error| match error {
+        std::fs::TryLockError::WouldBlock => {
+            io::Error::new(io::ErrorKind::WouldBlock, "process owner is busy")
+        }
+        std::fs::TryLockError::Error(error) => error,
+    })?;
+    Ok(lock)
+}
+
+fn run_locked_owner(directory: &Path, record: &mut OwnerRecord, _lock: File) -> io::Result<()> {
     if !matches!(record.phase, OwnerPhase::Prepared) {
         return Err(io::Error::other(
             "process owner generation has already started",
         ));
     }
     become_subreaper()?;
-    let socket_path = directory.join("control.sock");
+    let socket_path = socket_path(directory, record);
+    if record.launch.is_some() {
+        use std::os::unix::fs::DirBuilderExt;
+        let parent = socket_path
+            .parent()
+            .ok_or_else(|| io::Error::other("invalid socket path"))?;
+        // A previous owner that died before activation may leave this socket.
+        // The exclusive lock and Prepared phase fence all delayed launchers.
+        match std::fs::DirBuilder::new().mode(0o700).create(parent) {
+            Ok(()) => {}
+            Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
+                validate_socket_directory(parent)?;
+                remove_socket(&socket_path)?;
+            }
+            Err(error) => return Err(error),
+        }
+    }
     let listener = UnixListener::bind(&socket_path)?;
     listener.set_nonblocking(true)?;
     let log = |suffix: &str| -> io::Result<File> {
@@ -137,7 +218,7 @@ pub fn run_owner(directory: &Path) -> io::Result<()> {
     record.phase = OwnerPhase::Running {
         pid: owned.child.id(),
     };
-    persist(directory, &record)?;
+    persist(directory, record)?;
     // Spawn returns after the gate executable starts, before the user's code.
     // Its private stdin closes without activation if this owner dies here.
     let mut activation = owned
@@ -153,7 +234,7 @@ pub fn run_owner(directory: &Path) -> io::Result<()> {
         match listener.accept() {
             Ok((connection, _)) => {
                 // An abandoned or malformed client must not end the owner.
-                let _ = respond(connection, &record, &owned);
+                let _ = respond(connection, record, &owned);
             }
             Err(error) if error.kind() == io::ErrorKind::WouldBlock => {}
             Err(error) => return Err(error),
@@ -164,12 +245,59 @@ pub fn run_owner(directory: &Path) -> io::Result<()> {
         if let Some(code) = exit_code
             && retire_children(&mut owned)?
         {
-            record.phase = OwnerPhase::Retired { exit_code: code };
-            persist(directory, &record)?;
-            std::fs::remove_file(&socket_path)?;
+            record.phase = OwnerPhase::Retiring { exit_code: code };
+            persist(directory, record)?;
+            drop(listener);
+            complete_retirement(directory, record)?;
             return Ok(());
         }
         std::thread::sleep(Duration::from_millis(10));
+    }
+}
+
+pub(crate) fn complete_retirement(directory: &Path, record: &mut OwnerRecord) -> io::Result<()> {
+    let OwnerPhase::Retiring { exit_code } = record.phase else {
+        return Err(io::Error::other("process retirement has no absence proof"));
+    };
+    let socket = socket_path(directory, record);
+    if record.launch.is_some() {
+        let parent = socket
+            .parent()
+            .ok_or_else(|| io::Error::other("invalid socket path"))?;
+        match validate_socket_directory(parent) {
+            Ok(()) => {
+                remove_socket(&socket)?;
+                std::fs::remove_dir(parent)?;
+            }
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error),
+        }
+    } else {
+        remove_socket(&socket)?;
+    }
+    record.phase = OwnerPhase::Retired { exit_code };
+    persist(directory, record)
+}
+
+pub(crate) fn validate_socket_directory(directory: &Path) -> io::Result<()> {
+    use std::os::unix::fs::MetadataExt;
+    let metadata = std::fs::symlink_metadata(directory)?;
+    if !metadata.is_dir()
+        || metadata.uid() != nix::unistd::geteuid().as_raw()
+        || metadata.mode() & 0o777 != 0o700
+    {
+        return Err(io::Error::other("invalid private process socket directory"));
+    }
+    Ok(())
+}
+
+pub(crate) fn remove_socket(path: &Path) -> io::Result<()> {
+    use std::os::unix::fs::FileTypeExt;
+    match std::fs::symlink_metadata(path) {
+        Ok(metadata) if metadata.file_type().is_socket() => std::fs::remove_file(path),
+        Ok(_) => Err(io::Error::other("unexpected file at process owner socket")),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(error),
     }
 }
 
