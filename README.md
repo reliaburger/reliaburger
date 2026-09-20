@@ -111,6 +111,12 @@ target/debug/relish            # interactive terminal dashboard
 open http://localhost:9117/    # web dashboard
 ```
 
+Process mode supports foreground workloads: the main process stays under Bun's
+supervision, and its children must remain in the supervised process group.
+Use an application's foreground option; shell wrappers should `exec` the server
+or wait for their children. Daemonising or detached workloads must use the Linux
+container mode instead. See the [runtime contract](docs/README.md#processgrill-built-in-fallback).
+
 With runc (Linux) or Apple Container (macOS) installed, the same flow runs
 real OCI images — and `relish init cluster` generates the PKI and mTLS
 config for a secure multi-node cluster. The [documentation](docs/README.md)

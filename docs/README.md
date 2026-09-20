@@ -296,7 +296,22 @@ Notes:
 
 ### ProcessGrill (built-in fallback)
 
-Works on any platform. Spawns child processes instead of real containers — no namespaces, no cgroups, no rootfs isolation. Useful for development, testing, and platforms without a container runtime installed.
+Spawns native processes on macOS and Linux, without namespaces, cgroups or rootfs
+isolation. Useful for development and testing without a container runtime.
+
+**0.1.0 contract: foreground workloads only.** The main process stays under Bun's
+supervision and children must remain in its supervised process group. A service
+can run unattended and spawn workers; foreground does not mean an open terminal.
+Use the application's foreground/no-daemon option. A shell wrapper should `exec`
+the server, or wait for its children. Do not detach into a new session or process
+group, daemonise, or hand work to an external service manager.
+
+If those restrictions don't fit, use **Linux containers**: runc on Linux or the
+[managed Linux cluster](quickstart.md) on a laptop. Process groups are a
+cooperative supervision contract, not a security boundary for untrusted code.
+Bun must retain cleanup ownership whenever runtime absence cannot be confirmed.
+The remaining launch-identity and pre-adoption crash fixes are tracked in C34;
+this scope decision does not mark them complete.
 
 No installation needed. This is what you get by default.
 

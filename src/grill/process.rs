@@ -5,6 +5,11 @@
 /// Works on macOS and Linux — the cross-platform fallback when
 /// neither `runc` nor Apple's `container` CLI is available.
 ///
+/// The 0.1.0 contract requires foreground workloads whose children remain in
+/// the supervised process group. Daemonising, detached groups/sessions and
+/// hand-off to external service managers require Linux container mode instead.
+/// Process groups are cooperative supervision, not a security boundary.
+///
 /// Two capture modes:
 /// - **In-memory** (default, `new()`): stdout/stderr are piped into
 ///   buffers. Simple, but nothing survives a bun restart.
@@ -267,8 +272,8 @@ impl super::Grill for ProcessGrill {
             cmd.args(&effective_args[1..]);
         }
         // A workload may be a shell that starts grandchildren. Giving each
-        // workload its own process group lets stop/kill reach the complete
-        // tree instead of orphaning the shell's children.
+        // workload its own process group lets stop/kill signal children that
+        // follow the foreground contract. Detached groups are unsupported.
         #[cfg(unix)]
         cmd.process_group(0);
 

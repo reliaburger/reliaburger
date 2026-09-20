@@ -35,6 +35,14 @@ Grill is Bun's container runtime interface -- the abstraction layer between Bun'
 
 > **Decision log — Grill drives runtimes directly, not via containerd.** An earlier draft (still visible in a few listings below, e.g. §2 and §4.1) had Grill talk to `containerd` over its gRPC socket. The shipped Grill has three concrete backends and no containerd dependency: `runc` on Linux (Grill writes the OCI bundle and drives foreground `runc run` plus the state/exec commands itself), Apple Container on macOS, and a `process` backend that runs a host binary with no OCI runtime at all. We dropped containerd because it duplicated the exact state Bun already keeps (which container is where, in what state) and added a socket, a gRPC dependency, and a second thing to keep alive under memory pressure — for a single-binary orchestrator that already reconciles container state on restart, the shim earned its keep nowhere. Where the text below says "containerd," read "the Grill backend for this node's runtime." References to state surviving Bun restarts still hold: `runc`'s own `state` and the Apple VM outlive Bun, and Grill re-adopts them on startup.
 
+**0.1.0 process-mode scope (20 September 2026):** Native process workloads must
+run in the foreground and keep all children in the supervised process group.
+Daemonising, detached sessions/groups and hand-off to external service managers
+are unsupported. Use Linux containers for those workloads. This is a cooperative
+lifecycle contract, not containment; C34 still requires atomic launch ownership
+and recovery before adoption records. The broader process-isolation design below
+remains future work.
+
 **Key design decisions:**
 
 1. **Single binary, no sidecar model.** Bun is not a separate process from the orchestrator -- it IS the orchestrator on this node. All subsystems (Grill, Onion, Ketchup, Mayo, Pickle, Mustard, Wrapper, Brioche) run as async tasks within the same Tokio runtime. This eliminates IPC overhead and version compatibility concerns between components.

@@ -622,6 +622,13 @@ until repair. Protocol 8/state 12; lease schema 4. See the
 Registry leases, atomic process identity and the pre-adoption runtime crash
 window remain open.
 
+**Process-mode scope decision (20 September):** The user approved foreground
+workloads whose children remain in the supervised process group. Daemonising or
+detached workloads must use Linux containers. Native process mode remains a
+cooperative development runtime, not a containment boundary. Atomic launch
+ownership, crash recovery and positive group-retirement proof remain required;
+this decision does not waive or complete those fixes.
+
 **Ordinary-job recovery decision:** The user selected explicit rerun for a batch
 job whose outcome is unknown after Bun crashes. Recovery must persist/report
 that uncertainty rather than automatically repeat the execution. The durable

@@ -408,6 +408,18 @@ longer needs a pretend service partition to test Raft safety.
 
 Not everything runs in a container. Monitoring agents, log shippers, custom exporters — these are host binaries that need to run alongside your containerised apps. Until now, you'd manage them separately with systemd or supervisord. Process workloads make them first-class citizens.
 
+For 0.1.0, process mode supports foreground workloads. A server may start worker
+processes, but those workers must stay in the supervised process group. The
+server must not daemonise or hand execution to another service manager. A shell
+wrapper can use `exec` to replace itself with the server, keeping the same process
+identity; a wrapper that starts several children should wait for them.
+
+This keeps the native development path small enough to verify on macOS and
+Linux. It isn't a sandbox. For software that needs to detach, or needs stronger
+containment, use Linux containers. The crash-recovery implementation must still
+establish ownership before execution and retain uncertain cleanup; documenting
+foreground-only support does not close those outstanding C34 requirements.
+
 Two fields in the app config:
 
 ```toml
@@ -452,10 +464,13 @@ The allowlist is configured per node:
 ```toml
 [process_workloads]
 allowed_binaries = ["/usr/local/bin/metrics-exporter", "/usr/bin/python3"]
-mount_isolation = true
+mount_isolation = false
 ```
 
-An empty list means all binaries are allowed. This is the default — opt-in restriction rather than opt-out freedom. On Linux, `mount_isolation = true` runs process workloads in a separate mount namespace so they can't see `/var/lib/reliaburger` or other workloads' volumes.
+An empty or omitted allowlist refuses host `exec`/`script` workloads. Scripts
+need their interpreter (`/bin/sh`) on the list. Process mode does not implement
+mount isolation; requests for isolation it cannot provide are refused. Use
+Linux containers when the workload needs that boundary.
 
 ### How it fits together
 
