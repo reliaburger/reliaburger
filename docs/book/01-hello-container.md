@@ -3233,3 +3233,51 @@ The tests retain prepared and running commands, preserve uncertain owner
 metadata, reject a redirected garbage directory, and resume a partially deleted
 tombstone. The polling regression then checks the bound through actual commands,
 including their successful exits.
+
+### Connect ownership to the OCI adapter
+
+A container can finish before Bun saves its adoption record. The runtime still
+needs to distinguish a successful short job from an unstarted preparation. The
+durable Runc adapter reads the original-intent journal first and gets execution
+evidence from the bound launcher owner. Agent adoption metadata supplements
+that evidence; it doesn't create ownership after the fact.
+
+The opt-in rootful path now retains a generation claim through namespace setup,
+image preparation, rootfs work, launcher activation and cleanup. Each lifecycle
+operation runs in a worker that owns the runtime clone and its lifecycle guard.
+Dropping the caller cannot release that guard while a blocking rootfs operation
+continues. A queued operation also carries the generation it observed before
+waiting, so it cannot quietly act on a replacement with the same instance name.
+
+The common operation helper accepts `FnOnce`, a closure Rust permits us to call
+once. That lets the closure consume its captured values when it constructs the
+async operation. `Future<Output = io::Result<T>>` describes the result of that
+operation: `T` may be a state, an exit code or another return value. The helper
+applies the same claim and cancellation rules to each of those operations.
+
+Cleanup seals command admission and retires the foreground launcher and its
+auxiliary exec owners before inspecting OCI state. It then uses owned commands
+to delete stale runtime state and forwarding, removes mounts and namespaces,
+withdraws its local DNS bindings, and finally releases the address reservation.
+Any failure leaves the original intent available for another attempt. A missing
+agent PID record is never the proof that permits cleanup.
+
+The first physical fixtures use a static BusyBox binary in an otherwise empty
+rootfs, so an image registry doesn't influence the result. They cover abandoned
+preparation, a short job's exit and output, and actual caller death during
+container exec. Rootless helpers, production Bun selection and discovery/egress
+reconciliation remain separate qualification steps before release.
+
+Adoption checks both the original specification and the saved log identity. The
+log path contains the immutable launcher command and runtime generation; matching
+specifications alone could accept metadata left by an earlier identical launch.
+The live launcher PID and start time must also agree, but cleanup never signals a
+PID taken from that adoption record.
+
+A completed log reader uncovered another lifetime problem. Its output channel
+could stall while it held the exclusive claim, blocking a replacement container.
+The regression reproduces that failure with a one-line channel. Retired log
+files are immutable, so the reader now captures their paths and releases the
+claim before waiting on its reader. Active streams keep the shared source for
+their original generation, drain final output, and never switch to a successor
+with the same instance name.

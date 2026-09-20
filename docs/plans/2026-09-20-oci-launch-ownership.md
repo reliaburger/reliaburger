@@ -76,6 +76,12 @@ changes only once the corresponding recovery contract is implemented.
     recovery, incomplete bindings, actual caller SIGKILL and stale shared handles
     pass within 27 ownership cases and strict Clippy on macOS/Linux. Production
     launcher/helper integration remains open.
+  - [x] Integrate the opt-in rootful Runc adapter. Six real Linux cases plus a
+    subprocess fixture pass: abandoned preparation, short exits/logs, caller
+    SIGKILL during exec, live adoption, cancelled preparation and a completed
+    log reader that must not block replacement. The latter fails before its fix.
+    All 304 Linux runtime tests, 34 macOS/36 Linux selected ownership cases and
+    strict Clippy on both pass. Production selection and rootless remain open.
 - [ ] Route namespace, link and forwarding mutations through owned commands.
   Before confirming cleanup, retire every admitted command, then verify OCI
   state, helper sockets, mounts, namespaces, links and owned forwarding state.
@@ -109,24 +115,26 @@ runtime unit suite does not close those release gates.
 
 ## Remaining adapter integration
 
-The primitives do not yet switch production Runc. Connect them in this order:
+The integrated rootful adapter remains opt-in. Production selection still awaits
+rootless, discovery and full qualification. Complete these remaining steps:
 
-1. Retain a generation-bound executor for each Runc instance, and keep the whole
-   create/start/cleanup worker alive through caller cancellation. Holding a
-   command claim alone does not cover a cancelled rootfs blocking worker.
-2. Persist distinct foreground-launcher and rootless-helper command references
-   before either can activate. Recover their original specifications, actual
+1. Extend the qualified rootful generation-bound executor and whole-operation
+   workers to rootless preparation, launch and cleanup. Holding a command claim
+   alone does not cover a cancelled rootfs blocking worker.
+2. Connect the existing durable role bindings to actual slirp4netns startup and
+   recovery; the rootful foreground launcher is integrated. Recover their original specifications, actual
    outcomes and logs independently of agent PID records. Unassociated prepared
    commands remain discoverable and must be cancelled during cleanup.
-3. Route Runc exec through the launcher owner's existing auxiliary-command
-   protocol. Release the adapter mutex before waiting for output: the owner must
-   fence exec admission and retire its children, allowing concurrent cleanup.
+3. Extend the qualified rootful exec/retirement ordering to rootless helpers.
+   Rootful exec now uses the launcher owner's auxiliary-command protocol without
+   holding the adapter mutex while waiting for output.
    Close normal command admission before retiring all launchers, auxiliary exec
    attempts and network helpers. Then run owned cleanup commands and inspect
    OCI state, mounts, namespaces, forwarding and discovery. Release address
    reservations only after every admitted mutator has positively retired.
-4. Preserve generation fencing across queued calls and separately constructed
-   adapters. A clone created before sealing cannot obtain cleanup authority.
+4. Preserve the existing generation fencing when adding rootless paths. Queued
+   calls, separately constructed adapters and stale pre-sealing clones must
+   retain their tested refusal semantics.
 5. Completed: prune positively retired short-command records under the same
    exclusive claim, so recurring runtime observations cannot grow the journal
    indefinitely. The failing growth regression and four pruning contracts pass

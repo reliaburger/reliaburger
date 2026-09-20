@@ -36,6 +36,8 @@ pub struct IntentConfiguration {
     pub runc_program: PathBuf,
     /// Whether preparation uses rootless user namespaces and networking.
     pub rootless: bool,
+    /// Resolver address mounted during preparation, if configured.
+    pub dns_nameserver: Option<std::net::Ipv4Addr>,
     /// Node subnet index used by rootful address reservations.
     pub node_index: u16,
 }

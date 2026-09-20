@@ -289,6 +289,12 @@ reconciles the older TODOs, records remaining correctness gaps and separates
 release acceptance from deferred capabilities. The current checklist lives in
 [progress.md](docs/progress.md).
 
+The opt-in durable rootful Runc adapter passes six real Linux recovery cases,
+including caller death before adoption and short-job exit recovery. Production
+selection, rootless helpers and discovery/Apple recovery remain release blockers
+in the [OCI ownership plan](docs/plans/2026-09-20-oci-launch-ownership.md).
+
+
 Log exports now preserve content generations, scope receipts to the destination,
 and serialise durable checkpoint updates across agent and offline exports. Source
 and checkpoint errors stop the export and prevent disk-pressure pruning.

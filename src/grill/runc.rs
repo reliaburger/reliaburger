@@ -14,11 +14,14 @@ use std::sync::Arc;
 
 use tokio::sync::Mutex;
 
+use super::command::{DirectCommandExecutor, RuntimeCommandExecutor};
 use super::image::{ImageStore, looks_like_image_ref};
 use super::netns::{self, ContainerNetwork, PortMapHandle};
 use super::oci::OciSpec;
 use super::state::ContainerState;
 use super::{GrillError, InstanceId};
+
+mod owned;
 
 /// Entry for a runc-managed container.
 ///
@@ -51,6 +54,7 @@ struct RuncEntry {
 pub struct RuncGrill {
     /// Base directory for OCI bundles.
     bundle_base: PathBuf,
+    ownership: Option<owned::Ownership>,
     /// Image store for pulling and caching OCI images.
     image_store: ImageStore,
     /// Whether to run in rootless mode (user namespaces, no sudo).
@@ -102,6 +106,7 @@ impl RuncGrill {
             network_leases: super::network_leases::NetworkLeases::new(bundle_base.clone()),
             lifecycle: Arc::new(Mutex::new(HashMap::new())),
             bundle_base,
+            ownership: None,
             image_store,
             rootless,
             state_dir,
@@ -554,6 +559,17 @@ impl RuncGrill {
         spec: &OciSpec,
         container_index: Option<u16>,
     ) -> Result<(), GrillError> {
+        self.prepare_with_commands(instance, spec, container_index, &DirectCommandExecutor)
+            .await
+    }
+
+    async fn prepare_with_commands(
+        &self,
+        instance: &InstanceId,
+        spec: &OciSpec,
+        container_index: Option<u16>,
+        commands: &impl RuntimeCommandExecutor,
+    ) -> Result<(), GrillError> {
         let bundle_dir = self.bundle_base.join(&instance.0);
         tokio::fs::create_dir_all(&bundle_dir)
             .await
@@ -588,8 +604,14 @@ impl RuncGrill {
                 reason: "missing durable network reservation".into(),
             })?;
 
-            match netns::setup_container_network(instance, self.node_index, container_index, false)
-                .await
+            match netns::setup_container_network_with_commands(
+                commands,
+                instance,
+                self.node_index,
+                container_index,
+                false,
+            )
+            .await
             {
                 Ok(network) => {
                     // Update the OCI spec to join our pre-created network namespace
@@ -606,16 +628,20 @@ impl RuncGrill {
                     // published port never listens must not be reported Running,
                     // so fail the prepare instead of just logging.
                     if let Some(pm) = &spec.port_mapping {
-                        let handle =
-                            netns::add_port_mapping(&network, pm.host_port, pm.container_port)
-                                .await
-                                .map_err(|e| GrillError::StartFailed {
-                                    instance: instance.clone(),
-                                    reason: format!(
-                                        "port mapping {}->{} failed: {e}",
-                                        pm.host_port, pm.container_port
-                                    ),
-                                })?;
+                        let handle = netns::add_port_mapping_with_commands(
+                            commands,
+                            &network,
+                            pm.host_port,
+                            pm.container_port,
+                        )
+                        .await
+                        .map_err(|e| GrillError::StartFailed {
+                            instance: instance.clone(),
+                            reason: format!(
+                                "port mapping {}->{} failed: {e}",
+                                pm.host_port, pm.container_port
+                            ),
+                        })?;
                         self.port_handles
                             .lock()
                             .await
@@ -630,7 +656,7 @@ impl RuncGrill {
                     // A configured resolver is only reachable through this
                     // namespace. Continuing would create a workload whose
                     // resolv.conf is guaranteed to be broken.
-                    if self.dns_nameserver.is_some() {
+                    if self.dns_nameserver.is_some() || self.ownership.is_some() {
                         return Err(GrillError::StartFailed {
                             instance: instance.clone(),
                             reason: format!("failed to create DNS-capable container network: {e}"),
@@ -767,6 +793,9 @@ impl RuncGrill {
 
 impl super::Grill for RuncGrill {
     async fn create(&self, instance: &InstanceId, spec: &OciSpec) -> Result<(), GrillError> {
+        if self.ownership.is_some() {
+            return self.owned_create(instance, spec).await;
+        }
         let _lifecycle = self.lock_lifecycle(instance).await;
         // Refuse before preparation and its rollback can touch an existing owner.
         let has_entry = self
@@ -828,6 +857,9 @@ impl super::Grill for RuncGrill {
     }
 
     async fn start(&self, instance: &InstanceId) -> Result<(), GrillError> {
+        if self.ownership.is_some() {
+            return self.owned_start(instance).await;
+        }
         let _lifecycle = self.lock_lifecycle(instance).await;
         let result = {
             let mut entries = self.entries.lock().await;
@@ -923,6 +955,9 @@ impl super::Grill for RuncGrill {
     }
 
     async fn stop(&self, instance: &InstanceId) -> Result<(), GrillError> {
+        if self.ownership.is_some() {
+            return self.owned_stop(instance).await;
+        }
         let _lifecycle = self.lock_lifecycle(instance).await;
         let signalled = self.signal_container(instance, "SIGTERM").await?;
         if !signalled {
@@ -939,6 +974,9 @@ impl super::Grill for RuncGrill {
     }
 
     async fn kill(&self, instance: &InstanceId) -> Result<(), GrillError> {
+        if self.ownership.is_some() {
+            return self.owned_kill(instance).await;
+        }
         let _lifecycle = self.lock_lifecycle(instance).await;
         self.signal_container(instance, "SIGKILL").await?;
         if let Some(entry) = self.entries.lock().await.get_mut(instance) {
@@ -963,6 +1001,9 @@ impl super::Grill for RuncGrill {
     }
 
     async fn state(&self, instance: &InstanceId) -> Result<ContainerState, GrillError> {
+        if self.ownership.is_some() {
+            return self.owned_state(instance).await;
+        }
         let _lifecycle = self.lock_lifecycle(instance).await;
         let (result_state, just_exited) = {
             let mut entries = self.entries.lock().await;
@@ -1022,6 +1063,9 @@ impl super::Grill for RuncGrill {
     }
 
     async fn exit_code(&self, instance: &InstanceId) -> Option<i32> {
+        if self.ownership.is_some() {
+            return self.owned_exit_code(instance).await;
+        }
         let _lifecycle = self.lock_lifecycle(instance).await;
         let (exit_code, just_exited) = {
             let mut entries = self.entries.lock().await;
@@ -1060,6 +1104,9 @@ impl super::Grill for RuncGrill {
     }
 
     async fn pid(&self, instance: &InstanceId) -> Option<u32> {
+        if self.ownership.is_some() {
+            return self.owned_pid(instance).await;
+        }
         let entries = self.entries.lock().await;
         let entry = entries.get(instance)?;
         entry
@@ -1074,6 +1121,20 @@ impl super::Grill for RuncGrill {
         // mapped port. Rootless networking has no address in this node pool.
         let networks = self.networks.lock().await;
         networks.get(instance).map(|n| n.container_ip)
+    }
+
+    async fn launch_inventory(&self) -> Result<Option<Vec<super::RuntimeLaunch>>, GrillError> {
+        if self.ownership.is_some() {
+            return self.owned_inventory().await;
+        }
+        Ok(None)
+    }
+
+    async fn log_stem(&self, instance: &InstanceId) -> Option<PathBuf> {
+        if self.ownership.is_some() {
+            return self.owned_log_stem(instance).await.ok().flatten();
+        }
+        None
     }
 
     fn runtime_kind(&self) -> super::records::RuntimeKind {
@@ -1103,6 +1164,9 @@ impl super::Grill for RuncGrill {
         instance: &InstanceId,
         record: &super::records::InstanceRecord,
     ) -> Result<bool, GrillError> {
+        if self.ownership.is_some() {
+            return self.owned_adopt(instance, record).await;
+        }
         let _lifecycle = self.lock_lifecycle(instance).await;
         // The recorded `runc run` process must still be the one we started...
         let (running, _) =
@@ -1240,6 +1304,9 @@ impl super::Grill for RuncGrill {
     }
 
     async fn logs(&self, instance: &InstanceId) -> Result<String, GrillError> {
+        if self.ownership.is_some() {
+            return self.owned_logs(instance).await;
+        }
         let log_path = {
             let entries = self.entries.lock().await;
             entries
@@ -1262,6 +1329,9 @@ impl super::Grill for RuncGrill {
     }
 
     async fn exec(&self, instance: &InstanceId, command: &[String]) -> Result<String, GrillError> {
+        if self.ownership.is_some() {
+            return self.owned_exec(instance, command).await;
+        }
         if command.is_empty() {
             return Err(GrillError::StartFailed {
                 instance: instance.clone(),
@@ -1291,6 +1361,10 @@ impl super::Grill for RuncGrill {
         instance: &InstanceId,
         lines_tx: tokio::sync::mpsc::Sender<String>,
     ) {
+        if self.ownership.is_some() {
+            self.owned_follow_logs(instance, lines_tx).await;
+            return;
+        }
         let log_path = {
             let entries = self.entries.lock().await;
             match entries.get(instance) {

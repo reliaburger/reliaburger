@@ -215,6 +215,12 @@ impl ImageStore {
         }
     }
 
+    /// Directory containing this runtime's selected image storage.
+    #[cfg(target_os = "linux")]
+    pub(crate) fn storage_directory(&self) -> &Path {
+        &self.store_root
+    }
+
     /// Install the cluster image source. Called once after the cluster
     /// subsystems start; later calls are ignored (`OnceLock`).
     pub fn set_cluster_source(&self, source: std::sync::Arc<dyn ClusterImageSource>) {

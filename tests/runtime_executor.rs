@@ -15,6 +15,7 @@ async fn executor(root: &Path) -> (IntentJournal, ClaimedCommandExecutor) {
             image_directory: root.join("images"),
             runc_program: "runc".into(),
             rootless: true,
+            dns_nameserver: None,
             node_index: 1,
         },
     );

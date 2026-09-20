@@ -43,6 +43,7 @@ pub(crate) struct RoleExecution {
 }
 
 impl RoleExecution {
+    /// Wait through the captured owner; caller cancellation closes its exec socket.
     pub(crate) async fn execute(&self, command: &[String]) -> io::Result<String> {
         self.commands
             .exec(&self.id, command)

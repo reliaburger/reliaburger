@@ -72,6 +72,17 @@ impl ClaimedCommandExecutor {
         }
     }
 
+    /// Read original intent and phase while retaining this generation's claim.
+    pub async fn intent(&self) -> io::Result<crate::grill::runc_intent::RuntimeIntent> {
+        let guard = self.commands.lock().await;
+        guard
+            .as_ref()
+            .ok_or_else(unavailable)?
+            .record()
+            .cloned()
+            .ok_or_else(unavailable)
+    }
+
     /// Start a bound long-lived role while retaining the shared generation claim.
     pub async fn start_role(
         &self,

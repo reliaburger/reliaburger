@@ -21,6 +21,7 @@ fn journal(root: &Path) -> IntentJournal {
             image_directory: root.join("images"),
             runc_program: "runc".into(),
             rootless: false,
+            dns_nameserver: None,
             node_index: NODE_INDEX,
         },
     )
