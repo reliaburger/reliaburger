@@ -304,8 +304,10 @@ now keeps policy through actual loader SIGKILL and recovers the same maps withou
 a detach window. The agent now records original workload policy before map
 writes and restores it before adoption; cleanup retains positive retirement
 evidence until metadata is gone. All 38 physical kernel tests pass. Verified
-container source identity, restart ordering, host-reboot reconciliation and
-production kernel selection remain release gates.
+container source identity, host-reboot reconciliation and production kernel
+selection remain release gates. Automatic application restarts now retire the
+predecessor’s adoption and policy records before creating a successor; failed
+cleanup blocks replacement while preserving the logical workload identity.
 
 Log exports now preserve content generations, scope receipts to the destination,
 and serialise durable checkpoint updates across agent and offline exports. Source

@@ -7361,6 +7361,11 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
                     eprintln!("bun: job retry refused for {id}: {error}");
                     continue;
                 }
+            } else if let Err(error) = self.retire_restart_artifacts(&id).await {
+                eprintln!(
+                    "bun: application restart retains predecessor artifacts for {id}: {error}"
+                );
+                continue;
             }
 
             // Pending → Preparing
@@ -7868,6 +7873,32 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
         crate::sesame::identity::prepare_identity_dir(&dir).map_err(|e| BunError::SecurityError {
             reason: format!("failed to prepare identity dir for {instance_id}: {e}"),
         })
+    }
+
+    /// Remove predecessor execution/policy evidence before an automatic restart.
+    /// Runtime retirement must already be confirmed. The same logical workload
+    /// keeps its identity bundle and mount; final retirement removes those too.
+    async fn retire_restart_artifacts(&mut self, instance_id: &InstanceId) -> Result<(), BunError> {
+        self.clear_egress(instance_id).await?;
+        if let Some(directory) = self.records_dir.clone() {
+            let id = instance_id.0.clone();
+            tokio::task::spawn_blocking(move || {
+                crate::grill::records::remove_record(&directory, &id)
+            })
+            .await
+            .map_err(|error| BunError::RetirementState {
+                instance_id: instance_id.clone(),
+                reason: error.to_string(),
+            })?
+            .map_err(|error| BunError::RetirementState {
+                instance_id: instance_id.clone(),
+                reason: error.to_string(),
+            })?;
+        }
+        self.forget_retired_egress_owner(instance_id).await?;
+        // Validate the mount source before a new runtime can consume it. The
+        // preparation is idempotent and preserves this workload's credentials.
+        self.prepare_instance_identity(instance_id)
     }
 
     /// Retire durable artifacts before allowing the caller to forget an owner.
@@ -17218,5 +17249,93 @@ host = "remote.local"
             check.violation,
             Some(crate::smoker::types::SafetyViolation::ReplicaMinimum { .. })
         ));
+    }
+
+    #[tokio::test]
+    async fn application_restart_retires_predecessor_artifacts_before_successor_create() {
+        let (mut agent, _tx, _shutdown, grill) = test_agent_with_grill();
+        let records = tempfile::tempdir().unwrap();
+        let volumes = tempfile::tempdir().unwrap();
+        agent.set_records_dir(records.path().to_path_buf());
+        agent.set_volumes_dir(volumes.path().to_path_buf());
+        grill.set_pid(std::process::id());
+        expect_complete(&drain_deploy(&mut agent, basic_config()).await);
+        let id = InstanceId("default__web-0".into());
+        let record = crate::grill::records::record_path(records.path(), &id.0);
+        let identity = agent.instance_identity_dir(&id);
+        std::fs::write(identity.join("old-generation"), b"old identity material").unwrap();
+        let instance = agent.supervisor.get_instance_mut(&id).unwrap();
+        instance.state = ContainerState::Pending;
+        instance.restart_count = 1;
+        grill.block_creates();
+        let task = tokio::spawn(async move {
+            agent.drive_pending_restarts().await;
+        });
+        tokio::time::timeout(std::time::Duration::from_secs(5), grill.wait_for_creates(1))
+            .await
+            .unwrap();
+        let predecessor_record_retired = !record.exists();
+        let logical_identity_retained = identity.join("old-generation").exists();
+        let successor_identity_prepared = identity.is_dir();
+        task.abort();
+        assert!(task.await.unwrap_err().is_cancelled());
+        crate::sesame::identity::cleanup_identity_dir(&identity).unwrap();
+        assert!(
+            predecessor_record_retired,
+            "successor creation retained the predecessor adoption record"
+        );
+        assert!(
+            logical_identity_retained,
+            "automatic restart discarded the logical workload identity"
+        );
+        assert!(
+            successor_identity_prepared,
+            "successor creation has no identity mount source"
+        );
+    }
+
+    #[tokio::test]
+    async fn application_restart_refuses_successor_creation_until_artifact_cleanup_succeeds() {
+        let (mut agent, _tx, _shutdown, grill) = test_agent_with_grill();
+        let records = tempfile::tempdir().unwrap();
+        let volumes = tempfile::tempdir().unwrap();
+        agent.set_records_dir(records.path().to_path_buf());
+        agent.set_volumes_dir(volumes.path().to_path_buf());
+        grill.set_pid(std::process::id());
+        expect_complete(&drain_deploy(&mut agent, basic_config()).await);
+        let id = InstanceId("default__web-0".into());
+        let record = crate::grill::records::record_path(records.path(), &id.0);
+        let identity = agent.instance_identity_dir(&id);
+        let original = std::fs::read(&record).unwrap();
+        std::fs::remove_file(&record).unwrap();
+        std::fs::create_dir(&record).unwrap();
+        let instance = agent.supervisor.get_instance_mut(&id).unwrap();
+        instance.state = ContainerState::Pending;
+        instance.restart_count = 1;
+        agent.drive_pending_restarts().await;
+        let creates = grill
+            .calls()
+            .iter()
+            .filter(|(operation, instance)| operation == "create" && instance == &id)
+            .count();
+        let predecessor_retained = record.exists();
+        let pending = agent.supervisor.get_instance(&id).unwrap().state == ContainerState::Pending;
+        std::fs::remove_dir(&record).unwrap();
+        std::fs::write(&record, original).unwrap();
+        assert_eq!(
+            creates, 1,
+            "a successor was created despite failed artifact cleanup"
+        );
+        assert!(
+            predecessor_retained && pending,
+            "restart lost the predecessor cleanup obligation"
+        );
+        agent.drive_pending_restarts().await;
+        assert_eq!(
+            agent.supervisor.get_instance(&id).unwrap().state,
+            ContainerState::Running
+        );
+        assert!(record.exists() && identity.is_dir());
+        agent.retire_workload("web", "default").await.unwrap();
     }
 }

@@ -242,9 +242,10 @@ original container cgroup before production selection; a launcher PID is not the
 container's network identity.
 
 
-Application restart also needs explicit generation ordering. The current retry
-path retires old adoption artifacts before `create` for jobs, but not ordinary
-applications. Add a failing crash-boundary test and move application artifact
-retirement ahead of successor creation; otherwise a new runtime generation can
-coexist with its predecessor's adoption and policy records until post-start
-publication. Keep this a separate fix and qualify the real process/Runc paths.
+Application restart now retires predecessor adoption and policy records before
+creating a successor. Two failing-first regressions pause at creation and inject
+record-removal failure; both then pass within 208 affected tests on macOS/Linux.
+Cleanup failure leaves the application Pending for retry. Automatic restarts
+retain the logical workload's identity credentials and validate its mount source;
+explicit retirement still removes that identity. Strict Clippy passes on both
+platforms. Actual Bun/Runc crash-boundary qualification remains open.

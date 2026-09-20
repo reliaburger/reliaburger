@@ -3355,3 +3355,29 @@ job's first network instruction, published-port recovery, helper replacement
 without repeating the workload, long data-directory paths and actual caller
 SIGKILL before any agent adoption record exists. Passing those cases qualifies
 this adapter; production selection and the broader release gates remain separate.
+
+
+### Retire the old execution before preparing the next
+
+An application exits and Bun prepares its replacement. What happens if Bun dies
+inside the next `create` call? If the old adoption record still exists, recovery
+sees a new runtime generation alongside metadata describing its predecessor.
+Neither record is necessarily corrupt. Their combination is wrong.
+
+The restart driver now confirms runtime retirement, removes the old kernel
+policy, removes the adoption record durably, and prunes the policy's retirement
+marker before calling `create`. A removal error keeps the application Pending.
+The next tick can retry; no successor has started in the meantime.
+
+The execution changes, but the logical workload identity stays the same. Its
+certificate files and mount source survive automatic restart. We validate that
+source before creation; explicit workload retirement still removes it. Deleting
+and recreating credentials on every process exit would introduce an unnecessary
+empty-identity interval into normal crash recovery.
+
+One regression holds `create` at a gate and checks that the predecessor record
+has already disappeared while identity material remains. Another replaces the
+record file with a directory, making removal fail, and proves that Bun never
+calls `create` until the obstruction is repaired. These tests target the ordering
+boundary directly. Physical Bun and container recovery exercise the wider
+contract separately.
