@@ -306,6 +306,8 @@ fails, the owned path stops execution while retaining the address and cleanup
 records. Exact service snapshot restoration and a durable discovery checkpoint
 now preserve original allocations and cleanup permissions; Bun integration and
 complete discovery recovery remain open.
+Rolling and blue-green cutovers now confirm kernel backend publication before
+exposing replacements in DNS and ingress; refusal preserves the original routing view.
 Rootful and rootless recovery tests cover caller death before adoption, short
 jobs, published ports and interrupted network-helper startup.
 Rootless networking is ready before the workload starts. Command waits retry

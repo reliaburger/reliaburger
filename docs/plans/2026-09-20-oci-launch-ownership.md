@@ -790,3 +790,23 @@ created directory now permits initialisation. Final qualification passes all
 formatting on both. The store is not yet selected by Bun and changes no
 production format. Complete agent publication/recovery gates, runtime inventory
 correlation, remote acknowledgements and actual Bun-death qualification remain open.
+
+
+## Confirm replacement publication before cutover
+
+A new assertion on the real frozen-backend rollout fails in 8.72s: although the
+rollout refuses to retire the old container, its userspace snapshot already
+advertises the replacement whose kernel publication failed. `PublishNewBackend`
+now returns a checked result through the worker channel. It validates a candidate
+service map and confirms kernel publication before publishing DNS/Wrapper.
+Rolling and blue-green failures enter their existing abort path; uncertain
+cleanup keeps runtime ownership. Closed channels and missing service/port inputs
+also refuse. Real rolling refusal/success pass in 18.78s and blue-green refusal
+passes in 9.52s. All 217 affected library tests pass on macOS/Linux
+(17.663s/24.082s), with strict all-target/all-feature Clippy and formatting.
+
+The generation-adoption unit fixture previously supplied a portless original
+record, an allocated host port and a service redeploy without discovery recovery.
+It now tests consistent portless generation continuity. This does not implement
+service recovery: missing original discovery remains a refusal, and journal
+integration is still required before production release.

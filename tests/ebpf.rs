@@ -4023,6 +4023,7 @@ async fn check_backend_retirement(strategy: Option<&str>, freeze: bool) {
     agent.set_records_dir(root.path().join("records"));
     agent.set_volumes_dir(root.path().join("volumes"));
     agent.set_onion_ebpf(Arc::clone(&ebpf)).await;
+    let services = agent.service_map_watch();
     let task = tokio::spawn(async move { agent.run().await });
     let exercise = async {
         for name in ["address-predecessor", "address-successor"] {
@@ -4059,7 +4060,7 @@ async fn check_backend_retirement(strategy: Option<&str>, freeze: bool) {
                     while let Some(event) = results.recv().await {
                         match event {
                             ApplyEvent::Error { message } if freeze => {
-                                refused |= message.contains("cannot retire backend");
+                                refused |= message.contains("cannot retire backend") || message.contains("cannot publish backend");
                             }
                             ApplyEvent::Error { message } => anyhow::bail!(message),
                             ApplyEvent::Complete { .. } => completed = true,
@@ -4068,6 +4069,11 @@ async fn check_backend_retirement(strategy: Option<&str>, freeze: bool) {
                     }
                     if freeze {
                         anyhow::ensure!(refused && !completed, "frozen backend rollout was acknowledged");
+                        let service = ServiceId::new("default", name);
+                        let view = services.borrow().clone();
+                        anyhow::ensure!(view.resolve(&service).is_some_and(|entry|
+                            entry.backends.iter().all(|backend| backend.instance_id == id.0 || !backend.healthy)),
+                            "userspace advertised a replacement whose kernel publication was refused");
                         anyhow::ensure!(runtime.state(&id).await? == reliaburger::grill::ContainerState::Running,
                             "rollout retired the original destination before confirmed backend withdrawal");
                     } else {

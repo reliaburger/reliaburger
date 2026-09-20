@@ -1310,3 +1310,25 @@ The agent regression compares the stored paths across both deployment
 strategies. The physical regression starts both containers, retires the old
 one, and requires the successor to remain Running before cleaning it up. This
 checks the consequence of the allocation, not just whether two strings differ.
+
+
+## Confirm the replacement before retiring its predecessor
+
+Freeze the kernel backend map during a rollout. The old route still works, but
+the kernel refuses to add the replacement. Previously, Bun put that replacement
+into its userspace service map and told DNS and Wrapper about it. The subsequent
+retirement failed, leaving different consumers with different routing views.
+Our real-container regression catches the premature userspace publication.
+
+The replacement operation now builds a candidate service map, validates the
+backend and requires the kernel update to succeed before publishing the candidate
+to readers. Its channel reply carries `Result<(), BunError>`: `()` is Rust's unit
+type, so success carries no extra value, while failure carries the reason. A
+closed agent channel is a failure too. Both rolling and blue-green workers stop
+cutover on that error and use their existing abort path, retaining any runtime
+whose cleanup cannot be confirmed. They do not retire a predecessor on the
+strength of an unacknowledged replacement.
+
+This orders one live publication boundary. It does not persist attempted routing
+across Bun death or prove remote consumers withdrew an old endpoint. The durable
+discovery journal and remote acknowledgement work must cover those boundaries.

@@ -744,7 +744,7 @@ enum DeployOp {
         host_port: Option<u16>,
         container_ip: Option<std::net::Ipv4Addr>,
         has_port: bool,
-        reply: oneshot::Sender<()>,
+        reply: oneshot::Sender<Result<(), BunError>>,
     },
     /// Finish retiring one old instance: the fast `&mut self` bookkeeping
     /// (lift egress, clean identity, drop the record + supervisor entry) after
@@ -1238,7 +1238,7 @@ impl DeployOps {
         host_port: Option<u16>,
         container_ip: Option<std::net::Ipv4Addr>,
         has_port: bool,
-    ) {
+    ) -> Result<(), BunError> {
         self.call(
             |reply| DeployOp::PublishNewBackend {
                 app_name: app_name.to_string(),
@@ -1249,7 +1249,10 @@ impl DeployOps {
                 has_port,
                 reply,
             },
-            (),
+            Err(BunError::BackendPublication {
+                service: crate::onion::service_id::ServiceId::new(namespace, app_name),
+                reason: "agent loop closed before backend publication".into(),
+            }),
         )
         .await
     }
@@ -2169,15 +2172,24 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
     }
 
     /// Require successful kernel publication before acknowledging deployment.
-    #[cfg(all(feature = "ebpf", target_os = "linux"))]
     async fn publish_backend_ebpf(
         &self,
         id: &crate::onion::service_id::ServiceId,
     ) -> Result<(), BunError> {
+        self.publish_backend_snapshot(id, &self.service_map).await
+    }
+
+    /// Publish a validated candidate before exposing it to userspace readers.
+    #[cfg(all(feature = "ebpf", target_os = "linux"))]
+    async fn publish_backend_snapshot(
+        &self,
+        id: &crate::onion::service_id::ServiceId,
+        services: &crate::onion::service_map::ServiceMap,
+    ) -> Result<(), BunError> {
         let Some(handle) = self.onion_ebpf.as_ref() else {
             return Ok(());
         };
-        let Some(entry) = self.service_map.resolve(id).cloned() else {
+        let Some(entry) = services.resolve(id).cloned() else {
             return Ok(());
         };
         let bpf = crate::onion::ebpf::maps::BpfServiceMap::new();
@@ -2190,9 +2202,10 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
     }
 
     #[cfg(not(all(feature = "ebpf", target_os = "linux")))]
-    async fn publish_backend_ebpf(
+    async fn publish_backend_snapshot(
         &self,
         _id: &crate::onion::service_id::ServiceId,
+        _services: &crate::onion::service_map::ServiceMap,
     ) -> Result<(), BunError> {
         Ok(())
     }
@@ -9198,19 +9211,30 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
         host_port: Option<u16>,
         container_ip: Option<std::net::Ipv4Addr>,
         has_port: bool,
-    ) {
+    ) -> Result<(), BunError> {
         if !has_port {
-            return;
+            return Ok(());
         }
         let Some(host_port) = host_port else {
-            return;
+            return Err(BunError::BackendPublication {
+                service: crate::onion::service_id::ServiceId::new(namespace, app_name),
+                reason: "replacement has no allocated port".into(),
+            });
         };
         let service_id = crate::onion::service_id::ServiceId::new(namespace, app_name);
         let backend = self.local_backend(new_id, &service_id, container_ip, host_port, true);
-        if let Err(e) = self.service_map.add_backend(&service_id, backend) {
-            eprintln!("onion: backend not registered for {service_id:?}: {e}");
-        }
+        let mut candidate = self.service_map.clone();
+        candidate
+            .add_backend(&service_id, backend)
+            .map_err(|error| BunError::BackendPublication {
+                service: service_id.clone(),
+                reason: error.to_string(),
+            })?;
+        self.publish_backend_snapshot(&service_id, &candidate)
+            .await?;
+        self.service_map = candidate;
         self.rebuild_routing_table().await;
+        Ok(())
     }
 
     /// Confirm one backend's withdrawal before runtime cleanup can reuse its address.
@@ -9744,16 +9768,17 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
                 has_port,
                 reply,
             } => {
-                self.publish_new_backend(
-                    &app_name,
-                    &namespace,
-                    &new_id,
-                    host_port,
-                    container_ip,
-                    has_port,
-                )
-                .await;
-                let _ = reply.send(());
+                let result = self
+                    .publish_new_backend(
+                        &app_name,
+                        &namespace,
+                        &new_id,
+                        host_port,
+                        container_ip,
+                        has_port,
+                    )
+                    .await;
+                let _ = reply.send(result);
             }
             DeployOp::BeginRetire { old_id, reply } => {
                 let result = self.begin_instance_retirement(&old_id).await;
@@ -10718,7 +10743,8 @@ impl<G: Grill + Clone + 'static> DeployWorker<G> {
             // `max_unavailable = 0` this is what makes the guarantee real —
             // retiring first and publishing later would leave a gap however
             // carefully the counts were tracked.
-            self.ops
+            if let Err(error) = self
+                .ops
                 .publish_new_backend(
                     app_name,
                     namespace,
@@ -10727,7 +10753,16 @@ impl<G: Grill + Clone + 'static> DeployWorker<G> {
                     container_ip,
                     spec.port.is_some(),
                 )
-                .await;
+                .await
+            {
+                let _ = events
+                    .send(ApplyEvent::Error {
+                        message: error.to_string(),
+                    })
+                    .await;
+                new_failed = true;
+                break;
+            }
             new_ids.push(new_id);
         }
 
@@ -11191,7 +11226,8 @@ impl<G: Grill + Clone + 'static> DeployWorker<G> {
         // command for up to fleet-size × drain_timeout), and finally send the
         // fast bookkeeping to the loop.
         for new_id in &new_ids {
-            self.ops
+            if let Err(error) = self
+                .ops
                 .publish_new_backend(
                     app_name,
                     namespace,
@@ -11200,7 +11236,30 @@ impl<G: Grill + Clone + 'static> DeployWorker<G> {
                     new_ips.get(new_id).copied().flatten(),
                     spec.port.is_some(),
                 )
+                .await
+            {
+                let _ = events
+                    .send(ApplyEvent::Error {
+                        message: error.to_string(),
+                    })
+                    .await;
+                self.abort_rollout(
+                    app_name,
+                    namespace,
+                    spec,
+                    &new_ids,
+                    &new_prepared,
+                    &runtime_attempted,
+                    &new_ports,
+                    &new_specs,
+                    deploy_config.auto_rollback,
+                    0,
+                    replica_count,
+                    events,
+                )
                 .await;
+                return std::ops::ControlFlow::Break(());
+            }
         }
         for old_id in &existing {
             if let Err(error) = self
@@ -11823,6 +11882,54 @@ mod tests {
     fn test_agent() -> (TestAgent, mpsc::Sender<AgentCommand>, CancellationToken) {
         let (agent, tx, shutdown, _grill) = test_agent_with_grill();
         (agent, tx, shutdown)
+    }
+
+    #[tokio::test]
+    async fn replacement_publication_refuses_a_closed_agent_channel() {
+        let (tx, rx) = mpsc::channel(1);
+        drop(rx);
+        let ops = DeployOps { tx };
+        let result = ops
+            .publish_new_backend(
+                "api",
+                "default",
+                &InstanceId("default__api-g1-0".into()),
+                Some(8080),
+                None,
+                true,
+            )
+            .await;
+        assert!(matches!(result, Err(BunError::BackendPublication { .. })));
+    }
+
+    #[tokio::test]
+    async fn replacement_publication_refuses_missing_service_or_port() {
+        let (mut agent, _commands, _shutdown) = test_agent();
+        let id = InstanceId("default__api-g1-0".into());
+        let service = crate::onion::service_id::ServiceId::new("default", "api");
+        let view = agent.service_map_watch();
+        assert!(
+            agent
+                .publish_new_backend("api", "default", &id, Some(8080), None, true)
+                .await
+                .is_err()
+        );
+        agent.service_map.register(&service, 8080, None).unwrap();
+        assert!(
+            agent
+                .publish_new_backend("api", "default", &id, None, None, true)
+                .await
+                .is_err()
+        );
+        assert!(
+            agent
+                .service_map
+                .resolve(&service)
+                .unwrap()
+                .backends
+                .is_empty()
+        );
+        assert!(view.borrow().resolve(&service).is_none());
     }
 
     fn test_agent_with_grill() -> (
@@ -16267,17 +16374,21 @@ host = "remote.local"
     }
 
     #[tokio::test]
-    async fn redeploy_after_adoption_never_reuses_an_owned_generation() {
+    async fn portless_redeploy_after_adoption_never_reuses_an_owned_generation() {
         for (runtime_id, generation) in [("default__web-g1-0", 1), ("default__web-g17-0", 17)] {
             let records = tempfile::tempdir().unwrap();
             let (mut agent, _tx, _shutdown, grill) = test_agent_with_grill();
             agent.set_records_dir(records.path().to_path_buf());
-            let record = adoption_record(runtime_id, "web", false);
+            let mut record = adoption_record(runtime_id, "web", false);
+            record.host_port = None;
             crate::grill::records::write_record(records.path(), &record).unwrap();
             grill.set_adopt_result(&InstanceId(runtime_id.into()), true);
             grill.set_pid(std::process::id());
             assert_eq!(agent.adopt_recorded_instances().await.unwrap(), 1);
-            let events = drain_deploy(&mut agent, basic_config()).await;
+            // Generation continuity needs no service recovery or guessed VIP.
+            let mut config = basic_config();
+            config.app.get_mut("web").unwrap().port = None;
+            let events = drain_deploy(&mut agent, config).await;
             let expected = format!("default__web-g{}-0", generation + 1);
             let created: Vec<_> = grill
                 .calls()
