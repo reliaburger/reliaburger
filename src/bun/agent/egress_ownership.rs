@@ -206,13 +206,12 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
             let path = binding
                 .original_spec
                 .linux
-                .cgroups_path
-                .clone()
+                .host_cgroup_path()
                 .ok_or_else(|| fail("original cgroup path is missing"))?;
             tokio::task::spawn_blocking(move || {
                 Ok::<_, std::io::Error>((
                     crate::bun::egress_owners::boot_id()?,
-                    crate::sesame::egress::cgroup_id_of_path(std::path::Path::new(&path)),
+                    crate::sesame::egress::cgroup_id_of_path(&path),
                 ))
             })
             .await

@@ -249,3 +249,21 @@ Cleanup failure leaves the application Pending for retry. Automatic restarts
 retain the logical workload's identity credentials and validate its mount source;
 explicit retirement still removes that identity. Strict Clippy passes on both
 platforms. Actual Bun/Runc crash-boundary qualification remains open.
+
+
+## OCI cgroup path correction
+
+The real-container regression reproduces a generated-path mismatch: Bun prepares
+`/sys/fs/cgroup/<workload>`, but the old OCI value places the process in
+`/sys/fs/cgroup/sys/fs/cgroup/<workload>`. Application, job and init generators
+now emit the hierarchy path required by OCI; restart and policy recovery perform
+an explicit, validated conversion back to the host path. State 21 refuses old
+ambiguous development records. Container source identity still needs verified
+runtime evidence; fixing the path alone does not establish launcher attribution
+or discovery cleanup.
+
+Qualification: all eight owned-Runc cases pass (7.11s), including the corrected
+first-instruction cgroup check, and all 38 physical kernel cases pass (9.48s).
+The 207 affected library tests pass on macOS/Linux (17.958s/24.152s). Both actual
+binary compatibility tests and strict all-target/all-feature Clippy pass on each
+platform. Format changes are explicit; the protocol remains 14 and state is 21.

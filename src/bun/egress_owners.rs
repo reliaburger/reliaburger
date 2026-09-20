@@ -63,12 +63,7 @@ struct Checkpoint {
 
 fn validate(owners: &HashMap<InstanceId, EgressBinding>) -> io::Result<()> {
     for (id, owner) in owners {
-        let path = owner
-            .original_spec
-            .linux
-            .cgroups_path
-            .as_deref()
-            .map(Path::new);
+        let path = owner.original_spec.linux.host_cgroup_path();
         if id.0.is_empty()
             || !id
                 .0

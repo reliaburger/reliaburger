@@ -15,10 +15,10 @@ pub struct Compatibility {
     pub state: u32,
 }
 
-/// Supported registry query protocol and durable repository generation format.
+/// Supported protocol and durable state, including OCI cgroup hierarchy paths.
 pub const CURRENT: Compatibility = Compatibility {
     protocol: 14,
-    state: 20,
+    state: 21,
 };
 
 /// Name of the durable format stamp at the root of a node's data directory.

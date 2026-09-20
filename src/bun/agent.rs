@@ -7392,15 +7392,10 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
                 .get(&(app_name.clone(), namespace.clone()))
                 .cloned()
             {
-                match oci_spec.linux.cgroups_path.as_deref() {
+                match oci_spec.linux.host_cgroup_path() {
                     Some(cgroup_path) => {
-                        self.apply_egress_pre_start(
-                            &id,
-                            &app_name,
-                            &spec,
-                            std::path::Path::new(cgroup_path),
-                        )
-                        .await
+                        self.apply_egress_pre_start(&id, &app_name, &spec, &cgroup_path)
+                            .await
                     }
                     None if spec.egress.as_ref().is_some_and(|e| !e.allow.is_empty()) => {
                         Err(BunError::DeployFailed {

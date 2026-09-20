@@ -3381,3 +3381,26 @@ record file with a directory, making removal fail, and proves that Bun never
 calls `create` until the obstruction is repaired. These tests target the ordering
 boundary directly. Physical Bun and container recovery exercise the wider
 contract separately.
+
+
+### A cgroup path has two roots
+
+Bun prepares `/sys/fs/cgroup/reliaburger/default/web/0` before startup and installs
+policy against that directory's kernel identity. We originally put the same
+string into OCI's `cgroupsPath`. Runc accepted it, then put the container below
+`/sys/fs/cgroup/sys/fs/cgroup/reliaburger/default/web/0`. The policy protected an
+empty cgroup. The container ran elsewhere.
+
+[OCI defines absolute cgroup paths relative to the cgroup mount](https://github.com/opencontainers/runtime-spec/blob/main/config-linux.md#cgroups-path).
+The JSON therefore needs `/reliaburger/default/web/0`. Application, job and init
+specifications now make that conversion when they are generated. Recovery uses
+`host_cgroup_path()` for the inverse conversion. It refuses relative paths,
+parent traversal, the hierarchy root and legacy host-prefixed values rather
+than guessing what a stored path meant. State generation 21 makes this change
+an explicit fresh-cluster boundary.
+
+The regression uses actual Runc and a local static BusyBox image. It creates the
+host cgroup before startup, records its kernel identity, and has the container's
+first command report `/proc/self/cgroup`. We compare the reported path and the
+original directory identity, then positively retire the runtime. Checking only
+the generated JSON would have repeated the original mistaken assumption.

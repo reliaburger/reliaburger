@@ -348,3 +348,45 @@ async fn runc_owned_completed_log_reader_cannot_block_a_replacement_generation()
     drop(receiver);
     stream.await.unwrap();
 }
+
+#[tokio::test]
+#[ignore = "requires root, runc, static /usr/bin/busybox, ip and nft"]
+async fn generated_cgroup_path_matches_the_actual_container_before_its_first_instruction() {
+    let root = tempfile::tempdir().unwrap();
+    let id = instance(root.path());
+    let expected = format!("/{}", id.0);
+    let host_path = format!("/sys/fs/cgroup{expected}");
+    let runtime = runtime(root.path());
+    let mut specification = spec(
+        root.path(),
+        "/bin/busybox cat /proc/self/cgroup > /work/cgroup; exec /bin/busybox sleep 60",
+    );
+    specification.linux.cgroups_path = reliaburger::grill::oci::generate_init_oci_spec(
+        &specification.process.args,
+        "default",
+        "cgroup-check",
+        None,
+        &host_path,
+        None,
+    )
+    .linux
+    .cgroups_path;
+    runtime.create(&id, &specification).await.unwrap();
+    install_fixture(root.path(), &id);
+    // Model Bun's pre-start policy: the cgroup must be the same kernel object
+    // when the container executes its first instruction.
+    std::fs::create_dir(&host_path).unwrap();
+    let before = reliaburger::sesame::egress::cgroup_id_of_path(Path::new(&host_path)).unwrap();
+    runtime.start(&id).await.unwrap();
+    wait_file(&root.path().join("shared/cgroup")).await;
+    let observed = std::fs::read_to_string(root.path().join("shared/cgroup")).unwrap();
+    let still_same =
+        reliaburger::sesame::egress::cgroup_id_of_path(Path::new(&host_path)) == Some(before);
+    runtime.kill(&id).await.unwrap();
+    if Path::new(&host_path).exists() {
+        std::fs::remove_dir(&host_path).unwrap();
+    }
+    assert_absent(root.path(), &id);
+    assert_eq!(observed.trim(), format!("0::{expected}"));
+    assert!(still_same, "runc replaced Bun's pre-programmed cgroup");
+}
