@@ -18,6 +18,8 @@ use nix::sys::signal::{Signal, kill};
 use nix::unistd::Pid;
 use serde::{Deserialize, Serialize};
 
+pub(crate) mod exec;
+
 const RECORD_LIMIT: u64 = 1024 * 1024;
 
 /// Durable evidence for one foreground execution generation.
@@ -130,13 +132,26 @@ pub(crate) fn persist(directory: &Path, record: &OwnerRecord) -> io::Result<()> 
     crate::sesame::identity::atomic_write_mode(&directory.join("owner.json"), &bytes, Some(0o600))
 }
 
+fn owner_executable() -> io::Result<PathBuf> {
+    // A Linux owner can outlive atomic replacement or unlinking of Bun's file.
+    // Execute its mapped image, not the obsolete pathname returned by readlink.
+    #[cfg(target_os = "linux")]
+    {
+        Ok(PathBuf::from("/proc/self/exe"))
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        std::env::current_exe()
+    }
+}
+
 /// Bootstrap a durable owner, then exit so host init owns its reaping.
 ///
 /// Only the hidden pre-Tokio Bun command calls this. The runtime waits for this
 /// bootstrapper to exit before acknowledging start, so a later Bun `exec` cannot
 /// discard the only waiter for a long-lived owner child.
 pub fn launch_detached_owner(directory: &Path, generation: &str) -> io::Result<()> {
-    let _child = Command::new(std::env::current_exe()?)
+    let _child = Command::new(owner_executable()?)
         .args(["__process-owner", "--directory"])
         .arg(directory)
         .arg("--generation")
@@ -194,6 +209,7 @@ fn run_locked_owner(directory: &Path, record: &mut OwnerRecord, _lock: File) -> 
         ));
     }
     become_subreaper()?;
+    exec::install_cancellation_handler()?;
     let socket_path = socket_path(directory, record);
     if record.launch.is_some() {
         use std::os::unix::fs::DirBuilderExt;
@@ -221,7 +237,7 @@ fn run_locked_owner(directory: &Path, record: &mut OwnerRecord, _lock: File) -> 
             .custom_flags(nix::libc::O_NOFOLLOW)
             .open(directory.join(format!("output.{suffix}")))
     };
-    let child = Command::new(std::env::current_exe()?)
+    let child = Command::new(owner_executable()?)
         .args(["__process-exec-gate", "--directory"])
         .arg(directory)
         .process_group(0)
@@ -248,11 +264,15 @@ fn run_locked_owner(directory: &Path, record: &mut OwnerRecord, _lock: File) -> 
     drop(activation);
 
     let mut exit_code = None;
+    let mut executions = Vec::new();
     loop {
+        if exec::cancelled() {
+            owned.signal(Signal::SIGKILL)?;
+        }
         match listener.accept() {
             Ok((connection, _)) => {
                 // An abandoned or malformed client must not end the owner.
-                let _ = respond(connection, record, &owned);
+                let _ = respond(connection, directory, record, &owned, &mut executions);
             }
             Err(error) if error.kind() == io::ErrorKind::WouldBlock => {}
             Err(error) => return Err(error),
@@ -260,7 +280,9 @@ fn run_locked_owner(directory: &Path, record: &mut OwnerRecord, _lock: File) -> 
         if exit_code.is_none() {
             exit_code = observe_exit(owned.child.id())?;
         }
+        let executions_retired = exec::poll(&mut executions, exit_code.is_some())?;
         if let Some(code) = exit_code
+            && executions_retired
             && retire_children(&mut owned)?
         {
             record.phase = OwnerPhase::Retiring { exit_code: code };
@@ -359,6 +381,11 @@ impl OwnedChild {
         // be recycled between observing exit and sending the signal.
         match kill(Pid::from_raw(-(self.child.id() as i32)), signal) {
             Ok(()) | Err(nix::errno::Errno::ESRCH) => Ok(()),
+            // macOS can refuse signals to a zombie-only group. The retained
+            // root proves its exit, but complete retirement still checks every
+            // group member before the owner publishes absence.
+            #[cfg(target_os = "macos")]
+            Err(nix::errno::Errno::EPERM) if observe_exit(self.child.id())?.is_some() => Ok(()),
             Err(error) => Err(error.into()),
         }
     }
@@ -410,24 +437,33 @@ fn observe_exit(pid: u32) -> io::Result<Option<Option<i32>>> {
 struct Request {
     nonce: String,
     action: Action,
+    #[serde(default)]
+    command: Vec<String>,
 }
 
 #[derive(Deserialize)]
 #[serde(rename_all = "snake_case")]
 enum Action {
     Status,
+    Exec,
     Terminate,
     Kill,
 }
 
-fn respond(mut socket: UnixStream, record: &OwnerRecord, child: &OwnedChild) -> io::Result<()> {
+fn respond(
+    mut socket: UnixStream,
+    directory: &Path,
+    record: &OwnerRecord,
+    child: &OwnedChild,
+    executions: &mut Vec<exec::Execution>,
+) -> io::Result<()> {
     socket.set_read_timeout(Some(Duration::from_millis(100)))?;
     socket.set_write_timeout(Some(Duration::from_millis(100)))?;
     let mut bytes = Vec::new();
     BufReader::new(socket.try_clone()?)
-        .take(1025)
+        .take(exec::REQUEST_LIMIT as u64 + 1)
         .read_until(b'\n', &mut bytes)?;
-    let response = if bytes.len() > 1024 || bytes.last() != Some(&b'\n') {
+    let response = if bytes.len() > exec::REQUEST_LIMIT || bytes.last() != Some(&b'\n') {
         serde_json::json!({"error": "invalid owner request size"})
     } else {
         match serde_json::from_slice::<Request>(&bytes) {
@@ -436,6 +472,22 @@ fn respond(mut socket: UnixStream, record: &OwnerRecord, child: &OwnedChild) -> 
             }
             Ok(request) => match request.action {
                 Action::Status => serde_json::json!({"phase": record.phase}),
+                Action::Exec => {
+                    if observe_exit(child.child.id())?.is_some() || exec::cancelled() {
+                        serde_json::json!({"error": "workload is stopping"})
+                    } else {
+                        match exec::Execution::launch(
+                            directory,
+                            record,
+                            request.command,
+                            socket.try_clone()?,
+                            executions,
+                        ) {
+                            Ok(()) => return Ok(()),
+                            Err(error) => serde_json::json!({"error": error.to_string()}),
+                        }
+                    }
+                }
                 action => match child.signal(match action {
                     Action::Terminate => Signal::SIGTERM,
                     _ => Signal::SIGKILL,

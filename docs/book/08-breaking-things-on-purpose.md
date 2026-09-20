@@ -1494,3 +1494,52 @@ its checkpoint with a fresh runtime and retires it without a signal or status
 query. The real Bun crash test also prints the retained lease state, job phases
 and recovery errors on failure. That made a CI-only timeout reproducible under
 the full native test suite, instead of hiding it behind a longer deadline.
+
+
+### Exec commands need an owner too
+
+Run `relish exec` against a process workload, then kill Bun. The application
+already has an independent owner, but the old exec path spawned its command
+inside Bun. Dropping the runtime future did not stop it. Worse, removing the application
+could report success while that command still ran. The two regression tests
+reproduce both failures before changing the implementation.
+
+The workload owner now starts a child owner for each exec request. That child
+uses the same durable record, activation gate and complete foreground-group
+retirement as an application. It stays a direct child of the workload owner,
+which retains its `Child` handle until it has both reaped the helper and checked
+positive retirement evidence. The application cannot finish retirement with an
+unresolved exec child. Separate process groups let us cancel an exec without
+killing the application. A missing auxiliary owner retains uncertainty.
+
+The request's Unix socket stays inside the calling async future. Dropping that
+future, or killing Bun, closes the socket. The workload owner observes EOF and
+asks its child owner to cancel. This is why this socket operation does not use
+our usual detached blocking worker: that worker would keep the socket alive
+after its caller disappeared.
+
+Cancellation uses SIGTERM against a retained, unreaped child, never a PID read
+back from a file. The child installs an `extern "C"` signal handler, where the
+quoted ABI tells Rust to use the calling convention expected by the operating
+system. The handler only stores `true` in an `AtomicBool`. This is a boolean
+that can be accessed without a lock; `Ordering::Relaxed` is sufficient because
+the flag carries no other memory that the receiver must observe in order. The
+normal owner loop reads it and performs cleanup. We never allocate, write files
+or take locks inside the signal handler.
+
+The helper admits at most sixteen concurrent requests and each command has a
+five-minute deadline. The request body is bounded to 64 KiB and returned output
+to 1 MiB across stdout and stderr. Replies use nonblocking writes so a client
+that stops reading cannot prevent workload retirement. On Linux, an existing
+owner starts helpers through `/proc/self/exe`, preserving access to its mapped
+binary even after self-upgrade replaces the file on disk.
+
+
+The implementation lives in a child module of `process_owner`. Its
+`pub(super)` items are visible to that parent module, keeping helper mechanics
+out of the public runtime API. A real HTTP regression starts an exec command,
+kills Bun with SIGKILL, waits for command and helper retirement, then starts Bun
+again and checks that the main workload keeps the same PID. Another deliberately
+kills only the auxiliary owner: the request fails, and application retirement
+stays unconfirmed even when the command exits. The Linux binary-unlink test
+also checks that an owner can start an exec after its original binary is removed.

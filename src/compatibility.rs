@@ -18,7 +18,7 @@ pub struct Compatibility {
 /// Supported registry query protocol and durable repository generation format.
 pub const CURRENT: Compatibility = Compatibility {
     protocol: 14,
-    state: 18,
+    state: 19,
 };
 
 /// Name of the durable format stamp at the root of a node's data directory.

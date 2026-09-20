@@ -239,15 +239,34 @@ fn malformed_and_abandoned_clients_do_not_end_the_owner() {
     // This connection never sends a newline. Its timeout must let the next
     // client through without preventing exit observation or future cleanup.
     let stalled = UnixStream::connect(&path).unwrap();
-    for request in [b"not-json\n".to_vec(), vec![b'x'; 1025]] {
+    let mut oversized = serde_json::to_vec(&serde_json::json!({
+        "nonce": "test-owner-generation", "action": "kill"
+    }))
+    .unwrap();
+    oversized.extend(vec![b' '; 64 * 1024]);
+    oversized.push(b'\n');
+    for request in [b"not-json\n".to_vec(), oversized] {
         let mut socket = UnixStream::connect(&path).unwrap();
         socket
             .set_read_timeout(Some(Duration::from_secs(2)))
             .unwrap();
-        socket.write_all(&request).unwrap();
+        socket
+            .set_write_timeout(Some(Duration::from_secs(2)))
+            .unwrap();
+        // An over-limit sender may receive a broken pipe when the bounded
+        // reader refuses before it has finished sending. Closure is refusal;
+        // any reply must be an error, and the valid-but-oversized Kill must
+        // never execute. The live status below proves that last condition.
+        let write = socket.write_all(&request);
         let mut response = String::new();
-        BufReader::new(socket).read_line(&mut response).unwrap();
-        assert!(serde_json::from_str::<serde_json::Value>(&response).unwrap()["error"].is_string());
+        if write.is_ok() {
+            let _ = BufReader::new(socket).read_line(&mut response);
+        }
+        if !response.is_empty() {
+            assert!(
+                serde_json::from_str::<serde_json::Value>(&response).unwrap()["error"].is_string()
+            );
+        }
     }
     drop(stalled);
     assert_eq!(

@@ -1,5 +1,6 @@
 //! Durable client of the foreground owner. All filesystem/socket operations run
-//! on blocking workers; cancellation never cancels an in-flight mutation.
+//! on blocking workers except exec sockets, whose lifetime carries cancellation.
+//! Cancellation never cancels an in-flight lifecycle mutation.
 
 use std::fs::{File, OpenOptions};
 use std::io;
@@ -365,6 +366,50 @@ impl ProcessControl {
             }
         }
         Ok(record)
+    }
+
+    /// Run through the durable owner; dropping this future cancels its socket.
+    pub(crate) async fn exec(&self, id: &InstanceId, command: &[String]) -> io::Result<String> {
+        use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt};
+        let record = self.record(id).await?;
+        if !matches!(record.phase, OwnerPhase::Running { .. }) {
+            return Err(io::Error::other("instance is not running"));
+        }
+        let path = process_owner::socket_path(&self.directory(id)?, &record);
+        let request = format!(
+            "{}\n",
+            serde_json::json!({"nonce": record.nonce, "action": "exec", "command": command})
+        );
+        if request.len() > process_owner::exec::REQUEST_LIMIT {
+            return Err(io::Error::other("exec request exceeds size limit"));
+        }
+        // Keep this socket in the caller's async future. Cancellation or Bun
+        // death closes it, allowing the independent owner to retire execution.
+        tokio::time::timeout(Duration::from_secs(300), async {
+            let mut socket = tokio::net::UnixStream::connect(path).await?;
+            socket.write_all(request.as_bytes()).await?;
+            let mut bytes = Vec::new();
+            tokio::io::BufReader::new(socket)
+                .take(process_owner::exec::RESPONSE_LIMIT + 1)
+                .read_until(b'\n', &mut bytes)
+                .await?;
+            if bytes.len() as u64 > process_owner::exec::RESPONSE_LIMIT
+                || bytes.last() != Some(&b'\n')
+            {
+                return Err(io::Error::other("invalid exec response size"));
+            }
+            let response: serde_json::Value = serde_json::from_slice(&bytes)?;
+            if let Some(error) = response.get("error") {
+                return Err(io::Error::other(format!("process exec refused: {error}")));
+            }
+            response
+                .get("output")
+                .and_then(|value| value.as_str())
+                .map(str::to_owned)
+                .ok_or_else(|| io::Error::other("process exec returned no output"))
+        })
+        .await
+        .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "process exec timed out"))?
     }
 
     pub(crate) fn log_stem(&self, id: &InstanceId) -> io::Result<PathBuf> {

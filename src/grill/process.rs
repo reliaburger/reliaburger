@@ -677,10 +677,11 @@ impl super::Grill for ProcessGrill {
 
     async fn exec(&self, instance: &InstanceId, command: &[String]) -> Result<String, GrillError> {
         // Verify the instance exists and is running
-        if self.control.is_some() {
-            if self.state(instance).await? != ContainerState::Running {
-                return Err(owner_error(instance, "instance is not running"));
-            }
+        if let Some(control) = &self.control {
+            return control
+                .exec(instance, command)
+                .await
+                .map_err(|error| owner_error(instance, error));
         } else {
             let procs = self.processes.lock().await;
             let entry = procs.get(instance).ok_or_else(|| GrillError::NotFound {

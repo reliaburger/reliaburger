@@ -109,13 +109,20 @@ security boundary against hostile same-user processes.
 - [x] Require the launched Bun's own API announcement before first-run readiness.
   A foreign-listener regression fails before the correction; all sixteen portable
   first-run cases and strict Clippy pass on macOS/Linux afterwards.
-- [ ] Supervise auxiliary process exec commands through the durable owner.
-  The current direct spawn escapes caller cancellation and Bun death; workload
-  retirement must also wait for these commands and their foreground children.
+- [x] Supervise auxiliary process exec commands through the durable owner.
+  Both cancelled-caller and confirmed-retirement regressions reproduce the old
+  direct-spawn leak. Implementation routes commands through child owners of the
+  workload owner, retaining live child identity and complete group retirement.
+  Async socket lifetime carries caller cancellation; helper loss preserves a
+  cleanup obligation. Qualification includes command output, surviving children
+  and actual caller SIGKILL. State 19 excludes old untracked exec generations.
+  All 42 macOS/43 Linux owner, recovery, real Bun-crash and compatibility
+  cases pass with strict Clippy. Physical HTTP exec/Bun SIGKILL preserves the
+  main workload PID on recovery; Linux also passes binary-unlink execution.
 - [ ] Qualify actual Bun death at the preparation/activation/adoption boundaries,
   helper loss, short jobs, cron and complete group retirement on macOS/Linux.
   Re-run the runtime, agent, job-recovery and upgrade suites.
 
 Production Bun now uses the durable process owner and startup reconciliation.
-Auxiliary exec commands, remaining runtime/discovery ownership and the
-0.1.0 release qualification gates remain open.
+Remaining [OCI/runtime/discovery ownership](2026-09-20-oci-launch-ownership.md),
+physical boundary qualification and the 0.1.0 release gates remain open.

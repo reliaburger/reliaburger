@@ -738,3 +738,309 @@ async fn cancelled_queued_kill_cannot_cancel_a_successor_generation() {
 async fn cancelled_queued_create_cannot_overwrite_a_successor_outcome() {
     cancelled_queued_mutation_preserves_successor(QueuedMutation::Create).await;
 }
+
+async fn read_exec_pid(path: &Path) -> u32 {
+    tokio::time::timeout(Duration::from_secs(15), async {
+        loop {
+            if let Ok(value) = tokio::fs::read_to_string(path).await
+                && let Ok(pid) = value.trim().parse()
+            {
+                return pid;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .unwrap()
+}
+
+async fn exec_process_is_gone(pid: u32) -> bool {
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while reliaburger::grill::records::process_start_time(pid).is_some() {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .is_ok()
+}
+
+async fn interrupted_exec_is_retired(cancel_caller: bool) {
+    let directory = tempfile::tempdir().unwrap();
+    let grill = std::sync::Arc::new(runtime(directory.path()));
+    let id = InstanceId("default__exec-0".into());
+    grill.create(&id, &spec("sleep 60")).await.unwrap();
+    grill.start(&id).await.unwrap();
+    let marker = directory.path().join("exec-pid");
+    let command = vec![
+        "/bin/sh".into(),
+        "-c".into(),
+        format!("echo $$ > '{}'; exec sleep 60", marker.display()),
+    ];
+    let task = {
+        let grill = grill.clone();
+        let id = id.clone();
+        tokio::spawn(async move { grill.exec(&id, &command).await })
+    };
+    let pid = read_exec_pid(&marker).await;
+    if cancel_caller {
+        task.abort();
+    } else {
+        grill.kill(&id).await.unwrap();
+    }
+    let gone = exec_process_is_gone(pid).await;
+    if !gone {
+        let _ = nix::sys::signal::kill(
+            nix::unistd::Pid::from_raw(pid as i32),
+            nix::sys::signal::Signal::SIGKILL,
+        );
+    }
+    task.abort();
+    let _ = task.await;
+    if cancel_caller {
+        grill.kill(&id).await.unwrap();
+    }
+    let result = tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            if matches!(grill.state(&id).await, Ok(ContainerState::Stopped)) {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await;
+    if result.is_err() {
+        let owner_dir = directory.path().join("process-owners").join(&id.0);
+        for entry in std::fs::read_dir(&owner_dir).unwrap() {
+            let path = entry.unwrap().path();
+            if path.is_dir() {
+                eprintln!(
+                    "aux {:?}: {:?}, log {:?}",
+                    path,
+                    std::fs::read_to_string(path.join("owner.json")),
+                    std::fs::read_to_string(path.join("owner.log"))
+                );
+            } else {
+                eprintln!("file {:?}: {:?}", path, std::fs::read_to_string(&path));
+            }
+        }
+    }
+    assert!(result.is_ok(), "parent did not retire");
+    assert!(
+        gone,
+        "exec subprocess survived cancellation or confirmed workload retirement"
+    );
+}
+
+#[tokio::test]
+async fn cancelled_exec_retires_its_process() {
+    interrupted_exec_is_retired(true).await;
+}
+
+#[tokio::test]
+async fn workload_retirement_waits_for_exec_processes() {
+    interrupted_exec_is_retired(false).await;
+}
+
+#[tokio::test]
+async fn exec_returns_output_only_after_retiring_surviving_children() {
+    let directory = tempfile::tempdir().unwrap();
+    let grill = runtime(directory.path());
+    let id = InstanceId("default__exec-output-0".into());
+    grill.create(&id, &spec("sleep 60")).await.unwrap();
+    grill.start(&id).await.unwrap();
+    let marker = directory.path().join("child-pid");
+    let command = vec![
+        "/bin/sh".into(),
+        "-c".into(),
+        format!(
+            "sleep 60 & echo $! > '{}'; printf stdout; printf stderr >&2; exit 7",
+            marker.display()
+        ),
+    ];
+    let output = grill.exec(&id, &command).await;
+    let pid = read_exec_pid(&marker).await;
+    let gone = exec_process_is_gone(pid).await;
+    grill.kill(&id).await.unwrap();
+    stopped(&grill, &id).await;
+    assert_eq!(output.unwrap(), "stdout\nstderr");
+    assert!(gone, "exec returned while its descendant remained");
+}
+
+#[tokio::test]
+async fn exec_rejects_empty_commands_and_excessive_output() {
+    let directory = tempfile::tempdir().unwrap();
+    let grill = runtime(directory.path());
+    let id = InstanceId("default__exec-limits-0".into());
+    grill.create(&id, &spec("sleep 60")).await.unwrap();
+    grill.start(&id).await.unwrap();
+    let empty = grill.exec(&id, &[]).await;
+    let oversized_request = grill
+        .exec(&id, &["/bin/echo".into(), "x".repeat(64 * 1024)])
+        .await;
+    let long_request = grill
+        .exec(&id, &["/bin/echo".into(), "x".repeat(2048)])
+        .await;
+    let oversized = grill
+        .exec(
+            &id,
+            &[
+                "/bin/sh".into(),
+                "-c".into(),
+                "head -c 1048577 /dev/zero".into(),
+            ],
+        )
+        .await;
+    let following = grill
+        .exec(&id, &["/bin/echo".into(), "still-running".into()])
+        .await;
+    grill.kill(&id).await.unwrap();
+    stopped(&grill, &id).await;
+    assert!(empty.unwrap_err().to_string().contains("no exec command"));
+    assert!(
+        oversized_request
+            .unwrap_err()
+            .to_string()
+            .contains("request exceeds")
+    );
+    assert_eq!(long_request.unwrap(), format!("{}\n", "x".repeat(2048)));
+    assert!(oversized.unwrap_err().to_string().contains("1 MiB"));
+    assert_eq!(following.unwrap(), "still-running\n");
+}
+
+#[tokio::test]
+async fn killed_exec_caller_closes_ownership_without_stopping_application() {
+    const DIRECTORY: &str = "RELIABURGER_EXEC_CALLER_DIRECTORY";
+    let id = InstanceId("default__exec-crash-0".into());
+    if let Some(path) = std::env::var_os(DIRECTORY) {
+        let directory = std::path::PathBuf::from(path);
+        let grill = runtime(&directory);
+        let command = vec![
+            "/bin/sh".into(),
+            "-c".into(),
+            format!(
+                "echo $$ > '{}'; exec sleep 60",
+                directory.join("exec-pid").display()
+            ),
+        ];
+        let _ = grill.exec(&id, &command).await;
+        return;
+    }
+    let directory = tempfile::tempdir().unwrap();
+    let grill = runtime(directory.path());
+    grill.create(&id, &spec("sleep 60")).await.unwrap();
+    grill.start(&id).await.unwrap();
+    let mut caller = tokio::process::Command::new(std::env::current_exe().unwrap())
+        .args([
+            "--exact",
+            "killed_exec_caller_closes_ownership_without_stopping_application",
+            "--nocapture",
+        ])
+        .env(DIRECTORY, directory.path())
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .kill_on_drop(true)
+        .spawn()
+        .unwrap();
+    let pid = read_exec_pid(&directory.path().join("exec-pid")).await;
+    caller.kill().await.unwrap();
+    let gone = exec_process_is_gone(pid).await;
+    let main_state = grill.state(&id).await;
+    grill.kill(&id).await.unwrap();
+    stopped(&grill, &id).await;
+    assert!(gone, "exec escaped actual caller SIGKILL");
+    assert_eq!(main_state.unwrap(), ContainerState::Running);
+}
+
+#[tokio::test]
+async fn lost_exec_owner_keeps_application_retirement_unconfirmed() {
+    let directory = tempfile::tempdir().unwrap();
+    let grill = runtime(directory.path());
+    let id = InstanceId("default__exec-owner-loss-0".into());
+    let release = directory.path().join("release");
+    let owner_pid = directory.path().join("owner-pid");
+    grill
+        .create(
+            &id,
+            &spec(&format!(
+                "echo $PPID > '{}'; while [ ! -f '{}' ]; do sleep 0.01; done",
+                owner_pid.display(),
+                release.display()
+            )),
+        )
+        .await
+        .unwrap();
+    grill.start(&id).await.unwrap();
+    let parent_owner = read_exec_pid(&owner_pid).await;
+    let result = tokio::time::timeout(
+        Duration::from_secs(15),
+        grill.exec(
+            &id,
+            &[
+                "/bin/sh".into(),
+                "-c".into(),
+                "kill -KILL \"$PPID\"; exit 0".into(),
+            ],
+        ),
+    )
+    .await
+    .unwrap();
+    std::fs::write(&release, "exit").unwrap();
+    tokio::time::sleep(Duration::from_millis(250)).await;
+    let state = grill.state(&id).await;
+    let parent_dir = directory.path().join("process-owners").join(&id.0);
+    let record: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(parent_dir.join("owner.json")).unwrap()).unwrap();
+    // Fault-injection cleanup: this fixture's retained helper deliberately
+    // cannot certify absence after its auxiliary owner was killed.
+    nix::sys::signal::kill(
+        nix::unistd::Pid::from_raw(parent_owner as i32),
+        nix::sys::signal::Signal::SIGKILL,
+    )
+    .unwrap();
+    for path in std::iter::once(parent_dir.clone()).chain(
+        std::fs::read_dir(&parent_dir)
+            .unwrap()
+            .filter_map(|entry| entry.ok().map(|entry| entry.path()))
+            .filter(|path| path.is_dir()),
+    ) {
+        let record: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(path.join("owner.json")).unwrap()).unwrap();
+        let socket_directory = std::path::PathBuf::from(format!(
+            "/tmp/rbp-{}-{}",
+            nix::unistd::geteuid(),
+            record["nonce"].as_str().unwrap()
+        ));
+        let _ = std::fs::remove_file(socket_directory.join("control.sock"));
+        let _ = std::fs::remove_dir(socket_directory);
+    }
+    assert!(
+        result
+            .unwrap_err()
+            .to_string()
+            .contains("without retirement proof")
+    );
+    assert!(!matches!(state, Ok(ContainerState::Stopped)));
+    assert_eq!(record["phase"]["state"], "running");
+}
+
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn exec_owner_can_launch_after_its_binary_has_been_unlinked() {
+    let directory = tempfile::tempdir().unwrap();
+    let executable = directory.path().join("bun-old");
+    tokio::fs::copy(env!("CARGO_BIN_EXE_bun"), &executable)
+        .await
+        .unwrap();
+    let grill = ProcessGrill::with_owner(directory.path().join("logs"), executable.clone());
+    let id = InstanceId("default__exec-old-binary-0".into());
+    grill.create(&id, &spec("sleep 60")).await.unwrap();
+    grill.start(&id).await.unwrap();
+    tokio::fs::remove_file(executable).await.unwrap();
+    let result = grill
+        .exec(&id, &["/bin/echo".into(), "mapped-image".into()])
+        .await;
+    grill.kill(&id).await.unwrap();
+    stopped(&grill, &id).await;
+    assert_eq!(result.unwrap(), "mapped-image\n");
+}

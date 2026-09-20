@@ -41,7 +41,7 @@ Install and usage details are in the [documentation](docs/README.md), and
 implementation status in [progress.md](docs/progress.md).
 
 0.1.0 requires a fresh cluster; development state is refused. Rolling upgrades
-require matching explicit formats (currently protocol 14 and state 18). See the
+require matching explicit formats (currently protocol 14 and state 19). See the
 [compatibility policy](docs/releasing.md#cluster-compatibility).
 Registry uploads belong to their exact creating credential. Recovery reclaims
 abandoned partial uploads after a crash and
@@ -114,6 +114,8 @@ open http://localhost:9117/    # web dashboard
 Process launches and completed job outcomes survive Bun replacement through
 private durable owners. Application deployment acknowledges success only after
 its recovery metadata is written; storage failures are deployment errors.
+Process exec commands also have owners: Bun death retires them while preserving
+the main workload, and application cleanup waits for their confirmed retirement.
 
 Process mode supports foreground workloads: the main process stays under Bun's
 supervision, and its children must remain in the supervised process group.

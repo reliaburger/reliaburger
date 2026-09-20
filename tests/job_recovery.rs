@@ -267,3 +267,95 @@ registry_port = 0
         recovered.crash().await;
     }
 }
+
+#[tokio::test]
+async fn killed_bun_retires_api_exec_and_adopts_the_original_workload() {
+    let root = tempfile::tempdir().unwrap();
+    let config_path = root.path().join("node.toml");
+    let log = root.path().join("bun.log");
+    let data = root.path().join("data");
+    std::fs::write(
+        &config_path,
+        format!(
+            r#"
+[storage]
+data = "{root}/data"
+images = "{root}/images"
+logs = "{root}/logs"
+metrics = "{root}/metrics"
+volumes = "{root}/volumes"
+[images]
+registry_bind = "127.0.0.1"
+registry_port = 0
+"#,
+            root = root.path().display()
+        ),
+    )
+    .unwrap();
+    let release = root.path().join("release");
+    let _release = ReleaseJob(release.clone());
+    let mut config = Config::parse("[job.work]\nimage = 'proc-grill:image-ignored'\n").unwrap();
+    config.job.get_mut("work").unwrap().command = Some(vec![
+        "/bin/sh".into(),
+        "-c".into(),
+        format!(
+            "n=0; while [ ! -f '{}' ] && [ $n -lt 600 ]; do sleep 0.05; n=$((n+1)); done",
+            release.display()
+        ),
+    ]);
+    let mut node = Node::start(&config_path, &log).await;
+    node.client.apply(&config).await.unwrap();
+    wait_job(&node.client, "running", 0).await;
+    let main_pid = node.client.status().await.unwrap()[0].pid.unwrap();
+    let marker = root.path().join("exec-pid");
+    let client = BunClient::new(&node.endpoint);
+    let command = vec![
+        "/bin/sh".into(),
+        "-c".into(),
+        format!("echo $$ > '{}'; exec sleep 60", marker.display()),
+    ];
+    let request = tokio::spawn(async move { client.exec("work", "default", &command).await });
+    let exec_pid: u32 = tokio::time::timeout(Duration::from_secs(15), async {
+        loop {
+            if let Ok(value) = std::fs::read_to_string(&marker)
+                && let Ok(pid) = value.trim().parse()
+            {
+                break pid;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .unwrap();
+    node.crash().await;
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            let owners = data.join("instances/process-owners/default__work-0");
+            let active_exec = std::fs::read_dir(&owners).unwrap().any(|entry| {
+                entry
+                    .unwrap()
+                    .file_name()
+                    .to_string_lossy()
+                    .starts_with("exec-")
+            });
+            if !active_exec && reliaburger::grill::records::process_start_time(exec_pid).is_none() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("actual Bun death must retire exec and its helper");
+    request.abort();
+    let _ = request.await;
+    let mut recovered = Node::start(&config_path, &log).await;
+    wait_job(&recovered.client, "running", 0).await;
+    assert_eq!(
+        recovered.client.status().await.unwrap()[0].pid,
+        Some(main_pid)
+    );
+    std::fs::write(release, "release").unwrap();
+    wait_job(&recovered.client, "stopped", 0).await;
+    recovered.client.stop("work", "default").await.unwrap();
+    recovered.crash().await;
+}

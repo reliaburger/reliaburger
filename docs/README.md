@@ -169,7 +169,7 @@ development configurations. Ingress currently uses unweighted round-robin on
 Bun's shared runtime, with no separate strategy or worker-thread setting.
 
 0.1.0 requires a fresh cluster; development state is refused. Rolling upgrades
-require matching explicit formats (currently protocol 14 and state 18). See the
+require matching explicit formats (currently protocol 14 and state 19). See the
 [compatibility policy](releasing.md#cluster-compatibility).
 
 Lease-owned test volumes and generated configuration have durable provisioning
@@ -304,6 +304,13 @@ if a crash prevented the later adoption record. Completed jobs preserve their
 exit code. An application deployment requires durable adoption metadata before
 success is acknowledged; failed writes retain cleanup ownership and return an
 error. Lost owner processes remain uncertain and require operator investigation.
+
+Process `relish exec` commands use child owners too. Cancelling the runtime request or killing Bun
+closes its owner socket and triggers command retirement; application cleanup
+waits for those owners and their foreground children. Each application permits
+sixteen concurrent exec requests, with a five-minute deadline, 64 KiB request
+limit and 1 MiB combined stdout/stderr response limit. Commands inherit the host
+environment and run without container isolation.
 
 **0.1.0 contract: foreground workloads only.** The main process stays under Bun's
 supervision and children must remain in its supervised process group. A service
