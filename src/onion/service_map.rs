@@ -43,6 +43,51 @@ impl ServiceMap {
         }
     }
 
+    /// Restore exact saved allocations without rehashing or publishing routes.
+    ///
+    /// Reject the entire inventory on conflicting identities, addresses or invalid
+    /// backends. Recorded health is historical: callers must reconcile runtime and
+    /// kernel ownership before exposing this map to DNS, ingress or kernel hooks.
+    pub fn from_snapshot(entries: &[ServiceEntry]) -> Result<Self, OnionError> {
+        let mut map = Self::new();
+        for entry in entries {
+            let id = ServiceId::new(&entry.namespace, &entry.app_name);
+            let key = id.qualified();
+            let invalid = |reason| OnionError::InvalidSnapshot {
+                service: key.clone(),
+                reason,
+            };
+            if !crate::config::valid_workload_label(&entry.namespace)
+                || !crate::config::valid_workload_label(&entry.app_name)
+                || entry.namespace_id != name_to_id(&entry.namespace)
+                || entry.app_id != u32::from(entry.vip.0)
+                || !(0x7f80_0001..=0x7f80_fffe).contains(&u32::from(entry.vip.0))
+                || entry.port == 0
+            {
+                return Err(invalid("invalid service identity or allocation"));
+            }
+            if map.entries.contains_key(&key) || map.allocated_vips.contains(&entry.vip) {
+                return Err(invalid("duplicate service or virtual IP owner"));
+            }
+            if entry.backends.len() > MAX_BACKENDS {
+                return Err(invalid("backend capacity exceeded"));
+            }
+            let mut backend_ids = HashSet::new();
+            for backend in &entry.backends {
+                if backend.instance_id.is_empty()
+                    || backend.host_port == 0
+                    || backend.node_ip.is_unspecified()
+                    || !backend_ids.insert(&backend.instance_id)
+                {
+                    return Err(invalid("invalid or duplicate backend"));
+                }
+            }
+            map.allocated_vips.insert(entry.vip);
+            map.entries.insert(key, entry.clone());
+        }
+        Ok(map)
+    }
+
     /// Register a new service in the map.
     ///
     /// Computes the VIP deterministically from the namespace-qualified
@@ -361,6 +406,103 @@ mod tests {
             host_port: port,
             healthy: true,
         }
+    }
+
+    #[test]
+    fn snapshot_restores_collision_resolved_addresses_in_any_order() {
+        let mut seen = HashMap::new();
+        let (first, second) = (0..65_535)
+            .find_map(|index| {
+                let id = sid("default", &format!("service-{index}"));
+                seen.insert(VirtualIP::from_service_id(&id), id.clone())
+                    .map(|first| (first, id))
+            })
+            .unwrap();
+        let mut map = ServiceMap::new();
+        let first_vip = map.register(&first, 8080, None).unwrap();
+        let second_vip = map
+            .register(&second, 9000, Some(vec!["default/client".into()]))
+            .unwrap();
+        assert_ne!(first_vip, second_vip);
+        let mut backend = test_backend("original-generation", [10, 0, 2, 2], 9000);
+        backend.healthy = false;
+        map.add_backend(&second, backend).unwrap();
+        let snapshot = vec![
+            map.resolve(&second).unwrap().clone(),
+            map.resolve(&first).unwrap().clone(),
+        ];
+        let mut recovered = ServiceMap::from_snapshot(&snapshot).unwrap();
+        for entry in &snapshot {
+            let id = sid(&entry.namespace, &entry.app_name);
+            assert_eq!(
+                serde_json::to_value(recovered.resolve(&id).unwrap()).unwrap(),
+                serde_json::to_value(entry).unwrap()
+            );
+        }
+        recovered.unregister(&second).unwrap();
+        assert_eq!(
+            recovered.register(&second, 9000, None).unwrap(),
+            second_vip,
+            "restoration forgot the first service's address reservation"
+        );
+    }
+
+    #[test]
+    fn snapshot_refuses_duplicate_service_or_address_ownership() {
+        let mut map = ServiceMap::new();
+        let first = sid("default", "first");
+        let second = sid("default", "second");
+        map.register(&first, 8080, None).unwrap();
+        map.register(&second, 9000, None).unwrap();
+        let first = map.resolve(&first).unwrap().clone();
+        let mut second = map.resolve(&second).unwrap().clone();
+        assert!(ServiceMap::from_snapshot(&[first.clone(), first.clone()]).is_err());
+        second.vip = first.vip;
+        second.app_id = first.app_id;
+        assert!(ServiceMap::from_snapshot(&[first, second]).is_err());
+    }
+
+    #[test]
+    fn snapshot_refuses_invalid_identity_or_backend_evidence() {
+        let mut map = ServiceMap::new();
+        let id = sid("default", "service");
+        map.register(&id, 8080, None).unwrap();
+        map.add_backend(&id, test_backend("original", [10, 0, 2, 2], 8080))
+            .unwrap();
+        let original = map.resolve(&id).unwrap().clone();
+        let invalid: &[fn(&mut ServiceEntry)] = &[
+            |entry| entry.namespace = "invalid__namespace".into(),
+            |entry| entry.app_name = String::new(),
+            |entry| entry.namespace_id ^= 1,
+            |entry| entry.app_id ^= 1,
+            |entry| {
+                entry.vip = VirtualIP(Ipv4Addr::new(192, 0, 2, 1));
+                entry.app_id = u32::from(entry.vip.0);
+            },
+            |entry| {
+                entry.vip = VirtualIP(Ipv4Addr::new(127, 128, 0, 0));
+                entry.app_id = u32::from(entry.vip.0);
+            },
+            |entry| {
+                entry.vip = VirtualIP(Ipv4Addr::new(127, 128, 255, 255));
+                entry.app_id = u32::from(entry.vip.0);
+            },
+            |entry| entry.port = 0,
+            |entry| entry.backends.push(entry.backends[0].clone()),
+            |entry| entry.backends = vec![entry.backends[0].clone(); MAX_BACKENDS + 1],
+            |entry| entry.backends[0].instance_id.clear(),
+            |entry| entry.backends[0].host_port = 0,
+            |entry| entry.backends[0].node_ip = Ipv4Addr::UNSPECIFIED,
+        ];
+        for (index, invalidate) in invalid.iter().enumerate() {
+            let mut damaged = original.clone();
+            invalidate(&mut damaged);
+            assert!(
+                ServiceMap::from_snapshot(&[damaged]).is_err(),
+                "accepted invalid snapshot case {index}"
+            );
+        }
+        assert!(ServiceMap::from_snapshot(&[]).unwrap().is_empty());
     }
 
     #[test]

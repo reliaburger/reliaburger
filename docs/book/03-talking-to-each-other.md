@@ -1386,3 +1386,30 @@ starts an unrelated container, proves it serves its own HTTP identity, and
 checks that it neither reuses the retained address nor answers through the old
 VIP. This is the opt-in owned runtime contract; complete recovery and production
 selection remain separate work.
+
+
+## Recover the allocation, not just the name
+
+Two service names can hash to the same VIP. The second registration probes for
+another address. Re-register those services in reverse order after a crash and
+the assignments change. Existing kernel routes and grants still refer to the
+original allocations. Our recovery regression finds two real colliding names,
+reverses their saved inventory and demonstrates that ordinary registration loses
+those original identities.
+
+`ServiceMap::from_snapshot` restores each exact VIP, destination identity, port,
+backend list and firewall configuration. It rebuilds the address reservations
+from those entries. Invalid labels, mismatched identities, duplicate service or
+VIP owners, invalid endpoints and duplicate or excessive backends reject the
+whole inventory. Construction happens in a new local map; an error drops it
+without publishing a partial result.
+
+The argument `&[ServiceEntry]` is a borrowed slice: the function can inspect the
+caller's entries without taking ownership. It clones validated entries into the
+returned map. The typed error's `&'static str` reason refers to a fixed string
+literal whose lifetime covers the whole programme.
+
+This is a recovery primitive, not permission to route traffic. Saved health is
+historical evidence. Bun must still load a durable checkpoint, correlate the
+original runtime and kernel ownership, and reconcile live backends before
+publishing DNS, ingress or kernel routes. That integration remains unfinished.

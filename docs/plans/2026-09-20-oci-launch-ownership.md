@@ -749,3 +749,17 @@ The next discovery-recovery change needs these transaction boundaries:
 5. Qualify actual Bun death and host reboot, then select the owned runtime and
    persistent kernel loader in production. A controller-task abort or an adapter
    reconstruction alone does not close those gates.
+
+
+## Exact service snapshot restoration
+
+`ServiceMap::from_snapshot` is the first discovery-reconstruction primitive.
+Its failing-first tests show ordinary registration assigning a different VIP
+when two real colliding service names are replayed in reverse order, accepting
+duplicate saved VIP ownership and ignoring invalid original identity. The new
+constructor preserves exact entries and reservations, validates the complete
+inventory and returns no partial map. Historical health remains unchanged;
+callers must reconcile before publication. Persistence, runtime-reference
+correlation and Bun integration remain open. All 106 macOS/118 Linux discovery
+library tests pass (0.195s/0.183s), with strict all-target/all-feature Clippy and
+formatting on both platforms. This changes no production selection or state format.
