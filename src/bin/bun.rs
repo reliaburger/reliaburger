@@ -56,6 +56,20 @@ struct Cli {
 /// Subcommands `bun` answers to besides running as an agent.
 #[derive(clap::Subcommand)]
 enum Command {
+    /// Internal foreground-process owner; runs before Tokio starts.
+    #[command(name = "__process-owner", hide = true)]
+    ProcessOwner {
+        /// Private execution-generation directory.
+        #[arg(long)]
+        directory: PathBuf,
+    },
+    /// Internal workload activation gate; never executes before durable ownership.
+    #[command(name = "__process-exec-gate", hide = true)]
+    ProcessExecutionGate {
+        /// Private execution-generation directory.
+        #[arg(long)]
+        directory: PathBuf,
+    },
     /// Run the built-in test workload.
     ///
     /// The same server the library exposes, shipped inside `bun` so every
@@ -566,6 +580,17 @@ fn main() -> anyhow::Result<()> {
             serde_json::to_string(&reliaburger::compatibility::CURRENT)?
         );
         return Ok(());
+    }
+
+    match &cli.command {
+        Some(Command::ProcessOwner { directory }) => {
+            return reliaburger::grill::process_owner::run_owner(directory).map_err(Into::into);
+        }
+        Some(Command::ProcessExecutionGate { directory }) => {
+            return reliaburger::grill::process_owner::run_execution_gate(directory)
+                .map_err(Into::into);
+        }
+        _ => {}
     }
 
     // The helper must not construct Tokio's multi-thread runtime: those

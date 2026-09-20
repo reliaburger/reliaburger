@@ -420,6 +420,34 @@ containment, use Linux containers. The crash-recovery implementation must still
 establish ownership before execution and retain uncertain cleanup; documenting
 foreground-only support does not close those outstanding C34 requirements.
 
+The first part of the replacement is a separate owner process. Imagine Bun
+crashes just after launching a shell. The shell starts a worker and exits. A
+replacement Bun has neither a child handle nor reliable evidence that the worker
+has stopped. Looking up the shell's old PID doesn't solve that problem; the
+kernel can eventually give that number to an unrelated process.
+
+The owner keeps the child relationship alive across Bun's death. It starts a
+gate, writes the gate's exact identity durably, and only then opens the gate to
+user code. Rust's `std::process::Child` represents that owned child. We keep it
+inside a single-threaded helper so another task cannot reap it between an exit
+observation and a signal. The gate uses `exec` to replace its executable while
+preserving the same process identity. If activation never arrives, it exits
+without running the workload.
+
+Exit and retirement are separate events. Linux's subreaper facility lets the
+owner acquire orphaned grandchildren and reap until it has no children left.
+On macOS, the owner retains the exited root while checking the complete process
+group, including zombies. Only then may it reap the root and publish retirement.
+The completion record carries the root's exit code; a signal termination has no
+exit code. An inspection or write failure leaves uncertainty in place.
+
+The actual-binary tests exercise these transitions, including stale clients,
+duplicate owners and failed completion writes. One test explicitly releases the
+parent while its child still has 30 seconds to run, then requires retirement
+within two seconds. It would fail if we merely waited for the child to finish
+naturally. This helper is the foundation: wiring ProcessGrill and recovery into
+it remains tracked in the [foreground ownership plan](../plans/2026-09-20-foreground-process-ownership.md).
+
 Two fields in the app config:
 
 ```toml

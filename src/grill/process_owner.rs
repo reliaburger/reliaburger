@@ -1,0 +1,419 @@
+//! Foreground workload owner that outlives Bun and retains kernel child identity.
+//!
+//! The internal Bun helper runs synchronously before Tokio starts. It is the
+//! only reaper of its children. User code waits behind an execution gate until
+//! the owner has durably recorded the exact child; no recovered PID is signalled.
+
+use std::collections::BTreeMap;
+use std::fs::{File, OpenOptions};
+use std::io::{self, BufRead, BufReader, Read, Write};
+use std::os::unix::fs::OpenOptionsExt;
+use std::os::unix::net::{UnixListener, UnixStream};
+use std::os::unix::process::CommandExt;
+use std::path::Path;
+use std::process::{Child, Command, Stdio};
+use std::time::Duration;
+
+use nix::sys::signal::{Signal, kill};
+use nix::unistd::Pid;
+use serde::{Deserialize, Serialize};
+
+const RECORD_LIMIT: u64 = 1024 * 1024;
+
+/// Durable evidence for one foreground execution generation.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "state", rename_all = "snake_case", deny_unknown_fields)]
+pub enum OwnerPhase {
+    /// No gate has been authorised to execute user code.
+    Prepared,
+    /// The child identity was persisted before its execution gate opened.
+    Running {
+        /// Informational PID; only the live owner may use it for signalling.
+        pid: u32,
+    },
+    /// The owner observed root exit and confirmed every supported child absent.
+    Retired {
+        /// Actual root exit code, or no code when terminated by a signal.
+        exit_code: Option<i32>,
+    },
+}
+
+/// Private launch input and latest durable evidence, owned by one helper.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct OwnerRecord {
+    /// Owner record format, independent of agent adoption records.
+    pub schema: u32,
+    /// Unpredictable generation capability used by the control socket.
+    pub nonce: String,
+    /// Foreground executable followed by its arguments.
+    pub command: Vec<String>,
+    /// Environment overrides inherited by the foreground executable.
+    pub environment: BTreeMap<String, String>,
+    /// Last durably confirmed execution phase.
+    pub phase: OwnerPhase,
+}
+
+fn load(directory: &Path) -> io::Result<OwnerRecord> {
+    let file = OpenOptions::new()
+        .read(true)
+        .custom_flags(nix::libc::O_NOFOLLOW | nix::libc::O_NONBLOCK)
+        .open(directory.join("owner.json"))?;
+    if !file.metadata()?.is_file() || file.metadata()?.len() > RECORD_LIMIT {
+        return Err(io::Error::other("invalid process owner record file"));
+    }
+    let mut bytes = Vec::new();
+    file.take(RECORD_LIMIT + 1).read_to_end(&mut bytes)?;
+    if bytes.len() as u64 > RECORD_LIMIT {
+        return Err(io::Error::other("process owner record exceeds size limit"));
+    }
+    let record: OwnerRecord = serde_json::from_slice(&bytes)?;
+    if record.schema != 1
+        || record.nonce.is_empty()
+        || record.nonce.len() > 128
+        || record
+            .command
+            .first()
+            .is_none_or(|command| command.is_empty())
+    {
+        return Err(io::Error::other("invalid process owner record"));
+    }
+    Ok(record)
+}
+
+fn persist(directory: &Path, record: &OwnerRecord) -> io::Result<()> {
+    crate::sesame::identity::atomic_write_mode(
+        &directory.join("owner.json"),
+        &serde_json::to_vec(record)?,
+        Some(0o600),
+    )
+}
+
+/// Run the internal owner on a single thread, before constructing any runtime.
+///
+/// The directory must already contain its private launch record. A duplicate
+/// helper refuses the live lock or a non-prepared generation before launching.
+pub fn run_owner(directory: &Path) -> io::Result<()> {
+    let lock = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .mode(0o600)
+        .custom_flags(nix::libc::O_NOFOLLOW)
+        .open(directory.join("owner.lock"))?;
+    lock.try_lock()
+        .map_err(|error| io::Error::other(format!("process owner is busy: {error}")))?;
+    let mut record = load(directory)?;
+    if !matches!(record.phase, OwnerPhase::Prepared) {
+        return Err(io::Error::other(
+            "process owner generation has already started",
+        ));
+    }
+    become_subreaper()?;
+    let socket_path = directory.join("control.sock");
+    let listener = UnixListener::bind(&socket_path)?;
+    listener.set_nonblocking(true)?;
+    let log = |suffix: &str| -> io::Result<File> {
+        OpenOptions::new()
+            .create(true)
+            .append(true)
+            .mode(0o600)
+            .custom_flags(nix::libc::O_NOFOLLOW)
+            .open(directory.join(format!("output.{suffix}")))
+    };
+    let child = Command::new(std::env::current_exe()?)
+        .args(["__process-exec-gate", "--directory"])
+        .arg(directory)
+        .process_group(0)
+        .stdin(Stdio::piped())
+        .stdout(log("stdout")?)
+        .stderr(log("stderr")?)
+        .spawn()?;
+    let mut owned = OwnedChild {
+        child,
+        reaped: false,
+    };
+    record.phase = OwnerPhase::Running {
+        pid: owned.child.id(),
+    };
+    persist(directory, &record)?;
+    // Spawn returns after the gate executable starts, before the user's code.
+    // Its private stdin closes without activation if this owner dies here.
+    let mut activation = owned
+        .child
+        .stdin
+        .take()
+        .ok_or_else(|| io::Error::other("execution gate has no activation pipe"))?;
+    activation.write_all(b"activate\n")?;
+    drop(activation);
+
+    let mut exit_code = None;
+    loop {
+        match listener.accept() {
+            Ok((connection, _)) => {
+                // An abandoned or malformed client must not end the owner.
+                let _ = respond(connection, &record, &owned);
+            }
+            Err(error) if error.kind() == io::ErrorKind::WouldBlock => {}
+            Err(error) => return Err(error),
+        }
+        if exit_code.is_none() {
+            exit_code = observe_exit(owned.child.id())?;
+        }
+        if let Some(code) = exit_code
+            && retire_children(&mut owned)?
+        {
+            record.phase = OwnerPhase::Retired { exit_code: code };
+            persist(directory, &record)?;
+            std::fs::remove_file(&socket_path)?;
+            return Ok(());
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+}
+
+/// Run the child's internal gate and replace it with the foreground command.
+///
+/// EOF, malformed activation or a mismatched durable child identity refuses
+/// before user code. The gate PID remains the workload PID across `exec`.
+pub fn run_execution_gate(directory: &Path) -> io::Result<()> {
+    let mut activation = [0u8; 9];
+    io::stdin()
+        .read_exact(&mut activation)
+        .map_err(|error| io::Error::other(format!("execution activation failed: {error}")))?;
+    if &activation != b"activate\n" {
+        return Err(io::Error::other("invalid execution activation"));
+    }
+    let record = load(directory)?;
+    if !matches!(record.phase, OwnerPhase::Running { pid } if pid == std::process::id()) {
+        return Err(io::Error::other(
+            "execution activation has no matching durable owner",
+        ));
+    }
+    let error = Command::new(&record.command[0])
+        .args(&record.command[1..])
+        .envs(&record.environment)
+        .stdin(Stdio::null())
+        .exec();
+    Err(error)
+}
+
+struct OwnedChild {
+    child: Child,
+    reaped: bool,
+}
+
+impl OwnedChild {
+    fn signal(&self, signal: Signal) -> io::Result<()> {
+        if self.reaped {
+            return Ok(());
+        }
+        // No other thread reaps this child, so its group identifier cannot
+        // be recycled between observing exit and sending the signal.
+        match kill(Pid::from_raw(-(self.child.id() as i32)), signal) {
+            Ok(()) | Err(nix::errno::Errno::ESRCH) => Ok(()),
+            Err(error) => Err(error.into()),
+        }
+    }
+}
+
+impl Drop for OwnedChild {
+    fn drop(&mut self) {
+        if !self.reaped {
+            let _ = self.signal(Signal::SIGKILL);
+            // An error never publishes Retired; durable uncertainty remains.
+        }
+    }
+}
+
+/// None means no exit yet; Some(None) means an observed signal termination.
+fn observe_exit(pid: u32) -> io::Result<Option<Option<i32>>> {
+    let mut info = std::mem::MaybeUninit::<nix::libc::siginfo_t>::zeroed();
+    // SAFETY: the caller exclusively owns this unreaped child. The POD output
+    // has its exact C layout and valid zeroed storage; WNOHANG bounds the call.
+    let result = unsafe {
+        nix::libc::waitid(
+            nix::libc::P_PID,
+            pid as nix::libc::id_t,
+            info.as_mut_ptr(),
+            nix::libc::WEXITED | nix::libc::WNOHANG | nix::libc::WNOWAIT,
+        )
+    };
+    if result != 0 {
+        return Err(io::Error::last_os_error());
+    }
+    // SAFETY: waitid succeeded with a zero-initialised siginfo_t. Reading the
+    // child-event fields is valid; zero si_pid represents no available event.
+    let info = unsafe { info.assume_init() };
+    // SAFETY: successful waitid initialised the child-event discriminator.
+    let observed = unsafe { info.si_pid() };
+    if observed == 0 {
+        return Ok(None);
+    }
+    if observed != pid as i32 {
+        return Err(io::Error::other("unexpected child exit identity"));
+    }
+    // SAFETY: si_pid identified this child exit event, whose status is valid.
+    let code = (info.si_code == nix::libc::CLD_EXITED).then(|| unsafe { info.si_status() });
+    Ok(Some(code))
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct Request {
+    nonce: String,
+    action: Action,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum Action {
+    Status,
+    Terminate,
+    Kill,
+}
+
+fn respond(mut socket: UnixStream, record: &OwnerRecord, child: &OwnedChild) -> io::Result<()> {
+    socket.set_read_timeout(Some(Duration::from_millis(100)))?;
+    socket.set_write_timeout(Some(Duration::from_millis(100)))?;
+    let mut bytes = Vec::new();
+    BufReader::new(socket.try_clone()?)
+        .take(1025)
+        .read_until(b'\n', &mut bytes)?;
+    let response = if bytes.len() > 1024 || bytes.last() != Some(&b'\n') {
+        serde_json::json!({"error": "invalid owner request size"})
+    } else {
+        match serde_json::from_slice::<Request>(&bytes) {
+            Ok(request) if request.nonce != record.nonce => {
+                serde_json::json!({"error": "owner generation mismatch"})
+            }
+            Ok(request) => match request.action {
+                Action::Status => serde_json::json!({"phase": record.phase}),
+                action => match child.signal(match action {
+                    Action::Terminate => Signal::SIGTERM,
+                    _ => Signal::SIGKILL,
+                }) {
+                    Ok(()) => serde_json::json!({"accepted": true}),
+                    Err(error) => serde_json::json!({"error": error.to_string()}),
+                },
+            },
+            Err(_) => serde_json::json!({"error": "invalid owner request"}),
+        }
+    };
+    serde_json::to_writer(&mut socket, &response)?;
+    socket.write_all(b"\n")
+}
+
+#[cfg(target_os = "linux")]
+fn become_subreaper() -> io::Result<()> {
+    // SAFETY: this helper is single-threaded and owns no unrelated children.
+    // The scalar prctl operation makes orphaned descendants its own children.
+    let result = unsafe { nix::libc::prctl(nix::libc::PR_SET_CHILD_SUBREAPER, 1, 0, 0, 0) };
+    if result == 0 {
+        Ok(())
+    } else {
+        Err(io::Error::last_os_error())
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn become_subreaper() -> io::Result<()> {
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+fn retire_children(owner: &mut OwnedChild) -> io::Result<bool> {
+    use nix::sys::wait::{WaitPidFlag, WaitStatus, waitpid};
+    if !owner.reaped {
+        owner.signal(Signal::SIGKILL)?;
+    }
+    // The subreaper can acquire grandchildren after their parents die. The
+    // list locates children to signal; only waitpid(ECHILD) proves completion.
+    let children =
+        std::fs::read_to_string(format!("/proc/self/task/{}/children", std::process::id()))?;
+    for value in children.split_whitespace() {
+        let pid: u32 = value.parse().map_err(io::Error::other)?;
+        match observe_exit(pid) {
+            Ok(None) => {
+                // It remains our unreaped child, even if it exits now.
+                match kill(Pid::from_raw(pid as i32), Signal::SIGKILL) {
+                    Ok(()) | Err(nix::errno::Errno::ESRCH) => {}
+                    Err(error) => return Err(error.into()),
+                }
+            }
+            Ok(Some(_)) => {}
+            Err(error) if error.raw_os_error() == Some(nix::libc::ECHILD) => {}
+            Err(error) => return Err(error),
+        }
+    }
+    loop {
+        match waitpid(Pid::from_raw(-1), Some(WaitPidFlag::WNOHANG)) {
+            Ok(WaitStatus::Exited(pid, _) | WaitStatus::Signaled(pid, _, _)) => {
+                if pid.as_raw() == owner.child.id() as i32 {
+                    owner.reaped = true;
+                }
+            }
+            Err(nix::errno::Errno::ECHILD) => return Ok(true),
+            Ok(_) => return Ok(false),
+            Err(error) => return Err(error.into()),
+        }
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn retire_children(owner: &mut OwnedChild) -> io::Result<bool> {
+    // XNU snapshots matching live and zombie process IDs under proc_list_lock.
+    // A short buffer cannot establish absence: grow and retry instead.
+    const PROC_PGRP_ONLY: u32 = 2;
+    let mut pids = vec![0i32; 64];
+    loop {
+        let capacity = std::mem::size_of_val(pids.as_slice());
+        // SAFETY: the vector provides aligned writable storage of capacity
+        // bytes. The retained child pins the queried process-group identity.
+        let bytes = unsafe {
+            nix::libc::proc_listpids(
+                PROC_PGRP_ONLY,
+                owner.child.id(),
+                pids.as_mut_ptr().cast(),
+                capacity as i32,
+            )
+        };
+        if bytes <= 0 {
+            return Err(io::Error::other("cannot inspect owned process group"));
+        }
+        let bytes = bytes as usize;
+        if bytes > capacity || !bytes.is_multiple_of(std::mem::size_of::<i32>()) {
+            return Err(io::Error::other("invalid process group snapshot size"));
+        }
+        if bytes == capacity {
+            if pids.len() >= 1_048_576 {
+                return Err(io::Error::other("process group snapshot exceeds limit"));
+            }
+            pids.resize(pids.len() * 2, 0);
+            continue;
+        }
+        pids.truncate(bytes / std::mem::size_of::<i32>());
+        if !pids.contains(&(owner.child.id() as i32)) {
+            return Err(io::Error::other(
+                "owned child missing from process group snapshot",
+            ));
+        }
+        if pids
+            .iter()
+            .any(|pid| *pid != 0 && *pid != owner.child.id() as i32)
+        {
+            // Zombie-only groups can refuse signals on macOS. Their members
+            // must still disappear from the snapshot before retirement.
+            match owner.signal(Signal::SIGKILL) {
+                Ok(()) => {}
+                Err(error) if error.raw_os_error() == Some(nix::libc::EPERM) => {}
+                Err(error) => return Err(error),
+            }
+            return Ok(false);
+        }
+        owner.child.wait()?;
+        owner.reaped = true;
+        return Ok(true);
+    }
+}

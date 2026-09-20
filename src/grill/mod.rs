@@ -22,6 +22,7 @@ pub(crate) mod oci_pull;
 pub mod port;
 pub mod portmap;
 pub mod process;
+pub mod process_owner;
 pub mod process_workload;
 pub mod records;
 #[cfg(target_os = "linux")]

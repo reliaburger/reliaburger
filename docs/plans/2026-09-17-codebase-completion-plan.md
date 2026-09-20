@@ -629,6 +629,11 @@ cooperative development runtime, not a containment boundary. Atomic launch
 ownership, crash recovery and positive group-retirement proof remain required;
 this decision does not waive or complete those fixes.
 
+The [foreground ownership plan](2026-09-20-foreground-process-ownership.md)
+records the owner/gate foundation, its actual-binary regressions and the
+remaining ProcessGrill, adoption and physical-crash integration. The helper's
+tests do not by themselves complete C34.
+
 **Ordinary-job recovery decision:** The user selected explicit rerun for a batch
 job whose outcome is unknown after Bun crashes. Recovery must persist/report
 that uncertainty rather than automatically repeat the execution. The durable
