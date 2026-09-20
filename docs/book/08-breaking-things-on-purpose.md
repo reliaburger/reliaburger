@@ -511,6 +511,16 @@ lost after activation remains uncertain; a replacement never signals its saved
 PID. The [foreground ownership plan](../plans/2026-09-20-foreground-process-ownership.md)
 tracks the remaining qualification work.
 
+An application needs more than the runtime's command to resume its health,
+ports and deployment policy. Bun therefore persists the full adoption record
+before acknowledging a fresh application or publishing its restarted instance.
+A missing process identity or failed write returns an error and retains cleanup
+ownership. The old warning-only path could acknowledge success, then lose that
+metadata on a crash. Short jobs are different: they can finish before a PID is
+observable, and their separate attempt checkpoint plus runtime intent preserve
+the outcome. Record writes run on a blocking worker and failures propagate back
+to the deployment worker, which performs checked rollback.
+
 Two fields in the app config:
 
 ```toml
@@ -1430,7 +1440,9 @@ A separate real-process test kills Bun and lets its surviving job finish with
 code zero. Recovery preserves that success, including when the test deliberately
 removes the agent adoption record after the crash. The durable runtime intent
 remains. That injected metadata fault exercises the missing-record path; it does
-not claim to time a kill between spawn and the adoption write.
+not claim to time a kill between spawn and the adoption write. The production
+adapter also passes the real single-node and cluster upgrade/rollback suites and
+the lease-recovery fixture that previously stranded an uncertain cron launch.
 
 There is still a separate boundary before the first runtime adoption record.
 A launch claim proves that execution was attempted; it cannot identify an

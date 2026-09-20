@@ -111,6 +111,10 @@ target/debug/relish            # interactive terminal dashboard
 open http://localhost:9117/    # web dashboard
 ```
 
+Process launches and completed job outcomes survive Bun replacement through
+private durable owners. Application deployment acknowledges success only after
+its recovery metadata is written; storage failures are deployment errors.
+
 Process mode supports foreground workloads: the main process stays under Bun's
 supervision, and its children must remain in the supervised process group.
 Use an application's foreground option; shell wrappers should `exec` the server

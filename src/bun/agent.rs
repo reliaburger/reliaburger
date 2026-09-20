@@ -2534,13 +2534,19 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
     }
 
     /// Write (or refresh) the instance record used for adoption after a bun
-    /// restart or self-upgrade exec. Best-effort: a failed record write must
-    /// never fail a deploy, but it is logged.
-    async fn persist_instance_record(&self, instance_id: &InstanceId) {
-        let Some(dir) = &self.records_dir else { return };
-        let Some(instance) = self.supervisor.get_instance(instance_id) else {
-            return;
+    /// restart or self-upgrade exec. Application acknowledgement requires this
+    /// metadata; short jobs recover through their separate attempt record.
+    async fn persist_instance_record(&self, instance_id: &InstanceId) -> Result<(), BunError> {
+        let Some(dir) = self.records_dir.clone() else {
+            return Ok(());
         };
+        let fail = |reason: &str| {
+            BunError::AdoptionState(format!("cannot record {instance_id}: {reason}"))
+        };
+        let instance = self
+            .supervisor
+            .get_instance(instance_id)
+            .ok_or_else(|| fail("instance is missing"))?;
         let runtime = self.supervisor.grill().runtime_kind();
         // Apple workloads live in VMs. Record the launcher for provenance;
         // Apple adoption checks the named container, never this host PID.
@@ -2549,13 +2555,24 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
         } else {
             self.supervisor.grill().pid(instance_id).await
         };
-        let Some(pid) = pid else { return };
+        let Some(pid) = pid else {
+            return if instance.is_job {
+                Ok(())
+            } else {
+                Err(fail("runtime process identity is unavailable"))
+            };
+        };
         let Some(pid_started_at) = crate::grill::records::process_start_time(pid) else {
-            return;
+            return if instance.is_job {
+                Ok(())
+            } else {
+                Err(fail("runtime process identity could not be observed"))
+            };
         };
-        let Some(oci_spec) = instance.oci_spec.clone() else {
-            return;
-        };
+        let oci_spec = instance
+            .oci_spec
+            .clone()
+            .ok_or_else(|| fail("runtime specification is missing"))?;
 
         let replica_index = crate::grill::InstanceIdentity::parse(&instance_id.0)
             .map(|ident| ident.ordinal)
@@ -2588,9 +2605,10 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
             oci_spec,
             rootless_network,
         };
-        if let Err(e) = crate::grill::records::write_record(dir, &record) {
-            eprintln!("bun: warning: failed to write instance record for {instance_id}: {e}");
-        }
+        tokio::task::spawn_blocking(move || crate::grill::records::write_record(&dir, &record))
+            .await
+            .map_err(|error| fail(&error.to_string()))?
+            .map_err(|error| fail(&error.to_string()))
     }
 
     /// Persist launch evidence while the replacement is still owned by its
@@ -5800,7 +5818,7 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
         container_ip: Option<std::net::Ipv4Addr>,
     ) -> Result<(), BunError> {
         self.spawn_log_forwarder(instance_id, app_name, namespace);
-        self.persist_instance_record(instance_id).await;
+        self.persist_instance_record(instance_id).await?;
 
         if let Some(instance) = self.supervisor.get_instance_mut(instance_id) {
             instance.container_ip = container_ip;
@@ -6113,7 +6131,7 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
             instance.oci_spec = Some(oci_spec);
         }
         self.spawn_log_forwarder(instance_id, job_name, namespace);
-        self.persist_instance_record(instance_id).await;
+        self.persist_instance_record(instance_id).await?;
         {
             let instance = self
                 .supervisor
@@ -7436,7 +7454,10 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
             }
             // Re-wire the restarted instance: stream its logs and keep it routable.
             self.spawn_log_forwarder(&id, &app_name, &namespace);
-            self.persist_instance_record(&id).await;
+            if let Err(error) = self.persist_instance_record(&id).await {
+                self.record_failed_restart(&id, &error.to_string()).await;
+                continue;
+            }
             // A re-created container may get a fresh IP; refresh it before
             // registering the backend so routing points at the live address.
             let container_ip = self.supervisor.grill().container_ip(&id).await;
@@ -12883,6 +12904,7 @@ interval = 1
 
     async fn restart_preserves_uncertain_cleanup(inject: fn(&MockGrill)) {
         let (mut agent, _tx, _shutdown, grill) = test_agent_with_grill();
+        grill.set_pid(std::process::id());
         let directory = tempfile::tempdir().unwrap();
         agent.set_volumes_dir(directory.path().join("volumes"));
         let records = directory.path().join("instances");
@@ -12890,6 +12912,10 @@ interval = 1
         let config = Config::parse("[app.restart]\nimage = \"mock:image\"\nport = 8080\n").unwrap();
         let (events, _received) = mpsc::channel(256);
         agent.deploy(config, &events).await;
+        assert_eq!(
+            agent.supervisor.list_instances()[0].state,
+            ContainerState::Running
+        );
         let id = agent.supervisor.list_instances()[0].id.clone();
         let port = agent.supervisor.get_instance(&id).unwrap().host_port;
         assert!(port.is_some());
@@ -13638,7 +13664,8 @@ host = "remote.local"
             let root = tempfile::tempdir().unwrap();
             let records = root.path().join("records");
             std::fs::create_dir(&records).unwrap();
-            let (mut agent, tx, shutdown) = test_agent();
+            let (mut agent, tx, shutdown, grill) = test_agent_with_grill();
+            grill.set_pid(std::process::id());
             agent.set_records_dir(records.clone());
             agent.set_volumes_dir(root.path().join("volumes"));
             let id = InstanceId("default__web-0".into());
@@ -13654,6 +13681,7 @@ host = "remote.local"
                 std::fs::write(&identity, "blocked identity cleanup").unwrap();
                 std::fs::write(&record, "owned until cleanup succeeds").unwrap();
             } else {
+                std::fs::remove_file(&record).unwrap();
                 std::fs::create_dir(&record).unwrap();
             }
             let (response, result) = oneshot::channel();
@@ -14859,6 +14887,45 @@ host = "remote.local"
             matches!(events.last(), Some(ApplyEvent::Error { message }) if message.contains("uncertain"))
         );
         assert!(!grill.calls().iter().any(|(op, _)| op == "start"));
+    }
+
+    #[tokio::test]
+    async fn application_deploy_refuses_failed_adoption_record_write() {
+        let records = tempfile::tempdir().unwrap();
+        let (mut agent, _, _, grill) = test_agent_with_grill();
+        agent.set_records_dir(records.path().to_path_buf());
+        grill.set_pid(std::process::id());
+        std::fs::create_dir(records.path().join("default__web-0.json")).unwrap();
+        let events = drain_deploy(
+            &mut agent,
+            Config::parse("[app.web]\nimage = 'test:v1'\n").unwrap(),
+        )
+        .await;
+        assert!(
+            matches!(events.last(), Some(ApplyEvent::Error { .. })),
+            "{events:?}"
+        );
+        assert!(
+            !events
+                .iter()
+                .any(|event| matches!(event, ApplyEvent::Complete { .. }))
+        );
+    }
+
+    #[tokio::test]
+    async fn application_deploy_refuses_missing_runtime_identity_for_adoption() {
+        let records = tempfile::tempdir().unwrap();
+        let (mut agent, _, _, _) = test_agent_with_grill();
+        agent.set_records_dir(records.path().to_path_buf());
+        let events = drain_deploy(
+            &mut agent,
+            Config::parse("[app.web]\nimage = 'test:v1'\n").unwrap(),
+        )
+        .await;
+        assert!(
+            matches!(events.last(), Some(ApplyEvent::Error { .. })),
+            "{events:?}"
+        );
     }
 
     #[tokio::test]

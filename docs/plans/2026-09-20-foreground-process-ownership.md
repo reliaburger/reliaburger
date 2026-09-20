@@ -94,15 +94,24 @@ security boundary against hostile same-user processes.
   recovered state to app/job cleanup obligations. State 18 requires mandatory
   runtime launch intent. Ordinary completed job outcomes survive Bun death;
   interrupted preparations retain unknown outcomes with proven runtime absence.
-- [ ] Require successful application adoption-record persistence before deploy
-  acknowledgement. A failed write currently logs a warning and can acknowledge
-  an application whose full specification will be unavailable after a crash.
-  Preserve the short-job path, whose checkpoint and runtime intent provide its
-  execution evidence without a PID record.
+- [x] Require application adoption-record persistence before deploy
+  acknowledgement and restarted-instance publication. Missing-identity and
+  failed-write regressions fail first; complete library checkpoints pass on
+  macOS/Linux (3,440/3,494), plus the process and job-crash recovery suites.
+  Short jobs retain checkpoint/intent recovery without requiring a live PID.
+- [x] Qualify the production owner through all nine single-node/cluster upgrade
+  and rollback cases plus the formerly failing job-lease crash-recovery fixture.
+  All ten pass on macOS/Linux (497.02s/288.14s).
+- [ ] Bind a queued start request to the generation observed before mutation.
+  Cancelling its caller must not let a delayed blocking worker activate a newer
+  preparation after the old generation has been cancelled and replaced.
+- [ ] Make first-run fixture readiness require the launched Bun's own API
+  announcement. A foreign listener currently bypasses the port-race retry and
+  caused a reporting-bind failure in the full native first-run run.
 - [ ] Qualify actual Bun death at the preparation/activation/adoption boundaries,
   helper loss, short jobs, cron and complete group retirement on macOS/Linux.
   Re-run the runtime, agent, job-recovery and upgrade suites.
 
 Production Bun now uses the durable process owner and startup reconciliation.
-Application acknowledgement, remaining runtime/discovery ownership and the
+Queued-start fencing, remaining runtime/discovery ownership and the
 0.1.0 release qualification gates remain open.

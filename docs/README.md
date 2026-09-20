@@ -299,6 +299,12 @@ Notes:
 Spawns native processes on macOS and Linux, without namespaces, cgroups or rootfs
 isolation. Useful for development and testing without a container runtime.
 
+Bun records process intent before execution and reconciles it on startup, even
+if a crash prevented the later adoption record. Completed jobs preserve their
+exit code. An application deployment requires durable adoption metadata before
+success is acknowledged; failed writes retain cleanup ownership and return an
+error. Lost owner processes remain uncertain and require operator investigation.
+
 **0.1.0 contract: foreground workloads only.** The main process stays under Bun's
 supervision and children must remain in its supervised process group. A service
 can run unattended and spawn workers; foreground does not mean an open terminal.
