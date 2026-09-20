@@ -25,7 +25,7 @@ jobs, published ports and interrupted network-helper startup.
 Rootless networking is ready before the workload starts. Command waits retry
 transient owner-control failures within their original deadline; losing a status
 response never counts as confirmed retirement. Production selection
-and discovery/Apple recovery remain release blockers
+and discovery recovery remain release blockers
 in the [OCI ownership plan](plans/2026-09-20-oci-launch-ownership.md).
 
 
@@ -271,7 +271,7 @@ xcode-select --install
 
 ## Container runtimes (optional)
 
-Reliaburger supports three container runtimes. The agent auto-detects which one to use at startup. **ProcessGrill** (plain OS processes) is the built-in fallback that works everywhere without extra software — you don't need to install anything else to get started.
+For 0.1.0, Bun selects Linux runc or the built-in process runtime. macOS containers run through managed Linux VMs. **ProcessGrill** (plain OS processes) is the built-in fallback that works everywhere without extra software — you don't need to install anything else to get started.
 
 ### runc (Linux)
 
@@ -301,30 +301,20 @@ refuses new creation. Addresses become reusable only after confirmed network
 teardown and nftables forwarding inspection; retain `.network-leases.json` with the runtime bundle state across
 restarts. Uncertain teardown keeps its reservation for explicit cleanup.
 
-### Apple Container (macOS)
+### macOS containers: managed Linux VMs
 
-[Apple Container](https://github.com/apple/container) runs Linux containers in lightweight VMs on Apple Silicon. It's OCI-compatible and pulls standard images from Docker Hub.
-
-**Requirements:**
-- macOS 15 (Sequoia) or later
-- Apple Silicon (M1/M2/M3/M4)
-
-**Install via Homebrew:**
+For 0.1.0, run containers through the [managed laptop quickstart](quickstart.md):
 
 ```sh
-brew install container
+relish setup --quickstart --nodes 3
 ```
 
-Or build from source — see the [project README](https://github.com/apple/container).
-
-**First-time setup:**
-
-```sh
-container system start
-```
-
-Notes:
-- To run Apple Container-specific tests: `make test-apple`
+Relish provisions Linux VMs with runc through Lima. Native macOS Bun supports
+foreground process workloads. Direct Apple Container selection is disabled,
+even when its CLI is installed: interrupted CLI requests can outlive Bun and
+mutate the Apple daemon, and their recovery guarantees are not yet complete.
+The adapter and its manual development tests remain in the repository for future
+work; they are outside the 0.1.0 runtime profile.
 
 ### ProcessGrill (built-in fallback)
 
@@ -419,8 +409,8 @@ selects ignored tests only and fails if its filter finds no tests. Target-specif
 `#[cfg(...)]`, so Linux-only tests are reported separately rather than pretending to pass on
 macOS. Retries are disabled.
 
-Apple Container remains a manual Apple-silicon check because hosted macOS runners cannot
-provide the nested virtualisation it needs. See the [test harness design](design/test-harness.md)
+The deferred Apple Container adapter has manual development tests on Apple silicon;
+these are not a 0.1.0 acceptance gate. See the [test harness design](design/test-harness.md)
 for the audit, exact suite contracts and CI mapping.
 
 ### Benchmarks
@@ -471,7 +461,7 @@ target/debug/relish top
 
 You should see the `hello` workload in `Running` state. Open
 <http://127.0.0.1:9117/> for the dashboard. ProcessGrill supervises a real OS
-process, but it doesn't isolate it; use runc or Apple Container for container
+process, but it doesn't isolate it; use Linux runc (through the managed VM on macOS) for container
 workloads.
 
 ### Node agent (bun)
@@ -488,7 +478,7 @@ Options:
 |------|---------|-------------|
 | `--config <path>` | (none) | Path to node config TOML file |
 | `--listen <addr>` | `127.0.0.1:9117` | API listen address |
-| `--runtime <name>` | `auto` | Runtime: `auto`, `process`, `runc`, `apple` |
+| `--runtime <name>` | `auto` | Runtime: `auto`, `process`, `runc` (Linux) |
 
 Examples:
 
@@ -558,9 +548,7 @@ target/debug/relish --ca-cert cluster/identity/root-ca.crt status
 ```
 
 This is a one-node Raft cluster: clustered code paths are live, but it cannot
-survive a node failure. The API listens at `https://127.0.0.1:9117`. On Apple
-Silicon use `--runtime apple` and run Bun as your ordinary user; don't put
-Apple Container behind `sudo`.
+survive a node failure. The API listens at `https://127.0.0.1:9117`. On macOS, use the [managed Linux VM quickstart](quickstart.md) for containers.
 
 To grow this into a resilient three-voter council, mint one token per new
 node. Join tokens are deliberately separate from API bearer tokens:
@@ -906,11 +894,11 @@ Used in the example configs to demonstrate health checks, restarts, and lifecycl
 
 ### Running real containers
 
-If you have a real container runtime (Apple Container on macOS, runc on Linux), you can run real Docker Hub images:
+On Linux with runc installed, you can run real Docker Hub images. On macOS, use the [managed Linux VM quickstart](quickstart.md):
 
 ```sh
 # Terminal 1 — start the agent with a real runtime
-cargo run --bin bun -- --runtime apple   # or --runtime runc
+cargo run --bin bun -- --runtime runc
 
 # Terminal 2 — deploy nginx with health checks
 cargo run --bin relish -- apply examples/phase-1/container-nginx.toml
@@ -959,7 +947,7 @@ refused; host tools should query `redis.<namespace>.internal`. The old
 Runc receives a per-instance, read-only resolver file. Bun doesn't modify the
 shared unpacked image. Both UDP and TCP must bind before the node reports DNS
 ready; a later responder-task failure stops Bun so its capability expires.
-Rootless runc, ProcessGrill, Apple Container and IPv6-only listeners remain
+Rootless runc, ProcessGrill and IPv6-only listeners remain
 unsupported rather than silently falling back to broken host DNS.
 
 ## Configuration
@@ -978,7 +966,7 @@ Workloads are defined in TOML. See [`examples/`](../examples/) for ready-to-appl
 | [`proc-full-featured.toml`](../examples/phase-1/proc-full-featured.toml) | All Phase 1 features |
 | [`proc-multi-app.toml`](../examples/phase-1/proc-multi-app.toml) | Multiple apps in one config |
 | [`proc-volumes.toml`](../examples/phase-1/proc-volumes.toml) | Managed and HostPath volumes |
-| **Real containers** (`container-*`) | **Pulls OCI images — requires runc or Apple Container** |
+| **Real containers** (`container-*`) | **Pulls OCI images — requires Linux runc** |
 | [`container-hello.toml`](../examples/phase-1/container-hello.toml) | Alpine hello world job |
 | [`container-nginx.toml`](../examples/phase-1/container-nginx.toml) | nginx with health check |
 | [`container-job-failure.toml`](../examples/phase-1/container-job-failure.toml) | Job that fails and gets retried |
@@ -1057,7 +1045,7 @@ interval = 10
 timeout = 5
 ```
 
-The `image` field is required for real runtimes (runc, Apple Container) but **ignored by ProcessGrill**, which runs the `command` directly as an OS process. ProcessGrill examples use `proc-grill:image-ignored` to make this explicit. If no `command` is set, ProcessGrill falls back to `sleep 86400`.
+The `image` field is required for the Linux runc runtime but **ignored by ProcessGrill**, which runs the `command` directly as an OS process. ProcessGrill examples use `proc-grill:image-ignored` to make this explicit. If no `command` is set, ProcessGrill falls back to `sleep 86400`.
 
 ### Jobs
 
@@ -1088,11 +1076,11 @@ For the full configuration reference (resource limits, replicas, environment var
 
 When `--runtime auto` (the default), bun checks what's available:
 
-1. **macOS**: looks for `container` in PATH → uses Apple Container
+1. **macOS**: uses ProcessGrill, even if the Apple Container CLI is installed
 2. **Linux**: looks for `runc` in PATH → uses RuncGrill
 3. **Fallback**: uses ProcessGrill (always available)
 
-Override with `--runtime process`, `--runtime runc`, or `--runtime apple`. Selecting a runtime that isn't available on your platform produces an error.
+Override with `--runtime process` or, on Linux, `--runtime runc`. Direct `--runtime apple` selection refuses with guidance to the managed Linux VM quickstart. Selecting a runtime unavailable on your platform also produces an error.
 
 ## API
 
@@ -1160,8 +1148,8 @@ a current leader with quorum. The runner releases the lease after a
 pass, failure, panic or timeout. Container cases use the official BusyBox
 1.37.0 multi-architecture OCI index pinned at
 `sha256:9532d8c39891ca2ecde4d30d7710e01fb739c87a8b9299685c63704296b16028`.
-The same immutable reference is accepted by the provisioned runc and Apple
-Container gates; ProcessGrill cases keep using the node's installed Bun.
+The provisioned runc gate uses this immutable reference; ProcessGrill cases keep
+using the node's installed Bun. The deferred Apple adapter has separate development tests.
 
 ### Decommissioning a node
 
@@ -1338,10 +1326,8 @@ different name or namespace for the other kind.
 
 Release maintainers: see [the build, signing and publication procedure](releasing.md).
 
-Apple Container remains experimental. Bind mounts, UID/GID, working directory,
-read-only root and published TCP ports are translated to the Apple CLI. Mount
-options other than bind/ro/rw and fractional CPU hard limits are rejected; use
-the managed Linux/runc quickstart for the supported laptop profile.
+Direct Apple Container is disabled for 0.1.0 while interrupted daemon-command
+recovery remains unfinished. Use the managed Linux/runc quickstart on macOS.
 
 Node chaos (kill, drain, pressure and council partitions) reserves one cluster-wide
 experiment slot. A deadline triggers target-side fencing and reversal; only a

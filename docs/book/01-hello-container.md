@@ -3427,3 +3427,26 @@ retirement and the original output. Leaving the socket unreachable instead
 exhausts the deadline and preserves the original Running record. The fixture's
 `Drop` implementation restores the socket even when unwinding through a failed
 assertion. Rust runs that cleanup when the guard leaves scope.
+
+
+## One container path for the first release
+
+You install the Apple Container CLI, then run Bun with automatic runtime
+selection. Previously, installing that extra binary changed which adapter Bun
+used. For 0.1.0, native macOS Bun always chooses foreground processes. Containers
+run inside the managed Linux VMs, through the same runc path used on Linux.
+Explicit `--runtime apple` selection refuses and points to
+`relish setup --quickstart`.
+
+Why keep the Apple adapter in the source tree? Its ordinary lifecycle already
+works, but a Bun crash can interrupt a CLI invocation whose daemon operation is
+still running. A dead client doesn't prove the daemon stopped creating a
+container. We need durable intent and confirmed reconciliation before claiming
+recovery. That work is deferred; the adapter is unavailable in the release CLI.
+
+The regression installs a fake `container` executable in a temporary directory
+and gives a child test process its own `PATH`. Rust's `Command::env` changes the
+child's environment without changing the parent's. That matters when other
+asynchronous tests run concurrently: changing the whole process environment
+would change their runtime discovery too. The child must still select
+ProcessGrill, and explicit Apple selection must explain the supported VM path.

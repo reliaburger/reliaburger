@@ -2090,6 +2090,11 @@ Connect hooks cannot implement delay/bandwidth or full DNS response synthesis; t
 
 ### F10 — Provide explicit managed-volume retirement and runtime parity
 
+For 0.1.0, the operator chose managed Linux VMs for macOS containers. Disable
+direct Apple selection and automatic detection. Complete interrupted CLI/daemon
+recovery before enabling that adapter in a later release. Native foreground
+process mode remains available.
+
 **Priority:** feature. **Wave:** 6. **Book chapters:** 05, 09, 14.
 
 Evidence: `src/grill`; `docs/design/agent-bun.md`.

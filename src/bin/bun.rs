@@ -40,7 +40,7 @@ struct Cli {
     #[arg(long, default_value = "127.0.0.1:9117")]
     listen: String,
 
-    /// Runtime to use: auto, process, runc, apple.
+    /// Runtime to use: auto, process, runc (Linux).
     #[arg(long, default_value = "auto")]
     runtime: String,
 
@@ -2882,6 +2882,8 @@ async fn run_agent(cli: Cli) -> anyhow::Result<()> {
     Ok(())
 }
 
+const APPLE_RUNTIME_DEFERRED: &str = "direct Apple Container is disabled for 0.1.0; use the managed Linux VM with `relish setup --quickstart`";
+
 async fn select_runtime(
     name: &str,
     instances_dir: &std::path::Path,
@@ -2905,8 +2907,8 @@ async fn select_runtime(
                     image_directory,
                     detected.is_rootless(),
                 )),
-                #[cfg(not(target_os = "linux"))]
-                other => other,
+                #[cfg(target_os = "macos")]
+                AnyGrill::Apple(_) => anyhow::bail!(APPLE_RUNTIME_DEFERRED),
             };
             let kind = match &runtime {
                 AnyGrill::Process(_) => "process",
@@ -2934,13 +2936,7 @@ async fn select_runtime(
             let grill = create_runc_runtime(instances_dir, image_directory, is_rootless);
             Ok(AnyGrill::Runc(grill))
         }
-        #[cfg(target_os = "macos")]
-        "apple" => {
-            println!("bun: using Apple Container runtime");
-            Ok(AnyGrill::Apple(
-                reliaburger::grill::apple::AppleContainerGrill::new(),
-            ))
-        }
+        "apple" => anyhow::bail!(APPLE_RUNTIME_DEFERRED),
         other => anyhow::bail!("unknown runtime: {other}"),
     }
 }
@@ -3128,6 +3124,19 @@ fn configure_workload_dns(
 mod tests {
     use super::*;
     use std::collections::BTreeMap;
+
+    #[tokio::test]
+    async fn apple_selection_explains_the_linux_vm_release_profile() {
+        let root = tempfile::tempdir().unwrap();
+        let error = select_runtime("apple", root.path(), root.path())
+            .await
+            .err()
+            .expect("direct Apple Container must be unavailable for 0.1.0");
+        let message = error.to_string();
+        assert!(message.contains("0.1.0"), "{message}");
+        assert!(message.contains("managed Linux VM"), "{message}");
+        assert!(message.contains("relish setup --quickstart"), "{message}");
+    }
 
     #[cfg(target_os = "linux")]
     #[tokio::test]

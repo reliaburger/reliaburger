@@ -116,9 +116,9 @@ changes only once the corresponding recovery contract is implemented.
     on both macOS and Linux, and strict Clippy passes on both.
   - [ ] Qualify the lifetime of unpinned cgroup links across actual Bun death,
     and restore or fence protected workloads before adoption.
-- [ ] Apply the same pre-adoption reasoning to Apple Container CLI operations.
-  Its experimental status does not justify falsely confirming cleanup while an
-  older invocation can still create a container.
+- Deferred beyond 0.1.0 (operator decision): apply the same pre-adoption reasoning
+  to Apple Container CLI operations before restoring direct selection. An older
+  invocation may still create a container; macOS containers use managed Linux VMs.
 
 ## Qualification
 
@@ -138,7 +138,7 @@ runtime unit suite does not close those release gates.
 ## Remaining adapter integration
 
 The integrated rootful and rootless adapters remain opt-in. Production selection
-still awaits discovery/Apple recovery and full qualification. Complete these remaining steps:
+still awaits discovery recovery and full qualification. Complete these remaining steps:
 
 1. Completed: extend generation-bound whole-operation workers to rootless
    preparation, launch and cleanup. Rootless mode creates no host overlay mount
@@ -217,7 +217,7 @@ Complete this before production OCI selection:
 
 The frozen-map repair is complete and remains separate: it proves live cleanup
 propagates kernel failures and retains its owner. It does not prove kernel policy
-survives process death. Apple daemon-command recovery also remains open.
+survives process death. Apple daemon-command recovery is deferred beyond 0.1.0.
 
 
 ## Agent policy ownership follow-up
@@ -577,3 +577,17 @@ Qualification: all 64 physical kernel cases pass (61.76s), including refused
 fresh publication. All 207 affected library tests pass on macOS/Linux
 (17.697s/23.243s), with strict Clippy and formatting on both platforms; both Linux
 binary compatibility cases also pass. Protocol/state remain 14/26.
+
+## macOS release profile
+
+The operator chose managed Linux VMs for macOS containers and deferred direct
+Apple Container beyond 0.1.0. Refuse explicit Apple selection with an actionable
+quickstart command, and ensure automatic detection cannot select it when the CLI
+is installed. Native foreground process workloads remain supported. Keep the
+adapter for future development, but move interrupted Apple CLI/daemon recovery
+to F10 rather than counting it as a current release blocker.
+
+Qualification: explicit refusal and isolated-PATH automatic detection both fail
+before the repair. All 23 macOS/27 Linux Bun binary tests pass (0.34s/0.40s),
+as does the isolated macOS detection regression. Strict all-target/all-feature
+Clippy and formatting pass on both platforms. No format change is required.

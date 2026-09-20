@@ -666,16 +666,10 @@ impl Grill for AnyGrill {
 
 /// Auto-detect the best available runtime.
 ///
-/// Checks for platform-specific runtimes first, falls back to ProcessGrill.
-/// On Linux, detects rootless mode and configures paths accordingly.
+/// On Linux, selects runc when installed and configures rootless mode and paths.
+/// Otherwise selects ProcessGrill. For 0.1.0, macOS containers use managed Linux
+/// VMs; the direct Apple adapter is excluded pending daemon-command recovery.
 pub async fn detect_runtime() -> AnyGrill {
-    #[cfg(target_os = "macos")]
-    {
-        if which_exists("container").await {
-            return AnyGrill::Apple(apple::AppleContainerGrill::new());
-        }
-    }
-
     #[cfg(target_os = "linux")]
     {
         if which_exists("runc").await {
@@ -712,6 +706,7 @@ pub async fn detect_runtime() -> AnyGrill {
 }
 
 /// Check if a binary exists in PATH.
+#[cfg(target_os = "linux")]
 async fn which_exists(name: &str) -> bool {
     tokio::process::Command::new("which")
         .arg(name)

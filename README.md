@@ -123,11 +123,12 @@ Use an application's foreground option; shell wrappers should `exec` the server
 or wait for their children. Daemonising or detached workloads must use the Linux
 container mode instead. See the [runtime contract](docs/README.md#processgrill-built-in-fallback).
 
-With runc (Linux) or Apple Container (macOS) installed, the same flow runs
-real OCI images — and `relish init cluster` generates the PKI and mTLS
+With runc installed on Linux, the same flow runs real OCI images — and `relish init cluster` generates the PKI and mTLS
 config for a secure multi-node cluster. The [documentation](docs/README.md)
 has the full secure-cluster walkthrough. Runc bundles and state follow the node's
 configured data directory, and its cache uses the selected images directory.
+On macOS, use the [managed Linux VM quickstart](docs/quickstart.md) for containers.
+Direct Apple Container is disabled for 0.1.0 pending daemon-command recovery.
 Rootful Linux networking retains address
 ownership across restarts and refuses subnet exhaustion. Runc retirement keeps
 resource ownership when OCI deletion, rootfs unmount or network cleanup fails,
@@ -300,7 +301,7 @@ jobs, published ports and interrupted network-helper startup.
 Rootless networking is ready before the workload starts. Command waits retry
 transient owner-control failures within their original deadline; losing a status
 response never counts as confirmed retirement. Production selection
-and discovery/Apple recovery remain release blockers
+and discovery recovery remain release blockers
 in the [OCI ownership plan](docs/plans/2026-09-20-oci-launch-ownership.md).
 
 
