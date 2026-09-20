@@ -463,3 +463,44 @@ owned-Runc initialisers and main workload. All 174 affected library tests pass
 on macOS/Linux (17.865s/23.270s), with strict Clippy and formatting on both. The
 Linux lint pass required removing an unused import from the new fixture; no
 product behaviour changed after the passing tests.
+
+## Initialiser ownership through failed deployment
+
+The agent regression reproduces parent Retire succeeding without observing an
+initialiser whose inspection fails. Track initialisers before runtime creation,
+retain them until positive termination and require their cleanup before lifting
+parent policy or deleting parent records. Use a reserved auxiliary identity
+separator that cannot collide with an ordinary DNS-label workload name.
+
+After controller failure, the original runtime launch inventory supplies the
+initialisers that never acquired adoption records. Retirement must first stop
+all unacknowledged launches; only then may a second pass retire their policy and
+metadata. Otherwise visiting a parent before its live initialiser can remove the
+shared cgroup policy even though recovery later refuses the initialiser.
+
+The implemented registry reserves children before creation and forgets them only
+after confirmed kill/exit. Parent artifact cleanup handles retained children
+first. Reserved `__init-N` IDs cannot collide with ordinary workload labels;
+state 25 refuses old development identities. The physical test also aborts the
+controller task, refuses recovery once, then removes the fault and confirms
+retirement. It specifically checks that the refused recovery preserves namespace
+policy. This is real Runc/kernel qualification, not yet actual Bun process death.
+
+## Backend and reusable-address retirement ordering
+
+Carry this into the open discovery ownership work: owned Runc cleanup releases
+its rootful address reservation, including when state inspection observes an
+exited launcher. Agent Stop currently withdraws the backend after runtime
+retirement. Inspect and physically reproduce whether a refused backend removal
+can therefore route an old VIP to a newly allocated container address. Durable
+backend records alone do not establish the required ordering: the route must be
+withdrawn before its destination address can be reused. Include natural exits,
+explicit Stop and per-instance rollout retirement in that qualification. This is
+an inspected ordering concern, not yet a reproduced connection leak.
+
+Initialiser-retirement qualification: all 59 physical kernel tests pass (26.59s),
+all 176 affected library tests pass on macOS/Linux (17.767s/22.899s), and both
+binary compatibility tests plus strict Clippy and formatting pass on each.
+Actual Bun process death and cancellation before/during runtime activation remain
+explicitly open. The physical failure fixture aborts the controller task and
+retains the actual owned runtimes and kernel maps for recovery.

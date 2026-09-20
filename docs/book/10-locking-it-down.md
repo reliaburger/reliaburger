@@ -1393,3 +1393,35 @@ rootfs and observes policy immediately before all three Start calls.
 This closes successful init sequencing. Failed or interrupted init launch and
 cleanup still need separate lifecycle evidence; a completed happy path cannot
 prove that an unknown child has stopped.
+
+### Failed initialisers still own execution
+
+An initialiser can start successfully and then become impossible to inspect.
+The parent never reaches Running, but that does not mean its child stopped.
+Both the agent regression and real Runc fixture showed Retire reporting success
+while the initialiser still owned execution. In the physical case, parent
+cleanup also removed the initialiser's namespace policy.
+
+Bun now reserves each initialiser before calling the runtime. A small parent-to-
+children registry keeps the obligation until force-kill and observed exit both
+succeed. Parent artifact cleanup retires those children first; a refusal keeps
+policy and metadata for another attempt. Successful init sequencing also confirms
+runtime cleanup before releasing the reservation and refreshing policy. We clone
+the small set of child IDs before awaiting retirement, so a mutable borrow of the
+registry does not span the runtime operation.
+
+Auxiliary IDs use `parent__init-N`. The extra underscore separator cannot occur
+inside an ordinary DNS-label workload name. With the previous hyphen-only form,
+`web`'s first initialiser could reuse the ordinary instance ID of `web-0-init`.
+A deployment regression checks that the foreign application's create is never
+repeated for the initialiser. Durable state 25 excludes the old ambiguous form.
+
+The in-memory registry is not recovery evidence. After controller failure, the
+runtime's original launch inventory supplies every unacknowledged initialiser.
+Recovery first stops all unacknowledged launches. Only a second pass retires
+policy and metadata. Clearing a parent during the first pass would otherwise
+lift a shared cgroup's policy before recovery reaches its child. The physical
+fixture refuses initialiser cleanup, aborts the controller task, and checks that
+another refused recovery keeps the original namespace map. Removing the injected
+failure then permits confirmed runtime and policy retirement. Actual Bun process
+death and production-path qualification remain the broader release gates.

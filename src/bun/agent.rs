@@ -643,6 +643,18 @@ enum DeployOp {
         oci_spec: Box<crate::grill::oci::OciSpec>,
         reply: oneshot::Sender<()>,
     },
+    /// Reserve an auxiliary identity before its runtime can be created.
+    RegisterInitialiser {
+        instance_id: InstanceId,
+        index: usize,
+        reply: oneshot::Sender<Result<InstanceId, BunError>>,
+    },
+    /// Release an initialiser only after confirmed runtime retirement.
+    ForgetInitialiser {
+        instance_id: InstanceId,
+        initialiser: InstanceId,
+        reply: oneshot::Sender<Result<(), BunError>>,
+    },
     /// Program source and egress policy before create → program → start. On
     /// failure the caller stops the created container and fails the deploy.
     ApplyNetworkPreStart {
@@ -990,6 +1002,42 @@ impl DeployOps {
                 reply,
             },
             (),
+        )
+        .await
+    }
+
+    async fn register_initialiser(
+        &self,
+        instance_id: &InstanceId,
+        index: usize,
+    ) -> Result<InstanceId, BunError> {
+        self.call(
+            |reply| DeployOp::RegisterInitialiser {
+                instance_id: instance_id.clone(),
+                index,
+                reply,
+            },
+            Err(BunError::InstanceNotFound {
+                instance_id: instance_id.clone(),
+            }),
+        )
+        .await
+    }
+
+    async fn forget_initialiser(
+        &self,
+        instance_id: &InstanceId,
+        initialiser: &InstanceId,
+    ) -> Result<(), BunError> {
+        self.call(
+            |reply| DeployOp::ForgetInitialiser {
+                instance_id: instance_id.clone(),
+                initialiser: initialiser.clone(),
+                reply,
+            },
+            Err(BunError::InstanceNotFound {
+                instance_id: instance_id.clone(),
+            }),
         )
         .await
     }
@@ -1581,6 +1629,8 @@ pub struct BunAgent<G: Grill> {
         Arc<tokio::sync::RwLock<Vec<crate::meat::deploy_types::DeployHistoryEntry>>>,
     /// Real apply-worker activity and bounded terminal outcomes for the API.
     deploy_operations: crate::bun::deploy_operations::DeployOperationTracker,
+    /// Initialisers whose runtime must retire before parent policy and records.
+    initialisers: std::collections::HashMap<InstanceId, std::collections::HashSet<InstanceId>>,
     /// Pre-created network namespace paths for instances (Linux + runc only).
     /// When present, the namespace path is passed to `generate_oci_spec` so
     /// the container joins the pre-created namespace instead of creating one.
@@ -1728,6 +1778,7 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
             last_firewall_nodes: None,
             deploy_history: Arc::new(tokio::sync::RwLock::new(Vec::new())),
             deploy_operations: crate::bun::deploy_operations::DeployOperationTracker::default(),
+            initialisers: std::collections::HashMap::new(),
             netns_paths: std::collections::HashMap::new(),
             deployed_specs: std::collections::HashMap::new(),
             next_deploy_gen: 1,
@@ -1831,6 +1882,7 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
             last_firewall_nodes: None,
             deploy_history: Arc::new(tokio::sync::RwLock::new(Vec::new())),
             deploy_operations: crate::bun::deploy_operations::DeployOperationTracker::default(),
+            initialisers: std::collections::HashMap::new(),
             netns_paths: std::collections::HashMap::new(),
             deployed_specs: std::collections::HashMap::new(),
             next_deploy_gen: 1,
@@ -2708,6 +2760,7 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
                 )));
             }
         }
+        let mut retired = Vec::new();
         for launch in launches {
             let id = &launch.instance_id;
             if recorded.contains(id.0.as_str()) {
@@ -2749,7 +2802,12 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
                 };
                 self.commit_jobs(jobs.clone()).await?;
             }
-            self.retire_instance_artifacts(id).await?;
+            retired.push(id.clone());
+        }
+        // An unacknowledged init can share its parent's cgroup. Retiring
+        // parent artifacts first would lift policy while that init still runs.
+        for id in retired {
+            self.retire_instance_artifacts(&id).await?;
         }
         for (id, job) in jobs.iter_mut() {
             if !inventory.contains_key(id.as_str()) && job.phase == JobPhase::Preparing {
@@ -8020,11 +8078,24 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
         self.prepare_instance_identity(instance_id)
     }
 
+    async fn retire_initialisers(&mut self, parent: &InstanceId) -> Result<(), BunError> {
+        let children = self.initialisers.get(parent).cloned().unwrap_or_default();
+        for child in children {
+            kill_runtime_instance(self.supervisor.grill(), &child).await?;
+            if let Some(remaining) = self.initialisers.get_mut(parent) {
+                remaining.remove(&child);
+            }
+        }
+        self.initialisers.remove(parent);
+        Ok(())
+    }
+
     /// Retire durable artifacts before allowing the caller to forget an owner.
     async fn retire_instance_artifacts(
         &mut self,
         instance_id: &InstanceId,
     ) -> Result<(), BunError> {
+        self.retire_initialisers(instance_id).await?;
         self.clear_egress(instance_id).await?;
         let identity_dir = self.instance_identity_dir(instance_id);
         let records_dir = self.records_dir.clone();
@@ -9031,12 +9102,18 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
         }
         self.publish_dns_faults();
 
-        let ids: Vec<InstanceId> = self
+        let mut ids: Vec<InstanceId> = self
             .supervisor
             .list_instances()
             .iter()
             .map(|i| i.id.clone())
             .collect();
+
+        ids.extend(
+            self.initialisers
+                .values()
+                .flat_map(|children| children.iter().cloned()),
+        );
 
         // Ask everything to stop (SIGTERM), wait (up to a grace period, but no
         // longer than needed) for it to exit, then force-kill (SIGKILL) whatever
@@ -9238,6 +9315,59 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
                     instance.oci_spec = Some(*oci_spec);
                 }
                 let _ = reply.send(());
+            }
+            DeployOp::RegisterInitialiser {
+                instance_id,
+                index,
+                reply,
+            } => {
+                let result = match self.supervisor.get_instance(&instance_id) {
+                    Some(instance) if instance.state == ContainerState::Initialising => {
+                        // DNS workload labels cannot contain this auxiliary separator.
+                        let initialiser = InstanceId(format!("{}__init-{index}", instance_id.0));
+                        if self
+                            .initialisers
+                            .entry(instance_id.clone())
+                            .or_default()
+                            .insert(initialiser.clone())
+                        {
+                            Ok(initialiser)
+                        } else {
+                            Err(BunError::RetirementState {
+                                instance_id,
+                                reason: "initialiser still owns its previous runtime".into(),
+                            })
+                        }
+                    }
+                    _ => Err(BunError::InstanceNotFound { instance_id }),
+                };
+                let _ = reply.send(result);
+            }
+            DeployOp::ForgetInitialiser {
+                instance_id,
+                initialiser,
+                reply,
+            } => {
+                let result = if self
+                    .initialisers
+                    .get_mut(&instance_id)
+                    .is_some_and(|children| children.remove(&initialiser))
+                {
+                    if self
+                        .initialisers
+                        .get(&instance_id)
+                        .is_some_and(|children| children.is_empty())
+                    {
+                        self.initialisers.remove(&instance_id);
+                    }
+                    Ok(())
+                } else {
+                    Err(BunError::RetirementState {
+                        instance_id,
+                        reason: "initialiser ownership changed before confirmation".into(),
+                    })
+                };
+                let _ = reply.send(result);
             }
             DeployOp::ApplyNetworkPreStart {
                 instance_id,
@@ -9919,7 +10049,7 @@ impl<G: Grill + Clone + 'static> DeployWorker<G> {
                 .transition_state(instance_id, ContainerState::Initialising)
                 .await?;
             for (i, init_spec) in spec.init.iter().enumerate() {
-                let init_id = InstanceId(format!("{}-init-{i}", instance_id.0));
+                let init_id = self.ops.register_initialiser(instance_id, i).await?;
                 let init_oci = crate::grill::oci::generate_init_oci_spec(
                     &init_spec.command,
                     namespace,
@@ -9958,6 +10088,8 @@ impl<G: Grill + Clone + 'static> DeployWorker<G> {
                         init_index: i,
                     });
                 }
+                kill_runtime_instance(&self.grill, &init_id).await?;
+                self.ops.forget_initialiser(instance_id, &init_id).await?;
                 // Runc can remove the shared cgroup when an init exits. Its
                 // successor must receive policy for the new kernel identity
                 // before either another init or the main workload executes.
@@ -15615,11 +15747,95 @@ host = "remote.local"
     }
 
     #[tokio::test]
+    async fn initialiser_identity_cannot_replace_an_ordinary_application() {
+        let (mut agent, tx, shutdown, grill) = test_agent_with_grill();
+        let task = tokio::spawn(async move { agent.run().await });
+        let foreign = InstanceId("default__web-0-init-0".into());
+        let reserved = InstanceId("default__web-0__init-0".into());
+        let config =
+            Config::parse("[app.web-0-init]\nimage = 'foreign:image'\ncommand = ['sleep', '60']\n")
+                .unwrap();
+        expect_complete(&send_deploy(&tx, config).await);
+        for id in [&foreign, &reserved] {
+            grill.set_state(id, ContainerState::Stopped);
+            grill.set_exit_code(id, Some(0));
+        }
+        let events = send_deploy(&tx, config_with_init_container()).await;
+        let foreign_creates = grill
+            .calls()
+            .iter()
+            .filter(|(operation, id)| operation == "create" && id == &foreign)
+            .count();
+        shutdown.cancel();
+        task.await.unwrap();
+        expect_complete(&events);
+        assert_eq!(
+            foreign_creates, 1,
+            "initialiser reused an ordinary workload identity"
+        );
+    }
+
+    #[tokio::test]
+    async fn uncertain_initialiser_keeps_parent_retirement_pending() {
+        let (mut agent, tx, shutdown, grill) = test_agent_with_grill();
+        let old = InstanceId("default__web-0-init-0".into());
+        let reserved = InstanceId("default__web-0__init-0".into());
+        grill.set_instance_inspection_failure(&old, true);
+        grill.set_instance_inspection_failure(&reserved, true);
+        let task = tokio::spawn(async move { agent.run().await });
+        let events = send_deploy(&tx, config_with_init_container()).await;
+        assert!(
+            events
+                .iter()
+                .any(|event| matches!(event, ApplyEvent::Error { .. }))
+        );
+        let initialiser = grill
+            .calls()
+            .into_iter()
+            .find_map(|(operation, id)| {
+                (operation == "create" && id.0 != "default__web-0").then_some(id)
+            })
+            .unwrap();
+        let (response, result) = oneshot::channel();
+        tx.send(AgentCommand::Retire {
+            app_name: "web".into(),
+            namespace: "default".into(),
+            response,
+        })
+        .await
+        .unwrap();
+        let first = result.await.unwrap();
+        grill.set_instance_inspection_failure(&old, false);
+        grill.set_instance_inspection_failure(&reserved, false);
+        let (response, result) = oneshot::channel();
+        tx.send(AgentCommand::Retire {
+            app_name: "web".into(),
+            namespace: "default".into(),
+            response,
+        })
+        .await
+        .unwrap();
+        let second = result.await.unwrap();
+        let stopped = grill.state(&initialiser).await.unwrap() == ContainerState::Stopped;
+        shutdown.cancel();
+        task.await.unwrap();
+        assert!(
+            first.is_err(),
+            "parent retired without observing its initialiser"
+        );
+        assert!(second.is_ok(), "confirmed retry failed: {second:?}");
+        assert!(
+            stopped,
+            "initialiser still owns execution after parent retirement"
+        );
+    }
+
+    #[tokio::test]
     async fn deploy_with_init_container_succeeds() {
         let (mut agent, tx, shutdown, grill) = test_agent_with_grill();
 
         // Pre-configure: init container exits successfully
-        let init_id = InstanceId("default__web-0-init-0".to_string());
+        let init_id = InstanceId("default__web-0__init-0".to_string());
         grill.set_state(&init_id, ContainerState::Stopped);
         grill.set_exit_code(&init_id, Some(0));
 
@@ -15648,7 +15864,7 @@ host = "remote.local"
         let (mut agent, tx, shutdown, grill) = test_agent_with_grill();
 
         // Pre-configure: init container exits with failure
-        let init_id = InstanceId("default__web-0-init-0".to_string());
+        let init_id = InstanceId("default__web-0__init-0".to_string());
         grill.set_state(&init_id, ContainerState::Stopped);
         grill.set_exit_code(&init_id, Some(1));
 

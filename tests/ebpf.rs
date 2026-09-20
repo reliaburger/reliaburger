@@ -3557,6 +3557,7 @@ struct InitPolicyGrill {
     bundles: PathBuf,
     bpf: std::sync::Arc<tokio::sync::Mutex<OnionEbpf>>,
     starts: std::sync::Arc<tokio::sync::Mutex<Vec<InitPolicyStart>>>,
+    refuse_init_cleanup: std::sync::Arc<std::sync::atomic::AtomicBool>,
 }
 
 impl reliaburger::grill::Grill for InitPolicyGrill {
@@ -3614,13 +3615,39 @@ impl reliaburger::grill::Grill for InitPolicyGrill {
         &self,
         id: &reliaburger::grill::InstanceId,
     ) -> Result<(), reliaburger::grill::GrillError> {
+        if id.0.ends_with("init-0")
+            && self
+                .refuse_init_cleanup
+                .load(std::sync::atomic::Ordering::SeqCst)
+        {
+            return Err(reliaburger::grill::GrillError::StateUnavailable {
+                instance: id.clone(),
+                reason: "injected initialiser cleanup refusal".into(),
+            });
+        }
         self.runtime.kill(id).await
     }
     async fn state(
         &self,
         id: &reliaburger::grill::InstanceId,
     ) -> Result<reliaburger::grill::ContainerState, reliaburger::grill::GrillError> {
+        if id.0.ends_with("init-0")
+            && self
+                .refuse_init_cleanup
+                .load(std::sync::atomic::Ordering::SeqCst)
+        {
+            return Err(reliaburger::grill::GrillError::StateUnavailable {
+                instance: id.clone(),
+                reason: "injected initialiser inspection refusal".into(),
+            });
+        }
         self.runtime.state(id).await
+    }
+    async fn launch_inventory(
+        &self,
+    ) -> Result<Option<Vec<reliaburger::grill::RuntimeLaunch>>, reliaburger::grill::GrillError>
+    {
+        self.runtime.launch_inventory().await
     }
     fn runtime_kind(&self) -> reliaburger::grill::records::RuntimeKind {
         self.runtime.runtime_kind()
@@ -3669,6 +3696,7 @@ async fn init_exit_preserves_policy_before_the_next_container_starts() {
         bundles,
         bpf: Arc::clone(&ebpf),
         starts: Arc::clone(&starts),
+        refuse_init_cleanup: Arc::new(std::sync::atomic::AtomicBool::new(false)),
     };
     let (commands, receiver) = mpsc::channel(64);
     let shutdown = CancellationToken::new();
@@ -3742,4 +3770,144 @@ async fn init_exit_preserves_policy_before_the_next_container_starts() {
             .all(|(_, source, egress)| *source == Some(namespace) && *egress),
         "policy disappeared between init/main containers: {observed:?}"
     );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "requires Linux root, runc, static BusyBox and RELIABURGER_EBPF_TESTS=1"]
+async fn uncertain_initialiser_preserves_parent_policy_until_confirmed_retirement() {
+    use reliaburger::bun::agent::{AgentCommand, ApplyEvent, BunAgent};
+    use reliaburger::grill::{Grill, ImageStore, port::PortAllocator, runc::RuncGrill};
+    use std::sync::Arc;
+    use tokio::sync::{Mutex, mpsc, oneshot};
+    assert!(ebpf_tests_enabled());
+    let root = tempfile::tempdir().unwrap();
+    let ebpf = Arc::new(Mutex::new(
+        OnionEbpf::load_embedded(CGROUP_PATH.as_ref()).unwrap(),
+    ));
+    let bundles = root.path().join("bundles");
+    let runtime = RuncGrill::new(
+        bundles.clone(),
+        ImageStore::new(root.path().join("images")),
+        false,
+        root.path().join("runc-state"),
+    )
+    .with_owner(env!("CARGO_BIN_EXE_bun").into())
+    .unwrap();
+    let starts = Arc::new(Mutex::new(Vec::new()));
+    let grill = InitPolicyGrill {
+        runtime: runtime.clone(),
+        bundles,
+        bpf: Arc::clone(&ebpf),
+        starts: Arc::clone(&starts),
+        refuse_init_cleanup: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+    };
+    let refusal = Arc::clone(&grill.refuse_init_cleanup);
+    refusal.store(true, std::sync::atomic::Ordering::SeqCst);
+    let (commands, receiver) = mpsc::channel(64);
+    let shutdown = CancellationToken::new();
+    let mut agent = BunAgent::new(
+        grill.clone(),
+        PortAllocator::new(43500, 43600),
+        receiver,
+        shutdown.clone(),
+    );
+    agent.set_records_dir(root.path().join("records"));
+    agent.set_volumes_dir(root.path().join("volumes"));
+    agent.set_onion_ebpf(Arc::clone(&ebpf)).await;
+    let task = tokio::spawn(async move { agent.run().await });
+    let config = reliaburger::config::Config::parse(
+        r#"
+        [app.init-retirement-boundary]
+        image = "/empty-fixture"
+        command = ["/bin/busybox", "sleep", "60"]
+        [app.init-retirement-boundary.egress]
+        allow = ["203.0.113.9:443"]
+        [[app.init-retirement-boundary.init]]
+        command = ["/bin/busybox", "sleep", "60"]
+    "#,
+    )
+    .unwrap();
+    let (events, mut results) = mpsc::channel(64);
+    commands
+        .send(AgentCommand::Deploy { config, events })
+        .await
+        .unwrap();
+    let mut failures = Vec::new();
+    while let Some(event) = results.recv().await {
+        if let ApplyEvent::Error { message } = event {
+            failures.push(message);
+        }
+    }
+    let observed = starts.lock().await.clone();
+    let (response, result) = oneshot::channel();
+    commands
+        .send(AgentCommand::Retire {
+            app_name: "init-retirement-boundary".into(),
+            namespace: "default".into(),
+            response,
+        })
+        .await
+        .unwrap();
+    let first = result.await.unwrap();
+    let initialiser = reliaburger::grill::InstanceId(observed[0].0.clone());
+    let first_state = runtime.state(&initialiser).await.unwrap();
+    let path = reliaburger::grill::cgroup::cgroup_path("default", "init-retirement-boundary", 0);
+    let cgroup = reliaburger::sesame::egress::cgroup_id_of_path(&path).unwrap();
+    let namespace =
+        reliaburger::sesame::firewall::read_firewall_state(&mut ebpf.lock().await.bpf, cgroup, 0)
+            .unwrap()
+            .source_namespace_id;
+    task.abort();
+    let _ = task.await;
+    let (_, receiver) = mpsc::channel(64);
+    let mut recovered = BunAgent::new(
+        grill,
+        PortAllocator::new(43500, 43600),
+        receiver,
+        CancellationToken::new(),
+    );
+    recovered.set_records_dir(root.path().join("records"));
+    recovered.set_volumes_dir(root.path().join("volumes"));
+    recovered.set_onion_ebpf(Arc::clone(&ebpf)).await;
+    let recovery_refused = recovered.adopt_recorded_instances().await.is_err();
+    let recovered_namespace =
+        reliaburger::sesame::firewall::read_firewall_state(&mut ebpf.lock().await.bpf, cgroup, 0)
+            .unwrap()
+            .source_namespace_id;
+    refusal.store(false, std::sync::atomic::Ordering::SeqCst);
+    let second = recovered.adopt_recorded_instances().await;
+    let second_state = runtime.state(&initialiser).await.unwrap();
+    for launch in runtime.launch_inventory().await.unwrap().unwrap() {
+        runtime.kill(&launch.instance_id).await.unwrap();
+    }
+    ebpf.lock().await.detach().unwrap();
+    let cgroup = reliaburger::grill::cgroup::cgroup_path("default", "init-retirement-boundary", 0);
+    if cgroup.exists() {
+        std::fs::remove_dir(cgroup).unwrap();
+    }
+    assert!(
+        !failures.is_empty(),
+        "injected init failure was not reported"
+    );
+    assert!(
+        first.is_err(),
+        "parent retired despite uncertain live initialiser"
+    );
+    assert_eq!(first_state, reliaburger::grill::ContainerState::Running);
+    assert_eq!(
+        namespace,
+        Some(reliaburger::onion::vip::name_to_id("default")),
+        "parent retirement lifted a live initialiser's policy"
+    );
+    assert!(
+        recovery_refused,
+        "unknown initialiser was accepted during recovery"
+    );
+    assert_eq!(
+        recovered_namespace,
+        Some(reliaburger::onion::vip::name_to_id("default")),
+        "recovery lifted policy before all launches stopped"
+    );
+    assert!(second.is_ok(), "confirmed retry failed: {second:?}");
+    assert_eq!(second_state, reliaburger::grill::ContainerState::Stopped);
 }
