@@ -55,6 +55,11 @@ changes only once the corresponding recovery contract is implemented.
   Include the instance generation and runtime configuration needed for recovery.
   Publish a validated complete inventory for the agent's existing reconciliation
   path. Missing, malformed or conflicting records must refuse.
+  - [x] Add the journal primitive and exclusive generation claims. Seven contracts
+    plus a real process-death fixture cover persistence, stale callers, separate
+    adapters, invalid inventory, configuration conflicts and publication failure.
+    All 13 selected journal/command cases and strict Clippy pass on macOS/Linux.
+    Production integration and complete agent inventory remain open.
 - [ ] Keep the per-instance lifecycle guard through the completion of each owned
   create/start/cleanup operation. A cancelled caller cannot leave a blocking
   worker or command able to mutate resources after a successor acquires that

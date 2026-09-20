@@ -3050,3 +3050,48 @@ This check protects the ownership evidence currently available to the adapter.
 It does not recover an interrupted preparation or exclude a delayed launcher
 from another Bun. Those require the durable intent and command ownership
 described above.
+
+
+### Remember the request before preparing it
+
+Bun can disappear after creating a network namespace but before writing its
+application adoption record. On restart, that record cannot tell us what was
+being prepared. Nor can `config.json`: preparation rewrites image references,
+root filesystem paths and network settings. We need the original request.
+
+`IntentJournal` stores that request alongside the runtime configuration and an
+unpredictable generation identifier. The generation distinguishes two attempts
+that reuse the same instance name. Each record is either Owned, meaning cleanup
+is still owed, or Retired with an optional independently observed workload exit
+code. Publishing a replacement requires Retired. Merely dropping the Rust value
+that represents a claim does not retire any resources.
+
+A Tokio mutex can coordinate clones of one adapter. It cannot coordinate two
+adapters constructed separately after recovery. Each intent therefore has a
+stable filesystem lock. We never remove or replace its file: doing so would let
+two callers lock different inodes behind the same name. The caller first observes
+a generation, then claims that exact generation. The claim checks again after
+locking, so a queued operation cannot acquire authority over a successor.
+
+The claim owns the file descriptor. Its `Drop` implementation explicitly unlocks
+it, including when an error returns early. Publication and retirement take
+`self` by value and return the claim on success. That transfers the whole claim
+into the blocking worker. If the async caller disappears during a filesystem
+write, the worker still holds the lock until the write completes. Other runtime
+effects must retain that same claim through their own completion; this API does
+not make arbitrary detached work safe automatically.
+
+First publication writes a private staging directory, syncs its complete record,
+then atomically renames the directory and syncs its parent. No resource mutation
+is permitted before that succeeds. Recovery ignores abandoned staging
+directories, but refuses published directories with missing, oversized, invalid
+or redirected records. It also refuses a different bundle directory, state
+root, image cache, executable, rootless setting or node subnet. Guessing those
+values could make surviving resources look absent.
+
+The journal is separate from the command owner. The journal says what the
+runtime owes; the command owner establishes whether a particular command
+finished. Before connecting either to the agent's complete launch inventory,
+Runc must restore its launcher and helper obligations and demonstrate retirement.
+The tests for this journal establish persistence, exclusion and generation
+fencing, not physical container-crash recovery.
