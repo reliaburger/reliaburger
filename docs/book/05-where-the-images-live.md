@@ -1103,3 +1103,25 @@ states, checking the returned inventory at each step. Real TLS tests replace
 the leader and remove quorum. Request limits include a stalled body, since a
 deadline around just the handler would start too late. These queries provide
 the cleanup worker's evidence; they do not themselves remove any files.
+
+### A repository name is not an ownership record
+
+Suppose a node receives an upload, crashes, and later sees a cleanup request for
+that repository. The name alone is insufficient. The local catalogue now keeps
+`repository_owners: BTreeMap<String, String>`, mapping each reserved repository
+to its exact lease generation before bytes may be accepted. `BTreeMap` stores
+keys in sorted order, giving deterministic serialisation; both strings are owned
+by the catalogue rather than borrowing a request buffer.
+
+Claiming the same generation is idempotent. A different generation refuses.
+Existing reserved metadata with no recorded owner also refuses, because adopting
+it would invent evidence. Retirement checks the generation before removing rows,
+tags and the owner entry. Repeating an already-completed retirement is harmless,
+but repeating it after a later owner has claimed the repository refuses. Shared
+content still follows the ordinary reference-aware garbage collector.
+
+The reload regression failed because serde ignored the previously unknown owner
+field. It now survives atomic persistence. Other tests cover conflicting claims,
+stale retirement, unowned legacy metadata and catalogue copies across snapshots.
+The durable-state generation advances to 14; development clusters still start
+fresh. HTTP integration must persist this record before accepting upload bytes.

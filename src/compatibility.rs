@@ -15,10 +15,10 @@ pub struct Compatibility {
     pub state: u32,
 }
 
-/// Supported formats; registry writer receipts require protocol nine/state thirteen.
+/// Supported formats; registry receipts and local generation journals require protocol nine/state fourteen.
 pub const CURRENT: Compatibility = Compatibility {
     protocol: 9,
-    state: 13,
+    state: 14,
 };
 
 /// Name of the durable format stamp at the root of a node's data directory.

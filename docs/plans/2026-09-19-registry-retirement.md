@@ -208,3 +208,19 @@ inventory, revoked/foreign identities and oversized/stalled request bodies.
 Eight route-authorisation audits and strict Clippy pass on both platforms.
 This supplies discovery for the cleanup worker; HTTP lease admission and actual
 storage retirement remain open. No durable format changes.
+
+## Exact local repository generation
+
+The local and replicated catalogue now retain repository-to-lease-generation
+ownership independently of manifest rows. Claims and retirement refuse a different
+generation or unowned existing metadata. Retiring empty, already-cleaned storage
+is idempotent, while a later owner cannot be erased by an old cleanup retry.
+Raft validates every repository generation before final lease removal. State
+advances to 14 (protocol 9, lease schema 5); development clusters remain fresh-only.
+
+The reload regression fails before the fix. All 44 catalogue-type and 87 Raft
+state-machine tests, two actual-binary compatibility tests and strict Clippy pass
+on macOS/Linux. The generic snapshot-copy fixture now creates an ordinary
+repository and asserts that both copies existed before retirement; its old
+reserved name had silently refused the setup. HTTP admission must next persist
+these generation records before upload creation.

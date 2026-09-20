@@ -925,6 +925,12 @@ Refusals preserve the creator's temporary bytes. All 249 Pickle and existing
 registry integration cases pass on macOS/Linux, with strict Clippy. Session
 identity is ephemeral; durable repository ownership remains open.
 
+**Local repository generations (20 September):** Catalogue ownership survives
+restart independently of manifest publication. Conflicting claims, stale cleanup
+and unowned reserved metadata refuse. The failing-first reload regression, 44
+catalogue-type/87 Raft tests, two binary compatibility cases and strict Clippy
+pass on macOS/Linux. State is now 14; HTTP integration remains open.
+
 **Registry ownership queries (20 September):** Worker discovery now requires
 service authentication, the actual TLS node identity and a quorum-backed leader
 read. Only active lease ownership and that node's workload-retired obligations

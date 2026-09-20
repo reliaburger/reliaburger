@@ -3,7 +3,7 @@
 //! Defines digests, manifests, layer descriptors, and all the types
 //! that flow through Raft for manifest catalog and layer location tracking.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 use std::time::SystemTime;
 
@@ -208,6 +208,9 @@ pub struct DeleteTag {
 /// The manifest catalog stored in Raft as part of DesiredState.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct ManifestCatalog {
+    /// Exact lease generation owning each reserved repository, even before a manifest.
+    #[serde(default)]
+    pub repository_owners: BTreeMap<String, String>,
     /// Per-repository manifest rows, carrying their content digest as the key.
     /// Identical content may have independent tags in several repositories.
     pub manifests: Vec<(String, ImageManifest)>,
@@ -218,6 +221,64 @@ pub struct ManifestCatalog {
 }
 
 impl ManifestCatalog {
+    /// Bind local storage to its exact lease before accepting any upload bytes.
+    /// Existing unowned metadata cannot be adopted as proof of a fresh repository.
+    pub fn claim_repository(
+        &mut self,
+        repository: &str,
+        lease_id: &str,
+    ) -> Result<(), PickleError> {
+        if lease_id.is_empty()
+            || !repository
+                .split_once('/')
+                .is_some_and(|(namespace, _)| namespace.starts_with("rbtest-"))
+        {
+            return Err(PickleError::LeaseDenied(
+                "invalid repository lease identity".into(),
+            ));
+        }
+        self.check_repository_owner(repository, lease_id)?;
+        self.repository_owners
+            .insert(repository.into(), lease_id.into());
+        Ok(())
+    }
+
+    /// Refuse a different generation or metadata whose original owner is unknown.
+    pub fn check_repository_owner(
+        &self,
+        repository: &str,
+        lease_id: &str,
+    ) -> Result<(), PickleError> {
+        match self.repository_owners.get(repository) {
+            Some(owner) if owner == lease_id => Ok(()),
+            Some(_) => Err(PickleError::LeaseDenied(
+                "repository belongs to another lease generation".into(),
+            )),
+            None if self
+                .manifests
+                .iter()
+                .any(|(_, manifest)| manifest.repository == repository)
+                || !self.tags_for_repository(repository).is_empty() =>
+            {
+                Err(PickleError::LeaseDenied(
+                    "repository metadata has no confirmed lease owner".into(),
+                ))
+            }
+            None => Ok(()),
+        }
+    }
+
+    /// Retire this exact generation; an already empty repository is an idempotent retry.
+    pub fn retire_leased_repository(
+        &mut self,
+        repository: &str,
+        lease_id: &str,
+    ) -> Result<(), PickleError> {
+        self.check_repository_owner(repository, lease_id)?;
+        self.retire_repository(repository);
+        Ok(())
+    }
+
     /// Look up shared content by digest, without selecting repository metadata.
     /// Repository-aware callers must use `get_repository_manifest` instead.
     pub fn get_manifest(&self, digest: &str) -> Option<&ImageManifest> {
@@ -411,6 +472,7 @@ impl ManifestCatalog {
     /// Remove all metadata for one retired repository, preserving shared content.
     /// The caller must establish workload retirement and fence every writer first.
     pub fn retire_repository(&mut self, repository: &str) {
+        self.repository_owners.remove(repository);
         let candidates: std::collections::HashSet<_> = self
             .manifests
             .iter()
@@ -575,6 +637,9 @@ pub struct AttachSignature {
 /// Errors from Pickle operations.
 #[derive(Debug, thiserror::Error)]
 pub enum PickleError {
+    /// Lease authority or exact repository ownership could not be established.
+    #[error("repository lease denied: {0}")]
+    LeaseDenied(String),
     #[error("invalid digest: {0}")]
     InvalidDigest(String),
     #[error("blob not found: {0}")]
@@ -606,6 +671,71 @@ pub enum PickleError {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn repository_lease_generation_survives_catalogue_reload() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("catalogue.json");
+        let catalog: ManifestCatalog = serde_json::from_value(serde_json::json!({
+            "manifests": [], "tags": [], "layer_locations": [],
+            "repository_owners": {"rbtest-run1/web": "run1"}
+        }))
+        .unwrap();
+        catalog.persist_to(&path).unwrap();
+        let reloaded = ManifestCatalog::load_from(&path).unwrap();
+        assert_eq!(
+            serde_json::to_value(reloaded).unwrap()["repository_owners"]["rbtest-run1/web"],
+            "run1"
+        );
+    }
+
+    #[test]
+    fn repository_generation_refuses_stale_cleanup_and_unowned_metadata() {
+        let mut catalog = ManifestCatalog::default();
+        catalog.claim_repository("rbtest-run1/web", "run1").unwrap();
+        catalog.claim_repository("rbtest-run1/web", "run1").unwrap();
+        assert!(catalog.claim_repository("rbtest-run1/web", "run2").is_err());
+        assert!(
+            catalog
+                .retire_leased_repository("rbtest-run1/web", "run2")
+                .is_err()
+        );
+        assert_eq!(catalog.repository_owners["rbtest-run1/web"], "run1");
+        catalog
+            .retire_leased_repository("rbtest-run1/web", "run1")
+            .unwrap();
+        catalog
+            .retire_leased_repository("rbtest-run1/web", "run1")
+            .unwrap();
+        catalog.claim_repository("rbtest-run1/web", "run2").unwrap();
+        assert!(
+            catalog
+                .retire_leased_repository("rbtest-run1/web", "run1")
+                .is_err()
+        );
+        assert_eq!(catalog.repository_owners["rbtest-run1/web"], "run2");
+        catalog.apply_manifest_commit(&ManifestCommit {
+            manifest: test_manifest("rbtest-legacy/web", "a"),
+            tag: "latest".into(),
+            holder_nodes: BTreeSet::from([1]),
+        });
+        assert!(
+            catalog
+                .claim_repository("rbtest-legacy/web", "run1")
+                .is_err()
+        );
+        assert!(
+            catalog
+                .retire_leased_repository("rbtest-legacy/web", "run1")
+                .is_err()
+        );
+        assert!(
+            catalog
+                .get_manifest_by_tag("rbtest-legacy/web", "latest")
+                .is_some()
+        );
+        assert!(catalog.claim_repository("ordinary", "run1").is_err());
+    }
 
     /// L10 regression: the catalog used to be `default()` on every
     /// boot, so image metadata evaporated on restart.
