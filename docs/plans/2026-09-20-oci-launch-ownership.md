@@ -82,6 +82,12 @@ changes only once the corresponding recovery contract is implemented.
     log reader that must not block replacement. The latter fails before its fix.
     All 304 Linux runtime tests, 34 macOS/36 Linux selected ownership cases and
     strict Clippy on both pass. Production selection and rootless remain open.
+  - [x] Permit replacement of positively retired network helpers while preserving
+    the launcher's one-attempt rule. Required journal format 3 retains previous
+    helper bindings; interrupted preparations are cancelled and corrupt history
+    refuses. Five new contracts pass within 39 macOS/41 Linux ownership cases,
+    all six real rootful cases plus their fixture pass, and strict Clippy passes
+    on both. Actual slirp integration remains open.
 - [ ] Route namespace, link and forwarding mutations through owned commands.
   Before confirming cleanup, retire every admitted command, then verify OCI
   state, helper sockets, mounts, namespaces, links and owned forwarding state.

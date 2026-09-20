@@ -25,7 +25,7 @@ pub use executor::{ClaimedCommandExecutor, DirectCommandExecutor, RuntimeCommand
 const OUTPUT_LIMIT: u64 = 1024 * 1024;
 
 /// Identity of one immutable command attempt, independent of its caller's PID.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(transparent)]
 pub struct CommandId(InstanceId);
 

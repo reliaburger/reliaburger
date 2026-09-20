@@ -1,6 +1,6 @@
 //! Short runtime mutations admitted under an exclusive generation claim.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashSet};
 use std::io;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
@@ -82,16 +82,22 @@ impl IntentClaim {
                 .record
                 .as_mut()
                 .ok_or_else(|| io::Error::other("no runtime intent to bind"))?;
-            let binding = match role {
-                RuntimeRole::Launcher => &mut record.roles.launcher,
-                RuntimeRole::RootlessNetwork => &mut record.roles.rootless_network,
-            };
-            if record.phase != IntentPhase::Owned || binding.is_some() {
-                return Err(io::Error::other(
-                    "runtime role admission is sealed or already bound",
-                ));
+            if record.phase != IntentPhase::Owned {
+                return Err(io::Error::other("runtime role admission is sealed"));
             }
-            *binding = Some(id);
+            match role {
+                RuntimeRole::Launcher => {
+                    if record.roles.launcher.is_some() {
+                        return Err(io::Error::other("runtime launcher is already bound"));
+                    }
+                    record.roles.launcher = Some(id);
+                }
+                RuntimeRole::RootlessNetwork => {
+                    if let Some(previous) = record.roles.rootless_network.replace(id) {
+                        record.roles.retired_rootless_network.push(previous);
+                    }
+                }
+            }
             super::persist(
                 &self
                     .journal
@@ -154,25 +160,84 @@ impl IntentCommands {
     // Check every role before signalling any command. An unbound prepared
     // attempt is a crash before activation permission; executed ones are corruption.
     async fn validate_roles(&self) -> io::Result<()> {
+        let record = self
+            .record()
+            .ok_or_else(|| io::Error::other("no runtime role intent"))?;
         for role in RuntimeRole::ALL {
             let collection = self.collection(role);
             let ids = collection.inventory().await.map_err(io::Error::other)?;
-            if let Some(binding) = self.binding(role) {
-                if ids.as_slice() != [binding.clone()] {
-                    return Err(io::Error::other(
-                        "runtime role binding does not match command inventory",
-                    ));
+            let mut bindings: HashSet<&CommandId> = self.binding(role).into_iter().collect();
+            let previous = match role {
+                RuntimeRole::Launcher => &[][..],
+                RuntimeRole::RootlessNetwork => record.roles.retired_rootless_network.as_slice(),
+            };
+            if !previous.is_empty() && self.binding(role).is_none() {
+                return Err(io::Error::other(
+                    "retired helpers have no current role binding",
+                ));
+            }
+            for previous in previous {
+                if !bindings.insert(previous) {
+                    return Err(io::Error::other("duplicate runtime helper binding"));
                 }
-                collection.state(binding).await.map_err(io::Error::other)?;
-            } else {
-                for id in ids {
-                    if !matches!(
-                        collection.state(&id).await.map_err(io::Error::other)?,
-                        CommandState::Prepared | CommandState::Cancelled
-                    ) {
+            }
+            let observed: HashSet<&CommandId> = ids.iter().collect();
+            if !bindings.is_subset(&observed) {
+                return Err(io::Error::other(
+                    "runtime role binding does not match command inventory",
+                ));
+            }
+            for id in ids {
+                let state = collection.state(&id).await.map_err(io::Error::other)?;
+                if !bindings.contains(&id) {
+                    if !matches!(state, CommandState::Prepared | CommandState::Cancelled) {
                         return Err(io::Error::other("unbound runtime role has executed"));
                     }
+                } else if Some(&id) != self.binding(role)
+                    && !matches!(
+                        state,
+                        CommandState::Cancelled | CommandState::Retired { .. }
+                    )
+                {
+                    return Err(io::Error::other("earlier network helper has not retired"));
                 }
+            }
+        }
+        Ok(())
+    }
+
+    async fn prepare_role_admission(&self, role: RuntimeRole) -> io::Result<()> {
+        let collection = self.collection(role);
+        let ids = collection.inventory().await.map_err(io::Error::other)?;
+        if role == RuntimeRole::Launcher {
+            if self.binding(role).is_some() || !ids.is_empty() {
+                return Err(io::Error::other("runtime launcher already owns an attempt"));
+            }
+            return Ok(());
+        }
+        for id in ids {
+            match collection.state(&id).await.map_err(io::Error::other)? {
+                CommandState::Prepared => {
+                    collection
+                        .retire(&id, Duration::from_secs(15))
+                        .await
+                        .map_err(io::Error::other)?;
+                }
+                CommandState::Cancelled | CommandState::Retired { .. } => {}
+                CommandState::Running { .. } => {
+                    return Err(io::Error::other("runtime network helper is still running"));
+                }
+            }
+        }
+        // A pending owner's activation could race cancellation. Its positive
+        // terminal record, not the earlier Prepared snapshot, permits replacement.
+        self.validate_roles().await?;
+        for id in collection.inventory().await.map_err(io::Error::other)? {
+            if !matches!(
+                collection.state(&id).await.map_err(io::Error::other)?,
+                CommandState::Cancelled | CommandState::Retired { .. }
+            ) {
+                return Err(io::Error::other("runtime network helper has not retired"));
             }
         }
         Ok(())
@@ -180,6 +245,8 @@ impl IntentCommands {
 
     /// Bind a long-lived command durably before asking its owner to activate it.
     /// Cancellation retains the claim through binding and activation acknowledgement.
+    /// Only a network helper may replace an earlier positively retired role;
+    /// the workload launcher is never implicitly repeated.
     pub async fn start_role(
         mut self,
         role: RuntimeRole,
@@ -199,16 +266,7 @@ impl IntentCommands {
             }
             self.validate_roles().await?;
             self.require_terminal_commands().await?;
-            if self.binding(role).is_some()
-                || !self
-                    .collection(role)
-                    .inventory()
-                    .await
-                    .map_err(io::Error::other)?
-                    .is_empty()
-            {
-                return Err(io::Error::other("runtime role already owns an attempt"));
-            }
+            self.prepare_role_admission(role).await?;
             let id = self
                 .collection(role)
                 .prepare(&program, &arguments, &environment)

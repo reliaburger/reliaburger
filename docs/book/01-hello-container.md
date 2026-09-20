@@ -3152,11 +3152,12 @@ between the first two steps leaves an unbound Prepared command. Recovery may
 cancel it, because it never received permission to execute. An unbound command
 that has executed is inconsistent evidence, so recovery refuses it.
 
-The persisted `RuntimeRoles` struct groups the two `Option<CommandId>` bindings.
-`None` means no command was authorised for that role. `Some(id)` must match the
-role collection's complete inventory. A missing command, an extra attempt or a
-reference into another generation prevents cleanup. The journal format changes
-to version 2, so an older record cannot silently stand in for these bindings.
+The persisted `RuntimeRoles` struct groups the two current `Option<CommandId>`
+bindings and the identities of retired network helpers. `None` means no command
+was authorised for that role. Each bound ID must exist in the complete command
+inventory. A missing binding, an unbound executed command or a reference into
+another generation prevents cleanup. The journal format is version 3, so an
+older record cannot silently stand in for the helper replacement history.
 This format is still awaiting production Runc integration.
 
 Long-running roles don't block short state observations. They do block confirmed
@@ -3281,3 +3282,25 @@ files are immutable, so the reader now captures their paths and releases the
 claim before waiting on its reader. Active streams keep the shared source for
 their original generation, drain final output, and never switch to a successor
 with the same instance name.
+
+### Replace a network helper without repeating the workload
+
+The network helper exits, but the container keeps running. Restarting the
+container would repeat its application command. We only need a new helper.
+
+The role journal now keeps the current helper binding and every earlier helper
+that positively retired. Replacement records the new binding before activation
+and retains the old command as evidence. Missing history or a duplicate identity
+makes validation refuse. The workload launcher keeps its original one-attempt
+rule; this recovery path cannot rerun an ordinary job.
+
+A crash can leave a prepared replacement without its binding. That command never
+received activation permission. Recovery cancels such preparations under their
+owner locks and confirms their terminal state before preparing another helper.
+An unbound command that executed remains inconsistent evidence and blocks both
+replacement and retirement. We don't explain it away as an interrupted write.
+
+The validation set borrows command identities from the journal using
+`HashSet<&CommandId>`. The ampersand means the set holds references, so it doesn't
+copy their strings. The claim keeps the record alive and immutable throughout
+validation; the later binding update happens after those borrows end.

@@ -70,6 +70,8 @@ pub struct RuntimeRoles {
     pub launcher: Option<CommandId>,
     /// Rootless network helper belonging to this generation.
     pub rootless_network: Option<CommandId>,
+    /// Earlier helpers whose positive retirement permitted a replacement.
+    pub retired_rootless_network: Vec<CommandId>,
 }
 
 /// Immutable original request plus the runtime's latest retirement evidence.
@@ -267,7 +269,7 @@ impl IntentJournal {
             return Err(io::Error::other("runtime intent exceeds size limit"));
         }
         let record: RuntimeIntent = serde_json::from_slice(&bytes)?;
-        if record.version != 2
+        if record.version != 3
             || record.instance_id != *instance
             || record.configuration != self.configuration
             || record.generation.0.len() != 32
@@ -306,7 +308,7 @@ impl IntentClaim {
                 .fill(&mut nonce)
                 .map_err(|_| io::Error::other("cannot generate runtime intent identity"))?;
             let record = RuntimeIntent {
-                version: 2,
+                version: 3,
                 instance_id: self.instance.clone(),
                 generation: IntentGeneration(hex::encode(nonce)),
                 spec,
@@ -315,6 +317,7 @@ impl IntentClaim {
                 roles: RuntimeRoles {
                     launcher: None,
                     rootless_network: None,
+                    retired_rootless_network: Vec::new(),
                 },
             };
             let records = self.journal.directory.join("records");

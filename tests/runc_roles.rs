@@ -481,3 +481,212 @@ async fn cancelled_role_exec_cannot_complete_a_late_mutation() {
     assert!(!root.path().join("late-exec").exists());
     cleanup.finish(None).await.unwrap();
 }
+
+#[tokio::test]
+async fn a_retired_network_helper_can_be_replaced_without_restarting_the_launcher() {
+    let root = tempfile::tempdir().unwrap();
+    let commands = shell(
+        fresh(root.path()).await,
+        RuntimeRole::Launcher,
+        "exec sleep 60",
+    )
+    .await;
+    let launcher = commands.role_state(RuntimeRole::Launcher).await.unwrap();
+    let commands = shell(commands, RuntimeRole::RootlessNetwork, "exit 13").await;
+    assert_eq!(
+        terminal(&commands, RuntimeRole::RootlessNetwork).await,
+        CommandState::Retired {
+            exit_code: Some(13)
+        }
+    );
+    drop(commands);
+    let commands = shell(
+        recover(root.path()).await,
+        RuntimeRole::RootlessNetwork,
+        "exec sleep 60",
+    )
+    .await;
+    assert_eq!(
+        commands.role_state(RuntimeRole::Launcher).await.unwrap(),
+        launcher
+    );
+    assert_eq!(
+        role_collection(root.path(), "rootless-network")
+            .inventory()
+            .await
+            .unwrap()
+            .len(),
+        2
+    );
+    commands
+        .seal(Duration::from_secs(15))
+        .await
+        .unwrap()
+        .finish(None)
+        .await
+        .unwrap();
+}
+
+#[tokio::test]
+async fn abandoned_helper_replacement_is_cancelled_before_another_helper_can_start() {
+    let root = tempfile::tempdir().unwrap();
+    let commands = shell(
+        fresh(root.path()).await,
+        RuntimeRole::RootlessNetwork,
+        "exit 0",
+    )
+    .await;
+    terminal(&commands, RuntimeRole::RootlessNetwork).await;
+    drop(commands);
+    let collection = role_collection(root.path(), "rootless-network");
+    let abandoned = collection
+        .prepare(
+            Path::new("/bin/sh"),
+            &["-c".into(), "exit 0".into()],
+            &BTreeMap::new(),
+        )
+        .await
+        .unwrap();
+    let commands = shell(
+        recover(root.path()).await,
+        RuntimeRole::RootlessNetwork,
+        "exec sleep 60",
+    )
+    .await;
+    assert_eq!(
+        collection.state(&abandoned).await.unwrap(),
+        CommandState::Cancelled
+    );
+    assert!(collection.start(&abandoned).await.is_err());
+    commands
+        .seal(Duration::from_secs(15))
+        .await
+        .unwrap()
+        .finish(None)
+        .await
+        .unwrap();
+}
+
+#[tokio::test]
+async fn an_extra_executed_helper_refuses_replacement_and_retirement() {
+    let root = tempfile::tempdir().unwrap();
+    let commands = shell(
+        fresh(root.path()).await,
+        RuntimeRole::RootlessNetwork,
+        "exit 0",
+    )
+    .await;
+    terminal(&commands, RuntimeRole::RootlessNetwork).await;
+    drop(commands);
+    let collection = role_collection(root.path(), "rootless-network");
+    let extra = collection
+        .prepare(
+            Path::new("/bin/sh"),
+            &["-c".into(), "exit 0".into()],
+            &BTreeMap::new(),
+        )
+        .await
+        .unwrap();
+    collection.start(&extra).await.unwrap();
+    collection
+        .wait(&extra, Duration::from_secs(15))
+        .await
+        .unwrap();
+    assert!(
+        recover(root.path())
+            .await
+            .start_role(
+                RuntimeRole::RootlessNetwork,
+                Path::new("/bin/sh"),
+                &["-c".into(), "exit 0".into()],
+                &BTreeMap::new()
+            )
+            .await
+            .is_err()
+    );
+    assert!(
+        recover(root.path())
+            .await
+            .seal(Duration::from_secs(15))
+            .await
+            .is_err()
+    );
+}
+
+#[tokio::test]
+async fn helper_replacement_never_authorises_a_second_workload_launcher() {
+    let root = tempfile::tempdir().unwrap();
+    let commands = shell(fresh(root.path()).await, RuntimeRole::Launcher, "exit 0").await;
+    terminal(&commands, RuntimeRole::Launcher).await;
+    let marker = root.path().join("repeated-workload");
+    assert!(
+        commands
+            .start_role(
+                RuntimeRole::Launcher,
+                Path::new("/usr/bin/touch"),
+                &[marker.display().to_string()],
+                &BTreeMap::new()
+            )
+            .await
+            .is_err()
+    );
+    assert!(!marker.exists());
+    recover(root.path())
+        .await
+        .seal(Duration::from_secs(15))
+        .await
+        .unwrap()
+        .finish(Some(0))
+        .await
+        .unwrap();
+}
+
+#[tokio::test]
+async fn helper_history_refuses_duplicate_missing_or_unretired_bindings() {
+    let root = tempfile::tempdir().unwrap();
+    let commands = shell(
+        fresh(root.path()).await,
+        RuntimeRole::RootlessNetwork,
+        "exit 0",
+    )
+    .await;
+    terminal(&commands, RuntimeRole::RootlessNetwork).await;
+    drop(commands);
+    let path = record_path(root.path());
+    let original = std::fs::read(&path).unwrap();
+    let collection = role_collection(root.path(), "rootless-network");
+    let prepared = collection
+        .prepare(
+            Path::new("/bin/sh"),
+            &["-c".into(), "exit 0".into()],
+            &BTreeMap::new(),
+        )
+        .await
+        .unwrap();
+    let record: serde_json::Value = serde_json::from_slice(&original).unwrap();
+    for invalid in [
+        record["roles"]["rootless_network"].clone(),
+        serde_json::json!("command-missing"),
+        serde_json::to_value(prepared).unwrap(),
+    ] {
+        let mut damaged = record.clone();
+        damaged["roles"]["retired_rootless_network"] = serde_json::json!([invalid]);
+        std::fs::write(&path, serde_json::to_vec(&damaged).unwrap()).unwrap();
+        assert!(
+            recover(root.path())
+                .await
+                .seal(Duration::from_secs(15))
+                .await
+                .is_err()
+        );
+    }
+    std::fs::write(path, original).unwrap();
+    recover(root.path())
+        .await
+        .seal(Duration::from_secs(15))
+        .await
+        .unwrap()
+        .finish(None)
+        .await
+        .unwrap();
+}
