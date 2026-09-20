@@ -1477,6 +1477,8 @@ pub struct CouncilStatus {
 /// Holds communication channels to gossip, Raft, and reporting subsystems.
 /// `None` when running in single-node mode (no cluster config).
 pub struct ClusterHandle {
+    /// Original node identity, available before council membership is established.
+    pub local_node_id: crate::meat::NodeId,
     /// Membership snapshots from the gossip layer.
     pub membership_rx: watch::Receiver<Vec<MembershipSnapshot>>,
     /// Raft metrics (if this node is a council member).
@@ -7944,18 +7946,14 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
     }
 
     fn merged_service_map(&self) -> crate::onion::service_map::ServiceMap {
-        let local_name = self.cluster.as_ref().and_then(|cluster| {
-            cluster.raft_metrics_rx.as_ref().and_then(|receiver| {
-                let metrics = receiver.borrow();
-                metrics
-                    .membership_config
-                    .membership()
-                    .get_node(&metrics.id)
-                    .map(|node| node.name.clone())
-            })
-        });
+        // Membership can lag or omit a non-voter. Local retirement must not
+        // depend on the council having already learned this node's identity.
+        let local_name = self
+            .cluster
+            .as_ref()
+            .map(|cluster| cluster.local_node_id.0.as_str());
         self.service_map
-            .with_cluster_catalog_excluding_node(&self.cluster_catalog, local_name.as_deref())
+            .with_cluster_catalog_excluding_node(&self.cluster_catalog, local_name)
     }
 
     /// Use the container port for direct netns traffic, and the published port
@@ -11715,6 +11713,7 @@ mod tests {
         let (_command_tx, command_rx) = mpsc::channel(8);
         let node_gate = crate::smoker::node_fault::NodeTransportGate::new();
         let cluster = ClusterHandle {
+            local_node_id: crate::meat::NodeId::new("test"),
             membership_rx,
             raft_metrics_rx: None,
             council: None,

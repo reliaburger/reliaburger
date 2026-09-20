@@ -304,6 +304,10 @@ response never counts as confirmed retirement. Production selection
 and discovery recovery remain release blockers
 in the [OCI ownership plan](docs/plans/2026-09-20-oci-launch-ownership.md).
 
+Workers exclude their own advertised endpoints using their configured node identity,
+even before council membership arrives. Delayed catalogues cannot restore a locally
+retired endpoint in DNS, resolve responses or ingress routing. Remote retirement
+acknowledgements and durable discovery ownership remain release work.
 
 Egress cleanup now retains the stopped workload's binding and adoption record
 until the kernel confirms removal. Failed policy rewrites stop affected workloads;

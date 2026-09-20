@@ -602,6 +602,7 @@ pub async fn start(
     }
 
     let handle = ClusterHandle {
+        local_node_id: NodeId::new(&params.node_name),
         membership_rx,
         raft_metrics_rx: Some(raft_metrics_rx),
         council: Some(council),

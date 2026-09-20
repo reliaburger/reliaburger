@@ -591,3 +591,18 @@ Qualification: explicit refusal and isolated-PATH automatic detection both fail
 before the repair. All 23 macOS/27 Linux Bun binary tests pass (0.34s/0.40s),
 as does the isolated macOS detection regression. Strict all-target/all-feature
 Clippy and formatting pass on both platforms. No format change is required.
+
+## Local catalogue identity independent of council membership
+
+A worker with no council metrics receives a delayed catalogue containing its own
+retired endpoint. The integration regression observes two backends where only
+the remote backend should remain. Carry the configured node identity in the
+cluster handle and use it to exclude local catalogue entries before publishing
+resolve, DNS and ingress views. This also covers membership not yet containing
+the node. Remote-node acknowledgement of withdrawn endpoints remains separate;
+this change does not make distributed catalogue updates synchronous.
+
+Qualification: seven agent/cluster cases pass on macOS/Linux (0.226s/0.211s),
+including the failing-first regression. All eleven real multi-node placement
+cases pass (92.183s/93.548s), as do 201 affected library cases
+(18.519s/23.078s). Strict Clippy and formatting pass on both platforms.

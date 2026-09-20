@@ -1285,3 +1285,24 @@ other network mutations, so interrupted setup retains its cleanup obligation.
 
 Adoption now requires the `/32` endpoint shape. Durable state 26 refuses older
 development networks instead of assuming their connected routes are safe.
+
+
+## Don't ask membership who you are
+
+A worker retires a local endpoint. Before the next report reaches the leader,
+the worker receives a catalogue that still advertises its old host port. If it
+merges that entry back into its routing table, retirement has just undone itself.
+
+Our merger already excluded entries from the local node. The mistake was asking
+Raft membership for that node's name. A worker can lack council metrics, and a
+joining node can have metrics before membership includes it. Neither changes its
+configured identity. `ClusterHandle` now carries a `NodeId` directly from cluster
+startup; the merger borrows its name regardless of the current membership view.
+The existing `Option` still represents whether this is a clustered agent at all.
+
+The integration test sends a delayed catalogue through the agent's command
+channel without any council metrics. It checks the resolve response, the snapshot
+used by DNS and the ingress backend pool: the remote endpoint survives and both
+stale local endpoints disappear. This closes local self-restoration. It does not
+prove another node has received a withdrawal; that needs separate acknowledgement
+before an address can safely be reused.

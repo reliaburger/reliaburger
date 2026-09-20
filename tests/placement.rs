@@ -343,6 +343,7 @@ async fn start_node_with_auth(
         name: name.to_string(),
         client,
         handle: ClusterHandle {
+            local_node_id: reliaburger::meat::NodeId::new(name),
             membership_rx,
             raft_metrics_rx: None,
             council,

@@ -83,6 +83,7 @@ async fn agent_nodes_returns_membership() {
     let (cmd_tx, cmd_rx) = mpsc::channel(256);
 
     let cluster = ClusterHandle {
+        local_node_id: NodeId::new("node-1"),
         membership_rx,
         raft_metrics_rx: None,
         council: None,
@@ -179,6 +180,7 @@ async fn agent_council_returns_raft_state() {
     let (cmd_tx, cmd_rx) = mpsc::channel(256);
 
     let cluster = ClusterHandle {
+        local_node_id: NodeId::new("node-1"),
         membership_rx,
         raft_metrics_rx: Some(raft_metrics_rx),
         council: Some(council.clone()),
@@ -344,6 +346,7 @@ async fn agent_snapshot_request_returns_instances() {
     let (_cmd_tx, cmd_rx) = mpsc::channel(256);
 
     let cluster = ClusterHandle {
+        local_node_id: NodeId::new("node-1"),
         membership_rx,
         raft_metrics_rx: None,
         council: None,
@@ -388,4 +391,108 @@ async fn agent_snapshot_request_returns_instances() {
 
     shutdown.cancel();
     let _ = handle.await;
+}
+
+/// A delayed catalogue must not restore this worker's already retired endpoint.
+#[tokio::test]
+async fn worker_without_council_metrics_excludes_its_own_stale_endpoints() {
+    use reliaburger::cluster::orchestrate::IngressAssignment;
+    use reliaburger::onion::catalog::{CatalogBackend, EndpointCatalog};
+    use reliaburger::onion::service_id::ServiceId;
+
+    let shutdown = CancellationToken::new();
+    let (_membership_tx, membership_rx) = watch::channel(Vec::new());
+    let (_snapshot_tx, snapshot_rx) = mpsc::channel(1);
+    let (commands, command_rx) = mpsc::channel(8);
+    let cluster = ClusterHandle {
+        local_node_id: NodeId::new("worker"),
+        membership_rx,
+        raft_metrics_rx: None,
+        council: None,
+        snapshot_rx,
+        wrapping_ikm: None,
+        partition_blocklists: Default::default(),
+        crl_handle: Default::default(),
+    };
+    let volumes = tempfile::tempdir().unwrap();
+    let mut agent = BunAgent::with_cluster(
+        ProcessGrill::new(),
+        PortAllocator::new(50000, 51000),
+        command_rx,
+        shutdown.clone(),
+        cluster,
+        "default".into(),
+    );
+    agent.set_perimeter_enabled(false);
+    agent.set_volumes_dir(volumes.path().to_path_buf());
+    let dns = agent.service_map_watch();
+    let routes = agent.routing_table_handle();
+    let actor = tokio::spawn(async move { agent.run().await });
+
+    let shared = ServiceId::new("default", "shared");
+    let retired = ServiceId::new("default", "retired");
+    let local = CatalogBackend {
+        node_id: "worker".into(),
+        node_ip: "192.0.2.1".parse().unwrap(),
+        host_port: 30001,
+        healthy: true,
+    };
+    let remote = CatalogBackend {
+        node_id: "remote".into(),
+        node_ip: "192.0.2.2".parse().unwrap(),
+        host_port: 30002,
+        healthy: true,
+    };
+    let catalog = EndpointCatalog::rebuild([
+        (shared.clone(), 8080, vec![local.clone(), remote]),
+        (retired.clone(), 8080, vec![local]),
+    ]);
+    let result = tokio::time::timeout(Duration::from_secs(5), async {
+        commands
+            .send(AgentCommand::SyncClusterCatalog {
+                catalog: Box::new(catalog),
+                ingress: vec![IngressAssignment {
+                    namespace: "default".into(),
+                    name: "shared".into(),
+                    config: toml::from_str("host = \"shared.test\"\ntls = \"disabled\"").unwrap(),
+                }],
+            })
+            .await
+            .unwrap();
+        let (response, reply) = oneshot::channel();
+        commands
+            .send(AgentCommand::ResolveAll { response })
+            .await
+            .unwrap();
+        reply.await.unwrap()
+    })
+    .await;
+    // Retire the actor before asserting so a regression cannot leak its tasks.
+    shutdown.cancel();
+    tokio::time::timeout(Duration::from_secs(5), actor)
+        .await
+        .unwrap()
+        .unwrap();
+    let resolved = result.expect("catalogue query timed out");
+    let shared_response = resolved
+        .iter()
+        .find(|entry| entry.app_name == "shared")
+        .unwrap();
+    assert_eq!(
+        shared_response.total_backends, 1,
+        "worker restored its own stale endpoint"
+    );
+    assert_eq!(shared_response.backends[0].host_port, 30002);
+    let retired_response = resolved
+        .iter()
+        .find(|entry| entry.app_name == "retired")
+        .unwrap();
+    assert_eq!(retired_response.total_backends, 0);
+    let snapshot = dns.borrow();
+    assert!(snapshot.resolve(&retired).unwrap().backends.is_empty());
+    assert_eq!(snapshot.resolve(&shared).unwrap().backends.len(), 1);
+    let table = routes.read().await;
+    let route = table.lookup("shared.test", "/").unwrap();
+    assert_eq!(route.backends.len(), 1);
+    assert_eq!(route.select_backend().unwrap().addr.port(), 30002);
 }
