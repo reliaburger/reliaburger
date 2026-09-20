@@ -5941,12 +5941,12 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
                 host_port,
                 instance.state == ContainerState::Running,
             );
-            if let Err(e) = self.service_map.add_backend(
-                &crate::onion::service_id::ServiceId::new(namespace, app_name),
-                backend,
-            ) {
-                eprintln!("onion: backend not registered for {namespace}/{app_name}: {e}");
-            }
+            self.service_map
+                .add_backend(&service_id, backend)
+                .map_err(|error| BunError::BackendPublication {
+                    service: service_id,
+                    reason: error.to_string(),
+                })?;
         }
 
         self.finish_instance_networking(app_name, namespace).await?;
@@ -6098,9 +6098,12 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
                         host_port,
                         true,
                     );
-                    if let Err(e) = self.service_map.add_backend(&service_id, backend) {
-                        eprintln!("onion: backend not registered for {service_id:?}: {e}");
-                    }
+                    self.service_map
+                        .add_backend(&service_id, backend)
+                        .map_err(|error| BunError::BackendPublication {
+                            service: service_id.clone(),
+                            reason: error.to_string(),
+                        })?;
                 }
             }
             self.rebuild_routing_table().await;
@@ -6163,7 +6166,12 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
                     Some(f.allow_from.clone())
                 }
             });
-            let _ = self.service_map.register(&service_id, port, firewall);
+            self.service_map
+                .register(&service_id, port, firewall)
+                .map_err(|error| BunError::BackendPublication {
+                    service: service_id.clone(),
+                    reason: error.to_string(),
+                })?;
 
             for new_id in new_ids {
                 if let Some(host_port) = new_ports.get(new_id).copied().flatten() {
@@ -6174,9 +6182,12 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
                         host_port,
                         true,
                     );
-                    if let Err(e) = self.service_map.add_backend(&service_id, backend) {
-                        eprintln!("onion: backend not registered for {service_id:?}: {e}");
-                    }
+                    self.service_map
+                        .add_backend(&service_id, backend)
+                        .map_err(|error| BunError::BackendPublication {
+                            service: service_id.clone(),
+                            reason: error.to_string(),
+                        })?;
                 }
             }
         }
@@ -7800,8 +7811,9 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
             let service_id = crate::onion::service_id::ServiceId::new(&namespace, &app_name);
             if let Some(port) = host_port {
                 let backend = self.local_backend(&id, &service_id, container_ip, port, true);
-                if let Err(e) = self.service_map.add_backend(&service_id, backend) {
-                    eprintln!("onion: backend not registered for {service_id:?}: {e}");
+                if let Err(error) = self.service_map.add_backend(&service_id, backend) {
+                    self.record_failed_restart(&id, &error.to_string()).await;
+                    continue;
                 }
             }
             // Egress was applied before `start` above. Post-start networking
@@ -11912,6 +11924,38 @@ mod tests {
             .register_service_app("api", "default", 8080, None)
             .await;
         assert!(matches!(result, Err(BunError::BackendPublication { .. })));
+    }
+
+    #[tokio::test]
+    async fn deployment_refuses_backend_overflow_without_losing_runtime_owners() {
+        let (mut agent, _commands, _shutdown, grill) = test_agent_with_grill();
+        let mut config = basic_config();
+        config.app.get_mut("web").unwrap().replicas =
+            crate::config::Replicas::Fixed(crate::onion::types::MAX_BACKENDS as u32 + 1);
+        let events = drain_deploy(&mut agent, config).await;
+        let owners: std::collections::HashSet<_> = agent
+            .supervisor
+            .list_instances()
+            .iter()
+            .map(|instance| instance.id.clone())
+            .collect();
+        let unowned: Vec<_> = grill
+            .calls()
+            .into_iter()
+            .filter(|(call, id)| call == "create" && !owners.contains(id))
+            .collect();
+        agent.retire_workload("web", "default").await.unwrap();
+        assert!(
+            unowned.is_empty(),
+            "created runtimes lost their cleanup owner: {unowned:?}"
+        );
+        assert!(
+            !events
+                .iter()
+                .any(|event| matches!(event, ApplyEvent::Complete { .. })),
+            "deployment completed despite refusing an endpoint: {events:?}"
+        );
+        assert!(events.iter().any(|event| matches!(event, ApplyEvent::Error { message } if message.contains("cannot publish backend"))));
     }
 
     #[tokio::test]

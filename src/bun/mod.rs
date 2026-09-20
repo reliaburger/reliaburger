@@ -57,7 +57,7 @@ pub enum BunError {
         reason: String,
     },
 
-    /// Kernel backend publication failed, so deployment cannot report completion.
+    /// Backend registration or publication failed, so deployment cannot report completion.
     #[error("cannot publish backend for {service}: {reason}")]
     BackendPublication {
         service: crate::onion::service_id::ServiceId,

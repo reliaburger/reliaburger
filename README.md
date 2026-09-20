@@ -311,7 +311,8 @@ Rolling and blue-green cutovers now confirm kernel backend publication before
 exposing replacements in DNS and ingress; refusal preserves the original routing view.
 Fresh deployments also stop before workload creation when initial service publication fails.
 Health updates reach DNS and ingress after kernel confirmation; refused withdrawal
-blocks restart and retries on later probes.
+blocks restart and retries on later probes. Backend-capacity failures report a
+failed deployment while retaining created workloads for cleanup.
 Rootful and rootless recovery tests cover caller death before adoption, short
 jobs, published ports and interrupted network-helper startup.
 Rootless networking is ready before the workload starts. Command waits retry

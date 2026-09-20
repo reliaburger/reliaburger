@@ -1349,3 +1349,19 @@ there is no runtime to adopt. The restart driver requires a previous restart
 count, so it cannot turn this untouched fresh Pending instance into a delayed
 launch. This checked boundary is also where future journal-write failures must
 prevent publication and execution.
+
+
+### Runtime count is not endpoint count
+
+Ask one node to publish 33 replicas into a service map with 32 backend slots.
+Previously, the last backend insertion printed an error, but the worker still
+reported Complete for all 33 running instances. The deployment regression catches
+that false acknowledgement and checks that every created runtime retains its
+cleanup owner.
+
+Fresh and final rollout bookkeeping now propagate backend insertion failures as
+publication errors. Final service registration is checked too. A restart that
+cannot insert its backend enters the existing failed-restart path. The worker
+reports failure while retaining the resources that still need cleanup. Updating
+an existing endpoint at the limit remains valid; only a new endpoint consumes
+another slot.

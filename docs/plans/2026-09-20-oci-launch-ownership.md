@@ -870,3 +870,16 @@ retained fields unchanged. All 107 native Onion tests pass (0.213s), with strict
 all-target/all-feature Clippy and formatting. This portable map-only fix does not
 change kernel layouts or require another physical networking run; later affected
 Linux qualification and hosted CI remain separately recorded.
+
+
+## Checked backend insertion
+
+The regression requests 33 service endpoints and reproduces Complete despite a
+refused backend (0.265s). Fresh and final rollout bookkeeping now propagate typed
+publication errors, including final service registration. Restart insertion
+failure uses the existing failed-restart path. The test also confirms every
+created runtime retains a cleanup owner before explicit retirement.
+
+All 275 native/287 Linux affected agent and Onion tests pass
+(17.695s/24.086s), including the preceding portable capacity fix. Strict all-target/all-feature
+Clippy and formatting pass on both platforms.
