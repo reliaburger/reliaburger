@@ -15,6 +15,11 @@ gates; those stay unchecked.
 > acceptance gates. Implementation is in progress; signed-release and cold-install
 > qualification remain open.
 
+> **Latest session checkpoint (20 September):** the
+> [0.1.0 handoff](plans/2026-09-20-v0.1.0-session-handoff.md) records completed
+> commits, settled decisions, exact test evidence and the ordered resumption
+> steps through `51b2ee8`. C34 and V01–V04 remain open; hosted `ca0318b` is green.
+
 ## Current completion backlog (17 September 2026)
 
 The [codebase completion plan](plans/2026-09-17-codebase-completion-plan.md)
