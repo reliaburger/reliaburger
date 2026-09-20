@@ -1246,3 +1246,18 @@ This fixes the map helpers' evidence. Agent reconciliation must also retain
 failed obligations, and durable recovery must preserve original source owners.
 Those are separate steps. A helper returning an error isn't enough if its
 caller throws that error away.
+
+The next boundary is the caller's inventory. Replacing a remembered key set with
+the desired set loses any entry whose deletion failed. Reconciliation now
+records a key before attempting its write and forgets it only after confirmed
+removal. A failed write can therefore leave a cleanup obligation too. Retrying
+can inspect or remove it; silently dropping it can't.
+
+We remove obsolete allow rules before namespace identities. If removing an allow
+rule fails, its source keeps its namespace identity and both keys remain
+tracked. If namespace deletion fails after the allow rule was removed, only the
+namespace obligation remains. The real frozen-map regression repeats cleanup
+twice for each case. The mutable set references (`&mut HashSet<...>`) let the
+reconciler record this partial progress in the caller's inventory without moving
+ownership of the sets. Durable recovery still needs a journal; these sets alone
+only survive within the current agent.

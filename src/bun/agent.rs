@@ -2196,43 +2196,16 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
             &crate::sesame::firewall::resolve_firewall_rules(&services, &cgroup_ids),
         );
 
-        let desired_ns_keys: std::collections::HashSet<u64> =
-            ns_entries.iter().map(|e| e.cgroup_id).collect();
-        let desired_fw_keys: std::collections::HashSet<crate::onion::types::FirewallKey> =
-            fw_entries.iter().map(|(k, _)| *k).collect();
-        let ns_to_delete =
-            crate::sesame::firewall::keys_to_delete(&self.cgroup_ns_bpf_keys, &desired_ns_keys);
-        let fw_to_delete =
-            crate::sesame::firewall::keys_to_delete(&self.firewall_bpf_keys, &desired_fw_keys);
-
-        {
-            let mut ebpf = handle.lock().await;
-            for entry in &ns_entries {
-                if let Err(e) = crate::sesame::firewall::write_cgroup_namespace_entry(
-                    &mut ebpf.bpf,
-                    entry.cgroup_id,
-                    entry.namespace_id,
-                ) {
-                    eprintln!("sesame: cgroup-namespace map write failed: {e}");
-                }
-            }
-            for (key, value) in &fw_entries {
-                if let Err(e) =
-                    crate::sesame::firewall::write_firewall_entry(&mut ebpf.bpf, *key, *value)
-                {
-                    eprintln!("sesame: firewall map write failed: {e}");
-                }
-            }
-            for cg in &ns_to_delete {
-                let _ = crate::sesame::firewall::delete_cgroup_namespace_entry(&mut ebpf.bpf, *cg);
-            }
-            for key in &fw_to_delete {
-                let _ = crate::sesame::firewall::delete_firewall_entry(&mut ebpf.bpf, *key);
-            }
+        let mut ebpf = handle.lock().await;
+        if let Err(error) = crate::sesame::firewall::reconcile_firewall_maps(
+            &mut ebpf.bpf,
+            &ns_entries,
+            &fw_entries,
+            &mut self.cgroup_ns_bpf_keys,
+            &mut self.firewall_bpf_keys,
+        ) {
+            eprintln!("sesame: firewall reconciliation failed: {error}");
         }
-
-        self.cgroup_ns_bpf_keys = desired_ns_keys;
-        self.firewall_bpf_keys = desired_fw_keys;
     }
 
     #[cfg(not(all(feature = "ebpf", target_os = "linux")))]

@@ -283,6 +283,40 @@ mod maps {
         Ok(map.keys().filter_map(|k| k.ok()).collect())
     }
 
+    /// Reconcile namespace and firewall entries, retaining keys until removal.
+    pub fn reconcile_firewall_maps(
+        bpf: &mut aya::Ebpf,
+        namespace_entries: &[super::CgroupNamespaceEntry],
+        firewall_entries: &[(FirewallKey, FirewallValue)],
+        namespace_keys: &mut std::collections::HashSet<u64>,
+        firewall_keys: &mut std::collections::HashSet<FirewallKey>,
+    ) -> Result<(), FirewallMapError> {
+        let desired_namespaces = namespace_entries
+            .iter()
+            .map(|entry| entry.cgroup_id)
+            .collect();
+        let desired_firewall = firewall_entries.iter().map(|(key, _)| *key).collect();
+        for entry in namespace_entries {
+            // A failed syscall is not permission to forget attempted ownership.
+            namespace_keys.insert(entry.cgroup_id);
+            write_cgroup_namespace_entry(bpf, entry.cgroup_id, entry.namespace_id)?;
+        }
+        for (key, value) in firewall_entries {
+            firewall_keys.insert(*key);
+            write_firewall_entry(bpf, *key, *value)?;
+        }
+        // Keep namespace enforcement until obsolete allow rules are removed.
+        for key in super::keys_to_delete(firewall_keys, &desired_firewall) {
+            delete_firewall_entry(bpf, key)?;
+            firewall_keys.remove(&key);
+        }
+        for key in super::keys_to_delete(namespace_keys, &desired_namespaces) {
+            delete_cgroup_namespace_entry(bpf, key)?;
+            namespace_keys.remove(&key);
+        }
+        Ok(())
+    }
+
     /// Read the exact namespace and allow values the live connect hook would
     /// consult for one source/destination pair.
     pub fn read_firewall_state(

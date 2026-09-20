@@ -346,3 +346,19 @@ failed discovery obligation.
 All 41 physical Linux kernel cases pass after the fix (9.03s), including both
 new deletion contracts. Strict all-target/all-feature Clippy and formatting
 pass on Linux and macOS.
+
+## Retaining reconciliation obligations
+
+Extract the agent's namespace/firewall reconciliation into the shared concrete
+map operation used by its physical regression. Preserve the existing behaviour
+for the failing-first run: frozen-map deletion is ignored and the remembered
+keys are replaced by the desired sets. Repair by remembering attempted writes,
+propagating errors and forgetting only confirmed deletions. Retire obsolete
+allow rules before namespace identities. A repeated frozen-map test must retain
+both obligations on allow removal failure, or only the namespace obligation
+when that final deletion fails. This is in-memory evidence; durable source and
+backend retirement remain open.
+
+All 44 physical kernel cases pass (10.50s), including repeated frozen-map
+cleanup, partial publication, preservation of unrelated entries and repeated
+successful retirement. Strict Clippy and formatting pass on Linux and macOS.

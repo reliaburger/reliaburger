@@ -2825,3 +2825,148 @@ fn firewall_cleanup_confirms_removal_and_accepts_already_absent_entries() {
     );
     ebpf.detach().unwrap();
 }
+
+#[test]
+#[ignore = "requires Linux root and RELIABURGER_EBPF_TESTS=1"]
+fn firewall_reconciliation_retains_refused_cleanup_for_repeated_attempts() {
+    use reliaburger::onion::types::{FirewallKey, FirewallValue};
+    use reliaburger::sesame::firewall::{self, CgroupNamespaceEntry};
+    assert!(ebpf_tests_enabled());
+    for frozen in ["firewall_map", "cgroup_namespace_map"] {
+        let mut ebpf = OnionEbpf::load(&find_bpf_obj_dir(), CGROUP_PATH.as_ref()).unwrap();
+        let cgroup = 0xDEAD_BEEF_CAFE_6301;
+        let key = FirewallKey {
+            src_cgroup_id: cgroup,
+            dst_app_id: 37,
+            _pad: 0,
+        };
+        let mut namespaces = Default::default();
+        let mut rules = Default::default();
+        firewall::reconcile_firewall_maps(
+            &mut ebpf.bpf,
+            &[CgroupNamespaceEntry {
+                cgroup_id: cgroup,
+                namespace_id: 19,
+            }],
+            &[(
+                key,
+                FirewallValue {
+                    action: firewall::FIREWALL_ALLOW,
+                },
+            )],
+            &mut namespaces,
+            &mut rules,
+        )
+        .unwrap();
+        freeze_egress_map(&ebpf, frozen);
+        for _ in 0..2 {
+            let result = firewall::reconcile_firewall_maps(
+                &mut ebpf.bpf,
+                &[],
+                &[],
+                &mut namespaces,
+                &mut rules,
+            );
+            let retained =
+                firewall::read_firewall_state(&mut ebpf.bpf, cgroup, key.dst_app_id).unwrap();
+            assert!(result.is_err(), "forgot refused cleanup in {frozen}");
+            assert!(namespaces.contains(&cgroup));
+            assert_eq!(retained.source_namespace_id, Some(19));
+            if frozen == "firewall_map" {
+                assert!(rules.contains(&key));
+                assert_eq!(retained.action, Some(firewall::FIREWALL_ALLOW));
+            } else {
+                assert!(!rules.contains(&key));
+                assert_eq!(retained.action, None);
+            }
+        }
+        ebpf.detach().unwrap();
+    }
+}
+
+#[test]
+#[ignore = "requires Linux root and RELIABURGER_EBPF_TESTS=1"]
+fn firewall_reconciliation_retains_partial_publication_and_unrelated_entries() {
+    use reliaburger::onion::types::{FirewallKey, FirewallValue};
+    use reliaburger::sesame::firewall::{self, CgroupNamespaceEntry};
+    assert!(ebpf_tests_enabled());
+    let mut ebpf = OnionEbpf::load(&find_bpf_obj_dir(), CGROUP_PATH.as_ref()).unwrap();
+    let cgroup = 0xDEAD_BEEF_CAFE_6302;
+    let other = cgroup + 1;
+    let key = FirewallKey {
+        src_cgroup_id: cgroup,
+        dst_app_id: 37,
+        _pad: 0,
+    };
+    let mut namespaces = Default::default();
+    let mut rules = Default::default();
+    firewall::write_cgroup_namespace_entry(&mut ebpf.bpf, other, 23).unwrap();
+    freeze_egress_map(&ebpf, "firewall_map");
+    let result = firewall::reconcile_firewall_maps(
+        &mut ebpf.bpf,
+        &[CgroupNamespaceEntry {
+            cgroup_id: cgroup,
+            namespace_id: 19,
+        }],
+        &[(
+            key,
+            FirewallValue {
+                action: firewall::FIREWALL_ALLOW,
+            },
+        )],
+        &mut namespaces,
+        &mut rules,
+    );
+    let state = firewall::read_firewall_state(&mut ebpf.bpf, cgroup, key.dst_app_id).unwrap();
+    let unrelated = firewall::read_firewall_state(&mut ebpf.bpf, other, 0).unwrap();
+    ebpf.detach().unwrap();
+    assert!(result.is_err());
+    assert!(namespaces.contains(&cgroup));
+    assert!(rules.contains(&key), "lost attempted publication");
+    assert!(!namespaces.contains(&other), "claimed an unrelated entry");
+    assert_eq!(state.source_namespace_id, Some(19));
+    assert_eq!(state.action, None);
+    assert_eq!(unrelated.source_namespace_id, Some(23));
+}
+
+#[test]
+#[ignore = "requires Linux root and RELIABURGER_EBPF_TESTS=1"]
+fn firewall_reconciliation_forgets_confirmed_removals_only() {
+    use reliaburger::onion::types::{FirewallKey, FirewallValue};
+    use reliaburger::sesame::firewall::{self, CgroupNamespaceEntry};
+    assert!(ebpf_tests_enabled());
+    let mut ebpf = OnionEbpf::load(&find_bpf_obj_dir(), CGROUP_PATH.as_ref()).unwrap();
+    let cgroup = 0xDEAD_BEEF_CAFE_6304;
+    let key = FirewallKey {
+        src_cgroup_id: cgroup,
+        dst_app_id: 37,
+        _pad: 0,
+    };
+    let mut namespaces = Default::default();
+    let mut rules = Default::default();
+    firewall::reconcile_firewall_maps(
+        &mut ebpf.bpf,
+        &[CgroupNamespaceEntry {
+            cgroup_id: cgroup,
+            namespace_id: 19,
+        }],
+        &[(
+            key,
+            FirewallValue {
+                action: firewall::FIREWALL_ALLOW,
+            },
+        )],
+        &mut namespaces,
+        &mut rules,
+    )
+    .unwrap();
+    for _ in 0..2 {
+        firewall::reconcile_firewall_maps(&mut ebpf.bpf, &[], &[], &mut namespaces, &mut rules)
+            .unwrap();
+        assert!(namespaces.is_empty() && rules.is_empty());
+        let state = firewall::read_firewall_state(&mut ebpf.bpf, cgroup, key.dst_app_id).unwrap();
+        assert_eq!(state.source_namespace_id, None);
+        assert_eq!(state.action, None);
+    }
+    ebpf.detach().unwrap();
+}
