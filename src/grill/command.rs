@@ -209,19 +209,7 @@ impl OwnedCommands {
                     return Ok(state);
                 }
                 Ok(_) => {}
-                Err(CommandError::Io(error))
-                    if matches!(
-                        error.kind(),
-                        io::ErrorKind::BrokenPipe
-                            | io::ErrorKind::ConnectionReset
-                            | io::ErrorKind::ConnectionAborted
-                            | io::ErrorKind::ConnectionRefused
-                            | io::ErrorKind::NotConnected
-                            | io::ErrorKind::UnexpectedEof
-                            | io::ErrorKind::Interrupted
-                            | io::ErrorKind::WouldBlock
-                            | io::ErrorKind::TimedOut
-                    ) => {}
+                Err(CommandError::Io(error)) if transient_control_error(&error) => {}
                 Err(error) => return Err(error),
             }
             // Polling can race a closing socket or a busy owner. Only a later
@@ -267,7 +255,16 @@ impl OwnedCommands {
     /// the record available for recovery and must prevent resource retirement.
     pub async fn retire(&self, id: &CommandId, timeout: Duration) -> Result<(), CommandError> {
         tokio::time::timeout(timeout, async {
-            self.control.signal(&id.0, true).await?;
+            loop {
+                match self.control.signal(&id.0, true).await {
+                    Ok(()) => break,
+                    Err(error) if transient_control_error(&error) => {}
+                    Err(error) => return Err(error.into()),
+                }
+                // A lost response does not establish either acceptance or exit.
+                // Force-kill is idempotent for this immutable command identity.
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
             self.terminal(id).await?;
             Ok(())
         })
@@ -277,6 +274,21 @@ impl OwnedCommands {
             timeout,
         })?
     }
+}
+
+fn transient_control_error(error: &io::Error) -> bool {
+    matches!(
+        error.kind(),
+        io::ErrorKind::BrokenPipe
+            | io::ErrorKind::ConnectionReset
+            | io::ErrorKind::ConnectionAborted
+            | io::ErrorKind::ConnectionRefused
+            | io::ErrorKind::NotConnected
+            | io::ErrorKind::UnexpectedEof
+            | io::ErrorKind::Interrupted
+            | io::ErrorKind::WouldBlock
+            | io::ErrorKind::TimedOut
+    )
 }
 
 fn read_output(path: &Path, remaining: &mut u64) -> Result<Vec<u8>, CommandError> {

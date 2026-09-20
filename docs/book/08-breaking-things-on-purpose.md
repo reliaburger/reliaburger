@@ -1562,3 +1562,26 @@ and the successor and main markers have one each. These counts distinguish a
 fresh retry from a surviving old initialiser quietly continuing its work. The
 case exercises actual Bun death in foreground process mode; OCI runtime death,
 admission and cancellation boundaries have their own qualification work.
+
+## Retry a lost cancellation request, then prove exit
+
+The caller dies while an external runtime command is still running. Recovery
+seals command admission and asks the independent owner to kill the command.
+The owner's control socket closes during that request. A broken pipe tells us
+that the conversation failed; it says nothing about whether the owner accepted
+the request or whether the command has exited.
+
+The command adapter now retries transient control failures during signalling,
+just as it already does while observing completion. Both steps share the
+original retirement deadline. Repeating force-kill is safe here because command
+identities are immutable and never reused. A missing or conflicting ownership
+record still refuses immediately. After an accepted signal, only a positive
+Cancelled or Retired record can complete cleanup.
+
+The regression temporarily replaces the control socket, accepts one request
+and closes it without a response. The workload stays alive. Retirement must
+keep waiting, recover when the original socket returns, and confirm actual
+exit. A second test keeps the socket unreachable until the deadline: the result
+must be a timeout and the original Running record must remain intact. These
+tests exercise real owners and children, so retrying cannot quietly turn an
+uncertain outcome into successful cleanup.

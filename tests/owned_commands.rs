@@ -418,3 +418,84 @@ async fn unreachable_command_owner_expires_the_wait_and_retains_original_evidenc
         "unreachable owner lost its original Running evidence"
     );
 }
+
+#[tokio::test]
+async fn command_retirement_recovers_from_a_reset_before_confirming_exit() {
+    use tokio::io::AsyncReadExt;
+    let root = tempfile::tempdir().unwrap();
+    let owner = commands(root.path());
+    let id = owner
+        .prepare(Path::new("/bin/sleep"), &["60".into()], &BTreeMap::new())
+        .await
+        .unwrap();
+    owner.start(&id).await.unwrap();
+    let mut interruption = InterruptedControl::new(&owner, &id);
+    let retiring_owner = owner.clone();
+    let retiring_id = id.clone();
+    let mut retiring = tokio::spawn(async move {
+        retiring_owner
+            .retire(&retiring_id, Duration::from_secs(5))
+            .await
+    });
+    let (mut connection, _) = tokio::time::timeout(
+        Duration::from_secs(5),
+        interruption.listener.as_ref().unwrap().accept(),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    connection.read_exact(&mut [0u8; 1]).await.unwrap();
+    drop(connection);
+    interruption.listener.take();
+    let early = tokio::time::timeout(Duration::from_millis(100), &mut retiring).await;
+    drop(interruption);
+    let returned_early = early.is_ok();
+    if returned_early {
+        owner.retire(&id, Duration::from_secs(5)).await.unwrap();
+    } else {
+        retiring.await.unwrap().unwrap();
+    }
+    assert!(
+        !returned_early,
+        "transport reset ended the bounded retirement: {early:?}"
+    );
+    assert!(matches!(
+        owner.state(&id).await.unwrap(),
+        CommandState::Retired { .. }
+    ));
+}
+
+#[tokio::test]
+async fn unreachable_command_owner_expires_retirement_and_retains_original_evidence() {
+    let root = tempfile::tempdir().unwrap();
+    let owner = commands(root.path());
+    let id = owner
+        .prepare(Path::new("/bin/sleep"), &["60".into()], &BTreeMap::new())
+        .await
+        .unwrap();
+    owner.start(&id).await.unwrap();
+    let record = owner
+        .log_stem(&id)
+        .unwrap()
+        .parent()
+        .unwrap()
+        .join("owner.json");
+    let original = std::fs::read(&record).unwrap();
+    let mut interruption = InterruptedControl::new(&owner, &id);
+    interruption.listener.take();
+    let result = owner.retire(&id, Duration::from_millis(100)).await;
+    let retained = std::fs::read(record).unwrap() == original;
+    drop(interruption);
+    owner.retire(&id, Duration::from_secs(5)).await.unwrap();
+    assert!(
+        matches!(
+            result,
+            Err(reliaburger::grill::command::CommandError::TimedOut { .. })
+        ),
+        "{result:?}"
+    );
+    assert!(
+        retained,
+        "unreachable owner lost its original Running evidence"
+    );
+}
