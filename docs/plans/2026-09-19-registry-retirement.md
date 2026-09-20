@@ -260,3 +260,28 @@ library run passes 3,466 tests with 19 explicit gates. Both platforms pass the
 17 lease tests, 17 cluster/five integrity/five TLS authority/two upload/two binary
 compatibility integrations and strict all-target/all-feature Clippy. These do
 not close the separately listed P2P, workload-reference or crash qualifications.
+
+## Workload image-reference ownership completed
+
+Ordinary workloads and different leases cannot depend on disposable repositories.
+HTTP preflight checks every main, init and job image before any part of a mixed
+manifest applies. Raft repeats the application check with its committed observation
+time. Only the same active application lease may use its registered repositories;
+ordinary images remain available to all otherwise-authorised workloads.
+
+The HTTP-200 and unleased-Raft-write regressions fail before the fix. All three
+ownership cases, 124 Bun API/89 state-machine/17 lease tests and strict Clippy pass
+on macOS/Linux. Formats remain protocol 10/state 14, lease schema 5. P2P/healer
+ownership and physical multi-node registry qualification remain open.
+
+The next transfer step must also replace stale full-holder-set publication.
+A healer currently copies location sets from an earlier catalogue snapshot;
+writing those sets after GC or retirement can resurrect obsolete holders.
+Storage nodes should confirm their own digest-verified copy while excluding local
+GC, then add only themselves through a conditional authoritative operation. A
+replicator's earlier HEAD response alone is insufficient evidence across an
+already-approved deletion. Keep direct peer pulls owned through cancellation and
+retain failed temporary-file deletion in the upload-session tracker. Supply a
+bounded authoritative per-repository catalogue read for workers without a local
+Raft catalogue. Qualify cached-copy and concurrent GC/retirement cases before
+closing this path.

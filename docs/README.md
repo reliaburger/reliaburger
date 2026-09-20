@@ -118,7 +118,9 @@ and publication. Repository/upload lease cleanup remains open in C34.
 HTTP writes under `rbtest-…/` require the exact authenticated lease owner and
 the `x-reliaburger-test-lease` header. Nodes record ownership before upload files
 and confirm partial-upload and metadata retirement only after workloads stop.
-Peer-pull ownership and workload image-reference checks remain release gates.
+Only the owning application lease may depend on those images, including init
+images. Ordinary apps and jobs refuse disposable image dependencies. Peer-pull
+ownership and physical registry cleanup qualification remain release gates.
 
 Peer transfers preserve complete repository paths, including nested namespaces.
 Chunked uploads belong to the exact credential that created them. Continue and

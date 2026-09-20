@@ -1161,3 +1161,26 @@ shared blobs still referenced by an ordinary repository. A real TLS worker also
 exercises the claim, publication, workload barrier and final confirmation through
 the leader. This integrates HTTP writers; P2P pulls and workload image-reference
 admission still need the same ownership contract.
+
+### A disposable image cannot become an ordinary dependency
+
+Consider an ordinary application using `rbtest-run1/web:latest`. If run1 finishes,
+removing its repository would also remove the application's future source image.
+The registry cannot safely infer that dependency from running containers. We
+refuse it at admission: only an active application lease may use its own already
+registered repositories. Another lease, an ordinary app or a job must use an
+ordinary image instead. Init-container images count too.
+
+`AppSpec::image_references` returns `impl Iterator<Item = &str>`. The caller sees
+the iterator contract rather than the concrete chain/filter types, and the
+borrowed strings remain owned by the configuration. Omitted init images inherit
+the already-checked main image. The shared check accepts an iterator whose items
+have lifetime `'a`; it examines those borrowed strings without retaining them.
+Its optional `(lease, observed_time)` pair makes the time part of the committed
+decision instead of reading a different wall clock during Raft replay.
+
+HTTP checks every image before enqueueing a job or committing any part of a mixed
+manifest. Raft repeats the application check at apply time. The failing-first
+tests cover ordinary main/init images and jobs; the positive cases retain access
+for the same active lease, while missing repositories, another lease, expiry and
+Cleaning refuse. A hostname or digest reference cannot hide the repository name.

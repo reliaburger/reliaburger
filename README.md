@@ -53,7 +53,8 @@ authenticated leader; unconfirmed Raft commits return 503 for client retry;
 201 confirms catalogue acceptance, with blob replication potentially still pending.
 HTTP writes under `rbtest-…/` require their exact authenticated lease owner.
 Registry workers confirm upload and metadata retirement after workloads stop;
-peer-pull ownership and workload image-reference checks remain release gates.
+only the owning application lease may depend on those images. Peer-pull
+ownership and physical registry cleanup qualification remain release gates.
 Direct image pulls and Pickle verify pinned manifests, selected platform
 manifests and configuration bytes before accepting them into the cache.
 

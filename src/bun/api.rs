@@ -1578,7 +1578,8 @@ fn lease_error_response(error: crate::testkit::lease::LeaseError) -> Response {
     let status = match error {
         crate::testkit::lease::LeaseError::NotFound => StatusCode::NOT_FOUND,
         crate::testkit::lease::LeaseError::CleanupPending => StatusCode::ACCEPTED,
-        crate::testkit::lease::LeaseError::WrongOwner => StatusCode::FORBIDDEN,
+        crate::testkit::lease::LeaseError::WrongOwner
+        | crate::testkit::lease::LeaseError::ImageOwnership => StatusCode::FORBIDDEN,
         crate::testkit::lease::LeaseError::NotActive
         | crate::testkit::lease::LeaseError::Busy
         | crate::testkit::lease::LeaseError::AlreadyExists
@@ -2345,6 +2346,7 @@ async fn apply_handler(
         }
     }
     let mut lease_owner_id = None;
+    let mut image_lease = None;
     if let Some(lease_id) = &lease_id {
         let Some(auth) = auth.as_deref() else {
             return (StatusCode::UNAUTHORIZED, "authentication required").into_response();
@@ -2398,7 +2400,8 @@ async fn apply_handler(
                 None => spec.namespace = Some(lease.namespace.clone()),
             }
         }
-        lease_owner_id = Some(lease.owner_id);
+        lease_owner_id = Some(lease.owner_id.clone());
+        image_lease = Some(lease);
     } else {
         if config
             .namespace
@@ -2441,6 +2444,20 @@ async fn apply_handler(
         if let Err(response) = crate::sesame::auth::require_unscoped(auth.as_deref()) {
             return response;
         }
+    }
+
+    let images = config
+        .app
+        .values()
+        .flat_map(crate::config::AppSpec::image_references)
+        .chain(config.job.values().filter_map(|job| job.image.as_deref()));
+    if let Err(error) = crate::testkit::lease::authorise_image_references(
+        images,
+        image_lease
+            .as_ref()
+            .map(|lease| (lease, crate::testkit::lease::now_unix_millis())),
+    ) {
+        return lease_error_response(error);
     }
 
     // Check every workload before any Raft write or agent command. A job in
@@ -11052,6 +11069,29 @@ schedule = "* * * * *"
             commands.try_recv(),
             Ok(AgentCommand::Deploy { .. })
         ));
+        council.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn workload_manifests_cannot_reference_leased_images_without_ownership() {
+        let (app, council, mut commands) =
+            workload_admission_fixture("leased-image-admission").await;
+        for fragment in [
+            "[app.bad]\nimage = 'rbtest-run1/web:latest'\n",
+            "[app.bad]\nimage = 'ordinary:v1'\n[[app.bad.init]]\nimage = 'registry.example:5050/rbtest-run1/web:latest'\n",
+            "[job.bad]\nimage = 'rbtest-run1/web:latest'\n",
+        ] {
+            let manifest = format!("[app.safe]\nimage = 'ordinary:v1'\n{fragment}");
+            assert_eq!(
+                apply_as_context(&app, deployer_context(), &manifest).await,
+                StatusCode::FORBIDDEN
+            );
+            assert!(council.desired_state().await.apps.is_empty());
+            assert!(matches!(
+                commands.try_recv(),
+                Err(mpsc::error::TryRecvError::Empty)
+            ));
+        }
         council.shutdown().await.unwrap();
     }
 

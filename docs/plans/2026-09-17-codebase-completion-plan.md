@@ -925,6 +925,13 @@ Refusals preserve the creator's temporary bytes. All 249 Pickle and existing
 registry integration cases pass on macOS/Linux, with strict Clippy. Session
 identity is ephemeral; durable repository ownership remains open.
 
+**Leased image dependencies (20 September):** HTTP preflight and Raft application
+now require the same active application lease for every referenced disposable
+repository, including init images. Ordinary workloads, jobs, different leases and
+unregistered repositories refuse before mutation. Both admission regressions fail
+first; three ownership cases, 124 Bun API/89 state-machine/17 lease tests and strict
+Clippy pass on macOS/Linux. P2P/healer ownership and physical qualification remain.
+
 **HTTP repository retirement (20 September):** OCI requests bind the exact
 credential and lease namespace, commit writer receipts before files and persist
 local ownership. Final manifest publication rechecks lease activity. A supervised

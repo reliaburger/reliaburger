@@ -394,9 +394,38 @@ pub fn valid_test_namespace(namespace: &str) -> bool {
         && !namespace.ends_with('-')
 }
 
+/// A disposable image may only be used by its active owning application lease.
+/// The supplied observation time is part of the caller's committed admission decision.
+/// Ordinary images remain independent of test ownership.
+pub fn authorise_image_references<'a>(
+    images: impl IntoIterator<Item = &'a str>,
+    lease: Option<(&TestLease, u64)>,
+) -> Result<(), LeaseError> {
+    for image in images {
+        // An unparseable reference cannot resolve a repository in the image store.
+        let Ok(reference) = crate::grill::image::ImageReference::parse(image) else {
+            continue;
+        };
+        if !crate::pickle::lease::is_test_repository(&reference.repository) {
+            continue;
+        }
+        if !lease.is_some_and(|(lease, now)| {
+            lease.scope == LeaseScope::Applications
+                && lease.is_active_at(now)
+                && lease.owns_repository_name(&reference.repository)
+                && lease.repositories.contains_key(&reference.repository)
+        }) {
+            return Err(LeaseError::ImageOwnership);
+        }
+    }
+    Ok(())
+}
+
 /// Lease lifecycle or persistence failure.
 #[derive(Debug, thiserror::Error)]
 pub enum LeaseError {
+    #[error("leased image requires its active application lease and a registered repository")]
+    ImageOwnership,
     #[error("lease schema {found} is unsupported")]
     UnsupportedSchema { found: u32 },
     #[error("lease id is empty")]

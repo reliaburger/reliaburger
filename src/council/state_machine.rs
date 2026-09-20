@@ -281,6 +281,13 @@ impl StateMachineInner {
                         reason: "test lease namespace requires a leased app write".to_string(),
                     });
                 }
+                if let Err(error) =
+                    crate::testkit::lease::authorise_image_references(spec.image_references(), None)
+                {
+                    return Some(CouncilResponse::Refused {
+                        reason: error.to_string(),
+                    });
+                }
                 self.apply_app_spec(app_id, spec);
             }
             RaftRequest::AppDelete { app_id } => {
@@ -959,6 +966,14 @@ impl StateMachineInner {
                 if app_id.namespace != lease.namespace {
                     return Some(CouncilResponse::Refused {
                         reason: "app namespace does not match its lease".to_string(),
+                    });
+                }
+                if let Err(error) = crate::testkit::lease::authorise_image_references(
+                    spec.image_references(),
+                    Some((lease, *observed_at_unix_ms)),
+                ) {
+                    return Some(CouncilResponse::Refused {
+                        reason: error.to_string(),
                     });
                 }
                 let resource = crate::testkit::lease::LeasedResource::App {
@@ -4304,6 +4319,95 @@ mod tests {
             },
         });
         assert!(inner.apply_request(&ready).is_none());
+    }
+
+    #[test]
+    fn ordinary_app_specs_cannot_acquire_leased_images() {
+        for init in [false, true] {
+            let mut inner = StateMachineInner::default();
+            let mut spec = default_spec();
+            if init {
+                spec.init = vec![crate::config::app::InitContainerSpec {
+                    image: Some("rbtest-run1/web:latest".into()),
+                    command: vec![],
+                }];
+            } else {
+                spec.image = Some("registry.example:5050/rbtest-run1/web:latest".into());
+            }
+            let result = inner.apply_request(&RaftRequest::AppSpec {
+                app_id: AppId::new("ordinary", "default"),
+                spec: Box::new(spec),
+            });
+            assert!(
+                matches!(result, Some(CouncilResponse::Refused { .. })),
+                "ordinary app acquired a disposable image (init={init})"
+            );
+            assert!(inner.state.apps.is_empty());
+        }
+    }
+
+    #[test]
+    fn leased_images_require_the_same_active_application_lease_and_registered_repository() {
+        let mut inner = StateMachineInner::default();
+        for id in ["run1", "run2"] {
+            inner.apply_request(&RaftRequest::TestLeaseCreate(test_lease(id, 100)));
+            inner.apply_request(&RaftRequest::TestLeaseRegistryWriter {
+                lease_id: id.into(),
+                repository: format!("rbtest-{id}/web"),
+                node_id: 1,
+                owner_id: Some("token:ci".into()),
+                observed_at_unix_ms: 20,
+            });
+        }
+        for init in [false, true] {
+            for (image, allowed) in [
+                ("nginx:latest", true),
+                ("rbtest-run1/web:latest", true),
+                ("registry.example:5050/rbtest-run1/web@sha256:content", true),
+                ("rbtest-run2/web:latest", false),
+                ("rbtest-run1/missing:latest", false),
+            ] {
+                let mut spec = default_spec();
+                if init {
+                    spec.init = vec![crate::config::app::InitContainerSpec {
+                        image: Some(image.into()),
+                        command: vec![],
+                    }];
+                } else {
+                    spec.image = Some(image.into());
+                }
+                let result = inner.apply_request(&RaftRequest::TestLeaseAppSpec {
+                    lease_id: "run1".into(),
+                    observed_at_unix_ms: 20,
+                    app_id: AppId::new(if init { "init" } else { "main" }, "rbtest-run1"),
+                    spec: Box::new(spec),
+                });
+                assert_eq!(
+                    result.is_none(),
+                    allowed,
+                    "{image}, init={init}: {result:?}"
+                );
+            }
+        }
+        let owned = &inner.state.test_leases["run1"];
+        assert!(
+            crate::testkit::lease::authorise_image_references(
+                ["rbtest-run1/web:latest"],
+                Some((owned, 100))
+            )
+            .is_err()
+        );
+        inner.apply_request(&RaftRequest::TestLeaseBeginCleanup {
+            lease_id: "run1".into(),
+        });
+        let owned = &inner.state.test_leases["run1"];
+        assert!(
+            crate::testkit::lease::authorise_image_references(
+                ["rbtest-run1/web:latest"],
+                Some((owned, 20))
+            )
+            .is_err()
+        );
     }
 
     fn test_lease(id: &str, expires_at_unix_ms: u64) -> crate::testkit::lease::TestLease {
