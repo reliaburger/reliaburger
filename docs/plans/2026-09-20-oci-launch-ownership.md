@@ -606,3 +606,26 @@ Qualification: seven agent/cluster cases pass on macOS/Linux (0.226s/0.211s),
 including the failing-first regression. All eleven real multi-node placement
 cases pass (92.183s/93.548s), as do 201 affected library cases
 (18.519s/23.078s). Strict Clippy and formatting pass on both platforms.
+
+## Destination grants before service identity reuse
+
+Two kernel regressions reproduce a live retirement gap: Retire accepts a frozen
+firewall map, and ordinary retirement retains a grant to the now-reusable VIP.
+The fixture seeds a grant from another source and a grant to another destination;
+it deliberately leaves them out of the agent's transient written-key cache.
+The kernel remains the source of truth for whether those permissions exist.
+
+Withdraw the backend first, then enumerate and remove grants for the service's
+original allocated destination ID before unregistering it. Use the actual entry,
+including collision-adjusted allocation, rather than hashing its name again.
+Failed observation or deletion retains the service and adoption ownership for
+retry; unrelated destinations and source bindings remain untouched. Both full
+service withdrawal call sites (Stop/Retire and rollout finalisation) use the
+checked boundary. This closes live destination retirement, not reconstruction of
+original service identity after a crash. Durable discovery ownership remains open.
+
+Qualification: both kernel regressions fail first (0.70s for the four filtered
+cases). All 66 physical kernel cases then pass (61.81s), as do all 215 affected
+agent/firewall/egress tests on macOS/Linux (17.734s/25.730s). Both Linux binary
+compatibility cases and strict Clippy/formatting on both platforms pass.
+Protocol/state remain 14/26.

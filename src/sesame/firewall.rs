@@ -295,6 +295,20 @@ mod maps {
         delete_cgroup_namespace_entry(bpf, cgroup_id)
     }
 
+    /// Remove every grant to an originally owned destination before its VIP
+    /// becomes reusable. Other destinations and source identities are retained.
+    pub fn delete_destination_firewall_state(
+        bpf: &mut aya::Ebpf,
+        destination_app_id: u32,
+    ) -> Result<(), FirewallMapError> {
+        for key in list_firewall_keys(bpf)? {
+            if key.dst_app_id == destination_app_id {
+                delete_firewall_entry(bpf, key)?;
+            }
+        }
+        Ok(())
+    }
+
     /// Reconcile namespace and firewall entries, retaining keys until removal.
     pub fn reconcile_firewall_maps(
         bpf: &mut aya::Ebpf,

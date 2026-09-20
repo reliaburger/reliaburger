@@ -70,6 +70,13 @@ pub enum BunError {
         reason: String,
     },
 
+    /// Destination permissions remain owned until their removal is confirmed.
+    #[error("cannot retire destination grants for {service}: {reason}")]
+    DestinationRetirement {
+        service: crate::onion::service_id::ServiceId,
+        reason: String,
+    },
+
     /// An error from the container runtime.
     #[error(transparent)]
     Grill(#[from] GrillError),

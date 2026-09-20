@@ -140,6 +140,9 @@ when identity or adoption-record removal fails, so cleanup can be retried.
 Explicit Stop and per-instance rollout retirement now confirm kernel backend
 withdrawal before stopping the runtime. Refusal retains the original destination
 and its address. Natural-exit and durable discovery recovery remain release gates.
+Service retirement now confirms removal of grants to its exact allocated VIP before
+releasing that destination. Refusal retains the service and its cleanup owner;
+unrelated destination grants remain untouched. Durable discovery recovery remains open.
 Failed final kernel backend publication now reports a deployment error and retains
 the running workload’s ownership for cleanup or retry.
 Retirement also fences automatic restarts before signalling the old runtime.

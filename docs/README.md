@@ -67,6 +67,9 @@ withdrawal before stopping the runtime. A refused map update preserves the
 original service entry and runtime for retry; replacement backends remain in
 the proposed service entry. Failed retirement does not establish that execution
 stopped. Natural exits and durable discovery recovery remain open release gates.
+Service retirement now confirms removal of grants to its exact allocated VIP before
+releasing that destination. Refusal retains the service and its cleanup owner;
+unrelated destination grants remain untouched. Durable discovery recovery remains open.
 Failed final kernel backend publication now reports a deployment error and retains
 the running workload’s ownership for cleanup or retry.
 Before signalling an old instance, the rollout fences the periodic restart and

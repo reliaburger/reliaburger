@@ -4156,3 +4156,124 @@ async fn refused_backend_publication_cannot_report_a_completed_deployment() {
         "deployment completed without a published kernel backend"
     );
 }
+
+async fn check_destination_grant_retirement(frozen: bool) {
+    use reliaburger::bun::agent::AgentCommand;
+    use reliaburger::onion::types::{FirewallKey, FirewallValue};
+    use reliaburger::sesame::firewall;
+    assert!(ebpf_tests_enabled());
+    let name = if frozen {
+        "grant-refused"
+    } else {
+        "grant-confirmed"
+    };
+    let mut fixture = EgressRecoveryFixture::prepare_with_service(name, false, true).await;
+    let vip = VirtualIP::from_service_id(&ServiceId::new("default", name));
+    let source = 0xDEAD_BEEF_CAFE_6401;
+    let original = FirewallKey {
+        src_cgroup_id: source,
+        dst_app_id: u32::from(vip.0),
+        _pad: 0,
+    };
+    let unrelated = FirewallKey {
+        src_cgroup_id: source,
+        dst_app_id: original.dst_app_id + 1,
+        _pad: 0,
+    };
+    {
+        let mut kernel = fixture.ebpf.lock().await;
+        // Represent grants retained in the kernel but absent from the agent's
+        // transient written-key cache. Destination ownership must still retire them.
+        for key in [original, unrelated] {
+            firewall::write_firewall_entry(
+                &mut kernel.bpf,
+                key,
+                FirewallValue {
+                    action: firewall::FIREWALL_ALLOW,
+                },
+            )
+            .unwrap();
+        }
+        if frozen {
+            freeze_egress_map(&kernel, "firewall_map");
+        }
+    }
+    let first = fixture.retire(name).await;
+    let second = fixture.retire(name).await;
+    let record_retained = reliaburger::grill::records::record_path(
+        &fixture.root.path().join("records"),
+        &format!("default__{name}-0"),
+    )
+    .exists();
+    let (response, reply) = tokio::sync::oneshot::channel();
+    fixture
+        .commands
+        .send(AgentCommand::Resolve {
+            app_name: name.into(),
+            response,
+        })
+        .await
+        .unwrap();
+    let service_retained = reply.await.unwrap().is_some();
+    let (grant, other_grant) = {
+        let mut kernel = fixture.ebpf.lock().await;
+        (
+            firewall::read_firewall_state(&mut kernel.bpf, source, original.dst_app_id)
+                .unwrap()
+                .action,
+            firewall::read_firewall_state(&mut kernel.bpf, source, unrelated.dst_app_id)
+                .unwrap()
+                .action,
+        )
+    };
+    fixture.crash().await;
+    fixture.ebpf.lock().await.detach().unwrap();
+    std::fs::remove_dir(reliaburger::grill::cgroup::cgroup_path("default", name, 0)).unwrap();
+    assert_eq!(
+        other_grant,
+        Some(firewall::FIREWALL_ALLOW),
+        "removed another destination's grant"
+    );
+    if frozen {
+        assert!(
+            first.is_err() && second.is_err(),
+            "accepted unretired destination grants: {first:?}, {second:?}"
+        );
+        assert!(
+            first
+                .unwrap_err()
+                .to_string()
+                .contains("destination grants")
+        );
+        assert!(
+            second
+                .unwrap_err()
+                .to_string()
+                .contains("destination grants")
+        );
+        assert!(
+            record_retained && service_retained,
+            "freed the original destination owner"
+        );
+        assert_eq!(grant, Some(firewall::FIREWALL_ALLOW));
+    } else {
+        assert!(first.is_ok() && second.is_ok(), "{first:?}, {second:?}");
+        assert!(!record_retained && !service_retained);
+        assert_eq!(
+            grant, None,
+            "service retirement retained an allow grant to a reusable VIP"
+        );
+    }
+}
+
+#[tokio::test]
+#[ignore = "requires Linux root and RELIABURGER_EBPF_TESTS=1"]
+async fn refused_destination_grant_removal_retains_the_original_service() {
+    check_destination_grant_retirement(true).await;
+}
+
+#[tokio::test]
+#[ignore = "requires Linux root and RELIABURGER_EBPF_TESTS=1"]
+async fn confirmed_destination_retirement_removes_only_its_own_grants() {
+    check_destination_grant_retirement(false).await;
+}

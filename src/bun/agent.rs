@@ -2191,11 +2191,11 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
         Ok(())
     }
 
-    /// Drop an app's `backend_map` entry. Must be called *before* the app
-    /// is unregistered from the service map, while its VIP/port are still
-    /// known. A no-op without the eBPF data path loaded.
+    /// Withdraw a service's backend and destination grants before releasing
+    /// its allocated VIP. A failed removal retains the original service entry.
+    /// A no-op without the eBPF data path loaded.
     #[cfg(all(feature = "ebpf", target_os = "linux"))]
-    async fn remove_backend_ebpf(
+    async fn withdraw_service_ebpf(
         &self,
         id: &crate::onion::service_id::ServiceId,
     ) -> Result<(), BunError> {
@@ -2205,7 +2205,11 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
         // Read the VIP + port straight from the live entry: the VIP is
         // whatever the map allocated (which may have probed off the natural
         // hash on a collision), so we must not re-derive it here.
-        let Some((vip, port)) = self.service_map.resolve(id).map(|e| (e.vip, e.port)) else {
+        let Some((vip, port, destination)) = self
+            .service_map
+            .resolve(id)
+            .map(|entry| (entry.vip, entry.port, entry.app_id))
+        else {
             return Ok(());
         };
         let bpf = crate::onion::ebpf::maps::BpfServiceMap::new();
@@ -2214,11 +2218,16 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
             .map_err(|error| BunError::BackendRetirement {
                 service: id.clone(),
                 reason: error.to_string(),
+            })?;
+        crate::sesame::firewall::delete_destination_firewall_state(&mut ebpf.bpf, destination)
+            .map_err(|error| BunError::DestinationRetirement {
+                service: id.clone(),
+                reason: error.to_string(),
             })
     }
 
     #[cfg(not(all(feature = "ebpf", target_os = "linux")))]
-    async fn remove_backend_ebpf(
+    async fn withdraw_service_ebpf(
         &self,
         _id: &crate::onion::service_id::ServiceId,
     ) -> Result<(), BunError> {
@@ -6088,7 +6097,7 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
         for old_id in existing {
             self.finish_retire_bookkeeping(old_id).await?;
         }
-        self.remove_backend_ebpf(&service_id).await?;
+        self.withdraw_service_ebpf(&service_id).await?;
         let _ = self.service_map.unregister(&service_id);
 
         for new_id in new_ids {
@@ -7863,7 +7872,7 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
         // Runtime retirement can release a reusable container address. Refuse
         // before that happens if an old VIP can still route to the address.
         let service_id = crate::onion::service_id::ServiceId::new(namespace, app_name);
-        self.remove_backend_ebpf(&service_id).await?;
+        self.withdraw_service_ebpf(&service_id).await?;
         for id in &instances {
             let _ = self.service_map.remove_backend(&service_id, &id.0);
         }

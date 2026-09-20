@@ -1494,3 +1494,30 @@ record and does not claim execution stopped or rollback succeeded. The physical
 regression checks all three facts: the kernel has no backend, the caller receives
 an error, and the runtime's ownership record survives. Durable discovery recovery
 and intermediate/background map updates remain separate work.
+
+
+## Permissions outlive their destination unless we remove them
+
+Suppose a frontend may connect to a backend's virtual IP. The backend stops, and
+we release that VIP. If its old allow grant remains, a later service using that
+address can inherit permission the frontend was never meant to have.
+
+Removing the backend's source rules doesn't remove this grant. The grant belongs
+to the frontend's cgroup and names the backend as its destination. Live service
+retirement now removes the backend route, reads the actual firewall keys and
+removes those naming the service's allocated destination ID. Only then may it
+release the service entry and its VIP. We keep the original allocation because
+hash collisions can make it differ from the first address derived from the name.
+
+The kernel test seeds two grants from the same source: one to the retiring
+service and one elsewhere. With a frozen map, two retirement attempts must both
+refuse and retain ownership. With a writable map, both attempts succeed, the old
+grant disappears and the unrelated grant survives. The agent's cached key set is
+empty in both cases. A cache is not proof of what remains in the kernel.
+
+`delete_destination_firewall_state` returns `Result<(), FirewallMapError>`:
+`()` is Rust's unit type, meaning successful completion has no extra value.
+The `?` on each deletion propagates failure immediately. The caller turns it into
+a service-specific error and keeps the owner available for another attempt.
+This live boundary still needs the separate durable discovery journal to recover
+an exact original destination after Bun dies.
