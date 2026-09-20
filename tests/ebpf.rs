@@ -3940,6 +3940,28 @@ async fn read_runtime_fixture_page(address: SocketAddr) -> anyhow::Result<String
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[ignore = "requires Linux root, runc, static BusyBox and RELIABURGER_EBPF_TESTS=1"]
 async fn refused_backend_withdrawal_cannot_redirect_a_vip_to_a_new_workload() {
+    check_backend_retirement(None, true).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "requires Linux root, runc, static BusyBox and RELIABURGER_EBPF_TESTS=1"]
+async fn refused_rollout_withdrawal_cannot_retire_the_original_destination() {
+    check_backend_retirement(Some("rolling"), true).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "requires Linux root, runc, static BusyBox and RELIABURGER_EBPF_TESTS=1"]
+async fn refused_blue_green_withdrawal_cannot_retire_the_original_destination() {
+    check_backend_retirement(Some("blue-green"), true).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "requires Linux root, runc, static BusyBox and RELIABURGER_EBPF_TESTS=1"]
+async fn confirmed_rollout_withdrawal_keeps_the_replacement_reachable() {
+    check_backend_retirement(Some("rolling"), false).await;
+}
+
+async fn check_backend_retirement(strategy: Option<&str>, freeze: bool) {
     use reliaburger::bun::agent::{AgentCommand, ApplyEvent, BunAgent};
     use reliaburger::grill::{Grill, ImageStore, InstanceId, port::PortAllocator, runc::RuncGrill};
     use std::sync::Arc;
@@ -3998,10 +4020,41 @@ async fn refused_backend_withdrawal_cannot_redirect_a_vip_to_a_new_workload() {
                 let ready = read_runtime_fixture_page(SocketAddr::new(vip.0.into(), 8080))
                     .await.map_err(|error| anyhow::anyhow!("original VIP before retirement: {error}"))?;
                 anyhow::ensure!(ready.contains(&id.0), "original VIP did not serve its own identity");
-                freeze_egress_map(&*ebpf.lock().await, "backend_map");
-                let (response, result) = oneshot::channel();
-                commands.send(AgentCommand::Retire { app_name: name.into(), namespace: "default".into(), response }).await?;
-                anyhow::ensure!(result.await?.is_err(), "frozen backend retirement was acknowledged");
+                if freeze {
+                    freeze_egress_map(&*ebpf.lock().await, "backend_map");
+                }
+                if let Some(strategy) = strategy {
+                    let config = reliaburger::config::Config::parse(&format!(
+                        "[app.{name}]\nimage = '/empty-fixture'\ncommand = ['/bin/busybox', 'httpd', '-f', '-p', '8080', '-h', '/']\nport = 8080\n[app.{name}.deploy]\nstrategy = '{strategy}'\ndrain_timeout = '0s'\n"
+                    ))?;
+                    let (events, mut results) = mpsc::channel(64);
+                    commands.send(AgentCommand::Deploy { config, events }).await?;
+                    let mut refused = false;
+                    let mut completed = false;
+                    while let Some(event) = results.recv().await {
+                        match event {
+                            ApplyEvent::Error { message } if freeze => {
+                                refused |= message.contains("cannot retire backend");
+                            }
+                            ApplyEvent::Error { message } => anyhow::bail!(message),
+                            ApplyEvent::Complete { .. } => completed = true,
+                            _ => {}
+                        }
+                    }
+                    if freeze {
+                        anyhow::ensure!(refused && !completed, "frozen backend rollout was acknowledged");
+                        anyhow::ensure!(runtime.state(&id).await? == reliaburger::grill::ContainerState::Running,
+                            "rollout retired the original destination before confirmed backend withdrawal");
+                    } else {
+                        anyhow::ensure!(completed, "rollout did not complete");
+                        anyhow::ensure!(runtime.state(&id).await? == reliaburger::grill::ContainerState::Stopped,
+                            "confirmed rollout did not retire the original destination");
+                    }
+                } else {
+                    let (response, result) = oneshot::channel();
+                    commands.send(AgentCommand::Retire { app_name: name.into(), namespace: "default".into(), response }).await?;
+                    anyhow::ensure!(result.await?.is_err(), "frozen backend retirement was acknowledged");
+                }
             }
         }
         let vip = VirtualIP::from_service_id(&ServiceId::new("default", "address-predecessor"));
@@ -4010,12 +4063,13 @@ async fn refused_backend_withdrawal_cannot_redirect_a_vip_to_a_new_workload() {
     }.await;
     shutdown.cancel();
     task.await.unwrap();
+    let mut owned_cgroups = Vec::new();
     for launch in runtime.launch_inventory().await.unwrap().unwrap() {
+        owned_cgroups.extend(launch.spec.linux.host_cgroup_path());
         runtime.kill(&launch.instance_id).await.unwrap();
     }
     ebpf.lock().await.detach().unwrap();
-    for name in ["address-predecessor", "address-successor"] {
-        let path = reliaburger::grill::cgroup::cgroup_path("default", name, 0);
+    for path in owned_cgroups {
         if path.exists() {
             std::fs::remove_dir(path).unwrap();
         }
@@ -4025,8 +4079,13 @@ async fn refused_backend_withdrawal_cannot_redirect_a_vip_to_a_new_workload() {
         !response.contains("default__address-successor-0"),
         "old VIP served an unrelated replacement: {response}"
     );
+    let expected = if freeze {
+        "default__address-predecessor-0"
+    } else {
+        "default__address-predecessor-g1-0"
+    };
     assert!(
-        response.contains("default__address-predecessor-0"),
-        "refused retirement lost the original endpoint: {response}"
+        response.contains(expected),
+        "VIP lost its intended endpoint {expected}: {response}"
     );
 }

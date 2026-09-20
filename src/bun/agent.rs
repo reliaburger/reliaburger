@@ -9056,6 +9056,63 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
         self.rebuild_routing_table().await;
     }
 
+    /// Confirm one backend's withdrawal before runtime cleanup can reuse its address.
+    async fn withdraw_instance_backend(&mut self, id: &InstanceId) -> Result<(), BunError> {
+        let Some(owner) = self.supervisor.get_instance(id) else {
+            return Ok(());
+        };
+        let service = crate::onion::service_id::ServiceId::new(&owner.namespace, &owner.app_name);
+        let Some(mut entry) = self.service_map.resolve(&service).cloned() else {
+            return Ok(());
+        };
+        if !entry
+            .backends
+            .iter()
+            .any(|backend| backend.instance_id == id.0)
+        {
+            return Ok(());
+        }
+        entry.backends.retain(|backend| backend.instance_id != id.0);
+        // Keep the original userspace owner on refusal. A retry must still know
+        // the exact allocated key and the backend whose removal is outstanding.
+        #[cfg(all(feature = "ebpf", target_os = "linux"))]
+        if let Some(handle) = self.onion_ebpf.as_ref() {
+            let mut ebpf = handle.lock().await;
+            crate::onion::ebpf::maps::BpfServiceMap::new()
+                .update_backends_bpf(&mut ebpf, entry.vip, entry.port, &entry)
+                .map_err(|error| BunError::BackendRetirement {
+                    service: service.clone(),
+                    reason: error.to_string(),
+                })?;
+        }
+        self.service_map
+            .remove_backend(&service, &id.0)
+            .map_err(|error| BunError::BackendRetirement {
+                service,
+                reason: error.to_string(),
+            })?;
+        self.rebuild_routing_table().await;
+        Ok(())
+    }
+
+    /// Withdraw traffic before fencing supervision and permitting an off-loop stop.
+    async fn begin_instance_retirement(&mut self, id: &InstanceId) -> Result<(), BunError> {
+        if self.supervisor.get_instance(id).is_none() {
+            return Err(BunError::InstanceNotFound {
+                instance_id: id.clone(),
+            });
+        }
+        self.withdraw_instance_backend(id).await?;
+        if let Some(instance) = self.supervisor.get_instance_mut(id) {
+            instance.retry_pending = false;
+            if instance.state.can_transition_to(ContainerState::Stopping) {
+                instance.state = ContainerState::Stopping;
+            }
+        }
+        self.supervisor.health_checker_mut().unregister(id);
+        Ok(())
+    }
+
     /// Drain, stop and forget one old instance (M7).
     ///
     /// The fast `&mut self` bookkeeping half of retiring one old instance: the
@@ -9066,18 +9123,12 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
     async fn finish_retire_bookkeeping(&mut self, old_id: &InstanceId) -> Result<(), BunError> {
         // The worker already observed exit. Preserve a stopped cleanup owner,
         // so a filesystem failure cannot make the restart driver revive it.
-        let service_id = self.supervisor.get_instance(old_id).map(|owner| {
-            crate::onion::service_id::ServiceId::new(&owner.namespace, &owner.app_name)
-        });
         self.retain_stopped_instance(old_id);
+        self.withdraw_instance_backend(old_id).await?;
         self.retire_instance_artifacts(old_id).await?;
         self.supervisor.retire_instance(old_id).await;
-        if let Some(service_id) = service_id {
-            let _ = self.service_map.remove_backend(&service_id, &old_id.0);
-            self.sync_backend_ebpf(&service_id).await;
-            self.sync_firewall_ebpf().await;
-            self.rebuild_routing_table().await;
-        }
+        self.sync_firewall_ebpf().await;
+        self.rebuild_routing_table().await;
         Ok(())
     }
 
@@ -9539,19 +9590,7 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
                 let _ = reply.send(());
             }
             DeployOp::BeginRetire { old_id, reply } => {
-                let result = match self.supervisor.get_instance_mut(&old_id) {
-                    Some(instance) => {
-                        instance.retry_pending = false;
-                        if instance.state.can_transition_to(ContainerState::Stopping) {
-                            instance.state = ContainerState::Stopping;
-                        }
-                        self.supervisor.health_checker_mut().unregister(&old_id);
-                        Ok(())
-                    }
-                    None => Err(BunError::InstanceNotFound {
-                        instance_id: old_id,
-                    }),
-                };
+                let result = self.begin_instance_retirement(&old_id).await;
                 let _ = reply.send(result);
             }
             DeployOp::FinishRetire { old_id, reply } => {

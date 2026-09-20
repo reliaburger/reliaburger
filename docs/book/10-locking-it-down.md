@@ -1451,3 +1451,26 @@ then requests the old VIP after injecting backend-deletion refusal. That VIP
 must keep reaching its original owner, and must never serve the successor.
 Natural-exit cleanup, per-instance rollout updates, durable service ownership
 and stale cluster routing snapshots remain separate qualification boundaries.
+
+### A rolling replacement needs the same withdrawal boundary
+
+The ordinary Stop repair did not cover the deployment worker. Freeze the backend
+map during a rolling replacement and it still stopped the original container,
+leaving the kernel pointed at an address whose runtime had retired. Finalisation
+reported an error, but the earlier stop had already happened.
+
+The command loop now prepares a service entry without the retiring instance and
+requires the kernel update to succeed before changing the userspace entry. We
+clone the entry before modifying its backend vector: the original remains retry
+evidence if the syscall refuses. The replacement stays in the proposed entry,
+so withdrawing one instance does not delete every backend for the service.
+Only after that confirmed update and routing publication does Bun fence the
+old instance's restart/health supervision and permit the off-loop drain and stop.
+Final artifact cleanup repeats the checked withdrawal as an idempotent guard.
+
+The physical tests cover frozen-map refusal during rolling and blue-green
+replacement, plus a successful rolling replacement whose VIP serves the new
+container. Each also starts an unrelated portless container and checks that the
+VIP still selects its intended endpoint. This boundary covers requested
+per-instance retirement; natural exits and recovery still need durable address
+and discovery ownership.

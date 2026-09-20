@@ -544,3 +544,22 @@ before injecting failure. All 207 macOS/227 Linux affected library cases pass
 each platform. The separate route fix also passes all four network cases and
 eleven Runc cases. These results do not close the remaining combined failure,
 natural-exit, rollout or durable discovery ownership cases above.
+
+## Per-instance rollout withdrawal
+
+The frozen-map rolling regression reproduces the original destination being
+retired before confirmed withdrawal. Move checked single-instance backend
+publication into BeginRetire, before supervision is fenced and before the worker
+can drain/stop. Preserve the original service entry on refused kernel writes,
+and keep replacement backends in the proposed entry. Final artifact cleanup
+must also refuse unconfirmed withdrawal. Qualify rolling, blue-green and the
+successful replacement path using real HTTP responses and runtime state.
+
+Natural exits, complete durable discovery ownership and combined live-policy
+loss remain separate. In particular, a stopped runtime cannot itself prove an
+address safe to reuse while any retained route still reaches it.
+
+Qualification: all 63 physical kernel cases pass (59.53s), including both refused
+strategies and a successful rolling replacement. All 207 affected library tests
+pass on macOS/Linux (17.799s/22.892s), with strict Clippy and formatting on both;
+both Linux binary compatibility cases also pass. Protocol/state remain 14/26.

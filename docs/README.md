@@ -58,6 +58,11 @@ and blue-green retirement also require observed runtime exit. If a signal or
 inspection fails, the deployment reports an error and retains both generations
 for ordinary Stop/Retire cleanup. Finalisation propagates identity and record
 cleanup errors too, retaining the old instance as stopped until cleanup succeeds.
+Explicit Stop and per-instance rollout retirement confirm kernel backend
+withdrawal before stopping the runtime. A refused map update preserves the
+original service entry and runtime for retry; replacement backends remain in
+the proposed service entry. Failed retirement does not establish that execution
+stopped. Natural exits and durable discovery recovery remain open release gates.
 Before signalling an old instance, the rollout fences the periodic restart and
 health tasks so they cannot revive it during retirement. After Bun replacement,
 new rollout IDs advance past restored generations. Stopped/Failed entries with
