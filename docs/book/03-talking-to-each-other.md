@@ -1538,3 +1538,19 @@ Publication now uses `send_replace`, which retains the latest value whether or
 not anyone is listening. The first reader receives the current service and its
 backend immediately. The existing health-transition and retry tests also run
 against this publication path.
+
+### Notification backpressure must not hold the drain lock
+
+Fill the drain-completion channel, then let another backend finish. An awaited
+send used to hold the shared tracker lock until the receiver made space. Request
+guards need that same lock to release their counts. A notification consumer
+could therefore stop unrelated request cleanup.
+
+`try_send` returns immediately. Its `TrySendError` enum distinguishes a full
+queue from a closed receiver. With a full queue we retain the pending completion
+and retry on the next sweep; with a closed receiver, polling callers can still
+observe completion. The regression fills a one-slot queue, checks that the sweep
+returns and the entry remains, consumes the old notification, then verifies that
+the next sweep delivers the retained one. No notification is silently lost to
+backpressure. Capturing requests before drain starts and confirming their actual
+release after deadline cancellation are separate requirements.

@@ -264,14 +264,17 @@ impl DrainTracker {
                 // never fire before the deadline while requests are in flight,
                 // so a live request is never killed early.
                 entry.terminate.cancel();
-                completed.push(id.clone());
-                let _ = self
-                    .complete_tx
-                    .send(DrainComplete {
-                        app_name: entry.app_name.clone(),
-                        instance_id: id.clone(),
-                    })
-                    .await;
+                // The shared tracker lock also protects request cleanup.
+                // Never hold it while waiting for a notification consumer.
+                match self.complete_tx.try_send(DrainComplete {
+                    app_name: entry.app_name.clone(),
+                    instance_id: id.clone(),
+                }) {
+                    Ok(()) | Err(mpsc::error::TrySendError::Closed(_)) => {
+                        completed.push(id.clone());
+                    }
+                    Err(mpsc::error::TrySendError::Full(_)) => {}
+                }
             }
         }
 
@@ -298,6 +301,39 @@ mod tests {
             instance_id: instance.to_string(),
             timeout: Duration::from_secs(timeout_secs),
         }
+    }
+
+    #[tokio::test]
+    async fn full_completion_queue_preserves_pending_notification_without_blocking_cleanup() {
+        let (tx, mut rx) = mpsc::channel(1);
+        tx.send(DrainComplete {
+            app_name: "previous".into(),
+            instance_id: "previous-0".into(),
+        })
+        .await
+        .unwrap();
+        let drains = SharedDrains::new(DrainTracker::new(tx));
+        drains.start_drain(&drain_cmd("web", "web-0", 30)).await;
+        let completed =
+            tokio::time::timeout(Duration::from_millis(100), drains.check_completions())
+                .await
+                .expect("full notification queue blocked the shared drain tracker");
+        assert!(completed.is_empty());
+        assert!(drains.is_draining("web-0").await);
+        assert_eq!(rx.recv().await.unwrap().instance_id, "previous-0");
+        assert_eq!(drains.check_completions().await, vec!["web-0"]);
+        assert_eq!(rx.recv().await.unwrap().instance_id, "web-0");
+        assert!(!drains.is_draining("web-0").await);
+    }
+
+    #[tokio::test]
+    async fn closed_completion_receiver_does_not_prevent_observed_drain_completion() {
+        let (tx, rx) = mpsc::channel(1);
+        drop(rx);
+        let drains = SharedDrains::new(DrainTracker::new(tx));
+        drains.start_drain(&drain_cmd("web", "web-0", 30)).await;
+        assert_eq!(drains.check_completions().await, vec!["web-0"]);
+        assert!(!drains.is_draining("web-0").await);
     }
 
     #[tokio::test]
