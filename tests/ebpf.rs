@@ -2471,6 +2471,15 @@ impl EgressRecoveryFixture {
     }
 
     async fn prepare_with_service(name: &str, failed_checkpoint: bool, service: bool) -> Self {
+        Self::prepare_with_policy(name, failed_checkpoint, service, true).await
+    }
+
+    async fn prepare_with_policy(
+        name: &str,
+        failed_checkpoint: bool,
+        service: bool,
+        allowlist: bool,
+    ) -> Self {
         use reliaburger::bun::agent::{AgentCommand, ApplyEvent};
         let root = tempfile::tempdir().unwrap();
         std::fs::create_dir(root.path().join("records")).unwrap();
@@ -2495,7 +2504,15 @@ impl EgressRecoveryFixture {
         fixture.commands = commands;
         fixture.task = Some(tokio::spawn(async move { agent.run().await }));
         let port = if service { "port = 8080\n" } else { "" };
-        let config = reliaburger::config::Config::parse(&format!("[app.{name}]\nimage = 'mock:image'\ncommand = ['sleep', '600']\n{port}[app.{name}.egress]\nallow = ['203.0.113.9:443']\n")).unwrap();
+        let policy = if allowlist {
+            format!("[app.{name}.egress]\nallow = ['203.0.113.9:443']\n")
+        } else {
+            String::new()
+        };
+        let config = reliaburger::config::Config::parse(&format!(
+            "[app.{name}]\nimage = 'mock:image'\ncommand = ['sleep', '600']\n{port}{policy}"
+        ))
+        .unwrap();
         let (events, mut results) = tokio::sync::mpsc::channel(64);
         fixture
             .commands
@@ -3065,4 +3082,367 @@ async fn agent_retirement_confirms_backend_absence_before_forgetting_ownership()
     std::fs::remove_dir(reliaburger::grill::cgroup::cgroup_path("default", name, 0)).unwrap();
     assert!(!retained_record);
     assert!(backend.is_none());
+}
+
+async fn assert_source_policy_precedes_start(job: bool) {
+    use reliaburger::bun::agent::{AgentCommand, ApplyEvent, BunAgent};
+    use reliaburger::grill::{mock::MockGrill, port::PortAllocator};
+    use reliaburger::sesame::{egress, firewall};
+    use std::sync::Arc;
+    use tokio::sync::{Mutex, mpsc, oneshot};
+    assert!(ebpf_tests_enabled());
+    let name = if job {
+        "source-before-job"
+    } else {
+        "source-before-app"
+    };
+    let target_name = if job {
+        "source-target-job"
+    } else {
+        "source-target-app"
+    };
+    let kind = if job { "job" } else { "app" };
+    let root = tempfile::tempdir().unwrap();
+    let records = root.path().join("records");
+    let ebpf = Arc::new(Mutex::new(
+        OnionEbpf::load_embedded(CGROUP_PATH.as_ref()).unwrap(),
+    ));
+    let grill = MockGrill::new();
+    grill.set_honours_cgroup_path(true);
+    grill.set_pid(std::process::id());
+    let (commands, receiver) = mpsc::channel(64);
+    let shutdown = CancellationToken::new();
+    let mut agent = BunAgent::new(
+        grill.clone(),
+        PortAllocator::new(43400, 43500),
+        receiver,
+        shutdown.clone(),
+    );
+    agent.set_records_dir(records.clone());
+    agent.set_volumes_dir(root.path().join("volumes"));
+    agent.set_onion_ebpf(Arc::clone(&ebpf)).await;
+    let task = tokio::spawn(async move { agent.run().await });
+    let _tasks = TestTasks::new(shutdown.clone(), vec![task]);
+    let target_config = reliaburger::config::Config::parse(&format!(
+        "[app.{target_name}]\nimage = 'mock:image'\ncommand = ['sleep', '600']\nnamespace = 'backend'\nport = 8080\n[app.{target_name}.firewall]\nallow_from = ['default/{name}']\n"
+    )).unwrap();
+    let (target_events, mut target_results) = mpsc::channel(64);
+    commands
+        .send(AgentCommand::Deploy {
+            config: target_config,
+            events: target_events,
+        })
+        .await
+        .unwrap();
+    while let Some(event) = target_results.recv().await {
+        assert!(
+            !matches!(event, ApplyEvent::Error { .. }),
+            "target deploy failed: {event:?}"
+        );
+    }
+    grill.block_starts();
+    let config = reliaburger::config::Config::parse(&format!(
+        "[{kind}.{name}]\nimage = 'mock:image'\ncommand = ['sleep', '600']\n"
+    ))
+    .unwrap();
+    let (events, mut results) = mpsc::channel(64);
+    commands
+        .send(AgentCommand::Deploy { config, events })
+        .await
+        .unwrap();
+    tokio::time::timeout(Duration::from_secs(10), grill.wait_for_starts(1))
+        .await
+        .unwrap();
+    let path = reliaburger::grill::cgroup::cgroup_path("default", name, 0);
+    let cgroup = egress::cgroup_id_of_path(&path);
+    let namespace = if let Some(cgroup) = cgroup {
+        firewall::read_firewall_state(&mut ebpf.lock().await.bpf, cgroup, 0)
+            .unwrap()
+            .source_namespace_id
+    } else {
+        None
+    };
+    let action = if let Some(cgroup) = cgroup {
+        firewall::read_firewall_state(
+            &mut ebpf.lock().await.bpf,
+            cgroup,
+            reliaburger::onion::vip::name_to_id(target_name),
+        )
+        .unwrap()
+        .action
+    } else {
+        None
+    };
+    let protected = if let Some(cgroup) = cgroup {
+        egress::egress_enforced(&mut ebpf.lock().await.bpf, cgroup).unwrap()
+    } else {
+        false
+    };
+    let checkpoint = std::fs::read(records.join("egress-owners.checkpoint"))
+        .ok()
+        .and_then(|bytes| serde_json::from_slice::<serde_json::Value>(&bytes).ok());
+    grill.release_starts(1);
+    let mut failed = false;
+    while let Some(event) = results.recv().await {
+        failed |= matches!(event, ApplyEvent::Error { .. });
+    }
+    let (response, result) = oneshot::channel();
+    commands
+        .send(AgentCommand::Retire {
+            app_name: name.into(),
+            namespace: "default".into(),
+            response,
+        })
+        .await
+        .unwrap();
+    result.await.unwrap().unwrap();
+    let (response, result) = oneshot::channel();
+    commands
+        .send(AgentCommand::Retire {
+            app_name: target_name.into(),
+            namespace: "backend".into(),
+            response,
+        })
+        .await
+        .unwrap();
+    result.await.unwrap().unwrap();
+    shutdown.cancel();
+    ebpf.lock().await.detach().unwrap();
+    if path.exists() {
+        std::fs::remove_dir(path).unwrap();
+    }
+    let target_path = reliaburger::grill::cgroup::cgroup_path("backend", target_name, 0);
+    if target_path.exists() {
+        std::fs::remove_dir(target_path).unwrap();
+    }
+    assert!(!failed);
+    assert_eq!(
+        action,
+        Some(firewall::FIREWALL_ALLOW),
+        "explicit allow rule was missing at start"
+    );
+    assert!(
+        !protected,
+        "source-only ownership unexpectedly imposed an egress allowlist"
+    );
+    let namespace_id = reliaburger::onion::vip::name_to_id("default");
+    assert_eq!(
+        namespace,
+        Some(namespace_id),
+        "namespace was missing at start"
+    );
+    let owners = checkpoint
+        .as_ref()
+        .and_then(|value| value["owners"].as_array())
+        .expect("no durable source owner at start");
+    assert!(
+        owners
+            .iter()
+            .any(|owner| owner["instance_id"] == format!("default__{name}-0")
+                && owner["binding"]["phase"] == "Owned"
+                && owner["binding"]["source_namespace"] == namespace_id
+                && owner["binding"]["cgroup_id"].as_u64() == cgroup)
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "requires Linux root and RELIABURGER_EBPF_TESTS=1"]
+async fn source_policy_precedes_portless_application_start() {
+    assert_source_policy_precedes_start(false).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "requires Linux root and RELIABURGER_EBPF_TESTS=1"]
+async fn source_policy_precedes_job_start() {
+    assert_source_policy_precedes_start(true).await;
+}
+
+#[tokio::test]
+#[ignore = "requires Linux root and RELIABURGER_EBPF_TESTS=1"]
+async fn namespace_retirement_keeps_original_ownership_through_recovery() {
+    assert!(ebpf_tests_enabled());
+    let name = "namespace-retirement";
+    let mut fixture = EgressRecoveryFixture::deploy(name).await;
+    freeze_egress_map(&*fixture.ebpf.lock().await, "cgroup_namespace_map");
+    let first = fixture.retire(name).await;
+    let second = fixture.retire(name).await;
+    fixture.crash().await;
+    let (mut recovered, _, _) = fixture.agent().await;
+    let recovery = recovered.adopt_recorded_instances().await;
+    let record = reliaburger::grill::records::record_path(
+        &fixture.root.path().join("records"),
+        &format!("default__{name}-0"),
+    );
+    let retained_record = record.exists();
+    let owners: serde_json::Value = serde_json::from_slice(
+        &std::fs::read(fixture.root.path().join("records/egress-owners.checkpoint")).unwrap(),
+    )
+    .unwrap();
+    let retained_owner = owners["owners"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|owner| owner["binding"]["phase"] == "Owned");
+    fixture.ebpf.lock().await.detach().unwrap();
+    std::fs::remove_dir(reliaburger::grill::cgroup::cgroup_path("default", name, 0)).unwrap();
+    assert!(first.is_err() && second.is_err() && recovery.is_err());
+    assert!(retained_record && retained_owner);
+}
+
+#[tokio::test]
+#[ignore = "requires Linux root and RELIABURGER_EBPF_TESTS=1"]
+async fn namespace_adoption_refuses_missing_original_enforcement() {
+    use reliaburger::sesame::{egress, firewall};
+    assert!(ebpf_tests_enabled());
+    let name = "namespace-adoption";
+    let mut fixture = EgressRecoveryFixture::deploy(name).await;
+    fixture.crash().await;
+    let id = reliaburger::grill::InstanceId(format!("default__{name}-0"));
+    fixture.grill.set_adopt_result(&id, true);
+    let path = reliaburger::grill::cgroup::cgroup_path("default", name, 0);
+    let cgroup = egress::cgroup_id_of_path(&path).unwrap();
+    firewall::delete_cgroup_namespace_entry(&mut fixture.ebpf.lock().await.bpf, cgroup).unwrap();
+    let (mut recovered, _, _) = fixture.agent().await;
+    let result = recovered.adopt_recorded_instances().await;
+    let killed = fixture
+        .grill
+        .calls()
+        .iter()
+        .any(|(operation, instance)| operation == "kill" && instance == &id);
+    fixture.grill.set_adopt_result(&id, false);
+    recovered.adopt_recorded_instances().await.unwrap();
+    fixture.ebpf.lock().await.detach().unwrap();
+    std::fs::remove_dir(path).unwrap();
+    assert!(result.is_err() && killed);
+}
+
+#[tokio::test]
+#[ignore = "requires Linux root and RELIABURGER_EBPF_TESTS=1"]
+async fn source_namespace_loss_fences_a_live_workload() {
+    use reliaburger::sesame::{egress, firewall};
+    assert!(ebpf_tests_enabled());
+    let name = "namespace-live-loss";
+    let mut fixture = EgressRecoveryFixture::prepare_with_policy(name, false, false, false).await;
+    let id = reliaburger::grill::InstanceId(format!("default__{name}-0"));
+    let path = reliaburger::grill::cgroup::cgroup_path("default", name, 0);
+    let cgroup = egress::cgroup_id_of_path(&path).unwrap();
+    firewall::delete_cgroup_namespace_entry(&mut fixture.ebpf.lock().await.bpf, cgroup).unwrap();
+    let stopped = tokio::time::timeout(Duration::from_secs(4), async {
+        loop {
+            if reliaburger::grill::Grill::state(&fixture.grill, &id)
+                .await
+                .unwrap()
+                == reliaburger::grill::ContainerState::Stopped
+            {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .is_ok();
+    fixture.retire(name).await.unwrap();
+    fixture.crash().await;
+    fixture.ebpf.lock().await.detach().unwrap();
+    std::fs::remove_dir(path).unwrap();
+    assert!(
+        stopped,
+        "continued running without original namespace enforcement"
+    );
+}
+
+#[tokio::test]
+#[ignore = "requires Linux root and RELIABURGER_EBPF_TESTS=1"]
+async fn source_namespace_recovery_refuses_an_owner_with_erased_identity() {
+    use reliaburger::sesame::{egress, firewall};
+    assert!(ebpf_tests_enabled());
+    let name = "namespace-erased-owner";
+    let mut fixture = EgressRecoveryFixture::deploy(name).await;
+    fixture.crash().await;
+    let id = reliaburger::grill::InstanceId(format!("default__{name}-0"));
+    fixture.grill.set_adopt_result(&id, true);
+    let path = reliaburger::grill::cgroup::cgroup_path("default", name, 0);
+    let cgroup = egress::cgroup_id_of_path(&path).unwrap();
+    firewall::delete_cgroup_namespace_entry(&mut fixture.ebpf.lock().await.bpf, cgroup).unwrap();
+    let checkpoint = fixture.root.path().join("records/egress-owners.checkpoint");
+    let mut document: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&checkpoint).unwrap()).unwrap();
+    document["owners"][0]["binding"]["source_namespace"] = serde_json::Value::Null;
+    std::fs::write(checkpoint, serde_json::to_vec(&document).unwrap()).unwrap();
+    let (mut recovered, _, _) = fixture.agent().await;
+    let result = recovered.adopt_recorded_instances().await;
+    let retained =
+        reliaburger::grill::records::record_path(&fixture.root.path().join("records"), &id.0)
+            .exists();
+    fixture.ebpf.lock().await.detach().unwrap();
+    std::fs::remove_dir(path).unwrap();
+    assert!(
+        result.is_err(),
+        "adopted an owner with its namespace identity erased"
+    );
+    assert!(retained);
+}
+
+#[tokio::test]
+#[ignore = "requires Linux root and RELIABURGER_EBPF_TESTS=1"]
+async fn source_only_checkpoint_failure_prevents_execution() {
+    use reliaburger::sesame::{egress, firewall};
+    assert!(ebpf_tests_enabled());
+    let name = "source-checkpoint-failure";
+    let mut fixture = EgressRecoveryFixture::prepare_with_policy(name, true, false, false).await;
+    let started = fixture
+        .grill
+        .calls()
+        .iter()
+        .any(|(operation, _)| operation == "start");
+    let path = reliaburger::grill::cgroup::cgroup_path("default", name, 0);
+    let cgroup = egress::cgroup_id_of_path(&path).unwrap();
+    let namespace = firewall::read_firewall_state(&mut fixture.ebpf.lock().await.bpf, cgroup, 0)
+        .unwrap()
+        .source_namespace_id;
+    fixture.crash().await;
+    fixture.ebpf.lock().await.detach().unwrap();
+    std::fs::remove_dir(path).unwrap();
+    assert!(!started && namespace.is_none());
+}
+
+#[tokio::test]
+#[ignore = "requires Linux root and RELIABURGER_EBPF_TESTS=1"]
+async fn source_only_adoption_preserves_namespace_without_an_egress_allowlist() {
+    use reliaburger::bun::agent::AgentCommand;
+    use reliaburger::sesame::{egress, firewall};
+    assert!(ebpf_tests_enabled());
+    let name = "source-only-adoption";
+    let mut fixture = EgressRecoveryFixture::prepare_with_policy(name, false, false, false).await;
+    fixture.crash().await;
+    let id = reliaburger::grill::InstanceId(format!("default__{name}-0"));
+    fixture.grill.set_adopt_result(&id, true);
+    let (mut recovered, commands, shutdown) = fixture.agent().await;
+    assert_eq!(recovered.adopt_recorded_instances().await.unwrap(), 1);
+    let path = reliaburger::grill::cgroup::cgroup_path("default", name, 0);
+    let cgroup = egress::cgroup_id_of_path(&path).unwrap();
+    let namespace = firewall::read_firewall_state(&mut fixture.ebpf.lock().await.bpf, cgroup, 0)
+        .unwrap()
+        .source_namespace_id;
+    let allowlist = egress::egress_enforced(&mut fixture.ebpf.lock().await.bpf, cgroup).unwrap();
+    let task = tokio::spawn(async move { recovered.run().await });
+    let (response, result) = tokio::sync::oneshot::channel();
+    commands
+        .send(AgentCommand::Retire {
+            app_name: name.into(),
+            namespace: "default".into(),
+            response,
+        })
+        .await
+        .unwrap();
+    result.await.unwrap().unwrap();
+    shutdown.cancel();
+    task.await.unwrap();
+    fixture.ebpf.lock().await.detach().unwrap();
+    std::fs::remove_dir(path).unwrap();
+    assert_eq!(
+        namespace,
+        Some(reliaburger::onion::vip::name_to_id("default"))
+    );
+    assert!(!allowlist);
 }

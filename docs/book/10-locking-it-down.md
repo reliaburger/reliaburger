@@ -1304,3 +1304,47 @@ The successful case checks actual backend absence and repeated retirement.
 Durable service-map ownership across Bun death and per-instance rollout updates
 remain separate integration work; this check establishes the live Stop/Retire
 boundary.
+
+### Publish the source before starting it
+
+Stop a portless worker at its runtime Start call and inspect the kernel. Our
+first regression found no namespace entry. The same happened for a job. Updating
+rules after startup leaves time for the first request to bypass namespace
+isolation, so the agent now prepares the cgroup and publishes its source policy
+before allowing Start. Existing services' explicit allow rules must also be present
+then: otherwise an authorised first connection races reconciliation and fails.
+The controlled-start tests pause both an application and a job at this boundary,
+then inspect the actual namespace and grant maps.
+
+The private policy checkpoint now records `source_namespace: Option<u32>` beside
+the original OCI input, runtime, cgroup identity and kernel boot identity.
+`Some(id)` records namespace ownership. An empty external allowlist doesn't mean
+we should deny all outgoing traffic: source ownership and external egress
+filtering answer different questions. The checkpoint can own the former without
+enabling the latter. Jobs publish their original OCI input before taking this
+same pre-start path. The internal command returns an error if the agent loop
+closes, so losing the policy owner cannot grant permission to execute.
+
+We write the checkpoint before touching kernel maps. An uncertain write fences
+later mutation until recovery reads the file again. Reconciliation includes
+these prepared owners even when the runtime can't yet report a running process;
+otherwise a concurrent reconciliation could delete the very entry Start needs.
+
+Recovery restores the source inventory before adoption. Retained map entries
+must belong to original owners. A surviving workload must still have its original
+cgroup and namespace entry, and a required source identity cannot disappear from
+the checkpoint. We refuse unknown ownership instead of treating an empty
+in-memory set as permission to sweep kernel entries. Live monitoring also stops
+executing workloads whose namespace binding or required hooks disappear.
+
+Retirement removes a source's firewall grants before removing its namespace
+entry. Only then does the checkpoint record `Retired`. A failed deletion keeps
+the owner and adoption record, even through another Bun recovery attempt. The
+same source-only policy must survive without gaining an external egress flag;
+the controlled-start tests check that distinction directly.
+
+Checkpoint schema 2 and durable state 23 make this boundary explicit. Older
+development records don't contain the required source evidence and need a fresh
+cluster. Init-container cgroup lifetime and the production persistent loader
+still need their own physical qualification; this implementation doesn't waive
+those release gates.

@@ -34,6 +34,10 @@ pub struct MockGrill {
     block_create: Arc<AtomicBool>,
     create_started: Arc<tokio::sync::Semaphore>,
     create_release: Arc<tokio::sync::Semaphore>,
+    /// Deterministic gate before the workload's start returns.
+    block_start: Arc<AtomicBool>,
+    start_started: Arc<tokio::sync::Semaphore>,
+    start_release: Arc<tokio::sync::Semaphore>,
     /// Deterministic gate for testing unfinished deployment rollback.
     block_kill: Arc<AtomicBool>,
     kill_started: Arc<tokio::sync::Semaphore>,
@@ -70,6 +74,9 @@ impl Default for MockGrill {
             block_create: Arc::new(AtomicBool::new(false)),
             create_started: Arc::new(tokio::sync::Semaphore::new(0)),
             create_release: Arc::new(tokio::sync::Semaphore::new(0)),
+            block_start: Arc::new(AtomicBool::new(false)),
+            start_started: Arc::new(tokio::sync::Semaphore::new(0)),
+            start_release: Arc::new(tokio::sync::Semaphore::new(0)),
             block_kill: Arc::new(AtomicBool::new(false)),
             kill_started: Arc::new(tokio::sync::Semaphore::new(0)),
             kill_release: Arc::new(tokio::sync::Semaphore::new(0)),
@@ -245,6 +252,29 @@ impl MockGrill {
         self.create_release.add_permits(count);
     }
 
+    /// Hold future `start()` calls until [`Self::release_starts`] is called.
+    #[allow(dead_code)]
+    pub fn block_starts(&self) {
+        self.block_start.store(true, Ordering::SeqCst);
+    }
+
+    /// Wait until `count` blocked `start()` calls have started.
+    #[allow(dead_code)]
+    pub async fn wait_for_starts(&self, count: u32) {
+        let permits = Arc::clone(&self.start_started)
+            .acquire_many_owned(count)
+            .await
+            .expect("start gate closed");
+        permits.forget();
+    }
+
+    /// Release `count` calls held by [`Self::block_starts`].
+    #[allow(dead_code)]
+    pub fn release_starts(&self, count: usize) {
+        self.block_start.store(false, Ordering::SeqCst);
+        self.start_release.add_permits(count);
+    }
+
     /// Hold future `kill()` calls until [`Self::release_kills`] is called.
     #[allow(dead_code)]
     pub fn block_kills(&self) {
@@ -311,6 +341,15 @@ impl super::Grill for MockGrill {
             .lock()
             .unwrap()
             .push(("start".to_string(), instance.clone()));
+        if self.block_start.load(Ordering::SeqCst) {
+            self.start_started.add_permits(1);
+            let permit = self
+                .start_release
+                .acquire()
+                .await
+                .expect("start gate closed");
+            permit.forget();
+        }
         if self.fail_start.load(Ordering::SeqCst) {
             return Err(GrillError::StartFailed {
                 instance: instance.clone(),

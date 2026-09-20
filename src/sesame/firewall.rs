@@ -265,7 +265,34 @@ mod maps {
                     map_name: "cgroup_namespace_map",
                 })?,
         )?;
-        Ok(map.keys().filter_map(|k| k.ok()).collect())
+        map.keys().collect::<Result<_, _>>().map_err(Into::into)
+    }
+
+    /// Read all firewall keys without treating a failed observation as absence.
+    pub fn list_firewall_keys(
+        bpf: &mut aya::Ebpf,
+    ) -> Result<std::collections::HashSet<FirewallKey>, FirewallMapError> {
+        let map: HashMap<_, FirewallKey, FirewallValue> = HashMap::try_from(
+            bpf.map_mut("firewall_map")
+                .ok_or(FirewallMapError::MapNotFound {
+                    map_name: "firewall_map",
+                })?,
+        )?;
+        map.keys().collect::<Result<_, _>>().map_err(Into::into)
+    }
+
+    /// Retire one original source's allow rules before removing its namespace.
+    /// A failure retains the caller's ownership obligation for a later retry.
+    pub fn delete_cgroup_firewall_state(
+        bpf: &mut aya::Ebpf,
+        cgroup_id: u64,
+    ) -> Result<(), FirewallMapError> {
+        for key in list_firewall_keys(bpf)? {
+            if key.src_cgroup_id == cgroup_id {
+                delete_firewall_entry(bpf, key)?;
+            }
+        }
+        delete_cgroup_namespace_entry(bpf, cgroup_id)
     }
 
     /// Reconcile namespace and firewall entries, retaining keys until removal.

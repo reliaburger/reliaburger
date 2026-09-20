@@ -1,4 +1,4 @@
-//! Durable egress ownership published before any kernel policy mutation.
+//! Durable namespace and egress ownership before any kernel policy mutation.
 
 use std::collections::HashMap;
 use std::io::{self, Read};
@@ -33,6 +33,8 @@ pub(super) struct EgressBinding {
     pub phase: PolicyPhase,
     /// Original kernel cgroup identity, retained even after runtime deletion.
     pub cgroup_id: u64,
+    /// Original namespace identity, including workloads without an egress policy.
+    pub source_namespace: Option<u32>,
     /// Original allowlist, re-resolved periodically while the instance is live.
     pub allow: Vec<String>,
     /// Runtime responsible for proving execution and retirement.
@@ -71,7 +73,7 @@ fn validate(owners: &HashMap<InstanceId, EgressBinding>) -> io::Result<()> {
                 .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-'))
             || owner.cgroup_id == 0
             || owner.boot_id.0 == [0; 16]
-            || owner.allow.is_empty()
+            || (owner.allow.is_empty() && owner.source_namespace.is_none())
             || owner.allow.iter().any(String::is_empty)
             || path.is_none_or(|path| {
                 !path.is_absolute()
@@ -127,7 +129,7 @@ pub(super) fn load(directory: &Path) -> io::Result<HashMap<InstanceId, EgressBin
         return Err(io::Error::other("egress ownership checkpoint is too large"));
     }
     let checkpoint: Checkpoint = serde_json::from_slice(&bytes)?;
-    if checkpoint.schema != 1 {
+    if checkpoint.schema != 2 {
         return Err(io::Error::other("unsupported egress ownership schema"));
     }
     let mut owners = HashMap::new();
@@ -155,7 +157,7 @@ pub(super) fn persist(
         })
         .collect();
     owners.sort_by(|left, right| left.instance_id.0.cmp(&right.instance_id.0));
-    let bytes = serde_json::to_vec(&Checkpoint { schema: 1, owners })?;
+    let bytes = serde_json::to_vec(&Checkpoint { schema: 2, owners })?;
     if bytes.len() as u64 > MAX_CHECKPOINT_BYTES {
         return Err(io::Error::other("egress ownership checkpoint is too large"));
     }
@@ -217,6 +219,7 @@ mod tests {
             EgressBinding {
                 phase: PolicyPhase::Owned,
                 cgroup_id: 42,
+                source_namespace: None,
                 allow: vec!["203.0.113.1:443".into()],
                 runtime: RuntimeKind::Runc,
                 original_spec,
@@ -224,6 +227,32 @@ mod tests {
                 resolved: Vec::new(),
             },
         )])
+    }
+
+    #[test]
+    fn source_only_ownership_survives_recovery_without_an_external_allowlist() {
+        let root = tempfile::tempdir().unwrap();
+        let mut expected = owners();
+        let owner = expected.values_mut().next().unwrap();
+        owner.allow.clear();
+        owner.source_namespace = Some(crate::onion::vip::name_to_id("default"));
+        persist(root.path(), expected.clone()).unwrap();
+        assert_eq!(load(root.path()).unwrap(), expected);
+        expected.values_mut().next().unwrap().phase = PolicyPhase::Retired;
+        persist(root.path(), expected.clone()).unwrap();
+        assert_eq!(load(root.path()).unwrap(), expected);
+    }
+
+    #[test]
+    fn old_policy_schema_cannot_supply_source_ownership() {
+        let root = tempfile::tempdir().unwrap();
+        persist(root.path(), owners()).unwrap();
+        let path = root.path().join(CHECKPOINT_FILE);
+        let mut document: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        document["schema"] = 1.into();
+        std::fs::write(path, serde_json::to_vec(&document).unwrap()).unwrap();
+        assert!(load(root.path()).is_err());
     }
 
     #[test]

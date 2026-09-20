@@ -392,3 +392,44 @@ and per-instance rolling backend replacement remain open.
 Qualification: all 47 physical kernel cases pass (10.13s), including repeated
 refusal and confirmed backend absence. All 160 agent tests pass on macOS/Linux
 (17.835s/22.915s), with strict all-target/all-feature Clippy and formatting on both.
+
+## Source ownership before execution
+
+Both controlled-start regressions reproduce missing namespace identity at the
+application/job execution boundary. Extending them to an explicitly allowed
+cross-namespace destination also reproduces missing grants before Start.
+Checkpoint schema 2 records original source namespaces, including workloads with
+no external allowlist. Source ownership does not enable external egress filtering.
+The agent installs the namespace and existing services' grants before allowing
+Start, propagating map failures. Recovery restores owned source keys before
+adoption and refuses unowned retained entries or missing live enforcement.
+Retirement removes a source's grants before its namespace, preserving the
+checkpoint and adoption record on failure. Unknown namespace entries are no
+longer swept merely because memory lacks an owner.
+
+Source-only live monitoring now stops workloads when their original namespace
+binding or hooks disappear. All 55 physical kernel cases pass (12.66s), including
+checkpoint refusal, source-only adoption, erased owner identity, live namespace
+loss and repeated frozen-map recovery. All 174 affected library tests pass on
+macOS/Linux (17.877s/25.116s), both binary compatibility tests pass, and strict
+all-target/all-feature Clippy and formatting pass on both. State 23 and policy
+checkpoint schema 2 exclude older development records. Hosted CI passes all 19
+executed checks at the preceding `e4eab5c` checkpoint (two skipped); this feature
+still needs its own hosted run.
+
+Actual runtime cancellation/retry boundaries remain open. Inspect the
+init-container path separately: it currently shares the
+parent's cgroup and needs physical qualification that init exit cannot invalidate
+the parent's prepared policy before the main process starts. Do not select the
+persistent production paths until these boundaries are covered.
+
+## Remaining destination identity qualification
+
+Inspection found that local registration and merged remote service entries hash
+only the bare application name into the firewall destination ID. Because a grant
+key contains the source cgroup and destination ID, two same-named destinations in
+different namespaces may share an allow decision. Reproduce this with an allowed
+and forbidden destination before changing the identity representation. Include
+remote entries and collisions in the chosen representation; hashing a qualified
+name alone still needs a collision disposition. This remains an open correctness
+item, separate from source ownership and durable backend retirement.

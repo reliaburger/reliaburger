@@ -19,12 +19,18 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
                 .await
                 .map_err(|error| BunError::AdoptionState(error.to_string()))?
                 .map_err(|error| BunError::AdoptionState(error.to_string()))?;
+        #[cfg(all(feature = "ebpf", target_os = "linux"))]
+        let require_source =
+            self.onion_ebpf.is_some() && self.supervisor.grill().honours_cgroup_path();
+        #[cfg(not(all(feature = "ebpf", target_os = "linux")))]
+        let require_source = false;
         for record in records {
-            if record
-                .app_spec
-                .as_ref()
-                .and_then(|spec| spec.egress.as_ref())
-                .is_some_and(|policy| !policy.allow.is_empty())
+            if (require_source
+                || record
+                    .app_spec
+                    .as_ref()
+                    .and_then(|spec| spec.egress.as_ref())
+                    .is_some_and(|policy| !policy.allow.is_empty()))
                 && !owners.contains_key(&crate::grill::InstanceId(record.instance_id.clone()))
             {
                 return Err(BunError::AdoptionState(format!(
@@ -34,6 +40,11 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
             }
         }
         for (id, owner) in &owners {
+            if require_source && owner.source_namespace.is_none() {
+                return Err(BunError::AdoptionState(format!(
+                    "source owner {id} has no original namespace identity"
+                )));
+            }
             if owner.runtime != self.supervisor.grill().runtime_kind() {
                 return Err(BunError::AdoptionState(format!(
                     "egress owner {id} belongs to another runtime"
@@ -46,7 +57,12 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
                         .app_spec
                         .as_ref()
                         .and_then(|spec| spec.egress.as_ref())
-                        .is_none_or(|policy| policy.allow != owner.allow)
+                        .map(|policy| policy.allow.as_slice())
+                        .unwrap_or_default()
+                        != owner.allow.as_slice()
+                    || owner.source_namespace.is_some_and(|namespace| {
+                        namespace != crate::onion::vip::name_to_id(&record.namespace)
+                    })
                 {
                     return Err(BunError::AdoptionState(format!(
                         "egress owner {id} conflicts with adoption input"
@@ -75,6 +91,38 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
                 if owner.phase == PolicyPhase::Owned {
                     owner.resolved = Self::resolve_owned_egress(&owner.allow).await;
                 }
+            }
+            if let Some(handle) = self.onion_ebpf.clone() {
+                let boot = tokio::task::spawn_blocking(crate::bun::egress_owners::boot_id)
+                    .await
+                    .map_err(|error| BunError::AdoptionState(error.to_string()))?
+                    .map_err(|error| BunError::AdoptionState(error.to_string()))?;
+                let sources: std::collections::HashSet<_> = owners
+                    .values()
+                    .filter(|owner| {
+                        owner.phase == PolicyPhase::Owned
+                            && owner.boot_id == boot
+                            && owner.source_namespace.is_some()
+                    })
+                    .map(|owner| owner.cgroup_id)
+                    .collect();
+                let mut handle = handle.lock().await;
+                let namespaces =
+                    crate::sesame::firewall::list_cgroup_namespace_keys(&mut handle.bpf)
+                        .map_err(|error| BunError::AdoptionState(error.to_string()))?;
+                let rules = crate::sesame::firewall::list_firewall_keys(&mut handle.bpf)
+                    .map_err(|error| BunError::AdoptionState(error.to_string()))?;
+                if !namespaces.is_subset(&sources)
+                    || rules
+                        .iter()
+                        .any(|key| !sources.contains(&key.src_cgroup_id))
+                {
+                    return Err(BunError::AdoptionState(
+                        "kernel source entries have no original ownership".into(),
+                    ));
+                }
+                self.cgroup_ns_bpf_keys = sources;
+                self.firewall_bpf_keys = rules;
             }
             self.egress_bindings = owners;
             self.egress_store_uncertain = false;
@@ -192,7 +240,11 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
             .as_ref()
             .and_then(|spec| spec.egress.as_ref())
             .is_some_and(|policy| !policy.allow.is_empty());
-        if !protected {
+        let source = self
+            .egress_bindings
+            .get(id)
+            .and_then(|binding| binding.source_namespace);
+        if !protected && source.is_none() {
             return Ok(());
         }
         let fail = |reason: &str| {
@@ -228,10 +280,22 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
             || !ebpf.connect6_attached()
             || !ebpf.sendmsg4_attached()
             || !ebpf.sendmsg6_attached()
-            || !crate::sesame::egress::egress_enforced(&mut ebpf.bpf, binding.cgroup_id)
-                .map_err(|error| BunError::AdoptionState(error.to_string()))?
+            || (protected
+                && !crate::sesame::egress::egress_enforced(&mut ebpf.bpf, binding.cgroup_id)
+                    .map_err(|error| BunError::AdoptionState(error.to_string()))?)
         {
             return Err(fail("original enforcement is unavailable"));
+        }
+        if let Some(namespace) = source {
+            let live =
+                crate::sesame::firewall::read_firewall_state(&mut ebpf.bpf, binding.cgroup_id, 0)
+                    .map_err(|error| BunError::AdoptionState(error.to_string()))?;
+            if live.source_namespace_id != Some(namespace) {
+                return Err(fail("original namespace enforcement is unavailable"));
+            }
+        }
+        if !protected {
+            return Ok(());
         }
         let cgroup_id = binding.cgroup_id;
         drop(ebpf);
