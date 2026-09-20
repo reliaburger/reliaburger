@@ -182,3 +182,13 @@ lease schema 5. HTTP admission, local transaction fencing, replicated image
 writers, image-reference ownership checks and actual node cleanup remain open.
 No public OCI request may claim this work is complete until those paths and the
 physical cleanup cases pass.
+
+## Peer repository identity prerequisite
+
+Peer transfers no longer flatten nested repository names. The old workaround
+predated nested OCI routing and would bypass a reserved lease namespace on the
+receiving node. A real HTTP regression fails with an upload 404 before the fix,
+then verifies upload, HEAD inventory and digest-checked download at the exact
+nested path. All 17 replication, nine pull and 17 cluster integration cases
+pass on macOS/Linux, with strict Clippy. No format changes. Receiver-side lease
+admission and confirmation remain part of the integration work above.

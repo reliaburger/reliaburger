@@ -60,20 +60,6 @@ pub fn select_peers(
     candidates.into_iter().take(count).cloned().collect()
 }
 
-/// Flatten a repository name for peer blob-transfer URLs.
-///
-/// Blob endpoints are content-addressed — the receiving registry
-/// ignores the `{name}` segment entirely — but our axum routes only
-/// match a single path segment, so multi-segment names (`library/
-/// nginx`, `cache/<host>/<repo>`) would 404 on routing alone. Peer
-/// transfers therefore flatten the name. Manifest *blobs* travel over
-/// these URLs like any layer (REG1), but always by digest; the
-/// catalogue itself travels via Raft, so nothing round-trips through
-/// the flattened form.
-pub(crate) fn peer_blob_repo(repository: &str) -> String {
-    repository.replace('/', "-")
-}
-
 /// The result of a replication attempt.
 #[derive(Debug)]
 pub struct ReplicationResult {
@@ -112,7 +98,7 @@ pub async fn check_peer_has_layers(
         let url = format!(
             "{}/v2/{}/blobs/{}",
             peer.base_url,
-            peer_blob_repo(repository),
+            repository,
             digest.as_str()
         );
         let result = tokio::time::timeout(timeout, client.head(&url).send()).await;
@@ -183,11 +169,7 @@ pub async fn replicate_layer_to_peer(
     timeout: Duration,
 ) -> Result<(), PickleError> {
     // Initiate upload
-    let initiate_url = format!(
-        "{}/v2/{}/blobs/uploads/",
-        peer.base_url,
-        peer_blob_repo(repository)
-    );
+    let initiate_url = format!("{}/v2/{}/blobs/uploads/", peer.base_url, repository);
     let resp = tokio::time::timeout(timeout, client.post(&initiate_url).send())
         .await
         .map_err(|_| {
@@ -500,6 +482,81 @@ mod tests {
                 base_url: "http://10.0.1.4:5000".to_string(),
             },
         ]
+    }
+
+    #[tokio::test]
+    async fn peer_transfers_preserve_the_repository_namespace() {
+        use axum::{
+            Router,
+            http::StatusCode,
+            routing::{get, post},
+        };
+        let bytes = b"namespace-owned layer";
+        let digest = super::super::store::compute_sha256(bytes);
+        let blob_path = format!("/v2/rbtest-owned/team/web/blobs/{}", digest.as_str());
+        let app = Router::new()
+            .route(
+                "/v2/rbtest-owned/team/web/blobs/uploads/",
+                post(|| async {
+                    (
+                        StatusCode::ACCEPTED,
+                        [("location", "/v2/rbtest-owned/team/web/blobs/uploads/owned")],
+                    )
+                }),
+            )
+            .route(
+                "/v2/rbtest-owned/team/web/blobs/uploads/owned",
+                axum::routing::put(|body: axum::body::Bytes| async move {
+                    assert_eq!(body.as_ref(), b"namespace-owned layer");
+                    StatusCode::CREATED
+                }),
+            )
+            .route(&blob_path, get(|| async { "namespace-owned layer" }));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        let peer = Peer {
+            node_id: 1,
+            base_url: format!("http://{address}"),
+        };
+        let client = reqwest::Client::new();
+        let timeout = Duration::from_secs(2);
+        let result = replicate_layer_to_peer(
+            &peer,
+            "rbtest-owned/team/web",
+            &digest,
+            bytes,
+            &client,
+            timeout,
+        )
+        .await;
+        // Join the server on a failed assertion too; it owns no detached fixture.
+        if let Err(error) = result {
+            server.abort();
+            let _ = server.await;
+            panic!("nested peer upload failed: {error}");
+        }
+        let found =
+            check_peer_has_layers(&peer, "rbtest-owned/team/web", &[&digest], &client, timeout)
+                .await;
+        assert!(found.contains(digest.as_str()));
+        let directory = tempfile::tempdir().unwrap();
+        let store = BlobStore::new(directory.path());
+        super::super::pull::pull_layer_from_peer(
+            &peer,
+            "rbtest-owned/team/web",
+            &digest,
+            &store,
+            &client,
+            timeout,
+        )
+        .await
+        .unwrap();
+        assert_eq!(store.read_blob(&digest).unwrap(), bytes);
+        server.abort();
+        let _ = server.await;
     }
 
     // --- REG6: same-origin redirect constraint ---

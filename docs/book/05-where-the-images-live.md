@@ -1068,3 +1068,16 @@ request admission, replication and local upload/catalogue deletion into the
 protocol. Those callers must acquire the receipt before writing and retain
 transaction ownership until their mutation finishes. We track that integration
 separately rather than counting the schema as a finished cleanup feature.
+
+### Keeping repository names intact between peers
+
+`rbtest-run1/team/web` must keep that name when a node copies its layers.
+An old workaround replaced slashes with hyphens because the original HTTP
+router accepted only one path segment. The router has supported nested
+repositories for some time, but the workaround remained. That would move a
+leased upload outside the namespace which owns it.
+
+Peer HEAD, GET and upload requests now preserve the full repository path. The
+regression serves only the exact nested path: upload used to receive 404, and
+now upload, inventory and verified download all succeed. Content-addressed blob
+storage stays shared; it doesn't excuse losing the request's repository identity.

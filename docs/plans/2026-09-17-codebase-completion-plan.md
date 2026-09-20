@@ -944,6 +944,13 @@ contract; HTTP admission, cancellation-safe writer fencing, image-reference
 ownership, replication and physical repository cleanup remain open in the
 [registry plan](2026-09-19-registry-retirement.md).
 
+**Peer namespace prerequisite (20 September):** Remove the obsolete slash-to-
+hyphen repository rewrite in peer uploads, inventory and downloads. The router
+already accepts nested paths; flattening would bypass leased repository
+admission. A real HTTP nested-path test fails before the fix. All 17 replication,
+nine pull and 17 cluster integration cases and strict Clippy pass on both
+platforms. Registry lease integration remains open.
+
 Remaining resource contracts, each in its own commit: registry uploads/repositories
 and process identity/pre-adoption recovery. Managed volume/mount cleanup is
 implemented and qualified as recorded above. Node effects already use C06 reservations
