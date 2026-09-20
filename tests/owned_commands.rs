@@ -138,10 +138,17 @@ async fn oversized_output_preserves_confirmed_retirement() {
         .unwrap();
     owner.start(&id).await.unwrap();
     let output = owner.wait(&id, Duration::from_secs(15)).await;
-    assert!(matches!(
-        output,
-        Err(reliaburger::grill::command::CommandError::OutputTooLarge)
-    ));
+    match output {
+        Err(reliaburger::grill::command::CommandError::OutputTooLarge) => {}
+        Err(error) => panic!("unexpected output error: {error:?}"),
+        Ok(output) => panic!(
+            "output unexpectedly accepted: exit {:?}, stdout {} bytes, stderr {} bytes ({})",
+            output.exit_code,
+            output.stdout.len(),
+            output.stderr.len(),
+            String::from_utf8_lossy(&output.stderr[..output.stderr.len().min(512)])
+        ),
+    }
     assert_eq!(
         owner.state(&id).await.unwrap(),
         CommandState::Retired { exit_code: Some(0) }
@@ -280,4 +287,134 @@ async fn pruning_refuses_redirected_garbage_storage_and_preserves_active_records
     assert!(owner.prune_retired().await.is_err());
     assert_eq!(std::fs::read_to_string(marker).unwrap(), "unrelated");
     assert_eq!(owner.inventory().await.unwrap(), vec![id]);
+}
+
+struct InterruptedControl {
+    socket: std::path::PathBuf,
+    parked: std::path::PathBuf,
+    listener: Option<tokio::net::UnixListener>,
+}
+
+impl InterruptedControl {
+    fn new(owner: &OwnedCommands, id: &reliaburger::grill::command::CommandId) -> Self {
+        let directory = owner.log_stem(id).unwrap().parent().unwrap().to_path_buf();
+        let record: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(directory.join("owner.json")).unwrap()).unwrap();
+        let parent = std::path::PathBuf::from(format!(
+            "/tmp/rbp-{}-{}",
+            nix::unistd::geteuid(),
+            record["nonce"].as_str().unwrap()
+        ));
+        let socket = parent.join("control.sock");
+        let parked = parent.join("interrupted.sock");
+        std::fs::rename(&socket, &parked).unwrap();
+        let mut interruption = Self {
+            socket,
+            parked,
+            listener: None,
+        };
+        interruption.listener = Some(tokio::net::UnixListener::bind(&interruption.socket).unwrap());
+        interruption
+    }
+}
+
+impl Drop for InterruptedControl {
+    fn drop(&mut self) {
+        self.listener.take();
+        let _ = std::fs::remove_file(&self.socket);
+        let _ = std::fs::rename(&self.parked, &self.socket);
+    }
+}
+
+#[tokio::test]
+async fn command_wait_recovers_from_a_reset_without_inventing_retirement() {
+    use tokio::io::AsyncReadExt;
+    let root = tempfile::tempdir().unwrap();
+    let owner = commands(root.path());
+    let release = root.path().join("release");
+    let id = owner
+        .prepare(
+            Path::new("/bin/sh"),
+            &[
+                "-c".into(),
+                format!(
+                    "while [ ! -f '{}' ]; do sleep 0.01; done; printf confirmed",
+                    release.display()
+                ),
+            ],
+            &BTreeMap::new(),
+        )
+        .await
+        .unwrap();
+    owner.start(&id).await.unwrap();
+    let interruption = InterruptedControl::new(&owner, &id);
+    let waiting_owner = owner.clone();
+    let waiting_id = id.clone();
+    let mut waiting = tokio::spawn(async move {
+        waiting_owner
+            .wait(&waiting_id, Duration::from_secs(15))
+            .await
+    });
+    let (mut connection, _) = tokio::time::timeout(
+        Duration::from_secs(5),
+        interruption.listener.as_ref().unwrap().accept(),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    // Close with unread request bytes, forcing a reset while the actual owner
+    // and workload remain live. Their durable record still says Running.
+    connection.read_exact(&mut [0u8; 1]).await.unwrap();
+    drop(connection);
+    let early = tokio::time::timeout(Duration::from_millis(100), &mut waiting).await;
+    drop(interruption);
+    std::fs::write(release, b"release").unwrap();
+    let returned_early = early.is_ok();
+    let output = if returned_early {
+        owner.wait(&id, Duration::from_secs(15)).await.unwrap()
+    } else {
+        waiting.await.unwrap().unwrap()
+    };
+    owner.retire(&id, Duration::from_secs(5)).await.unwrap();
+    assert!(
+        !returned_early,
+        "transport reset ended the bounded wait: {early:?}"
+    );
+    assert_eq!(output.exit_code, Some(0));
+    assert_eq!(output.stdout, b"confirmed");
+}
+
+#[tokio::test]
+async fn unreachable_command_owner_expires_the_wait_and_retains_original_evidence() {
+    let root = tempfile::tempdir().unwrap();
+    let owner = commands(root.path());
+    let id = owner
+        .prepare(Path::new("/bin/sleep"), &["60".into()], &BTreeMap::new())
+        .await
+        .unwrap();
+    owner.start(&id).await.unwrap();
+    let record = owner
+        .log_stem(&id)
+        .unwrap()
+        .parent()
+        .unwrap()
+        .join("owner.json");
+    let original = std::fs::read(&record).unwrap();
+    let mut interruption = InterruptedControl::new(&owner, &id);
+    interruption.listener.take();
+    let result = owner.wait(&id, Duration::from_millis(100)).await;
+    let retained = std::fs::read(record).unwrap() == original;
+    drop(interruption);
+    owner.retire(&id, Duration::from_secs(5)).await.unwrap();
+    assert!(
+        matches!(
+            result,
+            Err(reliaburger::grill::command::CommandError::TimedOut { .. })
+        ),
+        "{result:?}"
+    );
+    assert!(
+        retained,
+        "unreachable owner lost its original Running evidence"
+    );
 }

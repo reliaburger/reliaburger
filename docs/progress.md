@@ -45,8 +45,9 @@ The subsequent cron checkpoint changes require their own hosted validation.
 
 Hosted CI at `97aecda` passes 3,905 macOS cases and fails the owned-command
 oversized-output check. The same failure reproduces in 12 of 200 concurrent
-native runs; 100 isolated runs pass. Its cause remains under investigation and
-blocks current-head release qualification. Build & Release passes at that head.
+native runs; diagnostics identify transient BrokenPipe errors during status
+polling. Bounded polling recovery is recorded under C34 below. Build & Release
+passes at that head; current-head hosted qualification remains separate.
 
 Hosted privileged Linux CI at `a5c1890` exposed an egress health-check race:
 a Pending/Preparing workload was fenced before its pre-start policy could be
@@ -182,6 +183,7 @@ Buildah-absence cases execute in isolated child environments on the equipped VM.
   - [ ] Recover runtime/discovery resources created before their first adoption record, including physical process-death qualification. The [OCI ownership plan](plans/2026-09-20-oci-launch-ownership.md) records the remaining evidence and implementation order.
     - [ ] Persist and supervise external runtime commands before activation, retaining their complete inventory and uncertain cleanup obligations.
       - [x] Add the explicit owned-command adapter with durable input, complete inventory, actual output/exit evidence and bounded waits that retain ownership. Five new contracts plus all owner/recovery checks pass (42 macOS/43 Linux), with strict Clippy on both. Production OCI wiring and lifecycle fencing remain separate.
+      - [x] Retry transient owner-control failures within an external command's existing wait deadline, requiring positive retirement before returning output. Hosted macOS's oversized-output failure reproduces locally under load; both deterministic transport/deadline regressions fail before repair. Afterwards, 200 concurrent output checks pass, as do 53 macOS/54 Linux command, process and lifecycle-fencing tests, with strict Clippy on both. Invalid ownership still refuses and unknown commands retain their original evidence.
     - [x] Scope production Runc bundles/state to the node data directory and use its actual selected image cache. The configured-path regression fails first; independent bundle preparation passes. All 27 macOS/31 Linux startup, compatibility and real Bun-crash cases pass with strict Clippy. The three actual rootful image-registry catalogue cases pass with confirmed cleanup (38.19s). State 20 requires fresh development state.
     - [x] Refuse duplicate Runc preparation while an entry still owns the instance, and refuse existing OCI state before any bundle mutation. Both rootless overwrite regressions fail first; all 304 selected Linux runtime tests pass, with strict Clippy on Linux and macOS. Confirmed retirement still permits replacement.
     - [ ] Journal original Runc specifications and generations before preparation; retain lifecycle guards through cancelled callers and blocking workers.

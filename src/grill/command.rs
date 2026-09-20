@@ -204,17 +204,35 @@ impl OwnedCommands {
 
     async fn terminal(&self, id: &CommandId) -> Result<CommandState, CommandError> {
         loop {
-            match self.state(id).await? {
-                state @ (CommandState::Cancelled | CommandState::Retired { .. }) => {
+            match self.state(id).await {
+                Ok(state @ (CommandState::Cancelled | CommandState::Retired { .. })) => {
                     return Ok(state);
                 }
-                _ => tokio::time::sleep(Duration::from_millis(10)).await,
+                Ok(_) => {}
+                Err(CommandError::Io(error))
+                    if matches!(
+                        error.kind(),
+                        io::ErrorKind::BrokenPipe
+                            | io::ErrorKind::ConnectionReset
+                            | io::ErrorKind::ConnectionAborted
+                            | io::ErrorKind::ConnectionRefused
+                            | io::ErrorKind::NotConnected
+                            | io::ErrorKind::UnexpectedEof
+                            | io::ErrorKind::Interrupted
+                            | io::ErrorKind::WouldBlock
+                            | io::ErrorKind::TimedOut
+                    ) => {}
+                Err(error) => return Err(error),
             }
+            // Polling can race a closing socket or a busy owner. Only a later
+            // positive terminal record can complete this bounded wait.
+            tokio::time::sleep(Duration::from_millis(10)).await;
         }
     }
 
     /// Wait for actual completion and bounded output. Timeout does not cancel
-    /// the command or discharge its caller's cleanup obligation.
+    /// the command or discharge its caller's cleanup obligation. Transient control
+    /// failures retry within the same deadline; invalid ownership still refuses.
     pub async fn wait(
         &self,
         id: &CommandId,

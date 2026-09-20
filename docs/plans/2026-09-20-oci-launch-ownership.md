@@ -267,3 +267,21 @@ first-instruction cgroup check, and all 38 physical kernel cases pass (9.48s).
 The 207 affected library tests pass on macOS/Linux (17.958s/24.152s). Both actual
 binary compatibility tests and strict all-target/all-feature Clippy pass on each
 platform. Format changes are explicit; the protocol remains 14 and state is 21.
+
+
+## Bounded command observation under load
+
+Hosted macOS CI at `97aecda` reports one failure among 3,906 tests. Concurrent
+native reproduction captures a BrokenPipe error from the owned-command status
+poll (16 failures in 200 diagnostic attempts). The wait now retries transient
+control failures within its existing deadline, requiring positive terminal
+evidence before reading output. Empty EOF has a distinct transport error;
+malformed responses and invalid ownership still refuse. Both deterministic
+regressions fail before the fix: interrupted polling returns prematurely, and
+an unreachable owner returns immediately instead of exhausting the bounded wait.
+Runtime activation is never retried by this observation loop.
+
+After repair, all 53 macOS/54 Linux selected command, process-recovery, owner and
+Runc-command tests pass (28.139s/21.417s), with strict all-target/all-feature
+Clippy on both. The same 200-run concurrent output reproduction now passes with
+no failures. Hosted validation of the new head remains a separate checkpoint.

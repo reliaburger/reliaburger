@@ -566,6 +566,12 @@ fn request(directory: &Path, record: &OwnerRecord, action: &str) -> io::Result<s
                 .take(4097)
                 .read_until(b'\n', &mut bytes)
                 .await?;
+            if bytes.is_empty() {
+                return Err(io::Error::new(
+                    io::ErrorKind::UnexpectedEof,
+                    "process owner closed before responding",
+                ));
+            }
             if bytes.len() > 4096 || bytes.last() != Some(&b'\n') {
                 return Err(io::Error::other("invalid process owner response size"));
             }

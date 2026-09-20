@@ -3404,3 +3404,26 @@ host cgroup before startup, records its kernel identity, and has the container's
 first command report `/proc/self/cgroup`. We compare the reported path and the
 original directory identity, then positively retire the runtime. Checking only
 the generated JSON would have repeated the original mistaken assumption.
+
+
+### A failed poll isn't a failed command
+
+The command-output regression passed in isolation, then failed under concurrent
+load. Its diagnostic was a broken pipe while asking the independent owner for
+status. The command hadn't supplied an invalid result; the client had lost one
+observation. Returning that transport error immediately made a bounded `wait`
+less useful precisely when the machine was busy.
+
+The wait now retries transient socket errors within its original deadline. An
+empty response is classified as `UnexpectedEof`, distinguishing a closed peer
+from a non-empty malformed message. Corrupt ownership, mismatched generations
+and malformed responses still refuse. The retry path never sends the command
+again, and never treats a connection failure as proof that it has stopped.
+
+Our deterministic tests temporarily redirect the private control socket while
+the real owner and workload stay alive. Closing a connection mid-request forces
+a failed observation; restoring the socket lets the same wait obtain positive
+retirement and the original output. Leaving the socket unreachable instead
+exhausts the deadline and preserves the original Running record. The fixture's
+`Drop` implementation restores the socket even when unwinding through a failed
+assertion. Rust runs that cleanup when the guard leaves scope.

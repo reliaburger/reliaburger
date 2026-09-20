@@ -292,7 +292,9 @@ release acceptance from deferred capabilities. The current checklist lives in
 The opt-in durable Runc adapter now covers rootful and rootless Linux containers.
 Six rootful and five rootless recovery cases pass, including caller death before
 adoption, short jobs, published ports and interrupted network-helper startup.
-Rootless networking is ready before the workload starts. Production selection
+Rootless networking is ready before the workload starts. Command waits retry
+transient owner-control failures within their original deadline; losing a status
+response never counts as confirmed retirement. Production selection
 and discovery/Apple recovery remain release blockers
 in the [OCI ownership plan](docs/plans/2026-09-20-oci-launch-ownership.md).
 
