@@ -1485,3 +1485,29 @@ Bun integration must distinguish an unopened journal from a consumed journal
 whose write was never acknowledged. Treating both as permission to initialise
 empty ownership would defeat the guarantee. These worker methods provide the
 ownership boundary; wiring every publication and recovery path remains separate.
+
+
+## Health changed; did routing change too?
+
+An HTTP probe returns 503 while the kernel backend map refuses updates. Previously,
+Bun marked its local backend unhealthy, printed the kernel error and advanced the
+instance to Pending for restart. The kernel still routed to that instance. The
+real regression observes restart count one even though withdrawal never succeeded.
+A separate portable regression shows that successful health changes were not
+published to the DNS/ingress snapshot either.
+
+Now Bun builds a candidate health view and checks kernel publication before
+replacing the service map and publishing the userspace snapshot. It records the
+observed lifecycle health truth even when publication fails, but it does not
+advance the restart state machine. The runtime and its cleanup evidence stay owned.
+
+Every subsequent probe retries publication. Waiting for another lifecycle
+transition would lose the retry: an already-Unhealthy instance remains Unhealthy
+on the next failing probe. Once publication succeeds, that later probe may initiate
+the bounded restart policy. A focused test first refuses publication without its
+original allocation, restores that same allocation, then verifies the next probe
+publishes withdrawal before increasing the restart count. Portless workloads do
+not need a backend update.
+
+This confirms the local health update. Remote withdrawal acknowledgements and
+requests that already captured an ingress backend remain separate cleanup proofs.

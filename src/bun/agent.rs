@@ -2164,16 +2164,6 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
     #[cfg(not(all(feature = "ebpf", target_os = "linux")))]
     pub fn set_ebpf_sweep_interval(&mut self, _secs: u64) {}
 
-    /// Mirror an app's current service-map entry into the kernel
-    /// `backend_map` so the eBPF connect hook rewrites its VIP to live
-    /// backends (L8 completeness). Called after every service-map add /
-    /// health change. A no-op without the eBPF data path loaded.
-    async fn sync_backend_ebpf(&self, id: &crate::onion::service_id::ServiceId) {
-        if let Err(error) = self.publish_backend_ebpf(id).await {
-            eprintln!("onion: {error}");
-        }
-    }
-
     /// Require successful kernel publication before acknowledging deployment.
     async fn publish_backend_ebpf(
         &self,
@@ -7190,50 +7180,33 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
         };
         let transition = self.supervisor.process_health_result(&instance_id, status);
 
-        // Propagate health transitions to the service map, noting the
-        // service so we can re-sync its eBPF backend_map entry afterwards.
-        let mut health_changed_service: Option<crate::onion::service_id::ServiceId> = None;
-        match &transition {
-            Ok(Some(ContainerState::Running)) => {
-                if let Some(inst) = self.supervisor.get_instance(&instance_id) {
-                    let service_id = crate::onion::service_id::ServiceId::new(
-                        inst.namespace.clone(),
-                        inst.app_name.clone(),
-                    );
-                    let _ = self
-                        .service_map
-                        .set_backend_health(&service_id, &instance_id.0, true);
-                    health_changed_service = Some(service_id);
-                }
-            }
-            Ok(Some(ContainerState::Unhealthy)) => {
-                if let Some(inst) = self.supervisor.get_instance(&instance_id) {
-                    let app = inst.app_name.clone();
-                    let namespace = inst.namespace.clone();
-                    let service_id =
-                        crate::onion::service_id::ServiceId::new(namespace.clone(), app.clone());
-                    let _ = self
-                        .service_map
-                        .set_backend_health(&service_id, &instance_id.0, false);
-                    self.record_event(
-                        crate::bun::events::EventKind::Health,
-                        crate::bun::events::EventSeverity::Warning,
-                        Some(app),
-                        Some(namespace),
-                        format!("instance {} became unhealthy", instance_id.0),
-                    )
-                    .await;
-                    health_changed_service = Some(service_id);
-                }
-            }
-            _ => {}
+        if let Ok(Some(ContainerState::Unhealthy)) = transition
+            && let Some(instance) = self.supervisor.get_instance(&instance_id)
+        {
+            self.record_event(
+                crate::bun::events::EventKind::Health,
+                crate::bun::events::EventSeverity::Warning,
+                Some(instance.app_name.clone()),
+                Some(instance.namespace.clone()),
+                format!("instance {} became unhealthy", instance_id.0),
+            )
+            .await;
         }
-        if let Some(service_id) = health_changed_service {
-            self.sync_backend_ebpf(&service_id).await;
+        // Retry publication even when health state already changed on an earlier
+        // probe. A refused withdrawal must not advance the restart state machine.
+        if let Err(error) = self.publish_instance_health(&instance_id).await {
+            eprintln!("bun: {error}");
+            self.supervisor
+                .health_checker_mut()
+                .schedule_next(instance_id, now);
+            return;
         }
 
-        // Handle restart if unhealthy
-        if let Ok(Some(ContainerState::Unhealthy)) = transition
+        // A later probe can complete publication that the transition probe failed.
+        if self
+            .supervisor
+            .get_instance(&instance_id)
+            .is_some_and(|instance| instance.state == ContainerState::Unhealthy)
             && self
                 .supervisor
                 .maybe_restart(&instance_id, now)
@@ -7257,6 +7230,32 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
         self.supervisor
             .health_checker_mut()
             .schedule_next(instance_id, now);
+    }
+
+    /// Confirm health publication before routing changes or automatic restart.
+    async fn publish_instance_health(&mut self, id: &InstanceId) -> Result<(), BunError> {
+        let instance =
+            self.supervisor
+                .get_instance(id)
+                .ok_or_else(|| BunError::InstanceNotFound {
+                    instance_id: id.clone(),
+                })?;
+        if instance.host_port.is_none() {
+            return Ok(());
+        }
+        let service =
+            crate::onion::service_id::ServiceId::new(&instance.namespace, &instance.app_name);
+        let mut candidate = self.service_map.clone();
+        candidate
+            .set_backend_health(&service, &id.0, instance.state == ContainerState::Running)
+            .map_err(|error| BunError::BackendPublication {
+                service: service.clone(),
+                reason: error.to_string(),
+            })?;
+        self.publish_backend_snapshot(&service, &candidate).await?;
+        self.service_map = candidate;
+        self.rebuild_routing_table().await;
+        Ok(())
     }
 
     /// Replace the schedule inventory only after its checkpoint is durable.
@@ -11913,6 +11912,87 @@ mod tests {
             .register_service_app("api", "default", 8080, None)
             .await;
         assert!(matches!(result, Err(BunError::BackendPublication { .. })));
+    }
+
+    #[tokio::test]
+    async fn health_transitions_publish_the_confirmed_userspace_view() {
+        let (mut agent, _commands, _shutdown) = test_agent();
+        let view = agent.service_map_watch();
+        expect_complete(&drain_deploy(&mut agent, basic_config()).await);
+        let id = InstanceId("default__web-0".into());
+        let service = crate::onion::service_id::ServiceId::new("default", "web");
+        let mut health = super::super::health::HealthCheckConfig::from_spec(
+            config_with_health().app["web"].health.as_ref().unwrap(),
+            8080,
+        );
+        health.threshold_unhealthy = 1;
+        let instance = agent.supervisor.get_instance_mut(&id).unwrap();
+        instance.health_config = Some(health);
+        instance.restart_policy.max_restarts = Some(0);
+        let created_at = instance.created_at;
+        agent
+            .complete_health_probe(
+                id.clone(),
+                created_at,
+                Ok(super::super::health::HealthStatus::Unhealthy),
+            )
+            .await;
+        assert!(
+            !view.borrow().resolve(&service).unwrap().backends[0].healthy,
+            "DNS/ingress retained a backend after its health withdrawal"
+        );
+        agent
+            .complete_health_probe(
+                id,
+                created_at,
+                Ok(super::super::health::HealthStatus::Healthy),
+            )
+            .await;
+        assert!(view.borrow().resolve(&service).unwrap().backends[0].healthy);
+    }
+
+    #[tokio::test]
+    async fn a_later_probe_retries_publication_before_starting_restart() {
+        let (mut agent, _commands, _shutdown) = test_agent();
+        let view = agent.service_map_watch();
+        expect_complete(&drain_deploy(&mut agent, basic_config()).await);
+        let id = InstanceId("default__web-0".into());
+        let service = crate::onion::service_id::ServiceId::new("default", "web");
+        let mut health = super::super::health::HealthCheckConfig::from_spec(
+            config_with_health().app["web"].health.as_ref().unwrap(),
+            8080,
+        );
+        health.threshold_unhealthy = 1;
+        let instance = agent.supervisor.get_instance_mut(&id).unwrap();
+        instance.health_config = Some(health);
+        let created_at = instance.created_at;
+        let original = agent.service_map.clone();
+        // Missing original allocation must refuse publication. Restore the same
+        // evidence before retrying, rather than inventing a replacement VIP.
+        agent.service_map = crate::onion::service_map::ServiceMap::new();
+        agent
+            .complete_health_probe(
+                id.clone(),
+                created_at,
+                Ok(super::super::health::HealthStatus::Unhealthy),
+            )
+            .await;
+        let instance = agent.supervisor.get_instance(&id).unwrap();
+        assert_eq!(instance.state, ContainerState::Unhealthy);
+        assert_eq!(instance.restart_count, 0);
+        assert!(view.borrow().resolve(&service).unwrap().backends[0].healthy);
+        agent.service_map = original;
+        agent
+            .complete_health_probe(
+                id.clone(),
+                created_at,
+                Ok(super::super::health::HealthStatus::Unhealthy),
+            )
+            .await;
+        let instance = agent.supervisor.get_instance(&id).unwrap();
+        assert_eq!(instance.state, ContainerState::Pending);
+        assert_eq!(instance.restart_count, 1);
+        assert!(!view.borrow().resolve(&service).unwrap().backends[0].healthy);
     }
 
     #[tokio::test]

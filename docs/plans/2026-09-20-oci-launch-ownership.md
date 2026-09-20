@@ -841,3 +841,21 @@ at fresh/final rollout bookkeeping, and complete durable journal integration at
 kernel, userspace and destination-grant boundaries. Preserve original allocations
 and runtime references before attempted writes. These gates do not establish
 remote acknowledgements or draining of captured ingress requests.
+
+
+## Checked health publication
+
+Two regressions reproduce separately: the correctly subscribed userspace view
+stays healthy after withdrawal (0.102s), and a real process plus frozen kernel
+map moves to Pending/restart count one after failed health withdrawal (3.32s).
+The first native fixture subscribed after deployment and observed an empty
+snapshot; that attempt is not evidence for the health regression.
+
+Bun now publishes a candidate health map to the kernel before replacing the
+userspace view or initiating restart. Later probes retry even when lifecycle
+health already changed. Portless workloads skip backend mutation. The real
+HTTP-health/frozen-map case passes (5.61s). All 263 affected library tests pass
+on macOS/Linux (17.764s/23.956s), followed by a focused positive retry-after-refusal
+contract on each (0.041s/0.034s). Strict all-target/all-feature Clippy and formatting
+pass on both platforms. The retry test restores the same original allocation and
+requires publication before the first restart.

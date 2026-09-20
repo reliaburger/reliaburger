@@ -4490,3 +4490,102 @@ async fn check_stopped_address_retention(lose_enforcement: bool) {
         "reused an address still held by a backend route"
     );
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "requires Linux root and RELIABURGER_EBPF_TESTS=1"]
+async fn refused_health_publication_prevents_restart_and_preserves_ownership() {
+    use reliaburger::bun::agent::{AgentCommand, ApplyEvent, BunAgent};
+    use reliaburger::grill::{Grill, InstanceId, port::PortAllocator, process::ProcessGrill};
+    use std::sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    };
+    use tokio::{
+        io::{AsyncReadExt, AsyncWriteExt},
+        sync::{Mutex, mpsc, oneshot},
+    };
+    assert!(ebpf_tests_enabled());
+    let root = tempfile::tempdir().unwrap();
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let health_port = listener.local_addr().unwrap().port();
+    let healthy = Arc::new(AtomicBool::new(true));
+    let response_health = Arc::clone(&healthy);
+    let server = tokio::spawn(async move {
+        while let Ok((mut stream, _)) = listener.accept().await {
+            let mut request = [0_u8; 1024];
+            if tokio::time::timeout(Duration::from_secs(1), stream.read(&mut request))
+                .await
+                .is_err()
+            {
+                continue;
+            }
+            let status = if response_health.load(Ordering::SeqCst) {
+                "200 OK"
+            } else {
+                "503 Unavailable"
+            };
+            let response =
+                format!("HTTP/1.1 {status}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n");
+            let _ = stream.write_all(response.as_bytes()).await;
+        }
+    });
+    let ebpf = Arc::new(Mutex::new(
+        OnionEbpf::load_embedded(CGROUP_PATH.as_ref()).unwrap(),
+    ));
+    let runtime = ProcessGrill::new();
+    let (commands, receiver) = mpsc::channel(64);
+    let shutdown = CancellationToken::new();
+    let mut agent = BunAgent::new(
+        runtime.clone(),
+        PortAllocator::new(43900, 44000),
+        receiver,
+        shutdown.clone(),
+    );
+    agent.set_records_dir(root.path().join("records"));
+    agent.set_volumes_dir(root.path().join("volumes"));
+    agent.set_onion_ebpf(Arc::clone(&ebpf)).await;
+    let task = tokio::spawn(async move { agent.run().await });
+    let id = InstanceId("default__health-refusal-0".into());
+    let exercise = tokio::time::timeout(Duration::from_secs(12), async {
+        let config = reliaburger::config::Config::parse(&format!(
+            "[app.health-refusal]\nimage = 'proc-grill:image-ignored'\ncommand = ['sleep', '60']\nport = 8080\n[app.health-refusal.health]\npath = '/'\nport = {health_port}\ninterval = 1\ntimeout = 1\nthreshold_unhealthy = 1\nthreshold_healthy = 1\n"
+        ))?;
+        let (events, mut results) = mpsc::channel(64);
+        commands.send(AgentCommand::Deploy { config, events }).await?;
+        while let Some(event) = results.recv().await {
+            if let ApplyEvent::Error { message } = event { anyhow::bail!(message); }
+        }
+        let mut frozen = false;
+        let mut unhealthy_since = None;
+        loop {
+            let (response, result) = oneshot::channel();
+            commands.send(AgentCommand::Status { response }).await?;
+            let instances = result.await?;
+            let instance = instances.iter().find(|instance| instance.id == id.0)
+                .ok_or_else(|| anyhow::anyhow!("health owner disappeared"))?;
+            if !frozen && instance.state == "running" {
+                freeze_egress_map(&*ebpf.lock().await, "backend_map");
+                healthy.store(false, Ordering::SeqCst);
+                frozen = true;
+            }
+            anyhow::ensure!(instance.restart_count == 0, "restart began before kernel health withdrawal was confirmed: {instance:?}");
+            if frozen && instance.state == "unhealthy" {
+                let since = unhealthy_since.get_or_insert_with(std::time::Instant::now);
+                if since.elapsed() >= Duration::from_secs(2) { break; }
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        anyhow::ensure!(runtime.state(&id).await? == reliaburger::grill::ContainerState::Running,
+            "refused health withdrawal retired the original runtime");
+        anyhow::ensure!(reliaburger::grill::records::record_path(&root.path().join("records"), &id.0).exists(),
+            "refused health withdrawal lost adoption ownership");
+        Ok::<(), anyhow::Error>(())
+    }).await;
+    shutdown.cancel();
+    task.await.unwrap();
+    runtime.kill(&id).await.unwrap();
+    ebpf.lock().await.detach().unwrap();
+    server.abort();
+    let _ = server.await;
+    exercise.unwrap().unwrap();
+}
