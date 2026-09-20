@@ -563,6 +563,19 @@ impl super::Grill for ProcessGrill {
         Ok(entry.state)
     }
 
+    async fn launch_inventory(&self) -> Result<Option<Vec<super::RuntimeLaunch>>, GrillError> {
+        let Some(control) = &self.control else {
+            return Ok(None);
+        };
+        control
+            .inventory()
+            .await
+            .map(Some)
+            .map_err(|error| GrillError::InventoryUnavailable {
+                reason: error.to_string(),
+            })
+    }
+
     async fn adopt(
         &self,
         instance: &InstanceId,

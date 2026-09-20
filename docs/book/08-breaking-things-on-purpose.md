@@ -489,6 +489,15 @@ validated durable identity, but doesn't need a live signalling endpoint. The
 owner-loss test checks both properties: stop and state refuse to invent authority,
 while the last diagnostic output remains readable.
 
+Startup also needs to discover owners it has never seen in its adoption table.
+The runtime exposes a complete launch inventory from the records published
+before execution. It validates every entry before returning anything; damaged
+records cannot quietly disappear from the result. Unpublished staging directories
+are excluded because no start operation can authorise them. The return type is
+`Option<Vec<RuntimeLaunch>>`: `Some` means the runtime established the inventory,
+even if it is empty; `None` means it cannot establish one. Keeping these cases
+separate prevents an unsupported runtime from accidentally proving absence.
+
 Filesystem operations run through `spawn_blocking`, which moves blocking work
 off Tokio's executor threads. Cancelling the caller doesn't abort that worker,
 so its generation record and lock remain owned until the operation finishes.

@@ -406,3 +406,66 @@ async fn owner_reaping_survives_parent_exec() {
         "replacement runtime inherited an unreaped helper"
     );
 }
+
+#[tokio::test]
+async fn inventory_finds_prepared_live_and_completed_unrecorded_launches() {
+    let directory = tempfile::tempdir().unwrap();
+    let grill = runtime(directory.path());
+    assert!(grill.launch_inventory().await.unwrap().unwrap().is_empty());
+    for name in ["prepared", "live", "completed"] {
+        let id = InstanceId(format!("default__{name}-0"));
+        grill
+            .create(
+                &id,
+                &spec(if name == "live" {
+                    "sleep 30"
+                } else {
+                    "exit 19"
+                }),
+            )
+            .await
+            .unwrap();
+        if name != "prepared" {
+            grill.start(&id).await.unwrap();
+        }
+        if name == "completed" {
+            stopped(&grill, &id).await;
+        }
+    }
+    let result = runtime(directory.path()).launch_inventory().await;
+    grill
+        .kill(&InstanceId("default__live-0".into()))
+        .await
+        .unwrap();
+    stopped(&grill, &InstanceId("default__live-0".into())).await;
+    let inventory = result.unwrap().unwrap();
+    assert_eq!(
+        inventory
+            .iter()
+            .map(|entry| entry.instance_id.0.as_str())
+            .collect::<Vec<_>>(),
+        [
+            "default__completed-0",
+            "default__live-0",
+            "default__prepared-0"
+        ]
+    );
+    assert_eq!(inventory[1].spec, spec("sleep 30"));
+}
+
+#[tokio::test]
+async fn inventory_refuses_damaged_or_unexpected_published_entries() {
+    let directory = tempfile::tempdir().unwrap();
+    let grill = runtime(directory.path());
+    let id = InstanceId("default__valid-0".into());
+    grill.create(&id, &spec("exit 0")).await.unwrap();
+    let root = directory.path().join("process-owners");
+    // A staged intent cannot execute and is not a published generation.
+    std::fs::create_dir(root.join(".preparing-abandoned")).unwrap();
+    assert_eq!(grill.launch_inventory().await.unwrap().unwrap().len(), 1);
+    std::fs::write(root.join("unexpected"), b"bad").unwrap();
+    assert!(grill.launch_inventory().await.is_err());
+    std::fs::remove_file(root.join("unexpected")).unwrap();
+    std::fs::write(root.join(&id.0).join("owner.json"), b"bad").unwrap();
+    assert!(grill.launch_inventory().await.is_err());
+}

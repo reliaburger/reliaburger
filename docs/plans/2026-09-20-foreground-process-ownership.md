@@ -76,6 +76,11 @@ security boundary against hostile same-user processes.
 - [x] Preserve diagnostic log access after owner loss. The regression fails first
   because log reads required live control; all eleven recovery tests and strict
   Clippy pass on macOS/Linux after separating validated file reads from signalling.
+- [x] Expose a validated runtime launch inventory independently of agent PID
+  records. Two regressions fail against the default unsupported inventory;
+  thirteen runtime recovery cases pass on macOS/Linux. Prepared, running and
+  completed generations are discoverable; damaged entries refuse the whole
+  inventory and unpublished staging directories cannot count as launches.
 - [ ] Select the owned adapter in production Bun only alongside complete
   pre-adoption reconciliation. Distinguish the latest job attempt from older
   completed runtime generations.

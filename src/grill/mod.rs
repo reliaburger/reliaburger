@@ -230,11 +230,27 @@ pub enum GrillError {
         reason: String,
     },
 
+    /// Durable launch inventory could not be established.
+    #[error("runtime launch inventory unavailable: {reason}")]
+    InventoryUnavailable {
+        /// The evidence that could not be read or validated.
+        reason: String,
+    },
+
     #[error("container {instance} not found")]
     NotFound { instance: InstanceId },
 
     #[error("image pull failed: {0}")]
     ImagePull(#[from] image::ImageError),
+}
+
+/// A durable runtime launch, written before user code can execute.
+#[derive(Debug, Clone)]
+pub struct RuntimeLaunch {
+    /// Canonical workload identity.
+    pub instance_id: InstanceId,
+    /// Specification committed for this generation.
+    pub spec: OciSpec,
 }
 
 /// The container runtime interface.
@@ -288,6 +304,16 @@ pub trait Grill: Send + Sync {
     ) -> impl std::future::Future<Output = Result<bool, GrillError>> + Send {
         let _ = (instance, record);
         std::future::ready(Ok(false))
+    }
+
+    /// Read the complete durable launch inventory, including launches without
+    /// agent adoption records. `None` means this runtime cannot establish that
+    /// inventory; it must never be interpreted as an empty inventory.
+    fn launch_inventory(
+        &self,
+    ) -> impl std::future::Future<Output = Result<Option<Vec<RuntimeLaunch>>, GrillError>> + Send
+    {
+        std::future::ready(Ok(None))
     }
 
     /// Which runtime kind this grill starts instances with. Recorded in
@@ -497,6 +523,16 @@ impl Grill for AnyGrill {
             AnyGrill::Runc(g) => g.adopt(instance, record).await,
             #[cfg(target_os = "macos")]
             AnyGrill::Apple(g) => g.adopt(instance, record).await,
+        }
+    }
+
+    async fn launch_inventory(&self) -> Result<Option<Vec<RuntimeLaunch>>, GrillError> {
+        match self {
+            AnyGrill::Process(g) => g.launch_inventory().await,
+            #[cfg(target_os = "linux")]
+            AnyGrill::Runc(g) => g.launch_inventory().await,
+            #[cfg(target_os = "macos")]
+            AnyGrill::Apple(g) => g.launch_inventory().await,
         }
     }
 
