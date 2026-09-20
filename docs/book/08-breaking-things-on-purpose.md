@@ -484,6 +484,11 @@ If it dies during socket cleanup, a fresh adapter can finish that cleanup under
 the owner lock. A record that still says Running provides no such permission.
 The adapter reports uncertainty even if the socket has disappeared.
 
+Logs remain available in that uncertain state. Reading an owned log file needs
+validated durable identity, but doesn't need a live signalling endpoint. The
+owner-loss test checks both properties: stop and state refuse to invent authority,
+while the last diagnostic output remains readable.
+
 Filesystem operations run through `spawn_blocking`, which moves blocking work
 off Tokio's executor threads. Cancelling the caller doesn't abort that worker,
 so its generation record and lock remain owned until the operation finishes.

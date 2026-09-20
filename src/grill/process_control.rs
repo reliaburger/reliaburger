@@ -200,6 +200,10 @@ impl ProcessControl {
         .await
     }
 
+    pub(crate) async fn record(&self, id: &InstanceId) -> io::Result<OwnerRecord> {
+        self.run(id, |this, id| this.load(&id)).await
+    }
+
     pub(crate) async fn status(&self, id: &InstanceId) -> io::Result<OwnerRecord> {
         self.run(id, |this, id| {
             let record = this.finish_retirement(&id)?;

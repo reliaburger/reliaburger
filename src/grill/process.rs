@@ -214,7 +214,7 @@ impl ProcessGrill {
                 .log_stem(instance)
                 .map_err(|error| owner_error(instance, error))?;
             control
-                .status(instance)
+                .record(instance)
                 .await
                 .map_err(|error| owner_error(instance, error))?;
             let path = log_file(&stem, if stdout { "stdout" } else { "stderr" });

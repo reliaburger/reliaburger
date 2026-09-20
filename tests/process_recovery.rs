@@ -161,7 +161,7 @@ async fn owner_loss_preserves_uncertainty_and_never_signals_recorded_pid() {
     // The workload kills its own owner to inject failure without recovering a
     // PID in the test. It exits on release or after a bounded fallback timeout.
     let script = format!(
-        "kill -KILL \"$PPID\"; touch '{}'; n=0; while [ ! -f '{}' ] && [ $n -lt 200 ]; do sleep 0.05; n=$((n+1)); done; touch '{}'",
+        "echo diagnostic-output; kill -KILL \"$PPID\"; touch '{}'; n=0; while [ ! -f '{}' ] && [ $n -lt 200 ]; do sleep 0.05; n=$((n+1)); done; touch '{}'",
         marker.display(),
         release.display(),
         done.display()
@@ -178,6 +178,7 @@ async fn owner_loss_preserves_uncertainty_and_never_signals_recorded_pid() {
     let recovered = runtime(directory.path());
     let status = recovered.state(&id).await;
     let kill = recovered.kill(&id).await;
+    let diagnostic_logs = recovered.logs(&id).await;
     std::fs::write(release, "release").unwrap();
     tokio::time::timeout(Duration::from_secs(5), async {
         while !done.exists() {
@@ -212,6 +213,7 @@ async fn owner_loss_preserves_uncertainty_and_never_signals_recorded_pid() {
     ));
     std::fs::remove_file(socket_directory.join("control.sock")).unwrap();
     std::fs::remove_dir(socket_directory).unwrap();
+    assert!(diagnostic_logs.unwrap().contains("diagnostic-output"));
 }
 
 #[tokio::test]

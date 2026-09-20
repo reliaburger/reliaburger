@@ -73,6 +73,9 @@ security boundary against hostile same-user processes.
   first with an unreaped child. All eleven runtime recovery and nine owner
   cases plus strict Clippy pass on macOS/Linux afterwards; user workloads remain
   foreground-only.
+- [x] Preserve diagnostic log access after owner loss. The regression fails first
+  because log reads required live control; all eleven recovery tests and strict
+  Clippy pass on macOS/Linux after separating validated file reads from signalling.
 - [ ] Select the owned adapter in production Bun only alongside complete
   pre-adoption reconciliation. Distinguish the latest job attempt from older
   completed runtime generations.
