@@ -38,7 +38,7 @@ fn spec(script: &str) -> OciSpec {
 async fn stopped(grill: &ProcessGrill, id: &InstanceId) {
     tokio::time::timeout(Duration::from_secs(15), async {
         loop {
-            if grill.state(id).await.unwrap() == ContainerState::Stopped {
+            if matches!(grill.state(id).await, Ok(ContainerState::Stopped)) {
                 break;
             }
             tokio::time::sleep(Duration::from_millis(10)).await;
@@ -269,7 +269,7 @@ async fn cancellation_of_start_preserves_the_owned_launch_transaction() {
     assert!(starting.await.unwrap_err().is_cancelled());
     let recovered = runtime(directory.path());
     tokio::time::timeout(Duration::from_secs(15), async {
-        while recovered.state(&id).await.unwrap() != ContainerState::Running {
+        while !matches!(recovered.state(&id).await, Ok(ContainerState::Running)) {
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
     })

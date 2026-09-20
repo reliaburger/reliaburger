@@ -3416,3 +3416,16 @@ fails before the change: the first attempt incorrectly succeeds. After the fix,
 Bun's bind failure triggers a fresh reservation and the second attempt proves
 readiness. This keeps port-allocation races separate from product startup errors;
 an unrelated error still fails the test.
+
+### Unknown is not stopped
+
+Hosted macOS CI caught a cancelled-start fixture unwrapping a transient owner
+socket error. The fixture was waiting for the independent owner to reach
+Running, but treated one broken connection as a final verdict. Under load, the
+owner's bounded request deadline can expire while the client is descheduled.
+
+The bounded readiness and retirement loops now accept only the state they are
+waiting for. A connection error keeps waiting; it never counts as Running or
+Stopped. If the deadline expires, the test still fails. This preserves the
+contract that matters: positive evidence establishes readiness and absence,
+and uncertain observations establish neither.
