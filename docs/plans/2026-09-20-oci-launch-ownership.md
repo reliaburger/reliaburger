@@ -362,3 +362,18 @@ backend retirement remain open.
 All 44 physical kernel cases pass (10.50s), including repeated frozen-map
 cleanup, partial publication, preservation of unrelated entries and repeated
 successful retirement. Strict Clippy and formatting pass on Linux and macOS.
+
+## Outbound-only source selection
+
+The portable regression reproduces an omitted namespace identity for a verified
+worker cgroup when that worker has no service record. Explicit `allow_from`
+resolution also incorrectly requires a service record for the source. Source
+identities must come from the verified workload inventory; service entries only
+identify destinations. Use the same namespace-name hash as service registration.
+The public-agent kernel regression deploys a portless application and inspects
+its map entry. This correction does not claim pre-start publication or durable
+job/source recovery; those lifecycle boundaries remain open.
+
+Qualification: the public-agent map is initially absent for a portless workload.
+After the repair, all 45 physical kernel cases pass (9.86s), as do all eight
+portable firewall resolver tests and strict Linux/macOS Clippy and formatting.

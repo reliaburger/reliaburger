@@ -2970,3 +2970,36 @@ fn firewall_reconciliation_forgets_confirmed_removals_only() {
     }
     ebpf.detach().unwrap();
 }
+
+#[tokio::test]
+#[ignore = "requires Linux root and RELIABURGER_EBPF_TESTS=1"]
+async fn agent_namespace_binding_includes_outbound_only_workloads() {
+    use reliaburger::sesame::{egress, firewall};
+    assert!(ebpf_tests_enabled());
+    let mut fixture =
+        EgressRecoveryFixture::prepare_with_service("outbound-source", false, false).await;
+    let path = reliaburger::grill::cgroup::cgroup_path("default", "outbound-source", 0);
+    let workload = egress::cgroup_id_of_path(&path).unwrap();
+    let launcher = egress::cgroup_id_of_pid(std::process::id()).unwrap();
+    let (workload_namespace, launcher_namespace) = {
+        let mut ebpf = fixture.ebpf.lock().await;
+        (
+            firewall::read_firewall_state(&mut ebpf.bpf, workload, 0)
+                .unwrap()
+                .source_namespace_id,
+            firewall::read_firewall_state(&mut ebpf.bpf, launcher, 0)
+                .unwrap()
+                .source_namespace_id,
+        )
+    };
+    fixture.retire("outbound-source").await.unwrap();
+    fixture.crash().await;
+    fixture.ebpf.lock().await.detach().unwrap();
+    std::fs::remove_dir(path).unwrap();
+    assert_ne!(workload, launcher);
+    assert_eq!(
+        workload_namespace,
+        Some(reliaburger::onion::vip::name_to_id("default"))
+    );
+    assert_eq!(launcher_namespace, None);
+}

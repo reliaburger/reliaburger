@@ -2190,8 +2190,7 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
             .into_iter()
             .cloned()
             .collect();
-        let ns_entries =
-            crate::sesame::firewall::resolve_cgroup_namespace_entries(&services, &cgroup_ids);
+        let ns_entries = crate::sesame::firewall::resolve_cgroup_namespace_entries(&cgroup_ids);
         let fw_entries = crate::sesame::firewall::rules_to_bpf_entries(
             &crate::sesame::firewall::resolve_firewall_rules(&services, &cgroup_ids),
         );

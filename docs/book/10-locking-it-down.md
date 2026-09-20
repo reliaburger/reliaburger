@@ -1261,3 +1261,24 @@ twice for each case. The mutable set references (`&mut HashSet<...>`) let the
 reconciler record this partial progress in the caller's inventory without moving
 ownership of the sets. Durable recovery still needs a journal; these sets alone
 only survive within the current agent.
+
+### A worker can connect without serving a port
+
+Imagine a worker in `frontend` that only sends requests to a database in
+`backend`. It doesn't advertise a service port. Our rule builder used the
+service catalogue to find both ends of a connection, so it omitted the worker's
+namespace identity and ignored an explicit `frontend/worker` allowance. The
+connect hook needs to know who sent the request even when nobody can connect
+back to that sender.
+
+Source selection now comes from verified workload cgroups, keyed by namespace
+and application name. Destination selection still comes from the service
+catalogue. Namespace identities use the same deterministic name mapping as
+service registration. An explicit allowance looks up the named source directly;
+it doesn't require that source to advertise a service.
+
+The portable regression supplies only a database service and a worker cgroup.
+The physical agent regression deploys an application without a port and checks
+its actual kernel namespace entry. This corrects source selection during
+reconciliation. Publishing and recording that identity before the first workload
+instruction remains the next lifecycle boundary, including the job-start path.

@@ -69,12 +69,8 @@ pub fn resolve_firewall_rules(
         match &service.firewall_allow_from {
             None => {
                 // Default: allow all apps in the same namespace
-                for other in services {
-                    if other.namespace == service.namespace
-                        && other.app_name != service.app_name
-                        && let Some(cgroups) =
-                            cgroup_ids.get(&(other.namespace.clone(), other.app_name.clone()))
-                    {
+                for ((namespace, app), cgroups) in cgroup_ids {
+                    if namespace == &service.namespace && app != &service.app_name {
                         for &cg in cgroups {
                             rules.push(ResolvedFirewallRule {
                                 src_cgroup_id: cg,
@@ -96,14 +92,8 @@ pub fn resolve_firewall_rules(
                             (service.namespace.as_str(), allowed_name.as_str())
                         };
 
-                    // Find the allowed app's cgroup IDs
-                    let matching_app = services
-                        .iter()
-                        .find(|s| s.app_name == target_app && s.namespace == target_ns);
-
-                    if matching_app.is_some()
-                        && let Some(cgroups) =
-                            cgroup_ids.get(&(target_ns.to_string(), target_app.to_string()))
+                    if let Some(cgroups) =
+                        cgroup_ids.get(&(target_ns.to_string(), target_app.to_string()))
                     {
                         for &cg in cgroups {
                             rules.push(ResolvedFirewallRule {
@@ -123,20 +113,15 @@ pub fn resolve_firewall_rules(
 
 /// Resolve cgroup-to-namespace mappings for all running instances.
 pub fn resolve_cgroup_namespace_entries(
-    services: &[ServiceEntry],
     cgroup_ids: &HashMap<(String, String), Vec<u64>>,
 ) -> Vec<CgroupNamespaceEntry> {
     let mut entries = Vec::new();
-    for service in services {
-        if let Some(cgroups) =
-            cgroup_ids.get(&(service.namespace.clone(), service.app_name.clone()))
-        {
-            for &cg in cgroups {
-                entries.push(CgroupNamespaceEntry {
-                    cgroup_id: cg,
-                    namespace_id: service.namespace_id,
-                });
-            }
+    for ((namespace, _app), cgroups) in cgroup_ids {
+        for &cgroup_id in cgroups {
+            entries.push(CgroupNamespaceEntry {
+                cgroup_id,
+                namespace_id: crate::onion::vip::name_to_id(namespace),
+            });
         }
     }
     entries
@@ -402,6 +387,33 @@ mod tests {
     }
 
     #[test]
+    fn outbound_only_workloads_receive_namespace_identity_and_allowed_routes() {
+        let services = vec![make_service(
+            "db",
+            "backend",
+            2,
+            200,
+            Some(vec!["frontend/worker".into()]),
+        )];
+        let cgroups = [cg("frontend", "worker", vec![1001])].into();
+        let entries = resolve_cgroup_namespace_entries(&cgroups);
+        assert_eq!(entries.len(), 1, "outbound-only source has no namespace");
+        assert_eq!(entries[0].cgroup_id, 1001);
+        assert_eq!(
+            entries[0].namespace_id,
+            crate::onion::vip::name_to_id("frontend")
+        );
+        let rules = resolve_firewall_rules(&services, &cgroups);
+        assert_eq!(
+            rules.len(),
+            1,
+            "explicitly allowed source needs no service port"
+        );
+        assert_eq!(rules[0].src_cgroup_id, 1001);
+        assert_eq!(rules[0].dst_app_id, 2);
+    }
+
+    #[test]
     fn default_allows_same_namespace() {
         let services = vec![
             make_service("api", "default", 1, 100, None),
@@ -464,20 +476,19 @@ mod tests {
 
     #[test]
     fn cgroup_namespace_entries_resolve_correctly() {
-        let services = vec![
-            make_service("api", "default", 1, 100, None),
-            make_service("redis", "default", 2, 100, None),
-        ];
         let cgroups: HashMap<(String, String), Vec<u64>> = [
             cg("default", "api", vec![1001, 1002]),
             cg("default", "redis", vec![2001]),
         ]
         .into();
 
-        let entries = resolve_cgroup_namespace_entries(&services, &cgroups);
+        let entries = resolve_cgroup_namespace_entries(&cgroups);
         assert_eq!(entries.len(), 3);
-        // All should map to namespace_id 100
-        assert!(entries.iter().all(|e| e.namespace_id == 100));
+        assert!(
+            entries
+                .iter()
+                .all(|e| e.namespace_id == crate::onion::vip::name_to_id("default"))
+        );
     }
 
     #[test]
@@ -509,10 +520,13 @@ mod tests {
             .collect();
         assert_eq!(sources, vec![1001], "team-b's web must not be allowed");
 
-        // Namespace mapping: team-b's web maps to namespace 200, not 100.
-        let entries = resolve_cgroup_namespace_entries(&services, &cgroups);
+        // Namespace mapping keeps the same-named source in its own namespace.
+        let entries = resolve_cgroup_namespace_entries(&cgroups);
         let team_b_web = entries.iter().find(|e| e.cgroup_id == 9001).unwrap();
-        assert_eq!(team_b_web.namespace_id, 200);
+        assert_eq!(
+            team_b_web.namespace_id,
+            crate::onion::vip::name_to_id("team-b")
+        );
     }
 
     #[test]
