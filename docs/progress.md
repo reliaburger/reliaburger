@@ -197,6 +197,8 @@ Buildah-absence cases execute in isolated child environments on the equipped VM.
 
 - [x] **C58** Give Pickle upstream HEAD, manifest/configuration and layer reads the direct puller's bounded retry policy. Four HTTP regressions fail first; denial/integrity controls remain terminal. All 47 image and 232 Pickle tests pass on macOS/Linux, including interrupted bodies, original deadlines and four-attempt limits, with strict Clippy on both.
 
+- [x] **C59** Resolve OCI indexes for Linux container targets, independently of the client's operating system, and allow the catalogue harness to select the target node's architecture. A Linux-only index reproduces the macOS failure before the fix; the previous fixture hid it by including Darwin entries. All 48 image and seven upstream tests, including explicit target selection and integrity/retry controls, pass on macOS/Linux alongside strict all-target/all-feature Clippy. Protocol/state remain 14/16.
+
 
 Hosted minimum-Rust CI at `9747fba` passed 3,658 tests but failed the cross-node
 log partial-result fixture (zero healthy rows). Its transport-only case now

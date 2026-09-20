@@ -1,6 +1,5 @@
 //! Bound upstream reads and verify OCI digests before either cache publishes them.
 
-use oci_distribution::client::current_platform_resolver;
 use oci_distribution::errors::OciDistributionError;
 use oci_distribution::manifest::{
     IMAGE_MANIFEST_LIST_MEDIA_TYPE, IMAGE_MANIFEST_MEDIA_TYPE, OCI_IMAGE_INDEX_MEDIA_TYPE,
@@ -71,6 +70,28 @@ pub(crate) async fn pull_verified_manifest(
     reference: &Reference,
     auth: &RegistryAuth,
 ) -> Result<VerifiedImageManifest, OciDistributionError> {
+    pull_verified_manifest_for_architecture(client, reference, auth, std::env::consts::ARCH).await
+}
+
+/// Normalise the advertised release targets to their Linux OCI architecture names.
+pub(crate) fn linux_architecture(architecture: &str) -> Result<&'static str, OciDistributionError> {
+    match architecture {
+        "x86_64" | "amd64" => Ok("amd64"),
+        "aarch64" | "arm64" => Ok("arm64"),
+        _ => Err(invalid(format!(
+            "unsupported Linux container architecture: {architecture}"
+        ))),
+    }
+}
+
+/// Verify an image for the target container host, independently of the client's OS.
+pub(crate) async fn pull_verified_manifest_for_architecture(
+    client: &Client,
+    reference: &Reference,
+    auth: &RegistryAuth,
+    architecture: &str,
+) -> Result<VerifiedImageManifest, OciDistributionError> {
+    let architecture = linux_architecture(architecture)?;
     // Headers are registry assertions, not evidence of the bytes received.
     let (mut manifest_bytes, _) = client
         .pull_manifest_raw(reference, auth, MEDIA_TYPES)
@@ -81,13 +102,20 @@ pub(crate) async fn pull_verified_manifest(
     let manifest = match parse_manifest(&manifest_bytes)? {
         OciManifest::Image(manifest) => manifest,
         OciManifest::ImageIndex(index) => {
-            let digest = current_platform_resolver(&index.manifests)
-                .ok_or_else(|| invalid("upstream index has no manifest for this platform"))?;
             let descriptor = index
                 .manifests
                 .iter()
-                .find(|entry| entry.digest == digest)
-                .ok_or_else(|| invalid("upstream platform descriptor is missing"))?;
+                .find(|entry| {
+                    entry.platform.as_ref().is_some_and(|platform| {
+                        platform.os == "linux" && platform.architecture == architecture
+                    })
+                })
+                .ok_or_else(|| {
+                    invalid(format!(
+                        "upstream index has no manifest for linux/{architecture}"
+                    ))
+                })?;
+            let digest = descriptor.digest.clone();
             let child_reference = Reference::with_digest(
                 reference.registry().to_owned(),
                 reference.repository().to_owned(),

@@ -110,6 +110,9 @@ restart. A manifest push persists its catalogue before acknowledging success;
 filesystem failures refuse the push. Clustered workers and followers forward
 manifest and GC proposals to the advertised leader over authenticated node TLS.
 The leader checks current identity and quorum; retired nodes cannot commit.
+OCI index selection targets Linux containers independently of the client OS;
+registry fixture clients can select the target node’s x86-64 or ARM64 architecture.
+
 OCI metadata reads, peer image resolution and configured quota checks use the
 same current authority, including on fresh workers without a local catalogue.
 `relish images` also lists committed cluster metadata rather than a node-local

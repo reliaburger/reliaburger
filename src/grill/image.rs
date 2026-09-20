@@ -1207,6 +1207,7 @@ mod tests {
         ChangedIndex,
         ChangedChild,
         ValidIndex,
+        Amd64Index,
         WrongConfigurationSize,
         WrongChildSize,
         NegativeLayerSize,
@@ -1444,19 +1445,23 @@ mod tests {
                 RegistryIntegrityCase::ChangedIndex
                     | RegistryIntegrityCase::ChangedChild
                     | RegistryIntegrityCase::ValidIndex
+                    | RegistryIntegrityCase::Amd64Index
                     | RegistryIntegrityCase::WrongChildSize
             )
         ) {
             let mut entries = Vec::new();
-            for os in ["linux", "darwin"] {
-                for architecture in ["amd64", "arm64"] {
-                    entries.push(serde_json::json!({
+            for architecture in ["amd64", "arm64"] {
+                if matches!(integrity, Some(RegistryIntegrityCase::Amd64Index))
+                    && architecture != "amd64"
+                {
+                    continue;
+                }
+                entries.push(serde_json::json!({
                         "mediaType": "application/vnd.oci.image.manifest.v1+json",
                         "digest": manifest_digest,
                         "size": state.manifest.len() + usize::from(matches!(integrity, Some(RegistryIntegrityCase::WrongChildSize))),
-                        "platform": {"os": os, "architecture": architecture}
+                        "platform": {"os": "linux", "architecture": architecture}
                     }));
-                }
             }
             let index = serde_json::to_vec(&serde_json::json!({
                 "schemaVersion": 2,
@@ -1656,6 +1661,31 @@ mod tests {
             crate::pickle::store::compute_sha256(&manifest.config_bytes),
             manifest.config.digest
         );
+    }
+
+    #[tokio::test]
+    async fn upstream_selects_the_target_linux_architecture_before_fetching_blobs() {
+        use crate::pickle::upstream::{OciUpstream, UpstreamRegistry};
+        let fixture =
+            start_registry_fixture_with_options(None, Some(RegistryIntegrityCase::Amd64Index))
+                .await;
+        let reference = ImageReference::parse(&fixture.reference).unwrap();
+        for architecture in ["x86_64", "amd64"] {
+            let upstream = OciUpstream::insecure_http(Default::default())
+                .with_linux_architecture(architecture)
+                .unwrap();
+            assert!(upstream.fetch_manifest(&reference).await.is_ok());
+        }
+        let upstream = OciUpstream::insecure_http(Default::default())
+            .with_linux_architecture("aarch64")
+            .unwrap();
+        assert!(upstream.fetch_manifest(&reference).await.is_err());
+        assert!(
+            OciUpstream::new(Default::default())
+                .with_linux_architecture("unknown")
+                .is_err()
+        );
+        assert_eq!(fixture.layer_requests.load(Ordering::SeqCst), 0);
     }
 
     #[tokio::test]

@@ -37,9 +37,9 @@ F items are missing capabilities, not evidence of failures in supported behaviou
 [Audit evidence and reproducible probes](../qualification/2026-09-17-code-audit.md)
 record those distinctions and the hosted checks inspected.
 
-There are **87 tracked work packages**: 58 correctness/contract items, 12
+There are **88 tracked work packages**: 59 correctness/contract items, 12
 engineering follow-ups, 12 capability families and five acceptance/release gates.
-The correctness items include 29 P1 priorities; these are engineering priorities, not
+The correctness items include 30 P1 priorities; these are engineering priorities, not
 security severity ratings. A capability family can require several commits.
 
 ## What is already done
@@ -1639,6 +1639,24 @@ four attempts maximum, fresh blob buffers and terminal permanent failures.
 Pickle tests pass (9.17s/2.16s), and strict all-target/all-feature Clippy passes
 on both. HTTP fixtures cover each read type, interrupted streams, denial,
 incorrect lengths, attempt counts and the original deadline.
+
+### C59 — Select the Linux container platform independently of the client OS
+
+**Priority:** P1. **Chapter:** 5. Discovered while implementing C30's runnable
+registry fixture after storage-node copy confirmation.
+
+The shared verified OCI puller calls the library's current-OS resolver. On macOS,
+it searches a normal Linux container index for a Darwin image and refuses. The
+integrity fixture supplied both OS entries for the same bytes and masked this.
+A Linux-only wire fixture reproduces the failure before the repair.
+
+Select Linux explicitly and normalise the advertised x86-64/ARM64 architecture
+names. Permit the harness to request the target node's architecture, preserving
+root/child/configuration digest and size checks plus bounded retry behaviour.
+The Linux-only index, explicit target selection and missing/unsupported target
+checks pass with all 48 image/seven upstream tests on macOS/Linux. Strict
+all-target/all-feature Clippy passes on both. The initial Linux-only wire test
+fails on macOS before the fix. No protocol or state change is needed.
 
 ## Engineering follow-ups
 

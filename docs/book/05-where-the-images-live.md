@@ -1333,3 +1333,23 @@ expiry/cleanup, GC generations and node retirement. The actual TLS fixture gives
 a fresh receiver its own certificate and proves that its confirmed holdings
 appear at the leader without filling its local catalogue with stale remote tags.
 The new replicated operation advances protocol/state compatibility to 14/16.
+
+### The client is a Mac; the container is still Linux
+
+Our upstream integrity fixture used to advertise the same child image for both
+Linux and Darwin. That let a platform bug hide in plain sight: the OCI library's
+current-platform resolver chose the client's operating system. A Mac asking for
+a normal Linux container index therefore found no usable image. Replacing the
+fixture with a Linux-only index made the existing end-to-end pull test fail.
+
+The verified puller now chooses Linux explicitly, normalising Rust's `x86_64` and
+`aarch64` names to OCI's `amd64` and `arm64`. Normal node pulls use the node's
+architecture. A catalogue client can instead select the container host's reported
+architecture before staging its runnable fixture. Missing or unsupported targets
+refuse; they cannot silently select another platform. The pinned root index,
+selected child and configuration retain the same digest and size verification.
+
+The target-architecture test supplies an amd64-only index. Both amd64 spellings
+succeed, an ARM64 request fails and an unknown architecture refuses before
+network access. The complete image-integrity suite still checks altered indexes,
+child manifests, configurations, length metadata and interrupted reads.

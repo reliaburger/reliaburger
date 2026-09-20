@@ -11,7 +11,7 @@ use std::collections::HashMap;
 use std::time::{Duration, SystemTime};
 
 use crate::grill::image::ImageReference;
-use crate::grill::oci_pull::{pull_verified_manifest, retry_registry_read};
+use crate::grill::oci_pull::{pull_verified_manifest_for_architecture, retry_registry_read};
 
 use super::types::{Digest, LayerDescriptor, ManifestCatalog, PickleError};
 
@@ -153,6 +153,7 @@ pub fn resolve_credentials(
 
 /// The real upstream client, wrapping `oci_distribution`.
 pub struct OciUpstream {
+    architecture: String,
     client: oci_distribution::Client,
     /// host → (username, password); anonymous when absent.
     credentials: HashMap<String, (String, String)>,
@@ -179,9 +180,19 @@ impl OciUpstream {
             ..Default::default()
         };
         Self {
+            architecture: std::env::consts::ARCH.into(),
             client: oci_distribution::Client::new(config),
             credentials,
         }
+    }
+
+    /// Select Linux images for the container node rather than the harness host.
+    /// Accepts the Rust or OCI spelling of the supported x86-64/ARM64 targets.
+    pub fn with_linux_architecture(mut self, architecture: &str) -> Result<Self, PickleError> {
+        self.architecture = crate::grill::oci_pull::linux_architecture(architecture)
+            .map_err(|error| PickleError::ReplicationFailed(error.to_string()))?
+            .into();
+        Ok(self)
     }
 
     fn auth_for(&self, host: &str) -> oci_distribution::secrets::RegistryAuth {
@@ -228,7 +239,12 @@ impl UpstreamRegistry for OciUpstream {
             let reference = Self::oci_reference(image)?;
             let auth = self.auth_for(&image.registry);
             let verified = retry_registry_read(Duration::from_secs(30), || {
-                pull_verified_manifest(&self.client, &reference, &auth)
+                pull_verified_manifest_for_architecture(
+                    &self.client,
+                    &reference,
+                    &auth,
+                    &self.architecture,
+                )
             })
             .await
             .map_err(|e| {
