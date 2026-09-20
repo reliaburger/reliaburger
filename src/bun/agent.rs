@@ -6250,7 +6250,7 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
 
         // A previous life of this instance (crash restart) programmed a
         // different cgroup id — the directory was recreated. Scrub it.
-        self.clear_egress(instance_id).await;
+        self.clear_egress(instance_id).await?;
 
         let allow = egress_spec.allow.clone();
         let allow_for_resolve = allow.clone();
@@ -6392,74 +6392,76 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
     /// cgroup path — deleting one instance's entries directly would wipe a
     /// co-tenant's policy.
     #[cfg(all(feature = "ebpf", target_os = "linux"))]
-    async fn clear_egress(&mut self, instance_id: &InstanceId) {
-        let Some(binding) = self.egress_bindings.remove(instance_id) else {
-            return;
+    async fn clear_egress(&mut self, instance_id: &InstanceId) -> Result<(), BunError> {
+        let Some(binding) = self.egress_bindings.get(instance_id) else {
+            return Ok(());
         };
-        self.reprogram_cgroup_egress(binding.cgroup_id).await;
+        self.reprogram_cgroup_egress(binding.cgroup_id, Some(instance_id))
+            .await
+            .map_err(|error| BunError::RetirementState {
+                instance_id: instance_id.clone(),
+                reason: error.to_string(),
+            })?;
+        self.egress_bindings.remove(instance_id);
+        Ok(())
     }
 
     /// No-op without the eBPF data path.
     #[cfg(not(all(feature = "ebpf", target_os = "linux")))]
-    async fn clear_egress(&mut self, _instance_id: &InstanceId) {}
+    async fn clear_egress(&mut self, _instance_id: &InstanceId) -> Result<(), BunError> {
+        Ok(())
+    }
 
-    /// Rebuild the kernel egress state for one cgroup id from the current
-    /// bindings: delete every entry for the cgroup, then write the union
-    /// of what the surviving bindings allow (and the enforcement flag).
-    /// With no surviving binding the cgroup is scrubbed completely.
-    /// Failures leave the cgroup denying more than intended, never less.
+    /// Rebuild one cgroup's policy, excluding a retiring instance only from the
+    /// proposed kernel state. Its binding remains owned until every write succeeds.
     #[cfg(all(feature = "ebpf", target_os = "linux"))]
-    async fn reprogram_cgroup_egress(&mut self, cgroup_id: u64) {
+    async fn reprogram_cgroup_egress(
+        &mut self,
+        cgroup_id: u64,
+        excluding: Option<&InstanceId>,
+    ) -> Result<(), crate::sesame::egress::EgressMapError> {
         use crate::sesame::egress;
-
-        let Some(handle) = self.onion_ebpf.clone() else {
-            return;
-        };
-        let union: Vec<egress::EgressDestination> = {
-            let mut set = std::collections::BTreeSet::new();
-            for binding in self
-                .egress_bindings
-                .values()
-                .filter(|b| b.cgroup_id == cgroup_id)
-            {
-                set.extend(binding.resolved.iter().copied());
-            }
-            set.into_iter().collect()
-        };
-        let survivors = self
+        let handle = self
+            .onion_ebpf
+            .clone()
+            .ok_or(egress::EgressMapError::Unavailable)?;
+        let survivors: Vec<_> = self
             .egress_bindings
-            .values()
-            .any(|b| b.cgroup_id == cgroup_id);
-
+            .iter()
+            .filter(|(id, binding)| Some(*id) != excluding && binding.cgroup_id == cgroup_id)
+            .map(|(_, binding)| binding)
+            .collect();
         let mut ebpf = handle.lock().await;
-        if !survivors {
-            if let Err(e) = egress::delete_cgroup_egress_state(&mut ebpf.bpf, cgroup_id) {
-                eprintln!("sesame: could not scrub egress state for cgroup {cgroup_id}: {e}");
-            }
-            return;
+        if survivors.is_empty() {
+            return egress::delete_cgroup_egress_state(&mut ebpf.bpf, cgroup_id);
         }
+        let union: Vec<_> = survivors
+            .iter()
+            .flat_map(|binding| binding.resolved.iter().copied())
+            .collect::<std::collections::BTreeSet<_>>()
+            .into_iter()
+            .collect();
+        let merged = egress::merge_cidr_ports(&union)?;
+        egress::set_egress_enforced(&mut ebpf.bpf, cgroup_id)?;
+        egress::delete_cgroup_egress_entries(&mut ebpf.bpf, cgroup_id)?;
+        egress::write_egress_destinations(&mut ebpf.bpf, cgroup_id, &union, &merged)
+    }
 
-        if let Err(e) = egress::delete_cgroup_egress_entries(&mut ebpf.bpf, cgroup_id) {
-            eprintln!("sesame: could not clear egress entries for cgroup {cgroup_id}: {e}");
-        }
-        match egress::merge_cidr_ports(&union) {
-            Ok(merged) => {
-                if let Err(e) =
-                    egress::write_egress_destinations(&mut ebpf.bpf, cgroup_id, &union, &merged)
-                {
-                    eprintln!(
-                        "sesame: egress rewrite failed for cgroup {cgroup_id} \
-                         (unwritten destinations stay denied): {e}"
-                    );
-                }
-            }
-            Err(e) => {
-                eprintln!("sesame: egress CIDR merge failed for cgroup {cgroup_id}: {e}");
-            }
-        }
-        if let Err(e) = egress::set_egress_enforced(&mut ebpf.bpf, cgroup_id) {
-            eprintln!("sesame: could not re-enable egress enforcement for cgroup {cgroup_id}: {e}");
-        }
+    /// Stop every workload affected by an unconfirmed policy rewrite.
+    #[cfg(all(feature = "ebpf", target_os = "linux"))]
+    async fn handle_egress_rewrite_failure(
+        &mut self,
+        cgroup_id: u64,
+        error: crate::sesame::egress::EgressMapError,
+    ) {
+        eprintln!("sesame: egress rewrite failed for cgroup {cgroup_id}: {error}");
+        let affected = self
+            .egress_bindings
+            .iter()
+            .filter(|(_, binding)| binding.cgroup_id == cgroup_id)
+            .map(|(id, _)| id.clone())
+            .collect();
+        self.stop_instances_after_egress_loss(affected).await;
     }
 
     /// Verify the security boundary on every event-loop tick. Map drift gets
@@ -6536,7 +6538,9 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
         let plan = egress::plan_live_egress_health(capability, &expected, &kernel_enforced);
         for cgroup_id in &plan.repair {
             eprintln!("sesame: live check restoring egress enforcement for cgroup {cgroup_id}");
-            self.reprogram_cgroup_egress(*cgroup_id).await;
+            if let Err(error) = self.reprogram_cgroup_egress(*cgroup_id, None).await {
+                self.handle_egress_rewrite_failure(*cgroup_id, error).await;
+            }
         }
 
         let mut fence: std::collections::HashSet<u64> = plan.fence.into_iter().collect();
@@ -6649,7 +6653,10 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
             if let Some(b) = self.egress_bindings.get_mut(&instance_id) {
                 b.resolved = new_resolved;
             }
-            self.reprogram_cgroup_egress(binding.cgroup_id).await;
+            if let Err(error) = self.reprogram_cgroup_egress(binding.cgroup_id, None).await {
+                self.handle_egress_rewrite_failure(binding.cgroup_id, error)
+                    .await;
+            }
         }
     }
 
@@ -6752,7 +6759,9 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
         // only way lost entries (as opposed to a lost flag) come back.
         let live_cgroups: std::collections::HashSet<u64> = expected;
         for cgroup_id in live_cgroups {
-            self.reprogram_cgroup_egress(cgroup_id).await;
+            if let Err(error) = self.reprogram_cgroup_egress(cgroup_id, None).await {
+                self.handle_egress_rewrite_failure(cgroup_id, error).await;
+            }
         }
 
         // 3. Namespace map: delete kernel keys no reconcile pass wrote,
@@ -7732,7 +7741,6 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
         let service_id = crate::onion::service_id::ServiceId::new(namespace, app_name);
         for id in &instances {
             let _ = self.service_map.remove_backend(&service_id, &id.0);
-            self.clear_egress(id).await;
         }
         self.remove_backend_ebpf(&service_id).await;
         let _ = self.service_map.unregister(&service_id);
@@ -7895,6 +7903,7 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
         &mut self,
         instance_id: &InstanceId,
     ) -> Result<(), BunError> {
+        self.clear_egress(instance_id).await?;
         let identity_dir = self.instance_identity_dir(instance_id);
         let records_dir = self.records_dir.clone();
         let id = instance_id.0.clone();
@@ -8864,7 +8873,6 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
         });
         self.retain_stopped_instance(old_id);
         self.retire_instance_artifacts(old_id).await?;
-        self.clear_egress(old_id).await;
         self.supervisor.retire_instance(old_id).await;
         if let Some(service_id) = service_id {
             let _ = self.service_map.remove_backend(&service_id, &old_id.0);

@@ -1854,3 +1854,193 @@ fn build_dns_query(name: &str) -> Vec<u8> {
 
     packet
 }
+
+// BPF_MAP_FREEZE makes userspace deletion fail while preserving readable
+// evidence. Each test owns a fresh, unpinned map destroyed with its loader.
+fn freeze_egress_map(ebpf: &OnionEbpf, name: &str) {
+    use std::os::fd::{AsFd, AsRawFd};
+    let aya::maps::Map::HashMap(map) = ebpf.bpf.map(name).unwrap() else {
+        panic!("expected a hash map");
+    };
+    #[repr(C)]
+    struct FreezeAttributes {
+        map_fd: u32,
+    }
+    let attributes = FreezeAttributes {
+        map_fd: map.fd().as_fd().as_raw_fd() as u32,
+    };
+    // Linux uapi bpf_cmd::BPF_MAP_FREEZE = 22; its only input is map_fd.
+    // SAFETY: the kernel reads the initialised repr(C) input for the stated
+    // length; the borrowed map descriptor remains open throughout the call.
+    let result = unsafe {
+        nix::libc::syscall(
+            nix::libc::SYS_bpf,
+            22,
+            &attributes,
+            std::mem::size_of::<FreezeAttributes>(),
+        )
+    };
+    assert_eq!(result, 0, "{}", std::io::Error::last_os_error());
+}
+
+#[test]
+#[ignore = "requires Linux root and RELIABURGER_EBPF_TESTS=1"]
+fn egress_cleanup_refuses_a_frozen_destination_map_and_keeps_enforcement() {
+    use reliaburger::sesame::egress::{self, EGRESS_ALLOW, EgressKey, EgressValue};
+    assert!(ebpf_tests_enabled());
+    let mut ebpf = OnionEbpf::load(&find_bpf_obj_dir(), CGROUP_PATH.as_ref()).unwrap();
+    let cgroup = 0xDEAD_BEEF_CAFE_6101;
+    let key = EgressKey {
+        src_cgroup_id: cgroup,
+        dst_ip: u32::from(Ipv4Addr::new(203, 0, 113, 1)).to_be(),
+        dst_port: 443u16.to_be(),
+        _pad: 0,
+    };
+    egress::write_egress_entry(
+        &mut ebpf.bpf,
+        key,
+        EgressValue {
+            action: EGRESS_ALLOW,
+        },
+    )
+    .unwrap();
+    egress::set_egress_enforced(&mut ebpf.bpf, cgroup).unwrap();
+    freeze_egress_map(&ebpf, "egress_map");
+    let result = egress::delete_cgroup_egress_state(&mut ebpf.bpf, cgroup);
+    let still_allowed = egress::egress_allowed(&mut ebpf.bpf, key).unwrap();
+    let still_enforced = egress::egress_enforced(&mut ebpf.bpf, cgroup).unwrap();
+    ebpf.detach();
+    assert!(result.is_err(), "cleanup ignored a kernel deletion refusal");
+    assert!(
+        still_allowed && still_enforced,
+        "failed cleanup must retain enforcement and the undeleted entry"
+    );
+}
+
+#[test]
+#[ignore = "requires Linux root and RELIABURGER_EBPF_TESTS=1"]
+fn egress_cleanup_refuses_a_frozen_enforcement_flag() {
+    use reliaburger::sesame::egress;
+    assert!(ebpf_tests_enabled());
+    let mut ebpf = OnionEbpf::load(&find_bpf_obj_dir(), CGROUP_PATH.as_ref()).unwrap();
+    let cgroup = 0xDEAD_BEEF_CAFE_6102;
+    egress::set_egress_enforced(&mut ebpf.bpf, cgroup).unwrap();
+    freeze_egress_map(&ebpf, "egress_enabled_map");
+    let result = egress::delete_cgroup_egress_state(&mut ebpf.bpf, cgroup);
+    let still_enforced = egress::egress_enforced(&mut ebpf.bpf, cgroup).unwrap();
+    ebpf.detach();
+    assert!(
+        result.is_err(),
+        "cleanup ignored a kernel enforcement deletion refusal"
+    );
+    assert!(still_enforced);
+}
+
+#[tokio::test]
+#[ignore = "requires Linux root and RELIABURGER_EBPF_TESTS=1"]
+async fn agent_retirement_keeps_its_record_when_kernel_egress_cleanup_fails() {
+    use reliaburger::bun::agent::{AgentCommand, ApplyEvent, BunAgent};
+    use reliaburger::config::Config;
+    use reliaburger::grill::mock::MockGrill;
+    use reliaburger::grill::port::PortAllocator;
+    use std::sync::Arc;
+    use tokio::sync::{Mutex, mpsc, oneshot};
+    assert!(ebpf_tests_enabled());
+    let root = tempfile::tempdir().unwrap();
+    let records = root.path().join("records");
+    std::fs::create_dir(&records).unwrap();
+    let ebpf = Arc::new(Mutex::new(
+        OnionEbpf::load(&find_bpf_obj_dir(), CGROUP_PATH.as_ref()).unwrap(),
+    ));
+    let grill = MockGrill::new();
+    grill.set_honours_cgroup_path(true);
+    grill.set_pid(std::process::id());
+    let (commands, receiver) = mpsc::channel(64);
+    let shutdown = CancellationToken::new();
+    let mut agent = BunAgent::new(
+        grill,
+        PortAllocator::new(43400, 43500),
+        receiver,
+        shutdown.clone(),
+    );
+    agent.set_records_dir(records.clone());
+    agent.set_volumes_dir(root.path().join("volumes"));
+    agent.set_onion_ebpf(Arc::clone(&ebpf)).await;
+    let task = tokio::spawn(async move { agent.run().await });
+    let config = Config::parse(
+        r#"
+        [app.egress-retirement]
+        image = "mock:image"
+        command = ["sleep", "600"]
+        [app.egress-retirement.egress]
+        allow = ["203.0.113.9:443"]
+    "#,
+    )
+    .unwrap();
+    let (events, mut results) = mpsc::channel(64);
+    commands
+        .send(AgentCommand::Deploy { config, events })
+        .await
+        .unwrap();
+    while let Some(event) = results.recv().await {
+        assert!(!matches!(event, ApplyEvent::Error { .. }), "{event:?}");
+    }
+    let record = reliaburger::grill::records::record_path(&records, "default__egress-retirement-0");
+    assert!(
+        record.exists(),
+        "deployment did not persist its adoption record"
+    );
+    freeze_egress_map(&*ebpf.lock().await, "egress_map");
+    let (response, result) = oneshot::channel();
+    commands
+        .send(AgentCommand::Retire {
+            app_name: "egress-retirement".into(),
+            namespace: "default".into(),
+            response,
+        })
+        .await
+        .unwrap();
+    let result = tokio::time::timeout(Duration::from_secs(10), result)
+        .await
+        .unwrap()
+        .unwrap();
+    let retained_record = record.exists();
+    let (response, retry) = oneshot::channel();
+    commands
+        .send(AgentCommand::Retire {
+            app_name: "egress-retirement".into(),
+            namespace: "default".into(),
+            response,
+        })
+        .await
+        .unwrap();
+    let retry = tokio::time::timeout(Duration::from_secs(10), retry)
+        .await
+        .unwrap()
+        .unwrap();
+    let retained_after_retry = record.exists();
+    let (response, status) = oneshot::channel();
+    commands
+        .send(AgentCommand::Status { response })
+        .await
+        .unwrap();
+    let retained_instances = status.await.unwrap();
+    shutdown.cancel();
+    task.await.unwrap();
+    ebpf.lock().await.detach();
+    assert!(result.is_err(), "retirement accepted failed kernel cleanup");
+    assert!(
+        retained_record,
+        "retirement discarded the durable cleanup owner"
+    );
+    assert!(retry.is_err(), "retry forgot the failed kernel binding");
+    assert!(
+        retained_after_retry,
+        "retry discarded the durable cleanup owner"
+    );
+    assert_eq!(
+        retained_instances.len(),
+        1,
+        "retirement forgot its stopped cleanup owner"
+    );
+}

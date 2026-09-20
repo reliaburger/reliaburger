@@ -1042,3 +1042,45 @@ This remains an audit guard, not the authorisation mechanism. The existing
 request tests still prove that read-only users cannot mutate resources and
 scoped users cannot access another tenant. The new regression places a GET and
 a POST on one path and verifies that both are collected independently.
+
+### Keep ownership when the kernel refuses cleanup
+
+A stopped container still has one last job for us: remove its egress policy.
+Suppose the kernel rejects that deletion. Our earlier implementation discarded
+the error, removed the in-memory binding and deleted the adoption record. The
+operator saw successful retirement while the old map entry remained.
+
+We reproduced this with `BPF_MAP_FREEZE`, a kernel operation that makes a map
+readable but rejects further userspace writes. One test freezes a destination
+map; another freezes the enforcement flag. A third drives the public agent
+`Retire` command against a real frozen map and checks the adoption record. All
+three fail before the repair. We own the test maps and destroy them afterwards
+by dropping their unpinned loader; no unrelated policy is frozen.
+
+The map functions now return deletion errors. An explicit missing-key result is
+successful absence, while permission failures and unavailable maps retain the
+cleanup obligation. Enumeration needs the same discipline. This expression:
+
+```rust
+let keys = map.keys().collect::<Result<Vec<_>, _>>()?;
+```
+
+turns an iterator of individual key results into one result containing every
+key. It stops at the first error. The `::<...>` supplies type arguments to
+`collect`; each `_` asks Rust to infer that part of the type. The final `?`
+returns an error to the caller instead of presenting a partial inventory as a
+complete one.
+
+The agent computes the proposed policy without the retiring instance, but keeps
+its existing binding until the kernel confirms every operation. This matters
+when instances share a cgroup: the remaining policy is the union of the other
+bindings. Only after that rewrite succeeds do we forget the retiring binding,
+remove identity material and delete the adoption record. A failed operation
+leaves a stopped owner that the operator can retry.
+
+Periodic policy rewrites also propagate errors. If rewriting fails, the agent
+stops the affected workloads. A failed deletion can leave an old destination
+allowed, so merely logging the failure would not preserve the requested policy.
+The stopped workloads retain their cleanup obligations if the kernel still
+refuses removal. This repair concerns live cleanup; proving policy lifetime and
+restoration across actual Bun death remains a separate release gate.

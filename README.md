@@ -297,6 +297,11 @@ and discovery/Apple recovery remain release blockers
 in the [OCI ownership plan](docs/plans/2026-09-20-oci-launch-ownership.md).
 
 
+Egress cleanup now retains the stopped workload's binding and adoption record
+until the kernel confirms removal. Failed policy rewrites stop affected workloads;
+repeated cleanup failures remain retryable. Actual Bun-death policy lifetime and
+restoration are still part of release qualification.
+
 Log exports now preserve content generations, scope receipts to the destination,
 and serialise durable checkpoint updates across agent and offline exports. Source
 and checkpoint errors stop the export and prevent disk-pressure pruning.

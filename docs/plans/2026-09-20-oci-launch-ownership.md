@@ -108,6 +108,14 @@ changes only once the corresponding recovery contract is implemented.
   verified source bindings; withdraw bindings before confirming retirement.
   Audit persistent kernel state created before agent adoption independently of
   the external-command changes.
+  - [x] Require positive kernel egress retirement. Three real frozen-map tests
+    reproduce ignored destination/flag deletion errors and premature removal of
+    an agent adoption record. The repair retains bindings and records through
+    repeated failed cleanup and propagates enumeration errors. All 27 physical
+    Linux eBPF cases pass (5.67s), all 202 selected agent/egress library cases pass
+    on both macOS and Linux, and strict Clippy passes on both.
+  - [ ] Qualify the lifetime of unpinned cgroup links across actual Bun death,
+    and restore or fence protected workloads before adoption.
 - [ ] Apply the same pre-adoption reasoning to Apple Container CLI operations.
   Its experimental status does not justify falsely confirming cleanup while an
   older invocation can still create a container.
