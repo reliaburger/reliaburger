@@ -72,6 +72,10 @@ changes only once the corresponding recovery contract is implemented.
   runtime state, exit outcomes, logs and forwarding from those records before
   relying on agent adoption metadata. Remove recovered-PID signalling from the
   production recovery path.
+  - [x] Persist exact launcher/helper bindings before activation. Original exit/log
+    recovery, incomplete bindings, actual caller SIGKILL and stale shared handles
+    pass within 27 ownership cases and strict Clippy on macOS/Linux. Production
+    launcher/helper integration remains open.
 - [ ] Route namespace, link and forwarding mutations through owned commands.
   Before confirming cleanup, retire every admitted command, then verify OCI
   state, helper sockets, mounts, namespaces, links and owned forwarding state.
@@ -114,7 +118,10 @@ The primitives do not yet switch production Runc. Connect them in this order:
    before either can activate. Recover their original specifications, actual
    outcomes and logs independently of agent PID records. Unassociated prepared
    commands remain discoverable and must be cancelled during cleanup.
-3. Close normal command admission before retiring all launchers, auxiliary exec
+3. Route Runc exec through the launcher owner's existing auxiliary-command
+   protocol. Release the adapter mutex before waiting for output: the owner must
+   fence exec admission and retire its children, allowing concurrent cleanup.
+   Close normal command admission before retiring all launchers, auxiliary exec
    attempts and network helpers. Then run owned cleanup commands and inspect
    OCI state, mounts, namespaces, forwarding and discovery. Release address
    reservations only after every admitted mutator has positively retired.

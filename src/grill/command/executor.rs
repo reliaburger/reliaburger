@@ -2,14 +2,14 @@
 
 use std::collections::BTreeMap;
 use std::io;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
 use tokio::sync::Mutex;
 
-use super::CommandOutput;
-use crate::grill::runc_intent::{IntentCommands, IntentPhase};
+use super::{CommandOutput, CommandState};
+use crate::grill::runc_intent::{IntentCommands, IntentPhase, RuntimeRole};
 
 const COMMAND_TIMEOUT: Duration = Duration::from_secs(5);
 
@@ -70,6 +70,63 @@ impl ClaimedCommandExecutor {
             commands: Arc::new(Mutex::new(Some(commands))),
             cleanup: false,
         }
+    }
+
+    /// Start a bound long-lived role while retaining the shared generation claim.
+    pub async fn start_role(
+        &self,
+        role: RuntimeRole,
+        program: &Path,
+        arguments: &[String],
+        environment: &BTreeMap<String, String>,
+    ) -> io::Result<()> {
+        if self.cleanup {
+            return Err(io::Error::other(
+                "cleanup handle cannot start runtime roles",
+            ));
+        }
+        let program = program.to_owned();
+        let arguments = arguments.to_vec();
+        let environment = environment.clone();
+        let mut guard = self.commands.clone().lock_owned().await;
+        tokio::spawn(async move {
+            let current = guard.as_ref().ok_or_else(unavailable)?;
+            if !current
+                .record()
+                .is_some_and(|record| record.phase == IntentPhase::Owned)
+            {
+                return Err(io::Error::other("runtime role admission is sealed"));
+            }
+            let current = guard.take().ok_or_else(unavailable)?;
+            *guard = Some(
+                current
+                    .start_role(role, &program, &arguments, &environment)
+                    .await?,
+            );
+            Ok(())
+        })
+        .await
+        .map_err(io::Error::other)?
+    }
+
+    /// Observe the exact durable role binding without signalling recovered PIDs.
+    pub async fn role_state(&self, role: RuntimeRole) -> io::Result<Option<CommandState>> {
+        let guard = self.commands.lock().await;
+        guard
+            .as_ref()
+            .ok_or_else(unavailable)?
+            .role_state(role)
+            .await
+    }
+
+    /// Locate original role logs through validated generation ownership.
+    pub async fn role_log_stem(&self, role: RuntimeRole) -> io::Result<Option<PathBuf>> {
+        let guard = self.commands.lock().await;
+        guard
+            .as_ref()
+            .ok_or_else(unavailable)?
+            .role_log_stem(role)
+            .await
     }
 
     /// Fence normal handles and return a cleanup handle after positive command draining.

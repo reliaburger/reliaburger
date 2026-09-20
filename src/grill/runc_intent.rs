@@ -17,7 +17,8 @@ use serde::{Deserialize, Serialize};
 use super::{InstanceId, OciSpec};
 
 mod commands;
-pub use commands::IntentCommands;
+use super::command::CommandId;
+pub use commands::{IntentCommands, RuntimeRole};
 
 const RECORD_LIMIT: u64 = 1024 * 1024;
 
@@ -59,6 +60,16 @@ pub enum IntentPhase {
     },
 }
 
+/// Durable role bindings, published before their commands may activate.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RuntimeRoles {
+    /// Foreground Runc launcher, including its independently owned descendants.
+    pub launcher: Option<CommandId>,
+    /// Rootless network helper belonging to this generation.
+    pub rootless_network: Option<CommandId>,
+}
+
 /// Immutable original request plus the runtime's latest retirement evidence.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -74,6 +85,8 @@ pub struct RuntimeIntent {
     pub configuration: IntentConfiguration,
     /// Whether replacement has been authorised by confirmed retirement.
     pub phase: IntentPhase,
+    /// Exact commands permitted to execute long-lived runtime roles.
+    pub roles: RuntimeRoles,
 }
 
 /// A node's persistent collection of original Runc preparation attempts.
@@ -252,7 +265,7 @@ impl IntentJournal {
             return Err(io::Error::other("runtime intent exceeds size limit"));
         }
         let record: RuntimeIntent = serde_json::from_slice(&bytes)?;
-        if record.version != 1
+        if record.version != 2
             || record.instance_id != *instance
             || record.configuration != self.configuration
             || record.generation.0.len() != 32
@@ -291,12 +304,16 @@ impl IntentClaim {
                 .fill(&mut nonce)
                 .map_err(|_| io::Error::other("cannot generate runtime intent identity"))?;
             let record = RuntimeIntent {
-                version: 1,
+                version: 2,
                 instance_id: self.instance.clone(),
                 generation: IntentGeneration(hex::encode(nonce)),
                 spec,
                 configuration: self.journal.configuration.clone(),
                 phase: IntentPhase::Owned,
+                roles: RuntimeRoles {
+                    launcher: None,
+                    rootless_network: None,
+                },
             };
             let records = self.journal.directory.join("records");
             let directory = records.join(&self.instance.0);

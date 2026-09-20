@@ -162,6 +162,11 @@ impl OwnedCommands {
             .collect())
     }
 
+    /// Return this command's private log stem; append stdout or stderr extensions.
+    pub fn log_stem(&self, id: &CommandId) -> Result<PathBuf, CommandError> {
+        Ok(self.control.log_stem(&id.0)?)
+    }
+
     /// Activate the prepared generation through its independent owner.
     pub async fn start(&self, id: &CommandId) -> Result<(), CommandError> {
         Ok(self.control.start(&id.0).await?)

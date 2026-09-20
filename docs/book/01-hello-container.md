@@ -3131,3 +3131,46 @@ a controlled wait. A new adapter claims the surviving generation, seals and
 drains it, and only then opens the old command's gate. No late mutation occurs.
 This exercises the ordering with real processes; wiring the same ordering into
 Runc's actual namespace and forwarding operations remains the integration step.
+
+### Give the launcher a durable role
+
+A foreground `runc run` can outlive Bun. So can the network helper that connects
+its rootless container. A recovered PID tells us neither which command we
+permitted nor whether its owner has finished collecting descendants. We need a
+record of the permission itself.
+
+Each runtime generation now has separate command collections for its launcher,
+rootless network helper and short mutations. `RuntimeRole` is a Rust enum: its
+`Launcher` and `RootlessNetwork` variants name the two long-lived responsibilities.
+A `match` selects the corresponding collection and binding; adding another
+variant makes the compiler demand that we handle it in each selection.
+
+Starting a role has three steps. Prepare an immutable command, persist its exact
+command ID in the original-intent record, then ask its independent owner to
+activate it. The generation claim stays in the worker throughout. A crash
+between the first two steps leaves an unbound Prepared command. Recovery may
+cancel it, because it never received permission to execute. An unbound command
+that has executed is inconsistent evidence, so recovery refuses it.
+
+The persisted `RuntimeRoles` struct groups the two `Option<CommandId>` bindings.
+`None` means no command was authorised for that role. `Some(id)` must match the
+role collection's complete inventory. A missing command, an extra attempt or a
+reference into another generation prevents cleanup. The journal format changes
+to version 2, so an older record cannot silently stand in for these bindings.
+This format is still awaiting production Runc integration.
+
+Long-running roles don't block short state observations. They do block confirmed
+retirement. Sealing first refuses further admission, validates both bindings,
+then retires every role and short command through their owners. Only afterwards
+may the runtime inspect kernel resources and release its address reservation.
+A short launcher that has already exited keeps its actual exit code and original
+log files across adapter reconstruction. A cleanup signal never manufactures a
+successful workload result.
+
+The role tests exercise a launcher exiting with code 7, two surviving roles,
+preparation interrupted before binding, corrupt bindings, and actual caller
+SIGKILL while both roles remain alive. Recovery retires both before opening their
+old mutation gate; neither can act afterwards. Shared handles also prove that a
+clone from before sealing cannot start a helper or discard cleanup authority.
+These tests establish the command protocol. Actual Runc, slirp, mount and agent recovery still need the
+integration and physical qualification described in the OCI ownership plan.
