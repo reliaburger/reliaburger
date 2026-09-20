@@ -9958,6 +9958,17 @@ impl<G: Grill + Clone + 'static> DeployWorker<G> {
                         init_index: i,
                     });
                 }
+                // Runc can remove the shared cgroup when an init exits. Its
+                // successor must receive policy for the new kernel identity
+                // before either another init or the main workload executes.
+                self.ops
+                    .apply_network_pre_start(
+                        instance_id,
+                        app_name,
+                        Some(spec),
+                        &prepared.cgroup_path,
+                    )
+                    .await?;
             }
         }
 

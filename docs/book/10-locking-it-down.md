@@ -1372,3 +1372,24 @@ identities, collision-probed local allocation and a remote catalogue's chosen
 address. State 24 and kernel ownership manifest 2 refuse older development
 state and pinned maps whose grants used bare-name identities. Confirming grant
 retirement before an address can be reused remains a separate lifecycle task.
+
+### An init exit can change the cgroup
+
+Two short init containers followed by a main workload exposed another execution
+boundary. The first init had the expected namespace and egress maps. The second
+init and main workload did not. Runc had removed the shared cgroup when the first
+init exited; recreating the same filesystem path produced a different kernel
+identity. The old map entries still existed, but they no longer governed the
+process about to start.
+
+After each successful init, the agent runs the same checked pre-start policy
+path again. It prepares the cgroup, retires policy bound to the predecessor's
+identity, durably records the new binding and installs its namespace, grants and
+external allowlist. Only then may another init or the main workload start. A
+failed policy update propagates to deployment failure instead of granting
+execution. The physical regression uses real owned Runc with an offline BusyBox
+rootfs and observes policy immediately before all three Start calls.
+
+This closes successful init sequencing. Failed or interrupted init launch and
+cleanup still need separate lifecycle evidence; a completed happy path cannot
+prove that an unknown child has stopped.

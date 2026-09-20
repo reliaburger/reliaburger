@@ -442,3 +442,24 @@ library tests pass, as do both binary compatibility cases on each platform.
 Strict all-target/all-feature Clippy and formatting pass on both platforms.
 Retiring stale grants before any VIP reuse remains part of the separate durable
 service-ownership work.
+
+## Init-container policy lifetime
+
+The actual owned-Runc regression runs two short initialisers followed by the main
+workload, using a local BusyBox fixture. Before the fix, only the first Start
+observes the expected namespace and egress flag. Runc removes the shared cgroup
+on exit, so subsequent Starts use a new identity without policy. Refresh the
+existing checked pre-start policy after each successful init, before authorising
+the next container. Failed publication must prevent that next Start.
+
+This item covers successful init sequencing. Keep failed/interrupted init
+creation, launch and cleanup in the remaining lifecycle qualification: establish
+that parent retirement cannot clear policy or report completion while an
+uncertain initialiser can still execute, including recovery ordering across the
+complete original runtime inventory.
+
+Qualification: all 58 physical kernel cases pass (24.52s), including the real
+owned-Runc initialisers and main workload. All 174 affected library tests pass
+on macOS/Linux (17.865s/23.270s), with strict Clippy and formatting on both. The
+Linux lint pass required removing an unused import from the new fixture; no
+product behaviour changed after the passing tests.
