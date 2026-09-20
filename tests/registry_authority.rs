@@ -1305,3 +1305,79 @@ async fn registry_control_routes_bound_oversized_and_stalled_request_bodies() {
     }
     council.shutdown().await.unwrap();
 }
+
+#[tokio::test]
+async fn registry_cleanup_remains_pending_until_every_storage_node_confirms() {
+    use reliaburger::council::{CouncilResponse, RaftRequest};
+    use reliaburger::testkit::lease::{
+        LeaseError, TestLease, TestLeaseState, cleanup_cluster_lease, now_unix_millis,
+    };
+    let hierarchy = ca::generate_ca_hierarchy("registry", &IKM).unwrap();
+    let council = council(&hierarchy, true).await;
+    let now = now_unix_millis();
+    let lease = TestLease::new(
+        "pending".into(),
+        "owner".into(),
+        "fixture".into(),
+        "rbtest-pending".into(),
+        now,
+        now + 600_000,
+    )
+    .unwrap();
+    council
+        .write(RaftRequest::TestLeaseCreate(lease.clone()))
+        .await
+        .unwrap();
+    for node_id in [1, 2] {
+        let response = council
+            .write(RaftRequest::TestLeaseRegistryWriter {
+                lease_id: lease.lease_id.clone(),
+                repository: "rbtest-pending/image".into(),
+                node_id,
+                owner_id: Some(lease.owner_id.clone()),
+                observed_at_unix_ms: now,
+            })
+            .await
+            .unwrap();
+        assert!(!matches!(response, CouncilResponse::Refused { .. }));
+    }
+    for confirmed in [None, Some(1), Some(2)] {
+        if let Some(node_id) = confirmed {
+            let response = council
+                .write(RaftRequest::TestLeaseRegistryRetired {
+                    lease_id: lease.lease_id.clone(),
+                    repository: "rbtest-pending/image".into(),
+                    node_id,
+                })
+                .await
+                .unwrap();
+            assert!(!matches!(response, CouncilResponse::Refused { .. }));
+        }
+        let result = cleanup_cluster_lease(&council, &lease.lease_id, None).await;
+        if confirmed != Some(2) {
+            assert!(
+                matches!(result, Err(LeaseError::CleanupPending)),
+                "awaiting storage is pending, not a consensus failure: {result:?}"
+            );
+            let state = council.desired_state().await;
+            let pending = &state.test_leases[&lease.lease_id];
+            assert!(pending.workloads_retired);
+            assert!(matches!(
+                &pending.state,
+                TestLeaseState::Cleaning {
+                    last_error: None,
+                    ..
+                }
+            ));
+        } else {
+            result.unwrap();
+            assert!(
+                !council
+                    .desired_state()
+                    .await
+                    .test_leases
+                    .contains_key(&lease.lease_id)
+            );
+        }
+    }
+}

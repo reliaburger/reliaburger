@@ -375,3 +375,18 @@ standalone healer fixtures now explicitly seed metadata and check each authority
 own proof; the TLS cluster fixture proves their union at a common leader.
 Physical registry cleanup qualification and the runnable-image catalogue remain
 open.
+
+## Await asynchronous storage acknowledgements
+
+The C30 physical catalogue observed successful registry assertions followed by
+HTTP 500 during cleanup: the coordinator tried to finish the lease before its
+registry writers acknowledged retirement. Raft correctly refused. The helper now
+returns the existing CleanupPending result after recording workload retirement
+and before attempting final deletion. Admission is already fenced, so receipt
+sets can only shrink. Transport/storage errors retain their original handling.
+
+A real Raft two-writer regression fails before the fix, then proves zero/one
+acknowledgements retain Pending and the second permits completion. Six authority
+integrations, 17 lease tests and strict all-target/all-feature Clippy pass on
+macOS/Linux. No format change. The C30 fixture and complete physical registry
+qualification remain separate commits.

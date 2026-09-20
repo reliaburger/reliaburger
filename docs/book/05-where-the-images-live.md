@@ -1353,3 +1353,23 @@ The target-architecture test supplies an amd64-only index. Both amd64 spellings
 succeed, an ARM64 request fails and an unknown architecture refuses before
 network access. The complete image-integrity suite still checks altered indexes,
 child manifests, configurations, length metadata and interrupted reads.
+
+### Pending retirement is an ordinary state
+
+The runnable registry acceptance found a misleading failure in cleanup. All
+workloads had stopped, but storage workers had not yet acknowledged their
+repositories. The coordinator immediately proposed final lease deletion, and
+Raft correctly refused. Turning that refusal into HTTP 500 made the test runner
+report failed cleanup even though normal asynchronous retirement was in progress.
+
+After recording the workload-retired barrier, the coordinator now checks the
+remaining writer receipts. Any outstanding receipt returns the existing
+`CleanupPending` result, which the API exposes as 202. The caller keeps polling;
+only confirmed removal finishes the lease. This follows the same rule as pending
+placements. Once cleanup starts, no new writer can attach, so those outstanding
+sets can only shrink. Final Raft checks still protect against concurrent changes.
+
+The regression records two writers, begins cleanup and receives Pending after
+zero and one confirmations. Only the second confirmation permits completion.
+Before the fix it received a consensus error and recorded a spurious cleanup
+failure. Actual transport or storage errors continue to retain their evidence.

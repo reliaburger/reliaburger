@@ -1175,6 +1175,17 @@ pub async fn cleanup_cluster_lease(
         )
         .await?;
     }
+    // Storage retirement is asynchronous, just like placement retirement.
+    // BeginCleanup fences new writers, so outstanding receipts can only shrink.
+    if council
+        .desired_state()
+        .await
+        .test_leases
+        .get(lease_id)
+        .is_some_and(|lease| !lease.registry_retirement_confirmed())
+    {
+        return Err(LeaseError::CleanupPending);
+    }
     let result = write_cluster_lease_request(
         council,
         crate::council::RaftRequest::TestLeaseFinishCleanup {
