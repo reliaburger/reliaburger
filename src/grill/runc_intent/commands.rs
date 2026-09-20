@@ -36,6 +36,21 @@ pub struct IntentCommands {
     drained: bool,
 }
 
+/// A captured owner capability; it cannot register independent role commands.
+pub(crate) struct RoleExecution {
+    commands: OwnedCommands,
+    id: CommandId,
+}
+
+impl RoleExecution {
+    pub(crate) async fn execute(&self, command: &[String]) -> io::Result<String> {
+        self.commands
+            .exec(&self.id, command)
+            .await
+            .map_err(io::Error::other)
+    }
+}
+
 impl IntentClaim {
     /// Attach short runtime mutations to this exact published generation.
     /// The Bun executable provides the independent foreground command owner.
@@ -222,6 +237,32 @@ impl IntentCommands {
             )),
             None => Ok(None),
         }
+    }
+
+    /// Capture the immutable owner capability before releasing the adapter mutex.
+    /// The independent owner fences and retires auxiliary work, including requests
+    /// queued before sealing but delivered while retirement is in progress.
+    pub(crate) async fn execution(&self, role: RuntimeRole) -> io::Result<RoleExecution> {
+        if !self
+            .record()
+            .is_some_and(|record| record.phase == IntentPhase::Owned)
+        {
+            return Err(io::Error::other("runtime exec admission is sealed"));
+        }
+        if !matches!(
+            self.role_state(role).await?,
+            Some(CommandState::Running { .. })
+        ) {
+            return Err(io::Error::other("runtime role is not running"));
+        }
+        let id = self
+            .binding(role)
+            .ok_or_else(|| io::Error::other("runtime role is unbound"))?
+            .clone();
+        Ok(RoleExecution {
+            commands: self.collection(role).clone(),
+            id,
+        })
     }
 
     /// Locate the bound role's original logs after validating its complete inventory.

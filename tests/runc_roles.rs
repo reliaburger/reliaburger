@@ -392,3 +392,91 @@ async fn runtime_roles_fixture() {
         .await
         .unwrap();
 }
+
+#[tokio::test]
+async fn role_exec_does_not_hold_the_adapter_lock_while_cleanup_retires_it() {
+    use reliaburger::grill::command::ClaimedCommandExecutor;
+    let root = tempfile::tempdir().unwrap();
+    let executor = ClaimedCommandExecutor::new(
+        shell(
+            fresh(root.path()).await,
+            RuntimeRole::Launcher,
+            "exec sleep 60",
+        )
+        .await,
+    );
+    let output = executor
+        .exec_role(
+            RuntimeRole::Launcher,
+            &["/bin/sh".into(), "-c".into(), "printf auxiliary".into()],
+        )
+        .await
+        .unwrap();
+    assert_eq!(output, "auxiliary");
+    let ready = root.path().join("exec-ready");
+    let running = executor.clone();
+    let arguments = vec![
+        "/bin/sh".into(),
+        "-c".into(),
+        "touch \"$1\"; exec sleep 60".into(),
+        "exec-fixture".into(),
+        ready.display().to_string(),
+    ];
+    let caller =
+        tokio::spawn(async move { running.exec_role(RuntimeRole::Launcher, &arguments).await });
+    tokio::time::timeout(Duration::from_secs(15), async {
+        while !ready.exists() {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .unwrap();
+    let cleanup = tokio::time::timeout(
+        Duration::from_secs(10),
+        executor.seal(Duration::from_secs(5)),
+    )
+    .await
+    .expect("exec held the adapter mutex during cleanup")
+    .unwrap();
+    assert!(caller.await.unwrap().is_err());
+    assert!(
+        executor
+            .exec_role(RuntimeRole::Launcher, &["/bin/true".into()])
+            .await
+            .is_err()
+    );
+    cleanup.finish(None).await.unwrap();
+}
+
+#[tokio::test]
+async fn cancelled_role_exec_cannot_complete_a_late_mutation() {
+    use reliaburger::grill::command::ClaimedCommandExecutor;
+    let root = tempfile::tempdir().unwrap();
+    let executor = ClaimedCommandExecutor::new(
+        shell(
+            fresh(root.path()).await,
+            RuntimeRole::Launcher,
+            "exec sleep 60",
+        )
+        .await,
+    );
+    let ready = root.path().join("exec-ready");
+    let running = executor.clone();
+    let arguments = vec!["/bin/sh".into(), "-c".into(), "touch \"$1/exec-ready\"; while [ ! -f \"$1/release\" ]; do sleep 0.02; done; touch \"$1/late-exec\"".into(), "exec-fixture".into(), root.path().display().to_string()];
+    let caller =
+        tokio::spawn(async move { running.exec_role(RuntimeRole::Launcher, &arguments).await });
+    tokio::time::timeout(Duration::from_secs(15), async {
+        while !ready.exists() {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .unwrap();
+    caller.abort();
+    let _ = caller.await;
+    let cleanup = executor.seal(Duration::from_secs(15)).await.unwrap();
+    std::fs::write(root.path().join("release"), "continue").unwrap();
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    assert!(!root.path().join("late-exec").exists());
+    cleanup.finish(None).await.unwrap();
+}

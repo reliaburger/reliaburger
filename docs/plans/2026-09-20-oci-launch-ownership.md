@@ -129,7 +129,11 @@ The primitives do not yet switch production Runc. Connect them in this order:
    adapters. A clone created before sealing cannot obtain cleanup authority.
 5. Prune positively retired short-command records under the same exclusive
    claim, so recurring runtime observations cannot grow the journal indefinitely.
-   Failed or uncertain attempts must remain discoverable.
+   Failed or uncertain attempts must remain discoverable. Move terminal records
+   atomically to a separate private garbage directory before deleting files, so
+   a crash during deletion cannot corrupt the active command inventory. Fence
+   delayed starts with the original operation and owner locks; command IDs are
+   never reused. Preserve launcher/helper records for outcomes and logs.
 6. Switch production selection and complete agent launch-inventory recovery only
    after these paths pass actual Bun-death, missing-adoption-record, short-job,
    rootful/rootless and rolling-upgrade qualification.

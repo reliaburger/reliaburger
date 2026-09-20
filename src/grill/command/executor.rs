@@ -119,6 +119,27 @@ impl ClaimedCommandExecutor {
             .await
     }
 
+    /// Run auxiliary work without holding the adapter mutex during its lifetime.
+    /// Cancellation closes the caller's owner socket; sealing can retire the role
+    /// concurrently and waits for its accepted auxiliary children to disappear.
+    pub async fn exec_role(&self, role: RuntimeRole, command: &[String]) -> io::Result<String> {
+        if self.cleanup {
+            return Err(io::Error::other(
+                "cleanup handle cannot execute runtime roles",
+            ));
+        }
+        let execution = {
+            let guard = self.commands.lock().await;
+            guard
+                .as_ref()
+                .ok_or_else(unavailable)?
+                .execution(role)
+                .await?
+        };
+        // Keep the socket future in this caller, so cancellation reaches the owner.
+        execution.execute(command).await
+    }
+
     /// Locate original role logs through validated generation ownership.
     pub async fn role_log_stem(&self, role: RuntimeRole) -> io::Result<Option<PathBuf>> {
         let guard = self.commands.lock().await;

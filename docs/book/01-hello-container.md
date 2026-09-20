@@ -3174,3 +3174,30 @@ old mutation gate; neither can act afterwards. Shared handles also prove that a
 clone from before sealing cannot start a helper or discard cleanup authority.
 These tests establish the command protocol. Actual Runc, slirp, mount and agent recovery still need the
 integration and physical qualification described in the OCI ownership plan.
+
+### Don't let exec hold up retirement
+
+An operator starts a long `runc exec`, then asks Bun to stop the container.
+Holding the adapter mutex until exec returns would make cleanup wait behind the
+very command it needs to interrupt. Instead, we capture the role's immutable
+owner capability under the mutex, release the mutex, and wait through the owner's
+existing auxiliary-command protocol.
+
+The captured value contains an owned-command collection and its exact command
+ID. It grants no permission to prepare another role. The independent owner
+checks whether its main command is still running before accepting exec, retains
+each accepted child owner, and waits for all of them during retirement. A request
+captured before sealing cannot target a successor generation. Its old owner
+must either refuse it or account for it before completing retirement.
+
+We deliberately keep the exec socket future in the caller. Cancelling that
+future closes the connection, which tells the owner to retire its auxiliary
+command. Spawning an unobserved background task here would discard that useful
+cancellation signal. This differs from short mutations, whose worker retains
+the generation claim until it finishes.
+
+Two regressions exercise concurrent cleanup and cancellation using actual child
+commands. One requires sealing to finish while a long exec is still waiting;
+the other opens a delayed mutation gate only after retirement and checks that
+nothing happens. Actual container exec qualification follows when Runc uses
+this adapter path.
