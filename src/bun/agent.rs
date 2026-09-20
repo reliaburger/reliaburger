@@ -2154,23 +2154,40 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
     /// `backend_map` so the eBPF connect hook rewrites its VIP to live
     /// backends (L8 completeness). Called after every service-map add /
     /// health change. A no-op without the eBPF data path loaded.
-    #[cfg(all(feature = "ebpf", target_os = "linux"))]
     async fn sync_backend_ebpf(&self, id: &crate::onion::service_id::ServiceId) {
-        let Some(handle) = self.onion_ebpf.as_ref() else {
-            return;
-        };
-        let Some(entry) = self.service_map.resolve(id).cloned() else {
-            return;
-        };
-        let bpf = crate::onion::ebpf::maps::BpfServiceMap::new();
-        let mut ebpf = handle.lock().await;
-        if let Err(e) = bpf.update_backends_bpf(&mut ebpf, entry.vip, entry.port, &entry) {
-            eprintln!("onion: backend map sync failed for {id}: {e}");
+        if let Err(error) = self.publish_backend_ebpf(id).await {
+            eprintln!("onion: {error}");
         }
     }
 
+    /// Require successful kernel publication before acknowledging deployment.
+    #[cfg(all(feature = "ebpf", target_os = "linux"))]
+    async fn publish_backend_ebpf(
+        &self,
+        id: &crate::onion::service_id::ServiceId,
+    ) -> Result<(), BunError> {
+        let Some(handle) = self.onion_ebpf.as_ref() else {
+            return Ok(());
+        };
+        let Some(entry) = self.service_map.resolve(id).cloned() else {
+            return Ok(());
+        };
+        let bpf = crate::onion::ebpf::maps::BpfServiceMap::new();
+        let mut ebpf = handle.lock().await;
+        bpf.update_backends_bpf(&mut ebpf, entry.vip, entry.port, &entry)
+            .map_err(|error| BunError::BackendPublication {
+                service: id.clone(),
+                reason: error.to_string(),
+            })
+    }
+
     #[cfg(not(all(feature = "ebpf", target_os = "linux")))]
-    async fn sync_backend_ebpf(&self, _id: &crate::onion::service_id::ServiceId) {}
+    async fn publish_backend_ebpf(
+        &self,
+        _id: &crate::onion::service_id::ServiceId,
+    ) -> Result<(), BunError> {
+        Ok(())
+    }
 
     /// Drop an app's `backend_map` entry. Must be called *before* the app
     /// is unregistered from the service map, while its VIP/port are still
@@ -5776,10 +5793,15 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
     /// backend into `backend_map` (L8) and reconcile namespace-firewall maps
     /// (NET5). Egress is deliberately absent here: it must already have been
     /// programmed before `start`, never repaired in post-start bookkeeping.
-    async fn finish_instance_networking(&mut self, app_name: &str, namespace: &str) {
+    async fn finish_instance_networking(
+        &mut self,
+        app_name: &str,
+        namespace: &str,
+    ) -> Result<(), BunError> {
         let service_id = crate::onion::service_id::ServiceId::new(namespace, app_name);
-        self.sync_backend_ebpf(&service_id).await;
+        self.publish_backend_ebpf(&service_id).await?;
         self.sync_firewall_ebpf().await;
+        Ok(())
     }
 
     /// Fast pre-create bookkeeping for a fresh instance (the loop side of the
@@ -5904,7 +5926,7 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
             }
         }
 
-        self.finish_instance_networking(app_name, namespace).await;
+        self.finish_instance_networking(app_name, namespace).await?;
         Ok(())
     }
 
@@ -6136,7 +6158,7 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
             }
         }
 
-        self.finish_instance_networking(app_name, namespace).await;
+        self.finish_instance_networking(app_name, namespace).await?;
         if let Some(ref ingress) = spec.ingress {
             self.ingress_configs.insert(
                 (namespace.to_string(), app_name.to_string()),
@@ -7635,7 +7657,10 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
             }
             // Egress was applied before `start` above. Post-start networking
             // only refreshes the service and namespace-firewall maps.
-            self.finish_instance_networking(&app_name, &namespace).await;
+            if let Err(error) = self.finish_instance_networking(&app_name, &namespace).await {
+                self.record_failed_restart(&id, &error.to_string()).await;
+                continue;
+            }
 
             // Starting → HealthWait, then Running if no health checks
             if let Some(instance) = self.supervisor.get_instance_mut(&id) {

@@ -56,6 +56,13 @@ pub enum BunError {
         reason: String,
     },
 
+    /// Kernel backend publication failed, so deployment cannot report completion.
+    #[error("cannot publish backend for {service}: {reason}")]
+    BackendPublication {
+        service: crate::onion::service_id::ServiceId,
+        reason: String,
+    },
+
     /// Kernel service withdrawal failed, so its workload ownership must remain.
     #[error("cannot retire backend for {service}: {reason}")]
     BackendRetirement {

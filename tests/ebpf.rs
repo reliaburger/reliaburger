@@ -4089,3 +4089,70 @@ async fn check_backend_retirement(strategy: Option<&str>, freeze: bool) {
         "VIP lost its intended endpoint {expected}: {response}"
     );
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "requires Linux root and RELIABURGER_EBPF_TESTS=1"]
+async fn refused_backend_publication_cannot_report_a_completed_deployment() {
+    use reliaburger::bun::agent::{AgentCommand, ApplyEvent, BunAgent};
+    use reliaburger::grill::{port::PortAllocator, process::ProcessGrill};
+    use std::sync::Arc;
+    use tokio::sync::{Mutex, mpsc};
+    assert!(ebpf_tests_enabled());
+    let root = tempfile::tempdir().unwrap();
+    let ebpf = Arc::new(Mutex::new(
+        OnionEbpf::load_embedded(CGROUP_PATH.as_ref()).unwrap(),
+    ));
+    freeze_egress_map(&*ebpf.lock().await, "backend_map");
+    let (commands, receiver) = mpsc::channel(64);
+    let shutdown = CancellationToken::new();
+    let mut agent = BunAgent::new(
+        ProcessGrill::new(),
+        PortAllocator::new(43800, 43900),
+        receiver,
+        shutdown.clone(),
+    );
+    agent.set_records_dir(root.path().join("records"));
+    agent.set_volumes_dir(root.path().join("volumes"));
+    agent.set_onion_ebpf(Arc::clone(&ebpf)).await;
+    let task = tokio::spawn(async move { agent.run().await });
+    let config = reliaburger::config::Config::parse("[app.publication-refusal]\nimage = 'proc-grill:image-ignored'\ncommand = ['sleep', '60']\nport = 8080\n").unwrap();
+    let (events, mut results) = mpsc::channel(64);
+    commands
+        .send(AgentCommand::Deploy { config, events })
+        .await
+        .unwrap();
+    let observation = tokio::time::timeout(Duration::from_secs(5), async {
+        let mut completed = false;
+        let mut failed = false;
+        while let Some(event) = results.recv().await {
+            completed |= matches!(event, ApplyEvent::Complete { .. });
+            if let ApplyEvent::Error { message } = event {
+                failed |= message.contains("cannot publish backend");
+            }
+        }
+        (completed, failed)
+    })
+    .await;
+    let record = reliaburger::grill::records::record_path(
+        &root.path().join("records"),
+        "default__publication-refusal-0",
+    )
+    .exists();
+    let vip = VirtualIP::from_service_id(&ServiceId::new("default", "publication-refusal"));
+    let backend = BpfServiceMap::new()
+        .read_backends(&mut *ebpf.lock().await, vip, 8080)
+        .unwrap();
+    shutdown.cancel();
+    task.await.unwrap();
+    ebpf.lock().await.detach().unwrap();
+    let (completed, failed) = observation.unwrap();
+    assert!(
+        backend.is_none(),
+        "injected backend refusal was ineffective"
+    );
+    assert!(record, "failed publication lost runtime ownership");
+    assert!(
+        !completed && failed,
+        "deployment completed without a published kernel backend"
+    );
+}

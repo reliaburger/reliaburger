@@ -563,3 +563,17 @@ Qualification: all 63 physical kernel cases pass (59.53s), including both refuse
 strategies and a successful rolling replacement. All 207 affected library tests
 pass on macOS/Linux (17.799s/22.892s), with strict Clippy and formatting on both;
 both Linux binary compatibility cases also pass. Protocol/state remain 14/26.
+
+## Checked deployment backend publication
+
+Freezing the backend map before a fresh deploy reproduces Complete despite an
+absent kernel backend (0.26s). Add a checked publication result to fresh and
+rolling finalisation, propagate failure to the client and retain runtime
+ownership. Restart finalisation must route the same failure through its existing
+bounded retry/cleanup policy. This does not establish durable service ownership
+or confirm every intermediate health/replacement publication; those remain open.
+
+Qualification: all 64 physical kernel cases pass (61.76s), including refused
+fresh publication. All 207 affected library tests pass on macOS/Linux
+(17.697s/23.243s), with strict Clippy and formatting on both platforms; both Linux
+binary compatibility cases also pass. Protocol/state remain 14/26.

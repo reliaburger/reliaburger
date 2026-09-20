@@ -139,6 +139,8 @@ when identity or adoption-record removal fails, so cleanup can be retried.
 Explicit Stop and per-instance rollout retirement now confirm kernel backend
 withdrawal before stopping the runtime. Refusal retains the original destination
 and its address. Natural-exit and durable discovery recovery remain release gates.
+Failed final kernel backend publication now reports a deployment error and retains
+the running workload’s ownership for cleanup or retry.
 Retirement also fences automatic restarts before signalling the old runtime.
 Rollout identities advance past adopted generations after Bun replacement. With rootful Linux DNS
 enabled, short

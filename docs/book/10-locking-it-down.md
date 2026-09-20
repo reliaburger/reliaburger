@@ -1474,3 +1474,23 @@ container. Each also starts an unrelated portless container and checks that the
 VIP still selects its intended endpoint. This boundary covers requested
 per-instance retirement; natural exits and recovery still need durable address
 and discovery ownership.
+
+### Failed publication is a deployment error
+
+Freeze the backend map before deploying an app. Bun used to print the failed
+kernel write and still send the client a Complete event. The process was running,
+but its VIP had no backend. Logging the failure was not enough.
+
+Deployment finalisation now awaits a checked backend publication and propagates
+its typed error. Rust's `Result<(), BunError>` makes the distinction explicit:
+`Ok(())` confirms the operation, while `Err` carries the service and failure.
+The `?` operator returns that failure to the deployment worker, which emits an
+Error event instead of Complete. Restart finalisation feeds the same failure
+into the existing bounded cleanup/retry path instead of marking the restart
+Running.
+
+This write occurs after runtime startup. Failure therefore retains the adoption
+record and does not claim execution stopped or rollback succeeded. The physical
+regression checks all three facts: the kernel has no backend, the caller receives
+an error, and the runtime's ownership record survives. Durable discovery recovery
+and intermediate/background map updates remain separate work.
