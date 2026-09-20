@@ -120,8 +120,9 @@ an ordinary repository does not preserve access through a retired name.
 Unconfirmed Raft commits return 503 and
 require a client retry; 201 confirms catalogue acceptance, while blob replication
 may still be pending. Push publication and GC deletion share a
-transaction guard, so collection cannot delete a layer between its final check
-and publication. Repository/upload lease cleanup remains open in C34.
+transaction guard through authoritative publication and physical deletion.
+A durable per-node GC generation also rejects delayed manifest proposals that
+were checked before collection. Stale publication returns 503 for a fresh retry. Repository/upload lease cleanup remains open in C34.
 HTTP writes under `rbtest-…/` require the exact authenticated lease owner and
 the `x-reliaburger-test-lease` header. Nodes record ownership before upload files
 and confirm partial-upload and metadata retirement only after workloads stop.

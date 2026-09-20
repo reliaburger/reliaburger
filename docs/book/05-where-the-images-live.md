@@ -1265,3 +1265,34 @@ on blocking workers. The queued-cleanup regression, cancelled caller, stalled
 body, corrupt data, failed publication and retained-deletion tests cover those
 boundaries. Publishing storage locations still needs its own conditional,
 GC-fenced confirmation; owning a transfer does not make an old holder set safe.
+
+### A late publication must not undo collection
+
+Suppose a node checks its uploaded blobs and proposes a manifest, but the
+proposal times out. Collection then runs. The old proposal can still reach Raft
+later, so a local mutex alone cannot prove that the advertised bytes survived.
+Each storage node now has a durable GC generation. Every approval that might
+delete bytes advances it before changing catalogue holdings; an exhausted counter
+refuses the entire operation. A refused deletion leaves the generation unchanged.
+
+The publisher queries its current generation while holding the local catalogue
+guard, checks that its verified blobs remain present, persists local metadata and
+keeps the guard through the authoritative proposal. Raft compares the attached
+generation with its current record before publishing either an ordinary or leased
+manifest. A stale publication gets a typed retry result, surfaced as 503, so the
+next attempt obtains a fresh generation and checks its bytes again.
+
+Both publication and GC run as owned tasks. GC acquires the same local guard
+before asking for approval and retains it through physical deletion. Cancelling
+a caller does not release a transaction that still owns work. If a GC proposal
+times out, it deletes nothing; a later committed generation still invalidates
+older publication attempts. This is why the generation belongs in the replicated
+state as well as the network request.
+
+The tests first reproduced a stale manifest being accepted and an exhausted
+counter still approving collection. They also exercise snapshot restoration,
+unchanged generations for refused deletions, ownership across caller cancellation
+and actual TLS publication after a worker collects an orphan. The state format
+advances to 15 and the protocol to 13. Development clusters still need fresh
+state. Peer-copy confirmation will use this same fence; its old full-holder-set
+operation remains the next piece to replace.

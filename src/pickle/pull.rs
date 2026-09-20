@@ -492,6 +492,7 @@ mod tests {
 
         let mut catalog = ManifestCatalog::default();
         catalog.apply_manifest_commit(&ManifestCommit {
+            observed_gc_generation: 0,
             manifest,
             tag: "latest".to_string(),
             holder_nodes: BTreeSet::from([1]),
@@ -518,6 +519,7 @@ mod tests {
 
         let mut catalog = ManifestCatalog::default();
         catalog.apply_manifest_commit(&ManifestCommit {
+            observed_gc_generation: 0,
             manifest,
             tag: "latest".to_string(),
             holder_nodes: BTreeSet::from([1]),
@@ -557,6 +559,7 @@ mod tests {
 
         let mut catalog = ManifestCatalog::default();
         catalog.apply_manifest_commit(&ManifestCommit {
+            observed_gc_generation: 0,
             manifest,
             tag: "latest".to_string(),
             holder_nodes: BTreeSet::from([1]),
@@ -575,6 +578,7 @@ mod tests {
         let manifest = test_manifest("myapp");
         let mut catalog = ManifestCatalog::default();
         catalog.apply_manifest_commit(&ManifestCommit {
+            observed_gc_generation: 0,
             manifest,
             tag: "latest".to_string(),
             holder_nodes: BTreeSet::from([1]),

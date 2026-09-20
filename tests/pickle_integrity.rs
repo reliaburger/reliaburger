@@ -594,6 +594,7 @@ async fn a_peer_committed_manifest_is_visible_through_the_authoritative_catalogu
     };
     council
         .write(RaftRequest::ManifestCommit(ManifestCommit {
+            observed_gc_generation: 0,
             manifest: manifest.clone(),
             tag: "v1".to_string(),
             holder_nodes: BTreeSet::from([2]),

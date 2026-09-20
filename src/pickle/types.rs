@@ -168,6 +168,10 @@ impl ImageManifest {
 /// Commit a manifest to the Raft catalog.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ManifestCommit {
+    /// GC generation observed while verifying the publishing node's local blobs.
+    /// Cluster publication refuses if collection advanced any declared holder.
+    #[serde(default)]
+    pub observed_gc_generation: u64,
     /// The manifest to store.
     pub manifest: ImageManifest,
     /// Tag to associate with this manifest (e.g. `"latest"`).
@@ -791,6 +795,7 @@ mod tests {
         );
         assert_eq!(catalog.repository_owners["rbtest-run1/web"], "run2");
         catalog.apply_manifest_commit(&ManifestCommit {
+            observed_gc_generation: 0,
             manifest: test_manifest("rbtest-legacy/web", "a"),
             tag: "latest".into(),
             holder_nodes: BTreeSet::from([1]),
@@ -925,6 +930,7 @@ mod tests {
         // Two nodes hold the layer, so holder bookkeeping alone would
         // approve a deletion — but the manifest still references it.
         catalog.apply_manifest_commit(&ManifestCommit {
+            observed_gc_generation: 0,
             manifest,
             tag: "latest".to_string(),
             holder_nodes: BTreeSet::from([1, 2]),
@@ -972,6 +978,7 @@ mod tests {
                 .is_empty()
         );
         catalog.apply_manifest_commit(&ManifestCommit {
+            observed_gc_generation: 0,
             manifest,
             tag: "latest".into(),
             holder_nodes: BTreeSet::from([2]),
@@ -1108,6 +1115,7 @@ mod tests {
             (unique.clone(), "unique"),
         ] {
             catalog.apply_manifest_commit(&ManifestCommit {
+                observed_gc_generation: 0,
                 manifest,
                 tag: tag.into(),
                 holder_nodes: BTreeSet::from([1]),
@@ -1115,6 +1123,7 @@ mod tests {
         }
         // Digest-addressed publication uses a reference containing a colon.
         catalog.apply_manifest_commit(&ManifestCommit {
+            observed_gc_generation: 0,
             manifest: unique.clone(),
             tag: unique.digest.as_str().into(),
             holder_nodes: BTreeSet::from([1]),
@@ -1173,6 +1182,7 @@ mod tests {
             ("rbtest-b/web", "other", 3),
         ] {
             catalog.apply_manifest_commit(&ManifestCommit {
+                observed_gc_generation: 0,
                 manifest: test_manifest(repository, digest),
                 tag: "latest".into(),
                 holder_nodes: BTreeSet::from([holder]),
@@ -1252,6 +1262,7 @@ mod tests {
         let m = test_manifest("myapp", "mfst1");
 
         catalog.apply_manifest_commit(&ManifestCommit {
+            observed_gc_generation: 0,
             manifest: m.clone(),
             tag: "latest".to_string(),
             holder_nodes: BTreeSet::from([1, 2]),
@@ -1278,6 +1289,7 @@ mod tests {
         let manifest = test_manifest("myapp", "mfst1");
 
         let commit = ManifestCommit {
+            observed_gc_generation: 0,
             manifest: manifest.clone(),
             tag: "latest".to_string(),
             holder_nodes: BTreeSet::from([1, 2]),
@@ -1295,6 +1307,7 @@ mod tests {
 
         let m1 = test_manifest("myapp", "mfst1");
         catalog.apply_manifest_commit(&ManifestCommit {
+            observed_gc_generation: 0,
             manifest: m1.clone(),
             tag: "latest".to_string(),
             holder_nodes: BTreeSet::from([1]),
@@ -1302,6 +1315,7 @@ mod tests {
 
         let m2 = test_manifest("myapp", "mfst2");
         catalog.apply_manifest_commit(&ManifestCommit {
+            observed_gc_generation: 0,
             manifest: m2.clone(),
             tag: "latest".to_string(),
             holder_nodes: BTreeSet::from([1]),
@@ -1317,11 +1331,13 @@ mod tests {
         let m = test_manifest("myapp", "mfst1");
 
         catalog.apply_manifest_commit(&ManifestCommit {
+            observed_gc_generation: 0,
             manifest: m.clone(),
             tag: "latest".to_string(),
             holder_nodes: BTreeSet::from([1]),
         });
         catalog.apply_manifest_commit(&ManifestCommit {
+            observed_gc_generation: 0,
             manifest: m,
             tag: "v1.0".to_string(),
             holder_nodes: BTreeSet::from([1]),
@@ -1341,6 +1357,7 @@ mod tests {
         leased.repository = "rbtest-owned/app".into();
         for manifest in [ordinary.clone(), leased] {
             catalog.apply_manifest_commit(&ManifestCommit {
+                observed_gc_generation: 0,
                 manifest,
                 tag: "latest".into(),
                 holder_nodes: BTreeSet::from([1]),
@@ -1386,6 +1403,7 @@ mod tests {
         other.repository = "two".into();
         for manifest in [original.clone(), other, test_manifest("one", "replacement")] {
             catalog.apply_manifest_commit(&ManifestCommit {
+                observed_gc_generation: 0,
                 manifest,
                 tag: "latest".into(),
                 holder_nodes: BTreeSet::from([1]),
@@ -1417,6 +1435,7 @@ mod tests {
             let mut manifest = original.clone();
             manifest.repository = repository.into();
             catalog.apply_manifest_commit(&ManifestCommit {
+                observed_gc_generation: 0,
                 manifest,
                 tag: "latest".into(),
                 holder_nodes: BTreeSet::from([1]),
@@ -1446,6 +1465,7 @@ mod tests {
         let m = test_manifest("myapp", "mfst1");
 
         catalog.apply_manifest_commit(&ManifestCommit {
+            observed_gc_generation: 0,
             manifest: m.clone(),
             tag: "latest".to_string(),
             holder_nodes: BTreeSet::from([1, 2, 3]),
@@ -1482,6 +1502,7 @@ mod tests {
         let m = test_manifest("myapp", "mfst1");
 
         catalog.apply_manifest_commit(&ManifestCommit {
+            observed_gc_generation: 0,
             manifest: m.clone(),
             tag: "latest".to_string(),
             holder_nodes: BTreeSet::from([1]),
@@ -1502,11 +1523,13 @@ mod tests {
         let m = test_manifest("myapp", "mfst1");
 
         catalog.apply_manifest_commit(&ManifestCommit {
+            observed_gc_generation: 0,
             manifest: m.clone(),
             tag: "latest".to_string(),
             holder_nodes: BTreeSet::from([1]),
         });
         catalog.apply_manifest_commit(&ManifestCommit {
+            observed_gc_generation: 0,
             manifest: m.clone(),
             tag: "v1.0".to_string(),
             holder_nodes: BTreeSet::from([1]),
@@ -1550,6 +1573,7 @@ mod tests {
     #[test]
     fn manifest_commit_serde_round_trip() {
         let commit = ManifestCommit {
+            observed_gc_generation: 0,
             manifest: test_manifest("myapp", "mfst1"),
             tag: "latest".to_string(),
             holder_nodes: BTreeSet::from([1, 2]),
@@ -1620,6 +1644,7 @@ mod tests {
         let mut catalog = ManifestCatalog::default();
         let m = test_manifest("myapp", "mfst1");
         catalog.apply_manifest_commit(&ManifestCommit {
+            observed_gc_generation: 0,
             manifest: m.clone(),
             tag: "latest".to_string(),
             holder_nodes: BTreeSet::from([1]),

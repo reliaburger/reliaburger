@@ -329,3 +329,23 @@ wait behind and then invalidate a newer copy proof. Also fence delayed manifest
 publication, not only the new copy operation: its proposal currently follows the
 local persistence task. Query the publishing node's GC generation while excluding
 local collection, and validate that generation when Raft applies the publication.
+
+## Publication and collection generation fence
+
+GC now acquires the local catalogue guard before requesting approval and keeps
+it through physical deletion in an owned task. Manifest publication similarly
+retains ownership through its authoritative response. Dropping a caller cannot
+release either operation early. A replicated per-node counter advances only for
+non-empty approved deletions; exhaustion refuses without changing metadata.
+Every manifest proposal carries the generation observed under that guard. A
+delayed proposal across collection returns a typed retryable refusal, even after
+a snapshot restores the leader. A proposal timeout never authorises deletion.
+
+The delayed-publication and counter-exhaustion regressions fail first. The full
+library checkpoints pass 3,428 macOS and 3,482 Linux tests, followed by all 31
+registry/compatibility integration cases, a further publication-cancellation
+regression and strict all-target/all-feature Clippy on both platforms. Tests
+retain GC/publication ownership after aborting their callers and exercise real
+TLS stale refusal followed by ordinary and leased publication at the new
+generation. Protocol 13/state 15, lease schema 5. Receiving-node copy confirmation
+and physical node-death qualification remain open.

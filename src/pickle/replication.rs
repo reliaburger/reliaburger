@@ -745,6 +745,7 @@ mod tests {
             ("three-copies", 30, vec![1, 2, 3]),
         ] {
             catalog.apply_manifest_commit(&ManifestCommit {
+                observed_gc_generation: 0,
                 manifest: heal_manifest(repo, suffix),
                 tag: "v1".to_string(),
                 holder_nodes: holders.into_iter().collect(),

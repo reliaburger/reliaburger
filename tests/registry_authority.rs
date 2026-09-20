@@ -568,6 +568,67 @@ async fn worker_and_follower_pushes_commit_through_the_advertised_leader() {
         1,
         "image list must use committed metadata, even without a local projection"
     );
+    // A worker must refresh its fencing generation after physical collection,
+    // including for the leased publication exercised later in this test.
+    let orphan = compute_sha256(b"collectable orphan");
+    state
+        .store
+        .write_blob(b"collectable orphan", &orphan)
+        .unwrap();
+    assert_eq!(
+        state
+            .collect_garbage(GcReport {
+                node_id: state.node_raft_id,
+                deleted_layers: vec![orphan.clone()]
+            })
+            .await
+            .unwrap(),
+        vec![orphan.clone()]
+    );
+    assert!(!state.store.has_blob(&orphan));
+    assert_eq!(
+        leader.desired_state().await.registry_gc_generations[&state.node_raft_id],
+        1
+    );
+    let old_manifest = leader
+        .manifest_catalog()
+        .await
+        .get_manifest_by_tag("ordinary", "worker")
+        .unwrap()
+        .clone();
+    let stale = RegistryMutation::Manifest(Box::new(reliaburger::pickle::types::ManifestCommit {
+        observed_gc_generation: 0,
+        manifest: old_manifest,
+        tag: "stale-after-gc".into(),
+        holder_nodes: std::collections::BTreeSet::from([state.node_raft_id]),
+    }));
+    assert!(matches!(
+        state
+            .forwarder
+            .as_ref()
+            .unwrap()
+            .write(None, stale)
+            .await
+            .unwrap(),
+        reliaburger::council::CouncilResponse::RegistryPublicationStale
+    ));
+    assert!(
+        leader
+            .manifest_catalog()
+            .await
+            .get_manifest_by_tag("ordinary", "stale-after-gc")
+            .is_none()
+    );
+    let response = reliaburger::pickle::api::router(state.clone())
+        .oneshot(
+            Request::put("/v2/ordinary/manifests/after-gc")
+                .header("content-type", "application/vnd.oci.image.manifest.v1+json")
+                .body(Body::from(body.clone()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::CREATED);
     let read_tokens = reliaburger::sesame::auth::new_token_store();
     read_tokens.write().await.push(
         reliaburger::sesame::token::create_token(

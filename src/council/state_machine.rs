@@ -189,6 +189,20 @@ fn verify_snapshot_checksum(
 }
 
 impl StateMachineInner {
+    fn registry_publication_is_current(
+        &self,
+        commit: &crate::pickle::types::ManifestCommit,
+    ) -> bool {
+        commit.holder_nodes.iter().all(|node| {
+            self.state
+                .registry_gc_generations
+                .get(node)
+                .copied()
+                .unwrap_or(0)
+                == commit.observed_gc_generation
+        })
+    }
+
     fn registry_node_retired(&self, node_id: u64) -> bool {
         self.state
             .security_state
@@ -365,6 +379,9 @@ impl StateMachineInner {
                 self.state.config.insert(key.clone(), value.clone());
             }
             RaftRequest::ManifestCommit(commit) => {
+                if !self.registry_publication_is_current(commit) {
+                    return Some(CouncilResponse::RegistryPublicationStale);
+                }
                 if commit
                     .manifest
                     .repository
@@ -414,7 +431,26 @@ impl StateMachineInner {
                 // racing to delete the last two copies of a layer get
                 // their reports arbitrated in order — the second one is
                 // refused the digest that would lose its final holder.
-                let approved = self.state.manifest_catalog.apply_gc_report(report);
+                let mut next = self.state.manifest_catalog.clone();
+                let approved = next.apply_gc_report(report);
+                if !approved.is_empty() {
+                    let Some(generation) = self
+                        .state
+                        .registry_gc_generations
+                        .get(&report.node_id)
+                        .copied()
+                        .unwrap_or(0)
+                        .checked_add(1)
+                    else {
+                        return Some(CouncilResponse::Refused {
+                            reason: "registry GC generation exhausted".into(),
+                        });
+                    };
+                    self.state
+                        .registry_gc_generations
+                        .insert(report.node_id, generation);
+                    self.state.manifest_catalog = next;
+                }
                 return Some(CouncilResponse::GcApproved { approved });
             }
             RaftRequest::DeleteTag(delete) => {
@@ -885,6 +921,9 @@ impl StateMachineInner {
                 observed_at_unix_ms,
                 commit,
             } => {
+                if !self.registry_publication_is_current(commit) {
+                    return Some(CouncilResponse::RegistryPublicationStale);
+                }
                 if self.registry_node_retired(commit.manifest.pushed_by)
                     || !self.state.test_leases.get(lease_id).is_some_and(|lease| {
                         lease.permits_registry_commit(commit, *observed_at_unix_ms)
@@ -2741,6 +2780,7 @@ mod tests {
 
     fn test_manifest_commit() -> crate::pickle::types::ManifestCommit {
         crate::pickle::types::ManifestCommit {
+            observed_gc_generation: 0,
             manifest: crate::pickle::types::ImageManifest {
                 digest: test_digest("m1"),
                 config: crate::pickle::types::LayerDescriptor {
@@ -2763,6 +2803,124 @@ mod tests {
             tag: "latest".to_string(),
             holder_nodes: std::collections::BTreeSet::from([1, 2]),
         }
+    }
+
+    #[test]
+    fn a_delayed_manifest_cannot_publish_across_a_gc_generation() {
+        let mut inner = StateMachineInner::default();
+        let report = crate::pickle::types::GcReport {
+            node_id: 1,
+            deleted_layers: vec![test_digest("orphan")],
+        };
+        assert!(
+            matches!(inner.apply_request(&RaftRequest::GcReport(report)), Some(CouncilResponse::GcApproved { approved }) if approved.len() == 1)
+        );
+        let mut commit = serde_json::to_value(test_manifest_commit()).unwrap();
+        commit["holder_nodes"] = serde_json::json!([1]);
+        commit["observed_gc_generation"] = serde_json::json!(0);
+        let request: RaftRequest =
+            serde_json::from_value(serde_json::json!({ "ManifestCommit": commit })).unwrap();
+        assert!(
+            matches!(
+                inner.apply_request(&request),
+                Some(CouncilResponse::RegistryPublicationStale)
+            ),
+            "a publication verified before GC must not restore its old holdings"
+        );
+        assert!(inner.state.manifest_catalog.manifests.is_empty());
+    }
+
+    #[test]
+    fn exhausted_gc_generation_refuses_without_mutating_the_catalogue() {
+        let mut inner = StateMachineInner::default();
+        let mut encoded = serde_json::to_value(&inner.state).unwrap();
+        encoded["registry_gc_generations"] = serde_json::json!({"1": u64::MAX});
+        inner.state = serde_json::from_value(encoded).unwrap();
+        let before = serde_json::to_value(&inner.state.manifest_catalog).unwrap();
+        let report = crate::pickle::types::GcReport {
+            node_id: 1,
+            deleted_layers: vec![test_digest("orphan")],
+        };
+        assert!(
+            matches!(
+                inner.apply_request(&RaftRequest::GcReport(report)),
+                Some(CouncilResponse::Refused { .. })
+            ),
+            "collection needs a fresh fencing generation before it can delete bytes"
+        );
+        assert_eq!(
+            serde_json::to_value(&inner.state.manifest_catalog).unwrap(),
+            before
+        );
+    }
+
+    #[tokio::test]
+    async fn gc_generation_survives_snapshot_and_only_advances_for_approved_deletions() {
+        let mut sm = CouncilStateMachine::new();
+        sm.apply(vec![normal_entry(
+            1,
+            1,
+            RaftRequest::GcReport(crate::pickle::types::GcReport {
+                node_id: 1,
+                deleted_layers: vec![test_digest("orphan")],
+            }),
+        )])
+        .await
+        .unwrap();
+        let mut builder = sm.get_snapshot_builder().await;
+        let snapshot = builder.build_snapshot().await.unwrap();
+        let mut restored = CouncilStateMachine::new();
+        restored
+            .install_snapshot(&snapshot.meta, snapshot.snapshot)
+            .await
+            .unwrap();
+        assert_eq!(
+            restored.desired_state().await.registry_gc_generations[&1],
+            1
+        );
+        let mut commit = test_manifest_commit();
+        commit.holder_nodes = std::collections::BTreeSet::from([1]);
+        let refused = restored
+            .apply(vec![normal_entry(
+                1,
+                2,
+                RaftRequest::ManifestCommit(commit.clone()),
+            )])
+            .await
+            .unwrap();
+        assert!(matches!(
+            refused[0],
+            CouncilResponse::RegistryPublicationStale
+        ));
+        commit.observed_gc_generation = 1;
+        let digest = commit.manifest.digest.clone();
+        let accepted = restored
+            .apply(vec![normal_entry(
+                1,
+                3,
+                RaftRequest::ManifestCommit(commit),
+            )])
+            .await
+            .unwrap();
+        assert!(matches!(accepted[0], CouncilResponse::Applied { .. }));
+        let response = restored
+            .apply(vec![normal_entry(
+                1,
+                4,
+                RaftRequest::GcReport(crate::pickle::types::GcReport {
+                    node_id: 1,
+                    deleted_layers: vec![digest],
+                }),
+            )])
+            .await
+            .unwrap();
+        assert!(
+            matches!(&response[0], CouncilResponse::GcApproved { approved } if approved.is_empty())
+        );
+        assert_eq!(
+            restored.desired_state().await.registry_gc_generations[&1],
+            1
+        );
     }
 
     #[tokio::test]

@@ -273,13 +273,31 @@ async fn record_commit_with_access(
     tag: String,
     access: &RegistryWriteAccess,
 ) -> Result<(), super::types::PickleError> {
+    let state = state.clone();
+    let access = access.clone();
+    tokio::spawn(async move { record_commit_owned(&state, manifest, tag, &access).await })
+        .await
+        .map_err(|error| {
+            super::types::PickleError::CatalogPersist(format!(
+                "manifest publication task failed: {error}"
+            ))
+        })?
+}
+
+async fn record_commit_owned(
+    state: &PickleState,
+    manifest: ImageManifest,
+    tag: String,
+    access: &RegistryWriteAccess,
+) -> Result<(), super::types::PickleError> {
     use super::types::PickleError;
     if super::lease::is_test_repository(&manifest.repository) != access.lease_id.is_some() {
         return Err(PickleError::LeaseDenied(
             "manifest requires matching repository lease admission".into(),
         ));
     }
-    let commit = ManifestCommit {
+    let mut commit = ManifestCommit {
+        observed_gc_generation: 0,
         manifest,
         tag,
         holder_nodes: std::collections::BTreeSet::from([state.node_raft_id]),
@@ -306,10 +324,11 @@ async fn record_commit_with_access(
     let transaction_writer = access.guard.clone();
     let lease_id = access.lease_id.clone();
     let mut catalog = Arc::clone(&state.catalog).write_owned().await;
+    commit.observed_gc_generation = state.registry_gc_generation().await?;
     let store = Arc::clone(&state.store);
     let persist = state.persist_path.clone();
     let local_commit = commit.clone();
-    tokio::task::spawn_blocking(move || {
+    let _catalog = tokio::task::spawn_blocking(move || {
         let _writer = transaction_writer;
         let _operation = local_operation;
         if let Some(lease_id) = lease_id
@@ -335,7 +354,7 @@ async fn record_commit_with_access(
             next.persist_to(&path)?;
         }
         *catalog = next;
-        Ok(())
+        Ok(catalog)
     })
     .await
     .map_err(|error| PickleError::CatalogPersist(error.to_string()))??;
@@ -360,6 +379,19 @@ async fn record_commit_with_access(
 }
 
 impl PickleState {
+    /// Query before proving bytes, while the caller excludes local collection.
+    async fn registry_gc_generation(&self) -> Result<u64, super::types::PickleError> {
+        match self
+            .registry_query(super::authority::RegistryQuery::GcGeneration)
+            .await?
+        {
+            super::authority::RegistryQueryResponse::GcGeneration(generation) => Ok(generation),
+            _ => Err(super::types::PickleError::ReplicationFailed(
+                "invalid registry GC generation response".into(),
+            )),
+        }
+    }
+
     pub(crate) async fn propose(
         &self,
         mutation: super::authority::RegistryMutation,
@@ -389,13 +421,26 @@ impl PickleState {
 }
 
 impl PickleState {
-    /// Arbitrate collection, then persist and delete under the manifest writer
-    /// guard. A persistence error deletes nothing and is safe to retry.
+    /// Hold the manifest writer guard from arbitration through physical deletion.
+    /// Caller cancellation retains ownership; failed persistence deletes nothing.
     pub async fn collect_garbage(
         &self,
         report: super::types::GcReport,
     ) -> Result<Vec<Digest>, super::types::PickleError> {
+        let state = self.clone();
+        tokio::spawn(async move { state.collect_garbage_owned(report).await })
+            .await
+            .map_err(|error| {
+                super::types::PickleError::CatalogPersist(format!("GC task failed: {error}"))
+            })?
+    }
+
+    async fn collect_garbage_owned(
+        &self,
+        report: super::types::GcReport,
+    ) -> Result<Vec<Digest>, super::types::PickleError> {
         use super::types::PickleError;
+        let mut catalog = Arc::clone(&self.catalog).write_owned().await;
         let authoritative = match self
             .propose(super::authority::RegistryMutation::GarbageCollection(
                 report.clone(),
@@ -410,7 +455,6 @@ impl PickleState {
                 )));
             }
         };
-        let mut catalog = Arc::clone(&self.catalog).write_owned().await;
         let store = Arc::clone(&self.store);
         let persist = self.persist_path.clone();
         tokio::task::spawn_blocking(move || {
@@ -2672,6 +2716,190 @@ mod tests {
             "layers": []
         }))
         .unwrap()
+    }
+
+    #[tokio::test]
+    async fn cancelled_manifest_publication_retains_its_catalogue_guard_until_authority_replies() {
+        use super::super::authority::{
+            REGISTRY_PROPOSAL_PATH, REGISTRY_QUERY_PATH, RegistryForwarder, RegistryQueryResponse,
+        };
+        let (mut state, directory) = test_state();
+        state.persist_path = Some(directory.path().join("catalog.json"));
+        let digest = compute_sha256(b"publication");
+        state.store.write_blob(b"publication", &digest).unwrap();
+        let manifest = ImageManifest {
+            repository: "ordinary".into(),
+            digest: digest.clone(),
+            tags: Default::default(),
+            config: LayerDescriptor {
+                digest,
+                size: 11,
+                media_type: "config".into(),
+            },
+            layers: vec![],
+            total_size: 11,
+            pushed_by: state.node_raft_id,
+            pushed_at: std::time::SystemTime::now(),
+            signature: None,
+        };
+        let proposed = Arc::new(tokio::sync::Notify::new());
+        let release = Arc::new(tokio::sync::Notify::new());
+        let seen = proposed.clone();
+        let released = release.clone();
+        let app = Router::new()
+            .route(
+                REGISTRY_QUERY_PATH,
+                axum::routing::post(|| async { Json(RegistryQueryResponse::GcGeneration(0)) }),
+            )
+            .route(
+                REGISTRY_PROPOSAL_PATH,
+                axum::routing::post(move || {
+                    let seen = seen.clone();
+                    let release = released.clone();
+                    async move {
+                        seen.notify_one();
+                        release.notified().await;
+                        Json(crate::council::CouncilResponse::Ok)
+                    }
+                }),
+            );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        let (_tx, rx) = tokio::sync::watch::channel(crate::mustard::directory::NodeDirectory {
+            leader: Some(crate::mustard::message::LeaderHint {
+                node_id: crate::meat::NodeId::new("leader"),
+                term: 1,
+                api_address: address,
+                reporting_address: address,
+            }),
+            ..Default::default()
+        });
+        state.forwarder = Some(RegistryForwarder::new(
+            crate::cluster::ClusterHttp::plaintext().with_bearer(Some("internal".into())),
+            rx,
+        ));
+        let publisher = state.clone();
+        let caller =
+            tokio::spawn(async move { record_commit(&publisher, manifest, "latest".into()).await });
+        tokio::time::timeout(std::time::Duration::from_secs(2), proposed.notified())
+            .await
+            .unwrap();
+        assert!(
+            state.catalog.try_write().is_err(),
+            "publication must own the local guard while authority is outstanding"
+        );
+        caller.abort();
+        let _ = caller.await;
+        assert!(
+            state.catalog.try_write().is_err(),
+            "a disconnected publisher must not release its pending transaction"
+        );
+        release.notify_one();
+        let completed =
+            tokio::time::timeout(std::time::Duration::from_secs(2), state.catalog.read())
+                .await
+                .unwrap();
+        assert!(
+            completed
+                .get_manifest_by_tag("ordinary", "latest")
+                .is_some()
+        );
+        assert!(
+            ManifestCatalog::load_from(&directory.path().join("catalog.json"))
+                .unwrap()
+                .get_manifest_by_tag("ordinary", "latest")
+                .is_some()
+        );
+        server.abort();
+        let _ = server.await;
+    }
+
+    #[tokio::test]
+    async fn gc_owns_the_catalogue_before_arbitration_and_through_caller_cancellation() {
+        use super::super::authority::{
+            REGISTRY_PROPOSAL_PATH, RegistryForwarder, RegistryMutation, RegistryProposal,
+        };
+        let (mut state, _directory) = test_state();
+        let digest = compute_sha256(b"collectable");
+        state.store.write_blob(b"collectable", &digest).unwrap();
+        let proposed = Arc::new(tokio::sync::Notify::new());
+        let release = Arc::new(tokio::sync::Notify::new());
+        let seen = proposed.clone();
+        let released = release.clone();
+        let app = Router::new().route(
+            REGISTRY_PROPOSAL_PATH,
+            axum::routing::post(move |Json(request): Json<RegistryProposal>| {
+                let seen = seen.clone();
+                let release = released.clone();
+                async move {
+                    let RegistryMutation::GarbageCollection(report) = request.mutation else {
+                        panic!("unexpected proposal");
+                    };
+                    seen.notify_one();
+                    release.notified().await;
+                    Json(crate::council::CouncilResponse::GcApproved {
+                        approved: report.deleted_layers,
+                    })
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        let (_tx, rx) = tokio::sync::watch::channel(crate::mustard::directory::NodeDirectory {
+            leader: Some(crate::mustard::message::LeaderHint {
+                node_id: crate::meat::NodeId::new("leader"),
+                term: 1,
+                api_address: address,
+                reporting_address: address,
+            }),
+            ..Default::default()
+        });
+        state.forwarder = Some(RegistryForwarder::new(
+            crate::cluster::ClusterHttp::plaintext().with_bearer(Some("internal".into())),
+            rx,
+        ));
+        let gate = state.catalog.write().await;
+        let owner = state.clone();
+        let collected = digest.clone();
+        let caller = tokio::spawn(async move {
+            owner
+                .collect_garbage(super::super::types::GcReport {
+                    node_id: owner.node_raft_id,
+                    deleted_layers: vec![collected],
+                })
+                .await
+        });
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(150), proposed.notified())
+                .await
+                .is_err(),
+            "GC must not request approval while another transaction owns its catalogue"
+        );
+        drop(gate);
+        tokio::time::timeout(std::time::Duration::from_secs(2), proposed.notified())
+            .await
+            .unwrap();
+        assert!(state.catalog.try_write().is_err());
+        caller.abort();
+        let _ = caller.await;
+        assert!(
+            state.catalog.try_write().is_err(),
+            "cancelling the caller must not release physical transaction ownership"
+        );
+        release.notify_one();
+        let _finished =
+            tokio::time::timeout(std::time::Duration::from_secs(2), state.catalog.write())
+                .await
+                .unwrap();
+        assert!(!state.store.has_blob(&digest));
+        server.abort();
+        let _ = server.await;
     }
 
     #[tokio::test]

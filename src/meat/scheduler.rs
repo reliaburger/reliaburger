@@ -785,6 +785,7 @@ mod tests {
             signature: None, // unsigned!
         };
         catalog.apply_manifest_commit(&ManifestCommit {
+            observed_gc_generation: 0,
             manifest,
             tag: "v1".to_string(),
             holder_nodes: BTreeSet::from([1]),
@@ -827,6 +828,7 @@ mod tests {
             signature: None, // unsigned upstream content
         };
         catalog.apply_manifest_commit(&ManifestCommit {
+            observed_gc_generation: 0,
             manifest,
             tag: "7".to_string(),
             holder_nodes: BTreeSet::from([1]),
@@ -874,6 +876,7 @@ mod tests {
             }),
         };
         catalog.apply_manifest_commit(&ManifestCommit {
+            observed_gc_generation: 0,
             manifest,
             tag: "v1".to_string(),
             holder_nodes: BTreeSet::from([1]),
@@ -932,6 +935,7 @@ mod tests {
             signature,
         };
         catalog.apply_manifest_commit(&ManifestCommit {
+            observed_gc_generation: 0,
             manifest,
             tag: "v1".to_string(),
             holder_nodes: BTreeSet::from([1]),
@@ -1077,6 +1081,7 @@ mod tests {
             signature: None,
         };
         catalog.apply_manifest_commit(&ManifestCommit {
+            observed_gc_generation: 0,
             manifest,
             tag: "v1".to_string(),
             holder_nodes: BTreeSet::from([1]),

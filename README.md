@@ -48,7 +48,7 @@ abandoned partial uploads after a crash and
 requires one Bun per writable image store; see the [startup contract](docs/README.md).
 Manifest pushes persist their local catalogue before acknowledgement and refuse
 filesystem failures. Publication and garbage collection serialise their final
-blob checks and deletion. Clustered workers and followers forward writes to the
+blob checks and deletion, with durable GC generations fencing delayed proposals. Clustered workers and followers forward writes to the
 authenticated leader. Repository reads and configured quota checks also require
 current authority; an unavailable leader returns 503 instead of an empty catalogue.
 `relish images` uses that committed cluster view too.

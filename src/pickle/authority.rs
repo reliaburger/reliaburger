@@ -119,6 +119,8 @@ pub struct RegistryReadAuthority {
 /// Restricted registry queries whose answers require current council authority.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum RegistryQuery {
+    /// Read the authenticated node's current publication fencing generation.
+    GcGeneration,
     /// List public image metadata from the committed catalogue.
     Images,
     /// Read committed metadata needed to resolve and copy one repository's images.
@@ -155,6 +157,8 @@ pub struct RegistryQueryRequest {
 /// A current registry ownership view; this never exposes other leases' credentials.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum RegistryQueryResponse {
+    /// Current fencing generation for this node's physical collection.
+    GcGeneration(u64),
     /// Public image rows; no lease credentials or internal storage receipts.
     Images(Vec<super::types::ImageSummary>),
     /// A repository-scoped current catalogue, including its shared holder records.
@@ -181,6 +185,13 @@ impl RegistryQuery {
         node_id: u64,
     ) -> RegistryQueryResponse {
         match self {
+            Self::GcGeneration => RegistryQueryResponse::GcGeneration(
+                state
+                    .registry_gc_generations
+                    .get(&node_id)
+                    .copied()
+                    .unwrap_or(0),
+            ),
             Self::Images => RegistryQueryResponse::Images(state.manifest_catalog.images()),
             Self::Repository { repository } => RegistryQueryResponse::Repository(Box::new(
                 state.manifest_catalog.repository_view(repository),
@@ -611,6 +622,7 @@ mod tests {
             signature: None,
         };
         let mutation = RegistryMutation::Manifest(Box::new(super::super::types::ManifestCommit {
+            observed_gc_generation: 0,
             manifest,
             tag: "latest".into(),
             holder_nodes: std::collections::BTreeSet::from([

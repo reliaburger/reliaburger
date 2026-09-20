@@ -554,6 +554,7 @@ fn manifest_with_holders(
     };
     let mut catalog = ManifestCatalog::default();
     catalog.apply_manifest_commit(&ManifestCommit {
+        observed_gc_generation: 0,
         manifest: manifest.clone(),
         tag: "v1".to_string(),
         holder_nodes: holders.iter().copied().collect(),

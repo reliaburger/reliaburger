@@ -362,6 +362,7 @@ mod tests {
         };
         let mut catalog = ManifestCatalog::default();
         catalog.apply_manifest_commit(&ManifestCommit {
+            observed_gc_generation: 0,
             manifest,
             tag: "7".to_string(),
             holder_nodes: BTreeSet::from([1]),

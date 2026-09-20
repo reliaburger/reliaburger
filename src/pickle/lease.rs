@@ -92,6 +92,9 @@ impl PickleState {
             }
             return Ok(query.answer(&council.desired_state().await, self.node_raft_id));
         }
+        if matches!(query, RegistryQuery::GcGeneration) {
+            return Ok(RegistryQueryResponse::GcGeneration(0));
+        }
         let state = match &query {
             RegistryQuery::Images
             | RegistryQuery::Repository { .. }
@@ -340,6 +343,9 @@ pub(super) fn require_acceptance(
         crate::council::CouncilResponse::Ok | crate::council::CouncilResponse::Applied { .. } => {
             Ok(())
         }
+        crate::council::CouncilResponse::RegistryPublicationStale => Err(unavailable(
+            "registry blobs must be verified again after garbage collection; retry",
+        )),
         crate::council::CouncilResponse::Refused { reason } => {
             Err(PickleError::LeaseDenied(reason))
         }

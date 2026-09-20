@@ -345,6 +345,8 @@ pub enum CouncilResponse {
     NodeDecommissioned {
         retirement: Box<crate::cluster::retirement::NodeRetirement>,
     },
+    /// Blob proof predates a collection decision; reverify and retry publication.
+    RegistryPublicationStale,
 }
 
 // ---------------------------------------------------------------------------
@@ -374,6 +376,9 @@ pub struct DesiredState {
     /// Pickle image registry manifest catalog.
     #[serde(default)]
     pub manifest_catalog: ManifestCatalog,
+    /// Monotonic per-node fencing generations for registry blob collection.
+    #[serde(default)]
+    pub registry_gc_generations: std::collections::BTreeMap<u64, u64>,
     /// Autoscale replica overrides (runtime adjustments above/below baseline).
     #[serde(default)]
     pub autoscale_overrides: Vec<(String, u32)>,
@@ -550,6 +555,7 @@ mod tests {
             },
             RaftRequest::Noop,
             RaftRequest::ManifestCommit(ManifestCommit {
+                observed_gc_generation: 0,
                 manifest: crate::pickle::types::ImageManifest {
                     digest: crate::pickle::types::Digest::from_sha256_hex(
                         "0000000000000000000000000000000000000000000000000000000000000001",

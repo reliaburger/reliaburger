@@ -313,6 +313,7 @@ mod tests {
             .map(|d| d.0.clone())
             .collect();
         catalog.apply_manifest_commit(&ManifestCommit {
+            observed_gc_generation: 0,
             manifest,
             tag: "latest".to_string(),
             holder_nodes: BTreeSet::from([1]),
@@ -361,6 +362,7 @@ mod tests {
         let manifest_digest = manifest.digest.clone();
 
         catalog.apply_manifest_commit(&ManifestCommit {
+            observed_gc_generation: 0,
             manifest,
             tag: "latest".to_string(),
             holder_nodes: BTreeSet::from([1, 2]),
@@ -390,6 +392,7 @@ mod tests {
         }
 
         catalog.apply_manifest_commit(&ManifestCommit {
+            observed_gc_generation: 0,
             manifest,
             tag: "latest".to_string(),
             holder_nodes: BTreeSet::from([1, 2]),
@@ -411,6 +414,7 @@ mod tests {
         }
 
         catalog.apply_manifest_commit(&ManifestCommit {
+            observed_gc_generation: 0,
             manifest,
             tag: "latest".to_string(),
             holder_nodes: BTreeSet::from([1, 2]),
