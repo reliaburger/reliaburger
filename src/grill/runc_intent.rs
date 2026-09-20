@@ -47,7 +47,6 @@ pub struct IntentConfiguration {
 #[serde(transparent)]
 pub struct IntentGeneration(String);
 
-#[cfg(target_os = "linux")]
 impl IntentGeneration {
     pub(crate) fn as_str(&self) -> &str {
         &self.0

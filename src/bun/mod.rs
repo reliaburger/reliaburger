@@ -11,6 +11,7 @@ pub mod build_runner;
 pub mod capabilities;
 pub mod deploy_operations;
 pub mod diagnostics;
+pub mod discovery_owners;
 pub mod disk_pressure;
 mod egress_owners;
 pub mod events;

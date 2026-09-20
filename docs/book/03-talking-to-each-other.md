@@ -1413,3 +1413,51 @@ This is a recovery primitive, not permission to route traffic. Saved health is
 historical evidence. Bun must still load a durable checkpoint, correlate the
 original runtime and kernel ownership, and reconcile live backends before
 publishing DNS, ingress or kernel routes. That integration remains unfinished.
+
+
+## Keep cleanup permission across the next crash
+
+A container has exited, but its old VIP may still lead to its address. We must
+retain that address until discovery has withdrawn it. Now suppose Bun crashes
+between withdrawing the route and releasing the runtime reservation. Where does
+the permission to finish cleanup live?
+
+`DiscoveryJournal` saves a complete inventory in a private directory. Service
+owners retain their exact allocated entries. Reference owners tie a service to
+its original instance, runtime generation and network allocation. `Held` means
+that discovery still owes withdrawal. `ReleaseAuthorised` records permission to
+ask the runtime to release the address. The caller records that permission first,
+performs the release, then forgets the completed reference. Recovery can replay
+the permission against the same runtime generation.
+
+These phases are Rust enums, so a transition has a named state rather than a
+collection of flags. The journal rejects changing a retained allocation,
+forgetting a held reference, or moving an authorised reference back to `Held`.
+Services have a similar `Owned` to `Withdrawn` transition. The store cannot prove
+that a kernel deletion, remote acknowledgement or runtime release happened.
+Its caller must establish those facts before advancing the corresponding phase.
+
+An owned `File` keeps the exclusive filesystem claim alive. Dropping the journal
+closes the descriptor and releases the claim. JSON contains a schema number and
+all owners together; `#[serde(deny_unknown_fields)]` on the envelope and owner
+records makes unexpected fields an error rather than silently dropping them.
+The loader also validates exact service allocations and original runtime
+references. Only a newly created directory may initialise a claim. An existing
+directory with a missing claim keeps refusing, even on repeated recovery attempts;
+otherwise the first failed open could create the evidence that the next open trusts. It bounds reads at 16 MiB and refuses missing established state,
+corrupt data, conflicting owners and redirected or non-private files.
+
+Saving writes and syncs a temporary file, atomically replaces the checkpoint,
+then syncs its directory. What if the last sync fails? The rename might already
+have happened. The journal retains its previous in-memory obligations and refuses
+further writes until recovery reopens the complete durable state. The failure
+test forces replacement to fail, restores the original file and checks that the
+same writer still refuses. Merely fixing the filesystem must not silently clear
+its uncertainty.
+
+This API performs blocking filesystem work. A future async caller must move the
+journal into a blocking worker that retains its claim until the entire operation
+finishes, even if the waiting future is cancelled. Bun does not use this store
+yet. Publication gates, runtime correlation, remote withdrawal acknowledgements
+and recovery qualification remain separate work. Passing storage tests does not
+prove a recovered route is safe to publish.

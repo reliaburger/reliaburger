@@ -763,3 +763,30 @@ callers must reconcile before publication. Persistence, runtime-reference
 correlation and Bun integration remain open. All 106 macOS/118 Linux discovery
 library tests pass (0.195s/0.183s), with strict all-target/all-feature Clippy and
 formatting on both platforms. This changes no production selection or state format.
+
+
+## Durable discovery checkpoint
+
+`bun::discovery_owners` adds a schema-1 complete checkpoint under an exclusive
+filesystem claim. It preserves exact service entries and runtime generation/address
+references, validates their association, and records withdrawal/release permission
+before the caller performs the corresponding cleanup. Retained allocations cannot
+be replaced, held references cannot be forgotten, and completed permissions cannot
+be reactivated. The caller still supplies the external withdrawal/release proof.
+
+Private atomic publication syncs the file and directory. A failed publication
+fences further writes until reopening the complete durable inventory. Missing or
+corrupt established state, future schemas, duplicate owners, redirected paths and
+non-private storage refuse. Initialisation interrupted before the first complete
+checkpoint also refuses; the loader never guesses that an established empty-looking
+directory has no obligations.
+
+All seven original contracts fail first and then pass within 113 macOS/125 Linux
+discovery library tests. Eleven runtime-intent integration tests and strict
+all-target/all-feature Clippy/formatting pass on each platform. Review added a
+regression that fails on repeated recovery after loss of the claim. Only a newly
+created directory now permits initialisation. Final qualification passes all
+114 macOS/126 Linux discovery tests (0.268s/0.623s), with strict Clippy and
+formatting on both. The store is not yet selected by Bun and changes no
+production format. Complete agent publication/recovery gates, runtime inventory
+correlation, remote acknowledgements and actual Bun-death qualification remain open.
