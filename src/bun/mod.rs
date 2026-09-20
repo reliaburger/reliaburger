@@ -56,6 +56,13 @@ pub enum BunError {
         reason: String,
     },
 
+    /// Kernel service withdrawal failed, so its workload ownership must remain.
+    #[error("cannot retire backend for {service}: {reason}")]
+    BackendRetirement {
+        service: crate::onion::service_id::ServiceId,
+        reason: String,
+    },
+
     /// An error from the container runtime.
     #[error(transparent)]
     Grill(#[from] GrillError),

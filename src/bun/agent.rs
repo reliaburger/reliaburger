@@ -2123,25 +2123,35 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
     /// is unregistered from the service map, while its VIP/port are still
     /// known. A no-op without the eBPF data path loaded.
     #[cfg(all(feature = "ebpf", target_os = "linux"))]
-    async fn remove_backend_ebpf(&self, id: &crate::onion::service_id::ServiceId) {
+    async fn remove_backend_ebpf(
+        &self,
+        id: &crate::onion::service_id::ServiceId,
+    ) -> Result<(), BunError> {
         let Some(handle) = self.onion_ebpf.as_ref() else {
-            return;
+            return Ok(());
         };
         // Read the VIP + port straight from the live entry: the VIP is
         // whatever the map allocated (which may have probed off the natural
         // hash on a collision), so we must not re-derive it here.
         let Some((vip, port)) = self.service_map.resolve(id).map(|e| (e.vip, e.port)) else {
-            return;
+            return Ok(());
         };
         let bpf = crate::onion::ebpf::maps::BpfServiceMap::new();
         let mut ebpf = handle.lock().await;
-        if let Err(e) = bpf.remove_backends_bpf(&mut ebpf, vip, port) {
-            eprintln!("onion: backend map removal failed for {id}: {e}");
-        }
+        bpf.remove_backends_bpf(&mut ebpf, vip, port)
+            .map_err(|error| BunError::BackendRetirement {
+                service: id.clone(),
+                reason: error.to_string(),
+            })
     }
 
     #[cfg(not(all(feature = "ebpf", target_os = "linux")))]
-    async fn remove_backend_ebpf(&self, _id: &crate::onion::service_id::ServiceId) {}
+    async fn remove_backend_ebpf(
+        &self,
+        _id: &crate::onion::service_id::ServiceId,
+    ) -> Result<(), BunError> {
+        Ok(())
+    }
 
     /// Reconcile the namespace-firewall eBPF maps against current state (NET5).
     ///
@@ -5985,7 +5995,7 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
         for old_id in existing {
             self.finish_retire_bookkeeping(old_id).await?;
         }
-        self.remove_backend_ebpf(&service_id).await;
+        self.remove_backend_ebpf(&service_id).await?;
         let _ = self.service_map.unregister(&service_id);
 
         for new_id in new_ids {
@@ -7672,18 +7682,19 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
             self.commit_jobs(jobs).await?;
         }
 
-        // Keep durable ownership until identity and record retirement succeed.
-        // A failed cleanup must remain retryable through Stop or Retire.
+        // Confirm kernel withdrawal before discarding any workload record or
+        // the service entry that owns the exact allocated VIP and port.
+        let service_id = crate::onion::service_id::ServiceId::new(namespace, app_name);
+        self.remove_backend_ebpf(&service_id).await?;
+        for id in &instances {
+            let _ = self.service_map.remove_backend(&service_id, &id.0);
+        }
+
+        // A failed artifact cleanup retains the empty service's key for retry.
         for id in &instances {
             self.retire_instance_artifacts(id).await?;
         }
 
-        // Remove backends and unregister from the service map
-        let service_id = crate::onion::service_id::ServiceId::new(namespace, app_name);
-        for id in &instances {
-            let _ = self.service_map.remove_backend(&service_id, &id.0);
-        }
-        self.remove_backend_ebpf(&service_id).await;
         let _ = self.service_map.unregister(&service_id);
         // NET5: prune this app's cgroup-namespace + firewall entries now it's
         // gone, so a reused cgroup inode can't inherit its isolation identity.

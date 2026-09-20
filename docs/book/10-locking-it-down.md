@@ -1282,3 +1282,25 @@ The physical agent regression deploys an application without a port and checks
 its actual kernel namespace entry. This corrects source selection during
 reconciliation. Publishing and recording that identity before the first workload
 instruction remains the next lifecycle boundary, including the job-start path.
+
+### Stop waits for backend withdrawal
+
+The backend map can refuse deletion too. In that case Stop used to log the error,
+remove the application record and return success. The next Retire request also
+returned success because the application was already forgotten. The kernel still
+held its backend entry.
+
+The agent now withdraws the exact allocated VIP and port before removing any
+workload record. Failure returns `BunError::BackendRetirement` and preserves the
+service entry and stopped workload owners for retry. Once withdrawal succeeds,
+we remove the userspace backends and retire the remaining artifacts. If that
+later cleanup fails, the retained empty service entry still identifies the same
+key for the next attempt. Rollout finalisation also propagates a refused backend
+deletion instead of proceeding past it.
+
+The physical regression freezes the backend map, calls Retire twice and checks
+both error responses, both retained records and the still-readable kernel entry.
+The successful case checks actual backend absence and repeated retirement.
+Durable service-map ownership across Bun death and per-instance rollout updates
+remain separate integration work; this check establishes the live Stop/Retire
+boundary.

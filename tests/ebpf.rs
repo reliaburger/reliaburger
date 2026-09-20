@@ -3003,3 +3003,66 @@ async fn agent_namespace_binding_includes_outbound_only_workloads() {
     );
     assert_eq!(launcher_namespace, None);
 }
+
+#[tokio::test]
+#[ignore = "requires Linux root and RELIABURGER_EBPF_TESTS=1"]
+async fn agent_retirement_preserves_ownership_when_backend_removal_is_refused() {
+    assert!(ebpf_tests_enabled());
+    let name = "backend-retirement";
+    let mut fixture = EgressRecoveryFixture::prepare_with_service(name, false, true).await;
+    let service = ServiceId::new("default", name);
+    let vip = VirtualIP::from_service_id(&service);
+    let record = reliaburger::grill::records::record_path(
+        &fixture.root.path().join("records"),
+        &format!("default__{name}-0"),
+    );
+    let bpf = BpfServiceMap::new();
+    let before = bpf
+        .read_backends(&mut *fixture.ebpf.lock().await, vip, 8080)
+        .unwrap();
+    freeze_egress_map(&*fixture.ebpf.lock().await, "backend_map");
+    let first = fixture.retire(name).await;
+    let first_record = record.exists();
+    let second = fixture.retire(name).await;
+    let second_record = record.exists();
+    let retained = bpf
+        .read_backends(&mut *fixture.ebpf.lock().await, vip, 8080)
+        .unwrap();
+    fixture.crash().await;
+    fixture.ebpf.lock().await.detach().unwrap();
+    std::fs::remove_dir(reliaburger::grill::cgroup::cgroup_path("default", name, 0)).unwrap();
+    assert!(before.is_some_and(|entry| entry.count == 1));
+    assert!(
+        first.is_err() && second.is_err(),
+        "accepted refused backend retirement: {first:?}, {second:?}"
+    );
+    assert!(
+        first_record && second_record,
+        "discarded backend cleanup owner"
+    );
+    assert!(retained.is_some_and(|entry| entry.count == 1));
+}
+
+#[tokio::test]
+#[ignore = "requires Linux root and RELIABURGER_EBPF_TESTS=1"]
+async fn agent_retirement_confirms_backend_absence_before_forgetting_ownership() {
+    assert!(ebpf_tests_enabled());
+    let name = "backend-confirmed";
+    let mut fixture = EgressRecoveryFixture::prepare_with_service(name, false, true).await;
+    let vip = VirtualIP::from_service_id(&ServiceId::new("default", name));
+    let record = reliaburger::grill::records::record_path(
+        &fixture.root.path().join("records"),
+        &format!("default__{name}-0"),
+    );
+    fixture.retire(name).await.unwrap();
+    fixture.retire(name).await.unwrap();
+    let retained_record = record.exists();
+    let backend = BpfServiceMap::new()
+        .read_backends(&mut *fixture.ebpf.lock().await, vip, 8080)
+        .unwrap();
+    fixture.crash().await;
+    fixture.ebpf.lock().await.detach().unwrap();
+    std::fs::remove_dir(reliaburger::grill::cgroup::cgroup_path("default", name, 0)).unwrap();
+    assert!(!retained_record);
+    assert!(backend.is_none());
+}

@@ -377,3 +377,18 @@ job/source recovery; those lifecycle boundaries remain open.
 Qualification: the public-agent map is initially absent for a portless workload.
 After the repair, all 45 physical kernel cases pass (9.86s), as do all eight
 portable firewall resolver tests and strict Linux/macOS Clippy and formatting.
+
+## Positive backend withdrawal during Stop/Retire
+
+The physical frozen-backend regression first gets `Ok(())` twice from Retire
+while the kernel entry survives and its workload record is discarded. Stop now
+requires successful deletion of the original service entry's exact VIP/port
+before retiring workload metadata. Refusal preserves the service key and stopped
+owners. After deletion, userspace backends are removed before artifact cleanup;
+a later artifact failure leaves the empty service key available for retry.
+Rollout finalisation also propagates deletion failure. Durable service ownership
+and per-instance rolling backend replacement remain open.
+
+Qualification: all 47 physical kernel cases pass (10.13s), including repeated
+refusal and confirmed backend absence. All 160 agent tests pass on macOS/Linux
+(17.835s/22.915s), with strict all-target/all-feature Clippy and formatting on both.
