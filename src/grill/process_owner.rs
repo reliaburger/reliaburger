@@ -130,6 +130,24 @@ pub(crate) fn persist(directory: &Path, record: &OwnerRecord) -> io::Result<()> 
     crate::sesame::identity::atomic_write_mode(&directory.join("owner.json"), &bytes, Some(0o600))
 }
 
+/// Bootstrap a durable owner, then exit so host init owns its reaping.
+///
+/// Only the hidden pre-Tokio Bun command calls this. The runtime waits for this
+/// bootstrapper to exit before acknowledging start, so a later Bun `exec` cannot
+/// discard the only waiter for a long-lived owner child.
+pub fn launch_detached_owner(directory: &Path, generation: &str) -> io::Result<()> {
+    let _child = Command::new(std::env::current_exe()?)
+        .args(["__process-owner", "--directory"])
+        .arg(directory)
+        .arg("--generation")
+        .arg(generation)
+        .process_group(0)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .spawn()?;
+    std::process::exit(0);
+}
+
 /// Run the internal owner on a single thread, before constructing any runtime.
 ///
 /// The directory must already contain its private launch record. A duplicate

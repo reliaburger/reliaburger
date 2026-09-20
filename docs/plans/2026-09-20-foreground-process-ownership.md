@@ -68,9 +68,14 @@ security boundary against hostile same-user processes.
   rename and parent sync; start
   re-establishes parent durability before execution. Existing malformed entries
   refuse instead of becoming fresh generations.
+- [x] Reparent durable helpers through a short bootstrapper, and reap that
+  bootstrapper before acknowledging start. A real parent-`exec` regression fails
+  first with an unreaped child. All eleven runtime recovery and nine owner
+  cases plus strict Clippy pass on macOS/Linux afterwards; user workloads remain
+  foreground-only.
 - [ ] Select the owned adapter in production Bun only alongside complete
   pre-adoption reconciliation. Distinguish the latest job attempt from older
-  completed runtime generations and preserve helper reaping across Bun `exec`.
+  completed runtime generations.
 - [ ] Discover generations before an agent adoption record exists, distinguish
   provably unactivated preparation from uncertain activated owners, and join
   recovered state to app/job cleanup obligations. Advance state compatibility

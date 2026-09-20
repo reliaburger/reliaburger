@@ -342,3 +342,65 @@ async fn failed_first_preparation_never_publishes_an_incomplete_instance() {
     grill.create(&id, &spec("exit 0")).await.unwrap();
     grill.kill(&id).await.unwrap();
 }
+
+#[tokio::test]
+async fn owner_reaping_survives_parent_exec() {
+    use std::os::unix::process::CommandExt;
+    const PHASE: &str = "RELIABURGER_OWNER_REEXEC_PHASE";
+    const DIRECTORY: &str = "RELIABURGER_OWNER_REEXEC_DIRECTORY";
+    let Some(phase) = std::env::var_os(PHASE) else {
+        let directory = tempfile::tempdir().unwrap();
+        let output = tokio::time::timeout(
+            Duration::from_secs(45),
+            tokio::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "owner_reaping_survives_parent_exec",
+                    "--nocapture",
+                ])
+                .env(PHASE, "start")
+                .env(DIRECTORY, directory.path())
+                .kill_on_drop(true)
+                .output(),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert!(
+            output.status.success(),
+            "child fixture failed:\n{}\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        return;
+    };
+    let directory = std::path::PathBuf::from(std::env::var_os(DIRECTORY).unwrap());
+    let grill = runtime(&directory);
+    let id = InstanceId("default__reexec-0".into());
+    if phase == "start" {
+        grill.create(&id, &spec("sleep 30")).await.unwrap();
+        grill.start(&id).await.unwrap();
+        let error = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "owner_reaping_survives_parent_exec",
+                "--nocapture",
+            ])
+            .env(PHASE, "recovered")
+            .exec();
+        panic!("fixture exec failed: {error}");
+    }
+    assert_eq!(phase, "recovered");
+    grill.kill(&id).await.unwrap();
+    stopped(&grill, &id).await;
+    // The exec discarded the original Tokio child waiter. A durable owner
+    // must not become an unreaped child of the replacement runtime.
+    assert_eq!(
+        nix::sys::wait::waitpid(
+            nix::unistd::Pid::from_raw(-1),
+            Some(nix::sys::wait::WaitPidFlag::WNOHANG)
+        ),
+        Err(nix::errno::Errno::ECHILD),
+        "replacement runtime inherited an unreaped helper"
+    );
+}

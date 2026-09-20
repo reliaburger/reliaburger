@@ -148,7 +148,7 @@ impl ProcessControl {
                 .custom_flags(nix::libc::O_NOFOLLOW)
                 .open(directory.join("owner.log"))?;
             let mut child = tokio::process::Command::new(&this.executable)
-                .args(["__process-owner", "--directory"])
+                .args(["__process-owner", "--detach", "--directory"])
                 .arg(&directory)
                 .arg("--generation")
                 .arg(&record.nonce)
@@ -158,13 +158,19 @@ impl ProcessControl {
                 .stderr(output)
                 .kill_on_drop(false)
                 .spawn()?;
-            // Tokio owns only the helper's reaping, never its workload child.
-            // Dropping/cancelling Bun's caller must not kill the durable owner.
-            tokio::spawn(async move {
-                let _ = child.wait().await;
-            });
+            // A long-lived helper must not depend on a waiter that Bun loses
+            // during exec. Reap the short bootstrapper before returning start.
+            let mut launch_status = None;
             let deadline = Instant::now() + Duration::from_secs(15);
             loop {
+                if launch_status.is_none() {
+                    launch_status = child.try_wait()?;
+                }
+                if launch_status.is_some_and(|status| !status.success()) {
+                    return Err(io::Error::other(
+                        "process owner bootstrapper failed; launch intent retained",
+                    ));
+                }
                 let current = this.load(&id)?;
                 if current.nonce != record.nonce {
                     return Err(io::Error::other("process launch generation changed"));
@@ -172,11 +178,15 @@ impl ProcessControl {
                 match current.phase {
                     OwnerPhase::Running { .. }
                     | OwnerPhase::Retiring { .. }
-                    | OwnerPhase::Retired { .. } => return Ok(()),
+                    | OwnerPhase::Retired { .. }
+                        if launch_status.is_some() =>
+                    {
+                        return Ok(());
+                    }
                     OwnerPhase::Cancelled => {
                         return Err(io::Error::other("process launch was cancelled"));
                     }
-                    OwnerPhase::Prepared => {}
+                    _ => {}
                 }
                 if Instant::now() >= deadline {
                     return Err(io::Error::new(

@@ -434,6 +434,16 @@ observation and a signal. The gate uses `exec` to replace its executable while
 preserving the same process identity. If activation never arrives, it exits
 without running the workload.
 
+Self-upgrade adds a reaping problem. Unix `exec` preserves the process and its
+children, but discards Tokio's waiter tasks. A long-lived owner left as Bun's
+child could later become a zombie with nobody waiting for it. A short
+bootstrapper starts the durable owner and exits; Bun reaps that bootstrapper
+before acknowledging launch. The host's init process then owns the durable
+owner's eventual exit. The regression actually replaces its parent executable,
+recovers the workload, stops it, and checks that the replacement inherited no
+unreaped children. This internal helper lifecycle doesn't relax the foreground
+contract for user workloads.
+
 Exit and retirement are separate events. Linux's subreaper facility lets the
 owner acquire orphaned grandchildren and reap until it has no children left.
 On macOS, the owner retains the exited root while checking the complete process
