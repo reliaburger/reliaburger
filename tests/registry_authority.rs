@@ -549,6 +549,97 @@ async fn worker_and_follower_pushes_commit_through_the_advertised_leader() {
                 .is_some()
         );
     }
+    // A different receiving node supplies its own TLS-bound proof; it never
+    // trusts the sender's old HEAD result or publishes the sender's holder set.
+    let receiving_identity = node_identity(&hierarchy, "receiver", 14);
+    let receiving_tls = reliaburger::sesame::mtls::build_mtls_client_config(
+        &receiving_identity,
+        reliaburger::sesame::mtls::CrlHandle::default(),
+    )
+    .unwrap();
+    let mut headers = reqwest::header::HeaderMap::new();
+    headers.insert(
+        reqwest::header::AUTHORIZATION,
+        "Bearer internal-token".parse().unwrap(),
+    );
+    let receiving_client = reqwest::Client::builder()
+        .redirect(reqwest::redirect::Policy::none())
+        .use_preconfigured_tls((*receiving_tls).clone())
+        .default_headers(headers)
+        .build()
+        .unwrap();
+    let receiving_root = tempfile::tempdir().unwrap();
+    let mut receiving = state.clone();
+    receiving.node_raft_id = reliaburger::cluster::identity::raft_id_from_name("receiver");
+    receiving.catalog = Arc::new(RwLock::new(ManifestCatalog::default()));
+    receiving.store = Arc::new(BlobStore::new(receiving_root.path().join("blobs")));
+    receiving.persist_path = Some(receiving_root.path().join("catalog.json"));
+    receiving.forwarder = Some(RegistryForwarder::new(
+        reliaburger::cluster::ClusterHttp::secure(receiving_client.clone())
+            .with_bearer(Some("internal-token".into())),
+        directory_tx.subscribe(),
+    ));
+    receiving.auth = Some(reliaburger::sesame::auth::AuthState::new(
+        reliaburger::sesame::auth::new_token_store(),
+        Some("internal-token".into()),
+    ));
+    receiving.allow_unauthenticated_bootstrap = false;
+    receiving.require_read_auth = true;
+    let digest = compute_sha256(&body);
+    receiving.store.write_blob(b"config", &config).unwrap();
+    receiving.store.write_blob(&body, &digest).unwrap();
+    let (receiving_address, receiving_server) = tls_server(
+        reliaburger::pickle::api::router(receiving.clone()),
+        &hierarchy,
+        "receiver",
+        15,
+    )
+    .await;
+    let receiving_peer = reliaburger::pickle::replication::Peer {
+        node_id: receiving.node_raft_id,
+        base_url: format!("https://{receiving_address}"),
+    };
+    let tags_before = leader.manifest_catalog().await.tags.clone();
+    let receipt = reliaburger::pickle::replication::confirm_peer_copy(
+        &receiving_peer,
+        "ordinary",
+        &digest,
+        &receiving_client,
+        Duration::from_secs(5),
+    )
+    .await
+    .unwrap();
+    assert_eq!(receipt.node_id, receiving.node_raft_id);
+    assert!(
+        receiving.catalog.read().await.manifests.is_empty(),
+        "confirmation must not replay remote tags into a worker projection"
+    );
+    let catalogue = leader.manifest_catalog().await;
+    assert_eq!(catalogue.tags, tags_before);
+    for blob in [&config, &digest] {
+        assert_eq!(
+            catalogue.layer_holders(blob.as_str()),
+            std::collections::BTreeSet::from([state.node_raft_id, receiving.node_raft_id])
+        );
+    }
+    let forged = RegistryMutation::Copy(reliaburger::pickle::types::ImageCopyConfirmation {
+        repository: "ordinary".into(),
+        manifest_digest: digest.clone(),
+        node_id: state.node_raft_id,
+        lease_id: None,
+        observed_gc_generation: 0,
+        observed_at_unix_ms: reliaburger::testkit::lease::now_unix_millis(),
+    });
+    assert!(
+        receiving
+            .forwarder
+            .as_ref()
+            .unwrap()
+            .write(None, forged)
+            .await
+            .is_err()
+    );
+    receiving_server.abort();
     let response = router(leader.clone(), None)
         .oneshot(
             Request::get("/v1/images")

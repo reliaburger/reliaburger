@@ -20,6 +20,8 @@ const PROPOSAL_TIMEOUT: Duration = Duration::from_secs(10);
 /// Registry operations that a storage node may propose for its own holdings.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum RegistryMutation {
+    /// Confirm the authenticated node's verified copy of a committed image.
+    Copy(super::types::ImageCopyConfirmation),
     /// Publish a manifest whose blobs are stored on the authenticated node.
     Manifest(Box<ManifestCommit>),
     /// Ask to remove only the authenticated node's blob holdings.
@@ -51,6 +53,7 @@ impl RegistryMutation {
     pub fn request_for_node(&self, node_name: &str) -> Result<RaftRequest, PickleError> {
         let id = crate::cluster::identity::raft_id_from_name(node_name);
         let valid = match self {
+            Self::Copy(copy) => copy.node_id == id,
             Self::Manifest(commit) | Self::LeasedManifest { commit, .. } => {
                 commit.holder_nodes == std::collections::BTreeSet::from([id])
                     && commit.manifest.pushed_by == id
@@ -70,6 +73,7 @@ impl RegistryMutation {
 
     pub(crate) fn request(&self) -> RaftRequest {
         match self {
+            Self::Copy(copy) => RaftRequest::ConfirmImageCopy(copy.clone()),
             Self::Manifest(commit) => RaftRequest::ManifestCommit(commit.as_ref().clone()),
             Self::GarbageCollection(report) => RaftRequest::GcReport(report.clone()),
             Self::ClaimWriter {

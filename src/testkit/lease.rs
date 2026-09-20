@@ -318,13 +318,22 @@ impl TestLease {
         commit: &crate::pickle::types::ManifestCommit,
         now_unix_ms: u64,
     ) -> bool {
+        commit.holder_nodes == BTreeSet::from([commit.manifest.pushed_by])
+            && self.permits_registry_copy(
+                &commit.manifest.repository,
+                commit.manifest.pushed_by,
+                now_unix_ms,
+            )
+    }
+
+    /// Recheck that the exact repository writer still belongs to this active lease.
+    pub fn permits_registry_copy(&self, repository: &str, node_id: u64, now_unix_ms: u64) -> bool {
         self.is_active_at(now_unix_ms)
-            && self.owns_repository_name(&commit.manifest.repository)
-            && commit.holder_nodes == BTreeSet::from([commit.manifest.pushed_by])
+            && self.owns_repository_name(repository)
             && self
                 .repositories
-                .get(&commit.manifest.repository)
-                .is_some_and(|owners| owners.contains(&commit.manifest.pushed_by))
+                .get(repository)
+                .is_some_and(|owners| owners.contains(&node_id))
     }
 
     /// Whether every possible storage node has confirmed repository retirement.
@@ -619,6 +628,26 @@ impl LocalLeaseStore {
         }
         let lease = inner.leases.get(lease_id).ok_or(LeaseError::NotFound)?;
         if !lease.permits_registry_commit(commit, now_unix_ms) {
+            return Err(LeaseError::NotActive);
+        }
+        Ok(LocalLeaseOperation {
+            _guard: operation_guard,
+        })
+    }
+
+    /// Serialise local copy publication against lease cleanup and expiry.
+    pub async fn begin_registry_copy(
+        &self,
+        copy: &crate::pickle::types::ImageCopyConfirmation,
+    ) -> Result<LocalLeaseOperation, LeaseError> {
+        let id = copy.lease_id.as_ref().ok_or(LeaseError::NotFound)?;
+        let operation_guard = self.operation_lock(id).await?.lock_owned().await;
+        let inner = self.inner.lock().await;
+        if inner.persistence_uncertain {
+            return Err(LeaseError::PersistenceUncertain);
+        }
+        let lease = inner.leases.get(id).ok_or(LeaseError::NotFound)?;
+        if !lease.permits_registry_copy(&copy.repository, copy.node_id, copy.observed_at_unix_ms) {
             return Err(LeaseError::NotActive);
         }
         Ok(LocalLeaseOperation {

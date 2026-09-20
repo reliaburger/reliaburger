@@ -2727,16 +2727,6 @@ async fn run_agent(cli: Cli) -> anyhow::Result<()> {
                 for error in &outcome.errors {
                     eprintln!("bun: pickle heal: {error}");
                 }
-                for update in outcome.updates {
-                    if let Err(e) = council
-                        .write(
-                            reliaburger::council::types::RaftRequest::UpdateLayerLocations(update),
-                        )
-                        .await
-                    {
-                        eprintln!("bun: replication holder update failed: {e}");
-                    }
-                }
             }
         });
     }

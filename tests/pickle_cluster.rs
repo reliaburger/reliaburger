@@ -418,6 +418,8 @@ async fn heal_tick_replicates_to_new_peer() {
 
     // Node 2 joins, empty.
     let joiner = Registry::start(2, false).await;
+    // Independent standalone fixtures receive the committed metadata explicitly.
+    *joiner.state.catalog.write().await = catalog.clone();
     let peers = vec![
         Peer {
             node_id: 1,
@@ -444,9 +446,21 @@ async fn heal_tick_replicates_to_new_peer() {
         "heal errors: {:?}",
         outcome.errors
     );
-    assert_eq!(outcome.updates.len(), 1);
-    for (_, holders) in &outcome.updates[0].updates {
-        assert_eq!(holders, &BTreeSet::from([1, 2]));
+    assert_eq!(outcome.confirmed_images.len(), 1);
+    for digest in catalog
+        .get_manifest_by_tag("app", "v1")
+        .unwrap()
+        .referenced_digests()
+    {
+        assert_eq!(
+            joiner
+                .state
+                .catalog
+                .read()
+                .await
+                .layer_holders(digest.as_str()),
+            BTreeSet::from([1, 2])
+        );
     }
 
     let manifest = catalog.get_manifest_by_tag("app", "v1").unwrap().clone();
@@ -471,6 +485,7 @@ async fn heal_tick_pulls_missing_layers_first() {
     let catalog = holder.state.catalog.read().await.clone();
 
     let leader = Registry::start(1, false).await;
+    *leader.state.catalog.write().await = catalog.clone();
     let leader_store = leader.state.store.clone();
     let peers = vec![Peer {
         node_id: 2,
@@ -502,10 +517,18 @@ async fn heal_tick_pulls_missing_layers_first() {
         );
     }
 
-    // …and the proposed update records it as a holder alongside node 2.
-    assert_eq!(outcome.updates.len(), 1);
-    for (_, holders) in &outcome.updates[0].updates {
-        assert_eq!(holders, &BTreeSet::from([1, 2]));
+    // The receiving leader publishes itself after verifying all bytes.
+    assert_eq!(outcome.confirmed_images.len(), 1);
+    for digest in manifest.referenced_digests() {
+        assert_eq!(
+            leader
+                .state
+                .catalog
+                .read()
+                .await
+                .layer_holders(digest.as_str()),
+            BTreeSet::from([1, 2])
+        );
     }
 }
 
@@ -962,6 +985,8 @@ async fn heal_tick_respects_per_tick_cap() {
     let catalog = leader.state.catalog.read().await.clone();
 
     let joiner = Registry::start(2, false).await;
+    // Independent standalone fixtures receive the committed metadata explicitly.
+    *joiner.state.catalog.write().await = catalog.clone();
     let peers = vec![
         Peer {
             node_id: 1,
@@ -985,7 +1010,7 @@ async fn heal_tick_respects_per_tick_cap() {
 
     assert!(outcome.errors.is_empty());
     assert_eq!(
-        outcome.updates.len(),
+        outcome.confirmed_images.len(),
         1,
         "cap of 1 means one manifest per tick"
     );

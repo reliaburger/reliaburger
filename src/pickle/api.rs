@@ -380,7 +380,7 @@ async fn record_commit_owned(
 
 impl PickleState {
     /// Query before proving bytes, while the caller excludes local collection.
-    async fn registry_gc_generation(&self) -> Result<u64, super::types::PickleError> {
+    pub(crate) async fn registry_gc_generation(&self) -> Result<u64, super::types::PickleError> {
         match self
             .registry_query(super::authority::RegistryQuery::GcGeneration)
             .await?
@@ -537,6 +537,8 @@ pub fn router(state: PickleState) -> Router {
 
 /// The parsed shape of an OCI `/v2/{name}/…` request.
 enum V2Route {
+    /// Internal storage-node confirmation of a complete existing image.
+    Copy { name: String, digest: String },
     /// `/v2/{name}/blobs/{digest}`
     Blob { name: String, digest: String },
     /// `/v2/{name}/blobs/uploads/`
@@ -581,6 +583,12 @@ fn parse_v2_route(rest: &str) -> Option<V2Route> {
             reference: reference.to_string(),
         });
     }
+    if let Some((name, digest)) = rest.rsplit_once("/copies/") {
+        return Some(V2Route::Copy {
+            name: name.to_string(),
+            digest: digest.to_string(),
+        });
+    }
     if let Some(name) = rest.strip_suffix("/tags/list") {
         return Some(V2Route::Tags {
             name: name.to_string(),
@@ -623,6 +631,34 @@ async fn dispatch_v2(
     }
 
     match (method, route) {
+        (Method::POST, V2Route::Copy { name, digest }) => {
+            let principal = match state.authorise_write(&headers).await {
+                Ok(principal) => principal,
+                Err(response) => return response,
+            };
+            let internal = principal.as_ref().is_some_and(|context| {
+                context.principal_id == crate::sesame::auth::SYSTEM_PRINCIPAL
+            });
+            let anonymous_local = principal.is_none()
+                && state.council.is_none()
+                && state.forwarder.is_none()
+                && state.allow_unauthenticated_bootstrap
+                && !super::lease::is_test_repository(&name);
+            if !internal && !anonymous_local {
+                return StatusCode::FORBIDDEN.into_response();
+            }
+            let digest = match Digest::new(&digest) {
+                Ok(digest) => digest,
+                Err(error) => return registry_write_error(error),
+            };
+            match tokio::time::timeout(UPLOAD_TIMEOUT, state.confirm_image_copy(&name, &digest))
+                .await
+            {
+                Ok(Ok(receipt)) => Json(receipt).into_response(),
+                Ok(Err(error)) => registry_write_error(error),
+                Err(_) => StatusCode::GATEWAY_TIMEOUT.into_response(),
+            }
+        }
         (Method::HEAD, V2Route::Blob { name, digest }) => blob_head(&state, &name, &digest).await,
         (Method::GET, V2Route::Blob { name, digest }) => blob_get(&state, &name, &digest).await,
         (Method::POST, V2Route::UploadInitiate { name }) => {
@@ -1486,6 +1522,111 @@ mod tests {
     use axum::body::Body;
     use http_body_util::BodyExt;
     use tower::ServiceExt;
+
+    #[tokio::test]
+    async fn copy_confirmation_rehashes_all_blobs_and_persists_without_replaying_tags() {
+        let (mut state, directory) = test_state();
+        state.persist_path = Some(directory.path().join("catalog.json"));
+        let config = compute_sha256(b"configuration");
+        state.store.write_blob(b"configuration", &config).unwrap();
+        let body = manifest_body(&config, 13);
+        let digest = compute_sha256(&body);
+        let app = router(state.clone());
+        assert_eq!(
+            put_manifest(&app, "/v2/ordinary/manifests/latest", body.clone())
+                .await
+                .status(),
+            StatusCode::CREATED
+        );
+        // Model committed metadata from another storage node.
+        for (_, holders) in &mut state.catalog.write().await.layer_locations {
+            *holders = std::collections::BTreeSet::from([99]);
+        }
+        let tags = state.catalog.read().await.tags.clone();
+        std::fs::write(state.store.blob_path(&config), b"corrupt").unwrap();
+        assert!(matches!(
+            state.confirm_image_copy("ordinary", &digest).await,
+            Err(super::super::types::PickleError::DigestMismatch { .. })
+        ));
+        assert_eq!(
+            state.catalog.read().await.layer_holders(digest.as_str()),
+            std::collections::BTreeSet::from([99])
+        );
+        std::fs::write(state.store.blob_path(&config), b"configuration").unwrap();
+        state.store.delete_blob(&digest).unwrap();
+        assert!(state.confirm_image_copy("ordinary", &digest).await.is_err());
+        state.store.write_blob(&body, &digest).unwrap();
+        let receipt = state.confirm_image_copy("ordinary", &digest).await.unwrap();
+        assert_eq!(receipt.node_id, state.node_raft_id);
+        let persisted = ManifestCatalog::load_from(state.persist_path.as_ref().unwrap()).unwrap();
+        for blob in [&config, &digest] {
+            assert_eq!(
+                persisted.layer_holders(blob.as_str()),
+                std::collections::BTreeSet::from([7, 99])
+            );
+        }
+        assert_eq!(persisted.tags, tags);
+        assert!(state.confirm_image_copy("missing", &digest).await.is_err());
+        state.catalog.write().await.retire_repository("ordinary");
+        assert!(state.confirm_image_copy("ordinary", &digest).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn copy_confirmation_requires_service_authority_when_authentication_is_configured() {
+        let (mut state, _directory) = test_state();
+        let token = crate::sesame::token::create_token(
+            "admin",
+            crate::sesame::types::ApiRole::Admin,
+            crate::sesame::types::TokenScope::default(),
+            None,
+        )
+        .unwrap();
+        let tokens = crate::sesame::auth::new_token_store();
+        tokens.write().await.push(token.token);
+        state.auth = Some(crate::sesame::auth::AuthState::new(
+            tokens,
+            Some("internal".into()),
+        ));
+        state.allow_unauthenticated_bootstrap = false;
+        let config = compute_sha256(b"config");
+        state.store.write_blob(b"config", &config).unwrap();
+        let body = manifest_body(&config, 6);
+        let digest = compute_sha256(&body);
+        // Use the same authenticated OCI publication path before testing the internal route.
+        let app = router(state.clone());
+        let response = app
+            .clone()
+            .oneshot(
+                axum::http::Request::put("/v2/ordinary/manifests/latest")
+                    .header("authorization", format!("Bearer {}", token.plaintext))
+                    .body(Body::from(body))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::CREATED);
+        for (bearer, expected) in [
+            (None, StatusCode::UNAUTHORIZED),
+            (Some(token.plaintext.as_str()), StatusCode::FORBIDDEN),
+            (Some("internal"), StatusCode::OK),
+        ] {
+            let mut request =
+                axum::http::Request::post(format!("/v2/ordinary/copies/{}", digest.as_str()));
+            if let Some(bearer) = bearer {
+                request = request.header("authorization", format!("Bearer {bearer}"));
+            }
+            let response = app
+                .clone()
+                .oneshot(request.body(Body::empty()).unwrap())
+                .await
+                .unwrap();
+            let status = response.status();
+            let body = axum::body::to_bytes(response.into_body(), 4096)
+                .await
+                .unwrap();
+            assert_eq!(status, expected, "{}", String::from_utf8_lossy(&body));
+        }
+    }
 
     #[tokio::test]
     async fn monolithic_upload_reaches_disk_before_the_request_finishes() {
@@ -2720,6 +2861,15 @@ mod tests {
 
     #[tokio::test]
     async fn cancelled_manifest_publication_retains_its_catalogue_guard_until_authority_replies() {
+        cancelled_publication_owns_guard(false).await;
+    }
+
+    #[tokio::test]
+    async fn cancelled_copy_confirmation_retains_its_catalogue_guard_until_authority_replies() {
+        cancelled_publication_owns_guard(true).await;
+    }
+
+    async fn cancelled_publication_owns_guard(copy: bool) {
         use super::super::authority::{
             REGISTRY_PROPOSAL_PATH, REGISTRY_QUERY_PATH, RegistryForwarder, RegistryQueryResponse,
         };
@@ -2742,6 +2892,12 @@ mod tests {
             pushed_at: std::time::SystemTime::now(),
             signature: None,
         };
+        if copy {
+            record_commit(&state, manifest.clone(), "latest".into())
+                .await
+                .unwrap();
+        }
+        let remote_catalogue = state.catalog.read().await.clone();
         let proposed = Arc::new(tokio::sync::Notify::new());
         let release = Arc::new(tokio::sync::Notify::new());
         let seen = proposed.clone();
@@ -2749,19 +2905,43 @@ mod tests {
         let app = Router::new()
             .route(
                 REGISTRY_QUERY_PATH,
-                axum::routing::post(|| async { Json(RegistryQueryResponse::GcGeneration(0)) }),
+                axum::routing::post(
+                    move |Json(request): Json<super::super::authority::RegistryQueryRequest>| {
+                        let catalogue = remote_catalogue.clone();
+                        async move {
+                            match request.query {
+                                super::super::authority::RegistryQuery::Repository { .. } => {
+                                    Json(RegistryQueryResponse::Repository(Box::new(catalogue)))
+                                }
+                                super::super::authority::RegistryQuery::GcGeneration => {
+                                    Json(RegistryQueryResponse::GcGeneration(0))
+                                }
+                                other => panic!("unexpected query: {other:?}"),
+                            }
+                        }
+                    },
+                ),
             )
             .route(
                 REGISTRY_PROPOSAL_PATH,
-                axum::routing::post(move || {
-                    let seen = seen.clone();
-                    let release = released.clone();
-                    async move {
-                        seen.notify_one();
-                        release.notified().await;
-                        Json(crate::council::CouncilResponse::Ok)
-                    }
-                }),
+                axum::routing::post(
+                    move |Json(proposal): Json<super::super::authority::RegistryProposal>| {
+                        assert_eq!(
+                            matches!(
+                                proposal.mutation,
+                                super::super::authority::RegistryMutation::Copy(_)
+                            ),
+                            copy
+                        );
+                        let seen = seen.clone();
+                        let release = released.clone();
+                        async move {
+                            seen.notify_one();
+                            release.notified().await;
+                            Json(crate::council::CouncilResponse::Ok)
+                        }
+                    },
+                ),
             );
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap();
@@ -2782,8 +2962,16 @@ mod tests {
             rx,
         ));
         let publisher = state.clone();
-        let caller =
-            tokio::spawn(async move { record_commit(&publisher, manifest, "latest".into()).await });
+        let caller = tokio::spawn(async move {
+            if copy {
+                publisher
+                    .confirm_image_copy("ordinary", &manifest.digest)
+                    .await
+                    .map(|_| ())
+            } else {
+                record_commit(&publisher, manifest, "latest".into()).await
+            }
+        });
         tokio::time::timeout(std::time::Duration::from_secs(2), proposed.notified())
             .await
             .unwrap();

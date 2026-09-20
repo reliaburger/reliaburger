@@ -349,3 +349,29 @@ retain GC/publication ownership after aborting their callers and exercise real
 TLS stale refusal followed by ordinary and leased publication at the new
 generation. Protocol 13/state 15, lease schema 5. Receiving-node copy confirmation
 and physical node-death qualification remain open.
+
+## Storage-node copy confirmation completed
+
+The failing-first whole-holder-list regression proves that the old Raft operation
+accepted claims without storage evidence. That operation now always refuses.
+Healers and direct peer consumers ask each receiving node to confirm its exact
+repository/digest after verifying all local files under owned catalogue and
+repository guards. Receivers propose only their own TLS-bound identity. Raft
+unions it with current holdings and rechecks GC generation, active exact lease,
+writer receipt, existing metadata and identity retirement. Tags remain unchanged.
+
+The internal endpoint requires the service credential, with only the explicit
+ordinary standalone bootstrap exception. Receipts have a bounded body/deadline
+and must identify the requested receiver and content. Cached HEAD responses
+cannot replace confirmation. Clustered receivers do not replay authoritative
+remote tags into their local projections.
+
+All 275 Pickle, 94 state-machine and 17 lease tests pass on macOS/Linux, alongside
+31 registry/compatibility integrations and strict all-target/all-feature Clippy.
+Coverage includes corrupt/missing blobs, cancellation, durable standalone writes,
+wrong/stalled/oversized receipts, cleanup/expiry/decommission fences and actual
+TLS receiving-node publication. Protocol 14/state 16, lease schema 5. The older
+standalone healer fixtures now explicitly seed metadata and check each authority's
+own proof; the TLS cluster fixture proves their union at a common leader.
+Physical registry cleanup qualification and the runnable-image catalogue remain
+open.

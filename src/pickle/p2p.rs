@@ -321,6 +321,9 @@ impl ClusterSource {
         )
         .await?;
 
+        self.state
+            .confirm_image_copy_with_access(repository, &manifest.digest, Some(access))
+            .await?;
         Ok(Some(
             manifest
                 .layers

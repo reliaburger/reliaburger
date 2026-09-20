@@ -410,8 +410,63 @@ impl StateMachineInner {
                 }
                 self.state.manifest_catalog.apply_manifest_commit(commit);
             }
-            RaftRequest::UpdateLayerLocations(update) => {
-                self.state.manifest_catalog.apply_update_locations(update);
+            RaftRequest::UpdateLayerLocations(_) => {
+                return Some(CouncilResponse::Refused {
+                    reason: "holder replacement requires storage-node copy confirmation".into(),
+                });
+            }
+            RaftRequest::ConfirmImageCopy(copy) => {
+                if self.registry_node_retired(copy.node_id) {
+                    return Some(CouncilResponse::Refused {
+                        reason: "registry writer identity is retired".into(),
+                    });
+                }
+                if self
+                    .state
+                    .registry_gc_generations
+                    .get(&copy.node_id)
+                    .copied()
+                    .unwrap_or(0)
+                    != copy.observed_gc_generation
+                {
+                    return Some(CouncilResponse::RegistryPublicationStale);
+                }
+                let catalogue = &self.state.manifest_catalog;
+                let reserved = copy
+                    .repository
+                    .split_once('/')
+                    .is_some_and(|(namespace, _)| namespace.starts_with("rbtest-"));
+                let permitted = match &copy.lease_id {
+                    Some(id) => {
+                        reserved
+                            && catalogue.repository_owners.get(&copy.repository) == Some(id)
+                            && self.state.test_leases.get(id).is_some_and(|lease| {
+                                lease.permits_registry_copy(
+                                    &copy.repository,
+                                    copy.node_id,
+                                    copy.observed_at_unix_ms,
+                                )
+                            })
+                    }
+                    None => {
+                        !reserved && !catalogue.repository_owners.contains_key(&copy.repository)
+                    }
+                };
+                if !permitted {
+                    return Some(CouncilResponse::Refused {
+                        reason: "repository copy requires its active owner and writer receipt"
+                            .into(),
+                    });
+                }
+                if !self.state.manifest_catalog.add_manifest_holder(
+                    &copy.repository,
+                    &copy.manifest_digest,
+                    copy.node_id,
+                ) {
+                    return Some(CouncilResponse::Refused {
+                        reason: "repository manifest no longer exists".into(),
+                    });
+                }
             }
             RaftRequest::GcReport(report) => {
                 if self
@@ -2309,6 +2364,206 @@ mod tests {
     }
 
     #[test]
+    fn copy_confirmation_adds_only_its_node_and_fences_gc_and_retirement() {
+        use crate::pickle::types::ImageCopyConfirmation;
+        let mut inner = StateMachineInner::default();
+        let commit = test_manifest_commit();
+        inner.state.manifest_catalog.apply_manifest_commit(&commit);
+        let mut copy = ImageCopyConfirmation {
+            repository: commit.manifest.repository.clone(),
+            manifest_digest: commit.manifest.digest.clone(),
+            node_id: 3,
+            lease_id: None,
+            observed_gc_generation: 0,
+            observed_at_unix_ms: 20,
+        };
+        let tags = inner.state.manifest_catalog.tags.clone();
+        assert!(
+            inner
+                .apply_request(&RaftRequest::ConfirmImageCopy(copy.clone()))
+                .is_none()
+        );
+        assert!(
+            inner
+                .apply_request(&RaftRequest::ConfirmImageCopy(copy.clone()))
+                .is_none()
+        );
+        for digest in commit.manifest.referenced_digests() {
+            assert_eq!(
+                inner.state.manifest_catalog.layer_holders(digest.as_str()),
+                std::collections::BTreeSet::from([1, 2, 3])
+            );
+        }
+        assert_eq!(inner.state.manifest_catalog.tags, tags);
+        copy.node_id = 4;
+        inner.state.registry_gc_generations.insert(4, 1);
+        assert_eq!(
+            inner.apply_request(&RaftRequest::ConfirmImageCopy(copy.clone())),
+            Some(CouncilResponse::RegistryPublicationStale)
+        );
+        copy.observed_gc_generation = 1;
+        assert!(
+            inner
+                .apply_request(&RaftRequest::ConfirmImageCopy(copy.clone()))
+                .is_none()
+        );
+        let valid = copy.clone();
+        for (repository, digest, lease) in [
+            ("unknown".to_owned(), copy.manifest_digest.clone(), None),
+            (copy.repository.clone(), test_digest("unknown"), None),
+            (
+                copy.repository.clone(),
+                copy.manifest_digest.clone(),
+                Some("wrong".to_owned()),
+            ),
+        ] {
+            let invalid = ImageCopyConfirmation {
+                repository,
+                manifest_digest: digest,
+                lease_id: lease,
+                ..valid.clone()
+            };
+            assert!(matches!(
+                inner.apply_request(&RaftRequest::ConfirmImageCopy(invalid)),
+                Some(CouncilResponse::Refused { .. })
+            ));
+        }
+        let node = "retired-copy-node";
+        copy.node_id = crate::cluster::identity::raft_id_from_name(node);
+        copy.observed_gc_generation = 0;
+        assert!(matches!(
+            inner.apply_request(&RaftRequest::DecommissionNode {
+                node_id: node.into(),
+                retired_by: "operator".into(),
+                reason: "isolated".into(),
+                retired_at_unix_ms: 20,
+                membership_log_id: None,
+            }),
+            Some(CouncilResponse::NodeDecommissioned { .. })
+        ));
+        assert!(matches!(
+            inner.apply_request(&RaftRequest::ConfirmImageCopy(copy)),
+            Some(CouncilResponse::Refused { .. })
+        ));
+    }
+
+    #[test]
+    fn leased_copy_confirmation_requires_exact_live_owner_and_writer_receipt() {
+        use crate::pickle::types::ImageCopyConfirmation;
+        let mut inner = StateMachineInner::default();
+        inner.apply_request(&RaftRequest::TestLeaseCreate(test_lease("run1", 100)));
+        let mut commit = test_manifest_commit();
+        commit.manifest.repository = "rbtest-run1/web".into();
+        commit.holder_nodes = std::collections::BTreeSet::from([1]);
+        for node_id in [1, 2] {
+            assert!(
+                inner
+                    .apply_request(&RaftRequest::TestLeaseRegistryWriter {
+                        lease_id: "run1".into(),
+                        repository: commit.manifest.repository.clone(),
+                        node_id,
+                        owner_id: Some("token:ci".into()),
+                        observed_at_unix_ms: 20,
+                    })
+                    .is_none()
+            );
+        }
+        assert!(
+            inner
+                .apply_request(&RaftRequest::TestLeaseManifestCommit {
+                    lease_id: "run1".into(),
+                    observed_at_unix_ms: 20,
+                    commit: Box::new(commit.clone()),
+                })
+                .is_none()
+        );
+        let copy = ImageCopyConfirmation {
+            repository: commit.manifest.repository.clone(),
+            manifest_digest: commit.manifest.digest.clone(),
+            node_id: 2,
+            lease_id: Some("run1".into()),
+            observed_gc_generation: 0,
+            observed_at_unix_ms: 20,
+        };
+        for invalid in [
+            ImageCopyConfirmation {
+                lease_id: None,
+                ..copy.clone()
+            },
+            ImageCopyConfirmation {
+                lease_id: Some("wrong".into()),
+                ..copy.clone()
+            },
+            ImageCopyConfirmation {
+                node_id: 3,
+                ..copy.clone()
+            },
+            ImageCopyConfirmation {
+                observed_at_unix_ms: 101,
+                ..copy.clone()
+            },
+        ] {
+            assert!(matches!(
+                inner.apply_request(&RaftRequest::ConfirmImageCopy(invalid)),
+                Some(CouncilResponse::Refused { .. })
+            ));
+        }
+        assert!(
+            inner
+                .apply_request(&RaftRequest::ConfirmImageCopy(copy.clone()))
+                .is_none()
+        );
+        inner.apply_request(&RaftRequest::TestLeaseBeginCleanup {
+            lease_id: "run1".into(),
+        });
+        assert!(matches!(
+            inner.apply_request(&RaftRequest::ConfirmImageCopy(copy.clone())),
+            Some(CouncilResponse::Refused { .. })
+        ));
+        inner
+            .state
+            .manifest_catalog
+            .retire_leased_repository(&copy.repository, "run1")
+            .unwrap();
+        assert!(matches!(
+            inner.apply_request(&RaftRequest::ConfirmImageCopy(copy)),
+            Some(CouncilResponse::Refused { .. })
+        ));
+        assert!(
+            inner
+                .state
+                .manifest_catalog
+                .get_repository_manifest(
+                    &commit.manifest.repository,
+                    commit.manifest.digest.as_str()
+                )
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn unscoped_registry_holder_replacement_is_refused() {
+        let mut inner = StateMachineInner::default();
+        let commit = test_manifest_commit();
+        inner.state.manifest_catalog.apply_manifest_commit(&commit);
+        let digest = commit.manifest.digest;
+        let before = inner.state.manifest_catalog.layer_holders(digest.as_str());
+        let response = inner.apply_request(&RaftRequest::UpdateLayerLocations(
+            crate::pickle::types::UpdateLayerLocations {
+                updates: vec![(digest.clone(), std::collections::BTreeSet::from([99]))],
+            },
+        ));
+        assert!(
+            matches!(response, Some(CouncilResponse::Refused { .. })),
+            "an old full holder set cannot establish present storage ownership"
+        );
+        assert_eq!(
+            inner.state.manifest_catalog.layer_holders(digest.as_str()),
+            before
+        );
+    }
+
+    #[test]
     fn with_store_fails_closed_on_a_corrupt_snapshot() {
         // CP3: a snapshot blob that exists but won't decode must abort startup,
         // not silently boot an empty desired/security state.
@@ -2993,22 +3248,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn apply_update_layer_locations() {
-        let mut sm = CouncilStateMachine::new();
-        let digest = test_digest("layer1");
-        let update = crate::pickle::types::UpdateLayerLocations {
-            updates: vec![(digest.clone(), std::collections::BTreeSet::from([3, 4]))],
-        };
-        let entry = normal_entry(1, 1, RaftRequest::UpdateLayerLocations(update));
-
-        sm.apply(vec![entry]).await.unwrap();
-
-        let state = sm.desired_state().await;
-        let holders = state.manifest_catalog.layer_holders(digest.as_str());
-        assert_eq!(holders, std::collections::BTreeSet::from([3, 4]));
-    }
-
-    #[tokio::test]
     async fn apply_gc_report_removes_holder() {
         let mut sm = CouncilStateMachine::new();
 
@@ -3017,13 +3256,12 @@ mod tests {
         let update = crate::pickle::types::UpdateLayerLocations {
             updates: vec![(digest.clone(), std::collections::BTreeSet::from([1, 2, 3]))],
         };
-        sm.apply(vec![normal_entry(
-            1,
-            1,
-            RaftRequest::UpdateLayerLocations(update),
-        )])
-        .await
-        .unwrap();
+        sm.inner
+            .write()
+            .await
+            .state
+            .manifest_catalog
+            .apply_update_locations(&update);
 
         // Then: GC report removes node 2
         let report = crate::pickle::types::GcReport {
@@ -3058,13 +3296,12 @@ mod tests {
         let update = crate::pickle::types::UpdateLayerLocations {
             updates: vec![(digest.clone(), std::collections::BTreeSet::from([1, 2]))],
         };
-        sm.apply(vec![normal_entry(
-            1,
-            1,
-            RaftRequest::UpdateLayerLocations(update),
-        )])
-        .await
-        .unwrap();
+        sm.inner
+            .write()
+            .await
+            .state
+            .manifest_catalog
+            .apply_update_locations(&update);
 
         // Both nodes nominate the layer, in log order.
         let report_from_1 = crate::pickle::types::GcReport {

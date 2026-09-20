@@ -1296,3 +1296,40 @@ and actual TLS publication after a worker collects an orphan. The state format
 advances to 15 and the protocol to 13. Development clusters still need fresh
 state. Peer-copy confirmation will use this same fence; its old full-holder-set
 operation remains the next piece to replace.
+
+### Let the storage node speak for itself
+
+A healer used to read a holder list, send some bytes and write back its updated
+list. Meanwhile, another node could collect a copy. The healer would then put
+that absent copy back in the catalogue. The failing regression exercises exactly
+that obsolete whole-list operation; Raft now refuses it.
+
+The replacement is `ImageCopyConfirmation`. It names one existing repository,
+one immutable manifest and one storage node. The receiver acquires repository
+ownership, reads current metadata and its GC generation, then hashes every
+referenced local file with a fixed-size buffer while retaining the catalogue
+guard. It proposes only its own identity. Raft checks the generation again and
+unions that node into the current holders, without replaying tags or another
+node's holdings. Reserved repositories also require their exact active lease and
+writer receipt. Cleanup, missing metadata and retired identities refuse.
+
+The internal confirmation endpoint requires the service credential. Explicit
+anonymous standalone bootstrap permits ordinary local repositories; it does not
+permit clustered or leased confirmation. Replication asks the receiver to confirm
+even when HEAD skipped all uploads. Receipts must match the requested node,
+repository and digest, and their complete bodies share a size limit and deadline.
+Direct peer consumers use the same local proof before using downloaded layers.
+
+An owned asynchronous task survives cancellation of its caller. Its blocking
+hashing closure returns a tuple containing the catalogue guard, repository access
+and optional local lease operation. Binding that tuple keeps all three alive
+until the authoritative reply. These are ordinary Rust values with destructors: a
+leading underscore suppresses an unused-variable warning, but does not drop a
+bound value early. That distinction matters when a value owns a lock.
+
+Tests cover corrupt and missing cached files, durable standalone confirmation,
+service-only admission, cancelled callers, wrong or stalled receipts, lease
+expiry/cleanup, GC generations and node retirement. The actual TLS fixture gives
+a fresh receiver its own certificate and proves that its confirmed holdings
+appear at the leader without filling its local catalogue with stale remote tags.
+The new replicated operation advances protocol/state compatibility to 14/16.

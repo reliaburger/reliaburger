@@ -129,8 +129,9 @@ and confirm partial-upload and metadata retirement only after workloads stop.
 Only the owning application lease may depend on those images, including init
 images. Ordinary apps and jobs refuse disposable image dependencies. Peer pulls
 also record repository ownership and track temporary uploads through caller
-cancellation; failed deletion remains pending for retry. Conditional storage-node
-copy confirmation and physical registry cleanup qualification remain release gates.
+cancellation; failed deletion remains pending for retry. Storage nodes now hash and conditionally
+confirm their own copies under the GC guard; the healer cannot replace stale
+holder lists. Physical registry cleanup qualification remains a release gate.
 
 Peer transfers preserve complete repository paths, including nested namespaces.
 Chunked uploads belong to the exact credential that created them. Continue and

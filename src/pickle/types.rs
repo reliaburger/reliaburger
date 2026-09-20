@@ -180,6 +180,23 @@ pub struct ManifestCommit {
     pub holder_nodes: BTreeSet<u64>,
 }
 
+/// Evidence that one storage node verified an existing image under its GC guard.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ImageCopyConfirmation {
+    /// Exact repository whose committed metadata supplies the dependency list.
+    pub repository: String,
+    /// Immutable image identity; never a mutable tag.
+    pub manifest_digest: Digest,
+    /// Authenticated storage node confirming only its own bytes.
+    pub node_id: u64,
+    /// Exact active owner for a disposable repository.
+    pub lease_id: Option<String>,
+    /// Generation observed before verification, fenced again at Raft application.
+    pub observed_gc_generation: u64,
+    /// Lease observation time recorded by the storage node.
+    pub observed_at_unix_ms: u64,
+}
+
 /// Update which nodes hold copies of specific layers.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct UpdateLayerLocations {
@@ -458,6 +475,28 @@ impl ManifestCatalog {
                     .push((layer_str, commit.holder_nodes.clone()));
             }
         }
+    }
+
+    /// Add one verified holder to an existing image without changing its tags.
+    /// Returns false when the exact repository/digest no longer exists.
+    pub fn add_manifest_holder(&mut self, repository: &str, digest: &Digest, node_id: u64) -> bool {
+        let Some(manifest) = self.get_repository_manifest(repository, digest.as_str()) else {
+            return false;
+        };
+        let digests: Vec<Digest> = manifest.referenced_digests().into_iter().cloned().collect();
+        for digest in digests {
+            if let Some((_, holders)) = self
+                .layer_locations
+                .iter_mut()
+                .find(|(key, _)| key == digest.as_str())
+            {
+                holders.insert(node_id);
+            } else {
+                self.layer_locations
+                    .push((digest.0, BTreeSet::from([node_id])));
+            }
+        }
+        true
     }
 
     /// Apply an UpdateLayerLocations.

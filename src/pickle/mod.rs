@@ -8,6 +8,7 @@ pub mod api;
 pub mod authority;
 pub mod build;
 pub mod capability;
+pub mod copy;
 pub mod gc;
 pub mod lease;
 pub mod p2p;

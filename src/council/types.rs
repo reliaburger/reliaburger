@@ -301,6 +301,8 @@ pub enum RaftRequest {
     },
     /// Allocate a renewal serial only while the node identity remains active.
     AllocateNodeSerial { node_id: String },
+    /// Conditionally add only the storage node that verified the existing image.
+    ConfirmImageCopy(crate::pickle::types::ImageCopyConfirmation),
 }
 
 // ---------------------------------------------------------------------------

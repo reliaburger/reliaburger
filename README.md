@@ -57,8 +57,9 @@ Unconfirmed Raft commits return 503 for client retry;
 HTTP writes under `rbtest-…/` require their exact authenticated lease owner.
 Registry workers confirm upload and metadata retirement after workloads stop;
 only the owning application lease may depend on those images. Peer pulls retain
-upload ownership through cancellation and failed cleanup. Conditional copy
-confirmation and physical registry cleanup qualification remain release gates.
+upload ownership through cancellation and failed cleanup. Storage nodes now hash and conditionally confirm their own copies under the GC
+guard; the healer cannot replace stale holder lists. Physical registry cleanup
+qualification remains a release gate.
 Direct image pulls and Pickle verify pinned manifests, selected platform
 manifests and configuration bytes before accepting them into the cache.
 
