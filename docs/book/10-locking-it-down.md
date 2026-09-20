@@ -1415,6 +1415,10 @@ inside an ordinary DNS-label workload name. With the previous hyphen-only form,
 `web`'s first initialiser could reuse the ordinary instance ID of `web-0-init`.
 A deployment regression checks that the foreign application's create is never
 repeated for the initialiser. Durable state 25 excludes the old ambiguous form.
+Keep that ordinary application running in the fixture: marking it Stopped lets
+normal supervision restart it, which would count as a second create without an
+identity collision. A bounded deployment wait also makes an accidental attempt
+to run the initialiser under the live application's identity fail promptly.
 
 The in-memory registry is not recovery evidence. After controller failure, the
 runtime's original launch inventory supplies every unacknowledged initialiser.

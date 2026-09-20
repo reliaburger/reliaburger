@@ -15756,11 +15756,13 @@ host = "remote.local"
             Config::parse("[app.web-0-init]\nimage = 'foreign:image'\ncommand = ['sleep', '60']\n")
                 .unwrap();
         expect_complete(&send_deploy(&tx, config).await);
-        for id in [&foreign, &reserved] {
-            grill.set_state(id, ContainerState::Stopped);
-            grill.set_exit_code(id, Some(0));
-        }
-        let events = send_deploy(&tx, config_with_init_container()).await;
+        grill.set_state(&reserved, ContainerState::Stopped);
+        grill.set_exit_code(&reserved, Some(0));
+        let events = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            send_deploy(&tx, config_with_init_container()),
+        )
+        .await;
         let foreign_creates = grill
             .calls()
             .iter()
@@ -15768,7 +15770,7 @@ host = "remote.local"
             .count();
         shutdown.cancel();
         task.await.unwrap();
-        expect_complete(&events);
+        expect_complete(&events.expect("initialiser reused the running application's identity"));
         assert_eq!(
             foreign_creates, 1,
             "initialiser reused an ordinary workload identity"
