@@ -64,6 +64,10 @@ changes only once the corresponding recovery contract is implemented.
   create/start/cleanup operation. A cancelled caller cannot leave a blocking
   worker or command able to mutate resources after a successor acquires that
   guard. Bind queued operations to their original generation.
+  - [x] Connect generation-bound short commands, durable admission sealing and
+    positive draining under cancelled callers and actual caller SIGKILL. All 17
+    selected command/journal cases and strict Clippy pass on macOS/Linux. Real
+    runtime command-path integration remains separate.
 - [ ] Move `runc run` and rootless slirp4netns behind durable owners. Reconstruct
   runtime state, exit outcomes, logs and forwarding from those records before
   relying on agent adoption metadata. Remove recovered-PID signalling from the

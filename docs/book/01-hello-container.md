@@ -3061,9 +3061,9 @@ root filesystem paths and network settings. We need the original request.
 
 `IntentJournal` stores that request alongside the runtime configuration and an
 unpredictable generation identifier. The generation distinguishes two attempts
-that reuse the same instance name. Each record is either Owned, meaning cleanup
-is still owed, or Retired with an optional independently observed workload exit
-code. Publishing a replacement requires Retired. Merely dropping the Rust value
+that reuse the same instance name. Owned means cleanup is still owed. Retiring fences new workload mutations
+while cleanup proceeds. Retired preserves an optional independently observed
+workload exit code. Publishing a replacement requires Retired. Merely dropping the Rust value
 that represents a claim does not retire any resources.
 
 A Tokio mutex can coordinate clones of one adapter. It cannot coordinate two
@@ -3095,3 +3095,39 @@ finished. Before connecting either to the agent's complete launch inventory,
 Runc must restore its launcher and helper obligations and demonstrate retirement.
 The tests for this journal establish persistence, exclusion and generation
 fencing, not physical container-crash recovery.
+
+
+### Close command admission before inspecting absence
+
+Imagine a network command waiting for a lock. Its caller times out, cleanup
+checks that the interface is absent, and a replacement reuses the address. The
+old command then creates the interface. Inspecting absence was real; treating
+that observation as final was the mistake.
+
+`IntentCommands` connects a generation claim to its durable short-command
+collection. `run` moves the claim into a spawned worker. Cancelling the caller
+drops its join handle, but Tokio keeps the worker running, and the worker keeps
+the claim until command registration and the bounded wait complete. A separate
+adapter cannot take that claim in the meantime. The cancellation regression
+blocks a real shell command, drops its caller, and verifies this exclusion before
+letting the command finish.
+
+A wait timeout leaves the command discoverable. Further normal commands refuse
+until earlier commands have positively retired. Cleanup first persists Retiring,
+then seals normal admission and drains the entire command collection. A drain
+error or deadline leaves Retiring on disk. Recovery must drain again; a fresh
+`IntentCommands` value never inherits an unverified in-memory success flag.
+
+Only the drained collection may run cleanup commands. Those commands have the
+same durable ownership and retirement checks. The runtime must then verify its
+OCI state, mounts and network resources absent before calling `finish`, which
+rechecks every command while it still owns the generation claim. The wrapper
+cannot inspect those runtime resources itself. Long-running launchers and
+network helpers need their separate role records; this collection covers short
+mutations.
+
+The process-death regression kills the actual caller after its command reaches
+a controlled wait. A new adapter claims the surviving generation, seals and
+drains it, and only then opens the old command's gate. No late mutation occurs.
+This exercises the ordering with real processes; wiring the same ordering into
+Runc's actual namespace and forwarding operations remains the integration step.

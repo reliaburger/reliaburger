@@ -16,6 +16,9 @@ use serde::{Deserialize, Serialize};
 
 use super::{InstanceId, OciSpec};
 
+mod commands;
+pub use commands::IntentCommands;
+
 const RECORD_LIMIT: u64 = 1024 * 1024;
 
 /// Runtime configuration whose meaning must remain unchanged during recovery.
@@ -47,6 +50,8 @@ pub struct IntentGeneration(String);
 pub enum IntentPhase {
     /// Preparation or execution may have created resources; absence is unproven.
     Owned,
+    /// New workload mutations are fenced while commands and resources retire.
+    Retiring,
     /// The runtime confirmed every command and resource retired.
     Retired {
         /// Actual workload exit code, when known independently of cleanup.
@@ -277,7 +282,7 @@ impl IntentClaim {
             if self
                 .record
                 .as_ref()
-                .is_some_and(|record| record.phase == IntentPhase::Owned)
+                .is_some_and(|record| !matches!(record.phase, IntentPhase::Retired { .. }))
             {
                 return Err(io::Error::other("runtime intent still owns resources"));
             }
