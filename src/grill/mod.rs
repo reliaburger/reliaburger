@@ -7,6 +7,7 @@
 pub mod apple;
 pub mod btrfs;
 pub mod cgroup;
+pub mod command;
 pub mod image;
 // Also exposed under the `ebpf` feature: the Lima-gated integration
 // tests drive the agent's pre-start egress programming through a mock

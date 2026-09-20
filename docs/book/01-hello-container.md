@@ -2966,3 +2966,42 @@ Unicode and length boundaries. The runtime regression uses harmless invalid
 labels and asserts that the mock receives no create call. Stored ownership
 records still need their own recovery validation; accepting a new configuration
 and interpreting old on-disk ownership are different entry points.
+
+### A command is still a process
+
+Suppose Bun runs `ip link add`, then disappears before collecting the result.
+Inspecting the network a moment later is not enough: the old command might
+still be about to create the link. The same problem applies to `runc run` and
+slirp4netns. Resource ownership needs to include the commands that can change
+those resources.
+
+The `OwnedCommands` adapter reuses the foreground owner's launch record and
+execution gate. It gives each command an unpredictable `CommandId`, persists
+its declared executable, arguments and environment, and only then permits
+activation. The identifier is a newtype: its tuple field is private, so callers
+cannot accidentally pass an application ID where a command ID belongs. Serde's
+`#[serde(transparent)]` stores the inner identifier directly rather than adding
+another JSON object around it. That allows a runtime's journal to retain the
+reference before it starts the command.
+
+Preparation and execution are separate calls for a reason. A crash after
+preparation leaves a discoverable, unactivated attempt. A crash after activation
+leaves an independent owner. Neither depends on the caller remembering the PID.
+`CommandState` distinguishes Prepared, Cancelled, Running and Retired. A missing
+owner returns an error; it is never another spelling of Retired.
+
+Waiting has a bounded deadline. When it expires, the command can still be
+running. The caller must retain its resource obligation and explicitly retire
+the command before confirming cleanup. Output is available only after confirmed
+retirement and is bounded to 1 MiB across both streams. Exceeding that bound
+makes output retrieval fail without losing the separate evidence that execution
+finished. Invalid paths, NUL bytes and malformed environment keys refuse before
+any intent is published.
+
+The collection belongs to one runtime generation. Its caller must hold that
+runtime's lifecycle guard while registering commands and collecting retirement
+evidence. Listing the current commands does not prevent a concurrent caller
+from registering another one. The adapter is a foundation; routing Runc and
+network operations through it, preserving the original OCI specification, and
+keeping their guards through cancellation are separate integration steps in the
+[OCI ownership plan](../plans/2026-09-20-oci-launch-ownership.md).

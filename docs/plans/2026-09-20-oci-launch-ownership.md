@@ -32,11 +32,15 @@ compare agent intent with the original input, not those derived values.
 Each item gets its own tests, book explanation and commit. Production selection
 changes only once the corresponding recovery contract is implemented.
 
-- [ ] Reuse the durable process owner for external runtime commands. Record
-  command input before activation, expose complete command inventory and actual
-  exit/output evidence, and preserve uncertain generations across cancellation
-  and Bun death. Keep command records under their owning runtime generation.
-  Do not turn a timeout or missing socket into successful command retirement.
+- [x] Add the explicit `OwnedCommands` foundation using the existing durable
+  owner. Five new integration contracts cover preparation before activation,
+  recovered inventory, timeout followed by explicit retirement, preserved
+  output/exit status, invalid-input refusal and bounded output after completion.
+  All 42 macOS/43 Linux adapter, owner and recovery cases pass with strict Clippy.
+- [ ] Use the adapter for external runtime commands, keeping records under their
+  owning runtime generation. Integrate complete inventory and actual retirement
+  evidence before changing production selection. A timeout or missing socket
+  must never become successful command retirement.
 - [ ] Journal original Runc intent before preparation can allocate resources.
   Include the instance generation and runtime configuration needed for recovery.
   Publish a validated complete inventory for the agent's existing reconciliation

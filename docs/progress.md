@@ -176,6 +176,7 @@ Buildah-absence cases execute in isolated child environments on the equipped VM.
     - [x] Require the first-run fixture's own Bun API announcement before accepting listener readiness. The occupied-port regression fails first by accepting a foreign listener; all sixteen portable first-run cases and strict Clippy pass on macOS/Linux after the fix. Product startup errors still fail; only a confirmed bind race retries.
   - [ ] Recover runtime/discovery resources created before their first adoption record, including physical process-death qualification. The [OCI ownership plan](plans/2026-09-20-oci-launch-ownership.md) records the remaining evidence and implementation order.
     - [ ] Persist and supervise external runtime commands before activation, retaining their complete inventory and uncertain cleanup obligations.
+      - [x] Add the explicit owned-command adapter with durable input, complete inventory, actual output/exit evidence and bounded waits that retain ownership. Five new contracts plus all owner/recovery checks pass (42 macOS/43 Linux), with strict Clippy on both. Production OCI wiring and lifecycle fencing remain separate.
     - [ ] Journal original Runc specifications and generations before preparation; retain lifecycle guards through cancelled callers and blocking workers.
     - [ ] Recover owned runc launchers and rootless slirp helpers without signalling recovered PIDs.
     - [ ] Retire namespace/link/forwarding mutators before inspecting kernel-resource absence and releasing address reservations.
