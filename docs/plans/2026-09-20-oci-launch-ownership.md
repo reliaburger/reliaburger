@@ -859,3 +859,14 @@ on macOS/Linux (17.764s/23.956s), followed by a focused positive retry-after-ref
 contract on each (0.041s/0.034s). Strict all-target/all-feature Clippy and formatting
 pass on both platforms. The retry test restores the same original allocation and
 requires publication before the first restart.
+
+
+## Backend replacement at capacity
+
+The capacity regression first rejects replacing an existing endpoint in a full
+32-entry map (0.087s). `add_backend` now replaces an existing instance before
+checking space for insertion. A new 33rd endpoint still refuses and leaves all
+retained fields unchanged. All 107 native Onion tests pass (0.213s), with strict
+all-target/all-feature Clippy and formatting. This portable map-only fix does not
+change kernel layouts or require another physical networking run; later affected
+Linux qualification and hosted CI remain separately recorded.

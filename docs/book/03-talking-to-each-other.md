@@ -1511,3 +1511,17 @@ not need a backend update.
 
 This confirms the local health update. Remote withdrawal acknowledgements and
 requests that already captured an ingress backend remain separate cleanup proofs.
+
+
+## A replacement does not need another slot
+
+A service already has 32 backends. Updating one instance's address, port or health
+still leaves 32 backends, but the old insertion path checked capacity before
+looking for that instance and rejected the update. The regression fills the map,
+replaces one endpoint and then attempts a genuinely new endpoint.
+
+The map now looks for an existing instance first. Rust's mutable iterator yields
+a mutable reference to its endpoint; assigning through that reference replaces
+its fields in place, then returns success. Only insertion checks the capacity.
+The test verifies the updated endpoint, unchanged count, and that overflow refusal
+leaves the entire retained entry unchanged.

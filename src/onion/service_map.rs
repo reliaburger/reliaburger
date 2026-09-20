@@ -176,23 +176,21 @@ impl ServiceMap {
             .get_mut(&key)
             .ok_or(OnionError::ServiceNotFound { name: key })?;
 
-        if entry.backends.len() >= MAX_BACKENDS {
-            return Err(OnionError::TooManyBackends {
-                app_name: id.qualified(),
-            });
-        }
-
-        // Replace if instance_id already exists (restart scenario)
+        // Updating an existing endpoint does not consume another backend slot.
         if let Some(existing) = entry
             .backends
             .iter_mut()
             .find(|b| b.instance_id == backend.instance_id)
         {
             *existing = backend;
-        } else {
-            entry.backends.push(backend);
+            return Ok(());
         }
-
+        if entry.backends.len() >= MAX_BACKENDS {
+            return Err(OnionError::TooManyBackends {
+                app_name: id.qualified(),
+            });
+        }
+        entry.backends.push(backend);
         Ok(())
     }
 
@@ -623,6 +621,37 @@ mod tests {
             )
             .unwrap_err();
         assert!(matches!(err, OnionError::ServiceNotFound { .. }));
+    }
+
+    #[test]
+    fn replacing_a_backend_at_capacity_does_not_consume_another_slot() {
+        let mut map = ServiceMap::new();
+        let service = sid("default", "api");
+        map.register(&service, 8080, None).unwrap();
+        for index in 0..MAX_BACKENDS {
+            map.add_backend(
+                &service,
+                test_backend(&format!("api-{index}"), [10, 0, 2, 2], 30000 + index as u16),
+            )
+            .unwrap();
+        }
+        let mut replacement = test_backend("api-0", [10, 0, 3, 3], 31000);
+        replacement.healthy = false;
+        map.add_backend(&service, replacement).unwrap();
+        let entry = map.resolve(&service).unwrap();
+        assert_eq!(entry.backends.len(), MAX_BACKENDS);
+        assert_eq!(entry.backends[0].node_ip, Ipv4Addr::new(10, 0, 3, 3));
+        assert_eq!(entry.backends[0].host_port, 31000);
+        assert!(!entry.backends[0].healthy);
+        let original = serde_json::to_value(entry).unwrap();
+        assert!(matches!(
+            map.add_backend(&service, test_backend("overflow", [10, 0, 4, 4], 32000)),
+            Err(OnionError::TooManyBackends { .. })
+        ));
+        assert_eq!(
+            serde_json::to_value(map.resolve(&service).unwrap()).unwrap(),
+            original
+        );
     }
 
     #[test]
