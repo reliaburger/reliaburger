@@ -1543,3 +1543,22 @@ again and checks that the main workload keeps the same PID. Another deliberately
 kills only the auxiliary owner: the request fails, and application retirement
 stays unconfirmed even when the command exits. The Linux binary-unlink test
 also checks that an owner can start an exec after its original binary is removed.
+
+
+## Kill the agent while an initialiser is running
+
+The first initialiser writes its PID and waits behind a file gate. The second
+initialiser and main workload each write a different marker. We kill the real
+Bun process while the gate is closed, then restart it with the same data.
+
+Recovery has no completed application to adopt. It must retire the original
+initialiser through its durable process owner, and neither later marker may
+exist. The test checks the runtime's confirmed Stopped state as well as the
+original process identity. Opening the gate afterwards is not permission to
+resume the abandoned chain.
+
+A new explicit apply starts a fresh chain. Now the first marker has two lines,
+and the successor and main markers have one each. These counts distinguish a
+fresh retry from a surviving old initialiser quietly continuing its work. The
+case exercises actual Bun death in foreground process mode; OCI runtime death,
+admission and cancellation boundaries have their own qualification work.

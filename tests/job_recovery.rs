@@ -1,4 +1,4 @@
-//! Real Bun process death must preserve a job's budget and unknown outcome.
+//! Real Bun death preserves job outcomes and retires interrupted initialisers.
 
 use std::path::{Path, PathBuf};
 use std::time::Duration;
@@ -358,4 +358,136 @@ registry_port = 0
     wait_job(&recovered.client, "stopped", 0).await;
     recovered.client.stop("work", "default").await.unwrap();
     recovered.crash().await;
+}
+
+/// Recovery must retire the interrupted init chain before a new apply can retry it.
+#[tokio::test]
+async fn killed_bun_during_initialisation_retires_the_chain_before_explicit_retry() {
+    use reliaburger::config::app::InitContainerSpec;
+    use reliaburger::grill::process::ProcessGrill;
+    use reliaburger::grill::state::ContainerState;
+    use reliaburger::grill::{Grill, InstanceId};
+
+    let root = tempfile::tempdir().unwrap();
+    let config_path = root.path().join("node.toml");
+    let log = root.path().join("bun.log");
+    std::fs::write(
+        &config_path,
+        format!(
+            r#"
+[storage]
+data = "{root}/data"
+images = "{root}/images"
+logs = "{root}/logs"
+metrics = "{root}/metrics"
+volumes = "{root}/volumes"
+[images]
+registry_bind = "127.0.0.1"
+registry_port = 0
+"#,
+            root = root.path().display()
+        ),
+    )
+    .unwrap();
+    let runs = root.path().join("init-runs");
+    let pid_file = root.path().join("init-pid");
+    let release = root.path().join("release-init");
+    let successor = root.path().join("second-init-runs");
+    let main = root.path().join("main-runs");
+    let _release = ReleaseJob(release.clone());
+    let mut config =
+        Config::parse("[app.init-crash]\nimage = 'proc-grill:image-ignored'\n").unwrap();
+    let app = config.app.get_mut("init-crash").unwrap();
+    app.init = vec![
+        InitContainerSpec {
+            image: None,
+            command: vec!["/bin/sh".into(), "-c".into(),
+                "printf 'init\\n' >> \"$1\"; printf '%s\\n' \"$$\" > \"$2\"; n=0; while [ ! -f \"$3\" ] && [ $n -lt 600 ]; do sleep 0.05; n=$((n+1)); done; [ -f \"$3\" ]".into(),
+                "init".into(), runs.display().to_string(), pid_file.display().to_string(), release.display().to_string()],
+        },
+        InitContainerSpec {
+            image: None,
+            command: vec!["/bin/sh".into(), "-c".into(), "printf 'next\\n' >> \"$1\"".into(), "next".into(), successor.display().to_string()],
+        },
+    ];
+    app.command = vec![
+        "/bin/sh".into(),
+        "-c".into(),
+        "printf 'main\\n' >> \"$1\"; exec sleep 60".into(),
+        "main".into(),
+        main.display().to_string(),
+    ];
+
+    let mut node = Node::start(&config_path, &log).await;
+    let applying = config.clone();
+    let client = BunClient::new(&node.endpoint);
+    let request = tokio::spawn(async move { client.apply(&applying).await });
+    let initialiser_pid: u32 = tokio::time::timeout(Duration::from_secs(15), async {
+        loop {
+            if let Ok(text) = std::fs::read_to_string(&pid_file)
+                && let Ok(pid) = text.trim().parse()
+            {
+                break pid;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("first initialiser must execute before the crash");
+    let original_process = reliaburger::grill::records::process_start_time(initialiser_pid);
+    node.crash().await;
+    request.abort();
+    let _ = request.await;
+
+    let mut recovered = Node::start(&config_path, &log).await;
+    let runtime = ProcessGrill::with_owner(
+        root.path().join("data/instances"),
+        env!("CARGO_BIN_EXE_bun").into(),
+    );
+    let retired = runtime
+        .state(&InstanceId("default__init-crash-0__init-0".into()))
+        .await;
+    let original_gone =
+        reliaburger::grill::records::process_start_time(initialiser_pid) != original_process;
+    let did_not_advance = !successor.exists() && !main.exists();
+    let recovered_status = recovered.client.status().await.unwrap();
+    let runs_before_retry = std::fs::read_to_string(&runs).unwrap();
+
+    std::fs::write(&release, "retry may proceed").unwrap();
+    let retry = recovered.client.apply(&config).await;
+    let main_started = tokio::time::timeout(Duration::from_secs(15), async {
+        loop {
+            if main.exists() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await;
+    let stopped = recovered.client.stop("init-crash", "default").await;
+    recovered.crash().await;
+    assert!(original_process.is_some());
+    assert_eq!(retired.unwrap(), ContainerState::Stopped);
+    assert!(
+        original_gone,
+        "the interrupted initialiser survived recovery"
+    );
+    assert!(
+        did_not_advance,
+        "the interrupted chain launched later payloads"
+    );
+    assert!(
+        recovered_status.is_empty(),
+        "an unacknowledged application was adopted"
+    );
+    assert_eq!(runs_before_retry.lines().count(), 1);
+    assert_eq!(retry.unwrap().created, 1);
+    main_started.expect("explicit retry must reach the main workload");
+    stopped.unwrap();
+    assert_eq!(std::fs::read_to_string(runs).unwrap().lines().count(), 2);
+    assert_eq!(
+        std::fs::read_to_string(successor).unwrap().lines().count(),
+        1
+    );
+    assert_eq!(std::fs::read_to_string(main).unwrap().lines().count(), 1);
 }

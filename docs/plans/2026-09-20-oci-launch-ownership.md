@@ -629,3 +629,20 @@ cases). All 66 physical kernel cases then pass (61.81s), as do all 215 affected
 agent/firewall/egress tests on macOS/Linux (17.734s/25.730s). Both Linux binary
 compatibility cases and strict Clippy/formatting on both platforms pass.
 Protocol/state remain 14/26.
+
+## Actual Bun death during process initialisation
+
+The portable binary-level case holds the first initialiser behind a file gate,
+observes its real PID, kills Bun, and restarts the same node state. Recovery must
+confirm the original initialiser stopped and leave both the second initialiser
+and main workload unexecuted. A new explicit apply then runs a fresh chain:
+two first-initialiser invocations in total, one successor and one main payload.
+Retire that application and Bun before asserting the captured observations.
+
+This qualifies the existing process recovery path, rather than claiming a new
+failing-first defect. It does not cover actual owned OCI integration, cancellation
+before original intent, or every create/retire interruption boundary.
+Qualification: all 32 macOS/33 Linux process and job recovery cases pass
+(26.911s/23.423s), with strict all-target/all-feature Clippy and formatting.
+The new test passes against the existing recovery implementation; this is
+additional physical qualification, not a repaired defect.
