@@ -519,7 +519,7 @@ Missing metric lists exist in the result but neither drive the non-zero exit nor
 
 Evidence: `src/testkit/cases/secrets_config.rs`; `image_registry.rs`; `workload_identity.rs`; `src/testkit/report.rs`.
 
-The audit found four cases returning Unknown unconditionally. Secret/config and workload-identity observations are now implemented; runnable registry deployment remains. Development and full profiles share a failed_any verdict, so missing required evidence still rejects acceptance.
+The audit found four cases returning Unknown unconditionally. Secret/config, workload-identity and runnable registry observations are now implemented. Development and full profiles share a failed_any verdict, so missing required evidence still rejects acceptance.
 
 **Completion test:** Implement runnable registry, secret/config and workload-identity fixtures in separate commits. Full profiles require their observations; development reports supported skips/warnings honestly and never converts missing evidence to success.
 
@@ -543,8 +543,23 @@ The three-case group passes; a second run trusting only the Node CA rejects the
 Workload-CA-issued leaf, with confirmed cleanup in both runs (51.73s total). All 117 testkit tests
 (0.62s) and strict Linux/macOS Clippy pass.
 No private key/token is read, and a mounted CA never becomes a trust anchor.
-A missing configured CA remains conditional Unknown. Runnable registry
-deployment remains open and depends on C34 registry ownership.
+A missing configured CA remains conditional Unknown.
+
+**Runnable registry fixture completed (20 September):** The physical runc
+regression initially reports two passes and one unconditional Unknown. All
+registry cases now use lease-scoped repositories and send the lease header on
+every write. The runnable case stages the verified pinned Linux child image for
+the target architecture, deploys its exact digest, waits for cluster-wide
+readiness and checks HTTP content from inside the owning container. Metadata
+staging refuses unpinned, corrupt and excessive fixtures. The list case matches
+both repository and digest.
+
+Real acceptance exposed a separate C34 coordinator bug: pending storage receipts
+were reported as failed consensus. After that independent repair, all three
+TLS/runc cases pass, all three cleanups are confirmed and the final public image
+catalogue is empty (37.61s). Three registry-upload integrations, the testkit/OCI
+suites (130 cases on Linux) and strict all-target/all-feature Clippy pass on both
+platforms. V01's complete live three-node catalogue remains separate.
 
 The broad library checkpoint was not green: 3,276 passed, one upgrade probe
 failed with Linux ETXTBSY, and 19 privileged gates were ignored. This execution

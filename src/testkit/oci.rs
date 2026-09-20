@@ -44,7 +44,7 @@ fn build_layer() -> Vec<u8> {
     encoder.finish().expect("finish gzip")
 }
 
-/// Construct a fresh synthetic image. `salt` varies the layer content so two
+/// Construct a fresh synthetic image. `salt` varies the configuration so two
 /// calls produce distinct digests when a test needs uniqueness.
 pub fn build_synthetic_image(salt: &str) -> SyntheticImage {
     // Vary the config's created field via the salt so digests differ per call.
@@ -114,12 +114,15 @@ async fn push_blob(
     repo: &str,
     data: &[u8],
     digest: &str,
+    lease_id: Option<&str>,
 ) -> Result<(), String> {
-    let start = http
-        .post(format!("{base}/v2/{repo}/blobs/uploads/"))
-        .send()
-        .await
-        .map_err(|e| format!("blob upload POST failed: {e}"))?;
+    let start = with_lease(
+        http.post(format!("{base}/v2/{repo}/blobs/uploads/")),
+        lease_id,
+    )
+    .send()
+    .await
+    .map_err(|e| format!("blob upload POST failed: {e}"))?;
     if !start.status().is_success() {
         return Err(format!("blob upload POST returned {}", start.status()));
     }
@@ -130,8 +133,7 @@ async fn push_blob(
         .map(|l| resolve_location(base, l))
         .ok_or_else(|| "upload POST returned no Location".to_string())??;
 
-    let patched = http
-        .patch(&location)
+    let patched = with_lease(http.patch(&location), lease_id)
         .body(data.to_vec())
         .send()
         .await
@@ -148,11 +150,13 @@ async fn push_blob(
         .unwrap_or(location);
 
     let separator = if location.contains('?') { '&' } else { '?' };
-    let finish = http
-        .put(format!("{location}{separator}digest={digest}"))
-        .send()
-        .await
-        .map_err(|e| format!("blob PUT failed: {e}"))?;
+    let finish = with_lease(
+        http.put(format!("{location}{separator}digest={digest}")),
+        lease_id,
+    )
+    .send()
+    .await
+    .map_err(|e| format!("blob PUT failed: {e}"))?;
     if !finish.status().is_success() {
         return Err(format!("blob PUT returned {}", finish.status()));
     }
@@ -168,18 +172,162 @@ pub async fn push_image(
     tag: &str,
     image: &SyntheticImage,
 ) -> Result<(), String> {
-    push_blob(http, base, repo, &image.config, &image.config_digest).await?;
-    push_blob(http, base, repo, &image.layer, &image.layer_digest).await?;
+    push_image_owned(http, base, repo, tag, image, None).await
+}
 
-    let manifest = http
-        .put(format!("{base}/v2/{repo}/manifests/{tag}"))
-        .header("Content-Type", "application/vnd.oci.image.manifest.v1+json")
-        .body(image.manifest.clone())
-        .send()
+/// Push a fixture under its server-issued repository lease on every write.
+pub async fn push_leased_image(
+    http: &reqwest::Client,
+    base: &str,
+    repo: &str,
+    tag: &str,
+    image: &SyntheticImage,
+    lease_id: &str,
+) -> Result<(), String> {
+    push_image_owned(http, base, repo, tag, image, Some(lease_id)).await
+}
+
+async fn push_image_owned(
+    http: &reqwest::Client,
+    base: &str,
+    repo: &str,
+    tag: &str,
+    image: &SyntheticImage,
+    lease_id: Option<&str>,
+) -> Result<(), String> {
+    push_blob(
+        http,
+        base,
+        repo,
+        &image.config,
+        &image.config_digest,
+        lease_id,
+    )
+    .await?;
+    push_blob(
+        http,
+        base,
+        repo,
+        &image.layer,
+        &image.layer_digest,
+        lease_id,
+    )
+    .await?;
+    push_manifest(http, base, repo, tag, &image.manifest, lease_id).await
+}
+
+fn with_lease(request: reqwest::RequestBuilder, lease_id: Option<&str>) -> reqwest::RequestBuilder {
+    match lease_id {
+        Some(id) => request.header("x-reliaburger-test-lease", id),
+        None => request,
+    }
+}
+
+async fn push_manifest(
+    http: &reqwest::Client,
+    base: &str,
+    repo: &str,
+    tag: &str,
+    manifest: &[u8],
+    lease_id: Option<&str>,
+) -> Result<(), String> {
+    let response = with_lease(
+        http.put(format!("{base}/v2/{repo}/manifests/{tag}")),
+        lease_id,
+    )
+    .header("Content-Type", "application/vnd.oci.image.manifest.v1+json")
+    .body(manifest.to_vec())
+    .send()
+    .await
+    .map_err(|error| format!("manifest PUT failed: {error}"))?;
+    if response.status() != reqwest::StatusCode::CREATED {
+        return Err(format!(
+            "manifest PUT did not confirm publication: {}",
+            response.status()
+        ));
+    }
+    Ok(())
+}
+
+/// Stage a pinned, platform-resolved upstream fixture in a leased repository.
+/// Each blob is size/digest checked before upload; the returned digest names the
+/// exact verified child manifest. Fixture content is limited to 64 MiB total.
+pub async fn stage_upstream_image(
+    http: &reqwest::Client,
+    base: &str,
+    repo: &str,
+    lease_id: &str,
+    upstream: &dyn crate::pickle::upstream::UpstreamRegistry,
+    image: &crate::grill::image::ImageReference,
+) -> Result<String, String> {
+    crate::pickle::types::Digest::new(&image.tag)
+        .map_err(|_| "runnable fixture requires a valid pinned upstream digest".to_owned())?;
+    let manifest = upstream
+        .fetch_manifest(image)
         .await
-        .map_err(|e| format!("manifest PUT failed: {e}"))?;
-    if !manifest.status().is_success() {
-        return Err(format!("manifest PUT returned {}", manifest.status()));
+        .map_err(|error| error.to_string())?;
+    let mut total = manifest.manifest_bytes.len() as u64;
+    total = total
+        .checked_add(manifest.config.size)
+        .ok_or("fixture size overflow")?;
+    for layer in &manifest.layers {
+        total = total
+            .checked_add(layer.size)
+            .ok_or("fixture size overflow")?;
+    }
+    if total > 64 * 1024 * 1024 || manifest.layers.len() > 128 {
+        return Err("runnable fixture exceeds its size limit".into());
+    }
+    if sha256_digest(&manifest.manifest_bytes) != manifest.digest.as_str() {
+        return Err("upstream fixture manifest digest mismatch".into());
+    }
+    verify_fixture_blob(&manifest.config_bytes, &manifest.config)?;
+    push_blob(
+        http,
+        base,
+        repo,
+        &manifest.config_bytes,
+        manifest.config.digest.as_str(),
+        Some(lease_id),
+    )
+    .await?;
+    for layer in &manifest.layers {
+        let bytes = upstream
+            .fetch_blob(image, layer)
+            .await
+            .map_err(|error| error.to_string())?;
+        verify_fixture_blob(&bytes, layer)?;
+        push_blob(
+            http,
+            base,
+            repo,
+            &bytes,
+            layer.digest.as_str(),
+            Some(lease_id),
+        )
+        .await?;
+    }
+    push_manifest(
+        http,
+        base,
+        repo,
+        "runnable",
+        &manifest.manifest_bytes,
+        Some(lease_id),
+    )
+    .await?;
+    Ok(manifest.digest.as_str().to_owned())
+}
+
+fn verify_fixture_blob(
+    bytes: &[u8],
+    descriptor: &crate::pickle::types::LayerDescriptor,
+) -> Result<(), String> {
+    if bytes.len() as u64 != descriptor.size || sha256_digest(bytes) != descriptor.digest.as_str() {
+        return Err(format!(
+            "upstream fixture blob fails size/digest verification: {}",
+            descriptor.digest.as_str()
+        ));
     }
     Ok(())
 }
@@ -210,6 +358,94 @@ pub async fn fetch_manifest(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn staging_rejects_invalid_or_oversized_metadata_before_uploading_or_fetching_layers() {
+        use crate::pickle::{
+            types::{Digest as ImageDigest, LayerDescriptor, PickleError},
+            upstream::{UpstreamFuture, UpstreamManifest, UpstreamRegistry},
+        };
+        struct Source(UpstreamManifest);
+        impl UpstreamRegistry for Source {
+            fn head_manifest_digest<'a>(
+                &'a self,
+                _: &'a crate::grill::image::ImageReference,
+            ) -> UpstreamFuture<'a, ImageDigest> {
+                Box::pin(async { panic!("pinned staging must not resolve a mutable tag") })
+            }
+            fn fetch_manifest<'a>(
+                &'a self,
+                _: &'a crate::grill::image::ImageReference,
+            ) -> UpstreamFuture<'a, UpstreamManifest> {
+                Box::pin(async { Ok(self.0.clone()) })
+            }
+            fn fetch_blob<'a>(
+                &'a self,
+                _: &'a crate::grill::image::ImageReference,
+                _: &'a LayerDescriptor,
+            ) -> UpstreamFuture<'a, Vec<u8>> {
+                Box::pin(async {
+                    Err(PickleError::ReplicationFailed(
+                        "layer read must not happen for refused fixture metadata".into(),
+                    ))
+                })
+            }
+        }
+        let fixture = build_synthetic_image("bounds");
+        let valid = UpstreamManifest {
+            digest: ImageDigest::new(&fixture.manifest_digest).unwrap(),
+            manifest_bytes: fixture.manifest,
+            config: LayerDescriptor {
+                digest: ImageDigest::new(&fixture.config_digest).unwrap(),
+                size: fixture.config.len() as u64,
+                media_type: String::new(),
+            },
+            config_bytes: fixture.config,
+            layers: vec![LayerDescriptor {
+                digest: ImageDigest::new(&fixture.layer_digest).unwrap(),
+                size: fixture.layer.len() as u64,
+                media_type: String::new(),
+            }],
+        };
+        let image = crate::grill::image::ImageReference::parse(&format!(
+            "example.com/fixture@{}",
+            fixture.manifest_digest
+        ))
+        .unwrap();
+        let http = reqwest::Client::new();
+        for mode in ["manifest", "configuration", "oversized", "overflow"] {
+            let mut manifest = valid.clone();
+            let expected = match mode {
+                "manifest" => {
+                    manifest.manifest_bytes.push(b' ');
+                    "manifest digest mismatch"
+                }
+                "configuration" => {
+                    manifest.config_bytes.push(b' ');
+                    "size/digest verification"
+                }
+                "oversized" => {
+                    manifest.layers[0].size = 65 * 1024 * 1024;
+                    "size limit"
+                }
+                _ => {
+                    manifest.layers[0].size = u64::MAX;
+                    "size overflow"
+                }
+            };
+            let error = stage_upstream_image(
+                &http,
+                "http://127.0.0.1:9",
+                "rbtest-fixture/image",
+                "fixture",
+                &Source(manifest),
+                &image,
+            )
+            .await
+            .unwrap_err();
+            assert!(error.contains(expected), "{mode}: {error}");
+        }
+    }
 
     #[tokio::test]
     async fn upload_locations_cannot_forward_credentials_to_another_origin() {

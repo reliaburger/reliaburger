@@ -135,6 +135,10 @@ also record repository ownership and track temporary uploads through caller
 cancellation; failed deletion remains pending for retry. Storage nodes now hash and conditionally
 confirm their own copies under the GC guard; the healer cannot replace stale
 holder lists. Physical registry cleanup qualification remains a release gate.
+`relish test --filter image-registry` now stages a pinned runnable image under its
+server lease, deploys the exact digest and checks its HTTP response. The real
+Linux/runc catalogue passes all three cases with confirmed repository cleanup.
+Multi-node crash qualification remains separate.
 
 Peer transfers preserve complete repository paths, including nested namespaces.
 Chunked uploads belong to the exact credential that created them. Continue and

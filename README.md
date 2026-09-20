@@ -60,6 +60,10 @@ only the owning application lease may depend on those images. Peer pulls retain
 upload ownership through cancellation and failed cleanup. Storage nodes now hash and conditionally confirm their own copies under the GC
 guard; the healer cannot replace stale holder lists. Physical registry cleanup
 qualification remains a release gate.
+`relish test --filter image-registry` now stages a pinned runnable image under its
+server lease, deploys the exact digest and checks its HTTP response. The real
+Linux/runc catalogue passes all three cases with confirmed repository cleanup.
+Multi-node crash qualification remains separate.
 OCI index selection targets Linux containers even when the client runs on macOS.
 Direct image pulls and Pickle verify pinned manifests, selected platform
 manifests and configuration bytes before accepting them into the cache.

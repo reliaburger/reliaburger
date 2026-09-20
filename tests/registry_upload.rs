@@ -157,3 +157,155 @@ async fn failed_upload_cleanup_stays_fenced_and_retries_without_blocking_other_u
     server.abort();
     let _ = server.await;
 }
+
+#[tokio::test]
+async fn catalogue_stages_verified_upstream_bytes_under_its_exact_lease_and_retires_them() {
+    use reliaburger::{
+        pickle::upstream::OciUpstream,
+        sesame::{
+            auth, token,
+            types::{ApiRole, TokenScope},
+        },
+        testkit::{lease::TestLease, oci},
+    };
+    let source_root = tempfile::tempdir().unwrap();
+    let mut source = registry_state(source_root.path());
+    source.auth = None;
+    source.require_read_auth = false;
+    source.allow_unauthenticated_bootstrap = true;
+    let source_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let source_address = source_listener.local_addr().unwrap();
+    let source_base = format!("http://{source_address}");
+    let source_server = tokio::spawn(async move {
+        axum::serve(source_listener, reliaburger::pickle::api::router(source))
+            .await
+            .unwrap();
+    });
+    let plain = reqwest::Client::builder()
+        .no_proxy()
+        .redirect(reqwest::redirect::Policy::none())
+        .timeout(std::time::Duration::from_secs(5))
+        .build()
+        .unwrap();
+    let fixture = oci::build_synthetic_image("source-content");
+    oci::push_image(&plain, &source_base, "fixture", "v1", &fixture)
+        .await
+        .unwrap();
+
+    let root = tempfile::tempdir().unwrap();
+    let mut state = registry_state(root.path());
+    state.persist_path = Some(root.path().join("catalog.json"));
+    let owner = token::create_token(
+        "fixture-owner",
+        ApiRole::Deployer,
+        TokenScope::default(),
+        None,
+    )
+    .unwrap();
+    let principal =
+        auth::authenticate(&owner.plaintext, std::slice::from_ref(&owner.token)).unwrap();
+    let tokens = auth::new_token_store();
+    tokens.write().await.push(owner.token);
+    state.auth = Some(auth::AuthState::new(tokens, None));
+    let now = reliaburger::testkit::lease::now_unix_millis();
+    state
+        .test_leases
+        .create(
+            TestLease::new(
+                "upload1".into(),
+                principal.principal_id,
+                "fixture-owner".into(),
+                "rbtest-upload1".into(),
+                now,
+                now + 600_000,
+            )
+            .unwrap(),
+        )
+        .await
+        .unwrap();
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let base = format!("http://{}", listener.local_addr().unwrap());
+    let app = reliaburger::pickle::api::router(state.clone());
+    let server = tokio::spawn(async move {
+        axum::serve(listener, app).await.unwrap();
+    });
+    let mut headers = reqwest::header::HeaderMap::new();
+    headers.insert(
+        reqwest::header::AUTHORIZATION,
+        format!("Bearer {}", owner.plaintext).parse().unwrap(),
+    );
+    let client = reqwest::Client::builder()
+        .default_headers(headers)
+        .no_proxy()
+        .redirect(reqwest::redirect::Policy::none())
+        .timeout(std::time::Duration::from_secs(5))
+        .build()
+        .unwrap();
+    let repository = "rbtest-upload1/runnable";
+    let upstream = OciUpstream::insecure_http(Default::default());
+    let pinned = reliaburger::grill::image::ImageReference::parse(&format!(
+        "{source_address}/fixture@{}",
+        fixture.manifest_digest
+    ))
+    .unwrap();
+    let mut mutable = pinned.clone();
+    mutable.tag = "v1".into();
+    assert!(
+        oci::stage_upstream_image(&client, &base, repository, "upload1", &upstream, &mutable)
+            .await
+            .is_err()
+    );
+    assert!(
+        oci::stage_upstream_image(
+            &client,
+            &base,
+            repository,
+            "wrong-lease",
+            &upstream,
+            &pinned
+        )
+        .await
+        .is_err()
+    );
+    assert!(state.catalog.read().await.manifests.is_empty());
+    let digest =
+        oci::stage_upstream_image(&client, &base, repository, "upload1", &upstream, &pinned)
+            .await
+            .unwrap();
+    assert_eq!(digest, fixture.manifest_digest);
+    assert_eq!(
+        oci::fetch_manifest(&client, &base, repository, &digest)
+            .await
+            .unwrap(),
+        fixture.manifest
+    );
+    assert_eq!(
+        state.test_leases.get("upload1").await.unwrap().repositories[repository],
+        std::collections::BTreeSet::from([1])
+    );
+    assert_eq!(
+        state.catalog.read().await.repository_owners[repository],
+        "upload1"
+    );
+    state
+        .test_leases
+        .begin_cleanup("upload1", None)
+        .await
+        .unwrap();
+    state
+        .test_leases
+        .confirm_workloads_retired("upload1")
+        .await
+        .unwrap();
+    state.reap_registry_leases_once().await.unwrap();
+    assert!(state.catalog.read().await.manifests.is_empty());
+    assert!(
+        oci::stage_upstream_image(&client, &base, repository, "upload1", &upstream, &pinned)
+            .await
+            .is_err()
+    );
+    server.abort();
+    source_server.abort();
+    let _ = server.await;
+    let _ = source_server.await;
+}

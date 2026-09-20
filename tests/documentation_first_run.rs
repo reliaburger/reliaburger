@@ -1411,6 +1411,13 @@ fn runc_catalogue_verifies_workload_spiffe_certificates() {
 }
 
 #[cfg(target_os = "linux")]
+#[test]
+#[ignore = "requires rootful runc, networking tools and registry access"]
+fn runc_catalogue_deploys_the_exact_image_pushed_to_pickle() {
+    qualify_runc_catalogue("image-registry");
+}
+
+#[cfg(target_os = "linux")]
 fn qualify_runc_catalogue(group: &str) {
     assert!(
         nix::unistd::geteuid().is_root(),
@@ -1519,6 +1526,25 @@ fn qualify_runc_catalogue(group: &str) {
         assert_eq!(case["cleanup"]["status"], "confirmed", "{report}");
     }
     assert_success(&output, "qualify runtime catalogue");
+    if group == "image-registry" {
+        let listed = run_relish(&[
+            "--endpoint",
+            &endpoint,
+            "--ca-cert",
+            ca,
+            "--token",
+            token.trim(),
+            "--output",
+            "json",
+            "images",
+        ]);
+        assert_success(&listed, "inspect catalogue after confirmed cleanup");
+        let catalogue: serde_json::Value = serde_json::from_slice(&listed.stdout).unwrap();
+        assert!(
+            catalogue["images"].as_array().unwrap().is_empty(),
+            "fixture repositories survived confirmed cleanup: {catalogue}"
+        );
+    }
     if group == "workload-identity" {
         // A Node CA can authenticate the API, but cannot validate a workload
         // leaf issued by the separate Workload CA. The mounted bundle must

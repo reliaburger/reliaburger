@@ -1,6 +1,7 @@
 # Registry ownership and retirement for 0.1.0
 
-C34 registry leases and C30's runnable pushed-image test remain release gates.
+C34 physical registry retirement remains a release gate. C30's runnable pushed-image
+fixture is complete; its evidence appears below.
 Implement each independently reviewable repair in its own commit.
 
 1. Make local catalogue mutation durable before acknowledging a push. Propagate
@@ -390,3 +391,18 @@ acknowledgements retain Pending and the second permits completion. Six authority
 integrations, 17 lease tests and strict all-target/all-feature Clippy pass on
 macOS/Linux. No format change. The C30 fixture and complete physical registry
 qualification remain separate commits.
+
+## Runnable leased catalogue completed
+
+The physical TLS/runc regression first reports the old unconditional Unknown.
+All three registry cases now use their lease namespace and exact lease header.
+The runnable case stages verified pinned Linux content for the target node's
+architecture, deploys the exact child digest and checks an HTTP response inside
+the owning container. Size/digest bounds apply before fixture blob uploads;
+mutable upstream tags refuse. The list assertion matches repository and digest.
+
+After the separately committed pending-retirement repair, the real three-case
+group passes with three confirmed cleanups and no remaining image metadata
+(37.61s). Three authenticated registry-upload integrations, testkit/OCI suites
+and strict all-target/all-feature Clippy pass on macOS/Linux. Complete physical
+node/client-death and leader-change qualification remains C34/V01/V02.

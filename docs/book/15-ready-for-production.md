@@ -1396,12 +1396,10 @@ speaks: POST to open an upload and read back a `Location`, PATCH the bytes to
 that location, PUT with `?digest=` to seal it — once per blob — then PUT the
 manifest under a tag. Reliaburger's own registry answers this protocol (that's
 how `buildah push` works against it), so the harness just plays the client side
-over `reqwest`. Two of the three cases run: push-and-pull-back-by-digest, and
-"does it show up in `relish images`". The third — actually *deploying* from the
-cluster registry — skips, honestly, because our synthetic image is one marker
-file with no binary in it; you can store it but you can't run it, and a deploy
-case that can't run its workload has nothing to prove. Staging a genuinely
-runnable image in Pickle is a job for another day, and it says so.
+over `reqwest`. The first version ran two of the three cases: push-and-pull-back
+by digest, and "does it show up in `relish images`". The synthetic image contains
+one marker file and no executable, so it couldn't prove deployment. That third
+case remained unknown until the runnable fixture described below.
 
 That completes the catalogue: thirteen groups, thirty-nine cases. Not all of
 them run everywhere — the process-runtime cases skip on runc and the container
@@ -3366,5 +3364,38 @@ These are controlled interleavings around real filesystem operations, not proof
 of complete physical-crash recovery. The live multi-node and process-death gates
 remain separate. We also keep ordinary content in the registry while deleting a
 leased repository with identical blobs, and check that GC still refuses to remove
-the shared bytes. The release catalogue must next exercise these paths with its
-real runnable image and tracked peer transfers.
+the shared bytes. The runnable catalogue below exercises leased upload and actual deployment.
+Complete multi-node registry crash qualification remains a separate gate.
+
+### Run what we pushed
+
+The registry catalogue used to report two passes and one unknown. Worse, its
+synthetic repositories had fixed names outside the lease namespace, so confirmed
+app cleanup said nothing about those images. The live runc regression preserves
+that original failure before replacing the fixture.
+
+Each case now uses its server-issued namespace as the repository prefix and
+attaches the exact lease header to every upload operation and manifest commit.
+The list assertion matches both repository and complete digest. Partial uploads
+and committed metadata therefore join the same storage receipt inventory used
+by normal test cleanup.
+
+For deployment we fetch the already-pinned BusyBox index through the shared
+verified upstream reader. The client selects Linux and the target node's reported
+architecture, then stages the verified child manifest, configuration and layers
+in Pickle. It verifies each blob's digest and length before upload, caps total
+fixture content at 64 MiB and refuses mutable upstream tags. Source registry
+access and authenticated cluster uploads use separate clients.
+
+The test deploys `repository@sha256:...` using the returned full child digest. Its
+command starts BusyBox's foreground HTTP server with known response content.
+After cluster-wide readiness, the harness finds the actual owner, executes a
+request inside that container and checks the response. A successful upload alone
+cannot pass this test. The physical acceptance also requires all three cleanup
+results to be confirmed and the final public image catalogue to be empty.
+
+The staging helper accepts `&dyn UpstreamRegistry`, a borrowed trait object. The
+borrow lets callers retain their registry client, while `dyn` dispatches through
+the implementation chosen at runtime. The same path uses a real upstream reader
+in production and controlled fixtures in tests. Refused or interrupted staging
+leaves its registered lease ownership available for the server's reaper.
