@@ -124,7 +124,7 @@ registry_port = 0
     let mut config = Config::parse("[job.work]\nimage = 'proc-grill:image-ignored'\n").unwrap();
     let job = config.job.get_mut("work").unwrap();
     job.command = Some(vec!["/bin/sh".into(), "-c".into(),
-        "if [ -f \"$RUN_FILE\" ]; then i=0; while [ ! -f \"$START_RETRY\" ] && [ ! -f \"$RELEASE_FILE\" ] && [ $i -lt 600 ]; do i=$((i+1)); sleep 0.05; done; fi; printf 'run\\n' >> \"$RUN_FILE\"; if [ \"$(wc -l < \"$RUN_FILE\")\" -eq 1 ]; then exit 1; fi; i=0; while [ $i -lt 600 ]; do [ -f \"$RELEASE_FILE\" ] && exit 0; i=$((i+1)); sleep 0.05; done; exit 1".into()]);
+        "if [ -f \"$RUN_FILE\" ]; then i=0; while [ ! -f \"$START_RETRY\" ] && [ ! -f \"$RELEASE_FILE\" ] && [ $i -lt 600 ]; do i=$((i+1)); sleep 0.05; done; fi; printf 'run\\n' >> \"$RUN_FILE\"; if [ \"$(wc -l < \"$RUN_FILE\")\" -eq 1 ]; then exit 1; fi; i=0; while [ $i -lt 600 ]; do if [ -f \"$RELEASE_FILE\" ]; then if [ \"$(wc -l < \"$RUN_FILE\")\" -eq 2 ]; then kill -TERM $$; else exit 0; fi; fi; i=$((i+1)); sleep 0.05; done; exit 1".into()]);
     job.env.insert(
         "RUN_FILE".into(),
         EnvValue::Plain(count.display().to_string()),
@@ -196,4 +196,74 @@ registry_port = 0
     assert_eq!(std::fs::read_to_string(&count).unwrap().lines().count(), 3);
     client.stop("work", "default").await.unwrap();
     node.crash().await;
+}
+
+#[tokio::test]
+async fn completed_job_survives_bun_death_with_or_without_adoption_record() {
+    for remove_adoption_record in [false, true] {
+        let root = tempfile::tempdir().unwrap();
+        let config_path = root.path().join("node.toml");
+        let log = root.path().join("bun.log");
+        let data = root.path().join("data");
+        std::fs::write(
+            &config_path,
+            format!(
+                r#"
+[storage]
+data = "{data}"
+images = "{root}/images"
+logs = "{root}/logs"
+metrics = "{root}/metrics"
+volumes = "{root}/volumes"
+[images]
+registry_bind = "127.0.0.1"
+registry_port = 0
+"#,
+                data = data.display(),
+                root = root.path().display()
+            ),
+        )
+        .unwrap();
+        let release = root.path().join("release");
+        let _release = ReleaseJob(release.clone());
+        let mut config = Config::parse("[job.work]\nimage = 'proc-grill:image-ignored'\n").unwrap();
+        let job = config.job.get_mut("work").unwrap();
+        job.command = Some(vec!["/bin/sh".into(), "-c".into(),
+            "i=0; while [ ! -f \"$RELEASE_FILE\" ] && [ $i -lt 600 ]; do i=$((i+1)); sleep 0.05; done; [ -f \"$RELEASE_FILE\" ]".into()]);
+        job.env.insert(
+            "RELEASE_FILE".into(),
+            EnvValue::Plain(release.display().to_string()),
+        );
+        let mut node = Node::start(&config_path, &log).await;
+        node.client.apply(&config).await.unwrap();
+        wait_job(&node.client, "running", 0).await;
+        node.crash().await;
+        if remove_adoption_record {
+            // Inject missing agent metadata after physical Bun death. The
+            // runtime intent remains; this does not claim a timed pre-write kill.
+            std::fs::remove_file(data.join("instances/default__work-0.json")).unwrap();
+        }
+        std::fs::write(&release, "release").unwrap();
+        let grill = reliaburger::grill::process::ProcessGrill::with_owner(
+            data.join("instances"),
+            env!("CARGO_BIN_EXE_bun").into(),
+        );
+        let id = reliaburger::grill::InstanceId("default__work-0".into());
+        use reliaburger::grill::Grill;
+        tokio::time::timeout(Duration::from_secs(15), async {
+            while grill.state(&id).await.unwrap() != reliaburger::grill::ContainerState::Stopped {
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .unwrap();
+        let mut recovered = Node::start(&config_path, &log).await;
+        wait_job(&recovered.client, "stopped", 0).await;
+        assert_eq!(
+            recovered.client.status().await.unwrap()[0].exit_code,
+            Some(0)
+        );
+        recovered.client.stop("work", "default").await.unwrap();
+        recovered.crash().await;
+    }
 }

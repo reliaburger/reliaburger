@@ -2845,13 +2845,13 @@ async fn select_runtime(name: &str, instances_dir: &std::path::Path) -> anyhow::
     match name {
         "auto" => {
             let runtime = detect_runtime().await;
-            // Rebuild the process fallback in file-backed mode: workload
-            // output must go to files (not pipes) to survive a self-upgrade
-            // exec and support adoption.
+            // The process fallback uses durable owners so launches remain
+            // discoverable even before agent adoption is recorded.
             let runtime = match runtime {
-                AnyGrill::Process(_) => {
-                    AnyGrill::Process(ProcessGrill::with_log_dir(instances_dir.to_path_buf()))
-                }
+                AnyGrill::Process(_) => AnyGrill::Process(ProcessGrill::with_owner(
+                    instances_dir.to_path_buf(),
+                    std::env::current_exe()?,
+                )),
                 other => other,
             };
             let kind = match &runtime {
@@ -2866,8 +2866,9 @@ async fn select_runtime(name: &str, instances_dir: &std::path::Path) -> anyhow::
         }
         "process" => {
             println!("bun: using process runtime");
-            Ok(AnyGrill::Process(ProcessGrill::with_log_dir(
+            Ok(AnyGrill::Process(ProcessGrill::with_owner(
                 instances_dir.to_path_buf(),
+                std::env::current_exe()?,
             )))
         }
         #[cfg(target_os = "linux")]

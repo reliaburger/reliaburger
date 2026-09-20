@@ -39,9 +39,12 @@ Grill is Bun's container runtime interface -- the abstraction layer between Bun'
 run in the foreground and keep all children in the supervised process group.
 Daemonising, detached sessions/groups and hand-off to external service managers
 are unsupported. Use Linux containers for those workloads. This is a cooperative
-lifecycle contract, not containment; C34 still requires atomic launch ownership
-and recovery before adoption records. The broader process-isolation design below
-remains future work.
+lifecycle contract, not containment. Production process mode uses a durable
+foreground owner: intent precedes execution, and startup reconciles every launch
+before adopting workloads or allowing replacements. Missing owners retain
+uncertainty; completed jobs preserve their exit code even without an agent PID
+record. C34 still tracks remaining runtime/discovery recovery and qualification.
+The broader process-isolation design below remains future work.
 
 **Key design decisions:**
 
@@ -967,7 +970,7 @@ before their Phase 15 cases can use this contract.
 
 ### 5.2 Process Workload Lifecycle
 
-> **Status: the isolation stack (steps 7-12) is planned — not yet implemented.** What ships today is the admission gate in step 3 (deny-by-default binary allowlist plus honest refusal of isolation a node can't provide) followed by a direct host `spawn` of the binary, in its own process group, with the spec's environment and stdout/stderr captured (`src/grill/process.rs`). The mount/PID/network/UTS namespaces, the seccomp profile, and dropping to the `burger` user (steps 7-12 below) describe the target design; a process workload currently runs as an ordinary child of the Bun process. Treat steps 7-12 as the roadmap, not a description of the running binary.
+> **Status: the isolation stack (steps 7-12) is planned — not yet implemented.** What ships today is the admission gate in step 3 (deny-by-default binary allowlist plus honest refusal of isolation a node can't provide) followed by a direct host `spawn` of the binary, in its own process group, with the spec's environment and stdout/stderr captured (`src/grill/process.rs`). The mount/PID/network/UTS namespaces, the seccomp profile, and dropping to the `burger` user (steps 7-12 below) describe the target design; a process workload currently runs as a child of its durable foreground owner, without that isolation stack. Treat steps 7-12 as the roadmap, not a description of the running binary.
 
 **Start a process workload:**
 
@@ -1411,7 +1414,7 @@ join = ["10.0.1.5:9443"]
 
 ### 8.2 Trust Boundaries
 
-> **Note: the "Process workloads" boundary below is the planned target, not the current state.** Process workloads today run as ordinary children of the Bun process without the PID/network/mount/UTS namespaces, seccomp filter, restricted filesystem view, or `burger` user shown in that box. The container-workload boundary is real; the process-workload isolation is the roadmap described in §5.2.
+> **Note: the "Process workloads" boundary below is the planned target, not the current state.** Process workloads today run under durable foreground owners without the PID/network/mount/UTS namespaces, seccomp filter, restricted filesystem view, or `burger` user shown in that box. The container-workload boundary is real; the process-workload isolation is the roadmap described in §5.2.
 
 ```
 ┌─────────────────────────────────────────────────────┐

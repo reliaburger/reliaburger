@@ -52,7 +52,7 @@ security boundary against hostile same-user processes.
   before startup of the large debug binary; the fixture allows 15 seconds for
   startup and separately requires descendant retirement within two seconds
   after an explicit parent-exit trigger.
-- [ ] Persist agent/runtime launch intent and an unpredictable generation before
+- [x] Persist runtime launch intent and an unpredictable generation before
   starting the owner; retain the record across caller cancellation. Keep Unix
   socket paths short and private even when the data-directory path is long.
 - [x] Add the explicit `ProcessGrill::with_owner` adapter for start, status, stop,
@@ -85,17 +85,24 @@ security boundary against hostile same-user processes.
   create, before start, on fresh runs and retries. Two ordering/persistence
   regressions fail first; all agent tests pass on macOS/Linux (155/154). Job
   schema 2 and state 17 reject the previous ambiguous launch meaning.
-- [ ] Select the owned adapter in production Bun only alongside complete
-  pre-adoption reconciliation. Distinguish the latest job attempt from older
-  completed runtime generations.
-- [ ] Discover generations before an agent adoption record exists, distinguish
+- [x] Select the owned adapter in production Bun alongside complete
+  pre-adoption reconciliation. Five startup regressions fail first; eighteen
+  runtime/reconciliation, nine owner and two actual Bun crash tests pass on
+  macOS/Linux, alongside the agent suites (155/154) and strict Clippy.
+- [x] Reconcile generations before an agent adoption record exists, distinguish
   provably unactivated preparation from uncertain activated owners, and join
-  recovered state to app/job cleanup obligations. Advance state compatibility
-  when persistent production records change.
+  recovered state to app/job cleanup obligations. State 18 requires mandatory
+  runtime launch intent. Ordinary completed job outcomes survive Bun death;
+  interrupted preparations retain unknown outcomes with proven runtime absence.
+- [ ] Require successful application adoption-record persistence before deploy
+  acknowledgement. A failed write currently logs a warning and can acknowledge
+  an application whose full specification will be unavailable after a crash.
+  Preserve the short-job path, whose checkpoint and runtime intent provide its
+  execution evidence without a PID record.
 - [ ] Qualify actual Bun death at the preparation/activation/adoption boundaries,
   helper loss, short jobs, cron and complete group retirement on macOS/Linux.
   Re-run the runtime, agent, job-recovery and upgrade suites.
 
-The helper and explicit runtime adapter are implemented. Bun still selects its
-existing launch/adoption path until the production integration items land. C34 and the
+Production Bun now uses the durable process owner and startup reconciliation.
+Application acknowledgement, remaining runtime/discovery ownership and the
 0.1.0 release qualification gates remain open.

@@ -502,9 +502,14 @@ Filesystem operations run through `spawn_blocking`, which moves blocking work
 off Tokio's executor threads. Cancelling the caller doesn't abort that worker,
 so its generation record and lock remain owned until the operation finishes.
 Socket requests use Tokio's existing reactor with a deadline covering connection,
-write and read. The explicit adapter and its recovery tests are implemented;
-Bun's production selection and pre-adoption reconciliation remain in the
-[foreground ownership plan](../plans/2026-09-20-foreground-process-ownership.md).
+write and read. Bun selects this adapter for explicit process mode and the
+automatic process fallback. Startup validates the full launch inventory against
+agent adoption records before reconciliation. It cancels unactivated launches,
+retires unrecorded active launches with confirmed absence, and preserves completed
+job exit codes. A launch permit with no runtime intent refuses startup. A helper
+lost after activation remains uncertain; a replacement never signals its saved
+PID. The [foreground ownership plan](../plans/2026-09-20-foreground-process-ownership.md)
+tracks the remaining qualification work.
 
 Two fields in the app config:
 
@@ -1417,9 +1422,15 @@ while lease retirement may forget the checkpoint after all cleanup is confirmed.
 The tests check the journal before a blocked create call, break persistence,
 restore observed and unknown outcomes, and exhaust the retry budget. A real
 binary test fails one attempt, kills Bun while its retry runs, adopts the same
-PID, then lets that process exit. The replacement cannot reap the old parent's
-exit status, so it reports unknown. Another Bun restart preserves that result.
+PID, then terminates that process by signal. Its owner confirms retirement but
+has no ordinary exit code, so Bun reports unknown. Another Bun restart preserves
+that result.
 Only the explicit CLI rerun appends another execution to the workload's log.
+A separate real-process test kills Bun and lets its surviving job finish with
+code zero. Recovery preserves that success, including when the test deliberately
+removes the agent adoption record after the crash. The durable runtime intent
+remains. That injected metadata fault exercises the missing-record path; it does
+not claim to time a kill between spawn and the adoption write.
 
 There is still a separate boundary before the first runtime adoption record.
 A launch claim proves that execution was attempted; it cannot identify an

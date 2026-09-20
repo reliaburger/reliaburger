@@ -372,33 +372,37 @@ A pid plus its start time is, for practical purposes, a unique process identity.
 
 ProcessGrill used to capture workload output with pipes: spawn with `Stdio::piped()`, read the other end in a tokio task. Follow the pieces through an exec. The reading task: gone (all threads). Bun's read-end FD: closed (CLOEXEC). The workload's write end: now points at a pipe nobody will ever read. The workload keeps serving happily until the pipe buffer fills or the kernel notices — and then its next `println!` gets **SIGPIPE, whose default action is process death**. The workload survives the upgrade and is then murdered by its own logging.
 
-The fix is the one runc used from day one: redirect stdout/stderr to *files*. A file doesn't care who reads it or whether the reader is alive; the workload appends through the swap without noticing, and the new bun just keeps reading from the recorded path. `ProcessGrill::with_log_dir` enables this mode (the binary uses it always; in-memory pipes remain for unit tests). This is the quiet lesson of the section: in a system where processes replace themselves, *shared state belongs in the filesystem, not in process plumbing*.
+The fix is the one runc used from day one: redirect stdout/stderr to *files*. A file doesn't care who reads it or whether the reader is alive; the workload appends through the swap without noticing, and the new bun just keeps reading from the recorded path. `ProcessGrill::with_owner` now enables file-backed capture and durable ownership in the binary; the earlier `with_log_dir` adapter remains for legacy tests. This is the quiet lesson of the section: in a system where processes replace themselves, *shared state belongs in the filesystem, not in process plumbing*.
 
 ### Problem 3: reaping — waitpid, ECHILD, and the two afterlives
 
-An adopted process has no `Child` handle, so someone must still collect its exit status when it dies — otherwise it lingers as a zombie. Here Unix hands us a fork in the road, because an adoptee has two possible histories:
+The first implementation reconstructed process ownership from a PID and start
+time. After an exec the workload was still Bun's child, so `waitpid` could reap
+it. After a full restart, init had adopted it and the replacement Bun could no
+longer collect its exit status. That difference made completed jobs look unknown.
+It also left a gap between spawn and the first adoption record.
 
-- **After an exec** (the upgrade path): it's still our child — same PID, remember. `waitpid(pid, WNOHANG)` works: it reports "still alive", or reaps the zombie and returns the exit code.
-- **After a full restart** (the crash path: the supervisor spawned a *new* bun process): the orphaned workload was reparented to init. `waitpid` returns `ECHILD` — "not your child" — and we fall back to `kill(pid, 0)`, the classic no-op signal that answers only "does this process exist?". The exit *code* is unknowable in this history; init reaped it.
+Production process mode now delegates to the durable foreground owner described
+in chapter 8. The owner retains the actual child across Bun exec and restart,
+records intent before activation, reaps the supported process group and persists
+the actual exit code. Bun controls it through a private generation-authenticated
+socket. The owner's short bootstrapper is reaped before launch is acknowledged;
+the long-lived owner is reparented to init, so Bun's exec cannot lose its reaper.
 
-```rust
-match waitpid(nix_pid, Some(WaitPidFlag::WNOHANG)) {
-    Ok(WaitStatus::StillAlive) => (true, None),
-    Ok(WaitStatus::Exited(_, code)) => (false, Some(code)),
-    Ok(_) => (false, None),                       // killed by signal, etc.
-    Err(Errno::ECHILD) => match kill(nix_pid, None) {
-        Ok(()) => (true, None),                   // alive, someone else's child
-        Err(_) => (false, None),                  // gone
-    },
-    Err(_) => (false, None),
-}
-```
+On Linux, `ECHILD` (no children) proves retirement only when reported to this
+owner after it has adopted and reaped the descendants. The same error in a new
+Bun process says nothing about somebody else's children. On macOS, the owner
+keeps its root child unreaped until a complete process-group snapshot contains
+no other members. Losing the owner remains uncertainty; a saved PID never grants
+a replacement permission to signal it. Logs remain readable for diagnosis.
 
-This is `poll_adopted_process`, and it's called from `state()` — which the supervisor polls continuously anyway, so polling doubles as reaping and no separate reaper task is needed. If you've only ever managed processes from Go's `os/exec` or Python's `subprocess`, this is the machinery those libraries hide from you; it stops being hideable the moment the process that called `spawn` isn't the process calling `wait`.
+The legacy PID-adoption helper remains in the older adapter and OCI paths.
+Those paths are separate from production process-mode ownership; C34 retains
+the remaining OCI launch/discovery recovery work.
 
-RunC adoption is the same story one level up, with one extra check: besides the `runc run` pid being live, `runc state <id>` must report the *container* as `running` — the pid check authenticates the process, the state check authenticates the container. Rootless runc has another process to own: `slirp4netns`. Its schema-v2 record carries the API socket, port mapping, container PID and the slirp PID/start-time pair. The adopter reclaims the exact live owner; if it died, Bun starts a replacement and restores the host forward before returning success. `make test-rootless-runc` kills that owner deliberately and proves the original host port still answers afterwards. Repeating adoption in the same Bun keeps its existing owner handle. Replacing a different owner first stops and reaps it, preserving the successor's socket; cancelled startup kills an unpublished helper. Chapter 3 explains why startup and handoff need different drop behaviour.
+RunC adoption currently uses a PID/start-time observation with an extra check: besides the `runc run` pid being live, `runc state <id>` must report the *container* as `running` — the pid check authenticates the process, the state check authenticates the container. Rootless runc has another process to own: `slirp4netns`. Its schema-v2 record carries the API socket, port mapping, container PID and the slirp PID/start-time pair. The adopter reclaims the exact live owner; if it died, Bun starts a replacement and restores the host forward before returning success. `make test-rootless-runc` kills that owner deliberately and proves the original host port still answers afterwards. Repeating adoption in the same Bun keeps its existing owner handle. Replacing a different owner first stops and reaps it, preserving the successor's socket; cancelled startup kills an unpublished helper. Chapter 3 explains why startup and handoff need different drop behaviour.
 
-Apple Container adoption drops the pid check entirely, and that's the interesting part. An Apple workload runs *inside a VM* managed by the `container` daemon; it was never a child of bun, so there's no pid to fingerprint. The recoverable handle is the container itself: `container inspect <id>` reporting `running` means the VM sailed through our exec, so we re-track the entry (rebuilt from the record's OCI spec) and re-discover its IP instead of tearing a perfectly good workload down. A vanished container declines adoption and reschedules the normal way. macOS exercises the pid-based path via ProcessGrill and the Apple path behind `make test-apple`.
+Apple Container adoption drops the pid check entirely, and that's the interesting part. An Apple workload runs *inside a VM* managed by the `container` daemon; it was never a child of bun, so there's no pid to fingerprint. The recoverable handle is the container itself: `container inspect <id>` reporting `running` means the VM sailed through our exec, so we re-track the entry (rebuilt from the record's OCI spec) and re-discover its IP instead of tearing a perfectly good workload down. A vanished container declines adoption and reschedules the normal way. macOS exercises durable process-owner recovery and the Apple path behind `make test-apple`.
 
 ### What we decided not to do
 

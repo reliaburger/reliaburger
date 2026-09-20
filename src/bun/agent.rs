@@ -2647,6 +2647,110 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
         .map_err(|error| fail(format!("persist replacement record: {error}")))
     }
 
+    /// Reconcile launches that reached the runtime before agent adoption was durable.
+    async fn reconcile_runtime_launches(
+        &mut self,
+        records: &[crate::grill::records::InstanceRecord],
+        jobs: &mut std::collections::BTreeMap<String, super::jobs::RecordedJob>,
+        launches: &[crate::grill::RuntimeLaunch],
+    ) -> Result<(), BunError> {
+        use super::jobs::JobPhase;
+        let inventory: std::collections::HashMap<_, _> = launches
+            .iter()
+            .map(|launch| (launch.instance_id.0.as_str(), launch))
+            .collect();
+        if inventory.len() != launches.len() {
+            return Err(BunError::AdoptionState(
+                "duplicate runtime launch identity".into(),
+            ));
+        }
+        let recorded: std::collections::HashSet<_> = records
+            .iter()
+            .map(|record| record.instance_id.as_str())
+            .collect();
+        // Validate all cross-record relationships before retiring any owner.
+        for record in records {
+            let launch = inventory.get(record.instance_id.as_str()).ok_or_else(|| {
+                BunError::AdoptionState(format!(
+                    "instance {} has no runtime launch intent",
+                    record.instance_id
+                ))
+            })?;
+            if launch.spec != record.oci_spec
+                || jobs
+                    .get(&record.instance_id)
+                    .is_some_and(|job| job.phase == JobPhase::Preparing)
+            {
+                return Err(BunError::AdoptionState(format!(
+                    "instance {} conflicts with runtime preparation",
+                    record.instance_id
+                )));
+            }
+        }
+        for (id, job) in jobs.iter() {
+            if !inventory.contains_key(id.as_str())
+                && !job.runtime_absent
+                && job.phase != JobPhase::Preparing
+            {
+                return Err(BunError::AdoptionState(format!(
+                    "job {id} has no runtime launch intent"
+                )));
+            }
+        }
+        for launch in launches {
+            let id = &launch.instance_id;
+            if recorded.contains(id.0.as_str()) {
+                continue;
+            }
+            let state = tokio::time::timeout(
+                std::time::Duration::from_secs(10),
+                self.supervisor.grill().state(id),
+            )
+            .await
+            .map_err(|_| {
+                BunError::AdoptionState(format!("runtime inspection timed out for {id}"))
+            })??;
+            if state != ContainerState::Stopped
+                && jobs.get(&id.0).is_some_and(|job| job.runtime_absent)
+            {
+                return Err(BunError::AdoptionState(format!(
+                    "job {id} has conflicting live and terminal evidence"
+                )));
+            }
+            // Without the agent's acknowledgement record an active launch has
+            // an uncertain outcome. Fence it before ordinary desired-state
+            // reconciliation can authorise any replacement.
+            if state != ContainerState::Stopped {
+                kill_runtime_instance(self.supervisor.grill(), id).await?;
+            }
+            if let Some(job) = jobs.get_mut(&id.0) {
+                job.runtime_absent = true;
+                job.phase = match job.phase {
+                    JobPhase::Launching if state == ContainerState::Stopped => {
+                        match self.supervisor.grill().exit_code(id).await {
+                            Some(code) => JobPhase::Exited { code },
+                            None => JobPhase::Unknown,
+                        }
+                    }
+                    JobPhase::Preparing | JobPhase::Launching => JobPhase::Unknown,
+                    JobPhase::Stopping => JobPhase::Stopped,
+                    ref phase => phase.clone(),
+                };
+                self.commit_jobs(jobs.clone()).await?;
+            }
+            self.retire_instance_artifacts(id).await?;
+        }
+        for (id, job) in jobs.iter_mut() {
+            if !inventory.contains_key(id.as_str()) && job.phase == JobPhase::Preparing {
+                // A complete mandatory intent inventory plus the pre-execution
+                // phase proves no runtime was activated for this preparation.
+                job.phase = JobPhase::Unknown;
+                job.runtime_absent = true;
+            }
+        }
+        self.commit_jobs(jobs.clone()).await
+    }
+
     /// Adopt still-running workloads recorded by a previous bun process.
     ///
     /// Called once at startup, BEFORE any reconciliation: adopted instances
@@ -2783,6 +2887,11 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
         self.recorded_jobs = jobs.clone();
         self.job_store_uncertain = false;
         let mut recovered_jobs = jobs;
+        let launch_inventory = self.supervisor.grill().launch_inventory().await?;
+        if let Some(launches) = &launch_inventory {
+            self.reconcile_runtime_launches(&records, &mut recovered_jobs, launches)
+                .await?;
+        }
         let mut adopted_jobs = std::collections::HashSet::new();
         for record in records {
             // Startup preflight proved that runtime, record and supervisor
@@ -2812,7 +2921,16 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
                         job.phase,
                         super::jobs::JobPhase::Preparing | super::jobs::JobPhase::Launching
                     ) {
-                        job.phase = super::jobs::JobPhase::Unknown;
+                        job.phase = if launch_inventory.is_some()
+                            && job.phase == super::jobs::JobPhase::Launching
+                        {
+                            match self.supervisor.grill().exit_code(&runtime_id).await {
+                                Some(code) => super::jobs::JobPhase::Exited { code },
+                                None => super::jobs::JobPhase::Unknown,
+                            }
+                        } else {
+                            super::jobs::JobPhase::Unknown
+                        };
                     }
                     // Preserve the positive observation before deleting the
                     // only record that let this runtime prove absence.
