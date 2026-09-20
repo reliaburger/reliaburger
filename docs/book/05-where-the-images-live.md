@@ -1003,3 +1003,26 @@ new leader and refuses after the remaining quorum is lost. Separate tests cover
 wrong credentials, forged holdings, certificate revocation and bounded streams.
 Repository lease ownership and cleanup still need their own conditional commits;
 forwarding alone cannot establish those obligations.
+
+### An upload belongs to its creator
+
+Two deploy tokens can publish into the same repository. That doesn't make them
+interchangeable halfway through an upload. Previously Pickle checked the role
+on every chunk but discarded the authenticated identity. Anyone with another
+deploy token and the upload URL could append bytes or complete the upload.
+
+Authentication now returns `Option<AuthContext>`. `Some(context)` retains the
+exact credential fingerprint and its scope; `None` represents the explicitly
+open standalone bootstrap mode. Upload metadata stores that fingerprint, never
+the bearer secret or just its human-readable name. A replacement credential
+with the same name doesn't inherit the old session. The internal service
+principal doesn't inherit it either.
+
+The session's existing writer guard checks repository, identity and lifecycle
+before body consumption. Every request still authenticates against the current
+token store, so revocation takes effect even if the session remains within its
+TTL. A refused outsider cannot mutate or discard the creator's temporary file.
+The TTL reaper remains responsible for abandoned sessions. The regression uses
+two credentials with the same name, attempts PATCH and completion with the
+wrong credential and the service principal, revokes the owner, then verifies
+that the restored owner can finish its unchanged bytes.

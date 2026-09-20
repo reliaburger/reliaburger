@@ -250,7 +250,7 @@ pub fn require_role(ctx: &AuthContext, required: ApiRole) -> Result<(), (StatusC
 }
 
 /// The `AuthContext` for the internal service principal (Admin-equivalent).
-fn system_context() -> AuthContext {
+pub(crate) fn system_context() -> AuthContext {
     AuthContext {
         token_name: SYSTEM_PRINCIPAL.to_string(),
         principal_id: SYSTEM_PRINCIPAL.to_string(),

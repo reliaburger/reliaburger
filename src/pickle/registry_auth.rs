@@ -139,16 +139,28 @@ pub async fn authorise_write(
     bearer: Option<&str>,
     allow_unauthenticated_bootstrap: bool,
 ) -> Result<(), WriteDenied> {
+    authenticate_writer(auth, bearer, allow_unauthenticated_bootstrap)
+        .await
+        .map(|_| ())
+}
+
+/// Authenticate a deploy-class writer without discarding its exact identity.
+/// `None` represents the explicitly permitted standalone bootstrap window.
+pub async fn authenticate_writer(
+    auth: &AuthState,
+    bearer: Option<&str>,
+    allow_unauthenticated_bootstrap: bool,
+) -> Result<Option<crate::sesame::auth::AuthContext>, WriteDenied> {
     // The internal service token authenticates node-to-node replication.
     if let (Some(bearer), Some(service)) = (bearer, auth.service_token.as_deref())
         && crate::sesame::auth::tokens_equal(bearer, service)
     {
-        return Ok(());
+        return Ok(Some(crate::sesame::auth::system_context()));
     }
 
     let tokens = { auth.tokens.read().await.clone() };
     if allow_unauthenticated_bootstrap && tokens.is_empty() && auth.service_token.is_none() {
-        return Ok(());
+        return Ok(None);
     }
 
     let Some(bearer) = bearer else {
@@ -158,7 +170,7 @@ pub async fn authorise_write(
         Ok(ctx) => {
             // A registry push is a deploy-class mutation.
             if crate::sesame::token::check_role(ctx.role, ApiRole::Deployer).is_ok() {
-                Ok(())
+                Ok(Some(ctx))
             } else {
                 Err(WriteDenied::Forbidden)
             }
@@ -219,6 +231,8 @@ struct UploadSession {
     last_activity: SystemTime,
     /// The repository the upload targets (for quota accounting).
     repository: String,
+    /// Exact authenticated credential; None is anonymous standalone bootstrap.
+    principal_id: Option<String>,
     /// Bytes written so far.
     written: u64,
     state: UploadState,
@@ -246,13 +260,20 @@ impl UploadSessions {
         }
     }
 
-    /// Record a new upload session for `repository`.
-    pub async fn register(&self, upload_id: &str, repository: &str, now: SystemTime) {
+    /// Record a new upload session for `repository` and its exact creator.
+    pub async fn register(
+        &self,
+        upload_id: &str,
+        repository: &str,
+        principal_id: Option<&str>,
+        now: SystemTime,
+    ) {
         self.inner.write().await.insert(
             upload_id.to_string(),
             UploadSession {
                 last_activity: now,
                 repository: repository.to_string(),
+                principal_id: principal_id.map(str::to_owned),
                 written: 0,
                 state: UploadState::Active,
                 writer: Arc::new(tokio::sync::Semaphore::new(1)),
@@ -260,15 +281,19 @@ impl UploadSessions {
         );
     }
 
-    /// Claim the sole writer for this repository's session, preventing PATCH/PUT races.
+    /// Claim the creator's sole writer for this repository, preventing PATCH/PUT races.
     pub async fn claim_writer(
         &self,
         upload_id: &str,
         repository: &str,
+        principal_id: Option<&str>,
     ) -> Option<tokio::sync::OwnedSemaphorePermit> {
         let guard = self.inner.read().await;
         let session = guard.get(upload_id)?;
-        if session.state == UploadState::Retiring || session.repository != repository {
+        if session.state == UploadState::Retiring
+            || session.repository != repository
+            || session.principal_id.as_deref() != principal_id
+        {
             return None;
         }
         Arc::clone(&session.writer).try_acquire_owned().ok()
@@ -518,13 +543,21 @@ mod tests {
     async fn expired_upload_stays_owned_until_cleanup_is_confirmed() {
         let sessions = UploadSessions::new(Duration::from_secs(60));
         let start = SystemTime::UNIX_EPOCH;
-        sessions.register("abandoned", "web", start).await;
-        let writer = sessions.claim_writer("abandoned", "web").await.unwrap();
+        sessions.register("abandoned", "web", None, start).await;
+        let writer = sessions
+            .claim_writer("abandoned", "web", None)
+            .await
+            .unwrap();
         let later = start + Duration::from_secs(61);
         assert!(sessions.sweep(later).await.is_empty());
         drop(writer);
         assert_eq!(sessions.sweep(later).await, vec!["abandoned"]);
-        assert!(sessions.claim_writer("abandoned", "web").await.is_none());
+        assert!(
+            sessions
+                .claim_writer("abandoned", "web", None)
+                .await
+                .is_none()
+        );
         assert!(!sessions.touch("abandoned", 0, start).await);
         // A failed file removal must leave the next sweep an owner to retry.
         assert_eq!(sessions.sweep(later).await, vec!["abandoned"]);
@@ -536,7 +569,7 @@ mod tests {
     async fn expired_upload_session_is_rejected_and_swept() {
         let sessions = UploadSessions::new(Duration::from_secs(60));
         let start = SystemTime::UNIX_EPOCH;
-        sessions.register("abc", "web", start).await;
+        sessions.register("abc", "web", None, start).await;
         assert!(sessions.is_active("abc", start).await);
 
         // 61s later: past the TTL.
@@ -552,9 +585,9 @@ mod tests {
     async fn sweep_removes_only_expired_sessions() {
         let sessions = UploadSessions::new(Duration::from_secs(60));
         let start = SystemTime::UNIX_EPOCH;
-        sessions.register("old", "web", start).await;
+        sessions.register("old", "web", None, start).await;
         let recent = start + Duration::from_secs(120);
-        sessions.register("fresh", "web", recent).await;
+        sessions.register("fresh", "web", None, recent).await;
 
         let swept = sessions.sweep(recent).await;
         assert_eq!(swept, vec!["old".to_string()]);
@@ -565,7 +598,7 @@ mod tests {
     async fn touch_within_ttl_keeps_the_session_alive() {
         let sessions = UploadSessions::new(Duration::from_secs(60));
         let start = SystemTime::UNIX_EPOCH;
-        sessions.register("abc", "web", start).await;
+        sessions.register("abc", "web", None, start).await;
         let within = start + Duration::from_secs(30);
         assert!(sessions.touch("abc", 5, within).await);
         assert!(sessions.is_active("abc", within).await);

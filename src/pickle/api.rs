@@ -76,25 +76,27 @@ impl PickleState {
             .map(str::to_string)
     }
 
-    /// Authorise a registry write (REG4). `Ok(())` means the request may
-    /// proceed; `Err(response)` is the 401/403 to return. No auth
-    /// configured means the gate is off (writes open).
+    /// Authenticate a writer and preserve the identity used for upload ownership.
+    /// `None` means anonymous standalone mode; errors carry the HTTP refusal.
     // `Response` is large but it IS the HTTP reply to send on failure —
     // boxing it would tax every call site for a value that lives one frame.
     #[allow(clippy::result_large_err)]
-    async fn authorise_write(&self, headers: &HeaderMap) -> Result<(), Response> {
+    async fn authorise_write(
+        &self,
+        headers: &HeaderMap,
+    ) -> Result<Option<crate::sesame::auth::AuthContext>, Response> {
         let Some(auth) = &self.auth else {
-            return Ok(());
+            return Ok(None);
         };
         let bearer = Self::bearer(headers);
-        match super::registry_auth::authorise_write(
+        match super::registry_auth::authenticate_writer(
             auth,
             bearer.as_deref(),
             self.allow_unauthenticated_bootstrap,
         )
         .await
         {
-            Ok(()) => Ok(()),
+            Ok(principal) => Ok(principal),
             Err(WriteDenied::Unauthenticated) => Err(oci_error(
                 StatusCode::UNAUTHORIZED,
                 "UNAUTHORIZED",
@@ -625,9 +627,13 @@ async fn blob_upload_initiate(
     body: axum::body::Body,
 ) -> Response {
     // Registry writes require a principal once auth is configured (REG4).
-    if let Err(response) = state.authorise_write(headers_in).await {
-        return response;
-    }
+    let principal = match state.authorise_write(headers_in).await {
+        Ok(principal) => principal,
+        Err(response) => return response,
+    };
+    let principal_id = principal
+        .as_ref()
+        .map(|context| context.principal_id.as_str());
 
     // Register monolithic requests too, so cancellation is covered by the TTL reaper.
     if let Some(digest_str) = query.digest {
@@ -640,7 +646,7 @@ async fn blob_upload_initiate(
         };
         state
             .sessions
-            .register(&upload_id, name, std::time::SystemTime::now())
+            .register(&upload_id, name, principal_id, std::time::SystemTime::now())
             .await;
         return blob_upload_complete(state, name, &upload_id, &digest_str, headers_in, body).await;
     }
@@ -650,7 +656,7 @@ async fn blob_upload_initiate(
         Ok(upload_id) => {
             state
                 .sessions
-                .register(&upload_id, name, std::time::SystemTime::now())
+                .register(&upload_id, name, principal_id, std::time::SystemTime::now())
                 .await;
             let location = format!("/v2/{name}/blobs/uploads/{upload_id}");
             let mut headers = HeaderMap::new();
@@ -674,14 +680,23 @@ async fn blob_upload_patch(
     headers_in: &HeaderMap,
     body: axum::body::Body,
 ) -> Response {
-    if let Err(response) = state.authorise_write(headers_in).await {
-        return response;
-    }
-    let Some(writer) = state.sessions.claim_writer(upload_id, name).await else {
+    let principal = match state.authorise_write(headers_in).await {
+        Ok(principal) => principal,
+        Err(response) => return response,
+    };
+    let principal_id = principal
+        .as_ref()
+        .map(|context| context.principal_id.as_str());
+    let Some(writer) = state
+        .sessions
+        .claim_writer(upload_id, name, principal_id)
+        .await
+    else {
         return oci_error(
             StatusCode::BAD_REQUEST,
             "BLOB_UPLOAD_UNKNOWN",
-            "upload session unknown, busy or belongs to another repository".to_string(),
+            "upload session unknown, busy or belongs to another repository or principal"
+                .to_string(),
         );
     };
     // An upload session that outlived its TTL is refused and swept (REG8),
@@ -792,14 +807,23 @@ async fn blob_upload_complete(
     headers_in: &HeaderMap,
     body: axum::body::Body,
 ) -> Response {
-    if let Err(response) = state.authorise_write(headers_in).await {
-        return response;
-    }
-    let Some(writer) = state.sessions.claim_writer(upload_id, name).await else {
+    let principal = match state.authorise_write(headers_in).await {
+        Ok(principal) => principal,
+        Err(response) => return response,
+    };
+    let principal_id = principal
+        .as_ref()
+        .map(|context| context.principal_id.as_str());
+    let Some(writer) = state
+        .sessions
+        .claim_writer(upload_id, name, principal_id)
+        .await
+    else {
         return oci_error(
             StatusCode::BAD_REQUEST,
             "BLOB_UPLOAD_UNKNOWN",
-            "upload session unknown, busy or belongs to another repository".to_string(),
+            "upload session unknown, busy or belongs to another repository or principal"
+                .to_string(),
         );
     };
     if !state
@@ -1392,7 +1416,7 @@ mod tests {
         let id = state.store.initiate_upload().await.unwrap();
         state
             .sessions
-            .register(&id, "team-a/web", std::time::SystemTime::now())
+            .register(&id, "team-a/web", None, std::time::SystemTime::now())
             .await;
         let store = Arc::clone(&state.store);
         let app = router(state);
@@ -1409,12 +1433,104 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn upload_session_belongs_to_the_exact_authenticated_credential() {
+        use crate::sesame::{
+            auth, token,
+            types::{ApiRole, TokenScope},
+        };
+        let (mut state, _directory) = test_state();
+        // Reusing the human-readable token name must not inherit ownership.
+        let alice =
+            token::create_token("publisher", ApiRole::Deployer, TokenScope::default(), None)
+                .unwrap();
+        let bob = token::create_token("publisher", ApiRole::Deployer, TokenScope::default(), None)
+            .unwrap();
+        let tokens = auth::new_token_store();
+        *tokens.write().await = vec![alice.token.clone(), bob.token.clone()];
+        state.auth = Some(auth::AuthState::new(
+            tokens.clone(),
+            Some("internal".into()),
+        ));
+        state.allow_unauthenticated_bootstrap = false;
+        let store = state.store.clone();
+        let app = router(state);
+        let request = |method: &str, uri: &str, bearer: &str, data: &'static str| {
+            axum::http::Request::builder()
+                .method(method)
+                .uri(uri)
+                .header("authorization", format!("Bearer {bearer}"))
+                .body(Body::from(data))
+                .unwrap()
+        };
+        let response = app
+            .clone()
+            .oneshot(request(
+                "POST",
+                "/v2/team/web/blobs/uploads/",
+                &alice.plaintext,
+                "",
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::ACCEPTED);
+        let location = response.headers()["location"].to_str().unwrap().to_owned();
+        let id = response.headers()["docker-upload-uuid"]
+            .to_str()
+            .unwrap()
+            .to_owned();
+        let digest = compute_sha256(b"owned");
+        let complete = format!("{location}?digest={}", digest.as_str());
+        for bearer in [&bob.plaintext, "internal"] {
+            for (method, uri) in [("PATCH", &location), ("PUT", &complete)] {
+                let response = app
+                    .clone()
+                    .oneshot(request(method, uri, bearer, "owned"))
+                    .await
+                    .unwrap();
+                assert_eq!(
+                    response.status(),
+                    StatusCode::BAD_REQUEST,
+                    "{method} must refuse another principal"
+                );
+                assert_eq!(store.upload_size(&id).await.unwrap(), 0);
+                assert!(!store.has_blob(&digest));
+            }
+        }
+        *tokens.write().await = vec![bob.token];
+        assert_eq!(
+            app.clone()
+                .oneshot(request("PATCH", &location, &alice.plaintext, "owned"))
+                .await
+                .unwrap()
+                .status(),
+            StatusCode::UNAUTHORIZED
+        );
+        tokens.write().await.push(alice.token);
+        assert_eq!(
+            app.clone()
+                .oneshot(request("PATCH", &location, &alice.plaintext, "owned"))
+                .await
+                .unwrap()
+                .status(),
+            StatusCode::ACCEPTED
+        );
+        assert_eq!(
+            app.oneshot(request("PUT", &complete, &alice.plaintext, ""))
+                .await
+                .unwrap()
+                .status(),
+            StatusCode::CREATED
+        );
+        assert_eq!(store.read_blob(&digest).unwrap(), b"owned");
+    }
+
+    #[tokio::test]
     async fn expired_upload_cannot_be_completed() {
         let (state, _dir) = test_state();
         let id = state.store.initiate_upload().await.unwrap();
         state
             .sessions
-            .register(&id, "web", std::time::SystemTime::UNIX_EPOCH)
+            .register(&id, "web", None, std::time::SystemTime::UNIX_EPOCH)
             .await;
         let digest = compute_sha256(b"data");
         let request = axum::http::Request::builder()

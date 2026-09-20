@@ -116,6 +116,11 @@ may still be pending. Push publication and GC deletion share a
 transaction guard, so collection cannot delete a layer between its final check
 and publication. Repository/upload lease cleanup remains open in C34.
 
+Chunked uploads belong to the exact credential that created them. Continue and
+complete an upload with that same credential; another deploy token (including a
+replacement with the same name) cannot take over. Each request rechecks current
+authentication. Revoked or abandoned uploads expire through the normal reaper.
+
 Registry startup claims exclusive ownership of the configured image store's
 upload directory. Run only one Bun with that writable image store. A restart
 reclaims abandoned temporary uploads before serving; clients restart interrupted

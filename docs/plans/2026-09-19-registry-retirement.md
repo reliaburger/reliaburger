@@ -109,3 +109,49 @@ as do the 13 renewal, 17 registry cluster, five integrity and two upload cases.
 Strict all-target/all-feature Clippy passes on macOS/Linux. Protocol 8/state 12
 and lease schema 4 remain unchanged. Repository ownership/retirement and the
 complete live catalogue remain open.
+
+## Exact upload creator prerequisite
+
+Upload authentication now preserves the exact credential identity. Session
+admission, PATCH and completion bind to that identity as well as the repository.
+Role checks alone previously admitted another deploy token's PATCH (202); the
+new HTTP regression reproduces that failure before the fix. Reusing a token
+name or presenting the internal service credential cannot take over a user's
+session. Revoked owners refuse on reauthentication, and refused writers leave
+the temporary bytes unchanged. Sessions remain ephemeral, with restart/TTL
+cleanup; no durable or replicated schema changes for this prerequisite.
+
+All 249 Pickle tests, 17 cluster/five integrity/four authority/two upload
+integration cases and strict all-target/all-feature Clippy pass on macOS/Linux.
+Repository lease admission and durable writer receipts remain step 2; exact
+upload identity alone does not implement them.
+
+## Repository retirement implementation order
+
+The replicated lease will retain repository names and each storage node that
+may have accepted a writer. A repository belongs under its server-selected
+`rbtest-.../` namespace. Admission records the node before any upload bytes,
+checks the exact owner, and refuses expired or Cleaning leases. A manifest
+commit repeats the active-lease check in Raft, so earlier HTTP admission cannot
+outlive cleanup. Ordinary writes cannot bypass the reserved namespace.
+
+Cleanup first deletes desired workloads and waits for every retained placement
+to confirm retirement. Only then may registry workers fence repository writes,
+wait for in-flight transactions, cancel partial uploads, durably remove all
+local repository metadata and acknowledge their exact obligation. Global
+metadata removal and lease deletion wait for all storage acknowledgements.
+Operator decommission clears only the retired identity's obligations and
+records the counts in its immutable audit. Shared digests remain protected by
+ordinary repository references. Unreferenced metadata locations must not leave
+orphaned test bytes permanently protected as a last copy.
+
+The same lifecycle must apply to standalone leases. A local reaper needs a
+registry cleanup handle and durable completion ordering, rather than assuming
+that agent cleanup also removes image metadata. Pull-through/P2P writers and
+ordinary job/app image references need the same reserved-namespace checks;
+adding a header only to the catalogue fixture would leave bypasses.
+
+Validate the state transitions and snapshots first, then HTTP writer admission
+and physical cleanup. Each meaningful repair remains its own commit. The
+replicated lease format change advances explicit compatibility before it is
+used; existing development state still requires a fresh cluster.

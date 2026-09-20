@@ -110,12 +110,18 @@ async fn failed_upload_cleanup_stays_fenced_and_retries_without_blocking_other_u
         .await
         .unwrap();
     assert_eq!(response.status(), 400);
-    assert!(state.sessions.claim_writer(id, "owned").await.is_none());
+    assert!(
+        state
+            .sessions
+            .claim_writer(id, "owned", None)
+            .await
+            .is_none()
+    );
 
     let other = state.store.initiate_upload().await.unwrap();
     state
         .sessions
-        .register(&other, "other", std::time::SystemTime::UNIX_EPOCH)
+        .register(&other, "other", None, std::time::SystemTime::UNIX_EPOCH)
         .await;
     let failures = state
         .sessions

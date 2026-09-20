@@ -917,6 +917,14 @@ limits. All 248 Pickle, 83 state-machine and eight route-audit tests, existing
 registry/renewal integrations and strict Clippy pass. No schema changed. The
 [registry retirement plan](2026-09-19-registry-retirement.md) records details.
 
+**Upload creator prerequisite (20 September):** Role-only authentication allowed
+another deploy token to append to an existing upload. The failing-first HTTP
+regression now checks the exact credential fingerprint on PATCH/completion,
+including credentials with the same name, the service principal and revocation.
+Refusals preserve the creator's temporary bytes. All 249 Pickle and existing
+registry integration cases pass on macOS/Linux, with strict Clippy. Session
+identity is ephemeral; durable repository ownership remains open.
+
 Remaining resource contracts, each in its own commit: registry uploads/repositories
 and process identity/pre-adoption recovery. Managed volume/mount cleanup is
 implemented and qualified as recorded above. Node effects already use C06 reservations
