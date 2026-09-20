@@ -810,3 +810,15 @@ record, an allocated host port and a service redeploy without discovery recovery
 It now tests consistent portless generation continuity. This does not implement
 service recovery: missing original discovery remains a refusal, and journal
 integration is still required before production release.
+
+
+## Owned blocking journal operations
+
+`DiscoveryJournal::open_async` and consuming `persist(self, next)` move filesystem
+work onto blocking workers. A successful awaited write returns the journal;
+failure or cancellation requires reopening and reconciling state. The worker
+retains the original claim until completion, even after the waiting task is
+cancelled. Two stalled-storage contracts fail with inline writes, then all ten
+checkpoint tests pass on macOS/Linux (0.295s/0.162s), with strict all-target/
+all-feature Clippy and formatting. These methods are ready for Bun integration;
+they do not select journal recovery in production.

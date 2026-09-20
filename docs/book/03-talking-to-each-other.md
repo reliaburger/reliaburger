@@ -1461,3 +1461,27 @@ finishes, even if the waiting future is cancelled. Bun does not use this store
 yet. Publication gates, runtime correlation, remote withdrawal acknowledgements
 and recovery qualification remain separate work. Passing storage tests does not
 prove a recovered route is safe to publish.
+
+
+### Move the journal, keep the claim
+
+An async function can still block its executor. Calling the synchronous journal
+write inside `async fn` does exactly that when storage stalls. Our regression
+pauses a write and checks that the single-thread async runtime can still send a
+heartbeat. A second test cancels the waiting caller, verifies another writer
+cannot take the filesystem claim, then resumes storage and recovers the saved
+obligation. Both tests fail with an inline write.
+
+`open_async` and `persist` run filesystem work through `spawn_blocking`.
+`persist(self, next)` consumes the journal: its `self` argument transfers ownership
+instead of borrowing with `&mut self`. The `move` closure then owns the journal,
+including its open claim file, until the write finishes. Cancelling the awaiting
+future does not cancel that already-running blocking operation or release its
+claim early. A successful awaited result returns the journal to the caller.
+Failure or cancellation requires reopening and reconciling durable state; the
+caller cannot continue using the moved value. Rust makes that last rule concrete.
+
+Bun integration must distinguish an unopened journal from a consumed journal
+whose write was never acknowledged. Treating both as permission to initialise
+empty ownership would defeat the guarantee. These worker methods provide the
+ownership boundary; wiring every publication and recovery path remains separate.

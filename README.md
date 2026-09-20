@@ -305,7 +305,8 @@ discovery ownership refuses cleanup. If live policy is lost and backend withdraw
 fails, the owned path stops execution while retaining the address and cleanup
 records. Exact service snapshot restoration and a durable discovery checkpoint
 now preserve original allocations and cleanup permissions; Bun integration and
-complete discovery recovery remain open.
+complete discovery recovery remain open. Journal I/O runs on blocking workers
+that retain exclusive ownership through caller cancellation.
 Rolling and blue-green cutovers now confirm kernel backend publication before
 exposing replacements in DNS and ingress; refusal preserves the original routing view.
 Rootful and rootless recovery tests cover caller death before adoption, short

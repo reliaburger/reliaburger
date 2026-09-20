@@ -81,9 +81,33 @@ pub struct DiscoveryJournal {
     inventory: DiscoveryInventory,
     uncertain: bool,
     _claim: File,
+    #[cfg(test)]
+    write_pause: Option<(
+        tokio::sync::oneshot::Sender<()>,
+        std::sync::mpsc::Receiver<()>,
+    )>,
 }
 
 impl DiscoveryJournal {
+    /// Open on a blocking worker; cancellation never leaves I/O on the async runtime.
+    pub async fn open_async(directory: &Path) -> io::Result<Self> {
+        let directory = directory.to_path_buf();
+        tokio::task::spawn_blocking(move || Self::open(&directory))
+            .await
+            .map_err(io::Error::other)?
+    }
+
+    /// Transfer ownership to a write worker and recover it only on acknowledged success.
+    /// Cancellation or failure requires reopening and reconciling the complete state.
+    pub async fn persist(mut self, next: DiscoveryInventory) -> io::Result<Self> {
+        tokio::task::spawn_blocking(move || {
+            self.save(next)?;
+            Ok(self)
+        })
+        .await
+        .map_err(io::Error::other)?
+    }
+
     /// Open the complete inventory under an exclusive claim. The parent must exist.
     /// Only a newly created directory may initialise ownership.
     /// Missing established state, redirected paths and incompatible schemas refuse.
@@ -144,6 +168,8 @@ impl DiscoveryJournal {
             inventory,
             uncertain: false,
             _claim: claim,
+            #[cfg(test)]
+            write_pause: None,
         })
     }
 
@@ -167,6 +193,11 @@ impl DiscoveryJournal {
         validate_transition(&self.inventory, &next)?;
         // Keep the original in-memory obligations on any uncertain disk outcome.
         self.uncertain = true;
+        #[cfg(test)]
+        if let Some((entered, resume)) = self.write_pause.take() {
+            let _ = entered.send(());
+            resume.recv().map_err(io::Error::other)?;
+        }
         write_checkpoint(&self.directory, &next)?;
         self.inventory = next;
         self.uncertain = false;
@@ -346,6 +377,77 @@ fn validate_transition(previous: &DiscoveryInventory, next: &DiscoveryInventory)
 mod tests {
     use super::*;
     use std::os::unix::fs::PermissionsExt;
+
+    #[tokio::test]
+    async fn slow_persistence_does_not_block_the_async_runtime() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("owners");
+        let mut journal = DiscoveryJournal::open_async(&path).await.unwrap();
+        let (entered, waiting) = tokio::sync::oneshot::channel();
+        let (resume, paused) = std::sync::mpsc::channel();
+        let (heartbeat, observed) = std::sync::mpsc::channel();
+        journal.write_pause = Some((entered, paused));
+        // A separate thread releases even a broken inline implementation, so
+        // the single-thread runtime test fails instead of deadlocking forever.
+        let release = std::thread::spawn(move || {
+            let responsive = observed
+                .recv_timeout(std::time::Duration::from_secs(2))
+                .is_ok();
+            let _ = resume.send(());
+            responsive
+        });
+        let write = tokio::spawn(journal.persist(inventory()));
+        waiting.await.unwrap();
+        let _ = heartbeat.send(());
+        let journal = write.await.unwrap().unwrap();
+        assert_eq!(journal.inventory().references.len(), 1);
+        assert!(
+            release.join().unwrap(),
+            "checkpoint I/O blocked the async runtime"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn cancelled_persistence_retains_its_claim_until_the_worker_finishes() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("owners");
+        let mut journal = DiscoveryJournal::open_async(&path).await.unwrap();
+        let (entered, waiting) = tokio::sync::oneshot::channel();
+        let (resume, paused) = std::sync::mpsc::channel();
+        journal.write_pause = Some((entered, paused));
+        let mut write = tokio::spawn(journal.persist(inventory()));
+        waiting.await.unwrap();
+        write.abort();
+        let cancelled = tokio::time::timeout(std::time::Duration::from_secs(1), &mut write).await;
+        let competing = DiscoveryJournal::open_async(&path).await;
+        resume.send(()).unwrap();
+        if cancelled.is_err() {
+            let _ = write.await;
+        }
+        let recovered = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            loop {
+                match DiscoveryJournal::open_async(&path).await {
+                    Ok(journal) => break journal,
+                    Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
+                        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+                    }
+                    Err(error) => panic!("recovery failed: {error}"),
+                }
+            }
+        })
+        .await
+        .unwrap();
+        assert!(matches!(competing, Err(error) if error.kind() == io::ErrorKind::WouldBlock));
+        assert!(
+            matches!(cancelled, Ok(Err(error)) if error.is_cancelled()),
+            "caller cancellation waited for blocking storage"
+        );
+        assert_eq!(
+            recovered.inventory().references.len(),
+            1,
+            "cancelled writer lost its durable obligation"
+        );
+    }
 
     fn inventory() -> DiscoveryInventory {
         let mut services = ServiceMap::new();
