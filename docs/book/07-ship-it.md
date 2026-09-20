@@ -1404,3 +1404,24 @@ and verifies that a later tick starts the replacement.
 These are local live-runtime gates. Recovered artifact cleanup, remote catalogue
 acknowledgements and durable discovery reconstruction remain separate release
 requirements.
+
+### Runtime exit does not finish discovery cleanup
+
+Suppose the runtime has exited, but Wrapper still holds a captured endpoint for
+a pending request. Deleting the adoption record and releasing the address at
+that point forgets an owner too early. The artifact-cleanup regression records a
+real adoption file and identity directory, marks the mock runtime stopped, and
+keeps a request captured while asking Bun to retire the artifacts. Previously,
+cleanup succeeded and deleted both paths.
+
+Artifact retirement now polls the same local withdrawal gate before clearing
+policy, releasing a runtime network reference or deleting those paths. Since the
+runtime is already absent, it requests immediate cancellation. If a request guard
+still exists, cleanup returns a retained-ownership error and can be retried.
+After the guard releases, the test retries and requires both paths to disappear.
+Automatic restarts use the same poll with their normal grace period. Neither path
+turns a cancellation request into permission to forget an owner.
+
+This gate covers local request ownership at the shared cleanup boundary. It does
+not supply missing original discovery metadata or acknowledgements from remote
+nodes. Those must still be reconstructed and confirmed separately.

@@ -634,6 +634,8 @@ work; completion requires the request guards to release. A stalled downstream
 reader cannot prevent cancellation of the upstream response. Ordinary Stop uses
 the same ingress drain before runtime retirement; automatic restart waits across
 agent ticks for captured requests to release before killing its predecessor.
+Stopped-runtime cleanup also retains identity/adoption records and address
+ownership until captured requests release; an incomplete cleanup can be retried.
 
 Automatic application restarts refresh DNS and ingress with the replacement's
 confirmed address. Applications with health checks stay out of healthy routing

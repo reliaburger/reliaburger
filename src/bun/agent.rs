@@ -7610,7 +7610,10 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
             .collect();
         for (id, state) in retrying {
             if state == ContainerState::Stopping {
-                match self.poll_restart_withdrawal(&id).await {
+                match self
+                    .poll_instance_withdrawal(&id, std::time::Duration::from_secs(STOP_GRACE_SECS))
+                    .await
+                {
                     Ok(true) => {}
                     Ok(false) => continue,
                     Err(error) => {
@@ -7702,7 +7705,10 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
             .collect();
 
         for (id, oci_spec, app_name, namespace, host_port) in pending_restarts {
-            match self.poll_restart_withdrawal(&id).await {
+            match self
+                .poll_instance_withdrawal(&id, std::time::Duration::from_secs(STOP_GRACE_SECS))
+                .await
+            {
                 Ok(true) => {}
                 Ok(false) => continue,
                 Err(error) => {
@@ -8304,7 +8310,15 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
         instance_id: &InstanceId,
     ) -> Result<(), BunError> {
         self.retire_initialisers(instance_id).await?;
-        self.withdraw_instance_backend(instance_id).await?;
+        if !self
+            .poll_instance_withdrawal(instance_id, std::time::Duration::ZERO)
+            .await?
+        {
+            return Err(BunError::RetirementState {
+                instance_id: instance_id.clone(),
+                reason: "captured ingress requests still require confirmed release".into(),
+            });
+        }
         self.clear_egress(instance_id).await?;
         self.release_network_reference(instance_id).await?;
         let identity_dir = self.instance_identity_dir(instance_id);
@@ -9228,14 +9242,18 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
         drain_and_stop_instance(&self.drains, self.supervisor.grill(), id, grace).await
     }
 
-    /// Withdraw a retry's predecessor without waiting for requests on the agent loop.
-    async fn poll_restart_withdrawal(&mut self, id: &InstanceId) -> Result<bool, BunError> {
+    /// Withdraw local routing and poll request release without blocking the agent loop.
+    async fn poll_instance_withdrawal(
+        &mut self,
+        id: &InstanceId,
+        timeout: std::time::Duration,
+    ) -> Result<bool, BunError> {
         self.withdraw_instance_backend(id).await?;
         self.drains
             .start_drain(&crate::wrapper::draining::DrainCommand {
                 app_name: String::new(),
                 instance_id: id.0.clone(),
-                timeout: std::time::Duration::from_secs(STOP_GRACE_SECS),
+                timeout,
             })
             .await;
         self.drains.check_completions().await;
@@ -11978,6 +11996,39 @@ mod tests {
         assert_eq!(entry.backends.len(), 1);
         assert_eq!(entry.backends[0].instance_id, "default__web-0");
         assert!(entry.backends[0].healthy);
+    }
+
+    #[tokio::test]
+    async fn stopped_runtime_keeps_artifacts_until_captured_ingress_releases() {
+        let (mut agent, _commands, _shutdown, grill) = test_agent_with_grill();
+        let records = tempfile::tempdir().unwrap();
+        agent.set_records_dir(records.path().to_owned());
+        grill.set_pid(std::process::id());
+        expect_complete(&drain_deploy(&mut agent, basic_config()).await);
+        let id = InstanceId("default__web-0".into());
+        let record = crate::grill::records::record_path(records.path(), &id.0);
+        let identity = agent.instance_identity_dir(&id);
+        assert!(record.exists() && identity.exists());
+        let drains = agent.drains.clone();
+        let tokens = drains
+            .capture_requests(std::slice::from_ref(&id.0), false)
+            .await
+            .unwrap();
+        grill.set_state(&id, ContainerState::Stopped);
+        let result = agent.retire_instance_artifacts(&id).await;
+        assert!(
+            matches!(result, Err(BunError::RetirementState { .. })),
+            "stopped-runtime cleanup discarded ownership before request release: {result:?}"
+        );
+        assert!(record.exists() && identity.exists());
+        assert!(
+            tokens[0].is_cancelled(),
+            "an absent runtime's captured requests were not cancelled"
+        );
+        drains.decrement_connections(&id.0).await;
+        agent.retire_instance_artifacts(&id).await.unwrap();
+        assert!(!record.exists() && !identity.exists());
+        agent.retire_workload("web", "default").await.unwrap();
     }
 
     #[tokio::test]
