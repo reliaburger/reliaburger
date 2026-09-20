@@ -419,3 +419,25 @@ The test passes on macOS (51.87s) and Linux (41.77s), with strict Clippy on both
 This closes storage-node/client death and shared-content preservation for one
 council node. Actual multi-node leader-change qualification remains open; existing
 in-process authority election tests do not substitute for it.
+
+## Physical leader change qualified
+
+The shared actual-binary fixture now has a three-node TLS variant. Two followers
+enrol through pinned-root join ceremonies. Before the fault, all nodes must agree
+on leadership and observe three voters. The elected leader is the sole storage
+writer. SIGKILL and client abandonment are followed by natural lease expiry on
+the surviving council. Both survivors must retain the old node's exact receipt;
+neither missing connectivity nor expired time counts as deletion proof.
+
+Restarting that same storage owner permits physical retirement and acknowledgement.
+All three APIs then report lease absence, while ordinary manifest/config/layer
+bytes remain exact. Both recovery cases pass under the CI nextest profile
+(109.64s macOS/98.44s Linux), with strict Clippy on both. Dedicated overrides
+serialise the two crash fixtures and allow their bounded lease/election waits.
+A Linux setup failure exposed invalid random transport offsets in the initial
+fixture; complete port blocks repair the fixture. Leader selection follows
+observed agreement rather than assuming bootstrap leadership is permanent.
+
+Registry ownership and physical retirement qualification are complete. C34 still
+tracks atomic process identity and recovery before runtime adoption records;
+the complete catalogue and signed release qualification remain V01–V04.

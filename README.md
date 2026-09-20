@@ -58,12 +58,13 @@ HTTP writes under `rbtest-…/` require their exact authenticated lease owner.
 Registry workers confirm upload and metadata retirement after workloads stop;
 only the owning application lease may depend on those images. Peer pulls retain
 upload ownership through cancellation and failed cleanup. Storage nodes now hash and conditionally confirm their own copies under the GC
-guard; the healer cannot replace stale holder lists. Physical registry cleanup
-qualification remains a release gate.
+guard; the healer cannot replace stale holder lists. Physical registry recovery passes actual Bun death and three-node TLS
+leader-change tests on macOS/Linux.
 `relish test --filter image-registry` now stages a pinned runnable image under its
 server lease, deploys the exact digest and checks its HTTP response. The real
 Linux/runc catalogue passes all three cases with confirmed repository cleanup.
-Multi-node crash qualification remains separate.
+A disconnected writer keeps cleanup pending until it returns and confirms
+retirement.
 OCI index selection targets Linux containers even when the client runs on macOS.
 Direct image pulls and Pickle verify pinned manifests, selected platform
 manifests and configuration bytes before accepting them into the cache.

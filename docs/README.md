@@ -125,7 +125,7 @@ require a client retry; 201 confirms catalogue acceptance, while blob replicatio
 may still be pending. Push publication and GC deletion share a
 transaction guard through authoritative publication and physical deletion.
 A durable per-node GC generation also rejects delayed manifest proposals that
-were checked before collection. Stale publication returns 503 for a fresh retry. Repository/upload lease cleanup remains open in C34.
+were checked before collection. Stale publication returns 503 for a fresh retry.
 HTTP writes under `rbtest-…/` require the exact authenticated lease owner and
 the `x-reliaburger-test-lease` header. Nodes record ownership before upload files
 and confirm partial-upload and metadata retirement only after workloads stop.
@@ -134,11 +134,13 @@ images. Ordinary apps and jobs refuse disposable image dependencies. Peer pulls
 also record repository ownership and track temporary uploads through caller
 cancellation; failed deletion remains pending for retry. Storage nodes now hash and conditionally
 confirm their own copies under the GC guard; the healer cannot replace stale
-holder lists. Physical registry cleanup qualification remains a release gate.
+holder lists. Physical registry recovery passes actual Bun death and three-node TLS
+leader-change tests on macOS/Linux.
 `relish test --filter image-registry` now stages a pinned runnable image under its
 server lease, deploys the exact digest and checks its HTTP response. The real
 Linux/runc catalogue passes all three cases with confirmed repository cleanup.
-Multi-node crash qualification remains separate.
+A disconnected writer keeps cleanup pending until it returns and confirms
+retirement.
 
 Peer transfers preserve complete repository paths, including nested namespaces.
 Chunked uploads belong to the exact credential that created them. Continue and

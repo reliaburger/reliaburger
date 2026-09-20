@@ -1682,6 +1682,15 @@ async fn abandoned_registry_upload_is_reclaimed_after_bun_sigkill() {
 
 #[tokio::test]
 async fn expired_registry_lease_recovers_after_bun_sigkill_and_preserves_shared_content() {
+    qualify_registry_owner_crash(false).await;
+}
+
+#[tokio::test]
+async fn new_leader_retains_registry_cleanup_until_the_killed_writer_returns() {
+    qualify_registry_owner_crash(true).await;
+}
+
+async fn qualify_registry_owner_crash(with_followers: bool) {
     use reliaburger::pickle::types::ManifestCatalog;
     use reliaburger::relish::client::BunClient;
     use reliaburger::testkit::oci::{build_synthetic_image, push_image, push_leased_image};
@@ -1699,7 +1708,7 @@ async fn expired_registry_lease_recovers_after_bun_sigkill_and_preserves_shared_
         ]),
         "initialise registry crash fixture",
     );
-    let config = cluster_dir.join("reliaburger.toml");
+    let mut config = cluster_dir.join("reliaburger.toml");
     let mut node = reliaburger::config::NodeConfig::from_file(&config).unwrap();
     node.network.advertise_address = Some("127.0.0.1".into());
     node.storage.data = root.path().join("data");
@@ -1708,23 +1717,26 @@ async fn expired_registry_lease_recovers_after_bun_sigkill_and_preserves_shared_
     node.storage.metrics = root.path().join("metrics");
     node.storage.volumes = root.path().join("volumes");
     node.images.registry_port = 0;
+    // The disconnected node must remain the sole byte owner. Other replicas
+    // would hide a lost receipt behind a readable surviving copy.
+    node.images.redundancy = 1;
     node.testing.safety_class = reliaburger::testkit::safety::ClusterSafetyClass::Development;
     node.testing
         .allowed_operations
         .insert(reliaburger::testkit::safety::OperationPermission::ProvisionIsolatedWorkloads);
-    let (mut bun, address) = spawn_bun_with_port_retry(true, || {
-        let [gossip, raft, reporting] = reserve_ports();
+    let (mut bun, mut address) = spawn_bun_with_port_retry(true, || {
+        let [gossip, raft, reporting, api] = reserve_cluster_port_block();
         node.cluster.gossip_port = gossip;
         node.cluster.raft_port = raft;
         node.cluster.reporting_port = reporting;
         std::fs::write(&config, toml::to_string_pretty(&node).unwrap()).unwrap();
         (
             config.clone(),
-            reserve_address(),
+            SocketAddr::from(([127, 0, 0, 1], api)),
             root.path().join("before.log"),
         )
     });
-    let endpoint = format!("https://{address}");
+    let mut endpoint = format!("https://{address}");
     let ca = cluster_dir.join("identity/root-ca.crt");
     let ca = ca.to_str().unwrap();
     wait_for_relish(
@@ -1758,7 +1770,161 @@ async fn expired_registry_lease_recovers_after_bun_sigkill_and_preserves_shared_
         tokio::time::sleep(Duration::from_millis(100)).await;
     }
     let ca_bytes = std::fs::read(ca).unwrap();
-    let client = BunClient::new_with_ca(&endpoint, Some(token), &ca_bytes).unwrap();
+    let mut client = BunClient::new_with_ca(&endpoint, Some(token), &ca_bytes).unwrap();
+    struct Peer {
+        process: BunProcess,
+        client: BunClient,
+        endpoint: String,
+        address: SocketAddr,
+        config: PathBuf,
+        node: reliaburger::config::NodeConfig,
+    }
+    let mut followers = Vec::new();
+    if with_followers {
+        use rustls::pki_types::{CertificateDer, pem::PemObject};
+        let root_der = CertificateDer::pem_slice_iter(&ca_bytes)
+            .next()
+            .unwrap()
+            .unwrap();
+        let fingerprint = reliaburger::sesame::identity_store::root_ca_fingerprint(&root_der);
+        for number in 2..=3 {
+            let name = format!("node-{number:02}");
+            let issued = run_relish(&[
+                "--endpoint",
+                &endpoint,
+                "--ca-cert",
+                ca,
+                "--token",
+                token,
+                "join-token",
+                "create",
+                "--node-id",
+                &name,
+            ]);
+            assert_success(&issued, "mint registry follower join token");
+            let join_token = String::from_utf8(issued.stdout).unwrap();
+            let follower_root = root.path().join(&name);
+            let identity_dir = follower_root.join("identity");
+            assert_success(
+                &run_relish(&[
+                    "join",
+                    "--token",
+                    join_token.trim(),
+                    "--node-id",
+                    &name,
+                    "--identity-dir",
+                    identity_dir.to_str().unwrap(),
+                    "--ca-fingerprint",
+                    &fingerprint,
+                    &endpoint,
+                ]),
+                "enrol registry follower",
+            );
+            let mut follower_node = node.clone();
+            follower_node.node.name = Some(name.clone());
+            follower_node.security.identity_dir = Some(identity_dir);
+            follower_node.security.bootstrap_path = None;
+            follower_node.cluster.join = vec![format!("127.0.0.1:{}", node.cluster.gossip_port)];
+            follower_node.storage.data = follower_root.join("data");
+            follower_node.storage.images = follower_root.join("images");
+            follower_node.storage.logs = follower_root.join("logs");
+            follower_node.storage.metrics = follower_root.join("metrics");
+            follower_node.storage.volumes = follower_root.join("volumes");
+            let follower_config = follower_root.join("node.toml");
+            let (mut process, address) = spawn_bun_with_port_retry(true, || {
+                let [gossip, raft, reporting, api] = reserve_cluster_port_block();
+                follower_node.cluster.gossip_port = gossip;
+                follower_node.cluster.raft_port = raft;
+                follower_node.cluster.reporting_port = reporting;
+                std::fs::write(
+                    &follower_config,
+                    toml::to_string_pretty(&follower_node).unwrap(),
+                )
+                .unwrap();
+                (
+                    follower_config.clone(),
+                    SocketAddr::from(([127, 0, 0, 1], api)),
+                    follower_root.join("bun.log"),
+                )
+            });
+            let url = format!("https://{address}");
+            wait_for_relish(
+                &mut process,
+                &[
+                    "--endpoint",
+                    &url,
+                    "--ca-cert",
+                    ca,
+                    "--token",
+                    token,
+                    "status",
+                ],
+            );
+            let observer = BunClient::new_with_ca(&url, Some(token), &ca_bytes).unwrap();
+            followers.push(Peer {
+                process,
+                client: observer,
+                endpoint: url,
+                address,
+                config: follower_config,
+                node: follower_node,
+            });
+        }
+        let deadline = Instant::now() + Duration::from_secs(90);
+        let leader = loop {
+            let mut views = Vec::new();
+            let mut all_voters_observed = true;
+            for (observer, url) in std::iter::once((&client, &endpoint))
+                .chain(followers.iter().map(|peer| (&peer.client, &peer.endpoint)))
+            {
+                let view: reliaburger::bun::agent::CouncilStatus = observer
+                    .http()
+                    .unwrap()
+                    .get(format!("{url}/v1/cluster/council"))
+                    .send()
+                    .await
+                    .unwrap()
+                    .error_for_status()
+                    .unwrap()
+                    .json()
+                    .await
+                    .unwrap();
+                let members = observer.nodes().await.unwrap();
+                all_voters_observed &= members.len() == 3
+                    && members
+                        .iter()
+                        .all(|member| member.is_council && member.state == "alive");
+                views.push(view);
+            }
+            if all_voters_observed
+                && let Some(leader) = &views[0].leader
+                && views
+                    .iter()
+                    .all(|view| view.members.len() == 3 && view.leader.as_ref() == Some(leader))
+            {
+                break leader.clone();
+            }
+            assert!(
+                Instant::now() < deadline,
+                "three TLS council voters did not converge: {views:?}"
+            );
+            tokio::time::sleep(Duration::from_millis(200)).await;
+        };
+        // Startup elections may legitimately replace the bootstrap leader.
+        // Make the observed leader the sole writer before killing it.
+        if Some(&leader) != node.node.name.as_ref() {
+            let peer = followers
+                .iter_mut()
+                .find(|peer| peer.node.node.name.as_ref() == Some(&leader))
+                .unwrap();
+            std::mem::swap(&mut bun, &mut peer.process);
+            std::mem::swap(&mut client, &mut peer.client);
+            std::mem::swap(&mut endpoint, &mut peer.endpoint);
+            std::mem::swap(&mut address, &mut peer.address);
+            std::mem::swap(&mut config, &mut peer.config);
+            std::mem::swap(&mut node, &mut peer.node);
+        }
+    }
     let registry = client
         .capabilities()
         .await
@@ -1819,10 +1985,94 @@ async fn expired_registry_lease_recovers_after_bun_sigkill_and_preserves_shared_
     // Kill the actual owner, abandon the writing client and let the original
     // server-issued deadline expire. The replacement observer never renews or
     // explicitly releases the lease, so only durable recovery can retire it.
+    if with_followers {
+        let view: reliaburger::bun::agent::CouncilStatus = client
+            .http()
+            .unwrap()
+            .get(format!("{endpoint}/v1/cluster/council"))
+            .send()
+            .await
+            .unwrap()
+            .error_for_status()
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        assert_eq!(
+            view.leader, node.node.name,
+            "writer lost leadership before fault injection"
+        );
+    }
     bun.child.kill().unwrap();
     bun.child.wait().unwrap();
     drop(http);
     drop(client);
+    if with_followers {
+        let deadline = Instant::now() + Duration::from_secs(70);
+        loop {
+            let mut confirmed = true;
+            for peer in &mut followers {
+                peer.process.assert_running();
+                let observer = &peer.client;
+                let url = &peer.endpoint;
+                let view: reliaburger::bun::agent::CouncilStatus = observer
+                    .http()
+                    .unwrap()
+                    .get(format!("{url}/v1/cluster/council"))
+                    .send()
+                    .await
+                    .unwrap()
+                    .error_for_status()
+                    .unwrap()
+                    .json()
+                    .await
+                    .unwrap();
+                if view.leader.is_none() || view.leader == node.node.name {
+                    confirmed = false;
+                    continue;
+                }
+                let response = observer
+                    .http()
+                    .unwrap()
+                    .get(format!("{url}/v1/test/leases/{}", lease.lease_id))
+                    .send()
+                    .await
+                    .unwrap();
+                if response.status() == 503 {
+                    confirmed = false;
+                    continue;
+                }
+                assert_eq!(
+                    response.status(),
+                    200,
+                    "new leader forgot an unconfirmed writer"
+                );
+                let pending: reliaburger::testkit::lease::TestLease =
+                    response.json().await.unwrap();
+                assert_eq!(
+                    pending.repositories[&repository],
+                    observed.repositories[&repository]
+                );
+                confirmed &= pending.workloads_retired
+                    && matches!(
+                        pending.state,
+                        reliaburger::testkit::lease::TestLeaseState::Cleaning { .. }
+                    );
+            }
+            if confirmed {
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "new leader did not retain pending registry cleanup"
+            );
+            tokio::time::sleep(Duration::from_millis(200)).await;
+        }
+        assert!(
+            upload.exists(),
+            "dead node's bytes vanished without a storage worker"
+        );
+    }
     let mut replacement = BunProcess::spawn(&config, address, true, root.path().join("after.log"));
     wait_for_relish(
         &mut replacement,
@@ -1857,6 +2107,22 @@ async fn expired_registry_lease_recovers_after_bun_sigkill_and_preserves_shared_
             "registry lease did not retire: {pending}"
         );
         tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    for peer in &followers {
+        let url = &peer.endpoint;
+        let response = peer
+            .client
+            .http()
+            .unwrap()
+            .get(format!("{url}/v1/test/leases/{}", lease.lease_id))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(
+            response.status(),
+            404,
+            "retirement did not reach the surviving council"
+        );
     }
     let registry = observer
         .capabilities()
@@ -1921,4 +2187,28 @@ async fn expired_registry_lease_recovers_after_bun_sigkill_and_preserves_shared_
             .iter()
             .any(|(_, manifest)| manifest.repository == "ordinary")
     );
+}
+
+/// Gossip derives peer transport addresses using cluster-uniform offsets.
+/// Keep TCP and UDP reservations alive together until the whole block is free.
+fn reserve_cluster_port_block() -> [u16; 4] {
+    for _ in 0..100 {
+        let first = TcpListener::bind("127.0.0.1:0").unwrap();
+        let base = first.local_addr().unwrap().port();
+        if base > u16::MAX - 3 {
+            continue;
+        }
+        let ports = [base, base + 1, base + 2, base + 3];
+        let Ok(_gossip) = std::net::UdpSocket::bind(("127.0.0.1", base)) else {
+            continue;
+        };
+        let remaining: std::io::Result<Vec<_>> = ports[1..]
+            .iter()
+            .map(|port| TcpListener::bind(("127.0.0.1", *port)))
+            .collect();
+        if remaining.is_ok() {
+            return ports;
+        }
+    }
+    panic!("could not reserve a complete cluster transport port block");
 }

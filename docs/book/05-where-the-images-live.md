@@ -1392,3 +1392,18 @@ configuration and layer must still return exactly their original bytes.
 This runs on macOS and Linux. It proves recovery after the storage owner dies;
 a single-node council cannot prove recovery through a different elected leader.
 That remains a separate multi-node qualification.
+
+The companion test enrols two more actual Bun processes through signed join
+requests with a pinned root fingerprint. All three must agree on the current
+leader and observe three voters before the test starts writing. The selected
+leader is the only storage owner. The fixture kills it, then waits for the two
+survivors to elect a replacement and start cleaning the expired lease. Both must
+still report the disconnected writer's receipt. After the old owner restarts,
+all three APIs must report the lease absent, with the same shared-content checks.
+
+One fixture mistake mattered here: our single-node port helper chose unrelated
+random ports. Peer Raft discovery uses a uniform offset from the gossip port;
+the three-node fixture now reserves a complete TCP/UDP transport block for each
+node. It also selects the observed leader instead of assuming that the bootstrap
+node wins every later election. These checks exercise the real cluster protocol
+without replacing it with an in-memory network.

@@ -996,8 +996,10 @@ admission. A real HTTP nested-path test fails before the fix. All 17 replication
 nine pull and 17 cluster integration cases and strict Clippy pass on both
 platforms. Registry lease integration remains open.
 
-Remaining resource contracts, each in its own commit: registry uploads/repositories
-and process identity/pre-adoption recovery. Managed volume/mount cleanup is
+Remaining resource contracts, each in its own commit: atomic process identity
+and runtime/discovery recovery before adoption records. Registry ownership and
+physical recovery are implemented and qualified in the
+[registry record](2026-09-19-registry-retirement.md). Managed volume/mount cleanup is
 implemented and qualified as recorded above. Node effects already use C06 reservations
 and C10 exact-fault receipts. Image distribution currently reports uncontrolled
 cache state and never evicts arbitrary images; any future cold-cache mode needs

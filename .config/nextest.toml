@@ -79,3 +79,16 @@ slow-timeout = { period = "120s", terminate-after = 3 }
 [[profile.ci.overrides]]
 filter = 'binary(node_pressure)'
 threads-required = "num-test-threads"
+
+# Registry crash acceptance includes an intentional 30-second lease expiry,
+# real TLS enrolment and a three-voter election. Serialise the physical cluster
+# fixtures and allow their explicit recovery deadlines to run under nextest.
+[[profile.default.overrides]]
+filter = 'binary(documentation_first_run) & (test(=expired_registry_lease_recovers_after_bun_sigkill_and_preserves_shared_content) | test(=new_leader_retains_registry_cleanup_until_the_killed_writer_returns))'
+test-group = "cluster-heavy"
+slow-timeout = { period = "60s", terminate-after = 4 }
+
+[[profile.ci.overrides]]
+filter = 'binary(documentation_first_run) & (test(=expired_registry_lease_recovers_after_bun_sigkill_and_preserves_shared_content) | test(=new_leader_retains_registry_cleanup_until_the_killed_writer_returns))'
+test-group = "cluster-heavy"
+slow-timeout = { period = "60s", terminate-after = 4 }
