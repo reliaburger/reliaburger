@@ -19,6 +19,9 @@ use super::oci::{OciLinux, OciProcess, OciRoot, OciSpec, OciUser};
 use super::process_control::ProcessControl;
 use super::process_owner::OwnerPhase;
 
+mod executor;
+pub use executor::{ClaimedCommandExecutor, DirectCommandExecutor, RuntimeCommandExecutor};
+
 const OUTPUT_LIMIT: u64 = 1024 * 1024;
 
 /// Identity of one immutable command attempt, independent of its caller's PID.

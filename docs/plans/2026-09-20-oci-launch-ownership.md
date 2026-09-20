@@ -76,6 +76,10 @@ changes only once the corresponding recovery contract is implemented.
   Before confirming cleanup, retire every admitted command, then verify OCI
   state, helper sockets, mounts, namespaces, links and owned forwarding state.
   Keep the address reservation and original intent until every check succeeds.
+  - [x] Qualify the generation-bound network executor, cancellation and actual
+    caller-SIGKILL recovery: 304 Linux runtime tests, 21 selected integration
+    cases, both privileged network cases and strict Clippy pass. macOS passes
+    19 selected integration cases and strict Clippy. Production wiring remains open.
 - [ ] Join runtime reconciliation to discovery and egress cleanup. Restore only
   verified source bindings; withdraw bindings before confirming retirement.
   Audit persistent kernel state created before agent adoption independently of
@@ -97,3 +101,28 @@ upgrade/rollback after integration. Then qualify the complete three-node
 catalogue (V01), sustained recovery (V02), the preserved signed candidate (V03)
 and repeated cold installs on the advertised host matrix (V04). Passing a
 runtime unit suite does not close those release gates.
+
+
+## Remaining adapter integration
+
+The primitives do not yet switch production Runc. Connect them in this order:
+
+1. Retain a generation-bound executor for each Runc instance, and keep the whole
+   create/start/cleanup worker alive through caller cancellation. Holding a
+   command claim alone does not cover a cancelled rootfs blocking worker.
+2. Persist distinct foreground-launcher and rootless-helper command references
+   before either can activate. Recover their original specifications, actual
+   outcomes and logs independently of agent PID records. Unassociated prepared
+   commands remain discoverable and must be cancelled during cleanup.
+3. Close normal command admission before retiring all launchers, auxiliary exec
+   attempts and network helpers. Then run owned cleanup commands and inspect
+   OCI state, mounts, namespaces, forwarding and discovery. Release address
+   reservations only after every admitted mutator has positively retired.
+4. Preserve generation fencing across queued calls and separately constructed
+   adapters. A clone created before sealing cannot obtain cleanup authority.
+5. Prune positively retired short-command records under the same exclusive
+   claim, so recurring runtime observations cannot grow the journal indefinitely.
+   Failed or uncertain attempts must remain discoverable.
+6. Switch production selection and complete agent launch-inventory recovery only
+   after these paths pass actual Bun-death, missing-adoption-record, short-job,
+   rootful/rootless and rolling-upgrade qualification.

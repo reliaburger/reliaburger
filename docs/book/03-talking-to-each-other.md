@@ -1226,3 +1226,43 @@ connection before noticing its close, so the second assertion sometimes saw an
 empty error response. A full native suite reproduced the failure. The fixture
 now uses axum to parse requests and manage keep-alive, and joins its proxy and
 backend tasks. The production forwarding code hasn't changed.
+
+
+### Retire the command before reusing the address
+
+A namespace already exists. The next `ip link add` invocation is waiting to
+create its veth pair. Now kill Bun. Looking only for the veth tells the new Bun
+that it is absent, but the old command can still create it. Our physical
+regression stops at exactly this point.
+
+Namespace creation, forwarding installation, forwarding inspection and teardown
+now accept a `RuntimeCommandExecutor`. There are two concrete implementations:
+a direct executor for standalone callers and a claimed executor attached to the
+durable generation described in chapter 1. The network operations construct the
+same argument arrays in either case. The trait changes who owns execution, not
+what command the network operation asks to run.
+
+The claimed executor shares a Tokio mutex containing `Option<IntentCommands>`.
+`Some` holds the live claim. An execution error leaves `None`, forcing recovery
+from durable evidence rather than allowing a second operation to assume the
+first completed. A spawned worker retains the mutex through the operation and
+restores the claim on success even when the requesting future is cancelled.
+A clone made before sealing keeps normal admission authority only; it cannot
+act as a cleanup handle after the generation enters Retiring. Its refusal also
+preserves the legitimate cleanup handle.
+
+The real Linux test creates a namespace, pauses the veth command, and sends
+SIGKILL to the caller process. Recovery claims the original generation, fences
+new work and positively retires the waiting command. Only then does it delete
+the namespace and inspect kernel absence. Opening the old gate afterwards
+produces no veth. A second physical test runs namespace setup and nftables port
+publication to completion, then verifies owned forwarding and network teardown.
+Both tests run in the provisioned Linux suite and share its host-network test
+group. They use private intent directories and distinct namespace names.
+
+A completed deletion command can return non-zero because its target is already
+absent. Teardown therefore inspects the kernel after command completion. A
+command execution error is different: it now refuses teardown before that
+inspection can be mistaken for final retirement. The owned network path is
+qualified independently; production Runc still needs to carry these handles
+alongside its durable launcher and rootless-helper records.
