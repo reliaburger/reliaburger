@@ -290,3 +290,19 @@ Manifest reads now enforce repository retirement for digest URLs as well as tags
 The failing-first shared-content regression passes on macOS and Linux alongside
 all 261 Pickle tests, 24 registry integrations and strict Clippy. Resolving fresh
 workers' catalogue reads through current authority remains a separate open item.
+
+The catalogue-read fix now routes repository metadata and quota usage through the
+current authenticated leader. Fresh workers and followers no longer turn a
+committed image into a cache miss; missing quorum refuses. Responses are scoped
+to the requested repository and bounded. Protocol advances to 11, state remains
+14. The original real-TLS fresh-worker regression fails before this change.
+
+The remaining copy operation also needs a per-node GC generation in durable
+state. A copy proposal can time out locally but still commit later, after its
+local guard has gone and collection has deleted the bytes. A node must query the
+repository and its GC generation coherently, verify bytes while excluding local
+collection, then propose only its own holder identity with that generation.
+Actual GC approval advances the generation; a delayed older copy must refuse.
+Check overflow before any mutation and qualify deferred copy versus GC, lease
+retirement and node decommission. This is planned work, not implemented proof.
+The public Bun image list also still needs current catalogue authority.

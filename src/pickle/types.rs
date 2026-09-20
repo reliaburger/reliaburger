@@ -279,6 +279,53 @@ impl ManifestCatalog {
         Ok(())
     }
 
+    /// Project one repository without exposing unrelated manifests, tags or holders.
+    pub fn repository_view(&self, repository: &str) -> Self {
+        let prefix = format!("{repository}:");
+        let mut view = Self {
+            repository_owners: self
+                .repository_owners
+                .iter()
+                .filter(|(name, _)| name.as_str() == repository)
+                .map(|(name, owner)| (name.clone(), owner.clone()))
+                .collect(),
+            manifests: self
+                .manifests
+                .iter()
+                .filter(|(_, manifest)| manifest.repository == repository)
+                .cloned()
+                .collect(),
+            tags: self
+                .tags
+                .iter()
+                .filter(|(name, _)| name.starts_with(&prefix))
+                .cloned()
+                .collect(),
+            layer_locations: Vec::new(),
+        };
+        let referenced = view.referenced_digest_set();
+        view.layer_locations = self
+            .layer_locations
+            .iter()
+            .filter(|(digest, _)| referenced.contains(digest))
+            .cloned()
+            .collect();
+        view
+    }
+
+    /// Logical stored image sizes used by repository and aggregate quota admission.
+    pub fn stored_sizes(&self, repository: &str) -> (u64, u64) {
+        let mut repository_bytes = 0u64;
+        let mut total_bytes = 0u64;
+        for (_, manifest) in &self.manifests {
+            total_bytes = total_bytes.saturating_add(manifest.total_size);
+            if manifest.repository == repository {
+                repository_bytes = repository_bytes.saturating_add(manifest.total_size);
+            }
+        }
+        (repository_bytes, total_bytes)
+    }
+
     /// Look up shared content by digest, without selecting repository metadata.
     /// Repository-aware callers must use `get_repository_manifest` instead.
     pub fn get_manifest(&self, digest: &str) -> Option<&ImageManifest> {
@@ -1086,6 +1133,55 @@ mod tests {
             pushed_by: 1,
             signature: None,
         }
+    }
+
+    #[test]
+    fn repository_views_preserve_shared_holders_without_other_repository_metadata() {
+        let mut catalog = ManifestCatalog::default();
+        for (repository, digest, holder) in [
+            ("rbtest-a/web", "shared", 1),
+            ("ordinary", "shared", 2),
+            ("rbtest-b/web", "other", 3),
+        ] {
+            catalog.apply_manifest_commit(&ManifestCommit {
+                manifest: test_manifest(repository, digest),
+                tag: "latest".into(),
+                holder_nodes: BTreeSet::from([holder]),
+            });
+        }
+        catalog
+            .repository_owners
+            .insert("rbtest-a/web".into(), "a".into());
+        catalog
+            .repository_owners
+            .insert("rbtest-b/web".into(), "b".into());
+        let view = catalog.repository_view("rbtest-a/web");
+        assert_eq!(view.manifests.len(), 1);
+        assert_eq!(view.tags.len(), 1);
+        assert_eq!(
+            view.repository_owners,
+            BTreeMap::from([("rbtest-a/web".into(), "a".into())])
+        );
+        assert!(view.get_manifest_by_tag("ordinary", "latest").is_none());
+        assert!(view.get_manifest_by_tag("rbtest-b/web", "latest").is_none());
+        assert!(
+            !view
+                .layer_locations
+                .iter()
+                .any(|(digest, _)| digest == test_digest("other").as_str())
+        );
+        assert_eq!(
+            view.layer_holders(test_digest("shared").as_str()),
+            BTreeSet::from([1, 2])
+        );
+        assert_eq!(catalog.stored_sizes("rbtest-a/web"), (31744, 3 * 31744));
+        let empty = catalog.repository_view("absent");
+        assert!(
+            empty.manifests.is_empty()
+                && empty.tags.is_empty()
+                && empty.layer_locations.is_empty()
+                && empty.repository_owners.is_empty()
+        );
     }
 
     #[test]

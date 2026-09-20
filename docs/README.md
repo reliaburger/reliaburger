@@ -110,6 +110,11 @@ restart. A manifest push persists its catalogue before acknowledging success;
 filesystem failures refuse the push. Clustered workers and followers forward
 manifest and GC proposals to the advertised leader over authenticated node TLS.
 The leader checks current identity and quorum; retired nodes cannot commit.
+OCI metadata reads, peer image resolution and configured quota checks use the
+same current authority, including on fresh workers without a local catalogue.
+Unavailable authority returns an error rather than a cache miss or zero usage.
+Digest reads also require live repository metadata; retaining shared bytes for
+an ordinary repository does not preserve access through a retired name.
 Unconfirmed Raft commits return 503 and
 require a client retry; 201 confirms catalogue acceptance, while blob replication
 may still be pending. Push publication and GC deletion share a

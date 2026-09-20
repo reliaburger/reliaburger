@@ -110,6 +110,10 @@ impl RegistryMutation {
 /// Restricted registry queries whose answers require current council authority.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum RegistryQuery {
+    /// Read committed metadata needed to resolve and copy one repository's images.
+    Repository { repository: String },
+    /// Read current logical usage without transferring the whole catalogue.
+    Usage { repository: String },
     /// Find the active lease which already owns this repository.
     Lease { repository: String },
     /// Find repository retirement obligations belonging to the authenticated node.
@@ -140,6 +144,13 @@ pub struct RegistryQueryRequest {
 /// A current registry ownership view; this never exposes other leases' credentials.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum RegistryQueryResponse {
+    /// A repository-scoped current catalogue, including its shared holder records.
+    Repository(Box<super::types::ManifestCatalog>),
+    /// Logical image bytes in this repository and in the complete registry.
+    Usage {
+        repository_bytes: u64,
+        total_bytes: u64,
+    },
     /// The active repository lease, or no active owner.
     Lease(Option<String>),
     /// Workload-retired repositories still awaiting this node's confirmation.
@@ -157,6 +168,17 @@ impl RegistryQuery {
         node_id: u64,
     ) -> RegistryQueryResponse {
         match self {
+            Self::Repository { repository } => RegistryQueryResponse::Repository(Box::new(
+                state.manifest_catalog.repository_view(repository),
+            )),
+            Self::Usage { repository } => {
+                let (repository_bytes, total_bytes) =
+                    state.manifest_catalog.stored_sizes(repository);
+                RegistryQueryResponse::Usage {
+                    repository_bytes,
+                    total_bytes,
+                }
+            }
             Self::Lease { repository } => RegistryQueryResponse::Lease(
                 state
                     .test_leases

@@ -92,13 +92,21 @@ impl PickleState {
             }
             return Ok(query.answer(&council.desired_state().await, self.node_raft_id));
         }
-        let state = crate::council::DesiredState {
-            test_leases: self
-                .test_leases
-                .snapshot()
-                .await
-                .map_err(|e| unavailable(e.to_string()))?,
-            ..Default::default()
+        let state = match &query {
+            RegistryQuery::Repository { .. } | RegistryQuery::Usage { .. } => {
+                crate::council::DesiredState {
+                    manifest_catalog: self.catalog.read().await.clone(),
+                    ..Default::default()
+                }
+            }
+            _ => crate::council::DesiredState {
+                test_leases: self
+                    .test_leases
+                    .snapshot()
+                    .await
+                    .map_err(|e| unavailable(e.to_string()))?,
+                ..Default::default()
+            },
         };
         Ok(query.answer(&state, self.node_raft_id))
     }

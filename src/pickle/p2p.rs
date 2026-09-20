@@ -250,7 +250,7 @@ impl ClusterSource {
         tag: &str,
         peers: &[Peer],
     ) -> Result<Option<Vec<PathBuf>>, PickleError> {
-        let catalog = self.state.catalog_snapshot().await;
+        let catalog = self.state.catalog_snapshot(repository).await?;
         // A digest in the tag position (`repo@sha256:…` references put
         // it there) resolves content-addressed, so the bytes verified
         // at admission are the bytes pulled — a tag moved between
@@ -345,7 +345,7 @@ impl ClusterSource {
         let cached_repo = super::upstream::cached_repository(image);
         let recheck = std::time::Duration::from_secs(self.cache_recheck_secs);
 
-        let catalog = self.state.catalog_snapshot().await;
+        let catalog = self.state.catalog_snapshot(&cached_repo).await?;
         match decide(
             &catalog,
             &cached_repo,
@@ -378,7 +378,7 @@ impl ClusterSource {
         // double-download. Re-check after acquiring: another task may
         // have filled while we waited.
         let _guard = self.fill_lock.lock().await;
-        let catalog = self.state.catalog_snapshot().await;
+        let catalog = self.state.catalog_snapshot(&cached_repo).await?;
         if matches!(
             decide(
                 &catalog,

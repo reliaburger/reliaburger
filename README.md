@@ -49,7 +49,9 @@ requires one Bun per writable image store; see the [startup contract](docs/READM
 Manifest pushes persist their local catalogue before acknowledgement and refuse
 filesystem failures. Publication and garbage collection serialise their final
 blob checks and deletion. Clustered workers and followers forward writes to the
-authenticated leader; unconfirmed Raft commits return 503 for client retry;
+authenticated leader. Repository reads and configured quota checks also require
+current authority; an unavailable leader returns 503 instead of an empty catalogue.
+Unconfirmed Raft commits return 503 for client retry;
 201 confirms catalogue acceptance, with blob replication potentially still pending.
 HTTP writes under `rbtest-…/` require their exact authenticated lease owner.
 Registry workers confirm upload and metadata retirement after workloads stop;

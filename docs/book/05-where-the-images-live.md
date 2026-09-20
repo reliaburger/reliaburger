@@ -1194,3 +1194,25 @@ repository's metadata before opening the shared blob. The HTTP regression first
 returned 200 for the retired repository; it now returns 404 while the ordinary
 repository still returns 200. The disk read runs on a blocking worker so it cannot
 stall the asynchronous request executor.
+
+### A fresh worker needs a current catalogue
+
+Push an image through one node, then ask a fresh worker to run it. The bytes may
+already be cached, yet a worker's empty local catalogue used to report that the
+image did not exist. An uninitialised follower had the same problem. Both now
+query the advertised leader over authenticated node TLS before resolving the
+repository. Tags, digest reads and pull-through decisions use that same view.
+
+The query returns only that repository's metadata and the locations of its
+referenced blobs. A separate usage query returns two numbers for configured
+quotas. Copying the whole catalogue merely to count bytes would waste bandwidth.
+No leader or no quorum produces an error, never an empty registry. Responses
+exceeding the control-message ceiling also refuse. These new enum variants change
+the wire contract, so the explicit protocol generation advances to 11; the disk
+format remains generation 14.
+
+The regression starts with a successfully committed image and an empty local
+catalogue, then checks actual TLS worker/follower resolution and quota refusal.
+Other tests exercise missing authority, lost quorum, repository projection and
+oversized responses. The public image-list endpoint and safe publication of peer
+copy receipts are separate work; a successful read alone proves neither.

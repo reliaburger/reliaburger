@@ -4350,12 +4350,29 @@ async fn registry_query_handler(
         )
             .into_response();
     }
-    Json(
-        request
-            .query
-            .answer(&council.desired_state().await, request.node_id),
-    )
-    .into_response()
+    let answer = request
+        .query
+        .answer(&council.desired_state().await, request.node_id);
+    bounded_registry_query_response(answer).await
+}
+
+async fn bounded_registry_query_response(
+    answer: crate::pickle::authority::RegistryQueryResponse,
+) -> Response {
+    let encoded = tokio::task::spawn_blocking(move || serde_json::to_vec(&answer)).await;
+    match encoded {
+        Ok(Ok(bytes)) if bytes.len() <= crate::pickle::authority::MAX_REGISTRY_PROPOSAL_BYTES => (
+            [(axum::http::header::CONTENT_TYPE, "application/json")],
+            bytes,
+        )
+            .into_response(),
+        Ok(Ok(_)) => (
+            StatusCode::SERVICE_UNAVAILABLE,
+            "registry query result exceeds the control-message limit",
+        )
+            .into_response(),
+        _ => StatusCode::INTERNAL_SERVER_ERROR.into_response(),
+    }
 }
 
 async fn join_handler(
@@ -8107,6 +8124,31 @@ async fn secret_rotate_handler(
 
 #[cfg(test)]
 mod tests {
+    #[tokio::test]
+    async fn registry_query_response_refuses_an_oversized_catalogue() {
+        use crate::pickle::authority::{MAX_REGISTRY_PROPOSAL_BYTES, RegistryQueryResponse};
+        let mut catalog = crate::pickle::types::ManifestCatalog::default();
+        catalog
+            .repository_owners
+            .insert("repository".into(), "x".repeat(MAX_REGISTRY_PROPOSAL_BYTES));
+        assert_eq!(
+            super::bounded_registry_query_response(RegistryQueryResponse::Repository(Box::new(
+                catalog
+            )))
+            .await
+            .status(),
+            axum::http::StatusCode::SERVICE_UNAVAILABLE
+        );
+        assert_eq!(
+            super::bounded_registry_query_response(RegistryQueryResponse::Repository(
+                Default::default()
+            ))
+            .await
+            .status(),
+            axum::http::StatusCode::OK
+        );
+    }
+
     use super::*;
     use axum::body::Body;
     use http_body_util::BodyExt;

@@ -15,9 +15,9 @@ pub struct Compatibility {
     pub state: u32,
 }
 
-/// Supported formats; registry receipts and local generation journals require protocol ten/state fourteen.
+/// Supported formats; registry receipts and local generation journals require protocol eleven/state fourteen.
 pub const CURRENT: Compatibility = Compatibility {
-    protocol: 10,
+    protocol: 11,
     state: 14,
 };
 

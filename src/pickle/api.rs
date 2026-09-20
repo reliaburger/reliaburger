@@ -163,22 +163,29 @@ impl PickleState {
 
     /// The current stored size of a repository and of the whole registry,
     /// from the authoritative catalogue (REG4 quota accounting).
-    async fn stored_sizes(&self, repository: &str) -> (u64, u64) {
-        let catalog = self.catalog_snapshot().await;
-        let mut repo_bytes = 0u64;
-        let mut total_bytes = 0u64;
-        for (_, manifest) in &catalog.manifests {
-            total_bytes = total_bytes.saturating_add(manifest.total_size);
-            if manifest.repository == repository {
-                repo_bytes = repo_bytes.saturating_add(manifest.total_size);
-            }
+    async fn stored_sizes(
+        &self,
+        repository: &str,
+    ) -> Result<(u64, u64), super::types::PickleError> {
+        match self
+            .registry_query(super::authority::RegistryQuery::Usage {
+                repository: repository.into(),
+            })
+            .await?
+        {
+            super::authority::RegistryQueryResponse::Usage {
+                repository_bytes,
+                total_bytes,
+            } => Ok((repository_bytes, total_bytes)),
+            _ => Err(super::types::PickleError::ReplicationFailed(
+                "invalid registry usage response".into(),
+            )),
         }
-        (repo_bytes, total_bytes)
     }
 
     /// Enforce the storage quota for admitting `incoming` bytes into
     /// `repository` (REG4). `Ok(())` when unlimited or within limits;
-    /// `Err(response)` is the 413 to return.
+    /// `Err(response)` is 413 for a full quota or 503 for unavailable authority.
     // `Response` is large but it IS the HTTP reply to send on failure —
     // boxing it would tax every call site for a value that lives one frame.
     #[allow(clippy::result_large_err)]
@@ -186,7 +193,10 @@ impl PickleState {
         if self.quota.is_unlimited() {
             return Ok(());
         }
-        let (repo_current, total_current) = self.stored_sizes(repository).await;
+        let (repo_current, total_current) = self
+            .stored_sizes(repository)
+            .await
+            .map_err(registry_write_error)?;
         match super::registry_auth::check_quota(
             &self.quota,
             repository,
@@ -227,13 +237,22 @@ async fn store_blob_off_runtime(
 }
 
 impl PickleState {
-    /// A point-in-time catalog view: the council's Raft-replicated
-    /// catalog when clustered, the local one otherwise. P2P pulls and
-    /// the pull-through cache plan against this.
-    pub async fn catalog_snapshot(&self) -> ManifestCatalog {
-        match &self.council {
-            Some(council) => council.manifest_catalog().await,
-            None => self.catalog.read().await.clone(),
+    /// A current repository view. Clustered workers and followers query the leader;
+    /// unavailable authority is an error, never an empty registry or cache miss.
+    pub async fn catalog_snapshot(
+        &self,
+        repository: &str,
+    ) -> Result<ManifestCatalog, super::types::PickleError> {
+        match self
+            .registry_query(super::authority::RegistryQuery::Repository {
+                repository: repository.into(),
+            })
+            .await?
+        {
+            super::authority::RegistryQueryResponse::Repository(catalog) => Ok(*catalog),
+            _ => Err(super::types::PickleError::ReplicationFailed(
+                "invalid registry catalogue response".into(),
+            )),
         }
     }
 }
@@ -1356,7 +1375,10 @@ async fn manifest_put(
 async fn manifest_get(state: &PickleState, name: &str, reference: &str) -> Response {
     // Shared blob bytes do not establish that this repository still exists.
     // Tags and digests must both resolve through its current metadata.
-    let catalog = state.catalog_snapshot().await;
+    let catalog = match state.catalog_snapshot(name).await {
+        Ok(catalog) => catalog,
+        Err(error) => return registry_write_error(error),
+    };
     let manifest = match Digest::new(reference) {
         Ok(digest) => catalog.get_repository_manifest(name, digest.as_str()),
         Err(_) => catalog.get_manifest_by_tag(name, reference),
@@ -1398,7 +1420,10 @@ fn detect_manifest_content_type(data: &[u8]) -> &'static str {
 async fn tags_list(state: &PickleState, name: &str) -> Response {
     // Read the authoritative catalogue (REG2): a repository a peer pushed
     // must list its tags here too, not only where the PUT landed.
-    let catalog = state.catalog_snapshot().await;
+    let catalog = match state.catalog_snapshot(name).await {
+        Ok(catalog) => catalog,
+        Err(error) => return registry_write_error(error),
+    };
     let tags = catalog.tags_for_repository(name);
     Json(serde_json::json!({
         "name": name,
@@ -3230,6 +3255,41 @@ mod tests {
             "pending",
             "push must honestly report replication is pending"
         );
+    }
+
+    #[tokio::test]
+    async fn unavailable_catalogue_authority_refuses_reads_and_quota_admission() {
+        let (mut state, _dir) = test_state();
+        let (_tx, rx) =
+            tokio::sync::watch::channel(crate::mustard::directory::NodeDirectory::default());
+        state.forwarder = Some(super::super::authority::RegistryForwarder::new(
+            crate::cluster::ClusterHttp::plaintext(),
+            rx,
+        ));
+        state.quota = QuotaConfig {
+            per_repository_bytes: 10,
+            total_bytes: 0,
+        };
+        assert_eq!(
+            state
+                .enforce_quota("ordinary", 1)
+                .await
+                .unwrap_err()
+                .status(),
+            StatusCode::SERVICE_UNAVAILABLE
+        );
+        let app = test_router(state.clone());
+        for path in ["/v2/ordinary/manifests/latest", "/v2/ordinary/tags/list"] {
+            assert_eq!(
+                app.clone()
+                    .oneshot(axum::http::Request::get(path).body(Body::empty()).unwrap())
+                    .await
+                    .unwrap()
+                    .status(),
+                StatusCode::SERVICE_UNAVAILABLE
+            );
+        }
+        assert!(state.catalog_snapshot("ordinary").await.is_err());
     }
 
     /// REG4: a push that would breach the repository quota is refused with
