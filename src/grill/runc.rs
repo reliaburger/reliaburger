@@ -1116,6 +1116,13 @@ impl super::Grill for RuncGrill {
             .or(entry.adopted_pid)
     }
 
+    async fn workload_cgroup(&self, instance: &InstanceId) -> Result<Option<u64>, GrillError> {
+        if self.ownership.is_some() && !self.rootless {
+            return self.owned_workload_cgroup(instance).await;
+        }
+        Ok(None)
+    }
+
     async fn container_ip(&self, instance: &InstanceId) -> Option<std::net::Ipv4Addr> {
         // Rootful containers publish their isolated address even without a
         // mapped port. Rootless networking has no address in this node pool.

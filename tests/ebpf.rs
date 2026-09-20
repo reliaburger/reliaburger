@@ -2467,6 +2467,10 @@ impl EgressRecoveryFixture {
     }
 
     async fn prepare(name: &str, failed_checkpoint: bool) -> Self {
+        Self::prepare_with_service(name, failed_checkpoint, false).await
+    }
+
+    async fn prepare_with_service(name: &str, failed_checkpoint: bool, service: bool) -> Self {
         use reliaburger::bun::agent::{AgentCommand, ApplyEvent};
         let root = tempfile::tempdir().unwrap();
         std::fs::create_dir(root.path().join("records")).unwrap();
@@ -2490,7 +2494,8 @@ impl EgressRecoveryFixture {
         let (mut agent, commands, _) = fixture.agent().await;
         fixture.commands = commands;
         fixture.task = Some(tokio::spawn(async move { agent.run().await }));
-        let config = reliaburger::config::Config::parse(&format!("[app.{name}]\nimage = 'mock:image'\ncommand = ['sleep', '600']\n[app.{name}.egress]\nallow = ['203.0.113.9:443']\n")).unwrap();
+        let port = if service { "port = 8080\n" } else { "" };
+        let config = reliaburger::config::Config::parse(&format!("[app.{name}]\nimage = 'mock:image'\ncommand = ['sleep', '600']\n{port}[app.{name}.egress]\nallow = ['203.0.113.9:443']\n")).unwrap();
         let (events, mut results) = tokio::sync::mpsc::channel(64);
         fixture
             .commands
@@ -2712,4 +2717,37 @@ async fn adoption_fences_missing_enforcement_before_publishing_the_workload() {
         result.is_err() && killed,
         "unprotected adoption did not fence its runtime"
     );
+}
+
+#[tokio::test]
+#[ignore = "requires Linux root and RELIABURGER_EBPF_TESTS=1"]
+async fn agent_namespace_binding_uses_the_workload_cgroup_instead_of_its_launcher() {
+    use reliaburger::sesame::{egress, firewall};
+    assert!(ebpf_tests_enabled());
+    let mut fixture =
+        EgressRecoveryFixture::prepare_with_service("source-cgroup", false, true).await;
+    let path = reliaburger::grill::cgroup::cgroup_path("default", "source-cgroup", 0);
+    let workload = egress::cgroup_id_of_path(&path).unwrap();
+    let launcher = egress::cgroup_id_of_pid(std::process::id()).unwrap();
+    let (workload_namespace, launcher_namespace) = {
+        let mut ebpf = fixture.ebpf.lock().await;
+        (
+            firewall::read_firewall_state(&mut ebpf.bpf, workload, 0)
+                .unwrap()
+                .source_namespace_id,
+            firewall::read_firewall_state(&mut ebpf.bpf, launcher, 0)
+                .unwrap()
+                .source_namespace_id,
+        )
+    };
+    fixture.retire("source-cgroup").await.unwrap();
+    fixture.crash().await;
+    fixture.ebpf.lock().await.detach().unwrap();
+    std::fs::remove_dir(path).unwrap();
+    assert_ne!(workload, launcher);
+    assert_eq!(
+        workload_namespace,
+        Some(reliaburger::onion::vip::name_to_id("default"))
+    );
+    assert_eq!(launcher_namespace, None);
 }

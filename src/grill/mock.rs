@@ -23,6 +23,7 @@ pub struct MockGrill {
     honours_cgroup_path: Arc<Mutex<bool>>,
     runtime_kind: Arc<Mutex<crate::grill::records::RuntimeKind>>,
     pid: Arc<Mutex<Option<u32>>>,
+    cgroup_paths: Arc<Mutex<HashMap<InstanceId, std::path::PathBuf>>>,
     rootless_network: Arc<Mutex<Option<crate::grill::records::RootlessNetworkRecord>>>,
     exec_outputs: Arc<Mutex<std::collections::VecDeque<String>>>,
     /// Deterministic gate for tests that need `exec()` to remain in flight.
@@ -60,6 +61,7 @@ impl Default for MockGrill {
             honours_cgroup_path: Arc::default(),
             runtime_kind: Arc::new(Mutex::new(crate::grill::records::RuntimeKind::Process)),
             pid: Arc::default(),
+            cgroup_paths: Arc::default(),
             rootless_network: Arc::default(),
             exec_outputs: Arc::default(),
             block_exec: Arc::new(AtomicBool::new(false)),
@@ -275,7 +277,7 @@ impl MockGrill {
 }
 
 impl super::Grill for MockGrill {
-    async fn create(&self, instance: &InstanceId, _spec: &OciSpec) -> Result<(), GrillError> {
+    async fn create(&self, instance: &InstanceId, spec: &OciSpec) -> Result<(), GrillError> {
         self.calls
             .lock()
             .unwrap()
@@ -294,6 +296,12 @@ impl super::Grill for MockGrill {
                 instance: instance.clone(),
                 reason: "injected create failure".into(),
             });
+        }
+        if let Some(path) = spec.linux.host_cgroup_path() {
+            self.cgroup_paths
+                .lock()
+                .unwrap()
+                .insert(instance.clone(), path);
         }
         Ok(())
     }
@@ -393,6 +401,20 @@ impl super::Grill for MockGrill {
         *self.honours_cgroup_path.lock().unwrap()
     }
 
+    async fn workload_cgroup(&self, instance: &InstanceId) -> Result<Option<u64>, GrillError> {
+        if !*self.honours_cgroup_path.lock().unwrap()
+            || self.state_overrides.lock().unwrap().get(instance) == Some(&ContainerState::Stopped)
+        {
+            return Ok(None);
+        }
+        Ok(self
+            .cgroup_paths
+            .lock()
+            .unwrap()
+            .get(instance)
+            .and_then(|path| crate::sesame::egress::cgroup_id_of_path(path)))
+    }
+
     async fn pid(&self, _instance: &InstanceId) -> Option<u32> {
         *self.pid.lock().unwrap()
     }
@@ -426,7 +448,7 @@ impl super::Grill for MockGrill {
     async fn adopt(
         &self,
         instance: &InstanceId,
-        _record: &super::records::InstanceRecord,
+        record: &super::records::InstanceRecord,
     ) -> Result<bool, GrillError> {
         self.calls
             .lock()
@@ -440,12 +462,19 @@ impl super::Grill for MockGrill {
                 reason: "simulated adoption inspection failure".into(),
             });
         }
-        Ok(self
+        let adopted = self
             .adopt_results
             .lock()
             .unwrap()
             .get(instance)
             .copied()
-            .unwrap_or(false))
+            .unwrap_or(false);
+        if adopted && let Some(path) = record.oci_spec.linux.host_cgroup_path() {
+            self.cgroup_paths
+                .lock()
+                .unwrap()
+                .insert(instance.clone(), path);
+        }
+        Ok(adopted)
     }
 }

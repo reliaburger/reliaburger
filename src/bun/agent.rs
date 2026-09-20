@@ -2165,7 +2165,7 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
         // Keying by the namespace-qualified identity — not the bare app name —
         // is what stops same-named apps in different namespaces from sharing a
         // firewall rule or a namespace mapping (H9). Collect the pairs first so
-        // the `list_instances` borrow is released before the async `pid` lookups.
+        // the `list_instances` borrow is released before the async workload-identity lookups.
         let pairs: Vec<((String, String), InstanceId)> = self
             .supervisor
             .list_instances()
@@ -2175,10 +2175,15 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
         let mut cgroup_ids: std::collections::HashMap<(String, String), Vec<u64>> =
             std::collections::HashMap::new();
         for (key, id) in pairs {
-            if let Some(pid) = self.supervisor.grill().pid(&id).await
-                && let Some(cg) = crate::sesame::egress::cgroup_id_of_pid(pid)
-            {
-                cgroup_ids.entry(key).or_default().push(cg);
+            match self.supervisor.grill().workload_cgroup(&id).await {
+                Ok(Some(cgroup)) => cgroup_ids.entry(key).or_default().push(cgroup),
+                Ok(None) => {}
+                Err(error) => {
+                    // Unavailable source evidence cannot authorise erasing
+                    // previously installed namespace/firewall bindings.
+                    eprintln!("sesame: source identity for {id} is unavailable: {error}");
+                    return;
+                }
             }
         }
 
@@ -5419,18 +5424,18 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
 
         let mut cgroup_ids = Vec::with_capacity(instances.len());
         for instance in instances {
-            let pid = self
+            let cgroup_id = self
                 .supervisor
                 .grill()
-                .pid(&instance)
+                .workload_cgroup(&instance)
                 .await
-                .ok_or_else(|| format!("source instance {} has no running PID", instance.0))?;
-            let cgroup_id = crate::sesame::egress::cgroup_id_of_pid(pid).ok_or_else(|| {
-                format!(
-                    "could not resolve the cgroup id for source instance {}",
-                    instance.0
-                )
-            })?;
+                .map_err(|error| format!("source instance {}: {error}", instance.0))?
+                .ok_or_else(|| {
+                    format!(
+                        "source instance {} has no verified workload cgroup",
+                        instance.0
+                    )
+                })?;
             cgroup_ids.push(cgroup_id);
         }
         cgroup_ids.sort_unstable();
@@ -8744,11 +8749,14 @@ impl<G: Grill + Clone + 'static> PreparedTrace<G> {
 
         #[cfg(all(feature = "ebpf", target_os = "linux"))]
         if let Some(handle) = &self.onion_ebpf {
-            let Some(pid) = self.grill.pid(source_instance).await else {
-                return unknown("runtime does not expose the source workload PID".to_string());
-            };
-            let Some(cgroup_id) = crate::sesame::egress::cgroup_id_of_pid(pid) else {
-                return unknown("source workload cgroup id could not be resolved".to_string());
+            let cgroup_id = match self.grill.workload_cgroup(source_instance).await {
+                Ok(Some(cgroup_id)) => cgroup_id,
+                Ok(None) => {
+                    return unknown("runtime does not expose a verified workload cgroup".into());
+                }
+                Err(error) => {
+                    return unknown(format!("source workload identity is unavailable: {error}"));
+                }
             };
             let mut ebpf = handle.lock().await;
             if !internal_destination {

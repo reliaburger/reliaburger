@@ -354,10 +354,22 @@ pub trait Grill: Send + Sync {
         std::future::ready(None)
     }
 
+    /// Return the verified live workload's cgroup v2 identity, when supported.
+    /// A launcher PID is not a workload cgroup. Unavailable or conflicting
+    /// ownership returns an error; unsupported runtimes return `None`.
+    fn workload_cgroup(
+        &self,
+        instance: &InstanceId,
+    ) -> impl std::future::Future<Output = Result<Option<u64>, GrillError>> + Send {
+        let _ = instance;
+        std::future::ready(Ok(None))
+    }
+
     /// Get the OS process ID for an instance, if available.
     ///
     /// Returns `None` for runtimes where the PID isn't directly visible
-    /// (e.g. containers running inside VMs).
+    /// (e.g. containers running inside VMs). Runc reports its owned launcher
+    /// here; use `workload_cgroup` for verified container network attribution.
     fn pid(&self, instance: &InstanceId) -> impl std::future::Future<Output = Option<u32>> + Send {
         let _ = instance;
         std::future::ready(None)
@@ -588,6 +600,16 @@ impl Grill for AnyGrill {
             AnyGrill::Runc(g) => g.pid(instance).await,
             #[cfg(target_os = "macos")]
             AnyGrill::Apple(g) => g.pid(instance).await,
+        }
+    }
+
+    async fn workload_cgroup(&self, instance: &InstanceId) -> Result<Option<u64>, GrillError> {
+        match self {
+            AnyGrill::Process(g) => g.workload_cgroup(instance).await,
+            #[cfg(target_os = "linux")]
+            AnyGrill::Runc(g) => g.workload_cgroup(instance).await,
+            #[cfg(target_os = "macos")]
+            AnyGrill::Apple(g) => g.workload_cgroup(instance).await,
         }
     }
 

@@ -523,6 +523,86 @@ impl RuncGrill {
         .flatten()
     }
 
+    /// Verify source attribution against the original launch and retained owner.
+    pub(super) async fn owned_workload_cgroup(
+        &self,
+        instance: &InstanceId,
+    ) -> Result<Option<u64>, GrillError> {
+        self.owned_operation(instance, |runtime, id, context| async move {
+            let intent = context.intent().await?;
+            if intent.phase != IntentPhase::Owned || runtime.rootless {
+                return Ok(None);
+            }
+            let Some(CommandState::Running { pid: launcher }) =
+                context.role_state(RuntimeRole::Launcher).await?
+            else {
+                return Ok(None);
+            };
+            if intent.spec.linux.cgroups_path.is_none() {
+                return Ok(None);
+            }
+            let path = intent
+                .spec
+                .linux
+                .host_cgroup_path()
+                .ok_or_else(|| io::Error::other("original workload cgroup path is invalid"))?;
+            let pid = runtime
+                .owned_running_pid(&id, &context)
+                .await?
+                .ok_or_else(|| io::Error::other("owned launcher has no verified live container"))?;
+            // Retain both kernel objects until the owner confirms the same
+            // launcher after inspection. Numeric PID reuse cannot change an
+            // already-open /proc directory underneath these reads.
+            let (_process, _cgroup, cgroup_id) = tokio::task::spawn_blocking(move || {
+                use std::os::fd::AsRawFd;
+                use std::os::unix::fs::MetadataExt;
+                let process = std::fs::File::open(format!("/proc/{pid}"))?;
+                let base = format!("/proc/self/fd/{}", process.as_raw_fd());
+                let status = std::fs::read_to_string(format!("{base}/status"))?;
+                let parent = status
+                    .lines()
+                    .find_map(|line| line.strip_prefix("PPid:"))
+                    .and_then(|value| value.trim().parse::<u32>().ok());
+                let nested_init = status
+                    .lines()
+                    .find_map(|line| line.strip_prefix("NSpid:"))
+                    .is_some_and(|value| {
+                        let ids: Vec<_> = value.split_whitespace().collect();
+                        ids.len() >= 2 && ids.last() == Some(&"1")
+                    });
+                let membership = std::fs::read_to_string(format!("{base}/cgroup"))?;
+                let hierarchy = membership.lines().find_map(|line| line.strip_prefix("0::"));
+                let expected = path
+                    .strip_prefix("/sys/fs/cgroup")
+                    .map_err(io::Error::other)?;
+                let expected = format!("/{}", expected.display());
+                if parent != Some(launcher) || !nested_init || hierarchy != Some(expected.as_str())
+                {
+                    return Err(io::Error::other(
+                        "container source identity conflicts with its original owner",
+                    ));
+                }
+                let cgroup = std::fs::File::open(path)?;
+                let metadata = cgroup.metadata()?;
+                if !metadata.is_dir() {
+                    return Err(io::Error::other("workload cgroup is not a directory"));
+                }
+                Ok::<_, io::Error>((process, cgroup, metadata.ino()))
+            })
+            .await
+            .map_err(io::Error::other)??;
+            if context.role_state(RuntimeRole::Launcher).await?
+                != Some(CommandState::Running { pid: launcher })
+            {
+                return Err(io::Error::other(
+                    "workload owner retired during source inspection",
+                ));
+            }
+            Ok(Some(cgroup_id))
+        })
+        .await
+    }
+
     /// Return original requests independently of agent adoption records.
     pub(super) async fn owned_inventory(
         &self,

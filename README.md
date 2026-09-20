@@ -290,8 +290,8 @@ release acceptance from deferred capabilities. The current checklist lives in
 [progress.md](docs/progress.md).
 
 The opt-in durable Runc adapter now covers rootful and rootless Linux containers.
-Six rootful and five rootless recovery cases pass, including caller death before
-adoption, short jobs, published ports and interrupted network-helper startup.
+Rootful and rootless recovery tests cover caller death before adoption, short
+jobs, published ports and interrupted network-helper startup.
 Rootless networking is ready before the workload starts. Command waits retry
 transient owner-control failures within their original deadline; losing a status
 response never counts as confirmed retirement. Production selection
@@ -305,9 +305,10 @@ repeated cleanup failures remain retryable. An opt-in persistent kernel loader
 now keeps policy through actual loader SIGKILL and recovers the same maps without
 a detach window. The agent now records original workload policy before map
 writes and restores it before adoption; cleanup retains positive retirement
-evidence until metadata is gone. All 38 physical kernel tests pass. Verified
-container source identity, host-reboot reconciliation and production kernel
-selection remain release gates. Automatic application restarts now retire the
+evidence until metadata is gone. Network rules, diagnostics and adoption now use
+the container’s verified original cgroup. All 39 physical kernel tests pass.
+Pre-start namespace binding, discovery cleanup, host-reboot reconciliation and
+production kernel selection remain release gates. Automatic application restarts now retire the
 predecessor’s adoption and policy records before creating a successor; failed
 cleanup blocks replacement while preserving the logical workload identity.
 

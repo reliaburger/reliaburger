@@ -1190,3 +1190,39 @@ resolves it again before rewriting policy, and never reactivates a retired
 binding. Uncertain checkpoint persistence also blocks subsequent kernel rewrites:
 otherwise the old in-memory owner could recreate policy after the disk had
 already recorded its retirement.
+
+
+### The launcher isn't the source of container traffic
+
+Runc has a host process that launches and watches a container. Bun needs that
+launcher's identity for adoption and owned command control. But network traffic
+comes from the container's cgroup. Looking up the launcher's cgroup for a
+namespace rule protects the wrong source, even when the container's OCI path is
+correct.
+
+`Grill::workload_cgroup` now separates those two questions. The owned rootful
+adapter reads its original launch specification under the generation claim,
+asks Runc for the running init PID, and opens that process's `/proc` directory.
+Through the retained descriptor it checks the parent, nested PID namespace and
+actual cgroup membership. The parent must be the authenticated launcher and the
+cgroup must match the original request. It retains the cgroup directory too,
+then rechecks the launcher's ownership before returning the kernel identity.
+
+The local bindings `_process` and `_cgroup` are still variables with destructors.
+Their leading underscores silence unused-variable warnings; they don't discard
+the files. Both descriptors remain owned until the check finishes. Dropping a
+file closes its descriptor. This keeps the inspection tied to kernel objects
+rather than looking up a potentially reused numeric PID again.
+
+Unsupported runtimes return no verified source identity. Conflicting ownership
+returns an error. Firewall reconciliation keeps its previous maps on an
+inspection error, trace reports unknown evidence, and a source-specific network
+fault refuses an unverified target. Recovered egress checks compare the original
+policy with this verified runtime identity before keeping the workload live.
+
+The actual-Runc regressions distinguish launcher and container cgroups, recover
+the same identity after reconstructing the adapter, and refuse a live container
+moved into another cgroup. A separate public-agent regression checks the real
+kernel namespace map. Pre-start namespace binding, complete discovery ownership
+and positive removal remain their own integration boundary; a correct identity
+lookup alone doesn't close those gaps.

@@ -390,3 +390,60 @@ async fn generated_cgroup_path_matches_the_actual_container_before_its_first_ins
     assert_eq!(observed.trim(), format!("0::{expected}"));
     assert!(still_same, "runc replaced Bun's pre-programmed cgroup");
 }
+
+#[tokio::test]
+#[ignore = "requires root, runc, static /usr/bin/busybox, ip and nft"]
+async fn recovered_source_identity_belongs_to_the_container_not_its_launcher() {
+    let root = tempfile::tempdir().unwrap();
+    let id = instance(root.path());
+    let path = format!("/sys/fs/cgroup/{}", id.0);
+    let mut specification = spec(root.path(), "exec /bin/busybox sleep 60");
+    specification.linux.cgroups_path = Some(format!("/{}", id.0));
+    let first = runtime(root.path());
+    first.create(&id, &specification).await.unwrap();
+    install_fixture(root.path(), &id);
+    first.start(&id).await.unwrap();
+    let expected = reliaburger::sesame::egress::cgroup_id_of_path(Path::new(&path)).unwrap();
+    let launcher = first.pid(&id).await.unwrap();
+    let launcher_cgroup = reliaburger::sesame::egress::cgroup_id_of_pid(launcher);
+    let live = first.workload_cgroup(&id).await;
+    drop(first);
+    let recovered = runtime(root.path());
+    let after_recovery = recovered.workload_cgroup(&id).await;
+    recovered.kill(&id).await.unwrap();
+    let retired = recovered.workload_cgroup(&id).await;
+    assert_absent(root.path(), &id);
+    assert_ne!(launcher_cgroup, Some(expected));
+    assert_eq!(live.unwrap(), Some(expected));
+    assert_eq!(after_recovery.unwrap(), Some(expected));
+    assert_eq!(retired.unwrap(), None);
+}
+
+#[tokio::test]
+#[ignore = "requires root, runc, static /usr/bin/busybox, ip and nft"]
+async fn source_identity_refuses_a_container_moved_out_of_its_original_cgroup() {
+    let root = tempfile::tempdir().unwrap();
+    let id = instance(root.path());
+    let runtime = runtime(root.path());
+    let mut specification = spec(root.path(), "exec /bin/busybox sleep 60");
+    specification.linux.cgroups_path = Some(format!("/{}", id.0));
+    runtime.create(&id, &specification).await.unwrap();
+    install_fixture(root.path(), &id);
+    runtime.start(&id).await.unwrap();
+    let state: serde_json::Value = serde_json::from_slice(
+        &std::fs::read(root.path().join("state").join(&id.0).join("state.json")).unwrap(),
+    )
+    .unwrap();
+    let pid = state["init_process_pid"].as_u64().unwrap();
+    let relocated = std::path::PathBuf::from(format!("/sys/fs/cgroup/{}-relocated", id.0));
+    std::fs::create_dir(&relocated).unwrap();
+    std::fs::write(relocated.join("cgroup.procs"), pid.to_string()).unwrap();
+    let identity = runtime.workload_cgroup(&id).await;
+    runtime.kill(&id).await.unwrap();
+    std::fs::remove_dir(relocated).unwrap();
+    assert_absent(root.path(), &id);
+    assert!(
+        identity.is_err(),
+        "accepted unverified source identity: {identity:?}"
+    );
+}

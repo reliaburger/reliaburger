@@ -235,11 +235,13 @@ interrupted metadata cleanup and repeated frozen-map recovery. Four portable
 checkpoint contracts and 206 affected tests pass on each platform, with strict
 Clippy on Linux and macOS. Actual Bun/upgrade and production selection remain open.
 
-Source identity also needs the same evidence. Several firewall and trace paths
-resolve the cgroup of `Grill::pid()`, while Runc deliberately reports its owned
-launcher PID for adoption and signalling. Audit those consumers against the
-original container cgroup before production selection; a launcher PID is not the
-container's network identity.
+Source identity now has a separate runtime query. The owned rootful adapter
+verifies the container's original cgroup, nested init and authenticated launcher
+parent through retained process/cgroup descriptors, then rechecks launcher
+ownership. Namespace reconciliation, trace, source-specific faults and recovered
+egress checks use that query. Unsupported runtimes expose no verified identity;
+conflicts refuse. Legacy and rootless Runc do not claim verified cgroup support.
+Actual Bun production selection remains pending the remaining integration gates.
 
 
 Application restart now retires predecessor adoption and policy records before
@@ -285,3 +287,28 @@ After repair, all 53 macOS/54 Linux selected command, process-recovery, owner an
 Runc-command tests pass (28.139s/21.417s), with strict all-target/all-feature
 Clippy on both. The same 200-run concurrent output reproduction now passes with
 no failures. Hosted validation of the new head remains a separate checkpoint.
+
+
+## Source identity and the remaining discovery boundary
+
+The real-container regressions distinguish the workload's cgroup from its
+launcher, recover the same identity, return no live identity after retirement,
+and refuse a container moved into another cgroup. The public-agent kernel-map
+regression first reproduces the missing workload namespace binding.
+
+Remaining discovery work must publish original source ownership before startup,
+including jobs and applications that expose no service port. The current
+namespace reconciliation derives entries from service records and runs after
+startup. Its map-write/removal failures and backend-map removal also need
+positive, retryable cleanup evidence. Recover retained maps before adoption;
+remove only bindings whose runtime and original ownership are positively
+retired. Qualify stopped owners, partial programming, Bun death, shared rollout
+state and frozen-map refusal before selecting persistent maps in production.
+
+Source-identity qualification: all ten physical owned-Runc cases pass (8.17s),
+including recovery, positive retirement and moved-cgroup refusal. All 39 physical
+kernel cases pass (8.78s); the public-agent namespace entry now uses the workload
+cgroup and leaves the launcher unbound. All 170 affected library tests pass on
+macOS/Linux (17.819s/22.973s), with strict all-target/all-feature Clippy on both.
+The privileged CI filter and host-network serialisation now select the complete
+owned-Runc binary, including tests without a `runc_` name prefix.

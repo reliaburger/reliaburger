@@ -202,22 +202,16 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
             .egress_bindings
             .get(id)
             .ok_or_else(|| fail("original policy ownership is missing"))?;
-        let (boot_id, cgroup) = {
-            let path = binding
-                .original_spec
-                .linux
-                .host_cgroup_path()
-                .ok_or_else(|| fail("original cgroup path is missing"))?;
-            tokio::task::spawn_blocking(move || {
-                Ok::<_, std::io::Error>((
-                    crate::bun::egress_owners::boot_id()?,
-                    crate::sesame::egress::cgroup_id_of_path(&path),
-                ))
-            })
+        let boot_id = tokio::task::spawn_blocking(crate::bun::egress_owners::boot_id)
             .await
             .map_err(|error| BunError::AdoptionState(error.to_string()))?
-            .map_err(|error| BunError::AdoptionState(error.to_string()))?
-        };
+            .map_err(|error| BunError::AdoptionState(error.to_string()))?;
+        let cgroup = self
+            .supervisor
+            .grill()
+            .workload_cgroup(id)
+            .await
+            .map_err(|error| BunError::AdoptionState(error.to_string()))?;
         if binding.phase != PolicyPhase::Owned
             || binding.boot_id != boot_id
             || cgroup != Some(binding.cgroup_id)
