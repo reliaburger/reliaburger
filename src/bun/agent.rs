@@ -7809,19 +7809,27 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
                 instance.container_ip = container_ip;
             }
             let service_id = crate::onion::service_id::ServiceId::new(&namespace, &app_name);
+            let mut candidate = self.service_map.clone();
             if let Some(port) = host_port {
-                let backend = self.local_backend(&id, &service_id, container_ip, port, true);
-                if let Err(error) = self.service_map.add_backend(&service_id, backend) {
+                let healthy = self
+                    .supervisor
+                    .get_instance(&id)
+                    .is_some_and(|instance| instance.health_config.is_none());
+                let backend = self.local_backend(&id, &service_id, container_ip, port, healthy);
+                if let Err(error) = candidate.add_backend(&service_id, backend) {
                     self.record_failed_restart(&id, &error.to_string()).await;
                     continue;
                 }
             }
-            // Egress was applied before `start` above. Post-start networking
-            // only refreshes the service and namespace-firewall maps.
-            if let Err(error) = self.finish_instance_networking(&app_name, &namespace).await {
+            // Keep every reader on the confirmed view. A runtime restart can
+            // change its address, but does not establish application health.
+            if let Err(error) = self.publish_backend_snapshot(&service_id, &candidate).await {
                 self.record_failed_restart(&id, &error.to_string()).await;
                 continue;
             }
+            self.service_map = candidate;
+            self.sync_firewall_ebpf().await;
+            self.rebuild_routing_table().await;
 
             // Starting → HealthWait, then Running if no health checks
             if let Some(instance) = self.supervisor.get_instance_mut(&id) {
@@ -11938,6 +11946,77 @@ mod tests {
         assert_eq!(entry.backends.len(), 1);
         assert_eq!(entry.backends[0].instance_id, "default__web-0");
         assert!(entry.backends[0].healthy);
+    }
+
+    #[tokio::test]
+    async fn automatic_restart_publishes_the_replacement_address() {
+        let (mut agent, _commands, _shutdown, grill) = test_agent_with_grill();
+        let old_ip = std::net::Ipv4Addr::new(10, 0, 2, 5);
+        let new_ip = std::net::Ipv4Addr::new(10, 0, 2, 6);
+        grill.set_container_ip(old_ip);
+        expect_complete(&drain_deploy(&mut agent, basic_config()).await);
+        let view = agent.service_map_watch();
+        let id = InstanceId("default__web-0".into());
+        let service = crate::onion::service_id::ServiceId::new("default", "web");
+        grill.set_state(&id, ContainerState::Stopped);
+        agent.check_apps().await;
+        grill.set_container_ip(new_ip);
+        agent.drive_pending_restarts().await;
+        assert_eq!(
+            agent.supervisor.get_instance(&id).unwrap().state,
+            ContainerState::Running
+        );
+        assert_eq!(
+            view.borrow().resolve(&service).unwrap().backends[0].node_ip,
+            new_ip
+        );
+        assert!(view.borrow().resolve(&service).unwrap().backends[0].healthy);
+        agent.retire_workload("web", "default").await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn automatic_restart_waits_for_health_before_publishing_a_healthy_backend() {
+        let (mut agent, _commands, _shutdown) = test_agent();
+        expect_complete(&drain_deploy(&mut agent, basic_config()).await);
+        let view = agent.service_map_watch();
+        let id = InstanceId("default__web-0".into());
+        let service = crate::onion::service_id::ServiceId::new("default", "web");
+        let mut health = super::super::health::HealthCheckConfig::from_spec(
+            config_with_health().app["web"].health.as_ref().unwrap(),
+            8080,
+        );
+        health.threshold_unhealthy = 1;
+        health.threshold_healthy = 1;
+        let instance = agent.supervisor.get_instance_mut(&id).unwrap();
+        instance.health_config = Some(health);
+        let created_at = instance.created_at;
+        agent
+            .complete_health_probe(
+                id.clone(),
+                created_at,
+                Ok(super::super::health::HealthStatus::Unhealthy),
+            )
+            .await;
+        agent.drive_pending_restarts().await;
+        assert_eq!(
+            agent.supervisor.get_instance(&id).unwrap().state,
+            ContainerState::HealthWait
+        );
+        assert!(
+            !agent.service_map.resolve(&service).unwrap().backends[0].healthy,
+            "restart published a healthy backend before its first successful probe"
+        );
+        assert!(!view.borrow().resolve(&service).unwrap().backends[0].healthy);
+        let created_at = agent.supervisor.get_instance(&id).unwrap().created_at;
+        agent
+            .complete_health_probe(
+                id,
+                created_at,
+                Ok(super::super::health::HealthStatus::Healthy),
+            )
+            .await;
+        assert!(view.borrow().resolve(&service).unwrap().backends[0].healthy);
+        agent.retire_workload("web", "default").await.unwrap();
     }
 
     #[tokio::test]

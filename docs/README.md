@@ -628,6 +628,10 @@ certificates. Peer API calls also present their node certificate and check the
 live revocation list; Relish and browsers may omit a client certificate and
 authenticate with a bearer token or session cookie over TLS.
 
+Automatic application restarts refresh DNS and ingress with the replacement's
+confirmed address. Applications with health checks stay out of healthy routing
+until a successful probe; failed backend publication retains cleanup ownership.
+
 Cluster-signed ingress leaves renew on the first handshake after half their
 validity period. Idle hosts renew when clients return; expired cached leaves
 are never reused. Operator-supplied ingress certificate/key files reload once

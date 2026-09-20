@@ -1365,3 +1365,20 @@ cannot insert its backend enters the existing failed-restart path. The worker
 reports failure while retaining the resources that still need cleanup. Updating
 an existing endpoint at the limit remains valid; only a new endpoint consumes
 another slot.
+
+### A restart needs a new routing snapshot
+
+A container exits and its replacement receives a different IP. Updating the
+agent's private service map is only half the job: DNS and Wrapper consume a
+published snapshot. Our regression runs the ordinary exit/restart path and
+observes that those readers still have the predecessor's IP.
+
+The restart now builds a candidate map, confirms kernel publication, then swaps
+in that map and refreshes the shared snapshot. A failed publication retains the
+previous view and the runtime's cleanup owner. If the application has a health
+check, the new backend stays unhealthy until a successful probe. Starting a
+process proves that it started, not that it can answer requests. A second
+regression drives an unhealthy application through restart, checks HealthWait
+and the unpublished health, then supplies a successful probe and checks the
+routing view again. These live checks do not replace the durable recovery and
+remote withdrawal proofs still required before reusing an address.
