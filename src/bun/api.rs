@@ -369,6 +369,12 @@ pub fn router_with_upgrade(
             post(node_renewal_handler).layer(axum::extract::DefaultBodyLimit::max(16 * 1024)),
         )
         .route(
+            "/v1/registry/query",
+            post(registry_query_handler)
+                .layer(axum::extract::DefaultBodyLimit::max(16 * 1024))
+                .layer(axum::middleware::from_fn(registry_proposal_deadline)),
+        )
+        .route(
             "/v1/registry/propose",
             post(registry_proposal_handler)
                 .layer(axum::extract::DefaultBodyLimit::max(
@@ -4288,6 +4294,51 @@ async fn registry_proposal_handler(
         Ok(Err(error)) => error.into_response(),
         Err(_) => (StatusCode::GATEWAY_TIMEOUT, "registry proposal timed out").into_response(),
     }
+}
+
+async fn registry_query_handler(
+    auth: Option<axum::Extension<crate::sesame::auth::AuthContext>>,
+    peer: Option<axum::Extension<crate::sesame::renewal::TlsPeerCertificate>>,
+    State(state): State<ApiState>,
+    Json(request): Json<crate::pickle::authority::RegistryQueryRequest>,
+) -> Response {
+    if let Err(response) = crate::sesame::auth::require_system(auth.as_deref()) {
+        return response;
+    }
+    if let Err(error) = request.compatibility.require_current() {
+        return (StatusCode::CONFLICT, error.to_string()).into_response();
+    }
+    let Some(peer) = peer else {
+        return (
+            StatusCode::FORBIDDEN,
+            "registry queries require a TLS node certificate",
+        )
+            .into_response();
+    };
+    let Some(council) = &state.council else {
+        return StatusCode::SERVICE_UNAVAILABLE.into_response();
+    };
+    let security = match council.security_state_linearizable().await {
+        Ok(security) => security,
+        Err(error) => return (StatusCode::SERVICE_UNAVAILABLE, error.to_string()).into_response(),
+    };
+    let node = match crate::sesame::renewal::validate_peer(&peer, &security) {
+        Ok(node) => node,
+        Err(error) => return (StatusCode::FORBIDDEN, error.to_string()).into_response(),
+    };
+    if crate::cluster::identity::raft_id_from_name(&node) != request.node_id {
+        return (
+            StatusCode::FORBIDDEN,
+            "registry query does not belong to authenticated node",
+        )
+            .into_response();
+    }
+    Json(
+        request
+            .query
+            .answer(&council.desired_state().await, request.node_id),
+    )
+    .into_response()
 }
 
 async fn join_handler(

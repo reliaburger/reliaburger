@@ -53,6 +53,93 @@ impl RegistryMutation {
     }
 }
 
+/// Restricted registry queries whose answers require current council authority.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub enum RegistryQuery {
+    /// Find the active lease which already owns this repository.
+    Lease { repository: String },
+    /// Find repository retirement obligations belonging to the authenticated node.
+    Retirements,
+}
+
+/// One storage node's outstanding repository cleanup obligation.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RegistryRetirement {
+    /// Exact lease generation, retained through cleanup.
+    pub lease_id: String,
+    /// Repository whose uploads and local metadata must retire.
+    pub repository: String,
+}
+
+/// Versioned read request bound to the sending node's TLS identity.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RegistryQueryRequest {
+    /// Explicit supported wire and state generations.
+    pub compatibility: crate::compatibility::Compatibility,
+    /// Node requesting its own receipt inventory.
+    pub node_id: u64,
+    /// The requested bounded registry view.
+    pub query: RegistryQuery,
+}
+
+/// A current registry ownership view; this never exposes other leases' credentials.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub enum RegistryQueryResponse {
+    /// The active repository lease, or no active owner.
+    Lease(Option<String>),
+    /// Workload-retired repositories still awaiting this node's confirmation.
+    Retirements(Vec<RegistryRetirement>),
+}
+
+/// Internal query endpoint, guarded like registry proposals.
+pub const REGISTRY_QUERY_PATH: &str = "/v1/registry/query";
+
+impl RegistryQuery {
+    /// Select only committed ownership after the caller establishes a current view.
+    pub fn answer(
+        &self,
+        state: &crate::council::DesiredState,
+        node_id: u64,
+    ) -> RegistryQueryResponse {
+        match self {
+            Self::Lease { repository } => RegistryQueryResponse::Lease(
+                state
+                    .test_leases
+                    .values()
+                    .find(|lease| {
+                        lease.is_active_at(crate::testkit::lease::now_unix_millis())
+                            && lease.repositories.contains_key(repository)
+                    })
+                    .map(|lease| lease.lease_id.clone()),
+            ),
+            Self::Retirements => RegistryQueryResponse::Retirements(
+                state
+                    .test_leases
+                    .values()
+                    .filter(|lease| {
+                        lease.workloads_retired
+                            && matches!(
+                                lease.state,
+                                crate::testkit::lease::TestLeaseState::Cleaning { .. }
+                            )
+                    })
+                    .flat_map(|lease| {
+                        lease
+                            .repositories
+                            .iter()
+                            .filter(move |(_, owners)| owners.contains(&node_id))
+                            .map(|(repository, _)| RegistryRetirement {
+                                lease_id: lease.lease_id.clone(),
+                                repository: repository.clone(),
+                            })
+                    })
+                    .collect(),
+            ),
+        }
+    }
+}
+
 /// A versioned proposal from one authenticated node to the current leader.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -102,6 +189,40 @@ impl RegistryForwarder {
                 Err(error) => return Err(unavailable(error.to_string())),
             }
         }
+        let proposal = RegistryProposal {
+            compatibility: crate::compatibility::CURRENT,
+            mutation,
+        };
+        self.send_request(council, REGISTRY_PROPOSAL_PATH, &proposal)
+            .await
+    }
+
+    /// Read current ownership directly from the advertised authoritative node.
+    pub async fn query(
+        &self,
+        council: Option<&Arc<CouncilNode>>,
+        node_id: u64,
+        query: RegistryQuery,
+    ) -> Result<RegistryQueryResponse, PickleError> {
+        let request = RegistryQueryRequest {
+            compatibility: crate::compatibility::CURRENT,
+            node_id,
+            query,
+        };
+        tokio::time::timeout(
+            PROPOSAL_TIMEOUT,
+            self.send_request(council, REGISTRY_QUERY_PATH, &request),
+        )
+        .await
+        .map_err(|_| unavailable("registry ownership query timed out"))?
+    }
+
+    async fn send_request<T: Serialize, R: serde::de::DeserializeOwned>(
+        &self,
+        council: Option<&Arc<CouncilNode>>,
+        path: &str,
+        request: &T,
+    ) -> Result<R, PickleError> {
         let address = {
             let directory = self.directory.borrow();
             if let Some(council) = council {
@@ -138,13 +259,8 @@ impl RegistryForwarder {
             .http
             .bearer()
             .ok_or_else(|| unavailable("registry forwarding requires a service credential"))?;
-        let url = self.http.url(&address.to_string(), REGISTRY_PROPOSAL_PATH);
-        let proposal = RegistryProposal {
-            compatibility: crate::compatibility::CURRENT,
-            mutation,
-        };
-        let bytes =
-            serde_json::to_vec(&proposal).map_err(|error| unavailable(error.to_string()))?;
+        let url = self.http.url(&address.to_string(), path);
+        let bytes = serde_json::to_vec(request).map_err(|error| unavailable(error.to_string()))?;
         if bytes.len() > MAX_REGISTRY_PROPOSAL_BYTES {
             return Err(unavailable(
                 "registry proposal exceeds the control-message limit",

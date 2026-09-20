@@ -12,7 +12,10 @@ use reliaburger::{
         state_machine::CouncilStateMachine,
     },
     pickle::{
-        authority::{REGISTRY_PROPOSAL_PATH, RegistryMutation, RegistryProposal},
+        authority::{
+            REGISTRY_PROPOSAL_PATH, REGISTRY_QUERY_PATH, RegistryMutation, RegistryProposal,
+            RegistryQuery, RegistryQueryRequest, RegistryQueryResponse, RegistryRetirement,
+        },
         types::GcReport,
     },
     sesame::{
@@ -232,6 +235,188 @@ async fn registry_proposals_require_service_and_current_node_authority() {
         StatusCode::FORBIDDEN
     );
     council.shutdown().await.unwrap();
+}
+
+async fn query(
+    app: Router,
+    body: &RegistryQueryRequest,
+    bearer: Option<&str>,
+) -> axum::response::Response {
+    let mut request = Request::post(REGISTRY_QUERY_PATH).header("content-type", "application/json");
+    if let Some(token) = bearer {
+        request = request.header("authorization", format!("Bearer {token}"));
+    }
+    app.oneshot(
+        request
+            .body(Body::from(serde_json::to_vec(body).unwrap()))
+            .unwrap(),
+    )
+    .await
+    .unwrap()
+}
+
+#[tokio::test]
+async fn registry_queries_require_current_node_authority_and_only_return_its_ready_receipts() {
+    use reliaburger::council::CouncilResponse;
+    use reliaburger::testkit::lease::{TestLease, now_unix_millis};
+    let hierarchy = ca::generate_ca_hierarchy("registry-queries", &IKM).unwrap();
+    let council = council(&hierarchy, true).await;
+    let certificate = peer(&hierarchy, 10);
+    let node_id = reliaburger::cluster::identity::raft_id_from_name("node");
+    let request = RegistryQueryRequest {
+        compatibility: reliaburger::compatibility::CURRENT,
+        node_id,
+        query: RegistryQuery::Retirements,
+    };
+    assert_eq!(
+        query(
+            router(council.clone(), None),
+            &request,
+            Some("internal-token")
+        )
+        .await
+        .status(),
+        StatusCode::FORBIDDEN
+    );
+    let app = router(council.clone(), Some(certificate.clone()));
+    for bearer in [None, Some("wrong-token")] {
+        assert!(matches!(
+            query(app.clone(), &request, bearer).await.status(),
+            StatusCode::UNAUTHORIZED | StatusCode::FORBIDDEN
+        ));
+    }
+    let mut invalid = request.clone();
+    invalid.node_id = 99;
+    assert_eq!(
+        query(app.clone(), &invalid, Some("internal-token"))
+            .await
+            .status(),
+        StatusCode::FORBIDDEN
+    );
+    invalid = request.clone();
+    invalid.compatibility.protocol += 1;
+    assert_eq!(
+        query(app.clone(), &invalid, Some("internal-token"))
+            .await
+            .status(),
+        StatusCode::CONFLICT
+    );
+    let foreign = peer(&ca::generate_ca_hierarchy("foreign", &IKM).unwrap(), 10);
+    assert_eq!(
+        query(
+            router(council.clone(), Some(foreign)),
+            &request,
+            Some("internal-token")
+        )
+        .await
+        .status(),
+        StatusCode::FORBIDDEN
+    );
+
+    let now = now_unix_millis();
+    let lease = TestLease::new(
+        "query-run".into(),
+        "token:ci".into(),
+        "ci".into(),
+        "rbtest-query-run".into(),
+        now,
+        now + 60_000,
+    )
+    .unwrap();
+    assert!(matches!(
+        council
+            .write(RaftRequest::TestLeaseCreate(lease))
+            .await
+            .unwrap(),
+        CouncilResponse::Applied { .. }
+    ));
+    for (repository, writer) in [
+        ("rbtest-query-run/web", node_id),
+        ("rbtest-query-run/other", 99),
+    ] {
+        assert!(matches!(
+            council
+                .write(RaftRequest::TestLeaseRegistryWriter {
+                    lease_id: "query-run".into(),
+                    repository: repository.into(),
+                    node_id: writer,
+                    owner_id: Some("token:ci".into()),
+                    observed_at_unix_ms: now
+                })
+                .await
+                .unwrap(),
+            CouncilResponse::Applied { .. }
+        ));
+    }
+    let lookup = RegistryQueryRequest {
+        query: RegistryQuery::Lease {
+            repository: "rbtest-query-run/web".into(),
+        },
+        ..request.clone()
+    };
+    assert!(
+        matches!(read_query(app.clone(), &lookup).await, RegistryQueryResponse::Lease(Some(id)) if id == "query-run")
+    );
+    assert!(
+        matches!(read_query(app.clone(), &request).await, RegistryQueryResponse::Retirements(items) if items.is_empty())
+    );
+    council
+        .write(RaftRequest::TestLeaseBeginCleanup {
+            lease_id: "query-run".into(),
+        })
+        .await
+        .unwrap();
+    assert!(matches!(
+        read_query(app.clone(), &lookup).await,
+        RegistryQueryResponse::Lease(None)
+    ));
+    assert!(
+        matches!(read_query(app.clone(), &request).await, RegistryQueryResponse::Retirements(items) if items.is_empty())
+    );
+    council
+        .write(RaftRequest::TestLeaseWorkloadsRetired {
+            lease_id: "query-run".into(),
+        })
+        .await
+        .unwrap();
+    assert!(
+        matches!(read_query(app.clone(), &request).await, RegistryQueryResponse::Retirements(items) if items == vec![RegistryRetirement { lease_id: "query-run".into(), repository: "rbtest-query-run/web".into() }])
+    );
+    council
+        .write(RaftRequest::TestLeaseRegistryRetired {
+            lease_id: "query-run".into(),
+            repository: "rbtest-query-run/web".into(),
+            node_id,
+        })
+        .await
+        .unwrap();
+    assert!(
+        matches!(read_query(app.clone(), &request).await, RegistryQueryResponse::Retirements(items) if items.is_empty())
+    );
+    council
+        .write(RaftRequest::RevokeCertificate(CrlEntry {
+            serial: SerialNumber(10),
+            issuer: CaRole::Node,
+            revoked_at: SystemTime::now(),
+            reason: "revoked on existing connection".into(),
+            expires_at: None,
+        }))
+        .await
+        .unwrap();
+    assert_eq!(
+        query(app, &request, Some("internal-token")).await.status(),
+        StatusCode::FORBIDDEN
+    );
+    council.shutdown().await.unwrap();
+}
+
+async fn read_query(app: Router, request: &RegistryQueryRequest) -> RegistryQueryResponse {
+    let response = query(app, request, Some("internal-token")).await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let bytes = axum::body::to_bytes(response.into_body(), 4096)
+        .await
+        .unwrap();
+    serde_json::from_slice(&bytes).unwrap()
 }
 
 #[tokio::test]
@@ -524,6 +709,9 @@ async fn registry_forwarding_recovers_after_election_and_refuses_lost_quorum() {
     })
     .await
     .expect("no quorum-backed registry route became available");
+    assert!(
+        matches!(forwarder.query(None, reliaburger::cluster::identity::raft_id_from_name("node"), RegistryQuery::Retirements).await.unwrap(), RegistryQueryResponse::Retirements(items) if items.is_empty())
+    );
     let survivors: Vec<usize> = (0..3).filter(|index| *index != initial).collect();
     for index in &survivors {
         network
@@ -548,7 +736,21 @@ async fn registry_forwarding_recovers_after_election_and_refuses_lost_quorum() {
         forwarder.write(None, mutation.clone()).await.is_err(),
         "isolated old leader accepted a proposal"
     );
+    assert!(
+        forwarder
+            .query(
+                None,
+                reliaburger::cluster::identity::raft_id_from_name("node"),
+                RegistryQuery::Retirements
+            )
+            .await
+            .is_err(),
+        "isolated old leader served ownership"
+    );
     directory_tx.send(view(elected)).unwrap();
+    assert!(
+        matches!(forwarder.query(None, reliaburger::cluster::identity::raft_id_from_name("node"), RegistryQuery::Retirements).await.unwrap(), RegistryQueryResponse::Retirements(items) if items.is_empty())
+    );
     assert!(matches!(
         forwarder.write(None, mutation.clone()).await.unwrap(),
         reliaburger::council::CouncilResponse::GcApproved { .. }
@@ -560,6 +762,17 @@ async fn registry_forwarding_recovers_after_election_and_refuses_lost_quorum() {
         forwarder.write(None, mutation).await.is_err(),
         "registry committed without quorum"
     );
+    assert!(
+        forwarder
+            .query(
+                None,
+                reliaburger::cluster::identity::raft_id_from_name("node"),
+                RegistryQuery::Retirements
+            )
+            .await
+            .is_err(),
+        "ownership read succeeded without quorum"
+    );
     for server in servers {
         server.abort();
         let _ = server.await;
@@ -570,37 +783,43 @@ async fn registry_forwarding_recovers_after_election_and_refuses_lost_quorum() {
 }
 
 #[tokio::test]
-async fn registry_proposals_bound_oversized_and_stalled_request_bodies() {
+async fn registry_control_routes_bound_oversized_and_stalled_request_bodies() {
     let hierarchy = ca::generate_ca_hierarchy("registry-bounds", &IKM).unwrap();
     let council = council(&hierarchy, true).await;
     let app = router(council.clone(), Some(peer(&hierarchy, 10)));
-    let request = |body| {
-        Request::post(REGISTRY_PROPOSAL_PATH)
-            .header("content-type", "application/json")
-            .header("authorization", "Bearer internal-token")
-            .body(body)
-            .unwrap()
-    };
-    let oversized = Body::from(vec![
-        b'x';
-        reliaburger::pickle::authority::MAX_REGISTRY_PROPOSAL_BYTES
-            + 1
-    ]);
-    assert_eq!(
-        app.clone()
-            .oneshot(request(oversized))
-            .await
-            .unwrap()
-            .status(),
-        StatusCode::PAYLOAD_TOO_LARGE
-    );
-    let stalled = Body::from_stream(futures_util::stream::pending::<
-        Result<axum::body::Bytes, std::io::Error>,
-    >());
-    let response = tokio::time::timeout(Duration::from_secs(12), app.oneshot(request(stalled)))
+    for (path, maximum) in [
+        (
+            REGISTRY_PROPOSAL_PATH,
+            reliaburger::pickle::authority::MAX_REGISTRY_PROPOSAL_BYTES,
+        ),
+        (REGISTRY_QUERY_PATH, 16 * 1024),
+    ] {
+        let request = |body| {
+            Request::post(path)
+                .header("content-type", "application/json")
+                .header("authorization", "Bearer internal-token")
+                .body(body)
+                .unwrap()
+        };
+        assert_eq!(
+            app.clone()
+                .oneshot(request(Body::from(vec![b'x'; maximum + 1])))
+                .await
+                .unwrap()
+                .status(),
+            StatusCode::PAYLOAD_TOO_LARGE
+        );
+        let stalled = Body::from_stream(futures_util::stream::pending::<
+            Result<axum::body::Bytes, std::io::Error>,
+        >());
+        let response = tokio::time::timeout(
+            Duration::from_secs(12),
+            app.clone().oneshot(request(stalled)),
+        )
         .await
         .unwrap()
         .unwrap();
-    assert_eq!(response.status(), StatusCode::REQUEST_TIMEOUT);
+        assert_eq!(response.status(), StatusCode::REQUEST_TIMEOUT);
+    }
     council.shutdown().await.unwrap();
 }

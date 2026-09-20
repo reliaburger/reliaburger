@@ -135,6 +135,7 @@ pub const ROUTE_MATRIX: &[Route] = &[
     // Renewal additionally requires the existing node TLS peer certificate.
     route(Post, "/v1/cluster/renew", System),
     route(Post, "/v1/registry/propose", System),
+    route(Post, "/v1/registry/query", System),
     route(Get, "/v1/capabilities", AnyToken),
     route(Get, "/v1/capabilities/cluster", AnyToken),
     route(Get, "/v1/diagnostics", AnyToken),

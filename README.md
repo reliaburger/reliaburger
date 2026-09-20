@@ -51,6 +51,8 @@ filesystem failures. Publication and garbage collection serialise their final
 blob checks and deletion. Clustered workers and followers forward writes to the
 authenticated leader; unconfirmed Raft commits return 503 for client retry;
 201 confirms catalogue acceptance, with blob replication potentially still pending.
+Internal registry ownership queries require the current leader and authenticated
+node identity; repository lease cleanup is still being integrated.
 Direct image pulls and Pickle verify pinned manifests, selected platform
 manifests and configuration bytes before accepting them into the cache.
 

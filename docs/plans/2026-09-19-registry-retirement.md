@@ -192,3 +192,19 @@ then verifies upload, HEAD inventory and digest-checked download at the exact
 nested path. All 17 replication, nine pull and 17 cluster integration cases
 pass on macOS/Linux, with strict Clippy. No format changes. Receiver-side lease
 admission and confirmation remain part of the integration work above.
+
+## Current ownership queries
+
+Registry workers can query the current leader for an active repository owner or
+for their own ready-to-retire repositories. The service bearer and actual TLS
+node certificate are both required; compatibility, revocation and node identity
+are checked against a quorum-backed security view. Cleaning alone does not
+allow metadata removal: the workload-retirement barrier must also be committed.
+The inventory never returns another node's obligations or lease credentials.
+
+Five integration cases pass on macOS/Linux (20.03s), covering TLS forwarding,
+leader replacement, refusal by an isolated old leader, lost quorum, exact-node
+inventory, revoked/foreign identities and oversized/stalled request bodies.
+Eight route-authorisation audits and strict Clippy pass on both platforms.
+This supplies discovery for the cleanup worker; HTTP lease admission and actual
+storage retirement remain open. No durable format changes.

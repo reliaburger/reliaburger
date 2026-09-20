@@ -925,6 +925,12 @@ Refusals preserve the creator's temporary bytes. All 249 Pickle and existing
 registry integration cases pass on macOS/Linux, with strict Clippy. Session
 identity is ephemeral; durable repository ownership remains open.
 
+**Registry ownership queries (20 September):** Worker discovery now requires
+service authentication, the actual TLS node identity and a quorum-backed leader
+read. Only active lease ownership and that node's workload-retired obligations
+are exposed. Five authority/TLS cases, eight route audits and strict Clippy pass
+on macOS/Linux. The physical cleanup worker and HTTP admission remain open.
+
 **Registry receipt contract (20 September):** Durable leases now retain each
 repository and every possible writer, with a separate confirmed-workload barrier.
 Conditional Raft publication fences cleaning/expired leases and unregistered

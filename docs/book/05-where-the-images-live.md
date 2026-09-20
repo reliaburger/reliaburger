@@ -1081,3 +1081,25 @@ Peer HEAD, GET and upload requests now preserve the full repository path. The
 regression serves only the exact nested path: upload used to receive 404, and
 now upload, inventory and verified download all succeed. Content-addressed blob
 storage stays shared; it doesn't excuse losing the request's repository identity.
+
+### Asking the current owner before deleting
+
+A worker knows which uploads it received. It cannot infer that the applications
+using those images have stopped. It asks the leader for its own outstanding
+repository receipts, and the leader returns them only after the committed
+workload-retirement barrier. The response includes the lease generation as well
+as the repository name; a cleanup retry must not target a later owner.
+
+`RegistryQuery` is an enum with two variants: `Lease { repository }` and
+`Retirements`. Matching the enum forces the server to handle both questions.
+The result is another enum, so a caller expecting a receipt inventory cannot
+silently reinterpret an owner lookup. A service bearer alone is insufficient:
+the TLS leaf identifies the actual node, and a quorum-backed security read
+checks revocation before answering. An isolated old leader refuses even if its
+local catalogue looks plausible.
+
+The integration test drives active, Cleaning, workload-retired and acknowledged
+states, checking the returned inventory at each step. Real TLS tests replace
+the leader and remove quorum. Request limits include a stalled body, since a
+deadline around just the handler would start too late. These queries provide
+the cleanup worker's evidence; they do not themselves remove any files.

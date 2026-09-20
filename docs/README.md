@@ -115,6 +115,8 @@ require a client retry; 201 confirms catalogue acceptance, while blob replicatio
 may still be pending. Push publication and GC deletion share a
 transaction guard, so collection cannot delete a layer between its final check
 and publication. Repository/upload lease cleanup remains open in C34.
+Internal ownership queries require a quorum-backed leader and authenticated node
+identity. Repository lease cleanup is still being integrated.
 
 Peer transfers preserve complete repository paths, including nested namespaces.
 Chunked uploads belong to the exact credential that created them. Continue and
