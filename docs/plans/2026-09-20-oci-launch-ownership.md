@@ -883,3 +883,12 @@ created runtime retains a cleanup owner before explicit retirement.
 All 275 native/287 Linux affected agent and Onion tests pass
 (17.695s/24.086s), including the preceding portable capacity fix. Strict all-target/all-feature
 Clippy and formatting pass on both platforms.
+
+
+## Discovery subscribers retain the latest value
+
+A subscriber attached after deployment received the channel's original empty
+map because `send` refused updates without readers. The regression fails first
+(0.101s). `send_replace` now retains the current snapshot unconditionally. The
+late-subscriber and two health publication/retry tests pass natively (0.049s),
+with strict Clippy/formatting. This changes no state format or kernel behaviour.

@@ -8163,9 +8163,8 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
         }
         drop(table);
 
-        // Publish the merged service-map snapshot for out-of-loop readers (DNS).
-        // send() only errs when no receiver exists, which is fine.
-        let _ = self.service_map_tx.send(merged);
+        // Retain the latest view even before the first DNS subscriber attaches.
+        self.service_map_tx.send_replace(merged);
     }
 
     /// Reconcile the perimeter firewall if cluster membership changed.
@@ -11924,6 +11923,21 @@ mod tests {
             .register_service_app("api", "default", 8080, None)
             .await;
         assert!(matches!(result, Err(BunError::BackendPublication { .. })));
+    }
+
+    #[tokio::test]
+    async fn late_discovery_subscribers_receive_the_latest_service_snapshot() {
+        let (mut agent, _commands, _shutdown) = test_agent();
+        expect_complete(&drain_deploy(&mut agent, basic_config()).await);
+        let view = agent.service_map_watch();
+        let snapshot = view.borrow();
+        let service = crate::onion::service_id::ServiceId::new("default", "web");
+        let entry = snapshot
+            .resolve(&service)
+            .expect("late subscriber lost the completed deployment");
+        assert_eq!(entry.backends.len(), 1);
+        assert_eq!(entry.backends[0].instance_id, "default__web-0");
+        assert!(entry.backends[0].healthy);
     }
 
     #[tokio::test]

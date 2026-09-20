@@ -1525,3 +1525,16 @@ a mutable reference to its endpoint; assigning through that reference replaces
 its fields in place, then returns success. Only insertion checks the capacity.
 The test verifies the updated endpoint, unchanged count, and that overflow refusal
 leaves the entire retained entry unchanged.
+
+
+### The first reader may arrive later
+
+Deploy an app before attaching a discovery subscriber. Tokio's watch `send`
+refuses the update when there are no receivers, leaving the channel's original
+empty map in place. A later subscriber therefore misses a completed deployment.
+The regression exercises exactly that ordering.
+
+Publication now uses `send_replace`, which retains the latest value whether or
+not anyone is listening. The first reader receives the current service and its
+backend immediately. The existing health-transition and retry tests also run
+against this publication path.
