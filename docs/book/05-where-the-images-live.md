@@ -1184,3 +1184,13 @@ manifest. Raft repeats the application check at apply time. The failing-first
 tests cover ordinary main/init images and jobs; the positive cases retain access
 for the same active lease, while missing repositories, another lease, expiry and
 Cleaning refuse. A hostname or digest reference cannot hide the repository name.
+
+### Shared bytes do not preserve a retired repository
+
+Two repositories can point at the same manifest bytes. Retiring one must leave
+those bytes for the other, but it must not leave the retired name usable through
+an exact digest URL. Both tag and digest reads therefore resolve the requested
+repository's metadata before opening the shared blob. The HTTP regression first
+returned 200 for the retired repository; it now returns 404 while the ordinary
+repository still returns 200. The disk read runs on a blocking worker so it cannot
+stall the asynchronous request executor.

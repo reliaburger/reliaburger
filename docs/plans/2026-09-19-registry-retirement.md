@@ -285,3 +285,8 @@ retain failed temporary-file deletion in the upload-session tracker. Supply a
 bounded authoritative per-repository catalogue read for workers without a local
 Raft catalogue. Qualify cached-copy and concurrent GC/retirement cases before
 closing this path.
+
+Manifest reads now enforce repository retirement for digest URLs as well as tags.
+The failing-first shared-content regression passes on macOS and Linux alongside
+all 261 Pickle tests, 24 registry integrations and strict Clippy. Resolving fresh
+workers' catalogue reads through current authority remains a separate open item.

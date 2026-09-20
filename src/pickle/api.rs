@@ -1353,52 +1353,31 @@ async fn manifest_put(
 ///
 /// `reference` can be a tag (e.g. `latest`) or a digest (e.g. `sha256:abc...`).
 /// Docker pulls sub-manifests by digest when resolving manifest lists.
-async fn manifest_get(state: &PickleState, _name: &str, reference: &str) -> Response {
-    // If the reference looks like a digest, try reading it directly
-    // from the blob store (Docker pulls sub-manifests by digest).
-    if let Ok(digest) = Digest::new(reference)
-        && let Ok(data) = state.store.read_blob(&digest)
-    {
-        let content_type = detect_manifest_content_type(&data);
-        let mut headers = HeaderMap::new();
-        headers.insert(
-            "content-type",
-            content_type.parse().expect("ASCII header value"),
-        );
-        headers.insert(
-            "docker-content-digest",
-            reference.parse().expect("ASCII header value"),
-        );
-        return (StatusCode::OK, headers, data).into_response();
-    }
-
-    // Try the catalogue by tag. Read the *authoritative* catalogue (the
-    // council's Raft-replicated one when clustered, local otherwise) so a
-    // manifest committed by a peer — or by a non-council push forwarded to
-    // Raft — is visible here even before a heal tick reconciles the local
-    // projection (REG2).
+async fn manifest_get(state: &PickleState, name: &str, reference: &str) -> Response {
+    // Shared blob bytes do not establish that this repository still exists.
+    // Tags and digests must both resolve through its current metadata.
     let catalog = state.catalog_snapshot().await;
-    let manifest = catalog.get_manifest_by_tag(_name, reference);
-
-    match manifest {
-        Some(m) => match state.store.read_blob(&m.digest) {
-            Ok(data) => {
-                let content_type = detect_manifest_content_type(&data);
-                let mut headers = HeaderMap::new();
-                headers.insert(
-                    "content-type",
-                    content_type.parse().expect("ASCII header value"),
-                );
-                headers.insert(
-                    "docker-content-digest",
-                    m.digest.as_str().parse().expect("ASCII header value"),
-                );
-                (StatusCode::OK, headers, data).into_response()
-            }
-            Err(_) => StatusCode::NOT_FOUND.into_response(),
-        },
-        None => StatusCode::NOT_FOUND.into_response(),
-    }
+    let manifest = match Digest::new(reference) {
+        Ok(digest) => catalog.get_repository_manifest(name, digest.as_str()),
+        Err(_) => catalog.get_manifest_by_tag(name, reference),
+    };
+    let Some(manifest) = manifest else {
+        return StatusCode::NOT_FOUND.into_response();
+    };
+    let digest = manifest.digest.clone();
+    let store = state.store.clone();
+    let read_digest = digest.clone();
+    let data = match tokio::task::spawn_blocking(move || store.read_blob(&read_digest)).await {
+        Ok(Ok(data)) => data,
+        Ok(Err(_)) => return StatusCode::NOT_FOUND.into_response(),
+        Err(_) => return StatusCode::INTERNAL_SERVER_ERROR.into_response(),
+    };
+    axum::http::Response::builder()
+        .status(StatusCode::OK)
+        .header("content-type", detect_manifest_content_type(&data))
+        .header("docker-content-digest", digest.as_str())
+        .body(axum::body::Body::from(data))
+        .unwrap_or_else(|_| StatusCode::INTERNAL_SERVER_ERROR.into_response())
 }
 
 /// Detect the correct content-type for a manifest blob.
@@ -1823,6 +1802,29 @@ mod tests {
         );
         assert!(state.store.has_blob(&config));
         assert!(state.store.has_blob(&digest));
+        let reader = router(state.clone());
+        for (repository, expected) in [
+            ("rbtest-run1/web", StatusCode::NOT_FOUND),
+            ("ordinary", StatusCode::OK),
+        ] {
+            let response = reader
+                .clone()
+                .oneshot(
+                    axum::http::Request::get(format!(
+                        "/v2/{repository}/manifests/{}",
+                        digest.as_str()
+                    ))
+                    .body(Body::empty())
+                    .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(
+                response.status(),
+                expected,
+                "digest reads must respect repository retirement"
+            );
+        }
     }
 
     #[tokio::test]
