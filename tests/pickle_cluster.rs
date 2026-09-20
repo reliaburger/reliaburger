@@ -67,6 +67,8 @@ impl Registry {
             node_raft_id,
             council: None,
             forwarder: None,
+            test_leases: Default::default(),
+            repository_writers: Default::default(),
             persist_path,
             auth: None,
             require_read_auth: false,
@@ -170,7 +172,7 @@ async fn identical_wire_pushes_keep_independent_repository_metadata() {
         .build()
         .unwrap();
     let image = reliaburger::testkit::oci::build_synthetic_image("shared");
-    for repository in ["production/app", "rbtest-copy/app"] {
+    for repository in ["production/app", "team-copy/app"] {
         reliaburger::testkit::oci::push_image(&client, &base, repository, "latest", &image)
             .await
             .unwrap();
@@ -178,7 +180,7 @@ async fn identical_wire_pushes_keep_independent_repository_metadata() {
     let mut recovered =
         ManifestCatalog::load_from(registry.state.persist_path.as_ref().unwrap()).unwrap();
     assert_eq!(recovered.manifests.len(), 2);
-    for repository in ["production/app", "rbtest-copy/app"] {
+    for repository in ["production/app", "team-copy/app"] {
         assert_eq!(
             recovered
                 .get_manifest_by_tag(repository, "latest")
@@ -188,7 +190,7 @@ async fn identical_wire_pushes_keep_independent_repository_metadata() {
         );
     }
     recovered.apply_delete_tag(&reliaburger::pickle::types::DeleteTag {
-        repository: "rbtest-copy/app".into(),
+        repository: "team-copy/app".into(),
         tag: "latest".into(),
     });
     *registry.state.catalog.write().await = recovered;
@@ -202,7 +204,7 @@ async fn identical_wire_pushes_keep_independent_repository_metadata() {
     );
     assert_eq!(
         client
-            .get(format!("{base}/v2/rbtest-copy/app/manifests/latest"))
+            .get(format!("{base}/v2/team-copy/app/manifests/latest"))
             .send()
             .await
             .unwrap()
@@ -286,6 +288,8 @@ async fn catalog_survives_restart() {
             node_raft_id: 7,
             council: None,
             forwarder: None,
+            test_leases: Default::default(),
+            repository_writers: Default::default(),
             persist_path: Some(persist_path.clone()),
             auth: None,
             require_read_auth: false,

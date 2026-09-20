@@ -3351,3 +3351,20 @@ worker must subsequently retire uploads and local metadata before acknowledging
 its receipt. Chapter 5 describes the catalogue side. These state transitions
 are prerequisites; the progress ledger separately tracks connecting every
 upload and replication caller and proving physical cleanup.
+
+### Registry cleanup needs storage evidence
+
+An HTTP response disappearing does not mean its upload disappeared. The registry
+lease tests pause registration after creating a temporary file, cancel the caller
+and require cleanup to wait for the task still holding ownership. The test then
+releases registration and checks both the empty upload directory and the confirmed
+receipt. Another test replaces the temporary file with a directory, proving a
+failed deletion retains the lease. Repairing that obstruction exposes the next
+barrier: failed catalogue persistence must also retain the receipt until retry.
+
+These are controlled interleavings around real filesystem operations, not proof
+of complete physical-crash recovery. The live multi-node and process-death gates
+remain separate. We also keep ordinary content in the registry while deleting a
+leased repository with identical blobs, and check that GC still refuses to remove
+the shared bytes. The release catalogue must next exercise these paths with its
+real runnable image and tracked peer transfers.

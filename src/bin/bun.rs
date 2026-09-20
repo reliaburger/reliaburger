@@ -2163,7 +2163,7 @@ async fn run_agent(cli: Cli) -> anyhow::Result<()> {
         config.images.trust_policy.require_signatures,
         static_capabilities,
         readiness.clone(),
-        Some(local_test_leases),
+        Some(local_test_leases.clone()),
         jwt_verifier,
     );
     let app = match capacity_admission {
@@ -2359,6 +2359,8 @@ async fn run_agent(cli: Cli) -> anyhow::Result<()> {
         node_raft_id,
         council: api_council.clone(),
         forwarder: registry_forwarder,
+        test_leases: local_test_leases.clone(),
+        repository_writers: Default::default(),
         persist_path: Some(catalog_path.clone()),
         auth: registry_auth,
         // O1: reads stay open on the loopback default (a local pull needs no
@@ -2420,6 +2422,21 @@ async fn run_agent(cli: Cli) -> anyhow::Result<()> {
             },
         ));
     }
+
+    let registry_lease_state = pickle_state.clone();
+    let registry_lease_shutdown = shutdown.clone();
+    let registry_lease_handle = reliaburger::bun::readiness::spawn_owned(
+        "registry-lease-cleanup",
+        true,
+        readiness.clone(),
+        shutdown.clone(),
+        move |ready| async move {
+            ready.ready();
+            registry_lease_state
+                .run_registry_lease_reaper(registry_lease_shutdown)
+                .await;
+        },
+    );
 
     let pickle_app = reliaburger::pickle::api::router(pickle_state.clone());
     // Describe the listener honestly (B3). A clustered listener authenticates
@@ -2752,6 +2769,7 @@ async fn run_agent(cli: Cli) -> anyhow::Result<()> {
         server_handle,
         pickle_handle,
         registry_evidence_handle,
+        registry_lease_handle,
         lease_reaper_handle
     );
 

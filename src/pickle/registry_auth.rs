@@ -364,6 +364,40 @@ impl UploadSessions {
         failures
     }
 
+    /// Fence and delete this repository's partial uploads, retaining failed cleanup.
+    /// The caller first excludes repository writers, including unpublished creation.
+    pub async fn cleanup_repository(
+        &self,
+        store: &super::store::BlobStore,
+        repository: &str,
+    ) -> Result<(), super::types::PickleError> {
+        let mut sessions = self.inner.write().await;
+        let mut uploads = Vec::new();
+        for (id, session) in sessions
+            .iter_mut()
+            .filter(|(_, session)| session.repository == repository)
+        {
+            session.state = UploadState::Retiring;
+            let permit = session.writer.clone().try_acquire_owned().map_err(|_| {
+                super::types::PickleError::ReplicationFailed(
+                    "repository still has an active upload writer".into(),
+                )
+            })?;
+            uploads.push((id.clone(), permit));
+        }
+        drop(sessions);
+        for (id, _permit) in uploads {
+            store.cancel_upload(&id).await?;
+            self.complete(&id).await;
+        }
+        Ok(())
+    }
+
+    #[cfg(test)]
+    pub(crate) async fn pause_registration(&self) -> impl Send + 'static {
+        self.inner.clone().write_owned().await
+    }
+
     /// Complete (remove) a session, returning its target repository.
     pub async fn complete(&self, upload_id: &str) -> Option<String> {
         self.inner

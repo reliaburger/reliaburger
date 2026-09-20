@@ -178,6 +178,35 @@ async fn registry_proposals_require_service_and_current_node_authority() {
         .status(),
         StatusCode::FORBIDDEN
     );
+    for mutation in [
+        RegistryMutation::ClaimWriter {
+            lease_id: "run".into(),
+            repository: "rbtest-run/web".into(),
+            node_id: 99,
+            owner_id: None,
+            observed_at_unix_ms: 1,
+        },
+        RegistryMutation::WriterRetired {
+            lease_id: "run".into(),
+            repository: "rbtest-run/web".into(),
+            node_id: 99,
+        },
+    ] {
+        let forged = RegistryProposal {
+            mutation,
+            ..proposal.clone()
+        };
+        assert_eq!(
+            propose(
+                router(council.clone(), Some(certificate.clone())),
+                &forged,
+                Some("internal-token")
+            )
+            .await
+            .status(),
+            StatusCode::FORBIDDEN
+        );
+    }
     let mut incompatible = proposal.clone();
     incompatible.compatibility.protocol += 1;
     assert_eq!(
@@ -473,6 +502,8 @@ async fn worker_and_follower_pushes_commit_through_the_advertised_leader() {
         node_raft_id: reliaburger::cluster::identity::raft_id_from_name("node"),
         council: None,
         forwarder: Some(RegistryForwarder::new(http, directory_rx)),
+        test_leases: Default::default(),
+        repository_writers: Default::default(),
         persist_path: Some(root.path().join("catalog.json")),
         auth: None,
         require_read_auth: false,
@@ -510,6 +541,129 @@ async fn worker_and_follower_pushes_commit_through_the_advertised_leader() {
                 .is_some()
         );
     }
+    // The same actual TLS route owns and retires a worker's leased repository.
+    let mut leased = state.clone();
+    let publisher = reliaburger::sesame::token::create_token(
+        "publisher",
+        reliaburger::sesame::types::ApiRole::Deployer,
+        Default::default(),
+        None,
+    )
+    .unwrap();
+    let principal = reliaburger::sesame::auth::authenticate(
+        &publisher.plaintext,
+        std::slice::from_ref(&publisher.token),
+    )
+    .unwrap();
+    let tokens = reliaburger::sesame::auth::new_token_store();
+    tokens.write().await.push(publisher.token);
+    leased.auth = Some(reliaburger::sesame::auth::AuthState::new(
+        tokens,
+        Some("internal-token".into()),
+    ));
+    leased.allow_unauthenticated_bootstrap = false;
+    let now = reliaburger::testkit::lease::now_unix_millis();
+    let lease = reliaburger::testkit::lease::TestLease::new(
+        "tls-run".into(),
+        principal.principal_id,
+        "publisher".into(),
+        "rbtest-tls-run".into(),
+        now,
+        now + 60_000,
+    )
+    .unwrap();
+    leader
+        .write(RaftRequest::TestLeaseCreate(lease))
+        .await
+        .unwrap();
+    let leased_app = reliaburger::pickle::api::router(leased.clone());
+    let push = || {
+        Request::put("/v2/rbtest-tls-run/web/manifests/latest")
+            .header("content-type", "application/vnd.oci.image.manifest.v1+json")
+            .header("authorization", format!("Bearer {}", publisher.plaintext))
+            .header("x-reliaburger-test-lease", "tls-run")
+            .body(Body::from(body.clone()))
+            .unwrap()
+    };
+    let response = leased_app.clone().oneshot(push()).await.unwrap();
+    let status = response.status();
+    let detail = axum::body::to_bytes(response.into_body(), 4096)
+        .await
+        .unwrap();
+    assert_eq!(
+        status,
+        StatusCode::CREATED,
+        "{}",
+        String::from_utf8_lossy(&detail)
+    );
+    assert!(
+        leader
+            .manifest_catalog()
+            .await
+            .get_manifest_by_tag("rbtest-tls-run/web", "latest")
+            .is_some()
+    );
+    leader
+        .write(RaftRequest::TestLeaseBeginCleanup {
+            lease_id: "tls-run".into(),
+        })
+        .await
+        .unwrap();
+    assert_eq!(
+        leased_app.oneshot(push()).await.unwrap().status(),
+        StatusCode::FORBIDDEN
+    );
+    leased.reap_registry_leases_once().await.unwrap();
+    assert!(
+        leased
+            .catalog
+            .read()
+            .await
+            .get_manifest_by_tag("rbtest-tls-run/web", "latest")
+            .is_some()
+    );
+    leader
+        .write(RaftRequest::TestLeaseWorkloadsRetired {
+            lease_id: "tls-run".into(),
+        })
+        .await
+        .unwrap();
+    assert!(matches!(
+        leader
+            .write(RaftRequest::TestLeaseFinishCleanup {
+                lease_id: "tls-run".into()
+            })
+            .await
+            .unwrap(),
+        reliaburger::council::CouncilResponse::Refused { .. }
+    ));
+    leased.reap_registry_leases_once().await.unwrap();
+    assert!(
+        leased
+            .catalog
+            .read()
+            .await
+            .get_manifest_by_tag("rbtest-tls-run/web", "latest")
+            .is_none()
+    );
+    assert!(matches!(
+        leader
+            .write(RaftRequest::TestLeaseFinishCleanup {
+                lease_id: "tls-run".into()
+            })
+            .await
+            .unwrap(),
+        reliaburger::council::CouncilResponse::Applied { .. }
+    ));
+    let catalog = leader.manifest_catalog().await;
+    assert!(
+        catalog
+            .get_manifest_by_tag("rbtest-tls-run/web", "latest")
+            .is_none()
+    );
+    assert!(catalog.get_manifest_by_tag("ordinary", "worker").is_some());
+    assert!(store.has_blob(&config));
+
     // Losing the leader's route cannot silently change a worker to standalone.
     directory_tx.send(NodeDirectory::default()).unwrap();
     let response = reliaburger::pickle::api::router(state)

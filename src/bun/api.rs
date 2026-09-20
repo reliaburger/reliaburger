@@ -4287,8 +4287,8 @@ async fn registry_proposal_handler(
     })
     .await;
     match result {
-        Ok(Ok(crate::council::CouncilResponse::Refused { reason })) => {
-            (StatusCode::CONFLICT, reason).into_response()
+        Ok(Ok(response @ crate::council::CouncilResponse::Refused { .. })) => {
+            (StatusCode::CONFLICT, Json(response)).into_response()
         }
         Ok(Ok(response)) => Json(response).into_response(),
         Ok(Err(error)) => error.into_response(),

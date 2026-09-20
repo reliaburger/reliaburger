@@ -224,3 +224,39 @@ on macOS/Linux. The generic snapshot-copy fixture now creates an ordinary
 repository and asserts that both copies existed before retirement; its old
 reserved name had silently refused the setup. HTTP admission must next persist
 these generation records before upload creation.
+
+## HTTP admission and storage-worker integration
+
+Direct OCI writes now require the exact authenticated lease owner and matching
+namespace, recording the writer receipt and local generation before temporary
+files. Internal blob replication may attach only to an already owned active
+repository; it cannot publish leased manifests. Every subsequent request checks
+admission again, and final publication is conditional on an active lease.
+Standalone publication holds the lease operation guard through persistence.
+
+The node's supervised registry reaper obtains current receipts, waits for local
+writers, removes partial uploads, persists repository metadata removal and then
+acknowledges the exact receipt. Failed cleanup retains ownership. Each repository
+has a deadline, so an unavailable writer does not starve later obligations.
+Owned upload creation covers cancellation before session registration; blocking
+blob/catalogue commits retain their repository guards after caller cancellation.
+
+The unleased-upload regression fails before implementation (202 instead of 403).
+Coverage includes exact owner/namespace refusal, cancelled creation, late commits,
+workload-retirement ordering, failed file removal, failed metadata persistence,
+shared ordinary content and actual TLS claim/publication/confirmation through the
+leader. The TLS fixture exposed a definitive lease refusal being flattened to
+503; the internal endpoint now returns a structured refusal and the worker
+preserves 403. The generic repository-copy fixture uses an ordinary namespace,
+while the new lease tests exercise the reserved namespace explicitly.
+
+Protocol advances to 10; state remains 14 and lease schema 5. P2P local writers,
+conditional healer publication, ordinary app/job image-reference admission and
+the physical multi-node qualification remain open. C34 is not complete.
+
+Qualification passes 3,411 native library tests (five explicit gates, 43.38s),
+followed by all 261 final Pickle tests and strict Clippy. The full final Linux
+library run passes 3,466 tests with 19 explicit gates. Both platforms pass the
+17 lease tests, 17 cluster/five integrity/five TLS authority/two upload/two binary
+compatibility integrations and strict all-target/all-feature Clippy. These do
+not close the separately listed P2P, workload-reference or crash qualifications.

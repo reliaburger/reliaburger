@@ -1125,3 +1125,39 @@ field. It now survives atomic persistence. Other tests cover conflicting claims,
 stale retirement, unowned legacy metadata and catalogue copies across snapshots.
 The durable-state generation advances to 14; development clusters still start
 fresh. HTTP integration must persist this record before accepting upload bytes.
+
+### Connecting the ownership record to an upload
+
+A lease owner sends `x-reliaburger-test-lease` on every request that writes under
+its `rbtest-…/` namespace. Authentication preserves the exact credential identity.
+Another deploy token with the same display name cannot use the lease. The
+receiving node first records its writer receipt in Raft (or the standalone lease
+store), then persists the local repository generation. Only then can it create
+an upload file. Internal peer uploads may discover an existing active owner;
+they cannot create a repository or publish a user's manifest.
+
+The local exclusion primitive is `RwLock<()>`. Here `()` is Rust's unit type,
+a value carrying no data: we need the lock's ownership, not a protected boolean.
+Writers hold read guards; retirement takes the exclusive write guard. Raft still
+makes the admission decision, so releasing the lock after cleanup cannot revive
+a Cleaning lease. `Arc<OwnedRwLockReadGuard<()>>` lets the request share the same
+guard with its blocking filesystem transaction. Cancelling the request drops
+one reference; it does not release the transaction's ownership.
+
+Creating a temporary file and registering its upload session also runs in an
+owned task. Otherwise cancellation between those two awaits leaves a file that
+the cleanup worker cannot find. The test pauses session registration, observes
+the newly created file, cancels the request and proves retirement still waits.
+Once registration resumes, cleanup removes the file and acknowledges the receipt.
+
+A manifest's final publication checks lease activity again. Standalone publication
+holds the lease operation guard through persistence; clustered publication uses
+the conditional Raft request. The cleanup worker queries only its own receipts,
+waits for writers, deletes partial uploads, persists metadata removal and finally
+acknowledges the exact lease/repository/node tuple. Failed deletion or persistence
+leaves that receipt pending. A blocked repository does not starve later receipts.
+The tests cover late writes, cancelled admission, both filesystem failures and
+shared blobs still referenced by an ordinary repository. A real TLS worker also
+exercises the claim, publication, workload barrier and final confirmation through
+the leader. This integrates HTTP writers; P2P pulls and workload image-reference
+admission still need the same ownership contract.

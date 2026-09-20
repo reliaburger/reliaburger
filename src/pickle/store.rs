@@ -279,7 +279,7 @@ impl BlobStore {
         upload_id: &str,
         expected_digest: &Digest,
     ) -> Result<(), PickleError> {
-        self.complete_upload_guarded(upload_id, expected_digest, None)
+        self.complete_upload_guarded(upload_id, expected_digest, None, None)
             .await
     }
 
@@ -290,6 +290,7 @@ impl BlobStore {
         upload_id: &str,
         expected_digest: &Digest,
         writer: Option<tokio::sync::OwnedSemaphorePermit>,
+        repository_writer: Option<super::lease::RepositoryReadGuard>,
     ) -> Result<(), PickleError> {
         validate_upload_id(upload_id)?;
         let upload = self.upload_path(upload_id);
@@ -298,6 +299,7 @@ impl BlobStore {
         tokio::task::spawn_blocking(move || -> Result<(), PickleError> {
             use std::io::Read as _;
             let _writer = writer;
+            let _repository_writer = repository_writer;
             let mut file = std::fs::File::open(&upload)?;
             let mut hasher = Sha256::new();
             let mut buffer = [0u8; 64 * 1024];

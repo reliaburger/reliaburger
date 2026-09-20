@@ -9,6 +9,7 @@ pub mod authority;
 pub mod build;
 pub mod capability;
 pub mod gc;
+pub mod lease;
 pub mod p2p;
 pub mod pull;
 pub mod registry_auth;

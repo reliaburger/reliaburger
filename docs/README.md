@@ -115,8 +115,10 @@ require a client retry; 201 confirms catalogue acceptance, while blob replicatio
 may still be pending. Push publication and GC deletion share a
 transaction guard, so collection cannot delete a layer between its final check
 and publication. Repository/upload lease cleanup remains open in C34.
-Internal ownership queries require a quorum-backed leader and authenticated node
-identity. Repository lease cleanup is still being integrated.
+HTTP writes under `rbtest-…/` require the exact authenticated lease owner and
+the `x-reliaburger-test-lease` header. Nodes record ownership before upload files
+and confirm partial-upload and metadata retirement only after workloads stop.
+Peer-pull ownership and workload image-reference checks remain release gates.
 
 Peer transfers preserve complete repository paths, including nested namespaces.
 Chunked uploads belong to the exact credential that created them. Continue and
@@ -145,7 +147,7 @@ development configurations. Ingress currently uses unweighted round-robin on
 Bun's shared runtime, with no separate strategy or worker-thread setting.
 
 0.1.0 requires a fresh cluster; development state is refused. Rolling upgrades
-require matching explicit formats (currently protocol 9 and state 14). See the
+require matching explicit formats (currently protocol 10 and state 14). See the
 [compatibility policy](releasing.md#cluster-compatibility).
 
 Lease-owned test volumes and generated configuration have durable provisioning

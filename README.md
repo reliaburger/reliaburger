@@ -41,7 +41,7 @@ Install and usage details are in the [documentation](docs/README.md), and
 implementation status in [progress.md](docs/progress.md).
 
 0.1.0 requires a fresh cluster; development state is refused. Rolling upgrades
-require matching explicit formats (currently protocol 9 and state 14). See the
+require matching explicit formats (currently protocol 10 and state 14). See the
 [compatibility policy](docs/releasing.md#cluster-compatibility).
 Registry uploads belong to their exact creating credential. Recovery reclaims
 abandoned partial uploads after a crash and
@@ -51,8 +51,9 @@ filesystem failures. Publication and garbage collection serialise their final
 blob checks and deletion. Clustered workers and followers forward writes to the
 authenticated leader; unconfirmed Raft commits return 503 for client retry;
 201 confirms catalogue acceptance, with blob replication potentially still pending.
-Internal registry ownership queries require the current leader and authenticated
-node identity; repository lease cleanup is still being integrated.
+HTTP writes under `rbtest-…/` require their exact authenticated lease owner.
+Registry workers confirm upload and metadata retirement after workloads stop;
+peer-pull ownership and workload image-reference checks remain release gates.
 Direct image pulls and Pickle verify pinned manifests, selected platform
 manifests and configuration bytes before accepting them into the cache.
 

@@ -925,6 +925,17 @@ Refusals preserve the creator's temporary bytes. All 249 Pickle and existing
 registry integration cases pass on macOS/Linux, with strict Clippy. Session
 identity is ephemeral; durable repository ownership remains open.
 
+**HTTP repository retirement (20 September):** OCI requests bind the exact
+credential and lease namespace, commit writer receipts before files and persist
+local ownership. Final manifest publication rechecks lease activity. A supervised
+storage reaper waits for in-flight writers, removes partial uploads, persists
+metadata retirement and acknowledges the exact receipt after workload retirement.
+Owned creation covers cancellation between file creation and session registration.
+Tests cover failed deletion/persistence, shared ordinary content, a blocked writer
+and actual TLS forwarding of the complete lifecycle. Protocol is 10, state 14 and
+lease schema 5. P2P/healer ownership, conditional holder publication, workload
+image-reference admission and physical multi-node qualification remain open.
+
 **Local repository generations (20 September):** Catalogue ownership survives
 restart independently of manifest publication. Conflicting claims, stale cleanup
 and unowned reserved metadata refuse. The failing-first reload regression, 44

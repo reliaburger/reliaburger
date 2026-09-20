@@ -567,6 +567,36 @@ impl LocalLeaseStore {
         self.inner.lock().await.leases.get(lease_id).cloned()
     }
 
+    /// Read a coherent ownership inventory, refusing uncertain persistence.
+    pub async fn snapshot(&self) -> Result<BTreeMap<String, TestLease>, LeaseError> {
+        let inner = self.inner.lock().await;
+        if inner.persistence_uncertain {
+            return Err(LeaseError::PersistenceUncertain);
+        }
+        Ok(inner.leases.clone())
+    }
+
+    /// Recheck a local publication while excluding lease cleanup until it persists.
+    pub async fn begin_registry_commit(
+        &self,
+        lease_id: &str,
+        commit: &crate::pickle::types::ManifestCommit,
+        now_unix_ms: u64,
+    ) -> Result<LocalLeaseOperation, LeaseError> {
+        let operation_guard = self.operation_lock(lease_id).await?.lock_owned().await;
+        let inner = self.inner.lock().await;
+        if inner.persistence_uncertain {
+            return Err(LeaseError::PersistenceUncertain);
+        }
+        let lease = inner.leases.get(lease_id).ok_or(LeaseError::NotFound)?;
+        if !lease.permits_registry_commit(commit, now_unix_ms) {
+            return Err(LeaseError::NotActive);
+        }
+        Ok(LocalLeaseOperation {
+            _guard: operation_guard,
+        })
+    }
+
     /// Attach an app atomically with the durable lease record.
     pub async fn attach_app(
         &self,

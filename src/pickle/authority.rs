@@ -24,6 +24,26 @@ pub enum RegistryMutation {
     Manifest(Box<ManifestCommit>),
     /// Ask to remove only the authenticated node's blob holdings.
     GarbageCollection(GcReport),
+    /// Record this storage node before accepting bytes for an active lease.
+    ClaimWriter {
+        lease_id: String,
+        repository: String,
+        node_id: u64,
+        owner_id: Option<String>,
+        observed_at_unix_ms: u64,
+    },
+    /// Publish only while the recorded lease and its writer remain active.
+    LeasedManifest {
+        lease_id: String,
+        observed_at_unix_ms: u64,
+        commit: Box<ManifestCommit>,
+    },
+    /// Confirm this node's exact repository obligation after local retirement.
+    WriterRetired {
+        lease_id: String,
+        repository: String,
+        node_id: u64,
+    },
 }
 
 impl RegistryMutation {
@@ -31,11 +51,14 @@ impl RegistryMutation {
     pub fn request_for_node(&self, node_name: &str) -> Result<RaftRequest, PickleError> {
         let id = crate::cluster::identity::raft_id_from_name(node_name);
         let valid = match self {
-            Self::Manifest(commit) => {
+            Self::Manifest(commit) | Self::LeasedManifest { commit, .. } => {
                 commit.holder_nodes == std::collections::BTreeSet::from([id])
                     && commit.manifest.pushed_by == id
             }
             Self::GarbageCollection(report) => report.node_id == id,
+            Self::ClaimWriter { node_id, .. } | Self::WriterRetired { node_id, .. } => {
+                *node_id == id
+            }
         };
         if !valid {
             return Err(PickleError::ReplicationFailed(
@@ -49,6 +72,37 @@ impl RegistryMutation {
         match self {
             Self::Manifest(commit) => RaftRequest::ManifestCommit(commit.as_ref().clone()),
             Self::GarbageCollection(report) => RaftRequest::GcReport(report.clone()),
+            Self::ClaimWriter {
+                lease_id,
+                repository,
+                node_id,
+                owner_id,
+                observed_at_unix_ms,
+            } => RaftRequest::TestLeaseRegistryWriter {
+                lease_id: lease_id.clone(),
+                repository: repository.clone(),
+                node_id: *node_id,
+                owner_id: owner_id.clone(),
+                observed_at_unix_ms: *observed_at_unix_ms,
+            },
+            Self::LeasedManifest {
+                lease_id,
+                observed_at_unix_ms,
+                commit,
+            } => RaftRequest::TestLeaseManifestCommit {
+                lease_id: lease_id.clone(),
+                observed_at_unix_ms: *observed_at_unix_ms,
+                commit: commit.clone(),
+            },
+            Self::WriterRetired {
+                lease_id,
+                repository,
+                node_id,
+            } => RaftRequest::TestLeaseRegistryRetired {
+                lease_id: lease_id.clone(),
+                repository: repository.clone(),
+                node_id: *node_id,
+            },
         }
     }
 }
@@ -276,12 +330,10 @@ impl RegistryForwarder {
             .send()
             .await
             .map_err(|error| unavailable(error.to_string()))?;
-        if response.url().as_str() != url || !response.status().is_success() {
-            return Err(unavailable(format!(
-                "registry leader refused proposal: {}",
-                response.status()
-            )));
+        if response.url().as_str() != url {
+            return Err(unavailable("registry forwarding refused a redirect"));
         }
+        let status = response.status();
         if response
             .content_length()
             .is_some_and(|size| size > MAX_REGISTRY_PROPOSAL_BYTES as u64)
@@ -302,6 +354,16 @@ impl RegistryForwarder {
                 ));
             }
             bytes.extend_from_slice(&chunk);
+        }
+        if !status.is_success() {
+            if status == reqwest::StatusCode::CONFLICT
+                && let Ok(CouncilResponse::Refused { reason }) = serde_json::from_slice(&bytes)
+            {
+                return Err(PickleError::LeaseDenied(reason));
+            }
+            return Err(unavailable(format!(
+                "registry leader refused proposal: {status}"
+            )));
         }
         serde_json::from_slice(&bytes)
             .map_err(|error| unavailable(format!("invalid registry response: {error}")))

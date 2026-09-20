@@ -299,6 +299,8 @@ async fn start_registry_with_council(
         node_raft_id: 1,
         council,
         forwarder: None,
+        test_leases: Default::default(),
+        repository_writers: Default::default(),
         persist_path: None,
         auth: None,
         require_read_auth: false,
