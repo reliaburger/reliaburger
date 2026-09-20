@@ -191,6 +191,18 @@ mod maps {
     use super::{FirewallKey, FirewallMapError, FirewallValue, LiveFirewallState};
     use aya::maps::HashMap;
 
+    fn deletion_result(result: Result<(), aya::maps::MapError>) -> Result<(), FirewallMapError> {
+        match result {
+            Ok(()) | Err(aya::maps::MapError::KeyNotFound) => Ok(()),
+            Err(aya::maps::MapError::SyscallError(error))
+                if error.io_error.kind() == std::io::ErrorKind::NotFound =>
+            {
+                Ok(())
+            }
+            Err(error) => Err(error.into()),
+        }
+    }
+
     /// Allow a single `(src_cgroup, dst_app)` cross-namespace connection.
     pub fn write_firewall_entry(
         bpf: &mut aya::Ebpf,
@@ -207,7 +219,7 @@ mod maps {
         Ok(())
     }
 
-    /// Remove a previously written firewall allow entry.
+    /// Remove an allow entry, accepting only confirmed deletion or absence.
     pub fn delete_firewall_entry(
         bpf: &mut aya::Ebpf,
         key: FirewallKey,
@@ -218,8 +230,7 @@ mod maps {
                     map_name: "firewall_map",
                 })?,
         )?;
-        let _ = map.remove(&key);
-        Ok(())
+        deletion_result(map.remove(&key))
     }
 
     /// Record which namespace a cgroup belongs to. Once this is set the
@@ -253,8 +264,7 @@ mod maps {
                     map_name: "cgroup_namespace_map",
                 })?,
         )?;
-        let _ = map.remove(&cgroup_id);
-        Ok(())
+        deletion_result(map.remove(&cgroup_id))
     }
 
     /// List every cgroup id currently recorded in `cgroup_namespace_map`

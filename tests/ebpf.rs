@@ -2751,3 +2751,77 @@ async fn agent_namespace_binding_uses_the_workload_cgroup_instead_of_its_launche
     );
     assert_eq!(launcher_namespace, None);
 }
+
+#[test]
+#[ignore = "requires Linux root and RELIABURGER_EBPF_TESTS=1"]
+fn firewall_cleanup_refuses_frozen_maps_and_preserves_their_entries() {
+    use reliaburger::onion::types::{FirewallKey, FirewallValue};
+    use reliaburger::sesame::firewall;
+    assert!(ebpf_tests_enabled());
+    let mut ebpf = OnionEbpf::load(&find_bpf_obj_dir(), CGROUP_PATH.as_ref()).unwrap();
+    let cgroup = 0xDEAD_BEEF_CAFE_6201;
+    let key = FirewallKey {
+        src_cgroup_id: cgroup,
+        dst_app_id: 37,
+        _pad: 0,
+    };
+    firewall::write_cgroup_namespace_entry(&mut ebpf.bpf, cgroup, 19).unwrap();
+    firewall::write_firewall_entry(
+        &mut ebpf.bpf,
+        key,
+        FirewallValue {
+            action: firewall::FIREWALL_ALLOW,
+        },
+    )
+    .unwrap();
+    freeze_egress_map(&ebpf, "firewall_map");
+    freeze_egress_map(&ebpf, "cgroup_namespace_map");
+    let allow_removed = firewall::delete_firewall_entry(&mut ebpf.bpf, key);
+    let namespace_removed = firewall::delete_cgroup_namespace_entry(&mut ebpf.bpf, cgroup);
+    let retained = firewall::read_firewall_state(&mut ebpf.bpf, cgroup, key.dst_app_id).unwrap();
+    ebpf.detach().unwrap();
+    assert!(allow_removed.is_err(), "accepted refused firewall removal");
+    assert!(
+        namespace_removed.is_err(),
+        "accepted refused namespace removal"
+    );
+    assert_eq!(retained.source_namespace_id, Some(19));
+    assert_eq!(retained.action, Some(firewall::FIREWALL_ALLOW));
+}
+
+#[test]
+#[ignore = "requires Linux root and RELIABURGER_EBPF_TESTS=1"]
+fn firewall_cleanup_confirms_removal_and_accepts_already_absent_entries() {
+    use reliaburger::onion::types::{FirewallKey, FirewallValue};
+    use reliaburger::sesame::firewall;
+    assert!(ebpf_tests_enabled());
+    let mut ebpf = OnionEbpf::load(&find_bpf_obj_dir(), CGROUP_PATH.as_ref()).unwrap();
+    let cgroup = 0xDEAD_BEEF_CAFE_6202;
+    let key = FirewallKey {
+        src_cgroup_id: cgroup,
+        dst_app_id: 37,
+        _pad: 0,
+    };
+    firewall::write_cgroup_namespace_entry(&mut ebpf.bpf, cgroup, 19).unwrap();
+    firewall::write_firewall_entry(
+        &mut ebpf.bpf,
+        key,
+        FirewallValue {
+            action: firewall::FIREWALL_ALLOW,
+        },
+    )
+    .unwrap();
+    for _ in 0..2 {
+        firewall::delete_firewall_entry(&mut ebpf.bpf, key).unwrap();
+        firewall::delete_cgroup_namespace_entry(&mut ebpf.bpf, cgroup).unwrap();
+        let state = firewall::read_firewall_state(&mut ebpf.bpf, cgroup, key.dst_app_id).unwrap();
+        assert_eq!(state.source_namespace_id, None);
+        assert_eq!(state.action, None);
+    }
+    assert!(
+        !firewall::list_cgroup_namespace_keys(&mut ebpf.bpf)
+            .unwrap()
+            .contains(&cgroup)
+    );
+    ebpf.detach().unwrap();
+}

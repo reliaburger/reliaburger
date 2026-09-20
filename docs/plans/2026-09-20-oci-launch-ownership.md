@@ -332,3 +332,17 @@ and blue-green deployment paths have distinct original cgroups. State 22
 refuses older rollout records that could share a predecessor's cgroup.
 The strengthened physical check also executes a command inside the successor
 after predecessor retirement. All eleven Runc cases pass again (9.91s).
+
+## Firewall deletion evidence
+
+The physical frozen-map regression reproduces false success from both namespace
+and firewall deletion helpers: they discarded the kernel's removal result.
+The helpers now accept only successful deletion or explicit key absence, and
+propagate every other error. Repeated removal of an ordinary entry remains
+idempotent. Agent bookkeeping, durable source ownership and retirement ordering
+remain open; this change does not claim that callers already preserve every
+failed discovery obligation.
+
+All 41 physical Linux kernel cases pass after the fix (9.03s), including both
+new deletion contracts. Strict all-target/all-feature Clippy and formatting
+pass on Linux and macOS.

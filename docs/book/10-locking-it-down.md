@@ -1226,3 +1226,23 @@ moved into another cgroup. A separate public-agent regression checks the real
 kernel namespace map. Pre-start namespace binding, complete discovery ownership
 and positive removal remain their own integration boundary; a correct identity
 lookup alone doesn't close those gaps.
+
+### A refused deletion is still an obligation
+
+Freeze a kernel firewall map, then ask Bun's map helper to delete an entry. The
+kernel refuses the operation, but our helper used to return `Ok(())` anyway.
+`let _ = map.remove(&key)` explicitly discards the `Result`. Rust allows that;
+the compiler can't decide whether ignoring an error fits our cleanup contract.
+Here it didn't.
+
+Firewall and namespace deletion now match the result. Successful deletion and
+an explicit missing-key response both establish absence. Permission errors,
+frozen maps and other failures return to the caller. The physical regression
+freezes both maps, attempts removal and checks that the original entries remain
+readable. Another check removes ordinary entries twice, proving that retries
+accept confirmed absence.
+
+This fixes the map helpers' evidence. Agent reconciliation must also retain
+failed obligations, and durable recovery must preserve original source owners.
+Those are separate steps. A helper returning an error isn't enough if its
+caller throws that error away.
