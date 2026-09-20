@@ -1332,3 +1332,20 @@ strength of an unacknowledged replacement.
 This orders one live publication boundary. It does not persist attempted routing
 across Bun death or prove remote consumers withdrew an old endpoint. The durable
 discovery journal and remote acknowledgement work must cover those boundaries.
+
+
+### Refuse before the first launch too
+
+The same rule applies before a fresh deployment. Previously, initial service
+registration printed a kernel error and replied with unit success. The worker
+continued to create and start the workload; only its final backend publication
+reported failure. The stronger frozen-map test observes that unexpected Running
+process and its adoption record.
+
+Registration now returns `Result<(), BunError>` through the channel, including
+when the agent loop closes. The worker stops before its create/start loop on
+failure. Logical allocations remain owned while their cleanup is uncertain;
+there is no runtime to adopt. The restart driver requires a previous restart
+count, so it cannot turn this untouched fresh Pending instance into a delayed
+launch. This checked boundary is also where future journal-write failures must
+prevent publication and execution.

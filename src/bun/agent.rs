@@ -617,7 +617,7 @@ enum DeployOp {
         namespace: String,
         port: u16,
         firewall: Option<Vec<String>>,
-        reply: oneshot::Sender<()>,
+        reply: oneshot::Sender<Result<(), BunError>>,
     },
     /// Store an app's ingress config for the routing table.
     StoreIngress {
@@ -940,7 +940,7 @@ impl DeployOps {
         namespace: &str,
         port: u16,
         firewall: Option<Vec<String>>,
-    ) {
+    ) -> Result<(), BunError> {
         self.call(
             |reply| DeployOp::RegisterServiceApp {
                 app_name: app_name.to_string(),
@@ -949,7 +949,10 @@ impl DeployOps {
                 firewall,
                 reply,
             },
-            (),
+            Err(BunError::BackendPublication {
+                service: crate::onion::service_id::ServiceId::new(namespace, app_name),
+                reason: "agent loop closed before service registration".into(),
+            }),
         )
         .await
     }
@@ -9522,10 +9525,19 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
                 reply,
             } => {
                 let service_id = crate::onion::service_id::ServiceId::new(&namespace, &app_name);
-                let _ = self.service_map.register(&service_id, port, firewall);
-                self.sync_backend_ebpf(&service_id).await;
-                self.sync_firewall_ebpf().await;
-                let _ = reply.send(());
+                let result = async {
+                    self.service_map
+                        .register(&service_id, port, firewall)
+                        .map_err(|error| BunError::BackendPublication {
+                            service: service_id.clone(),
+                            reason: error.to_string(),
+                        })?;
+                    self.publish_backend_ebpf(&service_id).await?;
+                    self.sync_firewall_ebpf().await;
+                    Ok(())
+                }
+                .await;
+                let _ = reply.send(result);
             }
             DeployOp::StoreIngress {
                 app_name,
@@ -10077,9 +10089,18 @@ impl<G: Grill + Clone + 'static> DeployWorker<G> {
                         Some(f.allow_from.clone())
                     }
                 });
-                self.ops
+                if let Err(error) = self
+                    .ops
                     .register_service_app(app_name, namespace, port, firewall)
-                    .await;
+                    .await
+                {
+                    let _ = events
+                        .send(ApplyEvent::Error {
+                            message: error.to_string(),
+                        })
+                        .await;
+                    return;
+                }
             }
 
             if let Some(ref ingress) = spec.ingress {
@@ -11882,6 +11903,16 @@ mod tests {
     fn test_agent() -> (TestAgent, mpsc::Sender<AgentCommand>, CancellationToken) {
         let (agent, tx, shutdown, _grill) = test_agent_with_grill();
         (agent, tx, shutdown)
+    }
+
+    #[tokio::test]
+    async fn service_registration_refuses_a_closed_agent_channel() {
+        let (tx, rx) = mpsc::channel(1);
+        drop(rx);
+        let result = DeployOps { tx }
+            .register_service_app("api", "default", 8080, None)
+            .await;
+        assert!(matches!(result, Err(BunError::BackendPublication { .. })));
     }
 
     #[tokio::test]

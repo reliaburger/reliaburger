@@ -4134,7 +4134,9 @@ async fn check_backend_retirement(strategy: Option<&str>, freeze: bool) {
 #[ignore = "requires Linux root and RELIABURGER_EBPF_TESTS=1"]
 async fn refused_backend_publication_cannot_report_a_completed_deployment() {
     use reliaburger::bun::agent::{AgentCommand, ApplyEvent, BunAgent};
-    use reliaburger::grill::{port::PortAllocator, process::ProcessGrill};
+    use reliaburger::grill::{
+        Grill, GrillError, InstanceId, port::PortAllocator, process::ProcessGrill,
+    };
     use std::sync::Arc;
     use tokio::sync::{Mutex, mpsc};
     assert!(ebpf_tests_enabled());
@@ -4145,8 +4147,9 @@ async fn refused_backend_publication_cannot_report_a_completed_deployment() {
     freeze_egress_map(&*ebpf.lock().await, "backend_map");
     let (commands, receiver) = mpsc::channel(64);
     let shutdown = CancellationToken::new();
+    let runtime = ProcessGrill::new();
     let mut agent = BunAgent::new(
-        ProcessGrill::new(),
+        runtime.clone(),
         PortAllocator::new(43800, 43900),
         receiver,
         shutdown.clone(),
@@ -4182,6 +4185,9 @@ async fn refused_backend_publication_cannot_report_a_completed_deployment() {
     let backend = BpfServiceMap::new()
         .read_backends(&mut *ebpf.lock().await, vip, 8080)
         .unwrap();
+    let runtime_state = runtime
+        .state(&InstanceId("default__publication-refusal-0".into()))
+        .await;
     shutdown.cancel();
     task.await.unwrap();
     ebpf.lock().await.detach().unwrap();
@@ -4190,7 +4196,10 @@ async fn refused_backend_publication_cannot_report_a_completed_deployment() {
         backend.is_none(),
         "injected backend refusal was ineffective"
     );
-    assert!(record, "failed publication lost runtime ownership");
+    assert!(
+        !record && matches!(runtime_state, Err(GrillError::NotFound { .. })),
+        "initial publication refusal still launched a workload: record={record}, state={runtime_state:?}"
+    );
     assert!(
         !completed && failed,
         "deployment completed without a published kernel backend"

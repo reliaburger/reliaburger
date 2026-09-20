@@ -822,3 +822,22 @@ cancelled. Two stalled-storage contracts fail with inline writes, then all ten
 checkpoint tests pass on macOS/Linux (0.295s/0.162s), with strict all-target/
 all-feature Clippy and formatting. These methods are ready for Bun integration;
 they do not select journal recovery in production.
+
+
+## Initial service registration is a launch gate
+
+The stronger frozen-map regression first observes a Running process and adoption
+record after the initial service publication already failed (0.27s). The
+`RegisterServiceApp` reply now carries registration/publication errors; the fresh
+worker returns before create/start. Logical/service allocations remain owned if
+cleanup is uncertain. The restart driver requires an existing restart count and
+cannot launch these untouched fresh Pending instances. The physical regression
+passes (5.25s), all 218 affected library tests pass on macOS/Linux
+(17.688s/24.119s), and strict Clippy/formatting pass on both.
+
+Remaining publication work includes health changes (retry failed kernel updates
+before restart and publish the resulting userspace view), checked backend insertion
+at fresh/final rollout bookkeeping, and complete durable journal integration at
+kernel, userspace and destination-grant boundaries. Preserve original allocations
+and runtime references before attempted writes. These gates do not establish
+remote acknowledgements or draining of captured ingress requests.
