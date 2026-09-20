@@ -12,6 +12,7 @@ pub mod capabilities;
 pub mod deploy_operations;
 pub mod diagnostics;
 pub mod disk_pressure;
+mod egress_owners;
 pub mod events;
 pub mod gpu;
 pub mod health;

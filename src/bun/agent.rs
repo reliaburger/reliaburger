@@ -1463,18 +1463,9 @@ pub struct PartitionBlocklists {
     pub node_gate: crate::smoker::node_fault::NodeTransportGate,
 }
 
-/// Egress enforcement bound to a running instance's cgroup (L16).
 #[cfg(all(feature = "ebpf", target_os = "linux"))]
-#[derive(Clone)]
-struct EgressBinding {
-    /// The instance's cgroup id (key into the egress maps).
-    cgroup_id: u64,
-    /// The raw `[egress] allow` list, re-resolved periodically.
-    allow: Vec<String>,
-    /// The destinations currently programmed into the egress maps
-    /// (exact v4/v6 and CIDR).
-    resolved: Vec<crate::sesame::egress::EgressDestination>,
-}
+use super::egress_owners::{EgressBinding, PolicyPhase};
+mod egress_ownership;
 
 /// An immutable, owned connectivity trace that can run outside the agent
 /// command loop. Workload probes have explicit timeouts, but even a bounded
@@ -1529,6 +1520,9 @@ pub struct BunAgent<G: Grill> {
     /// DNS changes (L16).
     #[cfg(all(feature = "ebpf", target_os = "linux"))]
     egress_bindings: std::collections::HashMap<InstanceId, EgressBinding>,
+    /// Block policy mutations until restart resolves an uncertain checkpoint write.
+    #[cfg(all(feature = "ebpf", target_os = "linux"))]
+    egress_store_uncertain: bool,
     /// Workloads fenced by the current live-enforcement incident. Kept after
     /// stop so the next capability report records what happened; cleared only
     /// after every required hook and pre-start guarantee recovers.
@@ -1702,6 +1696,8 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
             #[cfg(all(feature = "ebpf", target_os = "linux"))]
             egress_bindings: std::collections::HashMap::new(),
             #[cfg(all(feature = "ebpf", target_os = "linux"))]
+            egress_store_uncertain: false,
+            #[cfg(all(feature = "ebpf", target_os = "linux"))]
             egress_affected_workloads: std::collections::BTreeSet::new(),
             #[cfg(all(feature = "ebpf", target_os = "linux"))]
             egress_reresolve_ticks: 0,
@@ -1791,6 +1787,8 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
             onion_ebpf: None,
             #[cfg(all(feature = "ebpf", target_os = "linux"))]
             egress_bindings: std::collections::HashMap::new(),
+            #[cfg(all(feature = "ebpf", target_os = "linux"))]
+            egress_store_uncertain: false,
             #[cfg(all(feature = "ebpf", target_os = "linux"))]
             egress_affected_workloads: std::collections::BTreeSet::new(),
             #[cfg(all(feature = "ebpf", target_os = "linux"))]
@@ -2906,6 +2904,8 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
         self.job_store_uncertain = false;
         let mut recovered_jobs = jobs;
         let launch_inventory = self.supervisor.grill().launch_inventory().await?;
+        self.restore_egress_owners(&records, launch_inventory.as_deref())
+            .await?;
         if let Some(launches) = &launch_inventory {
             self.reconcile_runtime_launches(&records, &mut recovered_jobs, launches)
                 .await?;
@@ -2954,18 +2954,15 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
                     // only record that let this runtime prove absence.
                     self.commit_jobs(recovered_jobs.clone()).await?;
                 }
-                let records_dir = dir.clone();
-                let identity_dir = self.instance_identity_dir(&runtime_id);
-                // Keep the record if identity retirement fails, so the next
-                // startup retries instead of forgetting incomplete cleanup.
-                tokio::task::spawn_blocking(move || {
-                    crate::sesame::identity::cleanup_identity_dir(&identity_dir)?;
-                    crate::grill::records::remove_record(&records_dir, &record.instance_id)
-                })
-                .await
-                .map_err(|error| BunError::AdoptionState(error.to_string()))?
-                .map_err(|error| BunError::AdoptionState(error.to_string()))?;
+                self.retire_instance_artifacts(&runtime_id).await?;
                 continue;
+            }
+
+            if let Err(error) = self.restore_live_egress(&runtime_id, &record).await {
+                // Adoption has proved this is our surviving runtime. Do not
+                // publish it as Running without confirmed policy ownership.
+                kill_runtime_instance(self.supervisor.grill(), &runtime_id).await?;
+                return Err(error);
             }
 
             let recorded_job = recovered_jobs.get(&runtime_id.0);
@@ -3368,7 +3365,9 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
         let enforced = self
             .egress_bindings
             .iter()
-            .filter(|(_, binding)| enforced_cgroups.contains(&binding.cgroup_id))
+            .filter(|(_, binding)| {
+                binding.phase == PolicyPhase::Owned && enforced_cgroups.contains(&binding.cgroup_id)
+            })
             .map(|(instance_id, _)| instance_id.clone())
             .collect();
         (capabilities, enforced)
@@ -6236,151 +6235,63 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
         spec: &AppSpec,
         cgroup_id: u64,
     ) -> Result<(), BunError> {
-        use crate::sesame::egress;
-
-        let Some(handle) = self.onion_ebpf.clone() else {
-            return Err(BunError::DeployFailed {
-                app_name: app_name.to_string(),
-                reason: "eBPF disappeared before pre-start egress programming".to_string(),
-            });
-        };
-        let Some(egress_spec) = spec.egress.as_ref().filter(|e| !e.allow.is_empty()) else {
+        let Some(policy) = spec
+            .egress
+            .as_ref()
+            .filter(|policy| !policy.allow.is_empty())
+        else {
             return Ok(());
         };
-
-        // A previous life of this instance (crash restart) programmed a
-        // different cgroup id — the directory was recreated. Scrub it.
         self.clear_egress(instance_id).await?;
-
-        let allow = egress_spec.allow.clone();
-        let allow_for_resolve = allow.clone();
-        let resolved = match tokio::task::spawn_blocking(move || {
-            egress::resolve_egress_entries(&allow_for_resolve)
-        })
-        .await
-        {
-            Ok(Ok(entries)) => entries,
-            Ok(Err(e)) => {
-                eprintln!(
-                    "sesame: egress resolution failed for {}; starting deny-all: {e}",
-                    instance_id.0
-                );
-                return self
-                    .deny_all_pre_start(&handle, instance_id, app_name, cgroup_id, allow)
-                    .await;
+        let resolved = Self::resolve_owned_egress(&policy.allow).await;
+        let union: Vec<_> = self
+            .egress_bindings
+            .values()
+            .filter(|binding| binding.phase == PolicyPhase::Owned && binding.cgroup_id == cgroup_id)
+            .flat_map(|binding| binding.resolved.iter().copied())
+            .chain(resolved.iter().copied())
+            .collect();
+        crate::sesame::egress::merge_cidr_ports(&union).map_err(|error| {
+            BunError::DeployFailed {
+                app_name: app_name.into(),
+                reason: error.to_string(),
             }
-            Err(_) => {
-                return self
-                    .deny_all_pre_start(&handle, instance_id, app_name, cgroup_id, allow)
-                    .await;
-            }
-        };
-
-        // Representation errors (too many ports on one CIDR) are permanent
-        // config problems, not transient failures: fail the deploy.
-        let merged = match egress::merge_cidr_ports(&resolved) {
-            Ok(merged) => merged,
-            Err(e) => {
-                return Err(BunError::DeployFailed {
-                    app_name: app_name.to_string(),
-                    reason: format!(
-                        "egress allowlist for {} cannot be programmed: {e}",
-                        instance_id.0
-                    ),
-                });
-            }
-        };
-
-        let mut ebpf = handle.lock().await;
-        // Cgroup ids are kernel inode numbers and can be recycled. Scrub every
-        // old exact/CIDR entry before enabling this instance, otherwise a
-        // stale allow from an unclean predecessor could survive into the new
-        // policy (or into a DNS-failure deny-all start).
-        if let Err(e) = egress::delete_cgroup_egress_state(&mut ebpf.bpf, cgroup_id) {
-            return Err(BunError::DeployFailed {
-                app_name: app_name.to_string(),
-                reason: format!(
-                    "could not scrub recycled cgroup state for {}: {e}",
-                    instance_id.0
-                ),
-            });
-        }
-        if let Err(e) = egress::set_egress_enforced(&mut ebpf.bpf, cgroup_id) {
-            return Err(BunError::DeployFailed {
-                app_name: app_name.to_string(),
-                reason: format!(
-                    "could not enable egress enforcement for {}: {e}",
-                    instance_id.0
-                ),
-            });
-        }
-        if let Err(e) =
-            egress::write_egress_destinations(&mut ebpf.bpf, cgroup_id, &resolved, &merged)
-        {
-            // Fail the deploy and leave nothing half-programmed behind.
-            let _ = egress::delete_cgroup_egress_state(&mut ebpf.bpf, cgroup_id);
-            return Err(BunError::DeployFailed {
-                app_name: app_name.to_string(),
-                reason: format!("egress map programming failed for {}: {e}", instance_id.0),
-            });
-        }
-        drop(ebpf);
-
+        })?;
+        let original_spec = self
+            .supervisor
+            .get_instance(instance_id)
+            .and_then(|instance| instance.oci_spec.clone())
+            .ok_or_else(|| {
+                BunError::AdoptionState(format!(
+                    "egress owner {instance_id} has no original runtime input"
+                ))
+            })?;
+        let boot_id = tokio::task::spawn_blocking(super::egress_owners::boot_id)
+            .await
+            .map_err(|error| BunError::AdoptionState(error.to_string()))?
+            .map_err(|error| BunError::AdoptionState(error.to_string()))?;
         self.egress_bindings.insert(
             instance_id.clone(),
             EgressBinding {
+                phase: PolicyPhase::Owned,
                 cgroup_id,
-                allow,
+                allow: policy.allow.clone(),
                 resolved,
+                original_spec,
+                runtime: self.supervisor.grill().runtime_kind(),
+                boot_id,
             },
         );
-        Ok(())
-    }
-
-    /// Pre-start deny-all: enforcement on, no allow entries. Unlike the
-    /// post-start variant, a failure here fails the deploy — the process
-    /// has not started yet, so refusing is still possible.
-    #[cfg(all(feature = "ebpf", target_os = "linux"))]
-    async fn deny_all_pre_start(
-        &mut self,
-        handle: &std::sync::Arc<tokio::sync::Mutex<crate::onion::ebpf::loader::OnionEbpf>>,
-        instance_id: &InstanceId,
-        app_name: &str,
-        cgroup_id: u64,
-        allow: Vec<String>,
-    ) -> Result<(), BunError> {
-        {
-            let mut ebpf = handle.lock().await;
-            if let Err(e) =
-                crate::sesame::egress::delete_cgroup_egress_state(&mut ebpf.bpf, cgroup_id)
-            {
-                return Err(BunError::DeployFailed {
-                    app_name: app_name.to_string(),
-                    reason: format!(
-                        "could not scrub recycled cgroup state for {}: {e}",
-                        instance_id.0
-                    ),
-                });
-            }
-            if let Err(e) = crate::sesame::egress::set_egress_enforced(&mut ebpf.bpf, cgroup_id) {
-                return Err(BunError::DeployFailed {
-                    app_name: app_name.to_string(),
-                    reason: format!(
-                        "could not enable egress enforcement for {}: {e}",
-                        instance_id.0
-                    ),
-                });
-            }
-        }
-        self.egress_bindings.insert(
-            instance_id.clone(),
-            EgressBinding {
-                cgroup_id,
-                allow,
-                resolved: Vec::new(),
-            },
-        );
-        Ok(())
+        self.persist_egress_owners(self.egress_bindings.clone())
+            .await?;
+        // Keep the enable flag while rebuilding. During a rollout the old and
+        // new instances may share a cgroup, so removing it would open a gap.
+        self.reprogram_cgroup_egress(cgroup_id, None)
+            .await
+            .map_err(|error| BunError::DeployFailed {
+                app_name: app_name.into(),
+                reason: format!("egress map programming failed for {instance_id}: {error}"),
+            })
     }
 
     /// Lift egress enforcement for a stopped instance's cgroup (L16).
@@ -6393,16 +6304,39 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
     /// co-tenant's policy.
     #[cfg(all(feature = "ebpf", target_os = "linux"))]
     async fn clear_egress(&mut self, instance_id: &InstanceId) -> Result<(), BunError> {
-        let Some(binding) = self.egress_bindings.get(instance_id) else {
+        if self.egress_store_uncertain {
+            return Err(BunError::AdoptionState(
+                "egress ownership persistence is uncertain; restart to recover the checkpoint"
+                    .into(),
+            ));
+        }
+        let Some(binding) = self.egress_bindings.get(instance_id).cloned() else {
             return Ok(());
         };
-        self.reprogram_cgroup_egress(binding.cgroup_id, Some(instance_id))
+        if binding.phase == PolicyPhase::Retired {
+            return Ok(());
+        }
+        let boot_id = tokio::task::spawn_blocking(super::egress_owners::boot_id)
             .await
-            .map_err(|error| BunError::RetirementState {
-                instance_id: instance_id.clone(),
-                reason: error.to_string(),
-            })?;
-        self.egress_bindings.remove(instance_id);
+            .map_err(|error| BunError::AdoptionState(error.to_string()))?
+            .map_err(|error| BunError::AdoptionState(error.to_string()))?;
+        if binding.boot_id == boot_id {
+            self.reprogram_cgroup_egress(binding.cgroup_id, Some(instance_id))
+                .await
+                .map_err(|error| BunError::RetirementState {
+                    instance_id: instance_id.clone(),
+                    reason: error.to_string(),
+                })?;
+        }
+        // The caller has retired the previous workload. A different boot proves the
+        // old kernel maps are gone; never delete a recycled current-boot key.
+        let mut confirmed = binding;
+        confirmed.phase = PolicyPhase::Retired;
+        confirmed.resolved.clear();
+        let mut owners = self.egress_bindings.clone();
+        owners.insert(instance_id.clone(), confirmed.clone());
+        self.persist_egress_owners(owners).await?;
+        self.egress_bindings.insert(instance_id.clone(), confirmed);
         Ok(())
     }
 
@@ -6421,6 +6355,9 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
         excluding: Option<&InstanceId>,
     ) -> Result<(), crate::sesame::egress::EgressMapError> {
         use crate::sesame::egress;
+        if self.egress_store_uncertain {
+            return Err(egress::EgressMapError::Unavailable);
+        }
         let handle = self
             .onion_ebpf
             .clone()
@@ -6428,7 +6365,11 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
         let survivors: Vec<_> = self
             .egress_bindings
             .iter()
-            .filter(|(id, binding)| Some(*id) != excluding && binding.cgroup_id == cgroup_id)
+            .filter(|(id, binding)| {
+                binding.phase == PolicyPhase::Owned
+                    && Some(*id) != excluding
+                    && binding.cgroup_id == cgroup_id
+            })
             .map(|(_, binding)| binding)
             .collect();
         let mut ebpf = handle.lock().await;
@@ -6458,7 +6399,9 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
         let affected = self
             .egress_bindings
             .iter()
-            .filter(|(_, binding)| binding.cgroup_id == cgroup_id)
+            .filter(|(_, binding)| {
+                binding.phase == PolicyPhase::Owned && binding.cgroup_id == cgroup_id
+            })
             .map(|(id, _)| id.clone())
             .collect();
         self.stop_instances_after_egress_loss(affected).await;
@@ -6494,7 +6437,11 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
                         | ContainerState::Failed
                 )
             })
-            .filter(|instance| !self.egress_bindings.contains_key(&instance.id))
+            .filter(|instance| {
+                self.egress_bindings
+                    .get(&instance.id)
+                    .is_none_or(|binding| binding.phase != PolicyPhase::Owned)
+            })
             .filter(|instance| {
                 self.deployed_specs
                     .get(&(instance.app_name.clone(), instance.namespace.clone()))
@@ -6507,14 +6454,22 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
             .collect();
         let Some(handle) = self.onion_ebpf.clone() else {
             self.supervisor.set_egress_capability(Default::default());
-            let mut affected: std::collections::HashSet<InstanceId> =
-                self.egress_bindings.keys().cloned().collect();
+            let mut affected: std::collections::HashSet<InstanceId> = self
+                .egress_bindings
+                .iter()
+                .filter(|(_, binding)| binding.phase == PolicyPhase::Owned)
+                .map(|(id, _)| id.clone())
+                .collect();
             affected.extend(unbound);
             self.stop_instances_after_egress_loss(affected).await;
             return Default::default();
         };
-        let expected: std::collections::HashSet<u64> =
-            self.egress_bindings.values().map(|b| b.cgroup_id).collect();
+        let expected: std::collections::HashSet<u64> = self
+            .egress_bindings
+            .values()
+            .filter(|binding| binding.phase == PolicyPhase::Owned)
+            .map(|b| b.cgroup_id)
+            .collect();
         let (capability, kernel_enforced) = {
             let mut ebpf = handle.lock().await;
             let capability = egress::EgressEnforcementCapability {
@@ -6559,7 +6514,9 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
         let mut affected_ids: std::collections::HashSet<InstanceId> = self
             .egress_bindings
             .iter()
-            .filter(|(_, binding)| fence.contains(&binding.cgroup_id))
+            .filter(|(_, binding)| {
+                binding.phase == PolicyPhase::Owned && fence.contains(&binding.cgroup_id)
+            })
             .map(|(id, _)| id.clone())
             .collect();
         affected_ids.extend(unbound);
@@ -6611,6 +6568,9 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
     /// enforces egress.
     #[cfg(all(feature = "ebpf", target_os = "linux"))]
     async fn reresolve_egress(&mut self) {
+        if self.egress_store_uncertain {
+            return;
+        }
         // ~5 minutes at the 1s event-loop tick.
         const RERESOLVE_EVERY_TICKS: u32 = 300;
         self.egress_reresolve_ticks += 1;
@@ -6626,6 +6586,7 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
         let bindings: Vec<(InstanceId, EgressBinding)> = self
             .egress_bindings
             .iter()
+            .filter(|(_, binding)| binding.phase == PolicyPhase::Owned)
             .map(|(k, v)| (k.clone(), v.clone()))
             .collect();
 
@@ -6674,7 +6635,10 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
     async fn sweep_kernel_networking(&mut self) {
         use crate::sesame::egress;
 
-        if self.ebpf_sweep_interval_secs == 0 || self.onion_ebpf.is_none() {
+        if self.egress_store_uncertain
+            || self.ebpf_sweep_interval_secs == 0
+            || self.onion_ebpf.is_none()
+        {
             return;
         }
         self.ebpf_sweep_ticks += 1;
@@ -6703,7 +6667,11 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
                         | crate::grill::state::ContainerState::Failed
                 )
             })
-            .filter(|i| !self.egress_bindings.contains_key(&i.id))
+            .filter(|i| {
+                self.egress_bindings
+                    .get(&i.id)
+                    .is_none_or(|binding| binding.phase != PolicyPhase::Owned)
+            })
             .filter_map(|i| {
                 self.deployed_specs
                     .get(&(i.app_name.clone(), i.namespace.clone()))
@@ -6720,8 +6688,12 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
         self.stop_instances_after_egress_loss(missing).await;
 
         // 2. Kernel truth vs expected cgroups.
-        let expected: std::collections::HashSet<u64> =
-            self.egress_bindings.values().map(|b| b.cgroup_id).collect();
+        let expected: std::collections::HashSet<u64> = self
+            .egress_bindings
+            .values()
+            .filter(|binding| binding.phase == PolicyPhase::Owned)
+            .map(|b| b.cgroup_id)
+            .collect();
         let (kernel_enforced, kernel_entries) = {
             let mut ebpf = handle.lock().await;
             let enforced = match egress::list_enforced_cgroups(&mut ebpf.bpf) {
@@ -7923,6 +7895,7 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
             instance_id: instance_id.clone(),
             reason: error.to_string(),
         })?;
+        self.forget_retired_egress_owner(instance_id).await?;
         if let Some(instance) = self.supervisor.get_instance_mut(instance_id) {
             instance.identity = None;
             instance.identity_mount = None;

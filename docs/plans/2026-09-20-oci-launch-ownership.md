@@ -195,10 +195,10 @@ Complete this before production OCI selection:
 - [ ] Reconcile retained egress, namespace and service maps against original
   runtime intent and adoption records before serving recovered workloads. Do not
   erase policy merely because the new Bun has not rebuilt its in-memory bindings.
-  The current adoption path restores supervisor records without egress bindings;
-  its later live check would stop these workloads and its sweep can scrub their
-  retained policy. Persist policy ownership before programming and restore it
-  before adoption, including launches with no adoption record.
+  Egress ownership now precedes map programming and is restored before adoption;
+  original runtime intent also identifies policy created before its final record.
+  Namespace/service reconciliation and verified container source identity remain
+  open, followed by actual Bun/upgrade qualification.
 - [x] Qualify actual loader SIGKILL and retained-map recovery. The previously
   failing isolated-cgroup probe now remains denied during absence and after
   recovery, then connects only after explicit policy removal. All 32 physical
@@ -218,3 +218,33 @@ Complete this before production OCI selection:
 The frozen-map repair is complete and remains separate: it proves live cleanup
 propagates kernel failures and retains its owner. It does not prove kernel policy
 survives process death. Apple daemon-command recovery also remains open.
+
+
+## Agent policy ownership follow-up
+
+The public agent regression reproduced a second part of the same boundary:
+deployment had no durable policy checkpoint, and adoption restored the workload
+without its egress binding. The next live check stopped it. The repair persists
+original policy ownership before map writes and validates it against runtime
+intent and adoption records. A retired marker survives the interval between
+confirmed kernel cleanup and final metadata removal. Missing ownership refuses
+even when the runtime reports absence. Uncertain writes block later kernel
+rewrites until restart reloads durable authority. All 38 physical kernel tests
+pass (8.83s), including checkpoint-write refusal, missing ownership/enforcement,
+interrupted metadata cleanup and repeated frozen-map recovery. Four portable
+checkpoint contracts and 206 affected tests pass on each platform, with strict
+Clippy on Linux and macOS. Actual Bun/upgrade and production selection remain open.
+
+Source identity also needs the same evidence. Several firewall and trace paths
+resolve the cgroup of `Grill::pid()`, while Runc deliberately reports its owned
+launcher PID for adoption and signalling. Audit those consumers against the
+original container cgroup before production selection; a launcher PID is not the
+container's network identity.
+
+
+Application restart also needs explicit generation ordering. The current retry
+path retires old adoption artifacts before `create` for jobs, but not ordinary
+applications. Add a failing crash-boundary test and move application artifact
+retirement ahead of successor creation; otherwise a new runtime generation can
+coexist with its predecessor's adoption and policy records until post-start
+publication. Keep this a separate fix and qualify the real process/Runc paths.

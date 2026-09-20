@@ -2359,3 +2359,357 @@ fn persistent_policy_refuses_wrong_map_layout_and_foreign_map_identity() {
         assert_eq!(std::fs::read_dir(&owned.pin).unwrap().count(), 0);
     }
 }
+
+#[tokio::test]
+#[ignore = "requires Linux root and RELIABURGER_EBPF_TESTS=1"]
+async fn agent_adoption_restores_durable_egress_ownership_before_live_checks() {
+    use reliaburger::bun::agent::{AgentCommand, ApplyEvent, BunAgent};
+    use reliaburger::config::Config;
+    use reliaburger::grill::{InstanceId, mock::MockGrill, port::PortAllocator};
+    use std::sync::Arc;
+    use tokio::sync::{Mutex, mpsc, oneshot};
+    assert!(ebpf_tests_enabled());
+    let root = tempfile::tempdir().unwrap();
+    let records = root.path().join("records");
+    std::fs::create_dir(&records).unwrap();
+    let ebpf = Arc::new(Mutex::new(
+        OnionEbpf::load_embedded(CGROUP_PATH.as_ref()).unwrap(),
+    ));
+    let grill = MockGrill::new();
+    grill.set_honours_cgroup_path(true);
+    grill.set_pid(std::process::id());
+    let (commands, receiver) = mpsc::channel(64);
+    let mut agent = BunAgent::new(
+        grill.clone(),
+        PortAllocator::new(43400, 43500),
+        receiver,
+        CancellationToken::new(),
+    );
+    agent.set_records_dir(records.clone());
+    agent.set_volumes_dir(root.path().join("volumes"));
+    agent.set_onion_ebpf(Arc::clone(&ebpf)).await;
+    let task = tokio::spawn(async move { agent.run().await });
+    let config = Config::parse(
+        "[app.egress-adoption]\nimage = 'mock:image'\ncommand = ['sleep', '600']\n[app.egress-adoption.egress]\nallow = ['203.0.113.9:443']\n",
+    ).unwrap();
+    let (events, mut results) = mpsc::channel(64);
+    commands
+        .send(AgentCommand::Deploy { config, events })
+        .await
+        .unwrap();
+    while let Some(event) = results.recv().await {
+        assert!(!matches!(event, ApplyEvent::Error { .. }), "{event:?}");
+    }
+    let checkpoint_present = records.join("egress-owners.checkpoint").exists();
+    task.abort();
+    assert!(task.await.unwrap_err().is_cancelled());
+    let id = InstanceId("default__egress-adoption-0".into());
+    grill.set_adopt_result(&id, true);
+    let shutdown = CancellationToken::new();
+    let (commands, receiver) = mpsc::channel(64);
+    let mut restored = BunAgent::new(
+        grill,
+        PortAllocator::new(43400, 43500),
+        receiver,
+        shutdown.clone(),
+    );
+    restored.set_records_dir(records.clone());
+    restored.set_volumes_dir(root.path().join("volumes"));
+    restored.set_onion_ebpf(Arc::clone(&ebpf)).await;
+    assert_eq!(restored.adopt_recorded_instances().await.unwrap(), 1);
+    let task = tokio::spawn(async move { restored.run().await });
+    // Cross two one-second health observations. A missing restored binding
+    // previously caused the live checker to stop an otherwise healthy owner.
+    tokio::time::sleep(Duration::from_millis(1200)).await;
+    let (response, status) = oneshot::channel();
+    commands
+        .send(AgentCommand::Status { response })
+        .await
+        .unwrap();
+    let instances = status.await.unwrap();
+    let running = instances
+        .iter()
+        .any(|instance| instance.id == id.0 && instance.state == "running");
+    let (response, retired) = oneshot::channel();
+    commands
+        .send(AgentCommand::Retire {
+            app_name: "egress-adoption".into(),
+            namespace: "default".into(),
+            response,
+        })
+        .await
+        .unwrap();
+    retired.await.unwrap().unwrap();
+    shutdown.cancel();
+    task.await.unwrap();
+    ebpf.lock().await.detach().unwrap();
+    assert!(
+        checkpoint_present,
+        "policy was programmed without durable workload ownership"
+    );
+    assert!(
+        running,
+        "adoption did not restore policy ownership before live checks"
+    );
+}
+
+struct EgressRecoveryFixture {
+    root: tempfile::TempDir,
+    ebpf: std::sync::Arc<tokio::sync::Mutex<OnionEbpf>>,
+    grill: reliaburger::grill::mock::MockGrill,
+    commands: tokio::sync::mpsc::Sender<reliaburger::bun::agent::AgentCommand>,
+    task: Option<tokio::task::JoinHandle<()>>,
+}
+
+impl EgressRecoveryFixture {
+    async fn deploy(name: &str) -> Self {
+        Self::prepare(name, false).await
+    }
+
+    async fn prepare(name: &str, failed_checkpoint: bool) -> Self {
+        use reliaburger::bun::agent::{AgentCommand, ApplyEvent};
+        let root = tempfile::tempdir().unwrap();
+        std::fs::create_dir(root.path().join("records")).unwrap();
+        if failed_checkpoint {
+            std::fs::create_dir(root.path().join("records/egress-owners.checkpoint")).unwrap();
+        }
+        let ebpf = std::sync::Arc::new(tokio::sync::Mutex::new(
+            OnionEbpf::load_embedded(CGROUP_PATH.as_ref()).unwrap(),
+        ));
+        let grill = reliaburger::grill::mock::MockGrill::new();
+        grill.set_honours_cgroup_path(true);
+        grill.set_pid(std::process::id());
+        let (commands, _) = tokio::sync::mpsc::channel(64);
+        let mut fixture = Self {
+            root,
+            ebpf,
+            grill,
+            commands,
+            task: None,
+        };
+        let (mut agent, commands, _) = fixture.agent().await;
+        fixture.commands = commands;
+        fixture.task = Some(tokio::spawn(async move { agent.run().await }));
+        let config = reliaburger::config::Config::parse(&format!("[app.{name}]\nimage = 'mock:image'\ncommand = ['sleep', '600']\n[app.{name}.egress]\nallow = ['203.0.113.9:443']\n")).unwrap();
+        let (events, mut results) = tokio::sync::mpsc::channel(64);
+        fixture
+            .commands
+            .send(AgentCommand::Deploy { config, events })
+            .await
+            .unwrap();
+        let mut failed = false;
+        while let Some(event) = results.recv().await {
+            if matches!(event, ApplyEvent::Error { .. }) {
+                failed = true;
+            }
+        }
+        assert_eq!(failed, failed_checkpoint);
+
+        fixture
+    }
+
+    async fn agent(
+        &self,
+    ) -> (
+        reliaburger::bun::agent::BunAgent<reliaburger::grill::mock::MockGrill>,
+        tokio::sync::mpsc::Sender<reliaburger::bun::agent::AgentCommand>,
+        CancellationToken,
+    ) {
+        let (commands, receiver) = tokio::sync::mpsc::channel(64);
+        let shutdown = CancellationToken::new();
+        let mut agent = reliaburger::bun::agent::BunAgent::new(
+            self.grill.clone(),
+            reliaburger::grill::port::PortAllocator::new(43400, 43500),
+            receiver,
+            shutdown.clone(),
+        );
+        agent.set_records_dir(self.root.path().join("records"));
+        agent.set_volumes_dir(self.root.path().join("volumes"));
+        agent
+            .set_onion_ebpf(std::sync::Arc::clone(&self.ebpf))
+            .await;
+        (agent, commands, shutdown)
+    }
+
+    async fn crash(&mut self) {
+        if let Some(task) = self.task.take() {
+            task.abort();
+            assert!(task.await.unwrap_err().is_cancelled());
+        }
+    }
+
+    async fn retire(&self, name: &str) -> Result<(), reliaburger::bun::BunError> {
+        let (response, result) = tokio::sync::oneshot::channel();
+        self.commands
+            .send(reliaburger::bun::agent::AgentCommand::Retire {
+                app_name: name.into(),
+                namespace: "default".into(),
+                response,
+            })
+            .await
+            .unwrap();
+        result.await.unwrap()
+    }
+}
+
+impl Drop for EgressRecoveryFixture {
+    fn drop(&mut self) {
+        if let Some(task) = &self.task {
+            task.abort();
+        }
+        if let Ok(entries) = std::fs::read_dir(self.root.path().join("volumes/.identity")) {
+            for entry in entries.flatten() {
+                if let Err(error) =
+                    reliaburger::sesame::identity::cleanup_identity_dir(&entry.path())
+                {
+                    eprintln!("test identity cleanup failed: {error}");
+                }
+            }
+        }
+    }
+}
+
+#[tokio::test]
+#[ignore = "requires Linux root and RELIABURGER_EBPF_TESTS=1"]
+async fn confirmed_egress_retirement_survives_interrupted_adoption_record_cleanup() {
+    assert!(ebpf_tests_enabled());
+    let mut fixture = EgressRecoveryFixture::deploy("egress-tombstone").await;
+    let identity = reliaburger::sesame::identity::instance_identity_dir(
+        &fixture.root.path().join("volumes"),
+        "default__egress-tombstone-0",
+    );
+    std::fs::create_dir_all(identity.parent().unwrap()).unwrap();
+    reliaburger::sesame::identity::cleanup_identity_dir(&identity).unwrap();
+    std::fs::write(&identity, b"block identity cleanup").unwrap();
+    assert!(fixture.retire("egress-tombstone").await.is_err());
+    let records = fixture.root.path().join("records");
+    let document: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(records.join("egress-owners.checkpoint")).unwrap())
+            .unwrap();
+    let tombstone = document["owners"].as_array().unwrap().iter().any(|entry| {
+        entry["instance_id"] == "default__egress-tombstone-0"
+            && entry["binding"]["phase"] == "Retired"
+    });
+    let record = reliaburger::grill::records::record_path(&records, "default__egress-tombstone-0");
+    assert!(record.exists());
+    fixture.crash().await;
+    std::fs::remove_file(identity).unwrap();
+    let (mut restored, _, _) = fixture.agent().await;
+    assert_eq!(restored.adopt_recorded_instances().await.unwrap(), 0);
+    assert!(!record.exists());
+    fixture.ebpf.lock().await.detach().unwrap();
+    assert!(
+        tombstone,
+        "confirmed kernel retirement disappeared before adoption cleanup completed"
+    );
+}
+
+#[tokio::test]
+#[ignore = "requires Linux root and RELIABURGER_EBPF_TESTS=1"]
+async fn missing_policy_owner_refuses_even_a_stopped_recorded_runtime() {
+    assert!(ebpf_tests_enabled());
+    let mut fixture = EgressRecoveryFixture::deploy("egress-missing-owner").await;
+    fixture.crash().await;
+    let records = fixture.root.path().join("records");
+    std::fs::remove_file(records.join("egress-owners.checkpoint")).unwrap();
+    let (mut restored, _, _) = fixture.agent().await;
+    let result = restored.adopt_recorded_instances().await;
+    let retained =
+        reliaburger::grill::records::record_path(&records, "default__egress-missing-owner-0")
+            .exists();
+    fixture.ebpf.lock().await.detach().unwrap();
+    assert!(
+        result.is_err(),
+        "runtime absence substituted for lost kernel ownership"
+    );
+    assert!(
+        retained,
+        "missing policy ownership discarded the adoption record"
+    );
+}
+
+#[tokio::test]
+#[ignore = "requires Linux root and RELIABURGER_EBPF_TESTS=1"]
+async fn failed_policy_checkpoint_prevents_kernel_programming_and_workload_start() {
+    assert!(ebpf_tests_enabled());
+    let mut fixture = EgressRecoveryFixture::prepare("egress-checkpoint-failure", true).await;
+    let never_started = !fixture
+        .grill
+        .calls()
+        .iter()
+        .any(|(operation, _)| operation == "start");
+    let path = reliaburger::grill::cgroup::cgroup_path("default", "egress-checkpoint-failure", 0);
+    let id = reliaburger::sesame::egress::cgroup_id_of_path(&path).unwrap();
+    let enforced =
+        reliaburger::sesame::egress::egress_enforced(&mut fixture.ebpf.lock().await.bpf, id)
+            .unwrap();
+    fixture.crash().await;
+    fixture.ebpf.lock().await.detach().unwrap();
+    assert!(
+        never_started,
+        "workload started despite failed policy ownership persistence"
+    );
+    assert!(
+        !enforced,
+        "kernel policy was programmed before durable ownership"
+    );
+}
+
+#[tokio::test]
+#[ignore = "requires Linux root and RELIABURGER_EBPF_TESTS=1"]
+async fn agent_recovery_keeps_policy_ownership_when_kernel_retirement_is_refused() {
+    assert!(ebpf_tests_enabled());
+    let mut fixture = EgressRecoveryFixture::deploy("egress-recovery-cleanup").await;
+    fixture.crash().await;
+    freeze_egress_map(&*fixture.ebpf.lock().await, "egress_map");
+    let records = fixture.root.path().join("records");
+    let (mut restored, _, _) = fixture.agent().await;
+    assert!(restored.adopt_recorded_instances().await.is_err());
+    assert!(restored.adopt_recorded_instances().await.is_err());
+    let retained_record =
+        reliaburger::grill::records::record_path(&records, "default__egress-recovery-cleanup-0")
+            .exists();
+    let document: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(records.join("egress-owners.checkpoint")).unwrap())
+            .unwrap();
+    let retained_owner = document["owners"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|entry| entry["binding"]["phase"] == "Owned");
+    fixture.ebpf.lock().await.detach().unwrap();
+    assert!(
+        retained_record && retained_owner,
+        "recovery forgot unconfirmed kernel cleanup"
+    );
+}
+
+#[tokio::test]
+#[ignore = "requires Linux root and RELIABURGER_EBPF_TESTS=1"]
+async fn adoption_fences_missing_enforcement_before_publishing_the_workload() {
+    use reliaburger::sesame::egress;
+    assert!(ebpf_tests_enabled());
+    let mut fixture = EgressRecoveryFixture::deploy("egress-missing-flag").await;
+    fixture.crash().await;
+    let id = reliaburger::grill::InstanceId("default__egress-missing-flag-0".into());
+    fixture.grill.set_adopt_result(&id, true);
+    let path = reliaburger::grill::cgroup::cgroup_path("default", "egress-missing-flag", 0);
+    let cgroup = egress::cgroup_id_of_path(&path).unwrap();
+    egress::clear_egress_enforced(&mut fixture.ebpf.lock().await.bpf, cgroup).unwrap();
+    let (mut restored, _, _) = fixture.agent().await;
+    let result = restored.adopt_recorded_instances().await;
+    let killed = fixture
+        .grill
+        .calls()
+        .iter()
+        .any(|(operation, instance)| operation == "kill" && instance == &id);
+    fixture.grill.set_adopt_result(&id, false);
+    assert_eq!(restored.adopt_recorded_instances().await.unwrap(), 0);
+    let records = fixture.root.path().join("records");
+    assert!(!reliaburger::grill::records::record_path(&records, &id.0).exists());
+    fixture.ebpf.lock().await.detach().unwrap();
+    assert!(
+        result.is_err() && killed,
+        "unprotected adoption did not fence its runtime"
+    );
+}

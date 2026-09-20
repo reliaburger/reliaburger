@@ -1135,3 +1135,58 @@ conflicting owners, changed cgroup identity, partial startup, missing active pin
 and interrupted retirement. These tests establish the loader contract. Actual
 Bun restart and upgrade must also prove that the new agent doesn't erase retained
 policy before it has accounted for every original workload.
+
+### Recover the policy's workload owner too
+
+Keeping maps alive solves only half the restart problem. The old adoption path
+rebuilt the supervisor but left its egress bindings empty. On the next health
+check, Bun treated the surviving protected workload as unbound and stopped it.
+A later sweep could also mistake retained policy for an orphan.
+
+The agent now has an egress ownership checkpoint separate from its final
+adoption records. Before programming a policy, it records the instance identity,
+original OCI input, runtime, allowlist, cgroup number and kernel boot identity.
+An error after a checkpoint write makes persistence uncertain. Bun refuses
+further ownership changes until restart reloads the durable inventory; it cannot
+assume a failed write left the old file unchanged.
+
+Recovery validates the whole inventory against adoption records and, when the
+runtime provides it, original launch intent. A policy created before its final
+adoption record still has an owner. The runtime must positively retire that
+launch before Bun removes its policy. A surviving recorded workload must have
+matching original policy, cgroup and boot identities, all required hooks and an
+existing enforcement flag before Bun publishes it as running.
+
+DNS results aren't original authority. Recovery resolves the recorded allowlist
+again with a bounded wait; an unavailable resolver produces an empty allowlist
+until a later retry. While rebuilding destinations, Bun retains the enforcement
+flag. Removing and recreating that flag would briefly allow everything, and a
+rollout can have two instances sharing the same cgroup. The replacement policy
+is their union, excluding an instance only after its runtime has retired.
+
+The checkpoint keeps the cgroup number after the runtime deletes the cgroup.
+That lets cleanup remove the corresponding map entries without guessing from a
+missing directory. It also records the kernel boot identity: a cgroup number
+from an earlier boot cannot authorise deletion of the same number in the new
+kernel. Workload retirement still needs its own positive runtime evidence.
+
+There is a second checkpoint boundary during removal. Suppose policy cleanup
+succeeds, but removing identity material fails. If we immediately delete the
+policy owner, restart sees an adoption record with no policy evidence. That is
+indistinguishable from a lost checkpoint. We reproduced this by blocking identity
+cleanup after successful kernel removal.
+
+The policy journal now retains `PolicyPhase::Retired` until identity and adoption
+records are durably gone. This enum records positive evidence; an absent owner
+never means the same thing. Restart can finish a retired owner's metadata
+cleanup, while a protected record missing both ownership and retirement evidence
+refuses recovery. Completed markers are then removed, so successful cleanup does
+not accumulate one permanent journal entry per deployment.
+
+`#[serde(skip)]` on the resolved-destination field tells Serde to omit that
+transient field when writing the checkpoint and initialise it with its default
+value when reading. The recorded allowlist remains the authority. Recovery
+resolves it again before rewriting policy, and never reactivates a retired
+binding. Uncertain checkpoint persistence also blocks subsequent kernel rewrites:
+otherwise the old in-memory owner could recreate policy after the disk had
+already recorded its retirement.

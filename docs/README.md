@@ -31,8 +31,11 @@ Egress cleanup now retains the stopped workload's binding and adoption record
 until the kernel confirms removal. Failed policy rewrites stop affected workloads;
 repeated cleanup failures remain retryable. An opt-in persistent kernel loader
 now keeps policy through actual loader SIGKILL and recovers the same maps without
-a detach window. All 32 physical kernel cases pass. Bun adoption, host-reboot
-reconciliation and production selection remain release gates.
+a detach window. The agent now records original workload policy before map
+writes and restores it before adoption; cleanup retains positive retirement
+evidence until metadata is gone. All 38 physical kernel tests pass. Verified
+container source identity, restart ordering, host-reboot reconciliation and
+production kernel selection remain release gates.
 
 Log exports now preserve content generations, scope receipts to the destination,
 and serialise durable checkpoint updates across agent and offline exports. Source
