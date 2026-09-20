@@ -3,7 +3,7 @@
 
 use std::fs::{File, OpenOptions};
 use std::io;
-use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt};
+use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::time::{Duration, Instant};
@@ -75,27 +75,9 @@ impl ProcessControl {
         self.run(id, move |this, id| {
             let directory = this.directory(&id)?;
             if let Some(parent) = this.root.parent() {
-                std::fs::create_dir_all(parent)?;
+                create_parent_directories(parent)?;
             }
             create_directory(&this.root)?;
-            create_directory(&directory)?;
-            let _operation = operation_lock(&directory)?;
-            let _owner = wait_for_owner_lock(&directory)?;
-            match this.load(&id) {
-                Ok(previous) => {
-                    if !matches!(
-                        previous.phase,
-                        OwnerPhase::Retired { .. } | OwnerPhase::Cancelled
-                    ) {
-                        return Err(io::Error::other(
-                            "previous process generation has not retired",
-                        ));
-                    }
-                    remove_control_socket(&directory, &previous)?;
-                }
-                Err(error) if error.kind() == io::ErrorKind::NotFound => {}
-                Err(error) => return Err(error),
-            }
             let mut nonce = [0u8; 16];
             SystemRandom::new()
                 .fill(&mut nonce)
@@ -107,11 +89,43 @@ impl ProcessControl {
                 environment: environment(&spec),
                 phase: OwnerPhase::Prepared,
                 launch: Some(ProcessLaunch {
-                    instance_id: id,
+                    instance_id: id.clone(),
                     spec,
                 }),
             };
-            process_owner::persist(&directory, &record)
+            match std::fs::symlink_metadata(&directory) {
+                Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                    // No helper accepts an unpublished temporary directory.
+                    // Keep the operation lock through publication and sync so
+                    // another adapter cannot start an undurable generation.
+                    let temporary = tempfile::Builder::new()
+                        .prefix(".preparing-")
+                        .permissions(std::fs::Permissions::from_mode(0o700))
+                        .tempdir_in(&this.root)?;
+                    let _operation = operation_lock(temporary.path())?;
+                    process_owner::persist(temporary.path(), &record)?;
+                    std::fs::rename(temporary.path(), &directory)?;
+                    let _unpublished_path = temporary.keep();
+                    File::open(&this.root)?.sync_all()
+                }
+                Err(error) => Err(error),
+                Ok(_) => {
+                    validate_directory(&directory)?;
+                    let _operation = operation_lock(&directory)?;
+                    let _owner = wait_for_owner_lock(&directory)?;
+                    let previous = this.load(&id)?;
+                    if !matches!(
+                        previous.phase,
+                        OwnerPhase::Retired { .. } | OwnerPhase::Cancelled
+                    ) {
+                        return Err(io::Error::other(
+                            "previous process generation has not retired",
+                        ));
+                    }
+                    remove_control_socket(&directory, &previous)?;
+                    process_owner::persist(&directory, &record)
+                }
+            }
         })
         .await
     }
@@ -121,6 +135,9 @@ impl ProcessControl {
             let directory = this.directory(&id)?;
             let _operation = operation_lock(&directory)?;
             let record = this.load(&id)?;
+            // A prior preparer could have died after rename but before its
+            // directory sync. Re-establish publication before any execution.
+            File::open(&this.root)?.sync_all()?;
             if !matches!(record.phase, OwnerPhase::Prepared) {
                 return Err(io::Error::other("process generation is not prepared"));
             }
@@ -300,11 +317,33 @@ fn validate_directory(path: &Path) -> io::Result<()> {
     Ok(())
 }
 
+fn create_parent_directories(path: &Path) -> io::Result<()> {
+    match std::fs::metadata(path) {
+        Ok(metadata) if metadata.is_dir() => Ok(()),
+        Ok(_) => Err(io::Error::other(
+            "process ownership parent is not a directory",
+        )),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {
+            if let Some(parent) = path
+                .parent()
+                .filter(|parent| !parent.as_os_str().is_empty())
+            {
+                create_parent_directories(parent)?;
+            }
+            create_directory(path)
+        }
+        Err(error) => Err(error),
+    }
+}
+
 fn create_directory(path: &Path) -> io::Result<()> {
     match std::fs::DirBuilder::new().mode(0o700).create(path) {
         Ok(()) => {
             File::open(path)?.sync_all()?;
-            if let Some(parent) = path.parent() {
+            if let Some(parent) = path
+                .parent()
+                .filter(|parent| !parent.as_os_str().is_empty())
+            {
                 File::open(parent)?.sync_all()?;
             }
         }

@@ -62,9 +62,15 @@ security boundary against hostile same-user processes.
   cancelled launch callers, stale delayed helpers, damaged intent and owner
   loss. Positive absence evidence permits recovery after failed socket cleanup;
   a missing Running owner never permits a recovered-PID signal.
+- [x] Publish first intent atomically from a private, synced staging directory.
+  An oversized-record regression fails before the fix; all ten recovery cases
+  and strict Clippy pass on macOS/Linux afterwards. The operation lock spans
+  rename and parent sync; start
+  re-establishes parent durability before execution. Existing malformed entries
+  refuse instead of becoming fresh generations.
 - [ ] Select the owned adapter in production Bun only alongside complete
-  pre-adoption reconciliation. Qualify atomic first-intent publication and
-  distinguish the latest job attempt from older completed runtime generations.
+  pre-adoption reconciliation. Distinguish the latest job attempt from older
+  completed runtime generations and preserve helper reaping across Bun `exec`.
 - [ ] Discover generations before an agent adoption record exists, distinguish
   provably unactivated preparation from uncertain activated owners, and join
   recovered state to app/job cleanup obligations. Advance state compatibility

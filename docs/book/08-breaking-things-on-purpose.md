@@ -453,6 +453,14 @@ capability before starting the helper. A fresh adapter reads that inventory
 without needing the later agent PID record. It sends bounded socket requests to
 the owner; it never recovers signal authority from the recorded PID.
 
+The first intent needs atomic publication too. Creating the final instance
+directory before writing its record leaves an ambiguous empty entry if writing
+fails or Bun dies. We prepare a private temporary directory, sync its complete
+record, rename it into the inventory, and sync the parent. The operation lock
+moves with the directory and stays held through publication. A rejected oversized
+record therefore leaves no published instance. Existing malformed entries still
+refuse recovery; we don't reinterpret damaged state as a fresh workload.
+
 Cancelling preparation must also fence a delayed launcher. The client takes the
 same owner lock, records cancellation, and releases it. A helper that starts
 later reloads the record and refuses. When a replacement generation is prepared,

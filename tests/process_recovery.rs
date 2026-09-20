@@ -323,3 +323,22 @@ async fn recovery_finishes_socket_cleanup_only_after_durable_absence_proof() {
     assert_eq!(recovered.exit_code(&id).await, Some(17));
     assert!(!socket_directory.exists());
 }
+
+#[tokio::test]
+async fn failed_first_preparation_never_publishes_an_incomplete_instance() {
+    let directory = tempfile::tempdir().unwrap();
+    let grill = runtime(directory.path());
+    let id = InstanceId("default__oversized-0".into());
+    assert!(
+        grill
+            .create(&id, &spec(&"x".repeat(1024 * 1024)))
+            .await
+            .is_err()
+    );
+    assert!(
+        !directory.path().join("process-owners").join(&id.0).exists(),
+        "failed preparation published an instance without durable intent"
+    );
+    grill.create(&id, &spec("exit 0")).await.unwrap();
+    grill.kill(&id).await.unwrap();
+}
