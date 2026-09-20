@@ -1025,6 +1025,85 @@ async fn namespace_isolation_denies_cross_namespace_by_default() {
     ebpf.detach().unwrap();
 }
 
+/// An explicit grant must identify the destination service, not its bare name.
+#[tokio::test]
+#[ignore = "requires Linux root and RELIABURGER_EBPF_TESTS=1"]
+async fn namespace_grant_cannot_authorise_a_same_named_destination() {
+    use reliaburger::sesame::{egress, firewall};
+    use std::collections::HashMap;
+    assert!(ebpf_tests_enabled());
+    let mut ebpf = OnionEbpf::load_embedded(CGROUP_PATH.as_ref()).unwrap();
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let mut services = ServiceMap::new();
+    for namespace in ["permitted", "private"] {
+        let id = ServiceId::new(namespace, "database");
+        let allowed = if namespace == "permitted" {
+            vec!["frontend/client".into()]
+        } else {
+            vec![]
+        };
+        services.register(&id, port, Some(allowed)).unwrap();
+        services
+            .add_backend(
+                &id,
+                BackendInstance {
+                    instance_id: format!("{namespace}__database-0"),
+                    node_ip: Ipv4Addr::LOCALHOST,
+                    host_port: port,
+                    healthy: true,
+                },
+            )
+            .unwrap();
+        let entry = services.resolve(&id).unwrap();
+        BpfServiceMap::new()
+            .update_backends_bpf(&mut ebpf, entry.vip, entry.port, entry)
+            .unwrap();
+    }
+    let cgroup = egress::cgroup_id_of_pid(std::process::id()).unwrap();
+    firewall::write_cgroup_namespace_entry(
+        &mut ebpf.bpf,
+        cgroup,
+        reliaburger::onion::vip::name_to_id("frontend"),
+    )
+    .unwrap();
+    let sources = HashMap::from([(("frontend".into(), "client".into()), vec![cgroup])]);
+    let entries = services
+        .resolve_all()
+        .into_iter()
+        .cloned()
+        .collect::<Vec<_>>();
+    for (key, value) in
+        firewall::rules_to_bpf_entries(&firewall::resolve_firewall_rules(&entries, &sources))
+    {
+        firewall::write_firewall_entry(&mut ebpf.bpf, key, value).unwrap();
+    }
+    let permitted = services
+        .resolve(&ServiceId::new("permitted", "database"))
+        .unwrap();
+    let private = services
+        .resolve(&ServiceId::new("private", "database"))
+        .unwrap();
+    let allowed = TcpStream::connect_timeout(
+        &SocketAddr::new(permitted.vip.0.into(), port),
+        Duration::from_secs(2),
+    );
+    let denied = TcpStream::connect_timeout(
+        &SocketAddr::new(private.vip.0.into(), port),
+        Duration::from_secs(2),
+    );
+    firewall::delete_cgroup_firewall_state(&mut ebpf.bpf, cgroup).unwrap();
+    ebpf.detach().unwrap();
+    assert!(
+        allowed.is_ok(),
+        "explicitly allowed destination failed: {allowed:?}"
+    );
+    assert!(
+        matches!(denied, Err(error) if error.kind() == std::io::ErrorKind::PermissionDenied),
+        "grant to permitted/database also authorised private/database"
+    );
+}
+
 // ---------------------------------------------------------------------------
 // Tier 3: DNS responder
 // ---------------------------------------------------------------------------
@@ -2281,6 +2360,28 @@ fn persistent_policy_refuses_conflicting_owners_and_retired_state() {
 
 #[test]
 #[ignore = "requires Linux root and RELIABURGER_EBPF_TESTS=1"]
+fn persistent_policy_refuses_obsolete_destination_identity() {
+    assert!(ebpf_tests_enabled());
+    let owned = OwnedPolicyFixture::new();
+    drop(owned.load().unwrap());
+    let path = owned.root.path().join("ownership/owner.json");
+    let original = std::fs::read(&path).unwrap();
+    let mut obsolete: serde_json::Value = serde_json::from_slice(&original).unwrap();
+    obsolete["version"] = 1.into();
+    std::fs::write(&path, serde_json::to_vec(&obsolete).unwrap()).unwrap();
+    let result = owned.load();
+    let refused = result.is_err();
+    drop(result);
+    // Restore only this fixture's original ownership before its explicit cleanup.
+    std::fs::write(path, original).unwrap();
+    assert!(
+        refused,
+        "retained bare-name firewall identities were accepted"
+    );
+}
+
+#[test]
+#[ignore = "requires Linux root and RELIABURGER_EBPF_TESTS=1"]
 fn persistent_policy_recovers_partial_startup_and_interrupted_retirement() {
     assert!(ebpf_tests_enabled());
     let owned = OwnedPolicyFixture::new();
@@ -3166,7 +3267,7 @@ async fn assert_source_policy_precedes_start(job: bool) {
         firewall::read_firewall_state(
             &mut ebpf.lock().await.bpf,
             cgroup,
-            reliaburger::onion::vip::name_to_id(target_name),
+            u32::from(VirtualIP::from_service_id(&ServiceId::new("backend", target_name)).0),
         )
         .unwrap()
         .action

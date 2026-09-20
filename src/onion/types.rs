@@ -187,7 +187,7 @@ pub struct ServiceEntry {
     pub namespace: String,
     /// Deterministic namespace identifier (hash of namespace name).
     pub namespace_id: u32,
-    /// Deterministic app identifier (hash of app name).
+    /// Firewall destination identity: the allocated VIP as a host-order u32.
     pub app_id: u32,
     /// Virtual IP for this service.
     pub vip: VirtualIP,

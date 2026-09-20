@@ -109,7 +109,7 @@ fn claim(
     }
     let cgroup_path = std::fs::canonicalize(cgroup_path)?;
     let mut manifest = Manifest {
-        version: 1,
+        version: 2,
         cgroup_id: crate::sesame::egress::cgroup_id_of_path(&cgroup_path)
             .ok_or_else(|| io::Error::other("cannot identify ownership cgroup"))?,
         cgroup_path,

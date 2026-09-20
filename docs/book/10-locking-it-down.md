@@ -1348,3 +1348,27 @@ development records don't contain the required source evidence and need a fresh
 cluster. Init-container cgroup lifetime and the production persistent loader
 still need their own physical qualification; this implementation doesn't waive
 those release gates.
+
+### An allow rule belongs to one destination
+
+Suppose `frontend/client` may connect to `permitted/database`, while
+`private/database` should refuse it. The physical connection test showed both
+connections succeeding. The backend entries had different VIPs and namespaces,
+but both stored the hash of `database` as their firewall destination ID. One
+allow entry therefore authorised both destinations.
+
+The destination ID now uses the allocated service VIP. Allocation already
+resolves collisions between namespace-qualified services, so the firewall
+inherits that decision instead of introducing another truncated name hash.
+`u32::from(vip.0)` calls Rust's `From` conversion to represent the IPv4 address as
+an integer. The kernel treats this value as an opaque identity; it isn't the
+network-byte-order field used to match packet addresses. Remote-only service
+views use the catalogue's assigned address, including a collision-resolved one.
+
+The regression uses actual backend and firewall maps, then makes both TCP
+connections. The permitted service must remain reachable and the private one
+must return a permission error. Portable tests also cover distinct namespace
+identities, collision-probed local allocation and a remote catalogue's chosen
+address. State 24 and kernel ownership manifest 2 refuse older development
+state and pinned maps whose grants used bare-name identities. Confirming grant
+retirement before an address can be reused remains a separate lifecycle task.

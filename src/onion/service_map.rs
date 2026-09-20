@@ -66,7 +66,7 @@ impl ServiceMap {
             app_name: id.name.clone(),
             namespace: id.namespace.clone(),
             namespace_id: name_to_id(&id.namespace),
-            app_id: name_to_id(&id.name),
+            app_id: u32::from(vip.0),
             vip,
             port,
             backends: Vec::new(),
@@ -286,7 +286,7 @@ impl ServiceMap {
                         app_name: id.name.clone(),
                         namespace: id.namespace.clone(),
                         namespace_id: name_to_id(&id.namespace),
-                        app_id: name_to_id(&id.name),
+                        app_id: u32::from(service.vip.0),
                         vip: service.vip,
                         port: service.port,
                         backends: service
@@ -632,12 +632,55 @@ mod tests {
     }
 
     #[test]
+    fn same_named_destinations_have_distinct_firewall_identities() {
+        let mut map = ServiceMap::new();
+        map.register(&sid("permitted", "database"), 5432, None)
+            .unwrap();
+        map.register(&sid("private", "database"), 5432, None)
+            .unwrap();
+        assert_ne!(
+            map.resolve(&sid("permitted", "database")).unwrap().app_id,
+            map.resolve(&sid("private", "database")).unwrap().app_id,
+        );
+    }
+
+    #[test]
+    fn destination_identity_uses_the_collision_resolved_vip() {
+        let mut map = ServiceMap::new();
+        let id = sid("default", "redis");
+        let natural = VirtualIP::from_service_id(&id);
+        map.allocated_vips.insert(natural);
+        let assigned = map.register(&id, 6379, None).unwrap();
+        assert_ne!(assigned, natural);
+        assert_eq!(map.resolve(&id).unwrap().app_id, u32::from(assigned.0));
+    }
+
+    #[test]
+    fn remote_destination_identity_uses_the_catalogue_allocation() {
+        use crate::onion::catalog::{CatalogService, EndpointCatalog};
+        let id = sid("remote", "redis");
+        let assigned = VirtualIP(Ipv4Addr::new(127, 128, 7, 19));
+        assert_ne!(assigned, VirtualIP::from_service_id(&id));
+        let mut catalog = EndpointCatalog::new();
+        catalog.services.insert(
+            id.qualified(),
+            CatalogService {
+                vip: assigned,
+                port: 6379,
+                backends: Vec::new(),
+            },
+        );
+        let merged = ServiceMap::new().with_cluster_catalog(&catalog);
+        assert_eq!(merged.resolve(&id).unwrap().app_id, u32::from(assigned.0));
+    }
+
+    #[test]
     fn app_id_deterministic() {
         let mut map = ServiceMap::new();
         map.register(&sid("default", "redis"), 6379, None).unwrap();
 
         let entry = map.resolve(&sid("default", "redis")).unwrap();
-        assert_eq!(entry.app_id, name_to_id("redis"));
+        assert_eq!(entry.app_id, u32::from(entry.vip.0));
     }
 
     #[test]

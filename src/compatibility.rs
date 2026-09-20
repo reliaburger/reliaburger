@@ -15,10 +15,10 @@ pub struct Compatibility {
     pub state: u32,
 }
 
-/// Supported protocol and durable state, including durable workload source identity.
+/// Supported protocol and durable state, including namespace-safe kernel destination identity.
 pub const CURRENT: Compatibility = Compatibility {
     protocol: 14,
-    state: 23,
+    state: 24,
 };
 
 /// Name of the durable format stamp at the root of a node's data directory.

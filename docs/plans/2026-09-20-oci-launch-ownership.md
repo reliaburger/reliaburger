@@ -423,13 +423,22 @@ parent's cgroup and needs physical qualification that init exit cannot invalidat
 the parent's prepared policy before the main process starts. Do not select the
 persistent production paths until these boundaries are covered.
 
-## Remaining destination identity qualification
+## Namespace-safe destination identity
 
-Inspection found that local registration and merged remote service entries hash
-only the bare application name into the firewall destination ID. Because a grant
-key contains the source cgroup and destination ID, two same-named destinations in
-different namespaces may share an allow decision. Reproduce this with an allowed
-and forbidden destination before changing the identity representation. Include
-remote entries and collisions in the chosen representation; hashing a qualified
-name alone still needs a collision disposition. This remains an open correctness
-item, separate from source ownership and durable backend retirement.
+The unit regression gives `permitted/database` and `private/database` the same
+firewall ID. The physical connection regression then confirms that a grant to
+the former also permits a TCP connection to the latter. Both fail before repair.
+
+The destination identity now reuses the service's allocated VIP as an opaque
+32-bit integer. Local registration already resolves VIP collisions before
+returning the entry; remote-only views use the catalogue's chosen VIP. This
+avoids a second allocation scheme or another truncated name hash. Tests cover
+both collision-probed local allocation and an explicit remote catalogue address.
+State 24 and kernel ownership manifest 2 refuse retained bare-name grants.
+
+All 57 physical kernel tests pass (12.83s), including the actual denied/allowed
+connections and old-manifest refusal. All 111 native and 123 Linux affected
+library tests pass, as do both binary compatibility cases on each platform.
+Strict all-target/all-feature Clippy and formatting pass on both platforms.
+Retiring stale grants before any VIP reuse remains part of the separate durable
+service-ownership work.
