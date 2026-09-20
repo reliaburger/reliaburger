@@ -301,8 +301,9 @@ release acceptance from deferred capabilities. The current checklist lives in
 The opt-in durable Runc adapter now covers rootful and rootless Linux containers.
 Its rootful service path now retains a durable, generation-bound address reference
 across natural exit. Checked discovery withdrawal permits reuse; lost original
-discovery ownership refuses cleanup. Production integration and complete discovery
-recovery remain open.
+discovery ownership refuses cleanup. If live policy is lost and backend withdrawal
+fails, the owned path stops execution while retaining the address and cleanup
+records. Production integration and complete discovery recovery remain open.
 Rootful and rootless recovery tests cover caller death before adoption, short
 jobs, published ports and interrupted network-helper startup.
 Rootless networking is ready before the workload starts. Command waits retry

@@ -1362,3 +1362,27 @@ policy untouched.
 This isolates the routing claim. It does not promise that Bun overrides an
 operator's firewall. Direct Linux installations must permit the required
 forwarding; the managed VM path gives us a dedicated host configuration.
+
+
+## Stop unsafe execution even when cleanup refuses
+
+Now combine two failures. Remove a running container's egress enforcement flag
+and freeze that map so the repair fails. Also freeze the service backend map.
+The old agent tries to withdraw the backend before stopping the container,
+receives an error and leaves the payload running without its required policy.
+The real-container regression observes that it never stops within 15 seconds.
+
+The retained address gives us another option. After ordinary cleanup fails,
+the agent fences execution separately. For a published container address, it
+first checks that the runtime still holds the original address reference. It
+disables automatic restart, retires initialisers and force-stops the payload,
+requiring positive exit evidence. Every affected replica gets an attempt even
+if another replica refuses.
+
+Nothing here confirms discovery cleanup. The service key, address reference,
+policy ownership and adoption record stay in place. An explicit Stop still
+returns an error while the backend map refuses withdrawal. The regression also
+starts an unrelated container, proves it serves its own HTTP identity, and
+checks that it neither reuses the retained address nor answers through the old
+VIP. This is the opt-in owned runtime contract; complete recovery and production
+selection remain separate work.

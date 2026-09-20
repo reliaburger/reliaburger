@@ -4315,6 +4315,16 @@ async fn confirmed_destination_retirement_removes_only_its_own_grants() {
 #[tokio::test]
 #[ignore = "requires Linux root and RELIABURGER_EBPF_TESTS=1"]
 async fn natural_exit_keeps_its_address_while_a_retained_backend_can_reach_it() {
+    check_stopped_address_retention(false).await;
+}
+
+#[tokio::test]
+#[ignore = "requires Linux root and RELIABURGER_EBPF_TESTS=1"]
+async fn lost_enforcement_stops_execution_even_when_backend_withdrawal_refuses() {
+    check_stopped_address_retention(true).await;
+}
+
+async fn check_stopped_address_retention(lose_enforcement: bool) {
     use reliaburger::bun::agent::{AgentCommand, ApplyEvent, BunAgent};
     use reliaburger::grill::{
         ContainerState, Grill, ImageStore, InstanceId, port::PortAllocator, runc::RuncGrill,
@@ -4362,6 +4372,11 @@ async fn natural_exit_keeps_its_address_while_a_retained_backend_can_reach_it() 
             "/bin/busybox".into(), "sh".into(), "-c".into(),
             "/bin/busybox httpd -f -p 8080 -h / & server=$!; while [ ! -f /exit-now ]; do /bin/busybox sleep 0.01; done; kill \"$server\"; wait \"$server\"; exit 0".into(),
         ];
+        if lose_enforcement {
+            config.app.get_mut("natural-predecessor").unwrap().egress = Some(
+                toml::from_str("allow = ['203.0.113.9:443']")?,
+            );
+        }
         let (events, mut results) = mpsc::channel(64);
         commands.send(AgentCommand::Deploy { config, events }).await?;
         while let Some(event) = results.recv().await {
@@ -4371,19 +4386,47 @@ async fn natural_exit_keeps_its_address_while_a_retained_backend_can_reach_it() 
         let original = read_runtime_fixture_page(SocketAddr::new(vip.0.into(), 8080)).await?;
         anyhow::ensure!(original.contains(&old.0), "original VIP failed its positive control");
         freeze_egress_map(&*ebpf.lock().await, "backend_map");
-        // Controller loss must not turn a natural exit into permission to reuse
-        // an address still named by its retained kernel route.
-        let actor = task.take().unwrap();
-        actor.abort();
-        let _ = actor.await;
-        tokio::fs::write(bundles.join(&old.0).join("rootfs/exit-now"), b"exit").await?;
+        if lose_enforcement {
+            let launch = runtime.launch_inventory().await?.unwrap().into_iter()
+                .find(|launch| launch.instance_id == old).unwrap();
+            let cgroup = reliaburger::sesame::egress::cgroup_id_of_path(
+                &launch.spec.linux.host_cgroup_path().unwrap(),
+            ).unwrap();
+            let mut kernel = ebpf.lock().await;
+            anyhow::ensure!(reliaburger::sesame::egress::egress_enforced(&mut kernel.bpf, cgroup)?,
+                "positive control had no enforcement");
+            reliaburger::sesame::egress::clear_egress_enforced(&mut kernel.bpf, cgroup)?;
+            freeze_egress_map(&kernel, "egress_enabled_map");
+        } else {
+            // Controller loss must not authorise reuse after natural exit.
+            let actor = task.take().unwrap();
+            actor.abort();
+            let _ = actor.await;
+            tokio::fs::write(bundles.join(&old.0).join("rootfs/exit-now"), b"exit").await?;
+        }
         tokio::time::timeout(Duration::from_secs(15), async {
             loop {
                 if runtime.state(&old).await? == ContainerState::Stopped { return Ok::<(), anyhow::Error>(()); }
                 tokio::time::sleep(Duration::from_millis(10)).await;
             }
         }).await??;
-        anyhow::ensure!(runtime.exit_code(&old).await == Some(0), "original did not exit naturally");
+        if lose_enforcement {
+            anyhow::ensure!(runtime.network_reference(&old).await?.is_some(),
+                "security fencing released an unconfirmed network reference");
+            let (reply, result) = tokio::sync::oneshot::channel();
+            commands.send(AgentCommand::Stop {
+                app_name: "natural-predecessor".into(), namespace: "default".into(), response: reply,
+            }).await?;
+            anyhow::ensure!(result.await?.is_err(), "failed withdrawal was acknowledged as cleanup");
+            anyhow::ensure!(reliaburger::grill::records::load_records(&root.path().join("records"))?
+                .iter().any(|record| record.instance_id == old.0),
+                "security fencing forgot the unretired adoption record");
+            let actor = task.take().unwrap();
+            actor.abort();
+            let _ = actor.await;
+        } else {
+            anyhow::ensure!(runtime.exit_code(&old).await == Some(0), "original did not exit naturally");
+        }
         let successor: reliaburger::config::app::AppSpec = toml::from_str("image = '/empty-fixture'\ncommand = ['/bin/busybox', 'httpd', '-f', '-p', '8080', '-h', '/']\n")?;
         let cgroup = reliaburger::grill::cgroup::instance_cgroup_path("default", "natural-successor", &new)?;
         let spec = reliaburger::grill::oci::generate_oci_spec("natural-successor", "default", &successor, &new.0, None, &cgroup.to_string_lossy(), None, None);

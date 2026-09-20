@@ -704,3 +704,48 @@ Both outer-policy checks pass (0.07s each) with unchanged policy and zero packet
 through the outer forwarding chain. All four privileged network cases pass
 (1.19s), as do both refusal contracts and strict all-target/all-feature Linux
 Clippy and formatting. Hosted confirmation belongs to the next PR run.
+
+## Fence execution independently of refused cleanup
+
+The combined-loss regression fails first (16.58s): remove actual egress
+enforcement, freeze its map against repair, and freeze the backend map against
+withdrawal. The real owned container remains Running throughout the 15-second
+stop deadline. Ordinary cleanup returns early on backend failure.
+
+After failed cleanup, fence execution without discharging discovery ownership.
+For a published container address, require the runtime's retained reference and
+reject a conflicting captured generation. Disable automatic retry, positively
+retire initialisers and force-stop every affected replica. Preserve service and
+policy ownership, the adoption record and the address reference. An explicit
+Stop must still refuse while backend withdrawal is impossible; a different
+container must receive another address and must not answer through the old VIP.
+This path depends on the opt-in owned runtime. It does not solve legacy runtime
+ownership, durable service reconstruction or remote acknowledgement.
+
+All 68 physical kernel cases pass (82.57s), including the combined failure.
+All 215 affected library cases pass on macOS/Linux (17.738s/25.437s), with
+strict all-target/all-feature Clippy and formatting on both. The focused
+combined-failure case passes in 11.97s.
+
+The next discovery-recovery change needs these transaction boundaries:
+
+1. Persist the exact allocated service VIP, port, destination identity, attempted
+   backend publications and original runtime references before either kernel or
+   userspace publication. Recomputing a VIP from its name loses collision
+   resolution. Current entry points include `publish_backend_ebpf`, routing-table
+   publication and firewall reconciliation; cover all three.
+2. Validate the complete checkpoint against runtime launch inventory before
+   adoption or cleanup. Restore original allocations without republishing stale
+   healthy backends. Missing, conflicting or partially written ownership must
+   refuse, including when the kernel still contains entries.
+3. Persist permission to release only after confirmed withdrawal. Replay that
+   permission idempotently across a crash between checkpoint and runtime writes;
+   prevent a successor from replacing the original reference before completion.
+   Frozen maps and failed checkpoint writes must preserve the obligation.
+4. Include remote catalogue consumers and captured ingress requests in the
+   withdrawal proof. A local empty map proves neither remote acknowledgement nor
+   completed requests. Lost nodes retain obligations until confirmed retirement
+   or the approved permanently fenced decommission operation.
+5. Qualify actual Bun death and host reboot, then select the owned runtime and
+   persistent kernel loader in production. A controller-task abort or an adapter
+   reconstruction alone does not close those gates.

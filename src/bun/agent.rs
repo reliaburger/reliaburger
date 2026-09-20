@@ -6831,8 +6831,74 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
                 eprintln!(
                     "sesame: failed to stop {namespace}/{app_name} after egress loss: {error}"
                 );
+                if let Err(error) = self.fence_app_execution(&app_name, &namespace).await {
+                    eprintln!(
+                        "sesame: execution fencing remains unconfirmed for {namespace}/{app_name}: {error}"
+                    );
+                }
             }
         }
+    }
+
+    /// Stop unsafe execution while preserving refused discovery and policy cleanup.
+    #[cfg(all(feature = "ebpf", target_os = "linux"))]
+    async fn fence_app_execution(
+        &mut self,
+        app_name: &str,
+        namespace: &str,
+    ) -> Result<(), BunError> {
+        let instances: Vec<_> = self
+            .supervisor
+            .list_instances()
+            .iter()
+            .filter(|instance| {
+                instance.app_name == app_name
+                    && instance.namespace == namespace
+                    && instance.state != ContainerState::Stopped
+            })
+            .map(|instance| {
+                (
+                    instance.id.clone(),
+                    instance.container_ip.is_some() && instance.host_port.is_some(),
+                )
+            })
+            .collect();
+        self.supervisor.stop_app(app_name, namespace).await?;
+        let mut first_error = None;
+        for (id, publishes_address) in instances {
+            let result = async {
+                if publishes_address {
+                    let reference = self.supervisor.grill().network_reference(&id).await?;
+                    if reference.is_none()
+                        || self
+                            .network_references
+                            .get(&id)
+                            .is_some_and(|original| reference.as_ref() != Some(original))
+                    {
+                        return Err(BunError::RetirementState {
+                            instance_id: id.clone(),
+                            reason: "execution fencing requires the original retained address"
+                                .into(),
+                        });
+                    }
+                }
+                self.retire_initialisers(&id).await?;
+                self.kill_and_wait_for_exit(&id).await
+            }
+            .await;
+            if let Err(error) = result {
+                first_error.get_or_insert(error);
+                continue;
+            }
+            if let Some(instance) = self.supervisor.get_instance_mut(&id)
+                && instance.state.can_transition_to(ContainerState::Stopped)
+            {
+                instance.state = ContainerState::Stopped;
+            }
+        }
+        // Address holds, service keys, grants and adoption records remain owned.
+        // An execution stop is not an acknowledgement of their retirement.
+        first_error.map_or(Ok(()), Err)
     }
 
     /// Portable builds cannot have live egress bindings.
