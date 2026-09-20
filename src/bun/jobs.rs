@@ -16,7 +16,9 @@ const MAX_CHECKPOINT_BYTES: u64 = 16 * 1024 * 1024;
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(super) enum JobPhase {
-    /// Intent committed before create/start; no exit has been observed.
+    /// Budget claimed before create; execution has not been authorised.
+    Preparing,
+    /// Runtime preparation completed and execution was authorised durably.
     Launching,
     /// The runtime reported an actual exit status.
     Exited {
@@ -107,7 +109,7 @@ pub(super) fn load(directory: &Path) -> std::io::Result<BTreeMap<String, Recorde
         return Err(std::io::Error::other("job attempt checkpoint is too large"));
     }
     let checkpoint: Checkpoint = serde_json::from_slice(&bytes)?;
-    if checkpoint.schema != 1 {
+    if checkpoint.schema != 2 {
         return Err(std::io::Error::other(
             "unsupported job attempt checkpoint schema",
         ));
@@ -132,7 +134,7 @@ pub(super) fn persist(
 ) -> std::io::Result<()> {
     validate(&jobs)?;
     let bytes = serde_json::to_vec(&Checkpoint {
-        schema: 1,
+        schema: 2,
         jobs: jobs.into_values().collect(),
     })?;
     if bytes.len() as u64 > MAX_CHECKPOINT_BYTES {

@@ -81,6 +81,10 @@ security boundary against hostile same-user processes.
   thirteen runtime recovery cases pass on macOS/Linux. Prepared, running and
   completed generations are discoverable; damaged entries refuse the whole
   inventory and unpublished staging directories cannot count as launches.
+- [x] Persist job preparation before create and a separate launch permit after
+  create, before start, on fresh runs and retries. Two ordering/persistence
+  regressions fail first; all agent tests pass on macOS/Linux (155/154). Job
+  schema 2 and state 17 reject the previous ambiguous launch meaning.
 - [ ] Select the owned adapter in production Bun only alongside complete
   pre-adoption reconciliation. Distinguish the latest job attempt from older
   completed runtime generations.

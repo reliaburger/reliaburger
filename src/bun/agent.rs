@@ -2396,10 +2396,12 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
             .scheduled_jobs
             .contains_key(&(name.into(), namespace.into()))
             && previous.as_ref().is_some_and(|job| job.runtime_absent);
-        if previous
-            .as_ref()
-            .is_some_and(|job| matches!(job.phase, JobPhase::Unknown | JobPhase::Launching))
-            && !rerun_unknown
+        if previous.as_ref().is_some_and(|job| {
+            matches!(
+                job.phase,
+                JobPhase::Unknown | JobPhase::Preparing | JobPhase::Launching
+            )
+        }) && !rerun_unknown
             && !next_cron_occurrence
         {
             return Err(refuse(
@@ -2435,7 +2437,7 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
                 runtime: self.supervisor.grill().runtime_kind(),
                 generation,
                 restart_count: 0,
-                phase: JobPhase::Launching,
+                phase: JobPhase::Preparing,
                 runtime_absent: false,
             },
         );
@@ -2472,9 +2474,50 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
             )));
         }
         job.restart_count = count;
-        job.phase = JobPhase::Launching;
+        job.phase = JobPhase::Preparing;
         job.runtime_absent = false;
         self.commit_jobs(next).await
+    }
+
+    /// Commit permission to execute only after the runtime has prepared this attempt.
+    async fn transition_deploy_state(
+        &mut self,
+        id: &InstanceId,
+        to: ContainerState,
+    ) -> Result<(), BunError> {
+        let instance =
+            self.supervisor
+                .get_instance(id)
+                .ok_or_else(|| BunError::InstanceNotFound {
+                    instance_id: id.clone(),
+                })?;
+        let state = instance.state.transition_to(to)?;
+        if instance.is_job && to == ContainerState::Starting {
+            if self.job_store_uncertain {
+                return Err(BunError::JobState(
+                    "checkpoint is uncertain; restart Bun".into(),
+                ));
+            }
+            let mut jobs = self.recorded_jobs.clone();
+            let job = jobs
+                .get_mut(&id.0)
+                .ok_or_else(|| BunError::JobState(format!("missing attempt for {id}")))?;
+            if job.phase != super::jobs::JobPhase::Preparing || job.runtime_absent {
+                return Err(BunError::JobState(format!(
+                    "job {id} has no prepared attempt"
+                )));
+            }
+            job.phase = super::jobs::JobPhase::Launching;
+            self.commit_jobs(jobs).await?;
+        }
+        let instance =
+            self.supervisor
+                .get_instance_mut(id)
+                .ok_or_else(|| BunError::InstanceNotFound {
+                    instance_id: id.clone(),
+                })?;
+        instance.state = state;
+        Ok(())
     }
 
     fn job_state_label(&self, instance: &WorkloadInstance) -> String {
@@ -2765,7 +2808,10 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
             if !adopted {
                 if let Some(job) = recovered_jobs.get_mut(&runtime_id.0) {
                     job.runtime_absent = true;
-                    if job.phase == super::jobs::JobPhase::Launching {
+                    if matches!(
+                        job.phase,
+                        super::jobs::JobPhase::Preparing | super::jobs::JobPhase::Launching
+                    ) {
                         job.phase = super::jobs::JobPhase::Unknown;
                     }
                     // Preserve the positive observation before deleting the
@@ -2880,7 +2926,12 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
         }
 
         for (id, job) in &mut recovered_jobs {
-            if !adopted_jobs.contains(id) && job.phase == super::jobs::JobPhase::Launching {
+            if !adopted_jobs.contains(id)
+                && matches!(
+                    job.phase,
+                    super::jobs::JobPhase::Preparing | super::jobs::JobPhase::Launching
+                )
+            {
                 job.phase = super::jobs::JobPhase::Unknown;
             }
         }
@@ -5943,15 +5994,6 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
         if let Some(instance) = self.supervisor.get_instance_mut(instance_id) {
             instance.oci_spec = Some(oci_spec);
         }
-        {
-            let instance = self
-                .supervisor
-                .get_instance_mut(instance_id)
-                .ok_or_else(|| BunError::InstanceNotFound {
-                    instance_id: instance_id.clone(),
-                })?;
-            instance.state = instance.state.transition_to(ContainerState::Starting)?;
-        }
         self.spawn_log_forwarder(instance_id, job_name, namespace);
         self.persist_instance_record(instance_id).await;
         {
@@ -7261,12 +7303,13 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
                 continue;
             }
 
-            // Preparing → Starting
-            if let Some(instance) = self.supervisor.get_instance_mut(&id) {
-                match instance.state.transition_to(ContainerState::Starting) {
-                    Ok(s) => instance.state = s,
-                    Err(_) => continue,
-                }
+            // The durable job permit must precede every retry's start too.
+            if let Err(error) = self
+                .transition_deploy_state(&id, ContainerState::Starting)
+                .await
+            {
+                self.record_failed_restart(&id, &error.to_string()).await;
+                continue;
             }
 
             if let Err(error) = self.supervisor.grill().start(&id).await {
@@ -8950,16 +8993,7 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
                 to,
                 reply,
             } => {
-                let result = match self.supervisor.get_instance_mut(&instance_id) {
-                    Some(instance) => match instance.state.transition_to(to) {
-                        Ok(state) => {
-                            instance.state = state;
-                            Ok(())
-                        }
-                        Err(e) => Err(BunError::from(e)),
-                    },
-                    None => Err(BunError::InstanceNotFound { instance_id }),
-                };
+                let result = self.transition_deploy_state(&instance_id, to).await;
                 let _ = reply.send(result);
             }
             DeployOp::FinishFreshInstance {
@@ -9697,6 +9731,9 @@ impl<G: Grill + Clone + 'static> DeployWorker<G> {
         let oci_spec = generate_job_oci_spec(job_name, namespace, spec, &cgroup_str, None);
 
         self.grill.create(instance_id, &oci_spec).await?;
+        self.ops
+            .transition_state(instance_id, ContainerState::Starting)
+            .await?;
         self.grill.start(instance_id).await?;
         self.ops
             .finish_job_instance(instance_id, job_name, namespace, oci_spec)
@@ -14707,6 +14744,46 @@ host = "remote.local"
     }
 
     #[tokio::test]
+    async fn job_checkpoint_failure_after_create_refuses_execution() {
+        let records = tempfile::tempdir().unwrap();
+        let (mut agent, tx, shutdown, grill) = test_agent_with_grill();
+        agent.set_records_dir(records.path().to_path_buf());
+        grill.block_creates();
+        let task = tokio::spawn(async move { agent.run().await });
+        let (events, mut results) = mpsc::channel(32);
+        tx.send(AgentCommand::Deploy {
+            config: Config::parse("[job.work]\nimage = 'test:v1'\n").unwrap(),
+            events,
+        })
+        .await
+        .unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(5), grill.wait_for_creates(1))
+            .await
+            .unwrap();
+        let checkpoint = records.path().join(super::super::jobs::CHECKPOINT_FILE);
+        std::fs::remove_file(&checkpoint).unwrap();
+        std::fs::create_dir(&checkpoint).unwrap();
+        grill.release_creates(1);
+        let event = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            loop {
+                let event = results.recv().await.unwrap();
+                if matches!(
+                    event,
+                    ApplyEvent::Complete { .. } | ApplyEvent::Error { .. }
+                ) {
+                    break event;
+                }
+            }
+        })
+        .await
+        .unwrap();
+        shutdown.cancel();
+        task.await.unwrap();
+        assert!(matches!(event, ApplyEvent::Error { .. }), "{event:?}");
+        assert!(!grill.calls().iter().any(|(op, _)| op == "start"));
+    }
+
+    #[tokio::test]
     async fn job_attempt_precedes_create_and_missing_record_stays_unknown() {
         let records = tempfile::tempdir().unwrap();
         let (mut agent, tx, shutdown, grill) = test_agent_with_grill();
@@ -14726,7 +14803,7 @@ host = "remote.local"
         let checkpoint = super::super::jobs::load(records.path()).unwrap();
         assert_eq!(
             checkpoint["default__work-0"].phase,
-            super::super::jobs::JobPhase::Launching
+            super::super::jobs::JobPhase::Preparing
         );
         assert!(
             crate::grill::records::load_records(records.path())

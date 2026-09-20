@@ -1379,12 +1379,24 @@ file replacement and directory sync make the claim durable before create/start.
 The small runtime adoption record still identifies the actual process; the job
 checkpoint supplies the execution policy that process belongs to.
 
-The outcome is a Rust enum, `JobPhase`, with separate variants for launch intent,
-an observed exit code, an unknown result and operator stopping/stopped states.
+The outcome is a Rust enum, `JobPhase`, with separate variants for preparation,
+permission to launch, an observed exit code, an unknown result and operator
+stopping/stopped states.
 An enum forces each recovery path to consider those different kinds of evidence.
 Likewise, `Option<i32>` distinguishes `Some(0)`, an observed successful exit, from
 `None`, no exit status. Treating `None` as a non-zero code used to replay an
 execution whose effects might already have happened.
+
+The preparation and launch variants close a less obvious retry gap. Suppose an
+old attempt exited with code 1. Bun claims a retry and crashes before the runtime
+replaces the old launch record. Reading that record as the retry's result would
+spend another retry without running it. The checkpoint now says `Preparing`
+until `create` returns successfully. Only then does Bun persist `Launching`,
+before calling `start`. A recovered preparation stays unknown and never inherits
+the previous generation's exit code. If the launch-permit write fails, Bun
+refuses to start. The same ordering covers ordinary jobs, prerequisite jobs,
+cron firings and automatic retries. Job checkpoint schema 2 and state generation
+17 reject older development state whose launch phase had a different meaning.
 
 On recovery, Bun adopts a surviving process with the original retry count and
 finite budget. A missing process with no recorded exit becomes `unknown` and
