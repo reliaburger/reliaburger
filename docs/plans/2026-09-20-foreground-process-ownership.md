@@ -102,16 +102,20 @@ security boundary against hostile same-user processes.
 - [x] Qualify the production owner through all nine single-node/cluster upgrade
   and rollback cases plus the formerly failing job-lease crash-recovery fixture.
   All ten pass on macOS/Linux (497.02s/288.14s).
-- [ ] Bind a queued start request to the generation observed before mutation.
-  Cancelling its caller must not let a delayed blocking worker activate a newer
-  preparation after the old generation has been cancelled and replaced.
+- [x] Bind every queued start, stop, kill and preparation request to the
+  generation observed before mutation. Four regressions reproduce successor
+  mutation after caller cancellation; 22 recovery, nine owner and two actual Bun
+  crash cases plus strict Clippy pass on macOS/Linux.
 - [x] Require the launched Bun's own API announcement before first-run readiness.
   A foreign-listener regression fails before the correction; all sixteen portable
   first-run cases and strict Clippy pass on macOS/Linux afterwards.
+- [ ] Supervise auxiliary process exec commands through the durable owner.
+  The current direct spawn escapes caller cancellation and Bun death; workload
+  retirement must also wait for these commands and their foreground children.
 - [ ] Qualify actual Bun death at the preparation/activation/adoption boundaries,
   helper loss, short jobs, cron and complete group retirement on macOS/Linux.
   Re-run the runtime, agent, job-recovery and upgrade suites.
 
 Production Bun now uses the durable process owner and startup reconciliation.
-Queued-start fencing, remaining runtime/discovery ownership and the
+Auxiliary exec commands, remaining runtime/discovery ownership and the
 0.1.0 release qualification gates remain open.

@@ -610,3 +610,131 @@ async fn agent_preflights_all_launch_intents_before_retiring_any() {
     assert!(result.is_err());
     assert_eq!(state.unwrap(), ContainerState::Running);
 }
+
+#[derive(Debug, Clone, Copy)]
+enum QueuedMutation {
+    Start,
+    Stop,
+    Kill,
+    Create,
+}
+
+async fn cancelled_queued_mutation_preserves_successor(mutation: QueuedMutation) {
+    use reliaburger::grill::process_owner;
+    use ring::rand::SecureRandom;
+    use std::future::Future;
+    use std::task::Poll;
+
+    let directory = tempfile::tempdir().unwrap();
+    let grill = runtime(directory.path());
+    let id = InstanceId("default__queued-0".into());
+    let marker = directory.path().join("unexpected-execution");
+    grill
+        .create(&id, &spec(&format!("touch '{}'", marker.display())))
+        .await
+        .unwrap();
+    if matches!(mutation, QueuedMutation::Create) {
+        grill.kill(&id).await.unwrap();
+    }
+    let owner_directory = directory.path().join("process-owners").join(&id.0);
+    let lock = std::fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .read(true)
+        .write(true)
+        .open(owner_directory.join("client.lock"))
+        .unwrap();
+    lock.lock().unwrap();
+    let stale_spec = spec("exit 42");
+    let mut operation: std::pin::Pin<
+        Box<dyn Future<Output = Result<(), reliaburger::grill::GrillError>> + Send + '_>,
+    > = match mutation {
+        QueuedMutation::Start => Box::pin(grill.start(&id)),
+        QueuedMutation::Stop => Box::pin(grill.stop(&id)),
+        QueuedMutation::Kill => Box::pin(grill.kill(&id)),
+        QueuedMutation::Create => Box::pin(grill.create(&id, &stale_spec)),
+    };
+    // Poll exactly once while the operation lock forbids mutation. Dropping
+    // the caller leaves any already queued blocking mutation alive.
+    std::future::poll_fn(|cx| {
+        assert!(operation.as_mut().poll(cx).is_pending());
+        Poll::Ready(())
+    })
+    .await;
+    drop(operation);
+    let read_record = || -> process_owner::OwnerRecord {
+        serde_json::from_slice(&std::fs::read(owner_directory.join("owner.json")).unwrap()).unwrap()
+    };
+    let persist_record = |record: &process_owner::OwnerRecord| {
+        use std::os::unix::fs::PermissionsExt;
+        let mut temporary = tempfile::Builder::new()
+            .permissions(std::fs::Permissions::from_mode(0o600))
+            .tempfile_in(&owner_directory)
+            .unwrap();
+        serde_json::to_writer(temporary.as_file_mut(), record).unwrap();
+        temporary.as_file().sync_all().unwrap();
+        temporary
+            .persist(owner_directory.join("owner.json"))
+            .unwrap();
+        std::fs::File::open(&owner_directory)
+            .unwrap()
+            .sync_all()
+            .unwrap();
+    };
+    // Model the exclusive lock holder committing cancellation and a successor
+    // before the cancelled caller's queued mutation acquires that same lock.
+    let mut record = read_record();
+    record.phase = process_owner::OwnerPhase::Cancelled;
+    persist_record(&record);
+    let mut nonce = [0u8; 16];
+    ring::rand::SystemRandom::new().fill(&mut nonce).unwrap();
+    record.nonce = hex::encode(nonce);
+    record.phase = if matches!(mutation, QueuedMutation::Create) {
+        process_owner::OwnerPhase::Retired {
+            exit_code: Some(37),
+        }
+    } else {
+        process_owner::OwnerPhase::Prepared
+    };
+    persist_record(&record);
+    let expected = serde_json::to_value(&record).unwrap();
+    drop(lock);
+    // Cover the owner's bounded startup interval too, including cold debug
+    // executable loading. The broken implementation changes the record first.
+    let changed = tokio::time::timeout(Duration::from_secs(20), async {
+        loop {
+            if serde_json::to_value(read_record()).unwrap() != expected || marker.exists() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .is_ok();
+    grill.kill(&id).await.unwrap();
+    stopped(&grill, &id).await;
+    assert!(
+        !changed,
+        "cancelled {mutation:?} changed a successor generation"
+    );
+}
+
+#[tokio::test]
+async fn cancelled_queued_start_cannot_activate_a_successor_generation() {
+    cancelled_queued_mutation_preserves_successor(QueuedMutation::Start).await;
+}
+
+#[tokio::test]
+async fn cancelled_queued_stop_cannot_cancel_a_successor_generation() {
+    cancelled_queued_mutation_preserves_successor(QueuedMutation::Stop).await;
+}
+
+#[tokio::test]
+async fn cancelled_queued_kill_cannot_cancel_a_successor_generation() {
+    cancelled_queued_mutation_preserves_successor(QueuedMutation::Kill).await;
+}
+
+#[tokio::test]
+async fn cancelled_queued_create_cannot_overwrite_a_successor_outcome() {
+    cancelled_queued_mutation_preserves_successor(QueuedMutation::Create).await;
+}

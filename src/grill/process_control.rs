@@ -108,6 +108,15 @@ impl ProcessControl {
     }
 
     pub(crate) async fn prepare(&self, id: &InstanceId, spec: &OciSpec) -> io::Result<()> {
+        let previous_nonce = self
+            .run(id, |this, id| {
+                match std::fs::symlink_metadata(this.directory(&id)?) {
+                    Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(None),
+                    Err(error) => Err(error),
+                    Ok(_) => this.load(&id).map(|record| Some(record.nonce)),
+                }
+            })
+            .await?;
         let spec = spec.clone();
         self.run(id, move |this, id| {
             let directory = this.directory(&id)?;
@@ -132,6 +141,11 @@ impl ProcessControl {
             };
             match std::fs::symlink_metadata(&directory) {
                 Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                    if previous_nonce.is_some() {
+                        return Err(io::Error::other(
+                            "process generation disappeared before preparation",
+                        ));
+                    }
                     // No helper accepts an unpublished temporary directory.
                     // Keep the operation lock through publication and sync so
                     // another adapter cannot start an undurable generation.
@@ -151,6 +165,11 @@ impl ProcessControl {
                     let _operation = operation_lock(&directory)?;
                     let _owner = wait_for_owner_lock(&directory)?;
                     let previous = this.load(&id)?;
+                    if previous_nonce.as_deref() != Some(previous.nonce.as_str()) {
+                        return Err(io::Error::other(
+                            "process generation changed before preparation",
+                        ));
+                    }
                     if !matches!(
                         previous.phase,
                         OwnerPhase::Retired { .. } | OwnerPhase::Cancelled
@@ -168,10 +187,20 @@ impl ProcessControl {
     }
 
     pub(crate) async fn start(&self, id: &InstanceId) -> io::Result<()> {
-        self.run(id, |this, id| {
+        // Cancellation can leave a blocking mutation queued behind another
+        // operation. Bind its authority before queueing that mutation, so it
+        // cannot activate a successor prepared by the intervening lock holder.
+        // Cancellation during this first, read-only operation grants no launch.
+        let nonce = self.record(id).await?.nonce;
+        self.run(id, move |this, id| {
             let directory = this.directory(&id)?;
             let _operation = operation_lock(&directory)?;
             let record = this.load(&id)?;
+            if record.nonce != nonce {
+                return Err(io::Error::other(
+                    "process launch generation changed before start",
+                ));
+            }
             // A prior preparer could have died after rename but before its
             // directory sync. Re-establish publication before any execution.
             File::open(&this.root)?.sync_all()?;
@@ -262,9 +291,15 @@ impl ProcessControl {
     }
 
     pub(crate) async fn signal(&self, id: &InstanceId, force: bool) -> io::Result<()> {
+        let nonce = self.record(id).await?.nonce;
         self.run(id, move |this, id| {
             let directory = this.directory(&id)?;
             let _operation = operation_lock(&directory)?;
+            if this.load(&id)?.nonce != nonce {
+                return Err(io::Error::other(
+                    "process generation changed before signalling",
+                ));
+            }
             let mut record = this.finish_retirement(&id)?;
             if matches!(record.phase, OwnerPhase::Prepared)
                 && let Ok(_owner) = process_owner::lock_owner(&directory)

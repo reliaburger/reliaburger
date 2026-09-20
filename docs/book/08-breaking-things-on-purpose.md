@@ -501,6 +501,22 @@ separate prevents an unsupported runtime from accidentally proving absence.
 Filesystem operations run through `spawn_blocking`, which moves blocking work
 off Tokio's executor threads. Cancelling the caller doesn't abort that worker,
 so its generation record and lock remain owned until the operation finishes.
+A queued worker needs one more boundary. An old start request can wait behind
+the operation lock while its caller is cancelled. The lock holder retires the
+old preparation and publishes a successor. If the worker discovers its generation
+only after acquiring the lock, it launches that successor using the cancelled
+caller's authority. Stop and kill can cancel the successor; a stale create can
+overwrite its completed outcome.
+
+Each mutation now observes its generation in a read-only step, before queueing
+the blocking mutation. A cancelled read cannot launch anything. The `move`
+closure carries that particular nonce into the worker, which compares it under
+the operation lock before changing state. Preparation also records whether no
+published generation existed; a newer record cannot be treated as the previous
+one. Four tests hold the lock, poll and cancel a request, publish a successor,
+then release the lock. Each reproduced the old cross-generation mutation before
+its fix. The corrected requests leave the successor unchanged.
+
 Socket requests use Tokio's existing reactor with a deadline covering connection,
 write and read. Bun selects this adapter for explicit process mode and the
 automatic process fallback. Startup validates the full launch inventory against
