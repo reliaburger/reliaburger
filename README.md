@@ -104,6 +104,47 @@ Ketchup (logs), Lettuce (GitOps), Smoker (chaos), Brioche (dashboard). The compo
 repo layout live in the manual (`relish manual`, "Under the hood") and the
 [design docs](docs/design/).
 
+```mermaid
+flowchart TB
+  operator[Operator] --> relish[Relish CLI / TUI]
+  traffic[Users and external traffic] --> wrapper[Wrapper ingress]
+
+  subgraph cluster[Reliaburger cluster]
+    direction TB
+    mustard[Mustard gossip membership]
+    council[Council Raft consensus]
+    meat[Meat scheduler]
+
+    subgraph nodes[Homogeneous Bun nodes]
+      direction LR
+      bun1[Bun node]
+      bun2[Bun node]
+      bun3[Bun node]
+    end
+
+    mustard -. membership .-> bun1
+    mustard -. membership .-> bun2
+    mustard -. membership .-> bun3
+    council <--> bun1
+    council <--> bun2
+    council <--> bun3
+    meat --> bun1
+    meat --> bun2
+    meat --> bun3
+
+    bun1 --> services1[Grill, Onion, Sesame, Pickle, Mayo, Ketchup, Lettuce]
+    bun2 --> services2[Grill, Onion, Sesame, Pickle, Mayo, Ketchup, Lettuce]
+    bun3 --> services3[Grill, Onion, Sesame, Pickle, Mayo, Ketchup, Lettuce]
+  end
+
+  relish -->|API requests| bun1
+  wrapper -->|route to healthy apps| bun2
+  bun1 <-->|service discovery and workload traffic| bun2
+  bun2 <-->|service discovery and workload traffic| bun3
+  brioche[Brioche web dashboard] -->|reads cluster state| bun1
+  smoker[Smoker chaos testing] -->|fault injection| bun3
+```
+
 ## Try it
 
 Use the source-based quick start above while we prepare the first release.
@@ -183,6 +224,10 @@ The [17 September codebase audit and completion plan](docs/plans/2026-09-17-code
 reconciles the older TODOs, records remaining correctness gaps and separates
 release acceptance from deferred capabilities. The current checklist lives in
 [progress.md](docs/progress.md).
+
+## Contributing
+
+See the [contributing guide](./CONTRIBUTING.md) for more on that.
 
 ## Licence
 
