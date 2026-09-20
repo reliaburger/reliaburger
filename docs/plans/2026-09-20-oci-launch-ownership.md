@@ -47,6 +47,10 @@ changes only once the corresponding recovery contract is implemented.
   compatibility and real Bun-crash cases plus strict Clippy pass. Three real
   rootful registry catalogue cases pass with confirmed cleanup (38.19s).
   State 20 refuses older development layouts.
+- [x] Refuse duplicate preparation and pre-existing OCI state before changing
+  bundles. Both rootless regressions fail first; all 304 selected Linux runtime
+  tests pass with strict Clippy on Linux and macOS. Confirmed retirement permits
+  replacement. Durable pre-adoption intent remains the next step.
 - [ ] Journal original Runc intent before preparation can allocate resources.
   Include the instance generation and runtime configuration needed for recovery.
   Publish a validated complete inventory for the agent's existing reconciliation

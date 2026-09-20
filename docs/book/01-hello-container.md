@@ -3028,3 +3028,25 @@ State format 20 rejects older development state, whose runtime files could live
 outside that node's data directory. Silently switching directories would make a
 surviving old container look absent. Fresh development clusters follow the
 release's existing compatibility policy.
+
+
+### Refuse duplicates before touching their bundles
+
+Create a rootless container twice with the same instance ID. The second call
+used to rewrite `config.json` and replace the in-memory entry. Rootful creation
+already checked for existing network resources, but rootless preparation had no
+equivalent check. An OCI state directory left by a previous Bun could also be
+overlooked.
+
+Runc now checks both its current entry and the instance's OCI state directory
+before preparing anything. An entry permits replacement only after confirmed
+retirement has marked it Stopped. The refusal returns before rollback, because
+rolling back a duplicate request could delete the first request's resources.
+The tests keep the original bundle bytes, attempt a replacement, and check that
+the refusal preserves them. A separate successful replacement after retirement
+ensures this guard does not prevent ordinary reuse.
+
+This check protects the ownership evidence currently available to the adapter.
+It does not recover an interrupted preparation or exclude a delayed launcher
+from another Bun. Those require the durable intent and command ownership
+described above.

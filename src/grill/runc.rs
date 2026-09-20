@@ -768,6 +768,25 @@ impl RuncGrill {
 impl super::Grill for RuncGrill {
     async fn create(&self, instance: &InstanceId, spec: &OciSpec) -> Result<(), GrillError> {
         let _lifecycle = self.lock_lifecycle(instance).await;
+        // Refuse before preparation and its rollback can touch an existing owner.
+        let has_entry = self
+            .entries
+            .lock()
+            .await
+            .get(instance)
+            .is_some_and(|entry| entry.state != ContainerState::Stopped);
+        let has_oci_state = tokio::fs::try_exists(self.state_dir.join(&instance.0))
+            .await
+            .map_err(|error| GrillError::StartFailed {
+                instance: instance.clone(),
+                reason: format!("cannot inspect OCI ownership: {error}"),
+            })?;
+        if has_entry || has_oci_state {
+            return Err(GrillError::StartFailed {
+                instance: instance.clone(),
+                reason: "runtime owner already exists; adopt or retire the owner first".into(),
+            });
+        }
         let container_index = if self.rootless {
             None
         } else {
@@ -1346,6 +1365,72 @@ impl Drop for RuncGrill {
 mod tests {
     use super::*;
     use crate::grill::Grill;
+
+    fn preparation_spec(command: &str) -> OciSpec {
+        serde_json::from_value(serde_json::json!({
+            "root": {"path": "/", "readonly": true},
+            "process": {"args": [command], "env": [], "cwd": "/", "user": {"uid": 0, "gid": 0}},
+            "mounts": [], "linux": {"namespaces": []}
+        }))
+        .unwrap()
+    }
+
+    #[tokio::test]
+    async fn duplicate_rootless_create_preserves_preparation_until_retirement() {
+        let root = tempfile::tempdir().unwrap();
+        let grill = RuncGrill::new(
+            root.path().join("bundles"),
+            ImageStore::new(root.path().join("images")),
+            true,
+            root.path().join("state"),
+        );
+        let id = InstanceId("default__duplicate-0".into());
+        let bundle = root.path().join("bundles").join(&id.0).join("config.json");
+        grill.create(&id, &preparation_spec("first")).await.unwrap();
+        let original = std::fs::read(&bundle).unwrap();
+        let replacement = grill.create(&id, &preparation_spec("second")).await;
+        let preserved = std::fs::read(&bundle).unwrap() == original;
+        grill.kill(&id).await.unwrap();
+        grill
+            .create(&id, &preparation_spec("second"))
+            .await
+            .unwrap();
+        let replaced = std::fs::read(&bundle).unwrap() != original;
+        grill.kill(&id).await.unwrap();
+        assert!(
+            replacement.is_err(),
+            "duplicate create discarded the existing runtime owner"
+        );
+        assert!(preserved, "duplicate create rewrote the owned bundle");
+        assert!(replaced, "confirmed retirement must allow a replacement");
+    }
+
+    #[tokio::test]
+    async fn create_refuses_existing_oci_state_before_touching_its_bundle() {
+        let root = tempfile::tempdir().unwrap();
+        let state = root.path().join("state");
+        let id = InstanceId("default__unadopted-0".into());
+        std::fs::create_dir_all(state.join(&id.0)).unwrap();
+        let bundle = root.path().join("bundles").join(&id.0);
+        std::fs::create_dir_all(&bundle).unwrap();
+        std::fs::write(bundle.join("config.json"), "original owner").unwrap();
+        let grill = RuncGrill::new(
+            root.path().join("bundles"),
+            ImageStore::new(root.path().join("images")),
+            true,
+            state.clone(),
+        );
+        let result = grill.create(&id, &preparation_spec("replacement")).await;
+        assert!(
+            result.is_err(),
+            "unadopted OCI state must fence a new create"
+        );
+        assert_eq!(
+            std::fs::read_to_string(bundle.join("config.json")).unwrap(),
+            "original owner"
+        );
+        assert!(state.join(&id.0).is_dir());
+    }
 
     #[tokio::test]
     async fn invalid_adoption_preserves_resources_without_invoking_runc() {
