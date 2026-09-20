@@ -1679,3 +1679,246 @@ async fn abandoned_registry_upload_is_reclaimed_after_bun_sigkill() {
         "restart lost the owner but retained the upload bytes"
     );
 }
+
+#[tokio::test]
+async fn expired_registry_lease_recovers_after_bun_sigkill_and_preserves_shared_content() {
+    use reliaburger::pickle::types::ManifestCatalog;
+    use reliaburger::relish::client::BunClient;
+    use reliaburger::testkit::oci::{build_synthetic_image, push_image, push_leased_image};
+
+    let root = tempfile::tempdir().unwrap();
+    let cluster_dir = root.path().join("cluster");
+    assert_success(
+        &run_relish(&[
+            "init",
+            cluster_dir.to_str().unwrap(),
+            "--cluster-name",
+            "registry-crash",
+            "--node-id",
+            "node-01",
+        ]),
+        "initialise registry crash fixture",
+    );
+    let config = cluster_dir.join("reliaburger.toml");
+    let mut node = reliaburger::config::NodeConfig::from_file(&config).unwrap();
+    node.network.advertise_address = Some("127.0.0.1".into());
+    node.storage.data = root.path().join("data");
+    node.storage.images = root.path().join("images");
+    node.storage.logs = root.path().join("logs");
+    node.storage.metrics = root.path().join("metrics");
+    node.storage.volumes = root.path().join("volumes");
+    node.images.registry_port = 0;
+    node.testing.safety_class = reliaburger::testkit::safety::ClusterSafetyClass::Development;
+    node.testing
+        .allowed_operations
+        .insert(reliaburger::testkit::safety::OperationPermission::ProvisionIsolatedWorkloads);
+    let (mut bun, address) = spawn_bun_with_port_retry(true, || {
+        let [gossip, raft, reporting] = reserve_ports();
+        node.cluster.gossip_port = gossip;
+        node.cluster.raft_port = raft;
+        node.cluster.reporting_port = reporting;
+        std::fs::write(&config, toml::to_string_pretty(&node).unwrap()).unwrap();
+        (
+            config.clone(),
+            reserve_address(),
+            root.path().join("before.log"),
+        )
+    });
+    let endpoint = format!("https://{address}");
+    let ca = cluster_dir.join("identity/root-ca.crt");
+    let ca = ca.to_str().unwrap();
+    wait_for_relish(
+        &mut bun,
+        &["--endpoint", &endpoint, "--ca-cert", ca, "status"],
+    );
+    let output = run_relish(&[
+        "--endpoint",
+        &endpoint,
+        "--ca-cert",
+        ca,
+        "token",
+        "create",
+        "--name",
+        "registry-crash-admin",
+        "--role",
+        "admin",
+    ]);
+    assert_success(&output, "create registry crash administrator");
+    let token = String::from_utf8(output.stdout).unwrap();
+    let token = token.trim();
+    let deadline = Instant::now() + WAIT;
+    while run_relish(&["--endpoint", &endpoint, "--ca-cert", ca, "token", "list"])
+        .status
+        .success()
+    {
+        assert!(
+            Instant::now() < deadline,
+            "authentication never left bootstrap"
+        );
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    let ca_bytes = std::fs::read(ca).unwrap();
+    let client = BunClient::new_with_ca(&endpoint, Some(token), &ca_bytes).unwrap();
+    let registry = client
+        .capabilities()
+        .await
+        .unwrap()
+        .service_endpoints
+        .registry
+        .unwrap();
+    let http = client.registry_http_client(&registry).unwrap();
+    let image = build_synthetic_image("shared-across-crash");
+    push_image(&http, &registry, "ordinary", "v1", &image)
+        .await
+        .unwrap();
+    let lease = client.create_test_lease(30, None).await.unwrap();
+    let repository = format!("{}/image", lease.namespace);
+    push_leased_image(&http, &registry, &repository, "v1", &image, &lease.lease_id)
+        .await
+        .unwrap();
+    let started = http
+        .post(format!("{registry}/v2/{repository}/blobs/uploads/"))
+        .header("x-reliaburger-test-lease", &lease.lease_id)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(started.status(), 202);
+    let location = started.headers()["location"].to_str().unwrap();
+    let upload = node
+        .storage
+        .images
+        .join("uploads")
+        .join(location.rsplit('/').next().unwrap());
+    let patched = http
+        .patch(format!("{registry}{location}"))
+        .header("x-reliaburger-test-lease", &lease.lease_id)
+        .body("partial leased content")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(patched.status(), 202);
+    assert_eq!(std::fs::read(&upload).unwrap(), b"partial leased content");
+    let catalogue_path = node.storage.data.join("pickle-catalog.json");
+    let catalogue: ManifestCatalog =
+        serde_json::from_slice(&std::fs::read(&catalogue_path).unwrap()).unwrap();
+    assert_eq!(
+        catalogue.repository_owners.get(&repository),
+        Some(&lease.lease_id)
+    );
+    let observed = client
+        .http()
+        .unwrap()
+        .get(format!("{endpoint}/v1/test/leases/{}", lease.lease_id))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(observed.status(), 200);
+    let observed: reliaburger::testkit::lease::TestLease = observed.json().await.unwrap();
+    assert_eq!(observed.repositories[&repository].len(), 1);
+
+    // Kill the actual owner, abandon the writing client and let the original
+    // server-issued deadline expire. The replacement observer never renews or
+    // explicitly releases the lease, so only durable recovery can retire it.
+    bun.child.kill().unwrap();
+    bun.child.wait().unwrap();
+    drop(http);
+    drop(client);
+    let mut replacement = BunProcess::spawn(&config, address, true, root.path().join("after.log"));
+    wait_for_relish(
+        &mut replacement,
+        &[
+            "--endpoint",
+            &endpoint,
+            "--ca-cert",
+            ca,
+            "--token",
+            token,
+            "status",
+        ],
+    );
+    let observer = BunClient::new_with_ca(&endpoint, Some(token), &ca_bytes).unwrap();
+    let deadline = Instant::now() + Duration::from_secs(60);
+    loop {
+        replacement.assert_running();
+        let response = observer
+            .http()
+            .unwrap()
+            .get(format!("{endpoint}/v1/test/leases/{}", lease.lease_id))
+            .send()
+            .await
+            .unwrap();
+        if response.status() == 404 {
+            break;
+        }
+        assert_eq!(response.status(), 200);
+        let pending = response.text().await.unwrap();
+        assert!(
+            Instant::now() < deadline,
+            "registry lease did not retire: {pending}"
+        );
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    let registry = observer
+        .capabilities()
+        .await
+        .unwrap()
+        .service_endpoints
+        .registry
+        .unwrap();
+    let http = observer.registry_http_client(&registry).unwrap();
+    assert_eq!(
+        http.get(format!(
+            "{registry}/v2/{repository}/manifests/{}",
+            image.manifest_digest
+        ))
+        .send()
+        .await
+        .unwrap()
+        .status(),
+        404
+    );
+    let ordinary = http
+        .get(format!(
+            "{registry}/v2/ordinary/manifests/{}",
+            image.manifest_digest
+        ))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(ordinary.status(), 200);
+    assert_eq!(ordinary.bytes().await.unwrap().as_ref(), image.manifest);
+    for (digest, expected) in [
+        (&image.config_digest, &image.config),
+        (&image.layer_digest, &image.layer),
+    ] {
+        let blob = http
+            .get(format!("{registry}/v2/ordinary/blobs/{digest}"))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(blob.status(), 200);
+        assert_eq!(blob.bytes().await.unwrap().as_ref(), expected);
+    }
+    assert!(!upload.exists());
+    assert_eq!(
+        std::fs::read_dir(node.storage.images.join("uploads"))
+            .unwrap()
+            .count(),
+        0
+    );
+    let catalogue: ManifestCatalog =
+        serde_json::from_slice(&std::fs::read(&catalogue_path).unwrap()).unwrap();
+    assert!(!catalogue.repository_owners.contains_key(&repository));
+    assert!(
+        catalogue
+            .manifests
+            .iter()
+            .all(|(_, manifest)| manifest.repository != repository)
+    );
+    assert!(
+        catalogue
+            .manifests
+            .iter()
+            .any(|(_, manifest)| manifest.repository == "ordinary")
+    );
+}

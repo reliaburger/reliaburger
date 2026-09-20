@@ -406,3 +406,16 @@ group passes with three confirmed cleanups and no remaining image metadata
 (37.61s). Three authenticated registry-upload integrations, testkit/OCI suites
 and strict all-target/all-feature Clippy pass on macOS/Linux. Complete physical
 node/client-death and leader-change qualification remains C34/V01/V02.
+
+## Physical storage-owner death qualified
+
+The actual Bun/TLS fixture durably commits one leased repository and a partial
+upload beside identical ordinary image content, then SIGKILLs Bun and abandons
+the writing client. A replacement uses the same state. Without renewal or an
+explicit release, natural expiry removes the lease, leased manifest, ownership
+row and partial upload. Ordinary manifest/config/layer bytes remain exact.
+
+The test passes on macOS (51.87s) and Linux (41.77s), with strict Clippy on both.
+This closes storage-node/client death and shared-content preservation for one
+council node. Actual multi-node leader-change qualification remains open; existing
+in-process authority election tests do not substitute for it.

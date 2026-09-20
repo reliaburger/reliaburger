@@ -1373,3 +1373,22 @@ The regression records two writers, begins cleanup and receives Pending after
 zero and one confirmations. Only the second confirmation permits completion.
 Before the fix it received a consensus error and recorded a spurious cleanup
 failure. Actual transport or storage errors continue to retain their evidence.
+
+### Kill the owner, then stop helping
+
+A cancelled request is useful coverage, but it leaves Bun alive. The physical
+recovery test launches the actual binary with TLS and a durable single-node
+council. It pushes identical content into an ordinary repository and a leased
+one, then leaves another leased upload incomplete. Before killing Bun, it checks
+both the committed writer receipt and the local catalogue's exact lease owner.
+
+The test sends SIGKILL and waits for that child to exit. It drops the writing
+clients, starts a replacement against the same data and observes the original
+lease deadline. It never renews or releases the lease. Recovery must discover the
+pending ownership itself. Only a missing lease, missing disposable manifest and
+empty upload directory count as complete retirement. The ordinary manifest,
+configuration and layer must still return exactly their original bytes.
+
+This runs on macOS and Linux. It proves recovery after the storage owner dies;
+a single-node council cannot prove recovery through a different elected leader.
+That remains a separate multi-node qualification.
