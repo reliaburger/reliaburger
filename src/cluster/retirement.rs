@@ -48,6 +48,9 @@ pub struct NodeRetirement {
     pub retired_at_unix_ms: u64,
     /// Number of unresolved placement obligations released for each lease.
     pub released_placements: BTreeMap<String, u64>,
+    /// Number of unresolved repository writer obligations released for each lease.
+    #[serde(default)]
+    pub released_registry_writers: BTreeMap<String, u64>,
     /// Node-chaos obligation resolved by the same external fencing attestation.
     #[serde(default)]
     pub released_node_fault: Option<u64>,

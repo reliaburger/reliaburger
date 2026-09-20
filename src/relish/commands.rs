@@ -641,8 +641,13 @@ pub async fn decommission_node(
                 .values()
                 .map(|count| u128::from(*count))
                 .sum();
+            let registry_released: u128 = retirement
+                .released_registry_writers
+                .values()
+                .map(|count| u128::from(*count))
+                .sum();
             println!(
-                "retired node {} (operator: {}); resolved {released} placement obligations",
+                "retired node {} (operator: {}); resolved {released} placement and {registry_released} registry obligations",
                 retirement.node_id, retirement.retired_by
             );
             println!("return requires fresh state and enrolment under a new node identity");

@@ -1026,3 +1026,45 @@ The TTL reaper remains responsible for abandoned sessions. The regression uses
 two credentials with the same name, attempts PATCH and completion with the
 wrong credential and the service principal, revokes the owner, then verifies
 that the restored owner can finish its unchanged bytes.
+
+### Keeping the writer receipt until cleanup finishes
+
+A repository can receive uploads on two nodes before either publishes a
+manifest. A catalogue of completed images can't tell us who owns those partial
+files. The lease therefore records each repository and every node which may
+have accepted a writer. The receipt comes before the bytes.
+
+The record uses `BTreeMap<String, BTreeSet<u64>>`: an ordered map from repository
+names to ordered sets of node identities. The type arguments inside `<...>`
+select what each generic collection stores. Ordering makes serialisation
+stable; a set makes a repeated writer claim idempotent. We retain a repository
+entry even after its final node acknowledges retirement, because the global
+catalogue still needs that repository name for its final cleanup.
+
+Publication is a separate conditional Raft operation. It checks the active
+lease, the repository namespace and the publishing node's receipt when the
+entry is applied. Moving the lease to Cleaning fences a proposal admitted
+before cleanup but committed afterwards. Ordinary manifest commits cannot
+bypass the reserved `rbtest-.../` repository namespace.
+
+The cleanup barrier has two stages. First, desired workloads disappear and
+all former placement owners confirm runtime retirement. Only then does Raft
+record `workloads_retired`. Registry acknowledgements before that point refuse.
+The lease remains until every registered writer confirms local retirement.
+Finishing removes all of the repository's metadata, including untagged rows,
+while preserving ordinary repositories and shared digests. Only exclusive,
+unreferenced digests lose their location records; normal GC can then reclaim
+the orphan bytes instead of retaining a useless last copy forever.
+
+Operator decommission records how many registry obligations it clears, alongside
+the existing placement audit. It doesn't grant the old identity a way back in.
+Snapshot restoration preserves the remaining owners and the original audit.
+The standalone lease store uses the same durable receipts and refuses early
+completion; its runtime reaper records the workload barrier only after the
+agent confirms cleanup.
+
+These are the durable state transitions. They don't, by themselves, wire OCI
+request admission, replication and local upload/catalogue deletion into the
+protocol. Those callers must acquire the receipt before writing and retain
+transaction ownership until their mutation finishes. We track that integration
+separately rather than counting the schema as a finished cleanup feature.

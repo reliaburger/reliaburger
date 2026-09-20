@@ -215,6 +215,28 @@ pub enum RaftRequest {
     PublishEndpoints(Box<crate::onion::catalog::EndpointCatalog>),
     /// Create a durable Phase 15 resource lease.
     TestLeaseCreate(crate::testkit::lease::TestLease),
+    /// Record a repository writer before any upload or replicated metadata.
+    TestLeaseRegistryWriter {
+        lease_id: String,
+        repository: String,
+        node_id: u64,
+        owner_id: Option<String>,
+        observed_at_unix_ms: u64,
+    },
+    /// Publish only while the repository's lease and writer receipt remain active.
+    TestLeaseManifestCommit {
+        lease_id: String,
+        observed_at_unix_ms: u64,
+        commit: Box<ManifestCommit>,
+    },
+    /// Confirm all desired workloads and retained runtime placements have retired.
+    TestLeaseWorkloadsRetired { lease_id: String },
+    /// A storage node has durably removed its uploads and repository metadata.
+    TestLeaseRegistryRetired {
+        lease_id: String,
+        repository: String,
+        node_id: u64,
+    },
     /// Atomically apply an app and attach its ownership to an active lease.
     TestLeaseAppSpec {
         lease_id: String,

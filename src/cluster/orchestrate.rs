@@ -2158,6 +2158,7 @@ image = "busybox:latest"
                 reason: "powered off".into(),
                 retired_at_unix_ms: 30,
                 released_placements: Default::default(),
+                released_registry_writers: Default::default(),
                 released_node_fault: None,
             },
         );

@@ -155,3 +155,30 @@ Validate the state transitions and snapshots first, then HTTP writer admission
 and physical cleanup. Each meaningful repair remains its own commit. The
 replicated lease format change advances explicit compatibility before it is
 used; existing development state still requires a fresh cluster.
+
+## Durable registry receipt contract
+
+The lease model now includes bounded repository-to-writer receipts and a
+workload-retirement barrier. Raft atomically attaches writers, conditionally
+publishes leased manifests, records the barrier only after desired resources
+and placements disappear, and accepts exact repository/node acknowledgements.
+Finish retains the lease until every writer resolves; only then does it remove
+global repository metadata. Node decommission clears and audits that node's
+registry receipts. Standalone records preserve the same obligations through
+reload and refuse early finish.
+
+The ordinary-commit bypass regression fails before implementation. Additional
+coverage exercises snapshot restoration, identity retirement, stale commit
+refusal, duplicate acknowledgement, wrong owner/namespace/expiry, shared resource
+limits and shared content preservation. A digest-addressed reference also
+caught a colon-parsing error in retirement before this feature was committed.
+Full library checkpoints pass 3,401 macOS/3,455 Linux tests (41.37s/88.76s), with
+five/19 explicit gates. Final 250 Pickle, 87 state-machine and 17 lease tests,
+eight API-token/two compatibility/four authority integrations and strict Clippy
+pass on both platforms.
+
+This changes the durable and replicated contract to protocol 9/state 13 and
+lease schema 5. HTTP admission, local transaction fencing, replicated image
+writers, image-reference ownership checks and actual node cleanup remain open.
+No public OCI request may claim this work is complete until those paths and the
+physical cleanup cases pass.

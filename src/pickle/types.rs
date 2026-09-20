@@ -408,6 +408,32 @@ impl ManifestCatalog {
         set
     }
 
+    /// Remove all metadata for one retired repository, preserving shared content.
+    /// The caller must establish workload retirement and fence every writer first.
+    pub fn retire_repository(&mut self, repository: &str) {
+        let candidates: std::collections::HashSet<_> = self
+            .manifests
+            .iter()
+            .filter(|(_, manifest)| manifest.repository == repository)
+            .flat_map(|(_, manifest)| {
+                manifest
+                    .referenced_digests()
+                    .into_iter()
+                    .map(|digest| digest.0.clone())
+            })
+            .collect();
+        self.manifests
+            .retain(|(_, manifest)| manifest.repository != repository);
+        let prefix = format!("{repository}:");
+        self.tags
+            .retain(|(reference, _)| !reference.starts_with(&prefix));
+        let referenced = self.referenced_digest_set();
+        // Otherwise the normal last-copy guard would preserve unreferenced test
+        // bytes forever. This changes metadata only; blob GC still rechecks refs.
+        self.layer_locations
+            .retain(|(digest, _)| !candidates.contains(digest) || referenced.contains(digest));
+    }
+
     /// Serialise the catalog to a JSON file crash-safely (REG5): write to
     /// a *unique* temp file, fsync its bytes, rename over the target, then
     /// fsync the parent directory so the rename itself is durable.
@@ -853,6 +879,69 @@ mod tests {
             size,
             media_type: "application/vnd.oci.image.layer.v1.tar+gzip".to_string(),
         }
+    }
+
+    #[test]
+    fn repository_retirement_preserves_shared_references_and_unpins_exclusive_orphans() {
+        let mut catalog = ManifestCatalog::default();
+        let mut ordinary = test_manifest("ordinary", "a");
+        let mut owned = ordinary.clone();
+        owned.repository = "rbtest-run1/web".into();
+        let unique = test_manifest("rbtest-run1/web", "b");
+        ordinary.signature = Some(ImageSignature {
+            method: SigningMethod::ExternalKey {
+                key_id: "test".into(),
+            },
+            signature: "signature".into(),
+            verification_material: VerificationMaterial::PublicKey(vec![1]),
+            signed_at: std::time::SystemTime::UNIX_EPOCH,
+        });
+        for (manifest, tag) in [
+            (ordinary.clone(), "latest"),
+            (owned, "shared"),
+            (unique.clone(), "unique"),
+        ] {
+            catalog.apply_manifest_commit(&ManifestCommit {
+                manifest,
+                tag: tag.into(),
+                holder_nodes: BTreeSet::from([1]),
+            });
+        }
+        // Digest-addressed publication uses a reference containing a colon.
+        catalog.apply_manifest_commit(&ManifestCommit {
+            manifest: unique.clone(),
+            tag: unique.digest.as_str().into(),
+            holder_nodes: BTreeSet::from([1]),
+        });
+        catalog.retire_repository("rbtest-run1/web");
+        assert!(catalog.tags_for_repository("rbtest-run1/web").is_empty());
+        assert!(
+            catalog
+                .get_repository_manifest("rbtest-run1/web", unique.digest.as_str())
+                .is_none()
+        );
+        assert!(
+            catalog
+                .get_manifest_by_tag("ordinary", "latest")
+                .unwrap()
+                .signature
+                .is_some()
+        );
+        let all = catalog.referenced_digest_set();
+        let unique_digest = unique.digest.clone();
+        assert!(!all.contains(unique_digest.as_str()));
+        let shared_digest = ordinary.digest.clone();
+        let approved = catalog.apply_gc_report(&GcReport {
+            node_id: 1,
+            deleted_layers: vec![unique_digest.clone(), shared_digest],
+        });
+        assert_eq!(approved, vec![unique_digest]);
+        let saved = catalog.clone();
+        catalog.retire_repository("rbtest-run1/web");
+        assert_eq!(
+            serde_json::to_value(&catalog).unwrap(),
+            serde_json::to_value(saved).unwrap()
+        );
     }
 
     fn test_manifest(repo: &str, digest_suffix: &str) -> ImageManifest {

@@ -3334,3 +3334,20 @@ releases that gate and waits for the workload's counter before killing Bun.
 This deliberately exercises the scheduling gap while keeping the crash at the
 intended point. The deadline is bounded; an extra or missing execution still
 fails. It does not relax recovery or treat an unknown launch as absent.
+
+### Waiting for registry writers after workloads
+
+A leased test image can outlive its app if we forget which node accepted the
+upload. Each application lease now has a repository-to-writer inventory beside
+its placement history. The reaper first removes desired resources and waits
+for the former runtime owners. It then commits a workload-retired barrier.
+Registry cleanup acknowledgements before that barrier refuse, and the lease
+cannot disappear while any writer remains. Decommissioning clears only the
+externally fenced identity's receipts and preserves the count in its audit.
+
+The standalone store persists the same inventory and barrier. Its reaper marks
+workloads retired only after the agent confirms their cleanup. The storage
+worker must subsequently retire uploads and local metadata before acknowledging
+its receipt. Chapter 5 describes the catalogue side. These state transitions
+are prerequisites; the progress ledger separately tracks connecting every
+upload and replication caller and proving physical cleanup.

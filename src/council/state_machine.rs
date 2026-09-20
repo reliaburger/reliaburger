@@ -189,6 +189,32 @@ fn verify_snapshot_checksum(
 }
 
 impl StateMachineInner {
+    fn registry_node_retired(&self, node_id: u64) -> bool {
+        self.state
+            .security_state
+            .crl
+            .retired_nodes
+            .keys()
+            .any(|name| crate::cluster::identity::raft_id_from_name(name) == node_id)
+    }
+
+    fn lease_workloads_absent(&self, lease: &crate::testkit::lease::TestLease) -> bool {
+        use crate::testkit::lease::{LeasedResource, TestLeaseState};
+        matches!(lease.state, TestLeaseState::Cleaning { .. })
+            && lease.placements.is_empty()
+            && lease.resources.iter().all(|resource| match resource {
+                LeasedResource::App { app_id } => !self.state.apps.contains_key(app_id),
+                LeasedResource::Job { .. } => false,
+                LeasedResource::Namespace { name } => !self.state.namespaces.contains_key(name),
+                LeasedResource::ApiToken { name, .. } => !self
+                    .state
+                    .security_state
+                    .api_tokens
+                    .iter()
+                    .any(|token| token.name == *name),
+            })
+    }
+
     /// Apply a request. Returns a request-specific response for entries
     /// that carry a verdict back to the proposer (`AllocateSerial` gets
     /// its serial, `GcReport` gets the approved deletions); `None` means
@@ -332,6 +358,17 @@ impl StateMachineInner {
                 self.state.config.insert(key.clone(), value.clone());
             }
             RaftRequest::ManifestCommit(commit) => {
+                if commit
+                    .manifest
+                    .repository
+                    .split_once('/')
+                    .is_some_and(|(namespace, _)| namespace.starts_with("rbtest-"))
+                {
+                    return Some(CouncilResponse::Refused {
+                        reason: "test repositories require an active lease and writer receipt"
+                            .into(),
+                    });
+                }
                 if self
                     .state
                     .security_state
@@ -767,6 +804,13 @@ impl StateMachineInner {
                 self.state.endpoint_catalog = *catalog.clone();
             }
             RaftRequest::TestLeaseCreate(lease) => {
+                if !lease.repositories.is_empty() || lease.workloads_retired {
+                    return Some(CouncilResponse::Refused {
+                        reason:
+                            "a new lease cannot carry registry receipts or retirement confirmations"
+                                .into(),
+                    });
+                }
                 if lease.scope != crate::testkit::lease::LeaseScope::Applications {
                     return Some(CouncilResponse::Refused {
                         reason: "node job leases must remain on their owning node".to_string(),
@@ -801,6 +845,92 @@ impl StateMachineInner {
                     .test_leases
                     .insert(lease.lease_id.clone(), lease.clone());
             }
+            RaftRequest::TestLeaseRegistryWriter {
+                lease_id,
+                repository,
+                node_id,
+                owner_id,
+                observed_at_unix_ms,
+            } => {
+                if self.registry_node_retired(*node_id) {
+                    return Some(CouncilResponse::Refused {
+                        reason: "registry writer identity is retired".into(),
+                    });
+                }
+                let Some(lease) = self.state.test_leases.get_mut(lease_id) else {
+                    return Some(CouncilResponse::Refused {
+                        reason: "lease not found".into(),
+                    });
+                };
+                if let Err(error) = lease.attach_registry_writer(
+                    repository,
+                    *node_id,
+                    owner_id.as_deref(),
+                    *observed_at_unix_ms,
+                ) {
+                    return Some(CouncilResponse::Refused {
+                        reason: error.to_string(),
+                    });
+                }
+            }
+            RaftRequest::TestLeaseManifestCommit {
+                lease_id,
+                observed_at_unix_ms,
+                commit,
+            } => {
+                if self.registry_node_retired(commit.manifest.pushed_by)
+                    || !self.state.test_leases.get(lease_id).is_some_and(|lease| {
+                        lease.permits_registry_commit(commit, *observed_at_unix_ms)
+                    })
+                {
+                    return Some(CouncilResponse::Refused {
+                        reason: "repository lease or writer is not active".into(),
+                    });
+                }
+                self.state.manifest_catalog.apply_manifest_commit(commit);
+            }
+            RaftRequest::TestLeaseWorkloadsRetired { lease_id } => {
+                let Some(lease) = self.state.test_leases.get(lease_id) else {
+                    return Some(CouncilResponse::Refused {
+                        reason: "lease not found".into(),
+                    });
+                };
+                if !self.lease_workloads_absent(lease) {
+                    return Some(CouncilResponse::Refused {
+                        reason: "lease still owns workloads or placement obligations".into(),
+                    });
+                }
+                if let Some(lease) = self.state.test_leases.get_mut(lease_id) {
+                    lease.workloads_retired = true;
+                }
+            }
+            RaftRequest::TestLeaseRegistryRetired {
+                lease_id,
+                repository,
+                node_id,
+            } => {
+                let Some(lease) = self.state.test_leases.get_mut(lease_id) else {
+                    return Some(CouncilResponse::Refused {
+                        reason: "lease not found".into(),
+                    });
+                };
+                if !lease.workloads_retired
+                    || !matches!(
+                        lease.state,
+                        crate::testkit::lease::TestLeaseState::Cleaning { .. }
+                    )
+                {
+                    return Some(CouncilResponse::Refused {
+                        reason: "lease workloads have not retired".into(),
+                    });
+                }
+                let Some(owners) = lease.repositories.get_mut(repository) else {
+                    return Some(CouncilResponse::Refused {
+                        reason: "repository does not belong to lease".into(),
+                    });
+                };
+                owners.remove(node_id);
+            }
             RaftRequest::TestLeaseAppSpec {
                 lease_id,
                 observed_at_unix_ms,
@@ -827,7 +957,7 @@ impl StateMachineInner {
                 };
                 let already_owned = lease.resources.contains(&resource);
                 if !already_owned
-                    && lease.resources.len() >= crate::testkit::lease::MAX_LEASED_RESOURCES
+                    && lease.resource_count() >= crate::testkit::lease::MAX_LEASED_RESOURCES
                 {
                     return Some(CouncilResponse::Refused {
                         reason: "lease resource limit reached".to_string(),
@@ -871,7 +1001,7 @@ impl StateMachineInner {
                     crate::testkit::lease::LeasedResource::Namespace { name: name.clone() };
                 let already_owned = lease.resources.contains(&resource);
                 if !already_owned
-                    && lease.resources.len() >= crate::testkit::lease::MAX_LEASED_RESOURCES
+                    && lease.resource_count() >= crate::testkit::lease::MAX_LEASED_RESOURCES
                 {
                     return Some(CouncilResponse::Refused {
                         reason: "lease resource limit reached".to_string(),
@@ -1074,7 +1204,16 @@ impl StateMachineInner {
                     }
                 }
                 let mut released_placements = std::collections::BTreeMap::new();
+                let mut released_registry_writers = std::collections::BTreeMap::new();
+                let registry_node_id = crate::cluster::identity::raft_id_from_name(node_id);
                 for (lease_id, lease) in &mut self.state.test_leases {
+                    let mut registry_count = 0u64;
+                    for owners in lease.repositories.values_mut() {
+                        registry_count += u64::from(owners.remove(&registry_node_id));
+                    }
+                    if registry_count > 0 {
+                        released_registry_writers.insert(lease_id.clone(), registry_count);
+                    }
                     let before = lease.placements.len();
                     lease.placements.retain(|owner| owner.node_id.0 != *node_id);
                     let released = before - lease.placements.len();
@@ -1102,6 +1241,7 @@ impl StateMachineInner {
                     reason: reason.clone(),
                     retired_at_unix_ms: *retired_at_unix_ms,
                     released_placements,
+                    released_registry_writers,
                     released_node_fault,
                 };
                 self.state
@@ -1222,6 +1362,14 @@ impl StateMachineInner {
                             remaining.join(", ")
                         ),
                     });
+                }
+                if !lease.registry_retirement_confirmed() {
+                    return Some(CouncilResponse::Refused {
+                        reason: "lease still owns unconfirmed registry writers".into(),
+                    });
+                }
+                for repository in lease.repositories.keys() {
+                    self.state.manifest_catalog.retire_repository(repository);
                 }
                 self.state.test_leases.remove(lease_id);
             }
@@ -3933,6 +4081,199 @@ mod tests {
             lease_id: "run1".into(),
         });
         assert!(inner.state.test_leases.is_empty());
+    }
+
+    #[test]
+    fn ordinary_manifest_commits_cannot_bypass_a_reserved_test_repository() {
+        let mut inner = StateMachineInner::default();
+        let mut commit = test_manifest_commit();
+        commit.manifest.repository = "rbtest-run1/web".into();
+        assert!(matches!(
+            inner.apply_request(&RaftRequest::ManifestCommit(commit)),
+            Some(CouncilResponse::Refused { .. })
+        ));
+        assert!(inner.state.manifest_catalog.manifests.is_empty());
+    }
+
+    #[test]
+    fn registry_writer_receipts_fence_late_commits_and_delay_lease_completion() {
+        let mut inner = StateMachineInner::default();
+        inner.apply_request(&RaftRequest::TestLeaseCreate(test_lease("run1", 100)));
+        let writer = |node, owner: &str| {
+            serde_json::from_value::<RaftRequest>(serde_json::json!({
+                "TestLeaseRegistryWriter": {
+                    "lease_id": "run1", "repository": "rbtest-run1/web", "node_id": node,
+                    "owner_id": owner, "observed_at_unix_ms": 20
+                }
+            }))
+            .expect("Raft must record a repository's possible storage owners")
+        };
+        assert!(matches!(
+            inner.apply_request(&writer(1, "wrong")),
+            Some(CouncilResponse::Refused { .. })
+        ));
+        assert!(inner.apply_request(&writer(1, "token:ci")).is_none());
+        assert!(inner.apply_request(&writer(2, "token:ci")).is_none());
+        assert!(inner.apply_request(&writer(1, "token:ci")).is_none());
+        let mut commit = test_manifest_commit();
+        commit.manifest.repository = "rbtest-run1/web".into();
+        commit.manifest.pushed_by = 1;
+        commit.holder_nodes = std::collections::BTreeSet::from([1]);
+        let publish = serde_json::from_value::<RaftRequest>(serde_json::json!({
+            "TestLeaseManifestCommit": {"lease_id":"run1", "observed_at_unix_ms":20, "commit":commit}
+        })).unwrap();
+        assert!(inner.apply_request(&publish).is_none());
+        inner.apply_request(&RaftRequest::TestLeaseBeginCleanup {
+            lease_id: "run1".into(),
+        });
+        assert!(matches!(
+            inner.apply_request(&writer(3, "token:ci")),
+            Some(CouncilResponse::Refused { .. })
+        ));
+        assert!(matches!(
+            inner.apply_request(&publish),
+            Some(CouncilResponse::Refused { .. })
+        ));
+        let finish = RaftRequest::TestLeaseFinishCleanup {
+            lease_id: "run1".into(),
+        };
+        assert!(matches!(
+            inner.apply_request(&finish),
+            Some(CouncilResponse::Refused { .. })
+        ));
+        let ack = |node| {
+            serde_json::from_value::<RaftRequest>(serde_json::json!({
+            "TestLeaseRegistryRetired": {"lease_id":"run1", "repository":"rbtest-run1/web", "node_id":node}
+        })).unwrap()
+        };
+        // Cleaning alone does not establish that workloads have stopped.
+        assert!(matches!(
+            inner.apply_request(&ack(1)),
+            Some(CouncilResponse::Refused { .. })
+        ));
+        let ready = serde_json::from_value::<RaftRequest>(serde_json::json!({
+            "TestLeaseWorkloadsRetired": {"lease_id":"run1"}
+        }))
+        .unwrap();
+        assert!(inner.apply_request(&ready).is_none());
+        assert!(inner.apply_request(&ack(1)).is_none());
+        assert!(inner.apply_request(&ack(1)).is_none());
+        assert!(matches!(
+            inner.apply_request(&finish),
+            Some(CouncilResponse::Refused { .. })
+        ));
+        assert!(inner.apply_request(&ack(2)).is_none());
+        assert!(inner.apply_request(&finish).is_none());
+        assert!(inner.state.test_leases.is_empty());
+        assert!(inner.state.manifest_catalog.manifests.is_empty());
+    }
+
+    #[tokio::test]
+    async fn registry_receipts_survive_snapshots_and_decommission_releases_only_the_retired_node() {
+        let mut sm = CouncilStateMachine::new();
+        let retired = crate::cluster::identity::raft_id_from_name("old-worker");
+        let surviving = crate::cluster::identity::raft_id_from_name("worker");
+        let request = |node| RaftRequest::TestLeaseRegistryWriter {
+            lease_id: "run1".into(),
+            repository: "rbtest-run1/web".into(),
+            node_id: node,
+            owner_id: Some("token:ci".into()),
+            observed_at_unix_ms: 20,
+        };
+        for (index, request) in [
+            RaftRequest::TestLeaseCreate(test_lease("run1", 100)),
+            request(retired),
+            request(surviving),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let response = sm
+                .apply(vec![normal_entry(1, index as u64 + 1, request)])
+                .await
+                .unwrap();
+            assert!(!matches!(response[0], CouncilResponse::Refused { .. }));
+        }
+        let mut builder = sm.get_snapshot_builder().await;
+        let snapshot = builder.build_snapshot().await.unwrap();
+        let mut restored = CouncilStateMachine::new();
+        restored
+            .install_snapshot(&snapshot.meta, snapshot.snapshot)
+            .await
+            .unwrap();
+        let mut inner = restored.inner.write().await;
+        assert_eq!(
+            inner.state.test_leases["run1"].repositories["rbtest-run1/web"].len(),
+            2
+        );
+        let retire = RaftRequest::DecommissionNode {
+            node_id: "old-worker".into(),
+            retired_by: "operator".into(),
+            reason: "powered off".into(),
+            retired_at_unix_ms: 30,
+            membership_log_id: None,
+        };
+        assert!(matches!(
+            inner.apply_request(&retire),
+            Some(CouncilResponse::NodeDecommissioned { .. })
+        ));
+        assert_eq!(
+            inner.state.test_leases["run1"].repositories["rbtest-run1/web"],
+            std::collections::BTreeSet::from([surviving])
+        );
+        let audit = inner.state.security_state.crl.retired_nodes["old-worker"].clone();
+        assert_eq!(audit.released_registry_writers["run1"], 1);
+        inner.apply_request(&retire);
+        assert_eq!(
+            inner.state.security_state.crl.retired_nodes["old-worker"],
+            audit
+        );
+        assert!(matches!(
+            inner.apply_request(&request(retired)),
+            Some(CouncilResponse::Refused { .. })
+        ));
+    }
+
+    #[test]
+    fn registry_cleanup_waits_for_desired_apps_and_every_former_placement() {
+        use crate::testkit::lease::{LeasedPlacement, LeasedResource};
+        let mut inner = StateMachineInner::default();
+        let mut lease = test_lease("run1", 100);
+        let app_id = AppId::new("web", "rbtest-run1");
+        lease.resources.insert(LeasedResource::App {
+            app_id: app_id.clone(),
+        });
+        lease.placements.insert(LeasedPlacement {
+            app_id: app_id.clone(),
+            node_id: NodeId::new("worker"),
+        });
+        inner.apply_request(&RaftRequest::TestLeaseCreate(lease));
+        inner.state.apps.insert(app_id.clone(), default_spec());
+        inner.apply_request(&RaftRequest::TestLeaseBeginCleanup {
+            lease_id: "run1".into(),
+        });
+        let ready = RaftRequest::TestLeaseWorkloadsRetired {
+            lease_id: "run1".into(),
+        };
+        assert!(matches!(
+            inner.apply_request(&ready),
+            Some(CouncilResponse::Refused { .. })
+        ));
+        inner.apply_request(&RaftRequest::AppDelete {
+            app_id: app_id.clone(),
+        });
+        assert!(matches!(
+            inner.apply_request(&ready),
+            Some(CouncilResponse::Refused { .. })
+        ));
+        inner.apply_request(&RaftRequest::TestLeasePlacementRetired {
+            lease_id: "run1".into(),
+            placement: LeasedPlacement {
+                app_id,
+                node_id: NodeId::new("worker"),
+            },
+        });
+        assert!(inner.apply_request(&ready).is_none());
     }
 
     fn test_lease(id: &str, expires_at_unix_ms: u64) -> crate::testkit::lease::TestLease {

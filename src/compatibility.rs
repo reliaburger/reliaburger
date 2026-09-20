@@ -15,10 +15,10 @@ pub struct Compatibility {
     pub state: u32,
 }
 
-/// Supported formats; lease-owned storage requires protocol eight/state twelve.
+/// Supported formats; registry writer receipts require protocol nine/state thirteen.
 pub const CURRENT: Compatibility = Compatibility {
-    protocol: 8,
-    state: 12,
+    protocol: 9,
+    state: 13,
 };
 
 /// Name of the durable format stamp at the root of a node's data directory.

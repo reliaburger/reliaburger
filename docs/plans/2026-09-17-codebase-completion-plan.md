@@ -925,6 +925,25 @@ Refusals preserve the creator's temporary bytes. All 249 Pickle and existing
 registry integration cases pass on macOS/Linux, with strict Clippy. Session
 identity is ephemeral; durable repository ownership remains open.
 
+**Registry receipt contract (20 September):** Durable leases now retain each
+repository and every possible writer, with a separate confirmed-workload barrier.
+Conditional Raft publication fences cleaning/expired leases and unregistered
+writers; ordinary commits refuse the reserved namespace. Cleanup retains the
+lease until all runtime and storage owners resolve. Decommission clears and
+audits only its identity's registry obligations. Local leases persist equivalent
+receipts and refuse early completion. Catalogue retirement preserves ordinary
+references/shared digests and unpins exclusive orphans for normal GC.
+
+The ordinary-commit bypass regression fails first; an additional digest-reference
+case catches and repairs a colon-parsing mistake before commit. Full library
+checkpoints pass 3,401 macOS/3,455 Linux tests (five/19 gates), followed by 250
+Pickle, 87 state-machine and 17 lease tests on both platforms. API-token,
+compatibility and real TLS authority integrations and strict Clippy pass.
+Formats advance to protocol 9/state 13 and lease schema 5. This is the durable
+contract; HTTP admission, cancellation-safe writer fencing, image-reference
+ownership, replication and physical repository cleanup remain open in the
+[registry plan](2026-09-19-registry-retirement.md).
+
 Remaining resource contracts, each in its own commit: registry uploads/repositories
 and process identity/pre-adoption recovery. Managed volume/mount cleanup is
 implemented and qualified as recorded above. Node effects already use C06 reservations
