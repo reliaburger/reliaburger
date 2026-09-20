@@ -7833,6 +7833,15 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
             self.commit_jobs(jobs).await?;
         }
 
+        // Runtime retirement can release a reusable container address. Refuse
+        // before that happens if an old VIP can still route to the address.
+        let service_id = crate::onion::service_id::ServiceId::new(namespace, app_name);
+        self.remove_backend_ebpf(&service_id).await?;
+        for id in &instances {
+            let _ = self.service_map.remove_backend(&service_id, &id.0);
+        }
+        self.rebuild_routing_table().await;
+
         // Stop via supervisor (moves the tracked state to Stopping).
         if !instances.is_empty() {
             self.supervisor.stop_app(app_name, namespace).await?;
@@ -7882,14 +7891,6 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
         }
         if owns_job {
             self.commit_jobs(jobs).await?;
-        }
-
-        // Confirm kernel withdrawal before discarding any workload record or
-        // the service entry that owns the exact allocated VIP and port.
-        let service_id = crate::onion::service_id::ServiceId::new(namespace, app_name);
-        self.remove_backend_ebpf(&service_id).await?;
-        for id in &instances {
-            let _ = self.service_map.remove_backend(&service_id, &id.0);
         }
 
         // A failed artifact cleanup retains the empty service's key for retry.

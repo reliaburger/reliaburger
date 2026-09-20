@@ -3572,6 +3572,9 @@ impl reliaburger::grill::Grill for InitPolicyGrill {
         tokio::fs::copy("/usr/bin/busybox", bin.join("busybox"))
             .await
             .unwrap();
+        tokio::fs::write(self.bundles.join(&id.0).join("rootfs/index.html"), &id.0)
+            .await
+            .unwrap();
         Ok(())
     }
 
@@ -3657,6 +3660,9 @@ impl reliaburger::grill::Grill for InitPolicyGrill {
     }
     async fn pid(&self, id: &reliaburger::grill::InstanceId) -> Option<u32> {
         self.runtime.pid(id).await
+    }
+    async fn container_ip(&self, id: &reliaburger::grill::InstanceId) -> Option<Ipv4Addr> {
+        self.runtime.container_ip(id).await
     }
     async fn exit_code(&self, id: &reliaburger::grill::InstanceId) -> Option<i32> {
         self.runtime.exit_code(id).await
@@ -3910,4 +3916,117 @@ async fn uncertain_initialiser_preserves_parent_policy_until_confirmed_retiremen
     );
     assert!(second.is_ok(), "confirmed retry failed: {second:?}");
     assert_eq!(second_state, reliaburger::grill::ContainerState::Stopped);
+}
+
+async fn read_runtime_fixture_page(address: SocketAddr) -> anyhow::Result<String> {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    tokio::time::timeout(Duration::from_secs(8), async {
+        let mut stream = loop {
+            match tokio::net::TcpStream::connect(address).await {
+                Ok(stream) => break stream,
+                Err(_) => tokio::time::sleep(Duration::from_millis(20)).await,
+            }
+        };
+        stream
+            .write_all(b"GET / HTTP/1.0\r\nHost: fixture\r\n\r\n")
+            .await?;
+        let mut response = String::new();
+        stream.take(4096).read_to_string(&mut response).await?;
+        Ok::<_, anyhow::Error>(response)
+    })
+    .await?
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "requires Linux root, runc, static BusyBox and RELIABURGER_EBPF_TESTS=1"]
+async fn refused_backend_withdrawal_cannot_redirect_a_vip_to_a_new_workload() {
+    use reliaburger::bun::agent::{AgentCommand, ApplyEvent, BunAgent};
+    use reliaburger::grill::{Grill, ImageStore, InstanceId, port::PortAllocator, runc::RuncGrill};
+    use std::sync::Arc;
+    use tokio::sync::{Mutex, mpsc, oneshot};
+    assert!(ebpf_tests_enabled());
+    let root = tempfile::tempdir().unwrap();
+    let ebpf = Arc::new(Mutex::new(
+        OnionEbpf::load_embedded(CGROUP_PATH.as_ref()).unwrap(),
+    ));
+    let bundles = root.path().join("bundles");
+    let runtime = RuncGrill::new(
+        bundles.clone(),
+        ImageStore::new(root.path().join("images")),
+        false,
+        root.path().join("runc-state"),
+    )
+    .with_owner(env!("CARGO_BIN_EXE_bun").into())
+    .unwrap();
+    let grill = InitPolicyGrill {
+        runtime: runtime.clone(),
+        bundles,
+        bpf: Arc::clone(&ebpf),
+        starts: Arc::new(Mutex::new(Vec::new())),
+        refuse_init_cleanup: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+    };
+    let (commands, receiver) = mpsc::channel(64);
+    let shutdown = CancellationToken::new();
+    let mut agent = BunAgent::new(
+        grill,
+        PortAllocator::new(43600, 43700),
+        receiver,
+        shutdown.clone(),
+    );
+    agent.set_records_dir(root.path().join("records"));
+    agent.set_volumes_dir(root.path().join("volumes"));
+    agent.set_onion_ebpf(Arc::clone(&ebpf)).await;
+    let task = tokio::spawn(async move { agent.run().await });
+    let exercise = async {
+        for name in ["address-predecessor", "address-successor"] {
+            let port = if name == "address-predecessor" { "port = 8080" } else { "" };
+            let config = reliaburger::config::Config::parse(&format!(
+                "[app.{name}]\nimage = '/empty-fixture'\ncommand = ['/bin/busybox', 'httpd', '-f', '-p', '8080', '-h', '/']\n{port}\n"
+            ))?;
+            let (events, mut results) = mpsc::channel(64);
+            commands.send(AgentCommand::Deploy { config, events }).await?;
+            while let Some(event) = results.recv().await {
+                if let ApplyEvent::Error { message } = event { anyhow::bail!(message); }
+            }
+            let id = InstanceId(format!("default__{name}-0"));
+            let ip = runtime.container_ip(&id).await.ok_or_else(|| anyhow::anyhow!("runtime omitted container address"))?;
+            let ready = read_runtime_fixture_page(SocketAddr::new(ip.into(), 8080))
+                .await.map_err(|error| anyhow::anyhow!("direct {id} ({ip}): {error}"))?;
+            anyhow::ensure!(ready.contains(&id.0), "fixture did not serve its own identity");
+            if name == "address-predecessor" {
+                let vip = VirtualIP::from_service_id(&ServiceId::new("default", name));
+                let ready = read_runtime_fixture_page(SocketAddr::new(vip.0.into(), 8080))
+                    .await.map_err(|error| anyhow::anyhow!("original VIP before retirement: {error}"))?;
+                anyhow::ensure!(ready.contains(&id.0), "original VIP did not serve its own identity");
+                freeze_egress_map(&*ebpf.lock().await, "backend_map");
+                let (response, result) = oneshot::channel();
+                commands.send(AgentCommand::Retire { app_name: name.into(), namespace: "default".into(), response }).await?;
+                anyhow::ensure!(result.await?.is_err(), "frozen backend retirement was acknowledged");
+            }
+        }
+        let vip = VirtualIP::from_service_id(&ServiceId::new("default", "address-predecessor"));
+        read_runtime_fixture_page(SocketAddr::new(vip.0.into(), 8080))
+            .await.map_err(|error| anyhow::anyhow!("original VIP after refused retirement: {error}"))
+    }.await;
+    shutdown.cancel();
+    task.await.unwrap();
+    for launch in runtime.launch_inventory().await.unwrap().unwrap() {
+        runtime.kill(&launch.instance_id).await.unwrap();
+    }
+    ebpf.lock().await.detach().unwrap();
+    for name in ["address-predecessor", "address-successor"] {
+        let path = reliaburger::grill::cgroup::cgroup_path("default", name, 0);
+        if path.exists() {
+            std::fs::remove_dir(path).unwrap();
+        }
+    }
+    let response = exercise.unwrap();
+    assert!(
+        !response.contains("default__address-successor-0"),
+        "old VIP served an unrelated replacement: {response}"
+    );
+    assert!(
+        response.contains("default__address-predecessor-0"),
+        "refused retirement lost the original endpoint: {response}"
+    );
 }

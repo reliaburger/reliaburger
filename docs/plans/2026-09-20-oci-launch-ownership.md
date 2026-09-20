@@ -501,15 +501,19 @@ backend withdrawal; its packet test requires neither Bun nor eBPF.
 
 ## Backend and reusable-address retirement ordering
 
-Carry this into the open discovery ownership work: owned Runc cleanup releases
-its rootful address reservation, including when state inspection observes an
-exited launcher. Agent Stop currently withdraws the backend after runtime
-retirement. Inspect and physically reproduce whether a refused backend removal
-can therefore route an old VIP to a newly allocated container address. Durable
-backend records alone do not establish the required ordering: the route must be
-withdrawn before its destination address can be reused. Include natural exits,
-explicit Stop and per-instance rollout retirement in that qualification. This is
-an inspected ordering concern, not yet a reproduced connection leak.
+Owned Runc cleanup releases its rootful address reservation, including when
+state inspection observes an exited launcher. The original Agent Stop withdrew
+backends after runtime retirement; the HTTP regression below now reproduces the
+resulting connection leak. Durable backend records alone do not establish the
+required ordering: the route must be withdrawn before its destination address
+can be reused. Include natural exits and per-instance rollout retirement in the
+remaining qualification.
+
+Also combine live-policy loss with refused backend withdrawal. Safety fencing
+must still stop execution, while retaining any address that an old route can
+reach. Simply moving a route deletion earlier in ordinary Stop does not prove
+that combined failure safe. Runtime execution, address ownership and discovery
+retirement need separately confirmed boundaries.
 
 Initialiser-retirement qualification: all 59 physical kernel tests pass (26.59s),
 all 176 affected library tests pass on macOS/Linux (17.767s/22.899s), and both
@@ -517,3 +521,26 @@ binary compatibility tests plus strict Clippy and formatting pass on each.
 Actual Bun process death and cancellation before/during runtime activation remain
 explicitly open. The physical failure fixture aborts the controller task and
 retains the actual owned runtimes and kernel maps for recovery.
+
+## Explicit Stop before address reuse
+
+The physical regression confirms the inspected ordering defect: freeze backend
+removal, Retire the original service, then start a portless container that serves
+its identity on the same internal port. The old VIP returns HTTP 200 with the
+successor's identity. The test checks the direct endpoints as positive controls.
+
+Move confirmed kernel withdrawal, userspace backend removal and routing
+publication before runtime Stop. Refusal keeps the original runtime/address
+owned; a failed Stop is not evidence that execution ceased. This closes the
+explicit Stop/Retire ordering case. Natural exits, per-instance rollout cleanup,
+durable backend ownership and stale cluster routing views remain open. In
+particular, qualify how a worker excludes its own advertised catalogue backends
+when it has no council metrics identity.
+
+Qualification: all 60 kernel cases pass (33.28s), including the old-VIP HTTP
+regression with positive direct-endpoint controls and the original VIP checked
+before injecting failure. All 207 macOS/227 Linux affected library cases pass
+(17.773s/23.946s), with both compatibility tests and strict Clippy/formatting on
+each platform. The separate route fix also passes all four network cases and
+eleven Runc cases. These results do not close the remaining combined failure,
+natural-exit, rollout or durable discovery ownership cases above.

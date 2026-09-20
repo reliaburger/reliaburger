@@ -1290,9 +1290,10 @@ remove the application record and return success. The next Retire request also
 returned success because the application was already forgotten. The kernel still
 held its backend entry.
 
-The agent now withdraws the exact allocated VIP and port before removing any
-workload record. Failure returns `BunError::BackendRetirement` and preserves the
-service entry and stopped workload owners for retry. Once withdrawal succeeds,
+The first repair withdrew the exact allocated VIP and port before removing any
+workload record. Failure returned `BunError::BackendRetirement` and preserved the
+service entry and stopped workload owners for retry. The address-reuse repair
+below moves that withdrawal ahead of runtime termination too. Once withdrawal succeeds,
 we remove the userspace backends and retire the remaining artifacts. If that
 later cleanup fails, the retained empty service entry still identifies the same
 key for the next attempt. Rollout finalisation also propagates a refused backend
@@ -1429,3 +1430,24 @@ fixture refuses initialiser cleanup, aborts the controller task, and checks that
 another refused recovery keeps the original namespace map. Removing the injected
 failure then permits confirmed runtime and policy retirement. Actual Bun process
 death and production-path qualification remain the broader release gates.
+
+### Withdraw the route before releasing the address
+
+Freezing the backend map exposed a more direct failure than a stale record.
+Retire stopped the old container, then failed to remove its VIP entry. Runc had
+already released the container's private address. A new, unrelated container
+received that address, and a request to the old VIP returned HTTP 200 with the
+new container's identity. The successor didn't even advertise a service port.
+
+Explicit Stop and Retire now confirm kernel backend withdrawal before stopping
+the runtime. After withdrawal, Bun empties the userspace backends and republishes
+routing state before termination can release the address. If withdrawal fails,
+the original runtime and address remain owned. The caller gets an error and can
+retry after fixing the kernel failure; the request has not stopped the workload.
+
+The physical regression serves each container's identity from an offline
+BusyBox HTTP server. It verifies the successor's direct endpoint independently,
+then requests the old VIP after injecting backend-deletion refusal. That VIP
+must keep reaching its original owner, and must never serve the successor.
+Natural-exit cleanup, per-instance rollout updates, durable service ownership
+and stale cluster routing snapshots remain separate qualification boundaries.
