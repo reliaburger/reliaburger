@@ -162,6 +162,14 @@ impl OwnedCommands {
             .collect())
     }
 
+    /// Prune positively retired attempts and their logs under exclusive collection ownership.
+    /// Prepared, running and uncertain attempts remain discoverable. Command IDs
+    /// are never reused, so delayed starts cannot activate a replacement after pruning.
+    /// Wait for any desired output before calling this operation.
+    pub async fn prune_retired(&self) -> Result<usize, CommandError> {
+        Ok(self.control.prune_retired_commands().await?)
+    }
+
     /// Return this command's private log stem; append stdout or stderr extensions.
     pub fn log_stem(&self, id: &CommandId) -> Result<PathBuf, CommandError> {
         Ok(self.control.log_stem(&id.0)?)

@@ -331,6 +331,10 @@ impl IntentCommands {
             }
             self.validate_roles().await?;
             self.require_terminal_commands().await?;
+            self.commands
+                .prune_retired()
+                .await
+                .map_err(io::Error::other)?;
             let id = self
                 .commands
                 .prepare(&program, &arguments, &environment)

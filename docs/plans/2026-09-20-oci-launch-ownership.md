@@ -127,8 +127,11 @@ The primitives do not yet switch production Runc. Connect them in this order:
    reservations only after every admitted mutator has positively retired.
 4. Preserve generation fencing across queued calls and separately constructed
    adapters. A clone created before sealing cannot obtain cleanup authority.
-5. Prune positively retired short-command records under the same exclusive
-   claim, so recurring runtime observations cannot grow the journal indefinitely.
+5. Completed: prune positively retired short-command records under the same
+   exclusive claim, so recurring runtime observations cannot grow the journal
+   indefinitely. The failing growth regression and four pruning contracts pass
+   within 34 macOS/36 Linux selected cases, strict Clippy on both platforms, and
+   both privileged network cases after pruning.
    Failed or uncertain attempts must remain discoverable. Move terminal records
    atomically to a separate private garbage directory before deleting files, so
    a crash during deletion cannot corrupt the active command inventory. Fence

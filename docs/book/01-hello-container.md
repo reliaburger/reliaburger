@@ -3201,3 +3201,35 @@ commands. One requires sealing to finish while a long exec is still waiting;
 the other opens a delayed mutation gate only after retirement and checks that
 nothing happens. Actual container exec qualification follows when Runc uses
 this adapter path.
+
+### Keep polling from filling the disk
+
+Twelve successful runtime queries used to leave twelve command records. A node
+polling for weeks would keep every one. The failing regression counts those
+records through the public inventory API, then requires the repeated-query path
+to retain only the latest completed command.
+
+Before admitting another short command, the generation owner proves all earlier
+short commands terminal and prunes them. Prepared or running records remain in
+the inventory. So do records whose owner disappeared without retirement proof.
+Launcher and network-helper collections keep their outcomes and logs; polling
+never prunes those roles.
+
+Deletion needs its own ordering. Removing files directly from an active command
+directory could leave a missing `owner.json` after a crash, making the next
+inventory rightly refuse the incomplete evidence. Instead, we take the command's
+operation and owner locks, recheck its generation and terminal state, then rename
+the whole directory into a private `retired-commands` directory. We sync both
+parents before deleting its contents. A later pass may finish an interrupted
+deletion there, even if the record file has already gone.
+
+Why is it safe to remove the lock files too? Command IDs are random and never
+reused. A delayed start either reaches the terminal record before pruning, or
+reloads its original path after that path disappears. Both refuse execution.
+This operation therefore belongs only to command collections. Ordinary workload
+instance names can be reused and must keep their existing generation protocol.
+
+The tests retain prepared and running commands, preserve uncertain owner
+metadata, reject a redirected garbage directory, and resume a partially deleted
+tombstone. The polling regression then checks the bound through actual commands,
+including their successful exits.

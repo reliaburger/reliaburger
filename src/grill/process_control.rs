@@ -15,6 +15,8 @@ use super::InstanceId;
 use super::oci::OciSpec;
 use super::process_owner::{self, OwnerPhase, OwnerRecord, ProcessLaunch};
 
+mod prune;
+
 #[derive(Debug, Clone)]
 pub(crate) struct ProcessControl {
     root: PathBuf,

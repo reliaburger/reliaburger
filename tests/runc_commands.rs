@@ -274,3 +274,52 @@ async fn runtime_command_fixture() {
     let environment = BTreeMap::from([("ROOT".into(), root.display().to_string())]);
     commands.run(Path::new("/bin/sh"), &["-c".into(), "touch \"$ROOT/ready\"; while [ ! -f \"$ROOT/release\" ]; do sleep 0.02; done; touch \"$ROOT/late-mutation\"".into()], &environment, Duration::from_secs(30)).await.unwrap();
 }
+
+#[tokio::test]
+async fn repeated_runtime_queries_keep_only_the_latest_terminal_mutation() {
+    let root = tempfile::tempdir().unwrap();
+    let mut commands = journal(root.path())
+        .claim(&instance(), None)
+        .await
+        .unwrap()
+        .publish(&spec())
+        .await
+        .unwrap()
+        .supervise_commands(bun())
+        .unwrap();
+    for _ in 0..12 {
+        let (next, output) = commands
+            .run(
+                Path::new("/bin/sh"),
+                &["-c".into(), "exit 0".into()],
+                &BTreeMap::new(),
+                Duration::from_secs(5),
+            )
+            .await
+            .unwrap();
+        assert_eq!(output.exit_code, Some(0));
+        commands = next;
+    }
+    let record = serde_json::to_value(commands.record().unwrap()).unwrap();
+    let collection = reliaburger::grill::command::OwnedCommands::new(
+        root.path()
+            .join("intents/records")
+            .join(instance().0)
+            .join("generations")
+            .join(record["generation"].as_str().unwrap())
+            .join("mutations"),
+        bun(),
+    );
+    assert_eq!(
+        collection.inventory().await.unwrap().len(),
+        1,
+        "runtime polling grows the command journal without a bound"
+    );
+    commands
+        .seal(Duration::from_secs(15))
+        .await
+        .unwrap()
+        .finish(None)
+        .await
+        .unwrap();
+}

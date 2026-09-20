@@ -148,3 +148,136 @@ async fn oversized_output_preserves_confirmed_retirement() {
     );
     owner.retire(&id, Duration::from_secs(5)).await.unwrap();
 }
+
+#[tokio::test]
+async fn pruning_removes_only_confirmed_terminal_commands_and_fences_old_starts() {
+    let root = tempfile::tempdir().unwrap();
+    let owner = commands(root.path());
+    let prepared = owner
+        .prepare(
+            Path::new("/bin/sh"),
+            &["-c".into(), "exit 0".into()],
+            &BTreeMap::new(),
+        )
+        .await
+        .unwrap();
+    let running = owner
+        .prepare(Path::new("/bin/sleep"), &["60".into()], &BTreeMap::new())
+        .await
+        .unwrap();
+    owner.start(&running).await.unwrap();
+    let finished = owner
+        .prepare(
+            Path::new("/bin/sh"),
+            &["-c".into(), "exit 0".into()],
+            &BTreeMap::new(),
+        )
+        .await
+        .unwrap();
+    owner.start(&finished).await.unwrap();
+    owner
+        .wait(&finished, Duration::from_secs(15))
+        .await
+        .unwrap();
+    assert_eq!(owner.prune_retired().await.unwrap(), 1);
+    let inventory = owner.inventory().await.unwrap();
+    assert_eq!(inventory.len(), 2);
+    assert!(inventory.contains(&prepared));
+    assert!(inventory.contains(&running));
+    assert!(
+        !owner
+            .log_stem(&finished)
+            .unwrap()
+            .with_extension("stdout")
+            .exists()
+    );
+    assert!(owner.start(&finished).await.is_err());
+    for id in [&prepared, &running] {
+        owner.retire(id, Duration::from_secs(15)).await.unwrap();
+    }
+    assert_eq!(owner.prune_retired().await.unwrap(), 2);
+    assert!(owner.inventory().await.unwrap().is_empty());
+    assert!(owner.start(&prepared).await.is_err());
+    assert_eq!(owner.prune_retired().await.unwrap(), 0);
+}
+
+#[tokio::test]
+async fn pruning_preserves_unknown_owner_evidence() {
+    let root = tempfile::tempdir().unwrap();
+    let owner = commands(root.path());
+    let id = owner
+        .prepare(
+            Path::new("/bin/sh"),
+            &["-c".into(), "exit 0".into()],
+            &BTreeMap::new(),
+        )
+        .await
+        .unwrap();
+    let directory = owner.log_stem(&id).unwrap().parent().unwrap().to_path_buf();
+    let path = directory.join("owner.json");
+    let mut record: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+    // A recorded Running command with no reachable owner is uncertain, not absent.
+    record["phase"] = serde_json::json!({"state":"running", "pid": u32::MAX});
+    std::fs::write(&path, serde_json::to_vec(&record).unwrap()).unwrap();
+    let before = std::fs::read(&path).unwrap();
+    assert_eq!(owner.prune_retired().await.unwrap(), 0);
+    assert_eq!(owner.inventory().await.unwrap(), vec![id]);
+    assert_eq!(std::fs::read(path).unwrap(), before);
+}
+
+#[tokio::test]
+async fn pruning_resumes_after_interrupted_deletion_outside_the_active_inventory() {
+    use std::os::unix::fs::PermissionsExt;
+    let root = tempfile::tempdir().unwrap();
+    let owner = commands(root.path());
+    let id = owner
+        .prepare(
+            Path::new("/bin/sh"),
+            &["-c".into(), "exit 0".into()],
+            &BTreeMap::new(),
+        )
+        .await
+        .unwrap();
+    owner.retire(&id, Duration::from_secs(5)).await.unwrap();
+    let directory = owner.log_stem(&id).unwrap().parent().unwrap().to_path_buf();
+    let record: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(directory.join("owner.json")).unwrap()).unwrap();
+    let garbage = root.path().join("retired-commands");
+    std::fs::create_dir(&garbage).unwrap();
+    std::fs::set_permissions(&garbage, std::fs::Permissions::from_mode(0o700)).unwrap();
+    let tombstone = garbage.join(format!(
+        "{}-{}",
+        directory.file_name().unwrap().to_str().unwrap(),
+        record["nonce"].as_str().unwrap()
+    ));
+    // Crash after atomic removal from the active collection, halfway through deletion.
+    std::fs::rename(&directory, &tombstone).unwrap();
+    std::fs::remove_file(tombstone.join("owner.json")).unwrap();
+    assert!(owner.inventory().await.unwrap().is_empty());
+    assert_eq!(owner.prune_retired().await.unwrap(), 0);
+    assert!(std::fs::read_dir(garbage).unwrap().next().is_none());
+    assert!(owner.start(&id).await.is_err());
+}
+
+#[tokio::test]
+async fn pruning_refuses_redirected_garbage_storage_and_preserves_active_records() {
+    let root = tempfile::tempdir().unwrap();
+    let unrelated = tempfile::tempdir().unwrap();
+    let marker = unrelated.path().join("keep");
+    std::fs::write(&marker, "unrelated").unwrap();
+    let owner = commands(root.path());
+    let id = owner
+        .prepare(
+            Path::new("/bin/sh"),
+            &["-c".into(), "exit 0".into()],
+            &BTreeMap::new(),
+        )
+        .await
+        .unwrap();
+    owner.retire(&id, Duration::from_secs(5)).await.unwrap();
+    std::os::unix::fs::symlink(unrelated.path(), root.path().join("retired-commands")).unwrap();
+    assert!(owner.prune_retired().await.is_err());
+    assert_eq!(std::fs::read_to_string(marker).unwrap(), "unrelated");
+    assert_eq!(owner.inventory().await.unwrap(), vec![id]);
+}
