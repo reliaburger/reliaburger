@@ -41,6 +41,8 @@ Pre-start namespace binding, discovery cleanup, host-reboot reconciliation and
 production kernel selection remain release gates. Automatic application restarts now retire the
 predecessor’s adoption and policy records before creating a successor; failed
 cleanup blocks replacement while preserving the logical workload identity.
+Rolling and blue-green generations now use separate cgroups, so retiring the
+predecessor preserves the running replacement.
 
 Log exports now preserve content generations, scope receipts to the destination,
 and serialise durable checkpoint updates across agent and offline exports. Source
@@ -192,7 +194,7 @@ development configurations. Ingress currently uses unweighted round-robin on
 Bun's shared runtime, with no separate strategy or worker-thread setting.
 
 0.1.0 requires a fresh cluster; development state is refused. Rolling upgrades
-require matching explicit formats (currently protocol 14 and state 21). See the
+require matching explicit formats (currently protocol 14 and state 22). See the
 [compatibility policy](releasing.md#cluster-compatibility).
 
 Lease-owned test volumes and generated configuration have durable provisioning

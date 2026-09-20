@@ -447,3 +447,62 @@ async fn source_identity_refuses_a_container_moved_out_of_its_original_cgroup() 
         "accepted unverified source identity: {identity:?}"
     );
 }
+
+#[tokio::test]
+#[ignore = "requires root, runc, static /usr/bin/busybox, ip and nft"]
+async fn retiring_a_rollout_predecessor_preserves_its_live_successor() {
+    let root = tempfile::tempdir().unwrap();
+    let app_name = instance(root.path()).0;
+    let first_id = reliaburger::grill::InstanceIdentity::new("default", &app_name, 0).instance_id();
+    let successor_id =
+        reliaburger::grill::InstanceIdentity::canary("default", &app_name, 1, 0).instance_id();
+    let runtime = runtime(root.path());
+    let mut specification = spec(root.path(), "exec /bin/busybox sleep 60");
+    let first_path =
+        reliaburger::grill::cgroup::instance_cgroup_path("default", &app_name, &first_id).unwrap();
+    specification.linux.cgroups_path = reliaburger::grill::oci::generate_init_oci_spec(
+        &specification.process.args,
+        "default",
+        &app_name,
+        None,
+        first_path.to_str().unwrap(),
+        None,
+    )
+    .linux
+    .cgroups_path;
+    runtime.create(&first_id, &specification).await.unwrap();
+    install_fixture(root.path(), &first_id);
+    runtime.start(&first_id).await.unwrap();
+    let successor_path =
+        reliaburger::grill::cgroup::instance_cgroup_path("default", &app_name, &successor_id)
+            .unwrap();
+    specification.linux.cgroups_path = reliaburger::grill::oci::generate_init_oci_spec(
+        &specification.process.args,
+        "default",
+        &app_name,
+        None,
+        successor_path.to_str().unwrap(),
+        None,
+    )
+    .linux
+    .cgroups_path;
+    runtime.create(&successor_id, &specification).await.unwrap();
+    install_fixture(root.path(), &successor_id);
+    let started = runtime.start(&successor_id).await;
+    let retired = runtime.kill(&first_id).await;
+    let successor = runtime.state(&successor_id).await;
+    let executed = runtime
+        .exec(&successor_id, &["/bin/busybox".into(), "true".into()])
+        .await;
+    runtime.kill(&successor_id).await.unwrap();
+    runtime.kill(&first_id).await.unwrap();
+    assert_absent(root.path(), &first_id);
+    assert_absent(root.path(), &successor_id);
+    assert!(started.is_ok(), "successor could not start: {started:?}");
+    assert!(retired.is_ok(), "predecessor could not retire: {retired:?}");
+    assert_eq!(successor.unwrap(), ContainerState::Running);
+    assert!(
+        executed.is_ok(),
+        "successor could not execute: {executed:?}"
+    );
+}

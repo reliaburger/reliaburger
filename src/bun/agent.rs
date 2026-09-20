@@ -692,7 +692,6 @@ enum DeployOp {
         namespace: String,
         spec: Box<AppSpec>,
         host_port: Option<u16>,
-        index: u32,
         reply: oneshot::Sender<Result<crate::grill::oci::OciSpec, BunError>>,
     },
     /// Persist a started replacement before health wait or traffic publication.
@@ -1101,7 +1100,6 @@ impl DeployOps {
         namespace: &str,
         spec: &AppSpec,
         host_port: Option<u16>,
-        index: u32,
     ) -> Result<crate::grill::oci::OciSpec, BunError> {
         self.call(
             |reply| DeployOp::PrepareRollingInstance {
@@ -1110,7 +1108,6 @@ impl DeployOps {
                 namespace: namespace.to_string(),
                 spec: Box::new(spec.clone()),
                 host_port,
-                index,
                 reply,
             },
             Err(BunError::InstanceNotFound {
@@ -3083,7 +3080,11 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
             self.supervisor
                 .deploy_job(&job.name, &job.namespace, &job.spec, now)
                 .await?;
-            let cgroup = crate::grill::cgroup::cgroup_path(&job.namespace, &job.name, 0);
+            let cgroup = crate::grill::cgroup::instance_cgroup_path(
+                &job.namespace,
+                &job.name,
+                &instance_id,
+            )?;
             let spec = generate_job_oci_spec(
                 &job.name,
                 &job.namespace,
@@ -5007,15 +5008,8 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
         pids
     }
 
-    /// The `(instance id, cgroup path)` pairs a resource fault should target.
-    ///
-    /// A resource fault names a service (and optionally one instance); the
-    /// cgroup a limit must be written to is `cgroup_path(namespace, app,
-    /// ordinal)` for each matching running instance. We take namespace and app
-    /// straight from the `WorkloadInstance`, and recover the ordinal from the
-    /// canonical instance id (falling back to `0` for a legacy id). This is
-    /// what threads instance metadata into `apply_fault` (CHAOS1): the fault
-    /// arrives with only a service name, and we turn it into concrete cgroups.
+    /// Original `(instance id, cgroup path)` pairs for matching workloads.
+    /// Rollout generations must never share their predecessor's target path.
     #[cfg(target_os = "linux")]
     fn target_instance_cgroups(
         &self,
@@ -5029,12 +5023,11 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
                     && rule.matches_namespace(&i.namespace)
                     && rule.target_instance.as_ref().is_none_or(|t| &i.id.0 == t)
             })
-            .map(|i| {
-                let ordinal = crate::grill::InstanceIdentity::parse(&i.id.0)
-                    .map(|ident| ident.ordinal)
-                    .unwrap_or(0);
-                let path = crate::grill::cgroup::cgroup_path(&i.namespace, &i.app_name, ordinal);
-                (i.id.clone(), path)
+            .filter_map(|instance| {
+                Some((
+                    instance.id.clone(),
+                    instance.oci_spec.as_ref()?.linux.host_cgroup_path()?,
+                ))
             })
             .collect()
     }
@@ -5214,7 +5207,7 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
                 }
             }
             FaultReversal::CpuMax(saved) => {
-                for (_id, cgroup, value) in Self::rejoin_cgroups(rule, saved) {
+                for (_id, cgroup, value) in self.rejoin_cgroups(rule, saved) {
                     if let Err(e) = crate::smoker::resource::restore_cpu_max(&cgroup, &value) {
                         eprintln!(
                             "smoker: restore cpu.max on {} failed: {e}",
@@ -5224,7 +5217,7 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
                 }
             }
             FaultReversal::MemoryHigh(saved) => {
-                for (_id, cgroup, value) in Self::rejoin_cgroups(rule, saved) {
+                for (_id, cgroup, value) in self.rejoin_cgroups(rule, saved) {
                     if let Err(e) = crate::smoker::resource::restore_memory_high(&cgroup, &value) {
                         eprintln!(
                             "smoker: restore memory.high on {} failed: {e}",
@@ -5281,19 +5274,24 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
 
     /// Pair each saved `(instance id, value)` with the instance's cgroup path.
     ///
-    /// The cgroup path is recomputed from the *current* target-instance list so
+    /// The cgroup path comes from the current instance's original OCI specification so
     /// reversal writes to the same directory the fault wrote to. An instance
     /// that has since gone away is dropped (nothing to restore).
     fn rejoin_cgroups(
+        &self,
         rule: &crate::smoker::types::FaultRule,
         saved: &[(String, String)],
     ) -> Vec<(String, std::path::PathBuf, String)> {
         saved
             .iter()
             .filter_map(|(id, value)| {
-                let ident = crate::grill::InstanceIdentity::parse(id)?;
-                let path =
-                    crate::grill::cgroup::cgroup_path(&ident.namespace, &ident.app, ident.ordinal);
+                let instance = self.supervisor.get_instance(&InstanceId(id.clone()))?;
+                if instance.app_name != rule.target_service
+                    || !rule.matches_namespace(&instance.namespace)
+                {
+                    return None;
+                }
+                let path = instance.oci_spec.as_ref()?.linux.host_cgroup_path()?;
                 // A specific instance target still restores only its own cgroup.
                 if rule.target_instance.as_ref().is_some_and(|t| t != id) {
                     return None;
@@ -5761,14 +5759,8 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
             .get_instance(instance_id)
             .and_then(|i| i.host_port);
 
-        // Extract the replica index from the canonical id's ordinal.
-        let instance_index: u32 = instance_id
-            .0
-            .rsplit('-')
-            .next()
-            .and_then(|s| s.parse().ok())
-            .unwrap_or(0);
-        let cgroup_path = crate::grill::cgroup::cgroup_path(namespace, app_name, instance_index);
+        let cgroup_path =
+            crate::grill::cgroup::instance_cgroup_path(namespace, app_name, instance_id)?;
         let cgroup_str = cgroup_path.to_string_lossy().into_owned();
         let netns_path = self
             .netns_paths
@@ -5927,7 +5919,6 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
         namespace: &str,
         spec: &AppSpec,
         host_port: Option<u16>,
-        index: u32,
     ) -> Result<crate::grill::oci::OciSpec, BunError> {
         let identities = self.decrypt_identities(namespace).await;
         if identities.is_empty() && spec.env.values().any(|v| v.is_encrypted()) {
@@ -5943,7 +5934,8 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
         if let Err(e) = self.prepare_instance_identity(instance_id) {
             eprintln!("bun: warning: {e}");
         }
-        let cgroup_path = crate::grill::cgroup::cgroup_path(namespace, app_name, index);
+        let cgroup_path =
+            crate::grill::cgroup::instance_cgroup_path(namespace, app_name, instance_id)?;
         let oci_spec = Self::oci_spec_with_secrets(
             app_name,
             namespace,
@@ -9201,18 +9193,10 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
                 namespace,
                 spec,
                 host_port,
-                index,
                 reply,
             } => {
                 let result = self
-                    .prepare_rolling_instance(
-                        &instance_id,
-                        &app_name,
-                        &namespace,
-                        &spec,
-                        host_port,
-                        index,
-                    )
+                    .prepare_rolling_instance(&instance_id, &app_name, &namespace, &spec, host_port)
                     .await;
                 let _ = reply.send(result);
             }
@@ -9874,13 +9858,8 @@ impl<G: Grill + Clone + 'static> DeployWorker<G> {
             .transition_state(instance_id, ContainerState::Preparing)
             .await?;
 
-        let instance_index: u32 = instance_id
-            .0
-            .rsplit('-')
-            .next()
-            .and_then(|s| s.parse().ok())
-            .unwrap_or(0);
-        let cgroup_path = crate::grill::cgroup::cgroup_path(namespace, job_name, instance_index);
+        let cgroup_path =
+            crate::grill::cgroup::instance_cgroup_path(namespace, job_name, instance_id)?;
         let cgroup_str = cgroup_path.to_string_lossy();
         let oci_spec = generate_job_oci_spec(job_name, namespace, spec, &cgroup_str, None);
 
@@ -10139,7 +10118,7 @@ impl<G: Grill + Clone + 'static> DeployWorker<G> {
             new_prepared.push(new_id.clone());
             let oci_spec = match self
                 .ops
-                .prepare_rolling_instance(&new_id, app_name, namespace, spec, host_port, i)
+                .prepare_rolling_instance(&new_id, app_name, namespace, spec, host_port)
                 .await
             {
                 Ok(oci_spec) => oci_spec,
@@ -10153,7 +10132,18 @@ impl<G: Grill + Clone + 'static> DeployWorker<G> {
                     break;
                 }
             };
-            let cgroup_path = crate::grill::cgroup::cgroup_path(namespace, app_name, i);
+            let Some(cgroup_path) = oci_spec.linux.host_cgroup_path() else {
+                let _ = events
+                    .send(ApplyEvent::Error {
+                        message: format!(
+                            "replacement {} has no valid original cgroup path",
+                            new_id.0
+                        ),
+                    })
+                    .await;
+                new_failed = true;
+                break;
+            };
 
             runtime_attempted.insert(new_id.clone());
             if let Err(e) = self.grill.create(&new_id, &oci_spec).await {
@@ -10578,7 +10568,7 @@ impl<G: Grill + Clone + 'static> DeployWorker<G> {
             new_prepared.push(new_id.clone());
             let oci_spec = match self
                 .ops
-                .prepare_rolling_instance(&new_id, app_name, namespace, spec, host_port, i)
+                .prepare_rolling_instance(&new_id, app_name, namespace, spec, host_port)
                 .await
             {
                 Ok(oci_spec) => oci_spec,
@@ -10592,7 +10582,18 @@ impl<G: Grill + Clone + 'static> DeployWorker<G> {
                     break;
                 }
             };
-            let cgroup_path = crate::grill::cgroup::cgroup_path(namespace, app_name, i);
+            let Some(cgroup_path) = oci_spec.linux.host_cgroup_path() else {
+                let _ = events
+                    .send(ApplyEvent::Error {
+                        message: format!(
+                            "replacement {} has no valid original cgroup path",
+                            new_id.0
+                        ),
+                    })
+                    .await;
+                new_failed = true;
+                break;
+            };
 
             runtime_attempted.insert(new_id.clone());
             if let Err(e) = self.grill.create(&new_id, &oci_spec).await {
@@ -17340,5 +17341,40 @@ host = "remote.local"
         );
         assert!(record.exists() && identity.is_dir());
         agent.retire_workload("web", "default").await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn rollout_generations_have_independent_cgroup_paths() {
+        for strategy in ["rolling", "blue-green"] {
+            let (mut agent, _tx, _shutdown, grill) = test_agent_with_grill();
+            let volumes = tempfile::tempdir().unwrap();
+            agent.set_volumes_dir(volumes.path().to_path_buf());
+            grill.set_pid(std::process::id());
+            expect_complete(&drain_deploy(&mut agent, basic_config()).await);
+            let previous = agent.supervisor.list_instances()[0]
+                .oci_spec
+                .as_ref()
+                .unwrap()
+                .linux
+                .cgroups_path
+                .clone();
+            let replacement = Config::parse(&format!(
+                "[app.web]\nimage = 'web:v2'\nport = 8080\n[app.web.deploy]\nstrategy = '{strategy}'\n"
+            )).unwrap();
+            expect_complete(&drain_deploy(&mut agent, replacement).await);
+            let current = agent.supervisor.list_instances()[0]
+                .oci_spec
+                .as_ref()
+                .unwrap()
+                .linux
+                .cgroups_path
+                .clone();
+            agent.retire_workload("web", "default").await.unwrap();
+            assert!(previous.is_some() && current.is_some());
+            assert_ne!(
+                previous, current,
+                "{strategy} reused its predecessor's cgroup"
+            );
+        }
     }
 }

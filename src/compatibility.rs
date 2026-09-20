@@ -15,10 +15,10 @@ pub struct Compatibility {
     pub state: u32,
 }
 
-/// Supported protocol and durable state, including OCI cgroup hierarchy paths.
+/// Supported protocol and durable state, including isolated rollout cgroup paths.
 pub const CURRENT: Compatibility = Compatibility {
     protocol: 14,
-    state: 21,
+    state: 22,
 };
 
 /// Name of the durable format stamp at the root of a node's data directory.

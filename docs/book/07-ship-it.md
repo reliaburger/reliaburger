@@ -1279,3 +1279,34 @@ would require a separate compatibility decision. The regression drives a real
 Bun deployment worker with a mock runtime, rolls `worker` to generation one,
 and attempts both fresh app and job collisions against Running and Stopped
 owners. It checks refusal, unchanged records and ports, and no runtime mutation.
+
+
+### A replacement needs its own cgroup
+
+We ran two real containers, then retired the older one. Both stopped. The
+runtime had done what we asked: both generations occupied the same cgroup, and
+removing that group affected its remaining member too.
+
+The allocator had kept only the replica ordinal. Both `default__web-0` and
+`default__web-g7-0` became `/reliaburger/default/web/0`. A unique container name
+wasn't enough. Every runtime resource used for independent retirement needs the
+same distinction.
+
+Cgroup allocation now keeps the suffix belonging to the structured workload
+owner. The steady instance still uses `web/0`; generation seven uses `web/g7-0`.
+We validate the namespace, app and canonical suffix before constructing the
+path. A mismatched owner, parent traversal or ambiguous numeric spelling fails
+instead of falling back to replica zero. An ordinary app named `web-g7` remains
+under its own app directory; we don't guess its identity from a suffix alone.
+
+Rolling and blue-green preparation use this exact path for the OCI specification
+and pre-start policy. Resource faults use the stored original specification;
+CPU diagnostics retain the generation when locating `cpu.stat`. Restart and
+adoption already retain the original specification. State generation 22 refuses
+older development records whose canaries may have shared their predecessor's
+cgroup.
+
+The agent regression compares the stored paths across both deployment
+strategies. The physical regression starts both containers, retires the old
+one, and requires the successor to remain Running before cleaning it up. This
+checks the consequence of the allocation, not just whether two strings differ.

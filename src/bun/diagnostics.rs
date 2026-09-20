@@ -329,13 +329,12 @@ pub(crate) async fn collect_cpu_throttle_totals(
         };
     }
     let reads = instances.into_iter().map(|instance| async move {
-        let identity = crate::grill::InstanceIdentity::parse(&instance.id)
-            .ok_or_else(|| format!("{} has an invalid instance id", instance.id))?;
-        let path = crate::grill::cgroup::cgroup_path(
+        let path = crate::grill::cgroup::instance_cgroup_path(
             &instance.namespace,
             &instance.app_name,
-            identity.ordinal,
+            &crate::grill::InstanceId(instance.id.clone()),
         )
+        .map_err(|error| error.to_string())?
         .join("cpu.stat");
         let contents = tokio::fs::read_to_string(&path)
             .await

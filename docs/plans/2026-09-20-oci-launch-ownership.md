@@ -312,3 +312,23 @@ cgroup and leaves the launcher unbound. All 170 affected library tests pass on
 macOS/Linux (17.819s/22.973s), with strict all-target/all-feature Clippy on both.
 The privileged CI filter and host-network serialisation now select the complete
 owned-Runc binary, including tests without a `runc_` name prefix.
+
+
+## Rollout cgroup isolation
+
+Actual Runc reproduces a shared-cgroup retirement failure: two live generations
+use the same app/ordinal path, and retiring the predecessor stops the successor.
+The public deployment regression also shows identical stored OCI paths before
+and after rolling replacement. Correct instance allocation must include the
+deployment generation. Resource faults and CPU diagnostics must follow that
+exact path as well. Preserve the original stored path for runtime recovery;
+never reconstruct a canary's path by discarding its generation.
+
+Qualification: all 189 affected library tests pass on macOS/Linux
+(17.744s/23.827s), both actual-binary compatibility tests pass on each platform,
+and strict all-target/all-feature Clippy passes on both. All eleven owned-Runc
+cases pass (11.46s), as do all 39 physical kernel cases (8.79s). Both rolling
+and blue-green deployment paths have distinct original cgroups. State 22
+refuses older rollout records that could share a predecessor's cgroup.
+The strengthened physical check also executes a command inside the successor
+after predecessor retirement. All eleven Runc cases pass again (9.91s).
