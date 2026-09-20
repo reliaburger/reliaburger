@@ -663,7 +663,7 @@ fn guarded_body_stream<S>(
     permit: OwnedSemaphorePermit,
     drain_guard: Option<DrainGuard>,
     terminate: Vec<CancellationToken>,
-) -> impl futures_util::Stream<Item = Result<axum::body::Bytes, reqwest::Error>>
+) -> impl futures_util::Stream<Item = Result<axum::body::Bytes, std::io::Error>>
 where
     S: futures_util::Stream<Item = Result<axum::body::Bytes, reqwest::Error>>
         + Unpin
@@ -679,7 +679,9 @@ where
         loop {
             let chunk = tokio::select! {
                 biased;
-                _ = super::draining::wait_for_termination(&terminate) => break,
+                _ = super::draining::wait_for_termination(&terminate) => {
+                    return Err(std::io::Error::new(std::io::ErrorKind::ConnectionAborted, "ingress drain cancelled the upstream response"));
+                },
                 _ = tx.closed() => break,
                 chunk = inner.next() => chunk,
             };
@@ -688,14 +690,30 @@ where
             };
             tokio::select! {
                 biased;
-                _ = super::draining::wait_for_termination(&terminate) => break,
+                _ = super::draining::wait_for_termination(&terminate) => {
+                    return Err(std::io::Error::new(std::io::ErrorKind::ConnectionAborted, "ingress drain cancelled the upstream response"));
+                },
                 result = tx.send(chunk) => if result.is_err() { break; },
             }
         }
+        Ok(())
     });
     let task = tokio_util::task::AbortOnDropHandle::new(task);
-    futures_util::stream::unfold((rx, permit, task), |(mut rx, permit, task)| async move {
-        rx.recv().await.map(|chunk| (chunk, (rx, permit, task)))
+    futures_util::stream::unfold(Some((rx, permit, task)), |state| async move {
+        let (mut rx, permit, mut task) = state?;
+        if let Some(chunk) = rx.recv().await {
+            return Some((
+                chunk.map_err(std::io::Error::other),
+                Some((rx, permit, task)),
+            ));
+        }
+        // A closed queue only proves the pump ended. Preserve its result so
+        // cancellation or a task failure cannot turn truncation into clean EOF.
+        match (&mut task).await {
+            Ok(Ok(())) => None,
+            Ok(Err(error)) => Some((Err(error), None)),
+            Err(error) => Some((Err(std::io::Error::other(error)), None)),
+        }
     })
 }
 
@@ -1453,6 +1471,108 @@ mod tests {
         assert_eq!(resp.status().as_u16(), 413);
 
         shutdown.cancel();
+    }
+
+    #[tokio::test]
+    async fn cancelling_a_partial_response_is_an_error_to_the_client() {
+        use crate::wrapper::draining::{DrainCommand, DrainTracker, SharedDrains};
+        use std::time::Duration;
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let backend = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = backend.local_addr().unwrap().port();
+        let backend_task = tokio::spawn(async move {
+            let (mut socket, _) = backend.accept().await.unwrap();
+            let mut request = Vec::new();
+            while !request.ends_with(b"\r\n\r\n") {
+                let mut byte = [0];
+                socket.read_exact(&mut byte).await.unwrap();
+                request.push(byte[0]);
+                assert!(
+                    request.len() < 8192,
+                    "test request headers exceed the fixture limit"
+                );
+            }
+            socket
+                .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 100\r\n\r\npartial")
+                .await
+                .unwrap();
+            // Keep the unfinished response alive until the proxy disconnects.
+            let _ = socket.read(&mut request).await;
+        });
+        let id = "default__web-0";
+        let mut services = crate::onion::service_map::ServiceMap::new();
+        let service = crate::onion::service_id::ServiceId::new("default", "web");
+        services.register(&service, 80, None).unwrap();
+        services
+            .add_backend(
+                &service,
+                crate::onion::types::BackendInstance {
+                    instance_id: id.into(),
+                    node_ip: std::net::Ipv4Addr::LOCALHOST,
+                    host_port: port,
+                    healthy: true,
+                },
+            )
+            .unwrap();
+        let ingress = std::collections::HashMap::from([(
+            ("default".into(), "web".into()),
+            crate::config::app::IngressSpec {
+                host: "web.test".into(),
+                path: None,
+                tls: None,
+                websocket: None,
+                rate_limit_rps: None,
+                rate_limit_burst: None,
+            },
+        )]);
+        let mut table = RoutingTable::new();
+        table.rebuild(&services, &ingress).unwrap();
+        let drains = SharedDrains::new(DrainTracker::new(tokio::sync::mpsc::channel(8).0));
+        let shutdown = CancellationToken::new();
+        let bound = bind_proxy_with_drains(
+            WrapperConfig {
+                http_port: 0,
+                https_port: 0,
+                ..WrapperConfig::default()
+            },
+            Arc::new(RwLock::new(table)),
+            Some(drains.clone()),
+            shutdown.clone(),
+        )
+        .await
+        .unwrap();
+        let address = bound.http_addr;
+        let proxy_task = tokio::spawn(bound.serve());
+        let mut response = reqwest::Client::new()
+            .get(format!("http://{address}/"))
+            .header("host", "web.test")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.chunk().await.unwrap().unwrap(), "partial");
+        drains
+            .start_drain(&DrainCommand {
+                app_name: "web".into(),
+                instance_id: id.into(),
+                timeout: Duration::ZERO,
+            })
+            .await;
+        tokio::time::timeout(Duration::from_secs(2), drains.wait_drained(id))
+            .await
+            .unwrap();
+        let remaining = tokio::time::timeout(Duration::from_secs(2), response.bytes())
+            .await
+            .unwrap();
+        shutdown.cancel();
+        proxy_task.await.unwrap().unwrap();
+        tokio::time::timeout(Duration::from_secs(2), backend_task)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(
+            remaining.is_err(),
+            "cancelled partial response was acknowledged as successful EOF: {remaining:?}"
+        );
     }
 
     /// ING3: a large response streams through rather than being buffered

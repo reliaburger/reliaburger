@@ -1595,3 +1595,23 @@ requires the splice to close before completion.
 This proves the local Wrapper ownership boundary used by deployment drains.
 Durable discovery recovery and remote catalogue acknowledgement still need their
 own proof before an allocator can reuse an old address.
+
+### A cancelled response must fail at the client
+
+The client has received seven bytes of a promised 100-byte response. A drain
+then cancels its upstream. If the pump simply closes its channel, the response
+stream sees ordinary EOF (end of file), and Hyper can finish the downstream
+response successfully. Our live proxy regression catches exactly that: the
+client accepts an incomplete response without an error.
+
+The pump now returns a `Result<(), std::io::Error>`. Once its chunk channel closes,
+the response stream checks that result before choosing successful EOF. A drain
+cancellation becomes `ConnectionAborted`; a failed pump task becomes an error
+too. Upstream read errors also retain their failure through the response body.
+The stream emits a terminal error once, then ends. Normal complete responses
+still end cleanly, covered by the large-response case.
+
+This does not move backend ownership back into a possibly stalled downstream
+reader. The pump releases its request guard when it finishes; the response owns
+the pump's final result until the client can observe it. Completion of cleanup
+and successful delivery are different facts, and both need honest reporting.
