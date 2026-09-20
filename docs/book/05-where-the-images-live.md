@@ -1236,3 +1236,32 @@ The failing-first test checks a committed image without a local projection.
 Worker/follower reads, a lost leader route and missing user authentication are
 also exercised. The authentication fixture seeds a user token, because an empty
 user-token store intentionally retains the local bootstrap window.
+
+### A cancelled peer download still needs an owner
+
+A peer pull created a temporary file and waited for more bytes. Cancelling its
+caller dropped the future, leaving that file outside the upload-session tracker.
+The failing-first regression pauses the HTTP body after its first chunk and
+checks ownership before cancelling the caller.
+
+Node pulls now run as owned Tokio tasks. The caller awaits a join handle; dropping
+that handle detaches the task, so the task still finishes its bounded network
+operation and cleanup. Before accepting bytes it records the repository's writer
+receipt and local lease generation, creates a tracked upload, and obtains the
+session's writer permit. It verifies the digest and syncs the final file before
+releasing ownership. Failed removal leaves a retiring session for the reaper.
+Stalled bodies, corrupt digests and failed final renames all take that same path.
+A node restart still uses the exclusive upload-directory recovery sweep.
+
+A whole-image pull shares its existing repository read guard with child pulls.
+Tokio's `RwLock` is fair: once a cleanup writer queues, a new reader waits behind
+it. Reacquiring a reader while retaining the old one could therefore deadlock.
+Sharing the guard also lets an already-admitted transfer finish after cleanup
+begins; cleanup waits for it and then removes its payload. Fresh transfers must
+still obtain active ownership, even when their bytes are cached locally.
+
+Runtime P2P fetches and the healer both use this path. Cached blobs are reverified
+on blocking workers. The queued-cleanup regression, cancelled caller, stalled
+body, corrupt data, failed publication and retained-deletion tests cover those
+boundaries. Publishing storage locations still needs its own conditional,
+GC-fenced confirmation; owning a transfer does not make an old holder set safe.

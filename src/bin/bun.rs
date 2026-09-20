@@ -2602,7 +2602,7 @@ async fn run_agent(cli: Cli) -> anyhow::Result<()> {
 
         let gc_store = Arc::clone(&blob_store);
         let gc_catalog = Arc::clone(&pickle_catalog);
-        let gc_registry = pickle_state;
+        let gc_registry = pickle_state.clone();
         let gc_shutdown = shutdown.clone();
         let gc_config = GcConfig {
             retain_days: config.images.gc_retain_days,
@@ -2680,11 +2680,10 @@ async fn run_agent(cli: Cli) -> anyhow::Result<()> {
     // first, capped per tick, pulling layers the leader lacks before
     // replicating onward — so it is testable without a running binary.
     if let (Some(council), Some(membership_rx)) = (api_council.clone(), replication_membership) {
-        let repl_store = Arc::clone(&blob_store);
+        let repl_registry = pickle_state.clone();
         let repl_shutdown = shutdown.clone();
         let redundancy = config.images.redundancy.max(1);
         let registry_port = config.images.registry_port;
-        let self_node = node_raft_id;
         // Peers and the client must match the registry's scheme/TLS (REG4).
         let heal_scheme = registry_scheme.to_string();
         let heal_client = registry_client.clone();
@@ -2717,8 +2716,7 @@ async fn run_agent(cli: Cli) -> anyhow::Result<()> {
 
                 let outcome = reliaburger::pickle::replication::heal_tick(
                     &catalog,
-                    &repl_store,
-                    self_node,
+                    &repl_registry,
                     &peers,
                     redundancy,
                     10,

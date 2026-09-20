@@ -290,8 +290,7 @@ async fn old_catalogue_without_manifest_holders_is_healed_not_collected() {
     let catalog_snapshot = node1.state.catalog.read().await.clone();
     let outcome = heal_tick(
         &catalog_snapshot,
-        &node1.state.store,
-        1,
+        &node1.state,
         &[node1.peer(1), node2.peer(2)],
         2,
         10,

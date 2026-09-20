@@ -1542,6 +1542,366 @@ mod tests {
         drop(writers);
     }
 
+    async fn serve_peer_body(
+        body: Vec<u8>,
+    ) -> (super::super::replication::Peer, tokio::task::JoinHandle<()>) {
+        let app = Router::new().fallback(axum::routing::get(move || {
+            let body = body.clone();
+            async move { body }
+        }));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let peer = super::super::replication::Peer {
+            node_id: 2,
+            base_url: format!("http://{}", listener.local_addr().unwrap()),
+        };
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        (peer, server)
+    }
+
+    #[tokio::test]
+    async fn peer_pull_cleans_up_corrupt_and_unpublishable_uploads() {
+        let digest = compute_sha256(b"valid");
+        for rename_failure in [false, true] {
+            let (state, directory) = test_state();
+            let bytes = if rename_failure { b"valid" } else { b"wrong" };
+            let (peer, server) = serve_peer_body(bytes.to_vec()).await;
+            if rename_failure {
+                std::fs::create_dir_all(state.store.blob_path(&digest)).unwrap();
+            }
+            assert!(
+                state
+                    .pull_peer_blob(
+                        &peer,
+                        "ordinary",
+                        &digest,
+                        &reqwest::Client::new(),
+                        std::time::Duration::from_secs(2)
+                    )
+                    .await
+                    .is_err()
+            );
+            assert_eq!(
+                std::fs::read_dir(directory.path().join("uploads"))
+                    .unwrap()
+                    .count(),
+                0
+            );
+            assert!(
+                state
+                    .sessions
+                    .sweep(std::time::SystemTime::now() + std::time::Duration::from_secs(7200))
+                    .await
+                    .is_empty()
+            );
+            server.abort();
+            let _ = server.await;
+        }
+    }
+
+    #[tokio::test]
+    async fn peer_pull_retains_failed_temporary_file_deletion_for_retry() {
+        let (state, directory) = test_state();
+        let (peer, server) = serve_peer_body(b"valid".to_vec()).await;
+        let pause = state.sessions.pause_registration().await;
+        let owner = state.clone();
+        let pull = tokio::spawn(async move {
+            owner
+                .pull_peer_blob(
+                    &peer,
+                    "ordinary",
+                    &compute_sha256(b"valid"),
+                    &reqwest::Client::new(),
+                    std::time::Duration::from_secs(2),
+                )
+                .await
+        });
+        let uploads = directory.path().join("uploads");
+        let file = tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            loop {
+                if let Ok(entries) = std::fs::read_dir(&uploads)
+                    && let Some(entry) = entries.flatten().next()
+                {
+                    break entry.path();
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .unwrap();
+        let id = file.file_name().unwrap().to_str().unwrap().to_owned();
+        std::fs::remove_file(&file).unwrap();
+        std::fs::create_dir(&file).unwrap();
+        drop(pause);
+        let error = pull.await.unwrap().unwrap_err();
+        assert!(
+            error.to_string().contains("cleanup remains pending"),
+            "{error}"
+        );
+        assert_eq!(
+            state.sessions.sweep(std::time::SystemTime::now()).await,
+            vec![id]
+        );
+        assert_eq!(
+            state
+                .sessions
+                .cleanup_expired(&state.store, std::time::SystemTime::now())
+                .await
+                .len(),
+            1
+        );
+        std::fs::remove_dir(&file).unwrap();
+        assert!(
+            state
+                .sessions
+                .cleanup_expired(&state.store, std::time::SystemTime::now())
+                .await
+                .is_empty()
+        );
+        assert!(
+            state
+                .sessions
+                .sweep(std::time::SystemTime::now())
+                .await
+                .is_empty()
+        );
+        server.abort();
+        let _ = server.await;
+    }
+
+    #[tokio::test]
+    async fn peer_pull_requires_active_repository_ownership_even_for_cached_bytes() {
+        let (state, directory, _owner, _other) = leased_registry_state().await;
+        let repository = "rbtest-run1/web";
+        let digest = compute_sha256(b"valid");
+        state.store.write_blob(b"valid", &digest).unwrap();
+        let peer = super::super::replication::Peer {
+            node_id: 2,
+            base_url: "http://127.0.0.1:1".into(),
+        };
+        let client = reqwest::Client::new();
+        let timeout = std::time::Duration::from_millis(50);
+        assert!(
+            state
+                .pull_peer_blob(&peer, repository, &digest, &client, timeout)
+                .await
+                .is_err()
+        );
+        let lease = state.test_leases.get("run1").await.unwrap();
+        state
+            .test_leases
+            .register_registry_writer(
+                "run1",
+                repository,
+                99,
+                Some(&lease.owner_id),
+                crate::testkit::lease::now_unix_millis(),
+            )
+            .await
+            .unwrap();
+        state
+            .pull_peer_blob(&peer, repository, &digest, &client, timeout)
+            .await
+            .unwrap();
+        assert!(
+            state.test_leases.get("run1").await.unwrap().repositories[repository]
+                .contains(&state.node_raft_id)
+        );
+        assert_eq!(
+            ManifestCatalog::load_from(&directory.path().join("catalog.json"))
+                .unwrap()
+                .repository_owners[repository],
+            "run1"
+        );
+        state.test_leases.begin_cleanup("run1", None).await.unwrap();
+        assert!(
+            state
+                .pull_peer_blob(&peer, repository, &digest, &client, timeout)
+                .await
+                .is_err()
+        );
+        assert_eq!(state.store.read_blob(&digest).unwrap(), b"valid");
+    }
+
+    #[tokio::test]
+    async fn admitted_parallel_pull_finishes_while_repository_cleanup_is_queued() {
+        let (state, _directory, _owner, _other) = leased_registry_state().await;
+        let repository = "rbtest-run1/web";
+        let lease = state.test_leases.get("run1").await.unwrap();
+        let access = state
+            .admit_repository_write(repository, Some("run1"), Some(&lease.owner_id), false)
+            .await
+            .unwrap();
+        state.test_leases.begin_cleanup("run1", None).await.unwrap();
+        state
+            .test_leases
+            .confirm_workloads_retired("run1")
+            .await
+            .unwrap();
+        let receipt = super::super::authority::RegistryRetirement {
+            lease_id: "run1".into(),
+            repository: repository.into(),
+        };
+        let mut retire = Box::pin(state.retire_registry_repository(&receipt));
+        assert!(futures_util::poll!(retire.as_mut()).is_pending());
+        let (peer, server) = serve_peer_body(b"valid".to_vec()).await;
+        let plan = super::super::p2p::DownloadPlan {
+            fetches: vec![super::super::p2p::LayerFetch {
+                digest: compute_sha256(b"valid"),
+                peer: peer.clone(),
+            }],
+            unavailable: vec![],
+        };
+        tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            super::super::p2p::pull_layers_parallel(
+                plan,
+                repository,
+                &ManifestCatalog::default(),
+                &[peer],
+                &state,
+                &access,
+                &reqwest::Client::new(),
+                1,
+                std::time::Duration::from_secs(1),
+            ),
+        )
+        .await
+        .expect("already-admitted pulls must reuse their guard behind a queued cleanup")
+        .unwrap();
+        drop(access);
+        retire.await.unwrap();
+        assert!(state.test_leases.get("run1").await.unwrap().repositories[repository].is_empty());
+        server.abort();
+        let _ = server.await;
+    }
+
+    #[tokio::test]
+    async fn peer_pull_stalled_body_expires_and_retires_its_upload() {
+        let (state, directory) = test_state();
+        let app = Router::new().fallback(axum::routing::get(|| async {
+            Body::from_stream(futures_util::stream::pending::<
+                Result<axum::body::Bytes, std::io::Error>,
+            >())
+        }));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let peer = super::super::replication::Peer {
+            node_id: 2,
+            base_url: format!("http://{}", listener.local_addr().unwrap()),
+        };
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        let error = state
+            .pull_peer_blob(
+                &peer,
+                "ordinary",
+                &compute_sha256(b"valid"),
+                &reqwest::Client::new(),
+                std::time::Duration::from_millis(150),
+            )
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("timed out"), "{error}");
+        assert_eq!(
+            std::fs::read_dir(directory.path().join("uploads"))
+                .unwrap()
+                .count(),
+            0
+        );
+        server.abort();
+        let _ = server.await;
+    }
+
+    #[tokio::test]
+    async fn cancelled_peer_pull_keeps_its_temporary_upload_owned() {
+        use futures_util::StreamExt as _;
+        let (state, directory) = test_state();
+        let release = Arc::new(tokio::sync::Notify::new());
+        let released = release.clone();
+        let digest = compute_sha256(b"first-last");
+        let app = Router::new().route(
+            &format!("/v2/ordinary/blobs/{}", digest.as_str()),
+            axum::routing::get(move || {
+                let release = released.clone();
+                async move {
+                    Body::from_stream(
+                        futures_util::stream::iter([Ok::<_, std::io::Error>(
+                            axum::body::Bytes::from_static(b"first-"),
+                        )])
+                        .chain(futures_util::stream::once(async move {
+                            release.notified().await;
+                            Ok::<_, std::io::Error>(axum::body::Bytes::from_static(b"last"))
+                        })),
+                    )
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let peer = super::super::replication::Peer {
+            node_id: 2,
+            base_url: format!("http://{}", listener.local_addr().unwrap()),
+        };
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        let owner = state.clone();
+        let requested = digest.clone();
+        let caller = tokio::spawn(async move {
+            owner
+                .pull_peer_blob(
+                    &peer,
+                    "ordinary",
+                    &requested,
+                    &reqwest::Client::new(),
+                    std::time::Duration::from_secs(5),
+                )
+                .await
+        });
+        let uploads = directory.path().join("uploads");
+        let id = tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            loop {
+                if let Ok(entries) = std::fs::read_dir(&uploads) {
+                    for entry in entries.flatten() {
+                        if entry.metadata().unwrap().len() == 6 {
+                            return entry.file_name().to_str().unwrap().to_owned();
+                        }
+                    }
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .unwrap();
+        assert!(
+            state
+                .sessions
+                .is_active(&id, std::time::SystemTime::now())
+                .await,
+            "a peer temporary file must have an upload owner before bytes arrive"
+        );
+        caller.abort();
+        assert!(caller.await.unwrap_err().is_cancelled());
+        release.notify_one();
+        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            while !state.store.has_blob(&digest)
+                || state
+                    .sessions
+                    .is_active(&id, std::time::SystemTime::now())
+                    .await
+            {
+                tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .unwrap();
+        assert_eq!(state.store.read_blob(&digest).unwrap(), b"first-last");
+        assert_eq!(std::fs::read_dir(&uploads).unwrap().count(), 0);
+        server.abort();
+        let _ = server.await;
+    }
+
     #[tokio::test]
     async fn test_repository_upload_requires_an_authenticated_lease_before_creating_files() {
         let (state, _directory) = test_state();

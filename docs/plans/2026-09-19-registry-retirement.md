@@ -313,3 +313,19 @@ routes refuse, and user authentication remains enforced. The initial empty-list
 regression fails first. All 263 Pickle/125 Bun API tests, five real TLS authority
 cases, two compatibility checks and strict Clippy pass on macOS/Linux. Current
 formats are protocol 12/state 14, lease schema 5.
+
+Runtime P2P and healer downloads now use owned, repository-admitted upload tasks.
+Caller cancellation cannot strand an untracked temporary file; failed deletion
+remains fenced for retry. Already-admitted image pulls share their read guard
+with children so queued cleanup cannot force recursive lock acquisition. Cached
+blobs still require ownership and digest verification. The unowned-file regression
+fails first; all 269 Pickle tests, 29 registry integration tests and strict Clippy
+pass on macOS/Linux. Formats remain protocol 12/state 14, lease schema 5.
+
+Conditional publication remains open. When implementing it, hold the local
+catalogue/GC guard before requesting GC approval, through physical deletion, in
+an owned transaction. A deletion approved before acquiring that guard must not
+wait behind and then invalidate a newer copy proof. Also fence delayed manifest
+publication, not only the new copy operation: its proposal currently follows the
+local persistence task. Query the publishing node's GC generation while excluding
+local collection, and validate that generation when Raft applies the publication.

@@ -126,8 +126,10 @@ HTTP writes under `rbtest-…/` require the exact authenticated lease owner and
 the `x-reliaburger-test-lease` header. Nodes record ownership before upload files
 and confirm partial-upload and metadata retirement only after workloads stop.
 Only the owning application lease may depend on those images, including init
-images. Ordinary apps and jobs refuse disposable image dependencies. Peer-pull
-ownership and physical registry cleanup qualification remain release gates.
+images. Ordinary apps and jobs refuse disposable image dependencies. Peer pulls
+also record repository ownership and track temporary uploads through caller
+cancellation; failed deletion remains pending for retry. Conditional storage-node
+copy confirmation and physical registry cleanup qualification remain release gates.
 
 Peer transfers preserve complete repository paths, including nested namespaces.
 Chunked uploads belong to the exact credential that created them. Continue and

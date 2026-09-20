@@ -431,8 +431,7 @@ async fn heal_tick_replicates_to_new_peer() {
 
     let outcome = heal_tick(
         &catalog,
-        &leader.state.store,
-        1,
+        &leader.state,
         &peers,
         2,
         10,
@@ -471,8 +470,8 @@ async fn heal_tick_pulls_missing_layers_first() {
     push_test_image(&holder.base_url(), "remote", "v1").await;
     let catalog = holder.state.catalog.read().await.clone();
 
-    let leader_dir = tempfile::tempdir().unwrap();
-    let leader_store = BlobStore::new(leader_dir.path());
+    let leader = Registry::start(1, false).await;
+    let leader_store = leader.state.store.clone();
     let peers = vec![Peer {
         node_id: 2,
         base_url: holder.base_url(),
@@ -480,8 +479,7 @@ async fn heal_tick_pulls_missing_layers_first() {
 
     let outcome = heal_tick(
         &catalog,
-        &leader_store,
-        1,
+        &leader.state,
         &peers,
         2,
         10,
@@ -976,8 +974,7 @@ async fn heal_tick_respects_per_tick_cap() {
 
     let outcome = heal_tick(
         &catalog,
-        &leader.state.store,
-        1,
+        &leader.state,
         &peers,
         2,
         1,

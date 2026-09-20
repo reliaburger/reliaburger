@@ -1,9 +1,8 @@
-//! Synchronous replication for Pickle.
+//! Peer replication and background healing for Pickle.
 //!
-//! After a manifest is pushed locally, layers are replicated to N peer
-//! nodes before the Raft commit. Replication uses the same OCI Distribution
-//! API endpoints that clients use, so each peer validates digests and
-//! stores blobs identically.
+//! A committed manifest can still await its configured redundancy. The healer
+//! copies it to peers through the OCI Distribution API, so receiving nodes
+//! validate digests and apply repository ownership before accepting bytes.
 
 use std::collections::BTreeSet;
 use std::time::Duration;
@@ -385,13 +384,14 @@ pub struct HealOutcome {
 #[allow(clippy::too_many_arguments)]
 pub async fn heal_tick(
     catalog: &super::types::ManifestCatalog,
-    store: &BlobStore,
-    self_node: u64,
+    state: &super::api::PickleState,
     peers: &[Peer],
     redundancy: u32,
     max_per_tick: usize,
     client: &reqwest::Client,
 ) -> HealOutcome {
+    let store = state.store.as_ref();
+    let self_node = state.node_raft_id;
     let config = ReplicationConfig {
         redundancy,
         peer_timeout: Duration::from_secs(30),
@@ -403,22 +403,65 @@ pub async fn heal_tick(
         let mut full_holders = candidate.full_holders;
         let digests: Vec<Digest> = manifest.referenced_digests().into_iter().cloned().collect();
 
-        // Pull-first: become a holder before replicating onward.
-        if !digests.iter().all(|d| store.has_blob(d))
-            && let Err(e) = super::pull::pull_manifest_layers(
-                &digests,
-                &manifest.repository,
-                catalog,
-                peers,
-                store,
-                client,
-                config.peer_timeout,
-            )
+        let access = match state
+            .admit_repository_write(&manifest.repository, None, None, true)
             .await
         {
+            Ok(access) => access,
+            Err(error) => {
+                outcome
+                    .errors
+                    .push(format!("cannot own {}: {error}", manifest.repository));
+                continue;
+            }
+        };
+        let mut pulled = Ok(());
+        for digest in &digests {
+            let holders = catalog.layer_holders(digest.as_str());
+            let store = state.store.clone();
+            let check = digest.clone();
+            match tokio::task::spawn_blocking(move || {
+                store.has_blob(&check) && store.revalidate_blob(&check)
+            })
+            .await
+            {
+                Ok(true) => continue,
+                Ok(false) => {}
+                Err(error) => {
+                    pulled = Err(PickleError::ReplicationFailed(format!(
+                        "cache verification failed: {error}"
+                    )));
+                    break;
+                }
+            }
+            let Some(peer) = peers
+                .iter()
+                .find(|peer| holders.contains(&peer.node_id) && peer.node_id != self_node)
+            else {
+                pulled = Err(PickleError::ReplicationFailed(format!(
+                    "no peer holds layer {digest}"
+                )));
+                break;
+            };
+            if let Err(error) = state
+                .pull_peer_blob_with_access(
+                    peer,
+                    &manifest.repository,
+                    digest,
+                    client,
+                    config.peer_timeout,
+                    Some(access.clone()),
+                )
+                .await
+            {
+                pulled = Err(error);
+                break;
+            }
+        }
+        if let Err(error) = pulled {
             outcome
                 .errors
-                .push(format!("cannot pull {}: {e}", manifest.repository));
+                .push(format!("cannot pull {}: {error}", manifest.repository));
             continue;
         }
         let self_is_new_holder = full_holders.insert(self_node);
