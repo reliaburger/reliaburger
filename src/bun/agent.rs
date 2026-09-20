@@ -6354,6 +6354,12 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
             return Ok(());
         }
         if let Some(reference) = self.supervisor.grill().retain_network_reference(id).await? {
+            if reference.instance_id != *id {
+                return Err(BunError::RetirementState {
+                    instance_id: id.clone(),
+                    reason: "runtime returned another instance's network reference".into(),
+                });
+            }
             if self
                 .network_references
                 .get(id)
@@ -6364,6 +6370,7 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
                     reason: "original network reference still belongs to another generation".into(),
                 });
             }
+            self.persist_discovery_reference(&reference).await?;
             self.network_references.insert(id.clone(), reference);
         }
         Ok(())
@@ -6386,6 +6393,7 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
             }
             return Ok(());
         };
+        self.require_discovery_release_permission(&reference)?;
         self.supervisor
             .grill()
             .release_network_reference(&reference)
@@ -12048,6 +12056,110 @@ mod tests {
             "runtime recovery ran before original discovery reconciliation"
         );
         assert!(crate::grill::records::record_path(records.path(), "default__web-0").exists());
+    }
+
+    fn original_test_network_reference() -> crate::grill::runc_intent::NetworkReference {
+        serde_json::from_value(serde_json::json!({
+            "instance_id": "default__web-0", "generation": "1234567890abcdef1234567890abcdef", "container_index": 7
+        })).unwrap()
+    }
+
+    #[tokio::test]
+    async fn held_discovery_reference_requires_durable_release_permission() {
+        let (mut agent, _, _, grill) = test_agent_with_grill();
+        let directory = tempfile::tempdir().unwrap();
+        agent
+            .enable_fresh_discovery_ownership(&directory.path().join("discovery"))
+            .await
+            .unwrap();
+        let reference = original_test_network_reference();
+        grill.set_network_reference(reference.clone()).await;
+        expect_complete(&drain_deploy(&mut agent, basic_config()).await);
+        let result = agent.stop_app("web", "default").await;
+        assert!(
+            matches!(result, Err(BunError::RetirementState { ref reason, .. }) if reason.contains("durable release permission")),
+            "held reference was not fenced by its durable owner: {result:?}"
+        );
+        assert_eq!(
+            grill
+                .network_reference(&reference.instance_id)
+                .await
+                .unwrap(),
+            Some(reference)
+        );
+    }
+
+    #[tokio::test]
+    async fn durable_discovery_captures_the_original_runtime_reference_before_launch() {
+        let (mut agent, _, _, grill) = test_agent_with_grill();
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("discovery");
+        agent.enable_fresh_discovery_ownership(&path).await.unwrap();
+        let reference = original_test_network_reference();
+        grill.set_network_reference(reference.clone()).await;
+        expect_complete(&drain_deploy(&mut agent, basic_config()).await);
+        drop(agent);
+        let journal = crate::bun::discovery_owners::DiscoveryJournal::open(&path).unwrap();
+        let references = &journal.inventory().references;
+        assert_eq!(
+            references.len(),
+            1,
+            "runtime started without a durable original reference"
+        );
+        assert_eq!(references[0].reference, reference);
+        assert_eq!(
+            references[0].service,
+            crate::onion::service_id::ServiceId::new("default", "web")
+        );
+        assert_eq!(
+            references[0].phase,
+            crate::bun::discovery_owners::ReferencePhase::Held
+        );
+    }
+
+    #[tokio::test]
+    async fn failed_runtime_reference_checkpoint_prevents_start_and_retains_the_address() {
+        let (mut agent, _, _, grill) = test_agent_with_grill();
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("discovery");
+        agent.enable_fresh_discovery_ownership(&path).await.unwrap();
+        let reference = original_test_network_reference();
+        grill.set_network_reference(reference.clone()).await;
+        grill.block_creates();
+        let task = tokio::spawn(async move {
+            let events = drain_deploy(&mut agent, basic_config()).await;
+            (agent, events)
+        });
+        tokio::time::timeout(std::time::Duration::from_secs(2), grill.wait_for_creates(1))
+            .await
+            .unwrap();
+        let checkpoint = path.join("discovery.json");
+        std::fs::remove_file(&checkpoint).unwrap();
+        std::fs::create_dir(&checkpoint).unwrap();
+        grill.release_creates(1);
+        let (_agent, events) = tokio::time::timeout(std::time::Duration::from_secs(5), task)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(
+            events
+                .iter()
+                .any(|event| matches!(event, ApplyEvent::Error { .. }))
+        );
+        assert!(
+            !grill
+                .calls()
+                .iter()
+                .any(|(operation, _)| operation == "start"),
+            "runtime started after original-reference persistence failed"
+        );
+        assert_eq!(
+            grill
+                .network_reference(&reference.instance_id)
+                .await
+                .unwrap(),
+            Some(reference)
+        );
     }
 
     #[tokio::test]

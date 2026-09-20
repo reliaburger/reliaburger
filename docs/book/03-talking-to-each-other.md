@@ -1648,3 +1648,32 @@ fresh-only recovery gate refuses those inputs before adopting, killing or deleti
 runtime evidence. Production selection, original runtime-reference correlation,
 withdrawal authorisation and remote acknowledgements remain unfinished. Enabling
 this publication producer is not permission to claim those recovery guarantees.
+
+### Journal the runtime's original address reference
+
+An owned runtime can stop execution while retaining its container address for
+old discovery consumers. Bun must remember *which* generation and allocation it
+holds. Keeping that reference only in a HashMap loses the link when Bun dies.
+The new regression starts a workload, drops the agent and reopens the discovery
+checkpoint. Before the fix, its service existed but its runtime reference did not.
+
+Bun now persists the exact reference after the runtime retains it and before
+Start. The record includes the service, instance, original generation and
+container index, with phase Held. A checkpoint failure leaves the runtime's hold
+intact and refuses Start. Another regression blocks runtime creation, breaks the
+checkpoint after initial service publication, then resumes creation. Previously,
+Start still happened and only final backend publication failed.
+
+The publication and reference operations use one update helper. It moves the
+journal into its blocking writer and restores Ready only on acknowledgement.
+The store's existing transition validation rejects replacement of an original
+held generation. Bun also rejects a runtime returning another instance's reference.
+Release requires an exact ReleaseAuthorised journal entry; a locally empty route
+cannot manufacture that permission. Authorisation and recovery reconciliation
+remain the next steps, so this opt-in profile stays outside production selection.
+
+The physical Linux case uses an owned Runc container and a real eBPF VIP. After
+controller-task loss it reopens the journal and compares the saved reference with
+the runtime's original hold. The fixture then confirms that natural exit leaves
+the old address unavailable to a successor while the retained backend exists.
+This is controller-task loss, not the later required actual Bun SIGKILL gate.

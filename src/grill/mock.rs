@@ -20,6 +20,8 @@ pub struct MockGrill {
     exit_codes: Arc<Mutex<HashMap<InstanceId, Option<i32>>>>,
     adopt_results: Arc<Mutex<HashMap<InstanceId, bool>>>,
     container_ip: Arc<Mutex<Option<std::net::Ipv4Addr>>>,
+    network_references:
+        Arc<tokio::sync::Mutex<HashMap<InstanceId, super::runc_intent::NetworkReference>>>,
     honours_cgroup_path: Arc<Mutex<bool>>,
     runtime_kind: Arc<Mutex<crate::grill::records::RuntimeKind>>,
     pid: Arc<Mutex<Option<u32>>>,
@@ -62,6 +64,7 @@ impl Default for MockGrill {
             exit_codes: Arc::default(),
             adopt_results: Arc::default(),
             container_ip: Arc::default(),
+            network_references: Arc::default(),
             honours_cgroup_path: Arc::default(),
             runtime_kind: Arc::new(Mutex::new(crate::grill::records::RuntimeKind::Process)),
             pid: Arc::default(),
@@ -306,7 +309,35 @@ impl MockGrill {
     }
 }
 
+impl MockGrill {
+    /// Configure an original runtime address reference returned by retention/inspection.
+    pub async fn set_network_reference(&self, reference: super::runc_intent::NetworkReference) {
+        self.network_references
+            .lock()
+            .await
+            .insert(reference.instance_id.clone(), reference);
+    }
+}
+
 impl super::Grill for MockGrill {
+    async fn retain_network_reference(
+        &self,
+        instance: &InstanceId,
+    ) -> Result<Option<super::runc_intent::NetworkReference>, GrillError> {
+        self.calls
+            .lock()
+            .unwrap()
+            .push(("retain_network_reference".into(), instance.clone()));
+        Ok(self.network_references.lock().await.get(instance).cloned())
+    }
+
+    async fn network_reference(
+        &self,
+        instance: &InstanceId,
+    ) -> Result<Option<super::runc_intent::NetworkReference>, GrillError> {
+        Ok(self.network_references.lock().await.get(instance).cloned())
+    }
+
     async fn create(&self, instance: &InstanceId, spec: &OciSpec) -> Result<(), GrillError> {
         self.calls
             .lock()

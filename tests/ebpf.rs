@@ -4330,16 +4330,22 @@ async fn confirmed_destination_retirement_removes_only_its_own_grants() {
 #[tokio::test]
 #[ignore = "requires Linux root and RELIABURGER_EBPF_TESTS=1"]
 async fn natural_exit_keeps_its_address_while_a_retained_backend_can_reach_it() {
-    check_stopped_address_retention(false).await;
+    check_stopped_address_retention(false, false).await;
 }
 
 #[tokio::test]
 #[ignore = "requires Linux root and RELIABURGER_EBPF_TESTS=1"]
 async fn lost_enforcement_stops_execution_even_when_backend_withdrawal_refuses() {
-    check_stopped_address_retention(true).await;
+    check_stopped_address_retention(true, false).await;
 }
 
-async fn check_stopped_address_retention(lose_enforcement: bool) {
+#[tokio::test]
+#[ignore = "requires Linux root and RELIABURGER_EBPF_TESTS=1"]
+async fn durable_discovery_retains_original_reference_after_controller_loss() {
+    check_stopped_address_retention(false, true).await;
+}
+
+async fn check_stopped_address_retention(lose_enforcement: bool, durable_discovery: bool) {
     use reliaburger::bun::agent::{AgentCommand, ApplyEvent, BunAgent};
     use reliaburger::grill::{
         ContainerState, Grill, ImageStore, InstanceId, port::PortAllocator, runc::RuncGrill,
@@ -4377,6 +4383,12 @@ async fn check_stopped_address_retention(lose_enforcement: bool) {
     agent.set_records_dir(root.path().join("records"));
     agent.set_volumes_dir(root.path().join("volumes"));
     agent.set_onion_ebpf(Arc::clone(&ebpf)).await;
+    if durable_discovery {
+        agent
+            .enable_fresh_discovery_ownership(&root.path().join("discovery"))
+            .await
+            .unwrap();
+    }
     let mut task = Some(tokio::spawn(async move { agent.run().await }));
     let old = InstanceId("default__natural-predecessor-0".into());
     let new = InstanceId("default__natural-successor-0".into());
@@ -4417,6 +4429,18 @@ async fn check_stopped_address_retention(lose_enforcement: bool) {
             let actor = task.take().unwrap();
             actor.abort();
             let _ = actor.await;
+            if durable_discovery {
+                let reference = runtime.network_reference(&old).await?
+                    .ok_or_else(|| anyhow::anyhow!("original runtime hold disappeared"))?;
+                let journal = reliaburger::bun::discovery_owners::DiscoveryJournal::open(&root.path().join("discovery"))?;
+                anyhow::ensure!(journal.inventory().references.len() == 1,
+                    "controller loss has no complete original reference");
+                anyhow::ensure!(journal.inventory().references[0].reference == reference,
+                    "discovery checkpoint changed the original runtime generation or allocation");
+                anyhow::ensure!(journal.inventory().references[0].phase == reliaburger::bun::discovery_owners::ReferencePhase::Held,
+                    "controller loss authorised address release");
+            }
+
             tokio::fs::write(bundles.join(&old.0).join("rootfs/exit-now"), b"exit").await?;
         }
         tokio::time::timeout(Duration::from_secs(15), async {

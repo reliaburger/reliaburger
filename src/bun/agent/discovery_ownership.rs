@@ -50,6 +50,91 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
         services: &crate::onion::service_map::ServiceMap,
     ) -> Result<(), BunError> {
         use crate::bun::discovery_owners::{ServiceOwner, ServicePhase};
+        self.update_discovery_inventory(id, |next| {
+            // Absence from the candidate is not withdrawal proof. Preserve
+            // earlier allocations until their confirmed retirement removes them.
+            for entry in services.resolve_all() {
+                let owner = ServiceOwner {
+                    entry: entry.clone(),
+                    phase: ServicePhase::Owned,
+                };
+                if let Some(previous) = next.services.iter_mut().find(|previous| {
+                    previous.entry.namespace == entry.namespace
+                        && previous.entry.app_name == entry.app_name
+                }) {
+                    *previous = owner;
+                } else {
+                    next.services.push(owner);
+                }
+            }
+        })
+        .await
+    }
+
+    /// Record the original held runtime generation before allowing its launch.
+    pub(super) async fn persist_discovery_reference(
+        &mut self,
+        reference: &crate::grill::runc_intent::NetworkReference,
+    ) -> Result<(), BunError> {
+        use crate::bun::discovery_owners::{ReferenceOwner, ReferencePhase};
+        if matches!(self.discovery_ownership, DiscoveryOwnership::Disabled) {
+            return Ok(());
+        }
+        let instance = self
+            .supervisor
+            .get_instance(&reference.instance_id)
+            .ok_or_else(|| BunError::InstanceNotFound {
+                instance_id: reference.instance_id.clone(),
+            })?;
+        let service =
+            crate::onion::service_id::ServiceId::new(&instance.namespace, &instance.app_name);
+        self.update_discovery_inventory(&service, |next| {
+            let owner = ReferenceOwner {
+                service: service.clone(),
+                reference: reference.clone(),
+                phase: ReferencePhase::Held,
+            };
+            if let Some(previous) = next
+                .references
+                .iter_mut()
+                .find(|previous| previous.reference.instance_id == reference.instance_id)
+            {
+                *previous = owner;
+            } else {
+                next.references.push(owner);
+            }
+        })
+        .await
+    }
+
+    /// Refuse address release until an exact durable permission exists.
+    pub(super) fn require_discovery_release_permission(
+        &self,
+        reference: &crate::grill::runc_intent::NetworkReference,
+    ) -> Result<(), BunError> {
+        use crate::bun::discovery_owners::ReferencePhase;
+        match &self.discovery_ownership {
+            DiscoveryOwnership::Disabled => Ok(()),
+            DiscoveryOwnership::Ready(journal)
+                if journal.inventory().references.iter().any(|owner| {
+                    owner.reference == *reference
+                        && owner.phase == ReferencePhase::ReleaseAuthorised
+                }) =>
+            {
+                Ok(())
+            }
+            _ => Err(BunError::RetirementState {
+                instance_id: reference.instance_id.clone(),
+                reason: "original discovery reference has no durable release permission".into(),
+            }),
+        }
+    }
+
+    async fn update_discovery_inventory(
+        &mut self,
+        id: &crate::onion::service_id::ServiceId,
+        update: impl FnOnce(&mut crate::bun::discovery_owners::DiscoveryInventory) + Send,
+    ) -> Result<(), BunError> {
         let failure = |reason: String| BunError::BackendPublication {
             service: id.clone(),
             reason,
@@ -68,22 +153,7 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
                 }
             };
         let mut next = journal.inventory().clone();
-        // Absence from the candidate is not withdrawal proof. Preserve every
-        // earlier allocation until a separate, confirmed retirement removes it.
-        for entry in services.resolve_all() {
-            let owner = ServiceOwner {
-                entry: entry.clone(),
-                phase: ServicePhase::Owned,
-            };
-            if let Some(previous) = next.services.iter_mut().find(|previous| {
-                previous.entry.namespace == entry.namespace
-                    && previous.entry.app_name == entry.app_name
-            }) {
-                *previous = owner;
-            } else {
-                next.services.push(owner);
-            }
-        }
+        update(&mut next);
         let journal = journal
             .persist(next)
             .await
