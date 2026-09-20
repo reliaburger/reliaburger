@@ -167,7 +167,7 @@ development configurations. Ingress currently uses unweighted round-robin on
 Bun's shared runtime, with no separate strategy or worker-thread setting.
 
 0.1.0 requires a fresh cluster; development state is refused. Rolling upgrades
-require matching explicit formats (currently protocol 10 and state 14). See the
+require matching explicit formats (currently protocol 14 and state 16). See the
 [compatibility policy](releasing.md#cluster-compatibility).
 
 Lease-owned test volumes and generated configuration have durable provisioning
