@@ -306,3 +306,10 @@ Actual GC approval advances the generation; a delayed older copy must refuse.
 Check overflow before any mutation and qualify deferred copy versus GC, lease
 retirement and node decommission. This is planned work, not implemented proof.
 The public Bun image list also still needs current catalogue authority.
+
+The public image-list fix is complete: a committed image is visible without a
+local catalogue projection, workers/followers use current authority, missing
+routes refuse, and user authentication remains enforced. The initial empty-list
+regression fails first. All 263 Pickle/125 Bun API tests, five real TLS authority
+cases, two compatibility checks and strict Clippy pass on macOS/Linux. Current
+formats are protocol 12/state 14, lease schema 5.

@@ -112,6 +112,8 @@ manifest and GC proposals to the advertised leader over authenticated node TLS.
 The leader checks current identity and quorum; retired nodes cannot commit.
 OCI metadata reads, peer image resolution and configured quota checks use the
 same current authority, including on fresh workers without a local catalogue.
+`relish images` also lists committed cluster metadata rather than a node-local
+projection; a missing leader route returns 503.
 Unavailable authority returns an error rather than a cache miss or zero usage.
 Digest reads also require live repository metadata; retaining shared bytes for
 an ordinary repository does not preserve access through a retired name.

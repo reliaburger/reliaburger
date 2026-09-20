@@ -107,9 +107,20 @@ impl RegistryMutation {
     }
 }
 
+/// Node-local routing identity for authenticated public catalogue reads.
+#[derive(Clone)]
+pub struct RegistryReadAuthority {
+    /// Current-leader transport with this node's live TLS credentials.
+    pub forwarder: RegistryForwarder,
+    /// The node's own immutable cluster identifier.
+    pub node_id: u64,
+}
+
 /// Restricted registry queries whose answers require current council authority.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum RegistryQuery {
+    /// List public image metadata from the committed catalogue.
+    Images,
     /// Read committed metadata needed to resolve and copy one repository's images.
     Repository { repository: String },
     /// Read current logical usage without transferring the whole catalogue.
@@ -144,6 +155,8 @@ pub struct RegistryQueryRequest {
 /// A current registry ownership view; this never exposes other leases' credentials.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum RegistryQueryResponse {
+    /// Public image rows; no lease credentials or internal storage receipts.
+    Images(Vec<super::types::ImageSummary>),
     /// A repository-scoped current catalogue, including its shared holder records.
     Repository(Box<super::types::ManifestCatalog>),
     /// Logical image bytes in this repository and in the complete registry.
@@ -168,6 +181,7 @@ impl RegistryQuery {
         node_id: u64,
     ) -> RegistryQueryResponse {
         match self {
+            Self::Images => RegistryQueryResponse::Images(state.manifest_catalog.images()),
             Self::Repository { repository } => RegistryQueryResponse::Repository(Box::new(
                 state.manifest_catalog.repository_view(repository),
             )),

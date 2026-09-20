@@ -2132,6 +2132,32 @@ async fn run_agent(cli: Cli) -> anyhow::Result<()> {
         None => None,
     };
 
+    let registry_forwarder = if let Some(directory) = registry_directory {
+        let mut builder = reqwest::Client::builder().redirect(reqwest::redirect::Policy::none());
+        if let Some(identity) = &api_identity {
+            builder = builder.use_preconfigured_tls(
+                (*reliaburger::sesame::mtls::build_live_mtls_client_config(
+                    identity,
+                    crl_refresh.clone().unwrap_or_default(),
+                    None,
+                )?)
+                .clone(),
+            );
+        }
+        let client = builder.build()?;
+        let http = if api_identity.is_some() {
+            reliaburger::cluster::ClusterHttp::secure(client)
+        } else {
+            reliaburger::cluster::ClusterHttp::plaintext_with_client(client)
+        }
+        .with_bearer(service_token.clone());
+        Some(reliaburger::pickle::authority::RegistryForwarder::new(
+            http, directory,
+        ))
+    } else {
+        None
+    };
+
     let app = api::router_with_upgrade(
         cmd_tx,
         Some(Arc::clone(&mayo_store)),
@@ -2166,6 +2192,15 @@ async fn run_agent(cli: Cli) -> anyhow::Result<()> {
         Some(local_test_leases.clone()),
         jwt_verifier,
     );
+    let app = match &registry_forwarder {
+        Some(forwarder) => app.layer(axum::Extension(
+            reliaburger::pickle::authority::RegistryReadAuthority {
+                forwarder: forwarder.clone(),
+                node_id: reliaburger::cluster::identity::raft_id_from_name(&node_name),
+            },
+        )),
+        None => app,
+    };
     let app = match capacity_admission {
         Some(admission) => app.layer(axum::Extension(admission)),
         None => app,
@@ -2328,31 +2363,6 @@ async fn run_agent(cli: Cli) -> anyhow::Result<()> {
     let upload_sessions = reliaburger::pickle::registry_auth::UploadSessions::new(
         reliaburger::pickle::registry_auth::DEFAULT_UPLOAD_TTL,
     );
-    let registry_forwarder = if let Some(directory) = registry_directory {
-        let mut builder = reqwest::Client::builder().redirect(reqwest::redirect::Policy::none());
-        if let Some(identity) = &api_identity {
-            builder = builder.use_preconfigured_tls(
-                (*reliaburger::sesame::mtls::build_live_mtls_client_config(
-                    identity,
-                    crl_refresh.clone().unwrap_or_default(),
-                    None,
-                )?)
-                .clone(),
-            );
-        }
-        let client = builder.build()?;
-        let http = if api_identity.is_some() {
-            reliaburger::cluster::ClusterHttp::secure(client)
-        } else {
-            reliaburger::cluster::ClusterHttp::plaintext_with_client(client)
-        }
-        .with_bearer(service_token.clone());
-        Some(reliaburger::pickle::authority::RegistryForwarder::new(
-            http, directory,
-        ))
-    } else {
-        None
-    };
     let pickle_state = PickleState {
         store: Arc::clone(&blob_store),
         catalog: Arc::clone(&pickle_catalog),

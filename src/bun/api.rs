@@ -7318,28 +7318,51 @@ async fn rollback_handler(
     Sse::new(stream).into_response()
 }
 
-/// `GET /v1/images` — list images in the local Pickle registry.
-async fn images_handler(State(state): State<ApiState>) -> impl IntoResponse {
-    let Some(catalog) = &state.pickle_catalog else {
-        return Json(serde_json::json!({"images": []}));
+/// `GET /v1/images` — list committed images using current cluster authority.
+async fn images_handler(
+    State(state): State<ApiState>,
+    authority: Option<axum::Extension<crate::pickle::authority::RegistryReadAuthority>>,
+) -> Response {
+    use crate::pickle::authority::{RegistryQuery, RegistryQueryResponse};
+    let images = if let Some(authority) = authority {
+        match authority
+            .forwarder
+            .query(
+                state.council.as_ref(),
+                authority.node_id,
+                RegistryQuery::Images,
+            )
+            .await
+        {
+            Ok(RegistryQueryResponse::Images(images)) => images,
+            Ok(_) => {
+                return (
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    "invalid registry image-list response",
+                )
+                    .into_response();
+            }
+            Err(error) => {
+                return (StatusCode::SERVICE_UNAVAILABLE, error.to_string()).into_response();
+            }
+        }
+    } else if let Some(council) = &state.council {
+        if let Err(error) = council.security_state_linearizable().await {
+            return (StatusCode::SERVICE_UNAVAILABLE, error.to_string()).into_response();
+        }
+        council.manifest_catalog().await.images()
+    } else if state.static_capabilities.cluster_mode {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            "registry authority is unavailable",
+        )
+            .into_response();
+    } else if let Some(catalog) = &state.pickle_catalog {
+        catalog.read().await.images()
+    } else {
+        Vec::new()
     };
-    let catalog = catalog.read().await;
-    let images: Vec<serde_json::Value> = catalog
-        .manifests
-        .iter()
-        .map(|(digest, m)| {
-            let tags: Vec<&str> = m.tags.iter().map(|t| t.as_str()).collect();
-            let layers = m.layers.len();
-            serde_json::json!({
-                "repository": m.repository,
-                "digest": digest,
-                "tags": tags,
-                "layers": layers,
-                "total_size": m.total_size,
-            })
-        })
-        .collect();
-    Json(serde_json::json!({"images": images}))
+    Json(serde_json::json!({ "images": images })).into_response()
 }
 
 /// GitOps webhook handler (public, HMAC-authenticated).

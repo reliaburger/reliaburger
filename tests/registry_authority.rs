@@ -90,6 +90,14 @@ fn peer(hierarchy: &ca::CaHierarchy, serial: u64) -> TlsPeerCertificate {
 }
 
 fn router(council: Arc<CouncilNode>, peer: Option<TlsPeerCertificate>) -> Router {
+    router_with_tokens(council, peer, None)
+}
+
+fn router_with_tokens(
+    council: Arc<CouncilNode>,
+    peer: Option<TlsPeerCertificate>,
+    tokens: Option<reliaburger::sesame::auth::TokenStore>,
+) -> Router {
     let (tx, _rx) = tokio::sync::mpsc::channel(1);
     let router = reliaburger::bun::api::router(
         tx,
@@ -99,7 +107,7 @@ fn router(council: Arc<CouncilNode>, peer: Option<TlsPeerCertificate>) -> Router
         None,
         None,
         Some(council),
-        None,
+        tokens,
         Some("internal-token".into()),
         None,
         None,
@@ -541,10 +549,72 @@ async fn worker_and_follower_pushes_commit_through_the_advertised_leader() {
                 .is_some()
         );
     }
+    let response = router(leader.clone(), None)
+        .oneshot(
+            Request::get("/v1/images")
+                .header("authorization", "Bearer internal-token")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let bytes = axum::body::to_bytes(response.into_body(), 4096)
+        .await
+        .unwrap();
+    let listed: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+    assert_eq!(
+        listed["images"].as_array().unwrap().len(),
+        1,
+        "image list must use committed metadata, even without a local projection"
+    );
+    let read_tokens = reliaburger::sesame::auth::new_token_store();
+    read_tokens.write().await.push(
+        reliaburger::sesame::token::create_token(
+            "reader",
+            reliaburger::sesame::types::ApiRole::ReadOnly,
+            Default::default(),
+            None,
+        )
+        .unwrap()
+        .token,
+    );
     for local_council in [None, Some(follower.clone())] {
         let mut fresh = state.clone();
         fresh.catalog = Arc::new(RwLock::new(ManifestCatalog::default()));
         fresh.council = local_council;
+        let public_reader = router_with_tokens(follower.clone(), None, Some(read_tokens.clone()))
+            .layer(axum::Extension(
+                reliaburger::pickle::authority::RegistryReadAuthority {
+                    forwarder: fresh.forwarder.clone().unwrap(),
+                    node_id: fresh.node_raft_id,
+                },
+            ));
+        assert_eq!(
+            public_reader
+                .clone()
+                .oneshot(Request::get("/v1/images").body(Body::empty()).unwrap())
+                .await
+                .unwrap()
+                .status(),
+            StatusCode::UNAUTHORIZED
+        );
+        let response = public_reader
+            .oneshot(
+                Request::get("/v1/images")
+                    .header("authorization", "Bearer internal-token")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let bytes = axum::body::to_bytes(response.into_body(), 4096)
+            .await
+            .unwrap();
+        let listed: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(listed["images"].as_array().unwrap().len(), 1);
+        assert_eq!(listed["images"][0]["repository"], "ordinary");
         let source = reliaburger::pickle::p2p::ClusterSource {
             state: fresh.clone(),
             members: None,
@@ -719,6 +789,39 @@ async fn worker_and_follower_pushes_commit_through_the_advertised_leader() {
 
     // Losing the leader's route cannot silently change a worker to standalone.
     directory_tx.send(NodeDirectory::default()).unwrap();
+    let public_reader = router_with_tokens(follower.clone(), None, Some(read_tokens.clone()))
+        .layer(axum::Extension(
+            reliaburger::pickle::authority::RegistryReadAuthority {
+                forwarder: state.forwarder.clone().unwrap(),
+                node_id: state.node_raft_id,
+            },
+        ));
+    assert_eq!(
+        public_reader
+            .oneshot(
+                Request::get("/v1/images")
+                    .header("authorization", "Bearer internal-token")
+                    .body(Body::empty())
+                    .unwrap()
+            )
+            .await
+            .unwrap()
+            .status(),
+        StatusCode::SERVICE_UNAVAILABLE
+    );
+    assert_eq!(
+        router(follower.clone(), None)
+            .oneshot(
+                Request::get("/v1/images")
+                    .header("authorization", "Bearer internal-token")
+                    .body(Body::empty())
+                    .unwrap()
+            )
+            .await
+            .unwrap()
+            .status(),
+        StatusCode::SERVICE_UNAVAILABLE
+    );
     let response = reliaburger::pickle::api::router(state)
         .oneshot(
             Request::put("/v2/ordinary/manifests/unconfirmed")

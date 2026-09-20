@@ -1216,3 +1216,23 @@ catalogue, then checks actual TLS worker/follower resolution and quota refusal.
 Other tests exercise missing authority, lost quorum, repository projection and
 oversized responses. The public image-list endpoint and safe publication of peer
 copy receipts are separate work; a successful read alone proves neither.
+
+### The image list must agree with image pulls
+
+The public `/v1/images` endpoint had its own copy of the stale-read problem. It
+looked only at a node-local catalogue, so even a leader could return an empty list
+while Raft contained a successfully pushed image. It now reads the same current
+authority as pulls. Production startup attaches the node's existing authenticated
+registry transport to the API router before serving requests.
+
+`Option<Extension<RegistryReadAuthority>>` is an optional axum extractor: the
+router supplies its typed routing context, and embedded standalone routers may
+omit it. A clustered router without usable authority returns 503. A standalone
+router continues to read its local catalogue. The query returns typed public
+image summaries, leaving internal writer receipts and lease ownership out of the
+response. This adds protocol generation 12 without changing durable state 14.
+
+The failing-first test checks a committed image without a local projection.
+Worker/follower reads, a lost leader route and missing user authentication are
+also exercised. The authentication fixture seeds a user token, because an empty
+user-token store intentionally retains the local bootstrap window.

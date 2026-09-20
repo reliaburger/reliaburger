@@ -205,6 +205,21 @@ pub struct DeleteTag {
 // Manifest catalog (part of DesiredState)
 // ---------------------------------------------------------------------------
 
+/// Public image-list entry, excluding internal ownership and storage-node details.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ImageSummary {
+    /// Repository containing this manifest.
+    pub repository: String,
+    /// Exact content digest.
+    pub digest: String,
+    /// Current tags belonging to this repository copy.
+    pub tags: BTreeSet<String>,
+    /// Number of filesystem layers.
+    pub layers: usize,
+    /// Logical manifest content size in bytes.
+    pub total_size: u64,
+}
+
 /// The manifest catalog stored in Raft as part of DesiredState.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct ManifestCatalog {
@@ -277,6 +292,20 @@ impl ManifestCatalog {
         self.check_repository_owner(repository, lease_id)?;
         self.retire_repository(repository);
         Ok(())
+    }
+
+    /// Describe committed images without exposing internal ownership records.
+    pub fn images(&self) -> Vec<ImageSummary> {
+        self.manifests
+            .iter()
+            .map(|(digest, manifest)| ImageSummary {
+                repository: manifest.repository.clone(),
+                digest: digest.clone(),
+                tags: manifest.tags.clone(),
+                layers: manifest.layers.len(),
+                total_size: manifest.total_size,
+            })
+            .collect()
     }
 
     /// Project one repository without exposing unrelated manifests, tags or holders.

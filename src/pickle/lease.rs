@@ -93,12 +93,12 @@ impl PickleState {
             return Ok(query.answer(&council.desired_state().await, self.node_raft_id));
         }
         let state = match &query {
-            RegistryQuery::Repository { .. } | RegistryQuery::Usage { .. } => {
-                crate::council::DesiredState {
-                    manifest_catalog: self.catalog.read().await.clone(),
-                    ..Default::default()
-                }
-            }
+            RegistryQuery::Images
+            | RegistryQuery::Repository { .. }
+            | RegistryQuery::Usage { .. } => crate::council::DesiredState {
+                manifest_catalog: self.catalog.read().await.clone(),
+                ..Default::default()
+            },
             _ => crate::council::DesiredState {
                 test_leases: self
                     .test_leases
