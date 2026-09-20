@@ -20,6 +20,10 @@ release acceptance from deferred capabilities. The current checklist lives in
 [progress.md](progress.md).
 
 The opt-in durable Runc adapter now covers rootful and rootless Linux containers.
+Its rootful service path now retains a durable, generation-bound address reference
+across natural exit. Checked discovery withdrawal permits reuse; lost original
+discovery ownership refuses cleanup. Production integration and complete discovery
+recovery remain open.
 Rootful and rootless recovery tests cover caller death before adoption, short
 jobs, published ports and interrupted network-helper startup.
 Rootless networking is ready before the workload starts. Command waits retry
@@ -208,7 +212,7 @@ development configurations. Ingress currently uses unweighted round-robin on
 Bun's shared runtime, with no separate strategy or worker-thread setting.
 
 0.1.0 requires a fresh cluster; development state is refused. Rolling upgrades
-require matching explicit formats (currently protocol 14 and state 26). See the
+require matching explicit formats (currently protocol 14 and state 27). See the
 [compatibility policy](releasing.md#cluster-compatibility).
 
 Lease-owned test volumes and generated configuration have durable provisioning

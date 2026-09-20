@@ -322,3 +322,128 @@ async fn invalid_publication_and_conflicting_exit_evidence_preserve_the_previous
     );
     assert_eq!(records[0].spec, spec("original"));
 }
+
+#[tokio::test]
+async fn network_reference_survives_recovery_and_blocks_full_retirement() {
+    use reliaburger::grill::runc_intent::NetworkReferenceState;
+    let root = tempfile::tempdir().unwrap();
+    let mut config = configuration(root.path());
+    config.rootless = false;
+    let journal = IntentJournal::new(root.path().join("intents"), config);
+    let id = InstanceId("default__network-0".into());
+    let claim = journal
+        .claim(&id, None)
+        .await
+        .unwrap()
+        .publish(&spec("first"))
+        .await
+        .unwrap()
+        .retain_network(7)
+        .await
+        .unwrap();
+    let generation = claim.record().unwrap().generation.clone();
+    let reference = match claim.record().unwrap().network_reference.clone().unwrap() {
+        NetworkReferenceState::Held(reference) => reference,
+        other => panic!("unexpected network state: {other:?}"),
+    };
+    assert!(
+        claim.retire(Some(0)).await.is_err(),
+        "execution exit freed a discovery reference"
+    );
+    let recovered = journal.inventory().await.unwrap().remove(0);
+    assert_eq!(
+        recovered.network_reference,
+        Some(NetworkReferenceState::Held(reference.clone()))
+    );
+    let claim = journal.claim(&id, Some(generation)).await.unwrap();
+    let claim = claim
+        .release_network(reference.clone())
+        .await
+        .unwrap()
+        .release_network(reference.clone())
+        .await
+        .unwrap();
+    let claim = claim.retire(Some(0)).await.unwrap();
+    assert_eq!(
+        claim.record().unwrap().network_reference,
+        Some(NetworkReferenceState::Released(reference))
+    );
+}
+
+#[tokio::test]
+async fn stale_network_release_cannot_discharge_a_successor_reference() {
+    use reliaburger::grill::runc_intent::NetworkReferenceState;
+    let root = tempfile::tempdir().unwrap();
+    let mut config = configuration(root.path());
+    config.rootless = false;
+    let journal = IntentJournal::new(root.path().join("intents"), config);
+    let id = InstanceId("default__network-0".into());
+    let claim = journal
+        .claim(&id, None)
+        .await
+        .unwrap()
+        .publish(&spec("first"))
+        .await
+        .unwrap()
+        .retain_network(0)
+        .await
+        .unwrap();
+    let NetworkReferenceState::Held(original) =
+        claim.record().unwrap().network_reference.clone().unwrap()
+    else {
+        panic!("missing hold");
+    };
+    let claim = claim
+        .release_network(original.clone())
+        .await
+        .unwrap()
+        .retire(Some(0))
+        .await
+        .unwrap()
+        .publish(&spec("second"))
+        .await
+        .unwrap()
+        .retain_network(0)
+        .await
+        .unwrap();
+    let successor = claim.record().unwrap().network_reference.clone();
+    assert!(claim.release_network(original).await.is_err());
+    assert_eq!(
+        journal.inventory().await.unwrap()[0].network_reference,
+        successor
+    );
+}
+
+#[tokio::test]
+async fn missing_or_conflicting_network_references_cannot_be_released() {
+    use reliaburger::grill::runc_intent::NetworkReferenceState;
+    let root = tempfile::tempdir().unwrap();
+    let mut config = configuration(root.path());
+    config.rootless = false;
+    let journal = IntentJournal::new(root.path().join("intents"), config);
+    let id = InstanceId("default__network-0".into());
+    let claim = journal
+        .claim(&id, None)
+        .await
+        .unwrap()
+        .publish(&spec("first"))
+        .await
+        .unwrap()
+        .retain_network(4)
+        .await
+        .unwrap();
+    let generation = claim.record().unwrap().generation.clone();
+    let NetworkReferenceState::Held(mut forged) =
+        claim.record().unwrap().network_reference.clone().unwrap()
+    else {
+        panic!("missing hold");
+    };
+    forged.container_index = 5;
+    assert!(claim.release_network(forged).await.is_err());
+    let claim = journal.claim(&id, Some(generation)).await.unwrap();
+    assert!(claim.retain_network(5).await.is_err());
+    assert!(matches!(
+        journal.inventory().await.unwrap()[0].network_reference,
+        Some(NetworkReferenceState::Held(_))
+    ));
+}

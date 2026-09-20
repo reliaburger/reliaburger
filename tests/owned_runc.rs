@@ -506,3 +506,90 @@ async fn retiring_a_rollout_predecessor_preserves_its_live_successor() {
         "successor could not execute: {executed:?}"
     );
 }
+
+#[tokio::test]
+#[ignore = "requires root, runc, static /usr/bin/busybox, ip and nft"]
+async fn retained_addresses_survive_exit_and_recovery_until_the_original_reference_releases() {
+    assert!(nix::unistd::geteuid().is_root());
+    let root = tempfile::tempdir().unwrap();
+    let id = instance(root.path());
+    let first = runtime(root.path());
+    first
+        .create(&id, &spec(root.path(), "exit 0"))
+        .await
+        .unwrap();
+    install_fixture(root.path(), &id);
+    let original_ip = first.container_ip(&id).await.unwrap();
+    let original = first.retain_network_reference(&id).await.unwrap().unwrap();
+    first.start(&id).await.unwrap();
+    tokio::time::timeout(Duration::from_secs(15), async {
+        while first.state(&id).await.unwrap() != ContainerState::Stopped {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .unwrap();
+    drop(first);
+    let recovered = runtime(root.path());
+    let retained = recovered.network_reference(&id).await.unwrap();
+    let other = InstanceId(format!("{}-other", id.0));
+    recovered
+        .create(&other, &spec(root.path(), "exit 0"))
+        .await
+        .unwrap();
+    let other_ip = recovered.container_ip(&other).await.unwrap();
+    recovered.kill(&other).await.unwrap();
+    let refused_replacement = recovered
+        .create(&id, &spec(root.path(), "exit 1"))
+        .await
+        .is_err();
+    let mut wrong_address = original.clone();
+    wrong_address.container_index += 1;
+    let refused_wrong_address = recovered
+        .release_network_reference(&wrong_address)
+        .await
+        .is_err();
+    recovered
+        .release_network_reference(&original)
+        .await
+        .unwrap();
+    recovered
+        .release_network_reference(&original)
+        .await
+        .unwrap();
+
+    recovered
+        .create(&id, &spec(root.path(), "exit 2"))
+        .await
+        .unwrap();
+    let reused_ip = recovered.container_ip(&id).await.unwrap();
+    let successor = recovered
+        .retain_network_reference(&id)
+        .await
+        .unwrap()
+        .unwrap();
+    let refused_stale_release = recovered
+        .release_network_reference(&original)
+        .await
+        .is_err();
+    let successor_still_held = recovered.network_reference(&id).await.unwrap();
+    // This fixture never publishes routes, so it may positively discharge its holds.
+    recovered
+        .release_network_reference(&successor)
+        .await
+        .unwrap();
+    recovered.kill(&id).await.unwrap();
+    assert_absent(root.path(), &id);
+    assert_absent(root.path(), &other);
+    assert_eq!(retained, Some(original));
+    assert_ne!(
+        original_ip, other_ip,
+        "natural exit released a referenced address"
+    );
+    assert!(refused_replacement && refused_wrong_address && refused_stale_release);
+    assert_eq!(
+        original_ip, reused_ip,
+        "confirmed release did not free the address"
+    );
+    assert_eq!(successor_still_held, Some(successor));
+}

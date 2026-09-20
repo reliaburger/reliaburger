@@ -1144,6 +1144,38 @@ impl super::Grill for RuncGrill {
         None
     }
 
+    async fn retain_network_reference(
+        &self,
+        instance: &InstanceId,
+    ) -> Result<Option<super::runc_intent::NetworkReference>, GrillError> {
+        if self.ownership.is_none() || self.rootless {
+            return Ok(None);
+        }
+        self.owned_retain_network_reference(instance)
+            .await
+            .map(Some)
+    }
+
+    async fn network_reference(
+        &self,
+        instance: &InstanceId,
+    ) -> Result<Option<super::runc_intent::NetworkReference>, GrillError> {
+        if self.ownership.is_none() || self.rootless {
+            return Ok(None);
+        }
+        match self.owned_network_reference(instance).await {
+            Err(GrillError::NotFound { .. }) => Ok(None),
+            result => result,
+        }
+    }
+
+    async fn release_network_reference(
+        &self,
+        reference: &super::runc_intent::NetworkReference,
+    ) -> Result<(), GrillError> {
+        self.owned_release_network_reference(reference).await
+    }
+
     fn runtime_kind(&self) -> super::records::RuntimeKind {
         super::records::RuntimeKind::Runc
     }

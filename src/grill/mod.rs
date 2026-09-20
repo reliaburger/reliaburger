@@ -318,6 +318,39 @@ pub trait Grill: Send + Sync {
         std::future::ready(Ok(None))
     }
 
+    /// Hold a rootful address before discovery publication. Unsupported adapters
+    /// return None; the production recovery profile must require this capability.
+    fn retain_network_reference(
+        &self,
+        instance: &InstanceId,
+    ) -> impl std::future::Future<Output = Result<Option<runc_intent::NetworkReference>, GrillError>>
+    + Send {
+        let _ = instance;
+        std::future::ready(Ok(None))
+    }
+
+    /// Read an outstanding discovery reference independently of execution state.
+    fn network_reference(
+        &self,
+        instance: &InstanceId,
+    ) -> impl std::future::Future<Output = Result<Option<runc_intent::NetworkReference>, GrillError>>
+    + Send {
+        let _ = instance;
+        std::future::ready(Ok(None))
+    }
+
+    /// Confirm withdrawal of every route naming this exact original address.
+    /// Callers must retain the reference on any failed or uncertain withdrawal.
+    fn release_network_reference(
+        &self,
+        reference: &runc_intent::NetworkReference,
+    ) -> impl std::future::Future<Output = Result<(), GrillError>> + Send {
+        std::future::ready(Err(GrillError::StateUnavailable {
+            instance: reference.instance_id.clone(),
+            reason: "runtime cannot release a discovery reference".into(),
+        }))
+    }
+
     /// Which runtime kind this grill starts instances with. Recorded in
     /// instance records so adoption is routed to the right runtime.
     fn runtime_kind(&self) -> records::RuntimeKind {
@@ -547,6 +580,45 @@ impl Grill for AnyGrill {
             AnyGrill::Runc(g) => g.launch_inventory().await,
             #[cfg(target_os = "macos")]
             AnyGrill::Apple(g) => g.launch_inventory().await,
+        }
+    }
+
+    async fn retain_network_reference(
+        &self,
+        instance: &InstanceId,
+    ) -> Result<Option<runc_intent::NetworkReference>, GrillError> {
+        match self {
+            AnyGrill::Process(runtime) => runtime.retain_network_reference(instance).await,
+            #[cfg(target_os = "linux")]
+            AnyGrill::Runc(runtime) => runtime.retain_network_reference(instance).await,
+            #[cfg(target_os = "macos")]
+            AnyGrill::Apple(runtime) => runtime.retain_network_reference(instance).await,
+        }
+    }
+
+    async fn network_reference(
+        &self,
+        instance: &InstanceId,
+    ) -> Result<Option<runc_intent::NetworkReference>, GrillError> {
+        match self {
+            AnyGrill::Process(runtime) => runtime.network_reference(instance).await,
+            #[cfg(target_os = "linux")]
+            AnyGrill::Runc(runtime) => runtime.network_reference(instance).await,
+            #[cfg(target_os = "macos")]
+            AnyGrill::Apple(runtime) => runtime.network_reference(instance).await,
+        }
+    }
+
+    async fn release_network_reference(
+        &self,
+        reference: &runc_intent::NetworkReference,
+    ) -> Result<(), GrillError> {
+        match self {
+            AnyGrill::Process(runtime) => runtime.release_network_reference(reference).await,
+            #[cfg(target_os = "linux")]
+            AnyGrill::Runc(runtime) => runtime.release_network_reference(reference).await,
+            #[cfg(target_os = "macos")]
+            AnyGrill::Apple(runtime) => runtime.release_network_reference(reference).await,
         }
     }
 

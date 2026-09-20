@@ -1633,6 +1633,10 @@ pub struct BunAgent<G: Grill> {
     deploy_operations: crate::bun::deploy_operations::DeployOperationTracker,
     /// Initialisers whose runtime must retire before parent policy and records.
     initialisers: std::collections::HashMap<InstanceId, std::collections::HashSet<InstanceId>>,
+    /// Captured before startup; a recovered runtime hold needs original discovery
+    /// reconciliation rather than an empty in-memory map authorising release.
+    network_references:
+        std::collections::HashMap<InstanceId, crate::grill::runc_intent::NetworkReference>,
     /// Pre-created network namespace paths for instances (Linux + runc only).
     /// When present, the namespace path is passed to `generate_oci_spec` so
     /// the container joins the pre-created namespace instead of creating one.
@@ -1781,6 +1785,7 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
             deploy_history: Arc::new(tokio::sync::RwLock::new(Vec::new())),
             deploy_operations: crate::bun::deploy_operations::DeployOperationTracker::default(),
             initialisers: std::collections::HashMap::new(),
+            network_references: std::collections::HashMap::new(),
             netns_paths: std::collections::HashMap::new(),
             deployed_specs: std::collections::HashMap::new(),
             next_deploy_gen: 1,
@@ -1885,6 +1890,7 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
             deploy_history: Arc::new(tokio::sync::RwLock::new(Vec::new())),
             deploy_operations: crate::bun::deploy_operations::DeployOperationTracker::default(),
             initialisers: std::collections::HashMap::new(),
+            network_references: std::collections::HashMap::new(),
             netns_paths: std::collections::HashMap::new(),
             deployed_specs: std::collections::HashMap::new(),
             next_deploy_gen: 1,
@@ -6244,6 +6250,7 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
         spec: Option<&AppSpec>,
         cgroup_path: &std::path::Path,
     ) -> Result<(), BunError> {
+        self.retain_network_reference(instance_id, spec).await?;
         use crate::sesame::egress::{self, PreStartEgress};
 
         let has_allowlist = spec
@@ -6297,15 +6304,65 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
         }
     }
 
+    async fn retain_network_reference(
+        &mut self,
+        id: &InstanceId,
+        spec: Option<&AppSpec>,
+    ) -> Result<(), BunError> {
+        if spec.is_none_or(|spec| spec.port.is_none()) {
+            return Ok(());
+        }
+        if let Some(reference) = self.supervisor.grill().retain_network_reference(id).await? {
+            if self
+                .network_references
+                .get(id)
+                .is_some_and(|original| original != &reference)
+            {
+                return Err(BunError::RetirementState {
+                    instance_id: id.clone(),
+                    reason: "original network reference still belongs to another generation".into(),
+                });
+            }
+            self.network_references.insert(id.clone(), reference);
+        }
+        Ok(())
+    }
+
+    async fn release_network_reference(&mut self, id: &InstanceId) -> Result<(), BunError> {
+        let Some(reference) = self.network_references.get(id).cloned() else {
+            if self
+                .supervisor
+                .grill()
+                .network_reference(id)
+                .await?
+                .is_some()
+            {
+                return Err(BunError::RetirementState {
+                    instance_id: id.clone(),
+                    reason: "retained network reference requires original discovery reconciliation"
+                        .into(),
+                });
+            }
+            return Ok(());
+        };
+        self.supervisor
+            .grill()
+            .release_network_reference(&reference)
+            .await?;
+        self.network_references.remove(id);
+        Ok(())
+    }
+
     /// A build without the eBPF data path cannot enforce an allowlist.
     #[cfg(not(all(feature = "ebpf", target_os = "linux")))]
     async fn apply_network_pre_start(
         &mut self,
-        _instance_id: &InstanceId,
+        instance_id: &InstanceId,
         app_name: &str,
         spec: Option<&AppSpec>,
         _cgroup_path: &std::path::Path,
     ) -> Result<(), BunError> {
+        self.retain_network_reference(instance_id, spec).await?;
         if spec
             .and_then(|spec| spec.egress.as_ref())
             .is_some_and(|e| !e.allow.is_empty())
@@ -8129,7 +8186,9 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
         instance_id: &InstanceId,
     ) -> Result<(), BunError> {
         self.retire_initialisers(instance_id).await?;
+        self.withdraw_instance_backend(instance_id).await?;
         self.clear_egress(instance_id).await?;
+        self.release_network_reference(instance_id).await?;
         let identity_dir = self.instance_identity_dir(instance_id);
         let records_dir = self.records_dir.clone();
         let id = instance_id.0.clone();
@@ -9097,32 +9156,41 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
         let Some(mut entry) = self.service_map.resolve(&service).cloned() else {
             return Ok(());
         };
-        if !entry
+        let had_backend = entry
             .backends
             .iter()
-            .any(|backend| backend.instance_id == id.0)
-        {
-            return Ok(());
-        }
+            .any(|backend| backend.instance_id == id.0);
         entry.backends.retain(|backend| backend.instance_id != id.0);
         // Keep the original userspace owner on refusal. A retry must still know
         // the exact allocated key and the backend whose removal is outstanding.
         #[cfg(all(feature = "ebpf", target_os = "linux"))]
         if let Some(handle) = self.onion_ebpf.as_ref() {
             let mut ebpf = handle.lock().await;
-            crate::onion::ebpf::maps::BpfServiceMap::new()
-                .update_backends_bpf(&mut ebpf, entry.vip, entry.port, &entry)
-                .map_err(|error| BunError::BackendRetirement {
+            let map = crate::onion::ebpf::maps::BpfServiceMap::new();
+            let failure =
+                |error: crate::onion::ebpf::maps::BpfMapError| BunError::BackendRetirement {
                     service: service.clone(),
+                    reason: error.to_string(),
+                };
+            // A missing userspace backend is not evidence that an earlier kernel
+            // rewrite succeeded. Conversely, never recreate a confirmed absent key.
+            if map
+                .read_backends(&mut ebpf, entry.vip, entry.port)
+                .map_err(failure)?
+                .is_some()
+            {
+                map.update_backends_bpf(&mut ebpf, entry.vip, entry.port, &entry)
+                    .map_err(failure)?;
+            }
+        }
+        if had_backend {
+            self.service_map
+                .remove_backend(&service, &id.0)
+                .map_err(|error| BunError::BackendRetirement {
+                    service,
                     reason: error.to_string(),
                 })?;
         }
-        self.service_map
-            .remove_backend(&service, &id.0)
-            .map_err(|error| BunError::BackendRetirement {
-                service,
-                reason: error.to_string(),
-            })?;
         self.rebuild_routing_table().await;
         Ok(())
     }

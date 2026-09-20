@@ -451,6 +451,18 @@ impl IntentCommands {
         .map_err(io::Error::other)?
     }
 
+    /// Persist a discovery hold while retaining exclusive generation authority.
+    pub async fn retain_network(mut self, container_index: u16) -> io::Result<Self> {
+        self.claim = self.claim.retain_network(container_index).await?;
+        Ok(self)
+    }
+
+    /// Persist the original publisher's release before address retirement.
+    pub async fn release_network(mut self, reference: super::NetworkReference) -> io::Result<Self> {
+        self.claim = self.claim.release_network(reference).await?;
+        Ok(self)
+    }
+
     /// Confirm retirement after the runtime has separately verified resource absence.
     /// The command inventory is rechecked while the claim still excludes admissions.
     pub async fn finish(self, exit_code: Option<i32>) -> io::Result<()> {

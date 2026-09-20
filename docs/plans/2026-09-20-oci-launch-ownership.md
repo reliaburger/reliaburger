@@ -646,3 +646,40 @@ Qualification: all 32 macOS/33 Linux process and job recovery cases pass
 (26.911s/23.423s), with strict all-target/all-feature Clippy and formatting.
 The new test passes against the existing recovery implementation; this is
 additional physical qualification, not a repaired defect.
+
+## Natural exit and retained address references
+
+The real Runc/HTTP regression now reproduces the natural-exit leak (2.09s):
+publish a service, freeze its backend map, abort the controller task and let the
+payload exit with code zero. Runtime observation tears down its network and
+releases its address. An unrelated portless container gets that address, and
+the old VIP returns HTTP 200 with the successor's identity. Direct successor
+HTTP and the original VIP before failure are positive controls. This is
+controller-task loss, not yet actual Bun process death.
+
+The opt-in adapter now separates execution retirement from discovery-authorised
+address release. Its owned Runc intent retains a generation-bound network
+reference before the main workload starts. Natural exit may seal/drain commands and tear down host
+resources, but must keep the address allocation and original intent while that
+reference remains Held. A matching release receipt becomes durable before
+address reuse; stale-generation releases refuse. Retired runtime intent remains
+the idempotent completion receipt. A fresh journal version requires fresh
+pre-release state.
+
+The agent captures the reference before startup and releases it only after
+checked backend withdrawal and policy cleanup. Lost in-memory service ownership
+must not authorise releasing a recovered runtime reference. Durable service
+reconstruction, remote catalogue acknowledgements, in-flight proxy requests and
+combined enforcement loss remain explicit boundaries to qualify. Production
+Runc/kernel selection must wait for the complete recovery contract.
+
+All 67 physical kernel cases pass (72.03s), including the original HTTP leak.
+All twelve owned rootful cases pass (11.65s), covering retained allocation after
+exit and adapter recovery, successful release/reuse, repeated release and stale
+successor refusal. Six rootless cases pass (3.33s). Three additional intent
+contracts cover reload, retirement refusal and generation/allocation matching;
+all 31 selected ownership/compatibility cases pass on macOS/Linux, alongside
+215 affected library tests (17.726s/22.884s) and strict Clippy/formatting on both.
+Protocol remains 14; state 27 and OCI intent schema 4 require fresh development
+clusters. This qualifies controller-task loss and adapter recovery, not actual
+Bun process death or complete discovery reconstruction.

@@ -3561,6 +3561,31 @@ struct InitPolicyGrill {
 }
 
 impl reliaburger::grill::Grill for InitPolicyGrill {
+    async fn retain_network_reference(
+        &self,
+        id: &reliaburger::grill::InstanceId,
+    ) -> Result<
+        Option<reliaburger::grill::runc_intent::NetworkReference>,
+        reliaburger::grill::GrillError,
+    > {
+        self.runtime.retain_network_reference(id).await
+    }
+    async fn network_reference(
+        &self,
+        id: &reliaburger::grill::InstanceId,
+    ) -> Result<
+        Option<reliaburger::grill::runc_intent::NetworkReference>,
+        reliaburger::grill::GrillError,
+    > {
+        self.runtime.network_reference(id).await
+    }
+    async fn release_network_reference(
+        &self,
+        reference: &reliaburger::grill::runc_intent::NetworkReference,
+    ) -> Result<(), reliaburger::grill::GrillError> {
+        self.runtime.release_network_reference(reference).await
+    }
+
     async fn create(
         &self,
         id: &reliaburger::grill::InstanceId,
@@ -4069,6 +4094,15 @@ async fn check_backend_retirement(strategy: Option<&str>, freeze: bool) {
         runtime.kill(&launch.instance_id).await.unwrap();
     }
     ebpf.lock().await.detach().unwrap();
+    for launch in runtime.launch_inventory().await.unwrap().unwrap() {
+        if let Some(reference) = runtime
+            .network_reference(&launch.instance_id)
+            .await
+            .unwrap()
+        {
+            runtime.release_network_reference(&reference).await.unwrap();
+        }
+    }
     for path in owned_cgroups {
         if path.exists() {
             std::fs::remove_dir(path).unwrap();
@@ -4276,4 +4310,125 @@ async fn refused_destination_grant_removal_retains_the_original_service() {
 #[ignore = "requires Linux root and RELIABURGER_EBPF_TESTS=1"]
 async fn confirmed_destination_retirement_removes_only_its_own_grants() {
     check_destination_grant_retirement(false).await;
+}
+
+#[tokio::test]
+#[ignore = "requires Linux root and RELIABURGER_EBPF_TESTS=1"]
+async fn natural_exit_keeps_its_address_while_a_retained_backend_can_reach_it() {
+    use reliaburger::bun::agent::{AgentCommand, ApplyEvent, BunAgent};
+    use reliaburger::grill::{
+        ContainerState, Grill, ImageStore, InstanceId, port::PortAllocator, runc::RuncGrill,
+    };
+    use std::sync::Arc;
+    use tokio::sync::{Mutex, mpsc};
+    assert!(ebpf_tests_enabled());
+    let root = tempfile::tempdir().unwrap();
+    let ebpf = Arc::new(Mutex::new(
+        OnionEbpf::load_embedded(CGROUP_PATH.as_ref()).unwrap(),
+    ));
+    let bundles = root.path().join("bundles");
+    let runtime = RuncGrill::new(
+        bundles.clone(),
+        ImageStore::new(root.path().join("images")),
+        false,
+        root.path().join("runc-state"),
+    )
+    .with_owner(env!("CARGO_BIN_EXE_bun").into())
+    .unwrap();
+    let grill = InitPolicyGrill {
+        runtime: runtime.clone(),
+        bundles: bundles.clone(),
+        bpf: Arc::clone(&ebpf),
+        starts: Arc::new(Mutex::new(Vec::new())),
+        refuse_init_cleanup: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+    };
+    let (commands, receiver) = mpsc::channel(64);
+    let mut agent = BunAgent::new(
+        grill.clone(),
+        PortAllocator::new(43600, 43700),
+        receiver,
+        CancellationToken::new(),
+    );
+    agent.set_records_dir(root.path().join("records"));
+    agent.set_volumes_dir(root.path().join("volumes"));
+    agent.set_onion_ebpf(Arc::clone(&ebpf)).await;
+    let mut task = Some(tokio::spawn(async move { agent.run().await }));
+    let old = InstanceId("default__natural-predecessor-0".into());
+    let new = InstanceId("default__natural-successor-0".into());
+    let vip = VirtualIP::from_service_id(&ServiceId::new("default", "natural-predecessor"));
+    let exercise = async {
+        let mut config = reliaburger::config::Config::parse("[app.natural-predecessor]\nimage = '/empty-fixture'\nport = 8080\n")?;
+        config.app.get_mut("natural-predecessor").unwrap().command = vec![
+            "/bin/busybox".into(), "sh".into(), "-c".into(),
+            "/bin/busybox httpd -f -p 8080 -h / & server=$!; while [ ! -f /exit-now ]; do /bin/busybox sleep 0.01; done; kill \"$server\"; wait \"$server\"; exit 0".into(),
+        ];
+        let (events, mut results) = mpsc::channel(64);
+        commands.send(AgentCommand::Deploy { config, events }).await?;
+        while let Some(event) = results.recv().await {
+            if let ApplyEvent::Error { message } = event { anyhow::bail!(message); }
+        }
+        let original_ip = runtime.container_ip(&old).await.ok_or_else(|| anyhow::anyhow!("original address absent"))?;
+        let original = read_runtime_fixture_page(SocketAddr::new(vip.0.into(), 8080)).await?;
+        anyhow::ensure!(original.contains(&old.0), "original VIP failed its positive control");
+        freeze_egress_map(&*ebpf.lock().await, "backend_map");
+        // Controller loss must not turn a natural exit into permission to reuse
+        // an address still named by its retained kernel route.
+        let actor = task.take().unwrap();
+        actor.abort();
+        let _ = actor.await;
+        tokio::fs::write(bundles.join(&old.0).join("rootfs/exit-now"), b"exit").await?;
+        tokio::time::timeout(Duration::from_secs(15), async {
+            loop {
+                if runtime.state(&old).await? == ContainerState::Stopped { return Ok::<(), anyhow::Error>(()); }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        }).await??;
+        anyhow::ensure!(runtime.exit_code(&old).await == Some(0), "original did not exit naturally");
+        let successor: reliaburger::config::app::AppSpec = toml::from_str("image = '/empty-fixture'\ncommand = ['/bin/busybox', 'httpd', '-f', '-p', '8080', '-h', '/']\n")?;
+        let cgroup = reliaburger::grill::cgroup::instance_cgroup_path("default", "natural-successor", &new)?;
+        let spec = reliaburger::grill::oci::generate_oci_spec("natural-successor", "default", &successor, &new.0, None, &cgroup.to_string_lossy(), None, None);
+        grill.create(&new, &spec).await?;
+        grill.start(&new).await?;
+        let successor_ip = runtime.container_ip(&new).await.ok_or_else(|| anyhow::anyhow!("successor address absent"))?;
+        let direct = read_runtime_fixture_page(SocketAddr::new(successor_ip.into(), 8080)).await?;
+        anyhow::ensure!(direct.contains(&new.0), "successor failed its direct positive control");
+        let old_route = read_runtime_fixture_page(SocketAddr::new(vip.0.into(), 8080)).await.ok();
+        Ok::<_, anyhow::Error>((original_ip, successor_ip, old_route))
+    }.await;
+    if let Some(actor) = task.take() {
+        actor.abort();
+        let _ = actor.await;
+    }
+    let launches = runtime.launch_inventory().await.unwrap().unwrap();
+    let paths: Vec<_> = launches
+        .iter()
+        .filter_map(|launch| launch.spec.linux.host_cgroup_path())
+        .collect();
+    for launch in launches {
+        runtime.kill(&launch.instance_id).await.unwrap();
+    }
+    ebpf.lock().await.detach().unwrap();
+    for launch in runtime.launch_inventory().await.unwrap().unwrap() {
+        if let Some(reference) = runtime
+            .network_reference(&launch.instance_id)
+            .await
+            .unwrap()
+        {
+            runtime.release_network_reference(&reference).await.unwrap();
+        }
+    }
+    for path in paths {
+        if path.exists() {
+            std::fs::remove_dir(path).unwrap();
+        }
+    }
+    let (original_ip, successor_ip, old_route) = exercise.unwrap();
+    assert!(
+        old_route.is_none(),
+        "old VIP reached a successor after natural exit: {old_route:?}"
+    );
+    assert_ne!(
+        original_ip, successor_ip,
+        "reused an address still held by a backend route"
+    );
 }

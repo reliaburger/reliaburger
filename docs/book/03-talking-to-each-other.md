@@ -1306,3 +1306,40 @@ used by DNS and the ingress backend pool: the remote endpoint survives and both
 stale local endpoints disappear. This closes local self-restoration. It does not
 prove another node has received a withdrawal; that needs separate acknowledgement
 before an address can safely be reused.
+
+
+## A stopped container can still own an address
+
+The container exits normally. Runc tears down its namespace, and our address pool
+makes its IP available again. Now freeze an old service's backend map before
+that happens, and start an unrelated container. The old VIP returns HTTP 200
+with the new container's identity. This is the natural-exit regression, using
+real Runc, a real kernel map and HTTP responses from both workloads.
+
+Stopping execution and releasing an address are separate facts. The opt-in owned
+Runc adapter now records a `NetworkReference` before a service workload starts.
+It contains the instance identity, runtime generation and original allocation.
+The original intent keeps that reference in either `Held` or `Released` state.
+`Option<NetworkReferenceState>` also distinguishes workloads that never held a
+discovery reference. These are data-bearing enum variants: Rust makes each
+variant carry the exact reference whose state it describes.
+
+Natural exit still seals command admission, drains accepted commands and removes
+host network resources. It can report that execution stopped. While discovery
+holds the address, the durable runtime intent remains Retiring and the address
+reservation remains occupied. A matching release first persists Released, then
+lets resource retirement finish. A retry reads that receipt; a request from an
+older generation cannot release its successor's reservation.
+
+The agent captures the reference before startup. During retirement it confirms
+backend withdrawal and policy cleanup before releasing the reference. It checks
+the kernel even when userspace no longer lists that backend: a failed earlier
+rewrite may have left it installed. It also avoids recreating a backend-map key
+whose absence is already confirmed.
+
+This does not turn missing service metadata into evidence. If a recovered runtime
+still holds a reference but the agent lacks its original discovery ownership,
+cleanup refuses rather than freeing the address. Complete service reconstruction,
+remote catalogue acknowledgements and in-flight proxy requests remain separate
+work before selecting this adapter in production. State format 27 and OCI intent
+version 4 reject older development state that lacks this distinction.

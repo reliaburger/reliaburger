@@ -177,6 +177,38 @@ impl ClaimedCommandExecutor {
         .map_err(io::Error::other)?
     }
 
+    /// Save a network reference without cancellation releasing the generation claim.
+    pub async fn retain_network(&self, container_index: u16) -> io::Result<()> {
+        if self.cleanup {
+            return Err(io::Error::other(
+                "cleanup cannot acquire a network reference",
+            ));
+        }
+        let mut guard = self.commands.clone().lock_owned().await;
+        tokio::spawn(async move {
+            let current = guard.take().ok_or_else(unavailable)?;
+            *guard = Some(current.retain_network(container_index).await?);
+            Ok(())
+        })
+        .await
+        .map_err(io::Error::other)?
+    }
+
+    /// Keep the claim through a durable, generation-matched release receipt.
+    pub async fn release_network(
+        &self,
+        reference: crate::grill::runc_intent::NetworkReference,
+    ) -> io::Result<()> {
+        let mut guard = self.commands.clone().lock_owned().await;
+        tokio::spawn(async move {
+            let current = guard.take().ok_or_else(unavailable)?;
+            *guard = Some(current.release_network(reference).await?);
+            Ok(())
+        })
+        .await
+        .map_err(io::Error::other)?
+    }
+
     /// Release the generation only after the caller has confirmed resource absence.
     pub async fn finish(&self, exit_code: Option<i32>) -> io::Result<()> {
         if !self.cleanup {

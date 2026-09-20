@@ -51,6 +51,62 @@ impl RuncGrill {
         Ok(self)
     }
 
+    /// Retain the original rootful address before a publisher exposes it.
+    pub(super) async fn owned_retain_network_reference(
+        &self,
+        instance: &InstanceId,
+    ) -> Result<super::super::runc_intent::NetworkReference, GrillError> {
+        self.owned_operation(instance, |runtime, id, context| async move {
+            let index = runtime
+                .network_leases
+                .lookup(&id, runtime.node_index)
+                .await?
+                .ok_or_else(|| io::Error::other("runtime network reservation is absent"))?;
+            context.retain_network(index).await?;
+            match context.intent().await?.network_reference {
+                Some(super::super::runc_intent::NetworkReferenceState::Held(reference)) => {
+                    Ok(reference)
+                }
+                _ => Err(io::Error::other(
+                    "runtime network reference was not retained",
+                )),
+            }
+        })
+        .await
+    }
+
+    /// Read a retained reference without inferring withdrawal from runtime exit.
+    pub(super) async fn owned_network_reference(
+        &self,
+        instance: &InstanceId,
+    ) -> Result<Option<super::super::runc_intent::NetworkReference>, GrillError> {
+        self.owned_operation(instance, |_runtime, _id, context| async move {
+            Ok(match context.intent().await?.network_reference {
+                Some(super::super::runc_intent::NetworkReferenceState::Held(reference)) => {
+                    Some(reference)
+                }
+                _ => None,
+            })
+        })
+        .await
+    }
+
+    /// Release only the matching original reference after discovery withdrawal.
+    pub(super) async fn owned_release_network_reference(
+        &self,
+        reference: &super::super::runc_intent::NetworkReference,
+    ) -> Result<(), GrillError> {
+        let original = reference.clone();
+        self.owned_operation(&reference.instance_id, |runtime, id, context| async move {
+            context.release_network(original).await?;
+            if context.intent().await?.phase == IntentPhase::Retiring {
+                runtime.owned_cleanup(&id, &context).await?;
+            }
+            Ok(())
+        })
+        .await
+    }
+
     fn ownership(&self) -> io::Result<&Ownership> {
         self.ownership
             .as_ref()
@@ -376,6 +432,17 @@ impl RuncGrill {
         } else {
             self.network_leases.lookup(id, self.node_index).await?
         };
+        let held = match &record.network_reference {
+            Some(super::super::runc_intent::NetworkReferenceState::Held(reference)) => {
+                Some(reference)
+            }
+            _ => None,
+        };
+        if held.is_some_and(|reference| index != Some(reference.container_index)) {
+            return Err(io::Error::other(
+                "retained discovery address has no matching reservation",
+            ));
+        }
         if let Some(index) = index {
             let network = netns::planned_container_network(id, self.node_index, index)
                 .map_err(io::Error::other)?;
@@ -401,6 +468,15 @@ impl RuncGrill {
             let mut networks = self.networks.lock().await;
             networks.remove(id);
             self.publish_dns_sources(&networks);
+        }
+        if held.is_some() {
+            // Commands and host resources are gone. Keep the allocation and
+            // sealed original intent until discovery confirms its own retirement.
+            if let Some(entry) = self.entries.lock().await.get_mut(id) {
+                entry.state = ContainerState::Stopped;
+                entry.exit_code = exit_code;
+            }
+            return Ok(());
         }
         if let Some(index) = index {
             self.network_leases

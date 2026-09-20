@@ -41,7 +41,7 @@ Install and usage details are in the [documentation](docs/README.md), and
 implementation status in [progress.md](docs/progress.md).
 
 0.1.0 requires a fresh cluster; development state is refused. Rolling upgrades
-require matching explicit formats (currently protocol 14 and state 26). See the
+require matching explicit formats (currently protocol 14 and state 27). See the
 [compatibility policy](docs/releasing.md#cluster-compatibility).
 Registry uploads belong to their exact creating credential. Recovery reclaims
 abandoned partial uploads after a crash and
@@ -299,6 +299,10 @@ release acceptance from deferred capabilities. The current checklist lives in
 [progress.md](docs/progress.md).
 
 The opt-in durable Runc adapter now covers rootful and rootless Linux containers.
+Its rootful service path now retains a durable, generation-bound address reference
+across natural exit. Checked discovery withdrawal permits reuse; lost original
+discovery ownership refuses cleanup. Production integration and complete discovery
+recovery remain open.
 Rootful and rootless recovery tests cover caller death before adoption, short
 jobs, published ports and interrupted network-helper startup.
 Rootless networking is ready before the workload starts. Command waits retry

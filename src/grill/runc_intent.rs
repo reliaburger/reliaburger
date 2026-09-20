@@ -81,6 +81,27 @@ pub struct RuntimeRoles {
     pub retired_rootless_network: Vec<CommandId>,
 }
 
+/// One runtime generation's address retained for a discovery publisher.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct NetworkReference {
+    /// Workload that originally reserved the address.
+    pub instance_id: InstanceId,
+    /// Original runtime generation; later generations cannot honour this reference.
+    pub generation: IntentGeneration,
+    /// Original allocation within the node's immutable subnet configuration.
+    pub container_index: u16,
+}
+
+/// Durable discovery ownership, including an idempotent release receipt.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum NetworkReferenceState {
+    /// Execution may stop, but its address cannot be released yet.
+    Held(NetworkReference),
+    /// The publisher confirmed withdrawal before permitting address release.
+    Released(NetworkReference),
+}
+
 /// Immutable original request plus the runtime's latest retirement evidence.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -98,6 +119,8 @@ pub struct RuntimeIntent {
     pub phase: IntentPhase,
     /// Exact commands permitted to execute long-lived runtime roles.
     pub roles: RuntimeRoles,
+    /// Discovery ownership survives runtime exit independently of its launcher.
+    pub network_reference: Option<NetworkReferenceState>,
 }
 
 /// A node's persistent collection of original Runc preparation attempts.
@@ -276,7 +299,7 @@ impl IntentJournal {
             return Err(io::Error::other("runtime intent exceeds size limit"));
         }
         let record: RuntimeIntent = serde_json::from_slice(&bytes)?;
-        if record.version != 3
+        if record.version != 4
             || record.instance_id != *instance
             || record.configuration != self.configuration
             || record.generation.0.len() != 32
@@ -287,6 +310,21 @@ impl IntentJournal {
                 .all(|byte| byte.is_ascii_hexdigit())
         {
             return Err(io::Error::other("invalid or incompatible runtime intent"));
+        }
+        if let Some(state) = &record.network_reference {
+            let reference = match state {
+                NetworkReferenceState::Held(reference)
+                | NetworkReferenceState::Released(reference) => reference,
+            };
+            if reference.instance_id != record.instance_id
+                || reference.generation != record.generation
+                || reference.container_index >= 509
+                || record.configuration.rootless
+                || (matches!(state, NetworkReferenceState::Held(_))
+                    && matches!(record.phase, IntentPhase::Retired { .. }))
+            {
+                return Err(io::Error::other("invalid runtime network reference"));
+            }
         }
         Ok(Some(record))
     }
@@ -315,12 +353,13 @@ impl IntentClaim {
                 .fill(&mut nonce)
                 .map_err(|_| io::Error::other("cannot generate runtime intent identity"))?;
             let record = RuntimeIntent {
-                version: 3,
+                version: 4,
                 instance_id: self.instance.clone(),
                 generation: IntentGeneration(hex::encode(nonce)),
                 spec,
                 configuration: self.journal.configuration.clone(),
                 phase: IntentPhase::Owned,
+                network_reference: None,
                 roles: RuntimeRoles {
                     launcher: None,
                     rootless_network: None,
@@ -347,6 +386,85 @@ impl IntentClaim {
         .map_err(io::Error::other)?
     }
 
+    /// Retain an original allocation before discovery can publish its address.
+    pub async fn retain_network(mut self, container_index: u16) -> io::Result<Self> {
+        tokio::task::spawn_blocking(move || {
+            let record = self
+                .record
+                .as_mut()
+                .ok_or_else(|| io::Error::other("no runtime intent"))?;
+            if record.phase != IntentPhase::Owned
+                || record.configuration.rootless
+                || container_index >= 509
+            {
+                return Err(io::Error::other(
+                    "runtime cannot retain this network reference",
+                ));
+            }
+            let reference = NetworkReference {
+                instance_id: record.instance_id.clone(),
+                generation: record.generation.clone(),
+                container_index,
+            };
+            match &record.network_reference {
+                Some(NetworkReferenceState::Held(existing)) if *existing == reference => {
+                    return Ok(self);
+                }
+                Some(_) => {
+                    return Err(io::Error::other(
+                        "runtime network reference cannot be replaced",
+                    ));
+                }
+                None => {}
+            }
+            record.network_reference = Some(NetworkReferenceState::Held(reference));
+            persist(
+                &self
+                    .journal
+                    .directory
+                    .join("records")
+                    .join(&self.instance.0),
+                record,
+            )?;
+            Ok(self)
+        })
+        .await
+        .map_err(io::Error::other)?
+    }
+
+    /// Save confirmed discovery withdrawal before the runtime may free its address.
+    pub async fn release_network(mut self, reference: NetworkReference) -> io::Result<Self> {
+        tokio::task::spawn_blocking(move || {
+            let record = self
+                .record
+                .as_mut()
+                .ok_or_else(|| io::Error::other("no runtime intent"))?;
+            match &record.network_reference {
+                Some(NetworkReferenceState::Released(existing)) if *existing == reference => {
+                    return Ok(self);
+                }
+                Some(NetworkReferenceState::Held(existing)) if *existing == reference => {}
+                _ => {
+                    return Err(io::Error::other(
+                        "network reference generation or allocation changed",
+                    ));
+                }
+            }
+            record.network_reference = Some(NetworkReferenceState::Released(reference));
+            persist(
+                &self
+                    .journal
+                    .directory
+                    .join("records")
+                    .join(&self.instance.0),
+                record,
+            )?;
+            Ok(self)
+        })
+        .await
+        .map_err(io::Error::other)?
+    }
+
     /// Record externally established retirement while retaining lifecycle authority.
     /// This call must follow positive retirement of every admitted command and
     /// owned resource. A deadline, missing PID or missing socket is insufficient.
@@ -356,6 +474,12 @@ impl IntentClaim {
                 .record
                 .as_mut()
                 .ok_or_else(|| io::Error::other("no runtime intent to retire"))?;
+            if matches!(
+                record.network_reference,
+                Some(NetworkReferenceState::Held(_))
+            ) {
+                return Err(io::Error::other("discovery still owns the runtime address"));
+            }
             if let IntentPhase::Retired {
                 exit_code: recorded,
             } = record.phase
