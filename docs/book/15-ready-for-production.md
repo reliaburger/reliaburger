@@ -3321,3 +3321,16 @@ The lease expires without a client cleanup request.
 Former placements must retain their data until lease cleanup. Unblocked owners
 can finish, but the lease must stay until the last worker's storage error is
 repaired. A neighbouring ordinary application directory remains intact.
+
+### Observing the child before killing its parent
+
+A job can be Running before its first shell command has executed. Spawning it
+and scheduling it are separate events. Our crash fixture used to read a counter
+file immediately after Running appeared. Hosted macOS caught that assumption:
+the retry had started, but the file still counted only its predecessor.
+
+The fixture now gates the retry before its first write, observes Running,
+releases that gate and waits for the workload's counter before killing Bun.
+This deliberately exercises the scheduling gap while keeping the crash at the
+intended point. The deadline is bounded; an extra or missing execution still
+fails. It does not relax recovery or treat an unknown launch as absent.

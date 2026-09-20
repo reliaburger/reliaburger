@@ -2033,6 +2033,14 @@ A short successful setup does not establish renewal, retention, mixed-version re
 
 **Probe launch repair (18 September):** The earlier 3,276-pass library checkpoint had one ETXTBSY failure during verified candidate launch. Retry only that error while keeping the same private bytes and one ten-second deadline for launch and response. Concurrent preparation coverage also passes before the fix, so it is stress coverage rather than a deterministic reproduction. After the repair, all 3,281 Linux library tests pass (19 explicit gates, 50.55s), as do strict Linux/macOS Clippy. Sustained crash qualification remains open.
 
+**Job crash fixture repair (20 September):** Hosted macOS at `53fd4a4`
+reported retry count one and Running before the child wrote its second counter
+line. A controlled workload gate reproduces that assertion failure. The fixture
+now observes the child's write before SIGKILL, preserving the original recovery
+assertions and bounded waits. The real recovery case passes on macOS/Linux
+(12.74s/3.46s), with strict Clippy on both. The separate unknown-cron launch gap
+still fails hosted macOS and remains a C34/V02 blocker.
+
 ### V03 — Publish and install the exact signed candidate
 
 **Priority:** gate. **Wave:** 7. **Book chapters:** 09, 14.

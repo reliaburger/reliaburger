@@ -119,11 +119,12 @@ registry_port = 0
     .unwrap();
     let count = root.path().join("runs");
     let release = root.path().join("release");
+    let start_retry = root.path().join("start-retry");
     let _release = ReleaseJob(release.clone());
     let mut config = Config::parse("[job.work]\nimage = 'proc-grill:image-ignored'\n").unwrap();
     let job = config.job.get_mut("work").unwrap();
     job.command = Some(vec!["/bin/sh".into(), "-c".into(),
-        "printf 'run\\n' >> \"$RUN_FILE\"; if [ \"$(wc -l < \"$RUN_FILE\")\" -eq 1 ]; then exit 1; fi; i=0; while [ $i -lt 600 ]; do [ -f \"$RELEASE_FILE\" ] && exit 0; i=$((i+1)); sleep 0.05; done; exit 1".into()]);
+        "if [ -f \"$RUN_FILE\" ]; then i=0; while [ ! -f \"$START_RETRY\" ] && [ ! -f \"$RELEASE_FILE\" ] && [ $i -lt 600 ]; do i=$((i+1)); sleep 0.05; done; fi; printf 'run\\n' >> \"$RUN_FILE\"; if [ \"$(wc -l < \"$RUN_FILE\")\" -eq 1 ]; then exit 1; fi; i=0; while [ $i -lt 600 ]; do [ -f \"$RELEASE_FILE\" ] && exit 0; i=$((i+1)); sleep 0.05; done; exit 1".into()]);
     job.env.insert(
         "RUN_FILE".into(),
         EnvValue::Plain(count.display().to_string()),
@@ -131,6 +132,10 @@ registry_port = 0
     job.env.insert(
         "RELEASE_FILE".into(),
         EnvValue::Plain(release.display().to_string()),
+    );
+    job.env.insert(
+        "START_RETRY".into(),
+        EnvValue::Plain(start_retry.display().to_string()),
     );
     let manifest = root.path().join("job.toml");
     std::fs::write(&manifest, toml::to_string(&config).unwrap()).unwrap();
@@ -140,6 +145,20 @@ registry_port = 0
     client.apply(&config).await.unwrap();
     wait_job(client, "running", 1).await;
     let pid = client.status().await.unwrap()[0].pid.unwrap();
+    // Running proves spawn succeeded, not that the child has executed printf.
+    // The gate deliberately exercises that scheduling gap before the crash.
+    std::fs::write(&start_retry, "start").unwrap();
+    tokio::time::timeout(Duration::from_secs(20), async {
+        loop {
+            let runs = std::fs::read_to_string(&count).unwrap();
+            if runs.lines().count() >= 2 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("retry must execute its workload before injecting Bun death");
     assert_eq!(std::fs::read_to_string(&count).unwrap().lines().count(), 2);
     node.crash().await;
 
