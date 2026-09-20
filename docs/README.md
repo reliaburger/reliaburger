@@ -628,6 +628,11 @@ certificates. Peer API calls also present their node certificate and check the
 live revocation list; Relish and browsers may omit a client certificate and
 authenticate with a bearer token or session cookie over TLS.
 
+Deployment drains retain requests already using an ingress backend, including
+captured failover candidates. The drain deadline cancels HTTP and WebSocket
+work; completion requires the request guards to release. A stalled downstream
+reader cannot prevent cancellation of the upstream response.
+
 Automatic application restarts refresh DNS and ingress with the replacement's
 confirmed address. Applications with health checks stay out of healthy routing
 until a successful probe; failed backend publication retains cleanup ownership.

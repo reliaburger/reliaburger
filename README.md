@@ -146,6 +146,10 @@ unrelated destination grants remain untouched. Durable discovery recovery remain
 Failed final kernel backend publication now reports a deployment error and retains
 the running workload’s ownership for cleanup or retry.
 Retirement also fences automatic restarts before signalling the old runtime.
+Deployment ingress drains count requests from route selection, including failover
+candidates. A deadline cancels HTTP/WebSocket work; completion waits for actual
+request release. Automatic restarts refresh the confirmed DNS/ingress address and
+keep health-checked replacements unhealthy until a successful probe.
 Rollout identities advance past adopted generations after Bun replacement. With rootful Linux DNS
 enabled, short
 service names resolve in the calling workload's namespace. Host tools use explicit

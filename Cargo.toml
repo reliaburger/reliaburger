@@ -36,7 +36,7 @@ semver = "1"
 thiserror = "2"
 tempfile = "3"
 tokio = { version = "1", features = ["full", "test-util"] }
-tokio-util = "0.7"
+tokio-util = { version = "0.7", features = ["rt"] }
 toml = "0.8"
 oci-distribution = { version = "0.11", default-features = false, features = ["rustls-tls"] }
 flate2 = "1"

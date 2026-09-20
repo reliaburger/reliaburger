@@ -832,15 +832,15 @@ Three error codes tell the client exactly what happened:
 
 When an app is being redeployed (rolling update), the old instances need to finish serving in-flight requests before they're stopped. This is the drain protocol:
 
-1. Bun tells Wrapper: "drain instance web-0, deadline 30 seconds"
-2. Wrapper moves the backend from the active pool to a draining pool — no new requests go to it
+1. Bun withdraws the backend from the routing table, waiting for existing route captures to finish
+2. Bun starts draining instance web-0 with a 30-second deadline; existing request guards remain counted
 3. In-flight requests complete normally
-4. When all connections are done (or the 30-second deadline hits), Wrapper tells Bun: "drain complete"
+4. The deadline cancels remaining work. Only after its request guards release does Wrapper tell Bun: "drain complete"
 5. Bun stops the old container
 
 The app never drops below its replica count during a deploy. If you have 3 replicas and `max_surge = 1`, the sequence is: start replica 4, drain replica 1, start replica 4', drain replica 2, and so on.
 
-"All connections are done" is trickier than it sounds once WebSockets are in play. A plain HTTP request is short: it arrives, gets a response, and it's gone. A WebSocket is a *long-lived splice* — the client and backend exchange frames for minutes or hours after the initial `101 Switching Protocols`. If the drain only counts HTTP requests, it declares "done" the instant the last request returns, then kills a container that still has a chat session or a live log tail flowing through it. So the tracker keeps two counts, and a backend isn't drained until *both* the HTTP count and the WebSocket count reach zero (or the deadline fires). We'll come back to exactly how the proxy keeps that WebSocket count honest.
+"All connections are done" is trickier than it sounds once WebSockets are in play. A plain HTTP request is short: it arrives, gets a response, and it's gone. A WebSocket is a *long-lived splice* — the client and backend exchange frames for minutes or hours after the initial `101 Switching Protocols`. If the drain only counts HTTP requests, it declares "done" the instant the last request returns, then kills a container that still has a chat session or a live log tail flowing through it. So the tracker keeps two counts, and a backend isn't drained until *both* the HTTP count and the WebSocket count reach zero. The deadline asks the splice to stop; it does not substitute for those zero counts. We'll come back to exactly how the proxy keeps that WebSocket count honest.
 
 ### Rate limiting
 
@@ -1554,3 +1554,44 @@ returns and the entry remains, consumes the old notification, then verifies that
 the next sweep delivers the retained one. No notification is silently lost to
 backpressure. Capturing requests before drain starts and confirming their actual
 release after deadline cancellation are separate requirements.
+
+
+### Capture the request before withdrawing the route
+
+A slow request reaches its backend. Then a deployment starts draining that
+backend. Counting only requests that arrive *during* the drain misses this one
+entirely. The live regression uses a gated HTTP server: it acknowledges receipt,
+waits while the test starts draining, then answers only when released. A second
+case reaches that server through failover. Both previously reported completion
+while the request was still waiting.
+
+Wrapper now takes the routing read lock, chooses its candidates and records a
+request guard for all of them before releasing the lock. Bun's route withdrawal
+needs the write lock, so it cannot pass a handler that has copied an endpoint
+without recording its ownership. Normal requests create active entries; starting
+a drain adds a deadline without resetting their counts. The guard conservatively
+holds every captured failover candidate until the request finishes. WebSockets
+capture just their single target because their handshake has no failover.
+
+A deadline cancels work. It doesn't prove the work stopped. HTTP body reads,
+upstream connection/header waits, response streaming and WebSocket handshakes
+and splices all observe cancellation. `FuturesUnordered` polls the cancellation
+futures for the captured candidates; the first one that resolves stops the
+request. The tracker reports completion only after the guard releases both
+connection counts. A cancelled task therefore keeps its ownership until its
+cleanup actually runs.
+
+Response streaming needs another detail. If a client stops reading, Hyper may
+stop polling its response body. A cancellation check inside that body cannot
+then run. A small spawned pump reads the upstream into a one-item channel and
+races both reads and sends against cancellation. Dropping the response aborts
+the pump through `AbortOnDropHandle`, an owning wrapper around the task handle.
+That uses tokio-util's `rt` feature. The connection permit stays with the response;
+the upstream guard stays with the pump. Buffered bytes need no backend address.
+The stalled-consumer regression deliberately never polls the response and still
+requires drain completion after cancellation. A live WebSocket regression also
+requires the splice to close before completion.
+
+This proves the local Wrapper ownership boundary used by deployment drains.
+Durable discovery recovery and remote catalogue acknowledgement still need their
+own proof before an allocator can reuse an old address.

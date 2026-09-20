@@ -62,7 +62,7 @@ struct ServedOverTls(bool);
 /// to do the (async) decrement — the count is released promptly regardless.
 struct DrainGuard {
     drains: super::draining::SharedDrains,
-    instance_id: String,
+    instance_ids: Vec<String>,
     /// Whether this request is a WebSocket splice. WebSocket splices bump a
     /// separate counter so the drain waits for the live splice, not just the
     /// 101 handshake (ING4).
@@ -72,13 +72,15 @@ struct DrainGuard {
 impl Drop for DrainGuard {
     fn drop(&mut self) {
         let drains = self.drains.clone();
-        let instance_id = std::mem::take(&mut self.instance_id);
+        let instance_ids = std::mem::take(&mut self.instance_ids);
         let websocket = self.websocket;
         tokio::spawn(async move {
-            if websocket {
-                drains.decrement_websocket(&instance_id).await;
+            for instance_id in instance_ids {
+                if websocket {
+                    drains.decrement_websocket(&instance_id).await;
+                }
+                drains.decrement_connections(&instance_id).await;
             }
-            drains.decrement_connections(&instance_id).await;
         });
     }
 }
@@ -427,21 +429,41 @@ async fn do_proxy(
 
     let path = req.uri().path().to_string();
 
-    // Look up the route, copying what we need out so the read lock
-    // is released before any await point. `select_backends` returns the
-    // primary plus up to two failover candidates in round-robin order.
-    let (route_allows_ws, tls_required, route_key, candidates, rate_limit) = {
+    // Capture request ownership before releasing the routing read lock.
+    // Withdrawal takes the write lock before starting a drain, so it cannot
+    // miss a handler that has already copied an endpoint (including failover).
+    let (route_allows_ws, tls_required, route_key, candidates, rate_limit, drain_guard, terminate) = {
         let table = state.routing_table.read().await;
         let route = match table.lookup(&host, &path) {
             Some(r) => r,
             None => return StatusCode::NOT_FOUND.into_response(),
         };
+        let candidates = route.select_backends(if is_ws { 1 } else { MAX_UPSTREAM_ATTEMPTS });
+        let (guard, tokens) = match &state.drains {
+            Some(drains) => {
+                let instance_ids: Vec<_> = candidates.iter().map(|(id, _)| id.clone()).collect();
+                let Some(tokens) = drains.capture_requests(&instance_ids, is_ws).await else {
+                    return StatusCode::SERVICE_UNAVAILABLE.into_response();
+                };
+                (
+                    Some(DrainGuard {
+                        drains: drains.clone(),
+                        instance_ids,
+                        websocket: is_ws,
+                    }),
+                    tokens,
+                )
+            }
+            None => (None, Vec::new()),
+        };
         (
             route.websocket,
             route.tls_mode.requires_tls(),
             route.route_key(),
-            route.select_backends(MAX_UPSTREAM_ATTEMPTS),
+            candidates,
             route.rate_limit.clone(),
+            guard,
+            tokens,
         )
     };
 
@@ -476,40 +498,9 @@ async fn do_proxy(
 
     // The primary backend, plus failover candidates behind it. An empty list
     // means nothing is routable, so 502.
-    let (instance_id, backend) = match candidates.first() {
-        Some((id, addr)) => (id.clone(), *addr),
+    let backend = match candidates.first() {
+        Some((_id, addr)) => *addr,
         None => return StatusCode::BAD_GATEWAY.into_response(),
-    };
-
-    // A backend can be selected right as it starts draining (routing rebuild
-    // and drain start aren't a single step). Two cases:
-    //   * past its deadline (terminating): reject this *new* request with 503
-    //     so no fresh load lands on a container about to be killed (§5.5).
-    //   * still within its drain window: count the request so Bun waits for it
-    //     to finish before killing the container (DEP5), and pick up the
-    //     terminate token so a deadline that passes mid-request tears the
-    //     connection down rather than leaving it running.
-    // The guard drops on every return path, decrementing exactly once. A
-    // WebSocket also bumps the websocket counter so the drain waits for the
-    // live splice, not just the 101 (ING4).
-    let mut terminate: Option<CancellationToken> = None;
-    let drain_guard = match &state.drains {
-        Some(drains) if drains.is_draining(&instance_id).await => {
-            if drains.is_terminating(&instance_id).await {
-                return StatusCode::SERVICE_UNAVAILABLE.into_response();
-            }
-            drains.increment_connections(&instance_id).await;
-            if is_ws {
-                drains.increment_websocket(&instance_id).await;
-            }
-            terminate = drains.terminate_token(&instance_id).await;
-            Some(DrainGuard {
-                drains: drains.clone(),
-                instance_id: instance_id.clone(),
-                websocket: is_ws,
-            })
-        }
-        _ => None,
     };
 
     // WebSocket: delegate to the upgrade handler (no body buffering). The
@@ -526,6 +517,7 @@ async fn do_proxy(
             over_tls,
             permit,
             boxed_guard,
+            terminate,
         )
         .await;
     }
@@ -535,7 +527,12 @@ async fn do_proxy(
     // buffers, but bounded: a body over the cap is rejected with 413 rather
     // than allowed to exhaust memory (ING3).
     let (parts, body) = req.into_parts();
-    let body_bytes = match axum::body::to_bytes(body, state.max_request_body_bytes).await {
+    let buffered = tokio::select! {
+        biased;
+        _ = super::draining::wait_for_termination(&terminate) => return StatusCode::SERVICE_UNAVAILABLE.into_response(),
+        result = axum::body::to_bytes(body, state.max_request_body_bytes) => result,
+    };
+    let body_bytes = match buffered {
         Ok(b) => b,
         Err(_) => return StatusCode::PAYLOAD_TOO_LARGE.into_response(),
     };
@@ -599,7 +596,12 @@ async fn do_proxy(
             upstream_req = upstream_req.body(body_bytes.clone());
         }
 
-        match upstream_req.send().await {
+        let sent = tokio::select! {
+            biased;
+            _ = super::draining::wait_for_termination(&terminate) => return StatusCode::SERVICE_UNAVAILABLE.into_response(),
+            result = upstream_req.send() => result,
+        };
+        match sent {
             Ok(resp) => {
                 let status =
                     StatusCode::from_u16(resp.status().as_u16()).unwrap_or(StatusCode::BAD_GATEWAY);
@@ -625,11 +627,9 @@ async fn do_proxy(
                 // SSE, gRPC and large downloads flow with backpressure and don't
                 // pin the whole response in memory (ING3).
                 //
-                // The permit, drain guard, and terminate token ride along in the
-                // stream's state, so they're released only when the body finishes
-                // streaming — keeping the connection permit and drain count
-                // accurate for the whole response, and letting a drain deadline
-                // that fires mid-stream tear the connection down (ING2/DEP5/§5.5).
+                // The response owns its permit; a bounded upstream pump owns
+                // the drain guard and observes cancellation even when the
+                // client stops polling its body (ING2/DEP5/§5.5).
                 let stream =
                     guarded_body_stream(resp.bytes_stream(), permit, drain_guard, terminate);
                 return response
@@ -656,40 +656,47 @@ async fn do_proxy(
 
 /// Wrap a byte stream so it owns the connection permit and drain guard.
 ///
-/// The guards live in the stream's state and drop when the stream ends or is
-/// dropped — i.e. when the response body has fully streamed to the client.
-/// So the connection permit and the drain accounting stay held for the whole
-/// response, not just until the handler returns.
+/// The response holds the connection permit; its bounded upstream pump holds
+/// the backend guard until completion, cancellation or response-body drop.
 fn guarded_body_stream<S>(
-    inner: S,
+    mut inner: S,
     permit: OwnedSemaphorePermit,
     drain_guard: Option<DrainGuard>,
-    terminate: Option<CancellationToken>,
+    terminate: Vec<CancellationToken>,
 ) -> impl futures_util::Stream<Item = Result<axum::body::Bytes, reqwest::Error>>
 where
-    S: futures_util::Stream<Item = Result<axum::body::Bytes, reqwest::Error>> + Unpin,
+    S: futures_util::Stream<Item = Result<axum::body::Bytes, reqwest::Error>>
+        + Unpin
+        + Send
+        + 'static,
 {
-    // `unfold` threads owned state through each poll; when the stream finishes
-    // or is dropped, the state (permit + guard + token) is dropped with it.
-    futures_util::stream::unfold(
-        (inner, permit, drain_guard, terminate),
-        |(mut inner, permit, drain_guard, terminate)| async move {
-            use futures_util::StreamExt;
-            // If the drain deadline fires mid-response, stop streaming so the
-            // connection closes rather than running on against a backend about
-            // to be killed (§5.5 HTTP termination).
-            let next = match &terminate {
-                Some(token) => {
-                    tokio::select! {
-                        _ = token.cancelled() => None,
-                        chunk = inner.next() => chunk,
-                    }
-                }
-                None => inner.next().await,
+    // A bounded pump can observe cancellation even when a slow client stops
+    // polling its response body. Buffered bytes carry no backend reference.
+    let (tx, rx) = tokio::sync::mpsc::channel(1);
+    let task = tokio::spawn(async move {
+        use futures_util::StreamExt;
+        let _guard = drain_guard;
+        loop {
+            let chunk = tokio::select! {
+                biased;
+                _ = super::draining::wait_for_termination(&terminate) => break,
+                _ = tx.closed() => break,
+                chunk = inner.next() => chunk,
             };
-            next.map(|chunk| (chunk, (inner, permit, drain_guard, terminate)))
-        },
-    )
+            let Some(chunk) = chunk else {
+                break;
+            };
+            tokio::select! {
+                biased;
+                _ = super::draining::wait_for_termination(&terminate) => break,
+                result = tx.send(chunk) => if result.is_err() { break; },
+            }
+        }
+    });
+    let task = tokio_util::task::AbortOnDropHandle::new(task);
+    futures_util::stream::unfold((rx, permit, task), |(mut rx, permit, task)| async move {
+        rx.recv().await.map(|chunk| (chunk, (rx, permit, task)))
+    })
 }
 
 /// Build a 308 redirect from a plain-HTTP request to the same URL on HTTPS.
@@ -1615,6 +1622,15 @@ mod tests {
     /// closes the permit frees and a new request succeeds.
     #[tokio::test]
     async fn websocket_holds_permit_through_the_splice() {
+        assert_websocket_retains_ownership(false).await;
+    }
+
+    #[tokio::test]
+    async fn drain_deadline_closes_a_websocket_before_releasing_ownership() {
+        assert_websocket_retains_ownership(true).await;
+    }
+
+    async fn assert_websocket_retains_ownership(drain_deadline: bool) {
         use crate::onion::types::BackendInstance;
         use std::net::Ipv4Addr;
         use std::time::Duration;
@@ -1671,7 +1687,10 @@ mod tests {
         let routing_table = Arc::new(RwLock::new(table));
 
         let shutdown = CancellationToken::new();
-        let bound = bind_proxy(
+        let drains = super::super::draining::SharedDrains::new(
+            super::super::draining::DrainTracker::new(tokio::sync::mpsc::channel(8).0),
+        );
+        let bound = bind_proxy_with_drains(
             WrapperConfig {
                 http_port: 0,
                 https_port: 0,
@@ -1679,6 +1698,7 @@ mod tests {
                 ..WrapperConfig::default()
             },
             routing_table,
+            Some(drains.clone()),
             shutdown.clone(),
         )
         .await
@@ -1716,6 +1736,27 @@ mod tests {
             "second request was not refused while a WebSocket held the permit"
         );
 
+        if drain_deadline {
+            drains
+                .start_drain(&super::super::draining::DrainCommand {
+                    app_name: "ws".into(),
+                    instance_id: "default__ws-0".into(),
+                    timeout: Duration::ZERO,
+                })
+                .await;
+            assert!(drains.check_completions().await.is_empty());
+            tokio::time::timeout(Duration::from_secs(2), drains.wait_drained("default__ws-0"))
+                .await
+                .expect("WebSocket did not release its captured backend after cancellation");
+            let closed = tokio::time::timeout(Duration::from_secs(2), ws.read(&mut buf))
+                .await
+                .unwrap();
+            assert!(
+                matches!(closed, Ok(0) | Err(_)),
+                "WebSocket stayed open after drain completion"
+            );
+        }
+
         // Close the WebSocket; the permit frees and a new request succeeds
         // (404 because /other has no backend body, but not 503).
         drop(ws);
@@ -1738,12 +1779,63 @@ mod tests {
         shutdown.cancel();
     }
 
+    #[tokio::test]
+    async fn stalled_response_consumer_does_not_prevent_drain_cancellation() {
+        use super::super::draining::{DrainCommand, DrainTracker, SharedDrains};
+        use std::time::Duration;
+        let drains = SharedDrains::new(DrainTracker::new(tokio::sync::mpsc::channel(8).0));
+        let ids = vec!["stream-0".to_owned()];
+        let tokens = drains.capture_requests(&ids, false).await.unwrap();
+        let guard = DrainGuard {
+            drains: drains.clone(),
+            instance_ids: ids,
+            websocket: false,
+        };
+        let permit = Arc::new(Semaphore::new(1)).acquire_owned().await.unwrap();
+        let polled = Arc::new(tokio::sync::Notify::new());
+        let notify = polled.clone();
+        let inner = futures_util::stream::repeat_with(move || {
+            notify.notify_one();
+            Ok::<_, reqwest::Error>(axum::body::Bytes::from_static(b"chunk"))
+        });
+        let body = guarded_body_stream(inner, permit, Some(guard), tokens);
+        tokio::time::timeout(Duration::from_secs(2), polled.notified())
+            .await
+            .unwrap();
+        drains
+            .start_drain(&DrainCommand {
+                app_name: "stream".into(),
+                instance_id: "stream-0".into(),
+                timeout: Duration::ZERO,
+            })
+            .await;
+        assert!(drains.check_completions().await.is_empty());
+        tokio::time::timeout(Duration::from_secs(2), drains.wait_drained("stream-0"))
+            .await
+            .expect("an unpolled response body prevented backend cleanup");
+        drop(body);
+    }
+
     /// DEP5: the live proxy counts a request to a draining backend against
     /// the shared drain tracker, so `check_completions` does not finish the
     /// drain until the in-flight request returns. A slow backend keeps the
     /// request open long enough to observe the tracker holding the count.
     #[tokio::test]
     async fn live_proxy_holds_drain_open_while_a_request_is_in_flight() {
+        assert_captured_request_holds_drain(false, false).await;
+    }
+
+    #[tokio::test]
+    async fn live_proxy_tracks_a_captured_failover_backend() {
+        assert_captured_request_holds_drain(true, false).await;
+    }
+
+    #[tokio::test]
+    async fn deadline_cancels_a_request_waiting_for_upstream_headers() {
+        assert_captured_request_holds_drain(false, true).await;
+    }
+
+    async fn assert_captured_request_holds_drain(failover: bool, cancel: bool) {
         use crate::onion::types::BackendInstance;
         use crate::wrapper::draining::{DrainCommand, DrainTracker, SharedDrains};
         use std::net::Ipv4Addr;
@@ -1776,6 +1868,19 @@ mod tests {
         service_map
             .register_app("web", "default", 80, None)
             .unwrap();
+        if failover {
+            service_map
+                .add_backend(
+                    &crate::onion::service_id::ServiceId::new("default", "web"),
+                    BackendInstance {
+                        instance_id: "unavailable-primary".into(),
+                        node_ip: Ipv4Addr::LOCALHOST,
+                        host_port: 0,
+                        healthy: true,
+                    },
+                )
+                .unwrap();
+        }
         service_map
             .add_backend(
                 &crate::onion::service_id::ServiceId::new("default", "web"),
@@ -1822,16 +1927,6 @@ mod tests {
             bound.serve().await.ok();
         });
 
-        // Mark the backend draining, then fire a request at it through the
-        // proxy. The slow backend keeps the request open for ~300ms.
-        drains
-            .start_drain(&DrainCommand {
-                app_name: "web".to_string(),
-                instance_id: "default__web-0".to_string(),
-                timeout: Duration::from_secs(30),
-            })
-            .await;
-
         let client = reqwest::Client::new();
         let url = format!("http://127.0.0.1:{http_port}/");
         let req =
@@ -1840,6 +1935,19 @@ mod tests {
         tokio::time::timeout(Duration::from_secs(2), request_started.notified())
             .await
             .expect("request did not reach the gated backend");
+        // The request already owns its captured backend before retirement.
+        drains
+            .start_drain(&DrainCommand {
+                app_name: "web".to_string(),
+                instance_id: "default__web-0".to_string(),
+                timeout: if cancel {
+                    Duration::ZERO
+                } else {
+                    Duration::from_secs(30)
+                },
+            })
+            .await;
+
         assert!(
             drains.check_completions().await.is_empty(),
             "drain completed while a request was still in flight"
@@ -1850,8 +1958,24 @@ mod tests {
         );
 
         // Once the request returns, the drain completes on the next sweep.
+        if !cancel {
+            release_backend.notify_one();
+        }
+        let response = tokio::time::timeout(Duration::from_secs(2), req)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            response.status(),
+            if cancel {
+                StatusCode::SERVICE_UNAVAILABLE
+            } else {
+                StatusCode::OK
+            }
+        );
+        drop(response);
         release_backend.notify_one();
-        let _ = req.await.unwrap();
         // Poll: the proxy's decrement runs on a spawned task after the guard
         // drops, so give it a moment.
         let mut completed = Vec::new();
