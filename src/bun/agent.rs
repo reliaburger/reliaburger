@@ -7610,6 +7610,16 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
             .collect();
         for (id, state) in retrying {
             if state == ContainerState::Stopping {
+                match self.poll_restart_withdrawal(&id).await {
+                    Ok(true) => {}
+                    Ok(false) => continue,
+                    Err(error) => {
+                        eprintln!(
+                            "bun: failed restart of {id} awaits discovery withdrawal: {error}"
+                        );
+                        continue;
+                    }
+                }
                 if let Err(error) = self.kill_and_wait_for_exit(&id).await {
                     eprintln!("bun: failed restart of {id} awaits runtime cleanup: {error}");
                     continue;
@@ -7692,6 +7702,14 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
             .collect();
 
         for (id, oci_spec, app_name, namespace, host_port) in pending_restarts {
+            match self.poll_restart_withdrawal(&id).await {
+                Ok(true) => {}
+                Ok(false) => continue,
+                Err(error) => {
+                    eprintln!("bun: restart of {id} awaits discovery withdrawal: {error}");
+                    continue;
+                }
+            }
             // Tear down the old container first. Without this, the same-id
             // create is rejected (ProcessGrill: stale-Running entry) or fails
             // (runc/apple: container still exists), leaving the instance wedged
@@ -9207,7 +9225,21 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
         {
             return Ok(());
         }
-        stop_runtime_instance(self.supervisor.grill(), id, grace).await
+        drain_and_stop_instance(&self.drains, self.supervisor.grill(), id, grace).await
+    }
+
+    /// Withdraw a retry's predecessor without waiting for requests on the agent loop.
+    async fn poll_restart_withdrawal(&mut self, id: &InstanceId) -> Result<bool, BunError> {
+        self.withdraw_instance_backend(id).await?;
+        self.drains
+            .start_drain(&crate::wrapper::draining::DrainCommand {
+                app_name: String::new(),
+                instance_id: id.0.clone(),
+                timeout: std::time::Duration::from_secs(STOP_GRACE_SECS),
+            })
+            .await;
+        self.drains.check_completions().await;
+        Ok(!self.drains.is_draining(&id.0).await)
     }
 
     /// Preserve ownership until both force-kill and observed runtime exit succeed.
@@ -11946,6 +11978,80 @@ mod tests {
         assert_eq!(entry.backends.len(), 1);
         assert_eq!(entry.backends[0].instance_id, "default__web-0");
         assert!(entry.backends[0].healthy);
+    }
+
+    #[tokio::test]
+    async fn explicit_stop_waits_for_captured_ingress_before_runtime_retirement() {
+        let (mut agent, _commands, _shutdown, grill) = test_agent_with_grill();
+        expect_complete(&drain_deploy(&mut agent, basic_config()).await);
+        let id = InstanceId("default__web-0".into());
+        let drains = agent.drains.clone();
+        let _tokens = drains
+            .capture_requests(std::slice::from_ref(&id.0), false)
+            .await
+            .unwrap();
+        let mut task = tokio::spawn(async move {
+            let result = agent.stop_app("web", "default").await;
+            (agent, result)
+        });
+        tokio::select! {
+            result = &mut task => panic!("stop returned before captured request release: {:?}", result.unwrap().1),
+            result = tokio::time::timeout(std::time::Duration::from_secs(2), async {
+                while !drains.is_draining(&id.0).await { tokio::task::yield_now().await; }
+            }) => result.expect("stop did not start an ingress drain"),
+        }
+        assert!(
+            !grill
+                .calls()
+                .iter()
+                .any(|(operation, instance)| instance == &id
+                    && matches!(operation.as_str(), "stop" | "kill")),
+            "runtime retired before ingress request release"
+        );
+        drains.decrement_connections(&id.0).await;
+        let (_agent, result) = tokio::time::timeout(std::time::Duration::from_secs(2), task)
+            .await
+            .unwrap()
+            .unwrap();
+        result.unwrap();
+    }
+
+    #[tokio::test]
+    async fn automatic_restart_defers_runtime_retirement_until_captured_ingress_releases() {
+        let (mut agent, grill, id, _directory) = failed_restart_fixture().await;
+        let drains = agent.drains.clone();
+        let view = agent.service_map_watch();
+        let _tokens = drains
+            .capture_requests(std::slice::from_ref(&id.0), false)
+            .await
+            .unwrap();
+        tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            agent.drive_pending_restarts(),
+        )
+        .await
+        .expect("waiting for ingress blocked the agent loop");
+        assert!(
+            !grill
+                .calls()
+                .iter()
+                .any(|(operation, instance)| instance == &id && operation == "kill"),
+            "restart retired its predecessor before request release"
+        );
+        assert_eq!(
+            agent.supervisor.get_instance(&id).unwrap().state,
+            ContainerState::Pending
+        );
+        let service = crate::onion::service_id::ServiceId::new("default", "retry");
+        assert!(view.borrow().resolve(&service).unwrap().backends.is_empty());
+        assert!(drains.is_draining(&id.0).await);
+        drains.decrement_connections(&id.0).await;
+        agent.drive_pending_restarts().await;
+        assert_eq!(
+            agent.supervisor.get_instance(&id).unwrap().state,
+            ContainerState::Running
+        );
+        agent.stop_app("retry", "default").await.unwrap();
     }
 
     #[tokio::test]

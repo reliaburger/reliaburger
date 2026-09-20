@@ -1382,3 +1382,25 @@ regression drives an unhealthy application through restart, checks HealthWait
 and the unpublished health, then supplies a successful probe and checks the
 routing view again. These live checks do not replace the durable recovery and
 remote withdrawal proofs still required before reusing an address.
+
+### Ordinary stops and retries share the ingress boundary
+
+A correct deployment drain does not help if an ordinary stop bypasses it. The
+new regression captures a request, starts Stop, and checks that Bun has neither
+stopped nor killed the runtime before the request releases. Stop now uses the
+same drain-and-stop helper as a rollout, after withdrawing routing and fencing
+supervision.
+
+Automatic retry needs the same ordering, but waiting for an entire drain inside
+the one-second agent tick would delay unrelated commands and health checks.
+The retry driver instead withdraws the predecessor, starts its drain and checks
+for completion. If requests remain, it keeps the instance Pending and tries
+again on a later tick. Failed-start cleanup follows the same gate. The deadline
+still cancels captured requests; positive guard release permits runtime cleanup
+and successor creation. The test holds a captured request through one tick,
+checks that no kill happened and the old endpoint disappeared, then releases it
+and verifies that a later tick starts the replacement.
+
+These are local live-runtime gates. Recovered artifact cleanup, remote catalogue
+acknowledgements and durable discovery reconstruction remain separate release
+requirements.

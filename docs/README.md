@@ -631,7 +631,9 @@ authenticate with a bearer token or session cookie over TLS.
 Deployment drains retain requests already using an ingress backend, including
 captured failover candidates. The drain deadline cancels HTTP and WebSocket
 work; completion requires the request guards to release. A stalled downstream
-reader cannot prevent cancellation of the upstream response.
+reader cannot prevent cancellation of the upstream response. Ordinary Stop uses
+the same ingress drain before runtime retirement; automatic restart waits across
+agent ticks for captured requests to release before killing its predecessor.
 
 Automatic application restarts refresh DNS and ingress with the replacement's
 confirmed address. Applications with health checks stay out of healthy routing
