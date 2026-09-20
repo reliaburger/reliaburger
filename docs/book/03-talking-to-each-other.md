@@ -1266,3 +1266,22 @@ command execution error is different: it now refuses teardown before that
 inspection can be mistaken for final retirement. The owned network path is
 qualified independently; production Runc still needs to carry these handles
 alongside its durable launcher and rootless-helper records.
+
+### Two containers need two routes
+
+One container could reach its gateway. Adding a second broke host access to
+that second address. Both host veth interfaces advertised the node's whole
+`/23` allocation as a directly connected network, so Linux sent packets for the
+second container through the first container's interface. The regression creates
+two real network namespaces and exchanges packets from the host and from each
+peer before removing both namespaces.
+
+Keep the `/23` as an allocation pool, but give each endpoint a `/32` address.
+The host installs an explicit route to each container through its own veth. Each
+container has a direct route to the gateway and a default route through it; it
+must not try to ARP for a peer behind another veth. Removing a veth also removes
+its routes. These setup commands use the same generation-bound executor as the
+other network mutations, so interrupted setup retains its cleanup obligation.
+
+Adoption now requires the `/32` endpoint shape. Durable state 26 refuses older
+development networks instead of assuming their connected routes are safe.

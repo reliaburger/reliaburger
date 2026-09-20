@@ -245,3 +245,67 @@ async fn teardown_refuses_unknown_deletion_even_when_resources_currently_appear_
             .is_err()
     );
 }
+
+#[tokio::test]
+#[ignore = "requires root, ip and ping; creates two isolated container networks"]
+async fn same_node_containers_have_independent_host_and_peer_routes() {
+    assert!(nix::unistd::geteuid().is_root());
+    let mut networks = Vec::new();
+    let exercise = async {
+        for index in 0..2 {
+            let id = InstanceId(format!("rbtest-peer-route-{}-{index}", std::process::id()));
+            networks.push(netns::setup_container_network(&id, NODE_INDEX - 1, index, false).await?);
+        }
+        for source in 0..2 {
+            let destination = networks[1 - source].container_ip.to_string();
+            let namespace = networks[source]
+                .namespace_path
+                .file_name()
+                .unwrap()
+                .to_str()
+                .unwrap();
+            for (label, args) in [
+                (
+                    "host",
+                    vec!["ping", "-c", "1", "-W", "1", destination.as_str()],
+                ),
+                (
+                    "peer",
+                    vec![
+                        "ip",
+                        "netns",
+                        "exec",
+                        namespace,
+                        "ping",
+                        "-c",
+                        "1",
+                        "-W",
+                        "1",
+                        destination.as_str(),
+                    ],
+                ),
+            ] {
+                let output = tokio::time::timeout(
+                    Duration::from_secs(5),
+                    tokio::process::Command::new(args[0])
+                        .args(&args[1..])
+                        .kill_on_drop(true)
+                        .output(),
+                )
+                .await??;
+                anyhow::ensure!(
+                    output.status.success(),
+                    "{label} cannot reach {destination}: {} {}",
+                    String::from_utf8_lossy(&output.stdout),
+                    String::from_utf8_lossy(&output.stderr)
+                );
+            }
+        }
+        Ok::<(), anyhow::Error>(())
+    }
+    .await;
+    for network in networks.iter().rev() {
+        netns::teardown_container_network(network).await.unwrap();
+    }
+    exercise.unwrap();
+}

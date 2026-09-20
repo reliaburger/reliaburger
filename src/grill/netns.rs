@@ -338,7 +338,7 @@ pub async fn setup_container_network_with_commands(
     .await?;
 
     // 4. Assign IP to host-side veth
-    let gw_cidr = format!("{gw_ip}/23");
+    let gw_cidr = format!("{gw_ip}/32");
     run_cmd(
         executor,
         "ip",
@@ -358,8 +358,29 @@ pub async fn setup_container_network_with_commands(
     )
     .await?;
 
+    // Each veth owns one address. A shared /23 connected route would send
+    // traffic for every container through whichever veth the host picks first.
+    let container_route = format!("{c_ip}/32");
+    let gateway = gw_ip.to_string();
+    run_cmd(
+        executor,
+        "ip",
+        &[
+            "route",
+            "add",
+            &container_route,
+            "dev",
+            &h_veth,
+            "src",
+            &gateway,
+        ],
+        instance_id,
+        "route container address to its own veth",
+    )
+    .await?;
+
     // 6. Assign IP to container-side veth (inside namespace)
-    let c_cidr = format!("{c_ip}/23");
+    let c_cidr = format!("{c_ip}/32");
     run_cmd(
         executor,
         "ip",
@@ -390,6 +411,19 @@ pub async fn setup_container_network_with_commands(
         &["netns", "exec", &ns_name, "ip", "link", "set", "lo", "up"],
         instance_id,
         "bring up loopback in namespace",
+    )
+    .await?;
+
+    // Peers are behind other veth pairs, not on this link. Reach the gateway
+    // directly and send every other destination through the host.
+    run_cmd(
+        executor,
+        "ip",
+        &[
+            "netns", "exec", &ns_name, "ip", "route", "add", &gw_cidr, "dev", &c_veth,
+        ],
+        instance_id,
+        "route gateway through container veth",
     )
     .await?;
 
@@ -482,12 +516,12 @@ pub async fn adopt_container_network(
         .flatten()
         .filter_map(|interface| interface.get("addr_info")?.as_array())
         .flatten()
-        .filter(|address| address["family"] == "inet" && address["prefixlen"] == 23)
+        .filter(|address| address["family"] == "inet" && address["prefixlen"] == 32)
         .filter_map(|address| address["local"].as_str()?.parse::<Ipv4Addr>().ok())
         .collect();
     let [container_ip] = addresses.as_slice() else {
         return Err(failure(
-            "adopted network must have exactly one IPv4 /23 address".into(),
+            "adopted network must have exactly one IPv4 /32 address".into(),
         ));
     };
     let [first, second, third, fourth] = container_ip.octets();

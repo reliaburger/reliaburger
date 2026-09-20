@@ -486,6 +486,19 @@ controller task, refuses recovery once, then removes the fault and confirms
 retirement. It specifically checks that the refused recovery preserves namespace
 policy. This is real Runc/kernel qualification, not yet actual Bun process death.
 
+## Independent routes for simultaneous containers
+
+The address-retirement regression exposed a second defect while keeping the
+original container alive: traffic from the host could not reach the successor.
+A separate two-namespace test reproduces complete packet loss to the second
+address. Both host veths had connected routes covering the full node allocation.
+
+Use `/32` endpoints with explicit host-to-container routes, a direct gateway
+route inside each namespace and a default route through that gateway. The node
+still allocates from its `/23` pool. Adoption requires the new endpoint shape,
+and state 26 excludes older development networks. Keep this fix separate from
+backend withdrawal; its packet test requires neither Bun nor eBPF.
+
 ## Backend and reusable-address retirement ordering
 
 Carry this into the open discovery ownership work: owned Runc cleanup releases
