@@ -76,6 +76,26 @@ enum Command {
         #[arg(long)]
         directory: PathBuf,
     },
+    /// Internal rootless helper: pin verified namespaces before executing slirp.
+    #[cfg(target_os = "linux")]
+    #[command(name = "__rootless-network", hide = true)]
+    RootlessNetwork {
+        #[arg(long)]
+        launcher: PathBuf,
+        #[arg(long)]
+        container_pid: u32,
+        #[arg(long)]
+        api_socket: PathBuf,
+    },
+    /// Internal OCI hook: keep the payload behind network readiness.
+    #[cfg(target_os = "linux")]
+    #[command(name = "__rootless-network-gate", hide = true)]
+    RootlessNetworkGate {
+        #[arg(long)]
+        directory: PathBuf,
+        #[arg(long)]
+        instance: String,
+    },
     /// Run the built-in test workload.
     ///
     /// The same server the library exposes, shipped inside `bun` so every
@@ -611,6 +631,27 @@ fn main() -> anyhow::Result<()> {
         }
         Some(Command::ProcessExecutionGate { directory }) => {
             return reliaburger::grill::process_owner::run_execution_gate(directory)
+                .map_err(Into::into);
+        }
+        #[cfg(target_os = "linux")]
+        Some(Command::RootlessNetwork {
+            launcher,
+            container_pid,
+            api_socket,
+        }) => {
+            return reliaburger::grill::rootless::run_owned_helper(
+                launcher,
+                *container_pid,
+                api_socket,
+            )
+            .map_err(Into::into);
+        }
+        #[cfg(target_os = "linux")]
+        Some(Command::RootlessNetworkGate {
+            directory,
+            instance,
+        }) => {
+            return reliaburger::grill::rootless::run_network_hook(directory, instance)
                 .map_err(Into::into);
         }
         _ => {}

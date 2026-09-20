@@ -88,6 +88,14 @@ changes only once the corresponding recovery contract is implemented.
     refuses. Five new contracts pass within 39 macOS/41 Linux ownership cases,
     all six real rootful cases plus their fixture pass, and strict Clippy passes
     on both. Actual slirp integration remains open.
+  - [x] Integrate the opt-in rootless adapter. Five actual unprivileged Linux
+    cases plus a namespace-refusal contract and subprocess fixture pass (3.79s).
+    The runtime pins verified namespace descriptors, gates the first workload
+    instruction on network readiness, recovers published ports without repeating
+    the launcher and drains interrupted helper startup after actual caller death.
+    All six rootful cases plus their fixture pass again (5.22s), 37 macOS/40 Linux
+    selected regressions pass, and strict Clippy passes on both. CI now includes
+    these rootless cases with a static BusyBox fixture. Production remains open.
 - [ ] Route namespace, link and forwarding mutations through owned commands.
   Before confirming cleanup, retire every admitted command, then verify OCI
   state, helper sockets, mounts, namespaces, links and owned forwarding state.
@@ -121,24 +129,25 @@ runtime unit suite does not close those release gates.
 
 ## Remaining adapter integration
 
-The integrated rootful adapter remains opt-in. Production selection still awaits
-rootless, discovery and full qualification. Complete these remaining steps:
+The integrated rootful and rootless adapters remain opt-in. Production selection
+still awaits discovery/Apple recovery and full qualification. Complete these remaining steps:
 
-1. Extend the qualified rootful generation-bound executor and whole-operation
-   workers to rootless preparation, launch and cleanup. Holding a command claim
-   alone does not cover a cancelled rootfs blocking worker.
-2. Connect the existing durable role bindings to actual slirp4netns startup and
-   recovery; the rootful foreground launcher is integrated. Recover their original specifications, actual
-   outcomes and logs independently of agent PID records. Unassociated prepared
-   commands remain discoverable and must be cancelled during cleanup.
-3. Extend the qualified rootful exec/retirement ordering to rootless helpers.
+1. Completed: extend generation-bound whole-operation workers to rootless
+   preparation, launch and cleanup. Rootless mode creates no host overlay mount
+   and does not inspect or mutate the rootful namespace/link reservations.
+2. Completed: bind actual slirp4netns startup and recovery to the original
+   generation. Verify the container belongs to the authenticated launcher owner,
+   retain namespace descriptors across exec and use a bounded OCI createRuntime
+   hook so even a short job sees a ready network. Unassociated prepared commands
+   remain discoverable and are cancelled during cleanup.
+3. Completed for runtime resources: extend exec/retirement ordering to rootless helpers.
    Rootful exec now uses the launcher owner's auxiliary-command protocol without
    holding the adapter mutex while waiting for output.
    Close normal command admission before retiring all launchers, auxiliary exec
    attempts and network helpers. Then run owned cleanup commands and inspect
    OCI state, mounts, namespaces, forwarding and discovery. Release address
    reservations only after every admitted mutator has positively retired.
-4. Preserve the existing generation fencing when adding rootless paths. Queued
+4. Completed for the opt-in adapters: preserve generation fencing. Queued
    calls, separately constructed adapters and stale pre-sealing clones must
    retain their tested refusal semantics.
 5. Completed: prune positively retired short-command records under the same

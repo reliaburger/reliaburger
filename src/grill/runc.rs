@@ -1145,6 +1145,9 @@ impl super::Grill for RuncGrill {
         &self,
         instance: &InstanceId,
     ) -> Option<super::records::RootlessNetworkRecord> {
+        if self.ownership.is_some() {
+            return self.owned_network_record(instance).await;
+        }
         self.slirp_handles
             .lock()
             .await

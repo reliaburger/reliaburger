@@ -1,4 +1,7 @@
-//! Rootful OCI integration of generation-bound command and resource ownership.
+//! OCI integration of generation-bound command and resource ownership.
+
+#[path = "owned_rootless.rs"]
+mod rootless;
 
 use std::collections::BTreeMap;
 use std::future::Future;
@@ -29,12 +32,12 @@ fn failure(instance: &InstanceId, error: impl std::fmt::Display) -> GrillError {
 }
 
 impl RuncGrill {
-    /// Enable durable rootful OCI ownership using Bun's independent command owners.
-    /// Configure this before creating workloads. Rootless integration is qualified separately.
+    /// Enable durable OCI ownership using Bun's independent command owners.
+    /// Configure this before creating workloads.
     pub fn with_owner(mut self, executable: PathBuf) -> io::Result<Self> {
-        if self.rootless || self.ownership.is_some() {
+        if self.ownership.is_some() {
             return Err(io::Error::other(
-                "durable ownership currently requires an unconfigured rootful runtime",
+                "durable ownership requires an unconfigured runtime",
             ));
         }
         self.bundle_base = std::path::absolute(&self.bundle_base)?;
@@ -167,11 +170,14 @@ impl RuncGrill {
                 return Err(io::Error::other("runtime generation still owns resources"));
             }
             let claim = runtime.intent_journal()?.claim(&id, expected).await?;
-            for path in [
-                runtime.state_dir.join(&id.0),
-                netns::namespace_path(&id),
-                PathBuf::from("/sys/class/net").join(netns::host_veth_name(&id)),
-            ] {
+            let mut paths = vec![runtime.state_dir.join(&id.0)];
+            if !runtime.rootless {
+                paths.extend([
+                    netns::namespace_path(&id),
+                    PathBuf::from("/sys/class/net").join(netns::host_veth_name(&id)),
+                ]);
+            }
+            for path in paths {
                 if tokio::fs::try_exists(path).await? {
                     return Err(io::Error::other(
                         "unretired OCI or network resources already exist",
@@ -188,14 +194,24 @@ impl RuncGrill {
                 .await
                 .insert(id.clone(), context.clone());
             let result = async {
-                let index = runtime
-                    .network_leases
-                    .reserve(&id, runtime.node_index)
-                    .await?;
+                let index = if runtime.rootless {
+                    None
+                } else {
+                    Some(
+                        runtime
+                            .network_leases
+                            .reserve(&id, runtime.node_index)
+                            .await?,
+                    )
+                };
                 runtime
-                    .prepare_with_commands(&id, &spec, Some(index), &context)
+                    .prepare_with_commands(&id, &spec, index, &context)
                     .await
-                    .map_err(io::Error::other)
+                    .map_err(io::Error::other)?;
+                if runtime.rootless {
+                    runtime.owned_prepare_rootless(&id, &context).await?;
+                }
+                Ok(())
             }
             .await;
             if result.is_err() {
@@ -287,6 +303,9 @@ impl RuncGrill {
                         &BTreeMap::new(),
                     )
                     .await?;
+                if runtime.rootless {
+                    runtime.owned_open_rootless_gate(&context).await?;
+                }
                 let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
                 loop {
                     if runtime.owned_running_pid(&id, &context).await?.is_some() {
@@ -344,10 +363,19 @@ impl RuncGrill {
                 return Err(io::Error::other("runc deletion left OCI state"));
             }
         }
-        super::super::rootfs::unmount_bundle(self.bundle_base.join(&id.0))
-            .await
-            .map_err(io::Error::other)?;
-        let index = self.network_leases.lookup(id, self.node_index).await?;
+        if !self.rootless {
+            super::super::rootfs::unmount_bundle(self.bundle_base.join(&id.0))
+                .await
+                .map_err(io::Error::other)?;
+        }
+        if self.rootless {
+            self.owned_remove_rootless(&record).await?;
+        }
+        let index = if self.rootless {
+            None
+        } else {
+            self.network_leases.lookup(id, self.node_index).await?
+        };
         if let Some(index) = index {
             let network = netns::planned_container_network(id, self.node_index, index)
                 .map_err(io::Error::other)?;
@@ -357,9 +385,12 @@ impl RuncGrill {
             netns::teardown_container_network_with_commands(&cleanup, &network)
                 .await
                 .map_err(io::Error::other)?;
-        } else if tokio::fs::try_exists(netns::namespace_path(id)).await?
-            || tokio::fs::try_exists(Path::new("/sys/class/net").join(netns::host_veth_name(id)))
-                .await?
+        } else if !self.rootless
+            && (tokio::fs::try_exists(netns::namespace_path(id)).await?
+                || tokio::fs::try_exists(
+                    Path::new("/sys/class/net").join(netns::host_veth_name(id)),
+                )
+                .await?)
         {
             return Err(io::Error::other(
                 "network resources have no owned address reservation",
@@ -438,7 +469,22 @@ impl RuncGrill {
             }
             match context.role_state(RuntimeRole::Launcher).await? {
                 None | Some(CommandState::Prepared) => Ok(ContainerState::Pending),
-                Some(CommandState::Running { .. }) => Ok(ContainerState::Running),
+                Some(CommandState::Running { .. }) => {
+                    if runtime.rootless {
+                        let Some(pid) = runtime.owned_running_pid(&id, &context).await? else {
+                            if matches!(
+                                context.role_state(RuntimeRole::Launcher).await?,
+                                Some(CommandState::Retired { .. })
+                            ) {
+                                runtime.owned_cleanup(&id, &context).await?;
+                                return Ok(ContainerState::Stopped);
+                            }
+                            return Ok(ContainerState::Pending);
+                        };
+                        runtime.owned_rootless_network(&context, pid).await?;
+                    }
+                    Ok(ContainerState::Running)
+                }
                 Some(CommandState::Cancelled | CommandState::Retired { .. }) => {
                     runtime.owned_cleanup(&id, &context).await?;
                     Ok(ContainerState::Stopped)
@@ -552,6 +598,10 @@ impl RuncGrill {
                 .owned_running_pid(&id, &context)
                 .await?
                 .ok_or_else(|| io::Error::other("owned launcher has no running OCI state"))?;
+            if runtime.rootless {
+                runtime.owned_rootless_network(&context, pid).await?;
+                return Ok(true);
+            }
             let index = runtime
                 .network_leases
                 .lookup(&id, runtime.node_index)

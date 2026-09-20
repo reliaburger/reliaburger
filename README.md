@@ -289,9 +289,11 @@ reconciles the older TODOs, records remaining correctness gaps and separates
 release acceptance from deferred capabilities. The current checklist lives in
 [progress.md](docs/progress.md).
 
-The opt-in durable rootful Runc adapter passes six real Linux recovery cases,
-including caller death before adoption and short-job exit recovery. Production
-selection, rootless helpers and discovery/Apple recovery remain release blockers
+The opt-in durable Runc adapter now covers rootful and rootless Linux containers.
+Six rootful and five rootless recovery cases pass, including caller death before
+adoption, short jobs, published ports and interrupted network-helper startup.
+Rootless networking is ready before the workload starts. Production selection
+and discovery/Apple recovery remain release blockers
 in the [OCI ownership plan](docs/plans/2026-09-20-oci-launch-ownership.md).
 
 

@@ -3304,3 +3304,54 @@ The validation set borrows command identities from the journal using
 `HashSet<&CommandId>`. The ampersand means the set holds references, so it doesn't
 copy their strings. The claim keeps the record alive and immutable throughout
 validation; the later binding update happens after those borrows end.
+
+### Give rootless networking the right namespace
+
+Suppose Bun records container PID 1234, then dies before starting its network
+helper. By the time the next Bun reads that record, Linux might have reused 1234.
+Checking a timestamp and then asking slirp4netns to open `/proc/1234/ns/net` still
+leaves a gap between those two operations.
+
+The owned helper opens the process's `/proc` directory first. A file descriptor
+is an open kernel reference, rather than another pathname to look up later.
+Reading `status` and opening `ns/user` and `ns/net` through that descriptor keeps
+all three observations tied to the same process. If that process exits during
+inspection, the operation fails or retains its old namespaces. It cannot silently
+switch to a new occupant of the PID.
+
+We then ask the launcher's independent owner to confirm its running root through
+its authenticated control socket. The container must be a namespace init whose
+parent is that root. The launcher owner retains the root's waitable identity
+until its descendants retire, so the parent PID cannot be recycled underneath
+this check. We also refuse the helper's own user and network namespaces.
+
+`File` closes its descriptor when it leaves scope. Calling `as_raw_fd()` borrows
+the underlying descriptor number without transferring ownership. We clear
+`FD_CLOEXEC` only on the two namespace files: this flag normally closes a file
+when `exec` replaces the process image. Slirp receives `/proc/self/fd/...` paths
+for those retained files. It never has to look up the container PID again.
+`CommandExt::exec()` replaces the helper with slirp in the same process, keeping
+the durable owner's root identity intact.
+
+There is a separate startup race. A job can execute its first network request
+before Bun has configured slirp. We add a runtime-specific `createRuntime` hook
+to the prepared OCI JSON. The original user specification stays unchanged in
+the intent journal. The hook reports its init PID and waits behind a bounded
+readiness gate. Bun binds the network role, starts the verified helper, inspects
+its forwarding API and opens the gate. Only then may Runc execute the payload.
+The hook and init remain descendants of the owned foreground launcher throughout.
+See the [OCI hook contract](https://github.com/opencontainers/runtime-spec/blob/main/config.md#createruntime-hooks)
+and [slirp API protocol](https://github.com/rootless-containers/slirp4netns/blob/master/slirp4netns.1.md#api-socket).
+
+The slirp API needs a write-half shutdown after each JSON request. We bound the
+whole exchange and parse the response structurally, including the exact host
+and guest ports. A socket file alone proves very little. Once a helper has
+positively retired, recovery can replace it and restore forwarding while the
+same launcher continues running. An unavailable owner remains an error.
+
+The Linux acceptance cases use a local static BusyBox fixture, so an image
+registry outage cannot masquerade as a lifecycle failure. They exercise a short
+job's first network instruction, published-port recovery, helper replacement
+without repeating the workload, long data-directory paths and actual caller
+SIGKILL before any agent adoption record exists. Passing those cases qualifies
+this adapter; production selection and the broader release gates remain separate.
