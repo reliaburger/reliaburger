@@ -169,7 +169,7 @@ development configurations. Ingress currently uses unweighted round-robin on
 Bun's shared runtime, with no separate strategy or worker-thread setting.
 
 0.1.0 requires a fresh cluster; development state is refused. Rolling upgrades
-require matching explicit formats (currently protocol 14 and state 19). See the
+require matching explicit formats (currently protocol 14 and state 20). See the
 [compatibility policy](releasing.md#cluster-compatibility).
 
 Lease-owned test volumes and generated configuration have durable provisioning
@@ -258,7 +258,7 @@ Download the latest binary from [github.com/opencontainers/runc/releases](https:
 Notes:
 - Rootless runc's namespace/spec path supports read-only OCI roots and path-based test bundles. It uses `slirp4netns` for outbound networking and published ports, and restores that userspace network across Bun replacement. Declarative app specs currently request writable roots, so normal image workloads must use root mode until Reliaburger owns a safe unprivileged snapshotter; they never fall back to a shared writable image tree.
 - Rootless resource limits remain unsupported and fail admission because Reliaburger doesn't create a delegated user cgroup. Ubuntu hosts that set `kernel.apparmor_restrict_unprivileged_userns=1` also need an AppArmor policy permitting the installed Bun binary (or that restriction disabled) before runc can write UID/GID maps.
-- Rootless stores bundles/images in `~/.local/share/reliaburger/`; root mode uses `/var/lib/reliaburger/`
+- Bun keeps Runc bundles and state under `<storage.data>/instances/runc/` and uses the selected `storage.images` directory for its image cache. Explicit Runc selection and automatic detection both follow these node paths, including any storage fallback reported at startup.
 - OCI images are pulled from Docker Hub automatically when the spec's `image` field is set (e.g. `alpine:latest`)
 - Root-mode writable images use one private OverlayFS upper per workload over the shared content-addressed image generation. A restart or Bun adoption reuses that workload's upper; exit and kill unmount it.
 - To run provisioned Linux runtime tests: `sudo make test-linux`

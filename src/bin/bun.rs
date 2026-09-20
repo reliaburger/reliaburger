@@ -873,7 +873,7 @@ async fn run_agent(cli: Cli) -> anyhow::Result<()> {
     }
 
     // Select runtime
-    let runtime = select_runtime(&cli.runtime, &instances_dir).await?;
+    let runtime = select_runtime(&cli.runtime, &instances_dir, &pickle_dir).await?;
     // DNS is a workload capability, not a best-effort side task. Select the
     // runtime first so we can derive its reachable resolver address, then bind
     // both sockets before starting the agent, reporting readiness or adopting
@@ -2841,7 +2841,13 @@ async fn run_agent(cli: Cli) -> anyhow::Result<()> {
     Ok(())
 }
 
-async fn select_runtime(name: &str, instances_dir: &std::path::Path) -> anyhow::Result<AnyGrill> {
+async fn select_runtime(
+    name: &str,
+    instances_dir: &std::path::Path,
+    image_directory: &std::path::Path,
+) -> anyhow::Result<AnyGrill> {
+    #[cfg(not(target_os = "linux"))]
+    let _ = image_directory;
     match name {
         "auto" => {
             let runtime = detect_runtime().await;
@@ -2852,6 +2858,13 @@ async fn select_runtime(name: &str, instances_dir: &std::path::Path) -> anyhow::
                     instances_dir.to_path_buf(),
                     std::env::current_exe()?,
                 )),
+                #[cfg(target_os = "linux")]
+                AnyGrill::Runc(detected) => AnyGrill::Runc(create_runc_runtime(
+                    instances_dir,
+                    image_directory,
+                    detected.is_rootless(),
+                )),
+                #[cfg(not(target_os = "linux"))]
                 other => other,
             };
             let kind = match &runtime {
@@ -2877,30 +2890,7 @@ async fn select_runtime(name: &str, instances_dir: &std::path::Path) -> anyhow::
             let mode = if is_rootless { "rootless" } else { "root" };
             println!("bun: using runc runtime ({mode})");
 
-            let (bundle_base, image_store, state_dir) = if is_rootless {
-                let base = dirs::data_local_dir()
-                    .unwrap_or_else(|| std::path::PathBuf::from("/tmp/reliaburger"))
-                    .join("reliaburger");
-                (
-                    base.join("bundles"),
-                    reliaburger::grill::ImageStore::new(base.join("images")),
-                    reliaburger::grill::rootless::rootless_state_dir(),
-                )
-            } else {
-                let base = std::path::PathBuf::from("/var/lib/reliaburger");
-                (
-                    base.join("bundles"),
-                    reliaburger::grill::ImageStore::new(base.join("images")),
-                    std::path::PathBuf::from("/run/reliaburger/runc"),
-                )
-            };
-
-            let grill = reliaburger::grill::runc::RuncGrill::new(
-                bundle_base,
-                image_store,
-                is_rootless,
-                state_dir,
-            );
+            let grill = create_runc_runtime(instances_dir, image_directory, is_rootless);
             Ok(AnyGrill::Runc(grill))
         }
         #[cfg(target_os = "macos")]
@@ -2912,6 +2902,23 @@ async fn select_runtime(name: &str, instances_dir: &std::path::Path) -> anyhow::
         }
         other => anyhow::bail!("unknown runtime: {other}"),
     }
+}
+
+#[cfg(target_os = "linux")]
+fn create_runc_runtime(
+    instances_dir: &std::path::Path,
+    image_directory: &std::path::Path,
+    rootless: bool,
+) -> reliaburger::grill::runc::RuncGrill {
+    // Runtime ownership must follow the node's actual storage directories,
+    // including configured paths and explicit storage fallback selection.
+    let runtime_directory = instances_dir.join("runc");
+    reliaburger::grill::runc::RuncGrill::new(
+        runtime_directory.join("bundles"),
+        reliaburger::grill::ImageStore::new(image_directory.to_path_buf()),
+        rootless,
+        runtime_directory.join("state"),
+    )
 }
 
 async fn runtime_version(runtime: &str) -> Option<String> {
@@ -3080,6 +3087,57 @@ fn configure_workload_dns(
 mod tests {
     use super::*;
     use std::collections::BTreeMap;
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn runc_selection_uses_the_nodes_private_image_storage() {
+        let root = tempfile::tempdir().unwrap();
+        let runtime = select_runtime(
+            "runc",
+            &root.path().join("instances"),
+            &root.path().join("custom-images"),
+        )
+        .await
+        .unwrap();
+        let store = runtime.image_store().unwrap();
+        let image = reliaburger::grill::image::ImageReference::parse("alpine:3.19").unwrap();
+        assert!(
+            store
+                .rootfs_path(&image)
+                .starts_with(root.path().join("custom-images")),
+            "runc ignored the configured node storage: {:?}",
+            store.rootfs_path(&image)
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn configured_runc_nodes_keep_prepared_bundles_separate() {
+        use reliaburger::grill::{Grill, InstanceId};
+        let root = tempfile::tempdir().unwrap();
+        let id = InstanceId("default__storage-0".into());
+        let mut paths = Vec::new();
+        for node in ["first", "second"] {
+            let instances = root.path().join(node).join("instances");
+            let runtime =
+                create_runc_runtime(&instances, &root.path().join(node).join("images"), true);
+            let spec: reliaburger::grill::oci::OciSpec = serde_json::from_value(serde_json::json!({
+                "root": {"path": "/", "readonly": true},
+                "process": {"args": [node], "env": [], "cwd": "/", "user": {"uid": 0, "gid": 0}},
+                "mounts": [], "linux": {"namespaces": []}
+            })).unwrap();
+            runtime.create(&id, &spec).await.unwrap();
+            let bundle = instances.join("runc/bundles").join(&id.0);
+            assert!(bundle.join("rootfs").is_dir());
+            assert!(instances.join("runc/state").is_dir());
+            paths.push((node, bundle.join("config.json")));
+        }
+        for (node, path) in paths {
+            let spec: serde_json::Value =
+                serde_json::from_slice(&std::fs::read(path).unwrap()).unwrap();
+            assert_eq!(spec["process"]["args"], serde_json::json!([node]));
+        }
+    }
 
     #[tokio::test]
     async fn storage_directory_preserves_configured_path_and_reports_both_failures() {

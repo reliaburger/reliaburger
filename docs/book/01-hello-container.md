@@ -3005,3 +3005,26 @@ from registering another one. The adapter is a foundation; routing Runc and
 network operations through it, preserving the original OCI specification, and
 keeping their guards through cancellation are separate integration steps in the
 [OCI ownership plan](../plans/2026-09-20-oci-launch-ownership.md).
+
+
+### Runtime files belong to the configured node
+
+Give two nodes different storage directories. You expect their prepared OCI
+bundles to be different files. Before the correction, Bun selected Runc with
+hard-coded defaults even when its own storage configuration pointed elsewhere.
+The registry used the configured images directory while Runc could pull into a
+second cache under the user's home directory. The read-only regression prints
+that unexpected cache path before failing.
+
+Bun now passes the actual selected images directory into runtime construction
+and keeps Runc bundles and state below the node's instance directory. Automatic
+detection uses the same construction path as explicit `--runtime runc`.
+A preparation test gives two node directories the same instance ID and different
+commands, then checks that writing the second bundle leaves the first unchanged.
+This establishes filesystem ownership; it does not claim that two nodes can
+share the same host network without additional isolation.
+
+State format 20 rejects older development state, whose runtime files could live
+outside that node's data directory. Silently switching directories would make a
+surviving old container look absent. Fresh development clusters follow the
+release's existing compatibility policy.

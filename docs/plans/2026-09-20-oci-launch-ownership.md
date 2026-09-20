@@ -41,6 +41,12 @@ changes only once the corresponding recovery contract is implemented.
   owning runtime generation. Integrate complete inventory and actual retirement
   evidence before changing production selection. A timeout or missing socket
   must never become successful command retirement.
+- [x] Keep production runtime files under the configured node: Runc bundles
+  and state below its instance directory, and image cache in the actual selected
+  images directory. The regression fails first; 27 macOS/31 Linux startup,
+  compatibility and real Bun-crash cases plus strict Clippy pass. Three real
+  rootful registry catalogue cases pass with confirmed cleanup (38.19s).
+  State 20 refuses older development layouts.
 - [ ] Journal original Runc intent before preparation can allocate resources.
   Include the instance generation and runtime configuration needed for recovery.
   Publish a validated complete inventory for the agent's existing reconciliation

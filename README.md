@@ -41,7 +41,7 @@ Install and usage details are in the [documentation](docs/README.md), and
 implementation status in [progress.md](docs/progress.md).
 
 0.1.0 requires a fresh cluster; development state is refused. Rolling upgrades
-require matching explicit formats (currently protocol 14 and state 19). See the
+require matching explicit formats (currently protocol 14 and state 20). See the
 [compatibility policy](docs/releasing.md#cluster-compatibility).
 Registry uploads belong to their exact creating credential. Recovery reclaims
 abandoned partial uploads after a crash and
@@ -126,7 +126,9 @@ container mode instead. See the [runtime contract](docs/README.md#processgrill-b
 With runc (Linux) or Apple Container (macOS) installed, the same flow runs
 real OCI images — and `relish init cluster` generates the PKI and mTLS
 config for a secure multi-node cluster. The [documentation](docs/README.md)
-has the full secure-cluster walkthrough. Rootful Linux networking retains address
+has the full secure-cluster walkthrough. Runc bundles and state follow the node's
+configured data directory, and its cache uses the selected images directory.
+Rootful Linux networking retains address
 ownership across restarts and refuses subnet exhaustion. Runc retirement keeps
 resource ownership when OCI deletion, rootfs unmount or network cleanup fails,
 and retries before reporting Stopped. Normal Stop/Retire also preserve ownership
