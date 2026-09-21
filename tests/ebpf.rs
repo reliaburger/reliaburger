@@ -3561,6 +3561,18 @@ struct InitPolicyGrill {
 }
 
 impl reliaburger::grill::Grill for InitPolicyGrill {
+    async fn log_stem(&self, id: &reliaburger::grill::InstanceId) -> Option<PathBuf> {
+        self.runtime.log_stem(id).await
+    }
+
+    async fn adopt(
+        &self,
+        id: &reliaburger::grill::InstanceId,
+        record: &reliaburger::grill::records::InstanceRecord,
+    ) -> Result<bool, reliaburger::grill::GrillError> {
+        self.runtime.adopt(id, record).await
+    }
+
     async fn retain_network_reference(
         &self,
         id: &reliaburger::grill::InstanceId,
@@ -4043,45 +4055,59 @@ fn kernel_lookup_denial_is_not_reported_as_backend_absence() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[ignore = "requires Linux root, runc, static BusyBox and RELIABURGER_EBPF_TESTS=1"]
 async fn refused_backend_withdrawal_cannot_redirect_a_vip_to_a_new_workload() {
-    check_backend_retirement(None, true, false, false).await;
+    check_backend_retirement(None, true, DiscoveryExercise::Disabled).await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[ignore = "requires Linux root, runc, static BusyBox and RELIABURGER_EBPF_TESTS=1"]
 async fn refused_rollout_withdrawal_cannot_retire_the_original_destination() {
-    check_backend_retirement(Some("rolling"), true, false, false).await;
+    check_backend_retirement(Some("rolling"), true, DiscoveryExercise::Disabled).await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[ignore = "requires Linux root, runc, static BusyBox and RELIABURGER_EBPF_TESTS=1"]
 async fn refused_blue_green_withdrawal_cannot_retire_the_original_destination() {
-    check_backend_retirement(Some("blue-green"), true, false, false).await;
+    check_backend_retirement(Some("blue-green"), true, DiscoveryExercise::Disabled).await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[ignore = "requires Linux root, runc, static BusyBox and RELIABURGER_EBPF_TESTS=1"]
 async fn confirmed_rollout_withdrawal_keeps_the_replacement_reachable() {
-    check_backend_retirement(Some("rolling"), false, false, false).await;
+    check_backend_retirement(Some("rolling"), false, DiscoveryExercise::Disabled).await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[ignore = "requires Linux root, runc, static BusyBox and RELIABURGER_EBPF_TESTS=1"]
 async fn standalone_discovery_release_allows_confirmed_address_reuse() {
-    check_backend_retirement(None, false, true, false).await;
+    check_backend_retirement(None, false, DiscoveryExercise::Release).await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[ignore = "requires Linux root, runc, static BusyBox and RELIABURGER_EBPF_TESTS=1"]
 async fn standalone_automatic_restart_replaces_the_original_address_owner() {
-    check_backend_retirement(None, false, true, true).await;
+    check_backend_retirement(None, false, DiscoveryExercise::Restart).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "requires Linux root, runc, static BusyBox and RELIABURGER_EBPF_TESTS=1"]
+async fn standalone_discovery_recovery_preserves_original_routing_and_cleanup() {
+    check_backend_retirement(None, false, DiscoveryExercise::Recover).await;
+}
+
+enum DiscoveryExercise {
+    Disabled,
+    Release,
+    Restart,
+    Recover,
 }
 
 async fn check_backend_retirement(
     strategy: Option<&str>,
     freeze: bool,
-    durable: bool,
-    restart_original: bool,
+    discovery: DiscoveryExercise,
 ) {
+    let durable = !matches!(discovery, DiscoveryExercise::Disabled);
+    let restart_original = matches!(discovery, DiscoveryExercise::Restart);
     use reliaburger::bun::agent::{AgentCommand, ApplyEvent, BunAgent};
     use reliaburger::grill::{Grill, ImageStore, InstanceId, port::PortAllocator, runc::RuncGrill};
     use std::sync::Arc;
@@ -4107,10 +4133,10 @@ async fn check_backend_retirement(
         starts: Arc::new(Mutex::new(Vec::new())),
         refuse_init_cleanup: Arc::new(std::sync::atomic::AtomicBool::new(false)),
     };
-    let (commands, receiver) = mpsc::channel(64);
+    let (mut commands, receiver) = mpsc::channel(64);
     let shutdown = CancellationToken::new();
     let mut agent = BunAgent::new(
-        grill,
+        grill.clone(),
         PortAllocator::new(43600, 43700),
         receiver,
         shutdown.clone(),
@@ -4124,8 +4150,8 @@ async fn check_backend_retirement(
             .await
             .unwrap();
     }
-    let services = agent.service_map_watch();
-    let task = tokio::spawn(async move { agent.run().await });
+    let mut services = agent.service_map_watch();
+    let mut task = Some(tokio::spawn(async move { agent.run().await }));
     let exercise = async {
         let mut original_address = None;
         for name in ["address-predecessor", "address-successor"] {
@@ -4152,6 +4178,42 @@ async fn check_backend_retirement(
                 let ready = read_runtime_fixture_page(SocketAddr::new(vip.0.into(), 8080))
                     .await.map_err(|error| anyhow::anyhow!("original VIP before retirement: {error}"))?;
                 anyhow::ensure!(ready.contains(&id.0), "original VIP did not serve its own identity");
+                if matches!(discovery, DiscoveryExercise::Recover) {
+                    let original = runtime.network_reference(&id).await?.ok_or_else(|| anyhow::anyhow!("original address hold missing"))?;
+                    let original_task = task.take().expect("original controller missing");
+                    original_task.abort();
+                    let stopped = original_task.await.expect_err("original controller did not stop");
+                    anyhow::ensure!(stopped.is_cancelled(), "original controller panicked");
+                    let mut foreign = ServiceMap::new();
+                    let foreign_id = ServiceId::new("default", "unowned-recovery-fixture");
+                    foreign.register(&foreign_id, 8080, None)?;
+                    let foreign_entry = foreign.resolve(&foreign_id).unwrap();
+                    let map = BpfServiceMap::new();
+                    map.update_backends_bpf(&mut *ebpf.lock().await, foreign_entry.vip, foreign_entry.port, foreign_entry)?;
+                    for refuse in [true, false] {
+                        let (next_commands, receiver) = mpsc::channel(64);
+                        let mut recovered = BunAgent::new(grill.clone(), PortAllocator::new(43600, 43700), receiver, shutdown.clone());
+                        recovered.set_records_dir(root.path().join("records"));
+                        recovered.set_volumes_dir(root.path().join("volumes"));
+                        recovered.set_onion_ebpf(Arc::clone(&ebpf)).await;
+                        let recovery = recovered.recover_discovery_ownership(&root.path().join("discovery")).await;
+                        if refuse {
+                            anyhow::ensure!(recovery.is_err(), "unknown kernel owner was accepted");
+                            anyhow::ensure!(runtime.network_reference(&id).await? == Some(original.clone()), "refused recovery changed the original hold");
+                            anyhow::ensure!(map.read_backends(&mut *ebpf.lock().await, vip, 8080)?.is_some(), "refused recovery removed original routing");
+                            map.remove_backends_bpf(&mut *ebpf.lock().await, foreign_entry.vip, foreign_entry.port)?;
+                            continue;
+                        }
+                        recovery?;
+                        anyhow::ensure!(recovered.adopt_recorded_instances().await? == 1, "original runtime was not adopted");
+                        services = recovered.service_map_watch();
+                        commands = next_commands;
+                        task = Some(tokio::spawn(async move { recovered.run().await }));
+                    }
+                    anyhow::ensure!(runtime.network_reference(&id).await? == Some(original), "recovery changed runtime generation or allocation");
+                    let ready = read_runtime_fixture_page(SocketAddr::new(vip.0.into(), 8080)).await?;
+                    anyhow::ensure!(ready.contains(&id.0), "recovered original VIP did not reach its runtime");
+                }
                 if restart_original {
                     let original = runtime.network_reference(&id).await?.ok_or_else(|| anyhow::anyhow!("original address hold missing"))?;
                     runtime.kill(&id).await?;
@@ -4234,7 +4296,9 @@ async fn check_backend_retirement(
         } else { response.map_err(|error| anyhow::anyhow!("original VIP after refused retirement: {error}")) }
     }.await;
     shutdown.cancel();
-    task.await.unwrap();
+    if let Some(task) = task {
+        task.await.unwrap();
+    }
     let mut owned_cgroups = Vec::new();
     for launch in runtime.launch_inventory().await.unwrap().unwrap() {
         owned_cgroups.extend(launch.spec.linux.host_cgroup_path());

@@ -313,10 +313,12 @@ agent journals publication and original address holds before launch. Standalone
 Stop and automatic retry persist release permission before returning addresses;
 confirmed service retirement removes its durable owner before freeing the VIP.
 Original runtime/discovery correlation checks generations, allocations and cgroup
-identity, including a hold saved before discovery acknowledgement. Complete
-recovery integration, remote acknowledgements and production selection remain
-open. Journal I/O runs on blocking workers that retain exclusive ownership
-through caller cancellation.
+identity, including a hold saved before discovery acknowledgement. Opt-in
+standalone startup recovery reserves original allocations, replays release
+permissions and publishes only positively adopted runtimes with fresh health
+checks. Remote acknowledgements, actual Bun/host crash qualification and
+production selection remain open. Journal I/O runs on blocking workers that
+retain exclusive ownership through caller cancellation.
 Rolling and blue-green cutovers now confirm kernel backend publication before
 exposing replacements in DNS and ingress; refusal preserves the original routing view.
 Fresh deployments also stop before workload creation when initial service publication fails.

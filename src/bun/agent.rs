@@ -1521,6 +1521,7 @@ pub struct PartitionBlocklists {
 #[cfg(all(feature = "ebpf", target_os = "linux"))]
 use super::egress_owners::{EgressBinding, PolicyPhase};
 mod discovery_ownership;
+mod discovery_recovery;
 mod egress_ownership;
 use discovery_ownership::DiscoveryOwnership;
 
@@ -3021,8 +3022,10 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
                 .as_ref()
                 .is_some_and(|launches| !launches.is_empty()),
         )?;
+        self.validate_recovered_discovery(&records, launch_inventory.as_deref())?;
         self.restore_egress_owners(&records, launch_inventory.as_deref())
             .await?;
+        self.replay_discovery_releases().await?;
         if let Some(launches) = &launch_inventory {
             self.reconcile_runtime_launches(&records, &mut recovered_jobs, launches)
                 .await?;
@@ -3234,6 +3237,7 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
 
         // Identity dirs with no live owner — legacy app-scoped layouts and
         // instances that died while bun was down — are stale key material.
+        self.finish_discovery_recovery().await?;
         self.sweep_orphaned_identity_dirs();
 
         Ok(adopted_count)
@@ -12280,6 +12284,223 @@ mod tests {
             entries[0].phase,
             crate::bun::discovery_owners::ServicePhase::Owned
         );
+    }
+
+    async fn discovery_recovery_fixture() -> (
+        BunAgent<MockGrill>,
+        MockGrill,
+        tempfile::TempDir,
+        crate::grill::runc_intent::NetworkReference,
+    ) {
+        let (mut original, _, _, grill) = test_agent_with_grill();
+        let root = tempfile::tempdir().unwrap();
+        original.set_records_dir(root.path().join("records"));
+        original.set_volumes_dir(root.path().join("volumes"));
+        original
+            .enable_fresh_discovery_ownership(&root.path().join("discovery"))
+            .await
+            .unwrap();
+        let reference = original_test_network_reference();
+        grill.set_pid(std::process::id());
+        grill.set_container_ip("10.0.2.5".parse().unwrap());
+        grill.set_network_reference(reference.clone()).await;
+        expect_complete(&drain_deploy(&mut original, basic_config()).await);
+        let spec = original
+            .supervisor
+            .get_instance(&reference.instance_id)
+            .unwrap()
+            .oci_spec
+            .clone()
+            .unwrap();
+        grill
+            .set_launch_inventory(vec![crate::grill::RuntimeLaunch {
+                instance_id: reference.instance_id.clone(),
+                spec,
+                network_reference: Some(crate::grill::runc_intent::NetworkReferenceState::Held(
+                    reference.clone(),
+                )),
+            }])
+            .await;
+        drop(original);
+        let (_, receiver) = mpsc::channel(32);
+        let mut recovered = BunAgent::new(
+            grill.clone(),
+            PortAllocator::new(30000, 31000),
+            receiver,
+            CancellationToken::new(),
+        );
+        recovered.set_records_dir(root.path().join("records"));
+        recovered.set_volumes_dir(root.path().join("volumes"));
+        (recovered, grill, root, reference)
+    }
+
+    #[tokio::test]
+    async fn discovery_recovery_reserves_original_vip_before_republishing_adopted_runtime() {
+        let (mut agent, grill, root, reference) = discovery_recovery_fixture().await;
+        let service = crate::onion::service_id::ServiceId::new("default", "web");
+        let saved =
+            crate::bun::discovery_owners::DiscoveryJournal::open(&root.path().join("discovery"))
+                .unwrap();
+        let original_vip = saved.inventory().services[0].entry.vip;
+        drop(saved);
+        grill.set_adopt_result(&reference.instance_id, true);
+        agent
+            .recover_discovery_ownership(&root.path().join("discovery"))
+            .await
+            .unwrap();
+        assert_eq!(
+            agent.service_map.resolve(&service).unwrap().vip,
+            original_vip
+        );
+        assert!(
+            agent
+                .service_map
+                .resolve(&service)
+                .unwrap()
+                .backends
+                .is_empty()
+        );
+        assert!(
+            agent
+                .service_map_watch()
+                .borrow()
+                .resolve(&service)
+                .is_none()
+        );
+        assert_eq!(agent.adopt_recorded_instances().await.unwrap(), 1);
+        let view = agent.service_map_watch();
+        let map = view.borrow();
+        let live = map.resolve(&service).unwrap();
+        assert_eq!(live.vip, original_vip);
+        assert_eq!(live.backends[0].node_ip.to_string(), "10.0.2.5");
+        assert!(live.backends[0].healthy);
+        drop(map);
+        agent.retire_workload("web", "default").await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn discovery_recovery_does_not_publish_historical_health() {
+        let (mut agent, grill, root, reference) = discovery_recovery_fixture().await;
+        let records = root.path().join("records");
+        let mut record = crate::grill::records::load_records(&records)
+            .unwrap()
+            .remove(0);
+        record.app_spec.as_mut().unwrap().health = config_with_health().app["web"].health.clone();
+        crate::grill::records::write_record(&records, &record).unwrap();
+        grill.set_adopt_result(&reference.instance_id, true);
+        agent
+            .recover_discovery_ownership(&root.path().join("discovery"))
+            .await
+            .unwrap();
+        assert_eq!(agent.adopt_recorded_instances().await.unwrap(), 1);
+        let service = crate::onion::service_id::ServiceId::new("default", "web");
+        assert!(
+            !agent
+                .service_map_watch()
+                .borrow()
+                .resolve(&service)
+                .unwrap()
+                .backends[0]
+                .healthy
+        );
+        assert_eq!(
+            agent
+                .supervisor
+                .get_instance(&reference.instance_id)
+                .unwrap()
+                .state,
+            ContainerState::HealthWait
+        );
+        agent.retire_workload("web", "default").await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn discovery_recovery_retires_unrecorded_original_runtime_and_allocation() {
+        let (mut agent, grill, root, reference) = discovery_recovery_fixture().await;
+        crate::grill::records::remove_record(
+            &root.path().join("records"),
+            &reference.instance_id.0,
+        )
+        .unwrap();
+        agent
+            .recover_discovery_ownership(&root.path().join("discovery"))
+            .await
+            .unwrap();
+        assert_eq!(agent.adopt_recorded_instances().await.unwrap(), 0);
+        assert!(
+            grill
+                .network_reference(&reference.instance_id)
+                .await
+                .unwrap()
+                .is_none()
+        );
+        drop(agent);
+        let journal =
+            crate::bun::discovery_owners::DiscoveryJournal::open(&root.path().join("discovery"))
+                .unwrap();
+        assert!(journal.inventory().references.is_empty());
+        assert!(journal.inventory().services.is_empty());
+    }
+
+    #[tokio::test]
+    async fn discovery_recovery_replays_original_permission_without_a_new_launch() {
+        let (mut agent, grill, root, reference) = discovery_recovery_fixture().await;
+        grill.set_state(&reference.instance_id, ContainerState::Stopped);
+        let journal =
+            crate::bun::discovery_owners::DiscoveryJournal::open(&root.path().join("discovery"))
+                .unwrap();
+        let mut inventory = journal.inventory().clone();
+        inventory.references[0].phase =
+            crate::bun::discovery_owners::ReferencePhase::ReleaseAuthorised;
+        inventory.services[0].entry.backends.clear();
+        drop(journal.persist(inventory).await.unwrap());
+        let before = grill.calls().len();
+        agent
+            .recover_discovery_ownership(&root.path().join("discovery"))
+            .await
+            .unwrap();
+        assert_eq!(agent.adopt_recorded_instances().await.unwrap(), 0);
+        assert!(
+            grill
+                .network_reference(&reference.instance_id)
+                .await
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            !grill.calls()[before..]
+                .iter()
+                .any(|(op, _)| op == "create" || op == "start")
+        );
+    }
+
+    #[tokio::test]
+    async fn discovery_recovery_refuses_changed_runtime_before_adoption_or_cleanup() {
+        let (mut agent, grill, root, reference) = discovery_recovery_fixture().await;
+        let mut launches = grill.launch_inventory().await.unwrap().unwrap();
+        let mut changed = reference.clone();
+        changed.container_index += 1;
+        launches[0].network_reference = Some(
+            crate::grill::runc_intent::NetworkReferenceState::Held(changed),
+        );
+        grill.set_launch_inventory(launches).await;
+        let before = grill.calls().len();
+        assert!(
+            agent
+                .recover_discovery_ownership(&root.path().join("discovery"))
+                .await
+                .is_err()
+        );
+        assert!(agent.adopt_recorded_instances().await.is_err());
+        assert_eq!(grill.calls().len(), before);
+        assert_eq!(
+            grill
+                .network_reference(&reference.instance_id)
+                .await
+                .unwrap(),
+            Some(reference)
+        );
+        assert!(agent.service_map_watch().borrow().resolve_all().is_empty());
     }
 
     #[tokio::test]

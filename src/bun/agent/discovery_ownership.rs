@@ -9,6 +9,7 @@ pub(super) enum DiscoveryOwnership {
     #[default]
     Disabled,
     Ready(DiscoveryJournal),
+    Recovered(DiscoveryJournal),
     Uncertain,
 }
 
@@ -125,7 +126,9 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
                 "remote withdrawal must be confirmed before durable release permission",
             ));
         }
-        let DiscoveryOwnership::Ready(journal) = &self.discovery_ownership else {
+        let (DiscoveryOwnership::Ready(journal) | DiscoveryOwnership::Recovered(journal)) =
+            &self.discovery_ownership
+        else {
             return Err(refuse(
                 "discovery ownership is uncertain; recovery required",
             ));
@@ -191,7 +194,9 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
             service: service.clone(),
             reason: reason.into(),
         };
-        let DiscoveryOwnership::Ready(journal) = &self.discovery_ownership else {
+        let (DiscoveryOwnership::Ready(journal) | DiscoveryOwnership::Recovered(journal)) =
+            &self.discovery_ownership
+        else {
             return Err(refuse(
                 "discovery ownership is uncertain; recovery required",
             ));
@@ -278,7 +283,9 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
             return Ok(());
         }
         self.require_discovery_release_permission(reference)?;
-        let DiscoveryOwnership::Ready(journal) = &self.discovery_ownership else {
+        let (DiscoveryOwnership::Ready(journal) | DiscoveryOwnership::Recovered(journal)) =
+            &self.discovery_ownership
+        else {
             return Err(BunError::RetirementState {
                 instance_id: reference.instance_id.clone(),
                 reason: "discovery release acknowledgement is uncertain".into(),
@@ -311,7 +318,7 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
         use crate::bun::discovery_owners::ReferencePhase;
         match &self.discovery_ownership {
             DiscoveryOwnership::Disabled => Ok(()),
-            DiscoveryOwnership::Ready(journal)
+            DiscoveryOwnership::Ready(journal) | DiscoveryOwnership::Recovered(journal)
                 if journal.inventory().references.iter().any(|owner| {
                     owner.reference == *reference
                         && owner.phase == ReferencePhase::ReleaseAuthorised
@@ -335,13 +342,14 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
             service: id.clone(),
             reason,
         };
-        let journal =
+        let (journal, recovered) =
             match std::mem::replace(&mut self.discovery_ownership, DiscoveryOwnership::Uncertain) {
                 DiscoveryOwnership::Disabled => {
                     self.discovery_ownership = DiscoveryOwnership::Disabled;
                     return Ok(());
                 }
-                DiscoveryOwnership::Ready(journal) => journal,
+                DiscoveryOwnership::Ready(journal) => (journal, false),
+                DiscoveryOwnership::Recovered(journal) => (journal, true),
                 DiscoveryOwnership::Uncertain => {
                     return Err(failure(
                         "discovery ownership is uncertain; recovery required".into(),
@@ -354,7 +362,11 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
             .persist(next)
             .await
             .map_err(|error| failure(error.to_string()))?;
-        self.discovery_ownership = DiscoveryOwnership::Ready(journal);
+        self.discovery_ownership = if recovered {
+            DiscoveryOwnership::Recovered(journal)
+        } else {
+            DiscoveryOwnership::Ready(journal)
+        };
         Ok(())
     }
 
@@ -365,7 +377,7 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
         has_launches: bool,
     ) -> Result<(), BunError> {
         match &self.discovery_ownership {
-            DiscoveryOwnership::Disabled => Ok(()),
+            DiscoveryOwnership::Disabled | DiscoveryOwnership::Recovered(_) => Ok(()),
             DiscoveryOwnership::Ready(journal)
                 if !has_records
                     && !has_launches

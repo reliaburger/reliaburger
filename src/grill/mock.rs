@@ -20,6 +20,7 @@ pub struct MockGrill {
     exit_codes: Arc<Mutex<HashMap<InstanceId, Option<i32>>>>,
     adopt_results: Arc<Mutex<HashMap<InstanceId, bool>>>,
     container_ip: Arc<Mutex<Option<std::net::Ipv4Addr>>>,
+    launch_inventory: Arc<tokio::sync::Mutex<Option<Vec<super::RuntimeLaunch>>>>,
     network_references:
         Arc<tokio::sync::Mutex<HashMap<InstanceId, super::runc_intent::NetworkReference>>>,
     honours_cgroup_path: Arc<Mutex<bool>>,
@@ -68,6 +69,7 @@ impl Default for MockGrill {
             adopt_results: Arc::default(),
             container_ip: Arc::default(),
             network_references: Arc::default(),
+            launch_inventory: Arc::default(),
             honours_cgroup_path: Arc::default(),
             runtime_kind: Arc::new(Mutex::new(crate::grill::records::RuntimeKind::Process)),
             pid: Arc::default(),
@@ -316,6 +318,11 @@ impl MockGrill {
 }
 
 impl MockGrill {
+    /// Supply a complete original runtime inventory for recovery tests.
+    pub async fn set_launch_inventory(&self, launches: Vec<super::RuntimeLaunch>) {
+        *self.launch_inventory.lock().await = Some(launches);
+    }
+
     /// Configure an original runtime address reference returned by retention/inspection.
     pub async fn set_network_reference(&self, reference: super::runc_intent::NetworkReference) {
         self.network_references
@@ -346,6 +353,10 @@ impl MockGrill {
 }
 
 impl super::Grill for MockGrill {
+    async fn launch_inventory(&self) -> Result<Option<Vec<super::RuntimeLaunch>>, GrillError> {
+        Ok(self.launch_inventory.lock().await.clone())
+    }
+
     async fn release_network_reference(
         &self,
         reference: &super::runc_intent::NetworkReference,
@@ -373,6 +384,15 @@ impl super::Grill for MockGrill {
             });
         }
         references.remove(&reference.instance_id);
+        if let Some(launches) = self.launch_inventory.lock().await.as_mut() {
+            for launch in launches {
+                if launch.instance_id == reference.instance_id {
+                    launch.network_reference = Some(
+                        super::runc_intent::NetworkReferenceState::Released(reference.clone()),
+                    );
+                }
+            }
+        }
         Ok(())
     }
 

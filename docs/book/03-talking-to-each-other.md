@@ -1785,3 +1785,33 @@ propagates every other failure. The regression first proves an absent key can be
 read normally, then denies BPF syscalls in an isolated subprocess using seccomp
 (a Linux syscall filter). Before the fix, that real denied lookup still reported
 absence. The subprocess confines the filter so it cannot affect later tests.
+
+### Recover before allowing adoption to mutate ownership
+
+The standalone startup entry point now opens the original journal, requires a
+complete runtime inventory and persists the correlated result. It reserves each
+original VIP and port without publishing old backends. With kernel networking,
+every existing backend key must belong to that inventory; an unknown key refuses
+recovery before withdrawal. Bun then removes the original routes and destination
+grants. The agent stays fenced until every withdrawal succeeds.
+
+A Recovered journal state records that startup reconciliation happened and keeps
+that distinction through later consuming writes. Before adoption changes runtime
+state, Bun validates the original inventory again, restores policy and replays
+pending release permissions. The normal runtime reconciliation can then retire
+launches that never acquired an adoption record. Their original address hold is
+now available to cleanup even though they have no supervisor entry.
+
+After positive adoption, Bun obtains current container addresses and publishes
+checked backend snapshots using the reserved allocations. A workload with a
+health check starts in HealthWait with an unhealthy backend. Saved healthy status
+is history. Empty services retire through the confirmed withdrawal checkpoints.
+
+The entry point requires startup without concurrent runtime registration and
+with all prior node consumers stopped. It refuses clustered recovery until remote
+acknowledgements exist. Unit cases cover live adoption, unrecorded cleanup,
+pending release, changed runtime evidence and historical health. The physical
+Linux case loses the controller task, refuses an unknown kernel owner, then
+recovers the same generation and proves VIP routing and later safe reuse.
+Actual Bun process death, host reboot and production selection remain separate
+qualification gates.
