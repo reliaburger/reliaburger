@@ -8150,6 +8150,7 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
             self.retire_instance_artifacts(id).await?;
         }
 
+        self.retire_discovery_service(&service_id).await?;
         let _ = self.service_map.unregister(&service_id);
         // NET5: prune this app's cgroup-namespace + firewall entries now it's
         // gone, so a reused cgroup inode can't inherit its isolation identity.
@@ -12281,6 +12282,60 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn confirmed_stop_forgets_durable_service_allocation() {
+        let (mut agent, _, _) = test_agent();
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("discovery");
+        agent.enable_fresh_discovery_ownership(&path).await.unwrap();
+        expect_complete(&drain_deploy(&mut agent, basic_config()).await);
+        agent.stop_app("web", "default").await.unwrap();
+        drop(agent);
+        let journal = crate::bun::discovery_owners::DiscoveryJournal::open(&path).unwrap();
+        assert!(
+            journal.inventory().services.is_empty(),
+            "confirmed stop retained its allocation"
+        );
+    }
+
+    #[tokio::test]
+    async fn failed_service_retirement_checkpoint_keeps_the_allocated_vip() {
+        let (mut agent, _, _) = test_agent();
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("discovery");
+        agent.enable_fresh_discovery_ownership(&path).await.unwrap();
+        expect_complete(&drain_deploy(&mut agent, basic_config()).await);
+        let service = crate::onion::service_id::ServiceId::new("default", "web");
+        let original = agent.service_map.resolve(&service).unwrap().vip;
+        let checkpoint = path.join("discovery.json");
+        std::fs::remove_file(&checkpoint).unwrap();
+        std::fs::create_dir(&checkpoint).unwrap();
+        assert!(
+            agent.stop_app("web", "default").await.is_err(),
+            "stop acknowledged failed service retirement"
+        );
+        assert_eq!(agent.service_map.resolve(&service).unwrap().vip, original);
+    }
+
+    #[tokio::test]
+    async fn clustered_service_retirement_requires_remote_proof_without_runtime_references() {
+        let (mut agent, _, _) = test_agent();
+        let directory = tempfile::tempdir().unwrap();
+        agent
+            .enable_fresh_discovery_ownership(&directory.path().join("discovery"))
+            .await
+            .unwrap();
+        expect_complete(&drain_deploy(&mut agent, basic_config()).await);
+        let (mut cluster_agent, _, _) = test_cluster_fault_agent().await;
+        agent.cluster = cluster_agent.cluster.take();
+        assert!(
+            agent.stop_app("web", "default").await.is_err(),
+            "clustered stop forgot an unconfirmed allocation"
+        );
+        let service = crate::onion::service_id::ServiceId::new("default", "web");
+        assert!(agent.service_map.resolve(&service).is_some());
+    }
+
+    #[tokio::test]
     async fn later_publication_preserves_unretired_discovery_allocations() {
         let (mut agent, _commands, _shutdown) = test_agent();
         let directory = tempfile::tempdir().unwrap();
@@ -12289,7 +12344,8 @@ mod tests {
         expect_complete(&drain_deploy(&mut agent, basic_config()).await);
         let service = crate::onion::service_id::ServiceId::new("default", "web");
         let original = agent.service_map.resolve(&service).unwrap().clone();
-        agent.stop_app("web", "default").await.unwrap();
+        // Simulate lost private metadata without confirmed retirement.
+        agent.service_map.unregister(&service).unwrap();
         assert!(agent.service_map.resolve(&service).is_none());
         let config = Config::parse("[app.other]\nimage = 'mock:image'\nport = 8081\n").unwrap();
         expect_complete(&drain_deploy(&mut agent, config).await);

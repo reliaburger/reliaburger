@@ -178,6 +178,97 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
         .await
     }
 
+    /// Retire an exact standalone allocation after kernel withdrawal and runtime cleanup.
+    pub(super) async fn retire_discovery_service(
+        &mut self,
+        service: &crate::onion::service_id::ServiceId,
+    ) -> Result<(), BunError> {
+        use crate::bun::discovery_owners::ServicePhase;
+        if matches!(self.discovery_ownership, DiscoveryOwnership::Disabled) {
+            return Ok(());
+        }
+        let refuse = |reason: &str| BunError::BackendPublication {
+            service: service.clone(),
+            reason: reason.into(),
+        };
+        let DiscoveryOwnership::Ready(journal) = &self.discovery_ownership else {
+            return Err(refuse(
+                "discovery ownership is uncertain; recovery required",
+            ));
+        };
+        let original = journal.inventory().services.iter().find(|owner| {
+            owner.entry.namespace == service.namespace && owner.entry.app_name == service.name
+        });
+        let live = self.service_map.resolve(service);
+        let Some(original) = original else {
+            // Portless workloads and repeated acknowledged stops own no allocation.
+            return if live.is_none() {
+                Ok(())
+            } else {
+                Err(refuse("original service allocation is missing"))
+            };
+        };
+        if self.cluster.is_some() {
+            return Err(refuse(
+                "remote withdrawal must be confirmed before service retirement",
+            ));
+        }
+        let Some(live) = live else {
+            return Err(refuse("original service withdrawal is unproven"));
+        };
+        if live.vip != original.entry.vip
+            || live.port != original.entry.port
+            || !live.backends.is_empty()
+        {
+            return Err(refuse("original service withdrawal is unproven"));
+        }
+        if journal
+            .inventory()
+            .references
+            .iter()
+            .any(|owner| owner.service == *service)
+        {
+            return Err(refuse("original runtime references still require release"));
+        }
+        // Include historical candidates: private metadata loss cannot prove that
+        // a request which already captured an endpoint released it.
+        let backends = original.entry.backends.clone();
+        for backend in &backends {
+            self.drains
+                .start_drain(&crate::wrapper::draining::DrainCommand {
+                    app_name: service.name.clone(),
+                    instance_id: backend.instance_id.clone(),
+                    timeout: std::time::Duration::ZERO,
+                })
+                .await;
+        }
+        self.drains.check_completions().await;
+        for backend in &backends {
+            if self.drains.is_draining(&backend.instance_id).await {
+                return Err(refuse(
+                    "captured ingress requests still require confirmed release",
+                ));
+            }
+        }
+        self.update_discovery_inventory(service, |next| {
+            for owner in &mut next.services {
+                if owner.entry.namespace == service.namespace
+                    && owner.entry.app_name == service.name
+                {
+                    owner.entry.backends.clear();
+                    owner.phase = ServicePhase::Withdrawn;
+                }
+            }
+        })
+        .await?;
+        self.update_discovery_inventory(service, |next| {
+            next.services.retain(|owner| {
+                owner.entry.namespace != service.namespace || owner.entry.app_name != service.name
+            });
+        })
+        .await
+    }
+
     /// Forget a permission only after the runtime acknowledges the exact release.
     pub(super) async fn forget_released_discovery_reference(
         &mut self,

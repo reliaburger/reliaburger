@@ -1700,3 +1700,27 @@ runtime/checkpoint reference, starts a successor on the same address and checks
 that the predecessor's VIP cannot reach it. Service-allocation retirement and
 recovery replay are separate remaining steps; these address permissions do not
 silently forget the service's original VIP.
+
+### Retire the service allocation as well
+
+Stopping the last backend is not the same as retiring its service VIP. The
+checkpoint used to retain an Owned allocation after a successful Stop, while the
+in-memory allocator made that address available again. A subsequent allocation
+could then disagree with the original durable owner.
+
+Stop now checks the exact original VIP and port, requires an empty live backend
+set and no remaining runtime references, and confirms release of any historical
+ingress candidates. Its caller has already withdrawn the kernel service and
+its destination grants. For a standalone agent, Bun first persists Withdrawn
+with no backends, then persists removal of that owner. Only after both writes
+succeed does it unregister the VIP. A failed write retains the allocation and
+fences further journal mutations. A crash after Withdrawn leaves an explicit
+retirement stage for recovery to finish.
+
+Three failing-first tests cover successful removal, checkpoint failure and a
+clustered agent without runtime references. That last case still refuses local
+retirement: the absence of a runtime hold says nothing about remote consumers.
+The original conservative-publication test now injects lost private metadata
+without calling Stop, so it continues to prove that absence is not retirement.
+The real Linux address-reuse case also checks that confirmed service retirement
+leaves no service owner in the journal. Full recovery remains separate.

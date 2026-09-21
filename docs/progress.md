@@ -15,10 +15,11 @@ gates; those stay unchecked.
 > acceptance gates. Implementation is in progress; signed-release and cold-install
 > qualification remain open.
 
-> **Latest session checkpoint (20 September):** the
+> **Latest session checkpoint (21 September):** the
 > [0.1.0 handoff](plans/2026-09-20-v0.1.0-session-handoff.md) records completed
 > commits, settled decisions, exact test evidence and the ordered resumption
-> steps through the durable discovery checkpoint. Bun integration is next.
+> steps through opt-in Bun publication and standalone address release. Service
+> retirement is complete for standalone agents; recovery and remote acknowledgement remain open.
 > C34 and V01–V04 remain open; hosted `51b7594` is green.
 
 ## Current completion backlog (17 September 2026)
@@ -247,6 +248,7 @@ Buildah-absence cases execute in isolated child environments on the equipped VM.
           - [x] Wire an opt-in fresh Bun agent to persist conservative publication ownership before kernel updates and fence uncertain writes. Three regressions fail first (0.147s); all 188 native/Linux agent and journal tests pass (17.817s/22.813s), with strict Clippy/formatting. Existing allocations remain recorded when absent from later snapshots, and fresh-only adoption refuses existing state. The journal pause hook now preserves Bun's Sync requirement. This producer is not selected in production.
           - [x] Persist exact original runtime address references before Start in the opt-in Bun journal; refuse physical release without durable permission. Two regressions fail first (0.162s). All 191 native/Linux agent, journal and mock tests pass (17.820s/23.205s), with strict Clippy/formatting. The real owned-Runc/eBPF controller-task-loss case passes (10.67s), comparing saved generation/index and proving natural exit retains the old address. Actual Bun SIGKILL and recovery correlation remain open.
           - [x] Persist standalone address-release permission before runtime release, then forget the exact reference only after acknowledgement. The ordering regression fails first (0.158s). All 193 affected native/Linux tests pass (17.860s/22.919s), with strict Clippy/formatting. The real owned-Runc/eBPF address-reuse case passes (26.28s), with successor reachability and stale-VIP isolation. Failed checkpoints retain the hold; clustered release still requires remote proof.
+          - [x] Persist confirmed standalone service withdrawal and owner removal before freeing its VIP. Three regressions fail first (0.198s). All 196 affected native/Linux tests pass (17.996s/24.243s), with strict Clippy/formatting. The physical address-reuse/service-retirement case passes (25.91s). Failed checkpoints retain the allocation; clustered retirement requires remote proof, even without runtime references.
           - [ ] Complete full original-inventory correlation, durable recovery and retirement/release authorisation, and remote catalogue acknowledgement before enabling production durable discovery or authorising allocation reuse.
           - [x] Report cancelled streamed HTTP responses as body errors, rather than successful EOF. The live partial-response regression fails first (0.126s); all 102 native/Linux Wrapper tests pass (0.514s/0.513s). After correcting the fixture header read, its final reruns pass (0.066s/0.044s) with strict Clippy/formatting on both. Backend cleanup remains independent of downstream polling.
         - [x] Refresh source/egress policy after each successful init exit before the next init/main Start. The real owned-Runc regression first observes policy only for the first initialiser. All 58 physical kernel cases pass (24.52s), including two initialisers followed by the main workload; all 174 affected library tests pass on macOS/Linux (17.865s/23.270s), with strict Clippy and formatting on both. Failed/interrupted init ownership remains separate.

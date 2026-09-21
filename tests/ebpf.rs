@@ -4108,6 +4108,7 @@ async fn check_backend_retirement(strategy: Option<&str>, freeze: bool, durable:
                         let checkpoint: serde_json::Value = serde_json::from_slice(&std::fs::read(root.path().join("discovery/discovery.json"))?)?;
                         let inventory: reliaburger::bun::discovery_owners::DiscoveryInventory = serde_json::from_value(checkpoint["inventory"].clone())?;
                         anyhow::ensure!(inventory.references.is_empty(), "acknowledged release remains in the checkpoint");
+                        anyhow::ensure!(inventory.services.is_empty(), "confirmed service retirement remains in the checkpoint");
                     } else {
                         anyhow::ensure!(retired.is_err(), "frozen backend retirement was acknowledged");
                     }
