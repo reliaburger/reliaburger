@@ -883,6 +883,33 @@ impl StateMachineInner {
             RaftRequest::PermissionDelete { name } => {
                 self.state.permissions.remove(name);
             }
+            RaftRequest::RegisterEndpointConsumer { node_id } => {
+                if let Err(reason) = crate::cluster::retirement::validate_node_id(node_id) {
+                    return Some(CouncilResponse::Refused {
+                        reason: reason.into(),
+                    });
+                }
+                if self
+                    .state
+                    .security_state
+                    .crl
+                    .retired_nodes
+                    .contains_key(node_id)
+                {
+                    return Some(CouncilResponse::Refused {
+                        reason: "node identity is retired; fresh enrolment is required".into(),
+                    });
+                }
+                if !self.state.endpoint_consumers.contains(node_id)
+                    && self.state.endpoint_consumers.len()
+                        >= crate::onion::catalog::MAX_ENDPOINT_CONSUMERS
+                {
+                    return Some(CouncilResponse::Refused {
+                        reason: "endpoint consumer limit reached".into(),
+                    });
+                }
+                self.state.endpoint_consumers.insert(node_id.clone());
+            }
             RaftRequest::PublishEndpoints(catalog) => {
                 if catalog.services.values().any(|service| {
                     service.backends.iter().any(|backend| {
@@ -1353,6 +1380,7 @@ impl StateMachineInner {
                     .active
                     .take()
                     .map(|active| active.sequence);
+                let released_endpoint_consumer = self.state.endpoint_consumers.remove(node_id);
                 let retirement = NodeRetirement {
                     node_id: node_id.clone(),
                     retired_by: retired_by.clone(),
@@ -1361,6 +1389,7 @@ impl StateMachineInner {
                     released_placements,
                     released_registry_writers,
                     released_node_fault,
+                    released_endpoint_consumer,
                 };
                 self.state
                     .security_state
@@ -2792,6 +2821,108 @@ mod tests {
         let state = sm.desired_state().await;
         let placements = state.scheduling.get(&app_id).unwrap();
         assert_eq!(placements.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn endpoint_consumers_survive_snapshot_and_require_explicit_decommission() {
+        let mut sm = CouncilStateMachine::new();
+        for (index, node) in ["offline", "survivor", "offline"].into_iter().enumerate() {
+            let responses = sm
+                .apply(vec![normal_entry(
+                    1,
+                    index as u64 + 1,
+                    RaftRequest::RegisterEndpointConsumer {
+                        node_id: node.into(),
+                    },
+                )])
+                .await
+                .unwrap();
+            assert!(matches!(responses[0], CouncilResponse::Applied { .. }));
+        }
+        let mut builder = sm.get_snapshot_builder().await;
+        let snapshot = builder.build_snapshot().await.unwrap();
+        let mut restored = CouncilStateMachine::new();
+        restored
+            .install_snapshot(&snapshot.meta, snapshot.snapshot)
+            .await
+            .unwrap();
+        assert_eq!(
+            restored.desired_state().await.endpoint_consumers,
+            std::collections::BTreeSet::from(["offline".into(), "survivor".into()])
+        );
+        let request = RaftRequest::DecommissionNode {
+            node_id: "offline".into(),
+            retired_by: "operator".into(),
+            reason: "powered off".into(),
+            retired_at_unix_ms: 10,
+            membership_log_id: None,
+        };
+        let response = restored
+            .apply(vec![normal_entry(1, 4, request.clone())])
+            .await
+            .unwrap();
+        assert!(matches!(
+            response[0],
+            CouncilResponse::NodeDecommissioned { .. }
+        ));
+        assert_eq!(
+            restored.desired_state().await.endpoint_consumers,
+            std::collections::BTreeSet::from(["survivor".into()])
+        );
+        let repeated = restored
+            .apply(vec![normal_entry(1, 5, request)])
+            .await
+            .unwrap();
+        assert_eq!(repeated, response);
+        assert!(
+            restored
+                .desired_state()
+                .await
+                .security_state
+                .crl
+                .retired_nodes["offline"]
+                .released_endpoint_consumer
+        );
+        let refused = restored
+            .apply(vec![normal_entry(
+                1,
+                6,
+                RaftRequest::RegisterEndpointConsumer {
+                    node_id: "offline".into(),
+                },
+            )])
+            .await
+            .unwrap();
+        assert!(matches!(refused[0], CouncilResponse::Refused { .. }));
+    }
+
+    #[test]
+    fn endpoint_consumer_registration_is_bounded_and_never_evicts_existing_owners() {
+        let mut inner = StateMachineInner::default();
+        for node in ["", "invalid\nidentity"] {
+            assert!(matches!(
+                inner.apply_request(&RaftRequest::RegisterEndpointConsumer {
+                    node_id: node.into()
+                }),
+                Some(CouncilResponse::Refused { .. })
+            ));
+        }
+        inner.state.endpoint_consumers = (0..65_536).map(|n| format!("worker-{n}")).collect();
+        assert!(matches!(
+            inner.apply_request(&RaftRequest::RegisterEndpointConsumer {
+                node_id: "overflow".into()
+            }),
+            Some(CouncilResponse::Refused { .. })
+        ));
+        assert!(
+            inner
+                .apply_request(&RaftRequest::RegisterEndpointConsumer {
+                    node_id: "worker-0".into()
+                })
+                .is_none()
+        );
+        assert_eq!(inner.state.endpoint_consumers.len(), 65_536);
+        assert!(!inner.state.endpoint_consumers.contains("overflow"));
     }
 
     #[tokio::test]

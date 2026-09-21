@@ -303,6 +303,8 @@ pub enum RaftRequest {
     AllocateNodeSerial { node_id: String },
     /// Conditionally add only the storage node that verified the existing image.
     ConfirmImageCopy(crate::pickle::types::ImageCopyConfirmation),
+    /// Record a node before it can consume cluster discovery publications.
+    RegisterEndpointConsumer { node_id: String },
 }
 
 // ---------------------------------------------------------------------------
@@ -433,6 +435,9 @@ pub struct DesiredState {
     /// Defaults empty so pre-12b.4 snapshots load cleanly.
     #[serde(default)]
     pub endpoint_catalog: crate::onion::catalog::EndpointCatalog,
+    /// Nodes that may retain discovery publications, including offline nodes.
+    #[serde(default)]
+    pub endpoint_consumers: std::collections::BTreeSet<String>,
     /// Active or interrupted-cleanup Phase 15 leases. Replication lets a new
     /// leader resume cleanup after the issuing process dies.
     #[serde(default)]

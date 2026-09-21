@@ -714,6 +714,7 @@ async fn lease_retirement_waits_for_paused_worker_across_leader_change() {
                 "http://127.0.0.1:{}/v1/placements/{}",
                 nodes[1].api_port, nodes[2].name
             ))
+            .bearer_auth(RETIREMENT_SERVICE_TOKEN)
             .send()
             .await
             .unwrap()

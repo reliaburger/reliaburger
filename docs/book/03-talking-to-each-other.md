@@ -504,7 +504,7 @@ RaftRequest::PublishEndpoints(Box<EndpointCatalog>)
 
 Applying it just replaces `DesiredState.endpoint_catalog` — a wholesale swap, so the leader is the single source of truth and a follower never merges half a view. Because it lives in `DesiredState`, it rides the same replication and snapshot machinery as every other cluster fact, and it survives a leader change for free: the new leader inherits the last catalogue and republishes from its own reports on the next tick. The leader only writes when the catalogue actually changed, so a steady cluster isn't churning the log every couple of seconds.
 
-The last hop is getting the catalogue *into* each node's resolution path. Council voters read `DesiredState` directly; worker nodes outside the council don't, but they already poll the leader's `/v1/placements/{node}` endpoint every couple of seconds to learn their assignments. We piggyback the catalogue on that same response — one extra field, `#[serde(default)]` so an old node talking to a new leader (or vice versa) still parses. The node's reconciler hands the catalogue to its Bun agent, which overlays it onto the local service map:
+The last hop is getting the catalogue *into* each node's resolution path. Every node's reconciler polls the leader's `/v1/placements/{node}` endpoint every couple of seconds to learn its assignments. We piggyback the catalogue on that response, after registering the consumer in Raft. Council voters also hold the replicated `DesiredState`, but use the same reconciler to install routing. Explicit protocol and state compatibility must match; a serde default is not permission to mix incompatible binaries. The reconciler hands the catalogue to its Bun agent, which overlays it onto the local service map:
 
 ```rust
 let merged = self.service_map.with_cluster_catalog(&self.cluster_catalog);
@@ -1853,3 +1853,33 @@ test uses a real single-node council: replace a previously published catalogue,
 require the running scheduler to restore it, then check that unchanged state
 produces no extra log entries. This is publication convergence, not proof that
 remote consumers have withdrawn an endpoint.
+
+
+### Remembering consumers that stop answering
+
+A worker can disappear from gossip while still holding an old routing table.
+Dropping it from the cleanup list would turn loss of contact into permission to
+reuse somebody else's address. We now register each catalogue consumer in Raft
+before returning its first placement response. The registration survives snapshots
+and has no heartbeat expiry. Repeated polls don't append another registration.
+
+`BTreeSet<String>` stores each node name once, in deterministic order. Unlike a
+map, a set has no separate value; membership itself is the fact we need here.
+The registration limit refuses new consumers without evicting existing ones.
+Where credentials are configured, the internal service credential is required.
+The existing credential-free development profile still registers every consumer;
+this only adds an obligation and cannot discharge one. With TLS, the peer's validated node
+identity must also match the requested node; the deliberately plaintext profile
+trusts the cluster service credential. Neither an ordinary API user nor an invalid
+certificate can create consumer records.
+
+Operator decommission removes the fenced identity from this census and records
+that fact in the immutable retirement result. A repeat returns the same result;
+the retired name cannot register again. This follows the existing requirement to
+stop or isolate workloads before decommissioning. Gossip suspicion and elapsed
+time cannot substitute for that action.
+
+Protocol 15/state 28 introduce the replicated consumer set and registration
+request. Fresh development clusters are required. This census establishes who
+must be accounted for; generation-specific withdrawal receipts and the gate that
+checks them before releasing addresses are still separate work.

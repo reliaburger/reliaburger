@@ -3048,9 +3048,29 @@ async fn refuse_retired_tls_peer(
 /// counts) the leader has assigned to a node. Served from the Raft
 /// state machine; reconcilers poll this every couple of seconds.
 async fn placements_handler(
+    auth: Option<axum::Extension<crate::sesame::auth::AuthContext>>,
+    peer: Option<axum::Extension<crate::sesame::renewal::TlsPeerCertificate>>,
     State(state): State<ApiState>,
     Path(node_id): Path<String>,
 ) -> Response {
+    // Credential-free development clusters already expose placements. Adding
+    // a retained consumer cannot authorise cleanup; receipt endpoints must
+    // separately authenticate permission to discharge that obligation.
+    let development_without_credentials = auth.is_none()
+        && state.service_token.is_none()
+        && state.cluster_http.scheme() == "http"
+        && match &state.token_store {
+            Some(tokens) => tokens.read().await.is_empty(),
+            None => true,
+        };
+    if !development_without_credentials
+        && let Err(response) = crate::sesame::auth::require_system(auth.as_deref())
+    {
+        return response;
+    }
+    if let Err(reason) = crate::cluster::retirement::validate_node_id(&node_id) {
+        return (StatusCode::BAD_REQUEST, reason).into_response();
+    }
     let Some(council) = &state.council else {
         return (
             StatusCode::SERVICE_UNAVAILABLE,
@@ -3066,7 +3086,25 @@ async fn placements_handler(
         )
             .into_response();
     }
-    let desired = council.desired_state().await;
+    let mut desired = council.desired_state().await;
+    if let Some(peer) = peer {
+        match crate::sesame::renewal::validate_peer(&peer, &desired.security_state) {
+            Ok(identity) if identity == node_id => {}
+            _ => {
+                return (
+                    StatusCode::FORBIDDEN,
+                    "placement consumer does not match TLS identity",
+                )
+                    .into_response();
+            }
+        }
+    } else if state.cluster_http.scheme() == "https" {
+        return (
+            StatusCode::FORBIDDEN,
+            "placement consumers require a TLS node certificate",
+        )
+            .into_response();
+    }
     if desired
         .security_state
         .crl
@@ -3078,6 +3116,34 @@ async fn placements_handler(
             "node identity is retired; fresh enrolment is required",
         )
             .into_response();
+    }
+    // Registration precedes every first exposure. Once committed, an offline
+    // consumer stays accountable until the operator permanently fences it.
+    if !desired.endpoint_consumers.contains(&node_id) {
+        let registration = tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            council.write(crate::council::RaftRequest::RegisterEndpointConsumer {
+                node_id: node_id.clone(),
+            }),
+        )
+        .await;
+        match registration {
+            Ok(Ok(crate::council::CouncilResponse::Applied { .. })) => {}
+            Ok(Ok(crate::council::CouncilResponse::Refused { reason })) => {
+                return (StatusCode::CONFLICT, reason).into_response();
+            }
+            _ => {
+                return (
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    "endpoint consumer registration is unconfirmed",
+                )
+                    .into_response();
+            }
+        }
+        desired = council.desired_state().await;
+        if !desired.endpoint_consumers.contains(&node_id) {
+            return (StatusCode::GONE, "endpoint consumer identity was retired").into_response();
+        }
     }
     let node = crate::meat::NodeId::new(&node_id);
 
@@ -9775,6 +9841,111 @@ schedule = "* * * * *"
                 .await
                 .0,
             StatusCode::GONE
+        );
+        shutdown.cancel();
+        council.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn credential_free_placements_still_record_consumers_but_a_service_token_requires_authentication()
+     {
+        let council = seeded_council("endpoint-consumer-development").await;
+        for service in [None, Some("internal".to_string())] {
+            let protected = service.is_some();
+            let (app, shutdown) = setup_with_auth_leases_events_and_council(
+                vec![],
+                service,
+                crate::bun::readiness::ReadinessTracker::new(),
+                lease_static_capabilities(),
+                None,
+                None,
+                Some(council.clone()),
+            )
+            .await;
+            let node = if protected {
+                "protected-worker"
+            } else {
+                "development-worker"
+            };
+            assert_eq!(
+                get_status(app, &format!("/v1/placements/{node}"), None).await,
+                if protected {
+                    StatusCode::FORBIDDEN
+                } else {
+                    StatusCode::OK
+                }
+            );
+            assert_eq!(
+                council
+                    .desired_state()
+                    .await
+                    .endpoint_consumers
+                    .contains(node),
+                !protected
+            );
+            shutdown.cancel();
+        }
+        council.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn placements_register_the_consumer_before_serving_discovery() {
+        let council = seeded_council("endpoint-consumer").await;
+        let (token, user_key) = a_user_token(crate::sesame::types::ApiRole::Admin);
+        let (app, shutdown) = setup_with_auth_leases_events_and_council(
+            vec![token],
+            Some("internal".into()),
+            crate::bun::readiness::ReadinessTracker::new(),
+            lease_static_capabilities(),
+            None,
+            None,
+            Some(council.clone()),
+        )
+        .await;
+        let path = "/v1/placements/worker";
+        assert_eq!(
+            get_authenticated(app.clone(), path, &user_key).await.0,
+            StatusCode::FORBIDDEN
+        );
+        assert!(council.desired_state().await.endpoint_consumers.is_empty());
+        assert_eq!(
+            get_authenticated(app.clone(), path, "internal").await.0,
+            StatusCode::OK
+        );
+        assert!(
+            council
+                .desired_state()
+                .await
+                .endpoint_consumers
+                .contains("worker")
+        );
+        let invalid_peer =
+            app.clone()
+                .layer(axum::Extension(crate::sesame::renewal::TlsPeerCertificate(
+                    Vec::from(b"invalid certificate".as_slice()).into(),
+                )));
+        assert_eq!(
+            get_authenticated(invalid_peer, "/v1/placements/imposter", "internal")
+                .await
+                .0,
+            StatusCode::FORBIDDEN
+        );
+        assert!(
+            !council
+                .desired_state()
+                .await
+                .endpoint_consumers
+                .contains("imposter")
+        );
+        let applied = council.desired_state().await.last_applied_log;
+        assert_eq!(
+            get_authenticated(app, path, "internal").await.0,
+            StatusCode::OK
+        );
+        assert_eq!(
+            council.desired_state().await.last_applied_log,
+            applied,
+            "an unchanged placement poll must not write another registration"
         );
         shutdown.cancel();
         council.shutdown().await.unwrap();

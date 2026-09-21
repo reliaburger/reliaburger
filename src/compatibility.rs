@@ -15,10 +15,10 @@ pub struct Compatibility {
     pub state: u32,
 }
 
-/// Supported formats, including durable discovery references to runtime addresses.
+/// Supported formats, including a durable census of cluster discovery consumers.
 pub const CURRENT: Compatibility = Compatibility {
-    protocol: 14,
-    state: 27,
+    protocol: 15,
+    state: 28,
 };
 
 /// Name of the durable format stamp at the root of a node's data directory.

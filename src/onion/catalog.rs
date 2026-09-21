@@ -21,6 +21,9 @@ use serde::{Deserialize, Serialize};
 use super::service_id::ServiceId;
 use super::vip::VirtualIP;
 
+/// Maximum retained discovery consumers; reaching the bound never evicts one.
+pub const MAX_ENDPOINT_CONSUMERS: usize = 65_536;
+
 /// One backend endpoint of a service, somewhere in the cluster.
 ///
 /// Carries the real address a connection should land on plus the health

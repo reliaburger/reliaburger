@@ -892,3 +892,44 @@ map because `send` refused updates without readers. The regression fails first
 (0.101s). `send_replace` now retains the current snapshot unconditionally. The
 late-subscriber and two health publication/retry tests pass natively (0.049s),
 with strict Clippy/formatting. This changes no state format or kernel behaviour.
+
+## Remote catalogue retirement continuation (21 September)
+
+The active catalogue allocator now preserves existing VIPs. Scheduler publication
+compares against committed state and recognises only an Applied council response.
+The durable consumer census is qualified: register before returning placements,
+retain offline identities across snapshots, remove only through operator fencing
+and permanent decommission. Protocol 15/state 28 carry that census. None of these
+steps alone authorises reuse of a deleted service or remote host port.
+
+Continue in this order, without re-auditing completed standalone recovery:
+
+1. Carry an exact original exposure identity from the runtime/Bun journal through
+   reports and catalogue entries. The current ordinal report and node/host-port
+   synthetic remote ID cannot distinguish successive owners of the same port.
+   Cover foreground process host ports as well as owned Runc addresses.
+2. Commit publication generations and withdrawal obligations in Raft. Capture
+   the durable consumer set before exposing an endpoint. Keep withdrawn VIPs and
+   endpoint addresses reserved while receipts are missing. New publications must
+   not erase old obligations; gossip loss, report expiry and leader changes are
+   not receipts. Decommission may discharge the fenced identity's obligations.
+3. Persist each consumer's original catalogue ownership before publication.
+   Remove routing and kernel destinations, cancel captured requests, and require
+   actual guard release before submitting an authenticated, generation-specific
+   receipt. Queue admission is not acknowledgement. Recovery must establish that
+   prior consumers are gone and withdraw original publications before replay.
+4. Require the committed retirement result at the producer's common address and
+   host-port release boundaries. Retain ownership after failed/cancelled writes;
+   replay uses the original generation. Test an offline consumer, late receipt,
+   port reuse, leadership change, consumer restart and explicit decommission.
+5. Then qualify actual Bun SIGKILL/cancellation at OCI boundaries, host reboot,
+   and production selection of owned Runc and persistent kernel state. Only
+   after C34 closes run the remaining V01–V04 release acceptance gates.
+
+Identity detail for step 1: ProcessGrill's `OwnerRecord::nonce` authenticates its
+control socket. Never publish that capability in reports, a catalogue or logs.
+Use a separate non-secret identity (for example a domain-separated one-way digest)
+while correlating it with the original private runtime record. `RuntimeLaunch`
+currently carries a spec and optional Runc network reference, but no process
+publication identity. Canonical instance names alone are insufficient because an
+automatic restart may reuse the same name.

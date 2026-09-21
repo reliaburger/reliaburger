@@ -2178,6 +2178,7 @@ image = "busybox:latest"
                 released_placements: Default::default(),
                 released_registry_writers: Default::default(),
                 released_node_fault: None,
+                released_endpoint_consumer: false,
             },
         );
         let app = AppId::new("web", "default");

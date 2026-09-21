@@ -54,6 +54,9 @@ pub struct NodeRetirement {
     /// Node-chaos obligation resolved by the same external fencing attestation.
     #[serde(default)]
     pub released_node_fault: Option<u64>,
+    /// This fenced identity no longer retains cluster discovery publications.
+    #[serde(default)]
+    pub released_endpoint_consumer: bool,
 }
 
 /// Accept bounded, printable identities without interpreting them as URL paths.
