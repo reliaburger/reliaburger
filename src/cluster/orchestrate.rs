@@ -155,8 +155,16 @@ pub fn spawn_leader_scheduler(
             // cross-node resolution shouldn't wait for a fresh leader to finish
             // reconstructing placements — the reports already say what's
             // running where, and a stale catalogue is worse than an early one.
-            let catalog = build_endpoint_catalog(&members, &reports, &desired);
-            if last_published.as_ref() != Some(&catalog) {
+            let catalog = match build_endpoint_catalog(&members, &reports, &desired) {
+                Ok(catalog) => Some(catalog),
+                Err(error) => {
+                    eprintln!("scheduler: failed to allocate endpoint catalogue: {error}");
+                    None
+                }
+            };
+            if let Some(catalog) = catalog
+                && last_published.as_ref() != Some(&catalog)
+            {
                 match council
                     .write(RaftRequest::PublishEndpoints(Box::new(catalog.clone())))
                     .await
@@ -678,9 +686,9 @@ fn aggregate_is_for_app(labels_json: &str, app_id: &crate::meat::types::AppId) -
 /// IP from gossip membership, the host port and the health flag. The
 /// declared container port comes from the desired-state `AppSpec` (a
 /// report only carries the host port). VIPs are then allocated
-/// cluster-wide by [`EndpointCatalog::rebuild`], deterministically and
-/// collision-free, so every node resolves the same service to the same
-/// VIP and reaches its backends wherever they run.
+/// cluster-wide by the catalogue, preserving existing allocations before
+/// adding newcomers. Declared services retain their VIP even when reports
+/// temporarily contain no running backend.
 ///
 /// Only services whose app declares a port appear: a portless app has no
 /// VIP and nothing to resolve.
@@ -688,7 +696,7 @@ fn build_endpoint_catalog(
     members: &[MembershipSnapshot],
     reports: &AggregatedState,
     desired: &crate::council::types::DesiredState,
-) -> crate::onion::catalog::EndpointCatalog {
+) -> Result<crate::onion::catalog::EndpointCatalog, crate::onion::types::OnionError> {
     use crate::onion::catalog::CatalogBackend;
     use crate::onion::service_id::ServiceId;
     use crate::reporting::types::ReportHealthStatus;
@@ -704,7 +712,16 @@ fn build_endpoint_catalog(
 
     // Qualified id -> (ServiceId, declared port, backends). A BTreeMap keyed
     // by the qualified string keeps the build deterministic.
-    let mut grouped: BTreeMap<String, (ServiceId, u16, Vec<CatalogBackend>)> = BTreeMap::new();
+    let mut grouped: BTreeMap<String, (ServiceId, u16, Vec<CatalogBackend>)> = desired
+        .apps
+        .iter()
+        .filter_map(|(app, spec)| {
+            spec.port.map(|port| {
+                let id = ServiceId::new(&app.namespace, &app.name);
+                (id.qualified(), (id, port, Vec::new()))
+            })
+        })
+        .collect();
     for (node_id, report) in &reports.reports {
         let Some(&node_ip) = node_ips.get(node_id) else {
             continue; // no known IP (departed, or IPv6-only) — can't route to it
@@ -733,7 +750,7 @@ fn build_endpoint_catalog(
         }
     }
 
-    crate::onion::catalog::EndpointCatalog::rebuild(grouped.into_values())
+    desired.endpoint_catalog.reconcile(grouped.into_values())
 }
 
 /// Build the scheduler's view of the cluster from gossip membership
@@ -1968,7 +1985,7 @@ image = "busybox:latest"
             spec_from_toml("[app.api]\nimage = \"x:1\"\nport = 3000\n"),
         );
 
-        let catalog = build_endpoint_catalog(&members, &reports, &desired);
+        let catalog = build_endpoint_catalog(&members, &reports, &desired).unwrap();
         let svc = catalog.resolve(&ServiceId::new("default", "api")).unwrap();
         assert_eq!(svc.port, 3000, "declared port taken from the spec");
         assert_eq!(svc.backends.len(), 2, "both nodes' backends present");
@@ -2005,7 +2022,7 @@ image = "busybox:latest"
         reports.reports.insert(NodeId::new("node-a"), ra);
 
         let desired = crate::council::types::DesiredState::default();
-        let catalog = build_endpoint_catalog(&members, &reports, &desired);
+        let catalog = build_endpoint_catalog(&members, &reports, &desired).unwrap();
         assert!(
             catalog.is_empty(),
             "portless and spec-less apps must be skipped"

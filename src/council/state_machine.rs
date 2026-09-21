@@ -2823,7 +2823,8 @@ mod tests {
                     healthy: true,
                 }],
             ),
-        ]);
+        ])
+        .unwrap();
         let entry = normal_entry(1, 1, RaftRequest::PublishEndpoints(Box::new(catalog)));
         sm.apply(vec![entry]).await.unwrap();
 
@@ -2845,7 +2846,7 @@ mod tests {
 
         // A later publish wholly replaces the catalogue (leader is authoritative).
         let replacement =
-            EndpointCatalog::rebuild([(ServiceId::new("default", "web"), 80, vec![])]);
+            EndpointCatalog::rebuild([(ServiceId::new("default", "web"), 80, vec![])]).unwrap();
         let entry2 = normal_entry(2, 1, RaftRequest::PublishEndpoints(Box::new(replacement)));
         sm.apply(vec![entry2]).await.unwrap();
         let state = sm.desired_state().await;

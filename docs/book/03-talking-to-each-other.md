@@ -491,10 +491,10 @@ for (node_id, report) in &reports.reports {
         // group this instance as a backend of its service…
     }
 }
-EndpointCatalog::rebuild(grouped)              // allocate VIPs, cluster-wide
+desired.endpoint_catalog.reconcile(grouped)?  // preserve VIPs, allocate newcomers
 ```
 
-`EndpointCatalog::rebuild` does the cluster-wide VIP allocation: same namespaced hash as the local map, same collision-probing, but done *once* on the leader so every node agrees on which service owns which VIP. The catalogue is a `BTreeMap` keyed by the qualified service id — deterministic JSON, so it snapshots and diffs cleanly.
+`EndpointCatalog::reconcile` preserves allocations from the committed catalogue before allocating newcomers. It uses the same namespaced hash and collision probing as the local map, but does this once on the leader so every node receives the same allocation. The catalogue is a `BTreeMap` keyed by the qualified service id — deterministic JSON, so it snapshots and diffs cleanly.
 
 Now, how does it reach every node? Through Raft. The leader writes the whole catalogue as one `PublishEndpoints` entry:
 
@@ -512,7 +512,7 @@ let merged = self.service_map.with_cluster_catalog(&self.cluster_catalog);
 
 `with_cluster_catalog` doesn't mutate the local map — that stays the source of truth for what this node runs and syncs to the eBPF backend map. It returns a *merged* view: local services keep their entry and gain any remote backends; a service running only elsewhere is added wholesale with the catalogue's cluster-agreed VIP. That merged view is what gets published to DNS and the ingress routing table. So the moment a service on node B lands in the catalogue, a container on node A resolves `redis.default.internal` to its VIP and the eBPF connect hook rewrites to node B's real address — with no change to the DNS or routing code, because both already read the service map snapshot.
 
-Gossip still plays its part. Mustard doesn't carry catalogue data — that would be too much traffic for O(log N) convergence. It handles *failure detection*: when a node crashes, Mustard marks it Dead within a few probe cycles, and the leader's next catalogue rebuild simply omits its backends (the reports for a dead node age out). So the data flow is:
+Gossip still plays its part. Mustard doesn't carry catalogue data — that would be too much traffic for O(log N) convergence. It handles *failure detection*: when a node crashes, Mustard marks it Dead within a few probe cycles, and the leader's next catalogue update omits its backends while retaining declared services' VIPs (the reports for a dead node age out). So the data flow is:
 
 1. **What's running where** flows through the reporting tree into the leader's catalogue, then out via Raft (voters) and the placements poll (workers). This is how cross-node backends get *added*.
 2. **Failure detection** flows through gossip; a dead node's backends drop out of the next rebuild.
@@ -1815,3 +1815,24 @@ Linux case loses the controller task, refuses an unknown kernel owner, then
 recovers the same generation and proves VIP routing and later safe reuse.
 Actual Bun process death, host reboot and production selection remain separate
 qualification gates.
+
+### A new report must not move an existing VIP
+
+Two services can hash to the same natural VIP. Rebuilding allocations from a
+sorted list on every update was deterministic, but it wasn't stable: adding an
+earlier-sorting service could move an existing one, and removing the first owner
+could move a collision-resolved service back to the natural address. Neither
+change has anything to do with that service's runtime.
+
+Catalogue reconciliation now reserves all retained allocations before assigning
+new ones. It validates the original inventory and refuses duplicates, invalid
+identities and exhausted address space. Fresh rebuild also returns Result;
+exhaustion no longer silently shares a VIP. The leader uses the committed
+catalogue as its starting point and includes every declared port-bearing service,
+even when reports contain no backends. Allocation failure preserves the last
+published catalogue while ordinary scheduling continues.
+
+Four failing-first tests cover colliding arrivals, departures, conflicting saved
+allocations and exhaustion. These stable active allocations are a prerequisite
+for remote retirement evidence. They do not authorise reuse after service deletion;
+retiring deleted allocations still needs the acknowledgement ledger.

@@ -446,7 +446,8 @@ async fn worker_without_council_metrics_excludes_its_own_stale_endpoints() {
     let catalog = EndpointCatalog::rebuild([
         (shared.clone(), 8080, vec![local.clone(), remote]),
         (retired.clone(), 8080, vec![local]),
-    ]);
+    ])
+    .unwrap();
     let result = tokio::time::timeout(Duration::from_secs(5), async {
         commands
             .send(AgentCommand::SyncClusterCatalog {

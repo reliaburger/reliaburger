@@ -887,7 +887,8 @@ mod tests {
                     healthy: true,
                 },
             ],
-        )]);
+        )])
+        .unwrap();
         let merged = local.with_cluster_catalog_excluding_node(&catalog, Some("here"));
         let entry = merged.resolve(&id).unwrap();
         assert_eq!(entry.backends.len(), 1);
@@ -910,7 +911,8 @@ mod tests {
                 host_port: 30002,
                 healthy: true,
             }],
-        )]);
+        )])
+        .unwrap();
         let merged = local.with_cluster_catalog(&catalog);
 
         let entry = merged.resolve(&sid("payments", "api")).unwrap();
@@ -950,7 +952,8 @@ mod tests {
                 host_port: 30002,
                 healthy: true,
             }],
-        )]);
+        )])
+        .unwrap();
         let merged = local.with_cluster_catalog(&catalog);
 
         let entry = merged.resolve(&sid("default", "web")).unwrap();
@@ -995,7 +998,8 @@ mod tests {
                 host_port: 30001,
                 healthy: true,
             }],
-        )]);
+        )])
+        .unwrap();
         let merged = local.with_cluster_catalog(&catalog);
 
         let entry = merged.resolve(&sid("default", "web")).unwrap();

@@ -14978,7 +14978,8 @@ host = "remote.local"
                 host_port: 30001,
                 healthy: true,
             }],
-        )]);
+        )])
+        .unwrap();
         agent
             .handle_command(AgentCommand::SyncClusterCatalog {
                 catalog: Box::new(catalog.clone()),

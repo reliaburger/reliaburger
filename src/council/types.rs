@@ -720,7 +720,8 @@ mod tests {
                 host_port: 30002,
                 healthy: true,
             }],
-        )]);
+        )])
+        .unwrap();
         let req = RaftRequest::PublishEndpoints(Box::new(catalog));
         let json = serde_json::to_string(&req).unwrap();
         let decoded: RaftRequest = serde_json::from_str(&json).unwrap();
