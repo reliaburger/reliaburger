@@ -700,7 +700,7 @@ We don't need Raft on all 10,000 nodes. Consensus is expensive: every write requ
 
 ### Standing on the shoulders of openraft
 
-We're not implementing Raft from scratch. The openraft crate (v0.9) is a mature, async-native, tokio-compatible implementation with pre-vote support and a clean trait-based adapter pattern. Implementing Raft correctly is notoriously fiddly — edge cases around log compaction, split votes, and pre-vote alone would cost us weeks. openraft handles all of that and has been battle-tested by other projects.
+We're not implementing Raft from scratch. The openraft crate (v0.9) is a mature, async-native, tokio-compatible implementation with a clean trait-based adapter pattern. Implementing Raft correctly is notoriously fiddly — edge cases around log compaction and split votes alone would cost us weeks. (One thing it doesn't give us yet is pre-vote, the extension that stops a node returning from a partition from forcing an election. That's still on the to-do list.) openraft handles all of that and has been battle-tested by other projects.
 
 What we do implement are three adapter traits that tell openraft how to store logs, apply entries to our state machine, and send messages between nodes:
 
