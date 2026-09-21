@@ -83,6 +83,13 @@ async fn runc_owned_preparation_recovers_original_intent_and_retires_without_ado
     let original = spec(root.path(), "exit 0");
     let first = runtime(root.path());
     first.create(&id, &original).await.unwrap();
+    let generation = first
+        .launch_inventory()
+        .await
+        .unwrap()
+        .unwrap()
+        .remove(0)
+        .generation;
     let path = root.path().join("bundles").join(&id.0).join("config.json");
     let prepared = std::fs::read(&path).unwrap();
     assert!(
@@ -97,8 +104,17 @@ async fn runc_owned_preparation_recovers_original_intent_and_retires_without_ado
     let inventory = recovered.launch_inventory().await.unwrap().unwrap();
     assert_eq!(inventory.len(), 1);
     assert_eq!(inventory[0].spec, original);
+    assert_eq!(inventory[0].generation, generation);
+    assert_eq!(generation.as_str().len(), 64);
     recovered.kill(&id).await.unwrap();
     assert_eq!(recovered.state(&id).await.unwrap(), ContainerState::Stopped);
+    assert_absent(root.path(), &id);
+    recovered.create(&id, &original).await.unwrap();
+    assert_ne!(
+        recovered.launch_inventory().await.unwrap().unwrap()[0].generation,
+        generation
+    );
+    recovered.kill(&id).await.unwrap();
     assert_absent(root.path(), &id);
 }
 

@@ -12314,6 +12314,7 @@ mod tests {
             .unwrap();
         grill
             .set_launch_inventory(vec![crate::grill::RuntimeLaunch {
+                generation: crate::grill::RuntimeGeneration::runc(reference.generation.as_str()),
                 instance_id: reference.instance_id.clone(),
                 spec,
                 network_reference: Some(crate::grill::runc_intent::NetworkReferenceState::Held(

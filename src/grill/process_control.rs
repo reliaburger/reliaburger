@@ -99,6 +99,7 @@ impl ProcessControl {
                     .launch
                     .ok_or_else(|| io::Error::other("missing process launch intent"))?;
                 launches.push(super::RuntimeLaunch {
+                    generation: super::RuntimeGeneration::process(&record.nonce),
                     instance_id,
                     spec: launch.spec,
                     network_reference: None,

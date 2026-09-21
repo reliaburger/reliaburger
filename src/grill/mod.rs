@@ -246,9 +246,37 @@ pub enum GrillError {
     ImagePull(#[from] image::ImageError),
 }
 
+/// Non-secret identity of one original runtime execution generation.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RuntimeGeneration(String);
+
+impl RuntimeGeneration {
+    /// Stable fingerprint for correlation, never an execution capability.
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+
+    pub(crate) fn process(token: &str) -> Self {
+        Self::fingerprint(b"reliaburger/runtime-generation/process/v1\0", token)
+    }
+
+    pub(crate) fn runc(token: &str) -> Self {
+        Self::fingerprint(b"reliaburger/runtime-generation/runc/v1\0", token)
+    }
+
+    fn fingerprint(domain: &[u8], token: &str) -> Self {
+        let mut digest = ring::digest::Context::new(&ring::digest::SHA256);
+        digest.update(domain);
+        digest.update(token.as_bytes());
+        Self(hex::encode(digest.finish().as_ref()))
+    }
+}
+
 /// A durable runtime launch, written before user code can execute.
 #[derive(Debug, Clone)]
 pub struct RuntimeLaunch {
+    /// Identity derived from the original private runtime intent.
+    pub generation: RuntimeGeneration,
     /// Canonical workload identity.
     pub instance_id: InstanceId,
     /// Specification committed for this generation.
@@ -793,6 +821,21 @@ async fn which_exists(name: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn runtime_generation_fingerprints_never_expose_or_confuse_owner_tokens() {
+        let token = "1234567890abcdef1234567890abcdef";
+        let process = super::RuntimeGeneration::process(token);
+        let runc = super::RuntimeGeneration::runc(token);
+        assert_ne!(process.as_str(), token);
+        assert_ne!(runc.as_str(), token);
+        assert_ne!(process, runc);
+        assert_eq!(process, super::RuntimeGeneration::process(token));
+        assert_ne!(
+            process,
+            super::RuntimeGeneration::process("abcdef1234567890abcdef1234567890")
+        );
+    }
+
     use super::*;
 
     #[test]

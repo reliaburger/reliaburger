@@ -49,6 +49,64 @@ async fn stopped(grill: &ProcessGrill, id: &InstanceId) {
 }
 
 #[tokio::test]
+async fn runtime_generation_survives_recovery_without_disclosing_control_capabilities() {
+    let directory = tempfile::tempdir().unwrap();
+    let id = InstanceId("default__generation-0".into());
+    let first = runtime(directory.path());
+    first.create(&id, &spec("exit 0")).await.unwrap();
+    let original = first
+        .launch_inventory()
+        .await
+        .unwrap()
+        .unwrap()
+        .remove(0)
+        .generation;
+    let record: serde_json::Value = serde_json::from_slice(
+        &std::fs::read(
+            directory
+                .path()
+                .join("process-owners")
+                .join(&id.0)
+                .join("owner.json"),
+        )
+        .unwrap(),
+    )
+    .unwrap();
+    let secret = record["nonce"].as_str().unwrap();
+    assert_ne!(original.as_str(), secret);
+    assert!(!format!("{original:?}").contains(secret));
+    drop(first);
+    let recovered = runtime(directory.path());
+    assert_eq!(
+        recovered.launch_inventory().await.unwrap().unwrap()[0].generation,
+        original
+    );
+    recovered.kill(&id).await.unwrap();
+    recovered.create(&id, &spec("exit 0")).await.unwrap();
+    let replacement = recovered
+        .launch_inventory()
+        .await
+        .unwrap()
+        .unwrap()
+        .remove(0)
+        .generation;
+    assert_ne!(
+        replacement, original,
+        "recreating the same instance must not reuse its generation"
+    );
+    assert_eq!(
+        runtime(directory.path())
+            .launch_inventory()
+            .await
+            .unwrap()
+            .unwrap()[0]
+            .generation,
+        replacement
+    );
+    recovered.kill(&id).await.unwrap();
+}
+
+#[tokio::test]
 async fn recovered_runtime_reads_short_job_outcome_without_pid_record() {
     let directory = tempfile::tempdir().unwrap();
     let id = InstanceId("default__short-0".into());

@@ -933,3 +933,13 @@ while correlating it with the original private runtime record. `RuntimeLaunch`
 currently carries a spec and optional Runc network reference, but no process
 publication identity. Canonical instance names alone are insufficient because an
 automatic restart may reuse the same name.
+
+
+The original runtime identity prerequisite is now implemented: RuntimeLaunch
+carries RuntimeGeneration, a domain-separated SHA-256 fingerprint derived from
+the private Process owner nonce or original Runc intent generation. Recovery
+preserves it and recreation changes it. Discovery correlation rejects a runtime
+fingerprint that does not match its original Runc address reference. Native/Linux
+library, real process recovery and two physical Runc cases pass, with strict
+checks. This has not yet been propagated through reports/catalogues; continue
+step 1 there. The private owner capability stays private. Formats remain 15/28.

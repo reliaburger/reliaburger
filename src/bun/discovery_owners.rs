@@ -115,10 +115,12 @@ impl DiscoveryJournal {
             if let Some(
                 NetworkReferenceState::Held(reference) | NetworkReferenceState::Released(reference),
             ) = &launch.network_reference
-                && reference.instance_id != launch.instance_id
+                && (reference.instance_id != launch.instance_id
+                    || launch.generation
+                        != crate::grill::RuntimeGeneration::runc(reference.generation.as_str()))
             {
                 return Err(io::Error::other(
-                    "runtime reference belongs to another instance",
+                    "runtime reference belongs to another instance or generation",
                 ));
             }
         }
@@ -608,6 +610,9 @@ mod tests {
         }))
         .unwrap();
         crate::grill::RuntimeLaunch {
+            generation: crate::grill::RuntimeGeneration::runc(
+                original.reference.generation.as_str(),
+            ),
             instance_id: original.reference.instance_id.clone(),
             spec,
             network_reference: Some(reference),
@@ -731,6 +736,24 @@ mod tests {
         );
         launch.network_reference = None;
         assert!(journal.reconcile_runtime_inventory(&[launch]).is_err());
+    }
+
+    #[test]
+    fn recovery_refuses_a_fingerprint_from_another_runtime_generation() {
+        use crate::grill::runc_intent::NetworkReferenceState;
+        let root = tempfile::tempdir().unwrap();
+        let mut journal = DiscoveryJournal::open(&root.path().join("owners")).unwrap();
+        let saved = inventory();
+        journal.save(saved.clone()).unwrap();
+        let mut launch = runtime_launch(NetworkReferenceState::Held(
+            saved.references[0].reference.clone(),
+        ));
+        launch.generation = crate::grill::RuntimeGeneration::process("another-private-generation");
+        assert!(journal.reconcile_runtime_inventory(&[launch]).is_err());
+        assert_eq!(
+            serde_json::to_value(journal.inventory()).unwrap(),
+            serde_json::to_value(&saved).unwrap()
+        );
     }
 
     #[test]

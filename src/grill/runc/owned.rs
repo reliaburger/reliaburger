@@ -697,6 +697,7 @@ impl RuncGrill {
             records
                 .into_iter()
                 .map(|record| crate::grill::RuntimeLaunch {
+                    generation: crate::grill::RuntimeGeneration::runc(record.generation.as_str()),
                     instance_id: record.instance_id,
                     spec: record.spec,
                     network_reference: record.network_reference,

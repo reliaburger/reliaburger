@@ -1883,3 +1883,24 @@ Protocol 15/state 28 introduce the replicated consumer set and registration
 request. Fresh development clusters are required. This census establishes who
 must be accounted for; generation-specific withdrawal receipts and the gate that
 checks them before releasing addresses are still separate work.
+
+### Distinguishing successive executions without publishing their secrets
+
+`default__api-0` can stop and restart under the same name. Its next execution is
+a different owner, even if it happens to receive the same host port. A delayed
+receipt for the first execution must never free the second one's address.
+
+The runtime inventory now carries `RuntimeGeneration`, an opaque public
+fingerprint of the original private execution record. ProcessGrill derives it
+from the owner token, and owned Runc derives it from its original intent
+generation. SHA-256 uses a different fixed prefix for each runtime, so identical
+input bytes in different runtimes don't represent the same identity. The process
+owner token authenticates its control socket. Publishing it directly would turn
+a diagnostic identifier into permission to control the workload.
+
+The newtype wraps a private String and exposes only its fingerprint through
+`as_str()`. Reopening the runtime reproduces the same value; recreating the same
+instance gets a new value. Discovery recovery also checks that this fingerprint
+matches the original Runc address reference before accepting the inventory.
+This change is in-memory runtime evidence only. Carrying it through reports and
+catalogues, and requiring generation-specific retirement receipts, comes next.
