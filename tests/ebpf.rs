@@ -3962,6 +3962,84 @@ async fn read_runtime_fixture_page(address: SocketAddr) -> anyhow::Result<String
     .await?
 }
 
+#[test]
+#[ignore = "requires Linux root and RELIABURGER_EBPF_TESTS=1"]
+fn kernel_lookup_denial_is_not_reported_as_backend_absence() {
+    assert!(ebpf_tests_enabled());
+    const CHILD: &str = "RELIABURGER_LOOKUP_DENIAL_CHILD";
+    if std::env::var_os(CHILD).is_none() {
+        let status = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "kernel_lookup_denial_is_not_reported_as_backend_absence",
+                "--ignored",
+                "--test-threads=1",
+                "--nocapture",
+            ])
+            .env(CHILD, "1")
+            .status()
+            .unwrap();
+        assert!(
+            status.success(),
+            "kernel lookup denial was mistaken for absence"
+        );
+        return;
+    }
+    let mut ebpf = OnionEbpf::load_embedded(CGROUP_PATH.as_ref()).unwrap();
+    let map = reliaburger::onion::ebpf::maps::BpfServiceMap::new();
+    let vip = VirtualIP::from_service_id(&ServiceId::new("default", "lookup-denial"));
+    assert!(map.read_backends(&mut ebpf, vip, 8080).unwrap().is_none());
+    // Deny only this subprocess test thread's BPF syscalls. Closing the map/link
+    // descriptors still releases the ephemeral objects after the assertion.
+    use nix::libc;
+    let mut filter = [
+        libc::sock_filter {
+            code: (libc::BPF_LD | libc::BPF_W | libc::BPF_ABS) as u16,
+            jt: 0,
+            jf: 0,
+            k: 0,
+        },
+        libc::sock_filter {
+            code: (libc::BPF_JMP | libc::BPF_JEQ | libc::BPF_K) as u16,
+            jt: 0,
+            jf: 1,
+            k: libc::SYS_bpf as u32,
+        },
+        libc::sock_filter {
+            code: (libc::BPF_RET | libc::BPF_K) as u16,
+            jt: 0,
+            jf: 0,
+            k: libc::SECCOMP_RET_ERRNO | libc::EACCES as u32,
+        },
+        libc::sock_filter {
+            code: (libc::BPF_RET | libc::BPF_K) as u16,
+            jt: 0,
+            jf: 0,
+            k: libc::SECCOMP_RET_ALLOW,
+        },
+    ];
+    let program = libc::sock_fprog {
+        len: filter.len() as u16,
+        filter: filter.as_mut_ptr(),
+    };
+    // SAFETY: scalar prctl arguments enable the calling thread's no-new-privileges flag.
+    assert_eq!(
+        unsafe { libc::prctl(libc::PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) },
+        0
+    );
+    // SAFETY: program points to a live, correctly sized filter array for this call;
+    // the kernel copies it, and the isolated child exits before another test runs.
+    assert_eq!(
+        unsafe { libc::prctl(libc::PR_SET_SECCOMP, libc::SECCOMP_MODE_FILTER, &program) },
+        0
+    );
+    let result = map.read_backends(&mut ebpf, vip, 8080);
+    assert!(
+        result.is_err(),
+        "denied kernel lookup was returned as absence"
+    );
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[ignore = "requires Linux root, runc, static BusyBox and RELIABURGER_EBPF_TESTS=1"]
 async fn refused_backend_withdrawal_cannot_redirect_a_vip_to_a_new_workload() {

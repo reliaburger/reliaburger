@@ -1774,3 +1774,14 @@ release, duplicate identities and ambiguous names. The real Runc recovery test
 also checks that its complete inventory exposes the original held reference and
 its eventual released receipt. Restoring allocations, withdrawing historical
 routing and adopting only validated runtimes are the next integration steps.
+
+### A failed lookup does not prove absence
+
+A permission error reading the kernel backend map used to become `Ok(None)`.
+The culprit was `.ok()`: it converts any `Result<T, E>` into `Option<T>`, dropping
+the error. Cleanup could therefore treat an unreadable entry as already absent.
+An explicit `match` now returns None only for Aya's KeyNotFound variant and
+propagates every other failure. The regression first proves an absent key can be
+read normally, then denies BPF syscalls in an isolated subprocess using seccomp
+(a Linux syscall filter). Before the fix, that real denied lookup still reported
+absence. The subprocess confines the filter so it cannot affect later tests.
