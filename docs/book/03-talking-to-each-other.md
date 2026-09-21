@@ -1724,3 +1724,24 @@ The original conservative-publication test now injects lost private metadata
 without calling Stop, so it continues to prove that absence is not retirement.
 The real Linux address-reuse case also checks that confirmed service retirement
 leaves no service owner in the journal. Full recovery remains separate.
+
+### A retry retires the old address, not the workload identity
+
+An application can keep the same instance name across automatic restarts, but its
+new runtime has a different generation. Previously the specialised retry cleanup
+removed the old execution record and policy while leaving its network reference
+held. The owned runtime correctly refused to create a successor over that owner.
+
+After routing withdrawal, request release and confirmed runtime exit, retry now
+clears the old policy and releases its exact address reference through the same
+durable permission path as Stop. Only then does it remove execution evidence and
+create the successor. Its identity bundle and mount remain: this is still the
+same logical workload. A failed permission write prevents successor creation.
+The successor's pre-start path records its new generation before allowing Start.
+
+Two failing-first contracts exercise ordering and failed persistence. The real
+Linux case kills a running owned container, waits for Bun's ordinary automatic
+restart, checks that the journal contains the replacement generation and proves
+the original VIP serves it. It then retires the service and checks safe address
+reuse. This exercises a workload crash; actual Bun death during retry remains a
+separate recovery gate.

@@ -8306,6 +8306,7 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
     /// keeps its identity bundle and mount; final retirement removes those too.
     async fn retire_restart_artifacts(&mut self, instance_id: &InstanceId) -> Result<(), BunError> {
         self.clear_egress(instance_id).await?;
+        self.release_network_reference(instance_id).await?;
         if let Some(directory) = self.records_dir.clone() {
             let id = instance_id.0.clone();
             tokio::task::spawn_blocking(move || {
@@ -12498,6 +12499,83 @@ mod tests {
             ContainerState::Running
         );
         agent.stop_app("retry", "default").await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn automatic_restart_releases_original_address_before_successor_creation() {
+        let (mut agent, _, _, grill) = test_agent_with_grill();
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("discovery");
+        agent.enable_fresh_discovery_ownership(&path).await.unwrap();
+        let original = original_test_network_reference();
+        grill.set_network_reference(original.clone()).await;
+        expect_complete(&drain_deploy(&mut agent, basic_config()).await);
+        grill.set_state(&original.instance_id, ContainerState::Stopped);
+        agent.check_apps().await;
+        agent.drive_pending_restarts().await;
+        let calls = grill.calls();
+        let release = calls.iter().position(|(operation, id)| {
+            operation == "release_network_reference" && id == &original.instance_id
+        });
+        let successor = calls
+            .iter()
+            .rposition(|(operation, id)| operation == "create" && id == &original.instance_id)
+            .unwrap();
+        assert!(
+            release.is_some_and(|release| release < successor),
+            "successor creation preceded original address release: {calls:?}"
+        );
+        assert!(!agent.network_references.contains_key(&original.instance_id));
+        assert_eq!(
+            agent
+                .supervisor
+                .get_instance(&original.instance_id)
+                .unwrap()
+                .state,
+            ContainerState::Running
+        );
+        agent.retire_workload("web", "default").await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn automatic_restart_retains_original_address_when_release_permission_fails() {
+        let (mut agent, _, _, grill) = test_agent_with_grill();
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("discovery");
+        agent.enable_fresh_discovery_ownership(&path).await.unwrap();
+        let original = original_test_network_reference();
+        grill.set_network_reference(original.clone()).await;
+        expect_complete(&drain_deploy(&mut agent, basic_config()).await);
+        grill.set_state(&original.instance_id, ContainerState::Stopped);
+        agent.check_apps().await;
+        let checkpoint = path.join("discovery.json");
+        std::fs::remove_file(&checkpoint).unwrap();
+        std::fs::create_dir(&checkpoint).unwrap();
+        agent.drive_pending_restarts().await;
+        assert_eq!(
+            grill
+                .calls()
+                .iter()
+                .filter(|(operation, id)| operation == "create" && id == &original.instance_id)
+                .count(),
+            1,
+            "successor created without release permission"
+        );
+        assert_eq!(
+            grill
+                .network_reference(&original.instance_id)
+                .await
+                .unwrap(),
+            Some(original.clone())
+        );
+        assert_eq!(
+            agent
+                .supervisor
+                .get_instance(&original.instance_id)
+                .unwrap()
+                .state,
+            ContainerState::Pending
+        );
     }
 
     #[tokio::test]

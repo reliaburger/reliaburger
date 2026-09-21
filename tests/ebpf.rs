@@ -3965,34 +3965,45 @@ async fn read_runtime_fixture_page(address: SocketAddr) -> anyhow::Result<String
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[ignore = "requires Linux root, runc, static BusyBox and RELIABURGER_EBPF_TESTS=1"]
 async fn refused_backend_withdrawal_cannot_redirect_a_vip_to_a_new_workload() {
-    check_backend_retirement(None, true, false).await;
+    check_backend_retirement(None, true, false, false).await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[ignore = "requires Linux root, runc, static BusyBox and RELIABURGER_EBPF_TESTS=1"]
 async fn refused_rollout_withdrawal_cannot_retire_the_original_destination() {
-    check_backend_retirement(Some("rolling"), true, false).await;
+    check_backend_retirement(Some("rolling"), true, false, false).await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[ignore = "requires Linux root, runc, static BusyBox and RELIABURGER_EBPF_TESTS=1"]
 async fn refused_blue_green_withdrawal_cannot_retire_the_original_destination() {
-    check_backend_retirement(Some("blue-green"), true, false).await;
+    check_backend_retirement(Some("blue-green"), true, false, false).await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[ignore = "requires Linux root, runc, static BusyBox and RELIABURGER_EBPF_TESTS=1"]
 async fn confirmed_rollout_withdrawal_keeps_the_replacement_reachable() {
-    check_backend_retirement(Some("rolling"), false, false).await;
+    check_backend_retirement(Some("rolling"), false, false, false).await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[ignore = "requires Linux root, runc, static BusyBox and RELIABURGER_EBPF_TESTS=1"]
 async fn standalone_discovery_release_allows_confirmed_address_reuse() {
-    check_backend_retirement(None, false, true).await;
+    check_backend_retirement(None, false, true, false).await;
 }
 
-async fn check_backend_retirement(strategy: Option<&str>, freeze: bool, durable: bool) {
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "requires Linux root, runc, static BusyBox and RELIABURGER_EBPF_TESTS=1"]
+async fn standalone_automatic_restart_replaces_the_original_address_owner() {
+    check_backend_retirement(None, false, true, true).await;
+}
+
+async fn check_backend_retirement(
+    strategy: Option<&str>,
+    freeze: bool,
+    durable: bool,
+    restart_original: bool,
+) {
     use reliaburger::bun::agent::{AgentCommand, ApplyEvent, BunAgent};
     use reliaburger::grill::{Grill, ImageStore, InstanceId, port::PortAllocator, runc::RuncGrill};
     use std::sync::Arc;
@@ -4063,6 +4074,28 @@ async fn check_backend_retirement(strategy: Option<&str>, freeze: bool, durable:
                 let ready = read_runtime_fixture_page(SocketAddr::new(vip.0.into(), 8080))
                     .await.map_err(|error| anyhow::anyhow!("original VIP before retirement: {error}"))?;
                 anyhow::ensure!(ready.contains(&id.0), "original VIP did not serve its own identity");
+                if restart_original {
+                    let original = runtime.network_reference(&id).await?.ok_or_else(|| anyhow::anyhow!("original address hold missing"))?;
+                    runtime.kill(&id).await?;
+                    let replacement = tokio::time::timeout(std::time::Duration::from_secs(30), async {
+                        loop {
+                            let published = services.borrow().resolve(&ServiceId::new("default", name)).is_some_and(|entry| entry.backends.iter().any(|backend| backend.instance_id == id.0 && backend.healthy));
+                            if let Some(reference) = runtime.network_reference(&id).await?
+                                && reference.generation != original.generation
+                                && published
+                                && runtime.state(&id).await? == reliaburger::grill::ContainerState::Running
+                            {
+                                break Ok::<_, anyhow::Error>(reference);
+                            }
+                            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+                        }
+                    }).await??;
+                    let checkpoint: serde_json::Value = serde_json::from_slice(&std::fs::read(root.path().join("discovery/discovery.json"))?)?;
+                    let inventory: reliaburger::bun::discovery_owners::DiscoveryInventory = serde_json::from_value(checkpoint["inventory"].clone())?;
+                    anyhow::ensure!(inventory.references.len() == 1 && inventory.references[0].reference == replacement && inventory.references[0].phase == reliaburger::bun::discovery_owners::ReferencePhase::Held, "restart did not replace its original durable hold");
+                    let ready = read_runtime_fixture_page(SocketAddr::new(vip.0.into(), 8080)).await?;
+                    anyhow::ensure!(ready.contains(&id.0), "replacement is not reachable through the original VIP");
+                }
                 if freeze {
                     freeze_egress_map(&*ebpf.lock().await, "backend_map");
                 }
