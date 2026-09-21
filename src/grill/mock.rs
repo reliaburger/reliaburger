@@ -30,6 +30,9 @@ pub struct MockGrill {
     exec_outputs: Arc<Mutex<std::collections::VecDeque<String>>>,
     /// Deterministic gate for tests that need `exec()` to remain in flight.
     block_exec: Arc<AtomicBool>,
+    block_network_release: Arc<AtomicBool>,
+    network_release_started: Arc<tokio::sync::Semaphore>,
+    network_release_resume: Arc<tokio::sync::Semaphore>,
     exec_started: Arc<tokio::sync::Semaphore>,
     exec_release: Arc<tokio::sync::Semaphore>,
     /// Deterministic gate for tests that need `create()` to remain in flight.
@@ -72,6 +75,9 @@ impl Default for MockGrill {
             rootless_network: Arc::default(),
             exec_outputs: Arc::default(),
             block_exec: Arc::new(AtomicBool::new(false)),
+            block_network_release: Arc::new(AtomicBool::new(false)),
+            network_release_started: Arc::new(tokio::sync::Semaphore::new(0)),
+            network_release_resume: Arc::new(tokio::sync::Semaphore::new(0)),
             exec_started: Arc::new(tokio::sync::Semaphore::new(0)),
             exec_release: Arc::new(tokio::sync::Semaphore::new(0)),
             block_create: Arc::new(AtomicBool::new(false)),
@@ -319,7 +325,57 @@ impl MockGrill {
     }
 }
 
+impl MockGrill {
+    /// Pause address release while a test inspects durable permission.
+    pub fn block_network_releases(&self) {
+        self.block_network_release.store(true, Ordering::SeqCst);
+    }
+    /// Wait for a paused address release.
+    pub async fn wait_for_network_release(&self) {
+        self.network_release_started
+            .acquire()
+            .await
+            .unwrap()
+            .forget();
+    }
+    /// Resume one paused address release.
+    pub fn resume_network_release(&self) {
+        self.block_network_release.store(false, Ordering::SeqCst);
+        self.network_release_resume.add_permits(1);
+    }
+}
+
 impl super::Grill for MockGrill {
+    async fn release_network_reference(
+        &self,
+        reference: &super::runc_intent::NetworkReference,
+    ) -> Result<(), GrillError> {
+        self.calls.lock().unwrap().push((
+            "release_network_reference".into(),
+            reference.instance_id.clone(),
+        ));
+        if self.block_network_release.load(Ordering::SeqCst) {
+            self.network_release_started.add_permits(1);
+            self.network_release_resume
+                .acquire()
+                .await
+                .unwrap()
+                .forget();
+        }
+        let mut references = self.network_references.lock().await;
+        if references
+            .get(&reference.instance_id)
+            .is_some_and(|held| held != reference)
+        {
+            return Err(GrillError::StateUnavailable {
+                instance: reference.instance_id.clone(),
+                reason: "network reference belongs to another generation".into(),
+            });
+        }
+        references.remove(&reference.instance_id);
+        Ok(())
+    }
+
     async fn retain_network_reference(
         &self,
         instance: &InstanceId,

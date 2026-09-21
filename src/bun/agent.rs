@@ -6393,11 +6393,13 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
             }
             return Ok(());
         };
+        self.authorise_local_discovery_release(&reference).await?;
         self.require_discovery_release_permission(&reference)?;
         self.supervisor
             .grill()
             .release_network_reference(&reference)
             .await?;
+        self.forget_released_discovery_reference(&reference).await?;
         self.network_references.remove(id);
         Ok(())
     }
@@ -12065,7 +12067,94 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn held_discovery_reference_requires_durable_release_permission() {
+    async fn failed_release_permission_checkpoint_preserves_the_runtime_hold() {
+        let (mut agent, _, _, grill) = test_agent_with_grill();
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("discovery");
+        agent.enable_fresh_discovery_ownership(&path).await.unwrap();
+        let reference = original_test_network_reference();
+        grill.set_network_reference(reference.clone()).await;
+        expect_complete(&drain_deploy(&mut agent, basic_config()).await);
+        let checkpoint = path.join("discovery.json");
+        std::fs::remove_file(&checkpoint).unwrap();
+        std::fs::create_dir(&checkpoint).unwrap();
+        assert!(agent.stop_app("web", "default").await.is_err());
+        assert!(
+            !grill
+                .calls()
+                .iter()
+                .any(|(operation, _)| operation == "release_network_reference")
+        );
+        assert_eq!(
+            grill
+                .network_reference(&reference.instance_id)
+                .await
+                .unwrap(),
+            Some(reference)
+        );
+    }
+
+    #[tokio::test]
+    async fn standalone_release_persists_permission_before_runtime_acknowledgement() {
+        let (mut agent, _, _, grill) = test_agent_with_grill();
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("discovery");
+        agent.enable_fresh_discovery_ownership(&path).await.unwrap();
+        let reference = original_test_network_reference();
+        grill.set_network_reference(reference.clone()).await;
+        expect_complete(&drain_deploy(&mut agent, basic_config()).await);
+        grill.block_network_releases();
+        let mut task = tokio::spawn(async move {
+            let result = agent.stop_app("web", "default").await;
+            (agent, result)
+        });
+        tokio::select! {
+            result = &mut task => panic!("standalone retirement returned before authorised release: {:?}", result.unwrap().1),
+            result = tokio::time::timeout(std::time::Duration::from_secs(2), grill.wait_for_network_release()) => result.unwrap(),
+        }
+        let checkpoint: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(path.join("discovery.json")).unwrap()).unwrap();
+        let inventory: crate::bun::discovery_owners::DiscoveryInventory =
+            serde_json::from_value(checkpoint["inventory"].clone()).unwrap();
+        assert_eq!(inventory.references[0].reference, reference);
+        assert_eq!(
+            inventory.references[0].phase,
+            crate::bun::discovery_owners::ReferencePhase::ReleaseAuthorised
+        );
+        assert!(
+            !inventory.services[0]
+                .entry
+                .backends
+                .iter()
+                .any(|backend| backend.instance_id == reference.instance_id.0)
+        );
+        assert_eq!(
+            grill
+                .network_reference(&reference.instance_id)
+                .await
+                .unwrap(),
+            Some(reference.clone())
+        );
+        grill.resume_network_release();
+        let (agent, result) = tokio::time::timeout(std::time::Duration::from_secs(2), task)
+            .await
+            .unwrap()
+            .unwrap();
+        result.unwrap();
+        drop(agent);
+        let journal = crate::bun::discovery_owners::DiscoveryJournal::open(&path).unwrap();
+        assert!(journal.inventory().references.is_empty());
+        assert!(
+            grill
+                .network_reference(&reference.instance_id)
+                .await
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[tokio::test]
+    async fn clustered_discovery_requires_remote_proof_before_release_permission() {
         let (mut agent, _, _, grill) = test_agent_with_grill();
         let directory = tempfile::tempdir().unwrap();
         agent
@@ -12075,6 +12164,8 @@ mod tests {
         let reference = original_test_network_reference();
         grill.set_network_reference(reference.clone()).await;
         expect_complete(&drain_deploy(&mut agent, basic_config()).await);
+        let (mut cluster_agent, _, _) = test_cluster_fault_agent().await;
+        agent.cluster = cluster_agent.cluster.take();
         let result = agent.stop_app("web", "default").await;
         assert!(
             matches!(result, Err(BunError::RetirementState { ref reason, .. }) if reason.contains("durable release permission")),

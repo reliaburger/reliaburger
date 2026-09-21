@@ -107,6 +107,111 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
         .await
     }
 
+    /// Persist standalone release permission after the caller confirms local withdrawal.
+    pub(super) async fn authorise_local_discovery_release(
+        &mut self,
+        reference: &crate::grill::runc_intent::NetworkReference,
+    ) -> Result<(), BunError> {
+        use crate::bun::discovery_owners::ReferencePhase;
+        if matches!(self.discovery_ownership, DiscoveryOwnership::Disabled) {
+            return Ok(());
+        }
+        let refuse = |reason: &str| BunError::RetirementState {
+            instance_id: reference.instance_id.clone(),
+            reason: reason.into(),
+        };
+        if self.cluster.is_some() {
+            return Err(refuse(
+                "remote withdrawal must be confirmed before durable release permission",
+            ));
+        }
+        let DiscoveryOwnership::Ready(journal) = &self.discovery_ownership else {
+            return Err(refuse(
+                "discovery ownership is uncertain; recovery required",
+            ));
+        };
+        let owner = journal
+            .inventory()
+            .references
+            .iter()
+            .find(|owner| owner.reference == *reference)
+            .ok_or_else(|| refuse("original discovery reference is missing"))?;
+        let service = owner.service.clone();
+        let original = journal
+            .inventory()
+            .services
+            .iter()
+            .find(|owner| {
+                owner.entry.namespace == service.namespace && owner.entry.app_name == service.name
+            })
+            .ok_or_else(|| refuse("original service allocation is missing"))?;
+        let live = self
+            .service_map
+            .resolve(&service)
+            .ok_or_else(|| refuse("original service withdrawal is unproven"))?;
+        if live.vip != original.entry.vip
+            || live.port != original.entry.port
+            || live
+                .backends
+                .iter()
+                .any(|backend| backend.instance_id == reference.instance_id.0)
+        {
+            return Err(refuse("original service withdrawal is unproven"));
+        }
+        self.update_discovery_inventory(&service, |next| {
+            for owner in &mut next.services {
+                if owner.entry.namespace == service.namespace
+                    && owner.entry.app_name == service.name
+                {
+                    owner
+                        .entry
+                        .backends
+                        .retain(|backend| backend.instance_id != reference.instance_id.0);
+                }
+            }
+            for owner in &mut next.references {
+                if owner.reference == *reference {
+                    owner.phase = ReferencePhase::ReleaseAuthorised;
+                }
+            }
+        })
+        .await
+    }
+
+    /// Forget a permission only after the runtime acknowledges the exact release.
+    pub(super) async fn forget_released_discovery_reference(
+        &mut self,
+        reference: &crate::grill::runc_intent::NetworkReference,
+    ) -> Result<(), BunError> {
+        if matches!(self.discovery_ownership, DiscoveryOwnership::Disabled) {
+            return Ok(());
+        }
+        self.require_discovery_release_permission(reference)?;
+        let DiscoveryOwnership::Ready(journal) = &self.discovery_ownership else {
+            return Err(BunError::RetirementState {
+                instance_id: reference.instance_id.clone(),
+                reason: "discovery release acknowledgement is uncertain".into(),
+            });
+        };
+        let Some(owner) = journal
+            .inventory()
+            .references
+            .iter()
+            .find(|owner| owner.reference == *reference)
+        else {
+            return Err(BunError::RetirementState {
+                instance_id: reference.instance_id.clone(),
+                reason: "original release permission is missing".into(),
+            });
+        };
+        let service = owner.service.clone();
+        self.update_discovery_inventory(&service, |next| {
+            next.references
+                .retain(|owner| owner.reference != *reference);
+        })
+        .await
+    }
+
     /// Refuse address release until an exact durable permission exists.
     pub(super) fn require_discovery_release_permission(
         &self,

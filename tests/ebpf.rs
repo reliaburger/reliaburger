@@ -3965,28 +3965,34 @@ async fn read_runtime_fixture_page(address: SocketAddr) -> anyhow::Result<String
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[ignore = "requires Linux root, runc, static BusyBox and RELIABURGER_EBPF_TESTS=1"]
 async fn refused_backend_withdrawal_cannot_redirect_a_vip_to_a_new_workload() {
-    check_backend_retirement(None, true).await;
+    check_backend_retirement(None, true, false).await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[ignore = "requires Linux root, runc, static BusyBox and RELIABURGER_EBPF_TESTS=1"]
 async fn refused_rollout_withdrawal_cannot_retire_the_original_destination() {
-    check_backend_retirement(Some("rolling"), true).await;
+    check_backend_retirement(Some("rolling"), true, false).await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[ignore = "requires Linux root, runc, static BusyBox and RELIABURGER_EBPF_TESTS=1"]
 async fn refused_blue_green_withdrawal_cannot_retire_the_original_destination() {
-    check_backend_retirement(Some("blue-green"), true).await;
+    check_backend_retirement(Some("blue-green"), true, false).await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[ignore = "requires Linux root, runc, static BusyBox and RELIABURGER_EBPF_TESTS=1"]
 async fn confirmed_rollout_withdrawal_keeps_the_replacement_reachable() {
-    check_backend_retirement(Some("rolling"), false).await;
+    check_backend_retirement(Some("rolling"), false, false).await;
 }
 
-async fn check_backend_retirement(strategy: Option<&str>, freeze: bool) {
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "requires Linux root, runc, static BusyBox and RELIABURGER_EBPF_TESTS=1"]
+async fn standalone_discovery_release_allows_confirmed_address_reuse() {
+    check_backend_retirement(None, false, true).await;
+}
+
+async fn check_backend_retirement(strategy: Option<&str>, freeze: bool, durable: bool) {
     use reliaburger::bun::agent::{AgentCommand, ApplyEvent, BunAgent};
     use reliaburger::grill::{Grill, ImageStore, InstanceId, port::PortAllocator, runc::RuncGrill};
     use std::sync::Arc;
@@ -4023,9 +4029,16 @@ async fn check_backend_retirement(strategy: Option<&str>, freeze: bool) {
     agent.set_records_dir(root.path().join("records"));
     agent.set_volumes_dir(root.path().join("volumes"));
     agent.set_onion_ebpf(Arc::clone(&ebpf)).await;
+    if durable {
+        agent
+            .enable_fresh_discovery_ownership(&root.path().join("discovery"))
+            .await
+            .unwrap();
+    }
     let services = agent.service_map_watch();
     let task = tokio::spawn(async move { agent.run().await });
     let exercise = async {
+        let mut original_address = None;
         for name in ["address-predecessor", "address-successor"] {
             let port = if name == "address-predecessor" { "port = 8080" } else { "" };
             let config = reliaburger::config::Config::parse(&format!(
@@ -4038,6 +4051,10 @@ async fn check_backend_retirement(strategy: Option<&str>, freeze: bool) {
             }
             let id = InstanceId(format!("default__{name}-0"));
             let ip = runtime.container_ip(&id).await.ok_or_else(|| anyhow::anyhow!("runtime omitted container address"))?;
+            if durable {
+                if name == "address-predecessor" { original_address = Some(ip); }
+                else { anyhow::ensure!(original_address == Some(ip), "confirmed release did not make the original address reusable"); }
+            }
             let ready = read_runtime_fixture_page(SocketAddr::new(ip.into(), 8080))
                 .await.map_err(|error| anyhow::anyhow!("direct {id} ({ip}): {error}"))?;
             anyhow::ensure!(ready.contains(&id.0), "fixture did not serve its own identity");
@@ -4084,13 +4101,25 @@ async fn check_backend_retirement(strategy: Option<&str>, freeze: bool) {
                 } else {
                     let (response, result) = oneshot::channel();
                     commands.send(AgentCommand::Retire { app_name: name.into(), namespace: "default".into(), response }).await?;
-                    anyhow::ensure!(result.await?.is_err(), "frozen backend retirement was acknowledged");
+                    let retired = result.await?;
+                    if durable {
+                        retired?;
+                        anyhow::ensure!(runtime.network_reference(&id).await?.is_none(), "runtime retained its released reference");
+                        let checkpoint: serde_json::Value = serde_json::from_slice(&std::fs::read(root.path().join("discovery/discovery.json"))?)?;
+                        let inventory: reliaburger::bun::discovery_owners::DiscoveryInventory = serde_json::from_value(checkpoint["inventory"].clone())?;
+                        anyhow::ensure!(inventory.references.is_empty(), "acknowledged release remains in the checkpoint");
+                    } else {
+                        anyhow::ensure!(retired.is_err(), "frozen backend retirement was acknowledged");
+                    }
                 }
             }
         }
         let vip = VirtualIP::from_service_id(&ServiceId::new("default", "address-predecessor"));
-        read_runtime_fixture_page(SocketAddr::new(vip.0.into(), 8080))
-            .await.map_err(|error| anyhow::anyhow!("original VIP after refused retirement: {error}"))
+        let response = read_runtime_fixture_page(SocketAddr::new(vip.0.into(), 8080)).await;
+        if durable {
+            anyhow::ensure!(response.is_err(), "retired VIP reached a reused address");
+            Ok(String::new())
+        } else { response.map_err(|error| anyhow::anyhow!("original VIP after refused retirement: {error}")) }
     }.await;
     shutdown.cancel();
     task.await.unwrap();
@@ -4115,6 +4144,9 @@ async fn check_backend_retirement(strategy: Option<&str>, freeze: bool) {
         }
     }
     let response = exercise.unwrap();
+    if durable {
+        return;
+    }
     assert!(
         !response.contains("default__address-successor-0"),
         "old VIP served an unrelated replacement: {response}"

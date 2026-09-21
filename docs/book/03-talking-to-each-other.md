@@ -1677,3 +1677,26 @@ controller-task loss it reopens the journal and compares the saved reference wit
 the runtime's original hold. The fixture then confirms that natural exit leaves
 the old address unavailable to a successor while the retained backend exists.
 This is controller-task loss, not the later required actual Bun SIGKILL gate.
+
+### Permission must precede physical release
+
+For an agent without cluster membership, successful local withdrawal and request
+release supply the discovery proof. Before handing an address back to the runtime,
+Bun checks the original service's VIP and port, confirms its backend is absent,
+and persists ReleaseAuthorised for the exact original reference. Only then does
+it call the runtime. After acknowledgement it removes the reference from the
+checkpoint and its in-memory inventory. A failure between those writes leaves a
+replayable permission, rather than an ambiguous missing owner.
+
+The ordering test pauses the runtime's release method and reads the checkpoint.
+It must already contain ReleaseAuthorised, while the runtime still holds the
+address. Resuming release must remove the reference from both inventories. A
+broken permission checkpoint must prevent the runtime call entirely. Clustered
+agents refuse this local authorisation: they need remote withdrawal evidence,
+even when this node's own routing is empty.
+
+A physical owned-Runc/eBPF case then retires an application, observes the cleared
+runtime/checkpoint reference, starts a successor on the same address and checks
+that the predecessor's VIP cannot reach it. Service-allocation retirement and
+recovery replay are separate remaining steps; these address permissions do not
+silently forget the service's original VIP.
