@@ -22,7 +22,7 @@ use crate::cluster::applied::{AppliedMap, AssignmentState};
 use crate::config::app::AppSpec;
 use crate::config::{Config, Replicas};
 use crate::council::node::CouncilNode;
-use crate::council::types::{CouncilNodeInfo, RaftRequest};
+use crate::council::types::{CouncilNodeInfo, CouncilResponse, RaftRequest};
 use crate::meat::cluster_state::{ClusterStateCache, SchedulerNodeState};
 use crate::meat::types::{NodeId, Resources};
 use crate::mustard::membership::MembershipSnapshot;
@@ -110,10 +110,6 @@ pub fn spawn_leader_scheduler(
     tokio::spawn(async move {
         let mut reconstruction = ReconstructionController::new(reconstruction_config);
         let mut was_leader = false;
-        // The catalogue last replicated, so a tick that finds no change skips
-        // the Raft write — the reporting interval ticks often and most ticks
-        // don't move any backend.
-        let mut last_published: Option<crate::onion::catalog::EndpointCatalog> = None;
         let mut tick = tokio::time::interval(RECONCILE_INTERVAL);
         loop {
             let capacity_request = tokio::select! {
@@ -163,13 +159,18 @@ pub fn spawn_leader_scheduler(
                 }
             };
             if let Some(catalog) = catalog
-                && last_published.as_ref() != Some(&catalog)
+                && desired.endpoint_catalog != catalog
             {
                 match council
-                    .write(RaftRequest::PublishEndpoints(Box::new(catalog.clone())))
+                    .write(RaftRequest::PublishEndpoints(Box::new(catalog)))
                     .await
                 {
-                    Ok(_) => last_published = Some(catalog),
+                    // A committed request can still be refused by the state
+                    // machine. Only committed catalogue state suppresses retry.
+                    Ok(CouncilResponse::Applied { .. }) => {}
+                    Ok(response) => {
+                        eprintln!("scheduler: endpoint catalogue was not applied: {response:?}");
+                    }
                     Err(e) => eprintln!("scheduler: failed to publish endpoint catalogue: {e}"),
                 }
             }

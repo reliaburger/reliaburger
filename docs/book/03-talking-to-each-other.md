@@ -1836,3 +1836,20 @@ Four failing-first tests cover colliding arrivals, departures, conflicting saved
 allocations and exhaustion. These stable active allocations are a prerequisite
 for remote retirement evidence. They do not authorise reuse after service deletion;
 retiring deleted allocations still needs the acknowledgement ledger.
+
+### A successful write is not a permanent receipt
+
+Suppose this scheduler publishes a catalogue, loses leadership, and later takes
+charge again. Another leader may have changed the catalogue in between. Comparing
+against a local copy of our last write can leave the wrong committed catalogue in
+place indefinitely. A Raft request can also commit successfully while its state
+machine returns `CouncilResponse::Refused`; transport success isn't application
+success.
+
+The scheduler now compares each candidate against the current committed catalogue.
+It accepts only `CouncilResponse::Applied` as a successful publication and logs
+other replies. No local success cache suppresses future retries. The integration
+test uses a real single-node council: replace a previously published catalogue,
+require the running scheduler to restore it, then check that unchanged state
+produces no extra log entries. This is publication convergence, not proof that
+remote consumers have withdrawn an endpoint.

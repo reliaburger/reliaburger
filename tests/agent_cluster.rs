@@ -47,6 +47,98 @@ fn node_info(id: u64, port: u16) -> CouncilNodeInfo {
     )
 }
 
+/// A previous successful write is not evidence about the current committed state.
+#[tokio::test]
+async fn scheduler_repairs_a_catalogue_replaced_after_its_last_publication() {
+    use reliaburger::cluster::orchestrate::spawn_leader_scheduler;
+    use reliaburger::council::types::CouncilResponse;
+    use reliaburger::onion::service_id::ServiceId;
+
+    let router = InMemoryRaftRouter::new();
+    let council = std::sync::Arc::new(
+        CouncilNode::new(
+            1,
+            fast_council_config(),
+            InMemoryRaftNetworkFactory::new(1, router.clone()),
+            MemLogStore::new(),
+            CouncilStateMachine::new(),
+            None,
+        )
+        .await
+        .unwrap(),
+    );
+    router.register(1, council.raft().clone()).await;
+    council
+        .initialize(BTreeMap::from([(1, node_info(1, 9444))]))
+        .await
+        .unwrap();
+    let mut metrics = council.metrics();
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while metrics.borrow().current_leader != Some(1) {
+            metrics.changed().await.unwrap();
+        }
+    })
+    .await
+    .unwrap();
+    let response = council
+        .write(RaftRequest::AppSpec {
+            app_id: reliaburger::meat::AppId::new("api", "default"),
+            spec: Box::new(toml::from_str("image = 'example:v1'\nport = 8080").unwrap()),
+        })
+        .await
+        .unwrap();
+    assert!(matches!(response, CouncilResponse::Applied { .. }));
+    let shutdown = CancellationToken::new();
+    let (_members, membership_rx) = watch::channel(Vec::new());
+    let (_reports, reports_rx) = watch::channel(Default::default());
+    let _admission = spawn_leader_scheduler(
+        council.clone(),
+        membership_rx,
+        reports_rx,
+        false,
+        Default::default(),
+        shutdown.clone(),
+    );
+    let service = ServiceId::new("default", "api");
+    let result = tokio::time::timeout(Duration::from_secs(8), async {
+        loop {
+            if council
+                .desired_state()
+                .await
+                .endpoint_catalog
+                .resolve(&service)
+                .is_some()
+            {
+                break;
+            }
+            metrics.changed().await.unwrap();
+        }
+        let original = council.desired_state().await.endpoint_catalog;
+        let response = council
+            .write(RaftRequest::PublishEndpoints(Box::default()))
+            .await
+            .unwrap();
+        assert!(matches!(response, CouncilResponse::Applied { .. }));
+        loop {
+            if council.desired_state().await.endpoint_catalog == original {
+                break;
+            }
+            metrics.changed().await.unwrap();
+        }
+        // Unchanged committed state must not produce a Raft write every tick.
+        let settled = metrics.borrow().last_applied;
+        tokio::time::sleep(Duration::from_secs(3)).await;
+        assert_eq!(metrics.borrow().last_applied, settled);
+    })
+    .await;
+    shutdown.cancel();
+    council.shutdown().await.unwrap();
+    assert!(
+        result.is_ok(),
+        "scheduler trusted an obsolete publication cache"
+    );
+}
+
 /// Agent nodes endpoint returns gossip membership when cluster is wired.
 #[tokio::test]
 async fn agent_nodes_returns_membership() {
