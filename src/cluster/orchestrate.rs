@@ -743,6 +743,7 @@ fn build_endpoint_catalog(
                 .or_insert((service_id, declared_port, Vec::new()))
                 .2
                 .push(CatalogBackend {
+                    execution: app.execution.clone(),
                     node_id: node_id.0.clone(),
                     node_ip,
                     host_port,
@@ -1944,6 +1945,7 @@ image = "busybox:latest"
     ) -> crate::reporting::types::RunningApp {
         use crate::reporting::types::{AppResourceUsage, ReportHealthStatus, RunningApp};
         RunningApp {
+            execution: None,
             app_name: name.to_string(),
             namespace: namespace.to_string(),
             instance_id: 0,
@@ -1974,6 +1976,11 @@ image = "busybox:latest"
         };
         let mut ra = report(4000, 100);
         ra.running_apps = vec![running_app("default", "api", 30001, true)];
+        let execution = crate::grill::RuntimeExecution {
+            instance_id: crate::grill::InstanceId("default__api-g3-0".into()),
+            generation: crate::grill::RuntimeGeneration::process("private-runtime-generation"),
+        };
+        ra.running_apps[0].execution = Some(execution.clone());
         reports.reports.insert(NodeId::new("node-a"), ra);
         let mut rb = report(4000, 100);
         rb.running_apps = vec![running_app("default", "api", 30002, false)];
@@ -1990,6 +1997,14 @@ image = "busybox:latest"
         let svc = catalog.resolve(&ServiceId::new("default", "api")).unwrap();
         assert_eq!(svc.port, 3000, "declared port taken from the spec");
         assert_eq!(svc.backends.len(), 2, "both nodes' backends present");
+        assert_eq!(
+            svc.backends
+                .iter()
+                .find(|backend| backend.node_id == "node-a")
+                .unwrap()
+                .execution,
+            Some(execution)
+        );
         assert!(
             svc.backends
                 .iter()

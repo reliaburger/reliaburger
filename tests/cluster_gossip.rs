@@ -67,6 +67,7 @@ fn spawn_fake_agent(mut rx: mpsc::Receiver<CollectSnapshotRequest>, shutdown: Ca
                         egress_degraded: false,
                         egress_affected_workloads: Vec::new(),
                         instances: vec![InstanceSnapshot {
+                            execution: None,
                             app_name: "web".to_string(),
                             namespace: "default".to_string(),
                             instance_id: 0,

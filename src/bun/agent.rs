@@ -3376,6 +3376,24 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
         #[cfg(not(all(feature = "ebpf", target_os = "linux")))]
         let egress_affected_workloads = Vec::new();
 
+        // The report deadline is two seconds. Bound the evidence read without
+        // hiding capacity when inventory is unavailable or internally ambiguous.
+        let launches = match tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            self.supervisor.grill().launch_inventory(),
+        )
+        .await
+        {
+            Ok(Ok(Some(launches))) => {
+                let count = launches.len();
+                let by_instance: std::collections::HashMap<_, _> = launches
+                    .into_iter()
+                    .map(|launch| (launch.instance_id.clone(), launch))
+                    .collect();
+                (by_instance.len() == count).then_some(by_instance)
+            }
+            _ => None,
+        };
         let instances = self.supervisor.list_instances();
         let snapshot = AgentSnapshot {
             instances: instances
@@ -3414,6 +3432,14 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
                     };
 
                     InstanceSnapshot {
+                        execution: launches
+                            .as_ref()
+                            .and_then(|known| known.get(&inst.id))
+                            .filter(|launch| inst.oci_spec.as_ref() == Some(&launch.spec))
+                            .map(|launch| crate::grill::RuntimeExecution {
+                                instance_id: launch.instance_id.clone(),
+                                generation: launch.generation.clone(),
+                            }),
                         app_name: inst.app_name.clone(),
                         namespace: inst.namespace.clone(),
                         instance_id,
@@ -12024,6 +12050,61 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn reporting_binds_execution_to_the_original_runtime_specification() {
+        let (mut agent, _, _, grill) = test_agent_with_grill();
+        expect_complete(&drain_deploy(&mut agent, basic_config()).await);
+        let id = InstanceId("default__web-0".into());
+        let spec = agent
+            .supervisor
+            .get_instance(&id)
+            .unwrap()
+            .oci_spec
+            .clone()
+            .unwrap();
+        for token in [
+            "first-original-generation",
+            "replacement-original-generation",
+        ] {
+            let launch = crate::grill::RuntimeLaunch {
+                instance_id: id.clone(),
+                spec: spec.clone(),
+                generation: crate::grill::RuntimeGeneration::process(token),
+                network_reference: None,
+            };
+            let expected = crate::grill::RuntimeExecution {
+                instance_id: id.clone(),
+                generation: launch.generation.clone(),
+            };
+            grill.set_launch_inventory(vec![launch.clone()]).await;
+            let (tx, rx) = oneshot::channel();
+            agent
+                .handle_snapshot_request(CollectSnapshotRequest { response: tx })
+                .await;
+            assert_eq!(rx.await.unwrap().instances[0].execution, Some(expected));
+            let mut wrong_spec = launch.clone();
+            wrong_spec
+                .spec
+                .process
+                .args
+                .push("different-runtime-spec".into());
+            for invalid in [vec![wrong_spec], vec![launch.clone(), launch], vec![]] {
+                grill.set_launch_inventory(invalid).await;
+                let (tx, rx) = oneshot::channel();
+                agent
+                    .handle_snapshot_request(CollectSnapshotRequest { response: tx })
+                    .await;
+                let report = rx.await.unwrap();
+                assert_eq!(
+                    report.instances.len(),
+                    1,
+                    "missing identity must not hide resource commitments"
+                );
+                assert!(report.instances[0].execution.is_none());
+            }
+        }
+    }
+
+    #[tokio::test]
     async fn late_discovery_subscribers_receive_the_latest_service_snapshot() {
         let (mut agent, _commands, _shutdown) = test_agent();
         expect_complete(&drain_deploy(&mut agent, basic_config()).await);
@@ -14974,6 +15055,7 @@ host = "remote.local"
             crate::onion::service_id::ServiceId::new("default", "remote"),
             8080,
             vec![crate::onion::catalog::CatalogBackend {
+                execution: None,
                 node_id: "other-node".into(),
                 node_ip: "192.168.1.2".parse().unwrap(),
                 host_port: 30001,

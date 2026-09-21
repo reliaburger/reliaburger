@@ -32,6 +32,9 @@ pub const MAX_ENDPOINT_CONSUMERS: usize = 65_536;
 /// leader rebuild the catalogue idempotently.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CatalogBackend {
+    /// Original execution identity, when durable runtime evidence is available.
+    #[serde(default)]
+    pub execution: Option<crate::grill::RuntimeExecution>,
     /// Name of the node running this backend.
     pub node_id: String,
     /// Real node IP the backend listens on.
@@ -201,6 +204,7 @@ mod tests {
 
     fn backend(node: &str, ip: [u8; 4], port: u16, healthy: bool) -> CatalogBackend {
         CatalogBackend {
+            execution: None,
             node_id: node.to_string(),
             node_ip: Ipv4Addr::from(ip),
             host_port: port,

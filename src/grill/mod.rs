@@ -247,8 +247,24 @@ pub enum GrillError {
 }
 
 /// Non-secret identity of one original runtime execution generation.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(try_from = "String")]
 pub struct RuntimeGeneration(String);
+
+impl TryFrom<String> for RuntimeGeneration {
+    type Error = &'static str;
+
+    fn try_from(value: String) -> Result<Self, Self::Error> {
+        if value.len() != 64
+            || !value
+                .bytes()
+                .all(|byte| byte.is_ascii_digit() || matches!(byte, b'a'..=b'f'))
+        {
+            return Err("invalid runtime generation fingerprint");
+        }
+        Ok(Self(value))
+    }
+}
 
 impl RuntimeGeneration {
     /// Stable fingerprint for correlation, never an execution capability.
@@ -270,6 +286,16 @@ impl RuntimeGeneration {
         digest.update(token.as_bytes());
         Self(hex::encode(digest.finish().as_ref()))
     }
+}
+
+/// Original execution behind a reported or published workload endpoint.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RuntimeExecution {
+    /// Exact canonical runtime instance name, including deployment generation.
+    pub instance_id: InstanceId,
+    /// Non-secret fingerprint from that instance's original runtime intent.
+    pub generation: RuntimeGeneration,
 }
 
 /// A durable runtime launch, written before user code can execute.
@@ -821,6 +847,27 @@ async fn which_exists(name: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn runtime_generation_wire_values_require_canonical_fingerprints() {
+        let original = RuntimeGeneration::process("private-generation");
+        let json = serde_json::to_string(&original).unwrap();
+        assert_eq!(
+            serde_json::from_str::<RuntimeGeneration>(&json).unwrap(),
+            original
+        );
+        for invalid in [
+            String::new(),
+            "private-owner-token".into(),
+            "A".repeat(64),
+            "g".repeat(64),
+            "a".repeat(65),
+        ] {
+            assert!(
+                serde_json::from_value::<RuntimeGeneration>(serde_json::json!(invalid)).is_err()
+            );
+        }
+    }
+
     #[test]
     fn runtime_generation_fingerprints_never_expose_or_confuse_owner_tokens() {
         let token = "1234567890abcdef1234567890abcdef";

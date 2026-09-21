@@ -720,6 +720,7 @@ mod tests {
             ServiceId::new("payments", "api"),
             3000,
             vec![CatalogBackend {
+                execution: None,
                 node_id: "node-b".to_string(),
                 node_ip: std::net::Ipv4Addr::new(10, 0, 0, 2),
                 host_port: 30002,

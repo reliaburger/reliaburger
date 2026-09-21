@@ -50,6 +50,10 @@ fn spawn_fake_agent(
                         egress_degraded: false,
                         egress_affected_workloads: Vec::new(),
                         instances: vec![InstanceSnapshot {
+                            execution: Some(reliaburger::grill::RuntimeExecution {
+                                instance_id: reliaburger::grill::InstanceId("default__web-g7-0".into()),
+                                generation: "a".repeat(64).try_into().unwrap(),
+                            }),
                             app_name: "web".to_string(),
                             namespace: "default".to_string(),
                             instance_id: 0,
@@ -137,6 +141,18 @@ async fn tcp_reporting_two_workers_report_to_one_aggregator() {
         "aggregator did not receive both worker reports; have: {:?}",
         watch_rx.borrow().reports.keys().collect::<Vec<_>>()
     );
+
+    {
+        let view = watch_rx.borrow();
+        for name in ["w1", "w2"] {
+            let execution = view.reports[&NodeId::new(name)].running_apps[0]
+                .execution
+                .as_ref()
+                .unwrap();
+            assert_eq!(execution.instance_id.0, "default__web-g7-0");
+            assert_eq!(execution.generation.as_str(), "a".repeat(64));
+        }
+    }
 
     shutdown.cancel();
     for task in tasks {

@@ -524,12 +524,14 @@ async fn worker_without_council_metrics_excludes_its_own_stale_endpoints() {
     let shared = ServiceId::new("default", "shared");
     let retired = ServiceId::new("default", "retired");
     let local = CatalogBackend {
+        execution: None,
         node_id: "worker".into(),
         node_ip: "192.0.2.1".parse().unwrap(),
         host_port: 30001,
         healthy: true,
     };
     let remote = CatalogBackend {
+        execution: None,
         node_id: "remote".into(),
         node_ip: "192.0.2.2".parse().unwrap(),
         host_port: 30002,

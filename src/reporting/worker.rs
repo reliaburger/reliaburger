@@ -28,6 +28,8 @@ use super::types::{
 /// to `RunningApp` for the StateReport.
 #[derive(Debug, Clone)]
 pub struct InstanceSnapshot {
+    /// Original execution identity, when durable runtime evidence is available.
+    pub execution: Option<crate::grill::RuntimeExecution>,
     /// App name.
     pub app_name: String,
     /// Namespace the app belongs to.
@@ -289,6 +291,7 @@ impl<T: ReportingTransport> ReportWorker<T> {
                 };
 
                 RunningApp {
+                    execution: inst.execution.clone(),
                     app_name: inst.app_name.clone(),
                     namespace: inst.namespace.clone(),
                     instance_id: inst.instance_id,
@@ -416,6 +419,7 @@ mod tests {
                                     namespace: "default".to_string(),
                                 }],
                                 instances: vec![InstanceSnapshot {
+                                    execution: None,
                                     app_name: "web".to_string(),
                                     namespace: "default".to_string(),
                                     instance_id: 0,
@@ -560,6 +564,7 @@ mod tests {
 
     fn instance(name: &str, state: ContainerState, cpu: u32, memory: u32) -> InstanceSnapshot {
         InstanceSnapshot {
+            execution: None,
             app_name: name.to_string(),
             namespace: "default".to_string(),
             instance_id: 0,
@@ -572,6 +577,39 @@ mod tests {
             memory_request_mb: memory,
             egress_enforcement: Default::default(),
         }
+    }
+
+    #[tokio::test]
+    async fn reporting_preserves_the_original_execution_identity() {
+        let net = InMemoryReportingNetwork::new();
+        let transport = net.register(addr(1)).await;
+        let (snapshot_tx, _) = mpsc::channel(1);
+        let (_, council_rx) = watch::channel(Vec::new());
+        let worker = ReportWorker::new(
+            NodeId::new("w1"),
+            transport,
+            test_config(),
+            snapshot_tx,
+            council_rx,
+            CancellationToken::new(),
+        );
+        let mut instance = instance("web", ContainerState::Running, 250, 128);
+        let execution = crate::grill::RuntimeExecution {
+            instance_id: crate::grill::InstanceId("default__web-g7-0".into()),
+            generation: crate::grill::RuntimeGeneration::process("private-generation"),
+        };
+        instance.execution = Some(execution.clone());
+        let report = worker.build_report(AgentSnapshot {
+            instances: vec![instance],
+            capabilities: Default::default(),
+            readiness: None,
+            egress_degraded: false,
+            egress_affected_workloads: vec![],
+            allocated_ports: vec![],
+            capacity_cpu_millicores: 8000,
+            capacity_memory_mb: 16384,
+        });
+        assert_eq!(report.running_apps[0].execution, Some(execution));
     }
 
     #[tokio::test]

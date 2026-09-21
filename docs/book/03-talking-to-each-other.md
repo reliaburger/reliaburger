@@ -1904,3 +1904,29 @@ instance gets a new value. Discovery recovery also checks that this fingerprint
 matches the original Runc address reference before accepting the inventory.
 This change is in-memory runtime evidence only. Carrying it through reports and
 catalogues, and requiring generation-specific retirement receipts, comes next.
+
+
+### Keeping the original execution identity through the reporting path
+
+The worker used to report only a replica ordinal. That loses deployment names
+and runtime generations, so two executions using the same node and host port
+look identical to remote routing. Reports and catalogue backends now also carry
+the canonical instance name and its non-secret execution fingerprint.
+
+Bun reads the original runtime inventory within a bounded deadline. It attaches
+an identity only when the instance and complete original specification match.
+Duplicate inventory entries, unavailable evidence and changed specifications
+produce an unknown identity; resource commitments still appear in the report.
+We don't invent an owner from an ordinal or a port number.
+
+The reporting worker preserves this evidence, the leader includes it in the
+catalogue, and remote routing includes the fingerprint in its backend key. A
+replacement execution therefore has a different key even if it reuses the same
+address. Unknown identities retain the older routing key and cannot serve as
+retirement proof. Withdrawal acknowledgements remain separate work.
+
+`TryFrom<String>` checks deserialised fingerprints before constructing the
+newtype: exactly 64 lowercase hexadecimal characters. Its Result either contains
+a valid identity or a short error, without echoing an accidentally supplied
+private token. Protocol 16/state 29 describe the changed reporting wire and
+replicated catalogue. Fresh pre-release clusters are required.

@@ -364,19 +364,17 @@ impl ServiceMap {
     }
 }
 
-/// A stable synthetic instance id for a catalogue backend.
-///
-/// The catalogue doesn't carry the original per-instance id, but the
-/// merge needs a key to deduplicate against local backends. `{node}:{ip}:
-/// {port}` is unique per backend and stable across ticks, so a remote
-/// backend never duplicates and a local one it overlaps is matched by the
-/// local map's own `add_backend` dedupe path (both key on this string when
-/// the local id was built the same way — see the agent's merge).
+/// Separate successive executions even when they share a node and host port.
+/// Unknown execution evidence retains the legacy key and is not retirement proof.
 fn catalog_instance_id(backend: &super::catalog::CatalogBackend) -> String {
-    format!(
+    let endpoint = format!(
         "{}:{}:{}",
         backend.node_id, backend.node_ip, backend.host_port
-    )
+    );
+    match &backend.execution {
+        Some(execution) => format!("{endpoint}:{}", execution.generation.as_str()),
+        None => endpoint,
+    }
 }
 
 /// Usable VIP slots in `127.128.0.0/16` (65,534: excludes .0.0 and .255.255).
@@ -875,12 +873,14 @@ mod tests {
             8080,
             vec![
                 CatalogBackend {
+                    execution: None,
                     node_id: "here".into(),
                     node_ip: "192.168.1.1".parse().unwrap(),
                     host_port: 30001,
                     healthy: true,
                 },
                 CatalogBackend {
+                    execution: None,
                     node_id: "there".into(),
                     node_ip: "192.168.1.2".parse().unwrap(),
                     host_port: 30002,
@@ -896,6 +896,40 @@ mod tests {
     }
 
     #[test]
+    fn remote_backend_identity_changes_when_the_same_port_gets_a_new_execution() {
+        use crate::onion::catalog::{CatalogBackend, EndpointCatalog};
+        let service = sid("default", "web");
+        let mut keys = Vec::new();
+        for token in ["original-generation", "replacement-generation"] {
+            let catalog = EndpointCatalog::rebuild([(
+                service.clone(),
+                8080,
+                vec![CatalogBackend {
+                    execution: Some(crate::grill::RuntimeExecution {
+                        instance_id: crate::grill::InstanceId("default__web-0".into()),
+                        generation: crate::grill::RuntimeGeneration::process(token),
+                    }),
+                    node_id: "worker".into(),
+                    node_ip: "192.0.2.1".parse().unwrap(),
+                    host_port: 30000,
+                    healthy: true,
+                }],
+            )])
+            .unwrap();
+            let view = ServiceMap::new().with_cluster_catalog(&catalog);
+            keys.push(
+                view.resolve(&service).unwrap().backends[0]
+                    .instance_id
+                    .clone(),
+            );
+        }
+        assert_ne!(
+            keys[0], keys[1],
+            "a stale withdrawal must not identify a replacement execution"
+        );
+    }
+
+    #[test]
     fn with_cluster_catalog_adds_remote_only_service() {
         use crate::onion::catalog::{CatalogBackend, EndpointCatalog};
 
@@ -906,6 +940,7 @@ mod tests {
             sid("payments", "api"),
             3000,
             vec![CatalogBackend {
+                execution: None,
                 node_id: "node-b".to_string(),
                 node_ip: Ipv4Addr::new(10, 0, 0, 2),
                 host_port: 30002,
@@ -947,6 +982,7 @@ mod tests {
             sid("default", "web"),
             8080,
             vec![CatalogBackend {
+                execution: None,
                 node_id: "node-b".to_string(),
                 node_ip: Ipv4Addr::new(10, 0, 0, 2),
                 host_port: 30002,
@@ -993,6 +1029,7 @@ mod tests {
             sid("default", "web"),
             8080,
             vec![CatalogBackend {
+                execution: None,
                 node_id: "node-a".to_string(),
                 node_ip: Ipv4Addr::new(10, 0, 0, 1),
                 host_port: 30001,

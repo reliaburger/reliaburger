@@ -943,3 +943,14 @@ fingerprint that does not match its original Runc address reference. Native/Linu
 library, real process recovery and two physical Runc cases pass, with strict
 checks. This has not yet been propagated through reports/catalogues; continue
 step 1 there. The private owner capability stays private. Formats remain 15/28.
+
+
+The report/catalogue identity path is now implemented and qualified (protocol
+16/state 29). Bun binds evidence to the original spec; unknown evidence still
+reports capacity. The original canonical instance and validated public fingerprint
+survive worker/TCP/council propagation, and remote backend keys distinguish
+successive executions on one address. Five red contracts, 688 native/700 Linux
+library cases, 14 integration cases per platform and three real placement cases
+pass with strict checks. Before the withdrawal ledger, bound the new periodic
+inventory readers across caller cancellation: their blocking worker must retain
+its single concurrency slot until it actually finishes.
