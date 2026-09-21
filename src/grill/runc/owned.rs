@@ -22,6 +22,7 @@ use crate::grill::runc_intent::{
 pub(super) struct Ownership {
     executable: PathBuf,
     contexts: Arc<Mutex<HashMap<InstanceId, ClaimedCommandExecutor>>>,
+    inventory_reader: crate::grill::inventory::InventoryReader,
 }
 
 fn failure(instance: &InstanceId, error: impl std::fmt::Display) -> GrillError {
@@ -47,6 +48,7 @@ impl RuncGrill {
         self.ownership = Some(Ownership {
             executable,
             contexts: Arc::new(Mutex::new(HashMap::new())),
+            inventory_reader: Default::default(),
         });
         Ok(self)
     }
@@ -683,16 +685,16 @@ impl RuncGrill {
     pub(super) async fn owned_inventory(
         &self,
     ) -> Result<Option<Vec<crate::grill::RuntimeLaunch>>, GrillError> {
-        let records = self
-            .intent_journal()
-            .map_err(|error| GrillError::InventoryUnavailable {
-                reason: error.to_string(),
-            })?
-            .inventory()
+        let unavailable = |error: io::Error| GrillError::InventoryUnavailable {
+            reason: error.to_string(),
+        };
+        let ownership = self.ownership().map_err(unavailable)?;
+        let journal = self.intent_journal().map_err(unavailable)?;
+        let records = ownership
+            .inventory_reader
+            .read(async move { journal.inventory().await })
             .await
-            .map_err(|error| GrillError::InventoryUnavailable {
-                reason: error.to_string(),
-            })?;
+            .map_err(unavailable)?;
         Ok(Some(
             records
                 .into_iter()

@@ -1930,3 +1930,23 @@ newtype: exactly 64 lowercase hexadecimal characters. Its Result either contains
 a valid identity or a short error, without echoing an accidentally supplied
 private token. Protocol 16/state 29 describe the changed reporting wire and
 replicated catalogue. Fresh pre-release clusters are required.
+
+
+### A report timeout must not start another filesystem reader
+
+A slow disk can outlast Bun's one-second inventory deadline. Tokio cannot cancel
+an already-running blocking filesystem operation merely because its caller stops
+waiting. Repeating that report could otherwise accumulate readers.
+
+ProcessControl and owned Runc now share one inventory permit across their clones.
+The reader acquires an `OwnedSemaphorePermit`, a token that keeps its semaphore
+alive without borrowing the caller. An `async move` task takes ownership of that
+token and keeps it until the read actually ends. Dropping the caller's join handle
+detaches the task; it doesn't release the permit. A caller cancelled while queued
+never starts its read. An I/O error releases the permit so the next report can retry.
+
+Runc constructs a new intent journal for each read, so putting the semaphore in
+that temporary journal would achieve nothing. It belongs to the shared runtime
+ownership instead. The regression aborts one caller, times out a second, releases
+the original operation, and verifies that the cancelled queued read never runs.
+A separate case checks recovery after a failed read.

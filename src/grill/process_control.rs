@@ -21,11 +21,16 @@ mod prune;
 pub(crate) struct ProcessControl {
     root: PathBuf,
     executable: PathBuf,
+    inventory_reader: super::inventory::InventoryReader,
 }
 
 impl ProcessControl {
     pub(crate) fn new(root: PathBuf, executable: PathBuf) -> Self {
-        Self { root, executable }
+        Self {
+            root,
+            executable,
+            inventory_reader: Default::default(),
+        }
     }
 
     fn directory(&self, id: &InstanceId) -> io::Result<PathBuf> {
@@ -75,41 +80,47 @@ impl ProcessControl {
 
     pub(crate) async fn inventory(&self) -> io::Result<Vec<super::RuntimeLaunch>> {
         let this = self.clone();
-        tokio::task::spawn_blocking(move || {
-            match std::fs::symlink_metadata(&this.root) {
-                Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(Vec::new()),
-                Err(error) => return Err(error),
-                Ok(_) => validate_directory(&this.root)?,
-            }
-            let mut launches = Vec::new();
-            for entry in std::fs::read_dir(&this.root)? {
-                let entry = entry?;
-                let name = entry
-                    .file_name()
-                    .into_string()
-                    .map_err(|_| io::Error::other("non-UTF-8 process launch identity"))?;
-                if name.starts_with(".preparing-") && entry.file_type()?.is_dir() {
-                    // Publication precedes owner launch. An abandoned staging
-                    // directory has never granted permission to execute.
-                    continue;
-                }
-                let instance_id = InstanceId(name);
-                let record = this.load(&instance_id)?;
-                let launch = record
-                    .launch
-                    .ok_or_else(|| io::Error::other("missing process launch intent"))?;
-                launches.push(super::RuntimeLaunch {
-                    generation: super::RuntimeGeneration::process(&record.nonce),
-                    instance_id,
-                    spec: launch.spec,
-                    network_reference: None,
-                });
-            }
-            launches.sort_by(|left, right| left.instance_id.0.cmp(&right.instance_id.0));
-            Ok(launches)
-        })
-        .await
-        .map_err(io::Error::other)?
+        self.inventory_reader
+            .read(async move {
+                tokio::task::spawn_blocking(move || {
+                    match std::fs::symlink_metadata(&this.root) {
+                        Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                            return Ok(Vec::new());
+                        }
+                        Err(error) => return Err(error),
+                        Ok(_) => validate_directory(&this.root)?,
+                    }
+                    let mut launches = Vec::new();
+                    for entry in std::fs::read_dir(&this.root)? {
+                        let entry = entry?;
+                        let name = entry
+                            .file_name()
+                            .into_string()
+                            .map_err(|_| io::Error::other("non-UTF-8 process launch identity"))?;
+                        if name.starts_with(".preparing-") && entry.file_type()?.is_dir() {
+                            // Publication precedes owner launch. An abandoned staging
+                            // directory has never granted permission to execute.
+                            continue;
+                        }
+                        let instance_id = InstanceId(name);
+                        let record = this.load(&instance_id)?;
+                        let launch = record
+                            .launch
+                            .ok_or_else(|| io::Error::other("missing process launch intent"))?;
+                        launches.push(super::RuntimeLaunch {
+                            generation: super::RuntimeGeneration::process(&record.nonce),
+                            instance_id,
+                            spec: launch.spec,
+                            network_reference: None,
+                        });
+                    }
+                    launches.sort_by(|left, right| left.instance_id.0.cmp(&right.instance_id.0));
+                    Ok(launches)
+                })
+                .await
+                .map_err(io::Error::other)?
+            })
+            .await
     }
 
     pub(crate) async fn prepare(&self, id: &InstanceId, spec: &OciSpec) -> io::Result<()> {

@@ -954,3 +954,11 @@ library cases, 14 integration cases per platform and three real placement cases
 pass with strict checks. Before the withdrawal ledger, bound the new periodic
 inventory readers across caller cancellation: their blocking worker must retain
 its single concurrency slot until it actually finishes.
+
+
+Periodic inventory admission is now bounded across cancelled callers. Process
+and owned Runc share one reader per runtime; its operation holds the permit until
+the underlying read completes. All 477 native/522 Linux affected library cases,
+29/30 process recovery cases, two physical Runc cases and strict checks pass.
+Before step 2, fix the transient leader-unavailable lease-cleanup failure observed
+in hosted multi-node CI (8bd5b65). See the session handoff for the exact failure.

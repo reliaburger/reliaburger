@@ -9,6 +9,7 @@ pub mod btrfs;
 pub mod cgroup;
 pub mod command;
 pub mod image;
+mod inventory;
 // Also exposed under the `ebpf` feature: the Lima-gated integration
 // tests drive the agent's pre-start egress programming through a mock
 // grill (a runtime whose `pid()` is `None`), which unit tests can't.
