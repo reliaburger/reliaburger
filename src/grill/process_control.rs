@@ -101,6 +101,7 @@ impl ProcessControl {
                 launches.push(super::RuntimeLaunch {
                     instance_id,
                     spec: launch.spec,
+                    network_reference: None,
                 });
             }
             launches.sort_by(|left, right| left.instance_id.0.cmp(&right.instance_id.0));

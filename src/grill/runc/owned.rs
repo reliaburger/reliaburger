@@ -699,6 +699,7 @@ impl RuncGrill {
                 .map(|record| crate::grill::RuntimeLaunch {
                     instance_id: record.instance_id,
                     spec: record.spec,
+                    network_reference: record.network_reference,
                 })
                 .collect(),
         ))

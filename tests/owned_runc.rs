@@ -532,6 +532,13 @@ async fn retained_addresses_survive_exit_and_recovery_until_the_original_referen
     drop(first);
     let recovered = runtime(root.path());
     let retained = recovered.network_reference(&id).await.unwrap();
+    let held_inventory = recovered.launch_inventory().await.unwrap().unwrap();
+    let held_evidence = held_inventory
+        .iter()
+        .find(|launch| launch.instance_id == id)
+        .unwrap()
+        .network_reference
+        .clone();
     let other = InstanceId(format!("{}-other", id.0));
     recovered
         .create(&other, &spec(root.path(), "exit 0"))
@@ -558,6 +565,14 @@ async fn retained_addresses_survive_exit_and_recovery_until_the_original_referen
         .await
         .unwrap();
 
+    let released_inventory = recovered.launch_inventory().await.unwrap().unwrap();
+    let released_evidence = released_inventory
+        .iter()
+        .find(|launch| launch.instance_id == id)
+        .unwrap()
+        .network_reference
+        .clone();
+
     recovered
         .create(&id, &spec(root.path(), "exit 2"))
         .await
@@ -581,6 +596,14 @@ async fn retained_addresses_survive_exit_and_recovery_until_the_original_referen
     recovered.kill(&id).await.unwrap();
     assert_absent(root.path(), &id);
     assert_absent(root.path(), &other);
+    assert_eq!(
+        held_evidence,
+        Some(reliaburger::grill::runc_intent::NetworkReferenceState::Held(original.clone()))
+    );
+    assert_eq!(
+        released_evidence,
+        Some(reliaburger::grill::runc_intent::NetworkReferenceState::Released(original.clone()))
+    );
     assert_eq!(retained, Some(original));
     assert_ne!(
         original_ip, other_ip,

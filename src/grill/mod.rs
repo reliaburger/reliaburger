@@ -253,6 +253,9 @@ pub struct RuntimeLaunch {
     pub instance_id: InstanceId,
     /// Specification committed for this generation.
     pub spec: OciSpec,
+    /// Original address hold or release receipt from the same durable runtime intent.
+    /// Process runtimes have no reusable container address and return None.
+    pub network_reference: Option<runc_intent::NetworkReferenceState>,
 }
 
 /// The container runtime interface.

@@ -97,6 +97,91 @@ impl DiscoveryJournal {
             .map_err(io::Error::other)?
     }
 
+    /// Correlate exact runtime address evidence before any recovery mutation.
+    /// The caller must exclude concurrent runtime registration and supply its complete inventory.
+    pub fn reconcile_runtime_inventory(
+        &self,
+        launches: &[crate::grill::RuntimeLaunch],
+    ) -> io::Result<DiscoveryInventory> {
+        use crate::grill::runc_intent::NetworkReferenceState;
+        if self.uncertain {
+            return Err(io::Error::other("discovery checkpoint is uncertain"));
+        }
+        let mut by_instance = std::collections::HashMap::new();
+        for launch in launches {
+            if by_instance.insert(&launch.instance_id, launch).is_some() {
+                return Err(io::Error::other("duplicate runtime launch identity"));
+            }
+            if let Some(
+                NetworkReferenceState::Held(reference) | NetworkReferenceState::Released(reference),
+            ) = &launch.network_reference
+                && reference.instance_id != launch.instance_id
+            {
+                return Err(io::Error::other(
+                    "runtime reference belongs to another instance",
+                ));
+            }
+        }
+        for owner in &self.inventory.references {
+            let launch = by_instance
+                .get(&owner.reference.instance_id)
+                .ok_or_else(|| io::Error::other("original runtime reference is missing"))?;
+            let (reference, released) = match &launch.network_reference {
+                Some(NetworkReferenceState::Held(reference)) => (reference, false),
+                Some(NetworkReferenceState::Released(reference)) => (reference, true),
+                None => return Err(io::Error::other("original runtime reference is missing")),
+            };
+            if *reference != owner.reference
+                || (released && owner.phase != ReferencePhase::ReleaseAuthorised)
+            {
+                return Err(io::Error::other(
+                    "original runtime reference conflicts with discovery ownership",
+                ));
+            }
+            if service_for_launch(&self.inventory, launch)? != owner.service {
+                return Err(io::Error::other(
+                    "runtime specification conflicts with original service",
+                ));
+            }
+        }
+        let mut next = self.inventory.clone();
+        for launch in launches {
+            let Some(NetworkReferenceState::Held(reference)) = &launch.network_reference else {
+                continue;
+            };
+            if next
+                .references
+                .iter()
+                .any(|owner| owner.reference.instance_id == launch.instance_id)
+            {
+                continue;
+            }
+            let service = service_for_launch(&next, launch)?;
+            next.references.push(ReferenceOwner {
+                service,
+                reference: reference.clone(),
+                phase: ReferencePhase::Held,
+            });
+        }
+        for service in &next.services {
+            for backend in &service.entry.backends {
+                if !next.references.iter().any(|owner| {
+                    owner.reference.instance_id.0 == backend.instance_id
+                        && owner.service.namespace == service.entry.namespace
+                        && owner.service.name == service.entry.app_name
+                        && owner.phase == ReferencePhase::Held
+                }) {
+                    return Err(io::Error::other(
+                        "published backend has no original runtime hold",
+                    ));
+                }
+            }
+        }
+        validate(&next)?;
+        validate_transition(&self.inventory, &next)?;
+        Ok(next)
+    }
+
     /// Transfer ownership to a write worker and recover it only on acknowledged success.
     /// Cancellation or failure requires reopening and reconciling the complete state.
     pub async fn persist(mut self, next: DiscoveryInventory) -> io::Result<Self> {
@@ -203,6 +288,44 @@ impl DiscoveryJournal {
         self.uncertain = false;
         Ok(())
     }
+}
+
+// Match structured ownership from the original intent, never ambiguous instance text.
+fn service_for_launch(
+    inventory: &DiscoveryInventory,
+    launch: &crate::grill::RuntimeLaunch,
+) -> io::Result<ServiceId> {
+    let cgroup = launch
+        .spec
+        .linux
+        .host_cgroup_path()
+        .ok_or_else(|| io::Error::other("runtime reference has no original cgroup identity"))?;
+    let port = launch
+        .spec
+        .port_mapping
+        .ok_or_else(|| io::Error::other("runtime reference has no original service port"))?;
+    let mut matches = inventory.services.iter().filter(|owner| {
+        owner.phase == ServicePhase::Owned
+            && owner.entry.port == port.container_port
+            && crate::grill::cgroup::instance_cgroup_path(
+                &owner.entry.namespace,
+                &owner.entry.app_name,
+                &launch.instance_id,
+            )
+            .is_ok_and(|expected| expected == cgroup)
+    });
+    let original = matches
+        .next()
+        .ok_or_else(|| io::Error::other("runtime reference has no matching original service"))?;
+    if matches.next().is_some() {
+        return Err(io::Error::other(
+            "runtime reference has ambiguous service ownership",
+        ));
+    }
+    Ok(ServiceId::new(
+        &original.entry.namespace,
+        &original.entry.app_name,
+    ))
 }
 
 fn validate_file(file: &File) -> io::Result<()> {
@@ -464,6 +587,171 @@ mod tests {
                 })).unwrap(),
                 phase: ReferencePhase::Held,
             }],
+        }
+    }
+
+    fn runtime_launch(
+        reference: crate::grill::runc_intent::NetworkReferenceState,
+    ) -> crate::grill::RuntimeLaunch {
+        let original = &inventory().references[0];
+        let cgroup = crate::grill::cgroup::instance_cgroup_path(
+            &original.service.namespace,
+            &original.service.name,
+            &original.reference.instance_id,
+        )
+        .unwrap();
+        let spec = serde_json::from_value(serde_json::json!({
+            "root": {"path": "/fixture", "readonly": true},
+            "process": {"args": ["/app"], "env": [], "cwd": "/", "user": {"uid": 0, "gid": 0}},
+            "mounts": [], "linux": {"namespaces": [], "cgroupsPath": format!("/{}", cgroup.strip_prefix("/sys/fs/cgroup").unwrap().display())},
+            "port_mapping": {"host_port": 20000, "container_port": 8080}
+        }))
+        .unwrap();
+        crate::grill::RuntimeLaunch {
+            instance_id: original.reference.instance_id.clone(),
+            spec,
+            network_reference: Some(reference),
+        }
+    }
+
+    #[test]
+    fn recovery_recovers_a_runtime_hold_saved_before_discovery_acknowledgement() {
+        use crate::grill::runc_intent::NetworkReferenceState;
+        let root = tempfile::tempdir().unwrap();
+        let mut journal = DiscoveryJournal::open(&root.path().join("owners")).unwrap();
+        let mut saved = inventory();
+        let reference = saved.references.remove(0);
+        journal.save(saved).unwrap();
+        let recovered = journal
+            .reconcile_runtime_inventory(&[runtime_launch(NetworkReferenceState::Held(
+                reference.reference.clone(),
+            ))])
+            .unwrap();
+        assert_eq!(
+            recovered.references.len(),
+            1,
+            "original hold was lost between journals"
+        );
+        assert_eq!(recovered.references[0].reference, reference.reference);
+        assert_eq!(recovered.references[0].service, reference.service);
+        assert_eq!(recovered.references[0].phase, ReferencePhase::Held);
+        assert!(
+            journal.inventory().references.is_empty(),
+            "correlation mutated durable state before acknowledgement"
+        );
+    }
+
+    #[test]
+    fn recovery_refuses_missing_changed_or_prematurely_released_runtime_ownership() {
+        use crate::grill::runc_intent::NetworkReferenceState;
+        let root = tempfile::tempdir().unwrap();
+        let mut journal = DiscoveryJournal::open(&root.path().join("owners")).unwrap();
+        journal.save(inventory()).unwrap();
+        let original = inventory().references[0].reference.clone();
+        let held = runtime_launch(NetworkReferenceState::Held(original.clone()));
+        assert!(
+            journal
+                .reconcile_runtime_inventory(std::slice::from_ref(&held))
+                .is_ok()
+        );
+        assert!(
+            journal.reconcile_runtime_inventory(&[]).is_err(),
+            "missing original runtime accepted"
+        );
+        let mut changed = original.clone();
+        changed.container_index += 1;
+        assert!(
+            journal
+                .reconcile_runtime_inventory(&[runtime_launch(NetworkReferenceState::Held(
+                    changed
+                ))])
+                .is_err()
+        );
+        assert!(
+            journal
+                .reconcile_runtime_inventory(&[runtime_launch(NetworkReferenceState::Released(
+                    original
+                ))])
+                .is_err(),
+            "runtime release had no discovery permission"
+        );
+        assert!(
+            journal
+                .reconcile_runtime_inventory(&[held.clone(), held])
+                .is_err(),
+            "duplicate runtime identities accepted"
+        );
+    }
+
+    #[test]
+    fn recovery_requires_original_service_and_cgroup_for_an_unacknowledged_hold() {
+        use crate::grill::runc_intent::NetworkReferenceState;
+        let root = tempfile::tempdir().unwrap();
+        let mut journal = DiscoveryJournal::open(&root.path().join("owners")).unwrap();
+        let mut saved = inventory();
+        let reference = saved.references.remove(0).reference;
+        let launch = runtime_launch(NetworkReferenceState::Held(reference));
+        assert!(
+            journal
+                .reconcile_runtime_inventory(std::slice::from_ref(&launch))
+                .is_err(),
+            "missing original service accepted"
+        );
+        journal.save(saved).unwrap();
+        let mut wrong = launch;
+        wrong.spec.linux.cgroups_path = Some("/reliaburger/default/api/g5-0".into());
+        assert!(
+            journal.reconcile_runtime_inventory(&[wrong]).is_err(),
+            "ambiguous instance text replaced original service evidence"
+        );
+    }
+
+    #[test]
+    fn recovery_refuses_published_backends_without_their_original_hold() {
+        use crate::grill::runc_intent::NetworkReferenceState;
+        let root = tempfile::tempdir().unwrap();
+        let mut journal = DiscoveryJournal::open(&root.path().join("owners")).unwrap();
+        let mut saved = inventory();
+        let original = saved.references.remove(0).reference;
+        saved.services[0]
+            .entry
+            .backends
+            .push(crate::onion::types::BackendInstance {
+                instance_id: original.instance_id.0.clone(),
+                node_ip: "10.0.0.4".parse().unwrap(),
+                host_port: 8080,
+                healthy: true,
+            });
+        journal.save(saved).unwrap();
+        let mut launch = runtime_launch(NetworkReferenceState::Held(original));
+        assert!(
+            journal
+                .reconcile_runtime_inventory(std::slice::from_ref(&launch))
+                .is_ok()
+        );
+        launch.network_reference = None;
+        assert!(journal.reconcile_runtime_inventory(&[launch]).is_err());
+    }
+
+    #[test]
+    fn recovery_preserves_release_permission_until_physical_acknowledgement() {
+        use crate::grill::runc_intent::NetworkReferenceState;
+        let root = tempfile::tempdir().unwrap();
+        let mut journal = DiscoveryJournal::open(&root.path().join("owners")).unwrap();
+        let mut saved = inventory();
+        saved.references[0].phase = ReferencePhase::ReleaseAuthorised;
+        journal.save(saved.clone()).unwrap();
+        for state in [
+            NetworkReferenceState::Held(saved.references[0].reference.clone()),
+            NetworkReferenceState::Released(saved.references[0].reference.clone()),
+        ] {
+            let recovered = journal
+                .reconcile_runtime_inventory(&[runtime_launch(state)])
+                .unwrap();
+            assert_eq!(
+                recovered.references[0].phase,
+                ReferencePhase::ReleaseAuthorised
+            );
         }
     }
 

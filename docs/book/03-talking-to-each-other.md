@@ -1745,3 +1745,32 @@ restart, checks that the journal contains the replacement generation and proves
 the original VIP serves it. It then retires the service and checks safe address
 reuse. This exercises a workload crash; actual Bun death during retry remains a
 separate recovery gate.
+
+### Correlate the two original inventories
+
+Consider a crash after Runc records an address hold but before Bun acknowledges
+its discovery checkpoint. The service allocation exists in one journal and the
+runtime generation exists in the other. Recovery needs both. The runtime launch
+inventory now includes its saved Held or Released reference alongside the
+original OCI specification; a Process runtime reports no container address.
+
+The discovery journal can validate that complete inventory and return a proposed
+reconciled snapshot. Existing references must match the exact generation and
+allocation. A runtime release requires prior ReleaseAuthorised permission. An
+unacknowledged hold can be recovered only by matching its original cgroup and
+container port to an existing Owned service allocation. Duplicate identities,
+missing originals and published backends without holds refuse the entire result.
+No routes, runtime calls or checkpoint writes happen during this correlation.
+
+Why use the cgroup? `api-g5-0` can describe ordinal zero of app `api-g5`, or a
+replacement of app `api` in generation five. The original OCI cgroup names the
+structured owner. Parsing the runtime name and hoping is not enough. Likewise,
+a released receipt stays paired with its discovery permission until a later
+physical acknowledgement completes the operation. Correlation is evidence for
+the recovery transaction, not permission to publish historical healthy backends.
+
+The tests cover the gap between writes, absent and changed originals, premature
+release, duplicate identities and ambiguous names. The real Runc recovery test
+also checks that its complete inventory exposes the original held reference and
+its eventual released receipt. Restoring allocations, withdrawing historical
+routing and adopting only validated runtimes are the next integration steps.
