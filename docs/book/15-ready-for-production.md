@@ -3429,3 +3429,22 @@ waiting for. A connection error keeps waiting; it never counts as Running or
 Stopped. If the deadline expires, the test still fails. This preserves the
 contract that matters: positive evidence establishes readiness and absence,
 and uncertain observations establish neither.
+
+### Cleanup through a leader election
+
+The live capacity test rejected an oversized application correctly, then ran its
+smaller fixture. Teardown failed anyway. A follower returned HTTP 503 because its
+lease leader was temporarily unavailable, and Relish abandoned cleanup at once.
+
+Lease release now retries HTTP 503 during both the initial DELETE and the later
+confirmation polls, within the original 30-second deadline. DELETE is idempotent:
+repeating it addresses the same durable lease, rather than creating another
+cleanup operation. HTTP 202 means accepted, so the client continues polling.
+Only HTTP 204 from DELETE, or HTTP 404 after acceptance, confirms completion.
+Authentication and conflict errors still return immediately.
+
+The deadline wraps the entire asynchronous operation. Moving it inside the retry
+loop would give every attempt another 30 seconds and could wait forever. Our
+HTTP fixture reproduces temporary failure before and after acceptance, checks
+permanent refusals, and advances Tokio's test clock to prove the overall limit.
+The original three-node case still runs against real nodes.

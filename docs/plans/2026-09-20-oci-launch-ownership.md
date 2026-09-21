@@ -960,5 +960,8 @@ Periodic inventory admission is now bounded across cancelled callers. Process
 and owned Runc share one reader per runtime; its operation holds the permit until
 the underlying read completes. All 477 native/522 Linux affected library cases,
 29/30 process recovery cases, two physical Runc cases and strict checks pass.
-Before step 2, fix the transient leader-unavailable lease-cleanup failure observed
-in hosted multi-node CI (8bd5b65). See the session handoff for the exact failure.
+The transient leader-unavailable lease-cleanup failure observed in hosted CI
+(8bd5b65) is also fixed: bounded HTTP 503 retries preserve confirmation and the
+original deadline. All 41 client/lease cases, the real three-node capacity case
+and strict checks pass on both platforms. Continue step 2, the committed
+withdrawal ledger; the session handoff records the latest evidence.

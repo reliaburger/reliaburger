@@ -1029,15 +1029,24 @@ impl BunClient {
 
     /// Release a lease and wait up to 30 seconds for server-confirmed cleanup.
     /// An accepted request keeps polling durable ownership until it disappears.
+    /// Transient leader unavailability retries within the same overall deadline.
     pub async fn release_test_lease(&self, lease_id: &str) -> Result<(), RelishError> {
         tokio::time::timeout(std::time::Duration::from_secs(30), async {
             let url = format!("{}/v1/test/leases/{lease_id}", self.base_url);
-            let response = self
-                .http()?
-                .delete(&url)
-                .send()
-                .await
-                .map_err(classify_error)?;
+            let response = loop {
+                let response = self
+                    .http()?
+                    .delete(&url)
+                    .send()
+                    .await
+                    .map_err(classify_error)?;
+                if response.status() != reqwest::StatusCode::SERVICE_UNAVAILABLE {
+                    break response;
+                }
+                // Retrying this idempotent mutation preserves its original lease.
+                drop(response);
+                tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+            };
             match response.status() {
                 reqwest::StatusCode::NO_CONTENT => return Ok(()),
                 reqwest::StatusCode::ACCEPTED => {}
@@ -1057,7 +1066,7 @@ impl BunClient {
                     .map_err(classify_error)?;
                 match response.status() {
                     reqwest::StatusCode::NOT_FOUND => return Ok(()),
-                    reqwest::StatusCode::OK => {}
+                    reqwest::StatusCode::OK | reqwest::StatusCode::SERVICE_UNAVAILABLE => {}
                     status => {
                         return Err(RelishError::ApiError {
                             status: status.as_u16(),
@@ -2583,6 +2592,132 @@ mod tests {
         );
 
         shutdown.cancel();
+    }
+
+    async fn assert_lease_cleanup_responses(
+        responses: Vec<(axum::http::Method, axum::http::StatusCode)>,
+        expected_error: Option<u16>,
+    ) {
+        use std::collections::VecDeque;
+        use std::sync::Arc;
+        let remaining = Arc::new(tokio::sync::Mutex::new(VecDeque::from(responses)));
+        let handler_remaining = remaining.clone();
+        let router = axum::Router::new().route(
+            "/v1/test/leases/fixture",
+            axum::routing::any(move |method: axum::http::Method| {
+                let remaining = handler_remaining.clone();
+                async move {
+                    let (expected, status) = remaining.lock().await.pop_front().unwrap();
+                    assert_eq!(method, expected);
+                    (status, "fixture response")
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
+        let result = BunClient::new_with_token(&format!("http://{address}"), None)
+            .release_test_lease("fixture")
+            .await;
+        server.abort();
+        let _ = server.await;
+        match expected_error {
+            Some(expected) => assert!(
+                matches!(result, Err(RelishError::ApiError { status, .. }) if status == expected),
+                "{result:?}"
+            ),
+            None => result.unwrap(),
+        }
+        assert!(remaining.lock().await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn lease_cleanup_retries_unavailable_leaders_until_positive_confirmation() {
+        use axum::http::{Method, StatusCode};
+        assert_lease_cleanup_responses(
+            vec![
+                (Method::DELETE, StatusCode::SERVICE_UNAVAILABLE),
+                (Method::DELETE, StatusCode::ACCEPTED),
+                (Method::GET, StatusCode::SERVICE_UNAVAILABLE),
+                (Method::GET, StatusCode::OK),
+                (Method::GET, StatusCode::NOT_FOUND),
+            ],
+            None,
+        )
+        .await;
+        assert_lease_cleanup_responses(
+            vec![
+                (Method::DELETE, StatusCode::SERVICE_UNAVAILABLE),
+                (Method::DELETE, StatusCode::NO_CONTENT),
+            ],
+            None,
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn lease_cleanup_preserves_permanent_refusals_without_retrying() {
+        use axum::http::{Method, StatusCode};
+        for status in [
+            StatusCode::UNAUTHORIZED,
+            StatusCode::FORBIDDEN,
+            StatusCode::CONFLICT,
+            StatusCode::NOT_FOUND,
+        ] {
+            assert_lease_cleanup_responses(vec![(Method::DELETE, status)], Some(status.as_u16()))
+                .await;
+        }
+        for status in [
+            StatusCode::UNAUTHORIZED,
+            StatusCode::FORBIDDEN,
+            StatusCode::CONFLICT,
+        ] {
+            assert_lease_cleanup_responses(
+                vec![
+                    (Method::DELETE, StatusCode::ACCEPTED),
+                    (Method::GET, status),
+                ],
+                Some(status.as_u16()),
+            )
+            .await;
+        }
+    }
+
+    #[tokio::test]
+    async fn lease_cleanup_unavailable_leader_remains_bounded_by_the_original_deadline() {
+        use std::sync::Arc;
+        let entered = Arc::new(tokio::sync::Notify::new());
+        let handler_entered = entered.clone();
+        let router = axum::Router::new().route(
+            "/v1/test/leases/fixture",
+            axum::routing::delete(move || {
+                let entered = handler_entered.clone();
+                async move {
+                    entered.notify_one();
+                    axum::http::StatusCode::SERVICE_UNAVAILABLE
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
+        let cleanup = tokio::spawn(async move {
+            BunClient::new_with_token(&format!("http://{address}"), None)
+                .release_test_lease("fixture")
+                .await
+        });
+        tokio::time::timeout(std::time::Duration::from_secs(2), entered.notified())
+            .await
+            .unwrap();
+        tokio::time::pause();
+        tokio::time::advance(std::time::Duration::from_secs(31)).await;
+        let result = cleanup.await.unwrap();
+        server.abort();
+        let _ = server.await;
+        assert!(
+            matches!(result, Err(RelishError::RequestTimeout)),
+            "{result:?}"
+        );
     }
 
     #[tokio::test]
