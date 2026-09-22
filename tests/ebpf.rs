@@ -3850,8 +3850,8 @@ async fn init_exit_preserves_policy_before_the_next_container_starts() {
         ImageStore::new(root.path().join("images")),
         false,
         root.path().join("runc-state"),
+        env!("CARGO_BIN_EXE_bun").into(),
     )
-    .with_owner(env!("CARGO_BIN_EXE_bun").into())
     .unwrap();
     let starts = Arc::new(Mutex::new(Vec::new()));
     let grill = InitPolicyGrill {
@@ -3953,8 +3953,8 @@ async fn uncertain_initialiser_preserves_parent_policy_until_confirmed_retiremen
         ImageStore::new(root.path().join("images")),
         false,
         root.path().join("runc-state"),
+        env!("CARGO_BIN_EXE_bun").into(),
     )
-    .with_owner(env!("CARGO_BIN_EXE_bun").into())
     .unwrap();
     let starts = Arc::new(Mutex::new(Vec::new()));
     let grill = InitPolicyGrill {
@@ -4243,8 +4243,8 @@ async fn check_backend_retirement(
         ImageStore::new(root.path().join("images")),
         false,
         root.path().join("runc-state"),
+        env!("CARGO_BIN_EXE_bun").into(),
     )
-    .with_owner(env!("CARGO_BIN_EXE_bun").into())
     .unwrap();
     let grill = InitPolicyGrill {
         runtime: runtime.clone(),
@@ -4691,8 +4691,8 @@ async fn check_stopped_address_retention(lose_enforcement: bool, durable_discove
         ImageStore::new(root.path().join("images")),
         false,
         root.path().join("runc-state"),
+        env!("CARGO_BIN_EXE_bun").into(),
     )
-    .with_owner(env!("CARGO_BIN_EXE_bun").into())
     .unwrap();
     let grill = InitPolicyGrill {
         runtime: runtime.clone(),

@@ -1395,9 +1395,8 @@ config-file mounting on a cluster with a container runtime.
 On a disposable Linux host with Runc, static BusyBox, `ip`, `nft`, a C compiler and
 sudo, run `scripts/release/qualify-oci-interruptions.sh`. It runs actual Bun crash
 and caller-cancellation cases in private network/mount namespaces and retains logs
-and test-binary checksums. The hidden `--experimental-owned-runc` option used by
-these tests is standalone-only. Normal standalone rootful startup with eBPF
-configured now selects durable runtime, discovery and kernel ownership.
+and test-binary checksums. Every Runc runtime is owned; standalone rootful
+startup with eBPF configured also selects durable discovery and kernel ownership.
 
 From the host, `scripts/release/qualify-oci-reboot.sh --vm DISPOSABLE_LIMA_VM`
 starts real OCI executions, force-stops that VM and verifies recovery after a new

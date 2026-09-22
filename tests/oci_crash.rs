@@ -38,9 +38,6 @@ impl Node {
         if root.join("cluster").exists() {
             command.arg("--cluster");
         }
-        if !root.join("production").exists() {
-            command.arg("--experimental-owned-runc");
-        }
         if let Ok(cgroup) = std::fs::read_to_string(root.join("service-cgroup")) {
             let procs = std::path::PathBuf::from(cgroup.trim()).join("cgroup.procs");
             // SAFETY: the closure runs in the forked child before exec and only
@@ -129,8 +126,8 @@ fn runtime(root: &Path) -> RuncGrill {
         ImageStore::new(root.join("images")),
         false,
         directory.join("state"),
+        env!("CARGO_BIN_EXE_bun").into(),
     )
-    .with_owner(env!("CARGO_BIN_EXE_bun").into())
     .unwrap()
 }
 

@@ -15,7 +15,7 @@ use reliaburger::bun::agent::BunAgent;
 use reliaburger::bun::api;
 use reliaburger::config::node::NodeConfig;
 use reliaburger::grill::port::PortAllocator;
-use reliaburger::grill::{AnyGrill, ProcessGrill, detect_runtime};
+use reliaburger::grill::{AnyGrill, DetectedRuntime, ProcessGrill, detect_runtime};
 use reliaburger::ketchup::log_store::LogStore;
 use reliaburger::mayo::alert::AlertEvaluator;
 use reliaburger::mayo::collector::SystemCollector;
@@ -43,10 +43,6 @@ struct Cli {
     /// Runtime to use: auto, process, runc (Linux).
     #[arg(long, default_value = "auto")]
     runtime: String,
-
-    /// Standalone qualification of durable OCI ownership; not production activation.
-    #[arg(long, hide = true)]
-    experimental_owned_runc: bool,
 
     /// Join/form a cluster using the `[cluster]` config (gossip membership).
     /// Without this flag, bun runs as a single node, as before.
@@ -944,20 +940,6 @@ async fn run_agent(cli: Cli) -> anyhow::Result<()> {
             "durable ownership requires its original runtime and enforcement mode; refusing a mode change"
         );
     }
-    let runtime = if cli.experimental_owned_runc || durable_discovery {
-        if cli.experimental_owned_runc && cli.cluster && !durable_discovery {
-            anyhow::bail!("owned Runc qualification requires a supported durable cluster profile");
-        }
-        match runtime {
-            #[cfg(target_os = "linux")]
-            AnyGrill::Runc(runtime) => {
-                AnyGrill::Runc(runtime.with_owner(std::env::current_exe()?)?)
-            }
-            _ => anyhow::bail!("owned Runc qualification requires the Linux runc runtime"),
-        }
-    } else {
-        runtime
-    };
     // DNS is a workload capability, not a best-effort side task. Select the
     // runtime first so we can derive its reachable resolver address, then bind
     // both sockets before starting the agent, reporting readiness or adopting
@@ -3023,22 +3005,19 @@ async fn select_runtime(
     let _ = image_directory;
     match name {
         "auto" => {
-            let runtime = detect_runtime().await;
-            // The process fallback uses durable owners so launches remain
+            // Both runtimes use durable owners, so launches remain
             // discoverable even before agent adoption is recorded.
-            let runtime = match runtime {
-                AnyGrill::Process(_) => AnyGrill::Process(ProcessGrill::with_owner(
+            let runtime = match detect_runtime().await {
+                DetectedRuntime::Process => AnyGrill::Process(ProcessGrill::with_owner(
                     instances_dir.to_path_buf(),
                     std::env::current_exe()?,
                 )),
                 #[cfg(target_os = "linux")]
-                AnyGrill::Runc(detected) => AnyGrill::Runc(create_runc_runtime(
+                DetectedRuntime::Runc { rootless } => AnyGrill::Runc(create_runc_runtime(
                     instances_dir,
                     image_directory,
-                    detected.is_rootless(),
-                )),
-                #[cfg(target_os = "macos")]
-                AnyGrill::Apple(_) => anyhow::bail!(APPLE_RUNTIME_DEFERRED),
+                    rootless,
+                )?),
             };
             let kind = match &runtime {
                 AnyGrill::Process(_) => "process",
@@ -3063,7 +3042,7 @@ async fn select_runtime(
             let mode = if is_rootless { "rootless" } else { "root" };
             println!("bun: using runc runtime ({mode})");
 
-            let grill = create_runc_runtime(instances_dir, image_directory, is_rootless);
+            let grill = create_runc_runtime(instances_dir, image_directory, is_rootless)?;
             Ok(AnyGrill::Runc(grill))
         }
         "apple" => anyhow::bail!(APPLE_RUNTIME_DEFERRED),
@@ -3076,16 +3055,17 @@ fn create_runc_runtime(
     instances_dir: &std::path::Path,
     image_directory: &std::path::Path,
     rootless: bool,
-) -> reliaburger::grill::runc::RuncGrill {
+) -> anyhow::Result<reliaburger::grill::runc::RuncGrill> {
     // Runtime ownership must follow the node's actual storage directories,
     // including configured paths and explicit storage fallback selection.
     let runtime_directory = instances_dir.join("runc");
-    reliaburger::grill::runc::RuncGrill::new(
+    Ok(reliaburger::grill::runc::RuncGrill::new(
         runtime_directory.join("bundles"),
         reliaburger::grill::ImageStore::new(image_directory.to_path_buf()),
         rootless,
         runtime_directory.join("state"),
-    )
+        std::env::current_exe()?,
+    )?)
 }
 
 async fn runtime_version(runtime: &str) -> Option<String> {
@@ -3300,7 +3280,8 @@ mod tests {
         for node in ["first", "second"] {
             let instances = root.path().join(node).join("instances");
             let runtime =
-                create_runc_runtime(&instances, &root.path().join(node).join("images"), true);
+                create_runc_runtime(&instances, &root.path().join(node).join("images"), true)
+                    .unwrap();
             let spec: reliaburger::grill::oci::OciSpec = serde_json::from_value(serde_json::json!({
                 "root": {"path": "/", "readonly": true},
                 "process": {"args": [node], "env": [], "cwd": "/", "user": {"uid": 0, "gid": 0}},
@@ -3389,7 +3370,9 @@ mod tests {
             reliaburger::grill::ImageStore::new(temp.path().join("images")),
             false,
             temp.path().join("state"),
-        );
+            std::env::current_exe().unwrap(),
+        )
+        .unwrap();
         let expected = grill.dns_gateway_address().unwrap();
 
         let (_, nameserver, freebind) =
@@ -3408,7 +3391,9 @@ mod tests {
             reliaburger::grill::ImageStore::new(temp.path().join("images")),
             false,
             temp.path().join("state"),
-        );
+            std::env::current_exe().unwrap(),
+        )
+        .unwrap();
 
         let error = configure_workload_dns(AnyGrill::Runc(grill), "127.0.0.53:53".parse().unwrap())
             .err()

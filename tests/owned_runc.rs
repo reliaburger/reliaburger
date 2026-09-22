@@ -13,8 +13,8 @@ fn runtime(root: &Path) -> RuncGrill {
         ImageStore::new(root.join("images")),
         false,
         root.join("state"),
+        env!("CARGO_BIN_EXE_bun").into(),
     )
-    .with_owner(env!("CARGO_BIN_EXE_bun").into())
     .unwrap()
 }
 
@@ -295,8 +295,8 @@ async fn runc_owned_cancelled_preparation_keeps_its_worker_until_queued_cleanup(
         ImageStore::new(root.path().join("images")),
         false,
         root.path().join("state"),
+        wrapper,
     )
-    .with_owner(wrapper)
     .unwrap();
     let creator = runtime.clone();
     let preparation_id = id.clone();

@@ -14,7 +14,7 @@ use std::sync::Arc;
 
 use tokio::sync::Mutex;
 
-use super::command::{DirectCommandExecutor, RuntimeCommandExecutor};
+use super::command::RuntimeCommandExecutor;
 use super::image::{ImageStore, looks_like_image_ref};
 use super::netns::{self, ContainerNetwork, PortMapHandle};
 use super::oci::OciSpec;
@@ -22,29 +22,6 @@ use super::state::ContainerState;
 use super::{GrillError, InstanceId};
 
 mod owned;
-
-/// Entry for a runc-managed container.
-///
-/// We drive containers with `runc run` (foreground: create + start + wait +
-/// delete) rather than detached `runc create`/`start`, so the child process's
-/// exit status *is* the container's exit code — the only way to get it from the
-/// runc CLI. stdout/stderr are redirected to `log_path` for `logs`/`follow_logs`.
-struct RuncEntry {
-    bundle_dir: PathBuf,
-    /// File the container's stdout+stderr are redirected to.
-    log_path: PathBuf,
-    /// The `runc run` child, once started.
-    child: Option<tokio::process::Child>,
-    /// Pid of an adopted `runc run` process (started by a previous bun).
-    /// Mutually exclusive with `child`.
-    adopted_pid: Option<u32>,
-    /// Start time of the adopted pid, to detect pid reuse (M23).
-    adopted_pid_started_at: Option<u64>,
-    /// Published port to install after rootless runc exposes its init PID.
-    port_mapping: Option<super::oci::PortMapping>,
-    state: ContainerState,
-    exit_code: Option<i32>,
-}
 
 /// Runc-based Grill implementation.
 ///
@@ -54,7 +31,8 @@ struct RuncEntry {
 pub struct RuncGrill {
     /// Base directory for OCI bundles.
     bundle_base: PathBuf,
-    ownership: Option<owned::Ownership>,
+    /// Independent owners that run every Runc command and outlive Bun.
+    ownership: owned::Ownership,
     /// Image store for pulling and caching OCI images.
     image_store: ImageStore,
     /// Whether to run in rootless mode (user namespaces, no sudo).
@@ -64,14 +42,11 @@ pub struct RuncGrill {
     state_dir: PathBuf,
     /// Executable used for every invocation, including the foreground launcher.
     runc_program: PathBuf,
-    entries: Arc<Mutex<HashMap<InstanceId, RuncEntry>>>,
     /// Per-container network namespaces (root mode only).
     /// Rootless mode uses slirp4netns instead.
     networks: Arc<Mutex<HashMap<InstanceId, ContainerNetwork>>>,
     /// Active host-port publications, torn down with the container.
     port_handles: Arc<Mutex<HashMap<InstanceId, PortMapHandle>>>,
-    /// Rootless userspace networks, including the slirp owner process.
-    slirp_handles: Arc<Mutex<HashMap<InstanceId, super::rootless::Slirp4netnsHandle>>>,
     /// Node index for IP address assignment (maps to a /23 subnet).
     node_index: u16,
     /// Durable reservations, including incomplete network setup.
@@ -87,13 +62,18 @@ pub struct RuncGrill {
 }
 
 impl RuncGrill {
-    /// Create a new RuncGrill with the given configuration.
+    /// Create a RuncGrill whose Runc commands run under durable owners.
+    ///
+    /// `owner_executable` is the Bun binary; it is re-run in a hidden helper
+    /// mode as each command's owner. Relative directories are made absolute,
+    /// because owners outlive this process and its working directory.
     pub fn new(
         bundle_base: PathBuf,
         image_store: ImageStore,
         rootless: bool,
         state_dir: PathBuf,
-    ) -> Self {
+        owner_executable: PathBuf,
+    ) -> std::io::Result<Self> {
         // Default node index from hostname. Will be overridden when
         // the node joins a cluster and gets a proper node ID.
         let hostname = std::fs::read_to_string("/etc/hostname")
@@ -102,26 +82,26 @@ impl RuncGrill {
             .to_string();
         let node_index = netns::node_index_from_id(&hostname);
 
-        Self {
+        let bundle_base = std::path::absolute(&bundle_base)?;
+        let state_dir = std::path::absolute(&state_dir)?;
+        Ok(Self {
             network_leases: super::network_leases::NetworkLeases::new(bundle_base.clone()),
             lifecycle: Arc::new(Mutex::new(HashMap::new())),
             bundle_base,
-            ownership: None,
+            ownership: owned::Ownership::new(owner_executable),
             image_store,
             rootless,
             state_dir,
             runc_program: PathBuf::from("runc"),
-            entries: Arc::new(Mutex::new(HashMap::new())),
             networks: Arc::new(Mutex::new(HashMap::new())),
             port_handles: Arc::new(Mutex::new(HashMap::new())),
-            slirp_handles: Arc::new(Mutex::new(HashMap::new())),
             node_index,
             dns_nameserver: None,
             dns_sources: tokio::sync::watch::channel(
                 crate::onion::dns::DnsSourceNamespaces::default(),
             )
             .0,
-        }
+        })
     }
 
     async fn lock_lifecycle(&self, instance: &InstanceId) -> tokio::sync::OwnedMutexGuard<()> {
@@ -186,351 +166,6 @@ impl RuncGrill {
     pub fn image_store(&self) -> &ImageStore {
         &self.image_store
     }
-
-    /// Run a runc command and return its output.
-    ///
-    /// Always passes `--root {state_dir}` so runc uses a writable
-    /// state directory (required for rootless mode).
-    async fn runc_command(
-        &self,
-        args: &[&str],
-        instance: &InstanceId,
-    ) -> Result<std::process::Output, GrillError> {
-        let state_dir_str = self.state_dir.to_string_lossy().to_string();
-        let mut full_args = vec!["--root", &state_dir_str];
-        full_args.extend_from_slice(args);
-
-        let output = tokio::process::Command::new(&self.runc_program)
-            .args(&full_args)
-            .kill_on_drop(true)
-            .output()
-            .await
-            .map_err(|e| GrillError::StartFailed {
-                instance: instance.clone(),
-                reason: format!("failed to run runc: {e}"),
-            })?;
-
-        Ok(output)
-    }
-
-    /// Observe the foreground owner without killing it to manufacture an exit.
-    async fn launcher_exited(&self, instance: &InstanceId) -> Result<bool, GrillError> {
-        let mut entries = self.entries.lock().await;
-        let Some(entry) = entries.get_mut(instance) else {
-            // Recovery may hold only a durable network reservation. Runtime
-            // absence must still be established separately before cleanup.
-            return Ok(true);
-        };
-        let observation = if let Some(child) = &mut entry.child {
-            child
-                .try_wait()
-                .map(|status| status.map(|status| status.code()))
-        } else if let Some(pid) = entry.adopted_pid {
-            super::records::poll_adopted_process(pid, entry.adopted_pid_started_at)
-                .map(|(running, code)| (!running).then_some(code))
-        } else {
-            // A prepared bundle has not launched a foreground owner yet.
-            Ok(Some(None))
-        }
-        .map_err(|error| GrillError::StateUnavailable {
-            instance: instance.clone(),
-            reason: error.to_string(),
-        })?;
-        match observation {
-            Some(code) => {
-                entry.exit_code = code.or(entry.exit_code);
-                Ok(true)
-            }
-            None => Ok(false),
-        }
-    }
-
-    /// An exited foreground owner and absent OCI state permit idempotent stop.
-    async fn runtime_already_absent(&self, instance: &InstanceId) -> Result<bool, GrillError> {
-        if !self.launcher_exited(instance).await? {
-            return Ok(false);
-        }
-        tokio::fs::try_exists(self.state_dir.join(&instance.0))
-            .await
-            .map(|exists| !exists)
-            .map_err(|error| GrillError::StateUnavailable {
-                instance: instance.clone(),
-                reason: error.to_string(),
-            })
-    }
-
-    /// Send a signal, retaining non-zero CLI status and transport failures.
-    async fn signal_container(
-        &self,
-        instance: &InstanceId,
-        signal: &str,
-    ) -> Result<bool, GrillError> {
-        if self.runtime_already_absent(instance).await? {
-            return Ok(false);
-        }
-        let output = tokio::time::timeout(
-            std::time::Duration::from_secs(2),
-            self.runc_command(&["kill", &instance.0, signal], instance),
-        )
-        .await
-        .map_err(|_| GrillError::StopFailed {
-            instance: instance.clone(),
-            reason: format!("runc {signal} timed out"),
-        })??;
-        if !output.status.success() {
-            // The workload may have exited naturally while the CLI ran.
-            if self.runtime_already_absent(instance).await? {
-                return Ok(false);
-            }
-            return Err(GrillError::StopFailed {
-                instance: instance.clone(),
-                reason: format!(
-                    "runc {signal} exited {}: {}",
-                    output.status,
-                    String::from_utf8_lossy(&output.stderr).trim()
-                ),
-            });
-        }
-        Ok(true)
-    }
-
-    /// Wait for OCI startup or, for rootful jobs, an already completed launcher.
-    async fn wait_for_container_start(
-        &self,
-        instance: &InstanceId,
-    ) -> Result<Option<u32>, GrillError> {
-        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
-        loop {
-            let output = tokio::time::timeout_at(
-                deadline,
-                self.runc_command(&["state", &instance.0], instance),
-            )
-            .await
-            .map_err(|_| GrillError::StartFailed {
-                instance: instance.clone(),
-                reason: "runc startup inspection exceeded 5s".into(),
-            })??;
-            if output.status.success()
-                && let Ok(state) = serde_json::from_slice::<serde_json::Value>(&output.stdout)
-                && state.get("status").and_then(|value| value.as_str()) == Some("running")
-                && let Some(pid) = state.get("pid").and_then(|value| value.as_u64())
-                && let Ok(pid) = u32::try_from(pid)
-            {
-                return Ok(Some(pid));
-            }
-            // A rootful batch job can finish before the first state query.
-            // Preserve its exit result for normal supervision. Rootless startup
-            // needs a live init PID to attach the network before it can succeed.
-            if !self.rootless && self.launcher_exited(instance).await? {
-                return Ok(None);
-            }
-            if let Some(reason) = self.runc_start_failure(instance).await {
-                return Err(GrillError::StartFailed {
-                    instance: instance.clone(),
-                    reason,
-                });
-            }
-            if tokio::time::Instant::now() >= deadline {
-                return Err(GrillError::StartFailed {
-                    instance: instance.clone(),
-                    reason: "runc did not publish a running container PID within 5s".to_string(),
-                });
-            }
-            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
-        }
-    }
-
-    /// Return the useful part of an early `runc run` failure instead of
-    /// waiting for the state-poll deadline and hiding the runtime error.
-    async fn runc_start_failure(&self, instance: &InstanceId) -> Option<String> {
-        let (status, log_path) = {
-            let mut entries = self.entries.lock().await;
-            let entry = entries.get_mut(instance)?;
-            let status = entry.child.as_mut()?.try_wait().ok()??;
-            (status, entry.log_path.clone())
-        };
-        let log = tokio::fs::read_to_string(log_path)
-            .await
-            .unwrap_or_default();
-        let detail = log.trim();
-        Some(if detail.is_empty() {
-            format!("runc run exited before the container started ({status})")
-        } else {
-            format!("runc run exited before the container started ({status}): {detail}")
-        })
-    }
-
-    /// Start the rootless network and install its optional host forward.
-    async fn start_rootless_network(
-        &self,
-        instance: &InstanceId,
-        container_pid: u32,
-        api_socket: &std::path::Path,
-        port_mapping: Option<super::oci::PortMapping>,
-    ) -> Result<(), GrillError> {
-        self.restore_rootless_network(instance, container_pid, api_socket, port_mapping, None)
-            .await
-    }
-
-    /// Serialise replacement and adoption so one instance has one network owner.
-    async fn restore_rootless_network(
-        &self,
-        instance: &InstanceId,
-        container_pid: u32,
-        api_socket: &std::path::Path,
-        port_mapping: Option<super::oci::PortMapping>,
-        recorded: Option<&super::records::RootlessNetworkRecord>,
-    ) -> Result<(), GrillError> {
-        let mut handles = self.slirp_handles.lock().await;
-        if let Some(record) = recorded.filter(|record| record.container_pid == container_pid)
-            && let Some(surviving) = super::rootless::Slirp4netnsHandle::adopt(record).await
-        {
-            if let Some(current) = handles
-                .get(instance)
-                .and_then(|handle| handle.adoption_record())
-                && current.owner_pid == record.owner_pid
-                && current.owner_pid_started_at == record.owner_pid_started_at
-            {
-                if &current != record {
-                    return Err(GrillError::StartFailed {
-                        instance: instance.clone(),
-                        reason: "rootless adoption record conflicts with the current owner".into(),
-                    });
-                }
-                // Keep an owned Child (and its reaping responsibility) on repeat adoption.
-                return Ok(());
-            }
-            if let Some(old) = handles.get_mut(instance) {
-                old.shutdown_retaining_owner(Some(&record.api_socket))
-                    .await
-                    .map_err(|error| GrillError::StartFailed {
-                        instance: instance.clone(),
-                        reason: format!("failed to retire rootless network owner: {error}"),
-                    })?;
-            }
-            handles.insert(instance.clone(), surviving);
-            return Ok(());
-        }
-        if let Some(old) = handles.get_mut(instance) {
-            old.shutdown_retaining_owner(None)
-                .await
-                .map_err(|error| GrillError::StartFailed {
-                    instance: instance.clone(),
-                    reason: format!("failed to retire rootless network owner: {error}"),
-                })?;
-        }
-        handles.remove(instance);
-        if let Some(record) = recorded {
-            super::rootless::stop_recorded_owner(record);
-        }
-        let handle = super::rootless::setup_slirp4netns(container_pid, api_socket, port_mapping)
-            .await
-            .map_err(|error| GrillError::StartFailed {
-                instance: instance.clone(),
-                reason: format!("failed to start rootless networking: {error}"),
-            })?;
-        handles.insert(instance.clone(), handle);
-        Ok(())
-    }
-
-    /// Retire owned runtime resources, retaining ownership until every step succeeds.
-    async fn cleanup(&self, instance: &InstanceId) -> Result<(), GrillError> {
-        let failure = |reason: String| GrillError::StopFailed {
-            instance: instance.clone(),
-            reason,
-        };
-        let state_path = self.state_dir.join(&instance.0);
-        if tokio::fs::try_exists(&state_path)
-            .await
-            .map_err(|error| failure(format!("cannot inspect OCI state: {error}")))?
-        {
-            let output = tokio::time::timeout(
-                std::time::Duration::from_secs(5),
-                self.runc_command(&["delete", "--force", &instance.0], instance),
-            )
-            .await
-            .map_err(|_| failure("runc deletion exceeded five seconds".into()))?
-            .map_err(|error| failure(error.to_string()))?;
-            let remains = tokio::fs::try_exists(&state_path)
-                .await
-                .map_err(|error| failure(format!("cannot confirm OCI deletion: {error}")))?;
-            if remains {
-                return Err(failure(format!(
-                    "runc deletion left OCI state ({}): {}",
-                    output.status,
-                    String::from_utf8_lossy(&output.stderr).trim(),
-                )));
-            }
-        }
-        tokio::time::timeout(std::time::Duration::from_secs(2), async {
-            while !self.launcher_exited(instance).await? {
-                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
-            }
-            Ok::<(), GrillError>(())
-        })
-        .await
-        .map_err(|_| failure("launcher remains alive during cleanup".into()))??;
-        // A launcher that was still starting could create state after the first
-        // inspection. Never tear down its resources based on that earlier read.
-        if tokio::fs::try_exists(&state_path)
-            .await
-            .map_err(|error| failure(format!("cannot confirm OCI absence: {error}")))?
-        {
-            return Err(failure(
-                "OCI state appeared during cleanup; retry required".into(),
-            ));
-        }
-        {
-            let mut handles = self.slirp_handles.lock().await;
-            if let Some(handle) = handles.get_mut(instance) {
-                handle
-                    .shutdown_retaining_owner(None)
-                    .await
-                    .map_err(|error| {
-                        failure(format!("rootless network teardown failed: {error}"))
-                    })?;
-            }
-            handles.remove(instance);
-        }
-        if !self.rootless {
-            super::rootfs::unmount_bundle(self.bundle_base.join(&instance.0))
-                .await
-                .map_err(|error| failure(format!("rootfs teardown failed: {error}")))?;
-            if let Some(index) = self
-                .network_leases
-                .lookup(instance, self.node_index)
-                .await
-                .map_err(|error| failure(format!("cannot recover network reservation: {error}")))?
-            {
-                let network = netns::planned_container_network(instance, self.node_index, index)
-                    .map_err(|error| failure(format!("invalid network reservation: {error}")))?;
-                // Address-based retirement is idempotent after cancellation and
-                // removes only forwards to this exclusively reserved address.
-                netns::retire_address_forwarding(network.container_ip)
-                    .await
-                    .map_err(|error| failure(format!("forwarding teardown failed: {error}")))?;
-                netns::teardown_container_network(&network)
-                    .await
-                    .map_err(|error| failure(format!("network teardown failed: {error}")))?;
-                self.port_handles.lock().await.remove(instance);
-                self.network_leases
-                    .retire(instance, self.node_index, index)
-                    .await
-                    .map_err(|error| {
-                        failure(format!("cannot retire network reservation: {error}"))
-                    })?;
-            } else if self.port_handles.lock().await.contains_key(instance) {
-                return Err(failure(
-                    "port mapping has no owned network reservation".into(),
-                ));
-            }
-        }
-        self.port_handles.lock().await.remove(instance);
-        let mut networks = self.networks.lock().await;
-        networks.remove(instance);
-        self.publish_dns_sources(&networks);
-        Ok(())
-    }
 }
 
 /// Read the bytes of `path` from `offset` to end. Returns an empty vec if the
@@ -553,16 +188,6 @@ async fn read_from_offset(path: &std::path::Path, offset: u64) -> std::io::Resul
 }
 
 impl RuncGrill {
-    async fn prepare(
-        &self,
-        instance: &InstanceId,
-        spec: &OciSpec,
-        container_index: Option<u16>,
-    ) -> Result<(), GrillError> {
-        self.prepare_with_commands(instance, spec, container_index, &DirectCommandExecutor)
-            .await
-    }
-
     async fn prepare_with_commands(
         &self,
         instance: &InstanceId,
@@ -653,18 +278,12 @@ impl RuncGrill {
                     self.publish_dns_sources(&networks);
                 }
                 Err(e) => {
-                    // A configured resolver is only reachable through this
-                    // namespace. Continuing would create a workload whose
-                    // resolv.conf is guaranteed to be broken.
-                    if self.dns_nameserver.is_some() || self.ownership.is_some() {
-                        return Err(GrillError::StartFailed {
-                            instance: instance.clone(),
-                            reason: format!("failed to create DNS-capable container network: {e}"),
-                        });
-                    }
-                    // DNS-disabled workloads retain the historical best-effort
-                    // networking behaviour.
-                    eprintln!("warning: container network setup failed for {instance}: {e}");
+                    // The address is reserved and owned; a workload without
+                    // its network would hold that reservation for nothing.
+                    return Err(GrillError::StartFailed {
+                        instance: instance.clone(),
+                        reason: format!("failed to create container network: {e}"),
+                    });
                 }
             }
         }
@@ -763,26 +382,9 @@ impl RuncGrill {
                 reason: format!("failed to write config.json: {e}"),
             })?;
 
-        // Bundle is prepared; the container is created and started together by
-        // `runc run` in `start()`. Record the entry as Pending.
-        let log_path = bundle_dir.join("output.log");
-        let mut entries = self.entries.lock().await;
-        entries.insert(
-            instance.clone(),
-            RuncEntry {
-                bundle_dir,
-                log_path,
-                child: None,
-                adopted_pid: None,
-                adopted_pid_started_at: None,
-                port_mapping: spec.port_mapping,
-                state: ContainerState::Pending,
-                exit_code: None,
-            },
-        );
         // Keep rollback armed until every fallible preparation step has
-        // succeeded and the entry is visible. Unwinding before here also
-        // drops the guard and releases the host mount.
+        // succeeded. Unwinding before here also drops the guard and releases
+        // the host mount.
         if let Some(mounted) = rootfs_mount {
             mounted.commit();
         }
@@ -793,334 +395,39 @@ impl RuncGrill {
 
 impl super::Grill for RuncGrill {
     async fn create(&self, instance: &InstanceId, spec: &OciSpec) -> Result<(), GrillError> {
-        if self.ownership.is_some() {
-            return self.owned_create(instance, spec).await;
-        }
-        let _lifecycle = self.lock_lifecycle(instance).await;
-        // Refuse before preparation and its rollback can touch an existing owner.
-        let has_entry = self
-            .entries
-            .lock()
-            .await
-            .get(instance)
-            .is_some_and(|entry| entry.state != ContainerState::Stopped);
-        let has_oci_state = tokio::fs::try_exists(self.state_dir.join(&instance.0))
-            .await
-            .map_err(|error| GrillError::StartFailed {
-                instance: instance.clone(),
-                reason: format!("cannot inspect OCI ownership: {error}"),
-            })?;
-        if has_entry || has_oci_state {
-            return Err(GrillError::StartFailed {
-                instance: instance.clone(),
-                reason: "runtime owner already exists; adopt or retire the owner first".into(),
-            });
-        }
-        let container_index = if self.rootless {
-            None
-        } else {
-            // Refuse an existing namespace/interface before claiming it. A failed
-            // second create must never enter cleanup for another live owner.
-            for path in [
-                netns::namespace_path(instance),
-                PathBuf::from("/sys/class/net").join(netns::host_veth_name(instance)),
-            ] {
-                if tokio::fs::try_exists(&path)
-                    .await
-                    .map_err(|error| GrillError::StartFailed {
-                        instance: instance.clone(),
-                        reason: format!("cannot inspect network ownership: {error}"),
-                    })?
-                {
-                    return Err(GrillError::StartFailed {
-                        instance: instance.clone(),
-                        reason: "network resources already exist; adopt or retire the owner first"
-                            .into(),
-                    });
-                }
-            }
-            Some(
-                self.network_leases
-                    .reserve(instance, self.node_index)
-                    .await
-                    .map_err(|error| GrillError::StartFailed {
-                        instance: instance.clone(),
-                        reason: format!("cannot reserve container address: {error}"),
-                    })?,
-            )
-        };
-        let result = self.prepare(instance, spec, container_index).await;
-        if result.is_err() {
-            self.cleanup(instance).await?;
-        }
-        result
+        self.owned_create(instance, spec).await
     }
 
     async fn start(&self, instance: &InstanceId) -> Result<(), GrillError> {
-        if self.ownership.is_some() {
-            return self.owned_start(instance).await;
-        }
-        let _lifecycle = self.lock_lifecycle(instance).await;
-        let result = {
-            let mut entries = self.entries.lock().await;
-            let entry = entries
-                .get_mut(instance)
-                .ok_or_else(|| GrillError::NotFound {
-                    instance: instance.clone(),
-                })?;
-
-            if entry.child.is_some() || entry.adopted_pid.is_some() {
-                return Err(GrillError::StartFailed {
-                    instance: instance.clone(),
-                    reason: "already started".to_string(),
-                });
-            }
-
-            (|| {
-                // Redirect stdout and stderr to the per-instance log file.
-                let log_file = std::fs::File::create(&entry.log_path).map_err(|e| {
-                    GrillError::StartFailed {
-                        instance: instance.clone(),
-                        reason: format!("failed to create log file: {e}"),
-                    }
-                })?;
-                let log_file_err = log_file.try_clone().map_err(|e| GrillError::StartFailed {
-                    instance: instance.clone(),
-                    reason: format!("failed to clone log file handle: {e}"),
-                })?;
-
-                // `runc run` = create + start + wait; its exit status is the
-                // container's exit code.
-                let state_dir_str = self.state_dir.to_string_lossy().to_string();
-                let bundle_str = entry.bundle_dir.to_string_lossy().to_string();
-                let child = tokio::process::Command::new(&self.runc_program)
-                    .args([
-                        "--root",
-                        &state_dir_str,
-                        "run",
-                        "--bundle",
-                        &bundle_str,
-                        &instance.0,
-                    ])
-                    .stdout(std::process::Stdio::from(log_file))
-                    .stderr(std::process::Stdio::from(log_file_err))
-                    .spawn()
-                    .map_err(|e| GrillError::StartFailed {
-                        instance: instance.clone(),
-                        reason: format!("failed to spawn runc run: {e}"),
-                    })?;
-
-                entry.child = Some(child);
-                Ok((entry.bundle_dir.clone(), entry.port_mapping))
-            })()
-        };
-
-        let (bundle_dir, port_mapping) = match result {
-            Ok(values) => values,
-            Err(error) => {
-                self.cleanup(instance).await?;
-                return Err(error);
-            }
-        };
-
-        let startup = async {
-            let container_pid = self.wait_for_container_start(instance).await?;
-            if self.rootless {
-                let container_pid = container_pid.ok_or_else(|| GrillError::StartFailed {
-                    instance: instance.clone(),
-                    reason: "rootless startup requires a running container".into(),
-                })?;
-                self.start_rootless_network(
-                    instance,
-                    container_pid,
-                    &bundle_dir.join("slirp4netns.sock"),
-                    port_mapping,
-                )
-                .await?;
-            }
-            if container_pid.is_some()
-                && let Some(entry) = self.entries.lock().await.get_mut(instance)
-            {
-                entry.state = ContainerState::Running;
-            }
-            Ok::<(), GrillError>(())
-        }
-        .await;
-        if let Err(error) = startup {
-            self.cleanup(instance).await?;
-            return Err(error);
-        }
-
-        Ok(())
+        self.owned_start(instance).await
     }
 
     async fn stop(&self, instance: &InstanceId) -> Result<(), GrillError> {
-        if self.ownership.is_some() {
-            return self.owned_stop(instance).await;
-        }
-        let _lifecycle = self.lock_lifecycle(instance).await;
-        let signalled = self.signal_container(instance, "SIGTERM").await?;
-        if !signalled {
-            self.cleanup(instance).await?;
-        }
-        if let Some(entry) = self.entries.lock().await.get_mut(instance) {
-            entry.state = if signalled {
-                ContainerState::Stopping
-            } else {
-                ContainerState::Stopped
-            };
-        }
-        Ok(())
+        self.owned_stop(instance).await
     }
 
     async fn kill(&self, instance: &InstanceId) -> Result<(), GrillError> {
-        if self.ownership.is_some() {
-            return self.owned_kill(instance).await;
-        }
-        let _lifecycle = self.lock_lifecycle(instance).await;
-        self.signal_container(instance, "SIGKILL").await?;
-        if let Some(entry) = self.entries.lock().await.get_mut(instance) {
-            entry.state = ContainerState::Stopping;
-        }
-        tokio::time::timeout(std::time::Duration::from_secs(2), async {
-            while !self.launcher_exited(instance).await? {
-                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
-            }
-            Ok::<(), GrillError>(())
-        })
-        .await
-        .map_err(|_| GrillError::StopFailed {
-            instance: instance.clone(),
-            reason: "runc launcher did not exit after force-kill".into(),
-        })??;
-        self.cleanup(instance).await?;
-        if let Some(entry) = self.entries.lock().await.get_mut(instance) {
-            entry.state = ContainerState::Stopped;
-        }
-        Ok(())
+        self.owned_kill(instance).await
     }
 
     async fn state(&self, instance: &InstanceId) -> Result<ContainerState, GrillError> {
-        if self.ownership.is_some() {
-            return self.owned_state(instance).await;
-        }
-        let _lifecycle = self.lock_lifecycle(instance).await;
-        let (result_state, just_exited) = {
-            let mut entries = self.entries.lock().await;
-            let entry = entries
-                .get_mut(instance)
-                .ok_or_else(|| GrillError::NotFound {
-                    instance: instance.clone(),
-                })?;
-
-            let mut just_exited = false;
-            if let Some(ref mut child) = entry.child {
-                match child.try_wait() {
-                    Ok(Some(status)) => {
-                        just_exited = entry.state != ContainerState::Stopped;
-                        if just_exited {
-                            entry.state = ContainerState::Stopping;
-                        }
-                        entry.exit_code = status.code();
-                    }
-                    Ok(None) => {}
-                    Err(error) => {
-                        return Err(GrillError::StateUnavailable {
-                            instance: instance.clone(),
-                            reason: error.to_string(),
-                        });
-                    }
-                }
-            } else if let Some(pid) = entry.adopted_pid
-                && entry.state != ContainerState::Stopped
-            {
-                // Adopted `runc run` process: no handle, poll (and reap)
-                // by pid. See records::poll_adopted_process.
-                let (running, exit_code) =
-                    super::records::poll_adopted_process(pid, entry.adopted_pid_started_at)
-                        .map_err(|error| GrillError::StateUnavailable {
-                            instance: instance.clone(),
-                            reason: error.to_string(),
-                        })?;
-                if !running {
-                    just_exited = true;
-                    entry.state = ContainerState::Stopping;
-                    entry.exit_code = exit_code.or(entry.exit_code);
-                }
-            }
-            (entry.state, just_exited)
-        };
-
-        // Release all host resources once `runc run` has exited (lock released).
-        if just_exited {
-            self.cleanup(instance).await?;
-            if let Some(entry) = self.entries.lock().await.get_mut(instance) {
-                entry.state = ContainerState::Stopped;
-            }
-            return Ok(ContainerState::Stopped);
-        }
-        Ok(result_state)
+        self.owned_state(instance).await
     }
 
     async fn exit_code(&self, instance: &InstanceId) -> Option<i32> {
-        if self.ownership.is_some() {
-            return self.owned_exit_code(instance).await;
-        }
-        let _lifecycle = self.lock_lifecycle(instance).await;
-        let (exit_code, just_exited) = {
-            let mut entries = self.entries.lock().await;
-            let entry = entries.get_mut(instance)?;
-            let mut just_exited = false;
-            // Reap the child so the exit code is captured even if state() wasn't
-            // polled since exit.
-            if let Some(ref mut child) = entry.child {
-                if let Ok(Some(status)) = child.try_wait() {
-                    just_exited = entry.state != ContainerState::Stopped;
-                    if just_exited {
-                        entry.state = ContainerState::Stopping;
-                    }
-                    entry.exit_code = status.code();
-                }
-            } else if let Some(pid) = entry.adopted_pid
-                && entry.state != ContainerState::Stopped
-            {
-                let (running, exit_code) =
-                    super::records::poll_adopted_process(pid, entry.adopted_pid_started_at).ok()?;
-                if !running {
-                    just_exited = true;
-                    entry.state = ContainerState::Stopping;
-                    entry.exit_code = exit_code.or(entry.exit_code);
-                }
-            }
-            (entry.exit_code, just_exited)
-        };
-        if just_exited {
-            self.cleanup(instance).await.ok()?;
-            if let Some(entry) = self.entries.lock().await.get_mut(instance) {
-                entry.state = ContainerState::Stopped;
-            }
-        }
-        exit_code
+        self.owned_exit_code(instance).await
     }
 
     async fn pid(&self, instance: &InstanceId) -> Option<u32> {
-        if self.ownership.is_some() {
-            return self.owned_pid(instance).await;
-        }
-        let entries = self.entries.lock().await;
-        let entry = entries.get(instance)?;
-        entry
-            .child
-            .as_ref()
-            .and_then(|c| c.id())
-            .or(entry.adopted_pid)
+        self.owned_pid(instance).await
     }
 
     async fn workload_cgroup(&self, instance: &InstanceId) -> Result<Option<u64>, GrillError> {
-        if self.ownership.is_some() && !self.rootless {
-            return self.owned_workload_cgroup(instance).await;
+        // Rootless runc may not own its cgroup tree.
+        if self.rootless {
+            return Ok(None);
         }
-        Ok(None)
+        self.owned_workload_cgroup(instance).await
     }
 
     async fn container_ip(&self, instance: &InstanceId) -> Option<std::net::Ipv4Addr> {
@@ -1131,24 +438,18 @@ impl super::Grill for RuncGrill {
     }
 
     async fn launch_inventory(&self) -> Result<Option<Vec<super::RuntimeLaunch>>, GrillError> {
-        if self.ownership.is_some() {
-            return self.owned_inventory().await;
-        }
-        Ok(None)
+        self.owned_inventory().await
     }
 
     async fn log_stem(&self, instance: &InstanceId) -> Option<PathBuf> {
-        if self.ownership.is_some() {
-            return self.owned_log_stem(instance).await.ok().flatten();
-        }
-        None
+        self.owned_log_stem(instance).await.ok().flatten()
     }
 
     async fn retain_network_reference(
         &self,
         instance: &InstanceId,
     ) -> Result<Option<super::runc_intent::NetworkReference>, GrillError> {
-        if self.ownership.is_none() || self.rootless {
+        if self.rootless {
             return Ok(None);
         }
         self.owned_retain_network_reference(instance)
@@ -1160,7 +461,7 @@ impl super::Grill for RuncGrill {
         &self,
         instance: &InstanceId,
     ) -> Result<Option<super::runc_intent::NetworkReference>, GrillError> {
-        if self.ownership.is_none() || self.rootless {
+        if self.rootless {
             return Ok(None);
         }
         match self.owned_network_reference(instance).await {
@@ -1184,14 +485,7 @@ impl super::Grill for RuncGrill {
         &self,
         instance: &InstanceId,
     ) -> Option<super::records::RootlessNetworkRecord> {
-        if self.ownership.is_some() {
-            return self.owned_network_record(instance).await;
-        }
-        self.slirp_handles
-            .lock()
-            .await
-            .get(instance)
-            .and_then(super::rootless::Slirp4netnsHandle::adoption_record)
+        self.owned_network_record(instance).await
     }
 
     /// Root-mode runc joins the exact cgroup v2 path from the OCI spec's
@@ -1206,196 +500,15 @@ impl super::Grill for RuncGrill {
         instance: &InstanceId,
         record: &super::records::InstanceRecord,
     ) -> Result<bool, GrillError> {
-        if self.ownership.is_some() {
-            return self.owned_adopt(instance, record).await;
-        }
-        let _lifecycle = self.lock_lifecycle(instance).await;
-        // The recorded `runc run` process must still be the one we started...
-        let (running, _) =
-            super::records::poll_adopted_process(record.pid, Some(record.pid_started_at)).map_err(
-                |error| GrillError::StateUnavailable {
-                    instance: instance.clone(),
-                    reason: error.to_string(),
-                },
-            )?;
-        if !running {
-            self.cleanup(instance).await?;
-            return Ok(false);
-        }
-        // ...and runc itself must agree the container is running.
-        let container_id = record.runc_container_id.as_deref().unwrap_or(&instance.0);
-        let output = match self.runc_command(&["state", container_id], instance).await {
-            Ok(output) => output,
-            Err(error) => {
-                self.cleanup(instance).await?;
-                return Err(error);
-            }
-        };
-        if !output.status.success() {
-            self.cleanup(instance).await?;
-            return Ok(false);
-        }
-        let state = serde_json::from_slice::<serde_json::Value>(&output.stdout).ok();
-        let running = state
-            .as_ref()
-            .and_then(|value| value.get("status"))
-            .and_then(|status| status.as_str())
-            == Some("running");
-        if !running {
-            self.cleanup(instance).await?;
-            return Ok(false);
-        }
-        let container_pid = state
-            .as_ref()
-            .and_then(|value| value.get("pid"))
-            .and_then(|pid| pid.as_u64())
-            .and_then(|pid| u32::try_from(pid).ok());
-
-        if !self.rootless {
-            let network = if let Some(pid) = container_pid {
-                netns::adopt_container_network(instance, pid)
-                    .await
-                    .map_err(|error| GrillError::StartFailed {
-                        instance: instance.clone(),
-                        reason: format!("cannot reclaim container network: {error}"),
-                    })?
-            } else {
-                None
-            };
-            if let Some(network) = network {
-                let index = u32::from(network.container_ip)
-                    .checked_sub(u32::from(netns::container_ip(self.node_index, 0)))
-                    .filter(|index| *index < u32::from(netns::MAX_CONTAINERS_PER_NODE))
-                    .ok_or_else(|| GrillError::StartFailed {
-                        instance: instance.clone(),
-                        reason: "adopted network subnet differs from the configured node subnet"
-                            .into(),
-                    })?;
-                self.network_leases
-                    .adopt(instance, self.node_index, index as u16)
-                    .await
-                    .map_err(|error| GrillError::StartFailed {
-                        instance: instance.clone(),
-                        reason: format!("cannot adopt network reservation: {error}"),
-                    })?;
-                let mut networks = self.networks.lock().await;
-                networks.insert(instance.clone(), network);
-                self.publish_dns_sources(&networks);
-            } else if self.dns_nameserver.is_some() {
-                return Err(GrillError::StartFailed {
-                    instance: instance.clone(),
-                    reason: "DNS-enabled adoption requires an owned container network".into(),
-                });
-            }
-        }
-
-        if self.rootless {
-            let Some(container_pid) = container_pid else {
-                self.cleanup(instance).await?;
-                return Err(GrillError::StartFailed {
-                    instance: instance.clone(),
-                    reason:
-                        "runc state omitted the container PID needed to restore rootless networking"
-                            .to_string(),
-                });
-            };
-            let api_socket = record
-                .rootless_network
-                .as_ref()
-                .map(|network| network.api_socket.clone())
-                .unwrap_or_else(|| self.bundle_base.join(&instance.0).join("slirp4netns.sock"));
-            if let Err(error) = self
-                .restore_rootless_network(
-                    instance,
-                    container_pid,
-                    &api_socket,
-                    record.oci_spec.port_mapping,
-                    record.rootless_network.as_ref(),
-                )
-                .await
-            {
-                self.cleanup(instance).await?;
-                return Err(error);
-            }
-        } else if let Some(pm) = &record.oci_spec.port_mapping {
-            // The root-mode map element survived in the kernel; rebuild only
-            // the owner handle whose shutdown removes it.
-            self.port_handles.lock().await.insert(
-                instance.clone(),
-                PortMapHandle::for_adopted(pm.host_port, pm.container_port),
-            );
-        }
-
-        let bundle_dir = self.bundle_base.join(&instance.0);
-        let log_path = bundle_dir.join("output.log");
-        self.entries.lock().await.insert(
-            instance.clone(),
-            RuncEntry {
-                bundle_dir,
-                log_path,
-                child: None,
-                adopted_pid: Some(record.pid),
-                adopted_pid_started_at: Some(record.pid_started_at),
-                port_mapping: record.oci_spec.port_mapping,
-                state: ContainerState::Running,
-                exit_code: None,
-            },
-        );
-
-        Ok(true)
+        self.owned_adopt(instance, record).await
     }
 
     async fn logs(&self, instance: &InstanceId) -> Result<String, GrillError> {
-        if self.ownership.is_some() {
-            return self.owned_logs(instance).await;
-        }
-        let log_path = {
-            let entries = self.entries.lock().await;
-            entries
-                .get(instance)
-                .ok_or_else(|| GrillError::NotFound {
-                    instance: instance.clone(),
-                })?
-                .log_path
-                .clone()
-        };
-        match tokio::fs::read(&log_path).await {
-            Ok(bytes) => Ok(String::from_utf8_lossy(&bytes).into_owned()),
-            // No output yet is not an error.
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(String::new()),
-            Err(e) => Err(GrillError::StartFailed {
-                instance: instance.clone(),
-                reason: format!("failed to read logs: {e}"),
-            }),
-        }
+        self.owned_logs(instance).await
     }
 
     async fn exec(&self, instance: &InstanceId, command: &[String]) -> Result<String, GrillError> {
-        if self.ownership.is_some() {
-            return self.owned_exec(instance, command).await;
-        }
-        if command.is_empty() {
-            return Err(GrillError::StartFailed {
-                instance: instance.clone(),
-                reason: "no command specified".to_string(),
-            });
-        }
-        // `--` terminates runc's own option parsing. It must precede the
-        // container id; after the id it becomes the command to execute.
-        let mut args = vec!["exec", "--", &instance.0];
-        for part in command {
-            args.push(part.as_str());
-        }
-        let output = self.runc_command(&args, instance).await?;
-        let mut result = String::from_utf8_lossy(&output.stdout).into_owned();
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        if !stderr.is_empty() {
-            if !result.is_empty() && !result.ends_with('\n') {
-                result.push('\n');
-            }
-            result.push_str(&stderr);
-        }
-        Ok(result)
+        self.owned_exec(instance, command).await
     }
 
     async fn follow_logs(
@@ -1403,60 +516,7 @@ impl super::Grill for RuncGrill {
         instance: &InstanceId,
         lines_tx: tokio::sync::mpsc::Sender<String>,
     ) {
-        if self.ownership.is_some() {
-            self.owned_follow_logs(instance, lines_tx).await;
-            return;
-        }
-        let log_path = {
-            let entries = self.entries.lock().await;
-            match entries.get(instance) {
-                Some(entry) => entry.log_path.clone(),
-                None => return,
-            }
-        };
-
-        let mut offset = 0u64;
-        let mut partial_line = String::new();
-        loop {
-            if let Ok(bytes) = read_from_offset(&log_path, offset).await
-                && !bytes.is_empty()
-            {
-                offset += bytes.len() as u64;
-                partial_line.push_str(&String::from_utf8_lossy(&bytes));
-                while let Some(pos) = partial_line.find('\n') {
-                    let line = partial_line[..pos].to_string();
-                    partial_line = partial_line[pos + 1..].to_string();
-                    if lines_tx.send(line).await.is_err() {
-                        return;
-                    }
-                }
-            }
-
-            // Stop once the container has exited and the file is fully read.
-            let exited = {
-                let entries = self.entries.lock().await;
-                match entries.get(instance) {
-                    Some(entry) => matches!(
-                        entry.state,
-                        ContainerState::Stopped | ContainerState::Stopping
-                    ),
-                    None => return,
-                }
-            };
-            if exited
-                && read_from_offset(&log_path, offset)
-                    .await
-                    .map(|b| b.is_empty())
-                    .unwrap_or(true)
-            {
-                if !partial_line.is_empty() {
-                    let _ = lines_tx.send(std::mem::take(&mut partial_line)).await;
-                }
-                return;
-            }
-
-            tokio::time::sleep(std::time::Duration::from_millis(200)).await;
-        }
+        self.owned_follow_logs(instance, lines_tx).await;
     }
 }
 
@@ -1482,6 +542,17 @@ mod tests {
     use super::*;
     use crate::grill::Grill;
 
+    /// The Bun binary that owns runtime commands in these tests.
+    fn test_owner() -> PathBuf {
+        std::env::var_os("RELIABURGER_BUN_BINARY")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| {
+                // Unit tests run from target/<profile>/deps; Bun is built beside it.
+                let executable = std::env::current_exe().unwrap();
+                executable.parent().unwrap().parent().unwrap().join("bun")
+            })
+    }
+
     fn preparation_spec(command: &str) -> OciSpec {
         serde_json::from_value(serde_json::json!({
             "root": {"path": "/", "readonly": true},
@@ -1499,7 +570,9 @@ mod tests {
             ImageStore::new(root.path().join("images")),
             true,
             root.path().join("state"),
-        );
+            test_owner(),
+        )
+        .unwrap();
         let id = InstanceId("default__duplicate-0".into());
         let bundle = root.path().join("bundles").join(&id.0).join("config.json");
         grill.create(&id, &preparation_spec("first")).await.unwrap();
@@ -1535,7 +608,9 @@ mod tests {
             ImageStore::new(root.path().join("images")),
             true,
             state.clone(),
-        );
+            test_owner(),
+        )
+        .unwrap();
         let result = grill.create(&id, &preparation_spec("replacement")).await;
         assert!(
             result.is_err(),
@@ -1546,283 +621,6 @@ mod tests {
             "original owner"
         );
         assert!(state.join(&id.0).is_dir());
-    }
-
-    #[tokio::test]
-    async fn invalid_adoption_preserves_resources_without_invoking_runc() {
-        use std::os::unix::fs::PermissionsExt;
-        let root = tempfile::tempdir().unwrap();
-        let program = root.path().join("runc-fixture");
-        std::fs::write(&program, "#!/bin/sh\ntouch \"$2/command-run\"\nexit 1\n").unwrap();
-        std::fs::set_permissions(&program, std::fs::Permissions::from_mode(0o700)).unwrap();
-        let state_dir = root.path().join("state");
-        let id = InstanceId("invalid-adoption".into());
-        std::fs::create_dir_all(state_dir.join(&id.0)).unwrap();
-        let mut grill = RuncGrill::new(
-            root.path().join("bundles"),
-            ImageStore::new(root.path().join("images")),
-            true,
-            state_dir.clone(),
-        );
-        grill.runc_program = program;
-        let mut record: super::super::records::InstanceRecord =
-            serde_json::from_value(serde_json::json!({
-                "schema": 2, "instance_id": id.0, "namespace": "default",
-                "app_name": "invalid-adoption", "replica_index": 0,
-                "is_job": false, "image": "unused", "runtime": "Runc",
-                "pid": 0, "pid_started_at": 1000,
-                "oci_spec": {
-                    "root": {"path": "/unused", "readonly": true},
-                    "process": {"args": [], "env": [], "cwd": "/", "user": {"uid": 0, "gid": 0}},
-                    "mounts": [], "linux": {"namespaces": []}
-                }
-            }))
-            .unwrap();
-        for pid in [0, u32::MAX, i32::MAX as u32 + 1] {
-            record.pid = pid;
-            assert!(matches!(
-                grill.adopt(&id, &record).await,
-                Err(GrillError::StateUnavailable { .. })
-            ));
-            assert!(state_dir.join(&id.0).exists());
-            assert!(!state_dir.join("command-run").exists());
-        }
-    }
-
-    async fn failed_deletion_retains_runtime_ownership(force: bool, adopted: bool) {
-        use std::os::unix::fs::PermissionsExt;
-        let root = tempfile::tempdir().unwrap();
-        let program = root.path().join("runc-fixture");
-        std::fs::write(
-            &program,
-            "#!/bin/sh\nif [ \"$3\" = delete ]; then\n  if [ -e \"$2/block-delete\" ]; then touch \"$2/delete-entered\"; exec sleep 60; fi\n  if [ -e \"$2/fail-delete\" ]; then echo injected-delete-failure >&2; exit 1; fi\n  rmdir \"$2/$5\"\nfi\n",
-        ).unwrap();
-        std::fs::set_permissions(&program, std::fs::Permissions::from_mode(0o700)).unwrap();
-        let state_dir = root.path().join("state");
-        let id = InstanceId("retry-runtime-cleanup".into());
-        std::fs::create_dir_all(state_dir.join(&id.0)).unwrap();
-        let refusal = state_dir.join("fail-delete");
-        std::fs::write(&refusal, b"refuse").unwrap();
-        let mut grill = RuncGrill::new(
-            root.path().join("bundles"),
-            ImageStore::new(root.path().join("images")),
-            true,
-            state_dir.clone(),
-        );
-        grill.runc_program = program;
-        let mut child = tokio::process::Command::new("sh")
-            .args(["-c", "exit 7"])
-            .spawn()
-            .unwrap();
-        let pid = child.id().unwrap();
-        child.wait().await.unwrap();
-        grill.entries.lock().await.insert(
-            id.clone(),
-            RuncEntry {
-                bundle_dir: root.path().join("bundles").join(&id.0),
-                log_path: root.path().join("container.log"),
-                child: (!adopted).then_some(child),
-                adopted_pid: adopted.then_some(pid),
-                adopted_pid_started_at: None,
-                port_mapping: None,
-                state: ContainerState::Running,
-                exit_code: adopted.then_some(7),
-            },
-        );
-        let result = if force {
-            grill.kill(&id).await
-        } else {
-            grill.state(&id).await.map(|_| ())
-        };
-        assert!(
-            result.is_err(),
-            "failed OCI deletion was acknowledged: {result:?}"
-        );
-        assert!(
-            result
-                .unwrap_err()
-                .to_string()
-                .contains("injected-delete-failure")
-        );
-        assert_ne!(
-            grill.entries.lock().await[&id].state,
-            ContainerState::Stopped
-        );
-        assert!(state_dir.join(&id.0).exists());
-        let blocked = state_dir.join("block-delete");
-        std::fs::write(&blocked, b"wait").unwrap();
-        let cleanup = tokio::spawn({
-            let grill = grill.clone();
-            let id = id.clone();
-            async move { grill.state(&id).await }
-        });
-        tokio::time::timeout(std::time::Duration::from_secs(2), async {
-            while !tokio::fs::try_exists(state_dir.join("delete-entered"))
-                .await
-                .unwrap()
-            {
-                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
-            }
-        })
-        .await
-        .unwrap();
-        cleanup.abort();
-        assert!(cleanup.await.unwrap_err().is_cancelled());
-        assert_eq!(
-            grill.entries.lock().await[&id].state,
-            ContainerState::Stopping
-        );
-        assert!(state_dir.join(&id.0).exists());
-        std::fs::remove_file(blocked).unwrap();
-        assert!(
-            grill.state(&id).await.is_err(),
-            "later observation forgot failed cleanup"
-        );
-        std::fs::remove_file(refusal).unwrap();
-        assert_eq!(grill.state(&id).await.unwrap(), ContainerState::Stopped);
-        assert!(!state_dir.join(&id.0).exists());
-        assert_eq!(grill.state(&id).await.unwrap(), ContainerState::Stopped);
-        assert_eq!(grill.exit_code(&id).await, Some(7));
-    }
-
-    #[tokio::test]
-    async fn state_retries_failed_runtime_deletion() {
-        failed_deletion_retains_runtime_ownership(false, false).await;
-    }
-
-    #[tokio::test]
-    async fn force_stop_preserves_failed_runtime_deletion() {
-        failed_deletion_retains_runtime_ownership(true, false).await;
-    }
-
-    #[tokio::test]
-    async fn cleanup_retries_preserve_recorded_adopted_exit_code() {
-        failed_deletion_retains_runtime_ownership(false, true).await;
-    }
-
-    #[tokio::test]
-    async fn state_preserves_resources_when_launcher_exit_cannot_be_observed() {
-        let root = tempfile::tempdir().unwrap();
-        let grill = RuncGrill::new(
-            root.path().join("bundles"),
-            ImageStore::new(root.path().join("images")),
-            true,
-            root.path().join("state"),
-        );
-        let id = InstanceId("lost-launcher-wait".into());
-        let child = tokio::process::Command::new("true").spawn().unwrap();
-        let pid = child.id().unwrap();
-        tokio::task::spawn_blocking(move || {
-            nix::sys::wait::waitpid(nix::unistd::Pid::from_raw(pid as i32), None).unwrap();
-        })
-        .await
-        .unwrap();
-        grill.entries.lock().await.insert(
-            id.clone(),
-            RuncEntry {
-                bundle_dir: root.path().join("bundles").join(&id.0),
-                log_path: root.path().join("container.log"),
-                child: Some(child),
-                adopted_pid: None,
-                adopted_pid_started_at: None,
-                port_mapping: None,
-                state: ContainerState::Running,
-                exit_code: None,
-            },
-        );
-        assert!(matches!(
-            grill.state(&id).await,
-            Err(GrillError::StateUnavailable { .. })
-        ));
-        assert_eq!(
-            grill.entries.lock().await.get(&id).unwrap().state,
-            ContainerState::Running
-        );
-    }
-
-    async fn signal_does_not_discard_a_live_launcher(force: bool, succeeds: bool) {
-        use std::os::unix::fs::PermissionsExt;
-        let root = tempfile::tempdir().unwrap();
-        let program = root.path().join("runc-fixture");
-        std::fs::write(
-            &program,
-            if succeeds {
-                "#!/bin/sh\nexit 0\n"
-            } else {
-                "#!/bin/sh\necho injected-signal-failure >&2\nexit 1\n"
-            },
-        )
-        .unwrap();
-        std::fs::set_permissions(&program, std::fs::Permissions::from_mode(0o700)).unwrap();
-        let mut grill = RuncGrill::new(
-            root.path().join("bundles"),
-            ImageStore::new(root.path().join("images")),
-            true,
-            root.path().join("state"),
-        );
-        grill.runc_program = program;
-        let id = InstanceId("signal-owner".into());
-        let child = tokio::process::Command::new("sleep")
-            .arg("60")
-            .kill_on_drop(true)
-            .spawn()
-            .unwrap();
-        grill.entries.lock().await.insert(
-            id.clone(),
-            RuncEntry {
-                bundle_dir: root.path().join("bundles").join(&id.0),
-                log_path: root.path().join("container.log"),
-                child: Some(child),
-                adopted_pid: None,
-                adopted_pid_started_at: None,
-                port_mapping: None,
-                state: ContainerState::Running,
-                exit_code: None,
-            },
-        );
-        let result = if force {
-            grill.kill(&id).await
-        } else {
-            grill.stop(&id).await
-        };
-        let mut entries = grill.entries.lock().await;
-        let entry = entries.get_mut(&id).unwrap();
-        let state = entry.state;
-        let child = entry.child.as_mut().unwrap();
-        let still_running = child.try_wait().unwrap().is_none();
-        let _ = child.kill().await;
-        let error = result.expect_err("unconfirmed signal/exit was acknowledged");
-        if succeeds {
-            assert!(
-                error.to_string().contains("launcher did not exit"),
-                "{error}"
-            );
-        } else {
-            assert!(
-                error.to_string().contains("injected-signal-failure"),
-                "{error}"
-            );
-        }
-        assert_ne!(state, ContainerState::Stopped);
-        assert!(
-            still_running,
-            "the runtime killed its launcher instead of establishing container exit"
-        );
-    }
-
-    #[tokio::test]
-    async fn failed_graceful_signal_preserves_the_launcher() {
-        signal_does_not_discard_a_live_launcher(false, false).await;
-    }
-
-    #[tokio::test]
-    async fn failed_force_signal_preserves_the_launcher() {
-        signal_does_not_discard_a_live_launcher(true, false).await;
-    }
-
-    #[tokio::test]
-    async fn acknowledged_force_signal_requires_observed_launcher_exit() {
-        signal_does_not_discard_a_live_launcher(true, true).await;
     }
 
     fn runc_tests_enabled() -> bool {
@@ -1876,142 +674,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn repeated_adoption_retires_only_the_displaced_owner() {
-        let tmp = tempfile::tempdir().unwrap();
-        let grill = RuncGrill::new(
-            tmp.path().join("bundles"),
-            ImageStore::new(tmp.path().join("images")),
-            true,
-            tmp.path().join("state"),
-        );
-        let id = InstanceId("adopt-rootless".into());
-        let socket = tmp.path().join("api.sock");
-        let _listener = tokio::net::UnixListener::bind(&socket).unwrap();
-        let mut old = tokio::process::Command::new("sleep")
-            .arg("60")
-            .kill_on_drop(true)
-            .spawn()
-            .unwrap();
-        let mut new = tokio::process::Command::new("sleep")
-            .arg("60")
-            .kill_on_drop(true)
-            .spawn()
-            .unwrap();
-        let record_for = |pid| super::super::records::RootlessNetworkRecord {
-            api_socket: socket.clone(),
-            owner_pid: pid,
-            owner_pid_started_at: super::super::records::process_start_time(pid).unwrap(),
-            container_pid: std::process::id(),
-            port_mapping: None,
-        };
-        let first = record_for(old.id().unwrap());
-        let second = record_for(new.id().unwrap());
-        for record in [&first, &second, &second] {
-            grill
-                .restore_rootless_network(&id, std::process::id(), &socket, None, Some(record))
-                .await
-                .unwrap();
-        }
-        assert!(
-            tokio::time::timeout(std::time::Duration::from_secs(2), old.wait())
-                .await
-                .is_ok()
-        );
-        assert!(new.try_wait().unwrap().is_none());
-        assert!(
-            socket.exists(),
-            "retiring old owner unlinked the replacement socket"
-        );
-        assert_eq!(
-            grill.rootless_network_record(&id).await,
-            Some(second.clone())
-        );
-        let mut conflicting = second.clone();
-        conflicting.port_mapping = Some(super::super::oci::PortMapping {
-            host_port: 8080,
-            container_port: 80,
-        });
-        assert!(
-            grill
-                .restore_rootless_network(
-                    &id,
-                    std::process::id(),
-                    &socket,
-                    None,
-                    Some(&conflicting)
-                )
-                .await
-                .is_err()
-        );
-        assert!(new.try_wait().unwrap().is_none());
-        assert_eq!(grill.rootless_network_record(&id).await, Some(second));
-        grill
-            .slirp_handles
-            .lock()
-            .await
-            .remove(&id)
-            .unwrap()
-            .shutdown()
-            .await
-            .unwrap();
-        assert!(!socket.exists());
-    }
-
-    #[tokio::test]
-    async fn failed_replacement_stops_displaced_rootless_owner() {
-        let tmp = tempfile::tempdir().unwrap();
-        let grill = RuncGrill::new(
-            tmp.path().join("bundles"),
-            ImageStore::new(tmp.path().join("images")),
-            true,
-            tmp.path().join("state"),
-        );
-        let id = InstanceId("replace-rootless".into());
-        let socket = tmp.path().join("old.sock");
-        let _listener = tokio::net::UnixListener::bind(&socket).unwrap();
-        let mut old = tokio::process::Command::new("sleep")
-            .arg("60")
-            .kill_on_drop(true)
-            .spawn()
-            .unwrap();
-        let pid = old.id().unwrap();
-        let record = super::super::records::RootlessNetworkRecord {
-            api_socket: socket.clone(),
-            owner_pid: pid,
-            owner_pid_started_at: super::super::records::process_start_time(pid).unwrap(),
-            container_pid: std::process::id(),
-            port_mapping: None,
-        };
-        grill.slirp_handles.lock().await.insert(
-            id.clone(),
-            super::super::rootless::Slirp4netnsHandle::adopt(&record)
-                .await
-                .unwrap(),
-        );
-        let result = grill
-            .start_rootless_network(
-                &id,
-                std::process::id(),
-                &tmp.path().join("missing/next.sock"),
-                None,
-            )
-            .await;
-        assert!(result.is_err());
-        let stopped = tokio::time::timeout(std::time::Duration::from_secs(2), old.wait())
-            .await
-            .is_ok();
-        if !stopped {
-            let _ = old.kill().await;
-        }
-        assert!(
-            stopped,
-            "replacement discarded the old helper without stopping it"
-        );
-        assert!(!socket.exists());
-        assert!(grill.rootless_network_record(&id).await.is_none());
-    }
-
-    #[tokio::test]
     async fn rootless_writable_image_fails_before_pull() {
         let tmp = tempfile::tempdir().unwrap();
         let grill = RuncGrill::new(
@@ -2019,7 +681,9 @@ mod tests {
             ImageStore::new(tmp.path().join("images")),
             true,
             tmp.path().join("state"),
-        );
+            test_owner(),
+        )
+        .unwrap();
         let id = InstanceId("rootless-writable".to_string());
         let spec = crate::grill::oci::OciSpec {
             port_mapping: None,
@@ -2057,127 +721,6 @@ mod tests {
         );
     }
 
-    /// Real replacement acceptance for M5. This downloads Alpine, starts a
-    /// rootless runc workload behind slirp4netns, kills the userspace network
-    /// owner to model process death, and proves an adopting grill recreates the
-    /// published port before reporting success.
-    #[tokio::test]
-    #[ignore = "requires Linux rootless runc, slirp4netns, network access and RELIABURGER_ROOTLESS_RUNC_TESTS=1"]
-    async fn rootless_published_port_survives_bun_replacement() {
-        assert!(
-            std::env::var("RELIABURGER_ROOTLESS_RUNC_TESTS").is_ok(),
-            "set RELIABURGER_ROOTLESS_RUNC_TESTS=1 after provisioning rootless runc and slirp4netns"
-        );
-        let port_probe = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let host_port = port_probe.local_addr().unwrap().port();
-        drop(port_probe);
-
-        let tmp = tempfile::tempdir().unwrap();
-        let bundle_base = tmp.path().join("bundles");
-        let state_dir = tmp.path().join("state");
-        let image_store = ImageStore::new(tmp.path().join("images"));
-        let original = RuncGrill::new(
-            bundle_base.clone(),
-            image_store.clone(),
-            true,
-            state_dir.clone(),
-        );
-        let id = InstanceId("rootless-adoption-port".to_string());
-        let spec = crate::grill::oci::OciSpec {
-            port_mapping: Some(crate::grill::oci::PortMapping {
-                host_port,
-                container_port: 8080,
-            }),
-            root: crate::grill::oci::OciRoot {
-                path: "docker.io/library/alpine:3.20".to_string(),
-                readonly: true,
-            },
-            process: crate::grill::oci::OciProcess {
-                args: vec![
-                    "/bin/sh".to_string(),
-                    "-c".to_string(),
-                    "while true; do printf 'HTTP/1.0 200 OK\\r\\nContent-Length: 3\\r\\n\\r\\nok\\n' | nc -l -p 8080; done".to_string(),
-                ],
-                env: vec!["PATH=/bin:/usr/bin".to_string()],
-                cwd: "/".to_string(),
-                user: crate::grill::oci::OciUser { uid: 0, gid: 0 },
-            },
-            mounts: crate::grill::oci::standard_mounts(),
-            linux: crate::grill::oci::OciLinux {
-                namespaces: crate::grill::oci::standard_namespaces(None),
-                resources: None,
-                cgroups_path: None,
-                uid_mappings: None,
-                gid_mappings: None,
-            },
-        };
-        original.create(&id, &spec).await.unwrap();
-        original.start(&id).await.unwrap();
-        wait_for_http(host_port).await;
-
-        let pid = original.pid(&id).await.unwrap();
-        let rootless_network = original.rootless_network_record(&id).await.unwrap();
-        let record = crate::grill::records::InstanceRecord {
-            schema: 2,
-            instance_id: id.0.clone(),
-            namespace: "default".to_string(),
-            app_name: "rootless-adoption-port".to_string(),
-            replica_index: 0,
-            is_job: false,
-            image: "docker.io/library/alpine:3.20".to_string(),
-            runtime: crate::grill::records::RuntimeKind::Runc,
-            pid,
-            pid_started_at: crate::grill::records::process_start_time(pid).unwrap(),
-            runc_container_id: Some(id.0.clone()),
-            log_stem: None,
-            host_port: Some(host_port),
-            app_spec: None,
-            oci_spec: spec,
-            rootless_network: Some(rootless_network.clone()),
-        };
-
-        crate::grill::rootless::stop_recorded_owner(&rootless_network);
-        for _ in 0..100 {
-            if !crate::grill::records::process_matches(
-                rootless_network.owner_pid,
-                rootless_network.owner_pid_started_at,
-            ) {
-                break;
-            }
-            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
-        }
-        drop(original);
-
-        let adopter = RuncGrill::new(bundle_base, image_store, true, state_dir);
-        assert!(adopter.adopt(&id, &record).await.unwrap());
-        let replacement = adopter.rootless_network_record(&id).await.unwrap();
-        assert_ne!(replacement.owner_pid, rootless_network.owner_pid);
-        wait_for_http(host_port).await;
-        adopter.kill(&id).await.unwrap();
-    }
-
-    async fn wait_for_http(port: u16) {
-        use tokio::io::{AsyncReadExt, AsyncWriteExt};
-
-        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(10);
-        loop {
-            if let Ok(mut stream) = tokio::net::TcpStream::connect(("127.0.0.1", port)).await
-                && stream.write_all(b"GET / HTTP/1.0\r\n\r\n").await.is_ok()
-            {
-                let mut response = Vec::new();
-                if stream.read_to_end(&mut response).await.is_ok() && response.starts_with(b"HTTP/")
-                {
-                    return;
-                }
-            }
-            assert!(
-                tokio::time::Instant::now() < deadline,
-                "published port {port} did not answer"
-            );
-            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-        }
-    }
-
     #[tokio::test]
     async fn exhausted_address_pool_refuses_before_creating_a_bundle() {
         let tmp = tempfile::tempdir().unwrap();
@@ -2188,7 +731,9 @@ mod tests {
             ImageStore::new(tmp.path().join("images")),
             false,
             tmp.path().join("state"),
-        );
+            test_owner(),
+        )
+        .unwrap();
         let allocations: std::collections::BTreeMap<String, u16> = (0
             ..netns::MAX_CONTAINERS_PER_NODE)
             .map(|index| (format!("existing-{index}"), index))
@@ -2253,7 +798,9 @@ mod tests {
             ImageStore::new(tmp.path().join("images")),
             true,
             state_dir,
-        );
+            test_owner(),
+        )
+        .unwrap();
         let id = InstanceId("runc-test-0".to_string());
         let spec = crate::grill::oci::OciSpec {
             port_mapping: None,
@@ -2286,8 +833,7 @@ mod tests {
         assert!(tmp.path().join("bundles/runc-test-0/config.json").exists());
 
         if result.is_ok() {
-            // Clean up runc state
-            let _ = grill.runc_command(&["delete", "--force", &id.0], &id).await;
+            grill.kill(&id).await.unwrap();
         }
     }
 
@@ -2307,7 +853,9 @@ mod tests {
             ImageStore::new(tmp.path().join("images")),
             false,
             tmp.path().join("state"),
-        );
+            test_owner(),
+        )
+        .unwrap();
         let nameserver = grill.dns_gateway_address().unwrap();
         let grill = grill.with_dns_nameserver(nameserver);
 
@@ -2461,7 +1009,9 @@ mod tests {
             ImageStore::new(tmp.path().join("images")),
             false,
             tmp.path().join("state"),
-        );
+            test_owner(),
+        )
+        .unwrap();
         let ids = [
             InstanceId("runc-rootfs-isolation-0".to_string()),
             InstanceId("runc-rootfs-isolation-1".to_string()),
@@ -2601,91 +1151,6 @@ mod tests {
     }
 
     #[tokio::test]
-    #[ignore = "requires rootful networking and RELIABURGER_RUNC_TESTS=1"]
-    async fn cancelled_creation_retains_address_until_recovered_teardown() {
-        assert!(runc_tests_enabled());
-        assert_eq!(nix::unistd::Uid::effective().as_raw(), 0);
-        let tmp = tempfile::tempdir().unwrap();
-        let bundle_base = tmp.path().join("bundles");
-        let images = ImageStore::new(tmp.path().join("images"));
-        let state_dir = tmp.path().join("state");
-        let id = InstanceId("default__cancelled-network-0".into());
-        let next_id = InstanceId("default__cancelled-network-1".into());
-        for owner in [&id, &next_id] {
-            remove_test_network(owner);
-        }
-        let _cleanup = TestNetworkCleanup(vec![id.clone(), next_id.clone()]);
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let port = listener.local_addr().unwrap().port();
-        let shutdown = tokio_util::sync::CancellationToken::new();
-        let _shutdown_guard = shutdown.clone().drop_guard();
-        let stop_server = shutdown.clone();
-        let (accepted, request) = tokio::sync::oneshot::channel();
-        let server = tokio::spawn(async move {
-            let (_socket, _) = listener.accept().await.unwrap();
-            accepted.send(()).unwrap();
-            stop_server.cancelled().await;
-        });
-        let grill = RuncGrill::new(
-            bundle_base.clone(),
-            images.clone(),
-            false,
-            state_dir.clone(),
-        );
-        let gateway = grill.dns_gateway_address().unwrap();
-        let grill = grill.with_dns_nameserver(gateway);
-        let mut spec = crate::grill::oci::OciSpec {
-            port_mapping: None,
-            root: crate::grill::oci::OciRoot {
-                path: format!("localhost:{port}/delayed:v1"),
-                readonly: true,
-            },
-            process: crate::grill::oci::OciProcess {
-                args: vec!["sh".into()],
-                env: vec![],
-                cwd: "/".into(),
-                user: crate::grill::oci::OciUser { uid: 0, gid: 0 },
-            },
-            mounts: vec![],
-            linux: crate::grill::oci::OciLinux {
-                namespaces: crate::grill::oci::standard_namespaces(None),
-                resources: None,
-                cgroups_path: None,
-                uid_mappings: None,
-                gid_mappings: None,
-            },
-        };
-        let owner = grill.clone();
-        let creating_id = id.clone();
-        let creating_spec = spec.clone();
-        let creating =
-            tokio::spawn(async move { owner.create(&creating_id, &creating_spec).await });
-        tokio::time::timeout(std::time::Duration::from_secs(10), request)
-            .await
-            .unwrap()
-            .unwrap();
-        let address = grill.container_ip(&id).await.unwrap();
-        assert!(netns::namespace_path(&id).exists());
-        creating.abort();
-        assert!(creating.await.unwrap_err().is_cancelled());
-        drop(grill);
-        let recovered =
-            RuncGrill::new(bundle_base, images, false, state_dir).with_dns_nameserver(gateway);
-        spec.root.path = "./rootfs".into();
-        assert!(recovered.create(&id, &spec).await.is_err());
-        recovered.create(&next_id, &spec).await.unwrap();
-        assert_ne!(recovered.container_ip(&next_id).await, Some(address));
-        recovered.kill(&next_id).await.unwrap();
-        recovered.kill(&id).await.unwrap();
-        assert!(!netns::namespace_path(&id).exists());
-        recovered.create(&next_id, &spec).await.unwrap();
-        assert_eq!(recovered.container_ip(&next_id).await, Some(address));
-        recovered.kill(&next_id).await.unwrap();
-        shutdown.cancel();
-        server.await.unwrap();
-    }
-
-    #[tokio::test]
     #[ignore = "requires rootful runc, overlayfs, network access to an OCI image, and RELIABURGER_RUNC_TESTS=1"]
     async fn runc_create_failure_rolls_back_private_rootfs_mount() {
         assert!(runc_tests_enabled());
@@ -2702,7 +1167,9 @@ mod tests {
             ImageStore::new(tmp.path().join("images")),
             false,
             tmp.path().join("state"),
-        );
+            test_owner(),
+        )
+        .unwrap();
         let spec = crate::grill::oci::OciSpec {
             port_mapping: None,
             root: crate::grill::oci::OciRoot {
@@ -2789,7 +1256,9 @@ mod tests {
             image_store.clone(),
             false,
             state_dir.clone(),
-        );
+            test_owner(),
+        )
+        .unwrap();
         let gateway = original.dns_gateway_address().unwrap();
         let original = original.with_dns_nameserver(gateway);
         let sources = original.dns_source_namespaces();
@@ -2840,7 +1309,8 @@ mod tests {
             pid,
             pid_started_at: started_at,
             runc_container_id: Some(id.0.clone()),
-            log_stem: None,
+            // Owned adoption checks the launcher's log identity too.
+            log_stem: original.log_stem(&id).await,
             host_port: None,
             app_spec: None,
             oci_spec: spec,
@@ -2848,8 +1318,9 @@ mod tests {
         };
         drop(original); // A Bun exec/process death drops the child handle only.
 
-        let adopter =
-            RuncGrill::new(bundle_base, image_store, false, state_dir).with_dns_nameserver(gateway);
+        let adopter = RuncGrill::new(bundle_base, image_store, false, state_dir, test_owner())
+            .unwrap()
+            .with_dns_nameserver(gateway);
         let adopted_sources = adopter.dns_source_namespaces();
         assert!(adopter.adopt(&id, &record).await.unwrap());
         assert_eq!(adopter.container_ip(&id).await, Some(container_ip));
@@ -2881,10 +1352,11 @@ mod tests {
         let error = adopter.kill(&id).await.unwrap_err();
         assert!(error.to_string().contains("rootfs"), "{error}");
         assert!(crate::grill::rootfs::is_mountpoint(&rootfs));
-        assert_ne!(
-            adopter.entries.lock().await[&id].state,
-            ContainerState::Stopped
-        );
+        // An unfinished teardown may report its error, but never Stopped.
+        assert!(!matches!(
+            adopter.state(&id).await,
+            Ok(ContainerState::Stopped)
+        ));
         drop(busy_mount);
         adopter.kill(&id).await.unwrap();
         assert!(
@@ -2938,7 +1410,9 @@ mod tests {
             ImageStore::new(tmp.path().join("images")),
             true,
             tmp.path().join("state"),
-        );
+            test_owner(),
+        )
+        .unwrap();
         let id = InstanceId("runc-pinned-workload".to_string());
         let spec = crate::grill::oci::OciSpec {
             port_mapping: None,

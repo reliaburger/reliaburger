@@ -1319,8 +1319,8 @@ that happens, and start an unrelated container. The old VIP returns HTTP 200
 with the new container's identity. This is the natural-exit regression, using
 real Runc, a real kernel map and HTTP responses from both workloads.
 
-Stopping execution and releasing an address are separate facts. The opt-in owned
-Runc adapter now records a `NetworkReference` before a service workload starts.
+Stopping execution and releasing an address are separate facts. The owned Runc
+adapter records a `NetworkReference` before a service workload starts.
 It contains the instance identity, runtime generation and original allocation.
 The original intent keeps that reference in either `Held` or `Released` state.
 `Option<NetworkReferenceState>` also distinguishes workloads that never held a
@@ -1387,8 +1387,7 @@ policy ownership and adoption record stay in place. An explicit Stop still
 returns an error while the backend map refuses withdrawal. The regression also
 starts an unrelated container, proves it serves its own HTTP identity, and
 checks that it neither reuses the retained address nor answers through the old
-VIP. This is the opt-in owned runtime contract; complete recovery and production
-selection remain separate work.
+VIP.
 
 
 ## Recover the allocation, not just the name

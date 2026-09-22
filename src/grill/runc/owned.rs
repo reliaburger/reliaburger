@@ -25,6 +25,16 @@ pub(super) struct Ownership {
     inventory_reader: crate::grill::inventory::InventoryReader,
 }
 
+impl Ownership {
+    pub(super) fn new(executable: PathBuf) -> Self {
+        Self {
+            executable,
+            contexts: Arc::new(Mutex::new(HashMap::new())),
+            inventory_reader: Default::default(),
+        }
+    }
+}
+
 fn failure(instance: &InstanceId, error: impl std::fmt::Display) -> GrillError {
     GrillError::StateUnavailable {
         instance: instance.clone(),
@@ -33,26 +43,6 @@ fn failure(instance: &InstanceId, error: impl std::fmt::Display) -> GrillError {
 }
 
 impl RuncGrill {
-    /// Enable durable OCI ownership using Bun's independent command owners.
-    /// Configure this before creating workloads.
-    pub fn with_owner(mut self, executable: PathBuf) -> io::Result<Self> {
-        if self.ownership.is_some() {
-            return Err(io::Error::other(
-                "durable ownership requires an unconfigured runtime",
-            ));
-        }
-        self.bundle_base = std::path::absolute(&self.bundle_base)?;
-        self.state_dir = std::path::absolute(&self.state_dir)?;
-        self.network_leases =
-            super::super::network_leases::NetworkLeases::new(self.bundle_base.clone());
-        self.ownership = Some(Ownership {
-            executable,
-            contexts: Arc::new(Mutex::new(HashMap::new())),
-            inventory_reader: Default::default(),
-        });
-        Ok(self)
-    }
-
     /// Retain the original rootful address before a publisher exposes it.
     pub(super) async fn owned_retain_network_reference(
         &self,
@@ -110,9 +100,7 @@ impl RuncGrill {
     }
 
     fn ownership(&self) -> io::Result<&Ownership> {
-        self.ownership
-            .as_ref()
-            .ok_or_else(|| io::Error::other("runtime ownership is not configured"))
+        Ok(&self.ownership)
     }
 
     fn intent_configuration(&self) -> io::Result<IntentConfiguration> {
@@ -510,10 +498,6 @@ impl RuncGrill {
         if held.is_some() {
             // Commands and host resources are gone. Keep the allocation and
             // sealed original intent until discovery confirms its own retirement.
-            if let Some(entry) = self.entries.lock().await.get_mut(id) {
-                entry.state = ContainerState::Stopped;
-                entry.exit_code = exit_code;
-            }
             return Ok(());
         }
         if let Some(index) = index {
@@ -523,10 +507,6 @@ impl RuncGrill {
         }
         cleanup.finish(exit_code).await?;
         self.ownership()?.contexts.lock().await.remove(id);
-        if let Some(entry) = self.entries.lock().await.get_mut(id) {
-            entry.state = ContainerState::Stopped;
-            entry.exit_code = exit_code;
-        }
         Ok(())
     }
 

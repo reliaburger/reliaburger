@@ -639,12 +639,6 @@ pub async fn add_port_mapping_with_commands(
     }
 }
 
-/// Remove any surviving owned DNAT entries before an address is reusable.
-/// This also recovers mappings installed before a cancelled setup published its handle.
-pub(crate) async fn retire_address_forwarding(address: Ipv4Addr) -> Result<(), String> {
-    retire_address_forwarding_with_commands(&DirectCommandExecutor, address).await
-}
-
 /// Retire an owned address's forwarding after the executor has fenced prior mutators.
 pub async fn retire_address_forwarding_with_commands(
     executor: &impl RuntimeCommandExecutor,
@@ -1264,7 +1258,7 @@ mod tests {
             .run(&portmap::element_add(&other))
             .await
             .unwrap();
-        retire_address_forwarding(network.container_ip)
+        retire_address_forwarding_with_commands(&DirectCommandExecutor, network.container_ip)
             .await
             .unwrap();
         let listing = list_map_elements().await;

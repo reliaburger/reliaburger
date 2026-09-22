@@ -511,8 +511,10 @@ bigger size win is documentation (T3.1/T3.2, about 13k Markdown lines).
 Estimates come from a survey agent (22 September 2026); T4.1's reachability was
 spot-checked by hand.
 
-- [ ] **T4.1 Delete the legacy rootless Runc path (~400 prod, ~280 test
-      lines; low risk).** Since `b41cdd9`, rootless startup always takes the
+- [x] **T4.1 Delete the legacy rootless Runc path (~400 prod, ~280 test
+      lines; low risk).** Done with T4.2. The legacy slirp4netns handles,
+      state-dir, subuid/subgid readers and their tests are gone; rootless Runc
+      keeps its owned slirp4netns helper. Since `b41cdd9`, rootless startup always takes the
       owned path (`src/bin/bun.rs:925-947`), so `Slirp4netnsHandle`,
       `setup_slirp4netns`, `stop_recorded_owner`, `PendingSlirp` and
       `add_slirp4netns_port_forward` (`src/grill/rootless.rs:174-450`),
@@ -522,9 +524,15 @@ spot-checked by hand.
       *Unblocked by decision G:* this is legacy code, so it goes. Rootless
       clusters (deferred past 0.1.0) will build on the owned path; git history
       keeps the slirp4netns code if it's ever wanted.
-- [ ] **T4.2 Make every Linux Runc instance owned; drop
+- [x] **T4.2 Make every Linux Runc instance owned; drop
       `--experimental-owned-runc` (~600–700 prod, ~375 test lines; medium
-      risk).** Removes the legacy branch of each
+      risk).** Done. `RuncGrill::new` takes the owner executable,
+      every `Grill` method calls the owned implementation, `RuncEntry` and
+      `--experimental-owned-runc` are gone, and `detect_runtime` returns a
+      `DetectedRuntime` instead of building an unowned runtime. Legacy-only
+      tests were deleted; surviving Runc tests were ported (about 1,900 lines
+      removed). Linux: runc unit 6/6, owned_runc 13/13, owned_network 4/4,
+      oci_crash 8/8, rootless 8/8. Removes the legacy branch of each
       `if self.ownership.is_some()` in `src/grill/runc.rs:795-1466` plus
       legacy-only helpers (`:194-363`). Nothing in the owned path needs eBPF,
       but `durable_discovery` currently also gates cluster identity rules and

@@ -3535,11 +3535,45 @@ case then performs an explicit retry and checks that the main payload runs once
 more. The fixture keeps its private logs, uses separate workload names and gives
 the non-root OCI user write access to its test bind mount.
 
-The hidden `--experimental-owned-runc` option selects the durable adapter for this
-standalone qualification. It refuses other runtimes and cluster mode. This is
-not production activation: durable consumer discovery recovery and pinned kernel
-recovery still have to meet their own contracts before the normal startup path
-can select them.
+### One Runc lifecycle
+
+For a while Bun had two Runc lifecycles. The owned one above, and an older
+one in which Bun spawned `runc run` as its own child and wrote down the PID
+afterwards. Every method on `RuncGrill` began with the same fork in the road:
+
+```rust
+if self.ownership.is_some() {
+    return self.owned_start(instance).await;
+}
+// ...the older path...
+```
+
+Rootful Runc with eBPF took the owned path, and so did rootless Runc. Rootful
+Runc without eBPF quietly took the old one, with every crash window this chapter
+has just closed. Nothing had been released yet, so nobody depended on the old
+behaviour, and we deleted it. `RuncGrill::new` now takes the owner executable as
+an argument, so there's no way to build a Runc runtime without owners:
+
+```rust
+pub fn new(
+    bundle_base: PathBuf,
+    image_store: ImageStore,
+    rootless: bool,
+    state_dir: PathBuf,
+    owner_executable: PathBuf,
+) -> std::io::Result<Self>
+```
+
+Making the owner a constructor argument, rather than an optional field set by a
+builder method, is a small use of the type system. An `Option` field means every
+method has to ask "is it there?", and a forgotten check is a silent second code
+path. A required argument means the question never arises. `new` returns
+`std::io::Result<Self>` because it also turns the runtime directories into
+absolute paths, which can fail, and owners outlive Bun's working directory.
+The legacy slirp4netns handles for rootless networking went too: rootless Runc
+already ran its networking under its own owner. About 1,900 lines disappeared,
+along with a hidden `--experimental-owned-runc` flag that no longer had anything
+to select.
 
 One gap is too small to hit reliably by polling. Bun can register an initialiser
 and die before Runc publishes its intent. The Linux qualification fixture compiles

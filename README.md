@@ -49,7 +49,7 @@ updates. Producer allocations remain held until committed consumer confirmation;
 permanent execution fences reject stale reports. Normal enrolled rootful startup and confirmed service VIP retirement are implemented;
 final release qualification remains open.
 
-The opt-in owned Runc path passes actual Bun crash/cancellation and abrupt VM
+The owned Runc runtime passes actual Bun crash/cancellation and abrupt VM
 reboot checks. Rolling replacements now run their initialisers before the main
 payload. Standalone durable discovery/kernel reboot recovery, enrolled clustered retirement
 and owned OCI upgrades/rollbacks are qualified. Final release acceptance remains open; see the [remaining work](docs/plans/2026-09-22-v0.1.0-remaining-work.md).

@@ -794,45 +794,33 @@ impl Grill for AnyGrill {
     }
 }
 
+/// Which runtime `detect_runtime` found on this host.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DetectedRuntime {
+    /// Native processes; no container runtime is available.
+    Process,
+    /// Runc is installed; `rootless` says whether Bun lacks root.
+    #[cfg(target_os = "linux")]
+    Runc {
+        /// Whether Bun runs without root and needs user namespaces.
+        rootless: bool,
+    },
+}
+
 /// Auto-detect the best available runtime.
 ///
-/// On Linux, selects runc when installed and configures rootless mode and paths.
-/// Otherwise selects ProcessGrill. For 0.1.0, macOS containers use managed Linux
-/// VMs; the direct Apple adapter is excluded pending daemon-command recovery.
-pub async fn detect_runtime() -> AnyGrill {
+/// On Linux, selects runc when installed. Otherwise selects native processes.
+/// For 0.1.0, macOS containers use managed Linux VMs; the direct Apple adapter
+/// is excluded pending daemon-command recovery. The caller builds the runtime
+/// with its configured storage and owner executable.
+pub async fn detect_runtime() -> DetectedRuntime {
     #[cfg(target_os = "linux")]
-    {
-        if which_exists("runc").await {
-            let is_rootless = rootless::is_rootless();
-
-            let (bundle_base, image_store, state_dir) = if is_rootless {
-                let base = dirs::data_local_dir()
-                    .unwrap_or_else(|| std::path::PathBuf::from("/tmp/reliaburger"))
-                    .join("reliaburger");
-                (
-                    base.join("bundles"),
-                    ImageStore::new(base.join("images")),
-                    rootless::rootless_state_dir(),
-                )
-            } else {
-                let base = std::path::PathBuf::from("/var/lib/reliaburger");
-                (
-                    base.join("bundles"),
-                    ImageStore::new(base.join("images")),
-                    std::path::PathBuf::from("/run/reliaburger/runc"),
-                )
-            };
-
-            return AnyGrill::Runc(runc::RuncGrill::new(
-                bundle_base,
-                image_store,
-                is_rootless,
-                state_dir,
-            ));
-        }
+    if which_exists("runc").await {
+        return DetectedRuntime::Runc {
+            rootless: rootless::is_rootless(),
+        };
     }
-
-    AnyGrill::Process(ProcessGrill::new())
+    DetectedRuntime::Process
 }
 
 /// Check if a binary exists in PATH.
