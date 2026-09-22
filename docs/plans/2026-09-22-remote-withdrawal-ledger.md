@@ -129,12 +129,11 @@ The receipt service is only the receiving boundary. The next implementation must
 preserve the evidence that permits a consumer to call it:
 
 - `src/cluster/orchestrate.rs` currently decodes generation/instructions but sends
-  only catalogue/ingress through `AgentCommand::SyncClusterCatalog`. Carry the
-  complete generation-bound update and wait for a checked agent result.
-- `src/bun/agent.rs` currently overwrites `cluster_catalog` before rebuilding
-  routing; `rebuild_routing_table` logs rebuild errors. Make the cluster path
-  preserve its previous confirmed state on failure and report errors to its
-  caller before allowing a receipt.
+  only catalogue/ingress through `AgentCommand::SyncClusterCatalog`. The checked
+  agent result is now implemented; next carry the complete generation-bound update.
+- `src/bun/agent.rs` now builds a candidate routing table before changing cluster
+  views and reports failure through the command reply. Durable consumer ownership
+  must precede this publication, and its result alone is not drain proof.
 - Add durable consumer ownership before any attempted publication. Bind it to
   the enrolled node/cluster, reject delayed older responses and retain original
   exposures across replacement. The existing `DiscoveryJournal` tracks local
@@ -171,7 +170,9 @@ oneshot reply prevents placement work from proceeding on queue acceptance alone.
 The existing deadline covers queueing and confirmation, including lost replies.
 Three contracts fail first (0.115s); six focused cases pass (6.225s). Implementation
 is committed early as `0e80491`. The broader native run identified one older fake
-agent missing its new reply (456/457 passed); the fixture is corrected, pending
-final native/Linux qualification. This internal channel change leaves protocol
+agent missing its new reply (456/457 passed); `866a52f` corrects it. Final
+native/Linux qualification passes 457/469 affected library cases, thirteen
+integrations and three real failover/decommission cases each, with strict Clippy
+and formatting. This internal channel change leaves protocol
 19/state 32 unchanged. Durable consumer ownership before publication and positive
 drain proof before receipts remain the next work.
