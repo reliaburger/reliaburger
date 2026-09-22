@@ -289,15 +289,18 @@ impl ClusterSource {
         let owner = access.guard.clone();
         let local: HashSet<Digest> = tokio::task::spawn_blocking(move || {
             let _owner = owner;
-            candidates
-                .into_iter()
-                .filter(|digest| store.has_blob(digest) && store.revalidate_blob(digest))
-                .collect()
+            let mut local = HashSet::new();
+            for digest in candidates {
+                if store.revalidate_blob(&digest)? {
+                    local.insert(digest);
+                }
+            }
+            Ok::<_, PickleError>(local)
         })
         .await
         .map_err(|error| {
             PickleError::ReplicationFailed(format!("cache verification failed: {error}"))
-        })?;
+        })??;
 
         let plan = plan_downloads(&digests, &local, &catalog, peers, self.state.node_raft_id);
         if !plan.unavailable.is_empty() {

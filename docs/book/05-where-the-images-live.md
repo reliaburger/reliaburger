@@ -364,6 +364,22 @@ pub fn revalidate_blob(&self, digest: &Digest) -> bool {
 
 The deploy path (`image_available_locally`) and the peer pull both call this instead of `has_blob`. Re-hashing every blob on every read would be wasteful, so we do it where it matters: before trusting a cache for a deploy, and before short-circuiting a peer pull.
 
+That first version had two problems, both hiding in `std::fs::read`. It loads the whole file into a `Vec<u8>`, and the heal loop and P2P resolver call it for every layer they consider. A 4 GB layer meant a 4 GB allocation, on every tick. And `let Ok(data) = ... else { return false }` turned *every* read error into "not cached". A permissions mistake or a dying disk looked like a cache miss, so we'd quietly download the layer again on top of a file we couldn't even read.
+
+Now the hash streams the file through a 64 KiB buffer (`sha256_file`, shared with the copy-confirmation path), and the function returns `Result<bool, PickleError>`:
+
+```rust
+let actual = match sha256_file(&path) {
+    Ok(actual) => actual,
+    Err(PickleError::Io(error)) if error.kind() == std::io::ErrorKind::NotFound => {
+        return Ok(false);
+    }
+    Err(error) => return Err(error),
+};
+```
+
+The `if` after a pattern is a *match guard*: the arm only matches when the pattern fits *and* the condition holds. Only "no such file" means "not cached". Any other I/O error propagates to the caller, and a mismatch still deletes the corrupt bytes, now checking that the delete worked too. Tests cover a multi-chunk blob whose last byte flips and a blob path that can't be read, which must be an error and must not be deleted.
+
 ### One rootfs per content, not per tag
 
 Here's a subtle one. The unpacked rootfs used to live at `rootfs/{registry}/{repo}/{tag}/`, and unpacking *cleared and recreated* that directory. Now picture a tag move — `web:v1` re-pointed at new content — while a container is running out of the old rootfs. The re-extract does `remove_dir_all` on the directory the running container is living in. Two concurrent pushes to the same tag race the same way.

@@ -372,12 +372,7 @@ async fn pull_fetches_missing_layers_from_peer() {
     // The "deploying node": empty local store.
     let local_dir = tempfile::tempdir().unwrap();
     let local_store = BlobStore::new(local_dir.path());
-    assert!(!image_available_locally(
-        "shared",
-        "v3",
-        &catalog,
-        &local_store
-    ));
+    assert!(!image_available_locally("shared", "v3", &catalog, &local_store).unwrap());
 
     let peers = vec![Peer {
         node_id: 1,
@@ -397,12 +392,7 @@ async fn pull_fetches_missing_layers_from_peer() {
     .await
     .unwrap();
 
-    assert!(image_available_locally(
-        "shared",
-        "v3",
-        &catalog,
-        &local_store
-    ));
+    assert!(image_available_locally("shared", "v3", &catalog, &local_store).unwrap());
 }
 
 /// Roadmap (Phase 12): an under-replicated image auto-heals when a new

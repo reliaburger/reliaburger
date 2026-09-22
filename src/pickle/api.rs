@@ -1768,12 +1768,13 @@ mod tests {
                     .await
                     .is_err()
             );
-            assert_eq!(
-                std::fs::read_dir(directory.path().join("uploads"))
-                    .unwrap()
-                    .count(),
-                0
-            );
+            // A directory squatting on the blob path can't be read, so the
+            // pull now refuses at cache verification, before any upload
+            // exists; either way no temporary file may survive.
+            let uploads = std::fs::read_dir(directory.path().join("uploads"))
+                .map(Iterator::count)
+                .unwrap_or(0);
+            assert_eq!(uploads, 0);
             assert!(
                 state
                     .sessions

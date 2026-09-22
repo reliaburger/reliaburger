@@ -403,10 +403,13 @@ Registry and storage:
       *Done.* The leader stamps: `ClaimWriter`/`LeasedManifest` lost their timestamp and
       `RegistryMutation::request(leader_now)` sets it (and overwrites copies'). Test
       `slow_clock_lease_observations_are_refused_after_leader_expiry` proves the refusal.
-- [ ] **T2.16 `revalidate_blob` reads multi-GB blobs into memory.**
+- [x] **T2.16 `revalidate_blob` reads multi-GB blobs into memory.**
       `src/pickle/store.rs:214-226`, called on every heal tick and p2p resolve.
       Stream the hash as `copy.rs:118` already does. Treat read errors as
       errors, not "not cached".
+      *Done.* `revalidate_blob` streams via a shared `sha256_file` (copy.rs uses it too) and
+      returns `Result<bool>`; only NotFound is a miss. Tests: a late-byte mismatch in a
+      multi-chunk blob is caught and removed; an unreadable blob path errors and survives.
 - [ ] **T2.17 An explicit council refusal doesn't roll back the local
       catalogue.** `src/pickle/api.rs:316-378`. A push that loses the GC race
       leaves its digest tagged locally, so its layers never get collected. Roll
