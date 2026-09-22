@@ -114,7 +114,9 @@ gh workflow run promote.yml --ref main \
   -f tag=v0.1.0 -f candidate_run=RUN_ID -f qualified_digest=RECORDED_SHA256
 ```
 
-The promotion workflow checks the tagged source, successful manual main build,
+The promotion workflow runs `main`'s own scripts and reads the tag only as data
+(its `Cargo.toml` version and commit), so nothing in the tagged tree executes
+with the release token. It checks the tagged source, successful manual main build,
 repository, version and recorded manifest digest. It downloads the preserved
 candidate and requires an exact file inventory and matching lengths/hashes.
 It then uploads those unchanged files to a new draft, checks GitHub's stored

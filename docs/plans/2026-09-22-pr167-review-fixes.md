@@ -310,12 +310,15 @@ Smaller, mostly one commit each.
 
 CI and release:
 
-- [ ] **T2.1 ✔ `promote.yml` runs the tag's own scripts with a write token.**
+- [x] **T2.1 ✔ `promote.yml` runs the tag's own scripts with a write token.**
       `.github/workflows/promote.yml:42-44` checks out `refs/tags/<tag>` and
       runs that tree's `scripts/release/candidate.py` with `contents: write`.
       Anyone who can push a tag and dispatch the workflow bypasses branch
       protection. *Fix:* check out `main`, and read the tag's `Cargo.toml` with
       `git show`.
+      *Done.* Promotion checks out `main`, validates the tag's shape, fetches it and reads
+      version/commit via `git show`/`git rev-parse`. `scripts/release/test_promote_workflow.py`
+      (run by `test-packaging`) fails on a tag checkout or `${{ inputs.* }}` inside `run:`.
 - [ ] **T2.2 ✔ Reboot "qualification" tests pass vacuously in CI.**
       `tests/owned_runc.rs:680` and `tests/oci_crash.rs:1216` `return` when
       their env var is unset, and `qualify-oci-interruptions.sh` and

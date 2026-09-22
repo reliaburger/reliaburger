@@ -1036,6 +1036,18 @@ the saved candidate and checks it against the report before creating a draft.
 It also compares GitHub's uploaded asset digests before making the draft public.
 No compiler or signing key participates in promotion.
 
+Promotion does hold a token that can write releases, though, so the code it
+runs matters as much as the bytes it publishes. Our first version checked out
+the tag and ran that tree's `candidate.py`. Anyone who could push a tag could
+therefore hand the write token a script of their own, skipping main's branch
+protection entirely. Now the workflow only runs from `main` and checks out
+`main`'s scripts. It treats the tag as data: `git show
+"refs/tags/$RELEASE_TAG:Cargo.toml"` reads the version and
+`git rev-parse "refs/tags/$RELEASE_TAG^{commit}"` names the candidate commit.
+Nothing from the tag's tree ever executes. `test_promote_workflow.py` pins
+both rules, and also checks that no `${{ inputs.* }}` expression is pasted
+into a shell script, where a crafted input would become code.
+
 The Python helper is deliberately separate from Rust's runtime upgrade verifier.
 It coordinates release files and GitHub provenance; the agent still verifies
 Ed25519 signatures before executing a replacement. A SHA-256 copied from an
