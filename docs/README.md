@@ -1410,3 +1410,19 @@ follower may briefly report the previous generation during rotation; fetch
 again and re-encrypt if that generation has been finalised before deployment.
 `relish test --filter secrets-config` checks actual container decryption and
 config-file mounting on a cluster with a container runtime.
+
+### OCI release qualification
+
+On a disposable Linux host with Runc, static BusyBox, `ip`, `nft`, a C compiler and
+sudo, run `scripts/release/qualify-oci-interruptions.sh`. It runs actual Bun crash
+and caller-cancellation cases in private network/mount namespaces and retains logs
+and test-binary checksums. The hidden `--experimental-owned-runc` option used by
+these tests is standalone-only; normal startup awaits complete durable discovery
+and kernel recovery qualification.
+
+From the host, `scripts/release/qualify-oci-reboot.sh --vm DISPOSABLE_LIMA_VM`
+starts real OCI executions, force-stops that VM and verifies recovery after a new
+kernel boot. This deliberately interrupts every process in the selected VM. The
+rootful runtime qualification passed, including address retention until explicit
+release. It does not close the remaining release gates in the
+[remaining-work table](plans/2026-09-22-v0.1.0-remaining-work.md).

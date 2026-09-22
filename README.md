@@ -47,6 +47,11 @@ consumer recovery and confirmed remote cleanup remain release blockers. The opt-
 durable path now holds producer allocations until committed consumer confirmation;
 permanent execution fences prevent stale reports from reviving retired endpoints.
 
+The opt-in owned Runc path passes actual Bun crash/cancellation and abrupt VM
+reboot checks. Rolling replacements now run their initialisers before the main
+payload. Complete durable discovery/kernel recovery and final release acceptance
+remain open; see the [remaining work](docs/plans/2026-09-22-v0.1.0-remaining-work.md).
+
 0.1.0 requires a fresh cluster; development state is refused. Rolling upgrades
 require matching explicit formats (currently protocol 20 and state 36). See the
 [compatibility policy](docs/releasing.md#cluster-compatibility).

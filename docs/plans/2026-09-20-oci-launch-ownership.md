@@ -1,5 +1,16 @@
 # OCI ownership before agent adoption
 
+Current qualification checkpoint (22 September): owned rootful Runc now passes
+seven actual Bun death/cancelled-caller boundaries and an abrupt VM reboot with
+positive boot identity, unknown outcomes, held addresses and stale-release refusal.
+The matrix found and fixed rolling replacements skipping initialisers. Command
+owner schema 3 and OCI intent schema 5 use durable state 36 (protocol 20).
+Rootless runtime, 74 kernel tests, affected native/Linux suites and strict checks
+also pass. Full durable consumer/kernel recovery and production selection remain
+open. The detailed evidence and next steps are in the
+[session handoff](2026-09-20-v0.1.0-session-handoff.md); older checklists below record
+the implementation sequence and do not replace the current C34 checklist.
+
 C34 remains open after foreground process ownership. This plan covers the
 remaining runtime work on PR #167. It does not change the agreed release
 contract: uncertain cleanup retains ownership, and operator decommission only
