@@ -230,7 +230,9 @@ development configurations. Ingress currently uses unweighted round-robin on
 Bun's shared runtime, with no separate strategy or worker-thread setting.
 
 Cluster discovery keeps its last confirmed DNS and ingress views when a routing
-update fails, and retries confirmation before continuing placement work.
+update fails, and retries confirmation before continuing placement work. Consumers
+reject stale catalogue generations and conflicting merged allocations. Durable
+consumer recovery and confirmed remote cleanup remain release blockers.
 
 0.1.0 requires a fresh cluster; development state is refused. Rolling upgrades
 require matching explicit formats (currently protocol 19 and state 33). See the

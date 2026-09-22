@@ -560,6 +560,7 @@ async fn worker_without_council_metrics_excludes_its_own_stale_endpoints() {
         let (response, confirmation) = oneshot::channel();
         commands
             .send(AgentCommand::SyncClusterCatalog {
+                generation: 1,
                 response,
                 catalog: Box::new(catalog),
                 ingress: vec![IngressAssignment {

@@ -2192,3 +2192,40 @@ The checkpoint schema advances to 2 and durable state to 33; protocol remains 19
 Publication does not yet call this storage path. Connecting it before publication,
 recovering original exposures, confirming drainage and sending receipts remain
 separate work. A saved attempt alone grants no permission to reuse an address.
+
+### Keeping delayed catalogue replies behind the current generation
+
+A consumer installs catalogue generation four, then receives a delayed reply for
+three. The server already protects against stale catalogue writers, but that
+protection does not order replies received by Bun. Previously the reconciler
+threw away the response's generation when it sent the catalogue to the agent.
+An old response could therefore restore a withdrawn backend.
+
+`SyncClusterCatalog` now carries the committed generation. Bun remembers the last
+confirmed generation as `Option<u64>`: `None` means it has not confirmed a cluster
+publication in this process, while `Some(0)` represents a confirmed empty initial
+catalogue. Those are different states. The `is_some_and` method runs a predicate
+only when the option contains a value; the closure receives that value and returns
+whether the incoming update conflicts with it.
+
+Bun refuses lower generations and a changed catalogue claiming the same generation.
+Zero requires an empty catalogue. Validation or routing failure does not advance
+the fence, so a corrected update can retry. An identical catalogue at a higher
+generation still advances it: equality of contents does not make the intermediate
+publication history disappear. Ingress configuration has its own desired-state
+changes, so an unchanged catalogue may still update ingress at the same catalogue
+generation. This fence does not order those independent ingress changes.
+
+The publisher also validates the effective merged service map before changing any
+view, including the otherwise identical-update path. A valid remote catalogue
+can collide with a local allocation after merging. In that case Bun keeps the
+previous publication and refuses the update; it does not silently move a VIP
+that another owner may still use. Regressions check catalogue, DNS and ingress
+retention, corrected retries, identical-generation advancement and merged-view
+conflicts. A real HTTP polling test checks that the response generation reaches
+the agent command.
+
+This fence is in memory. Restoring it from the durable consumer journal before
+new publication remains part of cluster recovery integration. It neither proves
+that old requests have drained nor authorises an address release. The command is
+internal, so protocol 19/state 33 remain unchanged.

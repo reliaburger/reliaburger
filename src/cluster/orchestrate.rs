@@ -1010,6 +1010,7 @@ pub fn spawn_placement_reconciler(
                 let (response, reply) = tokio::sync::oneshot::channel();
                 cmd_tx
                     .send(AgentCommand::SyncClusterCatalog {
+                        generation: assignments.endpoint_generation,
                         catalog: Box::new(assignments.endpoint_catalog.clone()),
                         ingress: assignments.ingress.clone(),
                         response,
@@ -1264,6 +1265,7 @@ mod tests {
     async fn placement_deployment_waits_for_confirmed_cluster_publication() {
         let root = tempfile::tempdir().unwrap();
         let assignments = NodeAssignments {
+            endpoint_generation: 7,
             apps: vec![NodeAssignment {
                 name: "web".into(),
                 namespace: "default".into(),
@@ -1308,9 +1310,15 @@ mod tests {
                 .is_err(),
             "queueing publication allowed deployment before its result"
         );
-        let AgentCommand::SyncClusterCatalog { response, .. } = pending else {
+        let AgentCommand::SyncClusterCatalog {
+            generation,
+            response,
+            ..
+        } = pending
+        else {
             unreachable!()
         };
+        assert_eq!(generation, 7);
         response
             .send(Err(crate::bun::BunError::ClusterPublication(
                 "injected refusal".into(),

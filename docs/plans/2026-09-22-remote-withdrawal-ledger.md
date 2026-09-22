@@ -208,3 +208,19 @@ cases per platform (5.487s/5.025s), strict all-target/all-feature Clippy and
 formatting. Both pipelines are reaped. Logs and scripts are
 `/tmp/rb-consumer-ownership-{native,linux}.{log,sh}`. Publication and recovery
 integration remain open; this checkpoint enables no new cleanup authority.
+
+
+### Consumer generation fence checkpoint
+
+The reconciler now carries the committed catalogue generation into Bun. The agent
+refuses lower generations and changed catalogues claiming the same generation,
+including delayed otherwise-identical updates. Identical newer catalogues still
+advance its confirmation. Invalid candidates leave both views and fence unchanged.
+Generation zero requires an empty catalogue. Merged-view validation refuses local
+and remote allocation collisions before publication. Four regression contracts
+fail first (0.095s); eight focused agent/HTTP polling cases pass (4.057s).
+
+The fence is in memory; recovery must restore it from original consumer evidence
+before new publication. Ingress can change independently at the same catalogue
+generation, so its ordering and original exposure history remain separate work.
+No new withdrawal receipt or release authority is enabled by this change.

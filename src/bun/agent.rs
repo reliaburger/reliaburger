@@ -465,6 +465,7 @@ pub enum AgentCommand {
     /// from the leader. The agent overlays it onto its local service map so
     /// DNS and ingress resolve services running on other nodes.
     SyncClusterCatalog {
+        generation: u64,
         catalog: Box<crate::onion::catalog::EndpointCatalog>,
         ingress: Vec<crate::cluster::orchestrate::IngressAssignment>,
         response: oneshot::Sender<Result<(), BunError>>,
@@ -1615,6 +1616,8 @@ pub struct BunAgent<G: Grill> {
     /// snapshot so this node resolves services whose backends live elsewhere.
     /// Empty on a single node — the local map is then the whole picture.
     cluster_catalog: crate::onion::catalog::EndpointCatalog,
+    /// Last confirmed catalogue generation; restart recovery must restore its durable fence.
+    cluster_catalog_generation: Option<u64>,
     /// Publisher for service-map snapshots (DNS responder subscribes).
     service_map_tx: tokio::sync::watch::Sender<crate::onion::service_map::ServiceMap>,
     /// Publisher for the set of services under a Smoker `DnsNxdomain` fault.
@@ -1778,6 +1781,7 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
             service_map: crate::onion::service_map::ServiceMap::new(),
             discovery_ownership: DiscoveryOwnership::default(),
             cluster_catalog: crate::onion::catalog::EndpointCatalog::new(),
+            cluster_catalog_generation: None,
             service_map_tx: tokio::sync::watch::channel(
                 crate::onion::service_map::ServiceMap::new(),
             )
@@ -1873,6 +1877,7 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
             service_map: crate::onion::service_map::ServiceMap::new(),
             discovery_ownership: DiscoveryOwnership::default(),
             cluster_catalog: crate::onion::catalog::EndpointCatalog::new(),
+            cluster_catalog_generation: None,
             service_map_tx: tokio::sync::watch::channel(
                 crate::onion::service_map::ServiceMap::new(),
             )
@@ -4422,11 +4427,14 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
                 let _ = response.send(results);
             }
             AgentCommand::SyncClusterCatalog {
+                generation,
                 catalog,
                 ingress,
                 response,
             } => {
-                let result = self.publish_cluster_catalogue(*catalog, ingress).await;
+                let result = self
+                    .publish_cluster_catalogue(generation, *catalog, ingress)
+                    .await;
                 let _ = response.send(result);
             }
             AgentCommand::Routes { response } => {
@@ -8201,9 +8209,20 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
     /// Prepare every view before replacing any confirmed cluster publication.
     async fn publish_cluster_catalogue(
         &mut self,
+        generation: u64,
         catalog: crate::onion::catalog::EndpointCatalog,
         ingress: Vec<crate::cluster::orchestrate::IngressAssignment>,
     ) -> Result<(), BunError> {
+        if (generation == 0 && !catalog.is_empty())
+            || self.cluster_catalog_generation.is_some_and(|confirmed| {
+                generation < confirmed
+                    || (generation == confirmed && catalog != self.cluster_catalog)
+            })
+        {
+            return Err(BunError::ClusterPublication(
+                "catalogue generation is stale or conflicts with confirmed publication".into(),
+            ));
+        }
         catalog
             .validate_allocations()
             .map_err(|error| BunError::ClusterPublication(error.to_string()))?;
@@ -8211,9 +8230,6 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
             .into_iter()
             .map(|route| ((route.namespace, route.name), route.config))
             .collect();
-        if self.cluster_catalog == catalog && self.cluster_ingress_configs == cluster_ingress {
-            return Ok(());
-        }
         let local_name = self
             .cluster
             .as_ref()
@@ -8221,6 +8237,15 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
         let merged = self
             .service_map
             .with_cluster_catalog_excluding_node(&catalog, local_name);
+        let entries: Vec<_> = merged.resolve_all().into_iter().cloned().collect();
+        crate::onion::service_map::ServiceMap::from_snapshot(&entries)
+            .map_err(|error| BunError::ClusterPublication(error.to_string()))?;
+        if self.cluster_catalog == catalog && self.cluster_ingress_configs == cluster_ingress {
+            // Even an identical catalogue can advance after an intermediate
+            // publication. Delayed replies must not regress that confirmation.
+            self.cluster_catalog_generation = Some(generation);
+            return Ok(());
+        }
         let mut ingress = self.ingress_configs.clone();
         ingress.extend(cluster_ingress.clone());
         let mut candidate = crate::wrapper::routing::RoutingTable::new();
@@ -8233,6 +8258,7 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
         let mut table = self.routing_table.write().await;
         *table = candidate;
         self.cluster_catalog = catalog;
+        self.cluster_catalog_generation = Some(generation);
         self.cluster_ingress_configs = cluster_ingress;
         self.service_map_tx.send_replace(merged);
         Ok(())
@@ -15128,12 +15154,164 @@ interval = 1
     }
 
     #[tokio::test]
+    async fn cluster_consumer_refuses_stale_and_rewritten_generations_without_changing_views() {
+        let (mut agent, _, _) = test_agent();
+        let (original, ingress) = cluster_publication_fixture();
+        agent
+            .publish_cluster_catalogue(4, original.clone(), ingress.clone())
+            .await
+            .unwrap();
+        let mut changed = original.clone();
+        changed
+            .services
+            .get_mut("default__remote")
+            .unwrap()
+            .backends[0]
+            .host_port = 30002;
+        for (generation, catalog) in [
+            (3, original.clone()),
+            (3, changed.clone()),
+            (4, changed.clone()),
+        ] {
+            assert!(
+                agent
+                    .publish_cluster_catalogue(generation, catalog, ingress.clone())
+                    .await
+                    .is_err(),
+                "accepted stale or rewritten generation {generation}"
+            );
+            assert_eq!(agent.cluster_catalog, original);
+            assert_eq!(
+                agent
+                    .routing_table
+                    .read()
+                    .await
+                    .lookup("remote.local", "/")
+                    .unwrap()
+                    .backends[0]
+                    .addr
+                    .port(),
+                30001
+            );
+            assert_eq!(
+                agent.service_map_tx.borrow().resolve_all()[0].backends[0].host_port,
+                30001
+            );
+        }
+        agent
+            .publish_cluster_catalogue(5, changed.clone(), ingress)
+            .await
+            .unwrap();
+        assert_eq!(agent.cluster_catalog, changed);
+    }
+
+    #[tokio::test]
+    async fn cluster_consumer_advances_identical_generations_and_does_not_consume_refused_updates()
+    {
+        let (mut agent, _, _) = test_agent();
+        let (original, ingress) = cluster_publication_fixture();
+        agent
+            .publish_cluster_catalogue(1, original.clone(), ingress.clone())
+            .await
+            .unwrap();
+        agent
+            .publish_cluster_catalogue(4, original.clone(), ingress.clone())
+            .await
+            .unwrap();
+        assert!(
+            agent
+                .publish_cluster_catalogue(3, original.clone(), ingress.clone())
+                .await
+                .is_err()
+        );
+        let mut changed = original.clone();
+        changed
+            .services
+            .get_mut("default__remote")
+            .unwrap()
+            .backends[0]
+            .host_port = 30002;
+        let mut invalid = ingress.clone();
+        invalid[0].config.rate_limit_rps = Some(0);
+        assert!(
+            agent
+                .publish_cluster_catalogue(6, changed.clone(), invalid)
+                .await
+                .is_err()
+        );
+        agent
+            .publish_cluster_catalogue(5, changed.clone(), ingress.clone())
+            .await
+            .unwrap();
+        agent
+            .publish_cluster_catalogue(5, changed.clone(), vec![])
+            .await
+            .unwrap();
+        assert!(
+            agent
+                .routing_table
+                .read()
+                .await
+                .lookup("remote.local", "/")
+                .is_none()
+        );
+        agent
+            .publish_cluster_catalogue(5, changed, ingress)
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn cluster_consumer_zero_generation_requires_an_empty_catalogue() {
+        let (mut agent, _, _) = test_agent();
+        let (catalog, ingress) = cluster_publication_fixture();
+        assert!(
+            agent
+                .publish_cluster_catalogue(0, catalog, ingress)
+                .await
+                .is_err()
+        );
+        assert!(agent.cluster_catalog.is_empty());
+        agent
+            .publish_cluster_catalogue(0, Default::default(), vec![])
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn cluster_consumer_refuses_collisions_in_the_effective_local_and_remote_view() {
+        let (mut agent, _, _) = test_agent();
+        let local = crate::onion::service_id::ServiceId::new("default", "local");
+        let vip = agent.service_map.register(&local, 8080, None).unwrap();
+        let (mut catalog, ingress) = cluster_publication_fixture();
+        catalog.services.get_mut("default__remote").unwrap().vip = vip;
+        catalog.validate_allocations().unwrap();
+        assert!(
+            agent
+                .publish_cluster_catalogue(1, catalog, ingress)
+                .await
+                .is_err()
+        );
+        assert!(agent.cluster_catalog.is_empty());
+        assert!(agent.service_map_tx.borrow().resolve_all().is_empty());
+        assert!(
+            agent
+                .routing_table
+                .read()
+                .await
+                .lookup("remote.local", "/")
+                .is_none()
+        );
+    }
+
+    #[tokio::test]
     async fn cluster_publication_refusal_preserves_the_confirmed_catalogue_dns_and_ingress() {
         let (mut agent, _, _) = test_agent();
         let (original, ingress) = cluster_publication_fixture();
         let (response, reply) = oneshot::channel();
         agent
             .handle_command(AgentCommand::SyncClusterCatalog {
+                generation: 1,
                 response,
                 catalog: Box::new(original.clone()),
                 ingress: ingress.clone(),
@@ -15152,6 +15330,7 @@ interval = 1
         let (response, reply) = oneshot::channel();
         agent
             .handle_command(AgentCommand::SyncClusterCatalog {
+                generation: 2,
                 response,
                 catalog: Box::new(changed.clone()),
                 ingress: invalid,
@@ -15184,6 +15363,7 @@ interval = 1
         let (response, reply) = oneshot::channel();
         agent
             .handle_command(AgentCommand::SyncClusterCatalog {
+                generation: 2,
                 catalog: Box::new(changed.clone()),
                 ingress,
                 response,
@@ -15225,6 +15405,7 @@ interval = 1
         let (response, reply) = oneshot::channel();
         agent
             .handle_command(AgentCommand::SyncClusterCatalog {
+                generation: 1,
                 response,
                 catalog: Box::new(invalid),
                 ingress,
@@ -15270,6 +15451,7 @@ host = "remote.local"
         let (response, reply) = oneshot::channel();
         agent
             .handle_command(AgentCommand::SyncClusterCatalog {
+                generation: 1,
                 response,
                 catalog: Box::new(catalog.clone()),
                 ingress: vec![crate::cluster::orchestrate::IngressAssignment {
@@ -15292,6 +15474,7 @@ host = "remote.local"
         let (response, reply) = oneshot::channel();
         agent
             .handle_command(AgentCommand::SyncClusterCatalog {
+                generation: 1,
                 response,
                 catalog: Box::new(catalog),
                 ingress: Vec::new(),
