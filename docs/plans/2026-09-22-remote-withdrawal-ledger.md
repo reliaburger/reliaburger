@@ -4,7 +4,7 @@ Continue C34 on `codex/codebase-completion-fixes`, PR167. Standalone discovery
 recovery, original runtime/report identities and durable consumer registration
 are already implemented. Do not repeat those audits.
 
-## Checkpoint 1: replicated withdrawal obligations
+## Checkpoint 1: replicated withdrawal obligations — complete
 
 - Add a monotonically increasing catalogue publication generation to replicated
   state. Identical publications are no-ops; overflow refuses without mutation.
@@ -53,3 +53,10 @@ Qualify offline consumers, delayed receipts, reuse, leader replacement, consumer
 restart and permanent decommission. Then finish actual OCI interruption/reboot
 qualification and production runtime selection, followed by V01–V04. Keep C34
 unchecked until all of these boundaries pass.
+
+
+Checkpoint 1 was committed early as `0ea5702` after focused/native library tests.
+Broader qualification now passes: 388 native/400 Linux library tests, ten
+agent/compatibility cases and three real failover/decommission cases per platform,
+plus strict Clippy/formatting. State format 30, protocol 16. The session handoff
+records timings and logs. Continue with checkpoint 2; C34 remains open.
