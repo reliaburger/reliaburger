@@ -2519,3 +2519,19 @@ still resolve the current leader and require authenticated HTTPS. A socket test
 holds the deployment open while the next consumer update arrives. The real mTLS
 fixture also holds it open through a lost receipt response, leader replacement
 and lost local confirmation before proving the durable receipt was forgotten.
+
+### Select ownership before starting consumers
+
+Normal Linux Runc startup now selects durable discovery for rootful nodes with
+eBPF enabled, including enrolled clusters, and for standalone rootless nodes.
+Kernel ownership is a separate condition: rootless forwarding has no kernel hooks
+to claim. Existing kernel state cannot be bypassed by switching to rootless mode.
+Clustered recovery requires both an enrolled node identity and the shared service
+authority. We fingerprint the root CA, which stays stable when a node leaf renews,
+and recover the consumer before adopting runtimes or starting DNS and ingress.
+
+The real-process regressions first show missing discovery journals on both startup
+paths. The rootless case then proves the original process and host forward survive
+Bun death and that confirmed stop clears publication. The cluster case verifies
+normal enrolled startup and restart. A complete clustered workload retirement and
+upgrade matrix is a separate qualification step.

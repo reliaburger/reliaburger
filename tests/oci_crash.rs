@@ -24,6 +24,9 @@ impl Node {
             .open(&log)
             .unwrap();
         let mut command = tokio::process::Command::new(env!("CARGO_BIN_EXE_bun"));
+        if root.join("cluster").exists() {
+            command.arg("--cluster");
+        }
         if !root.join("production").exists() {
             command.arg("--experimental-owned-runc");
         }
@@ -53,7 +56,22 @@ impl Node {
                     .lines()
                     .find_map(|line| line.strip_prefix("bun: API server listening on "))
                 {
-                    let client = BunClient::new(&format!("http://{address}"));
+                    let client = if root.join("cluster").exists() {
+                        let secret =
+                            std::fs::read_to_string(root.join("activation-master.key")).unwrap();
+                        let token = reliaburger::sesame::token::derive_service_token(
+                            &hex::decode(secret.trim()).unwrap().try_into().unwrap(),
+                        )
+                        .unwrap();
+                        BunClient::new_with_ca(
+                            &format!("https://{address}"),
+                            Some(&token),
+                            &std::fs::read(root.join("identity/root-ca.crt")).unwrap(),
+                        )
+                        .unwrap()
+                    } else {
+                        BunClient::new(&format!("http://{address}"))
+                    };
                     if client.health().await.is_ok() {
                         break client;
                     }
@@ -459,6 +477,131 @@ async fn normal_standalone_bun_recovers_durable_kernel_and_discovery() {
         "lost discovery evidence was silently recreated"
     );
     std::fs::rename(saved, checkpoint).unwrap();
+    retire_kernel(&root);
+}
+
+#[cfg(feature = "ebpf")]
+#[tokio::test]
+#[ignore = "requires unprivileged Linux user, rootless runc/slirp and static BusyBox"]
+async fn normal_rootless_bun_recovers_owned_forward_and_discovery() {
+    assert!(!nix::unistd::geteuid().is_root());
+    let root = tempfile::tempdir().unwrap().keep();
+    durable_fixture(&root);
+    let config = std::fs::read_to_string(root.join("node.toml")).unwrap();
+    std::fs::write(
+        root.join("node.toml"),
+        config.replace("enabled = true", "enabled = false"),
+    )
+    .unwrap();
+    let mut node = Node::start(&root).await;
+    let active = root.join("data/discovery/discovery.json").exists();
+    if !active {
+        node.crash().await;
+    }
+    assert!(
+        active,
+        "normal rootless startup did not activate durable discovery"
+    );
+    assert!(!root.join("data/kernel-policy").exists());
+    let mut app = durable_app("rootless-owned");
+    app.app.get_mut("rootless-owned").unwrap().command = vec![
+        "/bin/busybox".into(), "sh".into(), "-c".into(),
+        "printf 'main\n' >> /work/main; printf owned > /work/index.html; exec /bin/busybox httpd -f -p 8080 -h /work".into(),
+    ];
+    node.client.apply(&app).await.unwrap();
+    wait_file(&root.join("shared/main")).await;
+    let original = node.client.status().await.unwrap().remove(0);
+    let url = format!("http://127.0.0.1:{}/", original.host_port.unwrap());
+    assert_eq!(
+        reqwest::get(&url).await.unwrap().text().await.unwrap(),
+        "owned"
+    );
+    node.crash().await;
+    let mut recovered = Node::start(&root).await;
+    let adopted = recovered.client.status().await.unwrap().remove(0);
+    assert_eq!(adopted.pid, original.pid);
+    assert_eq!(adopted.host_port, original.host_port);
+    assert_eq!(
+        reqwest::get(&url).await.unwrap().text().await.unwrap(),
+        "owned"
+    );
+    assert_eq!(
+        std::fs::read_to_string(root.join("shared/main")).unwrap(),
+        "main\n"
+    );
+    recovered
+        .client
+        .stop("rootless-owned", "default")
+        .await
+        .unwrap();
+    recovered.crash().await;
+    let journal =
+        reliaburger::bun::discovery_owners::DiscoveryJournal::open(&root.join("data/discovery"))
+            .unwrap();
+    assert!(journal.inventory().services.is_empty());
+    assert!(reqwest::get(&url).await.is_err());
+}
+
+#[cfg(feature = "ebpf")]
+#[tokio::test]
+#[ignore = "requires isolated Linux root, bpffs, real runc/ip/nft and static BusyBox"]
+async fn normal_clustered_bun_recovers_enrolled_consumer_before_adoption() {
+    use reliaburger::config::node::NodeConfig;
+    use sha2::{Digest, Sha256};
+    let root = tempfile::tempdir().unwrap().keep();
+    durable_fixture(&root);
+    reliaburger::relish::commands::init(&root, "activation", "activation-node").unwrap();
+    let base = NodeConfig::from_file(&root.join("node.toml")).unwrap();
+    let mut config = NodeConfig::from_file(&root.join("reliaburger.toml")).unwrap();
+    config.storage = base.storage;
+    config.images = base.images;
+    config.ebpf = base.ebpf;
+    config.network.advertise_address = Some("127.0.0.1".into());
+    let gossip = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+    let raft = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let reporting = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    config.cluster.gossip_port = gossip.local_addr().unwrap().port();
+    config.cluster.raft_port = raft.local_addr().unwrap().port();
+    config.cluster.reporting_port = reporting.local_addr().unwrap().port();
+    std::fs::write(root.join("node.toml"), toml::to_string(&config).unwrap()).unwrap();
+    std::fs::write(root.join("cluster"), "enrolled").unwrap();
+    drop((gossip, raft, reporting));
+    let identity = reliaburger::sesame::identity_store::load(&root.join("identity"))
+        .unwrap()
+        .unwrap();
+    let expected = reliaburger::bun::consumer_owners::ConsumerIdentity {
+        node_id: reliaburger::meat::NodeId::new("activation-node"),
+        cluster_identity: Sha256::digest(&identity.root_ca_der).into(),
+    };
+    let mut node = Node::start(&root).await;
+    let active = root.join("data/discovery/discovery.json").exists();
+    if !active {
+        node.crash().await;
+    }
+    assert!(
+        active,
+        "normal clustered startup did not activate consumer ownership"
+    );
+    node.crash().await;
+    let journal =
+        reliaburger::bun::discovery_owners::DiscoveryJournal::open(&root.join("data/discovery"))
+            .unwrap();
+    assert_eq!(
+        journal.inventory().consumer.as_ref().unwrap().identity,
+        expected
+    );
+    drop(journal);
+    let mut recovered = Node::start(&root).await;
+    assert!(recovered.client.status().await.unwrap().is_empty());
+    recovered.crash().await;
+    let journal =
+        reliaburger::bun::discovery_owners::DiscoveryJournal::open(&root.join("data/discovery"))
+            .unwrap();
+    assert_eq!(
+        journal.inventory().consumer.as_ref().unwrap().identity,
+        expected
+    );
+    drop(journal);
     retire_kernel(&root);
 }
 

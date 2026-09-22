@@ -1444,3 +1444,10 @@ The complete standalone path is qualified by
 `scripts/release/qualify-discovery-reboot.sh --vm DISPOSABLE_LIMA_VM`. It retains
 Bun/test executable checksums and original discovery obligations through a real
 power-cut, then verifies retirement, explicit redeployment and same-boot adoption.
+
+Normal Linux Runc startup now recovers durable discovery on rootful nodes with
+`[ebpf] enabled = true`, including enrolled clusters, and on standalone rootless
+nodes. Cluster recovery requires the enrolled identity and cluster service key.
+Rootless mode provides owned host-port forwarding; it does not provide eBPF policy
+or workload DNS. Actual rootless process/port recovery and enrolled cluster startup
+pass; full clustered lifecycle and upgrade qualification remain release work.

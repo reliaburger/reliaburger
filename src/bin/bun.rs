@@ -920,25 +920,23 @@ async fn run_agent(cli: Cli) -> anyhow::Result<()> {
     // Select runtime
     let runtime = select_runtime(&cli.runtime, &instances_dir, &pickle_dir).await?;
     #[cfg(target_os = "linux")]
-    let durable_discovery = !cli.cluster
-        && config.ebpf.enabled
-        && !reliaburger::grill::rootless::is_rootless()
-        && matches!(&runtime, AnyGrill::Runc(_));
+    let (durable_discovery, durable_kernel) = match &runtime {
+        AnyGrill::Runc(runtime) if runtime.is_rootless() => (!cli.cluster, false),
+        AnyGrill::Runc(_) => (config.ebpf.enabled, config.ebpf.enabled),
+        _ => (false, false),
+    };
     #[cfg(not(target_os = "linux"))]
-    let durable_discovery = false;
-    if !durable_discovery
-        && (data_base.join("kernel-policy").try_exists()?
-            || data_base.join("discovery").try_exists()?)
+    let (durable_discovery, durable_kernel) = (false, false);
+    if (!durable_kernel && data_base.join("kernel-policy").try_exists()?)
+        || (!durable_discovery && data_base.join("discovery").try_exists()?)
     {
         anyhow::bail!(
-            "durable ownership requires standalone rootful Runc with eBPF enabled; refusing a mode change"
+            "durable ownership requires its original runtime and enforcement mode; refusing a mode change"
         );
     }
     let runtime = if cli.experimental_owned_runc || durable_discovery {
-        if cli.cluster {
-            anyhow::bail!(
-                "owned Runc qualification is standalone only; cluster recovery is not qualified"
-            );
+        if cli.experimental_owned_runc && cli.cluster && !durable_discovery {
+            anyhow::bail!("owned Runc qualification requires a supported durable cluster profile");
         }
         match runtime {
             #[cfg(target_os = "linux")]
@@ -1070,6 +1068,9 @@ async fn run_agent(cli: Cli) -> anyhow::Result<()> {
         // Fail closed on plaintext cluster transports bound to a routable
         // address unless the operator explicitly accepted it.
         enforce_cluster_transport_security(&config, &params)?;
+        if durable_discovery && params.identity.is_none() {
+            anyhow::bail!("durable clustered discovery requires an enrolled node identity");
+        }
         api_identity = params.identity.clone();
         if params.identity.is_some() {
             println!("bun: mTLS enabled on the Raft RPC, reporting and API transports");
@@ -1223,7 +1224,7 @@ async fn run_agent(cli: Cli) -> anyhow::Result<()> {
 
     // L8: load and attach the eBPF data path (Onion connect rewrite,
     // Smoker network faults, Sesame egress). Linux + `ebpf` feature only.
-    // Durable standalone ownership requires all hooks before recovery. A load
+    // Durable kernel ownership requires all hooks before recovery. A load
     // failure must not start an agent that can forget original policy owners.
     agent.set_ebpf_sweep_interval(config.ebpf.sweep_interval_secs);
     // Observed, not configured: `enabled = true` with a failed load means no
@@ -1237,7 +1238,7 @@ async fn run_agent(cli: Cli) -> anyhow::Result<()> {
         #[cfg(all(feature = "ebpf", target_os = "linux"))]
         {
             use reliaburger::onion::ebpf::loader::OnionEbpf;
-            let loaded = if durable_discovery {
+            let loaded = if durable_kernel {
                 use sha2::{Digest, Sha256};
                 let directory = std::fs::canonicalize(&data_base)?;
                 let identity = Sha256::digest(directory.as_os_str().as_encoded_bytes());
@@ -1266,7 +1267,7 @@ async fn run_agent(cli: Cli) -> anyhow::Result<()> {
                         "bun: eBPF data path loaded (attached={})",
                         ebpf.is_attached()
                     );
-                    if durable_discovery
+                    if durable_kernel
                         && !(ebpf.is_attached()
                             && ebpf.connect6_attached()
                             && ebpf.sendmsg4_attached()
@@ -1279,7 +1280,7 @@ async fn run_agent(cli: Cli) -> anyhow::Result<()> {
                         .set_onion_ebpf(Arc::new(tokio::sync::Mutex::new(ebpf)))
                         .await;
                 }
-                Err(error) if durable_discovery => {
+                Err(error) if durable_kernel => {
                     return Err(
                         anyhow::anyhow!(error).context("cannot recover durable kernel policy")
                     );
@@ -1296,7 +1297,7 @@ async fn run_agent(cli: Cli) -> anyhow::Result<()> {
         );
     }
 
-    if durable_discovery && !ebpf_loaded {
+    if durable_kernel && !ebpf_loaded {
         anyhow::bail!("durable discovery requires a binary with working Linux eBPF support");
     }
 
@@ -1307,6 +1308,10 @@ async fn run_agent(cli: Cli) -> anyhow::Result<()> {
         .and_then(|c| c.wrapping_ikm())
         .map(reliaburger::sesame::token::derive_service_token)
         .transpose()?;
+
+    if durable_discovery && cli.cluster && service_token.is_none() {
+        anyhow::bail!("durable clustered discovery requires the cluster service authority");
+    }
 
     // A clustered node with no master key cannot mint a service token, so its
     // registry writes and cross-node replication silently 401 forever. Warn
@@ -1529,10 +1534,29 @@ async fn run_agent(cli: Cli) -> anyhow::Result<()> {
     agent.set_trust_policy(config.images.trust_policy.clone());
     agent.set_records_dir(instances_dir.clone());
     if durable_discovery {
-        agent
-            .recover_discovery_ownership(&data_base.join("discovery"))
-            .await
-            .context("cannot recover durable discovery ownership")?;
+        let directory = data_base.join("discovery");
+        if cli.cluster {
+            use sha2::{Digest, Sha256};
+            let identity = api_identity
+                .as_ref()
+                .context("durable consumer recovery requires an enrolled identity")?
+                .snapshot();
+            agent
+                .recover_consumer_ownership(
+                    &directory,
+                    reliaburger::bun::consumer_owners::ConsumerIdentity {
+                        node_id: reliaburger::meat::NodeId::new(&identity.node_id),
+                        cluster_identity: Sha256::digest(&identity.root_ca_der).into(),
+                    },
+                )
+                .await
+                .context("cannot recover durable consumer ownership")?;
+        } else {
+            agent
+                .recover_discovery_ownership(&directory)
+                .await
+                .context("cannot recover durable discovery ownership")?;
+        }
     }
     if let Some(manager) = upgrade_manager.clone() {
         agent.set_upgrade_manager(manager);

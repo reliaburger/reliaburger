@@ -25,7 +25,7 @@ while IFS= read -r binary; do
         mkdir -p /run/netns
         mount -t tmpfs tmpfs /run/netns
         ip link set lo up
-        exec "$1" --ignored --nocapture --test-threads=1
+        exec "$1" --ignored --nocapture --test-threads=1 --skip normal_rootless_bun
     ' qualification "$binary" 2>&1 | tee "$evidence/$name.log"
 done < "$evidence/binaries"
 printf 'PASS: OCI interruptions; evidence retained at %s\n' "$evidence"

@@ -388,3 +388,10 @@ upgrade/rollback qualification remain release blockers.
 ## Licence
 
 [Apache 2.0](LICENSE)
+
+Normal Linux Runc startup now recovers durable discovery on rootful nodes with
+`[ebpf] enabled = true`, including enrolled clusters, and on standalone rootless
+nodes. Cluster recovery requires the enrolled identity and cluster service key.
+Rootless mode provides owned host-port forwarding; it does not provide eBPF policy
+or workload DNS. Actual rootless process/port recovery and enrolled cluster startup
+pass; full clustered lifecycle and upgrade qualification remain release work.
