@@ -230,3 +230,28 @@ affected library cases (18.398s/32.257s), thirteen integration cases each
 (5.121s/5.053s), three real failover/decommission cases each (71.409s/71.044s),
 strict all-target/all-feature Clippy and formatting. Both pipelines are reaped.
 Evidence: `/tmp/rb-consumer-generation-{red,focused,native,linux}.log`.
+
+
+### Producer release checkpoint
+
+`887c77a` adds permanent, node-scoped execution fences to Raft. Retirement atomically
+removes fenced endpoints and records withdrawals. Release waits for every historical
+consumer obligation for the execution, including uncorrelated original endpoints.
+Both scheduler and Raft reject delayed reports for retired executions; a different
+runtime generation can reuse the instance/address. Snapshots and bounded capacity
+retain fences permanently; overflow refuses without partial mutation. Protocol
+20/state 34 record the new request/response and durable state.
+
+The authenticated producer API derives identity from current TLS, requires system
+authority and quorum-backed security state, returns 202 while pending, and names
+the exact execution on release. The agent's opt-in durable path verifies original
+runtime inventory and the bounded HTTPS confirmation before records, host ports or
+Runc addresses can be released. Runc release permission is persisted first.
+Cancellation retains ownership; automatic restart uses the same gate. The binary
+supplies transport, while production activation still waits for consumer recovery.
+
+Focused evidence: three initial Raft, three initial API and two initial agent/client
+contracts fail before implementation. Nine final producer library cases (0.362s)
+and six receipt/producer API cases (0.057s) pass. Broader native/Linux qualification
+follows. Completing consumer recovery, receipt production and service VIP retirement
+is still required before enabling the production profile.

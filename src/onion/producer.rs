@@ -33,14 +33,13 @@ impl ProducerRetirements {
         execution: &RuntimeExecution,
     ) -> Result<Self, String> {
         crate::cluster::retirement::validate_node_id(node_id).map_err(String::from)?;
-        let identity = crate::grill::InstanceIdentity::parse(&execution.instance_id.0)
+        crate::grill::InstanceIdentity::parse(&execution.instance_id.0)
             .filter(|id| {
                 id.instance_id() == execution.instance_id
                     && crate::config::valid_workload_label(&id.namespace)
                     && crate::config::valid_workload_label(&id.app)
             })
             .ok_or_else(|| "invalid producer execution identity".to_string())?;
-        let _ = identity;
         if let Some(original) = self
             .executions
             .get(node_id)
@@ -105,4 +104,14 @@ impl ProducerRetirements {
                     })
             })
     }
+}
+
+/// Exact authenticated producer and execution whose remote withdrawal is committed.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ProducerReleaseConfirmation {
+    /// Identity derived from the producer's TLS certificate.
+    pub node_id: String,
+    /// Original fenced execution whose consumers have all confirmed withdrawal.
+    pub execution: RuntimeExecution,
 }

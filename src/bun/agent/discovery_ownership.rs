@@ -111,10 +111,11 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
         .await
     }
 
-    /// Persist standalone release permission after the caller confirms local withdrawal.
+    /// Persist release permission after local withdrawal and exact cluster confirmation.
     pub(super) async fn authorise_local_discovery_release(
         &mut self,
         reference: &crate::grill::runc_intent::NetworkReference,
+        remote: Option<&crate::onion::producer::ProducerReleaseConfirmation>,
     ) -> Result<(), BunError> {
         use crate::bun::discovery_owners::ReferencePhase;
         if matches!(self.discovery_ownership, DiscoveryOwnership::Disabled) {
@@ -124,7 +125,14 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
             instance_id: reference.instance_id.clone(),
             reason: reason.into(),
         };
-        if self.cluster.is_some() {
+        if let Some(cluster) = &self.cluster
+            && remote.is_none_or(|confirmed| {
+                confirmed.node_id != cluster.local_node_id.0
+                    || confirmed.execution.instance_id != reference.instance_id
+                    || confirmed.execution.generation
+                        != crate::grill::RuntimeGeneration::runc(reference.generation.as_str())
+            })
+        {
             return Err(refuse(
                 "remote withdrawal must be confirmed before durable release permission",
             ));

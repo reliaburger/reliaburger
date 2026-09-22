@@ -43,7 +43,9 @@ implementation status in [progress.md](docs/progress.md).
 Cluster discovery keeps its last confirmed DNS and ingress views when a routing
 update fails, and retries confirmation before continuing placement work. Consumers
 reject stale catalogue generations and conflicting merged allocations. Durable
-consumer recovery and confirmed remote cleanup remain release blockers.
+consumer recovery and confirmed remote cleanup remain release blockers. The opt-in
+durable path now holds producer allocations until committed consumer confirmation;
+permanent execution fences prevent stale reports from reviving retired endpoints.
 
 0.1.0 requires a fresh cluster; development state is refused. Rolling upgrades
 require matching explicit formats (currently protocol 20 and state 34). See the

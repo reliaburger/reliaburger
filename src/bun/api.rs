@@ -455,6 +455,7 @@ pub fn router_with_upgrade(
         .route("/v1/rollback/{app}/{namespace}", post(rollback_handler))
         .route("/v1/nodes/decommission", post(node_decommission_handler))
         .route("/v1/placements/{node_id}", get(placements_handler))
+        .route("/v1/discovery/retire", post(producer_retirement_handler))
         .route(
             "/v1/discovery/withdrawn",
             post(endpoint_withdrawal_receipt_handler),
@@ -3107,6 +3108,80 @@ async fn endpoint_withdrawal_receipt_handler(
         Err(_) => (
             StatusCode::GATEWAY_TIMEOUT,
             "endpoint receipt outcome unknown; repeat the same receipt",
+        )
+            .into_response(),
+    }
+}
+
+/// Producers contact the leader directly so forwarding cannot replace their TLS identity.
+async fn producer_retirement_handler(
+    auth: Option<axum::Extension<crate::sesame::auth::AuthContext>>,
+    peer: Option<axum::Extension<crate::sesame::renewal::TlsPeerCertificate>>,
+    State(state): State<ApiState>,
+    Json(receipt): Json<crate::onion::producer::ProducerRetirementRequest>,
+) -> Response {
+    if let Err(response) = crate::sesame::auth::require_system(auth.as_deref()) {
+        return response;
+    }
+    if let Err(error) = receipt.compatibility.require_current() {
+        return (StatusCode::CONFLICT, error.to_string()).into_response();
+    }
+    let Some(peer) = peer else {
+        return (
+            StatusCode::FORBIDDEN,
+            "producer retirement requires a TLS node certificate",
+        )
+            .into_response();
+    };
+    let Some(council) = &state.council else {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            "no endpoint council available",
+        )
+            .into_response();
+    };
+    let result = tokio::time::timeout(std::time::Duration::from_secs(10), async {
+        let security = council
+            .security_state_linearizable()
+            .await
+            .map_err(|error| (StatusCode::SERVICE_UNAVAILABLE, error.to_string()))?;
+        let node_id = crate::sesame::renewal::validate_peer(&peer, &security)
+            .map_err(|error| (StatusCode::FORBIDDEN, error.to_string()))?;
+        council
+            .write(crate::council::RaftRequest::RetireEndpointExecution {
+                node_id: node_id.clone(),
+                execution: receipt.execution.clone(),
+            })
+            .await
+            .map(|response| (node_id, response))
+            .map_err(|error| (StatusCode::SERVICE_UNAVAILABLE, error.to_string()))
+    })
+    .await;
+    match result {
+        Ok(Ok((
+            node_id,
+            crate::council::CouncilResponse::EndpointExecutionRetired { released: true },
+        ))) => Json(crate::onion::producer::ProducerReleaseConfirmation {
+            node_id,
+            execution: receipt.execution,
+        })
+        .into_response(),
+        Ok(Ok((
+            _,
+            crate::council::CouncilResponse::EndpointExecutionRetired { released: false },
+        ))) => StatusCode::ACCEPTED.into_response(),
+        Ok(Ok((_, crate::council::CouncilResponse::Refused { reason }))) => {
+            (StatusCode::CONFLICT, reason).into_response()
+        }
+        Ok(Ok(_)) => (
+            StatusCode::SERVICE_UNAVAILABLE,
+            "producer retirement is unconfirmed",
+        )
+            .into_response(),
+        Ok(Err(error)) => error.into_response(),
+        Err(_) => (
+            StatusCode::GATEWAY_TIMEOUT,
+            "producer retirement outcome unknown; repeat the same retirement",
         )
             .into_response(),
     }

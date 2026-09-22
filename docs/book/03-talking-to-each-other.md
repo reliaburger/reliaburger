@@ -2263,3 +2263,34 @@ confirmation establishes remote withdrawal only. The HTTP boundary authenticates
 the producer, and the agent must obtain that confirmation before returning its
 host port or runtime address. The Raft request/response and durable fence advance
 compatibility to protocol 20/state 34; old development clusters require fresh state.
+
+### Turning a remote release result into local permission
+
+The producer calls `/v1/discovery/retire` directly on the leader. The handler
+requires system authority, current protocol/state formats and a node certificate
+validated against a quorum-backed security read. It derives the producer identity
+from that certificate; a request cannot nominate another node. A committed fence
+with outstanding consumers returns 202. Confirmed release returns the exact node
+and execution in a bounded JSON response. Missing quorum and unknown outcomes do
+not authorise cleanup.
+
+Bun's durable discovery path now reads the original runtime inventory before
+retirement and correlates it with the owned instance, specification and host port.
+It asks the leader to retire that exact generation. The client requires HTTPS,
+limits response size and total request duration, and checks the returned node and
+execution. Pending, malformed, redirected and mismatched replies preserve the
+allocation. Dropping the wait cannot grant permission; a later attempt sends the
+same original execution and obtains a fresh committed result.
+
+The agent performs this check before deleting records or releasing an allocation,
+including the automatic-restart path. For Runc, the returned generation must also
+match the original network reference, and durable local release permission still
+precedes the runtime release call. Process host ports remain allocated until
+retirement bookkeeping completes. Standalone release keeps its existing local
+proof requirements. Portless workloads with no network reference need no remote
+address release.
+
+The production binary supplies the enrolled client and live leader watches. The
+gate is enabled by the opt-in durable discovery profile; selecting that profile
+for production still waits for complete consumer recovery. Service VIP retirement
+also remains separate from releasing one producer execution's physical address.

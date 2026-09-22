@@ -3119,6 +3119,23 @@ mod tests {
         assert_eq!(serde_json::to_value(&full.state).unwrap(), before);
     }
 
+    #[test]
+    fn producer_retirement_withdrawal_failure_preserves_catalogue_fence_and_history() {
+        let mut inner = StateMachineInner::default();
+        inner.state.endpoint_catalog = withdrawal_fixture_catalogue();
+        inner.state.endpoint_withdrawals.generation = u64::MAX;
+        let execution = inner.state.endpoint_catalog.services["default__api"].backends[0]
+            .execution
+            .clone()
+            .unwrap();
+        let before = serde_json::to_value(&inner.state).unwrap();
+        assert!(matches!(
+            inner.apply_request(&retire_endpoint("producer", &execution)),
+            Some(CouncilResponse::Refused { .. })
+        ));
+        assert_eq!(serde_json::to_value(&inner.state).unwrap(), before);
+    }
+
     #[tokio::test]
     async fn producer_retirement_and_delayed_report_fences_survive_raft_snapshot() {
         let mut sm = CouncilStateMachine::new();

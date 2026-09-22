@@ -1525,6 +1525,7 @@ use super::egress_owners::{EgressBinding, PolicyPhase};
 mod discovery_ownership;
 mod discovery_recovery;
 mod egress_ownership;
+mod producer_release;
 use discovery_ownership::DiscoveryOwnership;
 
 /// An immutable, owned connectivity trace that can run outside the agent
@@ -1611,6 +1612,8 @@ pub struct BunAgent<G: Grill> {
     service_map: crate::onion::service_map::ServiceMap,
     /// Exclusive publication checkpoint, or a fence after an uncertain write.
     discovery_ownership: DiscoveryOwnership,
+    /// Enrolled transport used by the opt-in durable producer retirement gate.
+    producer_release_client: Option<crate::cluster::producer::ProducerReleaseClient>,
     /// Cluster-wide endpoint catalogue (12b.4), replicated from the leader.
     /// Overlaid onto the local `service_map` when publishing the DNS/routing
     /// snapshot so this node resolves services whose backends live elsewhere.
@@ -1780,6 +1783,7 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
             cgroup_ns_bpf_keys: std::collections::HashSet::new(),
             service_map: crate::onion::service_map::ServiceMap::new(),
             discovery_ownership: DiscoveryOwnership::default(),
+            producer_release_client: None,
             cluster_catalog: crate::onion::catalog::EndpointCatalog::new(),
             cluster_catalog_generation: None,
             service_map_tx: tokio::sync::watch::channel(
@@ -1876,6 +1880,7 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
             cgroup_ns_bpf_keys: std::collections::HashSet::new(),
             service_map: crate::onion::service_map::ServiceMap::new(),
             discovery_ownership: DiscoveryOwnership::default(),
+            producer_release_client: None,
             cluster_catalog: crate::onion::catalog::EndpointCatalog::new(),
             cluster_catalog_generation: None,
             service_map_tx: tokio::sync::watch::channel(
@@ -6411,7 +6416,11 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
         Ok(())
     }
 
-    async fn release_network_reference(&mut self, id: &InstanceId) -> Result<(), BunError> {
+    async fn release_network_reference(
+        &mut self,
+        id: &InstanceId,
+        remote: Option<&crate::onion::producer::ProducerReleaseConfirmation>,
+    ) -> Result<(), BunError> {
         let Some(reference) = self.network_references.get(id).cloned() else {
             if self
                 .supervisor
@@ -6428,7 +6437,8 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
             }
             return Ok(());
         };
-        self.authorise_local_discovery_release(&reference).await?;
+        self.authorise_local_discovery_release(&reference, remote)
+            .await?;
         self.require_discovery_release_permission(&reference)?;
         self.supervisor
             .grill()
@@ -8398,8 +8408,10 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
     /// Runtime retirement must already be confirmed. The same logical workload
     /// keeps its identity bundle and mount; final retirement removes those too.
     async fn retire_restart_artifacts(&mut self, instance_id: &InstanceId) -> Result<(), BunError> {
+        let remote = self.confirm_producer_release(instance_id).await?;
         self.clear_egress(instance_id).await?;
-        self.release_network_reference(instance_id).await?;
+        self.release_network_reference(instance_id, remote.as_ref())
+            .await?;
         if let Some(directory) = self.records_dir.clone() {
             let id = instance_id.0.clone();
             tokio::task::spawn_blocking(move || {
@@ -8448,8 +8460,10 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
                 reason: "captured ingress requests still require confirmed release".into(),
             });
         }
+        let remote = self.confirm_producer_release(instance_id).await?;
         self.clear_egress(instance_id).await?;
-        self.release_network_reference(instance_id).await?;
+        self.release_network_reference(instance_id, remote.as_ref())
+            .await?;
         let identity_dir = self.instance_identity_dir(instance_id);
         let records_dir = self.records_dir.clone();
         let id = instance_id.0.clone();
@@ -12233,6 +12247,166 @@ mod tests {
         ));
     }
 
+    #[tokio::test]
+    async fn producer_agent_retains_process_port_and_owner_without_remote_confirmation() {
+        for has_inventory in [true, false] {
+            let (mut agent, _, _, grill) = test_agent_with_grill();
+            grill.set_pid(std::process::id());
+            let root = tempfile::tempdir().unwrap();
+            agent.set_volumes_dir(root.path().join("volumes"));
+            agent.set_records_dir(root.path().join("records"));
+            agent
+                .enable_fresh_discovery_ownership(&root.path().join("discovery"))
+                .await
+                .unwrap();
+            expect_complete(&drain_deploy(&mut agent, basic_config()).await);
+            let id = InstanceId("default__web-0".into());
+            let original = agent.supervisor.get_instance(&id).unwrap();
+            let original_port = original.host_port;
+            let original_spec = original.oci_spec.clone().unwrap();
+            if has_inventory {
+                grill
+                    .set_launch_inventory(vec![crate::grill::RuntimeLaunch {
+                        instance_id: id.clone(),
+                        generation: crate::grill::RuntimeGeneration::process("original"),
+                        spec: original_spec,
+                        network_reference: None,
+                    }])
+                    .await;
+            }
+            let (mut clustered, _, _) = test_cluster_fault_agent().await;
+            agent.cluster = clustered.cluster.take();
+            agent.kill_and_wait_for_exit(&id).await.unwrap();
+            assert!(
+                agent.finish_retire_bookkeeping(&id).await.is_err(),
+                "unconfirmed producer released its host port"
+            );
+            assert_eq!(
+                agent.supervisor.get_instance(&id).unwrap().host_port,
+                original_port
+            );
+            assert!(
+                crate::grill::records::record_path(&root.path().join("records"), &id.0).exists()
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn producer_agent_releases_process_ports_and_exact_runc_addresses_only_after_confirmation()
+     {
+        for runc in [false, true] {
+            let grill = MockGrill::new();
+            grill.set_pid(std::process::id());
+            let allocator = PortAllocator::new(30000, 30001);
+            let (_, receiver) = mpsc::channel(8);
+            let mut agent = BunAgent::new(
+                grill.clone(),
+                allocator.clone(),
+                receiver,
+                CancellationToken::new(),
+            );
+            let root = tempfile::tempdir().unwrap();
+            agent.set_volumes_dir(root.path().join("volumes"));
+            agent.set_records_dir(root.path().join("records"));
+            agent
+                .enable_fresh_discovery_ownership(&root.path().join("discovery"))
+                .await
+                .unwrap();
+            let reference = original_test_network_reference();
+            if runc {
+                grill.set_network_reference(reference.clone()).await;
+            }
+            expect_complete(&drain_deploy(&mut agent, basic_config()).await);
+            let id = reference.instance_id.clone();
+            let original = agent.supervisor.get_instance(&id).unwrap();
+            let host_port = original.host_port.unwrap();
+            let execution = crate::grill::RuntimeExecution {
+                instance_id: id.clone(),
+                generation: if runc {
+                    crate::grill::RuntimeGeneration::runc(reference.generation.as_str())
+                } else {
+                    crate::grill::RuntimeGeneration::process("original")
+                },
+            };
+            grill
+                .set_launch_inventory(vec![crate::grill::RuntimeLaunch {
+                    instance_id: id.clone(),
+                    generation: execution.generation.clone(),
+                    spec: original.oci_spec.clone().unwrap(),
+                    network_reference: runc.then(|| {
+                        crate::grill::runc_intent::NetworkReferenceState::Held(reference.clone())
+                    }),
+                }])
+                .await;
+            let (mut clustered, _, _) = test_cluster_fault_agent().await;
+            agent.cluster = clustered.cluster.take();
+            agent.kill_and_wait_for_exit(&id).await.unwrap();
+            let (client, task) = crate::cluster::producer::test_fixture(
+                axum::http::StatusCode::ACCEPTED,
+                String::new(),
+            )
+            .await;
+            agent.set_producer_release_client(client);
+            assert!(agent.finish_retire_bookkeeping(&id).await.is_err());
+            assert!(allocator.is_allocated(host_port).await);
+            assert!(agent.supervisor.get_instance(&id).is_some());
+            assert!(
+                !grill
+                    .calls()
+                    .iter()
+                    .any(|(operation, _)| operation == "release_network_reference")
+            );
+            task.abort();
+            let _ = task.await;
+            let confirmation =
+                serde_json::json!({"node_id": "test", "execution": execution}).to_string();
+            let (client, delayed_task) = crate::cluster::producer::test_delayed_fixture(
+                axum::http::StatusCode::OK,
+                confirmation.clone(),
+                std::time::Duration::from_secs(1),
+            )
+            .await;
+            agent.set_producer_release_client(client);
+            assert!(
+                tokio::time::timeout(
+                    std::time::Duration::from_millis(50),
+                    agent.finish_retire_bookkeeping(&id)
+                )
+                .await
+                .is_err()
+            );
+            assert!(allocator.is_allocated(host_port).await);
+            assert!(agent.supervisor.get_instance(&id).is_some());
+            assert!(
+                !grill
+                    .calls()
+                    .iter()
+                    .any(|(operation, _)| operation == "release_network_reference")
+            );
+            delayed_task.abort();
+            let _ = delayed_task.await;
+            let (client, task) =
+                crate::cluster::producer::test_fixture(axum::http::StatusCode::OK, confirmation)
+                    .await;
+            agent.set_producer_release_client(client);
+            agent.finish_retire_bookkeeping(&id).await.unwrap();
+            assert!(!allocator.is_allocated(host_port).await);
+            assert!(agent.supervisor.get_instance(&id).is_none());
+            assert!(
+                !crate::grill::records::record_path(&root.path().join("records"), &id.0).exists()
+            );
+            assert_eq!(
+                grill
+                    .calls()
+                    .iter()
+                    .any(|(operation, _)| operation == "release_network_reference"),
+                runc
+            );
+            task.abort();
+            let _ = task.await;
+        }
+    }
+
     fn original_test_network_reference() -> crate::grill::runc_intent::NetworkReference {
         serde_json::from_value(serde_json::json!({
             "instance_id": "default__web-0", "generation": "1234567890abcdef1234567890abcdef", "container_index": 7
@@ -12337,11 +12511,27 @@ mod tests {
         let reference = original_test_network_reference();
         grill.set_network_reference(reference.clone()).await;
         expect_complete(&drain_deploy(&mut agent, basic_config()).await);
+        grill
+            .set_launch_inventory(vec![crate::grill::RuntimeLaunch {
+                instance_id: reference.instance_id.clone(),
+                generation: crate::grill::RuntimeGeneration::runc(reference.generation.as_str()),
+                spec: agent
+                    .supervisor
+                    .get_instance(&reference.instance_id)
+                    .unwrap()
+                    .oci_spec
+                    .clone()
+                    .unwrap(),
+                network_reference: Some(crate::grill::runc_intent::NetworkReferenceState::Held(
+                    reference.clone(),
+                )),
+            }])
+            .await;
         let (mut cluster_agent, _, _) = test_cluster_fault_agent().await;
         agent.cluster = cluster_agent.cluster.take();
         let result = agent.stop_app("web", "default").await;
         assert!(
-            matches!(result, Err(BunError::RetirementState { ref reason, .. }) if reason.contains("durable release permission")),
+            matches!(result, Err(BunError::RetirementState { ref reason, .. }) if reason.contains("producer release transport")),
             "held reference was not fenced by its durable owner: {result:?}"
         );
         assert_eq!(

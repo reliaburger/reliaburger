@@ -18,6 +18,7 @@ pub mod directory;
 pub mod http;
 pub mod identity;
 pub mod orchestrate;
+pub mod producer;
 pub mod retirement;
 pub mod runtime;
 

@@ -369,3 +369,175 @@ async fn endpoint_receipts_refuse_without_current_leader_authority() {
     );
     council.shutdown().await.unwrap();
 }
+
+fn producer_execution() -> reliaburger::grill::RuntimeExecution {
+    serde_json::from_value(
+        serde_json::json!({"instance_id": "default__web-0", "generation": "a".repeat(64)}),
+    )
+    .unwrap()
+}
+
+async fn retire_producer(app: Router, body: serde_json::Value, bearer: &str) -> StatusCode {
+    app.oneshot(
+        Request::post("/v1/discovery/retire")
+            .header("content-type", "application/json")
+            .header("authorization", format!("Bearer {bearer}"))
+            .body(Body::from(serde_json::to_vec(&body).unwrap()))
+            .unwrap(),
+    )
+    .await
+    .unwrap()
+    .status()
+}
+
+fn producer_request() -> serde_json::Value {
+    serde_json::json!({"compatibility": reliaburger::compatibility::CURRENT, "execution": producer_execution()})
+}
+
+#[tokio::test]
+async fn producer_release_requires_authenticated_identity_and_every_consumer_receipt() {
+    let hierarchy = ca::generate_ca_hierarchy("producer-release", &IKM).unwrap();
+    let council = council(&hierarchy, true).await;
+    council
+        .write(RaftRequest::RegisterEndpointConsumer {
+            node_id: "offline".into(),
+        })
+        .await
+        .unwrap();
+    let catalog = EndpointCatalog::rebuild([(
+        ServiceId::new("default", "web"),
+        8080,
+        vec![CatalogBackend {
+            node_id: "producer".into(),
+            node_ip: "127.0.0.1".parse().unwrap(),
+            host_port: 18080,
+            healthy: true,
+            execution: Some(producer_execution()),
+        }],
+    )])
+    .unwrap();
+    council
+        .write(RaftRequest::PublishEndpoints {
+            expected_generation: 0,
+            catalog: Box::new(catalog.clone()),
+        })
+        .await
+        .unwrap();
+    let app = router(council.clone(), Some(peer(&hierarchy, "producer", 10)));
+    for _ in 0..2 {
+        assert_eq!(
+            retire_producer(app.clone(), producer_request(), "internal-token").await,
+            StatusCode::ACCEPTED
+        );
+        assert_eq!(
+            council
+                .desired_state()
+                .await
+                .endpoint_withdrawals
+                .generation,
+            2
+        );
+    }
+    assert_eq!(
+        acknowledge(
+            router(council.clone(), Some(peer(&hierarchy, "offline", 11))),
+            receipt(1),
+            "internal-token"
+        )
+        .await,
+        StatusCode::NO_CONTENT
+    );
+    for _ in 0..2 {
+        assert_eq!(
+            retire_producer(app.clone(), producer_request(), "internal-token").await,
+            StatusCode::OK
+        );
+    }
+    assert!(matches!(
+        council
+            .write(RaftRequest::PublishEndpoints {
+                expected_generation: 2,
+                catalog: Box::new(catalog)
+            })
+            .await
+            .unwrap(),
+        CouncilResponse::Refused { .. }
+    ));
+}
+
+#[tokio::test]
+async fn producer_release_refuses_missing_forged_retired_and_incompatible_authority() {
+    let hierarchy = ca::generate_ca_hierarchy("producer-authority", &IKM).unwrap();
+    let council = council(&hierarchy, true).await;
+    let app = router(council.clone(), Some(peer(&hierarchy, "producer", 10)));
+    let before = serde_json::to_value(council.desired_state().await).unwrap();
+    assert_eq!(
+        retire_producer(
+            router(council.clone(), None),
+            producer_request(),
+            "internal-token"
+        )
+        .await,
+        StatusCode::FORBIDDEN
+    );
+    assert!(
+        !retire_producer(app.clone(), producer_request(), "wrong-token")
+            .await
+            .is_success()
+    );
+    let foreign = ca::generate_ca_hierarchy("foreign", &IKM).unwrap();
+    assert_eq!(
+        retire_producer(
+            router(council.clone(), Some(peer(&foreign, "producer", 11))),
+            producer_request(),
+            "internal-token"
+        )
+        .await,
+        StatusCode::FORBIDDEN
+    );
+    let mut forged = producer_request();
+    forged["node_id"] = "victim".into();
+    assert_eq!(
+        retire_producer(app.clone(), forged, "internal-token").await,
+        StatusCode::UNPROCESSABLE_ENTITY
+    );
+    let mut incompatible = producer_request();
+    incompatible["compatibility"]["state"] = 0.into();
+    assert_eq!(
+        retire_producer(app.clone(), incompatible, "internal-token").await,
+        StatusCode::CONFLICT
+    );
+    assert_eq!(
+        serde_json::to_value(council.desired_state().await).unwrap(),
+        before
+    );
+    let retired = council
+        .write(RaftRequest::DecommissionNode {
+            node_id: "producer".into(),
+            retired_by: "operator".into(),
+            reason: "fenced".into(),
+            retired_at_unix_ms: 1,
+            membership_log_id: *council.desired_state().await.last_membership.log_id(),
+        })
+        .await
+        .unwrap();
+    assert!(matches!(
+        retired,
+        CouncilResponse::NodeDecommissioned { .. }
+    ));
+    assert_eq!(
+        retire_producer(app, producer_request(), "internal-token").await,
+        StatusCode::FORBIDDEN
+    );
+}
+
+#[tokio::test]
+async fn producer_release_without_a_quorum_is_not_confirmation() {
+    let hierarchy = ca::generate_ca_hierarchy("producer-no-quorum", &IKM).unwrap();
+    let council = council(&hierarchy, false).await;
+    let app = router(council, Some(peer(&hierarchy, "producer", 10)));
+    assert_eq!(
+        retire_producer(app, producer_request(), "internal-token").await,
+        StatusCode::SERVICE_UNAVAILABLE
+    );
+}

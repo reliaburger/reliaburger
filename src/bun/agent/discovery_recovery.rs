@@ -123,7 +123,7 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
             .map(|owner| owner.reference.instance_id.clone())
             .collect();
         for id in pending {
-            self.release_network_reference(&id).await?;
+            self.release_network_reference(&id, None).await?;
         }
         Ok(())
     }

@@ -2189,6 +2189,38 @@ image = "busybox:latest"
     }
 
     #[test]
+    fn producer_scheduler_filters_retired_and_uncorrelated_reports_but_preserves_successors() {
+        let mut desired = crate::council::types::DesiredState::default();
+        desired.apps.insert(
+            crate::meat::types::AppId::new("web", "default"),
+            spec_from_toml("[app.web]\nimage = \"x:1\"\nport = 80\n"),
+        );
+        let execution: crate::grill::RuntimeExecution = serde_json::from_value(serde_json::json!({
+            "instance_id": "default__web-0", "generation": "a".repeat(64)
+        }))
+        .unwrap();
+        desired.producer_retirements = desired
+            .producer_retirements
+            .plan_retirement("a", &execution)
+            .unwrap();
+        let mut successor = execution.clone();
+        successor.generation = "b".repeat(64).try_into().unwrap();
+        for original in [None, Some(execution), Some(successor.clone())] {
+            let mut report = report(4000, 0);
+            let mut app = running_app("default", "web", 30001, true);
+            app.execution = original.clone();
+            report.running_apps = vec![app];
+            let mut reports = AggregatedState::default();
+            reports.reports.insert(NodeId::new("a"), report);
+            let catalog = build_endpoint_catalog(&[member("a", 1)], &reports, &desired).unwrap();
+            assert_eq!(
+                catalog.services["default__web"].backends.len(),
+                usize::from(original == Some(successor.clone()))
+            );
+        }
+    }
+
+    #[test]
     fn build_endpoint_catalog_aggregates_backends_across_nodes() {
         use crate::onion::service_id::ServiceId;
 

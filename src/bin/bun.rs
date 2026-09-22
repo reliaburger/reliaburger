@@ -1341,6 +1341,14 @@ async fn run_agent(cli: Cli) -> anyhow::Result<()> {
         });
 
         if let Some(metrics_rx) = metrics_rx {
+            agent.set_producer_release_client(
+                reliaburger::cluster::producer::ProducerReleaseClient::new(
+                    cluster_http.clone().with_bearer(service_token.clone()),
+                    metrics_rx.clone(),
+                    directory_rx.clone(),
+                    api_port as i32 - config.cluster.raft_port as i32,
+                ),
+            );
             reliaburger::cluster::orchestrate::spawn_placement_reconciler(
                 node_name.clone(),
                 metrics_rx,
