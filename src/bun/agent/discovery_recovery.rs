@@ -201,9 +201,8 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
                 })
                 .collect();
             if instances.is_empty() {
-                if self.cluster.is_some() {
-                    // Keep the local allocation reserved until producer cleanup
-                    // and the committed cluster catalogue permit its retirement.
+                if !self.startup_retirements.is_empty() {
+                    // The live loop will finish retirement after receipt delivery starts.
                     continue;
                 }
                 self.retire_discovery_service(&service).await?;
@@ -214,27 +213,35 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
             }
             let mut candidate = self.service_map.clone();
             for (id, port, has_health) in instances {
-                let ip = self
-                    .supervisor
-                    .grill()
-                    .container_ip(&id)
-                    .await
-                    .ok_or_else(|| {
-                        BunError::AdoptionState(format!(
-                            "adopted runtime {id} has no confirmed container address"
-                        ))
-                    })?;
+                let ip = self.supervisor.grill().container_ip(&id).await;
+                if ip.is_none()
+                    && !self
+                        .supervisor
+                        .grill()
+                        .rootless_network_record(&id)
+                        .await
+                        .is_some_and(|network| {
+                            network.port_mapping.is_some_and(|mapping| {
+                                Some(mapping.host_port) == port
+                                    && mapping.container_port == entry.port
+                            })
+                        })
+                {
+                    return Err(BunError::AdoptionState(format!(
+                        "adopted runtime {id} has no confirmed container address or rootless forward"
+                    )));
+                }
                 let port = port.ok_or_else(|| {
                     BunError::AdoptionState(format!(
                         "adopted runtime {id} has no original published port"
                     ))
                 })?;
-                let backend = self.local_backend(&id, &service, Some(ip), port, !has_health);
+                let backend = self.local_backend(&id, &service, ip, port, !has_health);
                 candidate
                     .add_backend(&service, backend)
                     .map_err(|error| BunError::AdoptionState(error.to_string()))?;
                 if let Some(instance) = self.supervisor.get_instance_mut(&id) {
-                    instance.container_ip = Some(ip);
+                    instance.container_ip = ip;
                     if has_health {
                         instance.state = ContainerState::HealthWait;
                     }

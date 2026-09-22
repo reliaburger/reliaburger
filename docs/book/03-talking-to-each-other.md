@@ -2490,3 +2490,19 @@ service identity and both ports with the original runtime intent. Missing or
 replaced intent refuses recovery. The optional `BTreeMap<String, RuntimeGeneration>`
 uses sorted instance keys, keeping serialised evidence deterministic. An existing
 publication cannot replace its witness without withdrawing that backend first.
+
+### Let recovery serve its own confirmations
+
+A stopped producer can still own an address used by another node's old view.
+Waiting for that node before starting our own API creates a cycle: neither side
+can receive the confirmation it needs. We keep the original execution in a
+`VecDeque` (a double-ended queue), reserve its host port and start the control
+plane with workload readiness held closed. Each health tick retries one original
+retirement. Failed entries move to the back so another producer can progress.
+New deployments remain refused until the queue and local service cleanup finish.
+A missing or changed execution is an error, never permission to free its port.
+
+Rootless recovery has a different address proof: the owned network helper must
+confirm the original host/container port pair. Only then can adoption restore a
+loopback backend without a container IP. The regression deliberately removes the
+container address; an absent or mismatched helper still refuses adoption.

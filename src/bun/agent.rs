@@ -1535,6 +1535,7 @@ pub struct PartitionBlocklists {
 #[cfg(all(feature = "ebpf", target_os = "linux"))]
 use super::egress_owners::{EgressBinding, PolicyPhase};
 mod consumer;
+mod startup_recovery;
 pub use consumer::ConsumerUpdate;
 mod discovery_ownership;
 mod discovery_recovery;
@@ -1667,6 +1668,10 @@ pub struct BunAgent<G: Grill> {
     initialisers: std::collections::HashMap<InstanceId, std::collections::HashSet<InstanceId>>,
     /// Captured before startup; a recovered runtime hold needs original discovery
     /// reconciliation rather than an empty in-memory map authorising release.
+    /// Original executions awaiting cluster cleanup after the API becomes available.
+    startup_retirements: std::collections::VecDeque<crate::grill::RuntimeLaunch>,
+    /// Keep admission fenced until empty-allocation retirement also succeeds.
+    startup_cleanup_pending: bool,
     network_references:
         std::collections::HashMap<InstanceId, crate::grill::runc_intent::NetworkReference>,
     /// Pre-created network namespace paths for instances (Linux + runc only).
@@ -1820,6 +1825,8 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
             deploy_history: Arc::new(tokio::sync::RwLock::new(Vec::new())),
             deploy_operations: crate::bun::deploy_operations::DeployOperationTracker::default(),
             initialisers: std::collections::HashMap::new(),
+            startup_retirements: Default::default(),
+            startup_cleanup_pending: false,
             network_references: std::collections::HashMap::new(),
             netns_paths: std::collections::HashMap::new(),
             deployed_specs: std::collections::HashMap::new(),
@@ -1928,6 +1935,8 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
             deploy_history: Arc::new(tokio::sync::RwLock::new(Vec::new())),
             deploy_operations: crate::bun::deploy_operations::DeployOperationTracker::default(),
             initialisers: std::collections::HashMap::new(),
+            startup_retirements: Default::default(),
+            startup_cleanup_pending: false,
             network_references: std::collections::HashMap::new(),
             netns_paths: std::collections::HashMap::new(),
             deployed_specs: std::collections::HashMap::new(),
@@ -2907,7 +2916,9 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
         // An unacknowledged init can share its parent's cgroup. Retiring
         // parent artifacts first would lift policy while that init still runs.
         for id in retired {
-            self.retire_instance_artifacts(&id).await?;
+            if !self.defer_startup_retirement(&id).await? {
+                self.retire_instance_artifacts(&id).await?;
+            }
         }
         for (id, job) in jobs.iter_mut() {
             if !inventory.contains_key(id.as_str()) && job.phase == JobPhase::Preparing {
@@ -3116,7 +3127,9 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
                     // only record that let this runtime prove absence.
                     self.commit_jobs(recovered_jobs.clone()).await?;
                 }
-                self.retire_instance_artifacts(&runtime_id).await?;
+                if !self.defer_startup_retirement(&runtime_id).await? {
+                    self.retire_instance_artifacts(&runtime_id).await?;
+                }
                 continue;
             }
 
@@ -3360,6 +3373,7 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
                     self.handle_snapshot_request(req).await;
                 }
                 _ = health_interval.tick() => {
+                    self.drive_startup_retirements().await;
                     self.refresh_egress_readiness().await;
                     self.run_health_checks().await;
                     self.check_jobs().await;
@@ -3738,6 +3752,15 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
         register_schedule: bool,
         rerun_unknown_jobs: bool,
     ) {
+        if self.startup_cleanup_pending {
+            let _ = events
+                .send(ApplyEvent::Error {
+                    message: "startup cleanup still owns runtime allocations; retry after recovery"
+                        .into(),
+                })
+                .await;
+            return;
+        }
         if rerun_unknown_jobs && let Err(message) = super::jobs::validate_rerun(&config) {
             let _ = events
                 .send(ApplyEvent::Error {
@@ -8575,7 +8598,12 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
                 .supervisor
                 .get_instance(&InstanceId(name.clone()))
                 .is_some();
-            if tracked {
+            if tracked
+                || self
+                    .startup_retirements
+                    .iter()
+                    .any(|pending| pending.instance_id.0 == name)
+            {
                 continue;
             }
             if let Err(e) = crate::sesame::identity::cleanup_identity_dir(&entry.path()) {
@@ -20290,5 +20318,137 @@ host = "remote.local"
                 .unwrap();
         assert!(journal.inventory().services.is_empty());
         assert!(journal.inventory().consumer.is_some());
+    }
+    #[tokio::test]
+    async fn clustered_startup_retains_orphan_ports_until_api_driven_cleanup_can_finish() {
+        let (mut agent, grill, root, reference) = discovery_recovery_fixture().await;
+        crate::grill::records::remove_record(
+            &root.path().join("records"),
+            &reference.instance_id.0,
+        )
+        .unwrap();
+        let journal =
+            crate::bun::discovery_owners::DiscoveryJournal::open(&root.path().join("discovery"))
+                .unwrap();
+        let mut inventory = journal.inventory().clone();
+        let identity = crate::bun::consumer_owners::ConsumerIdentity {
+            node_id: crate::meat::NodeId::new("test"),
+            cluster_identity: [42; 32],
+        };
+        inventory.consumer = Some(crate::bun::consumer_owners::ConsumerOwnership {
+            identity: identity.clone(),
+            publications: vec![],
+            phase: crate::bun::consumer_owners::ConsumerPhase::Withdrawn,
+            receipts: Default::default(),
+        });
+        drop(journal.persist(inventory).await.unwrap());
+        let (mut clustered, _, _) = test_cluster_fault_agent().await;
+        agent.cluster = clustered.cluster.take();
+        agent
+            .recover_consumer_ownership(&root.path().join("discovery"), identity)
+            .await
+            .unwrap();
+        assert_eq!(agent.adopt_recorded_instances().await.unwrap(), 0);
+        let launch = grill.launch_inventory().await.unwrap().unwrap().remove(0);
+        assert!(
+            agent
+                .supervisor
+                .port_allocator
+                .is_allocated(launch.spec.port_mapping.unwrap().host_port)
+                .await
+        );
+        assert!(
+            grill
+                .network_reference(&reference.instance_id)
+                .await
+                .unwrap()
+                .is_some()
+        );
+        let (events, mut received) = mpsc::channel(8);
+        agent
+            .begin_deploy(basic_config(), events, true, false)
+            .await;
+        assert!(matches!(
+            received.recv().await,
+            Some(ApplyEvent::Error { .. })
+        ));
+        agent.drive_startup_retirements().await;
+        assert!(agent.startup_cleanup_pending);
+        assert!(
+            agent
+                .supervisor
+                .port_allocator
+                .is_allocated(launch.spec.port_mapping.unwrap().host_port)
+                .await
+        );
+        let confirmation = serde_json::json!({"node_id": "test", "execution": {"instance_id": reference.instance_id, "generation": launch.generation}}).to_string();
+        let (client, server) =
+            crate::cluster::producer::test_fixture(reqwest::StatusCode::OK, confirmation).await;
+        agent.set_producer_release_client(client);
+        agent.drive_startup_retirements().await;
+        assert!(!agent.startup_cleanup_pending);
+        assert!(
+            !agent
+                .supervisor
+                .port_allocator
+                .is_allocated(launch.spec.port_mapping.unwrap().host_port)
+                .await
+        );
+        assert!(agent.network_references.is_empty());
+        assert!(agent.service_map.resolve_all().is_empty());
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn rootless_discovery_adoption_restores_owned_host_forward_without_container_ip() {
+        let (mut agent, grill, root, reference) = discovery_recovery_fixture().await;
+        let mut launches = grill.launch_inventory().await.unwrap().unwrap();
+        launches[0].network_reference = None;
+        grill.release_network_reference(&reference).await.unwrap();
+        grill.set_launch_inventory(launches.clone()).await;
+        grill.set_adopt_result(&reference.instance_id, true);
+        grill.clear_container_ip();
+        grill.set_rootless_network(crate::grill::records::RootlessNetworkRecord {
+            api_socket: root.path().join("slirp.sock"),
+            owner_pid: std::process::id(),
+            owner_pid_started_at: 1,
+            container_pid: std::process::id(),
+            port_mapping: launches[0].spec.port_mapping,
+        });
+        let journal =
+            crate::bun::discovery_owners::DiscoveryJournal::open(&root.path().join("discovery"))
+                .unwrap();
+        let mut inventory = journal.inventory().clone();
+        inventory.references.clear();
+        let backend = &mut inventory.services[0].entry.backends[0];
+        backend.node_ip = std::net::Ipv4Addr::LOCALHOST;
+        backend.host_port = launches[0].spec.port_mapping.unwrap().host_port;
+        inventory.services[0].executions.insert(
+            reference.instance_id.0.clone(),
+            launches[0].generation.clone(),
+        );
+        drop(journal);
+        std::fs::write(
+            root.path().join("discovery/discovery.json"),
+            serde_json::to_vec(&serde_json::json!({"schema": 4, "inventory": inventory})).unwrap(),
+        )
+        .unwrap();
+        agent
+            .recover_discovery_ownership(&root.path().join("discovery"))
+            .await
+            .unwrap();
+        assert_eq!(agent.adopt_recorded_instances().await.unwrap(), 1);
+        let service = crate::onion::service_id::ServiceId::new("default", "web");
+        let entry = agent
+            .service_map_tx
+            .borrow()
+            .resolve(&service)
+            .unwrap()
+            .clone();
+        assert_eq!(entry.backends[0].node_ip, std::net::Ipv4Addr::LOCALHOST);
+        assert_eq!(
+            entry.backends[0].host_port,
+            launches[0].spec.port_mapping.unwrap().host_port
+        );
     }
 }

@@ -184,6 +184,11 @@ impl MockGrill {
         *self.container_ip.lock().unwrap() = Some(ip);
     }
 
+    /// Model a rootless runtime without a bridge address.
+    pub fn clear_container_ip(&self) {
+        *self.container_ip.lock().unwrap() = None;
+    }
+
     /// Queue deterministic combined outputs for successive `exec()` calls.
     #[allow(dead_code)]
     pub fn set_exec_outputs(&self, outputs: impl IntoIterator<Item = String>) {

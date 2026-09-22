@@ -69,6 +69,13 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
         if original.spec.port_mapping.is_none() && !self.network_references.contains_key(id) {
             return Ok(None);
         }
+        if matches!(original.network_reference,
+            Some(crate::grill::runc_intent::NetworkReferenceState::Released(ref reference))
+                if reference.instance_id == *id
+                    && original.generation == crate::grill::RuntimeGeneration::runc(reference.generation.as_str()))
+        {
+            return Ok(None);
+        }
         let execution = crate::grill::RuntimeExecution {
             instance_id: id.clone(),
             generation: original.generation.clone(),
