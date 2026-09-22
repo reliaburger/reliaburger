@@ -498,7 +498,10 @@ fn cluster_http_client(
     tls: ClientConfig,
     bearer: Option<&str>,
 ) -> Result<reqwest::Client, MtlsError> {
-    let mut builder = reqwest::Client::builder().use_preconfigured_tls(tls);
+    // Peer API authority is resolved explicitly; redirects must not replay receipts or tokens.
+    let mut builder = reqwest::Client::builder()
+        .redirect(reqwest::redirect::Policy::none())
+        .use_preconfigured_tls(tls);
     if let Some(headers) = bearer_default_headers(bearer)? {
         builder = builder.default_headers(headers);
     }

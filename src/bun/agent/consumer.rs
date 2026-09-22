@@ -97,12 +97,13 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
         catalog.validate_allocations().map_err(failure)?;
         // Cluster allocation is authoritative. Locally prepared or retiring
         // allocations remain reserved internally, but cannot invent a public VIP.
-        let launches = self
-            .supervisor
-            .grill()
-            .launch_inventory()
-            .await?
-            .ok_or_else(|| failure("consumer publication requires complete runtime inventory"))?;
+        let launches = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            self.supervisor.grill().launch_inventory(),
+        )
+        .await
+        .map_err(|_| failure("consumer runtime inventory timed out"))??
+        .ok_or_else(|| failure("consumer publication requires complete runtime inventory"))?;
         let local: Vec<_> = self
             .service_map
             .resolve_all()

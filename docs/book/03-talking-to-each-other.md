@@ -2419,3 +2419,25 @@ also survives, even after all but the latest publication have been compacted.
 The regression captures both an HTTP request and a WebSocket, confirms that
 cancellation alone sends no receipt, releases their guards independently, then
 reopens the journal and retries the exact original receipt.
+
+### Delivering the receipt
+
+Suppose a consumer has removed generation 17, but its reply to the leader gets
+lost. Repeating the receipt is safe. Guessing that the leader received it isn't.
+The local journal keeps the original instruction in `Ready` until an authenticated
+request to `/v1/discovery/withdrawn` returns 204. Redirects, 200, 202, failures and
+timeouts keep it queued. The cluster client disables redirects so a peer cannot
+forward node authority elsewhere. The next placement poll resolves the current
+leader again; no leader address becomes part of the durable permission.
+
+The reconciler sends small rotating batches, with a deadline and shutdown check
+for each request. It then sends `ConfirmConsumerReceipt` back to the agent. That
+second message removes the local journal entry. A crash between these two steps
+just repeats the receipt. Already completed withdrawals can still make progress
+when the new publication is refused, for example because its inventory is full.
+
+In Rust, the HTTP result and the agent reply are separate `Result` values. Neither
+channel acceptance nor an HTTP success category proves both operations happened.
+The code checks the exact acknowledgement before requesting the second durable
+write. This is the same ownership rule we've used throughout: retain evidence
+until the next owner has positively accepted responsibility.

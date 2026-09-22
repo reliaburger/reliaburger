@@ -939,6 +939,7 @@ pub fn spawn_placement_reconciler(
             }
         };
         let mut checkpoint_verified = false;
+        let mut receipt_cursor = 0usize;
 
         loop {
             tokio::select! {
@@ -1015,10 +1016,11 @@ pub fn spawn_placement_reconciler(
             let sync_catalogue = async {
                 let (response, reply) = tokio::sync::oneshot::channel();
                 cmd_tx
-                    .send(AgentCommand::SyncClusterCatalog {
+                    .send(AgentCommand::SyncClusterConsumer {
                         generation: assignments.endpoint_generation,
                         catalog: Box::new(assignments.endpoint_catalog.clone()),
                         ingress: assignments.ingress.clone(),
+                        withdrawals: assignments.endpoint_withdrawals.clone(),
                         response,
                     })
                     .await
@@ -1033,8 +1035,8 @@ pub fn spawn_placement_reconciler(
                 _ = shutdown.cancelled() => return,
                 result = tokio::time::timeout(RECONCILE_IO_TIMEOUT, sync_catalogue) => result,
             };
-            match synchronised {
-                Ok(Ok(())) => {}
+            let update = match synchronised {
+                Ok(Ok(update)) => update,
                 Ok(Err(error)) => {
                     eprintln!("orchestrator: {error}");
                     continue;
@@ -1043,6 +1045,37 @@ pub fn spawn_placement_reconciler(
                     eprintln!("orchestrator: cluster discovery publication timed out");
                     continue;
                 }
+            };
+
+            // Rotate bounded batches so a failing receipt cannot starve later generations.
+            let receipt_http = cluster_http.clone().with_bearer(service_token.clone());
+            let count = update.receipts.len();
+            if count > 0 {
+                for offset in 0..count.min(16) {
+                    let generation = update.receipts[(receipt_cursor + offset) % count];
+                    let deliver = async {
+                        super::consumer::acknowledge(&receipt_http, &leader_url, generation)
+                            .await
+                            .ok()?;
+                        let (response, reply) = tokio::sync::oneshot::channel();
+                        cmd_tx
+                            .send(AgentCommand::ConfirmConsumerReceipt {
+                                generation,
+                                response,
+                            })
+                            .await
+                            .ok()?;
+                        reply.await.ok()?.ok()
+                    };
+                    tokio::select! {
+                        _ = shutdown.cancelled() => return,
+                        _ = tokio::time::timeout(Duration::from_secs(1), deliver) => {}
+                    }
+                }
+                receipt_cursor = (receipt_cursor + count.min(16)) % count;
+            }
+            if !update.published {
+                continue;
             }
 
             let mut seen: HashSet<(String, String)> = HashSet::new();
@@ -1297,7 +1330,7 @@ mod tests {
         let pending = tokio::time::timeout(Duration::from_secs(5), async {
             loop {
                 match received.recv().await.unwrap() {
-                    command @ AgentCommand::SyncClusterCatalog { .. } => break command,
+                    command @ AgentCommand::SyncClusterConsumer { .. } => break command,
                     AgentCommand::Status { response } => {
                         response.send(vec![]).unwrap();
                     }
@@ -1316,7 +1349,7 @@ mod tests {
                 .is_err(),
             "queueing publication allowed deployment before its result"
         );
-        let AgentCommand::SyncClusterCatalog {
+        let AgentCommand::SyncClusterConsumer {
             generation,
             response,
             ..
@@ -1334,7 +1367,7 @@ mod tests {
             let response = tokio::time::timeout(Duration::from_secs(5), async {
                 loop {
                     match received.recv().await.unwrap() {
-                        AgentCommand::SyncClusterCatalog { response, .. } => break response,
+                        AgentCommand::SyncClusterConsumer { response, .. } => break response,
                         AgentCommand::Status { response } => {
                             response.send(vec![]).unwrap();
                         }
@@ -1348,7 +1381,12 @@ mod tests {
             .await
             .unwrap();
             if accept {
-                response.send(Ok(())).unwrap();
+                response
+                    .send(Ok(crate::bun::agent::ConsumerUpdate {
+                        published: true,
+                        receipts: vec![],
+                    }))
+                    .unwrap();
             } else {
                 drop(response);
             }
@@ -1450,7 +1488,7 @@ mod tests {
                     _ = ack_rx.recv() => break,
                     command = received.recv() => match command.unwrap() {
                         AgentCommand::Status { response } => { response.send(vec![]).unwrap(); }
-                        AgentCommand::SyncClusterCatalog { response, .. } => { let _ = response.send(Ok(())); }
+                        AgentCommand::SyncClusterConsumer { response, .. } => { let _ = response.send(Ok(crate::bun::agent::ConsumerUpdate { published: true, receipts: vec![] })); }
                         AgentCommand::RetireTestResources { app_name, namespace, response } => {
                             assert_eq!((app_name.as_str(), namespace.as_str()), ("web", "rbtest-run1"));
                             assert_eq!(acknowledgements.load(Ordering::SeqCst), 0);
@@ -1562,8 +1600,11 @@ mod tests {
                     AgentCommand::Status { response } => {
                         response.send(vec![]).unwrap();
                     }
-                    AgentCommand::SyncClusterCatalog { response, .. } => {
-                        let _ = response.send(Ok(()));
+                    AgentCommand::SyncClusterConsumer { response, .. } => {
+                        let _ = response.send(Ok(crate::bun::agent::ConsumerUpdate {
+                            published: true,
+                            receipts: vec![],
+                        }));
                     }
                     AgentCommand::Retire {
                         app_name, response, ..
@@ -1674,8 +1715,11 @@ namespace = "rbtest-interrupted"
                     AgentCommand::Status { response } => {
                         response.send(vec![]).unwrap();
                     }
-                    AgentCommand::SyncClusterCatalog { response, .. } => {
-                        let _ = response.send(Ok(()));
+                    AgentCommand::SyncClusterConsumer { response, .. } => {
+                        let _ = response.send(Ok(crate::bun::agent::ConsumerUpdate {
+                            published: true,
+                            receipts: vec![],
+                        }));
                     }
                     AgentCommand::Deploy { events, .. } => {
                         let saved = crate::cluster::applied::load(&checkpoint).unwrap();
@@ -1716,8 +1760,11 @@ namespace = "rbtest-interrupted"
                         AgentCommand::Status { response } => {
                             response.send(vec![]).unwrap();
                         }
-                        AgentCommand::SyncClusterCatalog { response, .. } => {
-                            let _ = response.send(Ok(()));
+                        AgentCommand::SyncClusterConsumer { response, .. } => {
+                            let _ = response.send(Ok(crate::bun::agent::ConsumerUpdate {
+                                published: true,
+                                receipts: vec![],
+                            }));
                         }
                         AgentCommand::Retire {
                             app_name,
@@ -1780,9 +1827,12 @@ namespace = "rbtest-interrupted"
                     AgentCommand::Status { response } => {
                         response.send(vec![]).unwrap();
                     }
-                    AgentCommand::SyncClusterCatalog { response, .. } => {
+                    AgentCommand::SyncClusterConsumer { response, .. } => {
                         polls += 1;
-                        let _ = response.send(Ok(()));
+                        let _ = response.send(Ok(crate::bun::agent::ConsumerUpdate {
+                            published: true,
+                            receipts: vec![],
+                        }));
                     }
                     AgentCommand::Deploy { .. } => {
                         panic!("deployment bypassed failed ownership persistence")
