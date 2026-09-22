@@ -3459,3 +3459,29 @@ views and retries only that exact 503 within a bounded deadline. Lost responses,
 other errors and unknown outcomes still fail the test; blindly retrying those
 could inject a second fault. Production safety checks are unchanged. The repaired
 live scenario passes on macOS (27.087s) and Linux (26.890s).
+
+
+### Closing an evidence gap
+
+An application exits. Bun starts its replacement, then dies before saving the
+replacement's adoption record. A clean restart test doesn't cover that interval.
+Neither does killing Bun during the application's first deployment.
+
+The C34 audit found that our physical interruption matrix covered initial
+creation and explicit retries, but left this automatic-restart boundary implicit.
+We added a test-only Linux interposer that pauses the adoption record's `fsync`
+(the step that asks the filesystem to persist its bytes), before the atomic
+rename publishes it. Policy checkpoint writes continue normally. The test proves
+that the predecessor's adoption record is gone and a different execution
+generation is alive, then kills the actual Bun process.
+
+Recovery must retire that unrecorded execution before reporting readiness. It
+must preserve the original kernel owner, publish no stale application and permit
+an explicit fresh deployment. The final stop must clear both service and address
+obligations. The existing implementation passes; the new regression makes that
+claim reviewable and runs in the privileged OCI CI matrix.
+
+We keep implementation closure separate from release acceptance. C34 proves
+these ownership and cleanup contracts for supported modes. The independent-host
+catalogue, sustained recovery run, exact signed candidate and cold installations
+still need their own evidence under V01–V04.

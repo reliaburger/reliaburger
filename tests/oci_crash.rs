@@ -495,6 +495,85 @@ async fn normal_standalone_bun_recovers_durable_kernel_and_discovery() {
 }
 
 #[cfg(feature = "ebpf")]
+#[tokio::test]
+#[ignore = "requires isolated Linux root, bpffs, real runc/ip/nft and static BusyBox"]
+async fn automatic_restart_bun_death_before_adoption_retires_the_unrecorded_successor() {
+    let root = tempfile::tempdir().unwrap().keep();
+    println!("qualifying automatic restart: {}", root.display());
+    durable_fixture(&root);
+    let name = "restart-crash";
+    let mut config = durable_app(name);
+    config.app.get_mut(name).unwrap().command = vec![
+        "/bin/busybox".into(), "sh".into(), "-c".into(),
+        "printf 'main\\n' >> /work/main; while [ ! -f /work/exit ]; do /bin/busybox sleep 0.1; done; /bin/busybox rm /work/exit; exit 7".into(),
+    ];
+    let mut node = Node::start(&root).await;
+    node.client.apply(&config).await.unwrap();
+    wait_file(&root.join("shared/main")).await;
+    let record = root.join("data/instances/default__restart-crash-0.json");
+    assert!(record.exists());
+    let original_kernel = kernel_manifest(&root);
+    let original = runtime(&root).launch_inventory().await.unwrap().unwrap();
+    let id = reliaburger::grill::InstanceId("default__restart-crash-0".into());
+    let original = original
+        .iter()
+        .find(|launch| launch.instance_id == id)
+        .unwrap();
+    std::fs::write(root.join("phase"), "restart-adoption").unwrap();
+    std::fs::write(root.join("armed"), "armed").unwrap();
+    std::fs::write(root.join("shared/exit"), "exit the actual application").unwrap();
+    wait_file(&root.join("ready")).await;
+    assert!(
+        !record.exists(),
+        "predecessor adoption survived into the successor"
+    );
+    tokio::time::timeout(Duration::from_secs(10), async {
+        while std::fs::read_to_string(root.join("shared/main")).unwrap() != "main\nmain\n" {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .unwrap();
+    node.crash().await;
+    let interrupted = runtime(&root).launch_inventory().await.unwrap().unwrap();
+    let interrupted = interrupted
+        .iter()
+        .find(|launch| launch.instance_id == id)
+        .unwrap();
+    assert_ne!(interrupted.generation, original.generation);
+    assert_eq!(
+        runtime(&root).state(&id).await.unwrap(),
+        ContainerState::Running
+    );
+    std::fs::remove_file(root.join("armed")).unwrap();
+    let mut recovered = Node::start(&root).await;
+    assert!(recovered.client.status().await.unwrap().is_empty());
+    assert_eq!(
+        runtime(&root).state(&id).await.unwrap(),
+        ContainerState::Stopped
+    );
+    assert!(!record.exists());
+    assert_eq!(kernel_manifest(&root), original_kernel);
+    recovered.client.apply(&config).await.unwrap();
+    tokio::time::timeout(Duration::from_secs(10), async {
+        while std::fs::read_to_string(root.join("shared/main")).unwrap() != "main\nmain\nmain\n" {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .unwrap();
+    recovered.client.stop(name, "default").await.unwrap();
+    recovered.crash().await;
+    let journal =
+        reliaburger::bun::discovery_owners::DiscoveryJournal::open(&root.join("data/discovery"))
+            .unwrap();
+    assert!(journal.inventory().services.is_empty());
+    assert!(journal.inventory().references.is_empty());
+    drop(journal);
+    retire_kernel(&root);
+}
+
+#[cfg(feature = "ebpf")]
 fn upgrade_fixture(root: &Path) -> Vec<u8> {
     use reliaburger::upgrade::signing;
     let directory = root.join("upgrade-bin");

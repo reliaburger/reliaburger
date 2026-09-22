@@ -12,7 +12,8 @@
 #include <unistd.h>
 
 static void admission_gate(const char *path) {
-    if (!strstr(path, "/bundles/.intents/locks/") || !strstr(path, "__init-0")) return;
+    int restart = !strcmp(path, "restart-adoption");
+    if (!restart && (!strstr(path, "/bundles/.intents/locks/") || !strstr(path, "__init-0"))) return;
     const char *root = getenv("OCI_CRASH_ROOT");
     if (!root) return;
     char name[4096], phase[32] = {0};
@@ -22,7 +23,7 @@ static void admission_gate(const char *path) {
     ssize_t count = read(file, phase, sizeof(phase)-1);
     close(file);
     if (count < 0) _exit(93);
-    if (strcmp(phase, "admission")) return;
+    if (strcmp(phase, restart ? "restart-adoption" : "admission")) return;
     snprintf(name, sizeof(name), "%s/armed", root);
     if (access(name, F_OK)) return;
     snprintf(name, sizeof(name), "%s/ready", root);
@@ -50,3 +51,25 @@ int function(const char *path, int flags, ...) { \
 }
 INTERPOSE(open)
 INTERPOSE(open64)
+
+/* Pause only the replacement adoption record, after serialisation but before
+ * its fsync/rename. Kernel-policy checkpoints in the same directory must pass. */
+int fsync(int fd) {
+    int (*original)(int) = (int (*)(int))dlsym(RTLD_NEXT, "fsync");
+    if (!original) _exit(96);
+    char link[64], path[4096], contents[4096];
+    snprintf(link, sizeof(link), "/proc/self/fd/%d", fd);
+    ssize_t length = readlink(link, path, sizeof(path)-1);
+    if (length > 0) {
+        path[length] = 0;
+        if (strstr(path, "/data/instances/.reliaburger-")) {
+            length = pread(fd, contents, sizeof(contents)-1, 0);
+            if (length > 0) {
+                contents[length] = 0;
+                if (strstr(contents, "\"instance_id\": \"default__restart-crash-0\""))
+                    admission_gate("restart-adoption");
+            }
+        }
+    }
+    return original(fd);
+}
