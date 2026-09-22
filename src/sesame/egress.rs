@@ -720,6 +720,18 @@ mod maps {
             .ok_or(EgressMapError::MapNotFound { map_name: name })
     }
 
+    fn deletion_result(result: Result<(), aya::maps::MapError>) -> Result<(), EgressMapError> {
+        match result {
+            Ok(()) | Err(aya::maps::MapError::KeyNotFound) => Ok(()),
+            Err(aya::maps::MapError::SyscallError(error))
+                if error.io_error.kind() == std::io::ErrorKind::NotFound =>
+            {
+                Ok(())
+            }
+            Err(error) => Err(error.into()),
+        }
+    }
+
     /// Enable egress enforcement for a cgroup: with this set, any
     /// destination not present in the allow maps for the cgroup is denied.
     pub fn set_egress_enforced(bpf: &mut aya::Ebpf, cgroup_id: u64) -> Result<(), EgressMapError> {
@@ -736,8 +748,7 @@ mod maps {
     ) -> Result<(), EgressMapError> {
         let mut map: HashMap<_, u64, u32> =
             HashMap::try_from(map_handle(bpf, "egress_enabled_map")?)?;
-        let _ = map.remove(&cgroup_id);
-        Ok(())
+        deletion_result(map.remove(&cgroup_id))
     }
 
     /// Allow a single (cgroup, dst_ip, dst_port) IPv4 destination.
@@ -756,8 +767,7 @@ mod maps {
     pub fn delete_egress_entry(bpf: &mut aya::Ebpf, key: EgressKey) -> Result<(), EgressMapError> {
         let mut map: HashMap<_, EgressKey, EgressValue> =
             HashMap::try_from(map_handle(bpf, "egress_map")?)?;
-        let _ = map.remove(&key);
-        Ok(())
+        deletion_result(map.remove(&key))
     }
 
     /// Program a full destination set for a cgroup: exact IPv4/IPv6
@@ -861,11 +871,12 @@ mod maps {
                 HashMap::try_from(map_handle(bpf, "egress_map")?)?;
             let keys: Vec<EgressKey> = map
                 .keys()
-                .filter_map(|k| k.ok())
+                .collect::<Result<Vec<_>, _>>()?
+                .into_iter()
                 .filter(|k| k.src_cgroup_id == cgroup_id)
                 .collect();
             for key in keys {
-                let _ = map.remove(&key);
+                deletion_result(map.remove(&key))?;
             }
         }
         {
@@ -873,11 +884,12 @@ mod maps {
                 HashMap::try_from(map_handle(bpf, "egress6_map")?)?;
             let keys: Vec<Egress6Key> = map
                 .keys()
-                .filter_map(|k| k.ok())
+                .collect::<Result<Vec<_>, _>>()?
+                .into_iter()
                 .filter(|k| k.src_cgroup_id == cgroup_id)
                 .collect();
             for key in keys {
-                let _ = map.remove(&key);
+                deletion_result(map.remove(&key))?;
             }
         }
         let cgroup_be = cgroup_id.to_be_bytes();
@@ -886,11 +898,12 @@ mod maps {
                 LpmTrie::try_from(map_handle(bpf, "egress_cidr4_map")?)?;
             let keys: Vec<Key<[u8; 12]>> = trie
                 .keys()
-                .filter_map(|k| k.ok())
+                .collect::<Result<Vec<_>, _>>()?
+                .into_iter()
                 .filter(|k| k.data()[..8] == cgroup_be)
                 .collect();
             for key in keys {
-                let _ = trie.remove(&key);
+                deletion_result(trie.remove(&key))?;
             }
         }
         {
@@ -898,11 +911,12 @@ mod maps {
                 LpmTrie::try_from(map_handle(bpf, "egress_cidr6_map")?)?;
             let keys: Vec<Key<[u8; 24]>> = trie
                 .keys()
-                .filter_map(|k| k.ok())
+                .collect::<Result<Vec<_>, _>>()?
+                .into_iter()
                 .filter(|k| k.data()[..8] == cgroup_be)
                 .collect();
             for key in keys {
-                let _ = trie.remove(&key);
+                deletion_result(trie.remove(&key))?;
             }
         }
         Ok(())
@@ -920,7 +934,7 @@ mod maps {
     /// List every cgroup id with the enforcement flag set.
     pub fn list_enforced_cgroups(bpf: &mut aya::Ebpf) -> Result<HashSet<u64>, EgressMapError> {
         let map: HashMap<_, u64, u32> = HashMap::try_from(map_handle(bpf, "egress_enabled_map")?)?;
-        Ok(map.keys().filter_map(|k| k.ok()).collect())
+        Ok(map.keys().collect::<Result<HashSet<_>, _>>()?)
     }
 
     /// List every cgroup id that owns at least one allow entry in any of
@@ -930,30 +944,50 @@ mod maps {
         {
             let map: HashMap<_, EgressKey, EgressValue> =
                 HashMap::try_from(map_handle(bpf, "egress_map")?)?;
-            cgroups.extend(map.keys().filter_map(|k| k.ok()).map(|k| k.src_cgroup_id));
+            cgroups.extend(
+                map.keys()
+                    .collect::<Result<Vec<_>, _>>()?
+                    .into_iter()
+                    .map(|k| k.src_cgroup_id),
+            );
         }
         {
             let map: HashMap<_, Egress6Key, EgressValue> =
                 HashMap::try_from(map_handle(bpf, "egress6_map")?)?;
-            cgroups.extend(map.keys().filter_map(|k| k.ok()).map(|k| k.src_cgroup_id));
+            cgroups.extend(
+                map.keys()
+                    .collect::<Result<Vec<_>, _>>()?
+                    .into_iter()
+                    .map(|k| k.src_cgroup_id),
+            );
         }
         {
             let trie: LpmTrie<_, [u8; 12], EgressCidrValue> =
                 LpmTrie::try_from(map_handle(bpf, "egress_cidr4_map")?)?;
-            cgroups.extend(trie.keys().filter_map(|k| k.ok()).map(|k| {
-                let mut be = [0u8; 8];
-                be.copy_from_slice(&k.data()[..8]);
-                u64::from_be_bytes(be)
-            }));
+            cgroups.extend(
+                trie.keys()
+                    .collect::<Result<Vec<_>, _>>()?
+                    .into_iter()
+                    .map(|k| {
+                        let mut be = [0u8; 8];
+                        be.copy_from_slice(&k.data()[..8]);
+                        u64::from_be_bytes(be)
+                    }),
+            );
         }
         {
             let trie: LpmTrie<_, [u8; 24], EgressCidrValue> =
                 LpmTrie::try_from(map_handle(bpf, "egress_cidr6_map")?)?;
-            cgroups.extend(trie.keys().filter_map(|k| k.ok()).map(|k| {
-                let mut be = [0u8; 8];
-                be.copy_from_slice(&k.data()[..8]);
-                u64::from_be_bytes(be)
-            }));
+            cgroups.extend(
+                trie.keys()
+                    .collect::<Result<Vec<_>, _>>()?
+                    .into_iter()
+                    .map(|k| {
+                        let mut be = [0u8; 8];
+                        be.copy_from_slice(&k.data()[..8]);
+                        u64::from_be_bytes(be)
+                    }),
+            );
         }
         Ok(cgroups)
     }
@@ -963,14 +997,22 @@ mod maps {
     pub fn egress_allowed(bpf: &mut aya::Ebpf, key: EgressKey) -> Result<bool, EgressMapError> {
         let map: HashMap<_, EgressKey, EgressValue> =
             HashMap::try_from(map_handle(bpf, "egress_map")?)?;
-        Ok(map.get(&key, 0).is_ok())
+        match map.get(&key, 0) {
+            Ok(_) => Ok(true),
+            Err(aya::maps::MapError::KeyNotFound) => Ok(false),
+            Err(error) => Err(error.into()),
+        }
     }
 
     /// Whether egress enforcement is enabled for a cgroup (reads
     /// `egress_enabled_map`). For tests and diagnostics.
     pub fn egress_enforced(bpf: &mut aya::Ebpf, cgroup_id: u64) -> Result<bool, EgressMapError> {
         let map: HashMap<_, u64, u32> = HashMap::try_from(map_handle(bpf, "egress_enabled_map")?)?;
-        Ok(map.get(&cgroup_id, 0).is_ok())
+        match map.get(&cgroup_id, 0) {
+            Ok(_) => Ok(true),
+            Err(aya::maps::MapError::KeyNotFound) => Ok(false),
+            Err(error) => Err(error.into()),
+        }
     }
 }
 
@@ -980,6 +1022,14 @@ pub use maps::*;
 /// Errors from writing the eBPF egress maps.
 #[derive(Debug, thiserror::Error)]
 pub enum EgressMapError {
+    /// No live program handle is available to confirm the requested mutation.
+    #[error("egress program is unavailable")]
+    Unavailable,
+
+    /// The proposed shared-cgroup policy exceeds the supported map representation.
+    #[error("egress policy cannot be represented: {0}")]
+    InvalidPolicy(#[from] EgressError),
+
     #[error("egress eBPF maps require Linux with --features ebpf")]
     Unsupported,
 

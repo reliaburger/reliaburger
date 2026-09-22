@@ -1,0 +1,131 @@
+# Foreground process ownership for 0.1.0
+
+The supported workload stays in the foreground and keeps its descendants in
+the supervised process group. Daemonising, changing group/session and handing
+work to an external service manager require Linux containers. The user approved
+this scope on 20 September. It does not relax crash-recovery or cleanup evidence.
+
+## Ownership before execution
+
+A PID and a timestamp are observations, not a retained kernel identity. Bun
+must not reconstruct signal authority from them after a restart. A small
+single-threaded owner process retains the actual child until retirement. It
+runs through a hidden Bun subcommand before Tokio starts, so no unrelated task
+can reap that child.
+
+The owner locks and reloads a private generation record, then starts a child
+behind an execution gate. It persists the child's identity with file and
+directory sync before sending activation over a private pipe. The gate checks
+that its own PID matches that record before replacing itself with user code.
+EOF or mismatched activation refuses execution. A duplicate owner cannot acquire
+the live generation; a completed generation cannot execute again.
+
+Control uses a private Unix socket and a generation capability. Requests are
+bounded in size and time. Only the live owner signals its unreaped child/group.
+Malformed, abandoned and stale-generation clients do not terminate the owner.
+Recorded PIDs remain informational to every other process.
+
+## Completion evidence
+
+The owner observes exit without reaping the root first. Linux uses a subreaper
+to adopt orphaned descendants, kill owned children and reap until the kernel
+reports no children. A process-list snapshot alone never proves completion.
+On macOS, the owner retains the root while taking a complete process-group
+snapshot that includes zombies. A full buffer triggers a larger retry. Only
+the retained root remaining permits its final reap.
+
+The root's actual exit code is recorded only after supported descendants have
+gone. A signal has no exit code. Failed inspection or persistence never publishes
+retirement. If the helper itself dies after activation, a replacement must
+retain uncertainty; disappearance of a socket or lock is not proof that the
+workload stopped. The foreground contract is cooperative supervision, not a
+security boundary against hostile same-user processes.
+
+## Delivery and remaining integration
+
+- [x] Add the internal owner, execution gate and nine actual-binary regressions.
+  The original four tests fail before implementation. Coverage includes short
+  jobs without agent adoption records, surviving children, wrong generations,
+  duplicate/retired owners, malformed/stalled clients, absent/mismatched gate
+  activation and failed terminal persistence. Native CI-profile tests pass;
+  Linux tests and strict Clippy pass. A macOS loader probe measured 5.88 seconds
+  before startup of the large debug binary; the fixture allows 15 seconds for
+  startup and separately requires descendant retirement within two seconds
+  after an explicit parent-exit trigger.
+- [x] Persist runtime launch intent and an unpredictable generation before
+  starting the owner; retain the record across caller cancellation. Keep Unix
+  socket paths short and private even when the data-directory path is long.
+- [x] Add the explicit `ProcessGrill::with_owner` adapter for start, status, stop,
+  kill, logs and adoption through the owner. Three recovery regressions fail
+  against the old adapter before implementation. Nine adapter regressions and
+  all nine owner tests pass on macOS/Linux. Coverage includes long paths,
+  cancelled launch callers, stale delayed helpers, damaged intent and owner
+  loss. Positive absence evidence permits recovery after failed socket cleanup;
+  a missing Running owner never permits a recovered-PID signal.
+- [x] Publish first intent atomically from a private, synced staging directory.
+  An oversized-record regression fails before the fix; all ten recovery cases
+  and strict Clippy pass on macOS/Linux afterwards. The operation lock spans
+  rename and parent sync; start
+  re-establishes parent durability before execution. Existing malformed entries
+  refuse instead of becoming fresh generations.
+- [x] Reparent durable helpers through a short bootstrapper, and reap that
+  bootstrapper before acknowledging start. A real parent-`exec` regression fails
+  first with an unreaped child. All eleven runtime recovery and nine owner
+  cases plus strict Clippy pass on macOS/Linux afterwards; user workloads remain
+  foreground-only.
+- [x] Preserve diagnostic log access after owner loss. The regression fails first
+  because log reads required live control; all eleven recovery tests and strict
+  Clippy pass on macOS/Linux after separating validated file reads from signalling.
+- [x] Expose a validated runtime launch inventory independently of agent PID
+  records. Two regressions fail against the default unsupported inventory;
+  thirteen runtime recovery cases pass on macOS/Linux. Prepared, running and
+  completed generations are discoverable; damaged entries refuse the whole
+  inventory and unpublished staging directories cannot count as launches.
+- [x] Persist job preparation before create and a separate launch permit after
+  create, before start, on fresh runs and retries. Two ordering/persistence
+  regressions fail first; all agent tests pass on macOS/Linux (155/154). Job
+  schema 2 and state 17 reject the previous ambiguous launch meaning.
+- [x] Select the owned adapter in production Bun alongside complete
+  pre-adoption reconciliation. Five startup regressions fail first; eighteen
+  runtime/reconciliation, nine owner and two actual Bun crash tests pass on
+  macOS/Linux, alongside the agent suites (155/154) and strict Clippy.
+- [x] Reconcile generations before an agent adoption record exists, distinguish
+  provably unactivated preparation from uncertain activated owners, and join
+  recovered state to app/job cleanup obligations. State 18 requires mandatory
+  runtime launch intent. Ordinary completed job outcomes survive Bun death;
+  interrupted preparations retain unknown outcomes with proven runtime absence.
+- [x] Require application adoption-record persistence before deploy
+  acknowledgement and restarted-instance publication. Missing-identity and
+  failed-write regressions fail first; complete library checkpoints pass on
+  macOS/Linux (3,440/3,494), plus the process and job-crash recovery suites.
+  Short jobs retain checkpoint/intent recovery without requiring a live PID.
+- [x] Qualify the production owner through all nine single-node/cluster upgrade
+  and rollback cases plus the formerly failing job-lease crash-recovery fixture.
+  All ten pass on macOS/Linux (497.02s/288.14s).
+- [x] Bind every queued start, stop, kill and preparation request to the
+  generation observed before mutation. Four regressions reproduce successor
+  mutation after caller cancellation; 22 recovery, nine owner and two actual Bun
+  crash cases plus strict Clippy pass on macOS/Linux.
+- [x] Require the launched Bun's own API announcement before first-run readiness.
+  A foreign-listener regression fails before the correction; all sixteen portable
+  first-run cases and strict Clippy pass on macOS/Linux afterwards.
+- [x] Supervise auxiliary process exec commands through the durable owner.
+  Both cancelled-caller and confirmed-retirement regressions reproduce the old
+  direct-spawn leak. Implementation routes commands through child owners of the
+  workload owner, retaining live child identity and complete group retirement.
+  Async socket lifetime carries caller cancellation; helper loss preserves a
+  cleanup obligation. Qualification includes command output, surviving children
+  and actual caller SIGKILL. State 19 excludes old untracked exec generations.
+  All 42 macOS/43 Linux owner, recovery, real Bun-crash and compatibility
+  cases pass with strict Clippy. Physical HTTP exec/Bun SIGKILL preserves the
+  main workload PID on recovery; Linux also passes binary-unlink execution.
+- [x] Qualify actual Bun death at the preparation/activation/adoption boundaries,
+  helper loss, short jobs, cron and complete group retirement on macOS/Linux.
+  Actual process-owner/recovery, job/exec/init Bun-death and signed upgrade
+  regressions pass on macOS/Linux. See the [C34 closure matrix](2026-09-22-c34-closure.md)
+  and dated evidence in `docs/progress.md`.
+
+Production Bun now uses the durable process owner and startup reconciliation.
+The [OCI/runtime/discovery integration](2026-09-20-oci-launch-ownership.md) and
+physical boundary qualification are also complete, with final hosted CI/builds
+passing at `6c64fed`. The independent V01–V04 release gates remain open.

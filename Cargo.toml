@@ -2,6 +2,7 @@
 name = "reliaburger"
 version = "0.1.0"
 edition = "2024"
+rust-version = "1.97"
 license = "Apache-2.0"
 description = "A batteries-included container orchestrator"
 
@@ -35,7 +36,7 @@ semver = "1"
 thiserror = "2"
 tempfile = "3"
 tokio = { version = "1", features = ["full", "test-util"] }
-tokio-util = "0.7"
+tokio-util = { version = "0.7", features = ["rt"] }
 toml = "0.8"
 oci-distribution = { version = "0.11", default-features = false, features = ["rustls-tls"] }
 flate2 = "1"
@@ -59,13 +60,12 @@ rcgen = { version = "0.13", features = ["x509-parser"] }
 # lets us set exact timestamped windows instead of calendar dates (PKI6).
 time = "0.3"
 ring = "0.17"
-rustls-pemfile = "2"
 x509-parser = { version = "0.16", features = ["verify"] }
 pem = "3"
 argon2 = "0.5"
 age = { version = "0.10", features = ["armor"] }
 base64 = "0.22"
-datafusion = "45"
+datafusion = "55"
 object_store = { version = "0.14", features = ["fs", "aws", "gcp"] }
 url = "2"
 sysinfo = "0.33"
@@ -80,6 +80,7 @@ hyper = { version = "1", features = ["http1"] }
 tower = "0.5"
 pulldown-cmark = "0.13.4"
 nucleo-matcher = "0.3.1"
+hickory-proto = { version = "0.26.3", default-features = false, features = ["std"] }
 
 [target.'cfg(target_os = "linux")'.dependencies]
 aya = { version = "0.13", optional = true }

@@ -196,6 +196,7 @@ mod tests {
                 version: "v0.1.0".parse().unwrap(),
                 api_port: 19117,
                 ingress_port: 18080,
+                registry_port: Some(15050),
             },
         )
         .unwrap()
@@ -254,6 +255,7 @@ mod tests {
             "admin.token",
             "security-bootstrap.json",
             "identity/node.key",
+            "identity/node.bundle.json",
         ] {
             assert_eq!(
                 std::fs::metadata(bootstrap.directory.join(name))

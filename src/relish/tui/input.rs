@@ -94,8 +94,8 @@ impl TuiApp {
                     .data
                     .instances
                     .iter()
-                    .find(|instance| instance.app_name == name)
-                    .map(|instance| instance.namespace.clone())
+                    .find(|instance| instance.instance.app_name == name)
+                    .map(|instance| instance.instance.namespace.clone())
                     .unwrap_or_else(|| "default".to_string());
                 self.push(View::Logs {
                     app: Some((name.clone(), namespace.clone())),

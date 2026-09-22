@@ -47,12 +47,16 @@ impl TestHarness {
         let port_allocator = PortAllocator::new(40000, 41000);
         let agent_shutdown = shutdown.clone();
         let mut agent = BunAgent::new(grill, port_allocator, cmd_rx, agent_shutdown);
+        let volumes = tempfile::tempdir().unwrap();
+        agent.set_volumes_dir(volumes.path().to_path_buf());
         let deploy_history = agent.deploy_history_handle();
         let event_store = Arc::new(RwLock::new(reliaburger::bun::events::EventStore::new()));
         agent.set_event_store(Arc::clone(&event_store));
 
         let agent_task = tokio::spawn(async move {
             agent.run().await;
+            drop(agent);
+            drop(volumes);
         });
 
         // Bind API to ephemeral port

@@ -4,7 +4,7 @@
 //! host filesystem paths. Collection can return degraded evidence alongside
 //! the facts it did observe, rather than hiding a partial failure.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::PathBuf;
 
 use serde::{Deserialize, Serialize};
@@ -93,6 +93,9 @@ pub struct DiagnosticStaticEvidence {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct DiskUsageEvidence {
+    /// Node-local filesystem identity. Absent on older or unsupported reporters.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub filesystem_id: Option<String>,
     /// Stable domain such as `images`, `logs` or `volumes`.
     pub storage_domain: String,
     /// Bytes used on the filesystem containing that domain.
@@ -233,6 +236,7 @@ pub fn collect_disk_usage(
         .list()
         .iter()
         .map(|disk| MountCapacity {
+            filesystem_id: filesystem_identity(disk.mount_point()),
             mount: disk.mount_point().to_path_buf(),
             total_bytes: disk.total_space(),
             available_bytes: disk.available_space(),
@@ -241,8 +245,22 @@ pub fn collect_disk_usage(
     disk_usage_from_mounts(storage_paths, &mounts, observed_at)
 }
 
+#[cfg(unix)]
+fn filesystem_identity(mount: &std::path::Path) -> Option<String> {
+    use std::os::unix::fs::MetadataExt;
+    std::fs::metadata(mount)
+        .ok()
+        .map(|metadata| format!("device:{:x}", metadata.dev()))
+}
+
+#[cfg(not(unix))]
+fn filesystem_identity(_mount: &std::path::Path) -> Option<String> {
+    None
+}
+
 #[derive(Debug, Clone)]
 struct MountCapacity {
+    filesystem_id: Option<String>,
     mount: PathBuf,
     total_bytes: u64,
     available_bytes: u64,
@@ -281,6 +299,7 @@ fn disk_usage_from_mounts(
         }
         let used_bytes = mount.total_bytes - mount.available_bytes;
         values.push(DiskUsageEvidence {
+            filesystem_id: mount.filesystem_id.clone(),
             storage_domain: storage.domain.clone(),
             used_bytes,
             total_bytes: mount.total_bytes,
@@ -310,13 +329,12 @@ pub(crate) async fn collect_cpu_throttle_totals(
         };
     }
     let reads = instances.into_iter().map(|instance| async move {
-        let identity = crate::grill::InstanceIdentity::parse(&instance.id)
-            .ok_or_else(|| format!("{} has an invalid instance id", instance.id))?;
-        let path = crate::grill::cgroup::cgroup_path(
+        let path = crate::grill::cgroup::instance_cgroup_path(
             &instance.namespace,
             &instance.app_name,
-            identity.ordinal,
+            &crate::grill::InstanceId(instance.id.clone()),
         )
+        .map_err(|error| error.to_string())?
         .join("cpu.stat");
         let contents = tokio::fs::read_to_string(&path)
             .await
@@ -387,7 +405,9 @@ pub(crate) fn cpu_throttle_window(
         .map(|sample| (sample.instance.clone(), sample))
         .collect::<BTreeMap<_, _>>();
     let mut values = Vec::new();
+    let mut observed_instances = BTreeSet::new();
     for sample in second {
+        observed_instances.insert(sample.instance.clone());
         let Some(previous) = first.get(&sample.instance) else {
             errors.push(format!(
                 "instance {} appeared during the CPU observation window",
@@ -413,16 +433,13 @@ pub(crate) fn cpu_throttle_window(
             window_seconds,
         });
     }
-    if first.len() != values.len() {
-        for instance in first.keys() {
-            if !values.iter().any(|sample| &sample.instance == instance)
-                && !errors.iter().any(|error| error.contains(instance))
-            {
-                errors.push(format!(
-                    "instance {instance} disappeared during the CPU observation window"
-                ));
-            }
-        }
+    for instance in first
+        .keys()
+        .filter(|instance| !observed_instances.contains(*instance))
+    {
+        errors.push(format!(
+            "instance {instance} disappeared during the CPU observation window"
+        ));
     }
     values.sort_by(|left, right| left.instance.cmp(&right.instance));
     finish_collection(values, errors, observed_at)
@@ -489,6 +506,28 @@ mod tests {
     }
 
     #[test]
+    fn one_instance_prefix_cannot_hide_another_missing_cpu_sample() {
+        let first = DiagnosticSource::Available {
+            observed_at: 10,
+            value: vec![cpu_total("api-1", 500), cpu_total("api-10", 500)],
+        };
+        let second = DiagnosticSource::Available {
+            observed_at: 11,
+            value: vec![cpu_total("api-10", 1)],
+        };
+        let result = cpu_throttle_window(first, second, 1, 11);
+        let DiagnosticSource::Unavailable { reason } = result else {
+            panic!("missing samples must be unavailable")
+        };
+        assert!(reason.contains("instance api-1 disappeared"), "{reason}");
+        assert!(
+            reason.contains("counter reset for instance api-10"),
+            "{reason}"
+        );
+        assert!(!reason.contains("instance api-10 disappeared"), "{reason}");
+    }
+
+    #[test]
     fn cpu_window_marks_counter_reset_unavailable() {
         let first = DiagnosticSource::Available {
             observed_at: 10,
@@ -506,6 +545,36 @@ mod tests {
         );
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn real_storage_paths_share_their_device_identity() {
+        use std::os::unix::fs::MetadataExt;
+        let directory = tempfile::tempdir().unwrap();
+        let nested = directory.path().join("logs");
+        std::fs::create_dir(&nested).unwrap();
+        let expected = format!("device:{:x}", std::fs::metadata(&nested).unwrap().dev());
+        let evidence = collect_disk_usage(
+            &[
+                DiagnosticStoragePath {
+                    domain: "data".into(),
+                    path: directory.path().canonicalize().unwrap(),
+                },
+                DiagnosticStoragePath {
+                    domain: "logs".into(),
+                    path: nested.canonicalize().unwrap(),
+                },
+            ],
+            10,
+        );
+        let disks = evidence.value().unwrap();
+        assert_eq!(disks.len(), 2);
+        assert!(
+            disks
+                .iter()
+                .all(|disk| disk.filesystem_id.as_deref() == Some(expected.as_str()))
+        );
+    }
+
     #[test]
     fn disk_capacity_is_attributed_to_longest_matching_mount() {
         let paths = vec![
@@ -520,11 +589,13 @@ mod tests {
         ];
         let mounts = vec![
             MountCapacity {
+                filesystem_id: None,
                 mount: PathBuf::from("/"),
                 total_bytes: 1000,
                 available_bytes: 500,
             },
             MountCapacity {
+                filesystem_id: None,
                 mount: PathBuf::from("/srv"),
                 total_bytes: 2000,
                 available_bytes: 500,
@@ -549,6 +620,7 @@ mod tests {
             disks: DiagnosticSource::Available {
                 observed_at: 10,
                 value: vec![DiskUsageEvidence {
+                    filesystem_id: None,
                     storage_domain: "images".to_string(),
                     used_bytes: 1,
                     total_bytes: 2,

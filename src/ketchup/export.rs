@@ -18,10 +18,9 @@
 //!
 //! # One Bun-owned checkpoint
 //!
-//! Only Bun's export task and disk-pressure task write this checkpoint.
-//! `relish logs-export` used to keep its own competing checkpoint in the
-//! same directory, which double-counted or skipped files depending on
-//! interleaving. It now shares this one path (X8).
+//! Every exporter locks the source directory's checkpoint, reloads its latest
+//! state, uploads, and atomically persists before acknowledging success. The
+//! lock is shared across Bun, the manual API and offline Relish processes.
 
 use std::collections::HashSet;
 use std::path::Path;
@@ -39,13 +38,16 @@ pub const CHECKPOINT_FILENAME: &str = "_export_checkpoint.json";
 /// Tracks which Parquet files have been exported, by durable id.
 ///
 /// Persisted as JSON so export is incremental across node restarts. The
-/// stored ids are `{filename}@{sha256-prefix}` (see [`durable_id`]), so a
+/// stored ids are `{filename}@{sha256}` (see `durable_id`), so a
 /// filename reused after retention pruning is treated as a new object.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct ExportCheckpoint {
     /// Durable ids (`{filename}@{hash}`) that have already been exported.
     #[serde(default)]
     pub exported_files: HashSet<String>,
+    /// Hash of the destination URL and node prefix these acknowledgements cover.
+    #[serde(default)]
+    pub scope: Option<String>,
 }
 
 impl ExportCheckpoint {
@@ -58,11 +60,14 @@ impl ExportCheckpoint {
             .unwrap_or_default()
     }
 
-    /// Save the checkpoint to a JSON file.
+    /// Atomically save a checkpoint snapshot, syncing the file and its directory.
+    ///
+    /// Export callers must use `export_logs`, which owns locking and persistence;
+    /// this low-level snapshot operation does not serialise competing writers.
     pub fn save(&self, path: &Path) -> Result<(), KetchupError> {
         let json = serde_json::to_string_pretty(self)
             .map_err(|e| KetchupError::Io(std::io::Error::other(e.to_string())))?;
-        std::fs::write(path, json)?;
+        crate::sesame::identity::atomic_write_mode(path, json.as_bytes(), Some(0o600))?;
         Ok(())
     }
 
@@ -70,7 +75,12 @@ impl ExportCheckpoint {
     ///
     /// The disk-pressure pruner uses this so it only deletes a local file once
     /// that exact content has landed in the object store.
-    pub fn contains_file(&self, path: &Path) -> bool {
+    pub fn contains_file(&self, path: &Path, destination: &str, node_id: &str) -> bool {
+        if export_scope(destination, node_id).ok().as_ref() != self.scope.as_ref()
+            || self.scope.is_none()
+        {
+            return false;
+        }
         match file_durable_id(path) {
             Ok(id) => self.exported_files.contains(&id),
             Err(_) => false,
@@ -97,16 +107,14 @@ pub struct ExportResult {
     pub bytes_written: u64,
 }
 
-/// The durable id of a file: its name plus a short hash of its contents.
+/// The durable id of a file: its name plus the full SHA-256 of its contents.
 ///
 /// Two files sharing a name but not contents (a name reused after
 /// retention pruning) get different ids, so the checkpoint never skips
 /// genuinely new bytes.
 fn durable_id(filename: &str, contents: &[u8]) -> String {
     let hash = hex::encode(Sha256::digest(contents));
-    // 16 hex chars (64 bits) is plenty to distinguish reused filenames
-    // without bloating the checkpoint.
-    format!("{filename}@{}", &hash[..16])
+    format!("{filename}@{hash}")
 }
 
 /// Build the object store and key prefix for a destination.
@@ -118,6 +126,24 @@ fn durable_id(filename: &str, contents: &[u8]) -> String {
 fn parse_destination(
     destination: &str,
 ) -> Result<(Box<dyn object_store::ObjectStore>, object_store::path::Path), KetchupError> {
+    let url = destination_url(destination)?;
+    object_store::parse_url(&url).map_err(|e| {
+        KetchupError::Io(std::io::Error::other(format!(
+            "unsupported destination: {e}"
+        )))
+    })
+}
+
+fn export_scope(destination: &str, node_id: &str) -> Result<String, KetchupError> {
+    let url = destination_url(destination)?;
+    let mut digest = Sha256::new();
+    digest.update(url.as_str().as_bytes());
+    digest.update([0]);
+    digest.update(node_id.as_bytes());
+    Ok(hex::encode(digest.finalize()))
+}
+
+fn destination_url(destination: &str) -> Result<url::Url, KetchupError> {
     // A bare filesystem path has no scheme; normalise it to a file:// URL so
     // `object_store::parse_url` picks the LocalFileSystem backend. Existing
     // configs and tests pass plain temp-dir paths, so this stays compatible.
@@ -132,20 +158,79 @@ fn parse_destination(
     }
     .map_err(|e| KetchupError::Io(std::io::Error::other(format!("invalid destination: {e}"))))?;
 
-    object_store::parse_url(&url).map_err(|e| {
-        KetchupError::Io(std::io::Error::other(format!(
-            "unsupported destination: {e}"
-        )))
-    })
+    Ok(url)
 }
 
 /// Export local Parquet log files to an object store.
 ///
 /// Ships any `.parquet` files in `source_dir` whose durable id isn't yet in
-/// the checkpoint to `{destination}/{node_id}/{filename}`, then records
+/// the checkpoint to `{destination}/{node_id}/{sha256}-{filename}`, then records
 /// each id. `destination` may be a local path, `file://…`, `s3://…` or
-/// `gs://…`. The checkpoint advances only for files that actually landed.
+/// `gs://…`. The source must exist. A competing exporter returns a busy error.
+/// The supplied snapshot is replaced only after uploads and checkpoint persistence
+/// succeed; callers must not separately save it over the authoritative file.
 pub async fn export_logs(
+    source_dir: &Path,
+    destination: &str,
+    node_id: &str,
+    checkpoint: &mut ExportCheckpoint,
+) -> Result<ExportResult, KetchupError> {
+    let directory = source_dir.to_path_buf();
+    let (lock, mut current) = tokio::task::spawn_blocking(move || {
+        let mut options = std::fs::OpenOptions::new();
+        options.read(true).write(true).create(true).truncate(false);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.mode(0o600);
+        }
+        let lock = options.open(directory.join("_export_checkpoint.lock"))?;
+        lock.try_lock().map_err(|error| {
+            std::io::Error::other(format!("export checkpoint is busy: {error}"))
+        })?;
+        let path = directory.join(CHECKPOINT_FILENAME);
+        let current = match std::fs::read(&path) {
+            Ok(bytes) => serde_json::from_slice(&bytes).map_err(|error| {
+                std::io::Error::other(format!(
+                    "invalid export checkpoint {}: {error}",
+                    path.display()
+                ))
+            })?,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                ExportCheckpoint::default()
+            }
+            Err(error) => {
+                return Err(std::io::Error::other(format!(
+                    "read export checkpoint {}: {error}",
+                    path.display()
+                )));
+            }
+        };
+        Ok::<_, std::io::Error>((lock, current))
+    })
+    .await
+    .map_err(|error| KetchupError::Io(std::io::Error::other(error.to_string())))??;
+
+    let result = export_logs_locked(source_dir, destination, node_id, &mut current).await?;
+    let path = source_dir.join(CHECKPOINT_FILENAME);
+    // Move the lock into the blocking write: cancellation cannot release it while
+    // a previous write is still replacing the authoritative checkpoint.
+    let committed = tokio::task::spawn_blocking(move || {
+        let _lock = lock;
+        current.save(&path).map_err(|error| {
+            KetchupError::Io(std::io::Error::other(format!(
+                "files exported but checkpoint could not be saved: {error}; retry is safe"
+            )))
+        })?;
+        Ok::<_, KetchupError>(current)
+    })
+    .await
+    .map_err(|error| KetchupError::Io(std::io::Error::other(error.to_string())))??;
+    *checkpoint = committed;
+    Ok(result)
+}
+
+async fn export_logs_locked(
     source_dir: &Path,
     destination: &str,
     node_id: &str,
@@ -153,39 +238,82 @@ pub async fn export_logs(
 ) -> Result<ExportResult, KetchupError> {
     let (store, prefix) = parse_destination(destination)?;
     let node_prefix = prefix.join(node_id);
+    let scope = export_scope(destination, node_id)?;
+    if checkpoint.scope.as_ref() != Some(&scope) {
+        // Legacy or differently scoped acknowledgements cannot justify skipping
+        // an upload or pruning its source. Immutable object names make retries safe.
+        checkpoint.exported_files.clear();
+        checkpoint.scope = Some(scope);
+    }
 
-    let entries = match std::fs::read_dir(source_dir) {
-        Ok(entries) => entries,
-        Err(_) => return Ok(ExportResult::default()),
-    };
-
-    // Collect candidate filenames first so the async put loop borrows nothing
-    // from the (non-Send) ReadDir iterator across an await point.
+    let mut entries = tokio::fs::read_dir(source_dir).await.map_err(|error| {
+        KetchupError::Io(std::io::Error::new(
+            error.kind(),
+            format!("list {}: {error}", source_dir.display()),
+        ))
+    })?;
     let mut candidates: Vec<String> = Vec::new();
-    for entry in entries.flatten() {
+    while let Some(entry) = entries.next_entry().await.map_err(|error| {
+        KetchupError::Io(std::io::Error::new(
+            error.kind(),
+            format!("read directory {}: {error}", source_dir.display()),
+        ))
+    })? {
         let path = entry.path();
-        if path.extension().is_none_or(|e| e != "parquet") {
+        if path
+            .extension()
+            .is_none_or(|extension| extension != "parquet")
+        {
             continue;
         }
-        if let Some(name) = path.file_name().and_then(|n| n.to_str()) {
-            candidates.push(name.to_string());
+        let kind = entry.file_type().await.map_err(|error| {
+            KetchupError::Io(std::io::Error::new(
+                error.kind(),
+                format!("inspect {}: {error}", path.display()),
+            ))
+        })?;
+        if !kind.is_file() {
+            return Err(KetchupError::Io(std::io::Error::other(format!(
+                "export source {} is not a regular file",
+                path.display()
+            ))));
         }
+        let name = entry.file_name().into_string().map_err(|name| {
+            KetchupError::Io(std::io::Error::other(format!(
+                "export filename is not UTF-8: {name:?}"
+            )))
+        })?;
+        candidates.push(name);
     }
     candidates.sort();
 
     let mut result = ExportResult::default();
+    let mut live_ids = HashSet::new();
     for filename in candidates {
         let source_path = source_dir.join(&filename);
-        let contents = match std::fs::read(&source_path) {
+        let contents = match tokio::fs::read(&source_path).await {
             Ok(bytes) => bytes,
-            Err(_) => continue, // pruned between listing and read; skip
+            // Retention may remove an immutable source between enumeration and read.
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(error) => {
+                return Err(KetchupError::Io(std::io::Error::new(
+                    error.kind(),
+                    format!("read export source {}: {error}", source_path.display()),
+                )));
+            }
         };
         let id = durable_id(&filename, &contents);
+        live_ids.insert(id.clone());
         if checkpoint.exported_files.contains(&id) {
             continue;
         }
 
-        let key = node_prefix.clone().join(filename.as_str());
+        // Include the generation in the object key, not only the checkpoint.
+        // Keep the Parquet extension so archive queries discover every generation.
+        let key = node_prefix.clone().join(format!(
+            "{}-{filename}",
+            hex::encode(Sha256::digest(&contents))
+        ));
         let len = contents.len() as u64;
         store
             .put(&key, object_store::PutPayload::from(contents))
@@ -197,6 +325,9 @@ pub async fn export_logs(
         result.bytes_written += len;
     }
 
+    // Only current source generations can need pruning proof. Retired ids
+    // can be forgotten: immutable destination keys make a later retry safe.
+    checkpoint.exported_files.retain(|id| live_ids.contains(id));
     Ok(result)
 }
 
@@ -244,8 +375,22 @@ mod tests {
         .unwrap();
 
         assert_eq!(result.files_exported, 2);
-        assert!(dest.path().join("node-1/logs_000000.parquet").exists());
-        assert!(dest.path().join("node-1/logs_000001.parquet").exists());
+        assert!(
+            dest.path()
+                .join(format!(
+                    "node-1/{}-logs_000000.parquet",
+                    hex::encode(Sha256::digest(b"data1"))
+                ))
+                .exists()
+        );
+        assert!(
+            dest.path()
+                .join(format!(
+                    "node-1/{}-logs_000001.parquet",
+                    hex::encode(Sha256::digest(b"data2"))
+                ))
+                .exists()
+        );
         assert!(!dest.path().join("node-1/not_parquet.txt").exists());
         // The checkpoint advanced by exactly the two exported ids.
         assert_eq!(checkpoint.exported_files.len(), 2);
@@ -264,7 +409,7 @@ mod tests {
             .unwrap();
 
         assert_eq!(result.files_exported, 1);
-        assert!(dest.path().join("node-1/logs_000000.parquet").exists());
+        assert_eq!(exported_files(dest.path()).len(), 1);
     }
 
     #[tokio::test]
@@ -275,11 +420,17 @@ mod tests {
         std::fs::write(source.path().join("logs_000000.parquet"), b"data1").unwrap();
         std::fs::write(source.path().join("logs_000001.parquet"), b"data2").unwrap();
 
-        let mut checkpoint = ExportCheckpoint::default();
+        let mut checkpoint = ExportCheckpoint {
+            scope: Some(export_scope(dest.path().to_str().unwrap(), "node-1").unwrap()),
+            ..ExportCheckpoint::default()
+        };
         // Pre-record the durable id of the first file.
         checkpoint
             .exported_files
             .insert(durable_id("logs_000000.parquet", b"data1"));
+        checkpoint
+            .save(&source.path().join(CHECKPOINT_FILENAME))
+            .unwrap();
 
         let result = export_logs(
             source.path(),
@@ -291,7 +442,7 @@ mod tests {
         .unwrap();
 
         assert_eq!(result.files_exported, 1);
-        assert!(dest.path().join("node-1/logs_000001.parquet").exists());
+        assert_eq!(exported_files(dest.path()).len(), 1);
     }
 
     /// The bug OBS7 called out: a filename reused after retention pruning
@@ -313,7 +464,8 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(r1.files_exported, 1);
-        let first_bytes = std::fs::read(dest.path().join("node-1/logs_000000.parquet")).unwrap();
+        let first_path = exported_files(dest.path()).pop().unwrap();
+        let first_bytes = std::fs::read(&first_path).unwrap();
         assert_eq!(first_bytes, b"first batch");
 
         // Retention prunes the local file; the flush counter resets, so a new
@@ -333,8 +485,12 @@ mod tests {
             r2.files_exported, 1,
             "reused filename with new bytes was skipped"
         );
-        let second_bytes = std::fs::read(dest.path().join("node-1/logs_000000.parquet")).unwrap();
-        assert_eq!(second_bytes, b"second batch", "destination not overwritten");
+        assert_eq!(std::fs::read(&first_path).unwrap(), b"first batch");
+        let second_path = exported_files(dest.path())
+            .into_iter()
+            .find(|path| path != &first_path)
+            .unwrap();
+        assert_eq!(std::fs::read(second_path).unwrap(), b"second batch");
     }
 
     #[tokio::test]
@@ -357,7 +513,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn export_missing_source_dir_is_noop() {
+    async fn export_missing_source_cannot_acquire_checkpoint_ownership() {
         let dest = tempfile::tempdir().unwrap();
         let mut checkpoint = ExportCheckpoint::default();
         let result = export_logs(
@@ -366,9 +522,8 @@ mod tests {
             "node-1",
             &mut checkpoint,
         )
-        .await
-        .unwrap();
-        assert_eq!(result.files_exported, 0);
+        .await;
+        assert!(result.is_err());
     }
 
     #[test]
@@ -387,6 +542,45 @@ mod tests {
 
         let loaded = ExportCheckpoint::load(&path);
         assert_eq!(loaded.exported_files.len(), 2);
+    }
+
+    #[test]
+    fn checkpoint_replacement_does_not_truncate_the_previous_inode() {
+        use std::io::Read;
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("checkpoint.json");
+        let mut checkpoint = ExportCheckpoint::default();
+        checkpoint.save(&path).unwrap();
+        let mut previous = std::fs::File::open(&path).unwrap();
+        checkpoint.exported_files.insert("new receipt".to_string());
+        checkpoint.save(&path).unwrap();
+        let mut bytes = Vec::new();
+        previous.read_to_end(&mut bytes).unwrap();
+        let old: ExportCheckpoint = serde_json::from_slice(&bytes).unwrap();
+        assert!(old.exported_files.is_empty());
+        assert_eq!(ExportCheckpoint::load(&path).exported_files.len(), 1);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            assert_eq!(
+                std::fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+                0o600
+            );
+        }
+    }
+
+    #[test]
+    fn failed_checkpoint_rename_cleans_its_temporary_file() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("checkpoint.json");
+        std::fs::create_dir(&path).unwrap();
+        std::fs::write(path.join("preserve"), b"existing data").unwrap();
+        assert!(ExportCheckpoint::default().save(&path).is_err());
+        assert_eq!(
+            std::fs::read(path.join("preserve")).unwrap(),
+            b"existing data"
+        );
+        assert_eq!(std::fs::read_dir(directory.path()).unwrap().count(), 1);
     }
 
     #[test]

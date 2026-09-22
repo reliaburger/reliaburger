@@ -15,7 +15,8 @@ use super::score::score_nodes;
 use super::types::{AppId, Placement, Resources, SchedulingDecision};
 
 /// Scheduling errors.
-#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error, serde::Serialize, serde::Deserialize)]
+#[serde(tag = "code", rename_all = "snake_case", deny_unknown_fields)]
 pub enum ScheduleError {
     #[error("no eligible nodes for app {app_id:?}")]
     NoEligibleNodes { app_id: AppId },
@@ -309,7 +310,9 @@ fn lookup_pickle_manifest<'a>(
     catalog: &'a crate::pickle::types::ManifestCatalog,
 ) -> Option<&'a crate::pickle::types::ImageManifest> {
     let manifest = match image_ref.split_once('@') {
-        Some((_, digest)) => catalog.get_manifest(digest),
+        Some((repository, digest)) => {
+            catalog.get_repository_manifest(canonical_repository(repository), digest)
+        }
         None => {
             let (name, tag) = split_repo_tag(image_ref);
             catalog.get_manifest_by_tag(canonical_repository(name), tag)
@@ -782,6 +785,7 @@ mod tests {
             signature: None, // unsigned!
         };
         catalog.apply_manifest_commit(&ManifestCommit {
+            observed_gc_generation: 0,
             manifest,
             tag: "v1".to_string(),
             holder_nodes: BTreeSet::from([1]),
@@ -824,6 +828,7 @@ mod tests {
             signature: None, // unsigned upstream content
         };
         catalog.apply_manifest_commit(&ManifestCommit {
+            observed_gc_generation: 0,
             manifest,
             tag: "7".to_string(),
             holder_nodes: BTreeSet::from([1]),
@@ -871,6 +876,7 @@ mod tests {
             }),
         };
         catalog.apply_manifest_commit(&ManifestCommit {
+            observed_gc_generation: 0,
             manifest,
             tag: "v1".to_string(),
             holder_nodes: BTreeSet::from([1]),
@@ -929,6 +935,7 @@ mod tests {
             signature,
         };
         catalog.apply_manifest_commit(&ManifestCommit {
+            observed_gc_generation: 0,
             manifest,
             tag: "v1".to_string(),
             holder_nodes: BTreeSet::from([1]),
@@ -1074,6 +1081,7 @@ mod tests {
             signature: None,
         };
         catalog.apply_manifest_commit(&ManifestCommit {
+            observed_gc_generation: 0,
             manifest,
             tag: "v1".to_string(),
             holder_nodes: BTreeSet::from([1]),
@@ -1204,6 +1212,7 @@ mod tests {
         let catalog = catalog_with(Some(sig));
         // The signing leaf cert has serial 100; revoke it.
         let crl = crate::sesame::types::Crl {
+            retired_nodes: Default::default(),
             entries: vec![crate::sesame::types::CrlEntry {
                 serial: crate::sesame::types::SerialNumber(100),
                 issuer: crate::sesame::types::CaRole::Workload,

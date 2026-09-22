@@ -59,11 +59,15 @@ impl IngressHarness {
         let grill = ProcessGrill::new();
         let port_allocator = PortAllocator::new(range_start, range_end);
         let mut agent = BunAgent::new(grill, port_allocator, cmd_rx, shutdown.clone());
+        let volumes = tempfile::tempdir().unwrap();
+        agent.set_volumes_dir(volumes.path().to_path_buf());
 
         // The proxy shares the routing table the agent rebuilds on deploys.
         let routing_table = agent.routing_table_handle();
         let agent_task = tokio::spawn(async move {
             agent.run().await;
+            drop(agent);
+            drop(volumes);
         });
 
         // Bind ingress on port 0 so the OS assigns free ports.

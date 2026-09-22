@@ -3,7 +3,7 @@
 //! Defines digests, manifests, layer descriptors, and all the types
 //! that flow through Raft for manifest catalog and layer location tracking.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 use std::time::SystemTime;
 
@@ -168,12 +168,33 @@ impl ImageManifest {
 /// Commit a manifest to the Raft catalog.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ManifestCommit {
+    /// GC generation observed while verifying the publishing node's local blobs.
+    /// Cluster publication refuses if collection advanced any declared holder.
+    #[serde(default)]
+    pub observed_gc_generation: u64,
     /// The manifest to store.
     pub manifest: ImageManifest,
     /// Tag to associate with this manifest (e.g. `"latest"`).
     pub tag: String,
     /// Nodes that hold all layers after replication.
     pub holder_nodes: BTreeSet<u64>,
+}
+
+/// Evidence that one storage node verified an existing image under its GC guard.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ImageCopyConfirmation {
+    /// Exact repository whose committed metadata supplies the dependency list.
+    pub repository: String,
+    /// Immutable image identity; never a mutable tag.
+    pub manifest_digest: Digest,
+    /// Authenticated storage node confirming only its own bytes.
+    pub node_id: u64,
+    /// Exact active owner for a disposable repository.
+    pub lease_id: Option<String>,
+    /// Generation observed before verification, fenced again at Raft application.
+    pub observed_gc_generation: u64,
+    /// Lease observation time recorded by the storage node.
+    pub observed_at_unix_ms: u64,
 }
 
 /// Update which nodes hold copies of specific layers.
@@ -205,10 +226,29 @@ pub struct DeleteTag {
 // Manifest catalog (part of DesiredState)
 // ---------------------------------------------------------------------------
 
+/// Public image-list entry, excluding internal ownership and storage-node details.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ImageSummary {
+    /// Repository containing this manifest.
+    pub repository: String,
+    /// Exact content digest.
+    pub digest: String,
+    /// Current tags belonging to this repository copy.
+    pub tags: BTreeSet<String>,
+    /// Number of filesystem layers.
+    pub layers: usize,
+    /// Logical manifest content size in bytes.
+    pub total_size: u64,
+}
+
 /// The manifest catalog stored in Raft as part of DesiredState.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct ManifestCatalog {
-    /// Manifests keyed by digest string.
+    /// Exact lease generation owning each reserved repository, even before a manifest.
+    #[serde(default)]
+    pub repository_owners: BTreeMap<String, String>,
+    /// Per-repository manifest rows, carrying their content digest as the key.
+    /// Identical content may have independent tags in several repositories.
     pub manifests: Vec<(String, ImageManifest)>,
     /// Tag→digest mappings. Key is `"repository:tag"`, value is digest string.
     pub tags: Vec<(String, String)>,
@@ -217,7 +257,127 @@ pub struct ManifestCatalog {
 }
 
 impl ManifestCatalog {
-    /// Look up a manifest by digest.
+    /// Bind local storage to its exact lease before accepting any upload bytes.
+    /// Existing unowned metadata cannot be adopted as proof of a fresh repository.
+    pub fn claim_repository(
+        &mut self,
+        repository: &str,
+        lease_id: &str,
+    ) -> Result<(), PickleError> {
+        if lease_id.is_empty()
+            || !repository
+                .split_once('/')
+                .is_some_and(|(namespace, _)| namespace.starts_with("rbtest-"))
+        {
+            return Err(PickleError::LeaseDenied(
+                "invalid repository lease identity".into(),
+            ));
+        }
+        self.check_repository_owner(repository, lease_id)?;
+        self.repository_owners
+            .insert(repository.into(), lease_id.into());
+        Ok(())
+    }
+
+    /// Refuse a different generation or metadata whose original owner is unknown.
+    pub fn check_repository_owner(
+        &self,
+        repository: &str,
+        lease_id: &str,
+    ) -> Result<(), PickleError> {
+        match self.repository_owners.get(repository) {
+            Some(owner) if owner == lease_id => Ok(()),
+            Some(_) => Err(PickleError::LeaseDenied(
+                "repository belongs to another lease generation".into(),
+            )),
+            None if self
+                .manifests
+                .iter()
+                .any(|(_, manifest)| manifest.repository == repository)
+                || !self.tags_for_repository(repository).is_empty() =>
+            {
+                Err(PickleError::LeaseDenied(
+                    "repository metadata has no confirmed lease owner".into(),
+                ))
+            }
+            None => Ok(()),
+        }
+    }
+
+    /// Retire this exact generation; an already empty repository is an idempotent retry.
+    pub fn retire_leased_repository(
+        &mut self,
+        repository: &str,
+        lease_id: &str,
+    ) -> Result<(), PickleError> {
+        self.check_repository_owner(repository, lease_id)?;
+        self.retire_repository(repository);
+        Ok(())
+    }
+
+    /// Describe committed images without exposing internal ownership records.
+    pub fn images(&self) -> Vec<ImageSummary> {
+        self.manifests
+            .iter()
+            .map(|(digest, manifest)| ImageSummary {
+                repository: manifest.repository.clone(),
+                digest: digest.clone(),
+                tags: manifest.tags.clone(),
+                layers: manifest.layers.len(),
+                total_size: manifest.total_size,
+            })
+            .collect()
+    }
+
+    /// Project one repository without exposing unrelated manifests, tags or holders.
+    pub fn repository_view(&self, repository: &str) -> Self {
+        let prefix = format!("{repository}:");
+        let mut view = Self {
+            repository_owners: self
+                .repository_owners
+                .iter()
+                .filter(|(name, _)| name.as_str() == repository)
+                .map(|(name, owner)| (name.clone(), owner.clone()))
+                .collect(),
+            manifests: self
+                .manifests
+                .iter()
+                .filter(|(_, manifest)| manifest.repository == repository)
+                .cloned()
+                .collect(),
+            tags: self
+                .tags
+                .iter()
+                .filter(|(name, _)| name.starts_with(&prefix))
+                .cloned()
+                .collect(),
+            layer_locations: Vec::new(),
+        };
+        let referenced = view.referenced_digest_set();
+        view.layer_locations = self
+            .layer_locations
+            .iter()
+            .filter(|(digest, _)| referenced.contains(digest))
+            .cloned()
+            .collect();
+        view
+    }
+
+    /// Logical stored image sizes used by repository and aggregate quota admission.
+    pub fn stored_sizes(&self, repository: &str) -> (u64, u64) {
+        let mut repository_bytes = 0u64;
+        let mut total_bytes = 0u64;
+        for (_, manifest) in &self.manifests {
+            total_bytes = total_bytes.saturating_add(manifest.total_size);
+            if manifest.repository == repository {
+                repository_bytes = repository_bytes.saturating_add(manifest.total_size);
+            }
+        }
+        (repository_bytes, total_bytes)
+    }
+
+    /// Look up shared content by digest, without selecting repository metadata.
+    /// Repository-aware callers must use `get_repository_manifest` instead.
     pub fn get_manifest(&self, digest: &str) -> Option<&ImageManifest> {
         self.manifests
             .iter()
@@ -225,11 +385,23 @@ impl ManifestCatalog {
             .map(|(_, m)| m)
     }
 
+    /// Look up one repository's manifest metadata for content with this digest.
+    pub fn get_repository_manifest(
+        &self,
+        repository: &str,
+        digest: &str,
+    ) -> Option<&ImageManifest> {
+        self.manifests
+            .iter()
+            .find(|(stored, manifest)| stored == digest && manifest.repository == repository)
+            .map(|(_, manifest)| manifest)
+    }
+
     /// Look up a manifest by repository and tag.
     pub fn get_manifest_by_tag(&self, repository: &str, tag: &str) -> Option<&ImageManifest> {
         let key = format!("{repository}:{tag}");
         let digest = self.tags.iter().find(|(k, _)| k == &key).map(|(_, v)| v)?;
-        self.get_manifest(digest)
+        self.get_repository_manifest(repository, digest)
     }
 
     /// Get all tags for a repository.
@@ -256,17 +428,32 @@ impl ManifestCatalog {
         let digest_str = commit.manifest.digest.0.clone();
         let tag_key = format!("{}:{}", commit.manifest.repository, commit.tag);
 
-        // Remove old tag→digest mapping if tag existed
-        self.tags.retain(|(k, _)| k != &tag_key);
-        // Add new tag→digest
+        // Signatures attest content, while tags and retirement belong to a
+        // repository. A new repository copy preserves the content signature.
+        let signature = commit.manifest.signature.clone().or_else(|| {
+            self.get_manifest(&digest_str)
+                .and_then(|manifest| manifest.signature.clone())
+        });
+        // A pull may already have verified and pinned the old digest. Moving
+        // its tag must not discard the metadata needed to finish that pull.
+        self.tags.retain(|(key, _)| key != &tag_key);
+        for (_, manifest) in self
+            .manifests
+            .iter_mut()
+            .filter(|(_, manifest)| manifest.repository == commit.manifest.repository)
+        {
+            manifest.tags.remove(&commit.tag);
+        }
         self.tags.push((tag_key, digest_str.clone()));
 
-        // Upsert the manifest (update tags if it already exists)
-        if let Some((_, existing)) = self.manifests.iter_mut().find(|(d, _)| d == &digest_str) {
+        if let Some((_, existing)) = self.manifests.iter_mut().find(|(digest, manifest)| {
+            digest == &digest_str && manifest.repository == commit.manifest.repository
+        }) {
             existing.tags.insert(commit.tag.clone());
         } else {
             let mut manifest = commit.manifest.clone();
-            manifest.tags.insert(commit.tag.clone());
+            manifest.tags = BTreeSet::from([commit.tag.clone()]);
+            manifest.signature = signature;
             self.manifests.push((digest_str.clone(), manifest));
         }
 
@@ -288,6 +475,28 @@ impl ManifestCatalog {
                     .push((layer_str, commit.holder_nodes.clone()));
             }
         }
+    }
+
+    /// Add one verified holder to an existing image without changing its tags.
+    /// Returns false when the exact repository/digest no longer exists.
+    pub fn add_manifest_holder(&mut self, repository: &str, digest: &Digest, node_id: u64) -> bool {
+        let Some(manifest) = self.get_repository_manifest(repository, digest.as_str()) else {
+            return false;
+        };
+        let digests: Vec<Digest> = manifest.referenced_digests().into_iter().cloned().collect();
+        for digest in digests {
+            if let Some((_, holders)) = self
+                .layer_locations
+                .iter_mut()
+                .find(|(key, _)| key == digest.as_str())
+            {
+                holders.insert(node_id);
+            } else {
+                self.layer_locations
+                    .push((digest.0, BTreeSet::from([node_id])));
+            }
+        }
+        true
     }
 
     /// Apply an UpdateLayerLocations.
@@ -346,11 +555,14 @@ impl ManifestCatalog {
             {
                 Some((_, holders)) => {
                     let others = holders.iter().filter(|&&n| n != report.node_id).count();
-                    if others >= 1 && holders.remove(&report.node_id) {
+                    if others >= 1 {
+                        // Approval may already have removed this holder before
+                        // a failed deletion or crash. Reapprove its extra copy,
+                        // while preserving the other advertised holder.
+                        holders.remove(&report.node_id);
                         approved.push(digest.clone());
                     }
-                    // Sole copy (or the node isn't a holder): rejected —
-                    // the layer stays where it is.
+                    // Without another advertised holder, keep the layer.
                 }
                 None => {
                     // Orphan: not tracked in the catalog, nothing to lose.
@@ -376,6 +588,33 @@ impl ManifestCatalog {
         set
     }
 
+    /// Remove all metadata for one retired repository, preserving shared content.
+    /// The caller must establish workload retirement and fence every writer first.
+    pub fn retire_repository(&mut self, repository: &str) {
+        self.repository_owners.remove(repository);
+        let candidates: std::collections::HashSet<_> = self
+            .manifests
+            .iter()
+            .filter(|(_, manifest)| manifest.repository == repository)
+            .flat_map(|(_, manifest)| {
+                manifest
+                    .referenced_digests()
+                    .into_iter()
+                    .map(|digest| digest.0.clone())
+            })
+            .collect();
+        self.manifests
+            .retain(|(_, manifest)| manifest.repository != repository);
+        let prefix = format!("{repository}:");
+        self.tags
+            .retain(|(reference, _)| !reference.starts_with(&prefix));
+        let referenced = self.referenced_digest_set();
+        // Otherwise the normal last-copy guard would preserve unreferenced test
+        // bytes forever. This changes metadata only; blob GC still rechecks refs.
+        self.layer_locations
+            .retain(|(digest, _)| !candidates.contains(digest) || referenced.contains(digest));
+    }
+
     /// Serialise the catalog to a JSON file crash-safely (REG5): write to
     /// a *unique* temp file, fsync its bytes, rename over the target, then
     /// fsync the parent directory so the rename itself is durable.
@@ -388,34 +627,19 @@ impl ManifestCatalog {
     /// Single-node mode has no Raft to remember the catalog, and even
     /// cluster nodes want their local holder view back after a restart.
     pub fn persist_to(&self, path: &std::path::Path) -> Result<(), PickleError> {
-        use std::io::Write as _;
-
         let json = serde_json::to_vec_pretty(self)
-            .map_err(|e| PickleError::CatalogPersist(e.to_string()))?;
-
-        let parent = path.parent().unwrap_or_else(|| std::path::Path::new("."));
-        std::fs::create_dir_all(parent).map_err(|e| PickleError::CatalogPersist(e.to_string()))?;
-
-        let tmp = parent.join(format!("catalog.{:032x}.json.tmp", rand::random::<u128>()));
-        {
-            let mut file = std::fs::File::create(&tmp)
-                .map_err(|e| PickleError::CatalogPersist(e.to_string()))?;
-            file.write_all(&json)
-                .map_err(|e| PickleError::CatalogPersist(e.to_string()))?;
-            file.sync_all()
-                .map_err(|e| PickleError::CatalogPersist(e.to_string()))?;
-        }
-        if let Err(e) = std::fs::rename(&tmp, path) {
-            let _ = std::fs::remove_file(&tmp);
-            return Err(PickleError::CatalogPersist(e.to_string()));
-        }
-        if let Ok(dir) = std::fs::File::open(parent) {
-            let _ = dir.sync_all();
-        }
-        Ok(())
+            .map_err(|error| PickleError::CatalogPersist(error.to_string()))?;
+        let parent = path
+            .parent()
+            .filter(|parent| !parent.as_os_str().is_empty())
+            .unwrap_or_else(|| std::path::Path::new("."));
+        std::fs::create_dir_all(parent)
+            .map_err(|error| PickleError::CatalogPersist(error.to_string()))?;
+        crate::sesame::identity::atomic_write_mode(path, &json, Some(0o600))
+            .map_err(|error| PickleError::CatalogPersist(error.to_string()))
     }
 
-    /// Load a catalog previously written by [`persist_to`]. A missing
+    /// Load a catalog previously written by [`Self::persist_to`]. A missing
     /// file yields an empty catalog (fresh node); a corrupt file is an
     /// error — silently starting empty would orphan every stored blob.
     pub fn load_from(path: &std::path::Path) -> Result<Self, PickleError> {
@@ -431,17 +655,16 @@ impl ManifestCatalog {
     /// manifest). Returns `false` when the digest is unknown, so the
     /// state machine can refuse instead of no-opping (JOB7).
     pub fn apply_attach_signature(&mut self, attach: &AttachSignature) -> bool {
-        match self
+        let mut found = false;
+        for (_, manifest) in self
             .manifests
             .iter_mut()
-            .find(|(d, _)| d == &attach.manifest_digest.0)
+            .filter(|(digest, _)| digest == &attach.manifest_digest.0)
         {
-            Some((_, manifest)) => {
-                manifest.signature = Some(attach.signature.clone());
-                true
-            }
-            None => false,
+            manifest.signature = Some(attach.signature.clone());
+            found = true;
         }
+        found
     }
 
     /// Apply a DeleteTag.
@@ -458,18 +681,17 @@ impl ManifestCatalog {
         // Remove the tag
         self.tags.retain(|(k, _)| k != &tag_key);
 
-        // If the manifest has no remaining tags, remove it
         if let Some(digest_str) = digest {
-            // Remove tag from the manifest's tag set
-            if let Some((_, manifest)) = self.manifests.iter_mut().find(|(d, _)| d == &digest_str) {
+            for (_, manifest) in self.manifests.iter_mut().filter(|(digest, manifest)| {
+                digest == &digest_str && manifest.repository == delete.repository
+            }) {
                 manifest.tags.remove(&delete.tag);
             }
-
-            // Check if any other tags still reference this digest
-            let still_referenced = self.tags.iter().any(|(_, v)| v == &digest_str);
-            if !still_referenced {
-                self.manifests.retain(|(d, _)| d != &digest_str);
-            }
+            self.manifests.retain(|(digest, manifest)| {
+                digest != &digest_str
+                    || manifest.repository != delete.repository
+                    || !manifest.tags.is_empty()
+            });
         }
     }
 }
@@ -497,7 +719,7 @@ pub enum SigningMethod {
     /// Keyless signing via workload identity OIDC token.
     /// The build job's SPIFFE identity serves as the signing credential.
     Keyless {
-        /// OIDC issuer URL (e.g. "https://prod.reliaburger.dev").
+        /// OIDC issuer URL (e.g. "<https://prod.reliaburger.dev>").
         issuer: String,
         /// SPIFFE URI of the signing workload.
         identity: String,
@@ -534,6 +756,9 @@ pub struct AttachSignature {
 /// Errors from Pickle operations.
 #[derive(Debug, thiserror::Error)]
 pub enum PickleError {
+    /// Lease authority or exact repository ownership could not be established.
+    #[error("repository lease denied: {0}")]
+    LeaseDenied(String),
     #[error("invalid digest: {0}")]
     InvalidDigest(String),
     #[error("blob not found: {0}")]
@@ -565,6 +790,72 @@ pub enum PickleError {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn repository_lease_generation_survives_catalogue_reload() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("catalogue.json");
+        let catalog: ManifestCatalog = serde_json::from_value(serde_json::json!({
+            "manifests": [], "tags": [], "layer_locations": [],
+            "repository_owners": {"rbtest-run1/web": "run1"}
+        }))
+        .unwrap();
+        catalog.persist_to(&path).unwrap();
+        let reloaded = ManifestCatalog::load_from(&path).unwrap();
+        assert_eq!(
+            serde_json::to_value(reloaded).unwrap()["repository_owners"]["rbtest-run1/web"],
+            "run1"
+        );
+    }
+
+    #[test]
+    fn repository_generation_refuses_stale_cleanup_and_unowned_metadata() {
+        let mut catalog = ManifestCatalog::default();
+        catalog.claim_repository("rbtest-run1/web", "run1").unwrap();
+        catalog.claim_repository("rbtest-run1/web", "run1").unwrap();
+        assert!(catalog.claim_repository("rbtest-run1/web", "run2").is_err());
+        assert!(
+            catalog
+                .retire_leased_repository("rbtest-run1/web", "run2")
+                .is_err()
+        );
+        assert_eq!(catalog.repository_owners["rbtest-run1/web"], "run1");
+        catalog
+            .retire_leased_repository("rbtest-run1/web", "run1")
+            .unwrap();
+        catalog
+            .retire_leased_repository("rbtest-run1/web", "run1")
+            .unwrap();
+        catalog.claim_repository("rbtest-run1/web", "run2").unwrap();
+        assert!(
+            catalog
+                .retire_leased_repository("rbtest-run1/web", "run1")
+                .is_err()
+        );
+        assert_eq!(catalog.repository_owners["rbtest-run1/web"], "run2");
+        catalog.apply_manifest_commit(&ManifestCommit {
+            observed_gc_generation: 0,
+            manifest: test_manifest("rbtest-legacy/web", "a"),
+            tag: "latest".into(),
+            holder_nodes: BTreeSet::from([1]),
+        });
+        assert!(
+            catalog
+                .claim_repository("rbtest-legacy/web", "run1")
+                .is_err()
+        );
+        assert!(
+            catalog
+                .retire_leased_repository("rbtest-legacy/web", "run1")
+                .is_err()
+        );
+        assert!(
+            catalog
+                .get_manifest_by_tag("rbtest-legacy/web", "latest")
+                .is_some()
+        );
+        assert!(catalog.claim_repository("ordinary", "run1").is_err());
+    }
 
     /// L10 regression: the catalog used to be `default()` on every
     /// boot, so image metadata evaporated on restart.
@@ -678,6 +969,7 @@ mod tests {
         // Two nodes hold the layer, so holder bookkeeping alone would
         // approve a deletion — but the manifest still references it.
         catalog.apply_manifest_commit(&ManifestCommit {
+            observed_gc_generation: 0,
             manifest,
             tag: "latest".to_string(),
             holder_nodes: BTreeSet::from([1, 2]),
@@ -697,6 +989,41 @@ mod tests {
             catalog.layer_holders(layer.as_str()),
             BTreeSet::from([1, 2])
         );
+    }
+
+    #[test]
+    fn gc_reapproval_preserves_the_last_holder_and_rechecks_new_references() {
+        let mut catalog = ManifestCatalog::default();
+        let manifest = test_manifest("ordinary", "mfst1");
+        let layer = manifest.layers[0].digest.clone();
+        catalog.apply_update_locations(&UpdateLayerLocations {
+            updates: vec![(layer.clone(), BTreeSet::from([1, 2]))],
+        });
+        let report = GcReport {
+            node_id: 1,
+            deleted_layers: vec![layer.clone()],
+        };
+        assert_eq!(catalog.apply_gc_report(&report), vec![layer.clone()]);
+        // Simulate restart after approval but before physical deletion.
+        let mut catalog: ManifestCatalog =
+            serde_json::from_slice(&serde_json::to_vec(&catalog).unwrap()).unwrap();
+        assert_eq!(catalog.apply_gc_report(&report), vec![layer.clone()]);
+        assert!(
+            catalog
+                .apply_gc_report(&GcReport {
+                    node_id: 2,
+                    deleted_layers: vec![layer.clone()]
+                })
+                .is_empty()
+        );
+        catalog.apply_manifest_commit(&ManifestCommit {
+            observed_gc_generation: 0,
+            manifest,
+            tag: "latest".into(),
+            holder_nodes: BTreeSet::from([2]),
+        });
+        assert!(catalog.apply_gc_report(&report).is_empty());
+        assert_eq!(catalog.layer_holders(layer.as_str()), BTreeSet::from([2]));
     }
 
     #[test]
@@ -806,6 +1133,71 @@ mod tests {
         }
     }
 
+    #[test]
+    fn repository_retirement_preserves_shared_references_and_unpins_exclusive_orphans() {
+        let mut catalog = ManifestCatalog::default();
+        let mut ordinary = test_manifest("ordinary", "a");
+        let mut owned = ordinary.clone();
+        owned.repository = "rbtest-run1/web".into();
+        let unique = test_manifest("rbtest-run1/web", "b");
+        ordinary.signature = Some(ImageSignature {
+            method: SigningMethod::ExternalKey {
+                key_id: "test".into(),
+            },
+            signature: "signature".into(),
+            verification_material: VerificationMaterial::PublicKey(vec![1]),
+            signed_at: std::time::SystemTime::UNIX_EPOCH,
+        });
+        for (manifest, tag) in [
+            (ordinary.clone(), "latest"),
+            (owned, "shared"),
+            (unique.clone(), "unique"),
+        ] {
+            catalog.apply_manifest_commit(&ManifestCommit {
+                observed_gc_generation: 0,
+                manifest,
+                tag: tag.into(),
+                holder_nodes: BTreeSet::from([1]),
+            });
+        }
+        // Digest-addressed publication uses a reference containing a colon.
+        catalog.apply_manifest_commit(&ManifestCommit {
+            observed_gc_generation: 0,
+            manifest: unique.clone(),
+            tag: unique.digest.as_str().into(),
+            holder_nodes: BTreeSet::from([1]),
+        });
+        catalog.retire_repository("rbtest-run1/web");
+        assert!(catalog.tags_for_repository("rbtest-run1/web").is_empty());
+        assert!(
+            catalog
+                .get_repository_manifest("rbtest-run1/web", unique.digest.as_str())
+                .is_none()
+        );
+        assert!(
+            catalog
+                .get_manifest_by_tag("ordinary", "latest")
+                .unwrap()
+                .signature
+                .is_some()
+        );
+        let all = catalog.referenced_digest_set();
+        let unique_digest = unique.digest.clone();
+        assert!(!all.contains(unique_digest.as_str()));
+        let shared_digest = ordinary.digest.clone();
+        let approved = catalog.apply_gc_report(&GcReport {
+            node_id: 1,
+            deleted_layers: vec![unique_digest.clone(), shared_digest],
+        });
+        assert_eq!(approved, vec![unique_digest]);
+        let saved = catalog.clone();
+        catalog.retire_repository("rbtest-run1/web");
+        assert_eq!(
+            serde_json::to_value(&catalog).unwrap(),
+            serde_json::to_value(saved).unwrap()
+        );
+    }
+
     fn test_manifest(repo: &str, digest_suffix: &str) -> ImageManifest {
         ImageManifest {
             digest: test_digest(digest_suffix),
@@ -818,6 +1210,56 @@ mod tests {
             pushed_by: 1,
             signature: None,
         }
+    }
+
+    #[test]
+    fn repository_views_preserve_shared_holders_without_other_repository_metadata() {
+        let mut catalog = ManifestCatalog::default();
+        for (repository, digest, holder) in [
+            ("rbtest-a/web", "shared", 1),
+            ("ordinary", "shared", 2),
+            ("rbtest-b/web", "other", 3),
+        ] {
+            catalog.apply_manifest_commit(&ManifestCommit {
+                observed_gc_generation: 0,
+                manifest: test_manifest(repository, digest),
+                tag: "latest".into(),
+                holder_nodes: BTreeSet::from([holder]),
+            });
+        }
+        catalog
+            .repository_owners
+            .insert("rbtest-a/web".into(), "a".into());
+        catalog
+            .repository_owners
+            .insert("rbtest-b/web".into(), "b".into());
+        let view = catalog.repository_view("rbtest-a/web");
+        assert_eq!(view.manifests.len(), 1);
+        assert_eq!(view.tags.len(), 1);
+        assert_eq!(
+            view.repository_owners,
+            BTreeMap::from([("rbtest-a/web".into(), "a".into())])
+        );
+        assert!(view.get_manifest_by_tag("ordinary", "latest").is_none());
+        assert!(view.get_manifest_by_tag("rbtest-b/web", "latest").is_none());
+        assert!(
+            !view
+                .layer_locations
+                .iter()
+                .any(|(digest, _)| digest == test_digest("other").as_str())
+        );
+        assert_eq!(
+            view.layer_holders(test_digest("shared").as_str()),
+            BTreeSet::from([1, 2])
+        );
+        assert_eq!(catalog.stored_sizes("rbtest-a/web"), (31744, 3 * 31744));
+        let empty = catalog.repository_view("absent");
+        assert!(
+            empty.manifests.is_empty()
+                && empty.tags.is_empty()
+                && empty.layer_locations.is_empty()
+                && empty.repository_owners.is_empty()
+        );
     }
 
     #[test]
@@ -859,6 +1301,7 @@ mod tests {
         let m = test_manifest("myapp", "mfst1");
 
         catalog.apply_manifest_commit(&ManifestCommit {
+            observed_gc_generation: 0,
             manifest: m.clone(),
             tag: "latest".to_string(),
             holder_nodes: BTreeSet::from([1, 2]),
@@ -885,6 +1328,7 @@ mod tests {
         let manifest = test_manifest("myapp", "mfst1");
 
         let commit = ManifestCommit {
+            observed_gc_generation: 0,
             manifest: manifest.clone(),
             tag: "latest".to_string(),
             holder_nodes: BTreeSet::from([1, 2]),
@@ -902,6 +1346,7 @@ mod tests {
 
         let m1 = test_manifest("myapp", "mfst1");
         catalog.apply_manifest_commit(&ManifestCommit {
+            observed_gc_generation: 0,
             manifest: m1.clone(),
             tag: "latest".to_string(),
             holder_nodes: BTreeSet::from([1]),
@@ -909,6 +1354,7 @@ mod tests {
 
         let m2 = test_manifest("myapp", "mfst2");
         catalog.apply_manifest_commit(&ManifestCommit {
+            observed_gc_generation: 0,
             manifest: m2.clone(),
             tag: "latest".to_string(),
             holder_nodes: BTreeSet::from([1]),
@@ -924,11 +1370,13 @@ mod tests {
         let m = test_manifest("myapp", "mfst1");
 
         catalog.apply_manifest_commit(&ManifestCommit {
+            observed_gc_generation: 0,
             manifest: m.clone(),
             tag: "latest".to_string(),
             holder_nodes: BTreeSet::from([1]),
         });
         catalog.apply_manifest_commit(&ManifestCommit {
+            observed_gc_generation: 0,
             manifest: m,
             tag: "v1.0".to_string(),
             holder_nodes: BTreeSet::from([1]),
@@ -941,11 +1389,122 @@ mod tests {
     }
 
     #[test]
+    fn identical_manifests_keep_repository_ownership_through_retirement() {
+        let mut catalog = ManifestCatalog::default();
+        let ordinary = test_manifest("production/app", "shared-manifest");
+        let mut leased = ordinary.clone();
+        leased.repository = "rbtest-owned/app".into();
+        for manifest in [ordinary.clone(), leased] {
+            catalog.apply_manifest_commit(&ManifestCommit {
+                observed_gc_generation: 0,
+                manifest,
+                tag: "latest".into(),
+                holder_nodes: BTreeSet::from([1]),
+            });
+        }
+        assert_eq!(catalog.manifests.len(), 2);
+        for repository in ["production/app", "rbtest-owned/app"] {
+            let manifest = catalog.get_manifest_by_tag(repository, "latest").unwrap();
+            assert_eq!(manifest.repository, repository);
+            assert_eq!(manifest.tags, BTreeSet::from(["latest".into()]));
+        }
+        // An operator/test tag deletion must retire only its repository's row.
+        catalog.apply_delete_tag(&DeleteTag {
+            repository: "rbtest-owned/app".into(),
+            tag: "latest".into(),
+        });
+        assert_eq!(catalog.manifests.len(), 1);
+        let retained = catalog
+            .get_manifest_by_tag("production/app", "latest")
+            .unwrap();
+        assert_eq!(retained.repository, "production/app");
+        assert_eq!(retained.tags, BTreeSet::from(["latest".into()]));
+        assert!(
+            catalog
+                .get_manifest_by_tag("rbtest-owned/app", "latest")
+                .is_none()
+        );
+        assert!(
+            catalog
+                .apply_gc_report(&GcReport {
+                    node_id: 1,
+                    deleted_layers: ordinary.referenced_digests().into_iter().cloned().collect(),
+                })
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn moving_a_tag_preserves_the_verified_digest_in_its_repository() {
+        let mut catalog = ManifestCatalog::default();
+        let original = test_manifest("one", "original");
+        let mut other = original.clone();
+        other.repository = "two".into();
+        for manifest in [original.clone(), other, test_manifest("one", "replacement")] {
+            catalog.apply_manifest_commit(&ManifestCommit {
+                observed_gc_generation: 0,
+                manifest,
+                tag: "latest".into(),
+                holder_nodes: BTreeSet::from([1]),
+            });
+        }
+        assert_eq!(catalog.manifests.len(), 3);
+        assert!(
+            catalog
+                .get_repository_manifest("one", original.digest.as_str())
+                .unwrap()
+                .tags
+                .is_empty()
+        );
+        assert_eq!(
+            catalog.get_manifest_by_tag("two", "latest").unwrap().digest,
+            original.digest
+        );
+        assert_ne!(
+            catalog.get_manifest_by_tag("one", "latest").unwrap().digest,
+            original.digest
+        );
+    }
+
+    #[test]
+    fn content_signatures_survive_repository_copies_and_tag_refresh() {
+        let mut catalog = ManifestCatalog::default();
+        let original = test_manifest("one", "signed");
+        for repository in ["one", "two", "three", "one"] {
+            let mut manifest = original.clone();
+            manifest.repository = repository.into();
+            catalog.apply_manifest_commit(&ManifestCommit {
+                observed_gc_generation: 0,
+                manifest,
+                tag: "latest".into(),
+                holder_nodes: BTreeSet::from([1]),
+            });
+            if repository == "two" {
+                assert!(catalog.apply_attach_signature(&AttachSignature {
+                    manifest_digest: original.digest.clone(),
+                    signature: test_signature(),
+                }));
+            }
+        }
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("catalog.json");
+        catalog.persist_to(&path).unwrap();
+        let recovered = ManifestCatalog::load_from(&path).unwrap();
+        assert_eq!(recovered.manifests.len(), 3);
+        for repository in ["one", "two", "three"] {
+            let manifest = recovered.get_manifest_by_tag(repository, "latest").unwrap();
+            assert_eq!(manifest.repository, repository);
+            assert!(manifest.signature.is_some());
+        }
+    }
+
+    #[test]
     fn manifest_catalog_layer_holders() {
         let mut catalog = ManifestCatalog::default();
         let m = test_manifest("myapp", "mfst1");
 
         catalog.apply_manifest_commit(&ManifestCommit {
+            observed_gc_generation: 0,
             manifest: m.clone(),
             tag: "latest".to_string(),
             holder_nodes: BTreeSet::from([1, 2, 3]),
@@ -982,6 +1541,7 @@ mod tests {
         let m = test_manifest("myapp", "mfst1");
 
         catalog.apply_manifest_commit(&ManifestCommit {
+            observed_gc_generation: 0,
             manifest: m.clone(),
             tag: "latest".to_string(),
             holder_nodes: BTreeSet::from([1]),
@@ -1002,11 +1562,13 @@ mod tests {
         let m = test_manifest("myapp", "mfst1");
 
         catalog.apply_manifest_commit(&ManifestCommit {
+            observed_gc_generation: 0,
             manifest: m.clone(),
             tag: "latest".to_string(),
             holder_nodes: BTreeSet::from([1]),
         });
         catalog.apply_manifest_commit(&ManifestCommit {
+            observed_gc_generation: 0,
             manifest: m.clone(),
             tag: "v1.0".to_string(),
             holder_nodes: BTreeSet::from([1]),
@@ -1050,6 +1612,7 @@ mod tests {
     #[test]
     fn manifest_commit_serde_round_trip() {
         let commit = ManifestCommit {
+            observed_gc_generation: 0,
             manifest: test_manifest("myapp", "mfst1"),
             tag: "latest".to_string(),
             holder_nodes: BTreeSet::from([1, 2]),
@@ -1120,6 +1683,7 @@ mod tests {
         let mut catalog = ManifestCatalog::default();
         let m = test_manifest("myapp", "mfst1");
         catalog.apply_manifest_commit(&ManifestCommit {
+            observed_gc_generation: 0,
             manifest: m.clone(),
             tag: "latest".to_string(),
             holder_nodes: BTreeSet::from([1]),

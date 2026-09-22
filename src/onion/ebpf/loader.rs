@@ -41,8 +41,14 @@ pub fn missing_names(required: &[&'static str], present: &[String]) -> Vec<&'sta
         .collect()
 }
 
+#[cfg(feature = "ebpf")]
+#[path = "ownership.rs"]
+mod ownership;
+
 /// Handle to loaded eBPF programs.
 pub struct OnionEbpf {
+    #[cfg(feature = "ebpf")]
+    ownership: Option<ownership::Ownership>,
     _cgroup_path: PathBuf,
     #[cfg(feature = "ebpf")]
     _connect_link_id: Option<aya::programs::cgroup_sock_addr::CgroupSockAddrLinkId>,
@@ -61,6 +67,27 @@ pub struct OnionEbpf {
 }
 
 impl OnionEbpf {
+    /// Open persistent maps and cgroup links under an exclusive recovery claim.
+    /// Dropping this handle preserves enforcement. Both ownership directories
+    /// must have existing parents; the pin directory must reside on bpffs.
+    #[cfg(feature = "ebpf")]
+    pub fn load_owned(
+        program_directory: Option<&Path>,
+        cgroup_path: &Path,
+        state_directory: &Path,
+        pin_directory: &Path,
+    ) -> Result<Self, OnionError> {
+        ownership::load(
+            program_directory,
+            cgroup_path,
+            state_directory,
+            pin_directory,
+        )
+        .map_err(|error| OnionError::EbpfLoadFailed {
+            reason: error.to_string(),
+        })
+    }
+
     /// Load and attach the connect eBPF programs.
     ///
     /// Loads `onion_connect.bpf.o` from `program_dir`, validates that
@@ -169,6 +196,7 @@ impl OnionEbpf {
             _sendmsg4_link_id: sendmsg4_link_id,
             _sendmsg6_link_id: sendmsg6_link_id,
             bpf,
+            ownership: None,
             attached: true,
             connect6_attached,
             sendmsg4_attached,
@@ -227,27 +255,82 @@ impl OnionEbpf {
 
     /// Check if eBPF programs are currently attached.
     pub fn is_attached(&self) -> bool {
+        #[cfg(feature = "ebpf")]
+        if let Some(owner) = &self.ownership {
+            return owner.attached(0);
+        }
         self.attached
     }
 
     /// Whether the IPv6 connect hook is attached. Without it, an egress
     /// allowlist is decorative — anything dual-stack bypasses it.
     pub fn connect6_attached(&self) -> bool {
+        #[cfg(feature = "ebpf")]
+        if let Some(owner) = &self.ownership {
+            return owner.attached(1);
+        }
         self.connect6_attached
     }
 
     /// Whether unconnected IPv4 UDP sends are covered by policy.
     pub fn sendmsg4_attached(&self) -> bool {
+        #[cfg(feature = "ebpf")]
+        if let Some(owner) = &self.ownership {
+            return owner.attached(2);
+        }
         self.sendmsg4_attached
     }
 
     /// Whether unconnected IPv6 UDP sends are covered by policy.
     pub fn sendmsg6_attached(&self) -> bool {
+        #[cfg(feature = "ebpf")]
+        if let Some(owner) = &self.ownership {
+            return owner.attached(3);
+        }
         self.sendmsg6_attached
     }
 
-    /// Detach eBPF programs from the cgroup.
-    pub fn detach(&mut self) {
+    /// Explicitly remove this owner's persistent links and maps.
+    /// The caller must first retire workloads using the data path. Failures
+    /// retain the manifest and any remaining pins for diagnosis and retry.
+    #[cfg(feature = "ebpf")]
+    pub fn retire_owned(&mut self) -> Result<(), OnionError> {
+        self.ownership
+            .as_mut()
+            .ok_or_else(|| OnionError::EbpfLoadFailed {
+                reason: "kernel data path has no persistent owner".into(),
+            })?
+            .detach()
+            .map_err(|error| OnionError::EbpfLoadFailed {
+                reason: error.to_string(),
+            })
+    }
+
+    /// Resume explicit terminal removal after an interrupted owner retirement.
+    /// The caller must first stop or isolate every workload using this path.
+    /// A retired ownership directory cannot be used to load new programs.
+    #[cfg(feature = "ebpf")]
+    pub fn retire_owned_state(
+        cgroup_path: &Path,
+        state_directory: &Path,
+        pin_directory: &Path,
+    ) -> Result<(), OnionError> {
+        ownership::retire(cgroup_path, state_directory, pin_directory).map_err(|error| {
+            OnionError::EbpfLoadFailed {
+                reason: error.to_string(),
+            }
+        })
+    }
+
+    /// Detach ephemeral eBPF programs from the cgroup.
+    /// Persistent paths require explicit, fallible `retire_owned` instead.
+    pub fn detach(&mut self) -> Result<(), OnionError> {
+        #[cfg(feature = "ebpf")]
+        if self.ownership.is_some() {
+            return Err(OnionError::EbpfLoadFailed {
+                reason: "persistent kernel ownership requires explicit retirement".into(),
+            });
+        }
         #[cfg(feature = "ebpf")]
         {
             Self::detach_program(&mut self.bpf, "onion_connect", self._connect_link_id.take());
@@ -271,6 +354,7 @@ impl OnionEbpf {
         self.connect6_attached = false;
         self.sendmsg4_attached = false;
         self.sendmsg6_attached = false;
+        Ok(())
     }
 
     #[cfg(feature = "ebpf")]

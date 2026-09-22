@@ -81,7 +81,10 @@ pub async fn check_and_relieve(
                 result.exported = export_result.files_exported > 0;
                 result.files_exported = export_result.files_exported;
             }
-            Err(error) => result.export_error = Some(error.to_string()),
+            Err(error) => {
+                result.export_error = Some(error.to_string());
+                return result;
+            }
         }
     }
 
@@ -130,7 +133,8 @@ pub async fn check_and_relieve(
             // Only prune if this exact content has been exported (or no export
             // dest configured). Keyed by durable id, so pruning never deletes a
             // reused-filename file whose new bytes haven't shipped yet.
-            let is_exported = export_dest.is_none() || checkpoint.contains_file(path);
+            let is_exported = export_dest
+                .is_none_or(|destination| checkpoint.contains_file(path, destination, node_id));
 
             if (past_retention || over_pressure)
                 && is_exported

@@ -24,6 +24,9 @@ pub struct LocalContext {
     pub token: String,
     /// Absolute path to the cluster's public CA certificate.
     pub ca_cert: PathBuf,
+    /// Explicit host forwards; absent legacy metadata never implies guest reachability.
+    #[serde(default)]
+    pub service_endpoints: crate::bun::capabilities::ServiceEndpoints,
 }
 
 impl LocalContext {
@@ -111,6 +114,7 @@ impl LocalContext {
             Some(token.unwrap_or(&self.token)),
             &ca,
         )
+        .map(|client| client.with_service_endpoints(self.service_endpoints.clone()))
     }
 
     fn validate(&self) -> Result<(), RelishError> {
@@ -197,6 +201,7 @@ mod tests {
             endpoint: "https://127.0.0.1:19117".to_string(),
             token: "rbrg_private".to_string(),
             ca_cert: root.join("root-ca.crt"),
+            service_endpoints: Default::default(),
         }
     }
 

@@ -2,7 +2,7 @@
 
 use crossterm::event::KeyEvent;
 
-use crate::bun::agent::{CouncilStatus, InstanceStatus, JobStatus, NodeStatus};
+use crate::bun::agent::{ClusterInstanceStatus, CouncilStatus, JobStatus, NodeStatus};
 use crate::bun::events::ClusterEvent;
 use crate::mayo::rollup::MetricsQueryResult;
 use crate::wrapper::types::RouteInfo;
@@ -30,10 +30,10 @@ pub enum Msg {
 /// Results from HTTP data providers.
 #[derive(Debug)]
 pub enum DataUpdate {
-    Status(Result<Vec<InstanceStatus>, ProviderError>),
+    Status(Result<Vec<ClusterInstanceStatus>, ProviderError>),
     Nodes(Result<Vec<NodeStatus>, ProviderError>),
     Council(Result<CouncilStatus, ProviderError>),
-    Alerts(Result<Vec<serde_json::Value>, ProviderError>),
+    Alerts(Result<Vec<crate::mayo::alert::AlertStatus>, ProviderError>),
     Routes(Result<Vec<RouteInfo>, ProviderError>),
     Jobs(Result<Vec<JobStatus>, ProviderError>),
     EventsSeed(Result<Vec<ClusterEvent>, ProviderError>),

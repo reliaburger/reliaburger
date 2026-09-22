@@ -8,7 +8,7 @@
 
 use std::collections::{BTreeMap, VecDeque};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use serde::{Deserialize, Serialize};
@@ -122,6 +122,9 @@ pub struct DeployOperation {
     pub started_at: u64,
     pub phase_changed_at: u64,
     pub finished_at: Option<u64>,
+    /// Time a caller requested cooperative cancellation, if any.
+    #[serde(default)]
+    pub cancellation_requested_at: Option<u64>,
     pub targets: Vec<DeployTarget>,
     pub current_target: Option<DeployTarget>,
     pub message: String,
@@ -145,11 +148,21 @@ pub struct ActiveDeployOperations {
 pub enum StartDeployOperationError {
     #[error("too many active deploy operations ({limit})")]
     ActiveLimit { limit: usize },
-    #[error("target {target:?} is already being changed by {operation_id}")]
+    #[error(
+        "target {target:?} is already being changed by {operation_id} (age {age_secs}s, phase {phase:?})"
+    )]
     TargetBusy {
         target: DeployTarget,
         operation_id: DeployOperationId,
+        age_secs: u64,
+        phase: DeployOperationPhase,
     },
+}
+
+#[derive(Debug, Clone, Default)]
+struct DeployCancellation {
+    requested: tokio_util::sync::CancellationToken,
+    observed: Arc<AtomicBool>,
 }
 
 /// In-memory active and bounded terminal records.
@@ -158,6 +171,7 @@ pub struct DeployOperationStore {
     active: BTreeMap<DeployOperationId, DeployOperation>,
     history: VecDeque<DeployOperation>,
     history_limit: usize,
+    cancellations: BTreeMap<DeployOperationId, DeployCancellation>,
 }
 
 impl DeployOperationStore {
@@ -166,6 +180,7 @@ impl DeployOperationStore {
             active: BTreeMap::new(),
             history: VecDeque::new(),
             history_limit,
+            cancellations: BTreeMap::new(),
         }
     }
 
@@ -183,7 +198,7 @@ impl DeployOperationStore {
         targets.sort();
         targets.dedup();
         for target in &targets {
-            if let Some((operation_id, _)) = self.active.iter().find(|(_, operation)| {
+            if let Some((operation_id, operation)) = self.active.iter().find(|(_, operation)| {
                 operation.targets.iter().any(|active| {
                     active.name == target.name && active.namespace == target.namespace
                 })
@@ -191,6 +206,8 @@ impl DeployOperationStore {
                 return Err(StartDeployOperationError::TargetBusy {
                     target: target.clone(),
                     operation_id: operation_id.clone(),
+                    age_secs: now.saturating_sub(operation.started_at),
+                    phase: operation.phase,
                 });
             }
         }
@@ -203,6 +220,7 @@ impl DeployOperationStore {
                 started_at: now,
                 phase_changed_at: now,
                 finished_at: None,
+                cancellation_requested_at: None,
                 targets,
                 current_target: None,
                 message: "deploy accepted".to_string(),
@@ -239,6 +257,7 @@ impl DeployOperationStore {
         let Some(mut operation) = self.active.remove(id) else {
             return false;
         };
+        self.cancellations.remove(id);
         operation.phase = DeployOperationPhase::Finished;
         operation.outcome = Some(outcome);
         operation.phase_changed_at = now;
@@ -287,14 +306,39 @@ impl DeployOperationTracker {
         config: &Config,
     ) -> Result<DeployOperationHandle, StartDeployOperationError> {
         let id = DeployOperationId::next();
-        self.store
-            .write()
-            .await
-            .start(id.clone(), targets(config), unix_seconds())?;
+        let cancellation = {
+            let mut store = self.store.write().await;
+            store.start(id.clone(), targets(config), unix_seconds())?;
+            store.cancellations.entry(id.clone()).or_default().clone()
+        };
         Ok(DeployOperationHandle {
             id,
             tracker: self.clone(),
+            cancellation,
         })
+    }
+
+    /// Request cooperative cancellation without releasing target ownership.
+    pub async fn request_cancellation(&self, id: &DeployOperationId) -> Option<DeployOperation> {
+        let mut store = self.store.write().await;
+        if let Some(operation) = store.active.get_mut(id) {
+            operation
+                .cancellation_requested_at
+                .get_or_insert_with(unix_seconds);
+            let operation = operation.clone();
+            store
+                .cancellations
+                .entry(id.clone())
+                .or_default()
+                .requested
+                .cancel();
+            return Some(operation);
+        }
+        store
+            .history
+            .iter()
+            .find(|operation| operation.id == *id)
+            .cloned()
     }
 
     pub async fn snapshot(&self) -> DeployOperationSnapshot {
@@ -307,11 +351,32 @@ impl DeployOperationTracker {
 pub struct DeployOperationHandle {
     id: DeployOperationId,
     tracker: DeployOperationTracker,
+    cancellation: DeployCancellation,
 }
 
 impl DeployOperationHandle {
     pub fn id(&self) -> &DeployOperationId {
         &self.id
+    }
+
+    /// Observe a request at a boundary where the worker can stop safely.
+    pub(crate) fn cancellation_requested(&self) -> bool {
+        if self.cancellation.requested.is_cancelled() {
+            self.cancellation.observed.store(true, Ordering::Release);
+            return true;
+        }
+        false
+    }
+
+    /// Interrupt a read-only health wait when cancellation is requested.
+    pub(crate) async fn cancelled(&self) {
+        self.cancellation.requested.cancelled().await;
+        self.cancellation.observed.store(true, Ordering::Release);
+    }
+
+    /// Whether the worker actually acted on cancellation before it finished.
+    pub(crate) fn cancellation_observed(&self) -> bool {
+        self.cancellation.observed.load(Ordering::Acquire)
     }
 
     pub async fn advance(
@@ -425,6 +490,32 @@ mod tests {
             )
             .unwrap_err();
         assert!(error.to_string().contains("deploy-100"));
+        assert!(error.to_string().contains("age 1s"));
+        assert!(error.to_string().contains("phase Accepted"));
+    }
+
+    #[tokio::test]
+    async fn cancellation_request_keeps_the_operation_active_and_idempotent() {
+        let tracker = DeployOperationTracker::default();
+        let config = Config::parse("[app.web]\nimage = 'web:v1'\n").unwrap();
+        let operation = tracker.start(&config).await.unwrap();
+        let first = tracker
+            .request_cancellation(operation.id())
+            .await
+            .expect("active operation not found");
+        let second = tracker.request_cancellation(operation.id()).await.unwrap();
+        assert_eq!(first, second);
+        assert!(first.outcome.is_none());
+        assert!(
+            tracker.start(&config).await.is_err(),
+            "a cancellation request released ownership"
+        );
+        operation
+            .finish(DeployOperationOutcome::Cancelled, "cancelled after cleanup")
+            .await;
+        let terminal = tracker.request_cancellation(operation.id()).await.unwrap();
+        assert_eq!(terminal.outcome, Some(DeployOperationOutcome::Cancelled));
+        assert!(tracker.start(&config).await.is_ok());
     }
 
     #[test]

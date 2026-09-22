@@ -427,7 +427,9 @@ async fn resource_exhaustion_degrades_gracefully(context: TestContext) -> Result
     Ok(())
 }
 
-async fn node_death_during_deploy_ends_clean(context: TestContext) -> Result<(), String> {
+async fn node_death_during_deploy_ends_clean(
+    context: TestContext,
+) -> crate::testkit::registry::CaseResult {
     let app = "chaos-c5-deploy";
     context
         .apply(&container_spec(&context, app, 4, false))
@@ -538,14 +540,14 @@ async fn node_death_during_deploy_ends_clean(context: TestContext) -> Result<(),
                 .find(|operation| operation.id == observed_operation)
                 .and_then(|entry| entry.outcome);
             if outcome == Some(DeployOperationOutcome::Unknown) || outcome.is_none() {
-                return Err(format!(
+                return Err((format!(
                     "deploy {observed_operation} ended without a defined terminal outcome: {outcome:?}"
-                ));
+                )).into());
             }
             return Ok(());
         }
         if context.deadline.remaining().is_zero() {
-            return Err("deploy remained active after node recovery".to_string());
+            return Err(("deploy remained active after node recovery".to_string()).into());
         }
         tokio::time::sleep(Duration::from_millis(500)).await;
     }

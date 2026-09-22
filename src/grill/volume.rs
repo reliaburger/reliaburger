@@ -4,6 +4,8 @@
 //! filesystem that enforces ENOSPC at the kernel level. On macOS and other
 //! platforms, size limits are soft-enforced with periodic checks and warnings.
 
+mod owned;
+
 use std::path::{Path, PathBuf};
 
 use crate::config::types::parse_resource_value;
@@ -11,6 +13,9 @@ use crate::config::types::parse_resource_value;
 /// Errors from volume operations.
 #[derive(Debug, thiserror::Error)]
 pub enum VolumeError {
+    /// Ownership or observed storage no longer permits a destructive operation.
+    #[error("test storage ownership: {0}")]
+    Ownership(String),
     #[error("failed to create volume at {path}: {reason}")]
     CreateFailed { path: String, reason: String },
     #[error("invalid size value: {0}")]
@@ -21,10 +26,15 @@ pub enum VolumeError {
     Io(#[from] std::io::Error),
 }
 
+#[cfg(test)]
+type ProvisionFault = fn(&Path, &Path) -> Result<(), VolumeError>;
+
 /// Manages volume creation and size enforcement.
 pub struct VolumeManager {
     /// Base directory for managed volumes.
     volumes_dir: PathBuf,
+    #[cfg(test)]
+    before_test_provision: Option<ProvisionFault>,
 }
 
 impl VolumeManager {
@@ -32,7 +42,26 @@ impl VolumeManager {
     pub fn new(volumes_dir: impl Into<PathBuf>) -> Self {
         Self {
             volumes_dir: volumes_dir.into(),
+            #[cfg(test)]
+            before_test_provision: None,
         }
+    }
+
+    /// Claim and provision disposable test storage before runtime creation.
+    /// The caller must serialise this with deployment and lease retirement.
+    pub fn prepare_test_storage(
+        &self,
+        namespace: &str,
+        app: &str,
+        spec: &crate::config::app::AppSpec,
+    ) -> Result<(), VolumeError> {
+        owned::prepare(self, namespace, app, spec)
+    }
+
+    /// Delete only journal-owned test storage after every workload has stopped.
+    /// Ordinary application namespaces refuse before any filesystem mutation.
+    pub fn retire_test_storage(&self, namespace: &str, app: &str) -> Result<(), VolumeError> {
+        owned::retire(self, namespace, app)
     }
 
     /// Create a managed volume for an app.
@@ -170,7 +199,10 @@ impl VolumeManager {
         for ns_entry in namespaces.flatten() {
             let ns_name = ns_entry.file_name().to_string_lossy().into_owned();
             // Skip bookkeeping dirs (.snapshots, .config).
-            if ns_name.starts_with('.') || !ns_entry.path().is_dir() {
+            if ns_name.starts_with('.')
+                || crate::testkit::lease::valid_test_namespace(&ns_name)
+                || !ns_entry.path().is_dir()
+            {
                 continue;
             }
             let Ok(app_dirs) = std::fs::read_dir(ns_entry.path()) else {

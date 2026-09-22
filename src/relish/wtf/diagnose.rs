@@ -161,6 +161,16 @@ fn check_council(inputs: &WtfInputs, report: &mut WtfReport) {
         });
         return;
     }
+    if council.member_count == 0 || inputs.cluster.council.unknown_reason().is_some() {
+        if !report.unknown.iter().any(|item| item.source == "council") {
+            report.unknown.push(WtfUnknown {
+                source: "council".into(),
+                reason: "configured council membership is not known".into(),
+                affected_resource: "council".into(),
+            });
+        }
+        return;
+    }
     let mut healthy = true;
     if council.leader.is_none() {
         healthy = false;
@@ -631,14 +641,32 @@ fn check_certificates(inputs: &WtfInputs, report: &mut WtfReport) {
         if !certificate.automatic_rotation {
             rotation_complete = false;
         }
-        let rotation_unhealthy = matches!(
-            certificate.rotation_state.as_str(),
-            "needs_rotation" | "grace_period" | "expired"
-        );
-        // Short-lived workload leaves are expected to have less than 14 days
-        // remaining. Warn only when their automatic rotation is unhealthy.
+        // Encoded expiry takes precedence over a potentially stale rotation label.
+        if certificate.not_after <= inputs.collected_at {
+            found = true;
+            report.critical.push(WtfFinding {
+                id: "cert-expired".to_string(),
+                title: format!("certificate for {} has expired", certificate.identity),
+                details: vec![format!(
+                    "{} certificate from {} (serial {}) expired at {}; rotation state: {}",
+                    certificate.certificate_kind,
+                    certificate.issuer,
+                    certificate.serial,
+                    certificate.not_after,
+                    certificate.rotation_state
+                )],
+                suggestion: format!(
+                    "renew the certificate for {} and verify its consumer serves the replacement",
+                    certificate.identity
+                ),
+                correlated_events: Vec::new(),
+                affected_resource: format!("identity.{}", certificate.identity),
+            });
+            continue;
+        }
+        // Short-lived leaves are normal only with positive rotation evidence.
         if certificate.not_after > warning_at
-            || (certificate.automatic_rotation && !rotation_unhealthy)
+            || (certificate.automatic_rotation && certificate.rotation_state == "valid")
         {
             continue;
         }
@@ -656,7 +684,7 @@ fn check_certificates(inputs: &WtfInputs, report: &mut WtfReport) {
                 certificate.rotation_state
             )],
             suggestion: format!(
-                "certificate for {} expires soon; rotation should be automatic, so check the CA and rotation state",
+                "renew the certificate for {} and check its CA and consumer rotation state",
                 certificate.identity
             ),
             correlated_events: Vec::new(),
@@ -678,7 +706,9 @@ fn check_certificates(inputs: &WtfInputs, report: &mut WtfReport) {
     if !found && rotation_complete {
         report.ok.push(WtfOk {
             id: "certificates".to_string(),
-            description: "all observed certificates are valid for at least 14 days".to_string(),
+            description:
+                "all observed certificates are currently valid with healthy automatic rotation"
+                    .to_string(),
         });
     }
 }
@@ -768,6 +798,7 @@ mod tests {
                 }),
                 faults: available(Vec::new()),
                 disks: available(vec![DiskObservation {
+                    filesystem_id: None,
                     node_id: "node-1".to_string(),
                     storage_domains: vec!["images".to_string()],
                     used_bytes: 20,
@@ -811,6 +842,53 @@ mod tests {
 
     fn available<T>(value: T) -> Evidence<T> {
         Evidence::available(NOW, value)
+    }
+
+    #[test]
+    fn expired_certificates_are_critical_even_with_a_stale_valid_rotation_label() {
+        for automatic_rotation in [false, true] {
+            let mut inputs = healthy_inputs();
+            inputs.cluster.certificates = available(vec![CertificateObservation {
+                certificate_kind: "workload".into(),
+                identity: "api".into(),
+                issuer: "workload-ca".into(),
+                serial: "01".into(),
+                not_after: NOW,
+                rotation_state: "valid".into(),
+                automatic_rotation,
+            }]);
+            let report = diagnose(&inputs);
+            assert!(
+                report
+                    .critical
+                    .iter()
+                    .any(|finding| finding.id == "cert-expired")
+            );
+            assert!(!report.ok.iter().any(|finding| finding.id == "certificates"));
+        }
+    }
+
+    #[test]
+    fn healthy_short_lived_certificates_do_not_claim_fourteen_days_of_validity() {
+        let mut inputs = healthy_inputs();
+        inputs.cluster.certificates = available(vec![CertificateObservation {
+            certificate_kind: "workload".into(),
+            identity: "api".into(),
+            issuer: "workload-ca".into(),
+            serial: "01".into(),
+            not_after: NOW + 90,
+            rotation_state: "valid".into(),
+            automatic_rotation: true,
+        }]);
+        let report = diagnose(&inputs);
+        assert!(report.critical.is_empty());
+        assert!(report.warnings.is_empty());
+        let evidence = report
+            .ok
+            .iter()
+            .find(|finding| finding.id == "certificates")
+            .unwrap();
+        assert!(!evidence.description.contains("14 days"));
     }
 
     #[test]
@@ -1030,6 +1108,7 @@ mod tests {
             message: "latency budget exhausted".to_string(),
         }]);
         inputs.cluster.disks = available(vec![DiskObservation {
+            filesystem_id: None,
             node_id: "node-1".to_string(),
             storage_domains: vec!["logs".to_string()],
             used_bytes: 96,

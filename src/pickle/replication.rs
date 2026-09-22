@@ -1,9 +1,8 @@
-//! Synchronous replication for Pickle.
+//! Peer replication and background healing for Pickle.
 //!
-//! After a manifest is pushed locally, layers are replicated to N peer
-//! nodes before the Raft commit. Replication uses the same OCI Distribution
-//! API endpoints that clients use, so each peer validates digests and
-//! stores blobs identically.
+//! A committed manifest can still await its configured redundancy. The healer
+//! copies it to peers through the OCI Distribution API, so receiving nodes
+//! validate digests and apply repository ownership before accepting bytes.
 
 use std::collections::BTreeSet;
 use std::time::Duration;
@@ -60,20 +59,6 @@ pub fn select_peers(
     candidates.into_iter().take(count).cloned().collect()
 }
 
-/// Flatten a repository name for peer blob-transfer URLs.
-///
-/// Blob endpoints are content-addressed — the receiving registry
-/// ignores the `{name}` segment entirely — but our axum routes only
-/// match a single path segment, so multi-segment names (`library/
-/// nginx`, `cache/<host>/<repo>`) would 404 on routing alone. Peer
-/// transfers therefore flatten the name. Manifest *blobs* travel over
-/// these URLs like any layer (REG1), but always by digest; the
-/// catalogue itself travels via Raft, so nothing round-trips through
-/// the flattened form.
-pub(crate) fn peer_blob_repo(repository: &str) -> String {
-    repository.replace('/', "-")
-}
-
 /// The result of a replication attempt.
 #[derive(Debug)]
 pub struct ReplicationResult {
@@ -112,7 +97,7 @@ pub async fn check_peer_has_layers(
         let url = format!(
             "{}/v2/{}/blobs/{}",
             peer.base_url,
-            peer_blob_repo(repository),
+            repository,
             digest.as_str()
         );
         let result = tokio::time::timeout(timeout, client.head(&url).send()).await;
@@ -183,11 +168,7 @@ pub async fn replicate_layer_to_peer(
     timeout: Duration,
 ) -> Result<(), PickleError> {
     // Initiate upload
-    let initiate_url = format!(
-        "{}/v2/{}/blobs/uploads/",
-        peer.base_url,
-        peer_blob_repo(repository)
-    );
+    let initiate_url = format!("{}/v2/{}/blobs/uploads/", peer.base_url, repository);
     let resp = tokio::time::timeout(timeout, client.post(&initiate_url).send())
         .await
         .map_err(|_| {
@@ -384,12 +365,13 @@ pub fn plan_heal<'a>(
     candidates
 }
 
-/// What one heal pass did: holder updates to propose to Raft, and the
+/// What one heal pass did: receiving-node confirmations, and the
 /// per-manifest failures (the caller logs them; a failure on one
 /// manifest never aborts the pass).
 #[derive(Debug, Default)]
 pub struct HealOutcome {
-    pub updates: Vec<super::types::UpdateLayerLocations>,
+    /// Images whose local and any successful peer copies were confirmed.
+    pub confirmed_images: Vec<Digest>,
     pub errors: Vec<String>,
 }
 
@@ -399,17 +381,18 @@ pub struct HealOutcome {
 /// `max_per_tick`): first pull any layers this node lacks from a
 /// holder — so manifests pushed to, or cache-filled on, *other* nodes
 /// still gain redundancy — then replicate to peers that lack them.
-/// Returns the holder updates for the caller to propose to Raft.
+/// Every receiving node proposes only its own verified copy to Raft.
 #[allow(clippy::too_many_arguments)]
 pub async fn heal_tick(
     catalog: &super::types::ManifestCatalog,
-    store: &BlobStore,
-    self_node: u64,
+    state: &super::api::PickleState,
     peers: &[Peer],
     redundancy: u32,
     max_per_tick: usize,
     client: &reqwest::Client,
 ) -> HealOutcome {
+    let store = state.store.as_ref();
+    let self_node = state.node_raft_id;
     let config = ReplicationConfig {
         redundancy,
         peer_timeout: Duration::from_secs(30),
@@ -421,60 +404,179 @@ pub async fn heal_tick(
         let mut full_holders = candidate.full_holders;
         let digests: Vec<Digest> = manifest.referenced_digests().into_iter().cloned().collect();
 
-        // Pull-first: become a holder before replicating onward.
-        if !digests.iter().all(|d| store.has_blob(d))
-            && let Err(e) = super::pull::pull_manifest_layers(
-                &digests,
+        let access = match state
+            .admit_repository_write(&manifest.repository, None, None, true)
+            .await
+        {
+            Ok(access) => access,
+            Err(error) => {
+                outcome
+                    .errors
+                    .push(format!("cannot own {}: {error}", manifest.repository));
+                continue;
+            }
+        };
+        let mut pulled = Ok(());
+        for digest in &digests {
+            let holders = catalog.layer_holders(digest.as_str());
+            let store = state.store.clone();
+            let check = digest.clone();
+            match tokio::task::spawn_blocking(move || {
+                store.has_blob(&check) && store.revalidate_blob(&check)
+            })
+            .await
+            {
+                Ok(true) => continue,
+                Ok(false) => {}
+                Err(error) => {
+                    pulled = Err(PickleError::ReplicationFailed(format!(
+                        "cache verification failed: {error}"
+                    )));
+                    break;
+                }
+            }
+            let Some(peer) = peers
+                .iter()
+                .find(|peer| holders.contains(&peer.node_id) && peer.node_id != self_node)
+            else {
+                pulled = Err(PickleError::ReplicationFailed(format!(
+                    "no peer holds layer {digest}"
+                )));
+                break;
+            };
+            if let Err(error) = state
+                .pull_peer_blob_with_access(
+                    peer,
+                    &manifest.repository,
+                    digest,
+                    client,
+                    config.peer_timeout,
+                    Some(access.clone()),
+                )
+                .await
+            {
+                pulled = Err(error);
+                break;
+            }
+        }
+        if let Err(error) = pulled {
+            outcome
+                .errors
+                .push(format!("cannot pull {}: {error}", manifest.repository));
+            continue;
+        }
+        if let Err(error) = state
+            .confirm_image_copy_with_access(
                 &manifest.repository,
-                catalog,
-                peers,
-                store,
-                client,
-                config.peer_timeout,
+                &manifest.digest,
+                Some(access.clone()),
             )
             .await
         {
             outcome
                 .errors
-                .push(format!("cannot pull {}: {e}", manifest.repository));
+                .push(format!("cannot confirm {}: {error}", manifest.repository));
             continue;
         }
-        let self_is_new_holder = full_holders.insert(self_node);
-
-        let mut new_holders: BTreeSet<u64> = BTreeSet::new();
-        if self_is_new_holder {
-            new_holders.insert(self_node);
-        }
-
+        full_holders.insert(self_node);
         let needed = (redundancy as usize).saturating_sub(full_holders.len());
         let targets = select_peers(peers, self_node, &full_holders, needed);
         if !targets.is_empty() {
             match replicate_manifest(manifest, store, &targets, &config, client).await {
-                Ok(result) => new_holders.extend(result.successful_nodes),
-                Err(e) => outcome.errors.push(format!(
-                    "replication of {} failed: {e}",
+                Ok(result) => {
+                    for (node, error) in result.failed_nodes {
+                        outcome
+                            .errors
+                            .push(format!("replication to {node} failed: {error}"));
+                    }
+                    for target in targets
+                        .iter()
+                        .filter(|target| result.successful_nodes.contains(&target.node_id))
+                    {
+                        if let Err(error) = confirm_peer_copy(
+                            target,
+                            &manifest.repository,
+                            &manifest.digest,
+                            client,
+                            config.peer_timeout,
+                        )
+                        .await
+                        {
+                            outcome.errors.push(format!(
+                                "copy confirmation at {} failed: {error}",
+                                target.node_id
+                            ));
+                        }
+                    }
+                }
+                Err(error) => outcome.errors.push(format!(
+                    "replication of {} failed: {error}",
                     manifest.repository
                 )),
             }
         }
-
-        if new_holders.is_empty() {
-            continue;
-        }
-        let updates = digests
-            .iter()
-            .map(|d| {
-                let mut holders = catalog.layer_holders(d.as_str());
-                holders.extend(new_holders.iter().copied());
-                (d.clone(), holders)
-            })
-            .collect();
-        outcome
-            .updates
-            .push(super::types::UpdateLayerLocations { updates });
+        outcome.confirmed_images.push(manifest.digest.clone());
     }
 
     outcome
+}
+
+/// Request proof from the receiving node even when HEAD avoided all uploads.
+/// The client must use the cluster's non-redirecting authenticated transport.
+pub async fn confirm_peer_copy(
+    peer: &Peer,
+    repository: &str,
+    digest: &Digest,
+    client: &reqwest::Client,
+    timeout: Duration,
+) -> Result<super::copy::ImageCopyReceipt, PickleError> {
+    tokio::time::timeout(timeout, async {
+        let url = format!(
+            "{}/v2/{repository}/copies/{}",
+            peer.base_url,
+            digest.as_str()
+        );
+        let mut response = client
+            .post(url)
+            .send()
+            .await
+            .map_err(|error| PickleError::ReplicationFailed(error.to_string()))?;
+        if !response.status().is_success() {
+            return Err(PickleError::ReplicationFailed(format!(
+                "peer {} refused copy confirmation: {}",
+                peer.node_id,
+                response.status()
+            )));
+        }
+        let mut bytes = Vec::new();
+        while let Some(chunk) = response
+            .chunk()
+            .await
+            .map_err(|error| PickleError::ReplicationFailed(error.to_string()))?
+        {
+            if bytes.len().saturating_add(chunk.len()) > 16 * 1024 {
+                return Err(PickleError::ReplicationFailed(
+                    "copy receipt exceeds limit".into(),
+                ));
+            }
+            bytes.extend_from_slice(&chunk);
+        }
+        let receipt: super::copy::ImageCopyReceipt =
+            serde_json::from_slice(&bytes).map_err(|error| {
+                PickleError::ReplicationFailed(format!("invalid copy receipt: {error}"))
+            })?;
+        if receipt.node_id != peer.node_id
+            || receipt.repository != repository
+            || receipt.manifest_digest != *digest
+        {
+            return Err(PickleError::ReplicationFailed(
+                "copy receipt does not match requested storage identity".into(),
+            ));
+        }
+        Ok(receipt)
+    })
+    .await
+    .map_err(|_| PickleError::ReplicationFailed("copy confirmation timed out".into()))?
 }
 
 #[cfg(test)]
@@ -500,6 +602,81 @@ mod tests {
                 base_url: "http://10.0.1.4:5000".to_string(),
             },
         ]
+    }
+
+    #[tokio::test]
+    async fn peer_transfers_preserve_the_repository_namespace() {
+        use axum::{
+            Router,
+            http::StatusCode,
+            routing::{get, post},
+        };
+        let bytes = b"namespace-owned layer";
+        let digest = super::super::store::compute_sha256(bytes);
+        let blob_path = format!("/v2/rbtest-owned/team/web/blobs/{}", digest.as_str());
+        let app = Router::new()
+            .route(
+                "/v2/rbtest-owned/team/web/blobs/uploads/",
+                post(|| async {
+                    (
+                        StatusCode::ACCEPTED,
+                        [("location", "/v2/rbtest-owned/team/web/blobs/uploads/owned")],
+                    )
+                }),
+            )
+            .route(
+                "/v2/rbtest-owned/team/web/blobs/uploads/owned",
+                axum::routing::put(|body: axum::body::Bytes| async move {
+                    assert_eq!(body.as_ref(), b"namespace-owned layer");
+                    StatusCode::CREATED
+                }),
+            )
+            .route(&blob_path, get(|| async { "namespace-owned layer" }));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        let peer = Peer {
+            node_id: 1,
+            base_url: format!("http://{address}"),
+        };
+        let client = reqwest::Client::new();
+        let timeout = Duration::from_secs(2);
+        let result = replicate_layer_to_peer(
+            &peer,
+            "rbtest-owned/team/web",
+            &digest,
+            bytes,
+            &client,
+            timeout,
+        )
+        .await;
+        // Join the server on a failed assertion too; it owns no detached fixture.
+        if let Err(error) = result {
+            server.abort();
+            let _ = server.await;
+            panic!("nested peer upload failed: {error}");
+        }
+        let found =
+            check_peer_has_layers(&peer, "rbtest-owned/team/web", &[&digest], &client, timeout)
+                .await;
+        assert!(found.contains(digest.as_str()));
+        let directory = tempfile::tempdir().unwrap();
+        let store = BlobStore::new(directory.path());
+        super::super::pull::pull_layer_from_peer(
+            &peer,
+            "rbtest-owned/team/web",
+            &digest,
+            &store,
+            &client,
+            timeout,
+        )
+        .await
+        .unwrap();
+        assert_eq!(store.read_blob(&digest).unwrap(), bytes);
+        server.abort();
+        let _ = server.await;
     }
 
     // --- REG6: same-origin redirect constraint ---
@@ -645,6 +822,7 @@ mod tests {
             ("three-copies", 30, vec![1, 2, 3]),
         ] {
             catalog.apply_manifest_commit(&ManifestCommit {
+                observed_gc_generation: 0,
                 manifest: heal_manifest(repo, suffix),
                 tag: "v1".to_string(),
                 holder_nodes: holders.into_iter().collect(),
@@ -703,5 +881,75 @@ mod tests {
                 .any(|c| c.manifest.repository == "three-copies" && c.full_holders.is_empty()),
             "a manifest blob with no recorded holders must be healed"
         );
+    }
+}
+
+#[cfg(test)]
+mod copy_receipt_tests {
+    use super::*;
+    use axum::{Router, body::Body, response::Response, routing::post};
+
+    #[tokio::test]
+    async fn copy_receipts_refuse_wrong_identity_oversized_and_stalled_bodies() {
+        let digest = super::super::store::compute_sha256(b"image");
+        for mode in [
+            "wrong-node",
+            "wrong-repository",
+            "wrong-digest",
+            "oversized",
+            "stalled",
+        ] {
+            let content = serde_json::to_vec(&super::super::copy::ImageCopyReceipt {
+                node_id: if mode == "wrong-node" { 99 } else { 2 },
+                repository: if mode == "wrong-repository" {
+                    "elsewhere"
+                } else {
+                    "ordinary"
+                }
+                .into(),
+                manifest_digest: if mode == "wrong-digest" {
+                    super::super::store::compute_sha256(b"another")
+                } else {
+                    digest.clone()
+                },
+            })
+            .unwrap();
+            let app = Router::new().route(
+                "/v2/ordinary/copies/{digest}",
+                post(move || {
+                    let content = content.clone();
+                    async move {
+                        let body = match mode {
+                            "oversized" => Body::from(vec![b'x'; 16 * 1024 + 1]),
+                            "stalled" => Body::from_stream(futures_util::stream::pending::<
+                                Result<axum::body::Bytes, std::io::Error>,
+                            >()),
+                            _ => Body::from(content),
+                        };
+                        Response::new(body)
+                    }
+                }),
+            );
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let address = listener.local_addr().unwrap();
+            let server = tokio::spawn(async move {
+                axum::serve(listener, app).await.unwrap();
+            });
+            let peer = Peer {
+                node_id: 2,
+                base_url: format!("http://{address}"),
+            };
+            let result = confirm_peer_copy(
+                &peer,
+                "ordinary",
+                &digest,
+                &reqwest::Client::new(),
+                Duration::from_millis(200),
+            )
+            .await;
+            assert!(result.is_err(), "{mode} cannot confirm storage");
+            server.abort();
+            let _ = server.await;
+        }
     }
 }

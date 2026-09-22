@@ -72,14 +72,23 @@ cached assets, the original CA and the owned VMs. A retry won't silently
 change the version, topology or ports, or replace a previously running VM
 that disappeared. The error tells you where the checkpoint lives.
 
+`status` checks every owned VM and its authenticated API. Exit 0 means every
+node is running and its critical subsystems are ready. Missing or stopped VMs,
+unresponsive APIs and unavailable evidence return exit 1 after printing the
+observations. A saved provisioning checkpoint is not a live health check.
+
 `stop` preserves data. `destroy --yes` removes only the VMs named in this
 cluster's saved record, along with its credentials and checkpoints. It keeps
 the downloaded tool and image cache for future clusters. `--name NAME` selects
 a different saved cluster; setup currently supports one active CLI context.
 
 The API forwards bind loopback ports 19117–19119. The first node's HTTP ingress
-uses 18080. Change these with `setup --quickstart --api-port PORT
---ingress-port PORT` if needed. Other guest ports aren't automatically exposed.
+uses 18080, and its authenticated HTTPS Pickle registry uses 15050. Change these
+with `setup --quickstart --api-port PORT --ingress-port PORT --registry-port PORT`
+if needed. Other guest ports aren't automatically exposed. The saved context
+records the explicit host forwards so catalogue tests don't guess guest ports.
+Older development clusters without a registry forward can still be stopped or
+destroyed; recreate them to use the new setup ports.
 The context contains an administrator credential and is stored with mode 0600;
 normal CLI commands read it without requiring a VM shell. The node APIs use
 TLS and pinned cluster CAs. Explicit `--endpoint` settings don't inherit this
@@ -92,6 +101,19 @@ LIMA_HOME="$HOME/.reliaburger/lima" \
   ~/.reliaburger/tools/lima-2.1.0/bin/limactl shell VM_NAME \
   sudo journalctl -u reliaburger.service --no-pager -n 100
 ```
+
+## Signed candidate qualification
+
+A release candidate can use an explicit HTTPS mirror of its unchanged assets:
+
+```sh
+relish setup --quickstart --release-mirror https://YOUR_HOST/candidate
+```
+
+This keeps guest-image checksums and embedded binary signatures enabled. It
+cannot be combined with development binaries. Repeat the mirror option when
+resuming. The [release guide](releasing.md#qualifying-a-staged-candidate) covers
+candidate verification and the matching installer environment variable.
 
 ## Development qualification
 

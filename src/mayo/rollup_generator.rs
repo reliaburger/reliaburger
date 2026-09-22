@@ -57,8 +57,8 @@ impl RollupGenerator {
     /// parent's overlapping 1-minute rows at query merge — double counting.
     /// Per-minute emission makes every row a genuine 60-second window, so the
     /// dedup drops exactly the minutes the parent already holds and keeps the
-    /// rest. Minutes held by *both* parents still overlap at query merge;
-    /// that is inherent to aggregator reassignment without handoff.
+    /// rest. Query fan-out retains worker identity and deduplicates minutes
+    /// held by both parents before calculating the cluster sum.
     pub async fn generate_backfill(
         &self,
         store: &MayoStore,

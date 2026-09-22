@@ -38,6 +38,8 @@ const MAX_DIRECTORY_LABEL_BYTES: usize = 512;
 pub struct GossipMessage {
     /// Protocol version for forward compatibility.
     pub version: u8,
+    /// Durable state generation required for cluster admission.
+    pub state_format: u32,
     /// Sender's node identity.
     pub sender: NodeId,
     /// Sender's current incarnation number.
@@ -47,26 +49,23 @@ pub struct GossipMessage {
     pub hmac: [u8; 32],
     /// The message payload.
     pub payload: GossipPayload,
-    /// Node-directory extension (Phase 12b.2). `#[serde(skip)]` keeps it out
-    /// of the bincode message body — bincode is positional, so a new field
-    /// inside the message would break every older decoder. The UDP transport
-    /// instead appends the encoded extension AFTER the message bytes (see
-    /// [`encode_datagram`]/[`decode_datagram`]); older peers ignore the
-    /// trailing bytes and newer peers pick them up. In-memory transports
-    /// clone the whole struct, so the extension flows through untouched.
+    /// Optional directory data outside the positional bincode message body.
+    /// Peers within the same protocol/state generation may omit or ignore
+    /// this extension. Unsupported development generations are refused first.
     #[serde(skip)]
     pub extension: Option<DirectoryExtension>,
 }
 
 impl GossipMessage {
     /// Current protocol version.
-    pub const VERSION: u8 = 1;
+    pub const VERSION: u8 = crate::compatibility::CURRENT.protocol as u8;
 
     /// Create a new gossip message with the given sender and payload.
     /// HMAC is zeroed; the transport signs it on send when a key is configured.
     pub fn new(sender: NodeId, incarnation: u64, payload: GossipPayload) -> Self {
         Self {
             version: Self::VERSION,
+            state_format: crate::compatibility::CURRENT.state,
             sender,
             incarnation,
             hmac: [0u8; 32],
@@ -154,7 +153,7 @@ impl GossipPayload {
 /// A single membership update piggybacked on gossip messages.
 ///
 /// Carries the node's identity, its new state, the incarnation number
-/// for conflict resolution, and a Lamport timestamp for causal ordering.
+/// for conflict resolution, and a reserved legacy timestamp field.
 /// The address is included so that nodes learning about a peer through
 /// gossip (not direct contact) can reach it.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -167,7 +166,9 @@ pub struct MembershipUpdate {
     pub state: NodeState,
     /// Incarnation number for CRDT-like conflict resolution.
     pub incarnation: u64,
-    /// Lamport timestamp for ordering.
+    /// Reserved legacy timestamp, retained in its original wire position.
+    /// Receivers ignore it; current senders write zero. Membership ordering
+    /// uses incarnation and node state, not this value.
     pub lamport: u64,
 }
 
@@ -314,15 +315,10 @@ impl DirectoryExtension {
 /// Encode a gossip message (and its directory extension, if any) into a
 /// single datagram: `bincode(message) || bincode(extension)`.
 ///
-/// The extension rides as trailing bytes because bincode is not
-/// self-describing: `#[serde(default)]` on a new struct field gives no
-/// tolerance at all (an old decoder misparses the extra bytes, a new decoder
-/// hits EOF on an old message). Trailing bytes give tolerance in BOTH
-/// directions — bincode's legacy `deserialize` ignores what it doesn't read,
-/// so an old peer parses a new datagram, and a new peer treats a datagram
-/// with no trailing bytes as extension-free.
+/// The extension is optional within one explicit format generation. Bincode
+/// fields are positional, so extension bytes follow the fixed message body.
 pub fn encode_datagram(message: &GossipMessage) -> Result<Vec<u8>, bincode::Error> {
-    // `extension` is #[serde(skip)], so this is exactly the old wire shape.
+    // `extension` is encoded separately from the fixed message body.
     let mut bytes = bincode::serialize(message)?;
     if let Some(extension) = &message.extension {
         bytes.extend(bincode::serialize(extension)?);
@@ -330,11 +326,16 @@ pub fn encode_datagram(message: &GossipMessage) -> Result<Vec<u8>, bincode::Erro
     Ok(bytes)
 }
 
-/// Decode a datagram produced by [`encode_datagram`] (or by an older peer,
-/// in which case the extension is `None`). A malformed extension is dropped
-/// silently rather than failing the whole message: the membership payload is
-/// still good, and gossip must keep flowing across versions.
+/// Decode a supported datagram, rejecting protocol/state mismatches.
+/// An absent or malformed directory extension does not invalidate the
+/// membership payload; callers still require endpoint/readiness evidence.
 pub fn decode_datagram(bytes: &[u8]) -> Result<GossipMessage, bincode::Error> {
+    if bytes.first() != Some(&GossipMessage::VERSION) {
+        return Err(Box::new(bincode::ErrorKind::Custom(
+            "incompatible gossip protocol".into(),
+        )));
+    }
+
     // The HMAC lives *inside* the encoded message, so we cannot authenticate
     // before decoding — decoding is how we get the tag. That makes this the
     // one place where unauthenticated bytes from any sender reach a
@@ -349,14 +350,19 @@ pub fn decode_datagram(bytes: &[u8]) -> Result<GossipMessage, bincode::Error> {
     // decode error instead of an allocation.
     //
     // The encoding must stay byte-identical to `bincode::serialize`, which
-    // `encode_datagram` uses and every deployed peer speaks. `bincode`'s
+    // `encode_datagram` uses and every peer in this generation speaks. `bincode`'s
     // builder API defaults to *varint* encoding, so the legacy shape has to be
     // asked for explicitly — `with_fixint_encoding().with_little_endian()`.
     // Getting this wrong wouldn't fail to compile, it would fail to talk to
-    // the rest of the cluster, so `legacy_wire_bytes_decode_unchanged` pins it.
+    // the rest of the cluster, so `fixed_width_wire_bytes_decode_unchanged` pins it.
     use bincode::Options;
     let mut cursor = std::io::Cursor::new(bytes);
     let mut message: GossipMessage = datagram_codec(bytes.len()).deserialize_from(&mut cursor)?;
+    if message.state_format != crate::compatibility::CURRENT.state {
+        return Err(Box::new(bincode::ErrorKind::Custom(
+            "incompatible gossip state format".into(),
+        )));
+    }
     let consumed = cursor.position() as usize;
     if consumed < bytes.len()
         && let Ok(extension) =
@@ -384,7 +390,48 @@ fn datagram_codec(limit: usize) -> impl bincode::Options {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn membership_update_preserves_legacy_timestamp_wire_slot() {
+        let update = super::MembershipUpdate {
+            node_id: crate::meat::types::NodeId::new("legacy-peer"),
+            address: "127.0.0.1:9443".parse().unwrap(),
+            state: super::NodeState::Alive,
+            incarnation: 7,
+            lamport: u64::MAX,
+        };
+        // The legacy sequence fixes field order and retains the final u64.
+        let bytes = bincode::serialize(&(
+            &update.node_id,
+            &update.address,
+            update.state,
+            update.incarnation,
+            update.lamport,
+        ))
+        .unwrap();
+        assert_eq!(bincode::serialize(&update).unwrap(), bytes);
+        assert_eq!(
+            bincode::deserialize::<super::MembershipUpdate>(&bytes).unwrap(),
+            update
+        );
+    }
+
     use super::*;
+
+    #[test]
+    fn incompatible_gossip_generation_is_refused() {
+        for version in [1, 255] {
+            let mut message = a_message();
+            message.version = version;
+            assert!(decode_datagram(&encode_datagram(&message).unwrap()).is_err());
+        }
+    }
+
+    #[test]
+    fn incompatible_gossip_state_format_is_refused() {
+        let mut message = a_message();
+        message.state_format = 99;
+        assert!(decode_datagram(&encode_datagram(&message).unwrap()).is_err());
+    }
 
     #[test]
     fn gossip_message_new_sets_version_and_zeroed_hmac() {
@@ -527,10 +574,11 @@ mod tests {
     }
 
     /// The exact wire shape a pre-12b.2 peer serialises and parses.
-    /// Field-for-field the old `GossipMessage` (no extension).
+    /// Current-generation message without a directory extension.
     #[derive(Debug, Serialize, Deserialize)]
-    struct LegacyGossipMessage {
+    struct BareGossipMessage {
         version: u8,
+        state_format: u32,
         sender: NodeId,
         incarnation: u64,
         hmac: [u8; 32],
@@ -538,23 +586,23 @@ mod tests {
     }
 
     #[test]
-    fn old_peer_parses_a_datagram_carrying_an_extension() {
+    fn current_generation_decoder_can_ignore_the_extension() {
         let mut msg = a_message();
         msg.extension = Some(an_extension());
         let datagram = encode_datagram(&msg).unwrap();
 
-        // An old peer deserialises the legacy shape from the full datagram;
-        // bincode's legacy `deserialize` must ignore the trailing extension.
-        let legacy: LegacyGossipMessage = bincode::deserialize(&datagram).unwrap();
+        // The fixed-shape decoder can ignore the optional directory extension.
+        let legacy: BareGossipMessage = bincode::deserialize(&datagram).unwrap();
         assert_eq!(legacy.sender, NodeId::new("sender"));
         assert_eq!(legacy.payload.updates().len(), 1);
     }
 
     #[test]
-    fn new_peer_parses_an_old_datagram_as_extension_free() {
-        // An old peer's datagram is just the bare message bytes.
-        let legacy = LegacyGossipMessage {
+    fn current_generation_allows_an_extension_free_datagram() {
+        // A supported peer may omit the directory extension.
+        let legacy = BareGossipMessage {
             version: GossipMessage::VERSION,
+            state_format: crate::compatibility::CURRENT.state,
             sender: NodeId::new("old-node"),
             incarnation: 3,
             hmac: [0u8; 32],
@@ -833,7 +881,7 @@ mod tests {
     /// every deployed peer. Pin the legacy shape against bytes produced by
     /// `bincode::serialize` directly, which is what peers send.
     #[test]
-    fn legacy_wire_bytes_decode_unchanged() {
+    fn fixed_width_wire_bytes_decode_unchanged() {
         let msg = GossipMessage::new(
             NodeId::new("legacy-peer"),
             42,

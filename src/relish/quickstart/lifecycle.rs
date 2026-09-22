@@ -18,6 +18,70 @@ pub enum Action {
     Destroy,
 }
 
+/// Observed state of one managed node, independent of its saved provisioning phase.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+#[serde(tag = "state", rename_all = "snake_case")]
+pub enum NodeCondition {
+    /// VM and authenticated critical-subsystem checks succeeded.
+    Ready,
+    /// The owned VM no longer exists.
+    Missing,
+    /// Lima reports a state other than Running.
+    NotRunning { vm_state: String },
+    /// The running VM did not prove API and critical-subsystem readiness.
+    ApiNotReady { reason: String },
+    /// VM state could not be observed.
+    Unknown { reason: String },
+}
+
+/// Structured status for one exact VM owned by this managed operation.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct NodeStatus {
+    /// Saved, validated VM name.
+    pub name: String,
+    /// Fresh VM and API evidence.
+    pub condition: NodeCondition,
+}
+
+/// Inspect every owned node, retaining failures as explicit observations.
+pub async fn collect_status(
+    lima: &Lima,
+    operation: &Operation,
+    bootstrap: &security::Bootstrap,
+) -> Vec<NodeStatus> {
+    let mut nodes = Vec::new();
+    for (index, node) in operation.state.nodes.iter().enumerate() {
+        let condition = match lima.status(&node.name).await {
+            Err(error) => NodeCondition::Unknown {
+                reason: error.to_string(),
+            },
+            Ok(None) => NodeCondition::Missing,
+            Ok(Some(state)) if state != "Running" => NodeCondition::NotRunning { vm_state: state },
+            Ok(Some(_)) => {
+                let probe = async {
+                    let client = bootstrap.client(&format!(
+                        "https://127.0.0.1:{}",
+                        operation.state.spec.api_port + index as u16
+                    ))?;
+                    crate::relish::readiness::wait_for_node(&client, Duration::from_secs(3)).await
+                }
+                .await;
+                match probe {
+                    Ok(()) => NodeCondition::Ready,
+                    Err(error) => NodeCondition::ApiNotReady {
+                        reason: error.to_string(),
+                    },
+                }
+            }
+        };
+        nodes.push(NodeStatus {
+            name: node.name.clone(),
+            condition,
+        });
+    }
+    nodes
+}
+
 /// Operate only on saved resource names, holding the same lock as setup.
 pub async fn run(action: Action, name: &str, confirmed: bool) -> Result<()> {
     if action == Action::Destroy && !confirmed {
@@ -41,25 +105,37 @@ pub async fn run(action: Action, name: &str, confirmed: bool) -> Result<()> {
         bail!("managed Lima is missing; resume setup to reinstall it");
     }
     let lima = Lima::new(executable, Duration::from_secs(120)).with_home(root.join("lima"));
-    for (index, node) in operation.state.nodes.iter().enumerate() {
+    if action == Action::Status {
+        let bootstrap = bootstrap.as_ref().context("cluster bootstrap is missing")?;
+        let nodes = collect_status(&lima, &operation, bootstrap).await;
+        let mut unhealthy = 0;
+        for node in &nodes {
+            let detail = match &node.condition {
+                NodeCondition::Ready => "Running; API ready".to_owned(),
+                NodeCondition::Missing => "Missing".to_owned(),
+                NodeCondition::NotRunning { vm_state } => vm_state.clone(),
+                NodeCondition::ApiNotReady { reason } => {
+                    format!("Running; API not ready: {reason}")
+                }
+                NodeCondition::Unknown { reason } => format!("Unknown: {reason}"),
+            };
+            println!("{}: {detail}", node.name);
+            if node.condition != NodeCondition::Ready {
+                unhealthy += 1;
+            }
+        }
+        if nodes.is_empty() || unhealthy > 0 {
+            bail!(
+                "managed cluster is not ready: {unhealthy} of {} nodes unhealthy or unknown",
+                nodes.len()
+            );
+        }
+        return Ok(());
+    }
+    for node in &operation.state.nodes {
         let status = lima.status(&node.name).await?;
         match action {
-            Action::Status => {
-                println!("{}: {}", node.name, status.as_deref().unwrap_or("Missing"));
-                if status.as_deref() == Some("Running") {
-                    let bootstrap = bootstrap.as_ref().context("cluster bootstrap is missing")?;
-                    let client = bootstrap.client(&format!(
-                        "https://127.0.0.1:{}",
-                        operation.state.spec.api_port + index as u16
-                    ))?;
-                    match crate::relish::readiness::wait_for_node(&client, Duration::from_secs(3))
-                        .await
-                    {
-                        Ok(()) => println!("  API ready"),
-                        Err(error) => println!("  API not ready: {error}"),
-                    }
-                }
-            }
+            Action::Status => {} // Handled by the structured observation path above.
             Action::Start => {
                 status.context(
                     "owned VM is missing; setup will not implicitly replace a lost cluster",

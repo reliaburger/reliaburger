@@ -215,7 +215,7 @@ mod tests {
             .await
             .unwrap();
         server.abort();
-        result
+        result.map_err(|error| error.to_string())
     }
 
     #[tokio::test]

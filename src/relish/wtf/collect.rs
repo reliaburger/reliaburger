@@ -1,6 +1,5 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::future::Future;
-use std::net::{IpAddr, SocketAddr};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use crate::bun::agent::{CouncilStatus, NodeStatus};
@@ -37,7 +36,7 @@ struct NodeCollection {
     diagnostics: Result<LocalDiagnosticSnapshot, String>,
     events: Result<Vec<crate::bun::events::ClusterEvent>, String>,
     deploys: Result<DeployOperationSnapshot, String>,
-    alerts: Result<Vec<serde_json::Value>, String>,
+    alerts: Result<Vec<crate::mayo::alert::AlertStatus>, String>,
     faults: Result<Vec<crate::smoker::types::FaultSummary>, String>,
 }
 
@@ -139,6 +138,7 @@ pub async fn collect(client: &BunClient, app: Option<&str>) -> Result<WtfInputs,
             let status = NodeStatus {
                 node_id: local_node_id,
                 address: client.base_url().to_string(),
+                api_address: None,
                 state: "alive".to_string(),
                 incarnation: 0,
                 is_council: false,
@@ -157,6 +157,7 @@ pub async fn collect(client: &BunClient, app: Option<&str>) -> Result<WtfInputs,
             let status = NodeStatus {
                 node_id: local_node_id,
                 address: client.base_url().to_string(),
+                api_address: None,
                 state: "alive".to_string(),
                 incarnation: 0,
                 is_council: false,
@@ -197,13 +198,8 @@ pub async fn collect(client: &BunClient, app: Option<&str>) -> Result<WtfInputs,
         bounded("service resolution", client.resolve_all()),
     );
 
-    let council = collect_council_evidence(
-        cluster_enabled,
-        membership.as_deref(),
-        &collected,
-        council_result,
-        collected_at,
-    );
+    let council =
+        collect_council_evidence(cluster_enabled, &collected, council_result, collected_at);
     let restarts = collect_restarts(&collected, collected_at);
     let deploys = collect_deploys(&collected, collected_at);
     let services = collect_services(desired_result, services_result, app, collected_at);
@@ -305,22 +301,7 @@ fn capability_identity(report: Option<&ClusterCapabilityReport>) -> (String, boo
 }
 
 pub(crate) fn node_client(entry: &BunClient, node: &NodeStatus) -> Result<BunClient, String> {
-    let entry_url = url::Url::parse(entry.base_url())
-        .map_err(|error| format!("invalid entry endpoint: {error}"))?;
-    let api_port = entry_url
-        .port_or_known_default()
-        .ok_or_else(|| "entry endpoint has no API port".to_string())?;
-    let address = node.address.parse::<SocketAddr>().map_err(|error| {
-        format!(
-            "node {} advertised an invalid address: {error}",
-            node.node_id
-        )
-    })?;
-    let host = match address.ip() {
-        IpAddr::V4(ip) => ip.to_string(),
-        IpAddr::V6(ip) => format!("[{ip}]"),
-    };
-    Ok(entry.with_base_url(&format!("{}://{host}:{api_port}", entry.scheme())))
+    entry.for_node(node).map_err(|error| error.to_string())
 }
 
 fn leader_client<'a>(
@@ -377,7 +358,6 @@ fn collect_node_evidence(
 
 fn collect_council_evidence(
     cluster_enabled: bool,
-    membership: Option<&[NodeStatus]>,
     collected: &[NodeCollection],
     council: Result<CouncilStatus, String>,
     observed_at: u64,
@@ -414,38 +394,13 @@ fn collect_council_evidence(
                 },
             )
         }
-        result => {
-            let Some(membership) = membership else {
-                return Evidence::Unavailable {
-                    reason: result
-                        .err()
-                        .unwrap_or_else(|| "council membership is empty".to_string()),
-                };
-            };
-            let members = membership
-                .iter()
-                .filter(|node| node.is_council)
-                .collect::<Vec<_>>();
-            let observation = CouncilObservation {
-                enabled: true,
-                member_count: members.len(),
-                reachable_members: members
-                    .iter()
-                    .filter(|node| health.get(node.node_id.as_str()).copied().unwrap_or(false))
-                    .count(),
-                leader: membership
-                    .iter()
-                    .find(|node| node.is_leader)
-                    .map(|node| node.node_id.clone()),
-            };
-            Evidence::Degraded {
-                observed_at,
-                value: observation,
-                reason: result
-                    .err()
-                    .unwrap_or_else(|| "leader council endpoint returned no members".to_string()),
-            }
-        }
+        result => Evidence::Unavailable {
+            // Gossip role flags can lag Raft membership changes. They cannot
+            // establish the voter denominator for a quorum diagnosis.
+            reason: result
+                .err()
+                .unwrap_or_else(|| "council endpoint returned no configured members".to_string()),
+        },
     }
 }
 
@@ -628,7 +583,7 @@ fn collect_alerts(
 ) -> Evidence<Vec<AlertObservation>> {
     if app_scope.is_some() {
         return Evidence::Unsupported {
-            reason: "alert statuses do not yet carry application and namespace labels".to_string(),
+            reason: "application-scoped alert collection is not supported; inspect cluster alerts and their series labels".to_string(),
         };
     }
     let mut builder = EvidenceBuilder::default();
@@ -637,18 +592,17 @@ fn collect_alerts(
         match &node.alerts {
             Ok(alerts) => {
                 for alert in alerts {
-                    if alert.get("state").and_then(serde_json::Value::as_str) != Some("firing") {
+                    if alert.state != crate::mayo::alert::AlertPhase::Firing {
                         continue;
                     }
-                    let rule = alert
-                        .get("rule_name")
-                        .and_then(serde_json::Value::as_str)
-                        .unwrap_or("unnamed alert");
-                    let description = alert
-                        .get("description")
-                        .and_then(serde_json::Value::as_str)
-                        .unwrap_or("no description");
-                    let message = format!("{rule}: {description}");
+                    let rule = &alert.rule_name;
+                    let description = &alert.description;
+                    let labels = &alert.labels;
+                    let message = if labels.is_empty() {
+                        format!("{rule}: {description}")
+                    } else {
+                        format!("{rule}: {description} {labels:?}")
+                    };
                     if seen.insert(message.clone()) {
                         builder.values.push(AlertObservation {
                             app: None,
@@ -681,6 +635,7 @@ fn collect_local_diagnostics(collected: &[NodeCollection], observed_at: u64) -> 
         };
         append_diagnostic_source(&snapshot.disks, &node.node_id, &mut disks, |disk| {
             DiskObservation {
+                filesystem_id: disk.filesystem_id.clone(),
                 node_id: node.node_id.clone(),
                 storage_domains: vec![disk.storage_domain.clone()],
                 used_bytes: disk.used_bytes,
@@ -720,15 +675,27 @@ fn collect_local_diagnostics(collected: &[NodeCollection], observed_at: u64) -> 
 }
 
 fn coalesce_disk_filesystems(disks: &mut Vec<DiskObservation>) {
-    let mut grouped = BTreeMap::<(String, u64, u64), DiskObservation>::new();
+    let mut grouped = BTreeMap::<(String, String), DiskObservation>::new();
     for disk in std::mem::take(disks) {
-        let key = (disk.node_id.clone(), disk.used_bytes, disk.total_bytes);
+        let Some(identity) = disk.filesystem_id.as_ref().filter(|id| !id.is_empty()) else {
+            // Matching capacities do not prove two observations share a device.
+            disks.push(disk);
+            continue;
+        };
+        let key = (disk.node_id.clone(), identity.clone());
         grouped
             .entry(key)
             .and_modify(|existing| {
                 existing
                     .storage_domains
-                    .extend(disk.storage_domains.clone())
+                    .extend(disk.storage_domains.clone());
+                // Readings can change during collection. Preserve the busiest
+                // observed reading as a whole, rather than mixing its counters.
+                if disk.used_percent > existing.used_percent {
+                    existing.used_bytes = disk.used_bytes;
+                    existing.total_bytes = disk.total_bytes;
+                    existing.used_percent = disk.used_percent;
+                }
             })
             .or_insert(disk);
     }
@@ -737,6 +704,9 @@ fn coalesce_disk_filesystems(disks: &mut Vec<DiskObservation>) {
         disk.storage_domains.dedup();
     }
     disks.extend(grouped.into_values());
+    disks.sort_by(|left, right| {
+        (&left.node_id, &left.storage_domains).cmp(&(&right.node_id, &right.storage_domains))
+    });
 }
 
 fn append_diagnostic_source<T, U, F>(
@@ -927,6 +897,7 @@ mod tests {
         NodeStatus {
             node_id: "node-1".to_string(),
             address: address.to_string(),
+            api_address: None,
             state: "alive".to_string(),
             incarnation: 1,
             is_council: true,
@@ -936,14 +907,19 @@ mod tests {
     }
 
     #[test]
-    fn node_client_reuses_auth_scheme_and_api_port_for_ipv4_and_ipv6() {
+    fn node_client_reuses_auth_and_scheme_with_each_ipv4_or_ipv6_api_port() {
         let entry = BunClient::new_with_token("https://127.0.0.1:9443", Some("secret"));
 
-        let ipv4 = node_client(&entry, &node("10.0.0.8:7946")).unwrap();
-        let ipv6 = node_client(&entry, &node("[2001:db8::8]:7946")).unwrap();
+        let mut v4_node = node("10.0.0.8:7946");
+        v4_node.api_address = Some("10.0.0.8:19443".parse().unwrap());
+        let mut v6_node = node("[2001:db8::8]:7946");
+        v6_node.api_address = Some("[2001:db8::8]:29443".parse().unwrap());
+        let ipv4 = node_client(&entry, &v4_node).unwrap();
+        let ipv6 = node_client(&entry, &v6_node).unwrap();
 
-        assert_eq!(ipv4.base_url(), "https://10.0.0.8:9443");
-        assert_eq!(ipv6.base_url(), "https://[2001:db8::8]:9443");
+        assert_eq!(ipv4.base_url(), "https://10.0.0.8:19443");
+        assert_eq!(ipv6.base_url(), "https://[2001:db8::8]:29443");
+        assert!(node_client(&entry, &node("10.0.0.8:7946")).is_err());
     }
 
     #[test]
@@ -977,12 +953,14 @@ mod tests {
                 observed_at: 10,
                 value: vec![
                     DiskUsageEvidence {
+                        filesystem_id: Some("device:a".into()),
                         storage_domain: "images".to_string(),
                         used_bytes: 95,
                         total_bytes: 100,
                         used_percent: 95.0,
                     },
                     DiskUsageEvidence {
+                        filesystem_id: Some("device:a".into()),
                         storage_domain: "logs".to_string(),
                         used_bytes: 95,
                         total_bytes: 100,
@@ -1042,6 +1020,32 @@ mod tests {
     }
 
     #[test]
+    fn labelled_alerts_remain_distinct_across_collected_nodes() {
+        let alerts = ["hot-a", "hot-b"].map(|node| crate::mayo::alert::AlertStatus {
+            rule_name: "cpu".into(),
+            description: "CPU high".into(),
+            state: crate::mayo::alert::AlertPhase::Firing,
+            severity: crate::mayo::alert::AlertSeverity::Critical,
+            labels: BTreeMap::from([("node".into(), node.into())]),
+            since: Some(1),
+        });
+        let collected = ["reporter-a", "reporter-b"].map(|node| NodeCollection {
+            node_id: node.into(),
+            reachable: true,
+            diagnostics: Err("unused".into()),
+            events: Ok(Vec::new()),
+            deploys: Err("unused".into()),
+            alerts: Ok(alerts.to_vec()),
+            faults: Err("unused".into()),
+        });
+        let evidence = collect_alerts(&collected, None, 10);
+        let observed = evidence.value().unwrap();
+        assert_eq!(observed.len(), 2);
+        assert!(observed[0].message.contains("hot-a"));
+        assert!(observed[1].message.contains("hot-b"));
+    }
+
+    #[test]
     fn clean_restart_collection_is_a_caveat_not_a_degrade() {
         let collected = vec![NodeCollection {
             node_id: "node-1".to_string(),
@@ -1085,10 +1089,133 @@ mod tests {
         assert!(!line_is_error("request completed"));
     }
 
+    #[tokio::test]
+    async fn disk_collection_groups_by_identity_not_matching_capacity() {
+        use axum::{Json, Router, routing::get};
+        for (identities, usages, expected_count) in [
+            ([None, None], [50, 50], 2),
+            ([Some("device-a"), Some("device-b")], [50, 50], 2),
+            ([Some("device-a"), Some("device-a")], [50, 60], 1),
+        ] {
+            let mut disks = Vec::new();
+            for (index, domain) in ["images", "logs"].into_iter().enumerate() {
+                let mut disk = serde_json::json!({"storage_domain":domain, "used_bytes":usages[index], "total_bytes":100, "used_percent":usages[index] as f64});
+                if let Some(identity) = identities[index] {
+                    disk["filesystem_id"] = identity.into();
+                }
+                disks.push(disk);
+            }
+            let snapshot = serde_json::json!({
+                "schema_version":1, "node_id":"node-a", "observed_at":10,
+                "disks":{"state":"available","observed_at":10,"value":disks},
+                "cpu_throttling":{"state":"unsupported","reason":"fixture"},
+                "certificates":{"state":"unsupported","reason":"fixture"},
+            });
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let address = listener.local_addr().unwrap();
+            let app = Router::new()
+                .route(
+                    "/v1/health",
+                    get(|| async { Json(serde_json::json!({"status":"ok"})) }),
+                )
+                .route(
+                    "/v1/cluster/nodes",
+                    get(|| async { Json(Vec::<NodeStatus>::new()) }),
+                )
+                .route(
+                    "/v1/diagnostics",
+                    get(move || {
+                        let snapshot = snapshot.clone();
+                        async move { Json(snapshot) }
+                    }),
+                );
+            let server = tokio::spawn(async move {
+                axum::serve(listener, app).await.unwrap();
+            });
+            let inputs = collect(&BunClient::new(&format!("http://{address}")), None)
+                .await
+                .unwrap();
+            server.abort();
+            let _ = server.await;
+            let disks = inputs.cluster.disks.value().expect("disk evidence");
+            assert_eq!(disks.len(), expected_count);
+            if expected_count == 1 {
+                assert_eq!(disks[0].storage_domains, ["images", "logs"]);
+                assert_eq!(disks[0].used_percent, 60.0);
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn missing_council_membership_never_invents_quorum_loss() {
+        use axum::{Json, Router, routing::get};
+        for (stale_council_flag, empty_answer) in [(false, false), (true, false), (true, true)] {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let address = listener.local_addr().unwrap();
+            let app = Router::new()
+                .route(
+                    "/v1/cluster/council",
+                    get(move || async move {
+                        (
+                            if empty_answer {
+                                axum::http::StatusCode::OK
+                            } else {
+                                axum::http::StatusCode::SERVICE_UNAVAILABLE
+                            },
+                            Json(CouncilStatus::default()),
+                        )
+                    }),
+                )
+                .route(
+                    "/v1/health",
+                    get(|| async { Json(serde_json::json!({"status":"ok"})) }),
+                )
+                .route(
+                    "/v1/cluster/nodes",
+                    get(move || async move {
+                        Json(vec![NodeStatus {
+                            node_id: "node-a".into(),
+                            address: address.to_string(),
+                            api_address: Some(address),
+                            state: "alive".into(),
+                            incarnation: 0,
+                            is_council: stale_council_flag,
+                            is_leader: false,
+                            labels: BTreeMap::new(),
+                        }])
+                    }),
+                );
+            let server = tokio::spawn(async move {
+                axum::serve(listener, app).await.unwrap();
+            });
+            let inputs = collect(&BunClient::new(&format!("http://{address}")), None)
+                .await
+                .unwrap();
+            server.abort();
+            let _ = server.await;
+            assert!(
+                inputs.cluster.council.value().is_none(),
+                "gossip flags cannot establish configured voters"
+            );
+            let report = super::super::diagnose(&inputs);
+            assert!(
+                report
+                    .unknown
+                    .iter()
+                    .any(|finding| finding.source == "council")
+            );
+            assert!(
+                !report
+                    .critical
+                    .iter()
+                    .any(|finding| ["quorum-loss", "no-leader"].contains(&finding.id.as_str()))
+            );
+        }
+    }
+
     #[test]
     fn standalone_council_is_an_observed_non_requirement() {
-        let evidence =
-            collect_council_evidence(false, Some(&[]), &[], Ok(CouncilStatus::default()), 10);
+        let evidence = collect_council_evidence(false, &[], Ok(CouncilStatus::default()), 10);
         let council = evidence.value().unwrap();
 
         assert!(!council.enabled);

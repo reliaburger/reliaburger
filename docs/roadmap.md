@@ -678,7 +678,7 @@ Design docs: [agent-bun.md](design/agent-bun.md)
 
 ## Phase 15: Testing, Benchmarking & Diagnostics
 
-Build the self-validation tooling. By this phase, all subsystem tests already exist and pass. This phase wraps them into the built-in test runner, adds the benchmark harness, and builds the diagnostic tools.
+Build the self-validation tooling on top of the subsystem tests. This phase adds a live-cluster case catalogue, the benchmark harness and diagnostic tools. The built-in catalogue is separate from Cargo integration tests; it does not execute the test binaries in `tests/`. Complete live acceptance remains V01 in the current completion plan.
 
 Book: **Chapter 15, "Ready for Production"** (built-in testing, performance measurement, cluster diagnosis)
 
@@ -690,9 +690,10 @@ Unit tests:
 - Benchmark result parsing, regression detection threshold logic
 - Test runner: filter matching, parallel execution coordination, JSON report schema
 
-Integration tests:
+Live acceptance goals (these are behaviours to qualify, not seven standalone
+files under `tests/`):
 
-- `relish test` runs all integration tests and reports results
+- `relish test` runs the selected live catalogue and reports outcomes and cleanup
 - `relish test --chaos` runs chaos suite and reports results
 - `relish test --filter scheduling` runs only scheduling tests
 - `relish bench` produces valid benchmark report with all metrics
@@ -700,9 +701,16 @@ Integration tests:
 - `relish wtf` detects and diagnoses known failure patterns
 - `relish trace <app> --to <app>` traces connectivity through eBPF, firewall, and network layers
 
+Current test locations: runner and comparison regressions live in
+`src/testkit/runner.rs` and `src/testkit/bench/compare.rs`; diagnostic and trace
+regressions live under `src/relish/wtf/` and in `src/relish/trace_cmd.rs`.
+`tests/wtf_watch.rs` exercises the real CLI process. Live cases live under
+`src/testkit/cases/` and `src/testkit/chaos/`; their complete three-node run is a
+release gate, not something the unit-test count establishes.
+
 ### Implementation
 
-1. **`relish test` command.** Test runner that executes all subsystem integration tests (compiled into binary), parallel execution, filtering, JSON output for CI.
+1. **`relish test` command.** Built-in live catalogue with bounded parallel execution, filtering, capability/policy checks and JSON output for CI.
 2. **`relish test --chaos`.** Five serial recovery scenarios using Smoker
    fault injection, fresh capability evidence, server-owned safety policy,
    explicit consent and exact panic-safe fault reversal. Missing destructive
@@ -715,6 +723,18 @@ Integration tests:
 Design docs: [cli-relish.md](design/cli-relish.md), [agent-bun.md](design/agent-bun.md), [chaos-smoker.md](design/chaos-smoker.md)
 
 **Milestone:** `relish test` runs the full suite and reports all green. `relish bench` measures performance across all subsystems. `relish wtf` diagnoses common failure patterns. All Phase 15 tests pass.
+
+---
+
+## Phase 16: Post-Phase-15 Audit and Hardening
+
+This follow-up repairs correctness gaps and reconciles the implementation,
+manual and book. Its historical checklist is in
+[progress.md](progress.md#phase-16-post-phase-15-audit--truthfulness--hardening),
+with current unresolved work mapped to the
+[completion plan](plans/2026-09-17-codebase-completion-plan.md).
+Each repair updates the relevant existing book chapter. Future architecture
+families and optional refactors remain explicitly separate from release gates.
 
 ---
 

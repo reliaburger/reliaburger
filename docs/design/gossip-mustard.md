@@ -31,7 +31,7 @@ Reliaburger coordinates a cluster of up to 10,000 homogeneous nodes without a de
 
 | Dependency | Component | Why |
 |------------|-----------|-----|
-| **Sesame** (Security/mTLS) | All inter-node communication | Mustard gossip messages are authenticated via HMAC derived from node certificates. Raft log entries are encrypted at rest. The reporting tree uses mTLS channels signed by the Node CA. Recovery candidate notifications are sent over mTLS. |
+| **Sesame** (Security/mTLS) | All inter-node communication | Mustard gossip messages are authenticated with an HMAC-SHA256 key derived (HKDF) from the cluster master key, when one is configured. Raft log entries are encrypted at rest. The reporting tree uses mTLS channels signed by the Node CA. Recovery candidate notifications are sent over mTLS. |
 | **Bun** (Agent) | Every node | Bun is the host process. Mustard, Raft, and the reporting tree all run as async tasks within the Bun process. Bun owns the node lifecycle (join, leave, shutdown) that Mustard reacts to. |
 | **Meat** (Scheduler) | Leader only | The leader runs Meat. Council selection criteria (resource availability, stability) are evaluated using data that Meat also consumes. The leader's scheduling decisions are replicated via Raft. |
 | **Lettuce** (GitOps) | Council coordinator | When GitOps is enabled, the Lettuce engine provides the authoritative desired state. During state reconstruction, the new leader loads desired state from the git repository via Lettuce. |
@@ -142,7 +142,7 @@ Raft is **not** used for:
 
 The leader selects council members from the general node pool. Selection criteria, in priority order:
 
-1. **Stability.** Node must have been in the cluster for at least `council.min_node_age` (default 10 minutes). This prevents a freshly joined node from immediately becoming a council member before it has proven reliable.
+1. **Stability.** Older nodes are preferred: after zone novelty, candidates are sorted by node age, oldest first. `CouncilSelectionConfig::min_node_age` defaults to 10 minutes, but the running reconciler (`src/cluster/runtime.rs`) overrides it to 0 so a fresh cluster can form a council immediately. Age therefore affects *ordering*, not eligibility. **TODO (not yet implemented):** a hard minimum age for joining an established council, so a freshly joined node can't become a council member before it has proven reliable.
 2. **Resource availability** *(criterion present in code, but a no-op in production).* The selector filters on CPU < 90% / memory < 85%, but because per-node resources are never gossiped (`NodeMembership.resources` is always `None` for remote peers), the filter treats every node as eligible — an unreported node passes. This criterion only bites once resource gossip is implemented; today it rejects no one.
 3. **Zone diversity.** If node labels include zone or region information, the leader maximizes geographic distribution among council members. A council where all members are in the same rack defeats the purpose of redundancy.
 4. **Random tiebreaker.** Among otherwise-equal candidates, selection is random (seeded by the leader's node ID + current term for reproducibility).
@@ -263,7 +263,7 @@ struct MembershipUpdate {
     state: NodeState,
     /// Incarnation number of the node (for crdt-like conflict resolution).
     incarnation: u64,
-    /// Lamport timestamp for ordering.
+    /// Reserved legacy wire slot; current senders write zero, receivers ignore it.
     lamport: u64,
 }
 
@@ -647,7 +647,7 @@ Leader election uses standard Raft semantics, constrained to the council.
 | Heartbeat interval | 150ms | Fast enough to detect leader failure quickly; slow enough to avoid spurious elections on a busy network. |
 | Election timeout (min) | 1000ms | Must be >> heartbeat interval. Randomized to prevent split votes. |
 | Election timeout (max) | 2000ms | Upper bound of the randomized election timeout range. |
-| Pre-vote | Enabled | Prevents disruptive elections from partitioned nodes that have not received recent heartbeats. Nodes must get a majority of pre-vote grants before incrementing their term. |
+| Pre-vote | **TODO (not yet implemented)** | Would prevent disruptive elections from partitioned nodes that have not received recent heartbeats: nodes would need a majority of pre-vote grants before incrementing their term. `openraft` 0.9 doesn't implement pre-vote, so a node returning from a partition can still force an election. |
 
 **Election sequence:**
 
@@ -701,7 +701,9 @@ fn select_council_candidates(
             n.state == NodeState::Alive
             // Must not already be on the council
             && !current_council.contains(&n.node_id)
-            // Must have been in the cluster long enough
+            // Must have been in the cluster long enough. The running
+            // reconciler sets min_node_age to 0, so today this never
+            // excludes anyone; age only orders candidates.
             && n.first_seen.elapsed() >= config.min_node_age
             // Must not be overloaded. NOTE: unreported == eligible.
             // Because gossip never carries resources, `resources` is always
@@ -963,6 +965,8 @@ min_council_size = 3
 max_council_size = 7
 
 # Minimum time a node must be alive before it can join the council.
+# The running reconciler overrides this to 0 (see §3.4), so it only
+# orders candidates today.
 min_node_age = "10m"
 
 # Resource-eligibility thresholds (see the note below): these constants
@@ -972,18 +976,22 @@ max_cpu_usage_fraction = 0.90
 max_memory_usage_fraction = 0.85
 ```
 
-The reporting-tree and reconstruction timings are likewise compile-time constants (again, not TOML sections):
+The reporting-tree timings are likewise compile-time constants (not a TOML section):
 
 ```text
 # reporting tree
 report_interval = "5s"          # how often a worker sends a StateReport
 max_events_per_report = 100
 stale_report_timeout = "30s"
+```
 
-# state reconstruction (learning period)
+The learning period, by contrast, *is* tunable: it's the `[reconstruction]` section of `node.toml` (`ReconstructionSection` in `src/config/node.rs`), shown here with its defaults:
+
+```toml
+[reconstruction]
 report_threshold_percent = 95
-learning_period_timeout = "15s"
-large_cluster_timeout = "30s"   # clusters > 5000 nodes
+learning_period_timeout_secs = 15
+large_cluster_timeout_secs = 30    # clusters > large_cluster_node_count
 large_cluster_node_count = 5000
 ```
 
@@ -1061,9 +1069,11 @@ At 10,000 nodes with 0.1% UDP packet loss, the expected convergence time increas
 
 ### 8.1 Gossip Authentication
 
-Every Mustard gossip message includes an HMAC-SHA256 tag computed over the serialised payload. The HMAC key is derived from the cluster's shared gossip key, which is distributed during the node join process (encrypted with the node's mTLS certificate). A node that has not completed the `relish join` handshake cannot forge or inject gossip messages.
+When the node has a cluster master key (`[security] master_key_path`, produced by `relish init` and provisioned onto every clustered node by the operator), every Mustard gossip message carries an HMAC-SHA256 tag computed over the message with the `hmac` field zeroed. Every node derives the same key from the master key with HKDF-SHA256 (`sesame::mtls::gossip_hmac::derive_gossip_key`), and the transport drops datagrams whose tag doesn't verify. A host without the master key can't forge or inject gossip messages.
 
-The gossip key is rotated when the leader rotates the cluster's CA certificates (via `relish ca rotate`). During rotation, nodes accept messages signed with either the old or new key (dual-key window) until all nodes have received the new key.
+A node started without a master key (single-node and pre-security configurations) gossips unauthenticated. Generated secure clusters always have one.
+
+**TODO (not yet implemented):** gossip key rotation. The key is fixed for the life of the master key; there's no rotation command and no dual-key acceptance window.
 
 ### 8.2 Encrypted Recovery Candidate List
 
@@ -1100,7 +1110,7 @@ All reporting tree connections use mTLS via Sesame's Node CA. A council member v
 
 | Metric | Target | Mechanism |
 |--------|--------|-----------|
-| Election time | < 5 seconds | Randomized timeout (1-2s) + one or two voting rounds. Pre-vote prevents spurious elections. |
+| Election time | < 5 seconds | Randomized timeout (1-2s) + one or two voting rounds. (Pre-vote, which would prevent spurious elections, is a TODO; see §5.2.) |
 | Leader announcement propagation | < 2 seconds | Gossip convergence at O(log 10000) ~ 13 periods * 500ms ~ 6.5s theoretical worst case, but leader aggressively pushes to all council members immediately and they amplify. Practical: < 2 seconds. |
 | Steady-state heartbeat overhead | ~50 KB/s total (council) | 150ms interval * 5 members * ~100 bytes per heartbeat. |
 
@@ -1199,7 +1209,7 @@ etcd is a distributed key-value store that uses Raft for consensus. Kubernetes d
 **What we borrow:**
 
 - Raft log compaction via snapshots (etcd's snapshot mechanism is well-understood).
-- Pre-vote extension to prevent disruptive elections from partitioned nodes.
+- Pre-vote extension to prevent disruptive elections from partitioned nodes. **TODO (not yet implemented):** `openraft` 0.9 doesn't provide it.
 
 **What we do differently:**
 
@@ -1251,7 +1261,7 @@ Nomad uses Raft for consensus among server nodes and a gossip protocol (Serf) fo
 
 | Crate | Notes |
 |-------|-------|
-| [`openraft`](https://crates.io/crates/openraft) | **Primary candidate.** Pure Rust, async-first (tokio-native), well-maintained, supports dynamic membership changes, pre-vote, and snapshots. Used by Databend and other production systems. |
+| [`openraft`](https://crates.io/crates/openraft) | **Primary candidate.** Pure Rust, async-first (tokio-native), well-maintained, supports dynamic membership changes and snapshots (but not pre-vote, as of 0.9). Used by Databend and other production systems. |
 | [`raft-rs`](https://crates.io/crates/raft) | Alternative. Port of etcd's Raft. More battle-tested algorithm but less idiomatic Rust API. Lower-level -- requires implementing your own transport and storage. |
 
 **Recommendation:** `openraft`. Its async-native design fits Reliaburger's tokio-based architecture. Dynamic membership changes are a first-class feature, which is critical for our elastic council.

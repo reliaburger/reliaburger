@@ -23,6 +23,7 @@ use std::path::PathBuf;
 use tokio_util::sync::CancellationToken;
 
 use super::InstanceId;
+use super::command::{DirectCommandExecutor, RuntimeCommandExecutor};
 use super::portmap::{self, NftCommandExecutor, NftExecutor};
 
 /// Errors from network namespace operations.
@@ -63,8 +64,8 @@ pub struct ContainerNetwork {
     pub rootless: bool,
 }
 
-/// Handle to an active port mapping. Drop or call `shutdown()` to
-/// remove the mapping.
+/// Handle to an active port mapping. Call `shutdown()` to remove the mapping.
+/// Dropping a rootful handle alone leaves kernel state for runtime recovery.
 pub struct PortMapHandle {
     /// Cancellation token that stops the TCP proxy (rootless) or
     /// signals that the map element should be removed (root).
@@ -204,6 +205,29 @@ pub fn host_veth_name(instance_id: &InstanceId) -> String {
 // Namespace lifecycle
 // ---------------------------------------------------------------------------
 
+/// Describe resources before mutation, so failed or cancelled setup can be
+/// retired using the persisted address reservation.
+pub fn planned_container_network(
+    instance: &InstanceId,
+    node_index: u16,
+    index: u16,
+) -> Result<ContainerNetwork, NetnsError> {
+    if node_index == 0 || node_index > MAX_NODE_INDEX || index >= MAX_CONTAINERS_PER_NODE {
+        return Err(NetnsError::SetupFailed {
+            instance: instance.0.clone(),
+            reason: "address is outside the node container subnet".into(),
+        });
+    }
+    Ok(ContainerNetwork {
+        namespace_path: namespace_path(instance),
+        container_ip: container_ip(node_index, index),
+        gateway_ip: gateway_ip(node_index),
+        host_veth: host_veth_name(instance),
+        container_veth: "eth0".into(),
+        rootless: false,
+    })
+}
+
 /// Create a network namespace, veth pair, assign IPs, and set the
 /// default route inside the namespace.
 ///
@@ -217,6 +241,25 @@ pub async fn setup_container_network(
     container_index: u16,
     rootless: bool,
 ) -> Result<ContainerNetwork, NetnsError> {
+    setup_container_network_with_commands(
+        &DirectCommandExecutor,
+        instance_id,
+        node_index,
+        container_index,
+        rootless,
+    )
+    .await
+}
+
+/// Prepare networking through the caller's exclusively owned command executor.
+pub async fn setup_container_network_with_commands(
+    executor: &impl RuntimeCommandExecutor,
+    instance_id: &InstanceId,
+    node_index: u16,
+    container_index: u16,
+    rootless: bool,
+) -> Result<ContainerNetwork, NetnsError> {
+    planned_container_network(instance_id, node_index, container_index)?;
     let ns_path = namespace_path(instance_id);
     let c_ip = container_ip(node_index, container_index);
     let gw_ip = gateway_ip(node_index);
@@ -236,6 +279,7 @@ pub async fn setup_container_network(
 
     // 1. Create the network namespace
     run_cmd(
+        executor,
         "ip",
         &["netns", "add", &ns_name],
         instance_id,
@@ -245,6 +289,7 @@ pub async fn setup_container_network(
 
     // 2. Create the veth pair (using a temporary name for the container side)
     run_cmd(
+        executor,
         "ip",
         &[
             "link",
@@ -263,6 +308,7 @@ pub async fn setup_container_network(
 
     // 3. Move the container-side veth into the namespace
     run_cmd(
+        executor,
         "ip",
         &["link", "set", &c_veth_tmp, "netns", &ns_name],
         instance_id,
@@ -273,6 +319,7 @@ pub async fn setup_container_network(
     // 3b. Rename to eth0 inside the namespace
     let c_veth = "eth0".to_string();
     run_cmd(
+        executor,
         "ip",
         &[
             "netns",
@@ -291,8 +338,9 @@ pub async fn setup_container_network(
     .await?;
 
     // 4. Assign IP to host-side veth
-    let gw_cidr = format!("{gw_ip}/23");
+    let gw_cidr = format!("{gw_ip}/32");
     run_cmd(
+        executor,
         "ip",
         &["addr", "add", &gw_cidr, "dev", &h_veth],
         instance_id,
@@ -302,6 +350,7 @@ pub async fn setup_container_network(
 
     // 5. Bring up host-side veth
     run_cmd(
+        executor,
         "ip",
         &["link", "set", &h_veth, "up"],
         instance_id,
@@ -309,9 +358,31 @@ pub async fn setup_container_network(
     )
     .await?;
 
-    // 6. Assign IP to container-side veth (inside namespace)
-    let c_cidr = format!("{c_ip}/23");
+    // Each veth owns one address. A shared /23 connected route would send
+    // traffic for every container through whichever veth the host picks first.
+    let container_route = format!("{c_ip}/32");
+    let gateway = gw_ip.to_string();
     run_cmd(
+        executor,
+        "ip",
+        &[
+            "route",
+            "add",
+            &container_route,
+            "dev",
+            &h_veth,
+            "src",
+            &gateway,
+        ],
+        instance_id,
+        "route container address to its own veth",
+    )
+    .await?;
+
+    // 6. Assign IP to container-side veth (inside namespace)
+    let c_cidr = format!("{c_ip}/32");
+    run_cmd(
+        executor,
         "ip",
         &[
             "netns", "exec", &ns_name, "ip", "addr", "add", &c_cidr, "dev", &c_veth,
@@ -323,6 +394,7 @@ pub async fn setup_container_network(
 
     // 7. Bring up container-side veth
     run_cmd(
+        executor,
         "ip",
         &[
             "netns", "exec", &ns_name, "ip", "link", "set", &c_veth, "up",
@@ -334,6 +406,7 @@ pub async fn setup_container_network(
 
     // 8. Bring up loopback inside namespace
     run_cmd(
+        executor,
         "ip",
         &["netns", "exec", &ns_name, "ip", "link", "set", "lo", "up"],
         instance_id,
@@ -341,9 +414,23 @@ pub async fn setup_container_network(
     )
     .await?;
 
+    // Peers are behind other veth pairs, not on this link. Reach the gateway
+    // directly and send every other destination through the host.
+    run_cmd(
+        executor,
+        "ip",
+        &[
+            "netns", "exec", &ns_name, "ip", "route", "add", &gw_cidr, "dev", &c_veth,
+        ],
+        instance_id,
+        "route gateway through container veth",
+    )
+    .await?;
+
     // 9. Set default route inside namespace
     let gw_str = gw_ip.to_string();
     run_cmd(
+        executor,
         "ip",
         &[
             "netns", "exec", &ns_name, "ip", "route", "add", "default", "via", &gw_str,
@@ -355,6 +442,7 @@ pub async fn setup_container_network(
 
     // 10. Enable IP forwarding on the host (idempotent)
     run_cmd(
+        executor,
         "sysctl",
         &["-w", "net.ipv4.ip_forward=1"],
         instance_id,
@@ -372,11 +460,102 @@ pub async fn setup_container_network(
     })
 }
 
+/// Recover an existing rootful network only when the live container owns it.
+/// The address comes from the kernel, not a guessed allocation or stale record.
+pub async fn adopt_container_network(
+    instance_id: &InstanceId,
+    container_pid: u32,
+) -> Result<Option<ContainerNetwork>, NetnsError> {
+    use std::os::unix::fs::MetadataExt;
+    let failure = |reason: String| NetnsError::SetupFailed {
+        instance: instance_id.0.clone(),
+        reason,
+    };
+    let path = namespace_path(instance_id);
+    let expected = match tokio::fs::metadata(&path).await {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(failure(format!("inspect adopted network: {error}"))),
+    };
+    let live = tokio::fs::metadata(format!("/proc/{container_pid}/ns/net"))
+        .await
+        .map_err(|error| failure(format!("inspect container network namespace: {error}")))?;
+    if (expected.dev(), expected.ino()) != (live.dev(), live.ino()) {
+        return Err(failure(
+            "container no longer owns its recorded network namespace".into(),
+        ));
+    }
+    let output = tokio::time::timeout(
+        std::time::Duration::from_secs(2),
+        tokio::process::Command::new("ip")
+            .args([
+                "-j",
+                "-n",
+                &format!("rb-{}", instance_id.0),
+                "address",
+                "show",
+                "dev",
+                "eth0",
+            ])
+            .kill_on_drop(true)
+            .output(),
+    )
+    .await
+    .map_err(|_| failure("adopted network inspection exceeded 2s".into()))?
+    .map_err(|error| failure(format!("inspect adopted network address: {error}")))?;
+    if !output.status.success() {
+        return Err(failure(
+            "ip could not inspect the adopted network address".into(),
+        ));
+    }
+    let interfaces: serde_json::Value = serde_json::from_slice(&output.stdout)
+        .map_err(|error| failure(format!("invalid adopted network address response: {error}")))?;
+    let addresses: Vec<_> = interfaces
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|interface| interface.get("addr_info")?.as_array())
+        .flatten()
+        .filter(|address| address["family"] == "inet" && address["prefixlen"] == 32)
+        .filter_map(|address| address["local"].as_str()?.parse::<Ipv4Addr>().ok())
+        .collect();
+    let [container_ip] = addresses.as_slice() else {
+        return Err(failure(
+            "adopted network must have exactly one IPv4 /32 address".into(),
+        ));
+    };
+    let [first, second, third, fourth] = container_ip.octets();
+    let host = u16::from(third & 1) * 256 + u16::from(fourth);
+    if first != 10 || !(2..=510).contains(&host) {
+        return Err(failure(
+            "adopted network address is outside the container range".into(),
+        ));
+    }
+    Ok(Some(ContainerNetwork {
+        namespace_path: path,
+        container_ip: *container_ip,
+        gateway_ip: Ipv4Addr::new(10, second, third & !1, 1),
+        host_veth: host_veth_name(instance_id),
+        container_veth: "eth0".into(),
+        rootless: false,
+    }))
+}
+
 /// Add a port mapping from a host port to a container port.
 ///
 /// In root mode, adds an nftables DNAT rule. In rootless mode, spawns
 /// a tokio TCP proxy task.
 pub async fn add_port_mapping(
+    network: &ContainerNetwork,
+    host_port: u16,
+    container_port: u16,
+) -> Result<PortMapHandle, NetnsError> {
+    add_port_mapping_with_commands(&DirectCommandExecutor, network, host_port, container_port).await
+}
+
+/// Publish a port through the caller's generation-bound command executor.
+pub async fn add_port_mapping_with_commands(
+    executor: &impl RuntimeCommandExecutor,
     network: &ContainerNetwork,
     host_port: u16,
     container_port: u16,
@@ -415,7 +594,7 @@ pub async fn add_port_mapping(
         })
     } else {
         // Root: one element in the DNAT map, O(1) at any scale.
-        ensure_nft_table()
+        ensure_nft_table(executor)
             .await
             .map_err(|e| NetnsError::PortMappingFailed {
                 instance: "nft-setup".to_string(),
@@ -424,19 +603,25 @@ pub async fn add_port_mapping(
                 reason: e,
             })?;
 
-        let executor = NftCommandExecutor;
         let entry = portmap::PortMapEntry {
             host_port,
             container_ip: network.container_ip,
             container_port,
         };
 
-        // `add element` errors if the key exists. A stale element can
-        // survive an unclean agent death, so delete first (best-effort)
-        // to self-heal rather than fail the container start.
-        let _ = executor.run(&portmap::element_delete(host_port)).await;
-        executor
-            .run(&portmap::element_add(&entry))
+        // A completed deletion may report an already absent element. An
+        // unknown deletion must not run late and remove the new publication.
+        let deletion = portmap::element_delete(host_port);
+        let arguments: Vec<&str> = deletion.iter().map(String::as_str).collect();
+        executor.output("nft", &arguments).await.map_err(|error| {
+            NetnsError::PortMappingFailed {
+                instance: "nft-map".into(),
+                host_port,
+                container_port,
+                reason: format!("cannot confirm previous deletion retired: {error}"),
+            }
+        })?;
+        run_nft(executor, &portmap::element_add(&entry))
             .await
             .map_err(|reason| NetnsError::PortMappingFailed {
                 instance: "nft-map".to_string(),
@@ -454,25 +639,89 @@ pub async fn add_port_mapping(
     }
 }
 
+/// Remove any surviving owned DNAT entries before an address is reusable.
+/// This also recovers mappings installed before a cancelled setup published its handle.
+pub(crate) async fn retire_address_forwarding(address: Ipv4Addr) -> Result<(), String> {
+    retire_address_forwarding_with_commands(&DirectCommandExecutor, address).await
+}
+
+/// Retire an owned address's forwarding after the executor has fenced prior mutators.
+pub async fn retire_address_forwarding_with_commands(
+    executor: &impl RuntimeCommandExecutor,
+    address: Ipv4Addr,
+) -> Result<(), String> {
+    async fn remaining(
+        executor: &impl RuntimeCommandExecutor,
+        address: Ipv4Addr,
+    ) -> Result<Vec<u16>, String> {
+        let output = executor
+            .output("nft", &["-j", "list", "ruleset"])
+            .await
+            .map_err(|error| format!("cannot inspect address forwarding: {error}"))?;
+        if output.exit_code != Some(0) {
+            return Err(format!(
+                "cannot inspect address forwarding: {}",
+                String::from_utf8_lossy(&output.stderr)
+            ));
+        }
+        portmap::ports_for_address(&output.stdout, address)
+    }
+    for port in remaining(executor, address).await? {
+        run_nft(executor, &portmap::element_delete(port)).await?;
+    }
+    if !remaining(executor, address).await?.is_empty() {
+        return Err("container address still has an owned forwarding entry".into());
+    }
+    Ok(())
+}
+
 /// Remove a network namespace, veth pair, and clean up.
 pub async fn teardown_container_network(network: &ContainerNetwork) -> Result<(), NetnsError> {
+    teardown_container_network_with_commands(&DirectCommandExecutor, network).await
+}
+
+/// Remove networking through a sealed executor and verify kernel resource absence.
+pub async fn teardown_container_network_with_commands(
+    executor: &impl RuntimeCommandExecutor,
+    network: &ContainerNetwork,
+) -> Result<(), NetnsError> {
     let ns_name = network
         .namespace_path
         .file_name()
         .and_then(|n| n.to_str())
         .unwrap_or("unknown");
 
-    // Delete the host-side veth (this also removes the peer)
-    let _ = run_cmd_raw(
-        "ip",
-        &["link", "del", &network.host_veth],
-        "delete host veth",
-    )
-    .await;
-
-    // Delete the network namespace
-    let _ = run_cmd_raw("ip", &["netns", "del", ns_name], "delete network namespace").await;
-
+    // A completed non-zero deletion can mean the resource was already absent.
+    // An execution error can still leave a delayed deletion able to hit reuse.
+    for arguments in [
+        vec!["link", "del", network.host_veth.as_str()],
+        vec!["netns", "del", ns_name],
+    ] {
+        executor
+            .output("ip", &arguments)
+            .await
+            .map_err(|error| NetnsError::TeardownFailed {
+                instance: ns_name.into(),
+                reason: format!("cannot confirm deletion command retirement: {error}"),
+            })?;
+    }
+    for path in [
+        network.namespace_path.clone(),
+        PathBuf::from("/sys/class/net").join(&network.host_veth),
+    ] {
+        match tokio::fs::try_exists(&path).await {
+            Ok(false) => {}
+            result => {
+                return Err(NetnsError::TeardownFailed {
+                    instance: ns_name.into(),
+                    reason: format!(
+                        "cannot confirm resource removal at {}: {result:?}",
+                        path.display()
+                    ),
+                });
+            }
+        }
+    }
     Ok(())
 }
 
@@ -481,9 +730,10 @@ pub async fn teardown_container_network(network: &ContainerNetwork) -> Result<()
 // ---------------------------------------------------------------------------
 
 /// Ensure the reliaburger nftables table and prerouting chain exist.
-async fn ensure_nft_table() -> Result<(), String> {
+async fn ensure_nft_table(executor: &impl RuntimeCommandExecutor) -> Result<(), String> {
     // Create table (idempotent — nft doesn't error if it exists)
-    run_cmd_raw(
+    run_cmd_raw_with(
+        executor,
         "nft",
         &["add", "table", "ip", "reliaburger"],
         "create nft table",
@@ -491,7 +741,8 @@ async fn ensure_nft_table() -> Result<(), String> {
     .await?;
 
     // Create prerouting chain
-    run_cmd_raw(
+    run_cmd_raw_with(
+        executor,
         "nft",
         &[
             "add",
@@ -506,7 +757,8 @@ async fn ensure_nft_table() -> Result<(), String> {
     .await?;
 
     // Create postrouting chain for masquerade
-    run_cmd_raw(
+    run_cmd_raw_with(
+        executor,
         "nft",
         &[
             "add",
@@ -522,9 +774,10 @@ async fn ensure_nft_table() -> Result<(), String> {
 
     // Masquerade outgoing traffic from container subnets. `add rule`
     // is not idempotent (it appends duplicates), so probe first.
-    let postrouting = list_chain("postrouting").await?;
+    let postrouting = list_chain(executor, "postrouting").await?;
     if !postrouting.contains("masquerade") {
-        run_cmd_raw(
+        run_cmd_raw_with(
+            executor,
             "nft",
             &[
                 "add",
@@ -543,19 +796,18 @@ async fn ensure_nft_table() -> Result<(), String> {
     }
 
     // The named port map (`add map` is idempotent, like table/chain).
-    NftCommandExecutor
-        .run(&portmap::portmap_definition())
-        .await?;
+    run_nft(executor, &portmap::portmap_definition()).await?;
 
     // The single lookup rule that consults the map, guarded the same
     // way — and a one-time sweep of legacy per-port DNAT rules left by
     // the pre-map scheme, which would otherwise match ahead of it.
-    let prerouting = list_chain("prerouting").await?;
+    let prerouting = list_chain(executor, "prerouting").await?;
     if !prerouting.contains("@portmap") {
-        NftCommandExecutor.run(&portmap::map_rule()).await?;
+        run_nft(executor, &portmap::map_rule()).await?;
     }
     for handle in portmap::legacy_rule_handles(&prerouting) {
-        let _ = run_cmd_raw(
+        run_cmd_raw_with(
+            executor,
             "nft",
             &[
                 "delete",
@@ -568,7 +820,7 @@ async fn ensure_nft_table() -> Result<(), String> {
             ],
             "sweep legacy dnat rule",
         )
-        .await;
+        .await?;
     }
 
     Ok(())
@@ -576,14 +828,13 @@ async fn ensure_nft_table() -> Result<(), String> {
 
 /// List a chain with rule handles (`nft -a list chain`). Used to guard
 /// one-shot rules and to sweep legacy per-port DNAT rules.
-async fn list_chain(chain: &str) -> Result<String, String> {
-    let output = tokio::process::Command::new("nft")
-        .args(["-a", "list", "chain", "ip", "reliaburger", chain])
-        .output()
+async fn list_chain(executor: &impl RuntimeCommandExecutor, chain: &str) -> Result<String, String> {
+    let output = executor
+        .output("nft", &["-a", "list", "chain", "ip", "reliaburger", chain])
         .await
         .map_err(|e| format!("failed to list chain {chain}: {e}"))?;
 
-    if !output.status.success() {
+    if output.exit_code != Some(0) {
         let stderr = String::from_utf8_lossy(&output.stderr);
         return Err(format!("nft list chain {chain} failed: {stderr}"));
     }
@@ -654,12 +905,13 @@ async fn run_tcp_proxy(
 
 /// Run a command, returning a `NetnsError` on failure.
 async fn run_cmd(
+    executor: &impl RuntimeCommandExecutor,
     program: &str,
     args: &[&str],
     instance_id: &InstanceId,
     description: &str,
 ) -> Result<(), NetnsError> {
-    run_cmd_raw(program, args, description)
+    run_cmd_raw_with(executor, program, args, description)
         .await
         .map_err(|reason| NetnsError::SetupFailed {
             instance: instance_id.0.clone(),
@@ -668,19 +920,33 @@ async fn run_cmd(
 }
 
 /// Run a command, returning a descriptive error string on failure.
-async fn run_cmd_raw(program: &str, args: &[&str], description: &str) -> Result<(), String> {
-    let output = tokio::process::Command::new(program)
-        .args(args)
-        .output()
+async fn run_cmd_raw_with(
+    executor: &impl RuntimeCommandExecutor,
+    program: &str,
+    args: &[&str],
+    description: &str,
+) -> Result<(), String> {
+    let output = executor
+        .output(program, args)
         .await
-        .map_err(|e| format!("{description}: failed to execute {program}: {e}"))?;
-
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        return Err(format!("{description}: {program} failed: {stderr}"));
+        .map_err(|error| format!("{description}: failed to execute {program}: {error}"))?;
+    if output.exit_code != Some(0) {
+        return Err(format!(
+            "{description}: {program} failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        ));
     }
-
     Ok(())
+}
+
+async fn run_nft(executor: &impl RuntimeCommandExecutor, args: &[String]) -> Result<(), String> {
+    let arguments: Vec<&str> = args.iter().map(String::as_str).collect();
+    run_cmd_raw_with(executor, "nft", &arguments, "nft operation").await
+}
+
+#[cfg(test)]
+async fn run_cmd_raw(program: &str, args: &[&str], description: &str) -> Result<(), String> {
+    run_cmd_raw_with(&DirectCommandExecutor, program, args, description).await
 }
 
 // ---------------------------------------------------------------------------
@@ -690,6 +956,42 @@ async fn run_cmd_raw(program: &str, args: &[&str], description: &str) -> Result<
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn teardown_reports_a_namespace_that_remains_present() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp
+            .path()
+            .join(format!("rb-owned-test-{}", std::process::id()));
+        std::fs::write(&path, b"still present").unwrap();
+        let network = ContainerNetwork {
+            namespace_path: path.clone(),
+            container_ip: Ipv4Addr::LOCALHOST,
+            gateway_ip: Ipv4Addr::LOCALHOST,
+            host_veth: format!("rbtest{}", std::process::id()),
+            container_veth: "eth0".into(),
+            rootless: false,
+        };
+        assert!(teardown_container_network(&network).await.is_err());
+        std::fs::remove_file(&path).unwrap();
+        teardown_container_network(&network).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn invalid_address_indices_refuse_before_any_network_setup() {
+        let instance = InstanceId("invalid-subnet-test".into());
+        for (node, index) in [(1, 509), (1, u16::MAX), (0, 0), (u16::MAX, 0)] {
+            let error = setup_container_network(&instance, node, index, false)
+                .await
+                .err()
+                .unwrap();
+            assert!(
+                error
+                    .to_string()
+                    .contains("outside the node container subnet")
+            );
+        }
+    }
 
     // -- IP address calculation -----------------------------------------------
 
@@ -951,6 +1253,33 @@ mod tests {
             !listing.contains("18080"),
             "shutdown should delete the element: {listing}"
         );
+        // Simulate cancellation before the mapping handle reaches its owner.
+        drop(add_port_mapping(&network, 18081, 80).await.unwrap());
+        let other = portmap::PortMapEntry {
+            host_port: 18082,
+            container_ip: container_ip(98, 1),
+            container_port: 80,
+        };
+        NftCommandExecutor
+            .run(&portmap::element_add(&other))
+            .await
+            .unwrap();
+        retire_address_forwarding(network.container_ip)
+            .await
+            .unwrap();
+        let listing = list_map_elements().await;
+        assert!(
+            !listing.contains("18081"),
+            "orphaned forwarding survived retirement"
+        );
+        assert!(
+            listing.contains("18082"),
+            "retirement removed another owner's forwarding"
+        );
+        NftCommandExecutor
+            .run(&portmap::element_delete(18082))
+            .await
+            .unwrap();
 
         teardown_container_network(&network)
             .await
@@ -974,7 +1303,9 @@ mod tests {
             "set RELIABURGER_NETNS_TESTS=1 after provisioning Linux network tools and root access"
         );
 
-        ensure_nft_table().await.expect("failed to ensure table");
+        ensure_nft_table(&DirectCommandExecutor)
+            .await
+            .expect("failed to ensure table");
         let executor = NftCommandExecutor;
         let container_ip = Ipv4Addr::new(10, 0, 2, 2);
 

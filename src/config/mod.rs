@@ -16,6 +16,7 @@ pub mod permission;
 pub mod process_workloads;
 pub mod types;
 mod validate;
+pub(crate) use validate::valid_workload_label;
 
 use std::collections::BTreeMap;
 use std::path::Path;
@@ -56,6 +57,25 @@ pub struct Config {
 
 impl Config {
     /// Parse workload configuration from a TOML string.
+    ///
+    /// Parsing checks the TOML shape; call [`Self::validate`] to check workload
+    /// semantics before deployment. Neither step contacts a node.
+    ///
+    /// ```
+    /// use reliaburger::config::Config;
+    ///
+    /// let config = Config::parse(r#"
+    ///     [app.web]
+    ///     image = "nginx:stable"
+    ///     replicas = 2
+    ///     port = 8080
+    /// "#).expect("valid TOML");
+    /// config.validate().expect("valid workload configuration");
+    /// assert_eq!(config.app["web"].image.as_deref(), Some("nginx:stable"));
+    ///
+    /// // Unknown keys fail instead of silently selecting a default.
+    /// assert!(Config::parse("[app.web]\nimage = 'nginx'\nreplcias = 2").is_err());
+    /// ```
     pub fn parse(toml: &str) -> Result<Self, ConfigError> {
         Ok(toml::from_str(toml)?)
     }

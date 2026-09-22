@@ -36,6 +36,7 @@ use crate::mayo::rollup_store::RollupStore;
 use crate::mayo::store::MayoStore;
 use crate::meat::deploy_types::DeployHistoryEntry;
 use crate::pickle::types::ManifestCatalog;
+use crate::testkit::lease::{LeaseScope, is_node_job_lease};
 
 use super::agent::{AgentCommand, ApplyEvent, InstanceStatus};
 
@@ -283,6 +284,8 @@ pub fn router_with_upgrade(
         build_signers: Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new())),
     };
 
+    spawn_node_fault_reaper(state.clone());
+
     let mut auth_state = crate::sesame::auth::AuthState::new(
         token_store.unwrap_or_else(crate::sesame::auth::new_token_store),
         service_token,
@@ -361,6 +364,24 @@ pub fn router_with_upgrade(
             "/v1/capabilities/cluster",
             get(cluster_capabilities_handler),
         )
+        .route(
+            "/v1/cluster/renew",
+            post(node_renewal_handler).layer(axum::extract::DefaultBodyLimit::max(16 * 1024)),
+        )
+        .route(
+            "/v1/registry/query",
+            post(registry_query_handler)
+                .layer(axum::extract::DefaultBodyLimit::max(16 * 1024))
+                .layer(axum::middleware::from_fn(registry_proposal_deadline)),
+        )
+        .route(
+            "/v1/registry/propose",
+            post(registry_proposal_handler)
+                .layer(axum::extract::DefaultBodyLimit::max(
+                    crate::pickle::authority::MAX_REGISTRY_PROPOSAL_BYTES,
+                ))
+                .layer(axum::middleware::from_fn(registry_proposal_deadline)),
+        )
         .route("/v1/diagnostics", get(diagnostics_handler))
         .route("/v1/diagnostics/apps", get(desired_apps_handler))
         .route("/v1/trace", post(trace_handler))
@@ -385,6 +406,8 @@ pub fn router_with_upgrade(
         )
         .route("/v1/cluster/elect", post(cluster_elect_handler))
         .route("/v1/chaos/partition", post(chaos_partition_handler))
+        .route("/v1/chaos/reserve", post(node_fault_reserve_handler))
+        .route("/v1/chaos/fence", post(node_fault_fence_handler))
         .route("/v1/chaos/heal", post(chaos_heal_handler))
         .route("/v1/chaos/status", get(chaos_status_handler))
         .route(
@@ -410,6 +433,10 @@ pub fn router_with_upgrade(
         .route("/v1/metrics/summary", get(metrics_summary_handler))
         .route("/v1/metrics/keys", get(metrics_keys_handler))
         .route("/v1/metrics/rollup", get(metrics_rollup_handler))
+        .route(
+            "/v1/metrics/rollup/owned",
+            get(metrics_owned_rollup_handler),
+        )
         .route("/v1/metrics/cluster", get(metrics_cluster_handler))
         .route(
             "/v1/metrics/app/{app}/{namespace}",
@@ -420,9 +447,20 @@ pub fn router_with_upgrade(
         .route("/v1/logs/export", post(logs_export_handler))
         .route("/v1/deploys/active", get(deploys_active_handler))
         .route("/v1/deploys/operations", get(deploys_operations_handler))
+        .route(
+            "/v1/deploys/operations/{id}/cancel",
+            post(deploy_cancel_handler),
+        )
         .route("/v1/deploys/history/{app}", get(deploys_history_handler))
         .route("/v1/rollback/{app}/{namespace}", post(rollback_handler))
+        .route("/v1/nodes/decommission", post(node_decommission_handler))
         .route("/v1/placements/{node_id}", get(placements_handler))
+        .route("/v1/discovery/retire", post(producer_retirement_handler))
+        .route(
+            "/v1/discovery/withdrawn",
+            post(endpoint_withdrawal_receipt_handler),
+        )
+        .route("/v1/test/leases/retired", post(test_lease_retired_handler))
         .route("/v1/images", get(images_handler))
         .route("/v1/batch", post(super::batch::batch_submit_handler))
         .route("/v1/batch/run", post(super::batch::batch_run_handler))
@@ -449,14 +487,21 @@ pub fn router_with_upgrade(
         .route("/v1/token/list", get(token_list_handler))
         .route("/v1/token/revoke", post(token_revoke_handler))
         .route("/v1/join-token/create", post(join_token_create_handler))
+        .route("/v1/secret/public-key", get(secret_public_key_handler))
         .route("/v1/secret/rotate", post(secret_rotate_handler))
         .route_layer(axum::middleware::from_fn_with_state(
             auth_state,
             crate::sesame::auth::auth_middleware,
         ))
-        .with_state(state);
+        .with_state(state.clone());
 
-    public.merge(auth_routes).merge(protected)
+    public
+        .merge(auth_routes)
+        .merge(protected)
+        .layer(axum::middleware::from_fn_with_state(
+            state,
+            refuse_retired_tls_peer,
+        ))
 }
 
 /// Liveness check.
@@ -650,6 +695,8 @@ struct DiagnosticsQuery {
 /// caller can request a 1–10 second window; one second is the default so the
 /// endpoint cannot be turned into an arbitrarily long-lived request.
 async fn diagnostics_handler(
+    live_identity: Option<axum::Extension<crate::sesame::credentials::LiveNodeIdentity>>,
+    renewal: Option<axum::Extension<crate::sesame::renewal_worker::RenewalMonitor>>,
     State(state): State<ApiState>,
     Query(query): Query<DiagnosticsQuery>,
 ) -> Json<crate::bun::diagnostics::LocalDiagnosticSnapshot> {
@@ -699,24 +746,45 @@ async fn diagnostics_handler(
             reason: format!("disk capacity collector failed: {error}"),
         },
     };
-    let certificates = match &state.static_capabilities.diagnostics.node_certificate {
-        // The node leaf metadata is genuinely available and diagnosable (expiry
-        // is checked from it). That the broader workload-certificate inventory
-        // and hot-reload state aren't exposed yet is a static product
-        // limitation, not a per-request collection failure — reporting it
-        // `Degraded` forced every mTLS cluster's `relish wtf` to exit 2, which
-        // the "0 = healthy" contract forbids. Serve it as `Available`.
-        Some(certificate) => DiagnosticSource::Available {
-            observed_at,
-            value: vec![certificate.clone()],
-        },
-        None if !state.static_capabilities.identity => DiagnosticSource::Unsupported {
-            reason: "workload identity issuance is disabled and no node mTLS leaf is loaded"
-                .to_string(),
-        },
-        None => DiagnosticSource::Unavailable {
-            reason: "identity issuance is enabled but no safe certificate inventory is available"
-                .to_string(),
+    let certificates = match live_identity {
+        Some(identity) => {
+            let current = identity.snapshot();
+            let worker_state = renewal.as_ref().map(|monitor| monitor.state());
+            let rotation_state = if std::time::SystemTime::now() >= current.not_after {
+                "expired"
+            } else {
+                worker_state.map_or("manual", |state| state.as_str())
+            };
+            let automatic_rotation = worker_state
+                .is_some_and(|state| state != crate::sesame::renewal_worker::RenewalState::Stopped);
+            match crate::bun::diagnostics::public_certificate_metadata(
+                "node",
+                &current.node_id,
+                &current.certificate_der,
+                rotation_state,
+                automatic_rotation,
+            ) {
+                Ok(metadata) => DiagnosticSource::Available {
+                    observed_at,
+                    value: vec![metadata],
+                },
+                Err(reason) => DiagnosticSource::Unavailable { reason },
+            }
+        }
+        None => match &state.static_capabilities.diagnostics.node_certificate {
+            Some(certificate) => DiagnosticSource::Available {
+                observed_at,
+                value: vec![certificate.clone()],
+            },
+            None if !state.static_capabilities.identity => DiagnosticSource::Unsupported {
+                reason: "workload identity issuance is disabled and no node mTLS leaf is loaded"
+                    .to_string(),
+            },
+            None => DiagnosticSource::Unavailable {
+                reason:
+                    "identity issuance is enabled but no safe certificate inventory is available"
+                        .to_string(),
+            },
         },
     };
 
@@ -954,13 +1022,7 @@ async fn trace_handler(
 }
 
 fn valid_trace_label(value: &str) -> bool {
-    let bytes = value.as_bytes();
-    let edge = |byte: u8| byte.is_ascii_lowercase() || byte.is_ascii_digit();
-    !bytes.is_empty()
-        && bytes.len() <= 63
-        && edge(bytes[0])
-        && edge(bytes[bytes.len() - 1])
-        && bytes.iter().all(|byte| edge(*byte) || *byte == b'-')
+    crate::config::valid_workload_label(value)
 }
 
 fn filter_desired_apps_for_scope(
@@ -991,6 +1053,8 @@ fn system_time_millis(time: std::time::SystemTime) -> u64 {
 #[derive(Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 struct CreateTestLeaseRequest {
+    #[serde(default)]
+    scope: LeaseScope,
     ttl_seconds: u64,
     namespace: Option<String>,
 }
@@ -1068,7 +1132,16 @@ async fn test_lease_create_handler(
         Ok(ttl) => ttl,
         Err(response) => return response,
     };
+    if request.scope == LeaseScope::NodeJobs {
+        if let Err(response) = crate::sesame::auth::require_unscoped(Some(auth)) {
+            return response;
+        }
+        if request.namespace.is_some() {
+            return lease_error_response(crate::testkit::lease::LeaseError::InvalidScope);
+        }
+    }
     if let Some(council) = &state.council
+        && request.scope == LeaseScope::Applications
         && !council.is_leader().await
     {
         return forward_test_lease_request(
@@ -1089,10 +1162,19 @@ async fn test_lease_create_handler(
         )
             .into_response();
     }
-    let lease_id = hex::encode(random);
-    let namespace = request
-        .namespace
-        .unwrap_or_else(|| format!("rbtest-{}", &lease_id[..12]));
+    let random_id = hex::encode(random);
+    let (lease_id, namespace) = match request.scope {
+        LeaseScope::Applications => {
+            let namespace = request
+                .namespace
+                .unwrap_or_else(|| format!("rbtest-{}", &random_id[..12]));
+            (random_id, namespace)
+        }
+        LeaseScope::NodeJobs => (
+            format!("node-jobs-{random_id}"),
+            format!("rbtest-node-{random_id}"),
+        ),
+    };
     if !crate::testkit::lease::valid_test_namespace(&namespace) {
         return (
             StatusCode::BAD_REQUEST,
@@ -1112,19 +1194,22 @@ async fn test_lease_create_handler(
             .into_response();
     }
     let now = crate::testkit::lease::now_unix_millis();
-    let lease = match crate::testkit::lease::TestLease::new(
+    let lease = match crate::testkit::lease::TestLease::new_scoped(
         lease_id,
         auth.principal_id.clone(),
         auth.token_name.clone(),
         namespace,
         now,
         now.saturating_add(ttl_millis),
+        request.scope,
     ) {
         Ok(lease) => lease,
         Err(error) => return lease_error_response(error),
     };
 
-    if let Some(council) = &state.council {
+    if let Some(council) = &state.council
+        && request.scope == LeaseScope::Applications
+    {
         if let Err(response) = write_lease_request(
             council,
             crate::council::RaftRequest::TestLeaseCreate(lease.clone()),
@@ -1143,17 +1228,37 @@ async fn test_lease_get_handler(
     auth: Option<axum::Extension<crate::sesame::auth::AuthContext>>,
     State(state): State<ApiState>,
     Path(lease_id): Path<String>,
+    headers: HeaderMap,
 ) -> Response {
     let auth =
         match authenticated_test_user(auth.as_deref(), crate::sesame::types::ApiRole::ReadOnly) {
             Ok(auth) => auth,
             Err(response) => return response,
         };
+    if let Some(council) = &state.council
+        && !is_node_job_lease(&lease_id)
+        && !confirmed_lease_leader(council).await
+    {
+        return forward_test_lease_request::<()>(
+            &state,
+            council,
+            reqwest::Method::GET,
+            &format!("/v1/test/leases/{lease_id}"),
+            &headers,
+            None,
+        )
+        .await;
+    }
     let Some(lease) = find_test_lease(&state, &lease_id).await else {
         return lease_error_response(crate::testkit::lease::LeaseError::NotFound);
     };
-    if lease.owner_id != auth.principal_id && auth.role != crate::sesame::types::ApiRole::Admin {
-        return lease_error_response(crate::testkit::lease::LeaseError::WrongOwner);
+    if lease.owner_id != auth.principal_id {
+        if auth.role != crate::sesame::types::ApiRole::Admin {
+            return lease_error_response(crate::testkit::lease::LeaseError::WrongOwner);
+        }
+        if let Err(response) = crate::sesame::auth::require_unscoped(Some(auth)) {
+            return response;
+        }
     }
     Json(lease).into_response()
 }
@@ -1178,6 +1283,7 @@ async fn test_lease_renew_handler(
         Err(response) => return response,
     };
     if let Some(council) = &state.council
+        && !is_node_job_lease(&lease_id)
         && !council.is_leader().await
     {
         return forward_test_lease_request(
@@ -1199,7 +1305,9 @@ async fn test_lease_renew_handler(
         return lease_error_response(error);
     }
 
-    if let Some(council) = &state.council {
+    if let Some(council) = &state.council
+        && !is_node_job_lease(&lease_id)
+    {
         if let Err(response) = write_lease_request(
             council,
             crate::council::RaftRequest::TestLeaseRenew {
@@ -1241,6 +1349,7 @@ async fn test_lease_release_handler(
             Err(response) => return response,
         };
     if let Some(council) = &state.council
+        && !is_node_job_lease(&lease_id)
         && !council.is_leader().await
     {
         return forward_test_lease_request::<()>(
@@ -1259,11 +1368,16 @@ async fn test_lease_release_handler(
     let owner_id = if lease.owner_id == auth.principal_id {
         Some(auth.principal_id.as_str())
     } else if auth.role == crate::sesame::types::ApiRole::Admin {
+        if let Err(response) = crate::sesame::auth::require_unscoped(Some(auth)) {
+            return response;
+        }
         None
     } else {
         return lease_error_response(crate::testkit::lease::LeaseError::WrongOwner);
     };
-    let result = if let Some(council) = &state.council {
+    let result = if let Some(council) = &state.council
+        && !is_node_job_lease(&lease_id)
+    {
         crate::testkit::lease::cleanup_cluster_lease(council, &lease_id, owner_id).await
     } else {
         crate::testkit::lease::cleanup_local_lease(
@@ -1281,6 +1395,50 @@ async fn test_lease_release_handler(
     }
 }
 
+/// Require a current quorum before a lease read or retirement instruction.
+async fn confirmed_lease_leader(council: &crate::council::CouncilNode) -> bool {
+    matches!(
+        tokio::time::timeout(std::time::Duration::from_secs(3), council.is_leader()).await,
+        Ok(true)
+    )
+}
+
+async fn test_lease_retired_handler(
+    auth: Option<axum::Extension<crate::sesame::auth::AuthContext>>,
+    State(state): State<ApiState>,
+    Json(retirement): Json<crate::cluster::orchestrate::LeaseRetirement>,
+) -> Response {
+    if let Err(response) = crate::sesame::auth::require_system(auth.as_deref()) {
+        return response;
+    }
+    let Some(council) = &state.council else {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            "not running in cluster mode",
+        )
+            .into_response();
+    };
+    if !confirmed_lease_leader(council).await {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            "retirement requires a current leader",
+        )
+            .into_response();
+    }
+    match write_lease_request(
+        council,
+        crate::council::RaftRequest::TestLeasePlacementRetired {
+            lease_id: retirement.lease_id,
+            placement: retirement.placement,
+        },
+    )
+    .await
+    {
+        Ok(()) => StatusCode::NO_CONTENT.into_response(),
+        Err(response) => response,
+    }
+}
+
 const MAX_LEASE_FORWARD_RESPONSE_BYTES: usize = 64 * 1024;
 
 /// Forward a lease mutation to the current leader while retaining the
@@ -1294,6 +1452,18 @@ async fn forward_test_lease_request<T: Serialize + ?Sized>(
     headers: &HeaderMap,
     body: Option<&T>,
 ) -> Response {
+    let points_to_self = {
+        let metrics = council.metrics();
+        let metrics = metrics.borrow();
+        metrics.current_leader == Some(metrics.id)
+    };
+    if points_to_self || headers.contains_key("x-reliaburger-lease-forwarded") {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            "lease leader is unavailable; retry shortly",
+        )
+            .into_response();
+    }
     let Some(leader_url) = leader_api_url(state, council).await else {
         return (
             StatusCode::SERVICE_UNAVAILABLE,
@@ -1304,7 +1474,8 @@ async fn forward_test_lease_request<T: Serialize + ?Sized>(
     let mut request = state
         .cluster_http
         .client()
-        .request(method, format!("{leader_url}{path}"));
+        .request(method, format!("{leader_url}{path}"))
+        .header("x-reliaburger-lease-forwarded", "1");
     for name in [
         axum::http::header::AUTHORIZATION,
         axum::http::header::COOKIE,
@@ -1378,6 +1549,9 @@ async fn find_test_lease(
     state: &ApiState,
     lease_id: &str,
 ) -> Option<crate::testkit::lease::TestLease> {
+    if is_node_job_lease(lease_id) {
+        return state.local_test_leases.get(lease_id).await;
+    }
     match &state.council {
         Some(council) => council
             .desired_state()
@@ -1408,19 +1582,25 @@ async fn write_lease_request(
 fn lease_error_response(error: crate::testkit::lease::LeaseError) -> Response {
     let status = match error {
         crate::testkit::lease::LeaseError::NotFound => StatusCode::NOT_FOUND,
-        crate::testkit::lease::LeaseError::WrongOwner => StatusCode::FORBIDDEN,
+        crate::testkit::lease::LeaseError::CleanupPending => StatusCode::ACCEPTED,
+        crate::testkit::lease::LeaseError::WrongOwner
+        | crate::testkit::lease::LeaseError::ImageOwnership => StatusCode::FORBIDDEN,
         crate::testkit::lease::LeaseError::NotActive
+        | crate::testkit::lease::LeaseError::Busy
         | crate::testkit::lease::LeaseError::AlreadyExists
         | crate::testkit::lease::LeaseError::NamespaceOwned
         | crate::testkit::lease::LeaseError::NamespaceMismatch
         | crate::testkit::lease::LeaseError::ResourceLimit => StatusCode::CONFLICT,
         crate::testkit::lease::LeaseError::TooManyLeases => StatusCode::TOO_MANY_REQUESTS,
         crate::testkit::lease::LeaseError::InvalidId
+        | crate::testkit::lease::LeaseError::InvalidScope
         | crate::testkit::lease::LeaseError::InvalidOwner
         | crate::testkit::lease::LeaseError::InvalidNamespace
         | crate::testkit::lease::LeaseError::InvalidExpiry
+        | crate::testkit::lease::LeaseError::InvalidToken
         | crate::testkit::lease::LeaseError::UnsupportedSchema { .. } => StatusCode::BAD_REQUEST,
         crate::testkit::lease::LeaseError::Persistence(_)
+        | crate::testkit::lease::LeaseError::PersistenceUncertain
         | crate::testkit::lease::LeaseError::Malformed(_)
         | crate::testkit::lease::LeaseError::StoreTooLarge
         | crate::testkit::lease::LeaseError::Cleanup(_)
@@ -1442,6 +1622,7 @@ async fn version_handler(State(state): State<ApiState>) -> impl IntoResponse {
     match &state.upgrade {
         Some(manager) => Json(serde_json::json!({
             "version": manager.running_version().to_string(),
+            "compatibility": crate::compatibility::CURRENT,
             "upgrade_in_flight": manager.upgrade_in_flight(),
             // Ids this node attempted and reverted — the orchestrator
             // reads these to detect node-side reverts.
@@ -1449,6 +1630,7 @@ async fn version_handler(State(state): State<ApiState>) -> impl IntoResponse {
         })),
         None => Json(serde_json::json!({
             "version": crate::upgrade::version::compiled_version().to_string(),
+            "compatibility": crate::compatibility::CURRENT,
             "upgrade_in_flight": false,
             "failed_upgrade_ids": [],
         })),
@@ -2054,6 +2236,7 @@ const CAPACITY_PROBE_HEADER: &str = "x-reliaburger-capacity-probe";
 
 async fn apply_handler(
     auth: Option<axum::Extension<crate::sesame::auth::AuthContext>>,
+    capacity_admission: Option<axum::Extension<crate::cluster::capacity::CapacityAdmission>>,
     State(state): State<ApiState>,
     headers: HeaderMap,
     body: String,
@@ -2080,6 +2263,29 @@ async fn apply_handler(
             Json(serde_json::json!({ "error": e.to_string() })),
         )
             .into_response();
+    }
+
+    let rerun_jobs = match headers.get("x-reliaburger-rerun-jobs") {
+        None => false,
+        Some(value) if value.as_bytes() == b"acknowledged" => true,
+        Some(_) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                "x-reliaburger-rerun-jobs must equal acknowledged",
+            )
+                .into_response();
+        }
+    };
+    if rerun_jobs {
+        if let Err(error) = crate::bun::jobs::validate_rerun(&config) {
+            return (StatusCode::BAD_REQUEST, error).into_response();
+        }
+        if let Err(response) = crate::sesame::auth::authorize_user(
+            auth.as_deref(),
+            crate::sesame::types::ApiRole::Deployer,
+        ) {
+            return response;
+        }
     }
 
     let lease_id = match headers.get("x-reliaburger-test-lease") {
@@ -2114,6 +2320,22 @@ async fn apply_handler(
             .into_response();
     }
     if capacity_probe {
+        if config.app.len() != 1
+            || !config.job.is_empty()
+            || !config.namespace.is_empty()
+            || !config.permission.is_empty()
+            || !config.build.is_empty()
+            || config
+                .app
+                .values()
+                .any(|spec| spec.replicas != crate::config::Replicas::Fixed(1))
+        {
+            return (
+                StatusCode::BAD_REQUEST,
+                "capacity probe requires exactly one new app with one replica",
+            )
+                .into_response();
+        }
         let Some(auth) = auth.as_deref() else {
             return (StatusCode::UNAUTHORIZED, "authentication required").into_response();
         };
@@ -2129,20 +2351,23 @@ async fn apply_handler(
         }
     }
     let mut lease_owner_id = None;
+    let mut image_lease = None;
     if let Some(lease_id) = &lease_id {
-        if !config.job.is_empty() || !config.permission.is_empty() || !config.build.is_empty() {
-            return (
-                StatusCode::BAD_REQUEST,
-                "leased apply currently accepts apps and their namespace declaration only",
-            )
-                .into_response();
-        }
         let Some(auth) = auth.as_deref() else {
             return (StatusCode::UNAUTHORIZED, "authentication required").into_response();
         };
         let Some(lease) = find_test_lease(&state, lease_id).await else {
             return lease_error_response(crate::testkit::lease::LeaseError::NotFound);
         };
+        let wrong_kind = match lease.scope {
+            LeaseScope::Applications => !config.job.is_empty(),
+            LeaseScope::NodeJobs => {
+                config.job.is_empty() || !config.app.is_empty() || !config.namespace.is_empty()
+            }
+        };
+        if wrong_kind || !config.permission.is_empty() || !config.build.is_empty() {
+            return lease_error_response(crate::testkit::lease::LeaseError::InvalidScope);
+        }
         if auth.token_name != crate::sesame::auth::SYSTEM_PRINCIPAL
             && lease.owner_id != auth.principal_id
         {
@@ -2169,7 +2394,19 @@ async fn apply_handler(
                 None => spec.namespace = Some(lease.namespace.clone()),
             }
         }
-        lease_owner_id = Some(lease.owner_id);
+        for spec in config.job.values_mut() {
+            match &spec.namespace {
+                Some(namespace) if namespace != &lease.namespace => {
+                    return lease_error_response(
+                        crate::testkit::lease::LeaseError::NamespaceMismatch,
+                    );
+                }
+                Some(_) => {}
+                None => spec.namespace = Some(lease.namespace.clone()),
+            }
+        }
+        lease_owner_id = Some(lease.owner_id.clone());
+        image_lease = Some(lease);
     } else {
         if config
             .namespace
@@ -2182,8 +2419,13 @@ async fn apply_handler(
             )
                 .into_response();
         }
-        for spec in config.app.values() {
-            let namespace = spec.namespace.as_deref().unwrap_or("default");
+        for namespace in config
+            .app
+            .values()
+            .map(|spec| spec.namespace.as_deref())
+            .chain(config.job.values().map(|spec| spec.namespace.as_deref()))
+        {
+            let namespace = namespace.unwrap_or("default");
             if crate::testkit::lease::valid_test_namespace(namespace) {
                 return (
                     StatusCode::CONFLICT,
@@ -2194,18 +2436,60 @@ async fn apply_handler(
         }
     }
 
-    // AUTH1: a scoped token may only deploy apps its scope covers. Check
-    // every app in the manifest, so one out-of-scope app rejects the whole
-    // apply rather than being silently dropped. A principal's `[permission]`
-    // spec (when it has one) must also grant `deploy` on each app — and
-    // `host-exec` for any app that runs an inline `script` (a host process),
-    // which is the capability the whitepaper ties to script workloads.
+    // Ordinary namespace quotas and permission grants are operator policy.
+    // A test lease has already confined its namespace declaration to the
+    // caller-owned reservation above; its quota cannot affect other tenants.
+    if !config.permission.is_empty() || (lease_id.is_none() && !config.namespace.is_empty()) {
+        if let Err(response) = crate::sesame::auth::authorize_user(
+            auth.as_deref(),
+            crate::sesame::types::ApiRole::Admin,
+        ) {
+            return response;
+        }
+        if let Err(response) = crate::sesame::auth::require_unscoped(auth.as_deref()) {
+            return response;
+        }
+    }
+
+    let images = config
+        .app
+        .values()
+        .flat_map(crate::config::AppSpec::image_references)
+        .chain(config.job.values().filter_map(|job| job.image.as_deref()));
+    if let Err(error) = crate::testkit::lease::authorise_image_references(
+        images,
+        image_lease
+            .as_ref()
+            .map(|lease| (lease, crate::testkit::lease::now_unix_millis())),
+    ) {
+        return lease_error_response(error);
+    }
+
+    // Check every workload before any Raft write or agent command. A job in
+    // a mixed manifest must not bypass admission after its apps have committed.
+    // Host execution includes both explicit binaries and inline scripts.
     let permissions = match &state.council {
         Some(council) => council.desired_state().await.permissions,
         None => std::collections::BTreeMap::new(),
     };
-    for (app_name, spec) in &config.app {
-        let namespace = spec.namespace.as_deref().unwrap_or("default");
+    let targets = config
+        .app
+        .iter()
+        .map(|(name, spec)| {
+            (
+                name.as_str(),
+                spec.namespace.as_deref().unwrap_or("default"),
+                spec.script.is_some() || spec.exec.is_some(),
+            )
+        })
+        .chain(config.job.iter().map(|(name, spec)| {
+            (
+                name.as_str(),
+                spec.namespace.as_deref().unwrap_or("default"),
+                spec.script.is_some() || spec.exec.is_some(),
+            )
+        }));
+    for (app_name, namespace, host_execution) in targets {
         if let Err(resp) =
             crate::sesame::auth::authorize_scoped(auth.as_deref(), app_name, namespace)
         {
@@ -2220,7 +2504,7 @@ async fn apply_handler(
         ) {
             return resp;
         }
-        if spec.script.is_some()
+        if host_execution
             && let Err(resp) = crate::sesame::auth::authorize_permission(
                 auth.as_deref(),
                 crate::config::PermissionAction::HostExec,
@@ -2248,26 +2532,48 @@ async fn apply_handler(
             body,
             lease_id,
             headers,
+            capacity_admission.map(|extension| extension.0),
         )
         .await;
+    }
+    if capacity_probe {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            "capacity admission requires a live cluster scheduler",
+        )
+            .into_response();
     }
 
     let lease_operation = if let (Some(lease_id), Some(owner_id)) =
         (&lease_id, lease_owner_id.as_deref())
     {
         let now = crate::testkit::lease::now_unix_millis();
-        let app_ids = config
-            .app
-            .iter()
-            .map(|(app_name, spec)| {
-                crate::meat::AppId::new(app_name, spec.namespace.as_deref().unwrap_or("default"))
-            })
-            .collect();
-        match state
-            .local_test_leases
-            .begin_app_operation(lease_id, owner_id, app_ids, now)
-            .await
-        {
+        let result = if is_node_job_lease(lease_id) {
+            let job_ids = config
+                .job
+                .iter()
+                .map(|(name, spec)| {
+                    crate::meat::AppId::new(name, spec.namespace.as_deref().unwrap_or("default"))
+                })
+                .collect();
+            state
+                .local_test_leases
+                .begin_job_operation(lease_id, owner_id, job_ids, now)
+                .await
+        } else {
+            let app_ids = config
+                .app
+                .iter()
+                .map(|(name, spec)| {
+                    crate::meat::AppId::new(name, spec.namespace.as_deref().unwrap_or("default"))
+                })
+                .collect();
+            state
+                .local_test_leases
+                .begin_app_operation(lease_id, owner_id, app_ids, now)
+                .await
+        };
+        match result {
             Ok(operation) => Some(operation),
             Err(error) => return lease_error_response(error),
         }
@@ -2276,15 +2582,18 @@ async fn apply_handler(
     };
 
     let (agent_event_tx, mut agent_event_rx) = mpsc::channel::<ApplyEvent>(32);
-    if state
-        .cmd_tx
-        .send(AgentCommand::Deploy {
+    let command = if rerun_jobs {
+        AgentCommand::RerunJobs {
             config,
             events: agent_event_tx,
-        })
-        .await
-        .is_err()
-    {
+        }
+    } else {
+        AgentCommand::Deploy {
+            config,
+            events: agent_event_tx,
+        }
+    };
+    if state.cmd_tx.send(command).await.is_err() {
         return (
             StatusCode::INTERNAL_SERVER_ERROR,
             Json(serde_json::json!({ "error": "agent unavailable" })),
@@ -2349,6 +2658,7 @@ async fn cluster_apply(
     raw_body: String,
     lease_id: Option<String>,
     caller_headers: HeaderMap,
+    capacity_admission: Option<crate::cluster::capacity::CapacityAdmission>,
 ) -> Response {
     // Follower? Forward to the leader rather than half-failing.
     if !council.is_leader().await {
@@ -2371,26 +2681,30 @@ async fn cluster_apply(
             if let Some(value) = caller_headers.get(CAPACITY_PROBE_HEADER) {
                 request = request.header(CAPACITY_PROBE_HEADER, value.as_bytes());
             }
-            for name in [
-                axum::http::header::AUTHORIZATION,
-                axum::http::header::COOKIE,
-            ] {
-                if let Some(value) = caller_headers.get(&name) {
-                    request = request.header(name.as_str(), value.as_bytes());
-                }
-            }
-        } else if let Some(token) = &state.service_token {
-            request = request.bearer_auth(token);
         }
-        return match request.send().await {
-            Ok(response) => {
-                let stream = response.bytes_stream();
-                Response::builder()
-                    .header("content-type", "text/event-stream")
-                    .body(axum::body::Body::from_stream(stream))
+        // The leader must evaluate the user's current grants, not the
+        // follower's internal service identity. ClusterHttp has no default
+        // bearer; node-to-node requests attach theirs explicitly.
+        request = copy_forwarded_auth(request, &caller_headers);
+        let response =
+            tokio::time::timeout(std::time::Duration::from_secs(5), request.send()).await;
+        return match response {
+            Ok(Ok(response)) => {
+                let mut builder = Response::builder().status(response.status());
+                if let Some(content_type) = response.headers().get(axum::http::header::CONTENT_TYPE)
+                {
+                    builder = builder.header(axum::http::header::CONTENT_TYPE, content_type);
+                }
+                builder
+                    .body(axum::body::Body::from_stream(response.bytes_stream()))
                     .unwrap_or_else(|_| StatusCode::BAD_GATEWAY.into_response())
             }
-            Err(e) => (
+            Err(_) => (
+                StatusCode::GATEWAY_TIMEOUT,
+                "leader apply request timed out",
+            )
+                .into_response(),
+            Ok(Err(e)) => (
                 StatusCode::BAD_GATEWAY,
                 Json(serde_json::json!({
                     "error": format!("failed to forward apply to the leader: {e}")
@@ -2418,6 +2732,44 @@ async fn cluster_apply(
             Json(serde_json::json!({ "error": e.to_string() })),
         )
             .into_response();
+    }
+
+    if caller_headers.contains_key(CAPACITY_PROBE_HEADER) {
+        use crate::cluster::capacity::{CapacityAdmissionError, SchedulingRefusal};
+        let Some(admission) = capacity_admission else {
+            return (
+                StatusCode::SERVICE_UNAVAILABLE,
+                "capacity admission is unavailable",
+            )
+                .into_response();
+        };
+        let Some((name, spec)) = config.app.iter().next() else {
+            return StatusCode::BAD_REQUEST.into_response();
+        };
+        let app_id = crate::meat::AppId::new(name, spec.namespace.as_deref().unwrap_or("default"));
+        let outcome = admission.check(&app_id, spec).await;
+        if !council.is_leader().await {
+            return unavailable_response("leadership changed during capacity admission".into());
+        }
+        let active_lease = council.desired_state().await.test_leases;
+        if !lease_id
+            .as_ref()
+            .and_then(|id| active_lease.get(id))
+            .is_some_and(|lease| lease.is_active_at(crate::testkit::lease::now_unix_millis()))
+        {
+            return lease_error_response(crate::testkit::lease::LeaseError::NotActive);
+        }
+        match outcome {
+            Ok(()) => {}
+            Err(CapacityAdmissionError::Rejected(error)) => {
+                return (
+                    StatusCode::UNPROCESSABLE_ENTITY,
+                    Json(SchedulingRefusal { error }),
+                )
+                    .into_response();
+            }
+            Err(error) => return unavailable_response(error.to_string()),
+        }
     }
 
     let (event_tx, event_rx) = mpsc::channel::<ApplyEvent>(32);
@@ -2577,13 +2929,291 @@ pub(crate) async fn leader_api_url(
     )
 }
 
+/// Retire an identity only on an explicit, authenticated operator attestation.
+async fn node_decommission_handler(
+    auth: Option<axum::Extension<crate::sesame::auth::AuthContext>>,
+    State(state): State<ApiState>,
+    headers: HeaderMap,
+    Json(request): Json<crate::cluster::retirement::DecommissionRequest>,
+) -> Response {
+    use crate::council::{CouncilResponse, RaftRequest};
+    let Some(auth) = auth.as_deref() else {
+        return (
+            StatusCode::UNAUTHORIZED,
+            "an authenticated operator is required",
+        )
+            .into_response();
+    };
+    if let Err(response) =
+        crate::sesame::auth::authorize_user(Some(auth), crate::sesame::types::ApiRole::Admin)
+    {
+        return response;
+    }
+    if let Err(response) = crate::sesame::auth::require_unscoped(Some(auth)) {
+        return response;
+    }
+    if let Err(error) = request.validate() {
+        return (StatusCode::BAD_REQUEST, error).into_response();
+    }
+    let Some(council) = &state.council else {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            "decommissioning requires a cluster council",
+        )
+            .into_response();
+    };
+    if !confirmed_lease_leader(council).await {
+        return forward_test_lease_request(
+            &state,
+            council,
+            reqwest::Method::POST,
+            "/v1/nodes/decommission",
+            &headers,
+            Some(&request),
+        )
+        .await;
+    }
+    let (is_self, membership_log_id) = {
+        let metrics = council.metrics();
+        let metrics = metrics.borrow();
+        (
+            metrics
+                .membership_config
+                .membership()
+                .get_node(&metrics.id)
+                .is_some_and(|node| node.name == request.node_id),
+            *metrics.membership_config.log_id(),
+        )
+    };
+    if is_self {
+        return (
+            StatusCode::CONFLICT,
+            "stop or fence the target and retry through a surviving leader",
+        )
+            .into_response();
+    }
+    let write = council.write(RaftRequest::DecommissionNode {
+        node_id: request.node_id,
+        retired_by: auth.principal_id.clone(),
+        reason: request.reason,
+        retired_at_unix_ms: crate::testkit::lease::now_unix_millis(),
+        membership_log_id,
+    });
+    match tokio::time::timeout(std::time::Duration::from_secs(10), write).await {
+        Ok(Ok(CouncilResponse::NodeDecommissioned { retirement })) => {
+            Json(retirement).into_response()
+        }
+        Ok(Ok(CouncilResponse::Refused { reason })) => {
+            (StatusCode::CONFLICT, reason).into_response()
+        }
+        Ok(Ok(_)) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "unexpected decommission response",
+        )
+            .into_response(),
+        Ok(Err(error)) => (StatusCode::SERVICE_UNAVAILABLE, error.to_string()).into_response(),
+        Err(_) => (
+            StatusCode::GATEWAY_TIMEOUT,
+            "decommission outcome unknown; repeat the same request",
+        )
+            .into_response(),
+    }
+}
+
+/// Existing TLS connections must observe an identity retirement too.
+async fn refuse_retired_tls_peer(
+    State(state): State<ApiState>,
+    request: axum::extract::Request,
+    next: axum::middleware::Next,
+) -> Response {
+    if let (Some(council), Some(peer)) = (
+        &state.council,
+        request
+            .extensions()
+            .get::<crate::sesame::renewal::TlsPeerCertificate>(),
+    ) {
+        let security = council.security_state().await;
+        let retired = crate::sesame::cert::subject_uri_sans(&peer.0).is_ok_and(|uris| {
+            uris.iter()
+                .filter_map(|uri| crate::sesame::ca::node_id_from_spiffe_uri(uri))
+                .any(|node| security.crl.retired_nodes.contains_key(node))
+        });
+        if retired {
+            return (
+                StatusCode::FORBIDDEN,
+                "node identity is retired; fresh enrolment is required",
+            )
+                .into_response();
+        }
+    }
+    next.run(request).await
+}
+
+/// Receipts must reach the leader directly, preserving the consumer's TLS identity.
+async fn endpoint_withdrawal_receipt_handler(
+    auth: Option<axum::Extension<crate::sesame::auth::AuthContext>>,
+    peer: Option<axum::Extension<crate::sesame::renewal::TlsPeerCertificate>>,
+    State(state): State<ApiState>,
+    Json(receipt): Json<crate::onion::withdrawal::EndpointWithdrawalReceipt>,
+) -> Response {
+    if let Err(response) = crate::sesame::auth::require_system(auth.as_deref()) {
+        return response;
+    }
+    if let Err(error) = receipt.compatibility.require_current() {
+        return (StatusCode::CONFLICT, error.to_string()).into_response();
+    }
+    let Some(peer) = peer else {
+        return (
+            StatusCode::FORBIDDEN,
+            "endpoint receipts require a TLS node certificate",
+        )
+            .into_response();
+    };
+    let Some(council) = &state.council else {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            "no endpoint council available",
+        )
+            .into_response();
+    };
+    let result = tokio::time::timeout(std::time::Duration::from_secs(10), async {
+        let security = council
+            .security_state_linearizable()
+            .await
+            .map_err(|error| (StatusCode::SERVICE_UNAVAILABLE, error.to_string()))?;
+        let node_id = crate::sesame::renewal::validate_peer(&peer, &security)
+            .map_err(|error| (StatusCode::FORBIDDEN, error.to_string()))?;
+        council
+            .write(crate::council::RaftRequest::AcknowledgeEndpointWithdrawal {
+                node_id,
+                generation: receipt.generation,
+            })
+            .await
+            .map_err(|error| (StatusCode::SERVICE_UNAVAILABLE, error.to_string()))
+    })
+    .await;
+    match result {
+        Ok(Ok(crate::council::CouncilResponse::Applied { .. })) => {
+            StatusCode::NO_CONTENT.into_response()
+        }
+        Ok(Ok(crate::council::CouncilResponse::Refused { reason })) => {
+            (StatusCode::CONFLICT, reason).into_response()
+        }
+        Ok(Ok(_)) => (
+            StatusCode::SERVICE_UNAVAILABLE,
+            "endpoint receipt is unconfirmed",
+        )
+            .into_response(),
+        Ok(Err(error)) => error.into_response(),
+        Err(_) => (
+            StatusCode::GATEWAY_TIMEOUT,
+            "endpoint receipt outcome unknown; repeat the same receipt",
+        )
+            .into_response(),
+    }
+}
+
+/// Producers contact the leader directly so forwarding cannot replace their TLS identity.
+async fn producer_retirement_handler(
+    auth: Option<axum::Extension<crate::sesame::auth::AuthContext>>,
+    peer: Option<axum::Extension<crate::sesame::renewal::TlsPeerCertificate>>,
+    State(state): State<ApiState>,
+    Json(receipt): Json<crate::onion::producer::ProducerRetirementRequest>,
+) -> Response {
+    if let Err(response) = crate::sesame::auth::require_system(auth.as_deref()) {
+        return response;
+    }
+    if let Err(error) = receipt.compatibility.require_current() {
+        return (StatusCode::CONFLICT, error.to_string()).into_response();
+    }
+    let Some(peer) = peer else {
+        return (
+            StatusCode::FORBIDDEN,
+            "producer retirement requires a TLS node certificate",
+        )
+            .into_response();
+    };
+    let Some(council) = &state.council else {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            "no endpoint council available",
+        )
+            .into_response();
+    };
+    let result = tokio::time::timeout(std::time::Duration::from_secs(10), async {
+        let security = council
+            .security_state_linearizable()
+            .await
+            .map_err(|error| (StatusCode::SERVICE_UNAVAILABLE, error.to_string()))?;
+        let node_id = crate::sesame::renewal::validate_peer(&peer, &security)
+            .map_err(|error| (StatusCode::FORBIDDEN, error.to_string()))?;
+        council
+            .write(crate::council::RaftRequest::RetireEndpointExecution {
+                node_id: node_id.clone(),
+                execution: receipt.execution.clone(),
+            })
+            .await
+            .map(|response| (node_id, response))
+            .map_err(|error| (StatusCode::SERVICE_UNAVAILABLE, error.to_string()))
+    })
+    .await;
+    match result {
+        Ok(Ok((
+            node_id,
+            crate::council::CouncilResponse::EndpointExecutionRetired { released: true },
+        ))) => Json(crate::onion::producer::ProducerReleaseConfirmation {
+            node_id,
+            execution: receipt.execution,
+        })
+        .into_response(),
+        Ok(Ok((
+            _,
+            crate::council::CouncilResponse::EndpointExecutionRetired { released: false },
+        ))) => StatusCode::ACCEPTED.into_response(),
+        Ok(Ok((_, crate::council::CouncilResponse::Refused { reason }))) => {
+            (StatusCode::CONFLICT, reason).into_response()
+        }
+        Ok(Ok(_)) => (
+            StatusCode::SERVICE_UNAVAILABLE,
+            "producer retirement is unconfirmed",
+        )
+            .into_response(),
+        Ok(Err(error)) => error.into_response(),
+        Err(_) => (
+            StatusCode::GATEWAY_TIMEOUT,
+            "producer retirement outcome unknown; repeat the same retirement",
+        )
+            .into_response(),
+    }
+}
+
 /// `GET /v1/placements/{node_id}` — the apps (and per-node replica
 /// counts) the leader has assigned to a node. Served from the Raft
 /// state machine; reconcilers poll this every couple of seconds.
 async fn placements_handler(
+    auth: Option<axum::Extension<crate::sesame::auth::AuthContext>>,
+    peer: Option<axum::Extension<crate::sesame::renewal::TlsPeerCertificate>>,
     State(state): State<ApiState>,
     Path(node_id): Path<String>,
 ) -> Response {
+    // Credential-free development clusters already expose placements. Adding
+    // a retained consumer cannot authorise cleanup; receipt endpoints must
+    // separately authenticate permission to discharge that obligation.
+    let development_without_credentials = auth.is_none()
+        && state.service_token.is_none()
+        && state.cluster_http.scheme() == "http"
+        && match &state.token_store {
+            Some(tokens) => tokens.read().await.is_empty(),
+            None => true,
+        };
+    if !development_without_credentials
+        && let Err(response) = crate::sesame::auth::require_system(auth.as_deref())
+    {
+        return response;
+    }
+    if let Err(reason) = crate::cluster::retirement::validate_node_id(&node_id) {
+        return (StatusCode::BAD_REQUEST, reason).into_response();
+    }
     let Some(council) = &state.council else {
         return (
             StatusCode::SERVICE_UNAVAILABLE,
@@ -2592,7 +3222,72 @@ async fn placements_handler(
             .into_response();
     };
 
-    let desired = council.desired_state().await;
+    if !confirmed_lease_leader(council).await {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            "placements require a current leader",
+        )
+            .into_response();
+    }
+    let mut desired = council.desired_state().await;
+    if let Some(peer) = peer {
+        match crate::sesame::renewal::validate_peer(&peer, &desired.security_state) {
+            Ok(identity) if identity == node_id => {}
+            _ => {
+                return (
+                    StatusCode::FORBIDDEN,
+                    "placement consumer does not match TLS identity",
+                )
+                    .into_response();
+            }
+        }
+    } else if state.cluster_http.scheme() == "https" {
+        return (
+            StatusCode::FORBIDDEN,
+            "placement consumers require a TLS node certificate",
+        )
+            .into_response();
+    }
+    if desired
+        .security_state
+        .crl
+        .retired_nodes
+        .contains_key(&node_id)
+    {
+        return (
+            StatusCode::GONE,
+            "node identity is retired; fresh enrolment is required",
+        )
+            .into_response();
+    }
+    // Registration precedes every first exposure. Once committed, an offline
+    // consumer stays accountable until the operator permanently fences it.
+    if !desired.endpoint_consumers.contains(&node_id) {
+        let registration = tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            council.write(crate::council::RaftRequest::RegisterEndpointConsumer {
+                node_id: node_id.clone(),
+            }),
+        )
+        .await;
+        match registration {
+            Ok(Ok(crate::council::CouncilResponse::Applied { .. })) => {}
+            Ok(Ok(crate::council::CouncilResponse::Refused { reason })) => {
+                return (StatusCode::CONFLICT, reason).into_response();
+            }
+            _ => {
+                return (
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    "endpoint consumer registration is unconfirmed",
+                )
+                    .into_response();
+            }
+        }
+        desired = council.desired_state().await;
+        if !desired.endpoint_consumers.contains(&node_id) {
+            return (StatusCode::GONE, "endpoint consumer identity was retired").into_response();
+        }
+    }
     let node = crate::meat::NodeId::new(&node_id);
 
     let mut apps = Vec::new();
@@ -2614,9 +3309,44 @@ async fn placements_handler(
 
     Json(crate::cluster::orchestrate::NodeAssignments {
         apps,
-        // Piggyback the replicated endpoint catalogue (12b.4) so the polling
-        // node can resolve services on other nodes.
+        retirements: desired
+            .test_leases
+            .values()
+            .filter(|lease| {
+                matches!(
+                    lease.state,
+                    crate::testkit::lease::TestLeaseState::Cleaning { .. }
+                )
+            })
+            .flat_map(|lease| {
+                lease
+                    .placements
+                    .iter()
+                    .filter(|placement| {
+                        placement.node_id == node && !desired.apps.contains_key(&placement.app_id)
+                    })
+                    .map(|placement| crate::cluster::orchestrate::LeaseRetirement {
+                        lease_id: lease.lease_id.clone(),
+                        placement: placement.clone(),
+                    })
+            })
+            .collect(),
+        // All discovery fields describe the same committed state; serving them
+        // does not discharge any cleanup obligation.
+        endpoint_generation: desired.endpoint_withdrawals.generation,
         endpoint_catalog: desired.endpoint_catalog.clone(),
+        endpoint_withdrawals: desired
+            .endpoint_withdrawals
+            .pending
+            .iter()
+            .filter(|(_, withdrawal)| withdrawal.consumers.contains(&node_id))
+            .map(|(generation, withdrawal)| {
+                crate::onion::withdrawal::EndpointWithdrawalInstruction {
+                    generation: *generation,
+                    services: withdrawal.services.clone(),
+                }
+            })
+            .collect(),
         ingress: desired
             .apps
             .iter()
@@ -3081,11 +3811,18 @@ async fn stop_local(state: &ApiState, app: String, namespace: String) -> Respons
 
     match resp_rx.await {
         Ok(Ok(())) => Json(serde_json::json!({ "status": "stopped" })).into_response(),
-        Ok(Err(e)) => (
-            StatusCode::NOT_FOUND,
-            Json(serde_json::json!({ "error": e.to_string() })),
-        )
-            .into_response(),
+        Ok(Err(error)) => {
+            let status = match error {
+                crate::bun::BunError::AppNotFound { .. } => StatusCode::NOT_FOUND,
+                crate::bun::BunError::WorkloadBusy { .. } => StatusCode::CONFLICT,
+                _ => StatusCode::INTERNAL_SERVER_ERROR,
+            };
+            (
+                status,
+                Json(serde_json::json!({ "error": error.to_string() })),
+            )
+                .into_response()
+        }
         Err(_) => (
             StatusCode::INTERNAL_SERVER_ERROR,
             Json(serde_json::json!({ "error": "agent dropped response" })),
@@ -3496,7 +4233,18 @@ async fn nodes_handler(State(state): State<ApiState>) -> Response {
     }
 
     match resp_rx.await {
-        Ok(nodes) => Json(serde_json::json!(nodes)).into_response(),
+        Ok(mut nodes) => {
+            if let Some(membership) = &state.membership {
+                let members = membership.read().await;
+                for node in &mut nodes {
+                    node.api_address = members
+                        .iter()
+                        .find(|member| member.node_id.0 == node.node_id)
+                        .map(|member| member.address);
+                }
+            }
+            Json(nodes).into_response()
+        }
         Err(_) => (
             StatusCode::INTERNAL_SERVER_ERROR,
             Json(serde_json::json!({ "error": "agent dropped response" })),
@@ -3633,15 +4381,6 @@ async fn ui_logout_handler(
         .into_response()
 }
 
-/// Request body for cluster join: a one-time token, the joiner's node id, and
-/// the joiner's CSR (PKI4 — the joiner keeps its private key).
-#[derive(Deserialize)]
-struct JoinRequest {
-    token: String,
-    node_id: String,
-    csr_b64: String,
-}
-
 /// Issue a certificate bundle to a joining node (issuer side).
 ///
 /// Public route: the join token is the credential. The joiner sends a CSR and
@@ -3675,14 +4414,201 @@ async fn cluster_ca_handler(State(state): State<ApiState>) -> Response {
     };
     let encoder = base64::engine::general_purpose::STANDARD;
     Json(serde_json::json!({
+        "compatibility": crate::compatibility::CURRENT,
         "node_ca_b64": encoder.encode(&node_ca.certificate_der),
         "root_ca_b64": encoder.encode(&root_ca.certificate_der),
     }))
     .into_response()
 }
 
-async fn join_handler(State(state): State<ApiState>, Json(body): Json<JoinRequest>) -> Response {
+/// Renew only the node authenticated on this connection. A follower refuses;
+/// forwarding would substitute the follower's TLS identity for the caller's.
+async fn node_renewal_handler(
+    auth: Option<axum::Extension<crate::sesame::auth::AuthContext>>,
+    peer: Option<axum::Extension<crate::sesame::renewal::TlsPeerCertificate>>,
+    State(state): State<ApiState>,
+    Json(request): Json<crate::sesame::renewal::RenewalRequest>,
+) -> Response {
+    use crate::sesame::renewal::{RenewalError, issue_renewal};
+    if let Err(response) = crate::sesame::auth::require_system(auth.as_deref()) {
+        return response;
+    }
+    let Some(peer) = peer else {
+        return (
+            StatusCode::FORBIDDEN,
+            "node renewal requires a TLS client certificate",
+        )
+            .into_response();
+    };
+    let Some(council) = &state.council else {
+        return (StatusCode::SERVICE_UNAVAILABLE, "no council available").into_response();
+    };
+    match tokio::time::timeout(
+        std::time::Duration::from_secs(10),
+        issue_renewal(council, &peer, &request),
+    )
+    .await
+    {
+        Ok(Ok(bundle)) => Json(bundle).into_response(),
+        Ok(Err(error)) => {
+            let status = match &error {
+                RenewalError::Identity(_) => StatusCode::FORBIDDEN,
+                RenewalError::Request(_) => StatusCode::BAD_REQUEST,
+                RenewalError::Unavailable(_) => StatusCode::SERVICE_UNAVAILABLE,
+            };
+            (
+                status,
+                Json(serde_json::json!({ "error": error.to_string() })),
+            )
+                .into_response()
+        }
+        Err(_) => (StatusCode::GATEWAY_TIMEOUT, "node renewal timed out").into_response(),
+    }
+}
+
+/// Include request-body extraction in the control-operation deadline.
+async fn registry_proposal_deadline(
+    request: axum::extract::Request,
+    next: axum::middleware::Next,
+) -> Response {
+    match tokio::time::timeout(std::time::Duration::from_secs(10), next.run(request)).await {
+        Ok(response) => response,
+        Err(_) => (
+            StatusCode::REQUEST_TIMEOUT,
+            "registry proposal deadline exceeded",
+        )
+            .into_response(),
+    }
+}
+
+/// A follower refuses instead of forwarding a request under its own identity.
+async fn registry_proposal_handler(
+    auth: Option<axum::Extension<crate::sesame::auth::AuthContext>>,
+    peer: Option<axum::Extension<crate::sesame::renewal::TlsPeerCertificate>>,
+    State(state): State<ApiState>,
+    Json(proposal): Json<crate::pickle::authority::RegistryProposal>,
+) -> Response {
+    if let Err(response) = crate::sesame::auth::require_system(auth.as_deref()) {
+        return response;
+    }
+    if let Err(error) = proposal.compatibility.require_current() {
+        return (StatusCode::CONFLICT, error.to_string()).into_response();
+    }
+    let Some(peer) = peer else {
+        return (
+            StatusCode::FORBIDDEN,
+            "registry proposals require a TLS node certificate",
+        )
+            .into_response();
+    };
+    let Some(council) = &state.council else {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            "no registry council available",
+        )
+            .into_response();
+    };
+    let result = tokio::time::timeout(std::time::Duration::from_secs(10), async {
+        let security = council
+            .security_state_linearizable()
+            .await
+            .map_err(|error| (StatusCode::SERVICE_UNAVAILABLE, error.to_string()))?;
+        let node_id = crate::sesame::renewal::validate_peer(&peer, &security)
+            .map_err(|error| (StatusCode::FORBIDDEN, error.to_string()))?;
+        let request = proposal
+            .mutation
+            .request_for_node(&node_id)
+            .map_err(|error| (StatusCode::FORBIDDEN, error.to_string()))?;
+        council
+            .write(request)
+            .await
+            .map_err(|error| (StatusCode::SERVICE_UNAVAILABLE, error.to_string()))
+    })
+    .await;
+    match result {
+        Ok(Ok(response @ crate::council::CouncilResponse::Refused { .. })) => {
+            (StatusCode::CONFLICT, Json(response)).into_response()
+        }
+        Ok(Ok(response)) => Json(response).into_response(),
+        Ok(Err(error)) => error.into_response(),
+        Err(_) => (StatusCode::GATEWAY_TIMEOUT, "registry proposal timed out").into_response(),
+    }
+}
+
+async fn registry_query_handler(
+    auth: Option<axum::Extension<crate::sesame::auth::AuthContext>>,
+    peer: Option<axum::Extension<crate::sesame::renewal::TlsPeerCertificate>>,
+    State(state): State<ApiState>,
+    Json(request): Json<crate::pickle::authority::RegistryQueryRequest>,
+) -> Response {
+    if let Err(response) = crate::sesame::auth::require_system(auth.as_deref()) {
+        return response;
+    }
+    if let Err(error) = request.compatibility.require_current() {
+        return (StatusCode::CONFLICT, error.to_string()).into_response();
+    }
+    let Some(peer) = peer else {
+        return (
+            StatusCode::FORBIDDEN,
+            "registry queries require a TLS node certificate",
+        )
+            .into_response();
+    };
+    let Some(council) = &state.council else {
+        return StatusCode::SERVICE_UNAVAILABLE.into_response();
+    };
+    let security = match council.security_state_linearizable().await {
+        Ok(security) => security,
+        Err(error) => return (StatusCode::SERVICE_UNAVAILABLE, error.to_string()).into_response(),
+    };
+    let node = match crate::sesame::renewal::validate_peer(&peer, &security) {
+        Ok(node) => node,
+        Err(error) => return (StatusCode::FORBIDDEN, error.to_string()).into_response(),
+    };
+    if crate::cluster::identity::raft_id_from_name(&node) != request.node_id {
+        return (
+            StatusCode::FORBIDDEN,
+            "registry query does not belong to authenticated node",
+        )
+            .into_response();
+    }
+    let answer = request
+        .query
+        .answer(&council.desired_state().await, request.node_id);
+    bounded_registry_query_response(answer).await
+}
+
+async fn bounded_registry_query_response(
+    answer: crate::pickle::authority::RegistryQueryResponse,
+) -> Response {
+    let encoded = tokio::task::spawn_blocking(move || serde_json::to_vec(&answer)).await;
+    match encoded {
+        Ok(Ok(bytes)) if bytes.len() <= crate::pickle::authority::MAX_REGISTRY_PROPOSAL_BYTES => (
+            [(axum::http::header::CONTENT_TYPE, "application/json")],
+            bytes,
+        )
+            .into_response(),
+        Ok(Ok(_)) => (
+            StatusCode::SERVICE_UNAVAILABLE,
+            "registry query result exceeds the control-message limit",
+        )
+            .into_response(),
+        _ => StatusCode::INTERNAL_SERVER_ERROR.into_response(),
+    }
+}
+
+async fn join_handler(
+    State(state): State<ApiState>,
+    Json(body): Json<crate::sesame::join::JoinRequest>,
+) -> Response {
     use base64::Engine as _;
+    if let Err(error) = body.compatibility.require_current() {
+        return (
+            StatusCode::CONFLICT,
+            Json(serde_json::json!({ "error": error.to_string() })),
+        )
+            .into_response();
+    }
     let csr_der = match base64::engine::general_purpose::STANDARD.decode(&body.csr_b64) {
         Ok(der) => der,
         Err(e) => {
@@ -3772,12 +4698,38 @@ async fn chaos_partition_handler(
         .as_deref()
         .map(|auth| auth.token_name.clone())
         .unwrap_or_else(|| "local-bootstrap".to_string());
+    let Some(target_node) = state.node_name.clone() else {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            "node fault safety requires a cluster identity",
+        )
+            .into_response();
+    };
+    let request = crate::smoker::types::FaultRequest {
+        fault_type: crate::smoker::types::FaultType::CouncilPartition,
+        target_service: body.peers.join(","),
+        namespace: None,
+        target_instance: None,
+        target_node: Some(target_node),
+        duration: std::time::Duration::from_secs(body.duration_secs),
+        injected_by: injected_by.clone(),
+        reason: Some("legacy chaos partition".into()),
+        include_leader: true,
+        override_safety: false,
+        acknowledged: body.acknowledged,
+    };
+    let reservation = match prepare_and_reserve_node_fault(&state, request).await {
+        Ok(grant) => grant,
+        Err(response) => return *response,
+    };
+    let duration_secs = reservation.request.duration.as_secs();
     let (resp_tx, resp_rx) = oneshot::channel();
     if state
         .cmd_tx
         .send(AgentCommand::InjectPartition {
+            reservation: Some(reservation),
             peers: body.peers,
-            duration_secs: body.duration_secs,
+            duration_secs,
             injected_by,
             response: resp_tx,
         })
@@ -3914,7 +4866,22 @@ async fn chaos_status_handler(State(state): State<ApiState>) -> Response {
     }
 
     match resp_rx.await {
-        Ok(status) => Json(serde_json::json!(status)).into_response(),
+        Ok(status) => {
+            let reservation = match &state.council {
+                Some(council) => council.desired_state().await.node_fault_reservations.active,
+                None => None,
+            };
+            Json(serde_json::json!({
+                "active_partition": status.active_partition,
+                "node_fault_reservation": reservation.map(|grant| serde_json::json!({
+                    "sequence": grant.sequence,
+                    "target_node": grant.request.target_node,
+                    "fault_type": grant.request.fault_type,
+                    "cleanup_after_unix_ms": grant.cleanup_after_unix_ms,
+                })),
+            }))
+            .into_response()
+        }
         Err(_) => (
             StatusCode::INTERNAL_SERVER_ERROR,
             Json(serde_json::json!({ "error": "agent dropped response" })),
@@ -3950,9 +4917,9 @@ fn snapshot_error_response(error: &crate::bun::BunError) -> Response {
         crate::bun::BunError::Snapshot(
             SnapshotError::NotFound { .. } | SnapshotError::NoVolumes { .. },
         ) => StatusCode::NOT_FOUND,
-        crate::bun::BunError::Snapshot(SnapshotError::UnsupportedFilesystem { .. }) => {
-            StatusCode::BAD_REQUEST
-        }
+        crate::bun::BunError::Snapshot(
+            SnapshotError::UnsupportedFilesystem { .. } | SnapshotError::TestStorage,
+        ) => StatusCode::BAD_REQUEST,
         _ => StatusCode::INTERNAL_SERVER_ERROR,
     };
     (
@@ -4230,6 +5197,17 @@ async fn fault_inject_handler(
         .as_deref()
         .map(|auth| auth.token_name.clone())
         .unwrap_or_else(|| "local-bootstrap".to_string());
+    let reservation = if request.fault_type.is_node_targeted() {
+        match prepare_and_reserve_node_fault(&state, request.clone()).await {
+            Ok(grant) => {
+                request = grant.request.clone();
+                Some(grant)
+            }
+            Err(response) => return *response,
+        }
+    } else {
+        None
+    };
     let audit_principal = auth
         .as_deref()
         .map(|auth| auth.principal_id.clone())
@@ -4247,6 +5225,7 @@ async fn fault_inject_handler(
     if state
         .cmd_tx
         .send(AgentCommand::InjectFault {
+            reservation,
             request,
             response: resp_tx,
         })
@@ -4434,6 +5413,309 @@ async fn check_node_fault_cluster_safety(
         )
             .into_response())
     }
+}
+
+#[derive(Clone, Serialize, Deserialize)]
+struct NodeFaultPreparation {
+    boot_id: String,
+    request: crate::smoker::types::FaultRequest,
+}
+
+/// The public endpoint remains an operator action; only a trusted target API
+/// may obtain the internal grant after it has checked its own server policy.
+async fn node_fault_reserve_handler(
+    auth: Option<axum::Extension<crate::sesame::auth::AuthContext>>,
+    State(state): State<ApiState>,
+    Json(prepared): Json<NodeFaultPreparation>,
+) -> Response {
+    if let Err(response) = crate::sesame::auth::require_system(auth.as_deref()) {
+        return response;
+    }
+    match reserve_node_fault_on_leader(&state, prepared).await {
+        Ok(grant) => Json(grant).into_response(),
+        Err(response) => *response,
+    }
+}
+
+#[derive(Serialize, Deserialize)]
+struct NodeFaultFenceRequest {
+    reservation: crate::smoker::reservation::NodeFaultReservation,
+    only_if_finished: bool,
+}
+
+async fn node_fault_fence_handler(
+    auth: Option<axum::Extension<crate::sesame::auth::AuthContext>>,
+    State(state): State<ApiState>,
+    Json(request): Json<NodeFaultFenceRequest>,
+) -> Response {
+    if let Err(response) = crate::sesame::auth::require_system(auth.as_deref()) {
+        return response;
+    }
+    if request.reservation.request.target_node.as_deref() != state.node_name.as_deref() {
+        return (
+            StatusCode::BAD_REQUEST,
+            "node fault fence targets another node",
+        )
+            .into_response();
+    }
+    match fence_node_fault_locally(&state, request.reservation, request.only_if_finished).await {
+        Ok(()) => StatusCode::NO_CONTENT.into_response(),
+        Err(error) => (StatusCode::SERVICE_UNAVAILABLE, error).into_response(),
+    }
+}
+
+async fn prepare_and_reserve_node_fault(
+    state: &ApiState,
+    request: crate::smoker::types::FaultRequest,
+) -> Result<crate::smoker::reservation::NodeFaultReservation, Box<Response>> {
+    let operation = async {
+        let (response, receiver) = oneshot::channel();
+        state
+            .cmd_tx
+            .send(AgentCommand::PrepareNodeFault { request, response })
+            .await
+            .map_err(|_| "agent unavailable".to_string())?;
+        receiver
+            .await
+            .map_err(|_| "agent dropped preparation response".to_string())?
+            .map_err(|error| error.to_string())
+    };
+    let (boot_id, request) =
+        match tokio::time::timeout(std::time::Duration::from_secs(5), operation).await {
+            Ok(Ok(value)) => value,
+            Ok(Err(error)) => return Err((StatusCode::BAD_REQUEST, error).into_response().into()),
+            Err(_) => {
+                return Err((
+                    StatusCode::GATEWAY_TIMEOUT,
+                    "node fault preparation timed out",
+                )
+                    .into_response()
+                    .into());
+            }
+        };
+    let prepared = NodeFaultPreparation { boot_id, request };
+    let Some(council) = &state.council else {
+        return Err((
+            StatusCode::SERVICE_UNAVAILABLE,
+            "node fault safety requires live council evidence",
+        )
+            .into_response()
+            .into());
+    };
+    if council.is_leader().await {
+        return reserve_node_fault_on_leader(state, prepared).await;
+    }
+    let Some(leader) = leader_api_url(state, council).await else {
+        return Err((
+            StatusCode::SERVICE_UNAVAILABLE,
+            "node fault safety requires a known council leader",
+        )
+            .into_response()
+            .into());
+    };
+    let bytes = post_node_fault_internal(state, format!("{leader}/v1/chaos/reserve"), &prepared)
+        .await
+        .map_err(|error| Box::new((StatusCode::SERVICE_UNAVAILABLE, error).into_response()))?;
+    serde_json::from_slice(&bytes)
+        .map_err(|error| Box::new((StatusCode::BAD_GATEWAY, error.to_string()).into_response()))
+}
+
+async fn reserve_node_fault_on_leader(
+    state: &ApiState,
+    prepared: NodeFaultPreparation,
+) -> Result<crate::smoker::reservation::NodeFaultReservation, Box<Response>> {
+    check_node_fault_cluster_safety(state, &prepared.request).await?;
+    let council = state
+        .council
+        .as_ref()
+        .ok_or_else(|| Box::new(StatusCode::SERVICE_UNAVAILABLE.into_response()))?;
+    if !council.is_leader().await {
+        return Err((
+            StatusCode::SERVICE_UNAVAILABLE,
+            "node fault leader changed; retry",
+        )
+            .into_response()
+            .into());
+    }
+    let metrics = council.metrics().borrow().clone();
+    let voters: std::collections::BTreeSet<_> =
+        metrics.membership_config.membership().voter_ids().collect();
+    let membership = state
+        .membership
+        .as_ref()
+        .ok_or_else(|| Box::new(StatusCode::SERVICE_UNAVAILABLE.into_response()))?;
+    let members = membership.read().await;
+    if !members
+        .iter()
+        .any(|member| Some(member.node_id.0.as_str()) == prepared.request.target_node.as_deref())
+    {
+        return Err((
+            StatusCode::SERVICE_UNAVAILABLE,
+            "node fault target is not in live membership",
+        )
+            .into_response()
+            .into());
+    }
+    let alive: std::collections::BTreeSet<_> = members
+        .iter()
+        .map(|member| crate::cluster::identity::raft_id_from_name(&member.node_id.0))
+        .collect();
+    drop(members);
+    let ledger = council.desired_state().await.node_fault_reservations;
+    let Some(sequence) = ledger.last_sequence.checked_add(1) else {
+        return Err((StatusCode::CONFLICT, "node fault sequence exhausted")
+            .into_response()
+            .into());
+    };
+    let reservation = crate::smoker::reservation::NodeFaultReservation {
+        sequence,
+        boot_id: prepared.boot_id,
+        cleanup_after_unix_ms: crate::testkit::lease::now_unix_millis()
+            .saturating_add(prepared.request.duration.as_millis().min(u64::MAX as u128) as u64),
+        request: prepared.request,
+    };
+    let write = council.write(crate::council::RaftRequest::ReserveNodeFault {
+        reservation: Box::new(reservation.clone()),
+        membership_log_id: *metrics.membership_config.log_id(),
+        unavailable_voters: voters.difference(&alive).copied().collect(),
+    });
+    match tokio::time::timeout(std::time::Duration::from_secs(5), write).await {
+        Ok(Ok(crate::council::CouncilResponse::Refused { reason })) => {
+            Err((StatusCode::CONFLICT, reason).into_response().into())
+        }
+        Ok(Ok(_)) => Ok(reservation),
+        Ok(Err(error)) => Err((StatusCode::SERVICE_UNAVAILABLE, error.to_string())
+            .into_response()
+            .into()),
+        Err(_) => Err((
+            StatusCode::GATEWAY_TIMEOUT,
+            "node fault reservation outcome unknown; capacity retained until fenced",
+        )
+            .into_response()
+            .into()),
+    }
+}
+
+async fn post_node_fault_internal<T: Serialize>(
+    state: &ApiState,
+    url: String,
+    body: &T,
+) -> Result<Vec<u8>, String> {
+    let token = state
+        .service_token
+        .as_ref()
+        .ok_or("node fault coordination requires a service identity")?;
+    let operation = async {
+        let mut response = state
+            .cluster_http
+            .client()
+            .post(url)
+            .bearer_auth(token)
+            .json(body)
+            .send()
+            .await
+            .map_err(|error| error.to_string())?;
+        let status = response.status();
+        let mut bytes = Vec::new();
+        while let Some(chunk) = response.chunk().await.map_err(|error| error.to_string())? {
+            if bytes.len().saturating_add(chunk.len()) > MAX_FAULT_FORWARD_RESPONSE_BYTES {
+                return Err("node fault coordination response exceeds 64 KiB".to_string());
+            }
+            bytes.extend_from_slice(&chunk);
+        }
+        if !status.is_success() {
+            return Err(format!(
+                "node fault coordination refused ({status}): {}",
+                String::from_utf8_lossy(&bytes)
+            ));
+        }
+        Ok(bytes)
+    };
+    tokio::time::timeout(std::time::Duration::from_secs(5), operation)
+        .await
+        .map_err(|_| "node fault coordination timed out; ownership remains reserved".to_string())?
+}
+
+async fn fence_node_fault_locally(
+    state: &ApiState,
+    reservation: crate::smoker::reservation::NodeFaultReservation,
+    only_if_finished: bool,
+) -> Result<(), String> {
+    let operation = async {
+        let (response, receiver) = oneshot::channel();
+        state
+            .cmd_tx
+            .send(AgentCommand::FenceNodeFault {
+                only_if_finished,
+                reservation,
+                response,
+            })
+            .await
+            .map_err(|_| "agent unavailable".to_string())?;
+        receiver
+            .await
+            .map_err(|_| "agent dropped fence response".to_string())?
+            .map_err(|error| error.to_string())
+    };
+    tokio::time::timeout(std::time::Duration::from_secs(5), operation)
+        .await
+        .map_err(|_| "node fault fence outcome unknown".to_string())?
+}
+
+fn spawn_node_fault_reaper(state: ApiState) {
+    let Some(council) = state.council.clone() else {
+        return;
+    };
+    tokio::spawn(async move {
+        let mut interval = tokio::time::interval(std::time::Duration::from_secs(1));
+        interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        loop {
+            tokio::select! { _ = state.cmd_tx.closed() => return, _ = interval.tick() => {} }
+            let cleanup = async {
+                if !council.is_leader().await {
+                    return;
+                }
+                let Some(grant) = council.desired_state().await.node_fault_reservations.active
+                else {
+                    return;
+                };
+                let only_if_finished =
+                    grant.cleanup_after_unix_ms > crate::testkit::lease::now_unix_millis();
+                let result = if grant.request.target_node.as_deref() == state.node_name.as_deref() {
+                    fence_node_fault_locally(&state, grant.clone(), only_if_finished).await
+                } else if let Some(target) = grant.request.target_node.as_deref() {
+                    match target_node_api_url(&state, target, "/v1/chaos/fence").await {
+                        Ok(url) => post_node_fault_internal(
+                            &state,
+                            url,
+                            &NodeFaultFenceRequest {
+                                reservation: grant.clone(),
+                                only_if_finished,
+                            },
+                        )
+                        .await
+                        .map(|_| ()),
+                        Err(_) => Err("node fault target is unavailable for fencing".to_string()),
+                    }
+                } else {
+                    Err("node fault reservation has no target".to_string())
+                };
+                if result.is_ok() {
+                    // A new leader either inherits this slot or sees the release.
+                    // No deadline or failed acknowledgement can clear ownership.
+                    let _ = council
+                        .write(crate::council::RaftRequest::ReleaseNodeFault {
+                            sequence: grant.sequence,
+                        })
+                        .await;
+                }
+            };
+            tokio::select! {
+                _ = state.cmd_tx.closed() => return,
+                _ = tokio::time::timeout(std::time::Duration::from_secs(10), cleanup) => {}
+            }
+        }
+    });
 }
 
 const MAX_FAULT_FORWARD_RESPONSE_BYTES: usize = 64 * 1024;
@@ -5196,6 +6478,7 @@ async fn gather_dashboard_data(state: &ApiState) -> Result<DashboardData, String
         let alert_rows = firing
             .iter()
             .map(|a| crate::brioche::dashboard::DashboardAlert {
+                labels: a.labels.clone(),
                 name: a.rule_name.clone(),
                 severity: format!("{:?}", a.severity),
                 description: a.description.clone(),
@@ -5461,6 +6744,7 @@ async fn fragment_alerts_handler(State(state): State<ApiState>) -> Response {
         eval.firing_alerts()
             .iter()
             .map(|a| crate::brioche::dashboard::DashboardAlert {
+                labels: a.labels.clone(),
                 name: a.rule_name.clone(),
                 severity: format!("{:?}", a.severity),
                 description: a.description.clone(),
@@ -5581,11 +6865,8 @@ struct LogsExportRequest {
 
 /// `POST /v1/logs/export` — export this node's Parquet log store now.
 ///
-/// Uses the Bun-owned export checkpoint (X8), so a manual export and the
-/// periodic export loop can't double-ship or skip each other's files. Both
-/// load/save the same checkpoint file non-atomically; that load/save window
-/// is a pre-existing exposure shared with the interval task and the
-/// disk-pressure sweep.
+/// Serialises with periodic, pressure and offline exporters through the same
+/// checkpoint lock. Success includes durable acknowledgement persistence.
 async fn logs_export_handler(
     auth: Option<axum::Extension<crate::sesame::auth::AuthContext>>,
     State(state): State<ApiState>,
@@ -5606,8 +6887,7 @@ async fn logs_export_handler(
             .into_response();
     };
     let data_dir = log_store.read().await.data_dir().to_path_buf();
-    let checkpoint_path = data_dir.join(crate::ketchup::export::CHECKPOINT_FILENAME);
-    let mut checkpoint = crate::ketchup::export::ExportCheckpoint::load(&checkpoint_path);
+    let mut checkpoint = crate::ketchup::export::ExportCheckpoint::default();
     let node_id = state
         .node_name
         .clone()
@@ -5621,28 +6901,13 @@ async fn logs_export_handler(
     )
     .await
     {
-        Ok(result) => {
-            // The files landed; a failed checkpoint save only means a later
-            // export may re-ship them. Say so instead of pretending.
-            let checkpoint_saved = if result.files_exported > 0 {
-                match checkpoint.save(&checkpoint_path) {
-                    Ok(()) => true,
-                    Err(e) => {
-                        eprintln!("bun: log export checkpoint save failed: {e}");
-                        false
-                    }
-                }
-            } else {
-                true
-            };
-            Json(serde_json::json!({
-                "files_exported": result.files_exported,
-                "bytes_written": result.bytes_written,
-                "node_id": node_id,
-                "checkpoint_saved": checkpoint_saved,
-            }))
-            .into_response()
-        }
+        Ok(result) => Json(serde_json::json!({
+            "files_exported": result.files_exported,
+            "bytes_written": result.bytes_written,
+            "node_id": node_id,
+            "checkpoint_saved": true,
+        }))
+        .into_response(),
         Err(e) => (
             StatusCode::INTERNAL_SERVER_ERROR,
             Json(serde_json::json!({"error": e.to_string()})),
@@ -5654,11 +6919,12 @@ async fn logs_export_handler(
 /// `GET /v1/alerts` — list all alert statuses.
 async fn alerts_handler(State(state): State<ApiState>) -> impl IntoResponse {
     let Some(alerts) = &state.alerts else {
-        return Json(serde_json::json!({"alerts": []}));
+        return Json(crate::mayo::alert::AlertsResponse { alerts: Vec::new() });
     };
     let evaluator = alerts.read().await;
-    let statuses = evaluator.all_statuses();
-    Json(serde_json::json!({"alerts": statuses}))
+    Json(crate::mayo::alert::AlertsResponse {
+        alerts: evaluator.all_statuses(),
+    })
 }
 
 /// `GET /v1/metrics/keys` — list all distinct metric names.
@@ -5742,6 +7008,41 @@ async fn metrics_rollup_handler(
     }
 }
 
+/// Return worker identity with each contribution so overlapping aggregators cannot double-count it.
+async fn metrics_owned_rollup_handler(
+    auth: Option<axum::Extension<crate::sesame::auth::AuthContext>>,
+    State(state): State<ApiState>,
+    Query(params): Query<MetricsQueryParams>,
+) -> Response {
+    if let Err(response) = crate::sesame::auth::require_unscoped(auth.as_deref()) {
+        return response;
+    }
+    let Some(store) = &state.rollup_store else {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            "no rollup store configured",
+        )
+            .into_response();
+    };
+    match store
+        .read()
+        .await
+        .query_owned_rows(
+            params.name.as_deref(),
+            params.start.unwrap_or(0),
+            params.end.unwrap_or(i64::MAX as u64),
+        )
+        .await
+    {
+        Ok(rows) => Json(rows).into_response(),
+        Err(error) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({"error":error.to_string()})),
+        )
+            .into_response(),
+    }
+}
+
 /// Resolve the base URLs of every council aggregator (Raft voter) from the
 /// live gossip membership.
 ///
@@ -5775,8 +7076,8 @@ async fn resolve_council_urls(state: &ApiState) -> Option<Vec<String>> {
 
 /// `GET /v1/metrics/cluster?name=X&start=S&end=E` — cluster-wide query.
 ///
-/// Fans out to all council aggregators' `/v1/metrics/rollup` endpoints,
-/// merges results (summing partial aggregates), and returns the combined data
+/// Fans out to all council aggregators' `/v1/metrics/rollup/owned` endpoints,
+/// deduplicates worker contributions before summing, and returns the combined data
 /// with any warnings about unresponsive aggregators. Falls back to reading the
 /// local rollup store when there is no council to fan out to (single-node).
 async fn metrics_cluster_handler(
@@ -5793,9 +7094,8 @@ async fn metrics_cluster_handler(
     // full-domain unsigned range like `timestamp <= u64::MAX`.
     let end = params.end.unwrap_or(i64::MAX as u64).min(i64::MAX as u64);
 
-    // Cluster path: fan out to every council aggregator's local rollup store
-    // and sum. Reading only this member's store (as this endpoint used to)
-    // undercounts, because each aggregator holds a different slice of workers.
+    // Retain worker identity until after deduplication: reassignment leaves
+    // overlapping history on old and new aggregators.
     if let Some(urls) = resolve_council_urls(&state).await {
         let query = MetricsQuery {
             metric_name: params.name.clone(),
@@ -5828,36 +7128,12 @@ async fn metrics_cluster_handler(
     };
 
     let store = rollup_store.read().await;
-    let result = match &params.name {
-        Some(name) => store.query_cluster_metric(name, start, end).await,
-        None => {
-            let sql = format!(
-                "SELECT timestamp, metric_name, labels, SUM(sum_val) as total_sum \
-                 FROM rollups \
-                 WHERE timestamp >= {start} AND timestamp <= {end} \
-                 GROUP BY timestamp, metric_name, labels \
-                 ORDER BY timestamp LIMIT 10000"
-            );
-            store.query_sql(&sql).await
-        }
-    };
-
+    let result = store
+        .query_owned_rows(params.name.as_deref(), start, end)
+        .await;
     match result {
         Ok(rows) => {
-            let data: Vec<MetricsQueryRow> = rows
-                .into_iter()
-                .map(|(ts, name, labels, val)| MetricsQueryRow {
-                    timestamp: ts,
-                    metric_name: name,
-                    labels,
-                    value: val,
-                })
-                .collect();
-            Json(MetricsQueryResult {
-                data,
-                warnings: vec![],
-            })
-            .into_response()
+            Json(crate::mayo::query_fanout::merge_owned_rollups(vec![rows])).into_response()
         }
         Err(e) => (
             StatusCode::INTERNAL_SERVER_ERROR,
@@ -5995,6 +7271,86 @@ async fn metrics_app_handler(
 // ---------------------------------------------------------------------------
 // Deploy endpoints
 // ---------------------------------------------------------------------------
+
+/// Request node-local cooperative cancellation under the same authority as apply.
+async fn deploy_cancel_handler(
+    auth: Option<axum::Extension<crate::sesame::auth::AuthContext>>,
+    State(state): State<ApiState>,
+    Path(id): Path<String>,
+) -> Response {
+    if let Err(response) =
+        crate::sesame::auth::authorize(auth.as_deref(), crate::sesame::types::ApiRole::Deployer)
+    {
+        return response;
+    }
+    let snapshot = match deploy_operation_snapshot(&state).await {
+        Ok(snapshot) => snapshot,
+        Err(response) => return response,
+    };
+    let Some(operation) = snapshot
+        .active_deploys
+        .iter()
+        .chain(&snapshot.history)
+        .find(|operation| operation.id.as_str() == id)
+    else {
+        return (
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({"error": "deploy operation not found on this node"})),
+        )
+            .into_response();
+    };
+    let permissions = match &state.council {
+        Some(council) => council.desired_state().await.permissions,
+        None => std::collections::BTreeMap::new(),
+    };
+    for target in &operation.targets {
+        if let Err(response) =
+            crate::sesame::auth::authorize_scoped(auth.as_deref(), &target.name, &target.namespace)
+        {
+            return response;
+        }
+        if let Err(response) = crate::sesame::auth::authorize_permission(
+            auth.as_deref(),
+            crate::config::PermissionAction::Deploy,
+            &target.name,
+            &target.namespace,
+            &permissions,
+        ) {
+            return response;
+        }
+    }
+    let (response, result) = oneshot::channel();
+    let request = async {
+        state
+            .cmd_tx
+            .send(AgentCommand::CancelDeploy {
+                operation_id: id.into(),
+                response,
+            })
+            .await
+            .ok()?;
+        result.await.ok()
+    };
+    match tokio::time::timeout(std::time::Duration::from_secs(2), request).await {
+        Ok(Some(Some(operation))) => {
+            let status = if operation.outcome.is_some() {
+                StatusCode::OK
+            } else {
+                StatusCode::ACCEPTED
+            };
+            (status, Json(operation)).into_response()
+        }
+        Ok(Some(None)) => {
+            (StatusCode::NOT_FOUND, "deploy operation no longer retained").into_response()
+        }
+        Ok(None) => (StatusCode::SERVICE_UNAVAILABLE, "agent unavailable").into_response(),
+        Err(_) => (
+            StatusCode::GATEWAY_TIMEOUT,
+            "cancellation receipt unknown; query or retry the same operation ID",
+        )
+            .into_response(),
+    }
+}
 
 /// `GET /v1/deploys/active` — list active deploys.
 async fn deploys_active_handler(State(state): State<ApiState>) -> Response {
@@ -6155,6 +7511,7 @@ async fn rollback_handler(
             raw,
             None,
             HeaderMap::new(),
+            None,
         )
         .await;
     }
@@ -6183,28 +7540,51 @@ async fn rollback_handler(
     Sse::new(stream).into_response()
 }
 
-/// `GET /v1/images` — list images in the local Pickle registry.
-async fn images_handler(State(state): State<ApiState>) -> impl IntoResponse {
-    let Some(catalog) = &state.pickle_catalog else {
-        return Json(serde_json::json!({"images": []}));
+/// `GET /v1/images` — list committed images using current cluster authority.
+async fn images_handler(
+    State(state): State<ApiState>,
+    authority: Option<axum::Extension<crate::pickle::authority::RegistryReadAuthority>>,
+) -> Response {
+    use crate::pickle::authority::{RegistryQuery, RegistryQueryResponse};
+    let images = if let Some(authority) = authority {
+        match authority
+            .forwarder
+            .query(
+                state.council.as_ref(),
+                authority.node_id,
+                RegistryQuery::Images,
+            )
+            .await
+        {
+            Ok(RegistryQueryResponse::Images(images)) => images,
+            Ok(_) => {
+                return (
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    "invalid registry image-list response",
+                )
+                    .into_response();
+            }
+            Err(error) => {
+                return (StatusCode::SERVICE_UNAVAILABLE, error.to_string()).into_response();
+            }
+        }
+    } else if let Some(council) = &state.council {
+        if let Err(error) = council.security_state_linearizable().await {
+            return (StatusCode::SERVICE_UNAVAILABLE, error.to_string()).into_response();
+        }
+        council.manifest_catalog().await.images()
+    } else if state.static_capabilities.cluster_mode {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            "registry authority is unavailable",
+        )
+            .into_response();
+    } else if let Some(catalog) = &state.pickle_catalog {
+        catalog.read().await.images()
+    } else {
+        Vec::new()
     };
-    let catalog = catalog.read().await;
-    let images: Vec<serde_json::Value> = catalog
-        .manifests
-        .iter()
-        .map(|(digest, m)| {
-            let tags: Vec<&str> = m.tags.iter().map(|t| t.as_str()).collect();
-            let layers = m.layers.len();
-            serde_json::json!({
-                "repository": m.repository,
-                "digest": digest,
-                "tags": tags,
-                "layers": layers,
-                "total_size": m.total_size,
-            })
-        })
-        .collect();
-    Json(serde_json::json!({"images": images}))
+    Json(serde_json::json!({ "images": images })).into_response()
 }
 
 /// GitOps webhook handler (public, HMAC-authenticated).
@@ -6355,6 +7735,9 @@ async fn identity_sign_handler(
     {
         return resp;
     }
+    if let Err(response) = crate::sesame::auth::require_unscoped(auth.as_deref()) {
+        return response;
+    }
     #[derive(serde::Deserialize)]
     struct SignRequest {
         digest: String,
@@ -6409,6 +7792,9 @@ async fn token_list_handler(
     {
         return resp;
     }
+    if let Err(response) = crate::sesame::auth::require_unscoped(auth.as_deref()) {
+        return response;
+    }
     let Some(ref council) = state.council else {
         return (
             StatusCode::SERVICE_UNAVAILABLE,
@@ -6444,6 +7830,9 @@ async fn token_revoke_handler(
         crate::sesame::auth::authorize_user(auth.as_deref(), crate::sesame::types::ApiRole::Admin)
     {
         return resp;
+    }
+    if let Err(response) = crate::sesame::auth::require_unscoped(auth.as_deref()) {
+        return response;
     }
     #[derive(serde::Deserialize)]
     struct RevokeRequest {
@@ -6498,6 +7887,7 @@ async fn token_revoke_handler(
 async fn token_create_handler(
     auth: Option<axum::Extension<crate::sesame::auth::AuthContext>>,
     State(state): State<ApiState>,
+    headers: HeaderMap,
     body: String,
 ) -> Response {
     // AUTH4: the highest-value lateral-movement target. A stolen service
@@ -6507,7 +7897,10 @@ async fn token_create_handler(
     {
         return resp;
     }
-    #[derive(serde::Deserialize)]
+    if let Err(response) = crate::sesame::auth::require_unscoped(auth.as_deref()) {
+        return response;
+    }
+    #[derive(serde::Deserialize, serde::Serialize)]
     struct CreateRequest {
         name: String,
         role: String,
@@ -6517,6 +7910,8 @@ async fn token_create_handler(
         namespaces: Option<Vec<String>>,
         #[serde(default)]
         ttl_days: Option<u64>,
+        #[serde(default)]
+        lease_id: Option<String>,
     }
 
     let req: CreateRequest = match serde_json::from_str(&body) {
@@ -6565,13 +7960,83 @@ async fn token_create_handler(
             .into_response();
     };
 
+    let lease_owner = if req.lease_id.is_some() {
+        let user =
+            match authenticated_test_user(auth.as_deref(), crate::sesame::types::ApiRole::Admin) {
+                Ok(user) => user,
+                Err(response) => return response,
+            };
+        if let Err(response) = crate::sesame::auth::require_unscoped(Some(user)) {
+            return response;
+        }
+        if let Err(response) = test_operation_authorisation(&state, user) {
+            return response;
+        }
+        if !council.is_leader().await {
+            return forward_test_lease_request(
+                &state,
+                council,
+                reqwest::Method::POST,
+                "/v1/token/create",
+                &headers,
+                Some(&req),
+            )
+            .await;
+        }
+        Some(user.principal_id.clone())
+    } else {
+        None
+    };
+    let lease = if let Some(lease_id) = &req.lease_id {
+        let Some(lease) = find_test_lease(&state, lease_id).await else {
+            return lease_error_response(crate::testkit::lease::LeaseError::NotFound);
+        };
+        if let Err(error) = lease.authorise_owner(
+            lease_owner.as_deref().unwrap_or_default(),
+            crate::testkit::lease::now_unix_millis(),
+        ) {
+            return lease_error_response(error);
+        }
+        Some(lease)
+    } else {
+        None
+    };
+
     let scope = crate::sesame::types::TokenScope {
         apps: req.apps.clone(),
         namespaces: req.namespaces.clone(),
     };
-    let expires_at = req
-        .ttl_days
-        .map(|d| std::time::SystemTime::now() + std::time::Duration::from_secs(d * 86400));
+    let mut expires_at = match req.ttl_days {
+        None => None,
+        Some(days) => {
+            let expiry = days
+                .checked_mul(86_400)
+                .filter(|seconds| *seconds > 0)
+                .and_then(|seconds| {
+                    std::time::SystemTime::now()
+                        .checked_add(std::time::Duration::from_secs(seconds))
+                });
+            let Some(expiry) = expiry else {
+                return (
+                    StatusCode::BAD_REQUEST,
+                    Json(serde_json::json!({
+                        "error": "ttl_days must be positive and produce a representable expiry"
+                    })),
+                )
+                    .into_response();
+            };
+            Some(expiry)
+        }
+    };
+
+    if let Some(lease) = &lease {
+        let Some(bound) = std::time::UNIX_EPOCH
+            .checked_add(std::time::Duration::from_millis(lease.expires_at_unix_ms))
+        else {
+            return lease_error_response(crate::testkit::lease::LeaseError::InvalidExpiry);
+        };
+        expires_at = Some(expires_at.map_or(bound, |expiry| expiry.min(bound)));
+    }
 
     // Argon2id hashing is deliberately slow + memory-hungry (M7): run it on the
     // blocking pool so it doesn't stall the async runtime worker.
@@ -6598,22 +8063,24 @@ async fn token_create_handler(
         }
     };
 
-    match council
-        .write(crate::council::RaftRequest::CreateApiToken(created.token))
-        .await
-    {
-        Ok(_) => Json(serde_json::json!({
-            "name": req.name,
-            "role": req.role,
-            "token": created.plaintext,
-        }))
-        .into_response(),
-        Err(e) => (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(serde_json::json!({ "error": e.to_string() })),
-        )
-            .into_response(),
+    let request = match (lease, lease_owner) {
+        (Some(lease), Some(owner_id)) => crate::council::RaftRequest::TestLeaseApiToken {
+            lease_id: lease.lease_id,
+            owner_id,
+            observed_at_unix_ms: crate::testkit::lease::now_unix_millis(),
+            token: Box::new(created.token),
+        },
+        _ => crate::council::RaftRequest::CreateApiToken(created.token),
+    };
+    if let Err(response) = write_lease_request(council, request).await {
+        return response;
     }
+    Json(serde_json::json!({
+        "name": req.name,
+        "role": req.role,
+        "token": created.plaintext,
+    }))
+    .into_response()
 }
 
 /// Create a short-lived, single-use node join token and persist its hash.
@@ -6630,6 +8097,9 @@ async fn join_token_create_handler(
         crate::sesame::auth::authorize_user(auth.as_deref(), crate::sesame::types::ApiRole::Admin)
     {
         return resp;
+    }
+    if let Err(response) = crate::sesame::auth::require_unscoped(auth.as_deref()) {
+        return response;
     }
 
     fn default_ttl_seconds() -> u64 {
@@ -6726,6 +8196,42 @@ async fn join_token_create_handler(
 // Secret rotation endpoint
 // ---------------------------------------------------------------------------
 
+/// Read the active public encryption recipient from locally applied state.
+///
+/// Publishing a recipient grants no decryption authority. Scoped read-only
+/// users may encrypt new values without gaining access to any private key.
+async fn secret_public_key_handler(
+    auth: Option<axum::Extension<crate::sesame::auth::AuthContext>>,
+    State(state): State<ApiState>,
+) -> Response {
+    if let Err(response) =
+        crate::sesame::auth::authorize(auth.as_deref(), crate::sesame::types::ApiRole::ReadOnly)
+    {
+        return response;
+    }
+    let Some(council) = &state.council else {
+        return (StatusCode::SERVICE_UNAVAILABLE, "no council available").into_response();
+    };
+    let security = council.security_state().await;
+    let Some(keypair) = security
+        .age_keypairs
+        .iter()
+        .filter(|key| key.scope == crate::sesame::types::AgeKeyScope::ClusterWide && !key.read_only)
+        .max_by_key(|key| key.generation)
+    else {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            "no active cluster encryption key available",
+        )
+            .into_response();
+    };
+    Json(crate::sesame::types::SecretPublicKey {
+        public_key: keypair.public_key.clone(),
+        generation: keypair.generation,
+    })
+    .into_response()
+}
+
 /// Rotate or finalise secret encryption key via Raft.
 async fn secret_rotate_handler(
     auth: Option<axum::Extension<crate::sesame::auth::AuthContext>>,
@@ -6738,6 +8244,9 @@ async fn secret_rotate_handler(
         crate::sesame::auth::authorize_user(auth.as_deref(), crate::sesame::types::ApiRole::Admin)
     {
         return resp;
+    }
+    if let Err(response) = crate::sesame::auth::require_unscoped(auth.as_deref()) {
+        return response;
     }
     #[derive(serde::Deserialize)]
     struct RotateRequest {
@@ -6860,6 +8369,31 @@ async fn secret_rotate_handler(
 
 #[cfg(test)]
 mod tests {
+    #[tokio::test]
+    async fn registry_query_response_refuses_an_oversized_catalogue() {
+        use crate::pickle::authority::{MAX_REGISTRY_PROPOSAL_BYTES, RegistryQueryResponse};
+        let mut catalog = crate::pickle::types::ManifestCatalog::default();
+        catalog
+            .repository_owners
+            .insert("repository".into(), "x".repeat(MAX_REGISTRY_PROPOSAL_BYTES));
+        assert_eq!(
+            super::bounded_registry_query_response(RegistryQueryResponse::Repository(Box::new(
+                catalog
+            )))
+            .await
+            .status(),
+            axum::http::StatusCode::SERVICE_UNAVAILABLE
+        );
+        assert_eq!(
+            super::bounded_registry_query_response(RegistryQueryResponse::Repository(
+                Default::default()
+            ))
+            .await
+            .status(),
+            axum::http::StatusCode::OK
+        );
+    }
+
     use super::*;
     use axum::body::Body;
     use http_body_util::BodyExt;
@@ -7180,6 +8714,27 @@ mod tests {
         local_test_leases: Option<crate::testkit::lease::LocalLeaseStore>,
         events: Option<Arc<RwLock<crate::bun::events::EventStore>>>,
     ) -> (Router, CancellationToken) {
+        setup_with_auth_leases_events_and_council(
+            tokens,
+            service_token,
+            readiness,
+            static_capabilities,
+            local_test_leases,
+            events,
+            None,
+        )
+        .await
+    }
+
+    async fn setup_with_auth_leases_events_and_council(
+        tokens: Vec<crate::sesame::types::ApiToken>,
+        service_token: Option<String>,
+        readiness: crate::bun::readiness::ReadinessTracker,
+        static_capabilities: crate::bun::capabilities::StaticCapabilities,
+        local_test_leases: Option<crate::testkit::lease::LocalLeaseStore>,
+        events: Option<Arc<RwLock<crate::bun::events::EventStore>>>,
+        council: Option<Arc<crate::council::CouncilNode>>,
+    ) -> (Router, CancellationToken) {
         let (cmd_tx, cmd_rx) = mpsc::channel(32);
         let shutdown = CancellationToken::new();
         let grill = MockGrill::new();
@@ -7197,7 +8752,7 @@ mod tests {
             None,
             None,
             None,
-            None,
+            council,
             Some(store),
             service_token,
             None,
@@ -7560,7 +9115,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn legacy_partition_response_exposes_the_exact_owned_fault_id() {
+    async fn legacy_partition_requires_cluster_reservation_evidence() {
         let (token, plaintext) = a_user_token(crate::sesame::types::ApiRole::Admin);
         let (app, shutdown) = setup_with_auth_readiness_and_leases(
             vec![token],
@@ -7579,13 +9134,8 @@ mod tests {
             None,
         )
         .await;
-        assert_eq!(status, StatusCode::OK);
-        let response: serde_json::Value = serde_json::from_slice(&body).unwrap();
-        assert!(response["fault"]["id"].as_u64().is_some(), "{response}");
-        assert_eq!(
-            response["fault"]["fault_type"].as_str(),
-            Some("council-partition")
-        );
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+        assert!(String::from_utf8_lossy(&body).contains("cluster identity"));
         shutdown.cancel();
     }
 
@@ -7930,6 +9480,893 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn node_job_lease_scope_is_fenced_and_stays_on_its_receiving_node() {
+        let council = seeded_council("node-jobs").await;
+        let (token, plaintext) = a_user_token(crate::sesame::types::ApiRole::Deployer);
+        let (other, other_text) =
+            named_user_token("other", crate::sesame::types::ApiRole::Deployer);
+        let (mut scoped, scoped_text) =
+            named_user_token("scoped", crate::sesame::types::ApiRole::Deployer);
+        scoped.scope.apps = Some(vec!["batch".into()]);
+        let tokens = vec![token, other, scoped];
+        let (app, shutdown) = setup_with_auth_leases_events_and_council(
+            tokens.clone(),
+            None,
+            crate::bun::readiness::ReadinessTracker::new(),
+            lease_static_capabilities(),
+            None,
+            None,
+            Some(Arc::clone(&council)),
+        )
+        .await;
+        let body = r#"{"ttl_seconds":60,"scope":"node_jobs"}"#;
+        assert_eq!(
+            post_authenticated(app.clone(), "/v1/test/leases", &scoped_text, body, None)
+                .await
+                .0,
+            StatusCode::FORBIDDEN
+        );
+        let (status, bytes) =
+            post_authenticated(app.clone(), "/v1/test/leases", &plaintext, body, None).await;
+        assert_eq!(status, StatusCode::CREATED);
+        let lease: crate::testkit::lease::TestLease = serde_json::from_slice(&bytes).unwrap();
+        assert!(council.desired_state().await.test_leases.is_empty());
+        for body in [
+            format!(
+                r#"{{"ttl_seconds":60,"scope":"node_jobs","namespace":"{}"}}"#,
+                lease.namespace
+            ),
+            format!(r#"{{"ttl_seconds":60,"namespace":"{}"}}"#, lease.namespace),
+        ] {
+            assert_eq!(
+                post_authenticated(app.clone(), "/v1/test/leases", &plaintext, &body, None)
+                    .await
+                    .0,
+                StatusCode::BAD_REQUEST
+            );
+        }
+        assert_eq!(
+            post_authenticated(
+                app.clone(),
+                "/v1/apply",
+                &plaintext,
+                "[app.web]\nimage = 'test:v1'",
+                Some(&lease.lease_id)
+            )
+            .await
+            .0,
+            StatusCode::BAD_REQUEST
+        );
+        let job = "[job.batch]\nimage = 'test:v1'";
+        assert_eq!(
+            post_authenticated(
+                app.clone(),
+                "/v1/apply",
+                &other_text,
+                job,
+                Some(&lease.lease_id)
+            )
+            .await
+            .0,
+            StatusCode::FORBIDDEN
+        );
+        assert_eq!(
+            post_authenticated(
+                app.clone(),
+                "/v1/apply",
+                &plaintext,
+                job,
+                Some(&lease.lease_id)
+            )
+            .await
+            .0,
+            StatusCode::OK
+        );
+        let path = format!("/v1/test/leases/{}", lease.lease_id);
+        assert_eq!(
+            post_authenticated(
+                app.clone(),
+                &format!("{path}/renew"),
+                &other_text,
+                r#"{"ttl_seconds":60}"#,
+                None
+            )
+            .await
+            .0,
+            StatusCode::FORBIDDEN
+        );
+        assert_eq!(
+            delete_authenticated(app.clone(), &path, &other_text).await,
+            StatusCode::FORBIDDEN
+        );
+        assert_eq!(
+            post_authenticated(
+                app.clone(),
+                &format!("{path}/renew"),
+                &plaintext,
+                r#"{"ttl_seconds":60}"#,
+                None
+            )
+            .await
+            .0,
+            StatusCode::OK
+        );
+
+        // An uninitialised council has no leader to forward to. All node-job
+        // routes must still answer from this node's own store.
+        use crate::council::network::{InMemoryRaftNetworkFactory, InMemoryRaftRouter};
+        use crate::council::{
+            CouncilNode, log_store::MemLogStore, state_machine::CouncilStateMachine,
+        };
+        let uninitialised = Arc::new(
+            CouncilNode::new(
+                2,
+                crate::council::types::CouncilConfig::default(),
+                InMemoryRaftNetworkFactory::new(2, InMemoryRaftRouter::new()),
+                MemLogStore::new(),
+                CouncilStateMachine::new(),
+                None,
+            )
+            .await
+            .unwrap(),
+        );
+        let (wrong_node, wrong_shutdown) = setup_with_auth_leases_events_and_council(
+            tokens,
+            None,
+            crate::bun::readiness::ReadinessTracker::new(),
+            lease_static_capabilities(),
+            None,
+            None,
+            Some(Arc::clone(&uninitialised)),
+        )
+        .await;
+        assert_eq!(
+            get_authenticated(wrong_node.clone(), &path, &plaintext)
+                .await
+                .0,
+            StatusCode::NOT_FOUND
+        );
+        assert_eq!(
+            post_authenticated(
+                wrong_node.clone(),
+                &format!("{path}/renew"),
+                &plaintext,
+                r#"{"ttl_seconds":60}"#,
+                None
+            )
+            .await
+            .0,
+            StatusCode::NOT_FOUND
+        );
+        assert_eq!(
+            delete_authenticated(wrong_node.clone(), &path, &plaintext).await,
+            StatusCode::NOT_FOUND
+        );
+        assert_eq!(
+            post_authenticated(
+                wrong_node.clone(),
+                "/v1/apply",
+                &plaintext,
+                job,
+                Some(&lease.lease_id)
+            )
+            .await
+            .0,
+            StatusCode::NOT_FOUND
+        );
+        assert_eq!(
+            post_authenticated(wrong_node, "/v1/test/leases", &plaintext, body, None)
+                .await
+                .0,
+            StatusCode::CREATED
+        );
+        assert_eq!(
+            get_authenticated(app.clone(), &path, &plaintext).await.0,
+            StatusCode::OK
+        );
+        assert_eq!(
+            delete_authenticated(app, &path, &plaintext).await,
+            StatusCode::NO_CONTENT
+        );
+        assert!(council.desired_state().await.test_leases.is_empty());
+        shutdown.cancel();
+        wrong_shutdown.cancel();
+        council.raft().shutdown().await.unwrap();
+        uninitialised.raft().shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn node_job_lease_persists_jobs_and_reclaims_their_schedule() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("leases.json");
+        let store = crate::testkit::lease::LocalLeaseStore::open(path.clone())
+            .await
+            .unwrap();
+        let (token, plaintext) = a_user_token(crate::sesame::types::ApiRole::Deployer);
+        let (app, shutdown) = setup_with_auth_readiness_and_leases(
+            vec![token],
+            None,
+            crate::bun::readiness::ReadinessTracker::new(),
+            lease_static_capabilities(),
+            Some(store),
+        )
+        .await;
+        let (status, body) = post_authenticated(
+            app.clone(),
+            "/v1/test/leases",
+            &plaintext,
+            r#"{"ttl_seconds":60,"scope":"node_jobs"}"#,
+            None,
+        )
+        .await;
+        assert_eq!(
+            status,
+            StatusCode::CREATED,
+            "{}",
+            String::from_utf8_lossy(&body)
+        );
+        let lease: crate::testkit::lease::TestLease = serde_json::from_slice(&body).unwrap();
+        assert!(lease.lease_id.starts_with("node-jobs-"));
+        assert!(lease.namespace.starts_with("rbtest-node-"));
+        let (status, body) = post_authenticated(
+            app.clone(),
+            "/v1/apply",
+            &plaintext,
+            r#"[job.batch]
+image = "test:v1"
+[job.scheduled]
+image = "test:v1"
+schedule = "* * * * *"
+"#,
+            Some(&lease.lease_id),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{}", String::from_utf8_lossy(&body));
+        let reopened = crate::testkit::lease::LocalLeaseStore::open(path)
+            .await
+            .unwrap();
+        let owned = reopened.get(&lease.lease_id).await.unwrap();
+        let owned_json = serde_json::to_value(&owned).unwrap();
+        assert_eq!(owned.resources.len(), 2);
+        assert!(
+            owned_json["resources"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .all(|resource| resource["kind"] == "job")
+        );
+        assert_eq!(
+            delete_authenticated(
+                app.clone(),
+                &format!("/v1/test/leases/{}", lease.lease_id),
+                &plaintext
+            )
+            .await,
+            StatusCode::NO_CONTENT
+        );
+        let (_, status) = get_authenticated(app.clone(), "/v1/status", &plaintext).await;
+        let instances: serde_json::Value = serde_json::from_slice(&status).unwrap();
+        assert!(
+            !String::from_utf8_lossy(&status).contains(&lease.namespace),
+            "{instances}"
+        );
+        assert_eq!(
+            get_authenticated(
+                app,
+                &format!("/v1/test/leases/{}", lease.lease_id),
+                &plaintext
+            )
+            .await
+            .0,
+            StatusCode::NOT_FOUND
+        );
+        shutdown.cancel();
+    }
+
+    #[tokio::test]
+    async fn lease_reads_forward_user_authority_and_refuse_an_isolated_leader() {
+        use crate::council::log_store::MemLogStore;
+        use crate::council::network::{InMemoryRaftNetworkFactory, InMemoryRaftRouter};
+        use crate::council::state_machine::CouncilStateMachine;
+        use crate::council::types::{CouncilConfig, CouncilNodeInfo};
+        use crate::council::{CouncilNode, CouncilResponse, RaftRequest};
+        let network = InMemoryRaftRouter::new();
+        let mut nodes = Vec::new();
+        let mut listeners = Vec::new();
+        let mut members = std::collections::BTreeMap::new();
+        for id in 1..=3 {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let address = listener.local_addr().unwrap();
+            members.insert(
+                id,
+                CouncilNodeInfo {
+                    addr: std::net::SocketAddr::new(address.ip(), address.port() - 3),
+                    name: format!("node-{id}"),
+                },
+            );
+            listeners.push(listener);
+            let node = Arc::new(
+                CouncilNode::new(
+                    id,
+                    CouncilConfig::default(),
+                    InMemoryRaftNetworkFactory::new(id, network.clone()),
+                    MemLogStore::new(),
+                    CouncilStateMachine::new(),
+                    None,
+                )
+                .await
+                .unwrap(),
+            );
+            network.register(id, node.raft().clone()).await;
+            nodes.push(node);
+        }
+        nodes[0].initialize(members).await.unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(10), async {
+            while !nodes[0].is_leader().await {
+                tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .unwrap();
+        let (owner, owner_key) = a_user_token(crate::sesame::types::ApiRole::Deployer);
+        let (stranger, stranger_key) =
+            named_user_token("stranger", crate::sesame::types::ApiRole::Deployer);
+        let now = crate::testkit::lease::now_unix_millis();
+        let lease = crate::testkit::lease::TestLease::new(
+            "read-quorum".into(),
+            crate::sesame::auth::authenticate(&owner_key, std::slice::from_ref(&owner))
+                .unwrap()
+                .principal_id,
+            owner.name.clone(),
+            "rbtest-read-quorum".into(),
+            now,
+            now + 60_000,
+        )
+        .unwrap();
+        assert!(!matches!(
+            nodes[0]
+                .write(RaftRequest::TestLeaseCreate(lease))
+                .await
+                .unwrap(),
+            CouncilResponse::Refused { .. }
+        ));
+        let leader_port = listeners[0].local_addr().unwrap().port();
+        let mut routers = Vec::new();
+        let mut stops = Vec::new();
+        let mut servers = Vec::new();
+        for (node, listener) in nodes.iter().zip(listeners) {
+            let (commands, _receiver) = mpsc::channel(4);
+            let store = crate::sesame::auth::new_token_store();
+            *store.write().await = vec![owner.clone(), stranger.clone()];
+            let router = router(
+                commands,
+                None,
+                None,
+                None,
+                None,
+                None,
+                Some(node.clone()),
+                Some(store),
+                Some("internal".into()),
+                None,
+                None,
+                None,
+                leader_port,
+                None,
+            );
+            let stop = CancellationToken::new();
+            routers.push(router.clone());
+            let cancelled = stop.clone();
+            servers.push(tokio::spawn(async move {
+                axum::serve(listener, router)
+                    .with_graceful_shutdown(async move { cancelled.cancelled().await })
+                    .await
+                    .unwrap();
+            }));
+            stops.push(stop);
+        }
+        tokio::time::timeout(std::time::Duration::from_secs(10), async {
+            while nodes[1].current_leader().await != Some(1) {
+                tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .unwrap();
+        let path = "/v1/test/leases/read-quorum";
+        assert_eq!(
+            get_authenticated(routers[1].clone(), path, &owner_key)
+                .await
+                .0,
+            StatusCode::OK
+        );
+        assert_eq!(
+            get_authenticated(routers[1].clone(), path, &stranger_key)
+                .await
+                .0,
+            StatusCode::FORBIDDEN
+        );
+        let looped = routers[1]
+            .clone()
+            .oneshot(
+                axum::http::Request::builder()
+                    .uri(path)
+                    .header("authorization", format!("Bearer {owner_key}"))
+                    .header("x-reliaburger-lease-forwarded", "1")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(looped.status(), StatusCode::SERVICE_UNAVAILABLE);
+        network.partition(1, 2).await;
+        network.partition(1, 3).await;
+        // The old leader still knows the record and believes it leads. Without
+        // quorum, neither presence nor absence is cleanup evidence.
+        for path in [path, "/v1/test/leases/missing"] {
+            assert_eq!(
+                get_authenticated(routers[0].clone(), path, &owner_key)
+                    .await
+                    .0,
+                StatusCode::SERVICE_UNAVAILABLE
+            );
+        }
+        assert_eq!(
+            get_authenticated(routers[0].clone(), "/v1/placements/worker", "internal")
+                .await
+                .0,
+            StatusCode::SERVICE_UNAVAILABLE
+        );
+        for stop in stops {
+            stop.cancel();
+        }
+        for node in nodes {
+            node.shutdown().await.unwrap();
+        }
+        for server in servers {
+            server.await.unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn decommission_requires_unscoped_operator_attestation_and_records_its_principal() {
+        let council = seeded_council("decommission").await;
+        let (admin, admin_key) = named_user_token("operator", crate::sesame::types::ApiRole::Admin);
+        let expected_principal =
+            crate::sesame::auth::authenticate(&admin_key, std::slice::from_ref(&admin))
+                .unwrap()
+                .principal_id;
+        let (mut scoped, scoped_key) =
+            named_user_token("scoped", crate::sesame::types::ApiRole::Admin);
+        scoped.scope.namespaces = Some(vec!["default".into()]);
+        let (deployer, deployer_key) =
+            named_user_token("deployer", crate::sesame::types::ApiRole::Deployer);
+        let (app, shutdown) = setup_with_auth_leases_events_and_council(
+            vec![admin, scoped, deployer],
+            Some("internal".into()),
+            crate::bun::readiness::ReadinessTracker::new(),
+            lease_static_capabilities(),
+            None,
+            None,
+            Some(council.clone()),
+        )
+        .await;
+        let body = serde_json::json!({"node_id":"worker", "workloads_stopped":true, "reason":"powered off for maintenance"}).to_string();
+        let path = "/v1/nodes/decommission";
+        for (key, expected) in [
+            (&scoped_key, StatusCode::FORBIDDEN),
+            (&deployer_key, StatusCode::FORBIDDEN),
+            (&"internal".into(), StatusCode::FORBIDDEN),
+            (&"unknown".into(), StatusCode::UNAUTHORIZED),
+        ] {
+            assert_eq!(
+                post_authenticated(app.clone(), path, key, &body, None)
+                    .await
+                    .0,
+                expected
+            );
+        }
+        for body in [
+            r#"{"node_id":"worker","workloads_stopped":false,"reason":"maintenance"}"#,
+            r#"{"node_id":"worker","workloads_stopped":true,"reason":" "}"#,
+        ] {
+            assert_eq!(
+                post_authenticated(app.clone(), path, &admin_key, body, None)
+                    .await
+                    .0,
+                StatusCode::BAD_REQUEST
+            );
+        }
+        let (status, bytes) = post_authenticated(app.clone(), path, &admin_key, &body, None).await;
+        assert_eq!(
+            status,
+            StatusCode::OK,
+            "{}",
+            String::from_utf8_lossy(&bytes)
+        );
+        let record: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(record["retired_by"], expected_principal);
+        assert_eq!(record["node_id"], "worker");
+        let (status, again) = post_authenticated(app.clone(), path, &admin_key, &body, None).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(
+            serde_json::from_slice::<serde_json::Value>(&again).unwrap(),
+            record
+        );
+        assert_eq!(
+            get_authenticated(app, "/v1/placements/worker", "internal")
+                .await
+                .0,
+            StatusCode::GONE
+        );
+        shutdown.cancel();
+        council.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn credential_free_placements_still_record_consumers_but_a_service_token_requires_authentication()
+     {
+        let council = seeded_council("endpoint-consumer-development").await;
+        for service in [None, Some("internal".to_string())] {
+            let protected = service.is_some();
+            let (app, shutdown) = setup_with_auth_leases_events_and_council(
+                vec![],
+                service,
+                crate::bun::readiness::ReadinessTracker::new(),
+                lease_static_capabilities(),
+                None,
+                None,
+                Some(council.clone()),
+            )
+            .await;
+            let node = if protected {
+                "protected-worker"
+            } else {
+                "development-worker"
+            };
+            assert_eq!(
+                get_status(app, &format!("/v1/placements/{node}"), None).await,
+                if protected {
+                    StatusCode::FORBIDDEN
+                } else {
+                    StatusCode::OK
+                }
+            );
+            assert_eq!(
+                council
+                    .desired_state()
+                    .await
+                    .endpoint_consumers
+                    .contains(node),
+                !protected
+            );
+            shutdown.cancel();
+        }
+        council.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn placements_expose_only_the_consumers_original_withdrawal_generations() {
+        use crate::council::{CouncilResponse, RaftRequest};
+        use crate::onion::catalog::{CatalogBackend, EndpointCatalog};
+        use crate::onion::service_id::ServiceId;
+
+        let council = seeded_council("withdrawal-instructions").await;
+        let (app, shutdown) = setup_with_auth_leases_events_and_council(
+            vec![],
+            Some("internal".into()),
+            crate::bun::readiness::ReadinessTracker::new(),
+            lease_static_capabilities(),
+            None,
+            None,
+            Some(council.clone()),
+        )
+        .await;
+        for consumer in ["worker", "other-worker"] {
+            assert_eq!(
+                get_authenticated(
+                    app.clone(),
+                    &format!("/v1/placements/{consumer}"),
+                    "internal"
+                )
+                .await
+                .0,
+                StatusCode::OK
+            );
+        }
+        let mut catalog = EndpointCatalog::default();
+        let mut originals = Vec::new();
+        for generation in 1..=3_u64 {
+            catalog = catalog
+                .reconcile([(
+                    ServiceId::new("default", "web"),
+                    8080,
+                    vec![CatalogBackend {
+                        execution: Some(crate::grill::RuntimeExecution {
+                            instance_id: crate::grill::InstanceId("default__web-0".into()),
+                            generation: format!("{generation:064x}").try_into().unwrap(),
+                        }),
+                        node_id: "producer".into(),
+                        node_ip: "127.0.0.1".parse().unwrap(),
+                        host_port: 18080 + generation as u16,
+                        healthy: true,
+                    }],
+                )])
+                .unwrap();
+            assert!(matches!(
+                council
+                    .write(RaftRequest::PublishEndpoints {
+                        expected_generation: generation - 1,
+                        catalog: Box::new(catalog.clone()),
+                    })
+                    .await
+                    .unwrap(),
+                CouncilResponse::Applied { .. }
+            ));
+            originals.push(serde_json::to_value(&catalog.services["default__web"]).unwrap());
+            if generation == 2 {
+                let (status, bytes) =
+                    get_authenticated(app.clone(), "/v1/placements/late-worker", "internal").await;
+                assert_eq!(status, StatusCode::OK);
+                let body: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+                assert_eq!(body["endpoint_generation"], 2);
+                assert_eq!(body["endpoint_withdrawals"], serde_json::json!([]));
+            }
+        }
+        let before = council.desired_state().await;
+        for (consumer, expected) in [
+            ("worker", vec![1, 2]),
+            ("other-worker", vec![1, 2]),
+            ("late-worker", vec![2]),
+        ] {
+            let (status, bytes) = get_authenticated(
+                app.clone(),
+                &format!("/v1/placements/{consumer}"),
+                "internal",
+            )
+            .await;
+            assert_eq!(status, StatusCode::OK);
+            let body: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+            assert_eq!(body["endpoint_generation"], 3);
+            assert_eq!(
+                body["endpoint_catalog"],
+                serde_json::to_value(&catalog).unwrap()
+            );
+            let instructions = body["endpoint_withdrawals"].as_array().unwrap();
+            assert_eq!(instructions.len(), expected.len());
+            for (instruction, generation) in instructions.iter().zip(expected) {
+                assert_eq!(instruction["generation"], generation);
+                assert_eq!(
+                    instruction["services"]["default__web"]["service"],
+                    originals[generation as usize - 1]
+                );
+                assert_eq!(instruction["services"]["default__web"]["retire_vip"], false);
+                assert!(
+                    instruction.get("consumers").is_none(),
+                    "do not expose another consumer's obligations"
+                );
+            }
+            // The receiving worker must retain the same exact instructions when decoding.
+            let decoded: crate::cluster::orchestrate::NodeAssignments =
+                serde_json::from_slice(&bytes).unwrap();
+            assert_eq!(serde_json::to_value(decoded).unwrap(), body);
+        }
+        let after = council.desired_state().await;
+        assert_eq!(before.last_applied_log, after.last_applied_log);
+        assert_eq!(
+            before.endpoint_withdrawals, after.endpoint_withdrawals,
+            "serving instructions is not a cleanup acknowledgement"
+        );
+        assert!(matches!(
+            council
+                .write(RaftRequest::PublishEndpoints {
+                    expected_generation: 3,
+                    catalog: Box::new(EndpointCatalog::default()),
+                })
+                .await
+                .unwrap(),
+            CouncilResponse::Applied { .. }
+        ));
+        let (status, bytes) =
+            get_authenticated(app, "/v1/placements/late-worker", "internal").await;
+        assert_eq!(status, StatusCode::OK);
+        let body: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(body["endpoint_generation"], 4);
+        assert_eq!(
+            body["endpoint_catalog"],
+            serde_json::to_value(EndpointCatalog::default()).unwrap()
+        );
+        let instructions = body["endpoint_withdrawals"].as_array().unwrap();
+        assert_eq!(instructions.len(), 2);
+        assert_eq!(instructions[1]["generation"], 3);
+        assert_eq!(
+            instructions[1]["services"]["default__web"]["service"],
+            originals[2]
+        );
+        assert_eq!(
+            instructions[1]["services"]["default__web"]["retire_vip"],
+            true
+        );
+        shutdown.cancel();
+        council.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn placements_register_the_consumer_before_serving_discovery() {
+        let council = seeded_council("endpoint-consumer").await;
+        let (token, user_key) = a_user_token(crate::sesame::types::ApiRole::Admin);
+        let (app, shutdown) = setup_with_auth_leases_events_and_council(
+            vec![token],
+            Some("internal".into()),
+            crate::bun::readiness::ReadinessTracker::new(),
+            lease_static_capabilities(),
+            None,
+            None,
+            Some(council.clone()),
+        )
+        .await;
+        let path = "/v1/placements/worker";
+        assert_eq!(
+            get_authenticated(app.clone(), path, &user_key).await.0,
+            StatusCode::FORBIDDEN
+        );
+        assert!(council.desired_state().await.endpoint_consumers.is_empty());
+        assert_eq!(
+            get_authenticated(app.clone(), path, "internal").await.0,
+            StatusCode::OK
+        );
+        assert!(
+            council
+                .desired_state()
+                .await
+                .endpoint_consumers
+                .contains("worker")
+        );
+        let invalid_peer =
+            app.clone()
+                .layer(axum::Extension(crate::sesame::renewal::TlsPeerCertificate(
+                    Vec::from(b"invalid certificate".as_slice()).into(),
+                )));
+        assert_eq!(
+            get_authenticated(invalid_peer, "/v1/placements/imposter", "internal")
+                .await
+                .0,
+            StatusCode::FORBIDDEN
+        );
+        assert!(
+            !council
+                .desired_state()
+                .await
+                .endpoint_consumers
+                .contains("imposter")
+        );
+        let applied = council.desired_state().await.last_applied_log;
+        assert_eq!(
+            get_authenticated(app, path, "internal").await.0,
+            StatusCode::OK
+        );
+        assert_eq!(
+            council.desired_state().await.last_applied_log,
+            applied,
+            "an unchanged placement poll must not write another registration"
+        );
+        shutdown.cancel();
+        council.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn cluster_lease_delete_waits_for_system_retirement_acknowledgements() {
+        use crate::council::{CouncilResponse, RaftRequest};
+        use crate::meat::{AppId, NodeId, Placement, Resources, SchedulingDecision};
+        let council = seeded_council("lease-retirement").await;
+        let (token, plaintext) = a_user_token(crate::sesame::types::ApiRole::Admin);
+        let service = "retirement-service-secret";
+        let (app, shutdown) = setup_with_auth_leases_events_and_council(
+            vec![token],
+            Some(service.into()),
+            crate::bun::readiness::ReadinessTracker::new(),
+            lease_static_capabilities(),
+            None,
+            None,
+            Some(council.clone()),
+        )
+        .await;
+        let (status, body) = post_authenticated(
+            app.clone(),
+            "/v1/test/leases",
+            &plaintext,
+            r#"{"ttl_seconds":60}"#,
+            None,
+        )
+        .await;
+        assert_eq!(status, StatusCode::CREATED);
+        let lease: crate::testkit::lease::TestLease = serde_json::from_slice(&body).unwrap();
+        let app_id = AppId::new("web", &lease.namespace);
+        let config = crate::config::Config::parse("[app.web]\nimage = \"test:v1\"\n").unwrap();
+        let mut spec = config.app["web"].clone();
+        spec.namespace = Some(lease.namespace.clone());
+        for request in [
+            RaftRequest::TestLeaseAppSpec {
+                lease_id: lease.lease_id.clone(),
+                observed_at_unix_ms: crate::testkit::lease::now_unix_millis(),
+                app_id: app_id.clone(),
+                spec: Box::new(spec),
+            },
+            RaftRequest::SchedulingDecision(SchedulingDecision {
+                app_id: app_id.clone(),
+                placements: vec![Placement {
+                    node_id: NodeId::new("worker"),
+                    resources: Resources::new(500, 1024, 0),
+                }],
+            }),
+        ] {
+            assert!(!matches!(
+                council.write(request).await.unwrap(),
+                CouncilResponse::Refused { .. }
+            ));
+        }
+        let path = format!("/v1/test/leases/{}", lease.lease_id);
+        assert_eq!(
+            delete_authenticated(app.clone(), &path, &plaintext).await,
+            StatusCode::ACCEPTED
+        );
+        let (status, body) = get_authenticated(app.clone(), "/v1/placements/worker", service).await;
+        assert_eq!(status, StatusCode::OK);
+        let assignments: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(assignments["retirements"].as_array().map(Vec::len), Some(1));
+        let acknowledgement = serde_json::json!({ "lease_id": lease.lease_id,
+            "placement": {"app_id": app_id, "node_id": "worker"} })
+        .to_string();
+        assert_eq!(
+            post_authenticated(
+                app.clone(),
+                "/v1/test/leases/retired",
+                &plaintext,
+                &acknowledgement,
+                None
+            )
+            .await
+            .0,
+            StatusCode::FORBIDDEN
+        );
+        assert_eq!(
+            post_authenticated(
+                app.clone(),
+                "/v1/test/leases/retired",
+                "unknown",
+                &acknowledgement,
+                None
+            )
+            .await
+            .0,
+            StatusCode::UNAUTHORIZED
+        );
+        for _ in 0..2 {
+            assert_eq!(
+                post_authenticated(
+                    app.clone(),
+                    "/v1/test/leases/retired",
+                    service,
+                    &acknowledgement,
+                    None
+                )
+                .await
+                .0,
+                StatusCode::NO_CONTENT
+            );
+        }
+        assert_eq!(
+            delete_authenticated(app.clone(), &path, &plaintext).await,
+            StatusCode::NO_CONTENT
+        );
+        assert_eq!(
+            get_authenticated(app, &path, &plaintext).await.0,
+            StatusCode::NOT_FOUND
+        );
+        shutdown.cancel();
+        council.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
     async fn lease_owns_apply_and_release_confirms_cleanup() {
         let (token, plaintext) = a_user_token(crate::sesame::types::ApiRole::Deployer);
         let (app, shutdown) = setup_with_auth_readiness_and_leases(
@@ -8088,7 +10525,13 @@ mod tests {
             &lease.namespace,
         )
         .await;
-        assert_eq!(status, StatusCode::OK, "{}", String::from_utf8_lossy(&body));
+        assert_eq!(
+            status,
+            StatusCode::SERVICE_UNAVAILABLE,
+            "{}",
+            String::from_utf8_lossy(&body)
+        );
+        assert!(String::from_utf8_lossy(&body).contains("live cluster scheduler"));
         admin_shutdown.cancel();
     }
 
@@ -8200,6 +10643,19 @@ mod tests {
             None,
         )
         .await;
+        let (job_status, _) = post_authenticated(
+            app.clone(),
+            "/v1/apply",
+            &plaintext,
+            "[job.probe]\nimage = \"test:v1\"\nnamespace = \"rbtest-unleased\"\n",
+            None,
+        )
+        .await;
+        assert_eq!(
+            job_status,
+            StatusCode::CONFLICT,
+            "unleased test jobs must not reach the agent"
+        );
         let (status, body) = post_authenticated(
             app.clone(),
             "/v1/apply",
@@ -8574,6 +11030,108 @@ mod tests {
         (app, shutdown, plaintext)
     }
 
+    #[tokio::test]
+    async fn secret_public_key_exposes_only_current_public_material_to_scoped_readers() {
+        let council = seeded_council_with_ikm("public-key").await;
+        let reader = crate::sesame::token::create_token(
+            "public-key-reader",
+            crate::sesame::types::ApiRole::ReadOnly,
+            crate::sesame::types::TokenScope {
+                apps: Some(vec!["web".into()]),
+                namespaces: Some(vec!["team-a".into()]),
+            },
+            None,
+        )
+        .unwrap();
+        let store = crate::sesame::auth::new_token_store();
+        store.write().await.push(reader.token);
+        let (tx, _rx) = mpsc::channel(1);
+        let app = router(
+            tx,
+            None,
+            None,
+            None,
+            None,
+            None,
+            Some(council.clone()),
+            Some(store),
+            None,
+            None,
+            None,
+            None,
+            0,
+            None,
+        );
+        assert_eq!(
+            get_status(app.clone(), "/v1/secret/public-key", None).await,
+            StatusCode::UNAUTHORIZED
+        );
+        for generation in 0..=1 {
+            if generation == 1 {
+                let (key, _) = crate::sesame::secret::generate_age_keypair(
+                    crate::sesame::types::AgeKeyScope::ClusterWide,
+                    council.wrapping_ikm().unwrap(),
+                    generation,
+                )
+                .unwrap();
+                council
+                    .write(crate::council::RaftRequest::RotateSecretKey {
+                        scope: crate::sesame::types::AgeKeyScope::ClusterWide,
+                        new_keypair: key,
+                    })
+                    .await
+                    .unwrap();
+            }
+            let response = app
+                .clone()
+                .oneshot(
+                    axum::http::Request::builder()
+                        .uri("/v1/secret/public-key")
+                        .header("authorization", format!("Bearer {}", reader.plaintext))
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::OK);
+            let body = response.into_body().collect().await.unwrap().to_bytes();
+            let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+            assert_eq!(
+                json.as_object().unwrap().len(),
+                2,
+                "public key responses must not serialise the stored keypair"
+            );
+            assert_eq!(json["generation"], generation);
+            let security = council.security_state().await;
+            let keypair = security.cluster_age_keypair().unwrap();
+            assert_eq!(json["public_key"], keypair.public_key);
+            let encrypted = crate::sesame::secret::encrypt_secret(
+                "probe",
+                json["public_key"].as_str().unwrap(),
+            )
+            .unwrap();
+            let identity = crate::sesame::secret::unwrap_age_identity(
+                keypair,
+                council.wrapping_ikm().unwrap(),
+            )
+            .unwrap();
+            assert_eq!(
+                crate::sesame::secret::decrypt_secret(&encrypted, &identity).unwrap(),
+                "probe"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn secret_public_key_refuses_when_cluster_keys_are_unavailable() {
+        let (app, shutdown) = setup_with_auth(vec![], None).await;
+        assert_eq!(
+            get_status(app, "/v1/secret/public-key", None).await,
+            StatusCode::SERVICE_UNAVAILABLE
+        );
+        shutdown.cancel();
+    }
+
     /// PKI8 end-to-end: finalising while a stored secret is still sealed
     /// under the retiring generation comes back as a 409 naming the secret.
     #[tokio::test]
@@ -8659,6 +11217,82 @@ mod tests {
         .await;
         assert_eq!(status, StatusCode::FORBIDDEN);
         shutdown.cancel();
+    }
+
+    #[tokio::test]
+    async fn deploy_cancellation_checks_every_target_scope_and_is_idempotent() {
+        let (admin, admin_secret) = a_user_token(crate::sesame::types::ApiRole::Admin);
+        let scoped = crate::sesame::token::create_token(
+            "cancel-scoped",
+            crate::sesame::types::ApiRole::Deployer,
+            crate::sesame::types::TokenScope {
+                apps: None,
+                namespaces: Some(vec!["team-a".into()]),
+            },
+            None,
+        )
+        .unwrap();
+        let secret = scoped.plaintext.clone();
+        let (app, shutdown) = setup_with_auth(vec![admin, scoped.token], None).await;
+        let response = app
+            .clone()
+            .oneshot(
+                axum::http::Request::builder()
+                    .method("POST")
+                    .uri("/v1/apply")
+                    .header("authorization", format!("Bearer {admin_secret}"))
+                    .body(Body::from(
+                        "[app.web]\nimage = 'web:v1'\nnamespace = 'team-b'\n",
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let body = axum::body::to_bytes(response.into_body(), 65536)
+            .await
+            .unwrap();
+        let text = String::from_utf8(body.to_vec()).unwrap();
+        let operation_id = text
+            .lines()
+            .filter_map(|line| line.strip_prefix("data:"))
+            .filter_map(|line| serde_json::from_str::<ApplyEvent>(line.trim()).ok())
+            .find_map(|event| match event {
+                ApplyEvent::Accepted { operation_id } => Some(operation_id),
+                _ => None,
+            })
+            .unwrap();
+        let path = format!("/v1/deploys/operations/{operation_id}/cancel");
+        assert_eq!(
+            post_status(app.clone(), &path, &secret, "").await,
+            StatusCode::FORBIDDEN
+        );
+        for _ in 0..2 {
+            assert_eq!(
+                post_status(app.clone(), &path, &admin_secret, "").await,
+                StatusCode::OK
+            );
+        }
+        shutdown.cancel();
+    }
+
+    #[tokio::test]
+    async fn deploy_cancellation_requires_deployer_and_reports_unknown_ids() {
+        for (role, expected) in [
+            (
+                crate::sesame::types::ApiRole::ReadOnly,
+                StatusCode::FORBIDDEN,
+            ),
+            (
+                crate::sesame::types::ApiRole::Deployer,
+                StatusCode::NOT_FOUND,
+            ),
+        ] {
+            let (app, shutdown, token) = setup_with_role("cancel-role", role).await;
+            let status =
+                post_status(app, "/v1/deploys/operations/unknown/cancel", &token, "").await;
+            assert_eq!(status, expected);
+            shutdown.cancel();
+        }
     }
 
     #[tokio::test]
@@ -8752,6 +11386,333 @@ mod tests {
         let status = post_status(app, "/v1/apply", &tok, manifest).await;
         assert_eq!(status, StatusCode::FORBIDDEN);
         shutdown.cancel();
+    }
+
+    fn deployer_context() -> crate::sesame::auth::AuthContext {
+        crate::sesame::auth::AuthContext {
+            token_name: "ci".into(),
+            principal_id: "ci-credential".into(),
+            role: crate::sesame::types::ApiRole::Deployer,
+            scoped_apps: None,
+            scoped_namespaces: None,
+        }
+    }
+
+    async fn apply_as_context(
+        app: &Router,
+        auth: crate::sesame::auth::AuthContext,
+        manifest: &str,
+    ) -> StatusCode {
+        let mut request = axum::http::Request::post("/v1/apply")
+            .body(Body::from(manifest.to_owned()))
+            .unwrap();
+        request.extensions_mut().insert(auth);
+        app.clone().oneshot(request).await.unwrap().status()
+    }
+
+    async fn workload_admission_fixture(
+        tag: &str,
+    ) -> (
+        Router,
+        Arc<crate::council::CouncilNode>,
+        mpsc::Receiver<AgentCommand>,
+    ) {
+        let council = seeded_council(tag).await;
+        let (tx, rx) = mpsc::channel(16);
+        let app = router(
+            tx,
+            None,
+            None,
+            None,
+            None,
+            None,
+            Some(council.clone()),
+            None,
+            None,
+            None,
+            None,
+            None,
+            0,
+            None,
+        );
+        (app, council, rx)
+    }
+
+    #[tokio::test]
+    async fn administrative_manifests_require_unscoped_user_admin_before_any_write() {
+        let (app, council, mut commands) = workload_admission_fixture("manifest-admin").await;
+        let declarations = [
+            "[permission.ci]\nactions = [\"deploy\", \"host-exec\"]\napps = [\"*\"]\n",
+            "[namespace.default]\nmax_apps = 1000\n",
+        ];
+        for declaration in declarations {
+            for mixed in [false, true] {
+                let manifest = if mixed {
+                    format!(
+                        "{declaration}[app.web]\nimage = \"test:v1\"\n[job.work]\nimage = \"test:v1\"\n"
+                    )
+                } else {
+                    declaration.to_owned()
+                };
+                for auth in [
+                    deployer_context(),
+                    {
+                        let mut auth = deployer_context();
+                        auth.role = crate::sesame::types::ApiRole::Admin;
+                        auth.scoped_namespaces = Some(vec!["default".into()]);
+                        auth
+                    },
+                    {
+                        let mut auth = deployer_context();
+                        auth.role = crate::sesame::types::ApiRole::Admin;
+                        auth.token_name = crate::sesame::auth::SYSTEM_PRINCIPAL.into();
+                        auth
+                    },
+                ] {
+                    assert_eq!(
+                        apply_as_context(&app, auth, &manifest).await,
+                        StatusCode::FORBIDDEN
+                    );
+                    let desired = council.desired_state().await;
+                    assert!(desired.permissions.is_empty());
+                    assert!(desired.namespaces.is_empty());
+                    assert!(desired.apps.is_empty());
+                    assert!(matches!(
+                        commands.try_recv(),
+                        Err(mpsc::error::TryRecvError::Empty)
+                    ));
+                }
+            }
+        }
+        let mut auth = deployer_context();
+        auth.role = crate::sesame::types::ApiRole::Admin;
+        let mut request = axum::http::Request::post("/v1/apply")
+            .body(Body::from(declarations.join("")))
+            .unwrap();
+        request.extensions_mut().insert(auth);
+        let response = app.oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(response.into_body(), 65536)
+            .await
+            .unwrap();
+        assert!(!String::from_utf8_lossy(&body).contains("error"));
+        let desired = council.desired_state().await;
+        assert!(desired.permissions.contains_key("ci"));
+        assert_eq!(desired.namespaces["default"].max_apps, Some(1000));
+        council.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn explicit_job_rerun_preserves_authority_and_refuses_mixed_manifests() {
+        let (app, council, mut commands) = workload_admission_fixture("rerun-admission").await;
+        let manifest = "[job.work]\nimage = 'test:v1'\nnamespace = 'team'\n";
+        let mut scoped = deployer_context();
+        scoped.scoped_namespaces = Some(vec!["other".into()]);
+        let mut system = deployer_context();
+        system.token_name = crate::sesame::auth::SYSTEM_PRINCIPAL.into();
+        for (auth, header, body, expected) in [
+            (
+                scoped,
+                "acknowledged",
+                manifest.to_string(),
+                StatusCode::FORBIDDEN,
+            ),
+            (
+                system,
+                "acknowledged",
+                manifest.to_string(),
+                StatusCode::FORBIDDEN,
+            ),
+            (
+                deployer_context(),
+                "true",
+                manifest.to_string(),
+                StatusCode::BAD_REQUEST,
+            ),
+            (
+                deployer_context(),
+                "acknowledged",
+                format!("{manifest}[app.web]\nimage = 'test:v1'\n"),
+                StatusCode::BAD_REQUEST,
+            ),
+            (
+                deployer_context(),
+                "acknowledged",
+                format!("{manifest}schedule = '* * * * *'\n"),
+                StatusCode::BAD_REQUEST,
+            ),
+        ] {
+            let mut request = axum::http::Request::post("/v1/apply")
+                .header("x-reliaburger-rerun-jobs", header)
+                .body(Body::from(body))
+                .unwrap();
+            request.extensions_mut().insert(auth);
+            assert_eq!(
+                app.clone().oneshot(request).await.unwrap().status(),
+                expected
+            );
+            assert!(commands.try_recv().is_err());
+            assert!(council.desired_state().await.apps.is_empty());
+        }
+        let mut request = axum::http::Request::post("/v1/apply")
+            .header("x-reliaburger-rerun-jobs", "acknowledged")
+            .body(Body::from(manifest))
+            .unwrap();
+        request.extensions_mut().insert(deployer_context());
+        assert_eq!(app.oneshot(request).await.unwrap().status(), StatusCode::OK);
+        assert!(
+            matches!(commands.recv().await, Some(AgentCommand::RerunJobs { config, .. }) if config.job.len() == 1)
+        );
+        assert!(council.desired_state().await.apps.is_empty());
+        council.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn job_apply_checks_namespace_and_app_scope_before_enqueuing_work() {
+        let (app, council, mut commands) = workload_admission_fixture("job-scope").await;
+        for (apps, namespaces) in [
+            (None, Some(vec!["allowed".into()])),
+            (Some(vec!["allowed".into()]), None),
+        ] {
+            let mut auth = deployer_context();
+            auth.scoped_apps = apps;
+            auth.scoped_namespaces = namespaces;
+            assert_eq!(
+                apply_as_context(
+                    &app,
+                    auth,
+                    "[job.denied]\nimage = \"test:v1\"\nnamespace = \"denied\"\n"
+                )
+                .await,
+                StatusCode::FORBIDDEN
+            );
+            assert!(matches!(
+                commands.try_recv(),
+                Err(mpsc::error::TryRecvError::Empty)
+            ));
+        }
+        let mut auth = deployer_context();
+        auth.scoped_apps = Some(vec!["allowed".into()]);
+        auth.scoped_namespaces = Some(vec!["allowed".into()]);
+        assert_eq!(
+            apply_as_context(
+                &app,
+                auth,
+                "[job.allowed]\nimage = \"test:v1\"\nnamespace = \"allowed\"\n"
+            )
+            .await,
+            StatusCode::OK
+        );
+        assert!(matches!(
+            commands.try_recv(),
+            Ok(AgentCommand::Deploy { .. })
+        ));
+        council.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn workload_manifests_cannot_reference_leased_images_without_ownership() {
+        let (app, council, mut commands) =
+            workload_admission_fixture("leased-image-admission").await;
+        for fragment in [
+            "[app.bad]\nimage = 'rbtest-run1/web:latest'\n",
+            "[app.bad]\nimage = 'ordinary:v1'\n[[app.bad.init]]\nimage = 'registry.example:5050/rbtest-run1/web:latest'\n",
+            "[job.bad]\nimage = 'rbtest-run1/web:latest'\n",
+        ] {
+            let manifest = format!("[app.safe]\nimage = 'ordinary:v1'\n{fragment}");
+            assert_eq!(
+                apply_as_context(&app, deployer_context(), &manifest).await,
+                StatusCode::FORBIDDEN
+            );
+            assert!(council.desired_state().await.apps.is_empty());
+            assert!(matches!(
+                commands.try_recv(),
+                Err(mpsc::error::TryRecvError::Empty)
+            ));
+        }
+        council.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn out_of_scope_job_refuses_the_entire_manifest_before_app_commit() {
+        let (app, council, mut commands) = workload_admission_fixture("mixed-job-scope").await;
+        let mut auth = deployer_context();
+        auth.scoped_namespaces = Some(vec!["allowed".into()]);
+        let manifest = "[app.allowed]\nimage = \"test:v1\"\nnamespace = \"allowed\"\n[job.denied]\nimage = \"test:v1\"\nnamespace = \"denied\"\n";
+        assert_eq!(
+            apply_as_context(&app, auth, manifest).await,
+            StatusCode::FORBIDDEN
+        );
+        assert!(council.desired_state().await.apps.is_empty());
+        assert!(matches!(
+            commands.try_recv(),
+            Err(mpsc::error::TryRecvError::Empty)
+        ));
+        council.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn workload_apply_checks_deploy_and_host_execution_permission_for_jobs_and_apps() {
+        let (app, council, mut commands) = workload_admission_fixture("job-permissions").await;
+        for (actions, fragments, expected) in [
+            (
+                vec!["logs"],
+                vec!["image = \"test:v1\""],
+                StatusCode::FORBIDDEN,
+            ),
+            (
+                vec!["deploy"],
+                vec!["script = \"echo hello\"", "exec = \"/bin/true\""],
+                StatusCode::FORBIDDEN,
+            ),
+            (
+                vec!["deploy", "host-exec"],
+                vec!["script = \"echo hello\"", "exec = \"/bin/true\""],
+                StatusCode::OK,
+            ),
+        ] {
+            council
+                .write(crate::council::RaftRequest::PermissionSpec {
+                    name: "ci".into(),
+                    spec: Box::new(crate::config::PermissionSpec {
+                        actions: actions.into_iter().map(str::to_string).collect(),
+                        apps: vec!["*".into()],
+                        namespaces: None,
+                    }),
+                })
+                .await
+                .unwrap();
+            for fragment in &fragments {
+                // Apps are cluster-scheduled; exercise their refusal paths here.
+                // The positive local-job path also proves the grant opens the gate.
+                let kinds: &[&str] = if expected == StatusCode::OK {
+                    &["job"]
+                } else {
+                    &["app", "job"]
+                };
+                for kind in kinds {
+                    let manifest = format!("[{kind}.work]\n{fragment}\n");
+                    assert_eq!(
+                        apply_as_context(&app, deployer_context(), &manifest).await,
+                        expected,
+                        "{manifest}"
+                    );
+                    if expected == StatusCode::OK {
+                        assert!(matches!(
+                            commands.try_recv(),
+                            Ok(AgentCommand::Deploy { .. })
+                        ));
+                    } else {
+                        assert!(matches!(
+                            commands.try_recv(),
+                            Err(mpsc::error::TryRecvError::Empty)
+                        ));
+                        assert!(council.desired_state().await.apps.is_empty());
+                    }
+                }
+            }
+        }
+        council.shutdown().await.unwrap();
     }
 
     /// A completed history entry for `web` in the `default` namespace; tests
@@ -9221,6 +12182,7 @@ mod tests {
             "/v1/metrics/summary",
             "/v1/metrics/keys",
             "/v1/metrics/rollup",
+            "/v1/metrics/rollup/owned",
             "/v1/metrics/cluster",
             "/v1/events",
         ] {
@@ -9947,6 +12909,68 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn nodes_endpoint_advertises_only_resolved_peer_api_addresses() {
+        let (tx, mut rx) = mpsc::channel(1);
+        let worker = tokio::spawn(async move {
+            let Some(AgentCommand::Nodes { response }) = rx.recv().await else {
+                panic!("expected membership request");
+            };
+            response
+                .send(
+                    ["one", "unknown"]
+                        .into_iter()
+                        .map(|id| super::super::agent::NodeStatus {
+                            node_id: id.to_string(),
+                            address: "127.0.0.1:7946".to_string(),
+                            api_address: None,
+                            state: "alive".to_string(),
+                            incarnation: 1,
+                            is_council: true,
+                            is_leader: false,
+                            labels: Default::default(),
+                        })
+                        .collect(),
+                )
+                .unwrap();
+        });
+        let membership = Arc::new(RwLock::new(vec![NodeMembershipInfo {
+            node_id: crate::meat::NodeId::new("one"),
+            address: "[::1]:19117".parse().unwrap(),
+        }]));
+        let app = router(
+            tx,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            Some(membership),
+            None,
+            9117,
+            None,
+        );
+        let response = app
+            .oneshot(
+                axum::http::Request::builder()
+                    .uri("/v1/cluster/nodes")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let nodes: Vec<crate::bun::agent::NodeStatus> = serde_json::from_slice(&body).unwrap();
+        assert_eq!(nodes[0].api_address, Some("[::1]:19117".parse().unwrap()));
+        assert_eq!(nodes[1].api_address, None);
+        worker.await.unwrap();
+    }
+
+    #[tokio::test]
     async fn nodes_endpoint_returns_empty_list() {
         let (app, shutdown) = test_setup();
 
@@ -10002,7 +13026,7 @@ mod tests {
                     .uri("/v1/cluster/join")
                     .header("content-type", "application/json")
                     .body(Body::from(
-                        r#"{"token":"abc123","node_id":"node-02","csr_b64":""}"#,
+                        serde_json::json!({"compatibility": crate::compatibility::CURRENT, "token": "abc123", "node_id": "node-02", "csr_b64": ""}).to_string(),
                     ))
                     .unwrap(),
             )
@@ -10011,6 +13035,18 @@ mod tests {
 
         // Without a council, join validation fails with a 400
         assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        shutdown.cancel();
+    }
+
+    #[tokio::test]
+    async fn incompatible_join_is_refused_before_csr_or_token_validation() {
+        let (app, shutdown) = test_setup();
+        let response = app.oneshot(axum::http::Request::builder()
+            .method("POST").uri("/v1/cluster/join")
+            .header("content-type", "application/json")
+            .body(Body::from(r#"{"compatibility":{"protocol":1,"state":1},"token":"unused","node_id":"old","csr_b64":"invalid!"}"#)).unwrap())
+            .await.unwrap();
+        assert_eq!(response.status(), StatusCode::CONFLICT);
         shutdown.cancel();
     }
 
@@ -10028,7 +13064,7 @@ mod tests {
                     .uri("/v1/cluster/join")
                     .header("content-type", "application/json")
                     .body(Body::from(
-                        r#"{"token":"whatever","node_id":"node-09","csr_b64":""}"#,
+                        serde_json::json!({"compatibility": crate::compatibility::CURRENT, "token": "whatever", "node_id": "node-09", "csr_b64": ""}).to_string(),
                     ))
                     .unwrap(),
             )

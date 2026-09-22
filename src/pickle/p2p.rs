@@ -12,7 +12,6 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use super::replication::Peer;
-use super::store::BlobStore;
 use super::types::{Digest, ManifestCatalog, PickleError};
 
 /// One planned fetch: this digest, from this peer.
@@ -110,12 +109,13 @@ pub fn plan_downloads(
 /// holders fails the whole call — the caller decides what a partial
 /// image means, not this function.
 #[allow(clippy::too_many_arguments)]
-pub async fn pull_layers_parallel(
+pub(crate) async fn pull_layers_parallel(
     plan: DownloadPlan,
     repository: &str,
     catalog: &ManifestCatalog,
     peers: &[Peer],
-    store: &Arc<BlobStore>,
+    state: &super::api::PickleState,
+    access: &super::lease::RegistryWriteAccess,
     client: &reqwest::Client,
     concurrency: usize,
     timeout: Duration,
@@ -130,18 +130,20 @@ pub async fn pull_layers_parallel(
         while in_flight.len() < concurrency {
             let Some(fetch) = queue.next() else { break };
             let repository = repository.to_string();
-            let store = Arc::clone(store);
+            let state = state.clone();
+            let access = access.clone();
             let client = client.clone();
             in_flight.spawn(async move {
-                let result = super::pull::pull_layer_from_peer(
-                    &fetch.peer,
-                    &repository,
-                    &fetch.digest,
-                    &store,
-                    &client,
-                    timeout,
-                )
-                .await;
+                let result = state
+                    .pull_peer_blob_with_access(
+                        &fetch.peer,
+                        &repository,
+                        &fetch.digest,
+                        &client,
+                        timeout,
+                        Some(access),
+                    )
+                    .await;
                 (fetch, result)
             });
         }
@@ -161,7 +163,7 @@ pub async fn pull_layers_parallel(
 
     // Retry pass: each failure tries the digest's remaining holders.
     for (digest, tried_node) in failed {
-        if store.has_blob(&digest) {
+        if state.store.has_blob(&digest) {
             continue;
         }
         let holders = catalog.layer_holders(digest.as_str());
@@ -170,7 +172,15 @@ pub async fn pull_layers_parallel(
             .iter()
             .filter(|p| p.node_id != tried_node && holders.contains(&p.node_id))
         {
-            if super::pull::pull_layer_from_peer(peer, repository, &digest, store, client, timeout)
+            if state
+                .pull_peer_blob_with_access(
+                    peer,
+                    repository,
+                    &digest,
+                    client,
+                    timeout,
+                    Some(access.clone()),
+                )
                 .await
                 .is_ok()
             {
@@ -250,27 +260,44 @@ impl ClusterSource {
         tag: &str,
         peers: &[Peer],
     ) -> Result<Option<Vec<PathBuf>>, PickleError> {
-        let catalog = self.state.catalog_snapshot().await;
+        let catalog = self.state.catalog_snapshot(repository).await?;
         // A digest in the tag position (`repo@sha256:…` references put
         // it there) resolves content-addressed, so the bytes verified
         // at admission are the bytes pulled — a tag moved between
         // verify and pull changes nothing (IMG1).
         let manifest = match Digest::new(tag) {
-            Ok(digest) => catalog.get_manifest(digest.as_str()).cloned(),
+            Ok(digest) => catalog
+                .get_repository_manifest(repository, digest.as_str())
+                .cloned(),
             Err(_) => catalog.get_manifest_by_tag(repository, tag).cloned(),
         };
         let Some(manifest) = manifest else {
             return Ok(None);
         };
 
+        // Cached bytes still need a durable repository owner before use.
+        let access = self
+            .state
+            .admit_repository_write(repository, None, None, true)
+            .await?;
+
         // Fetch everything the tag pins — the manifest blob included
         // (REG1), so this node can serve the manifest GET afterwards.
         let digests: Vec<Digest> = manifest.referenced_digests().into_iter().cloned().collect();
-        let local: HashSet<Digest> = digests
-            .iter()
-            .filter(|d| self.state.store.has_blob(d))
-            .cloned()
-            .collect();
+        let store = self.state.store.clone();
+        let candidates = digests.clone();
+        let owner = access.guard.clone();
+        let local: HashSet<Digest> = tokio::task::spawn_blocking(move || {
+            let _owner = owner;
+            candidates
+                .into_iter()
+                .filter(|digest| store.has_blob(digest) && store.revalidate_blob(digest))
+                .collect()
+        })
+        .await
+        .map_err(|error| {
+            PickleError::ReplicationFailed(format!("cache verification failed: {error}"))
+        })?;
 
         let plan = plan_downloads(&digests, &local, &catalog, peers, self.state.node_raft_id);
         if !plan.unavailable.is_empty() {
@@ -286,13 +313,17 @@ impl ClusterSource {
             repository,
             &catalog,
             peers,
-            &self.state.store,
+            &self.state,
+            &access,
             &self.client,
             self.concurrency,
             Duration::from_secs(30),
         )
         .await?;
 
+        self.state
+            .confirm_image_copy_with_access(repository, &manifest.digest, Some(access))
+            .await?;
         Ok(Some(
             manifest
                 .layers
@@ -343,7 +374,7 @@ impl ClusterSource {
         let cached_repo = super::upstream::cached_repository(image);
         let recheck = std::time::Duration::from_secs(self.cache_recheck_secs);
 
-        let catalog = self.state.catalog_snapshot().await;
+        let catalog = self.state.catalog_snapshot(&cached_repo).await?;
         match decide(
             &catalog,
             &cached_repo,
@@ -376,7 +407,7 @@ impl ClusterSource {
         // double-download. Re-check after acquiring: another task may
         // have filled while we waited.
         let _guard = self.fill_lock.lock().await;
-        let catalog = self.state.catalog_snapshot().await;
+        let catalog = self.state.catalog_snapshot(&cached_repo).await?;
         if matches!(
             decide(
                 &catalog,
@@ -429,7 +460,7 @@ impl ClusterSource {
             // repositories are exempt from require_signatures.
             signature: None,
         };
-        super::api::record_commit(&self.state, image_manifest, image.tag.clone()).await;
+        super::api::record_commit(&self.state, image_manifest, image.tag.clone()).await?;
 
         Ok(Some(layer_paths))
     }

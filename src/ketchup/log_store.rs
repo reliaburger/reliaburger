@@ -117,12 +117,12 @@ fn log_writer_properties() -> WriterProperties {
 
     let mut builder = WriterProperties::builder()
         .set_compression(Compression::ZSTD(ZstdLevel::default()))
-        .set_max_row_group_size(LOG_ROW_GROUP_SIZE);
+        .set_max_row_group_row_count(Some(LOG_ROW_GROUP_SIZE));
     for column in ["app", "namespace"] {
         builder = builder
             .set_column_bloom_filter_enabled(column.into(), true)
             .set_column_bloom_filter_fpp(column.into(), BLOOM_FPP)
-            .set_column_bloom_filter_ndv(column.into(), BLOOM_NDV);
+            .set_column_bloom_filter_max_ndv(column.into(), BLOOM_NDV);
     }
     builder.build()
 }

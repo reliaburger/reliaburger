@@ -209,12 +209,38 @@ pub enum RaftRequest {
     /// Publish the cluster-wide service endpoint catalogue (12b.4). The
     /// leader rebuilds it from every node's health reports and replicates
     /// the whole catalogue as one entry, so every node's DNS and ingress can
-    /// resolve services whose backends live on other nodes. Wholesale
-    /// replacement (not a delta) keeps the apply idempotent and the leader
-    /// authoritative — a follower never merges partial views.
-    PublishEndpoints(Box<crate::onion::catalog::EndpointCatalog>),
+    /// resolve services whose backends live on other nodes. Replacement requires
+    /// the exact publication generation used to prepare the candidate.
+    PublishEndpoints {
+        /// Committed generation observed while preparing this publication.
+        expected_generation: u64,
+        /// Complete replacement catalogue, including original execution identities.
+        catalog: Box<crate::onion::catalog::EndpointCatalog>,
+    },
     /// Create a durable Phase 15 resource lease.
     TestLeaseCreate(crate::testkit::lease::TestLease),
+    /// Record a repository writer before any upload or replicated metadata.
+    TestLeaseRegistryWriter {
+        lease_id: String,
+        repository: String,
+        node_id: u64,
+        owner_id: Option<String>,
+        observed_at_unix_ms: u64,
+    },
+    /// Publish only while the repository's lease and writer receipt remain active.
+    TestLeaseManifestCommit {
+        lease_id: String,
+        observed_at_unix_ms: u64,
+        commit: Box<ManifestCommit>,
+    },
+    /// Confirm all desired workloads and retained runtime placements have retired.
+    TestLeaseWorkloadsRetired { lease_id: String },
+    /// A storage node has durably removed its uploads and repository metadata.
+    TestLeaseRegistryRetired {
+        lease_id: String,
+        repository: String,
+        node_id: u64,
+    },
     /// Atomically apply an app and attach its ownership to an active lease.
     TestLeaseAppSpec {
         lease_id: String,
@@ -229,7 +255,21 @@ pub enum RaftRequest {
         name: String,
         spec: Box<crate::config::NamespaceSpec>,
     },
-    /// Extend an active lease. An expired lease cannot be revived.
+    /// Atomically mint a bounded test credential and record its exact ownership.
+    TestLeaseApiToken {
+        lease_id: String,
+        owner_id: String,
+        observed_at_unix_ms: u64,
+        token: Box<crate::sesame::types::ApiToken>,
+    },
+    /// Revoke only the exact credential owned by a cleaning lease.
+    TestLeaseRevokeApiToken {
+        lease_id: String,
+        name: String,
+        fingerprint: [u8; 32],
+    },
+    /// Extend an active lease. Existing token expiries are not extended.
+    /// An expired lease cannot be revived.
     TestLeaseRenew {
         lease_id: String,
         owner_id: String,
@@ -242,6 +282,40 @@ pub enum RaftRequest {
     TestLeaseFinishCleanup { lease_id: String },
     /// Retain bounded evidence explaining why cleanup must be retried.
     TestLeaseCleanupFailed { lease_id: String, reason: String },
+    /// Reserve node-chaos capacity against the exact observed voter configuration.
+    ReserveNodeFault {
+        reservation: Box<crate::smoker::reservation::NodeFaultReservation>,
+        membership_log_id: Option<openraft::LogId<u64>>,
+        unavailable_voters: std::collections::BTreeSet<u64>,
+    },
+    /// Release only after the target has fenced late activation and reversed effects.
+    ReleaseNodeFault { sequence: u64 },
+    /// Confirm runtime retirement on one exact owner of a cleaning lease.
+    TestLeasePlacementRetired {
+        lease_id: String,
+        placement: crate::testkit::lease::LeasedPlacement,
+    },
+    /// Permanently retire an operator-fenced node and resolve its lease duties.
+    DecommissionNode {
+        node_id: String,
+        retired_by: String,
+        reason: String,
+        retired_at_unix_ms: u64,
+        membership_log_id: Option<openraft::LogId<u64>>,
+    },
+    /// Allocate a renewal serial only while the node identity remains active.
+    AllocateNodeSerial { node_id: String },
+    /// Conditionally add only the storage node that verified the existing image.
+    ConfirmImageCopy(crate::pickle::types::ImageCopyConfirmation),
+    /// Record a node before it can consume cluster discovery publications.
+    RegisterEndpointConsumer { node_id: String },
+    /// Discharge one authenticated consumer's exact original withdrawal generation.
+    AcknowledgeEndpointWithdrawal { node_id: String, generation: u64 },
+    /// Fence an authenticated producer execution before authorising address reuse.
+    RetireEndpointExecution {
+        node_id: String,
+        execution: crate::grill::RuntimeExecution,
+    },
 }
 
 // ---------------------------------------------------------------------------
@@ -282,6 +356,14 @@ pub enum CouncilResponse {
     /// the token: it carries the serial allocated for the node certificate
     /// (PKI5). A racer that finds the token already consumed gets `Refused`.
     JoinTokenConsumed { serial: u64 },
+    /// Original immutable operator decision, including repeat requests.
+    NodeDecommissioned {
+        retirement: Box<crate::cluster::retirement::NodeRetirement>,
+    },
+    /// Blob proof predates a collection decision; reverify and retry publication.
+    RegistryPublicationStale,
+    /// The execution fence committed; release requires all original consumer obligations to finish.
+    EndpointExecutionRetired { released: bool },
 }
 
 // ---------------------------------------------------------------------------
@@ -311,6 +393,9 @@ pub struct DesiredState {
     /// Pickle image registry manifest catalog.
     #[serde(default)]
     pub manifest_catalog: ManifestCatalog,
+    /// Monotonic per-node fencing generations for registry blob collection.
+    #[serde(default)]
+    pub registry_gc_generations: std::collections::BTreeMap<u64, u64>,
     /// Autoscale replica overrides (runtime adjustments above/below baseline).
     #[serde(default)]
     pub autoscale_overrides: Vec<(String, u32)>,
@@ -363,10 +448,20 @@ pub struct DesiredState {
     /// Defaults empty so pre-12b.4 snapshots load cleanly.
     #[serde(default)]
     pub endpoint_catalog: crate::onion::catalog::EndpointCatalog,
+    /// Original discovery exposures awaiting remote withdrawal confirmation.
+    #[serde(default)]
+    pub endpoint_withdrawals: crate::onion::withdrawal::EndpointWithdrawals,
+    /// Nodes that may retain discovery publications, including offline nodes.
+    #[serde(default)]
+    pub endpoint_consumers: std::collections::BTreeSet<String>,
+    /// Permanent fences preventing stale reports from reviving retired executions.
+    pub producer_retirements: crate::onion::producer::ProducerRetirements,
     /// Active or interrupted-cleanup Phase 15 leases. Replication lets a new
     /// leader resume cleanup after the issuing process dies.
     #[serde(default)]
     pub test_leases: std::collections::BTreeMap<String, crate::testkit::lease::TestLease>,
+    /// Durable ownership of the single cluster-wide node-chaos slot.
+    pub node_fault_reservations: crate::smoker::reservation::NodeFaultReservations,
     /// Log position of the last applied entry.
     pub last_applied_log: Option<openraft::LogId<u64>>,
     /// Last known membership configuration.
@@ -485,6 +580,7 @@ mod tests {
             },
             RaftRequest::Noop,
             RaftRequest::ManifestCommit(ManifestCommit {
+                observed_gc_generation: 0,
                 manifest: crate::pickle::types::ImageManifest {
                     digest: crate::pickle::types::Digest::from_sha256_hex(
                         "0000000000000000000000000000000000000000000000000000000000000001",
@@ -611,43 +707,26 @@ mod tests {
     }
 
     #[test]
-    fn pre_theme_snapshot_without_namespaces_loads_cleanly() {
-        // A snapshot serialised before T6 added `namespaces`/`permissions`
-        // has neither key. The `#[serde(default)]` on both must fill them
-        // with empty maps rather than fail to deserialise (the #83 loader
-        // is strict, so a missing-field error here would brick startup).
-        let legacy = serde_json::json!({
-            "apps": [],
-            "scheduling": [],
-            "config": {},
-            "last_applied_log": null,
-            "last_membership": { "log_id": null, "membership": { "configs": [], "nodes": {} } }
-        });
-        let state: DesiredState = serde_json::from_value(legacy).unwrap();
+    fn compatible_snapshot_may_omit_optional_namespace_and_endpoint_fields() {
+        let mut snapshot = serde_json::to_value(DesiredState::default()).unwrap();
+        for field in ["namespaces", "permissions", "endpoint_catalog"] {
+            snapshot.as_object_mut().unwrap().remove(field);
+        }
+        let state: DesiredState = serde_json::from_value(snapshot).unwrap();
         assert!(state.namespaces.is_empty());
         assert!(state.permissions.is_empty());
-        assert!(state.apps.is_empty());
-        // 12b.4: the endpoint catalogue is serde-default too, so a snapshot
-        // that predates it loads with an empty catalogue rather than failing.
         assert!(state.endpoint_catalog.is_empty());
     }
 
     #[test]
-    fn pre_theme_snapshot_without_endpoint_catalog_loads_cleanly() {
-        // A snapshot serialised after T6 but before 12b.4 has `namespaces`
-        // and `permissions` but no `endpoint_catalog`. The `#[serde(default)]`
-        // must fill it with an empty catalogue.
-        let legacy = serde_json::json!({
-            "apps": [],
-            "scheduling": [],
-            "config": {},
-            "namespaces": {},
-            "permissions": {},
-            "last_applied_log": null,
-            "last_membership": { "log_id": null, "membership": { "configs": [], "nodes": {} } }
-        });
-        let state: DesiredState = serde_json::from_value(legacy).unwrap();
-        assert!(state.endpoint_catalog.is_empty());
+    fn snapshot_must_not_forget_node_fault_ownership() {
+        let mut snapshot = serde_json::to_value(DesiredState::default()).unwrap();
+        snapshot
+            .as_object_mut()
+            .unwrap()
+            .remove("node_fault_reservations");
+        let error = serde_json::from_value::<DesiredState>(snapshot).unwrap_err();
+        assert!(error.to_string().contains("node_fault_reservations"));
     }
 
     #[test]
@@ -659,16 +738,28 @@ mod tests {
             ServiceId::new("payments", "api"),
             3000,
             vec![CatalogBackend {
+                execution: None,
                 node_id: "node-b".to_string(),
                 node_ip: std::net::Ipv4Addr::new(10, 0, 0, 2),
                 host_port: 30002,
                 healthy: true,
             }],
-        )]);
-        let req = RaftRequest::PublishEndpoints(Box::new(catalog));
+        )])
+        .unwrap();
+        let req = RaftRequest::PublishEndpoints {
+            expected_generation: 42,
+            catalog: Box::new(catalog),
+        };
         let json = serde_json::to_string(&req).unwrap();
         let decoded: RaftRequest = serde_json::from_str(&json).unwrap();
         assert_eq!(req, decoded);
+        let mut value = serde_json::to_value(&req).unwrap();
+        assert_eq!(value["PublishEndpoints"]["expected_generation"], 42);
+        value["PublishEndpoints"]
+            .as_object_mut()
+            .unwrap()
+            .remove("expected_generation");
+        assert!(serde_json::from_value::<RaftRequest>(value).is_err());
     }
 
     #[test]

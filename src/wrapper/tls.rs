@@ -8,21 +8,9 @@
 /// TLS 1.0 and 1.1 are rejected. Only 1.2 and 1.3 are accepted.
 use std::path::Path;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
 
 use rustls::ServerConfig;
-use rustls::pki_types::{CertificateDer, PrivateKeyDer};
-
-/// Process-local monotonic serial source for ingress certificates (M15).
-///
-/// Ingress certs are minted per-SNI and short-lived, so threading the cluster's
-/// Raft serial allocator (a consensus write per cert) is impractical. This at
-/// least gives every ingress cert a *distinct* serial — the old code stamped
-/// every one `SerialNumber(1)`, so they were indistinguishable and could never
-/// be told apart in a CRL. Seeded high so it can't collide with the CA's
-/// centrally-allocated (low, sequential) serials. Central CRL-revocation of an
-/// individual ingress leaf remains future work.
-static INGRESS_SERIAL: AtomicU64 = AtomicU64::new(1 << 62);
+use rustls::pki_types::{CertificateDer, PrivateKeyDer, pem::PemObject};
 
 /// Errors from TLS operations.
 #[derive(Debug, thiserror::Error)]
@@ -66,36 +54,41 @@ pub fn generate_self_signed_cert()
 /// `ca_keypair` and `ca_params` come from the Ingress `GeneratedCa`
 /// (`hierarchy.ingress`). `hostnames` are the ingress hosts to put in the
 /// certificate's SANs. The returned cert/key plug straight into
-/// [`build_tls_config`].
+/// [`build_tls_config`]. The chain includes the original root-signed Ingress CA
+/// certificate so clients need only the cluster root as their trust anchor.
 pub fn issue_ingress_cert(
     hostnames: &[String],
     lifetime: std::time::Duration,
     ca_keypair: &rcgen::KeyPair,
     ca_params: &rcgen::CertificateParams,
+    issuer_certificate: &CertificateDer<'static>,
 ) -> Result<(Vec<CertificateDer<'static>>, PrivateKeyDer<'static>), TlsError> {
     let common_name = hostnames
         .first()
         .cloned()
         .ok_or_else(|| TlsError::CertGenFailed("no ingress hostname supplied".to_string()))?;
 
-    // The cert is a TLS server, so it carries the ServerAuth extended key
-    // usage. Each ingress cert gets a distinct serial (M15) — see INGRESS_SERIAL.
-    let serial = INGRESS_SERIAL.fetch_add(1, Ordering::Relaxed);
-    let (cert_der, key_der, _serial) = crate::sesame::ca::issue_end_entity_cert(
+    // The original certificate, not reconstructed signing parameters, defines
+    // the issuer's validity. A leaf must never extend that trust window.
+    let issuer_validity = CertificateValidity::parse(issuer_certificate)?;
+    let mut ca_params = ca_params.clone();
+    ca_params.not_before = time::OffsetDateTime::from_unix_timestamp(issuer_validity.not_before)
+        .map_err(|e| TlsError::CertGenFailed(e.to_string()))?;
+    ca_params.not_after = time::OffsetDateTime::from_unix_timestamp(issuer_validity.not_after)
+        .map_err(|e| TlsError::CertGenFailed(e.to_string()))?;
+    let (cert_der, key_der) = crate::sesame::ca::issue_ingress_leaf_cert(
         &common_name,
-        crate::sesame::types::SerialNumber(serial),
         lifetime,
         hostnames,
-        &[rcgen::ExtendedKeyUsagePurpose::ServerAuth],
         ca_keypair,
-        ca_params,
+        &ca_params,
     )
     .map_err(|e| TlsError::CertGenFailed(e.to_string()))?;
 
     let cert = CertificateDer::from(cert_der);
     let key = PrivateKeyDer::try_from(key_der)
         .map_err(|e| TlsError::CertGenFailed(format!("invalid issued key: {e}")))?;
-    Ok((vec![cert], key))
+    Ok((vec![cert, issuer_certificate.clone()], key))
 }
 
 /// Load a certificate and private key from PEM files on disk.
@@ -103,12 +96,8 @@ pub fn load_certs_from_disk(
     cert_path: &Path,
     key_path: &Path,
 ) -> Result<(Vec<CertificateDer<'static>>, PrivateKeyDer<'static>), TlsError> {
-    let cert_file = std::fs::File::open(cert_path).map_err(|e| TlsError::LoadFailed {
-        path: cert_path.display().to_string(),
-        reason: e.to_string(),
-    })?;
-    let mut cert_reader = std::io::BufReader::new(cert_file);
-    let certs: Vec<CertificateDer<'static>> = rustls_pemfile::certs(&mut cert_reader)
+    let cert_reader = read_pem(cert_path)?;
+    let certs: Vec<CertificateDer<'static>> = CertificateDer::pem_reader_iter(cert_reader)
         .collect::<Result<_, _>>()
         .map_err(|e| TlsError::LoadFailed {
             path: cert_path.display().to_string(),
@@ -122,12 +111,10 @@ pub fn load_certs_from_disk(
         });
     }
 
-    let key_file = std::fs::File::open(key_path).map_err(|e| TlsError::LoadFailed {
-        path: key_path.display().to_string(),
-        reason: e.to_string(),
-    })?;
-    let mut key_reader = std::io::BufReader::new(key_file);
-    let key = rustls_pemfile::private_key(&mut key_reader)
+    let key_reader = read_pem(key_path)?;
+    let key = PrivateKeyDer::pem_reader_iter(key_reader)
+        .next()
+        .transpose()
         .map_err(|e| TlsError::LoadFailed {
             path: key_path.display().to_string(),
             reason: e.to_string(),
@@ -138,6 +125,146 @@ pub fn load_certs_from_disk(
         })?;
 
     Ok((certs, key))
+}
+
+// Read each local regular file once with a hard size cap, off the async runtime.
+// O_NONBLOCK also keeps a mistakenly configured FIFO from hanging the loader.
+fn read_pem(path: &Path) -> Result<std::io::Cursor<Vec<u8>>, TlsError> {
+    use std::io::Read;
+    let read = || -> std::io::Result<Vec<u8>> {
+        let mut options = std::fs::OpenOptions::new();
+        options.read(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.custom_flags(nix::fcntl::OFlag::O_NONBLOCK.bits());
+        }
+        let file = options.open(path)?;
+        if !file.metadata()?.is_file() {
+            return Err(std::io::Error::other(
+                "certificate material must be a regular file",
+            ));
+        }
+        const MAX_PEM_BYTES: u64 = 1024 * 1024;
+        let mut bytes = Vec::new();
+        file.take(MAX_PEM_BYTES + 1).read_to_end(&mut bytes)?;
+        if bytes.len() as u64 > MAX_PEM_BYTES {
+            return Err(std::io::Error::other("certificate material exceeds 1 MiB"));
+        }
+        Ok(bytes)
+    };
+    read()
+        .map(std::io::Cursor::new)
+        .map_err(|error| TlsError::LoadFailed {
+            path: path.display().to_string(),
+            reason: error.to_string(),
+        })
+}
+
+/// An operator-supplied certificate pair reloaded without restarting listeners.
+/// Invalid replacements retain the previous pair only while it remains valid.
+pub(super) struct FileCertResolver {
+    cert_path: std::path::PathBuf,
+    key_path: std::path::PathBuf,
+    current: tokio::sync::watch::Sender<CachedCertificate>,
+}
+
+impl std::fmt::Debug for FileCertResolver {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("FileCertResolver").finish_non_exhaustive()
+    }
+}
+
+impl FileCertResolver {
+    pub(super) async fn load(cert_path: &Path, key_path: &Path) -> Result<Self, TlsError> {
+        let current = Self::read_pair(cert_path.to_owned(), key_path.to_owned()).await?;
+        let (current, _) = tokio::sync::watch::channel(current);
+        Ok(Self {
+            cert_path: cert_path.to_owned(),
+            key_path: key_path.to_owned(),
+            current,
+        })
+    }
+
+    async fn read_pair(
+        cert_path: std::path::PathBuf,
+        key_path: std::path::PathBuf,
+    ) -> Result<CachedCertificate, TlsError> {
+        tokio::task::spawn_blocking(move || {
+            let (chain, key) = load_certs_from_disk(&cert_path, &key_path)?;
+            let now = time::OffsetDateTime::now_utc().unix_timestamp();
+            let mut validity = CertificateValidity {
+                not_before: i64::MIN,
+                not_after: i64::MAX,
+            };
+            for certificate in &chain {
+                let window = CertificateValidity::parse(certificate)?;
+                if !window.contains(now) {
+                    return Err(TlsError::ConfigFailed(
+                        "certificate chain is outside its validity period".into(),
+                    ));
+                }
+                validity.not_before = validity.not_before.max(window.not_before);
+                validity.not_after = validity.not_after.min(window.not_after);
+            }
+            Ok(CachedCertificate {
+                key: certified_key(chain, key)?,
+                validity,
+            })
+        })
+        .await
+        .map_err(|error| TlsError::ConfigFailed(format!("certificate loader failed: {error}")))?
+    }
+
+    /// Poll once a second; the caller owns this future alongside the listeners.
+    pub(super) async fn run(&self, shutdown: tokio_util::sync::CancellationToken) {
+        let mut interval = tokio::time::interval(std::time::Duration::from_secs(1));
+        interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        let mut last_error = None;
+        loop {
+            tokio::select! {
+                biased;
+                _ = shutdown.cancelled() => return,
+                _ = interval.tick() => {}
+            }
+            let replacement = tokio::select! {
+                biased;
+                _ = shutdown.cancelled() => return,
+                replacement = Self::read_pair(self.cert_path.clone(), self.key_path.clone()) => replacement,
+            };
+            match replacement {
+                Ok(replacement) => {
+                    last_error = None;
+                    let changed = self.current.borrow().key.cert != replacement.key.cert;
+                    if changed {
+                        self.current.send_replace(replacement);
+                    }
+                }
+                Err(error) => {
+                    let error = error.to_string();
+                    if last_error.as_ref() != Some(&error) {
+                        eprintln!(
+                            "wrapper: TLS file reload refused; keeping the last pair subject to its expiry: {error}"
+                        );
+                        last_error = Some(error);
+                    }
+                }
+            }
+        }
+    }
+}
+
+impl rustls::server::ResolvesServerCert for FileCertResolver {
+    fn resolve(
+        &self,
+        _: rustls::server::ClientHello<'_>,
+    ) -> Option<Arc<rustls::sign::CertifiedKey>> {
+        let current = self.current.borrow();
+        current
+            .validity
+            .contains(time::OffsetDateTime::now_utc().unix_timestamp())
+            .then(|| Arc::clone(&current.key))
+    }
 }
 
 /// Build a rustls `ServerConfig` from a certificate and key.
@@ -160,6 +287,10 @@ pub fn build_tls_config(
 
     // Advertise HTTP/2 then HTTP/1.1 (E); hyper's auto builder serves whichever
     // ALPN the client negotiates.
+    // A resumed session skips certificate resolution and validity checks.
+    // Every reconnect must observe the current leaf after renewal or reload.
+    config.session_storage = Arc::new(rustls::server::NoServerSessionStorage {});
+    config.send_tls13_tickets = 0;
     config.alpn_protocols = crate::wrapper::types::alpn_protocols();
 
     Ok(Arc::new(config))
@@ -177,6 +308,10 @@ pub fn build_tls_config_with_resolver(
     let mut config = ServerConfig::builder()
         .with_no_client_auth()
         .with_cert_resolver(resolver);
+    // A resumed session skips certificate resolution and validity checks.
+    // Every reconnect must observe the current leaf after renewal or reload.
+    config.session_storage = Arc::new(rustls::server::NoServerSessionStorage {});
+    config.send_tls13_tickets = 0;
     config.alpn_protocols = crate::wrapper::types::alpn_protocols();
     Ok(Arc::new(config))
 }
@@ -188,10 +323,43 @@ fn certified_key(
 ) -> Result<Arc<rustls::sign::CertifiedKey>, TlsError> {
     let signing_key = rustls::crypto::ring::sign::any_supported_type(&key)
         .map_err(|e| TlsError::ConfigFailed(format!("unsupported ingress key: {e}")))?;
-    Ok(Arc::new(rustls::sign::CertifiedKey::new(
-        certs,
-        signing_key,
-    )))
+    let certified = rustls::sign::CertifiedKey::new(certs, signing_key);
+    certified
+        .keys_match()
+        .map_err(|error| TlsError::ConfigFailed(error.to_string()))?;
+    Ok(Arc::new(certified))
+}
+
+#[derive(Debug, Clone, Copy)]
+struct CertificateValidity {
+    not_before: i64,
+    not_after: i64,
+}
+
+impl CertificateValidity {
+    fn parse(certificate: &CertificateDer<'_>) -> Result<Self, TlsError> {
+        use x509_parser::prelude::FromDer;
+        let (_, parsed) = x509_parser::certificate::X509Certificate::from_der(certificate)
+            .map_err(|error| TlsError::ConfigFailed(format!("invalid certificate: {error}")))?;
+        Ok(Self {
+            not_before: parsed.validity().not_before.timestamp(),
+            not_after: parsed.validity().not_after.timestamp(),
+        })
+    }
+
+    fn contains(self, now: i64) -> bool {
+        self.not_before <= now && now < self.not_after
+    }
+
+    fn renewal_due(self, now: i64) -> bool {
+        now >= self.not_before + (self.not_after - self.not_before) / 2
+    }
+}
+
+#[derive(Clone)]
+struct CachedCertificate {
+    key: Arc<rustls::sign::CertifiedKey>,
+    validity: CertificateValidity,
 }
 
 /// Largest number of per-SNI certificates the resolver caches. The host
@@ -215,10 +383,11 @@ const MAX_SNI_CACHE: usize = 1024;
 pub struct IngressCertResolver {
     ca_keypair: rcgen::KeyPair,
     ca_params: rcgen::CertificateParams,
+    issuer_certificate: CertificateDer<'static>,
     lifetime: std::time::Duration,
     default_key: Arc<rustls::sign::CertifiedKey>,
     routes: Arc<tokio::sync::RwLock<super::routing::RoutingTable>>,
-    cache: std::sync::Mutex<std::collections::HashMap<String, Arc<rustls::sign::CertifiedKey>>>,
+    cache: std::sync::Mutex<std::collections::HashMap<String, CachedCertificate>>,
 }
 
 impl std::fmt::Debug for IngressCertResolver {
@@ -236,6 +405,7 @@ impl IngressCertResolver {
     pub fn new(
         ca_keypair: rcgen::KeyPair,
         ca_params: rcgen::CertificateParams,
+        issuer_certificate: CertificateDer<'static>,
         lifetime: std::time::Duration,
         routes: Arc<tokio::sync::RwLock<super::routing::RoutingTable>>,
         default_cert: Vec<CertificateDer<'static>>,
@@ -244,6 +414,7 @@ impl IngressCertResolver {
         Ok(Self {
             ca_keypair,
             ca_params,
+            issuer_certificate,
             lifetime,
             default_key: certified_key(default_cert, default_key)?,
             routes,
@@ -253,19 +424,58 @@ impl IngressCertResolver {
 
     /// Issue (or fetch from cache) a certified key for `hostname`.
     fn key_for(&self, hostname: &str) -> Option<Arc<rustls::sign::CertifiedKey>> {
-        if let Ok(cache) = self.cache.lock()
-            && let Some(existing) = cache.get(hostname)
+        let hostname = hostname.to_ascii_lowercase();
+        let now = time::OffsetDateTime::now_utc().unix_timestamp();
+        let existing = self
+            .cache
+            .lock()
+            .ok()
+            .and_then(|cache| cache.get(&hostname).cloned())
+            .filter(|entry| entry.validity.contains(now));
+        if let Some(entry) = &existing
+            && !entry.validity.renewal_due(now)
         {
-            return Some(Arc::clone(existing));
+            return Some(Arc::clone(&entry.key));
         }
+
+        // Signing stays outside the cache lock. If renewal fails, the previous
+        // key is usable only for its remaining validity, never after expiry.
+        self.issue_key(&hostname).or_else(|| {
+            existing
+                .filter(|entry| {
+                    entry
+                        .validity
+                        .contains(time::OffsetDateTime::now_utc().unix_timestamp())
+                })
+                .map(|entry| entry.key)
+        })
+    }
+
+    fn issue_key(&self, hostname: &str) -> Option<Arc<rustls::sign::CertifiedKey>> {
         let hosts = [hostname.to_string()];
-        let (chain, key) =
-            issue_ingress_cert(&hosts, self.lifetime, &self.ca_keypair, &self.ca_params).ok()?;
+        let (chain, key) = issue_ingress_cert(
+            &hosts,
+            self.lifetime,
+            &self.ca_keypair,
+            &self.ca_params,
+            &self.issuer_certificate,
+        )
+        .ok()?;
+        let validity = CertificateValidity::parse(chain.first()?).ok()?;
+        if !validity.contains(time::OffsetDateTime::now_utc().unix_timestamp()) {
+            return None;
+        }
         let certified = certified_key(chain, key).ok()?;
         if let Ok(mut cache) = self.cache.lock()
             && (cache.len() < MAX_SNI_CACHE || cache.contains_key(hostname))
         {
-            cache.insert(hostname.to_string(), Arc::clone(&certified));
+            cache.insert(
+                hostname.to_string(),
+                CachedCertificate {
+                    key: Arc::clone(&certified),
+                    validity,
+                },
+            );
         }
         Some(certified)
     }
@@ -356,13 +566,109 @@ mod tests {
             std::time::Duration::from_secs(90 * 24 * 3600),
             &hierarchy.ingress.signing_keypair,
             &hierarchy.ingress.certificate_params,
+            &CertificateDer::from(hierarchy.ingress.ca.certificate_der.clone()),
         )
         .unwrap();
 
-        assert_eq!(certs.len(), 1);
+        assert_eq!(certs.len(), 2);
         // The issued cert and key must yield a working rustls config.
         let config = build_tls_config(certs, key).unwrap();
         let _ = config; // built without error means it's servable
+    }
+
+    // Child entry point for the separate-process serial regression. No key
+    // material crosses stdout or process arguments.
+    #[test]
+    fn ingress_serial_child() {
+        use rcgen::{CertificateParams, KeyPair};
+        let Some(directory) = std::env::var_os("RELIABURGER_SERIAL_TEST_DIRECTORY") else {
+            return;
+        };
+        let directory = std::path::PathBuf::from(directory);
+        let certificate = CertificateDer::from(std::fs::read(directory.join("ca.der")).unwrap());
+        let params = CertificateParams::from_ca_cert_der(&certificate).unwrap();
+        let key =
+            PrivateKeyDer::try_from(std::fs::read(directory.join("ca.key")).unwrap()).unwrap();
+        let key = KeyPair::from_der_and_sign_algo(&key, &rcgen::PKCS_ECDSA_P256_SHA256).unwrap();
+        let (certificates, _) = issue_ingress_cert(
+            &["app.example.com".into()],
+            std::time::Duration::from_secs(3600),
+            &key,
+            &params,
+            &certificate,
+        )
+        .unwrap();
+        let destination = std::env::var_os("RELIABURGER_SERIAL_TEST_OUTPUT").unwrap();
+        std::fs::write(destination, &certificates[0]).unwrap();
+    }
+
+    #[tokio::test]
+    async fn ingress_serials_differ_across_nodes_and_restarts_under_one_issuer() {
+        use std::io::Write;
+        use std::os::unix::fs::OpenOptionsExt;
+        use x509_parser::prelude::FromDer;
+        let directory = tempfile::tempdir().unwrap();
+        let hierarchy =
+            crate::sesame::ca::generate_ca_hierarchy("serial-test", b"test-wrap-ikm").unwrap();
+        std::fs::write(
+            directory.path().join("ca.der"),
+            &hierarchy.ingress.ca.certificate_der,
+        )
+        .unwrap();
+        let mut key_file = std::fs::OpenOptions::new()
+            .create_new(true)
+            .write(true)
+            .mode(0o600)
+            .open(directory.path().join("ca.key"))
+            .unwrap();
+        key_file
+            .write_all(&hierarchy.ingress.private_key_der)
+            .unwrap();
+        drop(key_file);
+        async fn issue(directory: &Path, node: &str) -> Vec<u8> {
+            let destination = directory.join(node);
+            let mut child = tokio::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "wrapper::tls::tests::ingress_serial_child",
+                    "--nocapture",
+                ])
+                .env("RELIABURGER_SERIAL_TEST_DIRECTORY", directory)
+                .env("RELIABURGER_SERIAL_TEST_OUTPUT", &destination)
+                .kill_on_drop(true)
+                .spawn()
+                .unwrap();
+            let status = tokio::time::timeout(std::time::Duration::from_secs(60), child.wait())
+                .await
+                .unwrap()
+                .unwrap();
+            assert!(status.success());
+            std::fs::read(destination).unwrap()
+        }
+        let first = issue(directory.path(), "first.der").await;
+        let restarted = issue(directory.path(), "restarted.der").await;
+        let (peer_a, peer_b) = tokio::join!(
+            issue(directory.path(), "peer-a.der"),
+            issue(directory.path(), "peer-b.der")
+        );
+        let (_, ca) = x509_parser::certificate::X509Certificate::from_der(
+            &hierarchy.ingress.ca.certificate_der,
+        )
+        .unwrap();
+        let mut serials = std::collections::HashSet::new();
+        for der in [first, restarted, peer_a, peer_b] {
+            let (_, certificate) =
+                x509_parser::certificate::X509Certificate::from_der(&der).unwrap();
+            certificate.verify_signature(Some(ca.public_key())).unwrap();
+            assert!(
+                serials.insert(certificate.raw_serial().to_vec()),
+                "separate processes reused a certificate serial under the same CA"
+            );
+        }
+        for serial in serials {
+            assert_eq!(serial.len(), 20);
+            assert!((0x40..=0x7f).contains(&serial[0]));
+        }
     }
 
     #[test]
@@ -374,8 +680,59 @@ mod tests {
             std::time::Duration::from_secs(3600),
             &hierarchy.ingress.signing_keypair,
             &hierarchy.ingress.certificate_params,
+            &CertificateDer::from(hierarchy.ingress.ca.certificate_der.clone()),
         );
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn ingress_leaf_cannot_outlive_its_issuer() {
+        use x509_parser::prelude::FromDer;
+        let mut hierarchy =
+            crate::sesame::ca::generate_ca_hierarchy("short-issuer", b"test-ikm").unwrap();
+        hierarchy.ingress.certificate_params.not_after =
+            time::OffsetDateTime::now_utc() + time::Duration::seconds(30);
+        let issuer = hierarchy
+            .ingress
+            .certificate_params
+            .clone()
+            .self_signed(&hierarchy.ingress.signing_keypair)
+            .unwrap();
+        let (chain, _) = issue_ingress_cert(
+            &["web.example".into()],
+            std::time::Duration::from_secs(3600),
+            &hierarchy.ingress.signing_keypair,
+            &hierarchy.ingress.certificate_params,
+            issuer.der(),
+        )
+        .unwrap();
+        let (_, leaf) = x509_parser::certificate::X509Certificate::from_der(&chain[0]).unwrap();
+        let (_, issuer) = x509_parser::certificate::X509Certificate::from_der(&chain[1]).unwrap();
+        assert!(leaf.validity().not_after <= issuer.validity().not_after);
+    }
+
+    #[test]
+    fn expired_ingress_issuer_cannot_mint_a_leaf() {
+        let mut hierarchy =
+            crate::sesame::ca::generate_ca_hierarchy("expired-issuer", b"test-ikm").unwrap();
+        hierarchy.ingress.certificate_params.not_after =
+            time::OffsetDateTime::now_utc() - time::Duration::seconds(1);
+        let issuer = hierarchy
+            .ingress
+            .certificate_params
+            .clone()
+            .self_signed(&hierarchy.ingress.signing_keypair)
+            .unwrap();
+        assert!(
+            issue_ingress_cert(
+                &["web.example".into()],
+                std::time::Duration::from_secs(3600),
+                &hierarchy.ingress.signing_keypair,
+                &hierarchy.ingress.certificate_params,
+                issuer.der(),
+            )
+            .is_err()
+        );
     }
 
     /// M8: the per-SNI resolver issues a cluster-CA cert for the requested
@@ -389,6 +746,7 @@ mod tests {
         let resolver = IngressCertResolver::new(
             hierarchy.ingress.signing_keypair,
             hierarchy.ingress.certificate_params,
+            CertificateDer::from(hierarchy.ingress.ca.certificate_der),
             std::time::Duration::from_secs(90 * 24 * 3600),
             empty_routes(),
             vec![default_cert],
@@ -421,6 +779,7 @@ mod tests {
         IngressCertResolver::new(
             hierarchy.ingress.signing_keypair,
             hierarchy.ingress.certificate_params,
+            CertificateDer::from(hierarchy.ingress.ca.certificate_der),
             std::time::Duration::from_secs(3600),
             routes,
             vec![default_cert],

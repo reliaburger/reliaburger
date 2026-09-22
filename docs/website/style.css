@@ -24,7 +24,15 @@ code { font-family: var(--mono); font-size: .875em; }
 nav { display: flex; flex-wrap: wrap; gap: 28px; font-size: .875rem; font-weight: 550; }
 nav a { text-decoration: none; padding: 8px 0; }
 nav a:hover { text-decoration: underline; }
-.intro { padding: 68px 0 48px; }
+.intro { display: grid; grid-template-columns: minmax(0, 1fr) auto; gap: 40px; align-items: center; padding: 68px 0 48px; }
+.intro-copy { min-width: 0; }
+.intro-art { margin: 0; justify-self: end; }
+.burger { display: block; width: clamp(220px, 24vw, 300px); height: auto; mix-blend-mode: multiply; }
+.burger-still { display: none; }
+@media (prefers-reduced-motion: reduce) {
+  .burger-loop { display: none; }
+  .burger-still { display: block; }
+}
 .eyebrow, .filetype, .section-number { font-family: var(--mono); font-size: .75rem; font-weight: 500; letter-spacing: .07em; }
 .eyebrow { color: var(--accent); margin-bottom: 22px; }
 h1 { font-size: clamp(2.4rem, 5.1vw, 3.7rem); line-height: 1.12; letter-spacing: -.055em; font-weight: 650; margin: 0 0 26px; }
@@ -81,6 +89,11 @@ footer { display: flex; flex-wrap: wrap; gap: 12px 24px; margin-top: 20px; paddi
   .start-grid { grid-template-columns: 1fr; gap: 24px; }
   .start-copy { max-width: 700px; }
   .subsystems > div { grid-template-columns: 1fr; gap: 2px; }
+}
+@media (max-width: 900px) {
+  .intro { grid-template-columns: 1fr; gap: 28px; }
+  .intro-art { justify-self: start; }
+  .burger { width: 220px; }
 }
 @media (max-width: 600px) {
   .page { padding: 0 22px; }

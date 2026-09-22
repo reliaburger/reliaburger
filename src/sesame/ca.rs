@@ -3,7 +3,7 @@
 //! Generates the root CA and intermediate CAs (Node, Workload, Ingress)
 //! using ECDSA P-256. Signs CSRs and issues certificates.
 
-use std::time::{Duration, SystemTime};
+use std::time::Duration;
 
 use rcgen::{
     BasicConstraints, CertificateParams, DistinguishedName, DnType, ExtendedKeyUsagePurpose, IsCa,
@@ -17,6 +17,8 @@ use super::types::{CaRole, CertificateAuthority, SerialNumber};
 /// Errors from CA operations.
 #[derive(Debug, thiserror::Error)]
 pub enum CaError {
+    #[error("invalid certificate input: {0}")]
+    InvalidInput(String),
     #[error("failed to generate keypair: {0}")]
     KeyGenFailed(String),
     #[error("failed to generate certificate: {0}")]
@@ -65,17 +67,7 @@ pub fn generate_root_ca(cluster_name: &str, serial: SerialNumber) -> Result<Gene
     params.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
     params.key_usages = vec![KeyUsagePurpose::KeyCertSign, KeyUsagePurpose::CrlSign];
     params.serial_number = Some(RcgenSerial::from_slice(&serial.0.to_be_bytes()));
-    params.not_before = rcgen::date_time_ymd(
-        time_to_year(SystemTime::now()),
-        time_to_month(SystemTime::now()),
-        time_to_day(SystemTime::now()),
-    );
-    let not_after_time = SystemTime::now() + ROOT_CA_LIFETIME;
-    params.not_after = rcgen::date_time_ymd(
-        time_to_year(not_after_time),
-        time_to_month(not_after_time),
-        time_to_day(not_after_time),
-    );
+    set_validity(&mut params, ROOT_CA_LIFETIME)?;
 
     let certificate = params
         .clone()
@@ -83,14 +75,13 @@ pub fn generate_root_ca(cluster_name: &str, serial: SerialNumber) -> Result<Gene
         .map_err(|e| CaError::CertGenFailed(e.to_string()))?;
     let certificate_der = certificate.der().to_vec();
 
-    let now = SystemTime::now();
     let ca = CertificateAuthority {
         role: CaRole::Root,
         certificate_der,
         private_key_wrapped: None,
         serial,
-        not_before: now,
-        not_after: now + ROOT_CA_LIFETIME,
+        not_before: params.not_before.into(),
+        not_after: params.not_after.into(),
         issuer_serial: None,
         generation: 0,
     };
@@ -124,7 +115,11 @@ pub fn generate_intermediate_ca(
         CaRole::Node => "Node",
         CaRole::Workload => "Workload",
         CaRole::Ingress => "Ingress",
-        CaRole::Root => unreachable!("root CA is not an intermediate"),
+        CaRole::Root => {
+            return Err(CaError::InvalidInput(
+                "root CA is not an intermediate".into(),
+            ));
+        }
     };
 
     let mut params = CertificateParams::default();
@@ -143,17 +138,7 @@ pub fn generate_intermediate_ca(
         KeyUsagePurpose::DigitalSignature,
     ];
     params.serial_number = Some(RcgenSerial::from_slice(&serial.0.to_be_bytes()));
-    params.not_before = rcgen::date_time_ymd(
-        time_to_year(SystemTime::now()),
-        time_to_month(SystemTime::now()),
-        time_to_day(SystemTime::now()),
-    );
-    let not_after_time = SystemTime::now() + INTERMEDIATE_CA_LIFETIME;
-    params.not_after = rcgen::date_time_ymd(
-        time_to_year(not_after_time),
-        time_to_month(not_after_time),
-        time_to_day(not_after_time),
-    );
+    set_validity(&mut params, INTERMEDIATE_CA_LIFETIME)?;
 
     // Sign with parent — both self_signed and signed_by consume their params,
     // so we clone before calling.
@@ -172,14 +157,13 @@ pub fn generate_intermediate_ca(
     let wrap_info = format!("reliaburger-{}-ca-wrap-v1", role_name.to_lowercase());
     let wrapped = crypto::wrap_key(wrapping_ikm, &private_key_der, &wrap_info)?;
 
-    let now = SystemTime::now();
     let ca = CertificateAuthority {
         role,
         certificate_der,
         private_key_wrapped: Some(wrapped),
         serial,
-        not_before: now,
-        not_after: now + INTERMEDIATE_CA_LIFETIME,
+        not_before: params.not_before.into(),
+        not_after: params.not_after.into(),
         issuer_serial: Some(parent_serial),
         generation: 0,
     };
@@ -207,9 +191,6 @@ pub fn node_id_from_spiffe_uri(uri: &str) -> Option<&str> {
     uri.strip_prefix("spiffe://reliaburger/node/")
 }
 
-/// Issue an end-entity certificate (e.g. node cert) signed by an intermediate CA.
-///
-/// Returns `(certificate_der, private_key_der, serial)`.
 /// Reconstruct a CA's signing keypair and issuer params from stored state.
 ///
 /// Unwraps the CA's private key with `wrapping_ikm` and rebuilds the rcgen
@@ -239,6 +220,9 @@ pub fn ca_signing_material(
     Ok((keypair, params))
 }
 
+/// Issue a leaf with a centrally allocated 64-bit serial.
+///
+/// Returns the certificate DER, private key DER and unchanged serial.
 pub fn issue_end_entity_cert(
     common_name: &str,
     serial: SerialNumber,
@@ -248,6 +232,56 @@ pub fn issue_end_entity_cert(
     ca_keypair: &KeyPair,
     ca_params: &CertificateParams,
 ) -> Result<(Vec<u8>, Vec<u8>, SerialNumber), CaError> {
+    let (certificate, key) = sign_end_entity_cert(
+        common_name,
+        RcgenSerial::from_slice(&serial.0.to_be_bytes()),
+        lifetime,
+        san_dns_names,
+        extended_key_usage,
+        ca_keypair,
+        ca_params,
+    )?;
+    Ok((certificate, key, serial))
+}
+
+/// Issue an ingress leaf with an independent positive 20-byte random serial.
+///
+/// Randomness failure refuses issuance. These serials are outside the node
+/// revocation API's 64-bit identity space; no truncation or counter is used.
+pub(crate) fn issue_ingress_leaf_cert(
+    common_name: &str,
+    lifetime: Duration,
+    san_dns_names: &[String],
+    ca_keypair: &KeyPair,
+    ca_params: &CertificateParams,
+) -> Result<(Vec<u8>, Vec<u8>), CaError> {
+    let mut serial = [0u8; 20];
+    SystemRandom::new().fill(&mut serial).map_err(|_| {
+        CaError::CertGenFailed("operating system randomness unavailable for ingress serial".into())
+    })?;
+    // RFC 5280 limits serials to 20 octets. Keep a positive, non-zero value
+    // with 158 random bits, disjoint from every centrally allocated u64.
+    serial[0] = (serial[0] & 0x3f) | 0x40;
+    sign_end_entity_cert(
+        common_name,
+        RcgenSerial::from_slice(&serial),
+        lifetime,
+        san_dns_names,
+        &[ExtendedKeyUsagePurpose::ServerAuth],
+        ca_keypair,
+        ca_params,
+    )
+}
+
+fn sign_end_entity_cert(
+    common_name: &str,
+    serial: RcgenSerial,
+    lifetime: Duration,
+    san_dns_names: &[String],
+    extended_key_usage: &[ExtendedKeyUsagePurpose],
+    ca_keypair: &KeyPair,
+    ca_params: &CertificateParams,
+) -> Result<(Vec<u8>, Vec<u8>), CaError> {
     let key_pair = KeyPair::generate_for(&rcgen::PKCS_ECDSA_P256_SHA256)
         .map_err(|e| CaError::KeyGenFailed(e.to_string()))?;
     let private_key_der = key_pair.serialize_der();
@@ -262,29 +296,30 @@ pub fn issue_end_entity_cert(
         KeyUsagePurpose::KeyEncipherment,
     ];
     params.extended_key_usages = extended_key_usage.to_vec();
-    params.serial_number = Some(RcgenSerial::from_slice(&serial.0.to_be_bytes()));
+    params.serial_number = Some(serial);
 
     let mut all_sans: Vec<rcgen::SanType> = san_dns_names
         .iter()
-        .map(|name| rcgen::SanType::DnsName(name.clone().try_into().unwrap()))
-        .collect();
+        .map(|name| {
+            name.clone()
+                .try_into()
+                .map(rcgen::SanType::DnsName)
+                .map_err(|error| {
+                    CaError::InvalidInput(format!("invalid DNS SAN {name:?}: {error}"))
+                })
+        })
+        .collect::<Result<_, _>>()?;
     // Also add the CN as a SAN (modern TLS requires SAN)
-    if let Ok(ia5) = common_name.to_string().try_into() {
-        all_sans.push(rcgen::SanType::DnsName(ia5));
-    }
+    let common_san = common_name.to_string().try_into().map_err(|error| {
+        CaError::InvalidInput(format!(
+            "invalid common-name DNS SAN {common_name:?}: {error}"
+        ))
+    })?;
+    all_sans.push(rcgen::SanType::DnsName(common_san));
     params.subject_alt_names = all_sans;
 
-    params.not_before = rcgen::date_time_ymd(
-        time_to_year(SystemTime::now()),
-        time_to_month(SystemTime::now()),
-        time_to_day(SystemTime::now()),
-    );
-    let not_after_time = SystemTime::now() + lifetime;
-    params.not_after = rcgen::date_time_ymd(
-        time_to_year(not_after_time),
-        time_to_month(not_after_time),
-        time_to_day(not_after_time),
-    );
+    set_validity(&mut params, lifetime)?;
+    bound_leaf_validity(&mut params, ca_params)?;
 
     let ca_cert = ca_params
         .clone()
@@ -296,7 +331,7 @@ pub fn issue_end_entity_cert(
         .map_err(|e| CaError::SignFailed(e.to_string()))?;
     let certificate_der = certificate.der().to_vec();
 
-    Ok((certificate_der, private_key_der, serial))
+    Ok((certificate_der, private_key_der))
 }
 
 /// Issue a node certificate signed by the Node CA. Convenience wrapper
@@ -315,7 +350,8 @@ pub fn issue_node_cert(
     let key_pair = KeyPair::generate_for(&rcgen::PKCS_ECDSA_P256_SHA256)
         .map_err(|e| CaError::KeyGenFailed(e.to_string()))?;
     let private_key_der = key_pair.serialize_der();
-    let params = node_cert_params(node_id, serial)?;
+    let mut params = node_cert_params(node_id, serial)?;
+    bound_leaf_validity(&mut params, ca_params)?;
 
     let ca_cert = ca_params
         .clone()
@@ -349,7 +385,8 @@ pub fn sign_node_csr(
     let csr_params = rcgen::CertificateSigningRequestParams::from_der(&csr_der_ref)
         .map_err(|e| CaError::SignFailed(format!("failed to parse node CSR: {e}")))?;
 
-    let params = node_cert_params(node_id, serial)?;
+    let mut params = node_cert_params(node_id, serial)?;
+    bound_leaf_validity(&mut params, ca_params)?;
     let ca_cert = ca_params
         .clone()
         .self_signed(ca_keypair)
@@ -359,6 +396,19 @@ pub fn sign_node_csr(
         .map_err(|e| CaError::SignFailed(e.to_string()))?;
 
     Ok((certificate.der().to_vec(), serial))
+}
+
+fn bound_leaf_validity(
+    params: &mut CertificateParams,
+    issuer: &CertificateParams,
+) -> Result<(), CaError> {
+    if params.not_before < issuer.not_before || params.not_before >= issuer.not_after {
+        return Err(CaError::InvalidInput(
+            "issuer is outside its validity period".into(),
+        ));
+    }
+    params.not_after = params.not_after.min(issuer.not_after);
+    Ok(())
 }
 
 /// Build the certificate params for a node certificate (shared by the
@@ -393,17 +443,7 @@ fn node_cert_params(node_id: &str, serial: SerialNumber) -> Result<CertificatePa
     }
     params.subject_alt_names = sans;
 
-    params.not_before = rcgen::date_time_ymd(
-        time_to_year(SystemTime::now()),
-        time_to_month(SystemTime::now()),
-        time_to_day(SystemTime::now()),
-    );
-    let not_after_time = SystemTime::now() + lifetime;
-    params.not_after = rcgen::date_time_ymd(
-        time_to_year(not_after_time),
-        time_to_month(not_after_time),
-        time_to_day(not_after_time),
-    );
+    set_validity(&mut params, lifetime)?;
     Ok(params)
 }
 
@@ -567,67 +607,113 @@ fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
 }
 
 // ---------------------------------------------------------------------------
-// Time helpers (rcgen needs year/month/day)
+// Precise validity shared by all CA and node issuance paths.
 // ---------------------------------------------------------------------------
 
-fn system_time_to_date_components(t: SystemTime) -> (i32, u8, u8) {
-    let duration = t
-        .duration_since(SystemTime::UNIX_EPOCH)
-        .unwrap_or(Duration::ZERO);
-    let secs = duration.as_secs() as i64;
-
-    // Simple conversion — good enough for certificate dates.
-    // Days since epoch
-    let days = secs / 86400;
-    // Approximate year (each year ~ 365.25 days)
-    let mut year = 1970 + (days / 365) as i32;
-    let mut day_of_year = days - ((year - 1970) as i64 * 365 + ((year - 1969) / 4) as i64);
-
-    // Correct for leap year drift
-    while day_of_year < 0 {
-        year -= 1;
-        day_of_year = days - ((year - 1970) as i64 * 365 + ((year - 1969) / 4) as i64);
-    }
-
-    let is_leap = (year % 4 == 0 && year % 100 != 0) || (year % 400 == 0);
-    let month_days: [i64; 12] = if is_leap {
-        [31, 29, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31]
-    } else {
-        [31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31]
-    };
-
-    let mut month = 0u8;
-    let mut remaining = day_of_year;
-    for (i, &md) in month_days.iter().enumerate() {
-        if remaining < md {
-            month = (i + 1) as u8;
-            break;
-        }
-        remaining -= md;
-    }
-    if month == 0 {
-        month = 12;
-    }
-    let day = (remaining + 1).max(1) as u8;
-
-    (year, month, day)
-}
-
-fn time_to_year(t: SystemTime) -> i32 {
-    system_time_to_date_components(t).0
-}
-
-fn time_to_month(t: SystemTime) -> u8 {
-    system_time_to_date_components(t).1
-}
-
-fn time_to_day(t: SystemTime) -> u8 {
-    system_time_to_date_components(t).2
+fn set_validity(params: &mut CertificateParams, lifetime: Duration) -> Result<(), CaError> {
+    // X.509 encodes whole seconds. Use that same instant for storage metadata.
+    let now = time::OffsetDateTime::now_utc();
+    let not_before = time::OffsetDateTime::from_unix_timestamp(now.unix_timestamp())
+        .map_err(|error| CaError::CertGenFailed(error.to_string()))?;
+    let lifetime = time::Duration::try_from(lifetime)
+        .map_err(|_| CaError::CertGenFailed("certificate lifetime is out of range".into()))?;
+    let not_after = not_before
+        .checked_add(lifetime)
+        .filter(|end| end.unix_timestamp() > not_before.unix_timestamp())
+        .ok_or_else(|| {
+            CaError::CertGenFailed(
+                "certificate lifetime must be at least one second and fit the supported date range"
+                    .into(),
+            )
+        })?;
+    params.not_before = not_before;
+    params.not_after = time::OffsetDateTime::from_unix_timestamp(not_after.unix_timestamp())
+        .map_err(|error| CaError::CertGenFailed(error.to_string()))?;
+    Ok(())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::time::SystemTime;
+
+    #[test]
+    fn invalid_certificate_names_return_errors() {
+        let root = generate_root_ca("test", SerialNumber(1)).unwrap();
+        assert!(
+            issue_end_entity_cert(
+                "api.test",
+                SerialNumber(2),
+                Duration::from_secs(90),
+                &["☃.test".to_string()],
+                &[],
+                &root.signing_keypair,
+                &root.certificate_params
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn root_role_is_refused_as_an_intermediate() {
+        let root = generate_root_ca("test", SerialNumber(1)).unwrap();
+        assert!(
+            generate_intermediate_ca(
+                CaRole::Root,
+                "test",
+                SerialNumber(2),
+                root.ca.serial,
+                &root.signing_keypair,
+                &root.certificate_params,
+                b"test"
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn short_lived_certificates_retain_their_full_validity_window() {
+        let root = generate_root_ca("test", SerialNumber(1)).unwrap();
+        let (der, _, _) = issue_end_entity_cert(
+            "api.test",
+            SerialNumber(2),
+            Duration::from_secs(90),
+            &[],
+            &[ExtendedKeyUsagePurpose::ServerAuth],
+            &root.signing_keypair,
+            &root.certificate_params,
+        )
+        .unwrap();
+        let (_, cert) = x509_parser::parse_x509_certificate(&der).unwrap();
+        let now = SystemTime::now()
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .unwrap()
+            .as_secs() as i64;
+        assert!(cert.validity().not_before.timestamp() <= now);
+        assert!(cert.validity().not_after.timestamp() >= now + 89);
+        assert_eq!(
+            cert.validity().not_after.timestamp() - cert.validity().not_before.timestamp(),
+            90
+        );
+        let (_, parsed_root) =
+            x509_parser::parse_x509_certificate(&root.ca.certificate_der).unwrap();
+        assert_eq!(
+            parsed_root.validity().not_before.timestamp(),
+            root.ca
+                .not_before
+                .duration_since(SystemTime::UNIX_EPOCH)
+                .unwrap()
+                .as_secs() as i64
+        );
+        assert_eq!(
+            parsed_root.validity().not_after.timestamp(),
+            root.ca
+                .not_after
+                .duration_since(SystemTime::UNIX_EPOCH)
+                .unwrap()
+                .as_secs() as i64
+        );
+    }
 
     #[test]
     fn generate_root_ca_produces_valid_cert() {

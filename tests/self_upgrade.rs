@@ -45,6 +45,10 @@ impl RealNodeHarness {
     /// v0.2.0 (copies of the compiled test binary), and start the
     /// supervisor loop with the symlink on v0.1.0.
     async fn start() -> Self {
+        Self::start_with_cluster(false).await
+    }
+
+    async fn start_with_cluster(cluster: bool) -> Self {
         let root = tempfile::tempdir().unwrap();
         let bin_dir = root.path().join("bin");
         let data_dir = root.path().join("data");
@@ -58,14 +62,11 @@ impl RealNodeHarness {
         install_version(&bin_dir, "v0.2.0");
         std::os::unix::fs::symlink("bun-v0.1.0", bin_dir.join("bun")).unwrap();
 
-        // Grab free ports for the API and the Pickle registry
-        // (bind-then-release; races are possible but rare enough for tests).
+        // Keep the API reservation while allocating the cluster transports;
+        // early release can select the same TCP port for two services. Pickle
+        // is not addressed by this fixture, so Bun can bind its actual port zero.
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let api = listener.local_addr().unwrap().to_string();
-        let registry_listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-        let registry_port = registry_listener.local_addr().unwrap().port();
-        drop(listener);
-        drop(registry_listener);
 
         let config_path = root.path().join("node.toml");
         std::fs::write(
@@ -81,7 +82,7 @@ volumes = "{root}/volumes"
 
 [images]
 registry_bind = "127.0.0.1"
-registry_port = {registry_port}
+registry_port = 0
 
 [upgrades]
 binary_dir = "{bin}"
@@ -101,6 +102,22 @@ retain_versions = 3
         )
         .unwrap();
 
+        let cluster_sockets = if cluster {
+            // A real cluster-mode process with no reachable peer. Local API
+            // health must not allow its replacement to commit an upgrade.
+            use std::io::Write;
+            let gossip = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+            let raft = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            let reporting = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            writeln!(std::fs::OpenOptions::new().append(true).open(&config_path).unwrap(),
+                "\n[cluster]\ngossip_port = {}\nraft_port = {}\nreporting_port = {}\n[network]\nadvertise_address = \"127.0.0.1\"",
+                gossip.local_addr().unwrap().port(), raft.local_addr().unwrap().port(),
+                reporting.local_addr().unwrap().port()).unwrap();
+            Some((gossip, raft, reporting))
+        } else {
+            None
+        };
+
         // The supervisor: spawn the symlink, respawn on exit. On a
         // successful upgrade the exec keeps the pid, so wait() simply keeps
         // waiting; only crashes (and reverts' exit(1)) come through here.
@@ -109,8 +126,16 @@ retain_versions = 3
         let listen = api.clone();
         let supervisor_config = config_path.clone();
         let supervisor = tokio::spawn(async move {
+            // Release only once every fixed address is chosen and immediately
+            // before launch. Replacements deliberately reuse those addresses.
+            drop(listener);
+            drop(cluster_sockets);
             loop {
-                let mut child = tokio::process::Command::new(&symlink)
+                let mut command = tokio::process::Command::new(&symlink);
+                if cluster {
+                    command.arg("--cluster");
+                }
+                let mut child = command
                     .arg("--config")
                     .arg(&supervisor_config)
                     .arg("--listen")
@@ -367,6 +392,8 @@ async fn single_node_upgrade_preserves_running_containers() {
     assert_eq!(harness.version().await.as_deref(), Some("v0.1.0"));
 
     harness.deploy_testapp("web", 46011).await;
+    // Preserve an actual canary generation across exec, then replace it again.
+    harness.deploy_testapp("web", 46012).await;
     let pid_before = harness.workload_pid("web").await.expect("workload pid");
 
     let directive = harness.directive("v0.2.0", "up-1");
@@ -381,7 +408,7 @@ async fn single_node_upgrade_preserves_running_containers() {
         pid_before, pid_after,
         "workload was restarted by the upgrade"
     );
-    let response = reqwest::get("http://127.0.0.1:46011/").await;
+    let response = reqwest::get("http://127.0.0.1:46012/").await;
     assert!(
         response.is_ok(),
         "workload stopped serving after the upgrade"
@@ -392,6 +419,27 @@ async fn single_node_upgrade_preserves_running_containers() {
     assert_eq!(target, Path::new("bun-v0.2.0"));
     assert!(!harness.data_dir.join("upgrade/marker.json").exists());
 
+    harness.deploy_testapp("web", 46013).await;
+    let status: serde_json::Value = harness
+        .client
+        .get(harness.url("/v1/status"))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let web = status
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|instance| instance["app_name"] == "web")
+        .unwrap();
+    assert_eq!(
+        web["id"], "default__web-g2-0",
+        "replacement reused an adopted generation: {status}"
+    );
+    assert_ne!(harness.workload_pid("web").await, Some(pid_after));
     harness.shutdown().await;
 }
 
@@ -540,5 +588,36 @@ async fn upgrade_rejects_bad_external_signature() {
     assert_eq!(target, Path::new("bun-v0.1.0"));
     assert!(!harness.data_dir.join("upgrade/marker.json").exists());
 
+    harness.shutdown().await;
+}
+
+#[tokio::test]
+#[ignore = "requires RELIABURGER_UPGRADE_TESTS=1 and real bun processes"]
+async fn isolated_replacement_reverts_without_restarting_its_workload() {
+    assert!(upgrade_tests_enabled());
+    let _serial = SERIAL.lock().await;
+    let mut harness = RealNodeHarness::start_with_cluster(true).await;
+    harness.deploy_testapp("rejoin", 46071).await;
+    let pid = harness.workload_pid("rejoin").await.unwrap();
+    assert_eq!(
+        harness
+            .post_upgrade(&harness.directive("v0.2.0", "no-rejoin"))
+            .await,
+        202
+    );
+    harness.wait_for_version("v0.2.0").await;
+    harness.wait_healthy().await;
+    tokio::time::sleep(Duration::from_secs(2)).await;
+    assert!(
+        harness.data_dir.join("upgrade/marker.json").exists(),
+        "local health and boot grace must not commit without a peer"
+    );
+    harness.wait_for_version("v0.1.0").await;
+    harness.wait_upgrade_settled().await;
+    assert_eq!(harness.workload_pid("rejoin").await, Some(pid));
+    assert_eq!(
+        std::fs::read_link(harness.bin_dir.join("bun")).unwrap(),
+        Path::new("bun-v0.1.0")
+    );
     harness.shutdown().await;
 }

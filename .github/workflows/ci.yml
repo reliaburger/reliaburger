@@ -5,7 +5,13 @@ on:
   push:
     branches: [main]
   pull_request:
-    branches: [main]
+    branches: [main, "codex/**"]
+
+# PR updates supersede earlier checks. Main/tag runs each retain their own group.
+# Fixed prefixes also keep reusable source CI separate from its release caller.
+concurrency:
+  group: source-ci-${{ github.event.pull_request.number || github.run_id }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 permissions:
   contents: read
@@ -23,15 +29,42 @@ jobs:
       - uses: taiki-e/install-action@cargo-audit
       - run: make audit
 
+  minimum-rust:
+    name: minimum Rust 1.97.0
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.97.0
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-nextest@0.9.145
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: minimum-rust-1.97.0
+      - name: Prepare portable build host
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get remove -y -qq buildah
+          sudo apt-get install -y -qq clang libbpf-dev llvm
+      - name: Check every target and feature with the locked graph
+        run: cargo check --locked --all-targets --all-features
+      - name: Test the minimum compiler with default features
+        run: cargo nextest run --locked --profile ci --no-tests=fail
+      - name: Test the minimum compiler without default features
+        run: cargo nextest run --locked --profile ci --no-tests=fail --no-default-features
+
   portable:
     name: portable Linux
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@1.98.0
         with:
           components: rustfmt, clippy
-      - uses: taiki-e/install-action@nextest
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-nextest@0.9.145
       - uses: Swatinem/rust-cache@v2
         with:
           key: portable
@@ -68,8 +101,10 @@ jobs:
     timeout-minutes: 20
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: taiki-e/install-action@nextest
+      - uses: dtolnay/rust-toolchain@1.98.0
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-nextest@0.9.145
       - uses: Swatinem/rust-cache@v2
         with:
           key: slow
@@ -81,15 +116,19 @@ jobs:
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: taiki-e/install-action@nextest
+      - uses: dtolnay/rust-toolchain@1.98.0
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-nextest@0.9.145
       - uses: Swatinem/rust-cache@v2
         with:
           key: linux-privileged
       - name: Install runtime and kernel test dependencies
         run: |
           sudo apt-get update -qq
-          sudo apt-get install -y -qq btrfs-progs buildah clang iproute2 libbpf-dev linux-headers-$(uname -r) llvm nftables runc slirp4netns uidmap
+          sudo apt-get install -y -qq btrfs-progs buildah busybox-static gcc clang iproute2 libbpf-dev linux-headers-$(uname -r) llvm nftables runc slirp4netns uidmap
+      - name: Mount persistent BPF storage for kernel recovery tests
+        run: mountpoint -q /sys/fs/bpf || sudo mount -t bpf bpf /sys/fs/bpf
       - name: Permit rootless runc on Ubuntu AppArmor hosts
         run: |
           if sysctl kernel.apparmor_restrict_unprivileged_userns >/dev/null 2>&1; then
@@ -97,6 +136,15 @@ jobs:
           fi
       - name: Prove rootless port adoption
         run: make test-rootless-runc
+      - name: Qualify actual Bun OCI interruptions
+        run: scripts/release/qualify-oci-interruptions.sh
+      - name: Retain OCI interruption evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: oci-interruption-evidence
+          path: /var/tmp/reliaburger-oci-interruptions.*/
+          if-no-files-found: ignore
       - name: Run only provisioned Linux tests
         run: sudo -E env PATH="$PATH" NEXTEST_PROFILE=ci make test-linux
 
@@ -106,8 +154,10 @@ jobs:
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: taiki-e/install-action@nextest
+      - uses: dtolnay/rust-toolchain@1.98.0
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-nextest@0.9.145
       - uses: Swatinem/rust-cache@v2
         with:
           key: cluster
@@ -119,8 +169,10 @@ jobs:
     timeout-minutes: 20
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: taiki-e/install-action@nextest
+      - uses: dtolnay/rust-toolchain@1.98.0
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-nextest@0.9.145
       - uses: Swatinem/rust-cache@v2
         with:
           key: upgrade-node
@@ -132,8 +184,10 @@ jobs:
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: taiki-e/install-action@nextest
+      - uses: dtolnay/rust-toolchain@1.98.0
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-nextest@0.9.145
       - uses: Swatinem/rust-cache@v2
         with:
           key: upgrade-cluster
@@ -144,10 +198,12 @@ jobs:
     runs-on: macos-15
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@1.98.0
         with:
           components: clippy
-      - uses: taiki-e/install-action@nextest
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-nextest@0.9.145
       - uses: Swatinem/rust-cache@v2
         with:
           key: macos-portable
@@ -161,10 +217,12 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@1.98.0
         with:
           components: llvm-tools-preview
-      - uses: taiki-e/install-action@nextest
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-nextest@0.9.145
       - uses: taiki-e/install-action@cargo-llvm-cov
       - uses: Swatinem/rust-cache@v2
         with:
@@ -184,7 +242,7 @@ jobs:
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@1.98.0
       - uses: Swatinem/rust-cache@v2
         with:
           key: benchmark-fast
@@ -201,7 +259,7 @@ jobs:
     timeout-minutes: 45
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@1.98.0
       - uses: Swatinem/rust-cache@v2
         with:
           key: benchmark-large
@@ -218,7 +276,7 @@ jobs:
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@1.98.0
       - uses: Swatinem/rust-cache@v2
         with:
           key: scale-10k

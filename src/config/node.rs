@@ -102,9 +102,6 @@ pub struct DnsSection {
     pub listen: String,
     /// Upstream resolver for non-`.internal` names.
     pub upstream: String,
-    /// Namespace a bare `<app>.internal` query resolves within. Fully
-    /// qualified `<app>.<namespace>.internal` queries ignore it.
-    pub default_namespace: String,
     /// Restrict the `.internal` zone to container-reachable (loopback /
     /// private-range) sources. On by default so the internal topology
     /// isn't exposed to public clients; disable only for debugging.
@@ -117,7 +114,6 @@ impl Default for DnsSection {
             enabled: false,
             listen: "0.0.0.0:53".to_string(),
             upstream: "8.8.8.8:53".to_string(),
-            default_namespace: "default".to_string(),
             restrict_sources: true,
         }
     }
@@ -146,7 +142,10 @@ impl DnsSection {
             listen_addr,
             upstream,
             upstream_timeout: std::time::Duration::from_secs(2),
-            default_namespace: self.default_namespace.clone(),
+            source_namespaces: tokio::sync::watch::channel(
+                crate::onion::dns::DnsSourceNamespaces::default(),
+            )
+            .1,
             source_acl: crate::onion::dns::SourceAcl {
                 restrict_to_private: self.restrict_sources,
             },
@@ -255,7 +254,6 @@ impl IngressSection {
             http_port: self.http_port,
             https_port: self.https_port,
             max_connections: self.max_connections,
-            worker_threads: 4,
             tls_cert_path: self.tls_cert.clone(),
             tls_key_path: self.tls_key.clone(),
             ..crate::wrapper::types::WrapperConfig::default()
@@ -311,10 +309,6 @@ pub struct UpgradeSection {
     pub external_signing_key: Option<String>,
     /// Number of previous binary versions to retain on disk for rollback.
     pub retain_versions: u32,
-    /// Default release-metadata endpoint. Reserved: `relish upgrade check`
-    /// currently takes its own `--url` (defaulting to a compiled-in constant)
-    /// and does not read this node-config value.
-    pub release_url: String,
     /// Directory holding the versioned binaries and the entry symlink.
     /// Defaults to the directory of the resolved current executable.
     pub binary_dir: Option<PathBuf>,
@@ -322,8 +316,8 @@ pub struct UpgradeSection {
     /// swap counts as verified.
     pub boot_grace_secs: u64,
     /// Seconds the new binary has to rejoin gossip (cluster mode only).
-    /// Reserved: parsed but not yet enforced (TODO Phase 14 — the cluster-mode
-    /// upgrade-verify path does not yet require a gossip rejoin).
+    /// Requires a direct peer acknowledgement from the replacement process;
+    /// isolated cluster nodes revert even when their local API is healthy.
     pub gossip_rejoin_secs: u64,
     /// Boot attempts on the new version before automatic revert.
     pub max_boot_attempts: u32,
@@ -338,7 +332,6 @@ impl Default for UpgradeSection {
         Self {
             external_signing_key: None,
             retain_versions: 3,
-            release_url: crate::upgrade::metadata::DEFAULT_RELEASE_URL.to_string(),
             binary_dir: None,
             boot_grace_secs: 30,
             gossip_rejoin_secs: 60,
@@ -535,9 +528,9 @@ impl Default for PortRange {
 pub struct ReportingTreeSection {
     /// How often worker nodes send StateReports (seconds).
     pub report_interval_secs: u64,
-    /// Maximum events in a single report's event log. Reserved: plumbed into
-    /// ClusterParams but not yet enforced — the worker does not currently
-    /// truncate a report's event log to this cap.
+    /// Fixed admission limit of 100 events per report. Other values refuse
+    /// configuration validation; oversized reports refuse without truncation.
+    /// The current agent does not populate the event log (future F06).
     pub max_events_per_report: usize,
     /// Time after which a report is considered stale (seconds).
     pub stale_report_timeout_secs: u64,
@@ -874,6 +867,21 @@ pub struct AlertDestination {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn node_config_rejects_ignored_release_endpoint() {
+        let error = NodeConfig::parse(
+            "[upgrades]\nrelease_url = 'https://example.invalid/metadata.json'\n",
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("release_url"));
+    }
+
+    #[test]
+    fn dns_rejects_node_default_namespace_override() {
+        let error = NodeConfig::parse("[dns]\ndefault_namespace = \"payments\"\n").unwrap_err();
+        assert!(error.to_string().contains("default_namespace"));
+    }
 
     #[test]
     fn parse_node_config_all_defaults() {

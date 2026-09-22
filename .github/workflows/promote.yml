@@ -1,0 +1,70 @@
+name: Promote qualified release
+
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Existing version tag pointing to the qualified candidate commit
+        required: true
+        type: string
+      candidate_run:
+        description: Successful manual Build & Release run that produced the candidate
+        required: true
+        type: string
+      qualified_digest:
+        description: SHA-256 of candidate.json recorded during completed qualification
+        required: true
+        type: string
+
+permissions:
+  contents: read
+  actions: read
+
+concurrency:
+  group: promote-release-${{ inputs.tag }}
+  cancel-in-progress: false
+
+jobs:
+  promote:
+    if: github.ref == 'refs/heads/main'
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+      actions: read
+    env:
+      GH_TOKEN: ${{ github.token }}
+      RELEASE_TAG: ${{ inputs.tag }}
+      RELEASE_REPOSITORY: ${{ github.repository }}
+      CANDIDATE_RUN: ${{ inputs.candidate_run }}
+      QUALIFIED_DIGEST: ${{ inputs.qualified_digest }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: refs/tags/${{ inputs.tag }}
+      - name: Check version and capture the tagged source commit
+        run: |
+          python3 - <<'PYCODE'
+          import os, tomllib
+          with open("Cargo.toml", "rb") as source:
+              expected = "v" + tomllib.load(source)["package"]["version"]
+          assert os.environ["RELEASE_TAG"] == expected, f"tag must match {expected}"
+          PYCODE
+          printf 'CANDIDATE_COMMIT=%s\n' "$(git rev-parse HEAD)" >> "$GITHUB_ENV"
+      - name: Download and verify the qualified candidate
+        run: |
+          python3 scripts/release/candidate.py fetch --directory dist \
+            --version "$RELEASE_TAG" --repository "$RELEASE_REPOSITORY" \
+            --commit "$CANDIDATE_COMMIT" --run-id "$CANDIDATE_RUN" \
+            --qualified-digest "$QUALIFIED_DIGEST"
+      - name: Upload unchanged assets to a new draft
+        run: |
+          gh release create "$RELEASE_TAG" --repo "$RELEASE_REPOSITORY" \
+            --verify-tag --draft --title "$RELEASE_TAG" --generate-notes dist/*
+      - name: Verify uploaded assets and publish
+        run: |
+          python3 scripts/release/candidate.py verify-upload --directory dist \
+            --version "$RELEASE_TAG" --repository "$RELEASE_REPOSITORY" \
+            --commit "$CANDIDATE_COMMIT" --run-id "$CANDIDATE_RUN" \
+            --qualified-digest "$QUALIFIED_DIGEST"
+          gh release edit "$RELEASE_TAG" --repo "$RELEASE_REPOSITORY" \
+            --verify-tag --draft=false --latest

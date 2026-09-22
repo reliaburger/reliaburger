@@ -22,6 +22,7 @@ struct {
     __type(key, struct backend_key);
     __type(value, struct backend_value);
     __uint(map_flags, BPF_F_NO_PREALLOC);
+    RELIABURGER_MAP_PINNING
 } backend_map SEC(".maps");
 
 struct {
@@ -30,6 +31,7 @@ struct {
     __type(key, struct firewall_key);
     __type(value, struct firewall_value);
     __uint(map_flags, BPF_F_NO_PREALLOC);
+    RELIABURGER_MAP_PINNING
 } firewall_map SEC(".maps");
 
 struct {
@@ -38,6 +40,7 @@ struct {
     __type(key, struct cgroup_ns_key);
     __type(value, struct cgroup_ns_value);
     __uint(map_flags, BPF_F_NO_PREALLOC);
+    RELIABURGER_MAP_PINNING
 } cgroup_namespace_map SEC(".maps");
 
 /* ---------- Egress allowlist map ---------------------------------------- */
@@ -48,6 +51,7 @@ struct {
     __type(key, struct egress_key);
     __type(value, struct egress_value);
     __uint(map_flags, BPF_F_NO_PREALLOC);
+    RELIABURGER_MAP_PINNING
 } egress_map SEC(".maps");
 
 /* Exact IPv6 destinations. Same semantics as egress_map. */
@@ -57,6 +61,7 @@ struct {
     __type(key, struct egress6_key);
     __type(value, struct egress_value);
     __uint(map_flags, BPF_F_NO_PREALLOC);
+    RELIABURGER_MAP_PINNING
 } egress6_map SEC(".maps");
 
 /* CIDR allowlists per family. LPM tries: a lookup returns the entry with
@@ -68,6 +73,7 @@ struct {
     __type(key, struct egress_cidr4_key);
     __type(value, struct egress_cidr_value);
     __uint(map_flags, BPF_F_NO_PREALLOC);
+    RELIABURGER_MAP_PINNING
 } egress_cidr4_map SEC(".maps");
 
 struct {
@@ -76,6 +82,7 @@ struct {
     __type(key, struct egress_cidr6_key);
     __type(value, struct egress_cidr_value);
     __uint(map_flags, BPF_F_NO_PREALLOC);
+    RELIABURGER_MAP_PINNING
 } egress_cidr6_map SEC(".maps");
 
 /* Per-cgroup flag: 1 = egress enforcement active for this cgroup.
@@ -86,6 +93,7 @@ struct {
     __type(key, __u64);         /* cgroup ID */
     __type(value, __u32);       /* 1 = enforce egress */
     __uint(map_flags, BPF_F_NO_PREALLOC);
+    RELIABURGER_MAP_PINNING
 } egress_enabled_map SEC(".maps");
 
 /* ---------- Egress policy helpers ---------------------------------------- */
@@ -189,6 +197,7 @@ struct {
     __type(key, struct fault_connect_key);
     __type(value, struct fault_connect_value);
     __uint(map_flags, BPF_F_NO_PREALLOC);
+    RELIABURGER_MAP_PINNING
 } fault_connect_map SEC(".maps");
 
 /* fault_state_map is not defined here — we use bpf_get_prandom_u32()

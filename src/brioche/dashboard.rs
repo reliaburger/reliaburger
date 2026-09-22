@@ -44,6 +44,9 @@ pub struct DashboardNode {
 /// An alert row in the dashboard.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DashboardAlert {
+    /// Labels identifying the firing series.
+    #[serde(default)]
+    pub labels: std::collections::BTreeMap<String, String>,
     pub name: String,
     pub severity: String,
     pub description: String,
@@ -222,6 +225,7 @@ mod tests {
         let data = DashboardData {
             alert_count: 1,
             alerts: vec![DashboardAlert {
+                labels: std::collections::BTreeMap::from([("node".into(), "hot-<a>".into())]),
                 name: "cpu_throttle".to_string(),
                 severity: "Critical".to_string(),
                 description: "CPU above 90%".to_string(),
@@ -230,6 +234,8 @@ mod tests {
         };
         let html = render_dashboard(&data);
         assert!(html.contains("cpu_throttle"));
+        assert!(html.contains("hot-&lt;a&gt;"));
+        assert!(!html.contains("hot-<a>"));
         assert!(html.contains("Critical"));
         assert!(!html.contains("none active"));
     }

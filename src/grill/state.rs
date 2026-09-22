@@ -36,15 +36,20 @@ impl ContainerState {
         matches!(
             (self, next),
             (ContainerState::Pending, ContainerState::Preparing)
+                | (ContainerState::Pending, ContainerState::Stopping)
                 | (ContainerState::Preparing, ContainerState::Initialising)
                 | (ContainerState::Preparing, ContainerState::Starting)
                 | (ContainerState::Preparing, ContainerState::Failed)
+                | (ContainerState::Preparing, ContainerState::Stopping)
                 | (ContainerState::Initialising, ContainerState::Starting)
                 | (ContainerState::Initialising, ContainerState::Failed)
+                | (ContainerState::Initialising, ContainerState::Stopping)
                 | (ContainerState::Starting, ContainerState::HealthWait)
                 | (ContainerState::Starting, ContainerState::Failed)
+                | (ContainerState::Starting, ContainerState::Stopping)
                 | (ContainerState::HealthWait, ContainerState::Running)
                 | (ContainerState::HealthWait, ContainerState::Failed)
+                | (ContainerState::HealthWait, ContainerState::Stopping)
                 | (ContainerState::Running, ContainerState::Unhealthy)
                 | (ContainerState::Running, ContainerState::Stopping)
                 | (ContainerState::Unhealthy, ContainerState::Running)
@@ -207,8 +212,8 @@ mod tests {
     }
 
     #[test]
-    fn health_wait_to_stopping_rejected() {
-        assert!(!ContainerState::HealthWait.can_transition_to(ContainerState::Stopping));
+    fn health_wait_can_be_stopped() {
+        assert!(ContainerState::HealthWait.can_transition_to(ContainerState::Stopping));
     }
 
     #[test]

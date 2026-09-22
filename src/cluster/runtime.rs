@@ -40,7 +40,7 @@ use crate::mustard::protocol::MustardNode;
 use crate::mustard::state::NodeState;
 use crate::mustard::transport::UdpMustardTransport;
 use crate::reporting::aggregator::{AggregatedState, ReportAggregator};
-use crate::reporting::transport::TcpReportingTransport;
+use crate::reporting::transport::{TcpReportingSender, TcpReportingTransport};
 use crate::reporting::worker::ReportWorker;
 
 /// How often the leader reconciles the council against gossip membership.
@@ -55,6 +55,8 @@ const RECONCILE_OP_TIMEOUT: Duration = Duration::from_secs(5);
 /// working, and exposes the local reporting aggregator's view. The spawned
 /// tasks stop when the shared `CancellationToken` is cancelled.
 pub struct ClusterRuntime {
+    /// Fresh peer acknowledgement from this process, never restored membership.
+    pub gossip_rejoined_rx: watch::Receiver<bool>,
     /// This node's reporting aggregator view. Only meaningful on the leader
     /// (the flat-star topology has every node report to the leader), where it
     /// holds the latest state report from every node.
@@ -102,7 +104,7 @@ pub struct ClusterParams {
     /// This node's mTLS identity. When set, the Raft RPC listener requires
     /// client certificates and peers are dialled over mTLS. `None` keeps the
     /// internal transports plaintext (the caller enforces `require_mtls`).
-    pub identity: Option<Arc<crate::sesame::identity_store::NodeIdentity>>,
+    pub identity: Option<crate::sesame::credentials::LiveNodeIdentity>,
     /// Encrypted external council backup (`[cluster.backup]`, 12b.2 D21/CP12).
     /// The leader-only export loop runs when `url` is set and a master key is
     /// available to seal with.
@@ -235,6 +237,8 @@ pub async fn start(
 
     let (membership_tx, membership_rx) = watch::channel::<Vec<MembershipSnapshot>>(Vec::new());
     node.set_membership_watch(membership_tx);
+    let (rejoin_tx, gossip_rejoined_rx) = watch::channel(false);
+    node.set_rejoin_watch(rejoin_tx);
 
     // Control-plane directory (12b.2): every datagram this node sends
     // advertises its API and reporting endpoints, plus the best leader hint
@@ -311,15 +315,16 @@ pub async fn start(
     let (raft_acceptor, raft_connector, raft_tls_material) = match &params.identity {
         Some(identity) => {
             let server =
-                crate::sesame::mtls::build_mtls_server_config(identity, crl_handle.clone())
+                crate::sesame::mtls::build_live_mtls_server_config(identity, crl_handle.clone())
                     .map_err(|e| std::io::Error::other(format!("mTLS server config: {e}")))?;
-            let client =
-                crate::sesame::mtls::build_mtls_client_config(identity, crl_handle.clone())
-                    .map_err(|e| std::io::Error::other(format!("mTLS client config: {e}")))?;
-            let material = crate::council::network::RaftTlsMaterial::new(
-                (**identity).clone(),
+            let client = crate::sesame::mtls::build_live_mtls_client_config(
+                identity,
                 crl_handle.clone(),
-            );
+                None,
+            )
+            .map_err(|e| std::io::Error::other(format!("mTLS client config: {e}")))?;
+            let material =
+                crate::council::network::RaftTlsMaterial::new(identity.clone(), crl_handle.clone());
             (
                 Some(tokio_rustls::TlsAcceptor::from(server)),
                 Some(tokio_rustls::TlsConnector::from(client)),
@@ -563,17 +568,9 @@ pub async fn start(
     );
 
     // Worker: snapshots this node's state (via the agent) and sends it to the
-    // leader. Binds an ephemeral port — it only sends; replies are ignored.
+    // leader. It has no listener: replies are not part of this protocol.
     let (snapshot_tx, snapshot_rx) = mpsc::channel(16);
-    let worker_transport = TcpReportingTransport::bind_tls_with_node_gate(
-        SocketAddr::new(params.gossip_addr.ip(), 0),
-        shutdown.clone(),
-        raft_acceptor.clone(),
-        raft_connector.clone(),
-        node_gate.clone(),
-    )
-    .await
-    .map_err(|e| std::io::Error::other(format!("reporting worker bind failed: {e}")))?;
+    let worker_transport = TcpReportingSender::new(raft_connector.clone(), node_gate.clone());
     let rollup_council_rx = council_rx.clone();
     let mut worker = ReportWorker::new(
         NodeId::new(&params.node_name),
@@ -590,15 +587,7 @@ pub async fn start(
     // Rollup worker: pushes this node's metric rollups to the leader,
     // where the aggregator ingests them into the rollup store.
     if let Some(mayo) = params.mayo.clone() {
-        let rollup_transport = TcpReportingTransport::bind_tls_with_node_gate(
-            SocketAddr::new(params.gossip_addr.ip(), 0),
-            shutdown.clone(),
-            raft_acceptor.clone(),
-            raft_connector.clone(),
-            node_gate.clone(),
-        )
-        .await
-        .map_err(|e| std::io::Error::other(format!("rollup worker bind failed: {e}")))?;
+        let rollup_transport = TcpReportingSender::new(raft_connector.clone(), node_gate.clone());
         let mut rollup_worker = crate::mayo::rollup_worker::RollupWorker::new(
             NodeId::new(&params.node_name),
             rollup_transport,
@@ -613,6 +602,7 @@ pub async fn start(
     }
 
     let handle = ClusterHandle {
+        local_node_id: NodeId::new(&params.node_name),
         membership_rx,
         raft_metrics_rx: Some(raft_metrics_rx),
         council: Some(council),
@@ -631,6 +621,7 @@ pub async fn start(
     Ok((
         handle,
         ClusterRuntime {
+            gossip_rejoined_rx,
             aggregated_rx,
             rollup_store,
             directory_rx,
@@ -668,7 +659,18 @@ fn spawn_supervised(
     };
     match supervision.readiness {
         Some(evidence) => {
-            crate::bun::readiness::spawn_owned(name, true, evidence, supervision.shutdown, guarded);
+            crate::bun::readiness::spawn_owned(
+                name,
+                true,
+                evidence,
+                supervision.shutdown,
+                move |ready| async move {
+                    // Callers bind transports and construct channel owners before
+                    // passing their run loop to this supervisor.
+                    ready.ready();
+                    guarded.await;
+                },
+            );
         }
         None => {
             tokio::spawn(guarded);
@@ -1168,7 +1170,12 @@ async fn reconcile_council_once(
     disk_pressured: &BTreeSet<u64>,
 ) {
     let now = Instant::now();
-    let snapshot = membership_rx.borrow().clone();
+    let retired = council.security_state().await.crl.retired_nodes;
+    if retired.contains_key(&self_info.name) {
+        return;
+    }
+    let mut snapshot = membership_rx.borrow().clone();
+    snapshot.retain(|member| !retired.contains_key(&member.node_id.0));
     let directory = council_directory(&snapshot, self_id, self_info, port_offset, now);
 
     let metrics = council.metrics().borrow().clone();
@@ -1247,6 +1254,35 @@ async fn reconcile_council_once(
 
     if !council.is_leader().await {
         return;
+    }
+
+    // An operator's committed fence does not need SWIM's failure timeout.
+    // The membership write still passes the shared fault/decommission guard.
+    if !change_in_flight {
+        let retired_ids: BTreeSet<u64> = membership
+            .nodes()
+            .filter(|(_, node)| retired.contains_key(&node.name))
+            .map(|(id, _)| *id)
+            .collect();
+        if !voters.is_disjoint(&retired_ids) {
+            let next = voters.difference(&retired_ids).copied().collect();
+            let result =
+                tokio::time::timeout(config.op_timeout, council.change_membership_evicting(next))
+                    .await;
+            log_membership_op("remove retired voters", result);
+            return;
+        }
+        if let Some(id) = retired_ids.iter().next() {
+            execute_council_action(
+                council,
+                CouncilAction::RemoveLearner(*id),
+                &voters,
+                &directory,
+                config.op_timeout,
+            )
+            .await;
+            return;
+        }
     }
 
     // A pressured leader never plans its own removal; it waits for a follower

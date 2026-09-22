@@ -66,6 +66,9 @@ impl Registry {
             catalog: Arc::new(RwLock::new(catalog)),
             node_raft_id,
             council: None,
+            forwarder: None,
+            test_leases: Default::default(),
+            repository_writers: Default::default(),
             persist_path,
             auth: None,
             require_read_auth: false,
@@ -159,6 +162,57 @@ async fn push_test_image(base_url: &str, repo: &str, tag: &str) -> (Digest, Dige
     (config_digest, layer_digest)
 }
 
+#[tokio::test]
+async fn identical_wire_pushes_keep_independent_repository_metadata() {
+    let registry = Registry::start(42, true).await;
+    let base = registry.base_url();
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(5))
+        .no_proxy()
+        .build()
+        .unwrap();
+    let image = reliaburger::testkit::oci::build_synthetic_image("shared");
+    for repository in ["production/app", "team-copy/app"] {
+        reliaburger::testkit::oci::push_image(&client, &base, repository, "latest", &image)
+            .await
+            .unwrap();
+    }
+    let mut recovered =
+        ManifestCatalog::load_from(registry.state.persist_path.as_ref().unwrap()).unwrap();
+    assert_eq!(recovered.manifests.len(), 2);
+    for repository in ["production/app", "team-copy/app"] {
+        assert_eq!(
+            recovered
+                .get_manifest_by_tag(repository, "latest")
+                .unwrap()
+                .repository,
+            repository
+        );
+    }
+    recovered.apply_delete_tag(&reliaburger::pickle::types::DeleteTag {
+        repository: "team-copy/app".into(),
+        tag: "latest".into(),
+    });
+    *registry.state.catalog.write().await = recovered;
+    let retained =
+        reliaburger::testkit::oci::fetch_manifest(&client, &base, "production/app", "latest")
+            .await
+            .unwrap();
+    assert_eq!(
+        reliaburger::testkit::oci::sha256_digest(&retained),
+        image.manifest_digest
+    );
+    assert_eq!(
+        client
+            .get(format!("{base}/v2/team-copy/app/manifests/latest"))
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        reqwest::StatusCode::NOT_FOUND
+    );
+}
+
 /// L10: pushes must record the pushing node's real raft id as the
 /// holder — not the hardcoded `{0}` they used to.
 #[tokio::test]
@@ -233,6 +287,9 @@ async fn catalog_survives_restart() {
             catalog: Arc::new(RwLock::new(ManifestCatalog::default())),
             node_raft_id: 7,
             council: None,
+            forwarder: None,
+            test_leases: Default::default(),
+            repository_writers: Default::default(),
             persist_path: Some(persist_path.clone()),
             auth: None,
             require_read_auth: false,
@@ -361,6 +418,8 @@ async fn heal_tick_replicates_to_new_peer() {
 
     // Node 2 joins, empty.
     let joiner = Registry::start(2, false).await;
+    // Independent standalone fixtures receive the committed metadata explicitly.
+    *joiner.state.catalog.write().await = catalog.clone();
     let peers = vec![
         Peer {
             node_id: 1,
@@ -374,8 +433,7 @@ async fn heal_tick_replicates_to_new_peer() {
 
     let outcome = heal_tick(
         &catalog,
-        &leader.state.store,
-        1,
+        &leader.state,
         &peers,
         2,
         10,
@@ -388,9 +446,21 @@ async fn heal_tick_replicates_to_new_peer() {
         "heal errors: {:?}",
         outcome.errors
     );
-    assert_eq!(outcome.updates.len(), 1);
-    for (_, holders) in &outcome.updates[0].updates {
-        assert_eq!(holders, &BTreeSet::from([1, 2]));
+    assert_eq!(outcome.confirmed_images.len(), 1);
+    for digest in catalog
+        .get_manifest_by_tag("app", "v1")
+        .unwrap()
+        .referenced_digests()
+    {
+        assert_eq!(
+            joiner
+                .state
+                .catalog
+                .read()
+                .await
+                .layer_holders(digest.as_str()),
+            BTreeSet::from([1, 2])
+        );
     }
 
     let manifest = catalog.get_manifest_by_tag("app", "v1").unwrap().clone();
@@ -414,8 +484,9 @@ async fn heal_tick_pulls_missing_layers_first() {
     push_test_image(&holder.base_url(), "remote", "v1").await;
     let catalog = holder.state.catalog.read().await.clone();
 
-    let leader_dir = tempfile::tempdir().unwrap();
-    let leader_store = BlobStore::new(leader_dir.path());
+    let leader = Registry::start(1, false).await;
+    *leader.state.catalog.write().await = catalog.clone();
+    let leader_store = leader.state.store.clone();
     let peers = vec![Peer {
         node_id: 2,
         base_url: holder.base_url(),
@@ -423,8 +494,7 @@ async fn heal_tick_pulls_missing_layers_first() {
 
     let outcome = heal_tick(
         &catalog,
-        &leader_store,
-        1,
+        &leader.state,
         &peers,
         2,
         10,
@@ -447,10 +517,18 @@ async fn heal_tick_pulls_missing_layers_first() {
         );
     }
 
-    // …and the proposed update records it as a holder alongside node 2.
-    assert_eq!(outcome.updates.len(), 1);
-    for (_, holders) in &outcome.updates[0].updates {
-        assert_eq!(holders, &BTreeSet::from([1, 2]));
+    // The receiving leader publishes itself after verifying all bytes.
+    assert_eq!(outcome.confirmed_images.len(), 1);
+    for digest in manifest.referenced_digests() {
+        assert_eq!(
+            leader
+                .state
+                .catalog
+                .read()
+                .await
+                .layer_holders(digest.as_str()),
+            BTreeSet::from([1, 2])
+        );
     }
 }
 
@@ -499,6 +577,7 @@ fn manifest_with_holders(
     };
     let mut catalog = ManifestCatalog::default();
     catalog.apply_manifest_commit(&ManifestCommit {
+        observed_gc_generation: 0,
         manifest: manifest.clone(),
         tag: "v1".to_string(),
         holder_nodes: holders.iter().copied().collect(),
@@ -906,6 +985,8 @@ async fn heal_tick_respects_per_tick_cap() {
     let catalog = leader.state.catalog.read().await.clone();
 
     let joiner = Registry::start(2, false).await;
+    // Independent standalone fixtures receive the committed metadata explicitly.
+    *joiner.state.catalog.write().await = catalog.clone();
     let peers = vec![
         Peer {
             node_id: 1,
@@ -919,8 +1000,7 @@ async fn heal_tick_respects_per_tick_cap() {
 
     let outcome = heal_tick(
         &catalog,
-        &leader.state.store,
-        1,
+        &leader.state,
         &peers,
         2,
         1,
@@ -930,7 +1010,7 @@ async fn heal_tick_respects_per_tick_cap() {
 
     assert!(outcome.errors.is_empty());
     assert_eq!(
-        outcome.updates.len(),
+        outcome.confirmed_images.len(),
         1,
         "cap of 1 means one manifest per tick"
     );

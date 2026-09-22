@@ -17,6 +17,8 @@ pub struct Deadline {
 pub enum DeadlineError {
     #[error("deadline budget must be greater than zero")]
     ZeroBudget,
+    #[error("deadline budget exceeds the monotonic clock range")]
+    BudgetTooLarge,
     #[error("deadline has already elapsed")]
     Expired,
     #[error("{operation} exceeded its {budget_ms} ms deadline")]
@@ -30,7 +32,9 @@ impl Deadline {
             return Err(DeadlineError::ZeroBudget);
         }
         Ok(Self {
-            expires_at: Instant::now() + budget,
+            expires_at: Instant::now()
+                .checked_add(budget)
+                .ok_or(DeadlineError::BudgetTooLarge)?,
             budget_ms: budget.as_millis().try_into().unwrap_or(u64::MAX),
         })
     }
@@ -45,7 +49,7 @@ impl Deadline {
         if remaining.is_zero() {
             return Err(DeadlineError::Expired);
         }
-        let expires_at = self.expires_at.min(now + maximum);
+        let expires_at = now + maximum.min(remaining);
         Ok(Self {
             expires_at,
             budget_ms: expires_at
@@ -95,6 +99,16 @@ mod tests {
             Deadline::after(Duration::ZERO),
             Err(DeadlineError::ZeroBudget)
         );
+    }
+
+    #[test]
+    fn overflowing_budget_is_an_error_and_large_child_is_bounded() {
+        assert_eq!(
+            Deadline::after(Duration::MAX),
+            Err(DeadlineError::BudgetTooLarge)
+        );
+        let parent = Deadline::after(Duration::from_secs(5)).unwrap();
+        assert!(parent.child(Duration::MAX).unwrap().expires_at() <= parent.expires_at());
     }
 
     #[tokio::test(start_paused = true)]

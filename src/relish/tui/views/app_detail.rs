@@ -33,17 +33,19 @@ pub fn lines(app: &TuiApp, height: usize) -> Vec<Line<'static>> {
         .data
         .instances
         .iter()
-        .filter(|instance| &instance.app_name == name && &instance.namespace == namespace)
+        .filter(|instance| {
+            &instance.instance.app_name == name && &instance.instance.namespace == namespace
+        })
         .collect();
     match tab {
         DetailTab::Overview => {
             let ready = instances
                 .iter()
-                .filter(|instance| instance.state == "running")
+                .filter(|instance| instance.instance.state == "running")
                 .count();
             let restarts: u32 = instances
                 .iter()
-                .map(|instance| instance.restart_count)
+                .map(|instance| instance.instance.restart_count)
                 .sum();
             lines.extend([
                 Line::raw(format!("ready          {ready}/{}", instances.len())),
@@ -53,22 +55,25 @@ pub fn lines(app: &TuiApp, height: usize) -> Vec<Line<'static>> {
         }
         DetailTab::Instances => {
             lines.push(widgets::heading(
-                "ID                       STATE         RESTARTS  HOST PORT  PID",
+                "NODE         ID                       STATE         RESTARTS  HOST PORT  PID",
             ));
             if instances.is_empty() {
                 lines.push(Line::raw("no instances"));
             }
             for instance in instances {
                 lines.push(Line::raw(format!(
-                    "{:<24} {:<13} {:>8}  {:>9}  {}",
-                    instance.id,
-                    instance.state,
-                    instance.restart_count,
+                    "{:<12} {:<24} {:<13} {:>8}  {:>9}  {}",
+                    instance.node,
+                    instance.instance.id,
+                    instance.instance.state,
+                    instance.instance.restart_count,
                     instance
+                        .instance
                         .host_port
                         .map(|port| port.to_string())
                         .unwrap_or_else(|| "-".into()),
                     instance
+                        .instance
                         .pid
                         .map(|pid| pid.to_string())
                         .unwrap_or_else(|| "-".into())
@@ -76,6 +81,7 @@ pub fn lines(app: &TuiApp, height: usize) -> Vec<Line<'static>> {
             }
         }
         DetailTab::Logs => {
+            lines.push(Line::raw("live logs from the connected node"));
             if let Some(error) = &app.log_stream_down {
                 lines.push(Line::raw(format!(
                     "stream disconnected — reconnecting: {error}"
@@ -140,6 +146,7 @@ pub fn lines(app: &TuiApp, height: usize) -> Vec<Line<'static>> {
             }
         }
         DetailTab::Deploys => {
+            lines.push(Line::raw("deployment history from the connected node"));
             let history =
                 app.data
                     .deploy_history
@@ -159,7 +166,7 @@ pub fn lines(app: &TuiApp, height: usize) -> Vec<Line<'static>> {
             lines.push(Line::raw(format!("instances      {}", instances.len())));
             let ports: Vec<_> = instances
                 .iter()
-                .filter_map(|instance| instance.host_port)
+                .filter_map(|instance| instance.instance.host_port)
                 .collect();
             lines.push(Line::raw(format!("host ports     {ports:?}")));
         }

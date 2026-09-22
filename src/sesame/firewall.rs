@@ -69,12 +69,8 @@ pub fn resolve_firewall_rules(
         match &service.firewall_allow_from {
             None => {
                 // Default: allow all apps in the same namespace
-                for other in services {
-                    if other.namespace == service.namespace
-                        && other.app_name != service.app_name
-                        && let Some(cgroups) =
-                            cgroup_ids.get(&(other.namespace.clone(), other.app_name.clone()))
-                    {
+                for ((namespace, app), cgroups) in cgroup_ids {
+                    if namespace == &service.namespace && app != &service.app_name {
                         for &cg in cgroups {
                             rules.push(ResolvedFirewallRule {
                                 src_cgroup_id: cg,
@@ -96,14 +92,8 @@ pub fn resolve_firewall_rules(
                             (service.namespace.as_str(), allowed_name.as_str())
                         };
 
-                    // Find the allowed app's cgroup IDs
-                    let matching_app = services
-                        .iter()
-                        .find(|s| s.app_name == target_app && s.namespace == target_ns);
-
-                    if matching_app.is_some()
-                        && let Some(cgroups) =
-                            cgroup_ids.get(&(target_ns.to_string(), target_app.to_string()))
+                    if let Some(cgroups) =
+                        cgroup_ids.get(&(target_ns.to_string(), target_app.to_string()))
                     {
                         for &cg in cgroups {
                             rules.push(ResolvedFirewallRule {
@@ -123,20 +113,15 @@ pub fn resolve_firewall_rules(
 
 /// Resolve cgroup-to-namespace mappings for all running instances.
 pub fn resolve_cgroup_namespace_entries(
-    services: &[ServiceEntry],
     cgroup_ids: &HashMap<(String, String), Vec<u64>>,
 ) -> Vec<CgroupNamespaceEntry> {
     let mut entries = Vec::new();
-    for service in services {
-        if let Some(cgroups) =
-            cgroup_ids.get(&(service.namespace.clone(), service.app_name.clone()))
-        {
-            for &cg in cgroups {
-                entries.push(CgroupNamespaceEntry {
-                    cgroup_id: cg,
-                    namespace_id: service.namespace_id,
-                });
-            }
+    for ((namespace, _app), cgroups) in cgroup_ids {
+        for &cgroup_id in cgroups {
+            entries.push(CgroupNamespaceEntry {
+                cgroup_id,
+                namespace_id: crate::onion::vip::name_to_id(namespace),
+            });
         }
     }
     entries
@@ -191,6 +176,18 @@ mod maps {
     use super::{FirewallKey, FirewallMapError, FirewallValue, LiveFirewallState};
     use aya::maps::HashMap;
 
+    fn deletion_result(result: Result<(), aya::maps::MapError>) -> Result<(), FirewallMapError> {
+        match result {
+            Ok(()) | Err(aya::maps::MapError::KeyNotFound) => Ok(()),
+            Err(aya::maps::MapError::SyscallError(error))
+                if error.io_error.kind() == std::io::ErrorKind::NotFound =>
+            {
+                Ok(())
+            }
+            Err(error) => Err(error.into()),
+        }
+    }
+
     /// Allow a single `(src_cgroup, dst_app)` cross-namespace connection.
     pub fn write_firewall_entry(
         bpf: &mut aya::Ebpf,
@@ -207,7 +204,7 @@ mod maps {
         Ok(())
     }
 
-    /// Remove a previously written firewall allow entry.
+    /// Remove an allow entry, accepting only confirmed deletion or absence.
     pub fn delete_firewall_entry(
         bpf: &mut aya::Ebpf,
         key: FirewallKey,
@@ -218,8 +215,7 @@ mod maps {
                     map_name: "firewall_map",
                 })?,
         )?;
-        let _ = map.remove(&key);
-        Ok(())
+        deletion_result(map.remove(&key))
     }
 
     /// Record which namespace a cgroup belongs to. Once this is set the
@@ -253,8 +249,7 @@ mod maps {
                     map_name: "cgroup_namespace_map",
                 })?,
         )?;
-        let _ = map.remove(&cgroup_id);
-        Ok(())
+        deletion_result(map.remove(&cgroup_id))
     }
 
     /// List every cgroup id currently recorded in `cgroup_namespace_map`
@@ -270,7 +265,82 @@ mod maps {
                     map_name: "cgroup_namespace_map",
                 })?,
         )?;
-        Ok(map.keys().filter_map(|k| k.ok()).collect())
+        map.keys().collect::<Result<_, _>>().map_err(Into::into)
+    }
+
+    /// Read all firewall keys without treating a failed observation as absence.
+    pub fn list_firewall_keys(
+        bpf: &mut aya::Ebpf,
+    ) -> Result<std::collections::HashSet<FirewallKey>, FirewallMapError> {
+        let map: HashMap<_, FirewallKey, FirewallValue> = HashMap::try_from(
+            bpf.map_mut("firewall_map")
+                .ok_or(FirewallMapError::MapNotFound {
+                    map_name: "firewall_map",
+                })?,
+        )?;
+        map.keys().collect::<Result<_, _>>().map_err(Into::into)
+    }
+
+    /// Retire one original source's allow rules before removing its namespace.
+    /// A failure retains the caller's ownership obligation for a later retry.
+    pub fn delete_cgroup_firewall_state(
+        bpf: &mut aya::Ebpf,
+        cgroup_id: u64,
+    ) -> Result<(), FirewallMapError> {
+        for key in list_firewall_keys(bpf)? {
+            if key.src_cgroup_id == cgroup_id {
+                delete_firewall_entry(bpf, key)?;
+            }
+        }
+        delete_cgroup_namespace_entry(bpf, cgroup_id)
+    }
+
+    /// Remove every grant to an originally owned destination before its VIP
+    /// becomes reusable. Other destinations and source identities are retained.
+    pub fn delete_destination_firewall_state(
+        bpf: &mut aya::Ebpf,
+        destination_app_id: u32,
+    ) -> Result<(), FirewallMapError> {
+        for key in list_firewall_keys(bpf)? {
+            if key.dst_app_id == destination_app_id {
+                delete_firewall_entry(bpf, key)?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Reconcile namespace and firewall entries, retaining keys until removal.
+    pub fn reconcile_firewall_maps(
+        bpf: &mut aya::Ebpf,
+        namespace_entries: &[super::CgroupNamespaceEntry],
+        firewall_entries: &[(FirewallKey, FirewallValue)],
+        namespace_keys: &mut std::collections::HashSet<u64>,
+        firewall_keys: &mut std::collections::HashSet<FirewallKey>,
+    ) -> Result<(), FirewallMapError> {
+        let desired_namespaces = namespace_entries
+            .iter()
+            .map(|entry| entry.cgroup_id)
+            .collect();
+        let desired_firewall = firewall_entries.iter().map(|(key, _)| *key).collect();
+        for entry in namespace_entries {
+            // A failed syscall is not permission to forget attempted ownership.
+            namespace_keys.insert(entry.cgroup_id);
+            write_cgroup_namespace_entry(bpf, entry.cgroup_id, entry.namespace_id)?;
+        }
+        for (key, value) in firewall_entries {
+            firewall_keys.insert(*key);
+            write_firewall_entry(bpf, *key, *value)?;
+        }
+        // Keep namespace enforcement until obsolete allow rules are removed.
+        for key in super::keys_to_delete(firewall_keys, &desired_firewall) {
+            delete_firewall_entry(bpf, key)?;
+            firewall_keys.remove(&key);
+        }
+        for key in super::keys_to_delete(namespace_keys, &desired_namespaces) {
+            delete_cgroup_namespace_entry(bpf, key)?;
+            namespace_keys.remove(&key);
+        }
+        Ok(())
     }
 
     /// Read the exact namespace and allow values the live connect hook would
@@ -358,6 +428,33 @@ mod tests {
     }
 
     #[test]
+    fn outbound_only_workloads_receive_namespace_identity_and_allowed_routes() {
+        let services = vec![make_service(
+            "db",
+            "backend",
+            2,
+            200,
+            Some(vec!["frontend/worker".into()]),
+        )];
+        let cgroups = [cg("frontend", "worker", vec![1001])].into();
+        let entries = resolve_cgroup_namespace_entries(&cgroups);
+        assert_eq!(entries.len(), 1, "outbound-only source has no namespace");
+        assert_eq!(entries[0].cgroup_id, 1001);
+        assert_eq!(
+            entries[0].namespace_id,
+            crate::onion::vip::name_to_id("frontend")
+        );
+        let rules = resolve_firewall_rules(&services, &cgroups);
+        assert_eq!(
+            rules.len(),
+            1,
+            "explicitly allowed source needs no service port"
+        );
+        assert_eq!(rules[0].src_cgroup_id, 1001);
+        assert_eq!(rules[0].dst_app_id, 2);
+    }
+
+    #[test]
     fn default_allows_same_namespace() {
         let services = vec![
             make_service("api", "default", 1, 100, None),
@@ -420,20 +517,19 @@ mod tests {
 
     #[test]
     fn cgroup_namespace_entries_resolve_correctly() {
-        let services = vec![
-            make_service("api", "default", 1, 100, None),
-            make_service("redis", "default", 2, 100, None),
-        ];
         let cgroups: HashMap<(String, String), Vec<u64>> = [
             cg("default", "api", vec![1001, 1002]),
             cg("default", "redis", vec![2001]),
         ]
         .into();
 
-        let entries = resolve_cgroup_namespace_entries(&services, &cgroups);
+        let entries = resolve_cgroup_namespace_entries(&cgroups);
         assert_eq!(entries.len(), 3);
-        // All should map to namespace_id 100
-        assert!(entries.iter().all(|e| e.namespace_id == 100));
+        assert!(
+            entries
+                .iter()
+                .all(|e| e.namespace_id == crate::onion::vip::name_to_id("default"))
+        );
     }
 
     #[test]
@@ -465,10 +561,13 @@ mod tests {
             .collect();
         assert_eq!(sources, vec![1001], "team-b's web must not be allowed");
 
-        // Namespace mapping: team-b's web maps to namespace 200, not 100.
-        let entries = resolve_cgroup_namespace_entries(&services, &cgroups);
+        // Namespace mapping keeps the same-named source in its own namespace.
+        let entries = resolve_cgroup_namespace_entries(&cgroups);
         let team_b_web = entries.iter().find(|e| e.cgroup_id == 9001).unwrap();
-        assert_eq!(team_b_web.namespace_id, 200);
+        assert_eq!(
+            team_b_web.namespace_id,
+            crate::onion::vip::name_to_id("team-b")
+        );
     }
 
     #[test]

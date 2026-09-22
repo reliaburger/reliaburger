@@ -62,7 +62,8 @@ pub struct InstanceRecord {
     /// OCI image reference (informational; empty for process workloads).
     pub image: String,
     pub runtime: RuntimeKind,
-    /// ProcessGrill: the workload pid. RunC: the foreground `runc run` pid.
+    /// ProcessGrill: workload PID; runc: launcher PID; Apple: Bun launcher PID.
+    /// Apple adoption uses container identity/inspection, not host PID liveness.
     pub pid: u32,
     /// Process start time (seconds since boot/epoch as reported by the OS)
     /// for pid-reuse detection.
@@ -93,54 +94,99 @@ pub fn record_path(records_dir: &Path, instance_id: &str) -> PathBuf {
 pub fn write_record(records_dir: &Path, record: &InstanceRecord) -> std::io::Result<()> {
     std::fs::create_dir_all(records_dir)?;
     let path = record_path(records_dir, &record.instance_id);
-    let tmp = records_dir.join(format!(
-        ".{}.tmp-{}",
-        record.instance_id,
-        std::process::id()
-    ));
-    // A record is plain data; serialisation cannot fail.
-    let json = serde_json::to_string_pretty(record).expect("record serialises");
-    std::fs::write(&tmp, json)?;
-    std::fs::rename(&tmp, path)?;
+    let json = serde_json::to_vec_pretty(record)
+        .map_err(|error| std::io::Error::other(error.to_string()))?;
+    crate::sesame::identity::atomic_write_mode(&path, &json, Some(0o600))?;
     Ok(())
 }
 
-/// Remove an instance's record. Missing records are fine (idempotent).
+/// Remove an instance's record and sync its directory. Missing records are fine.
 pub fn remove_record(records_dir: &Path, instance_id: &str) -> std::io::Result<()> {
     match std::fs::remove_file(record_path(records_dir, instance_id)) {
-        Ok(()) => Ok(()),
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
-        Err(e) => Err(e),
+        Ok(()) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => return Err(error),
+    }
+    // A retry after a failed directory sync must sync even if unlink already ran.
+    match std::fs::File::open(records_dir) {
+        Ok(directory) => directory.sync_all(),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(error),
     }
 }
 
-/// Load every parseable record in the directory. Unparseable files are
-/// skipped with a warning — a corrupt record must not block the others.
-pub fn load_records(records_dir: &Path) -> Vec<InstanceRecord> {
-    let entries = match std::fs::read_dir(records_dir) {
-        Ok(entries) => entries,
-        Err(_) => return Vec::new(),
+/// Load all ownership records, refusing unreadable or malformed state.
+/// A missing directory represents a fresh node; other failures never imply absence.
+pub fn load_records(records_dir: &Path) -> std::io::Result<Vec<InstanceRecord>> {
+    let contextual = |path: &Path, error: std::io::Error| {
+        std::io::Error::new(
+            error.kind(),
+            format!("cannot read ownership record {}: {error}", path.display()),
+        )
     };
+    match std::fs::symlink_metadata(records_dir) {
+        Ok(metadata) if metadata.is_dir() => {}
+        Ok(_) => {
+            return Err(contextual(
+                records_dir,
+                std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "expected an ownership directory",
+                ),
+            ));
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(error) => return Err(contextual(records_dir, error)),
+    }
+    let entries = std::fs::read_dir(records_dir).map_err(|error| contextual(records_dir, error))?;
     let mut records = Vec::new();
-    for entry in entries.flatten() {
+    for entry in entries {
+        let entry = entry.map_err(|error| contextual(records_dir, error))?;
         let path = entry.path();
-        if path.extension().and_then(|e| e.to_str()) != Some("json") {
+        if path.extension().and_then(|extension| extension.to_str()) != Some("json") {
             continue;
         }
-        match std::fs::read_to_string(&path)
-            .ok()
-            .and_then(|s| serde_json::from_str::<InstanceRecord>(&s).ok())
+        let mut options = std::fs::OpenOptions::new();
+        options.read(true);
+        #[cfg(unix)]
         {
-            Some(record) => records.push(record),
-            None => {
-                eprintln!(
-                    "bun: warning: skipping unreadable instance record {}",
-                    path.display()
-                );
-            }
+            use std::os::unix::fs::OpenOptionsExt;
+            options.custom_flags(nix::libc::O_NOFOLLOW | nix::libc::O_NONBLOCK);
         }
+        let file = options
+            .open(&path)
+            .map_err(|error| contextual(&path, error))?;
+        if !file
+            .metadata()
+            .map_err(|error| contextual(&path, error))?
+            .is_file()
+        {
+            return Err(contextual(
+                &path,
+                std::io::Error::new(std::io::ErrorKind::InvalidData, "expected a regular file"),
+            ));
+        }
+        let record: InstanceRecord = serde_json::from_reader(std::io::BufReader::new(file))
+            .map_err(|error| {
+                contextual(
+                    &path,
+                    std::io::Error::new(std::io::ErrorKind::InvalidData, error),
+                )
+            })?;
+        if !matches!(record.schema, 1 | 2)
+            || path.file_stem() != Some(std::ffi::OsStr::new(&record.instance_id))
+        {
+            return Err(contextual(
+                &path,
+                std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "unsupported schema or mismatched instance identifier",
+                ),
+            ));
+        }
+        records.push(record);
     }
-    records
+    Ok(records)
 }
 
 /// The start time of a live process, or `None` if it doesn't exist.
@@ -188,31 +234,47 @@ pub fn process_matches(pid: u32, recorded_started_at: u64) -> bool {
 /// so it is reported exited — without this a reused pid reads Running forever
 /// and a later stop/kill would signal an innocent process (M23).
 ///
-/// Returns `(running, exit_code)`.
-pub fn poll_adopted_process(pid: u32, pid_started_at: Option<u64>) -> (bool, Option<i32>) {
+/// Returns `(running, exit_code)`, or an error when exit cannot be established.
+/// Signal permission and process-inspection errors never count as an exit.
+pub fn poll_adopted_process(
+    pid: u32,
+    pid_started_at: Option<u64>,
+) -> std::io::Result<(bool, Option<i32>)> {
     use nix::errno::Errno;
     use nix::sys::signal::kill;
     use nix::sys::wait::{WaitPidFlag, WaitStatus, waitpid};
 
-    let nix_pid = nix::unistd::Pid::from_raw(pid as i32);
+    // Zero and negative wait/kill selectors address process groups, not a workload.
+    let signed_pid = i32::try_from(pid)
+        .ok()
+        .filter(|pid| *pid > 0)
+        .ok_or_else(|| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "invalid adopted process id",
+            )
+        })?;
+    let current_start = process_start_time(pid);
+    if let (Some(recorded), Some(current)) = (pid_started_at, current_start)
+        && current.abs_diff(recorded) > 2
+    {
+        // Do not reap an unrelated child after PID reuse either.
+        return Ok((false, None));
+    }
+    let nix_pid = nix::unistd::Pid::from_raw(signed_pid);
     match waitpid(nix_pid, Some(WaitPidFlag::WNOHANG)) {
-        Ok(WaitStatus::StillAlive) => (true, None),
-        Ok(WaitStatus::Exited(_, code)) => (false, Some(code)),
-        Ok(_) => (false, None),
+        Ok(WaitStatus::Exited(_, code)) => Ok((false, Some(code))),
+        Ok(WaitStatus::Signaled(..)) => Ok((false, None)),
+        Ok(_) => Ok((true, None)),
         Err(Errno::ECHILD) => match kill(nix_pid, None) {
-            // The pid is live, but confirm it is still *our* adoptee and not a
-            // reused pid before reporting it Running.
-            Ok(()) => match (pid_started_at, process_start_time(pid)) {
-                // Known start that no longer matches the live pid: it was reused.
-                (Some(recorded), Some(current)) if current.abs_diff(recorded) > 2 => (false, None),
-                // Known start but the pid vanished between kill and the read.
-                (Some(_), None) => (false, None),
-                // Match, or no recorded start (legacy adoptee): trust liveness.
-                _ => (true, None),
-            },
-            Err(_) => (false, None),
+            Ok(()) if pid_started_at.is_some() && current_start.is_none() => Err(
+                std::io::Error::other("cannot inspect adopted process identity"),
+            ),
+            Ok(()) => Ok((true, None)),
+            Err(Errno::ESRCH) => Ok((false, None)),
+            Err(error) => Err(error.into()),
         },
-        Err(_) => (false, None),
+        Err(error) => Err(error.into()),
     }
 }
 
@@ -276,7 +338,7 @@ mod tests {
         let original = record(4242, 1000);
         write_record(dir.path(), &original).unwrap();
 
-        let loaded = load_records(dir.path());
+        let loaded = load_records(dir.path()).unwrap();
         assert_eq!(loaded, vec![original]);
     }
 
@@ -309,23 +371,77 @@ mod tests {
         write_record(dir.path(), &record(4242, 1000)).unwrap();
         remove_record(dir.path(), "web-0").unwrap();
         remove_record(dir.path(), "web-0").unwrap();
-        assert!(load_records(dir.path()).is_empty());
+        assert!(load_records(dir.path()).unwrap().is_empty());
     }
 
     #[test]
-    fn load_records_skips_corrupt_files() {
+    fn load_records_refuses_corrupt_files() {
         let dir = tempfile::tempdir().unwrap();
         write_record(dir.path(), &record(4242, 1000)).unwrap();
         std::fs::write(dir.path().join("broken.json"), "not json").unwrap();
         std::fs::write(dir.path().join("ignored.txt"), "not a record").unwrap();
 
-        assert_eq!(load_records(dir.path()).len(), 1);
+        assert!(load_records(dir.path()).is_err());
+    }
+
+    #[test]
+    fn load_records_refuses_unreadable_directory_and_mismatched_identity() {
+        let dir = tempfile::tempdir().unwrap();
+        let blocked = tempfile::NamedTempFile::new().unwrap();
+        assert!(load_records(blocked.path()).is_err());
+        let mut owner = record(4242, 1000);
+        write_record(dir.path(), &owner).unwrap();
+        owner.instance_id = "other".into();
+        std::fs::write(
+            dir.path().join("web-0.json"),
+            serde_json::to_vec(&owner).unwrap(),
+        )
+        .unwrap();
+        assert!(load_records(dir.path()).is_err());
+        owner.instance_id = "web-0".into();
+        owner.schema = 999;
+        write_record(dir.path(), &owner).unwrap();
+        assert!(load_records(dir.path()).is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn load_records_refuses_symlinks_and_non_regular_records() {
+        let dir = tempfile::tempdir().unwrap();
+        let link_parent = tempfile::tempdir().unwrap();
+        let directory_link = link_parent.path().join("instances");
+        std::os::unix::fs::symlink(dir.path(), &directory_link).unwrap();
+        assert!(load_records(&directory_link).is_err());
+        let target = tempfile::NamedTempFile::new().unwrap();
+        std::fs::write(
+            target.path(),
+            serde_json::to_vec(&record(4242, 1000)).unwrap(),
+        )
+        .unwrap();
+        let path = dir.path().join("web-0.json");
+        std::os::unix::fs::symlink(target.path(), &path).unwrap();
+        assert!(load_records(dir.path()).is_err());
+        std::fs::remove_file(&path).unwrap();
+        nix::unistd::mkfifo(
+            &path,
+            nix::sys::stat::Mode::S_IRUSR | nix::sys::stat::Mode::S_IWUSR,
+        )
+        .unwrap();
+        assert!(load_records(dir.path()).is_err());
     }
 
     #[test]
     fn load_records_from_missing_dir_is_empty() {
         let dir = tempfile::tempdir().unwrap();
-        assert!(load_records(&dir.path().join("nope")).is_empty());
+        assert!(load_records(&dir.path().join("nope")).unwrap().is_empty());
+    }
+
+    #[test]
+    fn adopted_process_observation_rejects_invalid_identifiers() {
+        for pid in [0, u32::MAX, i32::MAX as u32 + 1] {
+            let error = poll_adopted_process(pid, Some(1000)).unwrap_err();
+            assert_eq!(error.kind(), std::io::ErrorKind::InvalidInput);
+        }
     }
 
     #[test]
@@ -363,15 +479,18 @@ mod tests {
         let real_start = process_start_time(my_pid).unwrap();
 
         // Recorded start matches the live pid: still our adoptee, Running.
-        assert_eq!(poll_adopted_process(my_pid, Some(real_start)), (true, None));
+        assert_eq!(
+            poll_adopted_process(my_pid, Some(real_start)).unwrap(),
+            (true, None)
+        );
         // Recorded start is from another era: the pid was reused, so it must
         // NOT read Running (else a later stop/kill signals an innocent pid).
         assert_eq!(
-            poll_adopted_process(my_pid, Some(real_start + 3600)),
+            poll_adopted_process(my_pid, Some(real_start + 3600)).unwrap(),
             (false, None)
         );
         // No recorded start (legacy adoptee): fall back to liveness only.
-        assert_eq!(poll_adopted_process(my_pid, None), (true, None));
+        assert_eq!(poll_adopted_process(my_pid, None).unwrap(), (true, None));
     }
 
     #[test]
@@ -380,6 +499,9 @@ mod tests {
         let pid = child.id();
         child.wait().unwrap();
         // Reaped: waitpid gives ECHILD, kill fails → exited.
-        assert_eq!(poll_adopted_process(pid, Some(1000)), (false, None));
+        assert_eq!(
+            poll_adopted_process(pid, Some(1000)).unwrap(),
+            (false, None)
+        );
     }
 }

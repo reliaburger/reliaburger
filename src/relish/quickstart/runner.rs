@@ -29,19 +29,33 @@ pub struct Options {
     pub api_port: u16,
     /// Browser-facing HTTP ingress port.
     pub ingress_port: u16,
+    /// Host port forwarded to Pickle on the first node.
+    pub registry_port: u16,
     /// Explicit development-only directory containing prebuilt Linux bun and relish.
     pub development_binaries: Option<PathBuf>,
+    /// HTTPS directory containing unchanged signed release candidate assets.
+    pub release_mirror: Option<String>,
 }
 
 /// Create or resume a cluster under one five-minute deadline, preserving checkpoints.
 pub async fn run(options: Options) -> Result<()> {
+    if options.release_mirror.is_some() && options.development_binaries.is_some() {
+        bail!("a release mirror cannot be combined with development binaries");
+    }
+    let version = env!("CARGO_PKG_VERSION").parse::<BinaryVersion>()?;
+    let mut downloader = Downloader::new(Duration::from_secs(180))?;
+    if let Some(mirror) = &options.release_mirror {
+        downloader = downloader.with_release_mirror(&version, mirror)?;
+        eprintln!("using an explicit release mirror with checksum and signature verification");
+    }
     let root = crate::relish::local_context::root_directory()?;
     let spec = ClusterSpec {
         name: options.name,
         nodes: options.nodes,
-        version: env!("CARGO_PKG_VERSION").parse::<BinaryVersion>()?,
+        version,
         api_port: options.api_port,
         ingress_port: options.ingress_port,
+        registry_port: Some(options.registry_port),
     };
     let operation_root = root.clone();
     let (mut operation, bootstrap, _setup_lock) =
@@ -74,6 +88,7 @@ pub async fn run(options: Options) -> Result<()> {
             &mut operation,
             &bootstrap,
             options.development_binaries.as_deref(),
+            &downloader,
         ),
     )
     .await;
@@ -111,12 +126,12 @@ async fn provision_cluster(
     operation: &mut Operation,
     bootstrap: &Bootstrap,
     development: Option<&Path>,
+    downloader: &Downloader,
 ) -> Result<()> {
     let spec = operation.state.spec.clone();
     let cache = root.join("cache");
     tokio::fs::create_dir_all(&cache).await?;
     super::preflight::host(root).await?;
-    let downloader = Downloader::new(Duration::from_secs(180))?;
     println!("preparing verified Linux image and tooling");
     let binaries = async {
         if let Some(directory) = development {
@@ -128,8 +143,8 @@ async fn provision_cluster(
             return Ok::<_, anyhow::Error>((bun, relish));
         }
         tokio::try_join!(
-            artifacts::binary(&cache, &spec.version, "bun", &downloader),
-            artifacts::binary(&cache, &spec.version, "relish", &downloader)
+            artifacts::binary(&cache, &spec.version, "bun", downloader),
+            artifacts::binary(&cache, &spec.version, "relish", downloader)
         )
     };
     let image = async {
@@ -141,11 +156,11 @@ async fn provision_cluster(
                 .await?;
             Ok::<_, anyhow::Error>(path)
         } else {
-            artifacts::image(&cache, &spec.version, &downloader).await
+            artifacts::image(&cache, &spec.version, downloader).await
         }
     };
     let (lima, image, (bun, relish)) =
-        tokio::try_join!(artifacts::tooling(root, &downloader), image, binaries)?;
+        tokio::try_join!(artifacts::tooling(root, downloader), image, binaries)?;
     println!("starting {} Linux VM(s)", spec.nodes);
     let mut statuses = Vec::new();
     for node in &operation.state.nodes {
@@ -168,15 +183,18 @@ async fn provision_cluster(
             std::env::consts::ARCH,
             spec.api_port + index as u16,
             (index == 0).then_some(spec.ingress_port),
+            (index == 0).then_some(spec.registry_port).flatten(),
         )?;
         tokio::fs::write(&config_path, yaml).await?;
         let status = statuses[index].clone();
         let api_port = spec.api_port + index as u16;
         let ingress_port = (index == 0).then_some(spec.ingress_port);
+        let registry_port = (index == 0).then_some(spec.registry_port).flatten();
         let boot = async move {
             if status.as_deref() != Some("Running") {
                 let mut ports = vec![api_port];
                 ports.extend(ingress_port);
+                ports.extend(registry_port);
                 super::preflight::ports(&ports).await?;
             }
             match status.as_deref() {
@@ -270,6 +288,7 @@ async fn provision_cluster(
                     "node-ca.crt",
                     "root-ca.crt",
                     "meta.json",
+                    "node.bundle.json",
                     "bundle.committed",
                 ] {
                     lima.install(
@@ -412,6 +431,13 @@ async fn provision_cluster(
         endpoint,
         token: tokio::fs::read_to_string(bootstrap.directory.join("admin.token")).await?,
         ca_cert: bootstrap.directory.join("identity/root-ca.crt"),
+        service_endpoints: crate::bun::capabilities::ServiceEndpoints {
+            registry: spec
+                .registry_port
+                .map(|port| format!("https://127.0.0.1:{port}")),
+            ingress_http: Some(format!("http://127.0.0.1:{}", spec.ingress_port)),
+            ingress_https: None,
+        },
     };
     let path = root.join("context.json");
     tokio::task::spawn_blocking(move || context.save(&path)).await??;

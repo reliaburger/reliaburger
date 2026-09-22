@@ -1,7 +1,7 @@
 //! Release metadata: what versions exist and where their binaries live.
 //!
-//! Served as a static JSON file from any HTTPS host (`upgrades.release_url`
-//! in node.toml). Metadata is NOT signed — it travels over TLS and can at
+//! Served as a static JSON file from any HTTPS host, selected with the CLI
+//! `relish upgrade check --url` option. Metadata is NOT signed — it travels over TLS and can at
 //! worst lie about what exists; it cannot make a node run anything, because
 //! the per-binary dual signatures gate execution.
 

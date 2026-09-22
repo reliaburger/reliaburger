@@ -11,6 +11,7 @@ pub fn vm_config(
     arch: &str,
     api_port: u16,
     ingress_port: Option<u16>,
+    registry_port: Option<u16>,
 ) -> Result<String> {
     if !matches!(arch, "aarch64" | "x86_64") {
         bail!("unsupported VM architecture");
@@ -20,6 +21,9 @@ pub fn vm_config(
     })];
     if let Some(port) = ingress_port {
         forwards.push(serde_json::json!({"guestPort":80,"hostPort":port,"hostIP":"127.0.0.1"}));
+    }
+    if let Some(port) = registry_port {
+        forwards.push(serde_json::json!({"guestPort":5050,"hostPort":port,"hostIP":"127.0.0.1"}));
     }
     // Lima otherwise forwards every listening guest port automatically.
     forwards.push(serde_json::json!({
@@ -76,7 +80,7 @@ pub fn node_config(
 }
 
 /// Guest service supervised and restarted by systemd; logs go to its journal.
-pub const SERVICE: &str = "[Unit]\nDescription=Reliaburger node\nAfter=network-online.target\nWants=network-online.target\n\n[Service]\nType=simple\nExecStart=/usr/local/bin/bun --cluster --runtime runc --config /etc/reliaburger/node.toml --listen 0.0.0.0:9117\nRestart=on-failure\nRestartSec=2\nLimitNOFILE=1048576\nKillMode=mixed\nTimeoutStopSec=30\n\n[Install]\nWantedBy=multi-user.target\n";
+pub const SERVICE: &str = "[Unit]\nDescription=Reliaburger node\nAfter=network-online.target\nWants=network-online.target\n\n[Service]\nType=simple\nExecStartPre=/bin/sh -ec 'mountpoint -q /sys/fs/bpf || mount -t bpf bpf /sys/fs/bpf'\nExecStart=/usr/local/bin/bun --cluster --runtime runc --config /etc/reliaburger/node.toml --listen 0.0.0.0:9117\nRestart=on-failure\nRestartSec=2\nLimitNOFILE=1048576\nKillMode=mixed\nTimeoutStopSec=30\n\n[Install]\nWantedBy=multi-user.target\n";
 
 #[cfg(test)]
 mod tests {
@@ -84,19 +88,29 @@ mod tests {
 
     #[test]
     fn managed_vm_has_no_host_mounts_and_only_explicit_loopback_forwards() {
-        let yaml = vm_config("/private/cache/ubuntu.img", "aarch64", 19117, Some(18080)).unwrap();
+        let yaml = vm_config(
+            "/private/cache/ubuntu.img",
+            "aarch64",
+            19117,
+            Some(18080),
+            Some(15050),
+        )
+        .unwrap();
         let value: serde_yaml::Value = serde_yaml::from_str(&yaml).unwrap();
         assert_eq!(value["mounts"].as_sequence().unwrap().len(), 0);
         assert_eq!(value["containerd"]["user"], false);
         assert_eq!(value["containerd"]["system"], false);
         let forwards = value["portForwards"].as_sequence().unwrap();
-        assert_eq!(forwards.len(), 3);
+        assert_eq!(forwards.len(), 4);
+        assert_eq!(forwards[2]["guestPort"], 5050);
+        assert_eq!(forwards[2]["hostPort"], 15050);
+        assert_eq!(forwards[2]["hostIP"], "127.0.0.1");
         assert_eq!(forwards[0]["hostIP"], "127.0.0.1");
         assert_eq!(forwards[0]["hostPort"], 19117);
         assert_eq!(forwards[1]["hostPort"], 18080);
-        assert_eq!(forwards[2]["ignore"], true);
-        assert_eq!(forwards[2]["proto"], "any");
-        assert_eq!(forwards[2]["guestIP"], "0.0.0.0");
+        assert_eq!(forwards[3]["ignore"], true);
+        assert_eq!(forwards[3]["proto"], "any");
+        assert_eq!(forwards[3]["guestIP"], "0.0.0.0");
         assert_eq!(value["networks"][0]["lima"], "user-v2");
     }
 

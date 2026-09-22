@@ -66,10 +66,14 @@ impl Harness {
         let port_allocator = PortAllocator::new(42000, 43000);
         let agent_shutdown = shutdown.clone();
         let mut agent = BunAgent::new(grill, port_allocator, cmd_rx, agent_shutdown);
+        let volumes = tempfile::tempdir().unwrap();
+        agent.set_volumes_dir(volumes.path().to_path_buf());
         let deploy_history = agent.deploy_history_handle();
 
         let agent_task = tokio::spawn(async move {
             agent.run().await;
+            drop(agent);
+            drop(volumes);
         });
 
         let aggregated = {

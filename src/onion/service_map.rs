@@ -43,6 +43,51 @@ impl ServiceMap {
         }
     }
 
+    /// Restore exact saved allocations without rehashing or publishing routes.
+    ///
+    /// Reject the entire inventory on conflicting identities, addresses or invalid
+    /// backends. Recorded health is historical: callers must reconcile runtime and
+    /// kernel ownership before exposing this map to DNS, ingress or kernel hooks.
+    pub fn from_snapshot(entries: &[ServiceEntry]) -> Result<Self, OnionError> {
+        let mut map = Self::new();
+        for entry in entries {
+            let id = ServiceId::new(&entry.namespace, &entry.app_name);
+            let key = id.qualified();
+            let invalid = |reason| OnionError::InvalidSnapshot {
+                service: key.clone(),
+                reason,
+            };
+            if !crate::config::valid_workload_label(&entry.namespace)
+                || !crate::config::valid_workload_label(&entry.app_name)
+                || entry.namespace_id != name_to_id(&entry.namespace)
+                || entry.app_id != u32::from(entry.vip.0)
+                || !(0x7f80_0001..=0x7f80_fffe).contains(&u32::from(entry.vip.0))
+                || entry.port == 0
+            {
+                return Err(invalid("invalid service identity or allocation"));
+            }
+            if map.entries.contains_key(&key) || map.allocated_vips.contains(&entry.vip) {
+                return Err(invalid("duplicate service or virtual IP owner"));
+            }
+            if entry.backends.len() > MAX_BACKENDS {
+                return Err(invalid("backend capacity exceeded"));
+            }
+            let mut backend_ids = HashSet::new();
+            for backend in &entry.backends {
+                if backend.instance_id.is_empty()
+                    || backend.host_port == 0
+                    || backend.node_ip.is_unspecified()
+                    || !backend_ids.insert(&backend.instance_id)
+                {
+                    return Err(invalid("invalid or duplicate backend"));
+                }
+            }
+            map.allocated_vips.insert(entry.vip);
+            map.entries.insert(key, entry.clone());
+        }
+        Ok(map)
+    }
+
     /// Register a new service in the map.
     ///
     /// Computes the VIP deterministically from the namespace-qualified
@@ -66,7 +111,7 @@ impl ServiceMap {
             app_name: id.name.clone(),
             namespace: id.namespace.clone(),
             namespace_id: name_to_id(&id.namespace),
-            app_id: name_to_id(&id.name),
+            app_id: u32::from(vip.0),
             vip,
             port,
             backends: Vec::new(),
@@ -131,23 +176,21 @@ impl ServiceMap {
             .get_mut(&key)
             .ok_or(OnionError::ServiceNotFound { name: key })?;
 
-        if entry.backends.len() >= MAX_BACKENDS {
-            return Err(OnionError::TooManyBackends {
-                app_name: id.qualified(),
-            });
-        }
-
-        // Replace if instance_id already exists (restart scenario)
+        // Updating an existing endpoint does not consume another backend slot.
         if let Some(existing) = entry
             .backends
             .iter_mut()
             .find(|b| b.instance_id == backend.instance_id)
         {
             *existing = backend;
-        } else {
-            entry.backends.push(backend);
+            return Ok(());
         }
-
+        if entry.backends.len() >= MAX_BACKENDS {
+            return Err(OnionError::TooManyBackends {
+                app_name: id.qualified(),
+            });
+        }
+        entry.backends.push(backend);
         Ok(())
     }
 
@@ -286,7 +329,7 @@ impl ServiceMap {
                         app_name: id.name.clone(),
                         namespace: id.namespace.clone(),
                         namespace_id: name_to_id(&id.namespace),
-                        app_id: name_to_id(&id.name),
+                        app_id: u32::from(service.vip.0),
                         vip: service.vip,
                         port: service.port,
                         backends: service
@@ -321,19 +364,17 @@ impl ServiceMap {
     }
 }
 
-/// A stable synthetic instance id for a catalogue backend.
-///
-/// The catalogue doesn't carry the original per-instance id, but the
-/// merge needs a key to deduplicate against local backends. `{node}:{ip}:
-/// {port}` is unique per backend and stable across ticks, so a remote
-/// backend never duplicates and a local one it overlaps is matched by the
-/// local map's own `add_backend` dedupe path (both key on this string when
-/// the local id was built the same way — see the agent's merge).
+/// Separate successive executions even when they share a node and host port.
+/// Unknown execution evidence retains the legacy key and is not retirement proof.
 fn catalog_instance_id(backend: &super::catalog::CatalogBackend) -> String {
-    format!(
+    let endpoint = format!(
         "{}:{}:{}",
         backend.node_id, backend.node_ip, backend.host_port
-    )
+    );
+    match &backend.execution {
+        Some(execution) => format!("{endpoint}:{}", execution.generation.as_str()),
+        None => endpoint,
+    }
 }
 
 /// Usable VIP slots in `127.128.0.0/16` (65,534: excludes .0.0 and .255.255).
@@ -361,6 +402,103 @@ mod tests {
             host_port: port,
             healthy: true,
         }
+    }
+
+    #[test]
+    fn snapshot_restores_collision_resolved_addresses_in_any_order() {
+        let mut seen = HashMap::new();
+        let (first, second) = (0..65_535)
+            .find_map(|index| {
+                let id = sid("default", &format!("service-{index}"));
+                seen.insert(VirtualIP::from_service_id(&id), id.clone())
+                    .map(|first| (first, id))
+            })
+            .unwrap();
+        let mut map = ServiceMap::new();
+        let first_vip = map.register(&first, 8080, None).unwrap();
+        let second_vip = map
+            .register(&second, 9000, Some(vec!["default/client".into()]))
+            .unwrap();
+        assert_ne!(first_vip, second_vip);
+        let mut backend = test_backend("original-generation", [10, 0, 2, 2], 9000);
+        backend.healthy = false;
+        map.add_backend(&second, backend).unwrap();
+        let snapshot = vec![
+            map.resolve(&second).unwrap().clone(),
+            map.resolve(&first).unwrap().clone(),
+        ];
+        let mut recovered = ServiceMap::from_snapshot(&snapshot).unwrap();
+        for entry in &snapshot {
+            let id = sid(&entry.namespace, &entry.app_name);
+            assert_eq!(
+                serde_json::to_value(recovered.resolve(&id).unwrap()).unwrap(),
+                serde_json::to_value(entry).unwrap()
+            );
+        }
+        recovered.unregister(&second).unwrap();
+        assert_eq!(
+            recovered.register(&second, 9000, None).unwrap(),
+            second_vip,
+            "restoration forgot the first service's address reservation"
+        );
+    }
+
+    #[test]
+    fn snapshot_refuses_duplicate_service_or_address_ownership() {
+        let mut map = ServiceMap::new();
+        let first = sid("default", "first");
+        let second = sid("default", "second");
+        map.register(&first, 8080, None).unwrap();
+        map.register(&second, 9000, None).unwrap();
+        let first = map.resolve(&first).unwrap().clone();
+        let mut second = map.resolve(&second).unwrap().clone();
+        assert!(ServiceMap::from_snapshot(&[first.clone(), first.clone()]).is_err());
+        second.vip = first.vip;
+        second.app_id = first.app_id;
+        assert!(ServiceMap::from_snapshot(&[first, second]).is_err());
+    }
+
+    #[test]
+    fn snapshot_refuses_invalid_identity_or_backend_evidence() {
+        let mut map = ServiceMap::new();
+        let id = sid("default", "service");
+        map.register(&id, 8080, None).unwrap();
+        map.add_backend(&id, test_backend("original", [10, 0, 2, 2], 8080))
+            .unwrap();
+        let original = map.resolve(&id).unwrap().clone();
+        let invalid: &[fn(&mut ServiceEntry)] = &[
+            |entry| entry.namespace = "invalid__namespace".into(),
+            |entry| entry.app_name = String::new(),
+            |entry| entry.namespace_id ^= 1,
+            |entry| entry.app_id ^= 1,
+            |entry| {
+                entry.vip = VirtualIP(Ipv4Addr::new(192, 0, 2, 1));
+                entry.app_id = u32::from(entry.vip.0);
+            },
+            |entry| {
+                entry.vip = VirtualIP(Ipv4Addr::new(127, 128, 0, 0));
+                entry.app_id = u32::from(entry.vip.0);
+            },
+            |entry| {
+                entry.vip = VirtualIP(Ipv4Addr::new(127, 128, 255, 255));
+                entry.app_id = u32::from(entry.vip.0);
+            },
+            |entry| entry.port = 0,
+            |entry| entry.backends.push(entry.backends[0].clone()),
+            |entry| entry.backends = vec![entry.backends[0].clone(); MAX_BACKENDS + 1],
+            |entry| entry.backends[0].instance_id.clear(),
+            |entry| entry.backends[0].host_port = 0,
+            |entry| entry.backends[0].node_ip = Ipv4Addr::UNSPECIFIED,
+        ];
+        for (index, invalidate) in invalid.iter().enumerate() {
+            let mut damaged = original.clone();
+            invalidate(&mut damaged);
+            assert!(
+                ServiceMap::from_snapshot(&[damaged]).is_err(),
+                "accepted invalid snapshot case {index}"
+            );
+        }
+        assert!(ServiceMap::from_snapshot(&[]).unwrap().is_empty());
     }
 
     #[test]
@@ -481,6 +619,37 @@ mod tests {
             )
             .unwrap_err();
         assert!(matches!(err, OnionError::ServiceNotFound { .. }));
+    }
+
+    #[test]
+    fn replacing_a_backend_at_capacity_does_not_consume_another_slot() {
+        let mut map = ServiceMap::new();
+        let service = sid("default", "api");
+        map.register(&service, 8080, None).unwrap();
+        for index in 0..MAX_BACKENDS {
+            map.add_backend(
+                &service,
+                test_backend(&format!("api-{index}"), [10, 0, 2, 2], 30000 + index as u16),
+            )
+            .unwrap();
+        }
+        let mut replacement = test_backend("api-0", [10, 0, 3, 3], 31000);
+        replacement.healthy = false;
+        map.add_backend(&service, replacement).unwrap();
+        let entry = map.resolve(&service).unwrap();
+        assert_eq!(entry.backends.len(), MAX_BACKENDS);
+        assert_eq!(entry.backends[0].node_ip, Ipv4Addr::new(10, 0, 3, 3));
+        assert_eq!(entry.backends[0].host_port, 31000);
+        assert!(!entry.backends[0].healthy);
+        let original = serde_json::to_value(entry).unwrap();
+        assert!(matches!(
+            map.add_backend(&service, test_backend("overflow", [10, 0, 4, 4], 32000)),
+            Err(OnionError::TooManyBackends { .. })
+        ));
+        assert_eq!(
+            serde_json::to_value(map.resolve(&service).unwrap()).unwrap(),
+            original
+        );
     }
 
     #[test]
@@ -632,12 +801,55 @@ mod tests {
     }
 
     #[test]
+    fn same_named_destinations_have_distinct_firewall_identities() {
+        let mut map = ServiceMap::new();
+        map.register(&sid("permitted", "database"), 5432, None)
+            .unwrap();
+        map.register(&sid("private", "database"), 5432, None)
+            .unwrap();
+        assert_ne!(
+            map.resolve(&sid("permitted", "database")).unwrap().app_id,
+            map.resolve(&sid("private", "database")).unwrap().app_id,
+        );
+    }
+
+    #[test]
+    fn destination_identity_uses_the_collision_resolved_vip() {
+        let mut map = ServiceMap::new();
+        let id = sid("default", "redis");
+        let natural = VirtualIP::from_service_id(&id);
+        map.allocated_vips.insert(natural);
+        let assigned = map.register(&id, 6379, None).unwrap();
+        assert_ne!(assigned, natural);
+        assert_eq!(map.resolve(&id).unwrap().app_id, u32::from(assigned.0));
+    }
+
+    #[test]
+    fn remote_destination_identity_uses_the_catalogue_allocation() {
+        use crate::onion::catalog::{CatalogService, EndpointCatalog};
+        let id = sid("remote", "redis");
+        let assigned = VirtualIP(Ipv4Addr::new(127, 128, 7, 19));
+        assert_ne!(assigned, VirtualIP::from_service_id(&id));
+        let mut catalog = EndpointCatalog::new();
+        catalog.services.insert(
+            id.qualified(),
+            CatalogService {
+                vip: assigned,
+                port: 6379,
+                backends: Vec::new(),
+            },
+        );
+        let merged = ServiceMap::new().with_cluster_catalog(&catalog);
+        assert_eq!(merged.resolve(&id).unwrap().app_id, u32::from(assigned.0));
+    }
+
+    #[test]
     fn app_id_deterministic() {
         let mut map = ServiceMap::new();
         map.register(&sid("default", "redis"), 6379, None).unwrap();
 
         let entry = map.resolve(&sid("default", "redis")).unwrap();
-        assert_eq!(entry.app_id, name_to_id("redis"));
+        assert_eq!(entry.app_id, u32::from(entry.vip.0));
     }
 
     #[test]
@@ -661,23 +873,60 @@ mod tests {
             8080,
             vec![
                 CatalogBackend {
+                    execution: None,
                     node_id: "here".into(),
                     node_ip: "192.168.1.1".parse().unwrap(),
                     host_port: 30001,
                     healthy: true,
                 },
                 CatalogBackend {
+                    execution: None,
                     node_id: "there".into(),
                     node_ip: "192.168.1.2".parse().unwrap(),
                     host_port: 30002,
                     healthy: true,
                 },
             ],
-        )]);
+        )])
+        .unwrap();
         let merged = local.with_cluster_catalog_excluding_node(&catalog, Some("here"));
         let entry = merged.resolve(&id).unwrap();
         assert_eq!(entry.backends.len(), 1);
         assert_eq!(entry.backends[0].host_port, 30002);
+    }
+
+    #[test]
+    fn remote_backend_identity_changes_when_the_same_port_gets_a_new_execution() {
+        use crate::onion::catalog::{CatalogBackend, EndpointCatalog};
+        let service = sid("default", "web");
+        let mut keys = Vec::new();
+        for token in ["original-generation", "replacement-generation"] {
+            let catalog = EndpointCatalog::rebuild([(
+                service.clone(),
+                8080,
+                vec![CatalogBackend {
+                    execution: Some(crate::grill::RuntimeExecution {
+                        instance_id: crate::grill::InstanceId("default__web-0".into()),
+                        generation: crate::grill::RuntimeGeneration::process(token),
+                    }),
+                    node_id: "worker".into(),
+                    node_ip: "192.0.2.1".parse().unwrap(),
+                    host_port: 30000,
+                    healthy: true,
+                }],
+            )])
+            .unwrap();
+            let view = ServiceMap::new().with_cluster_catalog(&catalog);
+            keys.push(
+                view.resolve(&service).unwrap().backends[0]
+                    .instance_id
+                    .clone(),
+            );
+        }
+        assert_ne!(
+            keys[0], keys[1],
+            "a stale withdrawal must not identify a replacement execution"
+        );
     }
 
     #[test]
@@ -691,12 +940,14 @@ mod tests {
             sid("payments", "api"),
             3000,
             vec![CatalogBackend {
+                execution: None,
                 node_id: "node-b".to_string(),
                 node_ip: Ipv4Addr::new(10, 0, 0, 2),
                 host_port: 30002,
                 healthy: true,
             }],
-        )]);
+        )])
+        .unwrap();
         let merged = local.with_cluster_catalog(&catalog);
 
         let entry = merged.resolve(&sid("payments", "api")).unwrap();
@@ -731,12 +982,14 @@ mod tests {
             sid("default", "web"),
             8080,
             vec![CatalogBackend {
+                execution: None,
                 node_id: "node-b".to_string(),
                 node_ip: Ipv4Addr::new(10, 0, 0, 2),
                 host_port: 30002,
                 healthy: true,
             }],
-        )]);
+        )])
+        .unwrap();
         let merged = local.with_cluster_catalog(&catalog);
 
         let entry = merged.resolve(&sid("default", "web")).unwrap();
@@ -776,12 +1029,14 @@ mod tests {
             sid("default", "web"),
             8080,
             vec![CatalogBackend {
+                execution: None,
                 node_id: "node-a".to_string(),
                 node_ip: Ipv4Addr::new(10, 0, 0, 1),
                 host_port: 30001,
                 healthy: true,
             }],
-        )]);
+        )])
+        .unwrap();
         let merged = local.with_cluster_catalog(&catalog);
 
         let entry = merged.resolve(&sid("default", "web")).unwrap();

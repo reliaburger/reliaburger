@@ -13,10 +13,14 @@
 //! reporting tree are layered on in follow-up changes.
 
 pub mod applied;
+pub mod capacity;
+pub mod consumer;
 pub mod directory;
 pub mod http;
 pub mod identity;
 pub mod orchestrate;
+pub mod producer;
+pub mod retirement;
 pub mod runtime;
 
 pub use http::ClusterHttp;

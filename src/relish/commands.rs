@@ -27,6 +27,21 @@ pub async fn apply(path: &Path, output: OutputFormat, dry_run: bool) -> Result<(
     apply_with_client(path, output, dry_run, &BunClient::default_local()).await
 }
 
+/// Explicitly rerun a node-local job manifest, including unknown prior outcomes.
+pub async fn rerun_jobs(path: &Path) -> Result<(), RelishError> {
+    let config = Config::from_file(path)?;
+    config.validate()?;
+    let result = BunClient::default_local()
+        .apply_rerunning_jobs(&config)
+        .await?;
+    println!(
+        "started {} job instance(s): {}",
+        result.created,
+        result.instances.join(", ")
+    );
+    Ok(())
+}
+
 async fn apply_with_client(
     path: &Path,
     output: OutputFormat,
@@ -174,7 +189,11 @@ fn parse_since(value: &str, now_epoch: u64) -> Result<u64, RelishError> {
         });
     }
 
-    let (number, unit) = value.split_at(value.len().saturating_sub(1));
+    let (number, unit) = value
+        .char_indices()
+        .next_back()
+        .map(|(index, _)| value.split_at(index))
+        .unwrap_or(("", ""));
     let multiplier = match unit {
         "s" => 1,
         "m" => 60,
@@ -191,7 +210,13 @@ fn parse_since(value: &str, now_epoch: u64) -> Result<u64, RelishError> {
         flag: "since".to_string(),
         reason: format!("{value:?} — use epoch seconds or a duration like 30s, 5m, 2h, 1d"),
     })?;
-    Ok(now_epoch.saturating_sub(amount * multiplier))
+    let seconds = amount
+        .checked_mul(multiplier)
+        .ok_or_else(|| RelishError::InvalidFlag {
+            flag: "since".to_string(),
+            reason: format!("duration {value:?} exceeds the supported seconds range"),
+        })?;
+    Ok(now_epoch.saturating_sub(seconds))
 }
 
 /// Parse a `--json-field` value of the form `key=value`.
@@ -296,12 +321,9 @@ pub async fn logs_export(
 }
 
 async fn logs_export_from(source: &Path, dest_str: &str, node_id: &str) -> Result<(), RelishError> {
-    use crate::ketchup::export::{CHECKPOINT_FILENAME, ExportCheckpoint, export_logs};
+    use crate::ketchup::export::{ExportCheckpoint, export_logs};
 
-    // X8: share Bun's one authoritative checkpoint, not a competing Relish
-    // copy. Whichever process exports last records into the same file, so a
-    // manual `relish logs-export` and the agent's export loop can't
-    // double-ship or skip each other's files.
+    // The exporter owns cross-process locking, reload and durable persistence.
     let _entries = tokio::fs::read_dir(source)
         .await
         .map_err(|error| RelishError::ApiError {
@@ -311,18 +333,13 @@ async fn logs_export_from(source: &Path, dest_str: &str, node_id: &str) -> Resul
                 source.display()
             ),
         })?;
-    let checkpoint_path = source.join(CHECKPOINT_FILENAME);
-    let mut checkpoint = ExportCheckpoint::load(&checkpoint_path);
+    let mut checkpoint = ExportCheckpoint::default();
 
     match export_logs(source, dest_str, node_id, &mut checkpoint).await {
         Ok(result) => {
             if result.files_exported == 0 {
                 println!("no new files to export");
             } else {
-                checkpoint.save(&checkpoint_path).map_err(|error| RelishError::ApiError {
-                    status: 0,
-                    body: format!("files exported but checkpoint could not be saved: {error}; a later export may repeat these files"),
-                })?;
                 println!(
                     "exported {} file(s) ({} bytes) to {}/{}",
                     result.files_exported, result.bytes_written, dest_str, node_id,
@@ -522,6 +539,7 @@ pub fn init_with_security(
     eprintln!("  Joiners must see the same root CA fingerprint from `relish join`.");
 
     let mut node_config = crate::config::node::NodeConfig::default();
+    node_config.node.name = Some(node_id.to_string());
     node_config.cluster.name = cluster_name.to_string();
     node_config.security.master_key_path = Some(secret_path.clone());
     node_config.security.bootstrap_path = Some(bootstrap_path.clone());
@@ -601,6 +619,51 @@ pub(super) fn node_identity_from_init(
     })
 }
 
+/// Retire a node identity after an operator has stopped or fenced its workloads.
+pub async fn decommission_node(
+    node_id: &str,
+    workloads_stopped: bool,
+    reason: &str,
+    output: OutputFormat,
+) -> Result<(), RelishError> {
+    let request = crate::cluster::retirement::DecommissionRequest {
+        node_id: node_id.into(),
+        workloads_stopped,
+        reason: reason.into(),
+    };
+    let retirement = BunClient::default_local()
+        .decommission_node(&request)
+        .await?;
+    match output {
+        OutputFormat::Human => {
+            let released: u128 = retirement
+                .released_placements
+                .values()
+                .map(|count| u128::from(*count))
+                .sum();
+            let registry_released: u128 = retirement
+                .released_registry_writers
+                .values()
+                .map(|count| u128::from(*count))
+                .sum();
+            println!(
+                "retired node {} (operator: {}); resolved {released} placement and {registry_released} registry obligations",
+                retirement.node_id, retirement.retired_by
+            );
+            println!("return requires fresh state and enrolment under a new node identity");
+        }
+        OutputFormat::Json => println!(
+            "{}",
+            serde_json::to_string_pretty(&retirement).map_err(RelishError::SerialiseJson)?
+        ),
+        OutputFormat::Yaml => print!(
+            "{}",
+            serde_yaml::to_string(&retirement).map_err(RelishError::SerialiseYaml)?
+        ),
+    }
+    Ok(())
+}
+
 /// List cluster nodes and their gossip state.
 pub async fn nodes(output: OutputFormat) -> Result<(), RelishError> {
     nodes_with_client(output, &BunClient::default_local()).await
@@ -656,10 +719,9 @@ pub async fn chaos(action: &str, acknowledged: bool) -> Result<(), RelishError> 
             eprintln!("unknown chaos action: {other}");
             eprintln!();
             eprintln!("available actions:");
-            eprintln!("  council-partition   partition a council minority from the majority");
-            eprintln!("  worker-isolation    isolate a worker from all council members");
+            eprintln!("  use relish test --chaos for guarded recovery scenarios");
             eprintln!("  status              show active fault injections");
-            eprintln!("  heal                remove all fault injections");
+            eprintln!("  mutations and blanket heal are retired");
             Err(RelishError::ApiError {
                 status: 0,
                 body: format!("unknown chaos action: {other}"),
@@ -1029,6 +1091,58 @@ pub async fn deploy(path: &Path, output: OutputFormat, dry_run: bool) -> Result<
             Err(RelishError::AgentUnreachable)
         }
     }
+}
+
+/// Request cooperative cancellation and wait up to 30 seconds for terminal evidence.
+pub async fn cancel_deploy(operation_id: &str, output: OutputFormat) -> Result<(), RelishError> {
+    let client = BunClient::default_local();
+    let operation = tokio::time::timeout(std::time::Duration::from_secs(30), async {
+        let mut operation = client.cancel_deploy(operation_id).await?;
+        while operation.outcome.is_none() {
+            tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+            let snapshot = client.deploy_operations().await?;
+            operation = snapshot.active_deploys.into_iter().chain(snapshot.history)
+                .find(|operation| operation.id.as_str() == operation_id)
+                .ok_or_else(|| RelishError::ApiError { status: 404,
+                    body: format!("operation {operation_id} is no longer retained; cancellation outcome is unknown") })?;
+        }
+        Ok::<_, RelishError>(operation)
+    }).await.map_err(|_| RelishError::ApiError { status: 202,
+        body: format!("cancellation of {operation_id} is still pending; in-flight work retains ownership; query or retry the same ID") })??;
+    match output {
+        OutputFormat::Human => println!(
+            "{}: {:?}: {}",
+            operation.id,
+            operation
+                .outcome
+                .unwrap_or(crate::bun::deploy_operations::DeployOperationOutcome::Unknown),
+            operation.message
+        ),
+        OutputFormat::Json => println!(
+            "{}",
+            serde_json::to_string_pretty(&operation).map_err(RelishError::SerialiseJson)?
+        ),
+        OutputFormat::Yaml => print!(
+            "{}",
+            serde_yaml::to_string(&operation).map_err(RelishError::SerialiseYaml)?
+        ),
+    }
+    if matches!(
+        operation.outcome,
+        Some(
+            crate::bun::deploy_operations::DeployOperationOutcome::Unknown
+                | crate::bun::deploy_operations::DeployOperationOutcome::Failed
+        )
+    ) {
+        return Err(RelishError::ApiError {
+            status: 0,
+            body: format!(
+                "deployment ended with {:?}: {}",
+                operation.outcome, operation.message
+            ),
+        });
+    }
+    Ok(())
 }
 
 /// Show deploy history for an app in a namespace.
@@ -2060,6 +2174,19 @@ mod tests {
         assert_eq!(parse_since("5m", now).unwrap(), now - 300);
         assert_eq!(parse_since("2h", now).unwrap(), now - 7200);
         assert_eq!(parse_since("1d", now).unwrap(), now - 86_400);
+    }
+
+    #[test]
+    fn oversized_or_unicode_since_values_return_errors() {
+        for value in [
+            "18446744073709551615d",
+            "18446744073709551615h",
+            "18446744073709551615m",
+            "é",
+            "5☃",
+        ] {
+            assert!(parse_since(value, 1_750_000_000).is_err(), "{value}");
+        }
     }
 
     #[test]

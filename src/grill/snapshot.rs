@@ -21,6 +21,9 @@ use super::btrfs::{self, VolumeBackend};
 /// Errors from snapshot operations.
 #[derive(Debug, thiserror::Error)]
 pub enum SnapshotError {
+    /// Disposable test storage cannot create persistent snapshot or upload owners.
+    #[error("snapshots are not supported for lease-owned test storage")]
+    TestStorage,
     #[error(
         "volume {volume} of {namespace}/{app} is not a btrfs subvolume — \
          snapshots need the volumes directory on btrfs"
@@ -154,6 +157,9 @@ impl SnapshotManager {
         app: &str,
         volume_path: &str,
     ) -> Result<PathBuf, SnapshotError> {
+        if crate::testkit::lease::valid_test_namespace(namespace) {
+            return Err(SnapshotError::TestStorage);
+        }
         let host_path = self.volume_host_path(namespace, app, volume_path);
         let manager = super::volume::VolumeManager::new(&self.volumes_dir);
         match manager.backend_of(&host_path) {
@@ -288,6 +294,9 @@ impl SnapshotManager {
 
     /// Delete a snapshot and its metadata.
     pub fn delete(&self, namespace: &str, app: &str, name: &str) -> Result<(), SnapshotError> {
+        if crate::testkit::lease::valid_test_namespace(namespace) {
+            return Err(SnapshotError::TestStorage);
+        }
         let meta = self.find(namespace, app, name)?;
         let snapshot_path = self
             .snapshot_dir(namespace, app, &meta.volume_path)
@@ -375,6 +384,21 @@ mod tests {
     use std::time::Duration;
 
     // -- pure helpers -----------------------------------------------------
+
+    #[test]
+    fn leased_storage_refuses_snapshot_creation_and_deletion() {
+        let root = tempfile::tempdir().unwrap();
+        let manager = SnapshotManager::new(root.path());
+        assert!(matches!(
+            manager.create("rbtest-storage", "web", "/data", None, SystemTime::now()),
+            Err(SnapshotError::TestStorage)
+        ));
+        assert!(matches!(
+            manager.delete("rbtest-storage", "web", "snapshot"),
+            Err(SnapshotError::TestStorage)
+        ));
+        assert!(std::fs::read_dir(root.path()).unwrap().next().is_none());
+    }
 
     #[test]
     fn volume_slug_flattens_paths() {

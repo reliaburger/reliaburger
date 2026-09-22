@@ -8,8 +8,8 @@ expression: "render_to_string(&app, 120, 40)"
 │web · default                                                                                                         │
 │ Overview  │  Instances  │  Logs  │  Metrics  │ [Deploys] │  Config                                                   │
 │                                                                                                                      │
+│deployment history from the connected node                                                                            │
 │no deploy history                                                                                                     │
-│                                                                                                                      │
 │                                                                                                                      │
 │                                                                                                                      │
 │                                                                                                                      │

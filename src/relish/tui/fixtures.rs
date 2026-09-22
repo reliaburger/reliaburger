@@ -2,7 +2,9 @@
 
 use std::collections::BTreeMap;
 
-use crate::bun::agent::{CouncilStatus, InstanceStatus, JobStatus, NodeStatus};
+use crate::bun::agent::{
+    ClusterInstanceStatus, CouncilStatus, InstanceStatus, JobStatus, NodeStatus,
+};
 use crate::bun::events::{ClusterEvent, EventKind, EventSeverity};
 use crate::mayo::rollup::{MetricsQueryResult, MetricsQueryRow};
 use crate::wrapper::types::RouteInfo;
@@ -39,15 +41,18 @@ impl TestScenario {
             };
             for replica in 0..2 {
                 let degraded = matches!(self, Self::DegradedApp) && app_index == 0 && replica == 1;
-                data.instances.push(InstanceStatus {
-                    id: format!("{name}-{replica}"),
-                    app_name: name.clone(),
-                    namespace: "default".into(),
-                    state: if degraded { "unhealthy" } else { "running" }.into(),
-                    restart_count: u32::from(degraded) * 4,
-                    host_port: Some(8000 + app_index as u16),
-                    exit_code: None,
-                    pid: Some(1000 + app_index as u32 * 2 + replica),
+                data.instances.push(ClusterInstanceStatus {
+                    node: format!("node-{}", replica + 1),
+                    instance: InstanceStatus {
+                        id: format!("{name}-{replica}"),
+                        app_name: name.clone(),
+                        namespace: "default".into(),
+                        state: if degraded { "unhealthy" } else { "running" }.into(),
+                        restart_count: u32::from(degraded) * 4,
+                        host_port: Some(8000 + app_index as u16),
+                        exit_code: None,
+                        pid: Some(1000 + app_index as u32 * 2 + replica),
+                    },
                 });
             }
         }
@@ -56,6 +61,7 @@ impl TestScenario {
                 data.nodes.push(NodeStatus {
                     node_id: format!("node-{}", index + 1),
                     address: format!("10.0.0.{}:9118", index + 1),
+                    api_address: None,
                     state: "alive".into(),
                     incarnation: 1,
                     is_council: true,

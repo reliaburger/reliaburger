@@ -65,6 +65,7 @@ pub async fn handle_websocket_upgrade(
     over_tls: bool,
     permit: tokio::sync::OwnedSemaphorePermit,
     drain_guard: Option<Box<dyn std::any::Any + Send>>,
+    terminate: Vec<tokio_util::sync::CancellationToken>,
 ) -> Response {
     // Capture the client-side upgrade future before consuming the request.
     // It resolves to the raw client stream once our 101 is written.
@@ -76,7 +77,7 @@ pub async fn handle_websocket_upgrade(
     // handler, its connection permit, and the drain guard indefinitely — the
     // 30s reqwest timeout only covers the non-WS path.
     let upgrade_request = build_upgrade_request(&req, backend, remote, over_tls);
-    let handshake_result = tokio::time::timeout(WS_HANDSHAKE_TIMEOUT, async {
+    let handshake = tokio::time::timeout(WS_HANDSHAKE_TIMEOUT, async {
         let mut backend_stream = TcpStream::connect(backend).await.ok()?;
         backend_stream
             .write_all(upgrade_request.as_bytes())
@@ -86,8 +87,12 @@ pub async fn handle_websocket_upgrade(
         // forwarded to the client before the bidirectional splice begins.
         let (head, leftover) = read_http_head(&mut backend_stream).await?;
         Some((backend_stream, head, leftover))
-    })
-    .await;
+    });
+    let handshake_result = tokio::select! {
+        biased;
+        _ = super::draining::wait_for_termination(&terminate) => return StatusCode::SERVICE_UNAVAILABLE.into_response(),
+        result = handshake => result,
+    };
     let (mut backend_stream, head, leftover) = match handshake_result {
         Ok(Some(triple)) => triple,
         // Timed out, or connect/write/read failed.
@@ -119,15 +124,21 @@ pub async fn handle_websocket_upgrade(
         // Bind the guards so they live for the whole splice, then release.
         let _permit = permit;
         let _drain_guard = drain_guard;
-        let upgraded = match client_upgrade.await {
-            Ok(u) => u,
-            Err(_) => return,
-        };
-        let mut client_io = TokioIo::new(upgraded);
-        if !leftover.is_empty() && client_io.write_all(&leftover).await.is_err() {
-            return;
+        tokio::select! {
+            biased;
+            _ = super::draining::wait_for_termination(&terminate) => {},
+            _ = async {
+                let upgraded = match client_upgrade.await {
+                    Ok(u) => u,
+                    Err(_) => return,
+                };
+                let mut client_io = TokioIo::new(upgraded);
+                if !leftover.is_empty() && client_io.write_all(&leftover).await.is_err() {
+                    return;
+                }
+                let _ = tokio::io::copy_bidirectional(&mut client_io, &mut backend_stream).await;
+            } => {},
         }
-        let _ = tokio::io::copy_bidirectional(&mut client_io, &mut backend_stream).await;
     });
 
     response

@@ -1,17 +1,22 @@
+# 0.9.145 fixes sibling capture-pipe inheritance on Apple platforms.
+nextest-version = "0.9.145"
+
 [store]
 dir = "target/nextest"
 
 [profile.default]
 retries = 0
+leak-timeout = { period = "100ms", result = "fail" }
 fail-fast = true
-status-level = "slow"
+status-level = "leak"
 final-status-level = "slow"
 slow-timeout = { period = "30s", terminate-after = 2 }
 
 [profile.ci]
 retries = 0
+leak-timeout = { period = "100ms", result = "fail" }
 fail-fast = false
-status-level = "slow"
+status-level = "leak"
 final-status-level = "slow"
 slow-timeout = { period = "30s", terminate-after = 2 }
 junit = { path = "junit.xml" }
@@ -23,7 +28,7 @@ process-heavy = { max-threads = 2 }
 upgrade-heavy = { max-threads = 1 }
 
 [[profile.default.overrides]]
-filter = 'binary(ebpf) | test(/(runc|netns|btrfs|buildah|image_pull)/)'
+filter = 'binary(ebpf) | binary(owned_network) | binary(owned_runc) | binary(owned_rootless) | test(/(runc|netns|btrfs|buildah|image_pull)/)'
 test-group = "host-network"
 slow-timeout = { period = "60s", terminate-after = 2 }
 
@@ -50,7 +55,7 @@ filter = 'binary(node_pressure)'
 threads-required = "num-test-threads"
 
 [[profile.ci.overrides]]
-filter = 'binary(ebpf) | test(/(runc|netns|btrfs|buildah|image_pull)/)'
+filter = 'binary(ebpf) | binary(owned_network) | binary(owned_runc) | binary(owned_rootless) | test(/(runc|netns|btrfs|buildah|image_pull)/)'
 test-group = "host-network"
 slow-timeout = { period = "60s", terminate-after = 2 }
 
@@ -74,3 +79,16 @@ slow-timeout = { period = "120s", terminate-after = 3 }
 [[profile.ci.overrides]]
 filter = 'binary(node_pressure)'
 threads-required = "num-test-threads"
+
+# Registry crash acceptance includes an intentional 30-second lease expiry,
+# real TLS enrolment and a three-voter election. Serialise the physical cluster
+# fixtures and allow their explicit recovery deadlines to run under nextest.
+[[profile.default.overrides]]
+filter = 'binary(documentation_first_run) & (test(=expired_registry_lease_recovers_after_bun_sigkill_and_preserves_shared_content) | test(=new_leader_retains_registry_cleanup_until_the_killed_writer_returns))'
+test-group = "cluster-heavy"
+slow-timeout = { period = "60s", terminate-after = 4 }
+
+[[profile.ci.overrides]]
+filter = 'binary(documentation_first_run) & (test(=expired_registry_lease_recovers_after_bun_sigkill_and_preserves_shared_content) | test(=new_leader_retains_registry_cleanup_until_the_killed_writer_returns))'
+test-group = "cluster-heavy"
+slow-timeout = { period = "60s", terminate-after = 4 }

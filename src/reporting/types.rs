@@ -40,6 +40,9 @@ pub struct StateReport {
 /// A single running app instance on a worker node.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RunningApp {
+    /// Original execution identity, when durable runtime evidence is available.
+    #[serde(default)]
+    pub execution: Option<crate::grill::RuntimeExecution>,
     /// Name of the app.
     pub app_name: String,
     /// Namespace the app belongs to.
@@ -58,9 +61,8 @@ pub struct RunningApp {
     pub resource_usage: AppResourceUsage,
 }
 
-/// Typed capability and enforcement evidence sent beside the legacy state
-/// report. This is a separate message so mixed-version clusters keep the
-/// existing positional bincode `StateReport` wire shape intact.
+/// Typed capability and enforcement evidence sent beside the state report.
+/// Explicit protocol compatibility governs admission of every message.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct NodeCapabilityReport {
     /// Node that observed this evidence.
@@ -309,6 +311,7 @@ mod tests {
             node_id: NodeId::new(name),
             timestamp: SystemTime::now(),
             running_apps: vec![RunningApp {
+                execution: None,
                 app_name: "web".to_string(),
                 namespace: "default".to_string(),
                 instance_id: 0,

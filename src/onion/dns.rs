@@ -15,11 +15,14 @@
 /// interception, which turned out to be infeasible: the cgroup
 /// sendmsg4/recvmsg4 hooks can modify socket addresses but can't
 /// read or synthesise DNS packet payloads.
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::sync::Arc;
 use std::time::Duration;
 
+use hickory_proto::op::{Message, MessageType, OpCode, ResponseCode};
+use hickory_proto::rr::{DNSClass, RData, Record, rdata::A};
+use hickory_proto::serialize::binary::{BinDecodable, BinDecoder};
 use serde::{Deserialize, Serialize};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, UdpSocket};
@@ -37,40 +40,43 @@ use super::vip::VirtualIP;
 /// entry into an eBPF object that was never loaded, so the fault did
 /// nothing. DNS resolution lives entirely in this responder now, so the
 /// fault lives here too: the agent publishes the set of faulted service
-/// names (with their expiry) on a `watch` channel, and [`answer_internal`]
+/// names (with their expiry) on a `watch` channel, and `answer_internal`
 /// returns NXDOMAIN for any name that matches while the fault is live.
 ///
-/// A fault targets a service by its bare app name (`redis`), the same way
-/// the Smoker keys every other fault, so a name is faulted in every
-/// namespace it appears in. Expiry is belt-and-braces: the agent removes
-/// a fault from the published set when it clears or expires, and the
-/// resolver also ignores any entry whose deadline has already passed, so
-/// a fault can never outlive its window even if a publish is missed.
+/// Faults retain the authorised namespace and service identity. Overlapping
+/// owners keep the name faulted until the latest expiry; clearing one owner
+/// republishes the union of the remaining owners.
 #[derive(Debug, Clone, Default)]
 pub struct DnsFaultState {
-    /// App name → expiry (`CLOCK_MONOTONIC` nanoseconds, matching the
-    /// Smoker registry's `expires_at_ns`). `0` means "no expiry".
-    faulted: BTreeMap<String, u64>,
+    /// Service identity → monotonic expiry. Zero represents an indefinite owner.
+    faulted: HashMap<ServiceId, u64>,
 }
 
 impl DnsFaultState {
-    /// Build a fault state from `(app name, expiry_ns)` pairs.
-    pub fn from_faults(faults: impl IntoIterator<Item = (String, u64)>) -> Self {
-        Self {
-            faulted: faults.into_iter().collect(),
+    /// Build the union of active owners for each namespace-qualified service.
+    pub fn from_faults(faults: impl IntoIterator<Item = (ServiceId, u64)>) -> Self {
+        let mut result = Self::default();
+        for (service, expires) in faults {
+            result
+                .faulted
+                .entry(service)
+                .and_modify(|current| {
+                    *current = if *current == 0 || expires == 0 {
+                        0
+                    } else {
+                        (*current).max(expires)
+                    };
+                })
+                .or_insert(expires);
         }
+        result
     }
 
-    /// Whether `app` should be forced to NXDOMAIN right now.
-    ///
-    /// `now_ns` is the current `CLOCK_MONOTONIC` reading. A fault with a
-    /// non-zero expiry that has already passed is treated as gone even if
-    /// it's still in the map, so a stale publish can't keep a name dark.
-    pub fn is_faulted(&self, app: &str, now_ns: u64) -> bool {
-        match self.faulted.get(app) {
-            Some(&expires_ns) => expires_ns == 0 || now_ns < expires_ns,
-            None => false,
-        }
+    /// Whether this exact service has at least one unexpired DNS fault owner.
+    pub fn is_faulted(&self, service: &ServiceId, now_ns: u64) -> bool {
+        self.faulted
+            .get(service)
+            .is_some_and(|expires| *expires == 0 || now_ns < *expires)
     }
 }
 
@@ -129,6 +135,37 @@ impl DnsCapability {
     }
 }
 
+/// Namespace identities published by the local runtime for isolated source IPs.
+/// Shared or ambiguous addresses must not borrow another workload's namespace.
+#[derive(Debug, Clone, Default)]
+pub struct DnsSourceNamespaces {
+    bindings: BTreeMap<IpAddr, Option<String>>,
+}
+
+impl DnsSourceNamespaces {
+    /// Build a snapshot, refusing conflicting namespaces for the same address.
+    pub fn from_bindings(bindings: impl IntoIterator<Item = (IpAddr, String)>) -> Self {
+        let mut result = Self::default();
+        for (ip, namespace) in bindings {
+            result
+                .bindings
+                .entry(ip)
+                .and_modify(|current| {
+                    if current.as_deref() != Some(namespace.as_str()) {
+                        *current = None;
+                    }
+                })
+                .or_insert_with(|| (!namespace.is_empty()).then_some(namespace));
+        }
+        result
+    }
+
+    /// Return the uniquely identified namespace, or no identity for this source.
+    pub fn namespace(&self, source: IpAddr) -> Option<&str> {
+        self.bindings.get(&source)?.as_deref()
+    }
+}
+
 /// Configuration for the DNS responder.
 #[derive(Debug, Clone)]
 pub struct DnsConfig {
@@ -138,15 +175,9 @@ pub struct DnsConfig {
     pub upstream: SocketAddr,
     /// How long to wait for an upstream reply before SERVFAIL.
     pub upstream_timeout: Duration,
-    /// Namespace a bare `<app>.internal` query resolves within.
-    ///
-    /// A container that asks for `redis.internal` (rather than the fully
-    /// qualified `redis.payments.internal`) means "redis in my namespace".
-    /// The userspace responder can't see the querying container's cgroup,
-    /// so it falls back to this namespace — set per-node to the namespace
-    /// the node predominantly serves, `default` otherwise. Fully qualified
-    /// `<app>.<namespace>.internal` queries ignore it.
-    pub default_namespace: String,
+    /// Runtime-owned source addresses and their workload namespaces.
+    /// Short names are refused when the source is absent or ambiguous.
+    pub source_namespaces: watch::Receiver<DnsSourceNamespaces>,
     /// Which source addresses may query the `.internal` zone.
     pub source_acl: SourceAcl,
 }
@@ -157,7 +188,7 @@ impl Default for DnsConfig {
             listen_addr: SocketAddr::new(Ipv4Addr::UNSPECIFIED.into(), 53),
             upstream: SocketAddr::new(Ipv4Addr::new(8, 8, 8, 8).into(), 53),
             upstream_timeout: Duration::from_secs(2),
-            default_namespace: "default".to_string(),
+            source_namespaces: watch::channel(DnsSourceNamespaces::default()).1,
             source_acl: SourceAcl::default(),
         }
     }
@@ -176,19 +207,33 @@ pub struct BoundDnsResponder {
 impl BoundDnsResponder {
     /// Bind both UDP and TCP on the configured address.
     pub async fn bind(mut config: DnsConfig) -> Result<Self, std::io::Error> {
-        let udp = Arc::new(UdpSocket::bind(config.listen_addr).await?);
-        // Port zero is useful for tests and embedded callers. Bind UDP first,
-        // then make TCP use the same kernel-selected port rather than letting
-        // each transport receive a different ephemeral port.
-        if config.listen_addr.port() == 0 {
-            config.listen_addr.set_port(udp.local_addr()?.port());
+        let requested = config.listen_addr;
+        for attempt in 0..16 {
+            let udp = Arc::new(UdpSocket::bind(requested).await?);
+            // UDP's ephemeral allocator does not reserve the same TCP port.
+            // Retry only automatic selection; explicit port conflicts remain
+            // startup errors. Each failed attempt drops its UDP reservation.
+            config.listen_addr = udp.local_addr()?;
+            let tcp = match TcpListener::bind(config.listen_addr).await {
+                Ok(tcp) => tcp,
+                Err(error)
+                    if requested.port() == 0
+                        && error.kind() == std::io::ErrorKind::AddrInUse
+                        && attempt < 15 =>
+                {
+                    continue;
+                }
+                Err(error) => return Err(error),
+            };
+            return Ok(Self {
+                config: Arc::new(config),
+                udp,
+                tcp,
+            });
         }
-        let tcp = TcpListener::bind(config.listen_addr).await?;
-        Ok(Self {
-            config: Arc::new(config),
-            udp,
-            tcp,
-        })
+        Err(std::io::Error::other(
+            "could not allocate a shared DNS port",
+        ))
     }
 
     /// Bind an IPv4 address that the kernel will add after startup.
@@ -353,7 +398,11 @@ impl SourceAcl {
     }
 }
 
-/// Run the DNS responder until the cancellation token is triggered.
+/// Run a standalone DNS responder until its cancellation token is triggered.
+///
+/// This convenience entry point serves standalone users and the DNS/eBPF
+/// integration tests. Bun uses [`BoundDnsResponder`] directly so socket
+/// binding can participate in its startup readiness checks.
 ///
 /// Reads the service map from a watch channel — the agent publishes a
 /// snapshot whenever the map changes, so lookups here never contend
@@ -554,7 +603,7 @@ async fn answer_tcp_query(
 /// Enforces the source ACL first: a client outside the container-reachable
 /// ranges gets REFUSED, so the internal topology never leaks. The name is
 /// then resolved namespace-aware: `<app>.<namespace>` targets that exact
-/// service, while a bare `<app>` resolves in `config.default_namespace`.
+/// service, while a bare `<app>` requires the runtime-owned source namespace.
 ///
 /// Authoritative: resolves A queries from the service map, returns an
 /// empty NOERROR for AAAA on known names (we only have IPv4 VIPs),
@@ -579,14 +628,14 @@ fn answer_internal(
         return build_status_response(query, RCODE_REFUSED);
     }
 
-    let service_id = service_id_for(stripped, &config.default_namespace);
+    let sources = config.source_namespaces.borrow();
+    let Some(service_id) = service_id_for(stripped, sources.namespace(src)) else {
+        return build_status_response(query, RCODE_REFUSED);
+    };
 
-    // Smoker DNS fault: a targeted app is forced to NXDOMAIN regardless of
-    // whether it resolves. The fault is keyed by bare app name (matching
-    // how every Smoker fault targets a service), so it bites in whatever
-    // namespace the query lands in.
+    // Retain the namespace chosen above when checking fault ownership.
     let now_ns = crate::smoker::types::monotonic_now_ns();
-    if dns_faults.borrow().is_faulted(&service_id.name, now_ns) {
+    if dns_faults.borrow().is_faulted(&service_id, now_ns) {
         return build_status_response(query, RCODE_NXDOMAIN);
     }
 
@@ -601,16 +650,19 @@ fn answer_internal(
     }
 }
 
-/// Map the stripped `.internal` label(s) to a [`ServiceId`].
-///
-/// `<app>.<namespace>` becomes `ServiceId { namespace, app }`; a bare
-/// `<app>` (no dot) resolves in `default_namespace`. A name with more than
-/// two labels keeps the first as the app and the second as the namespace
-/// (deeper labels are ignored — there's no third level in the scheme).
-fn service_id_for(stripped: &str, default_namespace: &str) -> ServiceId {
+/// Resolve qualified names directly and short names only with a source identity.
+fn service_id_for(stripped: &str, namespace: Option<&str>) -> Option<ServiceId> {
     match stripped.split_once('.') {
-        Some((app, namespace)) => ServiceId::new(namespace, app),
-        None => ServiceId::new(default_namespace, stripped),
+        Some((app, namespace))
+            if !app.is_empty() && !namespace.is_empty() && !namespace.contains('.') =>
+        {
+            Some(ServiceId::new(namespace, app))
+        }
+        Some(_) => None,
+        None if !stripped.is_empty() => {
+            namespace.map(|namespace| ServiceId::new(namespace, stripped))
+        }
+        None => None,
     }
 }
 
@@ -667,155 +719,92 @@ async fn forward_upstream(
 ///
 /// Returns the name as a lowercase dotted string, or `None` if the
 /// packet is malformed.
+/// Decode the complete packet before admitting its one Internet-class question.
+/// The codec owns name lengths, compression and record boundaries; Onion owns
+/// which operations and service-name representations it supports.
+fn decode_query(packet: &[u8]) -> Option<Message> {
+    if packet.len() < 12 || packet[3] & 0x40 != 0 {
+        return None;
+    }
+    let mut decoder = BinDecoder::new(packet);
+    let message = Message::read(&mut decoder).ok()?;
+    if !decoder.is_empty()
+        || message.metadata.message_type != MessageType::Query
+        || message.metadata.op_code != OpCode::Query
+        || message.metadata.response_code != ResponseCode::NoError
+        || message.metadata.truncation
+        || message.queries.len() != 1
+        || !message.answers.is_empty()
+        || !message.authorities.is_empty()
+        || !message.additionals.is_empty()
+        || message.signature.is_some()
+        || message
+            .edns
+            .as_ref()
+            .is_some_and(|edns| edns.version() != 0)
+    {
+        return None;
+    }
+    let question = &message.queries[0];
+    if question.query_class != DNSClass::IN
+        || question.name.is_root()
+        // A literal dot is part of one DNS label, never a namespace separator.
+        || question.name.iter().any(|label| label.contains(&b'.'))
+    {
+        return None;
+    }
+    Some(message)
+}
+
 fn parse_query(packet: &[u8]) -> Option<(String, u16)> {
-    // DNS header is 12 bytes
-    if packet.len() < 13 {
-        return None;
-    }
-
-    let mut pos = 12; // skip header
-    let mut name = String::new();
-
-    loop {
-        if pos >= packet.len() {
-            return None;
-        }
-
-        let label_len = packet[pos] as usize;
-        pos += 1;
-
-        if label_len == 0 {
-            break; // end of name
-        }
-
-        if label_len > 63 || pos + label_len > packet.len() {
-            return None; // invalid label
-        }
-
-        if !name.is_empty() {
-            name.push('.');
-        }
-
-        for &b in &packet[pos..pos + label_len] {
-            name.push(b.to_ascii_lowercase() as char);
-        }
-
-        pos += label_len;
-    }
-
-    if name.is_empty() {
-        return None;
-    }
-
-    // QTYPE follows the name terminator
-    if pos + 2 > packet.len() {
-        return None;
-    }
-    let qtype = u16::from_be_bytes([packet[pos], packet[pos + 1]]);
-
-    Some((name, qtype))
+    let message = decode_query(packet)?;
+    let question = &message.queries[0];
+    Some((
+        question
+            .name
+            .to_ascii()
+            .trim_end_matches('.')
+            .to_ascii_lowercase(),
+        question.query_type.into(),
+    ))
 }
 
-/// Build a minimal DNS A record response for a VIP.
+/// Encode a bounded answer with a validated question and optional EDNS0.
+fn build_response(query: &[u8], rcode: u8, vip: Option<VirtualIP>) -> Vec<u8> {
+    let Some(query) = decode_query(query) else {
+        return Vec::new();
+    };
+    let mut response = Message::response(query.metadata.id, OpCode::Query);
+    response.metadata.authoritative = true;
+    response.metadata.recursion_desired = query.metadata.recursion_desired;
+    response.metadata.response_code = ResponseCode::from(0, rcode);
+    if let Some(vip) = vip {
+        response.add_answer(Record::from_rdata(
+            query.queries[0].name.clone(),
+            0,
+            RData::A(A(vip.0)),
+        ));
+    }
+    response.queries = query.queries;
+    if query.edns.is_some() {
+        let mut edns = hickory_proto::op::Edns::new();
+        edns.set_max_payload(MAX_PACKET as u16);
+        response.set_edns(edns);
+    }
+    response.to_vec().unwrap_or_else(|error| {
+        eprintln!("onion-dns: cannot encode response: {error}");
+        Vec::new()
+    })
+}
+
+/// Build an authoritative, zero-TTL IPv4 answer.
 fn build_a_response(query: &[u8], vip: VirtualIP) -> Vec<u8> {
-    if query.len() < 12 {
-        return Vec::new();
-    }
-
-    let mut response = Vec::with_capacity(query.len() + 16);
-
-    // Copy the query ID
-    response.extend_from_slice(&query[..2]);
-
-    // Flags: QR=1 (response), AA=1 (authoritative), RCODE=0
-    response.push(0x84); // QR=1, Opcode=0, AA=1, TC=0, RD=0
-    response.push(0x00); // RA=0, Z=0, RCODE=0
-
-    // QDCOUNT=1 (copy from query)
-    response.extend_from_slice(&query[4..6]);
-    // ANCOUNT=1
-    response.push(0x00);
-    response.push(0x01);
-    // NSCOUNT=0
-    response.push(0x00);
-    response.push(0x00);
-    // ARCOUNT=0
-    response.push(0x00);
-    response.push(0x00);
-
-    // Copy the question section from the query
-    let question_end = find_question_end(query);
-    if question_end > 12 {
-        response.extend_from_slice(&query[12..question_end]);
-    }
-
-    // Answer section: pointer to name in question (compression)
-    response.push(0xC0); // pointer
-    response.push(0x0C); // offset 12 (start of question name)
-
-    // TYPE = A (1)
-    response.push(0x00);
-    response.push(0x01);
-    // CLASS = IN (1)
-    response.push(0x00);
-    response.push(0x01);
-    // TTL = 0 (always re-resolve; map is always current)
-    response.extend_from_slice(&[0x00, 0x00, 0x00, 0x00]);
-    // RDLENGTH = 4
-    response.push(0x00);
-    response.push(0x04);
-    // RDATA = IPv4 address
-    response.extend_from_slice(&vip.0.octets());
-
-    response
+    build_response(query, 0, Some(vip))
 }
 
-/// Build an answerless response with the given RCODE.
-///
-/// RCODE 0 with ANCOUNT=0 is the "name exists, no records of that
-/// type" answer (used for AAAA on IPv4-only names); 2 is SERVFAIL,
-/// 3 NXDOMAIN, 4 NOTIMP.
+/// Build an authoritative answerless response with the given RCODE.
 fn build_status_response(query: &[u8], rcode: u8) -> Vec<u8> {
-    if query.len() < 12 {
-        return Vec::new();
-    }
-
-    let mut response = Vec::with_capacity(query.len());
-
-    response.extend_from_slice(&query[..2]); // ID
-    response.push(0x84); // QR=1, AA=1
-    response.push(rcode & 0x0F); // RA=0, Z=0, RCODE
-    response.extend_from_slice(&query[4..6]); // QDCOUNT
-    response.extend_from_slice(&[0x00, 0x00]); // ANCOUNT=0
-    response.extend_from_slice(&[0x00, 0x00]); // NSCOUNT=0
-    response.extend_from_slice(&[0x00, 0x00]); // ARCOUNT=0
-
-    let question_end = find_question_end(query);
-    if question_end > 12 {
-        response.extend_from_slice(&query[12..question_end]);
-    }
-
-    response
-}
-
-/// Find the end of the question section in a DNS packet.
-fn find_question_end(packet: &[u8]) -> usize {
-    let mut pos = 12;
-
-    // Skip the query name
-    while pos < packet.len() {
-        let label_len = packet[pos] as usize;
-        pos += 1;
-        if label_len == 0 {
-            break;
-        }
-        pos += label_len;
-    }
-
-    // Skip QTYPE (2 bytes) and QCLASS (2 bytes)
-    pos += 4;
-
-    pos.min(packet.len())
+    build_response(query, rcode, None)
 }
 
 #[cfg(test)]
@@ -956,6 +945,11 @@ mod tests {
     /// separately), resolving bare names in `default`.
     fn test_config() -> DnsConfig {
         DnsConfig {
+            source_namespaces: watch::channel(DnsSourceNamespaces::from_bindings([(
+                LOOPBACK,
+                "default".into(),
+            )]))
+            .1,
             source_acl: SourceAcl {
                 restrict_to_private: false,
             },
@@ -972,14 +966,14 @@ mod tests {
 
     #[test]
     fn service_id_for_qualified_name() {
-        let id = service_id_for("api.payments", "default");
+        let id = service_id_for("api.payments", None).unwrap();
         assert_eq!(id.namespace, "payments");
         assert_eq!(id.name, "api");
     }
 
     #[test]
-    fn service_id_for_bare_name_uses_default_namespace() {
-        let id = service_id_for("api", "team-b");
+    fn service_id_for_bare_name_uses_source_namespace() {
+        let id = service_id_for("api", Some("team-b")).unwrap();
         assert_eq!(id.namespace, "team-b");
         assert_eq!(id.name, "api");
     }
@@ -1009,7 +1003,53 @@ mod tests {
     }
 
     #[test]
-    fn answer_internal_bare_name_resolves_in_default_namespace() {
+    fn short_names_keep_two_simultaneous_callers_in_their_own_namespaces() {
+        let mut map = ServiceMap::new();
+        let red = map.register_app("redis", "red", 6379, None).unwrap();
+        let blue = map.register_app("redis", "blue", 6379, None).unwrap();
+        let (_map_tx, map_rx) = watch::channel(map);
+        let mut config = test_config();
+        config.source_namespaces = watch::channel(DnsSourceNamespaces::from_bindings([
+            ("10.3.0.2".parse().unwrap(), "red".into()),
+            ("10.3.0.3".parse().unwrap(), "blue".into()),
+        ]))
+        .1;
+        let query = build_dns_query("redis.internal");
+        for (source, vip) in [("10.3.0.2", red), ("10.3.0.3", blue)] {
+            let response = answer_internal(
+                &config,
+                &map_rx,
+                &no_dns_faults(),
+                &query,
+                "redis",
+                QTYPE_A,
+                source.parse().unwrap(),
+            );
+            assert_eq!(response[3] & 0xf, 0);
+            assert_eq!(&response[response.len() - 4..], &vip.0.octets());
+        }
+    }
+
+    #[test]
+    fn unknown_source_cannot_resolve_a_short_name_in_the_nodes_namespace() {
+        let mut map = ServiceMap::new();
+        map.register_app("redis", "default", 6379, None).unwrap();
+        let (_tx, rx) = watch::channel(map);
+        let query = build_dns_query("redis.internal");
+        let response = answer_internal(
+            &DnsConfig::default(),
+            &rx,
+            &no_dns_faults(),
+            &query,
+            "redis",
+            QTYPE_A,
+            "10.3.0.12".parse().unwrap(),
+        );
+        assert_eq!(response[3] & 0x0f, RCODE_REFUSED);
+    }
+
+    #[test]
+    fn answer_internal_bare_name_resolves_in_identified_namespace() {
         let mut map = ServiceMap::new();
         map.register_app("redis", "default", 6379, None).unwrap();
         let vip = map
@@ -1160,6 +1200,20 @@ mod tests {
     }
 
     #[test]
+    fn overlapping_dns_owners_keep_the_latest_expiry_independent_of_order() {
+        let service = ServiceId::new("red", "redis");
+        for expiries in [[10, 20], [20, 10]] {
+            let state =
+                DnsFaultState::from_faults(expiries.map(|expiry| (service.clone(), expiry)));
+            assert!(state.is_faulted(&service, 15));
+            assert!(!state.is_faulted(&service, 20));
+            assert!(!state.is_faulted(&ServiceId::new("blue", "redis"), 15));
+        }
+        let state = DnsFaultState::from_faults([(service.clone(), 0), (service.clone(), 20)]);
+        assert!(state.is_faulted(&service, u64::MAX));
+    }
+
+    #[test]
     fn dns_nxdomain_fault_forces_nxdomain_for_the_targeted_service() {
         // Two services that both normally resolve; the fault targets only
         // `redis`. `redis` must go NXDOMAIN while `api` still resolves.
@@ -1170,8 +1224,10 @@ mod tests {
         let (_map_tx, map_rx) = watch::channel(map);
 
         // No expiry (0) — the fault is live until cleared.
-        let (_fault_tx, fault_rx) =
-            watch::channel(DnsFaultState::from_faults([("redis".to_string(), 0)]));
+        let (_fault_tx, fault_rx) = watch::channel(DnsFaultState::from_faults([(
+            ServiceId::new("default", "redis"),
+            0,
+        )]));
 
         let redis_query = build_dns_query("redis.internal");
         let redis_resp = answer_internal(
@@ -1232,8 +1288,10 @@ mod tests {
 
         // Clear: the agent publishes an empty state, and the service resolves
         // again immediately.
-        let (fault_tx, fault_rx) =
-            watch::channel(DnsFaultState::from_faults([("redis".to_string(), 0)]));
+        let (fault_tx, fault_rx) = watch::channel(DnsFaultState::from_faults([(
+            ServiceId::new("default", "redis"),
+            0,
+        )]));
         assert!(!resolves(&fault_rx), "fault active — should not resolve");
         fault_tx.send(DnsFaultState::default()).unwrap();
         assert!(
@@ -1244,8 +1302,10 @@ mod tests {
         // Expiry: an entry whose deadline has already passed is ignored even
         // if a publish is missed. `1` ns is comfortably in the past for the
         // monotonic clock (which reads seconds-since-boot).
-        let (_expired_tx, expired_rx) =
-            watch::channel(DnsFaultState::from_faults([("redis".to_string(), 1)]));
+        let (_expired_tx, expired_rx) = watch::channel(DnsFaultState::from_faults([(
+            ServiceId::new("default", "redis"),
+            1,
+        )]));
         assert!(
             resolves(&expired_rx),
             "an expired fault must not keep the name dark"

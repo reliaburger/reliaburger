@@ -1,20 +1,93 @@
 //! Workload-identity cases: JWKS and token scoping.
 //!
-//! These exercise the identity/auth control plane, which is API-level and
-//! runtime-independent, so they run on a process-runtime cluster too.
+//! JWKS and token scoping exercise the control plane on any runtime. The
+//! certificate case also requires a container and inspects its public bundle.
 
 use crate::bun::capabilities::Capability;
-use crate::config::Config;
-use crate::relish::client::BunClient;
 use crate::testkit::TestContext;
 use crate::testkit::registry::{TestCase, unknown};
 use crate::testkit::report::TestGroup;
 use crate::testkit_case;
 
-/// A running workload's SPIFFE certificate isn't reachable through the API, so
-/// this can't be asserted end-to-end from the harness yet.
-async fn workload_receives_spiffe_certificate(_ctx: TestContext) -> Result<(), String> {
-    unknown("a workload's SPIFFE certificate is not exposed via the orchestrator API")
+/// A workload receives the expected SPIFFE leaf under the configured cluster CA.
+async fn workload_receives_spiffe_certificate(
+    ctx: TestContext,
+) -> crate::testkit::registry::CaseResult {
+    use rustls::pki_types::{CertificateDer, UnixTime, pem::PemObject};
+    use std::sync::Arc;
+    use x509_parser::prelude::{FromDer, X509Certificate};
+
+    let Some(ca_pem) = ctx.client.cluster_ca_pem() else {
+        return unknown("certificate verification requires an explicit cluster CA");
+    };
+    let mut roots = rustls::RootCertStore::empty();
+    for certificate in CertificateDer::pem_slice_iter(ca_pem) {
+        roots
+            .add(certificate.map_err(|error| format!("invalid cluster CA PEM: {error}"))?)
+            .map_err(|error| format!("invalid cluster CA certificate: {error}"))?;
+    }
+    let verifier = rustls::server::WebPkiClientVerifier::builder_with_provider(
+        Arc::new(roots),
+        Arc::new(rustls::crypto::ring::default_provider()),
+    )
+    .build()
+    .map_err(|error| format!("cannot configure workload certificate verification: {error}"))?;
+
+    let app = "identity-app";
+    ctx.apply(&ctx.container_idle_spec(app)).await?;
+    ctx.wait_running_cluster(app, 1).await?;
+    let bundle = ctx
+        .deadline
+        .run("wait for workload certificate", async {
+            loop {
+                if let Ok(bundle) = ctx
+                    .exec_in_workload(
+                        app,
+                        &[
+                            "/bin/busybox".into(),
+                            "cat".into(),
+                            "/run/reliaburger/identity/bundle.pem".into(),
+                        ],
+                    )
+                    .await
+                    && bundle.starts_with("-----BEGIN CERTIFICATE-----")
+                {
+                    return bundle;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+            }
+        })
+        .await
+        .map_err(|error| error.to_string())?;
+    let certificates = CertificateDer::pem_slice_iter(bundle.as_bytes())
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|error| format!("invalid workload certificate PEM: {error}"))?;
+    let (leaf, intermediates) = certificates
+        .split_first()
+        .ok_or_else(|| "workload certificate bundle is empty".to_string())?;
+    verifier
+        .verify_client_cert(leaf, intermediates, UnixTime::now())
+        .map_err(|error| format!("workload certificate chain is invalid: {error}"))?;
+
+    let (_, certificate) = X509Certificate::from_der(leaf.as_ref())
+        .map_err(|error| format!("invalid workload certificate: {error}"))?;
+    let expected = crate::sesame::types::SpiffeUri {
+        trust_domain: ctx.capabilities.cluster_name.clone(),
+        namespace: ctx.namespace.clone(),
+        workload_type: crate::sesame::types::WorkloadType::App,
+        name: app.into(),
+    }
+    .to_uri();
+    let names = certificate
+        .subject_alternative_name()
+        .map_err(|error| format!("invalid workload certificate names: {error}"))?
+        .ok_or_else(|| "workload certificate has no subject alternative names".to_string())?;
+    if names.value.general_names.as_slice()
+        != [x509_parser::extensions::GeneralName::URI(&expected)]
+    {
+        return Err(format!("workload certificate does not identify exactly {expected}").into());
+    }
+    Ok(())
 }
 
 /// The JWKS endpoint serves at least one well-formed signing key.
@@ -49,67 +122,71 @@ async fn jwks_endpoint_serves_signing_keys(ctx: TestContext) -> Result<(), Strin
     Ok(())
 }
 
-/// A token scoped to one namespace is refused when it writes to another.
-async fn namespace_scoped_token_is_rejected_elsewhere(ctx: TestContext) -> Result<(), String> {
-    // Mint a Deployer token confined to this test's namespace. (This needs the
-    // harness itself to hold an admin token, which the dev cluster provides.)
-    let token_name = format!("rbtest-scope-{}", ctx.namespace);
+/// A token scoped to one namespace is refused when it reads another's logs.
+async fn namespace_scoped_token_is_rejected_elsewhere(
+    ctx: TestContext,
+) -> crate::testkit::registry::CaseResult {
+    let lease_id = ctx
+        .lease_id
+        .as_deref()
+        .ok_or_else(|| "scoped-token probe requires a server-owned lease".to_string())?;
+    let token_name = format!("{}-scope", ctx.namespace);
     let token = ctx
         .client
-        .token_create(
-            &token_name,
-            "Deployer",
-            None,
-            Some(vec![ctx.namespace.clone()]),
-            Some(1),
-        )
+        .token_create_with_lease(&token_name, &ctx.namespace, lease_id)
         .await
-        .map_err(|error| format!("could not mint a scoped token: {error}"))?;
-
-    let scoped = BunClient::new_with_token(ctx.client.base_url(), Some(&token));
-    // Deliberately avoid rbtest-* here. Those names are lease-only, and a
-    // rejection at that boundary would not prove token-scope enforcement.
+        .map_err(|error| format!("could not mint a leased scoped token: {error}"))?;
+    let scoped = ctx.client.with_token(&token);
     let other_namespace = format!("outside-{}", ctx.namespace.trim_start_matches("rbtest-"));
-    let spec = format!(
-        "[app.probe]\n\
-         image = \"proc-grill:image-ignored\"\n\
-         command = [\"true\"]\n\
-         namespace = \"{other_namespace}\"\n",
-    );
-    let config =
-        Config::parse(&spec).map_err(|error| format!("probe spec does not parse: {error}"))?;
-
-    // Only the scope gate's own refusal proves enforcement: AUTH1 answers
-    // 403 with "token scope does not allow …". Any error used to count as a
-    // pass, so a network blip or a 500 silently green-lit the case; and 403
-    // alone is not enough — a role failure is also 403.
-    let verdict = match scoped.apply(&config).await {
-        Err(crate::relish::RelishError::ApiError { status: 403, body })
-            if body.contains("token scope does not allow") =>
-        {
-            Ok(())
+    // A read proves the scope gate without creating an unowned resource if that
+    // very gate is broken. Raft owns token cleanup even if this future is dropped.
+    loop {
+        let result = ctx
+            .deadline
+            .run(
+                "scoped-token probe",
+                scoped.log_entries("probe", &other_namespace, 1, 0),
+            )
+            .await
+            .map_err(|error| format!("scope enforcement unproven: {error}"))?;
+        match result {
+            Err(crate::relish::RelishError::ApiError { status: 403, body })
+                if body.contains("token scope does not allow") =>
+            {
+                return Ok(());
+            }
+            Err(crate::relish::RelishError::ApiError { status: 401, .. }) => {
+                // Each node refreshes its local authentication store from Raft.
+                ctx.deadline
+                    .run(
+                        "token propagation",
+                        tokio::time::sleep(std::time::Duration::from_millis(100)),
+                    )
+                    .await
+                    .map_err(|error| format!("scope enforcement unproven: {error}"))?;
+            }
+            Err(
+                error @ (crate::relish::RelishError::AgentUnreachable
+                | crate::relish::RelishError::RequestTimeout),
+            ) => {
+                return unknown(format!(
+                    "could not probe the scope boundary: {error}; enforcement unproven"
+                ));
+            }
+            Err(error) => {
+                return Err(format!(
+                    "expected the scope refusal (403 with token scope does not allow), got: {error}"
+                )
+                .into());
+            }
+            Ok(_) => {
+                return Err(
+                    "a namespace-scoped token could read another namespace's logs"
+                        .to_string()
+                        .into(),
+                );
+            }
         }
-        Err(
-            error @ (crate::relish::RelishError::AgentUnreachable
-            | crate::relish::RelishError::RequestTimeout),
-        ) => unknown(format!(
-            "could not probe the scope boundary: {error}; enforcement unproven"
-        )),
-        Err(error) => Err(format!(
-            "expected the scope refusal (403 \"token scope does not allow\"), got: {error}"
-        )),
-        Ok(_) => {
-            // It was wrongly allowed — clean up the leak, then fail.
-            let _ = ctx.client.stop("probe", &other_namespace).await;
-            Err("a namespace-scoped token was allowed to write to another namespace".to_string())
-        }
-    };
-    // Revoke is cleanup: it must not overwrite a genuine verdict. Surface a
-    // revoke failure only when the case would otherwise pass.
-    let revoked = ctx.client.token_revoke(&token_name).await;
-    match (verdict, revoked) {
-        (Ok(()), Err(error)) => Err(format!("could not revoke scoped test token: {error}")),
-        (verdict, _) => verdict,
     }
 }
 
@@ -118,7 +195,11 @@ pub fn cases() -> Vec<TestCase> {
         TestCase {
             name: "workload_receives_spiffe_certificate",
             group: TestGroup::WorkloadIdentity,
-            requires: &[Capability::Identity],
+            requires: &[
+                Capability::ContainerRuntime,
+                Capability::Council,
+                Capability::Identity,
+            ],
             run: testkit_case!(workload_receives_spiffe_certificate),
         },
         TestCase {
@@ -130,7 +211,7 @@ pub fn cases() -> Vec<TestCase> {
         TestCase {
             name: "namespace_scoped_token_is_rejected_elsewhere",
             group: TestGroup::WorkloadIdentity,
-            requires: &[Capability::Identity],
+            requires: &[Capability::Council, Capability::Identity],
             run: testkit_case!(namespace_scoped_token_is_rejected_elsewhere),
         },
     ]

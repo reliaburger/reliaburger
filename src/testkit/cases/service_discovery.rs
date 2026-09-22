@@ -54,7 +54,9 @@ async fn resolve_reflects_scale_up(ctx: TestContext) -> Result<(), String> {
 
 /// Stopping an app removes it from the backend list (no healthy backends, or
 /// the service resolves to nothing at all).
-async fn stopped_instance_leaves_the_backend_list(ctx: TestContext) -> Result<(), String> {
+async fn stopped_instance_leaves_the_backend_list(
+    ctx: TestContext,
+) -> crate::testkit::registry::CaseResult {
     let app = "svc-stop";
     ctx.apply(&ctx.testapp_spec(app, "healthy", 1)).await?;
     ctx.wait_running_cluster(app, 1).await?;
@@ -76,7 +78,7 @@ async fn stopped_instance_leaves_the_backend_list(ctx: TestContext) -> Result<()
                 error @ (crate::relish::RelishError::AgentUnreachable
                 | crate::relish::RelishError::RequestTimeout),
             ) => Some(error.to_string()),
-            Err(error) => return Err(format!("resolve failed: {error}")),
+            Err(error) => return Err((format!("resolve failed: {error}")).into()),
             _ => None,
         };
         if Instant::now() >= deadline {
@@ -84,7 +86,7 @@ async fn stopped_instance_leaves_the_backend_list(ctx: TestContext) -> Result<()
                 Some(error) => unknown(format!(
                     "could not resolve {app} ({error}); backend removal unproven"
                 )),
-                None => Err("a stopped app still has healthy backends".to_string()),
+                None => Err(("a stopped app still has healthy backends".to_string()).into()),
             };
         }
         tokio::time::sleep(Duration::from_millis(500)).await;

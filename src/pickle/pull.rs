@@ -24,7 +24,165 @@ use super::types::{Digest, ManifestCatalog, PickleError};
 /// forever either.
 const MAX_PEER_BLOB_BYTES: usize = 2 * 1024 * 1024 * 1024;
 
-/// Pull a layer from a peer node's OCI API.
+impl super::api::PickleState {
+    /// Pull a blob while retaining repository and temporary-file ownership through
+    /// caller cancellation. Failed deletion remains in the upload-session reaper.
+    pub async fn pull_peer_blob(
+        &self,
+        peer: &Peer,
+        repository: &str,
+        digest: &Digest,
+        client: &reqwest::Client,
+        timeout: Duration,
+    ) -> Result<(), PickleError> {
+        self.pull_peer_blob_with_access(peer, repository, digest, client, timeout, None)
+            .await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) async fn pull_peer_blob_with_access(
+        &self,
+        peer: &Peer,
+        repository: &str,
+        digest: &Digest,
+        client: &reqwest::Client,
+        timeout: Duration,
+        admitted: Option<super::lease::RegistryWriteAccess>,
+    ) -> Result<(), PickleError> {
+        let state = self.clone();
+        let peer = peer.clone();
+        let repository = repository.to_owned();
+        let digest = digest.clone();
+        let client = client.clone();
+        tokio::spawn(async move {
+            // Reuse a manifest's existing reader: taking another fair RwLock
+            // reader while cleanup waits for the first would deadlock.
+            let access = match admitted {
+                Some(access) => access,
+                None => {
+                    state
+                        .admit_repository_write(&repository, None, None, true)
+                        .await?
+                }
+            };
+            let store = state.store.clone();
+            let verify = digest.clone();
+            let cached = tokio::task::spawn_blocking(move || {
+                store.has_blob(&verify) && store.revalidate_blob(&verify)
+            })
+            .await
+            .map_err(|error| {
+                PickleError::ReplicationFailed(format!("peer cache verification failed: {error}"))
+            })?;
+            if cached {
+                return Ok(());
+            }
+            let deadline = tokio::time::Instant::now()
+                .checked_add(timeout)
+                .ok_or_else(|| {
+                    PickleError::ReplicationFailed("peer timeout overflows the clock".into())
+                })?;
+            let url = format!(
+                "{}/v2/{repository}/blobs/{}",
+                peer.base_url,
+                digest.as_str()
+            );
+            let response = tokio::time::timeout_at(deadline, client.get(url).send())
+                .await
+                .map_err(|_| PickleError::ReplicationFailed("peer blob request timed out".into()))?
+                .map_err(|error| {
+                    PickleError::ReplicationFailed(format!("peer blob request failed: {error}"))
+                })?;
+            if !response.status().is_success() {
+                return Err(PickleError::BlobNotFound(digest));
+            }
+            if response
+                .content_length()
+                .is_some_and(|size| size > MAX_PEER_BLOB_BYTES as u64)
+            {
+                return Err(PickleError::ReplicationFailed(
+                    "peer blob exceeds the size limit".into(),
+                ));
+            }
+            let principal = Some(crate::sesame::auth::SYSTEM_PRINCIPAL);
+            let id = state
+                .initiate_owned_upload(&repository, principal, &access)
+                .await?;
+            let result = async {
+                let writer = state
+                    .sessions
+                    .claim_writer(&id, &repository, principal)
+                    .await
+                    .ok_or_else(|| {
+                        PickleError::ReplicationFailed(
+                            "peer upload no longer admits a writer".into(),
+                        )
+                    })?;
+                let mut stream = response.bytes_stream();
+                let mut size = 0u64;
+                while let Some(chunk) = tokio::time::timeout_at(deadline, stream.next())
+                    .await
+                    .map_err(|_| {
+                        PickleError::ReplicationFailed("peer blob body timed out".into())
+                    })?
+                {
+                    let chunk = chunk.map_err(|error| {
+                        PickleError::ReplicationFailed(format!("peer blob body failed: {error}"))
+                    })?;
+                    size = size
+                        .checked_add(chunk.len() as u64)
+                        .filter(|size| *size <= MAX_PEER_BLOB_BYTES as u64)
+                        .ok_or_else(|| {
+                            PickleError::ReplicationFailed(
+                                "peer blob exceeds the size limit".into(),
+                            )
+                        })?;
+                    state.store.write_upload_chunk(&id, &chunk).await?;
+                    if !state
+                        .sessions
+                        .touch(&id, size, std::time::SystemTime::now())
+                        .await
+                    {
+                        return Err(PickleError::ReplicationFailed(
+                            "peer upload expired during transfer".into(),
+                        ));
+                    }
+                }
+                state
+                    .store
+                    .complete_upload_guarded(&id, &digest, Some(writer), access.guard.clone())
+                    .await
+            }
+            .await;
+            match result {
+                Ok(()) => {
+                    state.sessions.complete(&id).await;
+                    Ok(())
+                }
+                Err(error) => {
+                    state.sessions.retire(&id).await;
+                    match state.store.cancel_upload(&id).await {
+                        Ok(()) => {
+                            state.sessions.complete(&id).await;
+                            Err(error)
+                        }
+                        Err(cleanup) => Err(PickleError::ReplicationFailed(format!(
+                            "{error}; peer upload cleanup remains pending: {cleanup}"
+                        ))),
+                    }
+                }
+            }
+        })
+        .await
+        .map_err(|error| {
+            PickleError::ReplicationFailed(format!("peer transfer task failed: {error}"))
+        })?
+    }
+}
+
+/// Low-level standalone copy from a peer node's OCI API.
+/// Node lifecycle callers use [`super::api::PickleState::pull_peer_blob`] so
+/// cancellation and failed cleanup retain repository/session ownership.
 ///
 /// Downloads the blob via `GET /v2/{repository}/blobs/{digest}` and
 /// verifies the SHA-256 digest before storing locally.
@@ -44,12 +202,12 @@ pub async fn pull_layer_from_peer(
         return Ok(()); // Already cached locally and verified
     }
 
-    // Peer blob URLs flatten multi-segment names (see peer_blob_repo):
-    // the blob store is content-addressed and ignores the name anyway.
+    // Preserve repository identity for upload ownership and quota boundaries,
+    // even though the final blob bytes are content-addressed.
     let url = format!(
         "{}/v2/{}/blobs/{}",
         peer.base_url,
-        super::replication::peer_blob_repo(repository),
+        repository,
         digest.as_str()
     );
 
@@ -134,7 +292,9 @@ pub async fn pull_layer_from_peer(
     match streamed.and_then(|inner| inner) {
         Ok(()) => {}
         Err(e) => {
-            store.cancel_upload(&upload_id).await;
+            store.cancel_upload(&upload_id).await.map_err(|cleanup| {
+                PickleError::ReplicationFailed(format!("{e}; upload cleanup failed: {cleanup}"))
+            })?;
             return Err(e);
         }
     }
@@ -185,11 +345,12 @@ fn find_peer_for_layer<'a>(holders: &BTreeSet<u64>, peers: &'a [Peer]) -> Option
     peers.iter().find(|p| holders.contains(&p.node_id))
 }
 
-/// Resolve an image: check the local Pickle store, then fall back
-/// to external pull.
+/// Check whether the local catalogued image has every verified blob.
 ///
-/// Returns `true` if the image was found locally (no external fetch needed).
-/// Returns `false` if the caller should fall back to the original pull path.
+/// This read-only library query performs no external pull and promises no
+/// runtime image availability. It is exercised by the Pickle cluster tests;
+/// runtime preparation uses the image store's separate pull/verification path.
+/// Returns `false` for a missing manifest, missing blob or corrupt blob.
 pub fn image_available_locally(
     repository: &str,
     tag: &str,
@@ -331,6 +492,7 @@ mod tests {
 
         let mut catalog = ManifestCatalog::default();
         catalog.apply_manifest_commit(&ManifestCommit {
+            observed_gc_generation: 0,
             manifest,
             tag: "latest".to_string(),
             holder_nodes: BTreeSet::from([1]),
@@ -357,6 +519,7 @@ mod tests {
 
         let mut catalog = ManifestCatalog::default();
         catalog.apply_manifest_commit(&ManifestCommit {
+            observed_gc_generation: 0,
             manifest,
             tag: "latest".to_string(),
             holder_nodes: BTreeSet::from([1]),
@@ -396,6 +559,7 @@ mod tests {
 
         let mut catalog = ManifestCatalog::default();
         catalog.apply_manifest_commit(&ManifestCommit {
+            observed_gc_generation: 0,
             manifest,
             tag: "latest".to_string(),
             holder_nodes: BTreeSet::from([1]),
@@ -414,6 +578,7 @@ mod tests {
         let manifest = test_manifest("myapp");
         let mut catalog = ManifestCatalog::default();
         catalog.apply_manifest_commit(&ManifestCommit {
+            observed_gc_generation: 0,
             manifest,
             tag: "latest".to_string(),
             holder_nodes: BTreeSet::from([1]),
