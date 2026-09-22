@@ -1390,17 +1390,32 @@ async fn concurrent_node_kills_and_leader_change_preserve_reserved_capacity() {
         .clear_fault(summary.id, Some(&target.name), true)
         .await
         .unwrap();
-    let old_leader = nodes[wait_for_fault_admission_views(&nodes).await];
-    let sender = nodes
-        .iter()
-        .find(|node| node.name != old_leader.name)
-        .copied()
-        .unwrap();
-    sender
-        .client
-        .inject_fault(&request(old_leader, Duration::from_secs(12)))
-        .await
-        .unwrap();
+    let (old_leader, sender) = tokio::time::timeout(Duration::from_secs(60), async {
+        loop {
+            let leader = nodes[wait_for_fault_admission_views(&nodes).await];
+            let sender = nodes
+                .iter()
+                .find(|node| node.name != leader.name)
+                .copied()
+                .unwrap();
+            match sender
+                .client
+                .inject_fault(&request(leader, Duration::from_secs(12)))
+                .await
+            {
+                Ok(_) => break (leader, sender),
+                // This exact refusal precedes reservation/mutation. Membership
+                // can change between our probe and the API's own safety check.
+                Err(reliaburger::relish::RelishError::ApiError { status: 503, body })
+                    if body
+                        == "node fault safety cannot map the council leader to live membership" => {
+                }
+                Err(error) => panic!("leader fault admission failed: {error}"),
+            }
+        }
+    })
+    .await
+    .expect("leader fault admission did not converge");
     let mut inherited = None;
     let deadline = tokio::time::Instant::now() + Duration::from_secs(8);
     while tokio::time::Instant::now() < deadline {

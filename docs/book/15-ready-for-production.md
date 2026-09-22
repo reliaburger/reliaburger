@@ -3448,3 +3448,14 @@ loop would give every attempt another 30 seconds and could wait forever. Our
 HTTP fixture reproduces temporary failure before and after acceptance, checks
 permanent refusals, and advances Tokio's test clock to prove the overall limit.
 The original three-node case still runs against real nodes.
+
+### Retry only a confirmed admission refusal
+
+The concurrent node-fault acceptance test can observe a healthy council and still
+reach the fault API after its membership view changes. Hosted CI returned the
+explicit refusal that the leader could not be mapped to live membership. That
+check runs before reserving or applying a fault. The fixture now refreshes the
+views and retries only that exact 503 within a bounded deadline. Lost responses,
+other errors and unknown outcomes still fail the test; blindly retrying those
+could inject a second fault. Production safety checks are unchanged. The repaired
+live scenario passes on macOS (27.087s) and Linux (26.890s).
