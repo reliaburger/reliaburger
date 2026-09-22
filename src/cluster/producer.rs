@@ -96,6 +96,9 @@ impl ProducerReleaseClient {
 }
 
 #[cfg(test)]
+pub(crate) use tests::{delayed_fixture as test_delayed_fixture, fixture as test_fixture};
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use axum::{Router, response::IntoResponse, routing::post};
@@ -191,6 +194,3 @@ mod tests {
         }
     }
 }
-
-#[cfg(test)]
-pub(crate) use tests::{delayed_fixture as test_delayed_fixture, fixture as test_fixture};
