@@ -4941,3 +4941,193 @@ async fn refused_health_publication_prevents_restart_and_preserves_ownership() {
     let _ = server.await;
     exercise.unwrap().unwrap();
 }
+
+async fn consumer_kernel_agent(
+    root: &std::path::Path,
+    ebpf: std::sync::Arc<tokio::sync::Mutex<OnionEbpf>>,
+) -> Result<
+    (
+        tokio::sync::mpsc::Sender<reliaburger::bun::agent::AgentCommand>,
+        tokio::task::JoinHandle<()>,
+    ),
+    reliaburger::bun::BunError,
+> {
+    use reliaburger::bun::agent::{BunAgent, ClusterHandle};
+    let (_, membership_rx) = tokio::sync::watch::channel(Vec::new());
+    let (_, snapshot_rx) = tokio::sync::mpsc::channel(1);
+    let (commands, receiver) = tokio::sync::mpsc::channel(16);
+    let grill = reliaburger::grill::mock::MockGrill::new();
+    grill.set_launch_inventory(vec![]).await;
+    let mut agent = BunAgent::with_cluster(
+        grill,
+        reliaburger::grill::port::PortAllocator::new(43600, 43700),
+        receiver,
+        CancellationToken::new(),
+        ClusterHandle {
+            local_node_id: reliaburger::meat::NodeId::new("consumer"),
+            membership_rx,
+            raft_metrics_rx: None,
+            council: None,
+            snapshot_rx,
+            wrapping_ikm: None,
+            partition_blocklists: Default::default(),
+            crl_handle: Default::default(),
+        },
+        "consumer".into(),
+    );
+    agent.set_records_dir(root.join("records"));
+    agent.set_onion_ebpf(ebpf).await;
+    agent
+        .recover_consumer_ownership(
+            &root.join("discovery"),
+            reliaburger::bun::consumer_owners::ConsumerIdentity {
+                node_id: reliaburger::meat::NodeId::new("consumer"),
+                cluster_identity: [42; 32],
+            },
+        )
+        .await?;
+    Ok((commands, tokio::spawn(async move { agent.run().await })))
+}
+
+async fn exercise_consumer_kernel_withdrawal(freeze: bool) {
+    use reliaburger::bun::agent::AgentCommand;
+    use reliaburger::onion::{
+        catalog::{CatalogBackend, EndpointCatalog},
+        withdrawal::{EndpointWithdrawalInstruction, ServiceWithdrawal},
+    };
+    assert!(ebpf_tests_enabled());
+    let owned = OwnedPolicyFixture::new();
+    let ebpf = std::sync::Arc::new(tokio::sync::Mutex::new(owned.load().unwrap()));
+    let (commands, actor) = consumer_kernel_agent(owned.root.path(), ebpf.clone())
+        .await
+        .unwrap();
+    let service = ServiceId::new("default", "remote-consumer");
+    let catalog = EndpointCatalog::rebuild([(
+        service.clone(),
+        8080,
+        vec![CatalogBackend {
+            execution: None,
+            node_id: "producer".into(),
+            node_ip: "192.0.2.3".parse().unwrap(),
+            host_port: 30001,
+            healthy: true,
+        }],
+    )])
+    .unwrap();
+    let vip = catalog.resolve(&service).unwrap().vip;
+    let instruction = EndpointWithdrawalInstruction {
+        generation: 1,
+        services: catalog
+            .services
+            .iter()
+            .map(|(id, service)| {
+                (
+                    id.clone(),
+                    ServiceWithdrawal {
+                        service: service.clone(),
+                        retire_vip: true,
+                    },
+                )
+            })
+            .collect(),
+    };
+    let (response, reply) = tokio::sync::oneshot::channel();
+    commands
+        .send(AgentCommand::SyncClusterConsumer {
+            generation: 1,
+            catalog: Box::new(catalog),
+            ingress: vec![],
+            withdrawals: vec![],
+            response,
+        })
+        .await
+        .unwrap();
+    assert!(reply.await.unwrap().unwrap().published);
+    let maps = BpfServiceMap::new();
+    assert!(
+        maps.read_backends(&mut *ebpf.lock().await, vip, 8080)
+            .unwrap()
+            .is_some_and(|value| value.count == 1)
+    );
+    if freeze {
+        freeze_egress_map(&*ebpf.lock().await, "backend_map");
+    }
+    let (response, reply) = tokio::sync::oneshot::channel();
+    commands
+        .send(AgentCommand::SyncClusterConsumer {
+            generation: 2,
+            catalog: Box::default(),
+            ingress: vec![],
+            withdrawals: vec![instruction.clone()],
+            response,
+        })
+        .await
+        .unwrap();
+    let result = reply.await.unwrap();
+    actor.abort();
+    let _ = actor.await;
+    {
+        let journal = reliaburger::bun::discovery_owners::DiscoveryJournal::open(
+            &owned.root.path().join("discovery"),
+        )
+        .unwrap();
+        let owner = journal.inventory().consumer.as_ref().unwrap();
+        assert_eq!(owner.receipts[&1].withdrawal, instruction);
+        if freeze {
+            assert!(result.is_err());
+            assert_eq!(
+                owner.receipts[&1].phase,
+                reliaburger::bun::consumer_owners::ReceiptPhase::Pending
+            );
+            assert_eq!(owner.publications.len(), 2);
+        } else {
+            assert_eq!(result.unwrap().receipts, vec![1]);
+            assert_eq!(
+                owner.receipts[&1].phase,
+                reliaburger::bun::consumer_owners::ReceiptPhase::Ready
+            );
+            assert_eq!(owner.publications.len(), 1);
+            assert!(
+                maps.read_backends(&mut *ebpf.lock().await, vip, 8080)
+                    .unwrap()
+                    .is_none()
+            );
+        }
+    }
+    let recovered = consumer_kernel_agent(owned.root.path(), ebpf.clone()).await;
+    if freeze {
+        assert!(
+            recovered.is_err(),
+            "recovery acknowledged a refused kernel delete"
+        );
+    } else {
+        let (commands, actor) = recovered.unwrap();
+        let (response, reply) = tokio::sync::oneshot::channel();
+        commands
+            .send(AgentCommand::SyncClusterConsumer {
+                generation: 2,
+                catalog: Box::default(),
+                ingress: vec![],
+                withdrawals: vec![instruction],
+                response,
+            })
+            .await
+            .unwrap();
+        assert_eq!(reply.await.unwrap().unwrap().receipts, vec![1]);
+        actor.abort();
+        let _ = actor.await;
+    }
+    drop(ebpf);
+}
+
+#[tokio::test]
+#[ignore = "requires Linux root and RELIABURGER_EBPF_TESTS=1"]
+async fn consumer_kernel_withdrawal_recovers_ready_receipt_without_republishing() {
+    exercise_consumer_kernel_withdrawal(false).await;
+}
+
+#[tokio::test]
+#[ignore = "requires Linux root and RELIABURGER_EBPF_TESTS=1"]
+async fn consumer_kernel_delete_refusal_retains_pending_receipt_across_restart() {
+    exercise_consumer_kernel_withdrawal(true).await;
+}
