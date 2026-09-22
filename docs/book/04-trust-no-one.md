@@ -841,7 +841,17 @@ leaf never outlives its issuer compared the leaf's `not_before` with the
 issuer's window. Once that start moved five minutes back, an ingress CA that had
 expired a second ago could still mint a (born-expired) leaf. The check now judges
 the issuer at the real issuing instant, and clamps the leaf's backdated start so
-it never predates its issuer. The regression issues a root, an intermediate, a node
+it never predates its issuer.
+
+A second knock-on showed up in the ingress certificate cache, which renews a
+leaf once half its life has passed. It computed "half" from `not_before`. For a
+ten-second test leaf, the window became five minutes and ten seconds long, and
+its midpoint landed two and a half minutes *before* issuance, so every TLS
+handshake minted a fresh certificate. The cache runs on the clock that issued the
+leaf, so it now measures the leaf's life from the issuing instant; the backdate
+is for everyone else's clocks. The existing renewal test caught it.
+
+The regression for the backdate itself issues a root, an intermediate, a node
 certificate (both the self-issued and CSR-signed kinds) and an ingress leaf,
 then checks each one with a clock sixty seconds in the past.
 

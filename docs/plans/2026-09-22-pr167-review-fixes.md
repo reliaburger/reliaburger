@@ -265,6 +265,10 @@ this tier now blocks the 0.1.0 candidate rather than the merge.
       backdated start) and clamps the leaf's start to the issuer's. A regression
       checks root, intermediate, self-issued and CSR-signed node certificates
       and an end-entity leaf at `now - 60 s`; it failed before the fix.
+      Follow-up: the ingress SNI cache measured its renewal midpoint from the
+      backdated `not_before`, so short-lived leaves renewed on every handshake
+      (caught by `cached_ingress_leaves_renew_before_expiry_and_after_an_idle_expiry`);
+      it now measures from the issuing instant.
       `set_validity` in `src/sesame/ca.rs` now sets `not_before = now` (the old
       code effectively backdated to midnight), and `check_validity_at`
       (`src/sesame/cert.rs:123`) has no leeway. A joiner or renewing node whose
