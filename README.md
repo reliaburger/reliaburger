@@ -40,72 +40,36 @@ The full architectural vision lives in the [whitepaper](docs/whitepaper.md).
 Install and usage details are in the [documentation](docs/README.md), and
 implementation status in [progress.md](docs/progress.md).
 
-Durable cluster consumers journal catalogue and ingress exposure before publication,
-withdraw the previous view and wait for captured HTTP/WebSocket requests to finish.
-Recovery starts with empty views under the original enrolled identity. Ready cleanup
-receipts survive crashes and retry against the current authenticated leader until
-positively acknowledged. This conservative path can briefly interrupt routing during
-updates. Producer allocations remain held until committed consumer confirmation;
-permanent execution fences reject stale reports. Normal enrolled rootful startup and confirmed service VIP retirement are implemented;
-final release qualification remains open.
+## 0.1.0 scope and limits
 
-The owned Runc runtime passes actual Bun crash/cancellation and abrupt VM
-reboot checks. Rolling replacements now run their initialisers before the main
-payload. Standalone durable discovery/kernel reboot recovery, enrolled clustered retirement
-and owned OCI upgrades/rollbacks are qualified. Final release acceptance remains open; see the [remaining work](docs/plans/2026-09-22-v0.1.0-remaining-work.md).
+0.1.0 is the first release, so we've kept its promises narrow and explicit:
 
-0.1.0 requires a fresh cluster; development state is refused. Rolling upgrades
-require matching explicit formats (currently protocol 20 and state 39). See the
-[compatibility policy](docs/releasing.md#cluster-compatibility).
-Registry uploads belong to their exact creating credential. Recovery reclaims
-abandoned partial uploads after a crash and
-requires one Bun per writable image store; see the [startup contract](docs/README.md).
-Manifest pushes persist their local catalogue before acknowledgement and refuse
-filesystem failures. Publication and garbage collection serialise their final
-blob checks and deletion, with durable GC generations fencing delayed proposals. Clustered workers and followers forward writes to the
-authenticated leader. Repository reads and configured quota checks also require
-current authority; an unavailable leader returns 503 instead of an empty catalogue.
-`relish images` uses that committed cluster view too.
-Unconfirmed Raft commits return 503 for client retry;
-201 confirms catalogue acceptance, with blob replication potentially still pending.
-HTTP writes under `rbtest-…/` require their exact authenticated lease owner.
-Registry workers confirm upload and metadata retirement after workloads stop;
-only the owning application lease may depend on those images. Peer pulls retain
-upload ownership through cancellation and failed cleanup. Storage nodes now hash and conditionally confirm their own copies under the GC
-guard; the healer cannot replace stale holder lists. Physical registry recovery passes actual Bun death and three-node TLS
-leader-change tests on macOS/Linux.
-`relish test --filter image-registry` now stages a pinned runnable image under its
-server lease, deploys the exact digest and checks its HTTP response. The real
-Linux/runc catalogue passes all three cases with confirmed repository cleanup.
-A disconnected writer keeps cleanup pending until it returns and confirms
-retirement.
-OCI index selection targets Linux containers even when the client runs on macOS.
-Direct image pulls and Pickle verify pinned manifests, selected platform
-manifests and configuration bytes before accepting them into the cache.
-
-Lease-owned test volumes and generated configuration have durable provisioning
-records. Ordinary Stop and rescheduling keep their data; lease retirement removes
-it only after confirmed runtime cleanup. Failed unmounts keep cleanup pending.
-Host-source volumes and ordinary application data remain outside test ownership.
-Disposable test-volume snapshots are unsupported in 0.1.0.
-
-Restart also refuses unreadable ownership records or uncertain runtime adoption,
-preserving records and workload identities for recovery. Legacy aliases and
-inconsistent stored instance identities refuse startup without runtime mutation.
-Workload and namespace
-names must be lowercase DNS labels; invalid names are refused before deployment.
-Rollback and halt retain replacement ownership until runtime and artifact
-cleanup are confirmed. Cluster test leases also retain former placement owners
-through rescheduling and leader changes; an unavailable worker keeps cleanup
-pending until it confirms retirement. After stopping or fencing that machine, an
-administrator can use `relish decommission-node` to release its obligations and
-permanently retire its identity. Returning machines need fresh enrolment under a
-new name; see the [operator procedure](docs/README.md#decommissioning-a-node).
-Node-local cron registrations survive restart. Cron skips missed or uncertain
-firings after a crash; it does not promise catch-up or exactly-once job execution.
-Job attempts retain their retry budget across Bun replacement. Unknown outcomes
-require an explicit `relish apply jobs.toml --rerun-jobs`; ordinary apply cannot
-silently replay them. See the [job recovery policy](docs/README.md).
+- **Container clusters run on rootful Linux Runc with eBPF.** Set
+  `[ebpf] enabled = true` and make bpffs available at `/sys/fs/bpf`. Bun owns
+  every Runc container durably: it records the launch before starting it,
+  adopts it again after a restart, and releases the container's address only
+  after cleanup is confirmed.
+- **Rootless Runc is standalone only.** Bun refuses to start with `--cluster`
+  when Runc runs without root. A rootless node gets host-port forwarding, but no
+  eBPF policy, workload DNS or resource limits.
+- **Declarative image workloads need root mode.** App specs ask for a writable
+  root filesystem, which rootless Runc can't provide safely yet. See the
+  [runc notes](docs/README.md#runc-linux).
+- **macOS runs containers through a managed Linux VM.** `relish setup
+  --quickstart` provisions it. Direct Apple Container is disabled for 0.1.0;
+  native macOS Bun runs process workloads.
+- **Native processes are foreground-only.** The main process stays under Bun's
+  supervision and its children must stay in the supervised process group.
+  Daemonising or detached workloads belong in Linux containers. See the
+  [runtime contract](docs/README.md#processgrill-built-in-fallback).
+- **Clusters start fresh.** There's no upgrade path from development builds:
+  Bun refuses their state, so create a new cluster. Rolling upgrades between
+  releases need matching protocol and state formats; see the
+  [compatibility policy](docs/releasing.md#cluster-compatibility).
+- **Jobs and cron don't replay uncertain work.** Cron skips firings it missed
+  during a crash, with no catch-up. A job whose outcome is unknown after a crash
+  stays unknown until you check its effects and run
+  `relish apply jobs.toml --rerun-jobs`.
 
 ## Quick start
 
@@ -125,53 +89,19 @@ target/debug/relish            # interactive terminal dashboard
 open http://localhost:9117/    # web dashboard
 ```
 
-Process launches and completed job outcomes survive Bun replacement through
-private durable owners. Application deployment acknowledges success only after
-its recovery metadata is written; storage failures are deployment errors.
-Process exec commands also have owners: Bun death retires them while preserving
-the main workload, and application cleanup waits for their confirmed retirement.
+Process mode runs plain OS processes, so it works on macOS and Linux without a
+container runtime. Keep workloads in the foreground: use the application's
+no-daemon option, and have shell wrappers `exec` the server or wait for their
+children.
 
-Process mode supports foreground workloads: the main process stays under Bun's
-supervision, and its children must remain in the supervised process group.
-Use an application's foreground option; shell wrappers should `exec` the server
-or wait for their children. Daemonising or detached workloads must use the Linux
-container mode instead. See the [runtime contract](docs/README.md#processgrill-built-in-fallback).
+With runc installed on Linux, the same flow runs real OCI images, and
+`relish init <dir>` generates the PKI and mTLS config for a secure multi-node
+cluster. The [documentation](docs/README.md) has the full secure-cluster
+walkthrough. On macOS, use the [managed Linux VM quickstart](docs/quickstart.md)
+for containers.
 
-With runc installed on Linux, the same flow runs real OCI images — and `relish init cluster` generates the PKI and mTLS
-config for a secure multi-node cluster. The [documentation](docs/README.md)
-has the full secure-cluster walkthrough. Runc bundles and state follow the node's
-configured data directory, and its cache uses the selected images directory.
-On macOS, use the [managed Linux VM quickstart](docs/quickstart.md) for containers.
-Direct Apple Container is disabled for 0.1.0 pending daemon-command recovery.
-Rootful Linux networking retains address
-ownership across restarts and refuses subnet exhaustion. Runc retirement keeps
-resource ownership when OCI deletion, rootfs unmount or network cleanup fails,
-and retries before reporting Stopped. Normal Stop/Retire also preserve ownership
-when identity-directory or adoption-record removal fails. Rolling and blue-green
-deployments refuse completion if runtime exit is uncertain and keep both
-generations available for cleanup. Rollout finalisation also retains ownership
-when identity or adoption-record removal fails, so cleanup can be retried.
-Explicit Stop and per-instance rollout retirement now confirm kernel backend
-withdrawal before stopping the runtime. Refusal retains the original destination
-and its address. Natural-exit address holds and standalone discovery recovery are qualified.
-Service retirement now confirms removal of grants to its exact allocated VIP before
-releasing that destination. Refusal retains the service and its cleanup owner;
-unrelated destination grants remain untouched. Enrolled rootful cluster retirement is qualified; final release acceptance remains open.
-Failed final kernel backend publication now reports a deployment error and retains
-the running workload’s ownership for cleanup or retry.
-Retirement also fences automatic restarts before signalling the old runtime.
-Deployment ingress drains count requests from route selection, including failover
-candidates. A deadline cancels HTTP/WebSocket work; completion waits for actual
-request release. Automatic restarts refresh the confirmed DNS/ingress address and
-keep health-checked replacements unhealthy until a successful probe.
-Rollout identities advance past adopted generations after Bun replacement. With rootful Linux DNS
-enabled, short
-service names resolve in the calling workload's namespace. Host tools use explicit
-names such as `redis.payments.internal`; unknown sources cannot inherit a node's
-namespace.
-
-A blocked local rollout can be cancelled with `relish cancel-deploy <operation-id>`.
-The command waits for owned work to finish before you submit the correction;
+A blocked rollout can be cancelled with `relish cancel-deploy <operation-id>`.
+The command waits for in-flight work to finish before you submit the fix;
 cluster users should also update the desired configuration. See the
 [deployment guide](docs/README.md).
 
@@ -317,82 +247,22 @@ admission and observed running workloads; missing evidence fails the measurement
 
 ## Getting to 0.1.0
 
-Node startup now verifies the agent response, version and critical subsystem
-readiness before setup reports success. Managed setup also checks the council
-and the sample app through ingress; end-to-end qualification is still in progress.
-
 The core platform is implemented. We're preparing a release that takes a
 laptop to three healthy Linux nodes and a working sample app, with no Rust
 build or repo checkout. **Under five minutes is the target; the public
 installer and that timing guarantee aren't available yet.**
 
-The [0.1.0 release plan](docs/plans/2026-09-16-v0.1.0-release-plan.md)
-sets out the remaining work, in order:
-
-1. **Establish the release baseline.** Reconcile the older TODO lists,
-   define supported platforms and run the complete test matrix.
-2. **Finish correctness fixes.** Make readiness checks trustworthy, bound
-   registry upload memory and close the remaining consequential bugs.
-3. **Package and sign the release.** Publish Linux binaries, native macOS
-   CLI binaries, eBPF assets and matching release metadata.
-4. **Make laptop clusters reliable.** Use prebuilt assets and managed Linux
-   VMs, with secure enrolment, resumable setup and access from the host CLI
-   and browser.
-5. **Add the installer and first-run flow.** Install, start the cluster and
-   deploy a sample app, with clear progress, errors and cleanup commands.
-6. **Prove the downloadable release works.** Test clean installations,
-   restart and recovery, and measure the full three-node start with empty
-   caches before publishing the five-minute claim.
-
-The [candidate and promotion workflow](docs/releasing.md#metadata-and-publication)
-preserves signed assets and publishes only the qualified bytes. Hosted candidate
-creation and cold-install acceptance are still pending.
-
-Each step includes tests and updates to the documentation and book. Detailed
-acceptance gates and deferred features live in the release plan; implementation
-history remains in [progress.md](docs/progress.md).
-
-The [17 September codebase audit and completion plan](docs/plans/archive/2026-09-17-codebase-completion-plan.md)
-reconciles the older TODOs, records remaining correctness gaps and separates
-release acceptance from deferred capabilities. The current checklist lives in
+What's left is acceptance, not features: a live three-node run of the full test
+catalogue, a sustained failure-and-recovery soak, a signed release candidate
+installed from its exact published bytes, and repeated cold installs on clean
+laptops. The [remaining work](docs/plans/2026-09-22-v0.1.0-remaining-work.md)
+lists those gates, and the [0.1.0 release plan](docs/plans/2026-09-16-v0.1.0-release-plan.md)
+defines the supported scope. Implementation status lives in
 [progress.md](docs/progress.md).
 
-
-Normal Linux Runc startup selects durable ownership for rootful nodes with
-`[ebpf] enabled = true`, including enrolled clusters, and for standalone rootless
-nodes. Rootful policy recovery requires an eBPF-enabled binary and bpffs at
-`/sys/fs/bpf`. Cluster recovery binds consumers to their enrolled node ID and root
-CA and requires the cluster service key. Changing runtime or enforcement mode
-cannot bypass existing ownership; uncertain recovery prevents readiness.
-
-Before publication, Bun records the original execution, service allocation and
-kernel policy. Retirement preserves these records until runtime exit, local
-withdrawal and required remote confirmations succeed. Receipts survive crashes
-and retry against the current authenticated leader. Repeated local withdrawal is
-idempotent; an absent local backend does not authorise address reuse. DNS and
-ingress updates wait for confirmed kernel publication, and captured requests
-must release their guards before consumer withdrawal completes.
-
-Actual Linux qualification covers standalone host reboot, enrolled clustered
-publication/adoption/retirement, rootless forwarding recovery, signed upgrades,
-explicit rollback and failed-candidate automatic revert. Three enrolled OCI nodes
-also preserve the original workload and kernel ownership through six controlled
-binary swaps and final remote cleanup. C34 ownership and cleanup qualification is complete, including actual Bun death
-before automatic-restart adoption. Hosted CI and all four binary builds pass at
-`6c64fed`. Full independent-host acceptance, sustained qualification and the signed
-cold-install matrix remain release gates. Rootless
-support in 0.1.0 is standalone host-port forwarding, without eBPF policy or
-workload DNS. Bun refuses `--cluster` when Runc runs without root, including
-automatic runtime selection. Use rootful Linux Runc/eBPF for container clusters;
-on macOS, `relish setup --quickstart` provisions the managed Linux VM.
-
-Log exports now preserve content generations, scope receipts to the destination,
-and serialise durable checkpoint updates across agent and offline exports. Source
-and checkpoint errors stop the export and prevent disk-pressure pruning.
-
-Cluster-wide credential management and permission/quota declarations require
-an unscoped Admin. App and job manifests enforce the caller's scope and configured
-permissions before applying changes; see the [user guide](docs/README.md).
+The [candidate and promotion workflow](docs/releasing.md#metadata-and-publication)
+builds a release once, signs it, and publishes only the bytes that passed
+qualification.
 
 ## Contributing
 

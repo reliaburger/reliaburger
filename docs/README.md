@@ -1,236 +1,160 @@
 # Reliaburger Documentation
 
-For managed Linux VMs on a laptop, see the [quickstart guide](quickstart.md).
-The managed context records ingress and authenticated registry forwards; catalogue
-probes use declared service endpoints, including configured ports and IPv6.
-The source implementation is undergoing qualification; the signed public
-installer is pending release.
-
-Release candidates now have a separate [build and promotion procedure](releasing.md#metadata-and-publication).
-Promotion preserves qualified files instead of rebuilding at tag time. The first
-hosted candidate and cold-install qualification remain pending. An explicit
-HTTPS [candidate mirror](releasing.md#qualifying-a-staged-candidate) exercises
-unchanged installer/assets with checksums and signatures still enabled.
-
-User guide for building and running Reliaburger. For the full architectural vision, see the [whitepaper](whitepaper.md). For current implementation status, see [progress.md](progress.md).
-
-The [17 September codebase audit and completion plan](plans/archive/2026-09-17-codebase-completion-plan.md)
-reconciles the older TODOs, records remaining correctness gaps and separates
-release acceptance from deferred capabilities. The current checklist lives in
+User guide for building and running Reliaburger. For managed Linux VMs on a
+laptop, see the [quickstart guide](quickstart.md). For the architectural vision,
+see the [whitepaper](whitepaper.md); for implementation status, see
 [progress.md](progress.md).
 
-Normal Linux Runc startup selects durable ownership for rootful nodes with
-`[ebpf] enabled = true`, including enrolled clusters, and for standalone rootless
-nodes. Rootful policy recovery requires an eBPF-enabled binary and bpffs at
-`/sys/fs/bpf`. Cluster recovery binds consumers to their enrolled node ID and root
-CA and requires the cluster service key. Changing runtime or enforcement mode
-cannot bypass existing ownership; uncertain recovery prevents readiness.
+0.1.0 hasn't shipped yet. The source builds and runs today; the signed public
+installer arrives with the release. Release candidates follow a separate
+[build and promotion procedure](releasing.md#metadata-and-publication), and the
+[remaining work](plans/2026-09-22-v0.1.0-remaining-work.md) lists the acceptance
+gates still open.
 
-Before publication, Bun records the original execution, service allocation and
-kernel policy. Retirement preserves these records until runtime exit, local
-withdrawal and required remote confirmations succeed. Receipts survive crashes
-and retry against the current authenticated leader. Repeated local withdrawal is
-idempotent; an absent local backend does not authorise address reuse. DNS and
-ingress updates wait for confirmed kernel publication, and captured requests
-must release their guards before consumer withdrawal completes.
+## 0.1.0 scope and limits
 
-Actual Linux qualification covers standalone host reboot, enrolled clustered
-publication/adoption/retirement, rootless forwarding recovery, signed upgrades,
-explicit rollback and failed-candidate automatic revert. Three enrolled OCI nodes
-also preserve the original workload and kernel ownership through six controlled
-binary swaps and final remote cleanup. C34 ownership and cleanup qualification is complete, including actual Bun death
-before automatic-restart adoption. Hosted CI and all four binary builds pass at
-`6c64fed`. Full independent-host acceptance, sustained qualification and the signed
-cold-install matrix remain release gates. Rootless
-support in 0.1.0 is standalone host-port forwarding, without eBPF policy or
-workload DNS. Bun refuses `--cluster` when Runc runs without root, including
-automatic runtime selection. Use rootful Linux Runc/eBPF for container clusters;
-on macOS, `relish setup --quickstart` provisions the managed Linux VM.
+- **Container clusters run on rootful Linux Runc with eBPF.** Set
+  `[ebpf] enabled = true`; policy recovery also needs bpffs at `/sys/fs/bpf`.
+  Bun owns every Runc container durably. It records the original execution,
+  service allocation and kernel policy before publishing a workload, adopts
+  running containers again after a restart, and keeps those records until
+  runtime exit and every required cleanup confirmation succeed. Changing the
+  runtime or enforcement mode can't bypass existing ownership, and uncertain
+  recovery holds back readiness instead of guessing.
+- **Rootless Runc is standalone only.** Bun refuses `--cluster` when Runc runs
+  without root, including when it picks Runc automatically. Rootless nodes get
+  host-port forwarding through `slirp4netns`, without eBPF policy, workload DNS
+  or resource limits.
+- **Declarative image workloads need root mode.** App specs request writable
+  root filesystems, and rootless Runc only supports read-only roots; see the
+  [runc notes](#runc-linux).
+- **macOS runs containers through a managed Linux VM**
+  ([quickstart](quickstart.md)). Direct Apple Container is disabled; native
+  macOS Bun runs process workloads.
+- **Native processes are foreground-only.** See the
+  [ProcessGrill contract](#processgrill-built-in-fallback).
+- **Clusters start fresh.** There's no upgrade path from development builds:
+  Bun refuses their state, snapshots and backups, so create a new cluster.
+  Rolling upgrades need matching protocol and state formats; see the
+  [compatibility policy](releasing.md#cluster-compatibility).
+- **One Bun per writable image store.** Registry startup claims exclusive
+  ownership of the image store's upload directory.
+- **Test volumes have no snapshots.** Disposable test-volume snapshots aren't
+  supported.
 
-Log exports now preserve content generations, scope receipts to the destination,
-and serialise durable checkpoint updates across agent and offline exports. Source
-and checkpoint errors stop the export and prevent disk-pressure pruning.
+## Operating notes
 
-Runc retirement reports OCI, mount and network cleanup failures and retains
-ownership for retry. A busy root filesystem stays mounted; Stopped is reported
-only after cleanup completes. Short rootful jobs retain their actual exit codes,
-including when they finish before the first startup observation. Normal
-Stop/Retire also refuse to forget ownership until identity-directory cleanup and adoption-record removal
-succeed and their directories are synced; failed cleanup can be retried. Rolling
-and blue-green retirement also require observed runtime exit. If a signal or
-inspection fails, the deployment reports an error and retains both generations
-for ordinary Stop/Retire cleanup. Finalisation propagates identity and record
-cleanup errors too, retaining the old instance as stopped until cleanup succeeds.
-Explicit Stop and per-instance rollout retirement confirm kernel backend
-withdrawal before stopping the runtime. A refused map update preserves the
-original service entry and runtime for retry; replacement backends remain in
-the proposed service entry. Failed retirement does not establish that execution
-stopped. Natural-exit address holds and standalone discovery recovery are qualified.
-Service retirement now confirms removal of grants to its exact allocated VIP before
-releasing that destination. Refusal retains the service and its cleanup owner;
-unrelated destination grants remain untouched. Enrolled rootful cluster retirement is qualified; final release acceptance remains open.
-Failed final kernel backend publication now reports a deployment error and retains
-the running workload’s ownership for cleanup or retry.
-Before signalling an old instance, the rollout fences the periodic restart and
-health tasks so they cannot revive it during retirement. After Bun replacement,
-new rollout IDs advance past restored generations. Stopped/Failed entries with
-unfinished cleanup remain owners and cannot be overwritten by a fresh apply.
-Rollback and halt also require confirmed runtime and artifact cleanup. Failed
-cleanup retains replacements and their ports for retry; healthy replacements
-kept by a halt enter ordinary supervision. History reports Failed for incomplete
-cleanup and Halted after partial cutover, rather than claiming old instances were
-restored. Replacement preparation reserves an in-memory owner before launch;
-crash recovery before the first durable runtime record remains tracked in C34.
+### Names
 
-`relish test --filter jobs` creates durable leases on the receiving node for
-batch jobs and cron registrations. Keep using the same node endpoint for a
-lease's lifetime. Creation requires an unscoped credential and the server's
-isolated-workload test grant. Expiry resumes cleanup after Bun restarts; a node
-that is down retains its record until it can run cleanup again. These leases
-support job-only manifests and use server-selected namespaces. Ordinary jobs
-remain node-local; this does not introduce cluster job scheduling.
+App and job names, their namespaces and namespace declarations must be lowercase
+DNS labels: 1–63 ASCII letters/digits/hyphens, with a letter or digit at each end.
+Omit a namespace to use `default`; an explicitly empty namespace is invalid.
+Bun also refuses fresh app/job IDs that belong to another workload, including
+stopped cleanup owners. For example, `worker-g1` can't claim replica zero while
+generation one of `worker` owns that ID in the same namespace. Use another name
+or retire the existing owner first; runtime IDs are never silently renamed.
 
-Cron registrations and their latest claimed UTC minute persist before apply,
-stop or launch is acknowledged. Bun restores them before serving the API.
-Missed minutes are skipped; a crash after recording a firing but before launch
-can skip that occurrence too. There is no catch-up or exactly-once execution
-promise. Job retries are separate. An uncertain checkpoint write fences further
-cron changes and firings until Bun restarts and reloads its durable state.
+### When startup refuses
 
-Jobs record execution intent and their three-retry budget before launching.
+Bun refuses to start when a workload ownership record is unreadable or
+malformed, when a record's canonical ID disagrees with its app, namespace or
+replica, or when runtime adoption fails. It validates the whole inventory before
+touching any instance and keeps records and identity files for recovery. Inspect
+the reported path or runtime error, repair it and retry. Don't delete ownership
+records to get past the refusal while workloads may still be running.
+
+The registry's startup sweep works the same way. A busy owner, an unexpected
+entry, a symlinked upload directory or a cleanup error refuses startup with
+context. Repair the reported condition rather than removing a live owner's lock
+file. A normal restart reclaims abandoned temporary uploads; clients restart
+interrupted pushes.
+
+### Stopping and retiring workloads
+
+Stop, retire, rollback and halt all wait for confirmed cleanup: runtime exit,
+kernel backend withdrawal, mount and network teardown, and removal of identity
+and adoption records. If any step fails, Bun reports the error and keeps
+ownership, so the cleanup can be retried; it never reports Stopped for a
+workload it can't prove has stopped. Rolling and blue-green deployments keep
+both generations when the old one's exit is uncertain. A failed final kernel
+backend publication is a deployment error, and the running workload stays owned.
+
+### Jobs and cron
+
+Jobs record execution intent and their three-retry budget before launching, and
 Bun replacement restores that budget. An observed failure can retry after
-confirmed cleanup; an unknown exit status stays `unknown`, including across
-further restarts. Ordinary apply cannot repeat an uncertain execution. After
-checking its external effects, explicitly request a new run on the same node:
+confirmed cleanup. An unknown exit status stays `unknown`, including across
+further restarts, and ordinary apply won't repeat it. After checking the job's
+external effects, explicitly request a new run on the same node:
 
 ```sh
 relish apply jobs.toml --rerun-jobs
 ```
 
-The manifest must contain only non-scheduled jobs. The API requires the existing
-user deployment authority and workload scope; internal service credentials
-cannot authorise a rerun. The old runtime must still pass confirmed retirement.
-Explicit stop cancels pending retries but preserves an unknown outcome. A failed
-job checkpoint write blocks further job mutations until Bun reloads its state;
-unrelated apps can still stop. Pre-adoption runtime discovery remains a separate
-release blocker; the [recovery plan](plans/archive/2026-09-19-job-recovery.md) records it.
+The manifest must contain only non-scheduled jobs. The API requires user
+deployment authority and workload scope; internal service credentials can't
+authorise a rerun. Explicit stop cancels pending retries but keeps an unknown
+outcome.
 
-App and job names, their namespaces and namespace declarations must be lowercase
-DNS labels: 1–63 ASCII letters/digits/hyphens, with a letter or digit at each end.
-Omit a namespace to use `default`; an explicitly empty namespace is invalid.
-Bun rejects invalid labels before allocating runtime resources. It also refuses
-fresh app/job IDs that belong to another workload, including stopped cleanup
-owners. For example, `worker-g1` cannot claim replica zero while generation one
-of `worker` owns that ID in the same namespace. Use another name or retire the
-existing owner first; runtime IDs are not silently renamed.
+Cron registrations and their latest claimed UTC minute persist before apply,
+stop or launch is acknowledged, and Bun restores them before serving the API.
+Missed minutes are skipped, and a crash between recording a firing and launching
+it can skip that occurrence too. There's no catch-up and no exactly-once
+promise. If a cron checkpoint write fails, Bun fences further cron changes and
+firings until it restarts and reloads its state.
 
-Startup refuses unreadable or malformed workload ownership records and runtime
-adoption errors before serving the API. It preserves records and identity files
-for recovery; inspect the reported path or runtime error and retry once repaired.
-Do not delete ownership records to bypass the refusal while workloads may survive.
-Startup also refuses legacy aliases and records whose canonical ID disagrees with
-its app, namespace, replica or explicit app-spec namespace. It validates the whole
-inventory before adopting or cleaning any instance, preserving unsupported owners.
+`relish test --filter jobs` creates durable leases on the receiving node for
+batch jobs and cron registrations; keep using the same node endpoint for a
+lease's lifetime. Creation needs an unscoped credential and the server's
+isolated-workload test grant. Ordinary jobs stay node-local; there's no cluster
+job scheduling.
 
-External image reads retry interrupted connections and response streams within
-the same four-attempt and overall time limits as temporary registry errors.
-Both direct pulls and Pickle verify raw pinned manifests, platform-index links
-and configuration descriptors before cache publication. Digest headers alone
-are not trusted; integrity failures stop the pull without retries. Upstream layer
-sizes must be non-negative, fit accounting bounds and match the downloaded or
-cached bytes. Descriptor values are never used as an up-front allocation budget.
+### Registry behaviour
 
-Registry catalogue metadata now belongs to a repository and manifest digest.
-Pushing identical bytes into another repository preserves independent tags;
-retiring one repository's final tag leaves the other copy and shared layers
-referenced. Content signatures remain available across repository copies and
-restart. A manifest push persists its catalogue before acknowledging success;
-filesystem failures refuse the push. Clustered workers and followers forward
-manifest and GC proposals to the advertised leader over authenticated node TLS.
-The leader checks current identity and quorum; retired nodes cannot commit.
-OCI index selection targets Linux containers independently of the client OS;
-registry fixture clients can select the target node’s x86-64 or ARM64 architecture.
+- A manifest push persists its catalogue before acknowledging. 201 means the
+  catalogue accepted it (blob replication may still be running); 503 means the
+  Raft commit wasn't confirmed, so retry.
+- Clustered workers and followers forward writes to the authenticated leader.
+  Repository reads, quota checks and `relish images` also use the leader's
+  committed view; if the leader is unreachable you get 503, not an empty
+  catalogue.
+- Pushing identical bytes into another repository keeps independent tags and
+  signatures; retiring one repository leaves the other copy intact.
+- A chunked upload belongs to the credential that created it. Continue and
+  complete it with that same credential; revoked or abandoned uploads expire
+  through the normal reaper.
+- Writes under `rbtest-…/` require the exact authenticated test lease owner and
+  the `x-reliaburger-test-lease` header. Only the owning application lease can
+  depend on those images.
+- Direct pulls and Pickle verify pinned manifests, platform indexes and
+  configuration bytes before caching them, and retry transient upstream errors
+  up to four times within a fixed deadline. OCI index selection targets Linux
+  containers even when the client runs on macOS.
 
-OCI metadata reads, peer image resolution and configured quota checks use the
-same current authority, including on fresh workers without a local catalogue.
-`relish images` also lists committed cluster metadata rather than a node-local
-projection; a missing leader route returns 503.
-Unavailable authority returns an error rather than a cache miss or zero usage.
-Digest reads also require live repository metadata; retaining shared bytes for
-an ordinary repository does not preserve access through a retired name.
-Unconfirmed Raft commits return 503 and
-require a client retry; 201 confirms catalogue acceptance, while blob replication
-may still be pending. Push publication and GC deletion share a
-transaction guard through authoritative publication and physical deletion.
-A durable per-node GC generation also rejects delayed manifest proposals that
-were checked before collection. Stale publication returns 503 for a fresh retry.
-HTTP writes under `rbtest-…/` require the exact authenticated lease owner and
-the `x-reliaburger-test-lease` header. Nodes record ownership before upload files
-and confirm partial-upload and metadata retirement only after workloads stop.
-Only the owning application lease may depend on those images, including init
-images. Ordinary apps and jobs refuse disposable image dependencies. Peer pulls
-also record repository ownership and track temporary uploads through caller
-cancellation; failed deletion remains pending for retry. Storage nodes now hash and conditionally
-confirm their own copies under the GC guard; the healer cannot replace stale
-holder lists. Physical registry recovery passes actual Bun death and three-node TLS
-leader-change tests on macOS/Linux.
-`relish test --filter image-registry` now stages a pinned runnable image under its
-server lease, deploys the exact digest and checks its HTTP response. The real
-Linux/runc catalogue passes all three cases with confirmed repository cleanup.
-A disconnected writer keeps cleanup pending until it returns and confirms
-retirement.
-
-Peer transfers preserve complete repository paths, including nested namespaces.
-Chunked uploads belong to the exact credential that created them. Continue and
-complete an upload with that same credential; another deploy token (including a
-replacement with the same name) cannot take over. Each request rechecks current
-authentication. Revoked or abandoned uploads expire through the normal reaper.
-
-Registry startup claims exclusive ownership of the configured image store's
-upload directory. Run only one Bun with that writable image store. A restart
-reclaims abandoned temporary uploads before serving; clients restart interrupted
-pushes. A busy owner, unexpected entry, symlinked upload directory or cleanup
-error refuses startup with context. Repair the reported condition rather than
-removing a live owner's lock file. Committed images are not part of this sweep.
-
-## Release work
-
-The [0.1.0 plan](plans/2026-09-16-v0.1.0-release-plan.md) tracks packaging and
-the managed laptop cluster. `relish setup` now checks node version and critical
-subsystem readiness before reporting a successful start. A startup timeout
-returns an error with the log path; `--yes` still configures without starting a
-background node. The public installer remains in development.
-
-Upgrade metadata endpoints are selected by `relish upgrade check --url`. Node
-TOML rejects the obsolete `[upgrades] release_url` key; remove it from old
-development configurations. Ingress currently uses unweighted round-robin on
-Bun's shared runtime, with no separate strategy or worker-thread setting.
-
-Durable cluster consumers journal catalogue and ingress exposure before publication,
-withdraw the previous view and wait for captured HTTP/WebSocket requests to finish.
-Recovery starts with empty views under the original enrolled identity. Ready cleanup
-receipts survive crashes and retry against the current authenticated leader until
-positively acknowledged. This conservative path can briefly interrupt routing during
-updates. Producer allocations remain held until committed consumer confirmation;
-permanent execution fences reject stale reports. Normal enrolled rootful startup and confirmed service VIP retirement are implemented;
-final release qualification remains open.
-
-0.1.0 requires a fresh cluster; development state is refused. Rolling upgrades
-require matching explicit formats (currently protocol 22 and state 39). See the
-[compatibility policy](releasing.md#cluster-compatibility).
+### Test volumes and leases
 
 Lease-owned test volumes and generated configuration have durable provisioning
-records. Ordinary Stop and rescheduling keep their data; lease retirement removes
-it only after confirmed runtime cleanup. Failed unmounts keep cleanup pending.
-Host-source volumes and ordinary application data remain outside test ownership.
-Disposable test-volume snapshots are unsupported in 0.1.0.
+records. Ordinary Stop and rescheduling keep their data; lease retirement
+removes it only after confirmed runtime cleanup, and failed unmounts keep
+cleanup pending. Host-source volumes and ordinary application data stay outside
+test ownership. A worker that can't return to confirm cleanup keeps it pending;
+see [decommissioning a node](#decommissioning-a-node).
 
-Reporting refuses messages over 1 MiB or containing more than 100 events;
-`reporting_tree.max_events_per_report` currently supports only 100. Admission
-failures appear in node logs. State snapshots refresh next tick, while metrics
-retry the last five minutes; longer gaps require the retained node-local data.
-The reporting event producer remains future work. See
+### Reporting limits
+
+Reporting refuses messages over 1 MiB or with more than 100 events;
+`reporting_tree.max_events_per_report` only supports 100. Admission failures
+appear in node logs. State snapshots refresh on the next tick and metrics retry
+the last five minutes; longer gaps need the retained node-local data. See
 [reporting admission](book/11-eyes-everywhere.md#reporting-has-an-admission-boundary-c21).
+
+### Configuration changes
+
+Upgrade metadata endpoints are selected with `relish upgrade check --url`; node
+TOML rejects the obsolete `[upgrades] release_url` key. Ingress uses unweighted
+round-robin on Bun's shared runtime, with no separate strategy or worker-thread
+setting. `relish setup` checks node version and critical subsystem readiness
+before reporting success; a startup timeout returns an error with the log path.
 
 ## Prerequisites
 
@@ -303,7 +227,7 @@ sudo apt install runc iproute2 nftables
 Download the latest binary from [github.com/opencontainers/runc/releases](https://github.com/opencontainers/runc/releases) and place it in your `PATH`.
 
 Notes:
-- Rootless runc's namespace/spec path supports read-only OCI roots and path-based test bundles. It uses `slirp4netns` for outbound networking and published ports, and restores that userspace network across Bun replacement. Declarative app specs currently request writable roots, so normal image workloads must use root mode until Reliaburger owns a safe unprivileged snapshotter; they never fall back to a shared writable image tree.
+- Rootless runc is standalone only: Bun refuses `--cluster` without root. It supports read-only OCI roots and path-based test bundles, and uses `slirp4netns` for outbound networking and published ports, restoring that userspace network across Bun replacement. Declarative app specs currently request writable roots, so normal image workloads must use root mode until Reliaburger owns a safe unprivileged snapshotter; they never fall back to a shared writable image tree.
 - Rootless resource limits remain unsupported and fail admission because Reliaburger doesn't create a delegated user cgroup. Ubuntu hosts that set `kernel.apparmor_restrict_unprivileged_userns=1` also need an AppArmor policy permitting the installed Bun binary (or that restriction disabled) before runc can write UID/GID maps.
 - Bun keeps Runc bundles and state under `<storage.data>/instances/runc/` and uses the selected `storage.images` directory for its image cache. Explicit Runc selection and automatic detection both follow these node paths, including any storage fallback reported at startup.
 - OCI images are pulled from Docker Hub automatically when the spec's `image` field is set (e.g. `alpine:latest`)
@@ -366,9 +290,7 @@ group, daemonise, or hand work to an external service manager.
 If those restrictions don't fit, use **Linux containers**: runc on Linux or the
 [managed Linux cluster](quickstart.md) on a laptop. Process groups are a
 cooperative supervision contract, not a security boundary for untrusted code.
-Bun must retain cleanup ownership whenever runtime absence cannot be confirmed.
-The remaining launch-identity and pre-adoption crash fixes are tracked in C34;
-this scope decision does not mark them complete.
+Bun keeps cleanup ownership whenever it can't confirm the process has gone.
 
 No installation needed. This is what you get by default.
 
@@ -1389,22 +1311,22 @@ config-file mounting on a cluster with a container runtime.
 
 ### OCI release qualification
 
-On a disposable Linux host with Runc, static BusyBox, `ip`, `nft`, a C compiler and
-sudo, run `scripts/release/qualify-oci-interruptions.sh`. It runs actual Bun crash
-and caller-cancellation cases in private network/mount namespaces and retains logs
-and test-binary checksums. Every Runc runtime is owned; standalone rootful
-startup with eBPF configured also selects durable discovery and kernel ownership.
+These scripts exercise crash and reboot recovery on real hosts. They're manual:
+each one interrupts processes deliberately, so run them only on disposable
+machines.
 
-From the host, `scripts/release/qualify-oci-reboot.sh --vm DISPOSABLE_LIMA_VM`
-starts real OCI executions, force-stops that VM and verifies recovery after a new
-kernel boot. This deliberately interrupts every process in the selected VM. The
-rootful runtime qualification passed, including address retention until explicit
-release. It does not close the remaining release gates in the
+- `scripts/release/qualify-oci-interruptions.sh` needs a Linux host with Runc,
+  static BusyBox, `ip`, `nft`, a C compiler and sudo. It kills Bun and cancels
+  callers at each Runc lifecycle boundary, inside private network and mount
+  namespaces, and keeps logs and test-binary checksums.
+- `scripts/release/qualify-oci-reboot.sh --vm DISPOSABLE_LIMA_VM` runs from the
+  host. It starts real OCI executions, force-stops the VM and checks recovery
+  after the new kernel boot, including address retention until explicit
+  release.
+- `scripts/release/qualify-discovery-reboot.sh --vm DISPOSABLE_LIMA_VM` does the
+  same for the complete standalone path, carrying discovery ownership through
+  a power cut and then checking retirement, explicit redeployment and same-boot
+  adoption.
+
+Passing them doesn't close the release gates in the
 [remaining-work table](plans/2026-09-22-v0.1.0-remaining-work.md).
-
-
-
-The complete standalone path is qualified by
-`scripts/release/qualify-discovery-reboot.sh --vm DISPOSABLE_LIMA_VM`. It retains
-Bun/test executable checksums and original discovery obligations through a real
-power-cut, then verifies retirement, explicit redeployment and same-boot adoption.
