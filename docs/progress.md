@@ -21,8 +21,10 @@ gates; those stay unchecked.
 > steps through opt-in Bun publication and standalone address release. Service
 > retirement and startup recovery are implemented for the opt-in standalone path.
 > Standalone rootful Runc/eBPF now uses durable ownership on normal startup and
-> passes actual Bun/host reboot recovery. Consumer publication/recovery integration,
-> clustered/rootless activation and actual upgrade qualification remain open.
+> passes actual Bun/host reboot recovery. Durable consumer recovery, withdrawal and
+> receipt retry are implemented and qualified. Clustered/rootless activation, VIP
+> retirement and actual upgrade qualification are in progress; see the
+> [activation plan](plans/2026-09-22-cluster-activation.md).
 > C34 and V01–V04 remain open; current-head hosted qualification is separate.
 > See the [remaining-work estimates](plans/2026-09-22-v0.1.0-remaining-work.md).
 
