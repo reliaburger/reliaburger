@@ -529,7 +529,7 @@ This is where the model and I disagreed most often. It would cheerfully offer to
   kicker(s, "The other side", true);
   text(s, "So what's actually ours?", { x: 0.7, y: 1.0, w: 11.9, h: 0.9, fontFace: H, fontSize: 36, bold: true, color: CREAM });
   const ours = [
-    ["Mustard", "SWIM gossip. We needed bounded messages and our own piggyback payloads."],
+    ["Mustard", "SWIM gossip. There's a crate for it. We wrote our own anyway, and had to justify it."],
     ["Meat", "The scheduler. Placement is the one thing nobody can do for you."],
     ["Onion", "The eBPF programs, and the glue that keeps the maps honest."],
     ["The joins", "How all of it fits together: leases, ownership, recovery, who cleans up after whom."],
@@ -541,11 +541,19 @@ This is where the model and I disagreed most often. It would cheerfully offer to
     text(s, o[1], { x: 3.9, y, w: 8.7, h: 0.85, valign: "middle", fontSize: 17, color: CREAM });
   });
   text(s, "Write the part that's yours. Borrow the rest.", { x: 0.7, y: 6.5, w: 11.9, h: 0.55, fontSize: 24, bold: true, italic: true, color: MUSTARD });
-  s.addNotes(`[about 1 minute]
+  s.addNotes(`[about 1 minute 45 seconds]
 
 So what did we actually write?
 
-Mustard, the gossip layer, is ours. That was a real decision. There are good SWIM crates out there, but we wanted fixed-size messages and our own piggyback payloads, and that's the core of how it scales. So that one earned its place.
+Mustard, the gossip layer, is ours, and that's the one that needed justifying. Rule four says use the library, so what happened?
+
+Rust doesn't have an equivalent of HashiCorp's memberlist, the Go library that everyone uses for this. There's a crate called foca, and it's decent. We evaluated it, and the design doc still carries the decision.
+
+Three things we needed that didn't fit: messages that stay a fixed size no matter how big the cluster gets, our own piggyback payload riding along on every ping, and HMAC on every datagram. All three are the core of how this scales to ten thousand nodes, and all three mean reaching inside the protocol rather than sitting on top of it.
+
+SWIM is also a small protocol. The paper is clear, and the core is about a thousand lines. So we wrote it: about six thousand lines now, with the tests.
+
+That's the exception that proves rule four. You write it yourself when the thing you need is the part the library abstracts away. Not because it looks fun. It always looks fun.
 
 Meat, the scheduler, is ours, because placement is the one thing nobody can do for you. It's your policy.
 
