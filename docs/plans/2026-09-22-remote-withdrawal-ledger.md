@@ -112,10 +112,47 @@ readers, wrong identities, missing/revoked TLS credentials and unavailable leade
 
 ### Receipt implementation checkpoint
 
-The endpoint and Raft mutation are implemented, pending qualification. Three API
+The endpoint and Raft mutation are complete (`000db00`). Three API
 contracts fail first (0.066s), followed by two Raft snapshot/refusal contracts
 (0.092s). The body contains only compatibility and generation; the handler derives
 the consumer from a freshly validated TLS certificate. Only Applied returns 204.
 Historical retries leave all other obligations unchanged; registration is retained.
-The new durable command advances compatibility to protocol 19/state 32. Consumer
-proof production, cancellation recovery and producer release remain open.
+All five focused tests pass (0.055s). Native/Linux qualification passes 404/416
+affected library cases, thirteen integration cases each, three real
+failover/decommission cases each, strict Clippy and formatting. The new durable
+command advances compatibility to protocol 19/state 32. Consumer proof production,
+cancellation recovery and producer release remain open.
+
+### Consumer integration handoff
+
+The receipt service is only the receiving boundary. The next implementation must
+preserve the evidence that permits a consumer to call it:
+
+- `src/cluster/orchestrate.rs` currently decodes generation/instructions but sends
+  only catalogue/ingress through `AgentCommand::SyncClusterCatalog`. Carry the
+  complete generation-bound update and wait for a checked agent result.
+- `src/bun/agent.rs` currently overwrites `cluster_catalog` before rebuilding
+  routing; `rebuild_routing_table` logs rebuild errors. Make the cluster path
+  preserve its previous confirmed state on failure and report errors to its
+  caller before allowing a receipt.
+- Add durable consumer ownership before any attempted publication. Bind it to
+  the enrolled node/cluster, reject delayed older responses and retain original
+  exposures across replacement. The existing `DiscoveryJournal` tracks local
+  service/runtime ownership; remote consumer records cannot simply be treated as
+  local runtime references. Keep filesystem claims alive through cancelled I/O.
+- Routing/DNS currently overlay the remote catalogue, while eBPF synchronisation
+  uses the local map. Audit each actual publication surface. Withdraw old routes
+  before draining captured HTTP/WebSocket requests, then require actual guard
+  release through `SharedDrains`, not merely cancellation or a missing record.
+  Account for this node's own backends separately from the remote overlay.
+- Persist completed local withdrawal before sending the receipt. Failed, timed
+  out or cancelled requests retain replayable evidence. Recovery reconciles old
+  ownership before publishing or acknowledging anything; newer publications and
+  unrelated generations must remain intact during replay.
+- Keep producer address/host-port release closed until committed state confirms
+  every relevant withdrawal, and fence stale reports from reintroducing a retired
+  execution. Receipt acceptance alone does not implement that producer gate.
+
+Tests should interrupt consumer persistence, publication, drain and receipt waits;
+retain an offline consumer through leader replacement; then verify bounded retries,
+restart replay, and operator-fenced permanent identity retirement.
