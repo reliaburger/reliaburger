@@ -2115,3 +2115,38 @@ proof to this endpoint and gating physical producer release remain separate work
 
 The new Raft command advances compatibility to protocol 19/state 32. Pre-release
 clusters must start fresh rather than replay an unknown durable command.
+
+
+### Queueing a catalogue is not publishing it
+
+The leader sends a new remote backend together with an invalid ingress rate limit.
+Previously Bun replaced its catalogue, rebuilt only the valid ingress routes,
+logged the error and refreshed DNS anyway. Meanwhile, the placement reconciler
+had already treated sending the command as success. Different readers could see
+different updates, with no useful failure result for the caller.
+
+The cluster path now validates allocations and builds a separate candidate
+routing table. An error discards that candidate and keeps the confirmed catalogue,
+DNS snapshot and ingress configuration. After validation, Bun takes the routing
+write lock and replaces the views without an intervening await. Identical updates
+remain no-ops. The ordinary routing-table builder still reports invalid routes;
+the cluster publisher chooses when to install its result.
+
+`SyncClusterCatalog` now carries a `oneshot::Sender<Result<(), BunError>>`. The
+sender carries a single reply, whose inner Result distinguishes successful
+publication from a refusal. The receiving future can itself fail when its sender
+is dropped, so a lost reply is not success either. The placement loop puts one
+deadline around both queueing and confirmation, and honours shutdown while it
+waits. It retries refusals, lost replies and timeouts before performing the next
+placement work.
+
+The regressions first reproduce a changed catalogue after routing refusal, an
+invalid VIP accepted into the views, and a deployment queued before the publisher
+replies. They also verify a corrected retry and distinguish an explicit refusal,
+a lost reply and a positive confirmation. Existing fake agents must now send the
+confirmation too; otherwise a test would accidentally model a stalled publisher.
+
+This is an in-process contract, so protocol 19/state 32 remain unchanged. It is
+also only publication confirmation. A request captured before the table swap may
+still own an old backend. Durable consumer records, confirmed draining and receipt
+submission are the next steps; this reply alone cannot authorise address reuse.

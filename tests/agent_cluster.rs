@@ -557,8 +557,10 @@ async fn worker_without_council_metrics_excludes_its_own_stale_endpoints() {
     ])
     .unwrap();
     let result = tokio::time::timeout(Duration::from_secs(5), async {
+        let (response, confirmation) = oneshot::channel();
         commands
             .send(AgentCommand::SyncClusterCatalog {
+                response,
                 catalog: Box::new(catalog),
                 ingress: vec![IngressAssignment {
                     namespace: "default".into(),
@@ -568,6 +570,7 @@ async fn worker_without_council_metrics_excludes_its_own_stale_endpoints() {
             })
             .await
             .unwrap();
+        confirmation.await.unwrap().unwrap();
         let (response, reply) = oneshot::channel();
         commands
             .send(AgentCommand::ResolveAll { response })

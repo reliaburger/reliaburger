@@ -57,6 +57,10 @@ pub enum BunError {
         reason: String,
     },
 
+    /// The cluster catalogue and routing views could not be confirmed together.
+    #[error("cluster discovery publication failed: {0}")]
+    ClusterPublication(String),
+
     /// Backend registration or publication failed, so deployment cannot report completion.
     #[error("cannot publish backend for {service}: {reason}")]
     BackendPublication {

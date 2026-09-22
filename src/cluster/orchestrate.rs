@@ -1004,18 +1004,38 @@ pub fn spawn_placement_reconciler(
                 _ => continue,
             };
 
-            // Install routing before deployment, but do not wait indefinitely
-            // for a blocked agent queue. The next tick refreshes this snapshot.
-            let sync_catalogue = cmd_tx.send(AgentCommand::SyncClusterCatalog {
-                catalog: Box::new(assignments.endpoint_catalog.clone()),
-                ingress: assignments.ingress.clone(),
-            });
+            // Queue acceptance is not publication. The deadline covers both
+            // sending the update and receiving the agent's confirmed result.
+            let sync_catalogue = async {
+                let (response, reply) = tokio::sync::oneshot::channel();
+                cmd_tx
+                    .send(AgentCommand::SyncClusterCatalog {
+                        catalog: Box::new(assignments.endpoint_catalog.clone()),
+                        ingress: assignments.ingress.clone(),
+                        response,
+                    })
+                    .await
+                    .map_err(|_| {
+                        crate::bun::BunError::ClusterPublication("agent channel closed".into())
+                    })?;
+                reply.await.map_err(|_| {
+                    crate::bun::BunError::ClusterPublication("agent reply lost".into())
+                })?
+            };
             let synchronised = tokio::select! {
                 _ = shutdown.cancelled() => return,
                 result = tokio::time::timeout(RECONCILE_IO_TIMEOUT, sync_catalogue) => result,
             };
-            if !matches!(synchronised, Ok(Ok(()))) {
-                continue;
+            match synchronised {
+                Ok(Ok(())) => {}
+                Ok(Err(error)) => {
+                    eprintln!("orchestrator: {error}");
+                    continue;
+                }
+                Err(_) => {
+                    eprintln!("orchestrator: cluster discovery publication timed out");
+                    continue;
+                }
             }
 
             let mut seen: HashSet<(String, String)> = HashSet::new();
@@ -1240,6 +1260,104 @@ mod tests {
         )
     }
 
+    #[tokio::test]
+    async fn placement_deployment_waits_for_confirmed_cluster_publication() {
+        let root = tempfile::tempdir().unwrap();
+        let assignments = NodeAssignments {
+            apps: vec![NodeAssignment {
+                name: "web".into(),
+                namespace: "default".into(),
+                replicas: 1,
+                spec: spec_from_toml(
+                    "[app.web]\nimage = \"proc-grill:image-ignored\"\ncommand = [\"sleep\", \"60\"]",
+                ),
+            }],
+            ..Default::default()
+        };
+        let router = axum::Router::new().route(
+            "/v1/placements/worker",
+            axum::routing::get(move || {
+                let assignments = assignments.clone();
+                async move { axum::Json(assignments) }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
+        let (commands, mut received) = mpsc::channel(8);
+        let reconciler = reconciler_for_deadline_test(address, root.path(), commands);
+        let pending = tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                match received.recv().await.unwrap() {
+                    command @ AgentCommand::SyncClusterCatalog { .. } => break command,
+                    AgentCommand::Status { response } => {
+                        response.send(vec![]).unwrap();
+                    }
+                    AgentCommand::Deploy { .. } => {
+                        panic!("deployment preceded cluster publication")
+                    }
+                    _ => {}
+                }
+            }
+        })
+        .await
+        .unwrap();
+        assert!(
+            tokio::time::timeout(Duration::from_millis(200), received.recv())
+                .await
+                .is_err(),
+            "queueing publication allowed deployment before its result"
+        );
+        let AgentCommand::SyncClusterCatalog { response, .. } = pending else {
+            unreachable!()
+        };
+        response
+            .send(Err(crate::bun::BunError::ClusterPublication(
+                "injected refusal".into(),
+            )))
+            .unwrap();
+        for accept in [false, true] {
+            let response = tokio::time::timeout(Duration::from_secs(5), async {
+                loop {
+                    match received.recv().await.unwrap() {
+                        AgentCommand::SyncClusterCatalog { response, .. } => break response,
+                        AgentCommand::Status { response } => {
+                            response.send(vec![]).unwrap();
+                        }
+                        AgentCommand::Deploy { .. } => {
+                            panic!("deployment bypassed refused or lost publication")
+                        }
+                        _ => {}
+                    }
+                }
+            })
+            .await
+            .unwrap();
+            if accept {
+                response.send(Ok(())).unwrap();
+            } else {
+                drop(response);
+            }
+        }
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                match received.recv().await.unwrap() {
+                    AgentCommand::Deploy { .. } => break,
+                    AgentCommand::Status { response } => {
+                        response.send(vec![]).unwrap();
+                    }
+                    _ => {}
+                }
+            }
+        })
+        .await
+        .unwrap();
+        reconciler.abort();
+        let _ = reconciler.await;
+        server.abort();
+        let _ = server.await;
+    }
+
     #[test]
     fn placements_require_publication_generation_and_withdrawal_instructions() {
         for field in [
@@ -1318,7 +1436,7 @@ mod tests {
                     _ = ack_rx.recv() => break,
                     command = received.recv() => match command.unwrap() {
                         AgentCommand::Status { response } => { response.send(vec![]).unwrap(); }
-                        AgentCommand::SyncClusterCatalog { .. } => {}
+                        AgentCommand::SyncClusterCatalog { response, .. } => { let _ = response.send(Ok(())); }
                         AgentCommand::RetireTestResources { app_name, namespace, response } => {
                             assert_eq!((app_name.as_str(), namespace.as_str()), ("web", "rbtest-run1"));
                             assert_eq!(acknowledgements.load(Ordering::SeqCst), 0);
@@ -1539,6 +1657,9 @@ namespace = "rbtest-interrupted"
                     AgentCommand::Status { response } => {
                         response.send(vec![]).unwrap();
                     }
+                    AgentCommand::SyncClusterCatalog { response, .. } => {
+                        let _ = response.send(Ok(()));
+                    }
                     AgentCommand::Deploy { events, .. } => {
                         let saved = crate::cluster::applied::load(&checkpoint).unwrap();
                         break (saved, events);
@@ -1577,6 +1698,9 @@ namespace = "rbtest-interrupted"
                     match received.recv().await.unwrap() {
                         AgentCommand::Status { response } => {
                             response.send(vec![]).unwrap();
+                        }
+                        AgentCommand::SyncClusterCatalog { response, .. } => {
+                            let _ = response.send(Ok(()));
                         }
                         AgentCommand::Retire {
                             app_name,
@@ -1639,7 +1763,10 @@ namespace = "rbtest-interrupted"
                     AgentCommand::Status { response } => {
                         response.send(vec![]).unwrap();
                     }
-                    AgentCommand::SyncClusterCatalog { .. } => polls += 1,
+                    AgentCommand::SyncClusterCatalog { response, .. } => {
+                        polls += 1;
+                        let _ = response.send(Ok(()));
+                    }
                     AgentCommand::Deploy { .. } => {
                         panic!("deployment bypassed failed ownership persistence")
                     }
