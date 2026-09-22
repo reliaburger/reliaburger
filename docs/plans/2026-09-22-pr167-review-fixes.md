@@ -66,6 +66,10 @@ subsystem review agents that traced the code; confirm each one before fixing it.
 - [x] **E. Vendored `parquet`.** Decided 22 September 2026: drop it and
       upgrade DataFusion 45 → 55 (T2.19). See the dedicated section below.
 
+- [ ] **F. One Runc lifecycle (T4.2).** Recommended: yes, make owned Runc the
+      only Linux Runc path, after the Tier 1 owner-recovery fixes (T1.3/T1.4)
+      land, since those make the owned path safe to depend on everywhere.
+
 ## Tier 1: fix before merge
 
 All of these are introduced or exposed by this PR.
@@ -333,6 +337,72 @@ Config:
       "opt-in owned Runc" contradiction at `README.md:52` versus `:319`.
 - [ ] **T3.5 Decide on `docs/talks/`.** It arrived via PR #171 merged into this
       branch. Keep it, or move it to its own PR against `main`.
+
+## Tier 4: reduce code size
+
+`make loc` counts 133.4k production lines in `src/` against 108.5k on `main`
+(+24.9k, +23%). The count is accurate: only `src/bun/job_lifecycle_tests.rs`
+(349 lines) is misclassified test code. Most of the growth is owned/durable
+machinery that production uses, so the realistic production saving is about
+1.7–2.0k lines. Tests can lose another 1.2–1.8k through shared fixtures. The
+bigger size win is documentation (T3.1/T3.2, about 13k Markdown lines).
+
+Estimates come from a survey agent (22 September 2026); T4.1's reachability was
+spot-checked by hand.
+
+- [ ] **T4.1 Delete the legacy rootless Runc path (~400 prod, ~280 test
+      lines; low risk).** Since `b41cdd9`, rootless startup always takes the
+      owned path (`src/bin/bun.rs:925-947`), so `Slirp4netnsHandle`,
+      `setup_slirp4netns`, `stop_recorded_owner`, `PendingSlirp` and
+      `add_slirp4netns_port_forward` (`src/grill/rootless.rs:174-450`),
+      `start/restore_rootless_network` and `slirp_handles`
+      (`src/grill/runc.rs:74, 364-490`), the rootless arm of legacy `adopt`
+      (`:~1290-1320`) and its tests (`:1879-2160`) are dead.
+- [ ] **T4.2 Make every Linux Runc instance owned; drop
+      `--experimental-owned-runc` (~600–700 prod, ~375 test lines; medium
+      risk).** Removes the legacy branch of each
+      `if self.ownership.is_some()` in `src/grill/runc.rs:795-1466` plus
+      legacy-only helpers (`:194-363`). Nothing in the owned path needs eBPF,
+      but `durable_discovery` currently also gates cluster identity rules and
+      the mode-change refusal (`src/bin/bun.rs:940, 1081, 1322`). Split "owned
+      runtime" from "durable discovery" first, and qualify rootful Runc without
+      eBPF on the owned path. Also removes a less crash-safe mode. Needs a
+      scope decision (F below).
+- [ ] **T4.3 `ask_agent` helper in `src/bun/api.rs` (~250–350 lines; low
+      risk).** The oneshot + `cmd_tx.send` + "agent unavailable" + await
+      pattern repeats 36 times (e.g. `:853-858`, `:920-927`, `:988-1000`).
+- [ ] **T4.4 Shared private-record reader (~150–250 lines; low risk).** One
+      `read_private_json(path, limit)` for the O_NOFOLLOW → regular/private
+      file → size → bounded read → parse pattern in `process_owner.rs`,
+      `runc_intent.rs`, `discovery_owners.rs`, `egress_owners.rs`,
+      `volume/owned.rs`, `network_leases.rs`, `command.rs`, `jobs.rs`,
+      `schedules.rs`; dedupe `validate_file`/`validate_directory`. Keep the
+      domain-specific `validate()`/`validate_transition()` as they are.
+- [ ] **T4.5 Remove dead functions (~130–200 lines; low risk).** No callers
+      at all: `query_apps` (`ketchup/log_store.rs:605`),
+      `spawn_council_reconciler` (`cluster/runtime.rs:973`),
+      `derive_with_evidence` (`bun/capabilities.rs:361`), `query_sql_json`,
+      `check_route_role`, `generate_new_join_token`,
+      `read_cgroup_memory_current`, `bind_with_node_gate`, `rootless_default`,
+      `required_role`. Orphaned by this branch (tests only):
+      `pull_manifest_layers` (`pickle/pull.rs:311`), `apply_update_locations`,
+      `netns::add_port_mapping`. Re-grep before deleting.
+- [ ] **T4.6 Small helpers (~50–70 lines).** One `launch_inventory` with a
+      single timeout (7 copies, 1 s/5 s/none; this also fixes the missing
+      timeout in T2.14) and one drain-then-check helper (3 copies).
+- [ ] **T4.7 Shared test fixtures (~1.2–1.8k test lines; low risk).** The
+      eBPF enable-and-load preamble repeats 15 times in `tests/ebpf.rs`;
+      `NodeFaultAuth` setup 7 times; `spawn_gitops_sync` config 5 times; the
+      `router(cmd_tx, None ×11, …)` + agent spawn 12–20 times in the
+      `api.rs` test module. Table-driving saves little: only 5
+      near-duplicate test pairs exist.
+- [ ] **T4.8 Make `make loc` honest.** Count tracked files (`git ls-files`)
+      so `node_modules` Markdown under `docs/talks/` stops inflating `.md`, and
+      treat `#[cfg(test)] mod x;` files as tests.
+
+Not worth it: marking `ProcessGrill`'s unowned branches test-only (~450
+lines, but 40 test sites depend on them, so no lines are saved), and merging
+the per-module `failure()`/`refuse()` closures (costs readability).
 
 ## Vendored `parquet`
 
