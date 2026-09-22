@@ -1548,6 +1548,9 @@ mod tests {
                     AgentCommand::Status { response } => {
                         response.send(vec![]).unwrap();
                     }
+                    AgentCommand::SyncClusterCatalog { response, .. } => {
+                        let _ = response.send(Ok(()));
+                    }
                     AgentCommand::Retire {
                         app_name, response, ..
                     } if app_name == blocked.0 => {

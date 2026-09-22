@@ -40,6 +40,9 @@ The full architectural vision lives in the [whitepaper](docs/whitepaper.md).
 Install and usage details are in the [documentation](docs/README.md), and
 implementation status in [progress.md](docs/progress.md).
 
+Cluster discovery keeps its last confirmed DNS and ingress views when a routing
+update fails, and retries confirmation before continuing placement work.
+
 0.1.0 requires a fresh cluster; development state is refused. Rolling upgrades
 require matching explicit formats (currently protocol 19 and state 32). See the
 [compatibility policy](docs/releasing.md#cluster-compatibility).

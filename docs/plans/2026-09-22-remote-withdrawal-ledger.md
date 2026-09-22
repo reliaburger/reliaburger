@@ -144,7 +144,12 @@ preserve the evidence that permits a consumer to call it:
   uses the local map. Audit each actual publication surface. Withdraw old routes
   before draining captured HTTP/WebSocket requests, then require actual guard
   release through `SharedDrains`, not merely cancellation or a missing record.
-  Account for this node's own backends separately from the remote overlay.
+  Account for this node's own backends separately from the remote overlay. The
+  merge currently retains a local service's allocation and adds remote allocations
+  independently (`ServiceMap::with_cluster_catalog_excluding_node`). Consumer
+  recovery must validate the effective local-plus-remote view and correlate its
+  exact installed VIPs; validating the incoming catalogue alone does not prove
+  that this merged view has no allocation conflicts.
 - Persist completed local withdrawal before sending the receipt. Failed, timed
   out or cancelled requests retain replayable evidence. Recovery reconciles old
   ownership before publishing or acknowledging anything; newer publications and
@@ -156,3 +161,17 @@ preserve the evidence that permits a consumer to call it:
 Tests should interrupt consumer persistence, publication, drain and receipt waits;
 retain an offline consumer through leader replacement; then verify bounded retries,
 restart replay, and operator-fenced permanent identity retirement.
+
+### Checked cluster publication checkpoint
+
+The cluster publisher now validates allocations and builds a complete candidate
+routing table before changing catalogue, DNS or ingress views. Rejected candidates
+preserve the last confirmed publication; corrected updates can retry. A checked
+oneshot reply prevents placement work from proceeding on queue acceptance alone.
+The existing deadline covers queueing and confirmation, including lost replies.
+Three contracts fail first (0.115s); six focused cases pass (6.225s). Implementation
+is committed early as `0e80491`. The broader native run identified one older fake
+agent missing its new reply (456/457 passed); the fixture is corrected, pending
+final native/Linux qualification. This internal channel change leaves protocol
+19/state 32 unchanged. Durable consumer ownership before publication and positive
+drain proof before receipts remain the next work.
