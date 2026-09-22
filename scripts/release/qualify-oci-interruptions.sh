@@ -20,12 +20,15 @@ while IFS= read -r binary; do
     sha256sum "$binary" >> "$evidence/binaries.sha256"
     # Scope links, routing/firewall changes and namespace mount points to the
     # fixture. A failed test must not pollute the host's /run/netns directory.
+    # The reboot fixtures panic without their power-cycling drivers
+    # (qualify-oci-reboot.sh, qualify-discovery-reboot.sh), so skip them here.
     timeout 420s sudo unshare --mount --net --propagation private bash -c '
         set -eu
         mkdir -p /run/netns
         mount -t tmpfs tmpfs /run/netns
         ip link set lo up
-        exec "$1" --ignored --nocapture --test-threads=1 --skip normal_rootless_bun
+        exec "$1" --ignored --nocapture --test-threads=1 --skip normal_rootless_bun \
+            --skip actual_host_reboot --skip actual_bun_kernel_discovery_host_reboot
     ' qualification "$binary" 2>&1 | tee "$evidence/$name.log"
 done < "$evidence/binaries"
 printf 'PASS: OCI interruptions; evidence retained at %s\n' "$evidence"

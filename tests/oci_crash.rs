@@ -1281,9 +1281,12 @@ async fn assert_startup_refused(root: &Path, expected: &str) {
 #[tokio::test]
 #[ignore = "run through scripts/release/qualify-discovery-reboot.sh on a disposable VM"]
 async fn actual_bun_kernel_discovery_host_reboot() {
-    let Ok(directory) = std::env::var("RELIABURGER_DISCOVERY_REBOOT_DIRECTORY") else {
-        return;
-    };
+    // A missing variable means an automated driver picked this up by
+    // mistake. Passing would claim reboot evidence nobody collected.
+    let directory = std::env::var("RELIABURGER_DISCOVERY_REBOOT_DIRECTORY").expect(
+        "RELIABURGER_DISCOVERY_REBOOT_DIRECTORY unset: run this only through \
+         scripts/release/qualify-discovery-reboot.sh, which power-cycles the VM",
+    );
     let root = Path::new(&directory);
     let name = format!(
         "reboot-{}",

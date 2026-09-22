@@ -2433,6 +2433,11 @@ old service before readiness. An explicit redeployment runs once; the earlier
 release reference cannot free the successor's address. We then restart Bun once
 more to prove same-boot adoption still works after reboot recovery.
 
+Like its Chapter 1 sibling, the Rust half of this fixture panics when the driver's
+directory variable is missing instead of quietly passing, and the automated
+interruption driver skips it. Only the power-cycling driver can produce a green
+reboot result.
+
 The fixture reads the atomic discovery checkpoint rather than competing with
 Bun's runtime polling. Its isolated network namespace also needs a fresh
 `/run/netns` mount point after boot. These are test prerequisites, not recovery

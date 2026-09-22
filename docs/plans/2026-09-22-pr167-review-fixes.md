@@ -319,12 +319,15 @@ CI and release:
       *Done.* Promotion checks out `main`, validates the tag's shape, fetches it and reads
       version/commit via `git show`/`git rev-parse`. `scripts/release/test_promote_workflow.py`
       (run by `test-packaging`) fails on a tag checkout or `${{ inputs.* }}` inside `run:`.
-- [ ] **T2.2 ✔ Reboot "qualification" tests pass vacuously in CI.**
+- [x] **T2.2 ✔ Reboot "qualification" tests pass vacuously in CI.**
       `tests/owned_runc.rs:680` and `tests/oci_crash.rs:1216` `return` when
       their env var is unset, and `qualify-oci-interruptions.sh` and
       `make test-linux` run them. *Fix:* `panic!` when the var is missing, and
       `--skip` them in the automated drivers. The real runs stay manual
       (Lima), which the docs should say plainly.
+      *Done.* Both fixtures now `.expect()` their directory variable; the interruption driver
+      `--skip`s them and `make test-linux` excludes them by filter. Linux run of the
+      panic path still pending (macOS only compiles these files).
 - [ ] **T2.3 Quorum assertions were loosened.** `tests/placement.rs:~851` and
       `:1093-1103` now also accept capacity or leader-unknown refusals. Restore
       the quorum-specific assertion (set up capacity so the quorum check is the

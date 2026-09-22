@@ -678,9 +678,12 @@ async fn previous_boot_intent_cannot_start_or_remove_conflicting_live_resources(
 #[tokio::test]
 #[ignore = "run only through scripts/release/qualify-oci-reboot.sh in a disposable Linux VM"]
 async fn actual_host_reboot_preserves_holds_and_retires_original_execution() {
-    let Ok(directory) = std::env::var("RELIABURGER_REBOOT_DIRECTORY") else {
-        return;
-    };
+    // A missing variable means an automated driver picked this up by
+    // mistake. Passing would claim reboot evidence nobody collected.
+    let directory = std::env::var("RELIABURGER_REBOOT_DIRECTORY").expect(
+        "RELIABURGER_REBOOT_DIRECTORY unset: run this only through \
+         scripts/release/qualify-oci-reboot.sh, which power-cycles the VM",
+    );
     assert!(nix::unistd::geteuid().is_root());
     let root = Path::new(&directory);
     let id = instance(root);

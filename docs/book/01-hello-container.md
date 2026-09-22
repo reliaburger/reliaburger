@@ -3504,6 +3504,18 @@ payload never runs, and the held address cannot be reused until explicit release
 Finally it runs a replacement and refuses a delayed release from the old generation.
 The driver preserves both logs and the test binary's checksum across the reboot.
 
+The test itself is only half of that fixture; the driver supplies the other half
+through `RELIABURGER_REBOOT_DIRECTORY`. Our first version did `let Ok(directory)
+= std::env::var(...) else { return; };` when the variable was missing. That
+`let ... else` form binds the value if the pattern matches and runs the `else`
+block (which must leave the function) if it doesn't. Returning early made the
+test *pass*. `make test-linux` and the interruption driver both run every
+ignored test in the binary, so CI reported a green reboot qualification that
+never rebooted anything. Now the test calls `.expect("...")`, which is `unwrap()`
+with our own panic message, and the automated drivers `--skip` it. A green
+result can only come from the driver that actually power-cycles the VM, and that
+driver stays a manual, disposable-VM step.
+
 ### Kill the agent at the awkward moments
 
 `tests/oci_crash.rs` starts the actual Bun binary and actual Runc containers. Small
