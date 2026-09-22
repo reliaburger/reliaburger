@@ -731,6 +731,12 @@ fn build_endpoint_catalog(
             continue; // no known IP (departed, or IPv6-only) — can't route to it
         };
         for app in &report.running_apps {
+            if desired
+                .producer_retirements
+                .blocks(&node_id.0, app.execution.as_ref())
+            {
+                continue;
+            }
             let Some(host_port) = app.port else {
                 continue; // portless instance: nothing to resolve
             };

@@ -235,7 +235,7 @@ reject stale catalogue generations and conflicting merged allocations. Durable
 consumer recovery and confirmed remote cleanup remain release blockers.
 
 0.1.0 requires a fresh cluster; development state is refused. Rolling upgrades
-require matching explicit formats (currently protocol 19 and state 33). See the
+require matching explicit formats (currently protocol 20 and state 34). See the
 [compatibility policy](releasing.md#cluster-compatibility).
 
 Lease-owned test volumes and generated configuration have durable provisioning

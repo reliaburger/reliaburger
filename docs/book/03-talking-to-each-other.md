@@ -2229,3 +2229,37 @@ This fence is in memory. Restoring it from the durable consumer journal before
 new publication remains part of cluster recovery integration. It neither proves
 that old requests have drained nor authorises an address release. The command is
 internal, so protocol 19/state 33 remain unchanged.
+
+### Retiring an execution before reusing its address
+
+Suppose a worker stops an application and frees port 30001. An old health report
+then arrives at the leader. Without an execution fence, the leader can advertise
+the old application at an address that now belongs to its successor. Waiting for
+an empty catalogue once does not solve that race.
+
+Producer retirement now creates a permanent, node-scoped fence for the original
+runtime generation. In one Raft transaction it removes fenced backends and records
+the original consumer withdrawal obligations. The returned result distinguishes a
+committed fence with pending consumers from confirmed release. A retry checks all
+historical exposures for that execution, not only the latest catalogue. Unknown
+generation evidence from an already-fenced producer cannot revive an endpoint;
+its original withdrawals conservatively block release until consumers finish.
+
+The scheduler filters fenced reports, and Raft checks the proposed catalogue again.
+Both checks are necessary: a scheduler may have read state before retirement
+committed. A later execution can use the same instance name and address because
+its durable runtime fingerprint differs. Snapshot recovery retains the fence,
+including when an execution was retired before its first report ever arrived.
+
+The fence map uses nested `BTreeMap` values: node identity, then runtime generation,
+then original instance identity. Ordered maps make snapshots deterministic and
+avoid scanning every retired execution for each backend. The 65,536-entry bound
+refuses additional retirements rather than deleting history. Retirement computes
+new catalogue and withdrawal state before mutating the committed state, so a
+capacity or generation-overflow refusal leaves every original obligation intact.
+
+The producer still has to prove local runtime exit and request drainage. A server
+confirmation establishes remote withdrawal only. The HTTP boundary authenticates
+the producer, and the agent must obtain that confirmation before returning its
+host port or runtime address. The Raft request/response and durable fence advance
+compatibility to protocol 20/state 34; old development clusters require fresh state.

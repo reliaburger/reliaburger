@@ -311,6 +311,11 @@ pub enum RaftRequest {
     RegisterEndpointConsumer { node_id: String },
     /// Discharge one authenticated consumer's exact original withdrawal generation.
     AcknowledgeEndpointWithdrawal { node_id: String, generation: u64 },
+    /// Fence an authenticated producer execution before authorising address reuse.
+    RetireEndpointExecution {
+        node_id: String,
+        execution: crate::grill::RuntimeExecution,
+    },
 }
 
 // ---------------------------------------------------------------------------
@@ -357,6 +362,8 @@ pub enum CouncilResponse {
     },
     /// Blob proof predates a collection decision; reverify and retry publication.
     RegistryPublicationStale,
+    /// The execution fence committed; release requires all original consumer obligations to finish.
+    EndpointExecutionRetired { released: bool },
 }
 
 // ---------------------------------------------------------------------------
@@ -447,6 +454,8 @@ pub struct DesiredState {
     /// Nodes that may retain discovery publications, including offline nodes.
     #[serde(default)]
     pub endpoint_consumers: std::collections::BTreeSet<String>,
+    /// Permanent fences preventing stale reports from reviving retired executions.
+    pub producer_retirements: crate::onion::producer::ProducerRetirements,
     /// Active or interrupted-cleanup Phase 15 leases. Replication lets a new
     /// leader resume cleanup after the issuing process dies.
     #[serde(default)]
