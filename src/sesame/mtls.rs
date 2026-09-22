@@ -91,6 +91,18 @@ impl CrlHandle {
     /// Check every certificate in a presented chain against the CRL.
     fn check_chain(&self, chain: &[&CertificateDer<'_>]) -> Result<(), rustls::Error> {
         for der in chain {
+            if let Some(node_id) = node_id_from_leaf(der)
+                && self
+                    .inner
+                    .read()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                    .retired_nodes
+                    .contains_key(&node_id)
+            {
+                return Err(rustls::Error::InvalidCertificate(
+                    rustls::CertificateError::Revoked,
+                ));
+            }
             let serial = cert::serial_from_der(der).map_err(cert_error_to_rustls)?;
             self.check(serial).map_err(cert_error_to_rustls)?;
         }
@@ -479,7 +491,17 @@ pub fn build_cluster_http_client_with_bearer(
         .with_custom_certificate_verifier(verifier)
         .with_client_auth_cert(chain, key)
         .map_err(|e| MtlsError::ConfigFailed(e.to_string()))?;
-    let mut builder = reqwest::Client::builder().use_preconfigured_tls(tls);
+    cluster_http_client(tls, bearer)
+}
+
+fn cluster_http_client(
+    tls: ClientConfig,
+    bearer: Option<&str>,
+) -> Result<reqwest::Client, MtlsError> {
+    // Peer API authority is resolved explicitly; redirects must not replay receipts or tokens.
+    let mut builder = reqwest::Client::builder()
+        .redirect(reqwest::redirect::Policy::none())
+        .use_preconfigured_tls(tls);
     if let Some(headers) = bearer_default_headers(bearer)? {
         builder = builder.default_headers(headers);
     }
@@ -573,8 +595,56 @@ pub fn build_mtls_client_config_bound(
     Ok(Arc::new(config))
 }
 
+/// Build a required-mTLS listener using this node's live credentials.
+pub fn build_live_mtls_server_config(
+    identity: &super::credentials::LiveNodeIdentity,
+    crl: CrlHandle,
+) -> Result<Arc<ServerConfig>, MtlsError> {
+    let mut config = (*build_mtls_server_config(&identity.snapshot(), crl)?).clone();
+    config.cert_resolver = Arc::new(identity.clone());
+    Ok(Arc::new(config))
+}
+
+/// Build an optional-mTLS API or registry listener using live credentials.
+pub fn build_live_api_server_config(
+    identity: &super::credentials::LiveNodeIdentity,
+    crl: CrlHandle,
+) -> Result<Arc<ServerConfig>, MtlsError> {
+    let mut config = (*build_api_server_config(&identity.snapshot(), crl)?).clone();
+    config.cert_resolver = Arc::new(identity.clone());
+    Ok(Arc::new(config))
+}
+
+/// Build a cluster client using live credentials and optional peer-node binding.
+pub fn build_live_mtls_client_config(
+    identity: &super::credentials::LiveNodeIdentity,
+    crl: CrlHandle,
+    expected_node_id: Option<&str>,
+) -> Result<Arc<ClientConfig>, MtlsError> {
+    let initial = match expected_node_id {
+        Some(node) => build_mtls_client_config_bound(&identity.snapshot(), crl, node)?,
+        None => build_mtls_client_config(&identity.snapshot(), crl)?,
+    };
+    let mut config = (*initial).clone();
+    config.client_auth_cert_resolver = Arc::new(identity.clone());
+    // A resumed session can retain an earlier client identity. Every reconnect
+    // must select the current leaf and re-check the peer against the live CRL.
+    config.resumption = rustls::client::Resumption::disabled();
+    Ok(Arc::new(config))
+}
+
+/// Build an internal HTTPS client using live credentials and an optional service token.
+pub fn build_live_cluster_http_client(
+    identity: &super::credentials::LiveNodeIdentity,
+    crl: CrlHandle,
+    bearer: Option<&str>,
+) -> Result<reqwest::Client, MtlsError> {
+    let tls = (*build_live_mtls_client_config(identity, crl, None)?).clone();
+    cluster_http_client(tls, bearer)
+}
+
 /// The certificate chain this node presents, plus its private key.
-fn identity_chain_and_key(
+pub(super) fn identity_chain_and_key(
     identity: &NodeIdentity,
 ) -> Result<(Vec<CertificateDer<'static>>, PrivateKeyDer<'static>), MtlsError> {
     let chain = vec![
@@ -720,6 +790,7 @@ mod tests {
 
     fn crl_with(serial: u64) -> Crl {
         Crl {
+            retired_nodes: Default::default(),
             entries: vec![CrlEntry {
                 serial: SerialNumber(serial),
                 issuer: crate::sesame::types::CaRole::Node,
@@ -869,6 +940,45 @@ mod tests {
         try_handshake(server, client)
             .await
             .expect_err("a workload cert must not authenticate as a node");
+    }
+
+    #[tokio::test]
+    async fn retired_node_identity_refuses_every_serial_and_allows_fresh_enrolment() {
+        let hierarchy = test_hierarchy("retirement");
+        let server_id = identity_from(&hierarchy, "leader", 10);
+        let old_id = identity_from(&hierarchy, "retired-worker", 11);
+        let renewed_id = identity_from(&hierarchy, "retired-worker", 12);
+        let fresh_id = identity_from(&hierarchy, "replacement-worker", 13);
+        let handle = CrlHandle::default();
+        let server = build_mtls_server_config(&server_id, handle.clone()).unwrap();
+        let client = build_mtls_client_config(&old_id, CrlHandle::default()).unwrap();
+        try_handshake(server.clone(), client.clone()).await.unwrap();
+        let mut json = serde_json::to_value(Crl::default()).unwrap();
+        json["retired_nodes"] = serde_json::json!({
+            "retired-worker": {
+                "node_id": "retired-worker", "retired_by": "token:operator",
+                "reason": "powered off for maintenance", "retired_at_unix_ms": 100,
+                "released_placements": {"run1": 2}
+            }
+        });
+        handle.update(serde_json::from_value(json).unwrap());
+        assert!(
+            try_handshake(server.clone(), client).await.is_err(),
+            "the retired identity must stop authenticating even without a serial revocation"
+        );
+        let renewed = build_mtls_client_config(&renewed_id, CrlHandle::default()).unwrap();
+        assert!(
+            try_handshake(server.clone(), renewed).await.is_err(),
+            "a different certificate serial must not revive the same identity"
+        );
+        let fresh = build_mtls_client_config(&fresh_id, CrlHandle::default()).unwrap();
+        try_handshake(server, fresh).await.unwrap();
+        let old_server = build_mtls_server_config(&old_id, CrlHandle::default()).unwrap();
+        let informed_client = build_mtls_client_config(&fresh_id, handle).unwrap();
+        assert!(
+            try_handshake(old_server, informed_client).await.is_err(),
+            "a retired server identity must be refused too"
+        );
     }
 
     #[tokio::test]

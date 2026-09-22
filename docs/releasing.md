@@ -7,7 +7,7 @@ No public 0.1.0 release has been published by this work.
 ## What the workflow builds
 
 `.github/workflows/build.yml` builds the following native artefacts on pull
-requests, main and version tags:
+requests, main and manual candidate builds:
 
 | File | Build host | Use |
 | --- | --- | --- |
@@ -25,6 +25,38 @@ The initial Linux build baseline is Ubuntu 22.04. Compatibility with older
 systems is not promised. macOS builds are not yet Developer ID signed or
 notarised; don't equate an Actions build with clean-host acceptance.
 
+## Compiler baseline
+
+The source minimum is Rust 1.97 (`Cargo.toml`); CI checks the locked dependency
+graph and runs both feature configurations on 1.97.0. Native release jobs pin
+Rust 1.98.0 and build with `--locked`. To change this policy, update the manifest,
+workflow pins and installation docs together, then rerun minimum-compiler,
+native-build and upgrade qualification. A compiler change produces a new
+candidate and new checksums; never replace an existing release's binaries.
+The compiler pin does not promise identical bytes across different linkers or
+host operating systems.
+
+## Cluster compatibility
+
+0.1.0 requires fresh clusters. Preserve pre-release development data separately;
+startup and recovery refuse it rather than attempting an implicit migration.
+Do not copy a format stamp onto old data to bypass this check. Bun also refuses
+legacy workload-ID aliases and inconsistent ownership records without touching
+their runtimes or deleting their records. Canonical identity must agree with the
+recorded app, namespace and replica; startup does not rename surviving owners.
+
+Run `bun --compatibility` to read the binary's current `protocol` and `state`
+generations as JSON without starting a node. `GET /v1/version` includes the same
+contract. Different product versions may
+roll or roll back only when both generations match exactly. The agent verifies
+the signed executable and checks this contract before staging it. Joins and
+cluster transports also enforce compatibility; absent evidence is a refusal.
+
+For a future incompatible wire or state change, bump the relevant generation
+and design migration separately. Leader-last upgrade ordering does not make an
+unknown Raft request safe during elections. Qualify the actual old/new binary
+pair before advertising it as supported.
+
 ## Signing identity
 
 Configure the Actions secret `RELIABURGER_RELEASE_KEY` with the base64 encoding
@@ -32,6 +64,13 @@ of the existing Ed25519 PKCS#8 DER private key whose public key is listed in
 `src/upgrade/keys.rs`. Never commit that private key. This workflow does not
 rotate the project's identity or generate a replacement when the secret is
 missing.
+
+The 0.1.0 signing identity was established on 17 September 2026 because the
+pre-release development private key was unavailable. Fresh 0.1.0 installations
+trust the new public key in `src/upgrade/keys.rs`; old development binaries are
+not an upgrade source. Keep an encrypted offline backup of the private key.
+Replacing a key after a supported release requires an overlap release trusting
+both identities, not an unannounced replacement.
 
 The packaging script derives the public key and checks it against the compiled
 trust list before signing. A missing key, wrong key, incomplete matrix or failed
@@ -46,10 +85,54 @@ with their configured external key.
 
 ## Metadata and publication
 
-The tag must equal `v` plus the version in `Cargo.toml`. After source CI, native
-builds, packaging tests and PDF generation pass, the tag workflow signs all six
-binaries and attaches them, their envelopes, checksums, metadata and PDFs to a
-GitHub release.
+Candidate building and release publication are separate manual operations.
+After this workflow is on `main`, run:
+
+```sh
+gh workflow run build.yml --ref main
+```
+
+This reruns source CI and builds the native matrix and PDFs at one main commit.
+Only after those checks pass does it mirror the pinned guest images, sign all
+six binaries and upload `candidate-<commit>-<attempt>` as an Actions artefact.
+It creates no Git tag or GitHub release. PR and ordinary main builds never use
+the release signing secret.
+
+Download that artefact for qualification. Preserve its run ID, attempt, source
+commit and the `candidate.json` SHA-256 printed in the job summary alongside
+the qualification results. The record covers every binary, signature, metadata
+file, installer, PDF and guest image. Artefacts expire after 90 days; archive the
+qualified files, and don't expect promotion to rebuild an expired candidate.
+Rerunning the candidate run requires recording and qualifying its new attempt.
+
+Once all release gates pass, an operator creates the version tag at that exact
+candidate commit. The tag must equal `v` plus `Cargo.toml`'s version. Pushing a
+tag does not rebuild or publish anything. Promotion is explicit:
+
+```sh
+gh workflow run promote.yml --ref main \
+  -f tag=v0.1.0 -f candidate_run=RUN_ID -f qualified_digest=RECORDED_SHA256
+```
+
+The promotion workflow checks the tagged source, successful manual main build,
+repository, version and recorded manifest digest. It downloads the preserved
+candidate and requires an exact file inventory and matching lengths/hashes.
+It then uploads those unchanged files to a new draft, checks GitHub's stored
+asset digests and publishes. It neither compiles nor signs. An existing release
+refuses replacement; a failed upload/check leaves a draft for investigation,
+not an automatically repaired or overwritten release.
+
+The digest input must come from the qualification record. Copying a fresh digest
+from unqualified downloads defeats the gate. Workflow verification establishes
+identity and byte preservation; it cannot establish that somebody actually ran
+the cold-install and recovery tests. Those remain operator acceptance criteria.
+The complete hosted candidate and promotion paths have not yet been exercised.
+Actual pre-publication mirror delivery remains part of V03; downloading an
+Actions artefact alone does not qualify the public quickstart.
+
+GitHub documents the [default-branch requirement for manual workflows](https://docs.github.com/en/actions/how-tos/manage-workflow-runs/manually-run-a-workflow)
+and the [release asset digest fields](https://docs.github.com/en/rest/releases/releases).
+This PR must land before those manual workflows can run.
 
 - `metadata.json` selects **Bun** by platform, preserving the existing schema
   and upgrade reader.
@@ -69,9 +152,52 @@ release plan. Record timing from an empty cache, the actual artefact digests,
 host and guest versions, memory use, and the successful sample workload. Don't
 publish a five-minute claim from a source build or a warmed VM.
 
+## Qualifying a staged candidate
+
+Download the candidate artefact and verify it against the separately recorded
+source/run identity and manifest digest before staging it:
+
+```sh
+python3 scripts/release/candidate.py verify --directory candidate \
+  --version v0.1.0 --repository reliaburger/reliaburger \
+  --commit FULL_COMMIT_SHA --run-id RUN_ID --run-attempt ATTEMPT \
+  --qualified-digest RECORDED_SHA256
+```
+
+Serve those unchanged files from one HTTPS directory. The directory must contain
+the entire inventory, including both guest images and both metadata documents.
+Do not rewrite URLs inside the metadata or regenerate the installer. To exercise
+the candidate installer from empty caches:
+
+```sh
+curl --fail --location --proto '=https' --proto-redir '=https' \
+  https://YOUR_HOST/candidate/install.sh -o /tmp/reliaburger-candidate-install.sh
+RELIABURGER_RELEASE_BASE_URL=https://YOUR_HOST/candidate \
+  bash /tmp/reliaburger-candidate-install.sh
+```
+
+The static bootstrap accepts the same environment variable and fetches the
+candidate's installer first. The generated installer pins the CLI's checksum
+and passes `--release-mirror` to managed setup. If you installed the candidate
+CLI separately, run `relish setup --quickstart --release-mirror https://YOUR_HOST/candidate`.
+Repeat the same command to resume an interrupted setup.
+
+Only that version's Reliaburger release URLs are redirected to the directory.
+The pinned Lima tooling URLs stay unchanged. HTTPS, bounded requests, guest-image
+hashes and embedded binary signatures remain enforced. Credentials in URLs,
+query strings and fragments are refused. This cannot be combined with
+`--development-binaries`. As with the default bootstrap, HTTPS authenticates the
+selected installer host; the independently retained candidate digest establishes
+which complete file set is under qualification.
+
+Record the mirror URL and all downloaded hashes with the cold-run measurements.
+A staged run qualifies those signed bytes; final public URL/Pages checks still
+need their own evidence after publication. No staging host or public candidate
+has been created by this code change.
+
 ## Guest images and bootstrap installer
 
-The release job mirrors the two dated Ubuntu images in
+The candidate job mirrors the two dated Ubuntu images in
 `scripts/release/guest-images.json`, verifying SHA-256 before publication. The
 CLI embeds that same manifest and verifies its downloaded image. Update the
 manifest deliberately when changing the guest baseline; don't introduce an

@@ -413,6 +413,24 @@ mod tests {
         }
     }
 
+    #[test]
+    fn legacy_timestamp_cannot_override_incarnation_ordering() {
+        let mut table = MembershipTable::new();
+        table.add_node(NodeId::new("n1"), addr(9000), 5, BTreeMap::new(), now());
+        let mut stale = dead_update("n1", 4);
+        stale.lamport = u64::MAX;
+        table.apply_update(&stale, now());
+        assert_eq!(
+            table.get(&NodeId::new("n1")).unwrap().state,
+            NodeState::Alive
+        );
+        table.apply_update(&dead_update("n1", 6), now());
+        assert_eq!(
+            table.get(&NodeId::new("n1")).unwrap().state,
+            NodeState::Dead
+        );
+    }
+
     // -- add_node and basic queries ------------------------------------------
 
     #[test]

@@ -118,6 +118,54 @@ pub struct NodePressureController {
 struct NodePressureHandle {
     child: tokio::process::Child,
     cgroup: PathBuf,
+    // Dropping the owner aborts the drain, including a pipe held by a descendant.
+    _stderr_tasks: tokio::task::JoinSet<()>,
+}
+
+#[cfg(target_os = "linux")]
+#[derive(Clone, Default)]
+struct HelperDiagnostic {
+    prefix: Vec<u8>,
+    truncated: bool,
+    read_error: Option<String>,
+}
+
+#[cfg(target_os = "linux")]
+fn capture_helper_stderr(
+    mut stderr: tokio::process::ChildStderr,
+) -> (
+    tokio::task::JoinSet<()>,
+    tokio::sync::watch::Receiver<HelperDiagnostic>,
+) {
+    use tokio::io::AsyncReadExt;
+
+    const PREFIX_LIMIT: usize = 8192;
+    let (sender, receiver) = tokio::sync::watch::channel(HelperDiagnostic::default());
+    let mut tasks = tokio::task::JoinSet::new();
+    tasks.spawn(async move {
+        let mut diagnostic = HelperDiagnostic::default();
+        let mut buffer = [0; 4096];
+        loop {
+            match stderr.read(&mut buffer).await {
+                Ok(0) => break,
+                Ok(count) => {
+                    let retained = count.min(PREFIX_LIMIT - diagnostic.prefix.len());
+                    let newly_truncated = retained < count && !diagnostic.truncated;
+                    diagnostic.prefix.extend_from_slice(&buffer[..retained]);
+                    diagnostic.truncated |= retained < count;
+                    if retained > 0 || newly_truncated {
+                        sender.send_replace(diagnostic.clone());
+                    }
+                }
+                Err(error) => {
+                    diagnostic.read_error = Some(error.to_string());
+                    sender.send_replace(diagnostic);
+                    break;
+                }
+            }
+        }
+    });
+    (tasks, receiver)
 }
 
 impl NodePressureController {
@@ -174,6 +222,10 @@ impl NodePressureController {
             let cgroup = Path::new(NODE_PRESSURE_CGROUP_ROOT).join(id.to_string());
             let (_memory_ceiling_bytes, cores) = prepare_fault_cgroup(&cgroup, memory_percentage)?;
 
+            // No await may move this task to another worker between recording
+            // the creator and spawn: Linux ties PDEATHSIG to this exact thread.
+            // SAFETY: gettid reads the caller's kernel thread ID without pointers.
+            let parent_tid = unsafe { libc::gettid() };
             let mut command = tokio::process::Command::new(executable);
             command
                 .arg("__node-pressure-helper")
@@ -181,6 +233,8 @@ impl NodePressureController {
                 .arg(&cgroup)
                 .arg("--parent-pid")
                 .arg(std::process::id().to_string())
+                .arg("--parent-tid")
+                .arg(parent_tid.to_string())
                 .arg("--memory-percentage")
                 .arg(memory_percentage.to_string())
                 .arg("--cpu-workers")
@@ -203,7 +257,15 @@ impl NodePressureController {
                 let _ = remove_fault_cgroup(&cgroup);
                 return Err("node-pressure helper stdout was not captured".to_string());
             };
-            let mut reader = tokio::io::BufReader::new(stdout);
+            let Some(stderr) = child.stderr.take() else {
+                let _ = child.kill().await;
+                let _ = child.wait().await;
+                let _ = remove_fault_cgroup(&cgroup);
+                return Err("node-pressure helper stderr was not captured".to_string());
+            };
+            let (mut stderr_tasks, diagnostic) = capture_helper_stderr(stderr);
+            // A malformed helper must not grow the readiness buffer indefinitely.
+            let mut reader = tokio::io::BufReader::new(tokio::io::AsyncReadExt::take(stdout, 64));
             let mut ready = String::new();
             let started = tokio::time::timeout(
                 HELPER_START_TIMEOUT,
@@ -211,53 +273,52 @@ impl NodePressureController {
             )
             .await;
             if !matches!(&started, Ok(Ok(_))) || ready.trim() != "ready" {
-                let reason = if started.is_err() {
-                    "node-pressure helper did not become ready within 4 seconds".to_string()
+                let readiness = if started.is_err() {
+                    "did not become ready within 4 seconds".to_string()
                 } else {
-                    let stderr = child.stderr.take().map(tokio::io::BufReader::new).map(
-                        |mut stderr| async move {
-                            let mut message = String::new();
-                            let _ =
-                                tokio::io::AsyncReadExt::read_to_string(&mut stderr, &mut message)
-                                    .await;
-                            message
-                        },
-                    );
-                    let stderr_message = match stderr {
-                        Some(stderr) => {
-                            tokio::time::timeout(std::time::Duration::from_millis(100), stderr)
-                                .await
-                                .unwrap_or_default()
-                        }
-                        None => String::new(),
-                    };
-                    let status = child
-                        .try_wait()
-                        .ok()
-                        .flatten()
-                        .map(|status| status.to_string())
-                        .unwrap_or_else(|| "still running".to_string());
-                    let memory_events =
-                        std::fs::read_to_string(cgroup.join("memory.events")).unwrap_or_default();
-                    let memory_current =
-                        std::fs::read_to_string(cgroup.join("memory.current")).unwrap_or_default();
-                    let memory_peak =
-                        std::fs::read_to_string(cgroup.join("memory.peak")).unwrap_or_default();
-                    let memory_max =
-                        std::fs::read_to_string(cgroup.join("memory.max")).unwrap_or_default();
-                    format!(
-                        "node-pressure helper failed before readiness \
-                         (status: {status}; stderr: {stderr_message:?}; \
-                         memory.current: {:?}; memory.peak: {:?}; memory.max: {:?}; \
-                         memory.events: {:?})",
-                        memory_current.trim(),
-                        memory_peak.trim(),
-                        memory_max.trim(),
-                        memory_events.trim(),
-                    )
+                    format!("failed before readiness: {started:?}; stdout: {ready:?}")
                 };
+                let status = child
+                    .try_wait()
+                    .ok()
+                    .flatten()
+                    .map(|status| status.to_string())
+                    .unwrap_or_else(|| "still running".to_string());
                 let _ = child.kill().await;
                 let _ = child.wait().await;
+                // A descendant can retain the pipe after the helper exits. Keep
+                // the prefix already observed even if EOF never arrives.
+                let _ = tokio::time::timeout(
+                    std::time::Duration::from_millis(100),
+                    stderr_tasks.join_next(),
+                )
+                .await;
+                let diagnostic = diagnostic.borrow().clone();
+                let stderr_message = String::from_utf8_lossy(&diagnostic.prefix);
+                let truncation = if diagnostic.truncated {
+                    " (truncated)"
+                } else {
+                    ""
+                };
+                let memory_events =
+                    std::fs::read_to_string(cgroup.join("memory.events")).unwrap_or_default();
+                let memory_current =
+                    std::fs::read_to_string(cgroup.join("memory.current")).unwrap_or_default();
+                let memory_peak =
+                    std::fs::read_to_string(cgroup.join("memory.peak")).unwrap_or_default();
+                let memory_max =
+                    std::fs::read_to_string(cgroup.join("memory.max")).unwrap_or_default();
+                let reason = format!(
+                    "node-pressure helper {readiness} \
+                     (status: {status}; stderr: {stderr_message:?}{truncation}; \
+                     stderr read error: {:?}; memory.current: {:?}; memory.peak: {:?}; \
+                     memory.max: {:?}; memory.events: {:?})",
+                    diagnostic.read_error,
+                    memory_current.trim(),
+                    memory_peak.trim(),
+                    memory_max.trim(),
+                    memory_events.trim(),
+                );
                 let _ = remove_fault_cgroup(&cgroup);
                 return Err(reason);
             }
@@ -278,7 +339,14 @@ impl NodePressureController {
                 return Err(error);
             }
 
-            self.active.insert(id, NodePressureHandle { child, cgroup });
+            self.active.insert(
+                id,
+                NodePressureHandle {
+                    child,
+                    cgroup,
+                    _stderr_tasks: stderr_tasks,
+                },
+            );
             Ok(())
         }
     }
@@ -309,6 +377,36 @@ impl NodePressureController {
             }
             Ok(())
         }
+    }
+
+    /// Establish that no pressure process remains, including helpers inherited
+    /// from an earlier Bun process. A cleanup error must retain cluster capacity.
+    pub async fn confirm_no_helpers(&self) -> Result<(), String> {
+        #[cfg(target_os = "linux")]
+        {
+            tokio::task::spawn_blocking(|| {
+                let root = Path::new(NODE_PRESSURE_CGROUP_ROOT);
+                if !root.try_exists().map_err(|error| error.to_string())? {
+                    return Ok(());
+                }
+                for entry in std::fs::read_dir(root).map_err(|error| error.to_string())? {
+                    let path = entry.map_err(|error| error.to_string())?.path();
+                    if !path.is_dir() {
+                        continue;
+                    }
+                    let processes = std::fs::read_to_string(path.join("cgroup.procs"))
+                        .map_err(|error| format!("cannot establish pressure cleanup: {error}"))?;
+                    if !processes.trim().is_empty() {
+                        return Err("node pressure helpers remain active".to_string());
+                    }
+                }
+                Ok(())
+            })
+            .await
+            .map_err(|error| error.to_string())?
+        }
+        #[cfg(not(target_os = "linux"))]
+        Err("node pressure cleanup requires Linux cgroup evidence".to_string())
     }
 
     /// Re-attempt removal of any cgroup directory that lingered after its helper
@@ -344,16 +442,23 @@ async fn remove_fault_cgroup_async(cgroup: PathBuf) -> Result<(), String> {
 
 #[cfg(target_os = "linux")]
 fn prepare_controller(limits: NodePressureLimits) -> Result<(), String> {
-    if !limits.enabled() {
-        return Err("node pressure is disabled by policy".to_string());
-    }
     if crate::grill::rootless::is_rootless() {
         return Err("rootless Bun has no delegated pressure cgroup".to_string());
     }
     let root = Path::new(NODE_PRESSURE_CGROUP_ROOT);
+    // Policy controls new faults, not our responsibility for existing helpers.
+    // Do not create or enable a cgroup hierarchy when pressure is disabled.
+    if root
+        .try_exists()
+        .map_err(|error| format!("failed to inspect {}: {error}", root.display()))?
+    {
+        cleanup_stale_cgroups(root)?;
+    }
+    if !limits.enabled() {
+        return Err("node pressure is disabled by policy".to_string());
+    }
     std::fs::create_dir_all(root)
         .map_err(|error| format!("failed to create {}: {error}", root.display()))?;
-    cleanup_stale_cgroups(root)?;
 
     let controllers = std::fs::read_to_string(root.join("cgroup.controllers"))
         .map_err(|error| format!("failed to read cgroup controllers: {error}"))?;
@@ -506,9 +611,13 @@ pub fn parse_linux_meminfo(meminfo: &str) -> Result<(u64, u64), String> {
 pub fn run_helper(
     cgroup: &Path,
     parent_pid: u32,
+    parent_tid: u32,
     memory_percentage: u8,
     cpu_workers: usize,
 ) -> Result<(), String> {
+    // Linux ties this signal to the creating thread, not the parent's whole
+    // process. A Tokio worker exiting can therefore end pressure early; the
+    // cgroup remains owned until the controller confirms cleanup.
     // SAFETY: PR_SET_PDEATHSIG only changes this process's parent-death
     // signal. SIGKILL has no handler and needs no shared memory invariants.
     if unsafe { libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGKILL) } != 0 {
@@ -524,6 +633,15 @@ pub fn run_helper(
     let actual_parent = unsafe { libc::getppid() } as u32;
     if actual_parent == 1 || actual_parent != parent_pid {
         return Err("node-pressure helper lost its Bun parent before startup".to_string());
+    }
+    // getppid still names a live process when only its creator thread died.
+    // After arming the signal, require that task to remain in the parent group.
+    let parent_thread = PathBuf::from(format!("/proc/{parent_pid}/task/{parent_tid}"));
+    if !parent_thread
+        .try_exists()
+        .map_err(|error| format!("cannot inspect Bun parent thread: {error}"))?
+    {
+        return Err("node-pressure helper lost its Bun parent thread before startup".to_string());
     }
     std::fs::write(cgroup.join("cgroup.procs"), std::process::id().to_string())
         .map_err(|error| format!("failed to join pressure cgroup: {error}"))?;
@@ -586,6 +704,7 @@ pub fn run_helper(
 pub fn run_helper(
     _cgroup: &Path,
     _parent_pid: u32,
+    _parent_tid: u32,
     _memory_percentage: u8,
     _cpu_workers: usize,
 ) -> Result<(), String> {

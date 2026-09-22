@@ -16,7 +16,7 @@ use reliaburger::config::node::ReportingTreeSection;
 use reliaburger::grill::state::ContainerState;
 use reliaburger::meat::NodeId;
 use reliaburger::reporting::aggregator::ReportAggregator;
-use reliaburger::reporting::transport::TcpReportingTransport;
+use reliaburger::reporting::transport::{TcpReportingSender, TcpReportingTransport};
 use reliaburger::reporting::worker::{
     AgentSnapshot, CollectSnapshotRequest, InstanceSnapshot, ReportWorker,
 };
@@ -50,6 +50,10 @@ fn spawn_fake_agent(
                         egress_degraded: false,
                         egress_affected_workloads: Vec::new(),
                         instances: vec![InstanceSnapshot {
+                            execution: Some(reliaburger::grill::RuntimeExecution {
+                                instance_id: reliaburger::grill::InstanceId("default__web-g7-0".into()),
+                                generation: "a".repeat(64).try_into().unwrap(),
+                            }),
                             app_name: "web".to_string(),
                             namespace: "default".to_string(),
                             instance_id: 0,
@@ -95,11 +99,9 @@ async fn tcp_reporting_two_workers_report_to_one_aggregator() {
     // Council list both workers see: the single aggregator.
     let council = vec![(NodeId::new("agg"), agg_addr)];
 
-    // Two workers on their own real TCP sockets, each with a fake agent.
+    // Two outbound-only workers, each with a fake agent.
     for name in ["w1", "w2"] {
-        let transport = TcpReportingTransport::bind(local(0), shutdown.clone())
-            .await
-            .unwrap();
+        let transport = TcpReportingSender::new(None, Default::default());
         let (snap_tx, snap_rx) = mpsc::channel(16);
         tasks.push(spawn_fake_agent(snap_rx, shutdown.clone()));
         let (_council_tx, council_rx) = watch::channel(council.clone());
@@ -139,6 +141,18 @@ async fn tcp_reporting_two_workers_report_to_one_aggregator() {
         "aggregator did not receive both worker reports; have: {:?}",
         watch_rx.borrow().reports.keys().collect::<Vec<_>>()
     );
+
+    {
+        let view = watch_rx.borrow();
+        for name in ["w1", "w2"] {
+            let execution = view.reports[&NodeId::new(name)].running_apps[0]
+                .execution
+                .as_ref()
+                .unwrap();
+            assert_eq!(execution.instance_id.0, "default__web-g7-0");
+            assert_eq!(execution.generation.as_str(), "a".repeat(64));
+        }
+    }
 
     shutdown.cancel();
     for task in tasks {

@@ -30,10 +30,10 @@ test-slow: ## Run required wall-clock acceptance tests
 
 test-linux: ## Run provisioned Linux runtime, network, eBPF, Btrfs and Buildah tests
 	$(CARGO) build --features ebpf --bin bun
-	RELIABURGER_RUNC_TESTS=1 RELIABURGER_NETNS_TESTS=1 RELIABURGER_EBPF_TESTS=1 RELIABURGER_BTRFS_TESTS=1 RELIABURGER_BUILDAH_TESTS=1 RELIABURGER_CGROUP_TESTS=1 RELIABURGER_NODE_PRESSURE_TESTS=1 RELIABURGER_BUN_BINARY="$(CURDIR)/target/debug/bun" $(NEXTEST) --features ebpf --run-ignored=only -E 'binary(ebpf) | binary(build) | binary(node_pressure) | test(/(runc_|netns|btrfs_|cgroup_|identity_dir_is_tmpfs)/)'
+	RELIABURGER_RUNC_TESTS=1 RELIABURGER_NETNS_TESTS=1 RELIABURGER_EBPF_TESTS=1 RELIABURGER_BTRFS_TESTS=1 RELIABURGER_BUILDAH_TESTS=1 RELIABURGER_CGROUP_TESTS=1 RELIABURGER_NODE_PRESSURE_TESTS=1 RELIABURGER_BUN_BINARY="$(CURDIR)/target/debug/bun" $(NEXTEST) --features ebpf --run-ignored=only -E 'binary(ebpf) | binary(build) | binary(node_pressure) | binary(test_storage) | binary(owned_network) | binary(owned_runc) | test(/(runc_|netns|btrfs_|cgroup_|identity_dir_is_tmpfs)/)'
 
 test-rootless-runc: ## Prove rootless runc networking and port adoption as a non-root user
-	RELIABURGER_ROOTLESS_RUNC_TESTS=1 $(NEXTEST) --run-ignored=only -E 'test(rootless_published_port_survives_bun_replacement)'
+	RELIABURGER_ROOTLESS_RUNC_TESTS=1 $(NEXTEST) --features ebpf --run-ignored=only -E 'binary(owned_rootless) | test(rootless_published_port_survives_bun_replacement) | test(normal_rootless_bun)'
 
 test-cluster: ## Run all real multi-node cluster acceptance suites
 	RELIABURGER_CLUSTER_TESTS=1 $(NEXTEST) --run-ignored=only -E 'binary(cluster_failover) | binary(cluster_gossip) | binary(council_self_healing) | binary(council_disaster_recovery) | binary(placement) | binary(chaos)'
@@ -47,7 +47,7 @@ test-upgrade-node: ## Run only the single-node self-upgrade tests
 test-upgrade-cluster: ## Run only the cluster self-upgrade tests
 	RELIABURGER_UPGRADE_TESTS=1 $(NEXTEST) --run-ignored=only -E 'binary(self_upgrade_cluster)'
 
-test-apple: ## Run the manual Apple Container acceptance tests on Apple silicon
+test-apple: ## Run deferred Apple adapter development tests on Apple silicon
 	RELIABURGER_APPLE_CONTAINER_TESTS=1 $(NEXTEST) --run-ignored=only -E 'test(pinned_test_workload_runs_under_apple_container) | test(adopt_re_tracks_a_running_apple_container)'
 
 check: ## Type-check without producing binaries (fast)
@@ -66,6 +66,11 @@ audit: ## Fail on new RustSec findings or an expired advisory exception
 	@today=$$(date -u +%Y%m%d); expiry=20261118; \
 	if [ "$$today" -gt "$$expiry" ]; then \
 		echo "dependency advisory exceptions expired on 2026-11-18; review .cargo/audit.toml" >&2; \
+		exit 1; \
+	fi
+	@active=$$($(CARGO) tree --locked --all-features --target all -i rkyv --prefix none --format '{p}') || exit 1; \
+	if [ -n "$$active" ]; then \
+		echo "rkyv advisory exception requires an inactive dependency; review .cargo/audit.toml" >&2; \
 		exit 1; \
 	fi
 	$(CARGO) audit

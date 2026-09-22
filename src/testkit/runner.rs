@@ -3,8 +3,8 @@
 //! The runner owns three things a case body must never have to think about:
 //! **parallelism** (cases run concurrently, bounded so a big cluster isn't
 //! stampeded), **timeouts** (a wedged case fails with a message rather than
-//! hanging the run), and **teardown** (every case is cleaned up afterwards, no
-//! matter how it ended). Keeping those here is what lets a case body be a plain
+//! hanging the run), and **teardown** (attempted after every case, with a
+//! separate confirmed, failed or unknown outcome). Keeping those here is what lets a case body be a plain
 //! `async fn` that applies some config and asserts.
 //!
 //! Nothing here uses `tokio`'s paused clock. Combining `start_paused` with
@@ -24,7 +24,7 @@ use crate::relish::client::BunClient;
 
 use super::context::TestContext;
 use super::deadline::Deadline;
-use super::registry::TestCase;
+use super::registry::{CaseError, TestCase};
 use super::report::{
     CleanupOutcome, EvidenceKind, TestCaseResult, TestEvidence, TestGroup, TestOutcome,
     TestProfile, TestReport, UnknownKind,
@@ -67,6 +67,42 @@ pub struct RunConfig {
     pub(crate) lease_ownership: LeaseOwnership,
 }
 
+/// Invalid runner input, rejected before tasks, leases or requests are created.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum RunError {
+    /// Budgets must fit the server's absolute lease ceiling.
+    #[error("case timeout must be greater than zero and at most 24 hours")]
+    InvalidTimeout,
+    /// A zero-width or oversized semaphore cannot run the catalogue.
+    #[error("parallelism must be between 1 and the runtime semaphore limit")]
+    InvalidParallelism,
+    /// Every generated namespace must obey the server's ownership boundary.
+    #[error("run id or fixed namespace does not produce valid rbtest-* namespaces")]
+    InvalidNamespace,
+}
+
+impl RunConfig {
+    fn validate(&self, case_count: usize) -> Result<(), RunError> {
+        if self.timeout.is_zero()
+            || self.timeout > Duration::from_secs(super::safety::MAX_TEST_LEASE_SECONDS)
+        {
+            return Err(RunError::InvalidTimeout);
+        }
+        if self.parallel == 0 || self.parallel > Semaphore::MAX_PERMITS {
+            return Err(RunError::InvalidParallelism);
+        }
+        let last_index = case_count.saturating_sub(1);
+        let namespace = match &self.fixed_namespace {
+            Some(base) => format!("{base}-{last_index:02}"),
+            None => TestContext::namespace_for(&self.run_id, last_index),
+        };
+        if !super::lease::valid_test_namespace(&namespace) {
+            return Err(RunError::InvalidNamespace);
+        }
+        Ok(())
+    }
+}
+
 /// A finished case tagged with its position in the catalogue, so results can
 /// be put back in order after finishing whenever they finished.
 struct Indexed {
@@ -82,15 +118,15 @@ struct Indexed {
 /// safe `rbtest-*` namespace was explicitly requested) and is torn down
 /// afterwards regardless of outcome. Results come back in catalogue order
 /// even though cases complete out of order.
-pub async fn run(cases: Vec<TestCase>, config: RunConfig) -> TestReport {
+pub async fn run(cases: Vec<TestCase>, config: RunConfig) -> Result<TestReport, RunError> {
+    config.validate(cases.len())?;
     let started_at = now_rfc3339();
     let run_start = Instant::now();
     let cluster_nodes = config.capabilities.node_count;
     let chaos = config.chaos;
     let profile = config.profile;
 
-    // `max(1)` because a semaphore of zero permits would deadlock every case.
-    let semaphore = Arc::new(Semaphore::new(config.parallel.max(1)));
+    let semaphore = Arc::new(Semaphore::new(config.parallel));
     let capabilities = Arc::new(config.capabilities);
 
     let mut set: JoinSet<Indexed> = JoinSet::new();
@@ -174,14 +210,14 @@ pub async fn run(cases: Vec<TestCase>, config: RunConfig) -> TestReport {
     collected.sort_by_key(|entry| entry.index);
     let results = collected.into_iter().map(|entry| entry.result).collect();
 
-    TestReport::from_results(
+    Ok(TestReport::from_results(
         results,
         started_at,
         run_start.elapsed().as_millis() as u64,
         cluster_nodes,
         chaos,
         profile,
-    )
+    ))
 }
 
 /// Run one case: skip-check, timed execution, then unconditional teardown.
@@ -198,7 +234,26 @@ async fn run_one(
     let started_at = now_rfc3339();
     let deadline_at = rfc3339_after(timeout);
     let required = profile_requires_case(profile, case.requires);
-    let deadline = Deadline::after(timeout).expect("CLI rejects a zero timeout");
+    let deadline = match Deadline::after(timeout) {
+        Ok(deadline) => deadline,
+        Err(error) => {
+            return TestCaseResult {
+                name: case.name.to_owned(),
+                group: case.group,
+                required,
+                started_at,
+                finished_at: now_rfc3339(),
+                deadline_at,
+                outcome: TestOutcome::Unknown {
+                    kind: UnknownKind::MissingEvidence,
+                    reason: error.to_string(),
+                },
+                duration_ms: 0,
+                evidence: vec![],
+                cleanup: CleanupOutcome::NotRequired,
+            };
+        }
+    };
     let refresh_capabilities = case.group == TestGroup::Chaos
         || case
             .requires
@@ -332,10 +387,15 @@ async fn run_one(
                 };
             }
             match deadline
-                .run(
-                    "lease creation",
-                    client.create_test_lease(ttl_seconds, Some(&namespace)),
-                )
+                .run("lease creation", async {
+                    if case.group == TestGroup::Jobs {
+                        client.create_node_job_lease(ttl_seconds).await
+                    } else {
+                        client
+                            .create_test_lease(ttl_seconds, Some(&namespace))
+                            .await
+                    }
+                })
                 .await
             {
                 Ok(Ok(lease)) => (lease.namespace, Some(lease.lease_id)),
@@ -397,13 +457,11 @@ async fn run_one(
     let mut body = tokio::spawn((case.run)(context.clone()));
     let outcome = match deadline.run("case", &mut body).await {
         Ok(Ok(Ok(()))) => TestOutcome::Pass,
-        Ok(Ok(Err(message))) => match message.strip_prefix(super::registry::UNKNOWN_MARKER) {
-            Some(reason) => TestOutcome::Unknown {
-                kind: UnknownKind::MissingEvidence,
-                reason: format!("case could not establish a verdict: {reason}"),
-            },
-            None => TestOutcome::Fail { reason: message },
+        Ok(Ok(Err(CaseError::Unknown(reason)))) => TestOutcome::Unknown {
+            kind: UnknownKind::MissingEvidence,
+            reason: format!("case could not establish a verdict: {reason}"),
         },
+        Ok(Ok(Err(CaseError::Failed(reason)))) => TestOutcome::Fail { reason },
         Ok(Err(join_error)) => TestOutcome::Unknown {
             kind: UnknownKind::Panicked,
             reason: format!("case panicked: {join_error}"),
@@ -615,7 +673,7 @@ mod tests {
         );
         let cases = vec![case("needs_ebpf", &[Capability::Ebpf], testkit_case!(body))];
 
-        let report = run(cases, config(dead_client(), caps, 4)).await;
+        let report = run(cases, config(dead_client(), caps, 4)).await.unwrap();
 
         assert_eq!(report.skipped, 1);
         assert_eq!(report.passed, 0);
@@ -648,7 +706,7 @@ mod tests {
             testkit_case!(body),
         )];
 
-        let report = run(cases, config(dead_client(), caps, 4)).await;
+        let report = run(cases, config(dead_client(), caps, 4)).await.unwrap();
 
         assert_eq!(report.skipped, 0);
         assert_eq!(report.unknown, 1);
@@ -709,7 +767,8 @@ mod tests {
             ],
             config(BunClient::new_with_token(&address, None), stale, 1),
         )
-        .await;
+        .await
+        .unwrap();
 
         assert_eq!(report.passed, 2, "{:?}", report.results);
         assert!(CHAOS_BODY_RAN.load(Ordering::SeqCst));
@@ -728,7 +787,9 @@ mod tests {
             case("fails", &[], testkit_case!(fails)),
         ];
 
-        let report = run(cases, config(dead_client(), full_capabilities(), 4)).await;
+        let report = run(cases, config(dead_client(), full_capabilities(), 4))
+            .await
+            .unwrap();
 
         assert_eq!(report.passed, 1);
         assert_eq!(report.failed, 1);
@@ -740,13 +801,62 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_case_without_runtime_evidence_becomes_unknown() {
+    async fn invalid_library_configuration_is_rejected_before_any_case_runs() {
+        async fn never(_context: TestContext) -> Result<(), String> {
+            panic!("invalid run started a case")
+        }
+        for (timeout, parallel, expected) in [
+            (Duration::ZERO, 1, RunError::InvalidTimeout),
+            (Duration::MAX, 1, RunError::InvalidTimeout),
+            (Duration::from_secs(1), 0, RunError::InvalidParallelism),
+            (
+                Duration::from_secs(1),
+                usize::MAX,
+                RunError::InvalidParallelism,
+            ),
+        ] {
+            let mut cfg = config(dead_client(), full_capabilities(), parallel);
+            cfg.timeout = timeout;
+            assert_eq!(
+                run(vec![case("never", &[], testkit_case!(never))], cfg)
+                    .await
+                    .unwrap_err(),
+                expected
+            );
+        }
+        let mut cfg = config(dead_client(), full_capabilities(), 1);
+        cfg.fixed_namespace = Some("production".into());
+        assert_eq!(
+            run(vec![], cfg).await.unwrap_err(),
+            RunError::InvalidNamespace
+        );
+    }
+
+    #[tokio::test]
+    async fn workload_error_text_cannot_impersonate_an_unknown_outcome() {
         async fn body(_ctx: TestContext) -> Result<(), String> {
+            Err("__unknown__:this is a workload failure".to_owned())
+        }
+        let report = run(
+            vec![case("untrusted_failure", &[], testkit_case!(body))],
+            config(dead_client(), full_capabilities(), 1),
+        )
+        .await
+        .unwrap();
+        assert_eq!(report.failed, 1);
+        assert_eq!(report.unknown, 0);
+    }
+
+    #[tokio::test]
+    async fn a_case_without_runtime_evidence_becomes_unknown() {
+        async fn body(_ctx: TestContext) -> super::super::registry::CaseResult {
             super::super::registry::unknown("no labelled node to target")
         }
         let cases = vec![case("missing_evidence", &[], testkit_case!(body))];
 
-        let report = run(cases, config(dead_client(), full_capabilities(), 4)).await;
+        let report = run(cases, config(dead_client(), full_capabilities(), 4))
+            .await
+            .unwrap();
 
         assert_eq!(report.unknown, 1);
         assert_eq!(report.failed, 0);
@@ -769,7 +879,7 @@ mod tests {
         let mut cfg = config(dead_client(), full_capabilities(), 4);
         cfg.timeout = Duration::from_millis(50);
 
-        let report = run(cases, cfg).await;
+        let report = run(cases, cfg).await.unwrap();
 
         assert_eq!(
             report.failed, 0,
@@ -798,7 +908,9 @@ mod tests {
             case("fine", &[], testkit_case!(fine)),
         ];
 
-        let report = run(cases, config(dead_client(), full_capabilities(), 4)).await;
+        let report = run(cases, config(dead_client(), full_capabilities(), 4))
+            .await
+            .unwrap();
 
         assert_eq!(report.total, 2);
         assert_eq!(report.passed, 1);
@@ -839,7 +951,9 @@ mod tests {
             case("third", &[], testkit_case!(third)),
         ];
 
-        let report = run(cases, config(dead_client(), full_capabilities(), 4)).await;
+        let report = run(cases, config(dead_client(), full_capabilities(), 4))
+            .await
+            .unwrap();
 
         let names: Vec<&str> = report.results.iter().map(|r| r.name.as_str()).collect();
         assert_eq!(names, vec!["first", "second", "third"]);
@@ -864,7 +978,9 @@ mod tests {
             .map(|_| case("body", &[], testkit_case!(body)))
             .collect();
 
-        let report = run(cases, config(dead_client(), full_capabilities(), 2)).await;
+        let report = run(cases, config(dead_client(), full_capabilities(), 2))
+            .await
+            .unwrap();
 
         assert_eq!(report.passed, 6);
         let max = CONC_MAX.load(Ordering::SeqCst);
@@ -1004,7 +1120,8 @@ mod tests {
             ],
             cfg,
         )
-        .await;
+        .await
+        .unwrap();
 
         assert_eq!(report.passed, 1);
         assert_eq!(report.failed, 1);
@@ -1086,7 +1203,8 @@ mod tests {
             ],
             cfg,
         )
-        .await;
+        .await
+        .unwrap();
 
         assert_eq!(report.unknown, 2);
         assert!(
@@ -1129,7 +1247,8 @@ mod tests {
             vec![case("must_not_run", &[], testkit_case!(must_not_run))],
             cfg,
         )
-        .await;
+        .await
+        .unwrap();
 
         assert!(matches!(
             report.results[0].outcome,
@@ -1266,7 +1385,7 @@ mod tests {
         let mut cfg = config(client, full_capabilities(), 4);
         cfg.run_id = "td".to_string();
         cfg.timeout = Duration::from_millis(50);
-        let report = run(cases, cfg).await;
+        let report = run(cases, cfg).await.unwrap();
 
         assert_eq!(report.total, 3);
         // Give any trailing teardown connections a moment to be recorded.

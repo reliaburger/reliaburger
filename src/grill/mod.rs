@@ -7,7 +7,9 @@
 pub mod apple;
 pub mod btrfs;
 pub mod cgroup;
+pub mod command;
 pub mod image;
+mod inventory;
 // Also exposed under the `ebpf` feature: the Lima-gated integration
 // tests drive the agent's pre-start egress programming through a mock
 // grill (a runtime whose `pid()` is `None`), which unit tests can't.
@@ -15,10 +17,15 @@ pub mod image;
 pub mod mock;
 #[cfg(target_os = "linux")]
 pub mod netns;
+#[cfg(target_os = "linux")]
+mod network_leases;
 pub mod oci;
+pub(crate) mod oci_pull;
 pub mod port;
 pub mod portmap;
 pub mod process;
+mod process_control;
+pub mod process_owner;
 pub mod process_workload;
 pub mod records;
 #[cfg(target_os = "linux")]
@@ -27,6 +34,7 @@ mod rootfs;
 pub mod rootless;
 #[cfg(target_os = "linux")]
 pub mod runc;
+pub mod runc_intent;
 pub mod snapshot;
 pub mod state;
 pub mod volume;
@@ -50,7 +58,7 @@ pub use state::ContainerState;
 /// [`InstanceIdentity::instance_id`] rather than formatting by hand — the
 /// raw string is opaque to everything that keys on it (the supervisor
 /// map, on-disk records, container ids, netns names, identity dirs).
-#[derive(Debug, Clone, Hash, Eq, PartialEq)]
+#[derive(Debug, Clone, Hash, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct InstanceId(pub String);
 
 impl fmt::Display for InstanceId {
@@ -75,7 +83,10 @@ impl fmt::Display for InstanceId {
 /// separator can never appear inside a namespace or app name — both are
 /// DNS-1123 labels, which allow only `[a-z0-9-]` — so parsing the
 /// namespace back out is unambiguous even when the app name itself
-/// contains a hyphen.
+/// contains a hyphen. Generation-like app suffixes can still produce the same
+/// string as another app's canary (for example `worker-g1` and generation 1 of
+/// `worker`). Allocation must check the inventory's structured owner before
+/// claiming an ID; parsing the text alone cannot disambiguate those tuples.
 #[derive(Debug, Clone, Hash, Eq, PartialEq)]
 pub struct InstanceIdentity {
     /// Namespace the app runs in.
@@ -158,9 +169,9 @@ impl InstanceIdentity {
     ///
     /// The legacy format is inherently ambiguous when an app name's last
     /// hyphenated segment looks like `g{digits}` (e.g. an app literally
-    /// named `worker-g5`). Adoption doesn't rely on this: it rebuilds the
-    /// identity from the record's separate `namespace`/`app_name` fields,
-    /// so this heuristic only ever matters for a bare container-name parse.
+    /// named `worker-g5`). Adoption instead checks the canonical ID against
+    /// the record's separate `namespace`/`app_name` fields and refuses legacy
+    /// aliases, so this heuristic only matters for a bare container-name parse.
     pub fn parse_legacy(suffix: &str, namespace: &str) -> Option<Self> {
         let (head, ordinal_part) = suffix.rsplit_once('-')?;
         let ordinal: u32 = ordinal_part.parse().ok()?;
@@ -208,11 +219,98 @@ pub enum GrillError {
         reason: String,
     },
 
+    /// A stop signal or exit wait could not be completed safely.
+    #[error("container {instance} failed to stop: {reason}")]
+    StopFailed {
+        instance: InstanceId,
+        reason: String,
+    },
+
+    /// Runtime inspection could not establish the instance's current state.
+    #[error("container {instance} state unavailable: {reason}")]
+    StateUnavailable {
+        instance: InstanceId,
+        reason: String,
+    },
+
+    /// Durable launch inventory could not be established.
+    #[error("runtime launch inventory unavailable: {reason}")]
+    InventoryUnavailable {
+        /// The evidence that could not be read or validated.
+        reason: String,
+    },
+
     #[error("container {instance} not found")]
     NotFound { instance: InstanceId },
 
     #[error("image pull failed: {0}")]
     ImagePull(#[from] image::ImageError),
+}
+
+/// Non-secret identity of one original runtime execution generation.
+#[derive(Debug, Clone, Hash, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(try_from = "String")]
+pub struct RuntimeGeneration(String);
+
+impl TryFrom<String> for RuntimeGeneration {
+    type Error = &'static str;
+
+    fn try_from(value: String) -> Result<Self, Self::Error> {
+        if value.len() != 64
+            || !value
+                .bytes()
+                .all(|byte| byte.is_ascii_digit() || matches!(byte, b'a'..=b'f'))
+        {
+            return Err("invalid runtime generation fingerprint");
+        }
+        Ok(Self(value))
+    }
+}
+
+impl RuntimeGeneration {
+    /// Stable fingerprint for correlation, never an execution capability.
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+
+    pub(crate) fn process(token: &str) -> Self {
+        Self::fingerprint(b"reliaburger/runtime-generation/process/v1\0", token)
+    }
+
+    pub(crate) fn runc(token: &str) -> Self {
+        Self::fingerprint(b"reliaburger/runtime-generation/runc/v1\0", token)
+    }
+
+    fn fingerprint(domain: &[u8], token: &str) -> Self {
+        let mut digest = ring::digest::Context::new(&ring::digest::SHA256);
+        digest.update(domain);
+        digest.update(token.as_bytes());
+        Self(hex::encode(digest.finish().as_ref()))
+    }
+}
+
+/// Original execution behind a reported or published workload endpoint.
+#[derive(Debug, Clone, Hash, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RuntimeExecution {
+    /// Exact canonical runtime instance name, including deployment generation.
+    pub instance_id: InstanceId,
+    /// Non-secret fingerprint from that instance's original runtime intent.
+    pub generation: RuntimeGeneration,
+}
+
+/// A durable runtime launch, written before user code can execute.
+#[derive(Debug, Clone)]
+pub struct RuntimeLaunch {
+    /// Identity derived from the original private runtime intent.
+    pub generation: RuntimeGeneration,
+    /// Canonical workload identity.
+    pub instance_id: InstanceId,
+    /// Specification committed for this generation.
+    pub spec: OciSpec,
+    /// Original address hold or release receipt from the same durable runtime intent.
+    /// Process runtimes have no reusable container address and return None.
+    pub network_reference: Option<runc_intent::NetworkReferenceState>,
 }
 
 /// The container runtime interface.
@@ -268,6 +366,49 @@ pub trait Grill: Send + Sync {
         std::future::ready(Ok(false))
     }
 
+    /// Read the complete durable launch inventory, including launches without
+    /// agent adoption records. `None` means this runtime cannot establish that
+    /// inventory; it must never be interpreted as an empty inventory.
+    fn launch_inventory(
+        &self,
+    ) -> impl std::future::Future<Output = Result<Option<Vec<RuntimeLaunch>>, GrillError>> + Send
+    {
+        std::future::ready(Ok(None))
+    }
+
+    /// Hold a rootful address before discovery publication. Unsupported adapters
+    /// return None; the production recovery profile must require this capability.
+    fn retain_network_reference(
+        &self,
+        instance: &InstanceId,
+    ) -> impl std::future::Future<Output = Result<Option<runc_intent::NetworkReference>, GrillError>>
+    + Send {
+        let _ = instance;
+        std::future::ready(Ok(None))
+    }
+
+    /// Read an outstanding discovery reference independently of execution state.
+    fn network_reference(
+        &self,
+        instance: &InstanceId,
+    ) -> impl std::future::Future<Output = Result<Option<runc_intent::NetworkReference>, GrillError>>
+    + Send {
+        let _ = instance;
+        std::future::ready(Ok(None))
+    }
+
+    /// Confirm withdrawal of every route naming this exact original address.
+    /// Callers must retain the reference on any failed or uncertain withdrawal.
+    fn release_network_reference(
+        &self,
+        reference: &runc_intent::NetworkReference,
+    ) -> impl std::future::Future<Output = Result<(), GrillError>> + Send {
+        std::future::ready(Err(GrillError::StateUnavailable {
+            instance: reference.instance_id.clone(),
+            reason: "runtime cannot release a discovery reference".into(),
+        }))
+    }
+
     /// Which runtime kind this grill starts instances with. Recorded in
     /// instance records so adoption is routed to the right runtime.
     fn runtime_kind(&self) -> records::RuntimeKind {
@@ -304,10 +445,22 @@ pub trait Grill: Send + Sync {
         std::future::ready(None)
     }
 
+    /// Return the verified live workload's cgroup v2 identity, when supported.
+    /// A launcher PID is not a workload cgroup. Unavailable or conflicting
+    /// ownership returns an error; unsupported runtimes return `None`.
+    fn workload_cgroup(
+        &self,
+        instance: &InstanceId,
+    ) -> impl std::future::Future<Output = Result<Option<u64>, GrillError>> + Send {
+        let _ = instance;
+        std::future::ready(Ok(None))
+    }
+
     /// Get the OS process ID for an instance, if available.
     ///
     /// Returns `None` for runtimes where the PID isn't directly visible
-    /// (e.g. containers running inside VMs).
+    /// (e.g. containers running inside VMs). Runc reports its owned launcher
+    /// here; use `workload_cgroup` for verified container network attribution.
     fn pid(&self, instance: &InstanceId) -> impl std::future::Future<Output = Option<u32>> + Send {
         let _ = instance;
         std::future::ready(None)
@@ -478,6 +631,55 @@ impl Grill for AnyGrill {
         }
     }
 
+    async fn launch_inventory(&self) -> Result<Option<Vec<RuntimeLaunch>>, GrillError> {
+        match self {
+            AnyGrill::Process(g) => g.launch_inventory().await,
+            #[cfg(target_os = "linux")]
+            AnyGrill::Runc(g) => g.launch_inventory().await,
+            #[cfg(target_os = "macos")]
+            AnyGrill::Apple(g) => g.launch_inventory().await,
+        }
+    }
+
+    async fn retain_network_reference(
+        &self,
+        instance: &InstanceId,
+    ) -> Result<Option<runc_intent::NetworkReference>, GrillError> {
+        match self {
+            AnyGrill::Process(runtime) => runtime.retain_network_reference(instance).await,
+            #[cfg(target_os = "linux")]
+            AnyGrill::Runc(runtime) => runtime.retain_network_reference(instance).await,
+            #[cfg(target_os = "macos")]
+            AnyGrill::Apple(runtime) => runtime.retain_network_reference(instance).await,
+        }
+    }
+
+    async fn network_reference(
+        &self,
+        instance: &InstanceId,
+    ) -> Result<Option<runc_intent::NetworkReference>, GrillError> {
+        match self {
+            AnyGrill::Process(runtime) => runtime.network_reference(instance).await,
+            #[cfg(target_os = "linux")]
+            AnyGrill::Runc(runtime) => runtime.network_reference(instance).await,
+            #[cfg(target_os = "macos")]
+            AnyGrill::Apple(runtime) => runtime.network_reference(instance).await,
+        }
+    }
+
+    async fn release_network_reference(
+        &self,
+        reference: &runc_intent::NetworkReference,
+    ) -> Result<(), GrillError> {
+        match self {
+            AnyGrill::Process(runtime) => runtime.release_network_reference(reference).await,
+            #[cfg(target_os = "linux")]
+            AnyGrill::Runc(runtime) => runtime.release_network_reference(reference).await,
+            #[cfg(target_os = "macos")]
+            AnyGrill::Apple(runtime) => runtime.release_network_reference(reference).await,
+        }
+    }
+
     fn runtime_kind(&self) -> records::RuntimeKind {
         match self {
             AnyGrill::Process(_) => records::RuntimeKind::Process,
@@ -528,6 +730,16 @@ impl Grill for AnyGrill {
             AnyGrill::Runc(g) => g.pid(instance).await,
             #[cfg(target_os = "macos")]
             AnyGrill::Apple(g) => g.pid(instance).await,
+        }
+    }
+
+    async fn workload_cgroup(&self, instance: &InstanceId) -> Result<Option<u64>, GrillError> {
+        match self {
+            AnyGrill::Process(g) => g.workload_cgroup(instance).await,
+            #[cfg(target_os = "linux")]
+            AnyGrill::Runc(g) => g.workload_cgroup(instance).await,
+            #[cfg(target_os = "macos")]
+            AnyGrill::Apple(g) => g.workload_cgroup(instance).await,
         }
     }
 
@@ -584,16 +796,10 @@ impl Grill for AnyGrill {
 
 /// Auto-detect the best available runtime.
 ///
-/// Checks for platform-specific runtimes first, falls back to ProcessGrill.
-/// On Linux, detects rootless mode and configures paths accordingly.
+/// On Linux, selects runc when installed and configures rootless mode and paths.
+/// Otherwise selects ProcessGrill. For 0.1.0, macOS containers use managed Linux
+/// VMs; the direct Apple adapter is excluded pending daemon-command recovery.
 pub async fn detect_runtime() -> AnyGrill {
-    #[cfg(target_os = "macos")]
-    {
-        if which_exists("container").await {
-            return AnyGrill::Apple(apple::AppleContainerGrill::new());
-        }
-    }
-
     #[cfg(target_os = "linux")]
     {
         if which_exists("runc").await {
@@ -630,6 +836,7 @@ pub async fn detect_runtime() -> AnyGrill {
 }
 
 /// Check if a binary exists in PATH.
+#[cfg(target_os = "linux")]
 async fn which_exists(name: &str) -> bool {
     tokio::process::Command::new("which")
         .arg(name)
@@ -641,6 +848,42 @@ async fn which_exists(name: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn runtime_generation_wire_values_require_canonical_fingerprints() {
+        let original = RuntimeGeneration::process("private-generation");
+        let json = serde_json::to_string(&original).unwrap();
+        assert_eq!(
+            serde_json::from_str::<RuntimeGeneration>(&json).unwrap(),
+            original
+        );
+        for invalid in [
+            String::new(),
+            "private-owner-token".into(),
+            "A".repeat(64),
+            "g".repeat(64),
+            "a".repeat(65),
+        ] {
+            assert!(
+                serde_json::from_value::<RuntimeGeneration>(serde_json::json!(invalid)).is_err()
+            );
+        }
+    }
+
+    #[test]
+    fn runtime_generation_fingerprints_never_expose_or_confuse_owner_tokens() {
+        let token = "1234567890abcdef1234567890abcdef";
+        let process = super::RuntimeGeneration::process(token);
+        let runc = super::RuntimeGeneration::runc(token);
+        assert_ne!(process.as_str(), token);
+        assert_ne!(runc.as_str(), token);
+        assert_ne!(process, runc);
+        assert_eq!(process, super::RuntimeGeneration::process(token));
+        assert_ne!(
+            process,
+            super::RuntimeGeneration::process("abcdef1234567890abcdef1234567890")
+        );
+    }
+
     use super::*;
 
     #[test]

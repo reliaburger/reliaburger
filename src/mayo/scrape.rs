@@ -111,15 +111,9 @@ pub async fn ingest_samples(
 /// every declared endpoint is guaranteed up. Returns the total number of
 /// samples ingested across all targets.
 ///
-/// # Integrator hook
-///
-/// There is no scrape loop yet — the natural home is `src/bin/bun.rs`, next to
-/// the metrics collection loop that already owns the `mayo_store` handle. The
-/// integrator should spawn a task that ticks every
-/// `config.metrics.scrape_interval_secs` and calls
-/// `scrape_once(&mayo_store, &targets)`, where `targets` is built from
-/// `config.metrics.scrape_targets` (`(job, url)` pairs). An empty target list
-/// means the loop need not be spawned at all.
+/// Bun's scrape task calls this at the configured
+/// `metrics.scrape_interval_secs` with `(job, url)` pairs from
+/// `metrics.scrape_targets`. Bun omits the task when that list is empty.
 pub async fn scrape_once(
     store: &tokio::sync::RwLock<super::store::MayoStore>,
     targets: &[(String, String)],

@@ -8,11 +8,36 @@ use super::error::ConfigError;
 use super::node::NodeConfig;
 use super::types::parse_resource_value;
 
+/// Whether a workload or namespace is a non-empty lowercase DNS label.
+pub(crate) fn valid_workload_label(value: &str) -> bool {
+    let bytes = value.as_bytes();
+    let edge = |byte: u8| byte.is_ascii_lowercase() || byte.is_ascii_digit();
+    !bytes.is_empty()
+        && bytes.len() <= 63
+        && edge(bytes[0])
+        && edge(bytes[bytes.len() - 1])
+        && bytes.iter().all(|byte| edge(*byte) || *byte == b'-')
+}
+
+fn validate_label(value: &str, context: &str, field: &str) -> Result<(), ConfigError> {
+    if valid_workload_label(value) {
+        return Ok(());
+    }
+    Err(ConfigError::Validation {
+        field: field.into(),
+        context: context.into(),
+        reason: format!(
+            "{value:?} must be a lowercase DNS label of 1–63 bytes, with letters or digits at both ends and only letters, digits or hyphens within"
+        ),
+    })
+}
+
 impl Config {
     /// Validate the parsed configuration.
     ///
     /// Returns the first error found. Call after `from_str` or `from_file`.
     pub fn validate(&self) -> Result<(), ConfigError> {
+        self.validate_workload_names()?;
         for (name, app) in &self.app {
             validate_app(name, app)?;
         }
@@ -36,10 +61,41 @@ impl Config {
         Ok(())
     }
 
+    /// Validate identity labels and refuse app/job runtime identity collisions.
+    pub(crate) fn validate_workload_names(&self) -> Result<(), ConfigError> {
+        for name in self.namespace.keys() {
+            validate_label(name, "namespace declaration", "name")?;
+        }
+        for (name, job) in &self.job {
+            validate_label(name, "job", "name")?;
+            validate_label(
+                job.namespace.as_deref().unwrap_or("default"),
+                name,
+                "namespace",
+            )?;
+        }
+        for (name, app) in &self.app {
+            validate_label(name, "app", "name")?;
+            let namespace = app.namespace.as_deref().unwrap_or("default");
+            validate_label(namespace, name, "namespace")?;
+            if let Some(job) = self.job.get(name)
+                && job.namespace.as_deref().unwrap_or("default") == namespace
+            {
+                return Err(ConfigError::Validation {
+                    field: format!("job.{name}"),
+                    context: namespace.into(),
+                    reason: "apps and jobs must use distinct names within a namespace".into(),
+                });
+            }
+        }
+        Ok(())
+    }
+
     /// Validate this config, treating `known_namespaces` (from committed
     /// desired state) as also declared. Permissions and builds may target
     /// a namespace created by an earlier apply, not just one in this file.
     pub fn validate_against(&self, known_namespaces: &[String]) -> Result<(), ConfigError> {
+        self.validate_workload_names()?;
         for (name, app) in &self.app {
             validate_app(name, app)?;
         }
@@ -326,6 +382,15 @@ fn validate_job(name: &str, job: &super::job::JobSpec) -> Result<(), ConfigError
 impl NodeConfig {
     /// Validate the parsed node configuration.
     pub fn validate(&self) -> Result<(), ConfigError> {
+        if self.reporting_tree.max_events_per_report
+            != crate::reporting::transport::MAX_EVENTS_PER_REPORT
+        {
+            return Err(ConfigError::Validation {
+                field: "reporting_tree.max_events_per_report".into(),
+                context: "node config".into(),
+                reason: "0.1.0 supports a fixed 100-event admission limit; custom limits are not supported".into(),
+            });
+        }
         // Storage paths must be absolute
         let paths = [
             ("storage.data", &self.storage.data),
@@ -536,6 +601,96 @@ mod tests {
     }
 
     #[test]
+    fn app_and_job_cannot_share_a_name_in_one_namespace() {
+        let mut config =
+            Config::parse("[app.web]\nimage = 'web:v1'\n[job.web]\nimage = 'job:v1'\n").unwrap();
+        assert!(config.validate().is_err());
+        assert!(config.validate_against(&[]).is_err());
+        config.job.get_mut("web").unwrap().namespace = Some("batch".into());
+        config.validate().unwrap();
+        config.validate_against(&[]).unwrap();
+    }
+
+    #[test]
+    fn workload_labels_reject_unsafe_or_ambiguous_names() {
+        let oversized = "a".repeat(64);
+        for label in [
+            "",
+            ".",
+            "..",
+            "../outside",
+            "a/b",
+            "a\\b",
+            "a__b",
+            "Bad",
+            "a b",
+            "-a",
+            "a-",
+            "é",
+            oversized.as_str(),
+        ] {
+            for target in [
+                "app",
+                "job",
+                "app namespace",
+                "job namespace",
+                "declared namespace",
+            ] {
+                let mut config = Config::default();
+                match target {
+                    "app" => {
+                        config.app.insert(label.into(), minimal_app());
+                    }
+                    "job" => {
+                        config
+                            .job
+                            .insert(label.into(), toml::from_str("image = 'job:v1'").unwrap());
+                    }
+                    "app namespace" => {
+                        let mut spec = minimal_app();
+                        spec.namespace = Some(label.into());
+                        config.app.insert("web".into(), spec);
+                    }
+                    "job namespace" => {
+                        let mut spec: super::super::job::JobSpec =
+                            toml::from_str("image = 'job:v1'").unwrap();
+                        spec.namespace = Some(label.into());
+                        config.job.insert("batch".into(), spec);
+                    }
+                    _ => {
+                        config
+                            .namespace
+                            .insert(label.into(), toml::from_str("").unwrap());
+                    }
+                }
+                assert!(config.validate().is_err(), "accepted {target}: {label:?}");
+                assert!(
+                    config.validate_against(&[]).is_err(),
+                    "accepted {target}: {label:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn workload_labels_accept_dns_label_boundaries() {
+        for label in [
+            "a".to_owned(),
+            "0".to_owned(),
+            "web-g17".to_owned(),
+            "a".repeat(63),
+        ] {
+            let mut config = config_with_app(&label, minimal_app());
+            config.app.get_mut(&label).unwrap().namespace = Some(label.clone());
+            config
+                .namespace
+                .insert(label.clone(), toml::from_str("").unwrap());
+            config.validate().unwrap();
+            config.validate_against(&[]).unwrap();
+        }
+    }
+
+    #[test]
     fn validate_app_missing_image_rejected() {
         let app: AppSpec = toml::from_str("replicas = 1").unwrap();
         let config = config_with_app("test", app);
@@ -633,6 +788,21 @@ mod tests {
             nc.validate(),
             Err(ConfigError::InvalidPortRange { .. })
         ));
+    }
+
+    #[test]
+    fn custom_event_limit_is_refused_instead_of_ignored() {
+        let mut config = NodeConfig::default();
+        config.reporting_tree.max_events_per_report = 101;
+        assert!(
+            config
+                .validate()
+                .unwrap_err()
+                .to_string()
+                .contains("fixed 100-event")
+        );
+        config.reporting_tree.max_events_per_report = 100;
+        assert!(config.validate().is_ok());
     }
 
     #[test]

@@ -36,6 +36,48 @@ pub fn cgroup_path(namespace: &str, app_name: &str, instance: u32) -> PathBuf {
     PathBuf::from(format!("{CGROUP_ROOT}/{namespace}/{app_name}/{instance}"))
 }
 
+/// Build the host cgroup path for an exact workload instance.
+/// The deployment generation remains part of the leaf name, so retiring an
+/// old container cannot remove its successor's cgroup. Invalid identities refuse.
+pub fn instance_cgroup_path(
+    namespace: &str,
+    app_name: &str,
+    instance: &super::InstanceId,
+) -> Result<PathBuf, super::GrillError> {
+    let invalid = || super::GrillError::StartFailed {
+        instance: instance.clone(),
+        reason: "instance identity does not match its cgroup owner".into(),
+    };
+    let valid_label = |value: &str| {
+        !value.is_empty()
+            && value
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-')
+    };
+    if !valid_label(namespace) || !valid_label(app_name) {
+        return Err(invalid());
+    }
+    let prefix = format!("{namespace}__{app_name}-");
+    let suffix = instance.0.strip_prefix(&prefix).ok_or_else(invalid)?;
+    let canonical = if let Some((generation, ordinal)) = suffix
+        .strip_prefix('g')
+        .and_then(|value| value.split_once('-'))
+    {
+        let generation = generation.parse::<u64>().map_err(|_| invalid())?;
+        let ordinal = ordinal.parse::<u32>().map_err(|_| invalid())?;
+        format!("g{generation}-{ordinal}")
+    } else {
+        suffix.parse::<u32>().map_err(|_| invalid())?.to_string()
+    };
+    if suffix != canonical {
+        return Err(invalid());
+    }
+    Ok(PathBuf::from(CGROUP_ROOT)
+        .join(namespace)
+        .join(app_name)
+        .join(canonical))
+}
+
 /// Convert millicores to a `cpu.max` string.
 ///
 /// 500 millicores means 50ms of CPU time per 100ms period.
@@ -211,5 +253,47 @@ mod tests {
         assert!(params.cpu_weight.is_none());
         assert!(params.memory_max.is_none());
         assert!(params.memory_high.is_none());
+    }
+
+    #[test]
+    fn instance_paths_keep_deployment_generation_and_structured_owner() {
+        use super::super::InstanceIdentity;
+        let ordinary = InstanceIdentity::new("default", "web", 0).instance_id();
+        let canary = InstanceIdentity::canary("default", "web", 7, 0).instance_id();
+        assert_eq!(
+            instance_cgroup_path("default", "web", &ordinary).unwrap(),
+            cgroup_path("default", "web", 0)
+        );
+        assert_eq!(
+            instance_cgroup_path("default", "web", &canary).unwrap(),
+            PathBuf::from("/sys/fs/cgroup/reliaburger/default/web/g7-0")
+        );
+        // An ordinary app whose name resembles a generation is a different owner.
+        assert_ne!(
+            instance_cgroup_path("default", "web-g7", &canary).unwrap(),
+            instance_cgroup_path("default", "web", &canary).unwrap()
+        );
+    }
+
+    #[test]
+    fn instance_paths_reject_traversal_and_mismatched_or_noncanonical_ids() {
+        use super::super::InstanceId;
+        for id in [
+            "other__web-0",
+            "default__other-0",
+            "default__web-../0",
+            "default__web-g1-../0",
+            "default__web-00",
+            "default__web-g01-0",
+        ] {
+            assert!(
+                instance_cgroup_path("default", "web", &InstanceId(id.into())).is_err(),
+                "{id}"
+            );
+        }
+        assert!(
+            instance_cgroup_path("../default", "web", &InstanceId("../default__web-0".into()))
+                .is_err()
+        );
     }
 }

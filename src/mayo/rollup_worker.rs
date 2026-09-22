@@ -144,7 +144,10 @@ impl<T: ReportingTransport> RollupWorker<T> {
                 // A failed generation used to vanish silently; the stateless
                 // generator only rolls up the previous minute, so a swallowed
                 // error is a permanent gap. Log it and retry next tick (M9).
-                eprintln!("mayo: rollup generation failed, skipping this tick: {e}");
+                self.send_extended = true;
+                eprintln!(
+                    "mayo: rollup generation failed; requesting the last five minutes next tick: {e}"
+                );
                 return;
             }
         };
@@ -156,7 +159,9 @@ impl<T: ReportingTransport> RollupWorker<T> {
                 .send(parent, &ReportingMessage::MetricsRollup(rollup))
                 .await
             {
-                eprintln!("mayo: rollup push to parent failed, will retry next tick: {e}");
+                eprintln!(
+                    "mayo: rollup admission failed; requesting the last five minutes next tick (older gaps remain in local metrics only): {e}"
+                );
                 all_sent = false;
                 break;
             }
@@ -165,9 +170,7 @@ impl<T: ReportingTransport> RollupWorker<T> {
         // Only drop the backfill request once every minute has actually been
         // sent (M9). A partial success re-sends some minutes next tick, which
         // the parent's `(node, timestamp)` dedup makes idempotent.
-        if extended && all_sent {
-            self.send_extended = false;
-        }
+        self.send_extended = !all_sent;
     }
 }
 
@@ -330,10 +333,14 @@ mod tests {
             Duration::from_millis(100),
             CancellationToken::new(),
         );
-        worker.send_extended = true;
-
-        worker.push_rollup().await;
-        assert!(worker.send_extended, "flag survives a failed send");
+        for extended in [false, true] {
+            worker.send_extended = extended;
+            worker.push_rollup().await;
+            assert!(
+                worker.send_extended,
+                "normal and backfill failures request recovery"
+            );
+        }
     }
 
     #[tokio::test]

@@ -139,16 +139,28 @@ pub async fn authorise_write(
     bearer: Option<&str>,
     allow_unauthenticated_bootstrap: bool,
 ) -> Result<(), WriteDenied> {
+    authenticate_writer(auth, bearer, allow_unauthenticated_bootstrap)
+        .await
+        .map(|_| ())
+}
+
+/// Authenticate a deploy-class writer without discarding its exact identity.
+/// `None` represents the explicitly permitted standalone bootstrap window.
+pub async fn authenticate_writer(
+    auth: &AuthState,
+    bearer: Option<&str>,
+    allow_unauthenticated_bootstrap: bool,
+) -> Result<Option<crate::sesame::auth::AuthContext>, WriteDenied> {
     // The internal service token authenticates node-to-node replication.
     if let (Some(bearer), Some(service)) = (bearer, auth.service_token.as_deref())
         && crate::sesame::auth::tokens_equal(bearer, service)
     {
-        return Ok(());
+        return Ok(Some(crate::sesame::auth::system_context()));
     }
 
     let tokens = { auth.tokens.read().await.clone() };
     if allow_unauthenticated_bootstrap && tokens.is_empty() && auth.service_token.is_none() {
-        return Ok(());
+        return Ok(None);
     }
 
     let Some(bearer) = bearer else {
@@ -158,7 +170,7 @@ pub async fn authorise_write(
         Ok(ctx) => {
             // A registry push is a deploy-class mutation.
             if crate::sesame::token::check_role(ctx.role, ApiRole::Deployer).is_ok() {
-                Ok(())
+                Ok(Some(ctx))
             } else {
                 Err(WriteDenied::Forbidden)
             }
@@ -206,6 +218,12 @@ pub enum WriteDenied {
     Forbidden,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum UploadState {
+    Active,
+    Retiring,
+}
+
 /// One in-flight chunked upload session's metadata (REG8).
 #[derive(Debug, Clone)]
 struct UploadSession {
@@ -213,17 +231,20 @@ struct UploadSession {
     last_activity: SystemTime,
     /// The repository the upload targets (for quota accounting).
     repository: String,
+    /// Exact authenticated credential; None is anonymous standalone bootstrap.
+    principal_id: Option<String>,
     /// Bytes written so far.
     written: u64,
+    state: UploadState,
     writer: Arc<tokio::sync::Semaphore>,
 }
 
 /// Tracks chunked upload sessions so they can expire and be swept (REG8).
 ///
 /// Sessions are keyed by upload id. `touch` refreshes activity on every
-/// chunk; `is_expired` reports whether a session outlived its TTL; `sweep`
-/// removes expired sessions and returns their ids so the caller can delete
-/// the on-disk temp files.
+/// chunk; `is_active` checks its TTL and lifecycle state; `sweep`
+/// fences expired sessions until their on-disk temporary files are confirmed
+/// absent. Failed deletions retain ownership for the next sweep.
 #[derive(Clone, Default)]
 pub struct UploadSessions {
     inner: Arc<RwLock<HashMap<String, UploadSession>>>,
@@ -239,28 +260,40 @@ impl UploadSessions {
         }
     }
 
-    /// Record a new upload session for `repository`.
-    pub async fn register(&self, upload_id: &str, repository: &str, now: SystemTime) {
+    /// Record a new upload session for `repository` and its exact creator.
+    pub async fn register(
+        &self,
+        upload_id: &str,
+        repository: &str,
+        principal_id: Option<&str>,
+        now: SystemTime,
+    ) {
         self.inner.write().await.insert(
             upload_id.to_string(),
             UploadSession {
                 last_activity: now,
                 repository: repository.to_string(),
+                principal_id: principal_id.map(str::to_owned),
                 written: 0,
+                state: UploadState::Active,
                 writer: Arc::new(tokio::sync::Semaphore::new(1)),
             },
         );
     }
 
-    /// Claim the sole writer for this repository's session, preventing PATCH/PUT races.
+    /// Claim the creator's sole writer for this repository, preventing PATCH/PUT races.
     pub async fn claim_writer(
         &self,
         upload_id: &str,
         repository: &str,
+        principal_id: Option<&str>,
     ) -> Option<tokio::sync::OwnedSemaphorePermit> {
         let guard = self.inner.read().await;
         let session = guard.get(upload_id)?;
-        if session.repository != repository {
+        if session.state == UploadState::Retiring
+            || session.repository != repository
+            || session.principal_id.as_deref() != principal_id
+        {
             return None;
         }
         Arc::clone(&session.writer).try_acquire_owned().ok()
@@ -274,13 +307,14 @@ impl UploadSessions {
         let Some(session) = guard.get_mut(upload_id) else {
             return false;
         };
-        if now
-            .duration_since(session.last_activity)
-            .map(|elapsed| elapsed > self.ttl)
-            .unwrap_or(false)
+        if session.state == UploadState::Retiring
+            || now
+                .duration_since(session.last_activity)
+                .map(|elapsed| elapsed > self.ttl)
+                .unwrap_or(false)
         {
-            // Expired: drop it so the sweep (or the caller) cleans up.
-            guard.remove(upload_id);
+            // Keep ownership until the file deletion is confirmed.
+            session.state = UploadState::Retiring;
             return false;
         }
         session.last_activity = now;
@@ -292,12 +326,76 @@ impl UploadSessions {
     pub async fn is_active(&self, upload_id: &str, now: SystemTime) -> bool {
         let guard = self.inner.read().await;
         match guard.get(upload_id) {
-            Some(session) => now
-                .duration_since(session.last_activity)
-                .map(|elapsed| elapsed <= self.ttl)
-                .unwrap_or(true),
+            Some(session) => {
+                session.state == UploadState::Active
+                    && now
+                        .duration_since(session.last_activity)
+                        .map(|elapsed| elapsed <= self.ttl)
+                        .unwrap_or(true)
+            }
             None => false,
         }
+    }
+
+    /// Refuse future writers while retaining cleanup ownership. A current
+    /// writer keeps its permit until its own bounded operation completes.
+    pub async fn retire(&self, upload_id: &str) {
+        if let Some(session) = self.inner.write().await.get_mut(upload_id) {
+            session.state = UploadState::Retiring;
+        }
+    }
+
+    /// Reclaim every expired or retired session whose writer has exited.
+    /// Failed deletions stay fenced and are returned for logging and retry.
+    pub async fn cleanup_expired(
+        &self,
+        store: &super::store::BlobStore,
+        now: SystemTime,
+    ) -> Vec<(String, super::types::PickleError)> {
+        let mut failures = Vec::new();
+        for id in self.sweep(now).await {
+            match store.cancel_upload(&id).await {
+                Ok(()) => {
+                    self.complete(&id).await;
+                }
+                Err(error) => failures.push((id, error)),
+            }
+        }
+        failures
+    }
+
+    /// Fence and delete this repository's partial uploads, retaining failed cleanup.
+    /// The caller first excludes repository writers, including unpublished creation.
+    pub async fn cleanup_repository(
+        &self,
+        store: &super::store::BlobStore,
+        repository: &str,
+    ) -> Result<(), super::types::PickleError> {
+        let mut sessions = self.inner.write().await;
+        let mut uploads = Vec::new();
+        for (id, session) in sessions
+            .iter_mut()
+            .filter(|(_, session)| session.repository == repository)
+        {
+            session.state = UploadState::Retiring;
+            let permit = session.writer.clone().try_acquire_owned().map_err(|_| {
+                super::types::PickleError::ReplicationFailed(
+                    "repository still has an active upload writer".into(),
+                )
+            })?;
+            uploads.push((id.clone(), permit));
+        }
+        drop(sessions);
+        for (id, _permit) in uploads {
+            store.cancel_upload(&id).await?;
+            self.complete(&id).await;
+        }
+        Ok(())
+    }
+
+    #[cfg(test)]
+    pub(crate) async fn pause_registration(&self) -> impl Send + 'static {
+        self.inner.clone().write_owned().await
     }
 
     /// Complete (remove) a session, returning its target repository.
@@ -309,23 +407,26 @@ impl UploadSessions {
             .map(|s| s.repository)
     }
 
-    /// Remove every session past its TTL, returning the swept ids so the
-    /// caller can delete their temp files.
+    /// Fence expired writers and return their IDs for cleanup. Ownership
+    /// remains until `complete` confirms that the temporary file is absent.
     pub async fn sweep(&self, now: SystemTime) -> Vec<String> {
         let mut guard = self.inner.write().await;
         let expired: Vec<String> = guard
             .iter()
             .filter(|(_, s)| {
                 s.writer.available_permits() > 0
-                    && now
-                        .duration_since(s.last_activity)
-                        .map(|elapsed| elapsed > self.ttl)
-                        .unwrap_or(false)
+                    && (s.state == UploadState::Retiring
+                        || now
+                            .duration_since(s.last_activity)
+                            .map(|elapsed| elapsed > self.ttl)
+                            .unwrap_or(false))
             })
             .map(|(id, _)| id.clone())
             .collect();
         for id in &expired {
-            guard.remove(id);
+            if let Some(session) = guard.get_mut(id) {
+                session.state = UploadState::Retiring;
+            }
         }
         expired
     }
@@ -473,18 +574,44 @@ mod tests {
     // --- upload session expiry (REG8) ---
 
     #[tokio::test]
+    async fn expired_upload_stays_owned_until_cleanup_is_confirmed() {
+        let sessions = UploadSessions::new(Duration::from_secs(60));
+        let start = SystemTime::UNIX_EPOCH;
+        sessions.register("abandoned", "web", None, start).await;
+        let writer = sessions
+            .claim_writer("abandoned", "web", None)
+            .await
+            .unwrap();
+        let later = start + Duration::from_secs(61);
+        assert!(sessions.sweep(later).await.is_empty());
+        drop(writer);
+        assert_eq!(sessions.sweep(later).await, vec!["abandoned"]);
+        assert!(
+            sessions
+                .claim_writer("abandoned", "web", None)
+                .await
+                .is_none()
+        );
+        assert!(!sessions.touch("abandoned", 0, start).await);
+        // A failed file removal must leave the next sweep an owner to retry.
+        assert_eq!(sessions.sweep(later).await, vec!["abandoned"]);
+        sessions.complete("abandoned").await.unwrap();
+        assert!(sessions.sweep(later).await.is_empty());
+    }
+
+    #[tokio::test]
     async fn expired_upload_session_is_rejected_and_swept() {
         let sessions = UploadSessions::new(Duration::from_secs(60));
         let start = SystemTime::UNIX_EPOCH;
-        sessions.register("abc", "web", start).await;
+        sessions.register("abc", "web", None, start).await;
         assert!(sessions.is_active("abc", start).await);
 
         // 61s later: past the TTL.
         let later = start + Duration::from_secs(61);
         assert!(!sessions.touch("abc", 10, later).await, "expired touch");
-        // The failed touch already dropped it; the sweep sees nothing left.
+        // Expiry fences writes, but cleanup still owns the temporary file.
         let swept = sessions.sweep(later).await;
-        assert!(swept.is_empty());
+        assert_eq!(swept, vec!["abc"]);
         assert!(!sessions.is_active("abc", later).await);
     }
 
@@ -492,9 +619,9 @@ mod tests {
     async fn sweep_removes_only_expired_sessions() {
         let sessions = UploadSessions::new(Duration::from_secs(60));
         let start = SystemTime::UNIX_EPOCH;
-        sessions.register("old", "web", start).await;
+        sessions.register("old", "web", None, start).await;
         let recent = start + Duration::from_secs(120);
-        sessions.register("fresh", "web", recent).await;
+        sessions.register("fresh", "web", None, recent).await;
 
         let swept = sessions.sweep(recent).await;
         assert_eq!(swept, vec!["old".to_string()]);
@@ -505,7 +632,7 @@ mod tests {
     async fn touch_within_ttl_keeps_the_session_alive() {
         let sessions = UploadSessions::new(Duration::from_secs(60));
         let start = SystemTime::UNIX_EPOCH;
-        sessions.register("abc", "web", start).await;
+        sessions.register("abc", "web", None, start).await;
         let within = start + Duration::from_secs(30);
         assert!(sessions.touch("abc", 5, within).await);
         assert!(sessions.is_active("abc", within).await);

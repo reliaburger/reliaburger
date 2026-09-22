@@ -4,7 +4,7 @@
 /// failure), Bun tells Wrapper to drain it. The backend moves
 /// from active to draining: no new requests are routed to it,
 /// but in-flight requests are allowed to complete. Once all
-/// connections are done (or the timeout expires), Wrapper tells
+/// connections are done, Wrapper tells
 /// Bun the drain is complete and the container can be stopped.
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -16,10 +16,10 @@ use tokio_util::sync::CancellationToken;
 /// A drain tracker shared between the live Wrapper proxy and Bun's deploy
 /// path.
 ///
-/// The proxy holds a clone and bumps a draining backend's connection count
+/// The proxy holds a clone and captures each candidate backend's request count
 /// as requests come and go; Bun holds another clone, starts a drain when it
 /// retires an old instance, and waits until that instance's in-flight count
-/// reaches zero (or the timeout expires) before killing the container. Both
+/// reaches zero before killing the container. Deadlines cancel requests; both
 /// sides reach through the same `Arc<Mutex<DrainTracker>>`, so the tracker
 /// that was library-only in earlier phases now governs the real path.
 ///
@@ -42,6 +42,30 @@ impl SharedDrains {
     /// in-flight countdown.
     pub async fn start_drain(&self, cmd: &DrainCommand) -> bool {
         self.0.lock().await.start_drain(cmd)
+    }
+
+    /// Capture every candidate while the caller still holds the routing read lock.
+    /// A deadline that has already fired refuses the whole capture.
+    pub(crate) async fn capture_requests(
+        &self,
+        instance_ids: &[String],
+        websocket: bool,
+    ) -> Option<Vec<CancellationToken>> {
+        let mut tracker = self.0.lock().await;
+        if instance_ids.iter().any(|id| tracker.is_terminating(id)) {
+            return None;
+        }
+        let mut tokens = Vec::with_capacity(instance_ids.len());
+        for id in instance_ids {
+            tracker.increment_connections(id);
+            if websocket {
+                tracker.increment_websocket(id);
+            }
+            if let Some(token) = tracker.terminate_token(id) {
+                tokens.push(token);
+            }
+        }
+        Some(tokens)
     }
 
     /// True while `instance_id` is still draining.
@@ -91,8 +115,8 @@ impl SharedDrains {
         self.0.lock().await.check_completions().await
     }
 
-    /// Wait until `instance_id` has drained (zero in-flight) or its deadline
-    /// passes, whichever comes first. Returns once the instance is no longer
+    /// Wait until `instance_id` has no in-flight requests. Its deadline asks
+    /// those requests to cancel; their guards must still release. Returns once it is no longer
     /// tracked. Polls rather than blocks, so it never wedges the runtime.
     pub async fn wait_drained(&self, instance_id: &str) {
         loop {
@@ -134,24 +158,23 @@ pub struct DrainComplete {
 
 /// Tracks draining backends and their deadlines.
 pub struct DrainTracker {
-    /// Backends currently draining, keyed by instance ID.
+    /// Captured backends, active or draining, keyed by instance ID.
     draining: HashMap<String, DrainEntry>,
     /// Channel to notify Bun when draining is complete.
     complete_tx: mpsc::Sender<DrainComplete>,
 }
 
-/// A single backend being drained.
+/// Request ownership for one active or draining backend.
 struct DrainEntry {
     app_name: String,
-    /// Hard deadline — force close after this.
-    deadline: Instant,
+    /// None while active; Some asks requests to cancel after this deadline.
+    deadline: Option<Instant>,
     /// Number of in-flight connections to this backend.
     active_connections: u32,
     /// Number of WebSocket connections (subset of active_connections).
     websocket_connections: u32,
-    /// Fires when the drain finishes (deadline reached or all connections
-    /// gone). In-flight requests watch it so a deadline-forced completion
-    /// actively tears their connection down instead of leaving it running.
+    /// Requests cancellation at the deadline, or when an idle drain completes.
+    /// Cancellation itself does not release a request count.
     terminate: CancellationToken,
 }
 
@@ -167,20 +190,15 @@ impl DrainTracker {
     /// Start draining a backend. Returns true if the backend was
     /// added, false if it was already draining.
     pub fn start_drain(&mut self, cmd: &DrainCommand) -> bool {
-        if self.draining.contains_key(&cmd.instance_id) {
+        let entry = self
+            .draining
+            .entry(cmd.instance_id.clone())
+            .or_insert_with(DrainEntry::active);
+        if entry.deadline.is_some() {
             return false;
         }
-
-        self.draining.insert(
-            cmd.instance_id.clone(),
-            DrainEntry {
-                app_name: cmd.app_name.clone(),
-                deadline: Instant::now() + cmd.timeout,
-                active_connections: 0,
-                websocket_connections: 0,
-                terminate: CancellationToken::new(),
-            },
-        );
+        entry.app_name = cmd.app_name.clone();
+        entry.deadline = Some(Instant::now() + cmd.timeout);
         true
     }
 
@@ -190,23 +208,26 @@ impl DrainTracker {
     /// the proxy rejects any *new* request routed to it with 503 rather than
     /// piling more load onto a container on its way out.
     pub fn is_terminating(&self, instance_id: &str) -> bool {
-        self.draining
-            .get(instance_id)
-            .is_some_and(|entry| Instant::now() >= entry.deadline)
+        self.draining.get(instance_id).is_some_and(|entry| {
+            entry.terminate.is_cancelled()
+                || entry
+                    .deadline
+                    .is_some_and(|deadline| Instant::now() >= deadline)
+        })
     }
 
-    /// The termination token for `instance_id`, if it is draining.
+    /// The termination token for a captured or draining `instance_id`.
     pub fn terminate_token(&self, instance_id: &str) -> Option<CancellationToken> {
         self.draining.get(instance_id).map(|e| e.terminate.clone())
     }
 
-    /// Record that a new connection was routed to a draining backend.
-    /// (This shouldn't happen — the routing table should exclude
-    /// draining backends — but we track it for safety.)
+    /// Record a captured backend before releasing the routing read lock.
     pub fn increment_connections(&mut self, instance_id: &str) {
-        if let Some(entry) = self.draining.get_mut(instance_id) {
-            entry.active_connections += 1;
-        }
+        let entry = self
+            .draining
+            .entry(instance_id.to_owned())
+            .or_insert_with(DrainEntry::active);
+        entry.active_connections += 1;
     }
 
     /// Record that a connection to a draining backend completed.
@@ -214,6 +235,7 @@ impl DrainTracker {
         if let Some(entry) = self.draining.get_mut(instance_id) {
             entry.active_connections = entry.active_connections.saturating_sub(1);
         }
+        self.forget_idle_active(instance_id);
     }
 
     /// Record that a WebSocket connection was established to a draining backend.
@@ -228,6 +250,7 @@ impl DrainTracker {
         if let Some(entry) = self.draining.get_mut(instance_id) {
             entry.websocket_connections = entry.websocket_connections.saturating_sub(1);
         }
+        self.forget_idle_active(instance_id);
     }
 
     /// Get the WebSocket Close frame bytes to send during draining.
@@ -240,38 +263,40 @@ impl DrainTracker {
 
     /// Check whether a backend is currently draining.
     pub fn is_draining(&self, instance_id: &str) -> bool {
-        self.draining.contains_key(instance_id)
+        self.draining
+            .get(instance_id)
+            .is_some_and(|entry| entry.deadline.is_some())
     }
 
     /// Check all draining backends and complete any that are done
-    /// (zero connections or past deadline). Returns the instance IDs
+    /// (zero connections). A deadline requests cancellation, but does not
+    /// acknowledge release. Returns the instance IDs
     /// that completed.
     pub async fn check_completions(&mut self) -> Vec<String> {
         let now = Instant::now();
         let mut completed = Vec::new();
 
         for (id, entry) in &self.draining {
-            // A drain completes when both plain and WebSocket in-flight counts
-            // reach zero, or the deadline passes. Waiting on the WebSocket
-            // count too means a rolling deploy honours `drain_timeout` for a
-            // live WebSocket splice, not just HTTP requests (ING4).
+            let Some(deadline) = entry.deadline else {
+                continue;
+            };
             let idle = entry.active_connections == 0 && entry.websocket_connections == 0;
-            if idle || now >= entry.deadline {
-                // Signal termination on the way out. When the deadline forced
-                // this (connections still open), the fire actively tears those
-                // connections down; when it was already idle, nothing is
-                // watching and the cancel is a harmless no-op. Either way we
-                // never fire before the deadline while requests are in flight,
-                // so a live request is never killed early.
+            if idle || now >= deadline {
                 entry.terminate.cancel();
-                completed.push(id.clone());
-                let _ = self
-                    .complete_tx
-                    .send(DrainComplete {
-                        app_name: entry.app_name.clone(),
-                        instance_id: id.clone(),
-                    })
-                    .await;
+            }
+            // Cancellation asks a request to stop; its guard proves it stopped.
+            if idle {
+                // The shared tracker lock also protects request cleanup.
+                // Never hold it while waiting for a notification consumer.
+                match self.complete_tx.try_send(DrainComplete {
+                    app_name: entry.app_name.clone(),
+                    instance_id: id.clone(),
+                }) {
+                    Ok(()) | Err(mpsc::error::TrySendError::Closed(_)) => {
+                        completed.push(id.clone());
+                    }
+                    Err(mpsc::error::TrySendError::Full(_)) => {}
+                }
             }
         }
 
@@ -284,8 +309,43 @@ impl DrainTracker {
 
     /// Number of backends currently draining.
     pub fn draining_count(&self) -> usize {
-        self.draining.len()
+        self.draining
+            .values()
+            .filter(|entry| entry.deadline.is_some())
+            .count()
     }
+
+    fn forget_idle_active(&mut self, instance_id: &str) {
+        if self.draining.get(instance_id).is_some_and(|entry| {
+            entry.deadline.is_none()
+                && entry.active_connections == 0
+                && entry.websocket_connections == 0
+        }) {
+            self.draining.remove(instance_id);
+        }
+    }
+}
+
+impl DrainEntry {
+    fn active() -> Self {
+        Self {
+            app_name: String::new(),
+            deadline: None,
+            active_connections: 0,
+            websocket_connections: 0,
+            terminate: CancellationToken::new(),
+        }
+    }
+}
+
+/// Wait for any captured backend to require cancellation; an empty set never fires.
+pub(crate) async fn wait_for_termination(tokens: &[CancellationToken]) {
+    use futures_util::{StreamExt, stream::FuturesUnordered};
+    if tokens.is_empty() {
+        std::future::pending::<()>().await;
+    }
+    let mut waits: FuturesUnordered<_> = tokens.iter().map(CancellationToken::cancelled).collect();
+    waits.next().await;
 }
 
 #[cfg(test)]
@@ -298,6 +358,58 @@ mod tests {
             instance_id: instance.to_string(),
             timeout: Duration::from_secs(timeout_secs),
         }
+    }
+
+    #[tokio::test]
+    async fn full_completion_queue_preserves_pending_notification_without_blocking_cleanup() {
+        let (tx, mut rx) = mpsc::channel(1);
+        tx.send(DrainComplete {
+            app_name: "previous".into(),
+            instance_id: "previous-0".into(),
+        })
+        .await
+        .unwrap();
+        let drains = SharedDrains::new(DrainTracker::new(tx));
+        drains.start_drain(&drain_cmd("web", "web-0", 30)).await;
+        let completed =
+            tokio::time::timeout(Duration::from_millis(100), drains.check_completions())
+                .await
+                .expect("full notification queue blocked the shared drain tracker");
+        assert!(completed.is_empty());
+        assert!(drains.is_draining("web-0").await);
+        assert_eq!(rx.recv().await.unwrap().instance_id, "previous-0");
+        assert_eq!(drains.check_completions().await, vec!["web-0"]);
+        assert_eq!(rx.recv().await.unwrap().instance_id, "web-0");
+        assert!(!drains.is_draining("web-0").await);
+    }
+
+    #[tokio::test]
+    async fn closed_completion_receiver_does_not_prevent_observed_drain_completion() {
+        let (tx, rx) = mpsc::channel(1);
+        drop(rx);
+        let drains = SharedDrains::new(DrainTracker::new(tx));
+        drains.start_drain(&drain_cmd("web", "web-0", 30)).await;
+        assert_eq!(drains.check_completions().await, vec!["web-0"]);
+        assert!(!drains.is_draining("web-0").await);
+    }
+
+    #[tokio::test]
+    async fn deadline_cancels_but_waits_for_positive_request_release() {
+        let (tx, mut rx) = mpsc::channel(1);
+        let mut tracker = DrainTracker::new(tx);
+        tracker.start_drain(&drain_cmd("web", "web-0", 0));
+        tracker.increment_connections("web-0");
+        let token = tracker.terminate_token("web-0").unwrap();
+        assert!(
+            tracker.check_completions().await.is_empty(),
+            "deadline was mistaken for completed cleanup"
+        );
+        assert!(token.is_cancelled());
+        assert!(tracker.is_draining("web-0"));
+        assert!(rx.try_recv().is_err());
+        tracker.decrement_connections("web-0");
+        assert_eq!(tracker.check_completions().await, vec!["web-0"]);
+        assert_eq!(rx.recv().await.unwrap().instance_id, "web-0");
     }
 
     #[tokio::test]
@@ -373,7 +485,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn timeout_forces_completion() {
+    async fn timeout_requests_cancellation_before_completion() {
         let (tx, _rx) = mpsc::channel(16);
         let mut tracker = DrainTracker::new(tx);
 
@@ -386,7 +498,9 @@ mod tests {
         tokio::time::sleep(Duration::from_millis(1)).await;
 
         let completed = tracker.check_completions().await;
-        assert_eq!(completed, vec!["web-0"]);
+        assert!(completed.is_empty());
+        tracker.decrement_connections("web-0");
+        assert_eq!(tracker.check_completions().await, vec!["web-0"]);
     }
 
     #[tokio::test]
@@ -426,8 +540,8 @@ mod tests {
 
     #[tokio::test]
     async fn expired_drain_signals_termination() {
-        // ING/§5.5: when the deadline forces a drain to complete while a
-        // connection is still open, the terminate token fires so the live
+        // ING/§5.5: when the deadline passes while a connection is still
+        // open, the terminate token fires so the live
         // proxy tears that connection down instead of leaving it running.
         let (tx, _rx) = mpsc::channel(16);
         let mut tracker = DrainTracker::new(tx);
@@ -439,10 +553,10 @@ mod tests {
 
         tokio::time::sleep(Duration::from_millis(1)).await;
         let completed = tracker.check_completions().await;
-        assert_eq!(completed, vec!["web-0"]);
+        assert!(completed.is_empty());
         assert!(
             token.is_cancelled(),
-            "terminate token did not fire on a deadline-forced completion"
+            "terminate token did not fire at the deadline"
         );
     }
 
@@ -474,9 +588,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn websocket_drain_times_out_if_never_closes() {
-        // ING4: a WebSocket that never closes still lets the deploy proceed
-        // once the drain deadline passes, rather than blocking forever.
+    async fn websocket_drain_waits_for_release_after_timeout() {
+        // Cancellation must not acknowledge a WebSocket that has not closed.
         let (tx, _rx) = mpsc::channel(16);
         let mut tracker = DrainTracker::new(tx);
 
@@ -486,6 +599,10 @@ mod tests {
 
         tokio::time::sleep(Duration::from_millis(1)).await;
         let completed = tracker.check_completions().await;
-        assert_eq!(completed, vec!["web-0"]);
+        assert!(completed.is_empty());
+        tracker.decrement_connections("web-0");
+        assert!(tracker.check_completions().await.is_empty());
+        tracker.decrement_websocket("web-0");
+        assert_eq!(tracker.check_completions().await, vec!["web-0"]);
     }
 }

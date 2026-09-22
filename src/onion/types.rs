@@ -152,6 +152,15 @@ unsafe impl aya::Pod for FirewallValue {}
 /// Errors from Onion operations.
 #[derive(Debug, thiserror::Error)]
 pub enum OnionError {
+    /// Saved service ownership cannot be restored as a complete consistent map.
+    #[error("invalid service snapshot for {service:?}: {reason}")]
+    InvalidSnapshot {
+        /// Qualified service whose original ownership is invalid or conflicting.
+        service: String,
+        /// Validation failure; recovery must not publish a partial inventory.
+        reason: &'static str,
+    },
+
     #[error("service {name:?} not found")]
     ServiceNotFound { name: String },
 
@@ -179,7 +188,7 @@ pub enum OnionError {
 /// Bun compiles this into the BPF map entries. This is the
 /// source-of-truth that the `ServiceMap` stores and that
 /// `relish resolve` displays.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ServiceEntry {
     /// App name (e.g. "redis").
     pub app_name: String,
@@ -187,7 +196,7 @@ pub struct ServiceEntry {
     pub namespace: String,
     /// Deterministic namespace identifier (hash of namespace name).
     pub namespace_id: u32,
-    /// Deterministic app identifier (hash of app name).
+    /// Firewall destination identity: the allocated VIP as a host-order u32.
     pub app_id: u32,
     /// Virtual IP for this service.
     pub vip: VirtualIP,
@@ -201,7 +210,7 @@ pub struct ServiceEntry {
 }
 
 /// A single backend instance of a service.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct BackendInstance {
     /// Instance ID (e.g. "redis-0").
     pub instance_id: String,

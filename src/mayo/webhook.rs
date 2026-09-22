@@ -5,7 +5,8 @@
 //! Failed deliveries are retried 3 times with exponential backoff
 //! (1s, 5s, 25s).
 
-use std::collections::HashMap;
+use crate::mayo::types::MetricKey;
+use std::collections::{BTreeMap, HashMap};
 use std::time::{Duration, SystemTime};
 
 use ring::hmac;
@@ -30,6 +31,8 @@ pub struct WebhookPayload {
 /// Alert details within the webhook payload.
 #[derive(Debug, Clone, Serialize)]
 pub struct WebhookAlert {
+    /// Exact label set of the alert instance.
+    pub labels: BTreeMap<String, String>,
     pub name: String,
     pub severity: String,
     pub status: String,
@@ -75,6 +78,8 @@ pub struct PagerDutyPayload {
 /// The `payload` object required on a PagerDuty `trigger`.
 #[derive(Debug, Clone, Serialize)]
 pub struct PagerDutyDetails {
+    /// Labels included in the incident details.
+    pub custom_details: BTreeMap<String, String>,
     pub summary: String,
     pub source: String,
     /// `critical`, `error`, `warning`, or `info`.
@@ -186,6 +191,7 @@ impl WebhookDispatcher {
         WebhookPayload {
             version: "1",
             alert: WebhookAlert {
+                labels: t.labels.clone(),
                 name: t.rule_name.clone(),
                 severity: format!("{:?}", t.severity).to_lowercase(),
                 status: status.to_string(),
@@ -218,6 +224,9 @@ impl WebhookDispatcher {
         let status = if firing { "FIRING" } else { "RESOLVED" };
         let title = format!("[{status}] {} ({})", t.rule_name, self.cluster_name);
         let mut text = t.description.clone();
+        if !t.labels.is_empty() {
+            text.push_str(&format!("\nlabels: {:?}", t.labels));
+        }
         if let Some(v) = t.value {
             text.push_str(&format!(" (value: {v})"));
         }
@@ -250,8 +259,22 @@ impl WebhookDispatcher {
         PagerDutyPayload {
             routing_key: dest.secret.clone().unwrap_or_default(),
             event_action: if firing { "trigger" } else { "resolve" }.to_string(),
-            dedup_key: format!("{}/{}", self.cluster_name, t.rule_name),
+            dedup_key: format!(
+                "{}/{}/{}",
+                self.cluster_name,
+                t.rule_name,
+                hex::encode(
+                    ring::digest::digest(
+                        &ring::digest::SHA256,
+                        MetricKey::with_labels(&t.rule_name, t.labels.clone())
+                            .labels_json()
+                            .as_bytes()
+                    )
+                    .as_ref()
+                )
+            ),
             payload: firing.then(|| PagerDutyDetails {
+                custom_details: t.labels.clone(),
                 summary: t.description.clone(),
                 source: self.cluster_name.clone(),
                 severity: severity.to_string(),
@@ -354,23 +377,33 @@ const MAX_VALUE_AGE_SECS: u64 = 90;
 /// How far back to look for readings.
 const QUERY_WINDOW_SECS: u64 = 120;
 
-/// Collapse per-series readings into the one value per metric name that
-/// alert rules evaluate against (M20).
-///
-/// `series` maps `(metric_name, labels)` to its newest `(timestamp, value)`.
-/// Derived percentages are computed *within* a label set before collapsing,
-/// so `node_memory_usage_percent` can't end up dividing one series' `used`
-/// by another series' `total` — the mis-attribution the old
-/// entry-per-name collapse allowed.
-///
-/// Kept pure so the collapse rules are testable without a store.
-pub fn collapse_series(
+/// Keep each fresh labelled series and derive percentages within that label set.
+/// Invalid label JSON or non-finite readings provide no recovery evidence.
+pub fn latest_series_values(
     series: &HashMap<(String, String), (u64, f64)>,
     now_secs: u64,
-) -> HashMap<String, f64> {
-    // Derived percentages, per label set.
-    let mut derived: Vec<((String, String), (u64, f64))> = Vec::new();
-    for ((name, labels), (timestamp, _)) in series {
+) -> HashMap<MetricKey, f64> {
+    let mut fresh: HashMap<MetricKey, (u64, f64)> = HashMap::new();
+    for ((name, labels), (timestamp, value)) in series {
+        if now_secs.saturating_sub(*timestamp) > MAX_VALUE_AGE_SECS || !value.is_finite() {
+            continue;
+        }
+        let Ok(labels) = serde_json::from_str(labels) else {
+            continue;
+        };
+        let key = MetricKey::with_labels(name, labels);
+        let previous = fresh.entry(key).or_insert((*timestamp, *value));
+        if *timestamp > previous.0
+            || (*timestamp == previous.0 && value.total_cmp(&previous.1).is_gt())
+        {
+            *previous = (*timestamp, *value);
+        }
+    }
+    let mut result: HashMap<_, _> = fresh
+        .iter()
+        .map(|(key, (_, value))| (key.clone(), *value))
+        .collect();
+    for (key, (_, used)) in &fresh {
         for (used_name, total_name, percent_name) in [
             (
                 "node_memory_used_bytes",
@@ -383,59 +416,33 @@ pub fn collapse_series(
                 "node_disk_usage_percent",
             ),
         ] {
-            if name != used_name {
+            if key.name.0 != used_name {
                 continue;
             }
-            let Some((_, used)) = series.get(&(used_name.to_string(), labels.clone())) else {
-                continue;
-            };
-            let Some((_, total)) = series.get(&(total_name.to_string(), labels.clone())) else {
-                continue;
-            };
-            if *total > 0.0 {
-                derived.push((
-                    (percent_name.to_string(), labels.clone()),
-                    (*timestamp, (used / total) * 100.0),
-                ));
-            }
-        }
-    }
-
-    let mut all = series.clone();
-    all.extend(derived);
-
-    // Collapse to one value per name: the freshest series wins, and ties
-    // break on the label string so the result never depends on row order.
-    let mut best: HashMap<String, (u64, String, f64)> = HashMap::new();
-    for ((name, labels), (timestamp, value)) in all {
-        if now_secs.saturating_sub(timestamp) > MAX_VALUE_AGE_SECS {
-            continue;
-        }
-        match best.get(&name) {
-            Some((best_ts, best_labels, _))
-                if (*best_ts, best_labels.as_str()) >= (timestamp, labels.as_str()) => {}
-            _ => {
-                best.insert(name, (timestamp, labels, value));
+            let total_key = MetricKey::with_labels(total_name, key.labels.clone());
+            if let Some((_, total)) = fresh.get(&total_key)
+                && *total > 0.0
+            {
+                let percent = used / total * 100.0;
+                if percent.is_finite() {
+                    result.insert(
+                        MetricKey::with_labels(percent_name, key.labels.clone()),
+                        percent,
+                    );
+                }
             }
         }
     }
-
-    best.into_iter()
-        .map(|(name, (_, _, value))| (name, value))
-        .collect()
+    result
 }
 
 /// Gather the latest metric values from a MayoStore for alert evaluation.
 ///
-/// Reads the last [`QUERY_WINDOW_SECS`] of metrics, keeps the newest
-/// reading per `(metric_name, labels)` series, then hands them to
-/// [`collapse_series`] for the freshness bound, the derived percentages and
-/// the per-name collapse the evaluator expects.
-///
-/// The evaluator still takes one value per metric name; giving each
-/// labelled series its own alert state is a larger change to that contract
-/// and is not attempted here (M20).
-pub async fn gather_latest_values(store: &crate::mayo::store::MayoStore) -> HashMap<String, f64> {
+/// Reads the recent window, preserving the newest value of each metric/label
+/// identity. Freshness and derived percentages use [`latest_series_values`].
+pub async fn gather_latest_values(
+    store: &crate::mayo::store::MayoStore,
+) -> HashMap<MetricKey, f64> {
     let now = SystemTime::now()
         .duration_since(SystemTime::UNIX_EPOCH)
         .unwrap_or_default()
@@ -456,7 +463,7 @@ pub async fn gather_latest_values(store: &crate::mayo::store::MayoStore) -> Hash
         }
     }
 
-    collapse_series(&series, now)
+    latest_series_values(&series, now)
 }
 
 #[cfg(test)]
@@ -466,6 +473,7 @@ mod tests {
 
     fn firing_transition() -> AlertTransition {
         AlertTransition {
+            labels: BTreeMap::new(),
             rule_name: "cpu_throttle".to_string(),
             severity: AlertSeverity::Critical,
             description: "CPU usage above 90% for 5 minutes".to_string(),
@@ -477,6 +485,7 @@ mod tests {
 
     fn resolved_transition() -> AlertTransition {
         AlertTransition {
+            labels: BTreeMap::new(),
             rule_name: "cpu_throttle".to_string(),
             severity: AlertSeverity::Critical,
             description: "CPU usage above 90% for 5 minutes".to_string(),
@@ -488,6 +497,7 @@ mod tests {
 
     fn firing_warning_transition() -> AlertTransition {
         AlertTransition {
+            labels: BTreeMap::new(),
             rule_name: "memory_high".to_string(),
             severity: AlertSeverity::Warning,
             description: "Memory usage above 70%".to_string(),
@@ -495,6 +505,103 @@ mod tests {
             value: Some(75.0),
             fired_at: Some(SystemTime::UNIX_EPOCH + Duration::from_secs(1_700_000_000)),
         }
+    }
+
+    #[test]
+    fn notifications_keep_labels_and_resolve_only_the_matching_incident() {
+        let dispatcher = WebhookDispatcher::new(reqwest::Client::new(), vec![], "prod".into());
+        let destination = AlertDestination {
+            dest_type: "pagerduty".into(),
+            url: "http://unused".into(),
+            severity: vec![],
+            secret: Some("fixture".into()),
+        };
+        let mut a = firing_transition();
+        a.labels.insert("node".into(), "a".into());
+        let mut b = a.clone();
+        b.labels.insert("node".into(), "b".into());
+        let key_a = dispatcher
+            .build_pagerduty_payload(&destination, &a)
+            .dedup_key;
+        assert_ne!(
+            key_a,
+            dispatcher
+                .build_pagerduty_payload(&destination, &b)
+                .dedup_key
+        );
+        assert_eq!(dispatcher.build_payload(&a).alert.labels, a.labels);
+        assert_eq!(
+            dispatcher
+                .build_pagerduty_payload(&destination, &a)
+                .payload
+                .unwrap()
+                .custom_details,
+            a.labels
+        );
+        a.kind = TransitionKind::Resolved;
+        assert_eq!(
+            key_a,
+            dispatcher
+                .build_pagerduty_payload(&destination, &a)
+                .dedup_key
+        );
+        assert!(
+            dispatcher.build_slack_payload(&b).attachments[0]
+                .text
+                .contains("node")
+        );
+    }
+
+    #[tokio::test]
+    async fn real_store_preserves_two_labelled_series_for_evaluation() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut store = crate::mayo::store::MayoStore::new(directory.path().into());
+        for (node, value) in [("hot", 95.0), ("healthy", 10.0)] {
+            store.insert_now(
+                &MetricKey::with_labels("cpu", BTreeMap::from([("node".into(), node.into())])),
+                value,
+            );
+        }
+        store.flush().await.unwrap();
+        let values = gather_latest_values(&store).await;
+        assert_eq!(values.len(), 2);
+        assert_eq!(
+            values.get(&MetricKey::with_labels(
+                "cpu",
+                BTreeMap::from([("node".into(), "hot".into())])
+            )),
+            Some(&95.0)
+        );
+        assert_eq!(
+            values.get(&MetricKey::with_labels(
+                "cpu",
+                BTreeMap::from([("node".into(), "healthy".into())])
+            )),
+            Some(&10.0)
+        );
+    }
+
+    #[test]
+    fn stale_denominator_and_invalid_labels_provide_no_derived_value() {
+        let values = latest_series_values(
+            &series(&[
+                (
+                    "node_memory_used_bytes",
+                    r#"{"node":"a"}"#,
+                    MAX_VALUE_AGE_SECS + 1,
+                    90.0,
+                ),
+                ("node_memory_total_bytes", r#"{"node":"a"}"#, 0, 100.0),
+                ("cpu", "invalid labels", MAX_VALUE_AGE_SECS + 1, 50.0),
+            ]),
+            MAX_VALUE_AGE_SECS + 1,
+        );
+        assert_eq!(values.len(), 1);
+        assert!(
+            values
+                .keys()
+                .all(|key| key.name.0 == "node_memory_used_bytes")
+        );
     }
 
     #[test]
@@ -938,6 +1045,7 @@ mod tests {
         let dispatcher = WebhookDispatcher::new(client, vec![dest], "test".to_string());
 
         let warning_transition = AlertTransition {
+            labels: BTreeMap::new(),
             rule_name: "test".to_string(),
             severity: AlertSeverity::Warning,
             description: "test".to_string(),
@@ -968,7 +1076,31 @@ mod tests {
         assert_eq!(redact_url("weird-opaque-token"), "<redacted>");
     }
 
-    // -- collapse_series (M20) ------------------------------------------------
+    #[test]
+    fn healthy_series_cannot_hide_another_nodes_alert() {
+        use crate::mayo::alert::{AlertEvaluator, AlertOperator, AlertRule};
+        let values = latest_series_values(
+            &series(&[
+                ("cpu", r#"{"node":"hot"}"#, 99, 95.0),
+                ("cpu", r#"{"node":"healthy"}"#, 100, 10.0),
+            ]),
+            100,
+        );
+        let mut evaluator = AlertEvaluator::new(vec![AlertRule {
+            name: "cpu-high".into(),
+            metric_name: "cpu".into(),
+            threshold: 80.0,
+            operator: AlertOperator::GreaterThan,
+            for_duration: Duration::ZERO,
+            severity: AlertSeverity::Critical,
+            description: "CPU too high".into(),
+        }]);
+        evaluator.evaluate(&values);
+        evaluator.evaluate(&values);
+        assert_eq!(evaluator.firing_alerts().len(), 1);
+    }
+
+    // -- latest_series_values (M20) ------------------------------------------------
 
     fn series(entries: &[(&str, &str, u64, f64)]) -> HashMap<(String, String), (u64, f64)> {
         entries
@@ -985,19 +1117,25 @@ mod tests {
     /// produce a percentage that belonged to neither.
     #[test]
     fn derived_percentages_stay_within_one_label_set() {
-        let values = collapse_series(
+        let values = latest_series_values(
             &series(&[
                 // node-a: 50% used, and the newest reading.
-                ("node_memory_used_bytes", "node=a", 100, 50.0),
-                ("node_memory_total_bytes", "node=a", 100, 100.0),
+                ("node_memory_used_bytes", r#"{"node":"a"}"#, 100, 50.0),
+                ("node_memory_total_bytes", r#"{"node":"a"}"#, 100, 100.0),
                 // node-b: tiny total, would give a wild percentage if
                 // crossed with node-a's `used`.
-                ("node_memory_used_bytes", "node=b", 90, 1.0),
-                ("node_memory_total_bytes", "node=b", 90, 2.0),
+                ("node_memory_used_bytes", r#"{"node":"b"}"#, 90, 1.0),
+                ("node_memory_total_bytes", r#"{"node":"b"}"#, 90, 2.0),
             ]),
             100,
         );
-        assert_eq!(values.get("node_memory_usage_percent"), Some(&50.0));
+        assert_eq!(
+            values.get(&MetricKey::with_labels(
+                "node_memory_usage_percent",
+                BTreeMap::from([("node".into(), "a".into())])
+            )),
+            Some(&50.0)
+        );
     }
 
     /// A reading inside the query window but past the freshness bound is not
@@ -1005,17 +1143,23 @@ mod tests {
     /// answer may be.
     #[test]
     fn readings_past_the_freshness_bound_are_dropped() {
-        let values = collapse_series(
-            &series(&[("node_cpu_percent", "node=a", 0, 99.0)]),
+        let values = latest_series_values(
+            &series(&[("node_cpu_percent", r#"{"node":"a"}"#, 0, 99.0)]),
             MAX_VALUE_AGE_SECS + 1,
         );
-        assert!(!values.contains_key("node_cpu_percent"));
+        assert!(values.is_empty());
 
-        let values = collapse_series(
-            &series(&[("node_cpu_percent", "node=a", 1, 99.0)]),
+        let values = latest_series_values(
+            &series(&[("node_cpu_percent", r#"{"node":"a"}"#, 1, 99.0)]),
             MAX_VALUE_AGE_SECS + 1,
         );
-        assert_eq!(values.get("node_cpu_percent"), Some(&99.0));
+        assert_eq!(
+            values.get(&MetricKey::with_labels(
+                "node_cpu_percent",
+                BTreeMap::from([("node".into(), "a".into())])
+            )),
+            Some(&99.0)
+        );
     }
 
     /// The collapse must not depend on which row the query happened to
@@ -1023,27 +1167,33 @@ mod tests {
     #[test]
     fn collapsing_is_deterministic_across_equal_timestamps() {
         let entries = [
-            ("node_cpu_percent", "node=a", 100, 10.0),
-            ("node_cpu_percent", "node=b", 100, 20.0),
-            ("node_cpu_percent", "node=c", 100, 30.0),
+            ("node_cpu_percent", r#"{"node":"a"}"#, 100, 10.0),
+            ("node_cpu_percent", r#"{"node":"b"}"#, 100, 20.0),
+            ("node_cpu_percent", r#"{"node":"c"}"#, 100, 30.0),
         ];
-        let first = collapse_series(&series(&entries), 100);
+        let first = latest_series_values(&series(&entries), 100);
         let mut reversed = entries;
         reversed.reverse();
-        let second = collapse_series(&series(&reversed), 100);
+        let second = latest_series_values(&series(&reversed), 100);
         assert_eq!(first, second);
     }
 
-    /// The freshest series wins, regardless of label ordering.
+    /// Each label set keeps its own fresh reading.
     #[test]
-    fn the_freshest_series_wins() {
-        let values = collapse_series(
+    fn both_label_sets_keep_their_fresh_readings() {
+        let values = latest_series_values(
             &series(&[
-                ("node_cpu_percent", "node=a", 90, 10.0),
-                ("node_cpu_percent", "node=z", 100, 70.0),
+                ("node_cpu_percent", r#"{"node":"a"}"#, 90, 10.0),
+                ("node_cpu_percent", r#"{"node":"z"}"#, 100, 70.0),
             ]),
             100,
         );
-        assert_eq!(values.get("node_cpu_percent"), Some(&70.0));
+        assert_eq!(
+            values.get(&MetricKey::with_labels(
+                "node_cpu_percent",
+                BTreeMap::from([("node".into(), "z".into())])
+            )),
+            Some(&70.0)
+        );
     }
 }

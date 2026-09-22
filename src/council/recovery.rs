@@ -112,6 +112,8 @@ async fn load_state_from_data_dir(data_dir: &Path) -> Result<DesiredState, Recov
             path: snapshot_path.display().to_string(),
         });
     }
+    crate::compatibility::ensure_state_compatible(data_dir)
+        .map_err(|e| RecoveryError::OpenSource(e.to_string()))?;
     let db = std::sync::Arc::new(
         redb::Database::create(&snapshot_path)
             .map_err(|e| RecoveryError::OpenSource(format!("open snapshot store: {e}")))?,
@@ -136,6 +138,8 @@ async fn load_state_from_data_dir(data_dir: &Path) -> Result<DesiredState, Recov
 /// The node must not be running (redb takes an exclusive lock), which is the
 /// operator's responsibility.
 pub fn recover_data_dir(data_dir: &Path, state: DesiredState) -> Result<(), RecoveryError> {
+    crate::compatibility::ensure_state_compatible(data_dir)
+        .map_err(|e| RecoveryError::Persist(e.to_string()))?;
     let raft_dir = data_dir.join("raft");
     std::fs::create_dir_all(&raft_dir)
         .map_err(|e| RecoveryError::Persist(format!("create raft dir: {e}")))?;
@@ -262,6 +266,7 @@ mod tests {
 
         // The next start's loader sees the restored state with a bumped epoch
         // and no stale log id.
+        crate::compatibility::ensure_state_compatible(dir.path()).unwrap();
         let snapshot_path = dir.path().join("raft").join("snapshot.redb");
         let db = std::sync::Arc::new(redb::Database::create(&snapshot_path).unwrap());
         let sm = CouncilStateMachine::with_store(db).unwrap();
@@ -269,6 +274,18 @@ mod tests {
         assert_eq!(loaded.config.get("k").map(String::as_str), Some("v"));
         assert_eq!(loaded.recovery_epoch, 1);
         assert!(loaded.last_applied_log.is_none());
+    }
+
+    #[test]
+    fn recovery_refuses_to_overwrite_unmarked_development_state() {
+        let dir = tempfile::tempdir().unwrap();
+        let raft = dir.path().join("raft");
+        std::fs::create_dir(&raft).unwrap();
+        let log = raft.join("log.redb");
+        std::fs::write(&log, b"preserve old log").unwrap();
+        assert!(recover_data_dir(dir.path(), DesiredState::default()).is_err());
+        assert_eq!(std::fs::read(log).unwrap(), b"preserve old log");
+        assert!(!dir.path().join(crate::compatibility::STATE_STAMP).exists());
     }
 
     #[tokio::test]
@@ -288,6 +305,7 @@ mod tests {
         // before the first snapshot is written). Recovery must refuse rather
         // than load an empty DesiredState.
         let dir = tempfile::tempdir().unwrap();
+        crate::compatibility::ensure_state_compatible(dir.path()).unwrap();
         let snapshot_path = dir.path().join("raft").join("snapshot.redb");
         std::fs::create_dir_all(snapshot_path.parent().unwrap()).unwrap();
         {
@@ -321,6 +339,7 @@ mod tests {
         recover_data_dir(dir.path(), DesiredState::default()).unwrap();
 
         // Load, then recover again from the loaded state.
+        crate::compatibility::ensure_state_compatible(dir.path()).unwrap();
         let snapshot_path = dir.path().join("raft").join("snapshot.redb");
         let first = {
             let db = std::sync::Arc::new(redb::Database::create(&snapshot_path).unwrap());

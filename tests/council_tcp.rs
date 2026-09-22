@@ -69,6 +69,7 @@ impl TlsSetup {
 
 fn revoked_crl(serial: u64) -> CrlHandle {
     CrlHandle::new(reliaburger::sesame::types::Crl {
+        retired_nodes: Default::default(),
         entries: vec![CrlEntry {
             serial: SerialNumber(serial),
             issuer: CaRole::Node,

@@ -7,6 +7,7 @@
 /// reads incrementally — printing progress to stderr and collecting
 /// the final result.
 use futures_util::StreamExt;
+use rustls::pki_types::{CertificateDer, pem::PemObject};
 use tokio_tungstenite::tungstenite::client::IntoClientRequest;
 
 use crate::bun::agent::{
@@ -23,6 +24,8 @@ pub struct BunClient {
     client: Result<reqwest::Client, String>,
     websocket_tls: Option<std::sync::Arc<rustls::ClientConfig>>,
     token: Option<String>,
+    ca_pem: Option<Vec<u8>>,
+    service_endpoints: Option<crate::bun::capabilities::ServiceEndpoints>,
 }
 
 /// Options for fetching or streaming logs.
@@ -227,6 +230,20 @@ fn pick_endpoint(cli_flag: Option<&Option<String>>, env: Option<String>) -> Opti
 /// standalone development. User-info is rejected because embedding
 /// credentials in URLs leaks them through shell history, process listings and
 /// logs.
+///
+/// ```
+/// use reliaburger::relish::client::{validate_endpoint, EndpointError};
+///
+/// validate_endpoint("https://bun.example:9117").expect("remote HTTPS endpoint");
+/// validate_endpoint("http://127.0.0.1:9117").expect("local development endpoint");
+/// assert!(matches!(
+///     validate_endpoint("http://bun.example:9117"),
+///     Err(EndpointError::RemotePlaintext)
+/// ));
+/// ```
+///
+/// This checks the URL only; it does not open a connection, authenticate a
+/// caller or establish that the node is healthy.
 pub fn validate_endpoint(value: &str) -> Result<(), EndpointError> {
     let parsed = url::Url::parse(value)?;
     if !parsed.username().is_empty() || parsed.password().is_some() {
@@ -273,6 +290,8 @@ impl BunClient {
                     base_url: base_url.trim_end_matches('/').to_string(),
                     client: Err(format!("failed to read cluster CA: {error}")),
                     websocket_tls: None,
+                    ca_pem: None,
+                    service_endpoints: None,
                     token: token.map(str::to_string),
                 };
             }
@@ -307,7 +326,7 @@ impl BunClient {
                 builder = builder.default_headers(headers);
             }
             if let Some(pem) = ca_pem {
-                let certificates = rustls_pemfile::certs(&mut &pem[..])
+                let certificates = CertificateDer::pem_slice_iter(pem)
                     .collect::<Result<Vec<_>, _>>()
                     .map_err(|error| format!("invalid cluster CA PEM: {error}"))?;
                 if certificates.is_empty() {
@@ -331,6 +350,8 @@ impl BunClient {
             base_url: base_url.trim_end_matches('/').to_string(),
             client,
             websocket_tls,
+            ca_pem: ca_pem.map(<[u8]>::to_vec),
+            service_endpoints: None,
             token: token.map(str::to_string),
         }
     }
@@ -362,8 +383,82 @@ impl BunClient {
             base_url: base_url.trim_end_matches('/').to_string(),
             client: self.client.clone(),
             websocket_tls: self.websocket_tls.clone(),
+            ca_pem: self.ca_pem.clone(),
+            service_endpoints: None,
             token: self.token.clone(),
         }
+    }
+
+    /// Address one discovered node using its API endpoint and this client's identity.
+    ///
+    /// Gossip addresses and the entry node's port are not API-address evidence.
+    pub fn for_node(&self, node: &NodeStatus) -> Result<Self, RelishError> {
+        let address = node
+            .api_address
+            .filter(|address| address.port() != 0 && !address.ip().is_unspecified())
+            .ok_or_else(|| RelishError::ApiError {
+                status: 0,
+                body: format!(
+                    "node {} has no usable advertised API endpoint",
+                    node.node_id
+                ),
+            })?;
+        let endpoint = format!("{}://{address}", self.scheme());
+        validate_endpoint(&endpoint).map_err(|error| RelishError::ApiError {
+            status: 0,
+            body: format!("node {} API endpoint is invalid: {error}", node.node_id),
+        })?;
+        Ok(self.with_base_url(&endpoint))
+    }
+
+    /// Use another bearer credential with this connection's existing trust roots and forwards.
+    pub fn with_token(&self, token: &str) -> Self {
+        let mut client = Self::build(&self.base_url, Some(token), self.ca_pem.as_deref());
+        client.service_endpoints = self.service_endpoints.clone();
+        client
+    }
+
+    /// Declare the host forwards owned by this managed connection. Missing
+    /// forwards remain unavailable instead of falling back to guest addresses.
+    pub fn with_service_endpoints(
+        mut self,
+        endpoints: crate::bun::capabilities::ServiceEndpoints,
+    ) -> Self {
+        self.service_endpoints = Some(endpoints);
+        self
+    }
+
+    /// Public trust anchors configured for this cluster client.
+    pub(crate) fn cluster_ca_pem(&self) -> Option<&[u8]> {
+        self.ca_pem.as_deref()
+    }
+
+    /// Build a separate workload client with normal hostname verification and
+    /// the cluster CA, without the API bearer or client identity.
+    pub fn workload_http_builder(&self) -> Result<reqwest::ClientBuilder, String> {
+        self.http().map_err(|error| error.to_string())?;
+        let mut builder = reqwest::Client::builder()
+            .no_proxy()
+            .redirect(reqwest::redirect::Policy::none())
+            .timeout(std::time::Duration::from_secs(3));
+        if let Some(pem) = &self.ca_pem {
+            for certificate in CertificateDer::pem_slice_iter(pem) {
+                let certificate = certificate.map_err(|error| error.to_string())?;
+                builder = builder.add_root_certificate(
+                    reqwest::Certificate::from_der(&certificate)
+                        .map_err(|error| error.to_string())?,
+                );
+            }
+        }
+        Ok(builder)
+    }
+
+    /// Address a declared Pickle endpoint with control-plane credentials. Remote
+    /// plaintext and credentials embedded in URLs are refused before sending.
+    pub fn registry_http_client(&self, endpoint: &str) -> Result<reqwest::Client, String> {
+        validate_endpoint(endpoint).map_err(|error| error.to_string())?;
+        let client = Self::build(endpoint, self.token.as_deref(), self.ca_pem.as_deref());
+        client.http().cloned().map_err(|error| error.to_string())
     }
 
     /// The underlying HTTP client, pre-configured with the resolved bearer
@@ -399,6 +494,8 @@ impl BunClient {
                         base_url: context.endpoint,
                         client: Err(error.to_string()),
                         websocket_tls: None,
+                        ca_pem: None,
+                        service_endpoints: None,
                         token: None,
                     });
             }
@@ -407,6 +504,8 @@ impl BunClient {
                     base_url: "https://127.0.0.1:19117".to_string(),
                     client: Err(error.to_string()),
                     websocket_tls: None,
+                    ca_pem: None,
+                    service_endpoints: None,
                     token: None,
                 };
             }
@@ -479,7 +578,7 @@ impl BunClient {
     /// stderr as they arrive; the final `Complete` event is returned
     /// as an `ApplyResult`.
     pub async fn apply(&self, config: &Config) -> Result<ApplyResult, RelishError> {
-        self.apply_request(config, None, false).await
+        self.apply_request(config, None, false, false).await
     }
 
     /// Deploy apps under a server-owned Phase 15 resource lease.
@@ -488,7 +587,8 @@ impl BunClient {
         config: &Config,
         lease_id: &str,
     ) -> Result<ApplyResult, RelishError> {
-        self.apply_request(config, Some(lease_id), false).await
+        self.apply_request(config, Some(lease_id), false, false)
+            .await
     }
 
     /// Deploy a deliberately saturating app under both lease and capacity policy.
@@ -497,7 +597,17 @@ impl BunClient {
         config: &Config,
         lease_id: &str,
     ) -> Result<ApplyResult, RelishError> {
-        self.apply_request(config, Some(lease_id), true).await
+        self.apply_request(config, Some(lease_id), true, false)
+            .await
+    }
+
+    /// Explicitly rerun unknown jobs on this node after retiring their old runtime.
+    pub async fn apply_rerunning_jobs(&self, config: &Config) -> Result<ApplyResult, RelishError> {
+        crate::bun::jobs::validate_rerun(config).map_err(|error| RelishError::ApiError {
+            status: 400,
+            body: error.into(),
+        })?;
+        self.apply_request(config, None, false, true).await
     }
 
     async fn apply_request(
@@ -505,6 +615,7 @@ impl BunClient {
         config: &Config,
         lease_id: Option<&str>,
         capacity_probe: bool,
+        rerun_jobs: bool,
     ) -> Result<ApplyResult, RelishError> {
         let url = format!("{}/v1/apply", self.base_url);
         let toml_str = toml::to_string_pretty(config).map_err(|e| RelishError::ApiError {
@@ -513,6 +624,9 @@ impl BunClient {
         })?;
 
         let mut request = self.http()?.post(&url).body(toml_str);
+        if rerun_jobs {
+            request = request.header("x-reliaburger-rerun-jobs", "acknowledged");
+        }
         if let Some(lease_id) = lease_id {
             request = request.header("x-reliaburger-test-lease", lease_id);
         }
@@ -524,6 +638,13 @@ impl BunClient {
         let status = response.status().as_u16();
         if !response.status().is_success() {
             let body = response.text().await.unwrap_or_default();
+            if capacity_probe
+                && status == 422
+                && let Ok(refusal) =
+                    serde_json::from_str::<crate::cluster::capacity::SchedulingRefusal>(&body)
+            {
+                return Err(RelishError::SchedulingRejected(refusal.error));
+            }
             return Err(RelishError::ApiError { status, body });
         }
 
@@ -677,10 +798,11 @@ impl BunClient {
         Ok(statuses)
     }
 
-    /// List alert statuses as their wire JSON representation.
-    pub async fn alerts(&self) -> Result<Vec<serde_json::Value>, RelishError> {
-        let value: serde_json::Value = self.get_typed_json("/v1/alerts").await?;
-        Ok(value["alerts"].as_array().cloned().unwrap_or_default())
+    /// List validated alert statuses; missing or malformed evidence is an error.
+    pub async fn alerts(&self) -> Result<Vec<crate::mayo::alert::AlertStatus>, RelishError> {
+        let response: crate::mayo::alert::AlertsResponse =
+            self.get_typed_json("/v1/alerts").await?;
+        Ok(response.alerts)
     }
 
     /// List run-to-completion workload instances.
@@ -710,7 +832,12 @@ impl BunClient {
     pub async fn capabilities(
         &self,
     ) -> Result<crate::bun::capabilities::ClusterCapabilities, RelishError> {
-        self.get_typed_json("/v1/capabilities").await
+        let mut report: crate::bun::capabilities::ClusterCapabilities =
+            self.get_typed_json("/v1/capabilities").await?;
+        if let Some(endpoints) = &self.service_endpoints {
+            report.service_endpoints = endpoints.clone();
+        }
+        Ok(report)
     }
 
     /// Fetch an authenticated, bounded collection from current cluster peers.
@@ -827,6 +954,25 @@ impl BunClient {
         self.get_typed_json("/v1/deploys/operations").await
     }
 
+    /// Request cancellation of a node-local operation; admission is not completion.
+    pub async fn cancel_deploy(
+        &self,
+        operation_id: &str,
+    ) -> Result<crate::bun::deploy_operations::DeployOperation, RelishError> {
+        let segment: String =
+            url::form_urlencoded::byte_serialize(operation_id.as_bytes()).collect();
+        let response = self
+            .http()?
+            .post(format!(
+                "{}/v1/deploys/operations/{segment}/cancel",
+                self.base_url
+            ))
+            .send()
+            .await
+            .map_err(classify_error)?;
+        parse_typed_response(response).await
+    }
+
     /// Create a server-owned test resource lease.
     pub async fn create_test_lease(
         &self,
@@ -846,7 +992,26 @@ impl BunClient {
         parse_typed_response(response).await
     }
 
-    /// Renew an active test resource lease.
+    /// Create a durable job lease on this exact node, even in a cluster.
+    pub async fn create_node_job_lease(
+        &self,
+        ttl_seconds: u64,
+    ) -> Result<crate::testkit::lease::TestLease, RelishError> {
+        let response = self
+            .http()?
+            .post(format!("{}/v1/test/leases", self.base_url))
+            .json(&serde_json::json!({"ttl_seconds": ttl_seconds, "scope": "node_jobs"}))
+            .send()
+            .await
+            .map_err(classify_error)?;
+        parse_typed_response(response).await
+    }
+
+    /// Renew an active test resource lease as its authenticated owner.
+    ///
+    /// The node-local job recovery integration test uses this endpoint. The
+    /// catalogue runner instead requests a lease covering its bounded case
+    /// deadline plus teardown; it does not spawn a background renewal loop.
     pub async fn renew_test_lease(
         &self,
         lease_id: &str,
@@ -862,20 +1027,58 @@ impl BunClient {
         parse_typed_response(response).await
     }
 
-    /// Release a lease and wait for server-confirmed cleanup.
+    /// Release a lease and wait up to 30 seconds for server-confirmed cleanup.
+    /// An accepted request keeps polling durable ownership until it disappears.
+    /// Transient leader unavailability retries within the same overall deadline.
     pub async fn release_test_lease(&self, lease_id: &str) -> Result<(), RelishError> {
-        let response = self
-            .http()?
-            .delete(format!("{}/v1/test/leases/{lease_id}", self.base_url))
-            .send()
-            .await
-            .map_err(classify_error)?;
-        let status = response.status().as_u16();
-        if !response.status().is_success() {
-            let body = response.text().await.unwrap_or_default();
-            return Err(RelishError::ApiError { status, body });
-        }
-        Ok(())
+        tokio::time::timeout(std::time::Duration::from_secs(30), async {
+            let url = format!("{}/v1/test/leases/{lease_id}", self.base_url);
+            let response = loop {
+                let response = self
+                    .http()?
+                    .delete(&url)
+                    .send()
+                    .await
+                    .map_err(classify_error)?;
+                if response.status() != reqwest::StatusCode::SERVICE_UNAVAILABLE {
+                    break response;
+                }
+                // Retrying this idempotent mutation preserves its original lease.
+                drop(response);
+                tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+            };
+            match response.status() {
+                reqwest::StatusCode::NO_CONTENT => return Ok(()),
+                reqwest::StatusCode::ACCEPTED => {}
+                status => {
+                    return Err(RelishError::ApiError {
+                        status: status.as_u16(),
+                        body: response.text().await.unwrap_or_default(),
+                    });
+                }
+            }
+            loop {
+                let response = self
+                    .http()?
+                    .get(&url)
+                    .send()
+                    .await
+                    .map_err(classify_error)?;
+                match response.status() {
+                    reqwest::StatusCode::NOT_FOUND => return Ok(()),
+                    reqwest::StatusCode::OK | reqwest::StatusCode::SERVICE_UNAVAILABLE => {}
+                    status => {
+                        return Err(RelishError::ApiError {
+                            status: status.as_u16(),
+                            body: response.text().await.unwrap_or_default(),
+                        });
+                    }
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+            }
+        })
+        .await
+        .map_err(|_| RelishError::RequestTimeout)?
     }
 
     /// Fetch metrics recorded for one app.
@@ -1298,6 +1501,37 @@ impl BunClient {
         })?;
 
         Ok(json["output"].as_str().unwrap_or("").to_string())
+    }
+
+    /// Permanently retire a node after explicit external workload fencing.
+    pub async fn decommission_node(
+        &self,
+        request: &crate::cluster::retirement::DecommissionRequest,
+    ) -> Result<crate::cluster::retirement::NodeRetirement, RelishError> {
+        request.validate().map_err(|reason| RelishError::ApiError {
+            status: 0,
+            body: reason.into(),
+        })?;
+        let body = serde_json::to_string(request).map_err(|error| RelishError::ApiError {
+            status: 0,
+            body: error.to_string(),
+        })?;
+        let response = self.post_json("/v1/nodes/decommission", body).await?;
+        let retirement: crate::cluster::retirement::NodeRetirement =
+            serde_json::from_value(response).map_err(|error| RelishError::ApiError {
+                status: 0,
+                body: format!("invalid decommission response: {error}"),
+            })?;
+        if retirement.node_id != request.node_id
+            || retirement.retired_by.is_empty()
+            || retirement.retired_at_unix_ms == 0
+        {
+            return Err(RelishError::ApiError {
+                status: 0,
+                body: "decommission response does not confirm this identity".into(),
+            });
+        }
+        Ok(retirement)
     }
 
     /// Get cluster node membership.
@@ -1751,17 +1985,32 @@ impl BunClient {
         namespaces: Option<Vec<String>>,
         ttl_days: Option<u64>,
     ) -> Result<String, RelishError> {
+        self.create_token_request(serde_json::json!({
+            "name": name, "role": role, "apps": apps,
+            "namespaces": namespaces, "ttl_days": ttl_days,
+        }))
+        .await
+    }
+
+    /// Mint a namespace-scoped Deployer token whose lifetime and cleanup belong to a test lease.
+    pub async fn token_create_with_lease(
+        &self,
+        name: &str,
+        namespace: &str,
+        lease_id: &str,
+    ) -> Result<String, RelishError> {
+        self.create_token_request(serde_json::json!({
+            "name": name, "role": "deployer", "namespaces": [namespace], "lease_id": lease_id,
+        }))
+        .await
+    }
+
+    async fn create_token_request(&self, body: serde_json::Value) -> Result<String, RelishError> {
         let url = format!("{}/v1/token/create", self.base_url);
         let response = self
             .http()?
             .post(&url)
-            .json(&serde_json::json!({
-                "name": name,
-                "role": role,
-                "apps": apps,
-                "namespaces": namespaces,
-                "ttl_days": ttl_days,
-            }))
+            .json(&body)
             .send()
             .await
             .map_err(classify_error)?;
@@ -1845,6 +2094,13 @@ impl BunClient {
                 status: 0,
                 body: "response missing join token".to_string(),
             })
+    }
+
+    /// Fetch the active public recipient without accessing cluster key files.
+    pub async fn secret_public_key(
+        &self,
+    ) -> Result<crate::sesame::types::SecretPublicKey, RelishError> {
+        self.get_typed_json("/v1/secret/public-key").await
     }
 
     /// Rotate or finalise the secret encryption key.
@@ -2276,6 +2532,22 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn replacing_bearer_preserves_explicit_ca_and_uses_the_new_credential() {
+        let hierarchy = crate::sesame::ca::generate_ca_hierarchy("scoped-client", b"ikm").unwrap();
+        let identity = test_identity(&hierarchy, "node-01");
+        let shutdown = tokio_util::sync::CancellationToken::new();
+        let address = spawn_tls_health(&identity, shutdown.clone()).await;
+        let ca = pem_cert(&hierarchy.node.ca.certificate_der);
+        let client =
+            BunClient::new_with_ca(&format!("https://{address}"), Some("original"), &ca).unwrap();
+        // This endpoint accepts only rbrg_ws. The replacement must keep the
+        // explicit CA without inheriting the old credential's default header.
+        let result = client.with_token("rbrg_ws").ws_connect("/ws").await;
+        shutdown.cancel();
+        assert!(result.is_ok(), "replacement credential failed: {result:?}");
+    }
+
+    #[tokio::test]
     async fn websocket_refuses_an_unrelated_ca() {
         let hierarchy =
             crate::sesame::ca::generate_ca_hierarchy("websocket-server", b"ikm").unwrap();
@@ -2309,7 +2581,190 @@ mod tests {
             .await
             .expect("cluster-CA client should reach the agent over HTTPS");
 
+        let workload = client.workload_http_builder().unwrap().build().unwrap();
+        assert!(
+            workload
+                .get(format!("https://{addr}/v1/health"))
+                .send()
+                .await
+                .is_err(),
+            "workload clients must not inherit the control-plane hostname exception"
+        );
+
         shutdown.cancel();
+    }
+
+    async fn assert_lease_cleanup_responses(
+        responses: Vec<(axum::http::Method, axum::http::StatusCode)>,
+        expected_error: Option<u16>,
+    ) {
+        use std::collections::VecDeque;
+        use std::sync::Arc;
+        let remaining = Arc::new(tokio::sync::Mutex::new(VecDeque::from(responses)));
+        let handler_remaining = remaining.clone();
+        let router = axum::Router::new().route(
+            "/v1/test/leases/fixture",
+            axum::routing::any(move |method: axum::http::Method| {
+                let remaining = handler_remaining.clone();
+                async move {
+                    let (expected, status) = remaining.lock().await.pop_front().unwrap();
+                    assert_eq!(method, expected);
+                    (status, "fixture response")
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
+        let result = BunClient::new_with_token(&format!("http://{address}"), None)
+            .release_test_lease("fixture")
+            .await;
+        server.abort();
+        let _ = server.await;
+        match expected_error {
+            Some(expected) => assert!(
+                matches!(result, Err(RelishError::ApiError { status, .. }) if status == expected),
+                "{result:?}"
+            ),
+            None => result.unwrap(),
+        }
+        assert!(remaining.lock().await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn lease_cleanup_retries_unavailable_leaders_until_positive_confirmation() {
+        use axum::http::{Method, StatusCode};
+        assert_lease_cleanup_responses(
+            vec![
+                (Method::DELETE, StatusCode::SERVICE_UNAVAILABLE),
+                (Method::DELETE, StatusCode::ACCEPTED),
+                (Method::GET, StatusCode::SERVICE_UNAVAILABLE),
+                (Method::GET, StatusCode::OK),
+                (Method::GET, StatusCode::NOT_FOUND),
+            ],
+            None,
+        )
+        .await;
+        assert_lease_cleanup_responses(
+            vec![
+                (Method::DELETE, StatusCode::SERVICE_UNAVAILABLE),
+                (Method::DELETE, StatusCode::NO_CONTENT),
+            ],
+            None,
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn lease_cleanup_preserves_permanent_refusals_without_retrying() {
+        use axum::http::{Method, StatusCode};
+        for status in [
+            StatusCode::UNAUTHORIZED,
+            StatusCode::FORBIDDEN,
+            StatusCode::CONFLICT,
+            StatusCode::NOT_FOUND,
+        ] {
+            assert_lease_cleanup_responses(vec![(Method::DELETE, status)], Some(status.as_u16()))
+                .await;
+        }
+        for status in [
+            StatusCode::UNAUTHORIZED,
+            StatusCode::FORBIDDEN,
+            StatusCode::CONFLICT,
+        ] {
+            assert_lease_cleanup_responses(
+                vec![
+                    (Method::DELETE, StatusCode::ACCEPTED),
+                    (Method::GET, status),
+                ],
+                Some(status.as_u16()),
+            )
+            .await;
+        }
+    }
+
+    #[tokio::test]
+    async fn lease_cleanup_unavailable_leader_remains_bounded_by_the_original_deadline() {
+        use std::sync::Arc;
+        let entered = Arc::new(tokio::sync::Notify::new());
+        let handler_entered = entered.clone();
+        let router = axum::Router::new().route(
+            "/v1/test/leases/fixture",
+            axum::routing::delete(move || {
+                let entered = handler_entered.clone();
+                async move {
+                    entered.notify_one();
+                    axum::http::StatusCode::SERVICE_UNAVAILABLE
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
+        let cleanup = tokio::spawn(async move {
+            BunClient::new_with_token(&format!("http://{address}"), None)
+                .release_test_lease("fixture")
+                .await
+        });
+        tokio::time::timeout(std::time::Duration::from_secs(2), entered.notified())
+            .await
+            .unwrap();
+        tokio::time::pause();
+        tokio::time::advance(std::time::Duration::from_secs(31)).await;
+        let result = cleanup.await.unwrap();
+        server.abort();
+        let _ = server.await;
+        assert!(
+            matches!(result, Err(RelishError::RequestTimeout)),
+            "{result:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn managed_capabilities_use_only_declared_host_forwards() {
+        use crate::bun::capabilities::{ClusterCapabilities, ServiceEndpoints};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let router = axum::Router::new().route(
+            "/v1/capabilities",
+            axum::routing::get(|| async {
+                axum::Json(ClusterCapabilities {
+                    service_endpoints: ServiceEndpoints {
+                        registry: Some("https://192.168.104.2:5050".into()),
+                        ingress_http: Some("http://0.0.0.0:80".into()),
+                        ingress_https: Some("https://0.0.0.0:443".into()),
+                    },
+                    ..Default::default()
+                })
+            }),
+        );
+        let server = tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
+        let forwards = ServiceEndpoints {
+            registry: Some("https://127.0.0.1:15050".into()),
+            ingress_http: Some("http://127.0.0.1:18080".into()),
+            ingress_https: None,
+        };
+        let client = BunClient::new_with_token(&format!("http://{address}"), None)
+            .with_service_endpoints(forwards.clone());
+        assert_eq!(
+            client.capabilities().await.unwrap().service_endpoints,
+            forwards
+        );
+        assert_eq!(
+            client
+                .with_token("scoped")
+                .capabilities()
+                .await
+                .unwrap()
+                .service_endpoints,
+            forwards
+        );
+        assert!(
+            client
+                .registry_http_client("http://192.168.104.2:5050")
+                .is_err()
+        );
+        server.abort();
     }
 
     /// With built-in roots off, only the configured CA is trusted: a client
@@ -2422,6 +2877,130 @@ mod tests {
             Some("https://env.example:9117".to_string())
         );
         assert_eq!(pick_endpoint(None, None), None);
+    }
+
+    #[tokio::test]
+    async fn capacity_refusal_uses_the_code_not_human_wording() {
+        let router = axum::Router::new().route("/v1/apply", axum::routing::post(|| async {
+            (axum::http::StatusCode::UNPROCESSABLE_ENTITY, axum::Json(serde_json::json!({
+                "error": {"code": "no_eligible_nodes", "app_id": {"name": "capacity-0", "namespace": "rbtest-capacity"}}
+            })))
+        }));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let client = BunClient::new(&format!("http://{}", listener.local_addr().unwrap()));
+        let server = tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
+        let config = Config::parse(
+            "[app.capacity-0]\nimage = \"busybox\"\nnamespace = \"rbtest-capacity\"\n",
+        )
+        .unwrap();
+        let error = client
+            .apply_capacity_with_lease(&config, "lease-capacity")
+            .await
+            .unwrap_err();
+        server.abort();
+        assert!(matches!(error, RelishError::SchedulingRejected(
+            crate::meat::scheduler::ScheduleError::NoEligibleNodes { app_id }
+        ) if app_id == crate::meat::AppId::new("capacity-0", "rbtest-capacity")));
+    }
+
+    #[tokio::test]
+    async fn malformed_capacity_refusals_remain_api_failures() {
+        for payload in [
+            serde_json::json!({"error":"no eligible nodes"}),
+            serde_json::json!({"error":{"code":"no_eligible_nodes"}}),
+            serde_json::json!({"error":{"code":"mystery", "app_id":{"name":"a", "namespace":"default"}}}),
+        ] {
+            let router = axum::Router::new().route(
+                "/v1/apply",
+                axum::routing::post(move || {
+                    let payload = payload.clone();
+                    async move {
+                        (
+                            axum::http::StatusCode::UNPROCESSABLE_ENTITY,
+                            axum::Json(payload),
+                        )
+                    }
+                }),
+            );
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let client = BunClient::new(&format!("http://{}", listener.local_addr().unwrap()));
+            let server = tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
+            let config = Config::parse("[app.a]\nimage = \"busybox\"\n").unwrap();
+            let result = client
+                .apply_capacity_with_lease(&config, "lease-capacity")
+                .await;
+            server.abort();
+            assert!(matches!(
+                result,
+                Err(RelishError::ApiError { status: 422, .. })
+            ));
+        }
+    }
+
+    #[tokio::test]
+    async fn alerts_refuse_missing_malformed_or_unknown_status_evidence() {
+        for payload in [
+            serde_json::json!({}),
+            serde_json::json!({"alerts": null}),
+            serde_json::json!({"alerts": {}}),
+            serde_json::json!({"alerts": [{}]}),
+            serde_json::json!({"alerts": [{"rule_name":"cpu", "state":"mystery", "severity":"Critical", "description":"hot", "since":1}]}),
+            serde_json::json!({"alerts": [{"rule_name":"cpu", "state":"firing", "description":"hot", "since":1}]}),
+        ] {
+            let body = payload.clone();
+            let app = axum::Router::new().route(
+                "/v1/alerts",
+                axum::routing::get(move || {
+                    let body = body.clone();
+                    async move { axum::Json(body) }
+                }),
+            );
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let client = BunClient::new(&format!("http://{}", listener.local_addr().unwrap()));
+            let server = tokio::spawn(async move {
+                axum::serve(listener, app).await.unwrap();
+            });
+            let result = client.alerts().await;
+            server.abort();
+            assert!(
+                result.is_err(),
+                "accepted invalid alert evidence: {payload}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn alerts_preserve_empty_inventory_and_labelled_firing_status() {
+        use crate::mayo::alert::{AlertPhase, AlertSeverity};
+
+        for payload in [
+            serde_json::json!({"alerts": []}),
+            serde_json::json!({"alerts": [{
+                "rule_name": "cpu", "state": "firing", "severity": "Critical",
+                "description": "hot", "since": 42, "labels": {"app": "web"}
+            }]}),
+        ] {
+            let body = payload.clone();
+            let app = axum::Router::new().route(
+                "/v1/alerts",
+                axum::routing::get(move || {
+                    let body = body.clone();
+                    async move { axum::Json(body) }
+                }),
+            );
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let client = BunClient::new(&format!("http://{}", listener.local_addr().unwrap()));
+            let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+            let alerts = client.alerts().await.unwrap();
+            server.abort();
+            assert_eq!(serde_json::to_value(&alerts).unwrap(), payload["alerts"]);
+            if let Some(alert) = alerts.first() {
+                assert_eq!(alert.state, AlertPhase::Firing);
+                assert_eq!(alert.severity, AlertSeverity::Critical);
+                assert_eq!(alert.labels["app"], "web");
+                assert_eq!(alert.since, Some(42));
+            }
+        }
     }
 
     #[test]

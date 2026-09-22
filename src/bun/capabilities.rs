@@ -42,6 +42,8 @@ const MAX_CAPABILITY_RESPONSE_BYTES: usize = 1024 * 1024;
 /// `src/bin/bun.rs` and handed to the router.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct StaticCapabilities {
+    /// Bound service listeners, including dynamically allocated ports.
+    pub service_endpoints: ServiceEndpoints,
     /// Stable gossip/node identity.
     pub node_id: String,
     /// Stable display name and SPIFFE trust domain.
@@ -173,9 +175,24 @@ pub struct OperationPolicyEvidence {
     pub acknowledgement_required: bool,
 }
 
+/// Declared service origins, separate from capability and readiness evidence.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct ServiceEndpoints {
+    /// Pickle's HTTP or HTTPS origin. Absent means no declared reachable listener.
+    pub registry: Option<String>,
+    /// Wrapper's HTTP origin.
+    pub ingress_http: Option<String>,
+    /// Wrapper's HTTPS origin; requests must retain the workload's SNI name.
+    pub ingress_https: Option<String>,
+}
+
 /// What a node reports about itself at `GET /v1/capabilities`.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct ClusterCapabilities {
+    /// Actual listeners; a managed client substitutes its explicit host forwards.
+    #[serde(default)]
+    pub service_endpoints: ServiceEndpoints,
     /// Wire schema version.
     pub schema_version: u32,
     /// Stable identity of the node which assembled this report.
@@ -392,6 +409,7 @@ impl ClusterCapabilities {
         };
         let operations = operation_policy(&statics.test_policy);
         let mut report = Self {
+            service_endpoints: statics.service_endpoints.clone(),
             schema_version: CAPABILITY_SCHEMA_VERSION,
             node_id: statics.node_id.clone(),
             cluster_name: statics.cluster_name.clone(),

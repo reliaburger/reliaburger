@@ -21,6 +21,9 @@ use serde::{Deserialize, Serialize};
 use super::service_id::ServiceId;
 use super::vip::VirtualIP;
 
+/// Maximum retained discovery consumers; reaching the bound never evicts one.
+pub const MAX_ENDPOINT_CONSUMERS: usize = 65_536;
+
 /// One backend endpoint of a service, somewhere in the cluster.
 ///
 /// Carries the real address a connection should land on plus the health
@@ -29,6 +32,9 @@ use super::vip::VirtualIP;
 /// leader rebuild the catalogue idempotently.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CatalogBackend {
+    /// Original execution identity, when durable runtime evidence is available.
+    #[serde(default)]
+    pub execution: Option<crate::grill::RuntimeExecution>,
     /// Name of the node running this backend.
     pub node_id: String,
     /// Real node IP the backend listens on.
@@ -87,30 +93,83 @@ impl EndpointCatalog {
         self.services.is_empty()
     }
 
-    /// Rebuild the catalogue from a flat list of `(ServiceId, port,
-    /// backends)` gathered from node reports.
-    ///
-    /// VIPs are allocated cluster-wide and deterministically: each service
-    /// hashes its qualified id, and on the rare collision with a VIP
-    /// already assigned to a *different* service the allocation probes
-    /// deterministic successors (`{qualified}#1`, `#2`, …). Because both
-    /// the input order (a `BTreeMap` sorts by qualified id) and the probe
-    /// sequence are deterministic, every node that rebuilds from the same
-    /// reports arrives at the same VIP assignment — but only the leader
-    /// rebuilds and replicates, so followers never disagree.
-    pub fn rebuild(
+    /// Refresh active services while preserving their previously allocated VIPs.
+    /// Invalid prior allocations and exhausted address space refuse the update.
+    /// Callers retain retiring services until their separate withdrawal proof completes.
+    pub fn reconcile(
+        &self,
         services: impl IntoIterator<Item = (ServiceId, u16, Vec<CatalogBackend>)>,
-    ) -> Self {
-        // Collect into a BTreeMap first for a deterministic allocation order.
-        let mut inputs: BTreeMap<String, (ServiceId, u16, Vec<CatalogBackend>)> = BTreeMap::new();
-        for (id, port, backends) in services {
-            inputs.insert(id.qualified(), (id, port, backends));
-        }
+    ) -> Result<Self, super::types::OnionError> {
+        self.reconcile_reserving(services, std::iter::empty())
+    }
 
-        let mut allocated: std::collections::HashSet<VirtualIP> = std::collections::HashSet::new();
-        let mut catalogue = EndpointCatalog::new();
+    /// Check qualified identities, service ports and unique in-range allocations.
+    pub(crate) fn validate_allocations(&self) -> Result<(), super::types::OnionError> {
+        use super::types::OnionError;
+        let mut original_vips = std::collections::HashSet::new();
+        for (qualified, service) in &self.services {
+            let valid_id = ServiceId::parse(qualified).is_some_and(|id| {
+                crate::config::valid_workload_label(&id.namespace)
+                    && crate::config::valid_workload_label(&id.name)
+            });
+            if !valid_id
+                || service.port == 0
+                || !(0x7f80_0001..=0x7f80_fffe).contains(&u32::from(service.vip.0))
+                || !original_vips.insert(service.vip)
+            {
+                return Err(OnionError::InvalidSnapshot {
+                    service: qualified.clone(),
+                    reason: "invalid or conflicting catalogue allocation",
+                });
+            }
+        }
+        Ok(())
+    }
+
+    /// Reconcile active services while retaining additional withdrawal reservations.
+    pub fn reconcile_reserving(
+        &self,
+        services: impl IntoIterator<Item = (ServiceId, u16, Vec<CatalogBackend>)>,
+        reserved: impl IntoIterator<Item = VirtualIP>,
+    ) -> Result<Self, super::types::OnionError> {
+        use super::types::OnionError;
+        self.validate_allocations()?;
+        let mut inputs = BTreeMap::new();
+        for (id, port, backends) in services {
+            let qualified = id.qualified();
+            if !crate::config::valid_workload_label(&id.namespace)
+                || !crate::config::valid_workload_label(&id.name)
+                || port == 0
+            {
+                return Err(OnionError::InvalidSnapshot {
+                    service: qualified,
+                    reason: "invalid catalogue service identity or port",
+                });
+            }
+            if inputs
+                .insert(qualified.clone(), (id, port, backends))
+                .is_some()
+            {
+                return Err(OnionError::AlreadyRegistered { name: qualified });
+            }
+            if inputs.len() > VIP_SPACE as usize {
+                return Err(OnionError::VipSpaceExhausted { name: qualified });
+            }
+        }
+        // Reserve every retained allocation before a newcomer can claim its hash.
+        let mut allocated: std::collections::HashSet<_> = self
+            .services
+            .iter()
+            .filter(|(qualified, _)| inputs.contains_key(*qualified))
+            .map(|(_, service)| service.vip)
+            .collect();
+        allocated.extend(reserved);
+        let mut catalogue = Self::new();
         for (qualified, (id, port, backends)) in inputs {
-            let vip = allocate_vip(&id, &allocated);
+            let vip = match self.services.get(&qualified) {
+                Some(original) => original.vip,
+                None => allocate_vip(&id, &allocated)?,
+            };
             allocated.insert(vip);
             catalogue.services.insert(
                 qualified,
@@ -121,7 +180,15 @@ impl EndpointCatalog {
                 },
             );
         }
-        catalogue
+        Ok(catalogue)
+    }
+
+    /// Allocate a fresh deterministic catalogue, refusing invalid input or exhaustion.
+    /// Existing catalogues must use reconcile to preserve original allocations.
+    pub fn rebuild(
+        services: impl IntoIterator<Item = (ServiceId, u16, Vec<CatalogBackend>)>,
+    ) -> Result<Self, super::types::OnionError> {
+        Self::new().reconcile(services)
     }
 }
 
@@ -130,22 +197,22 @@ const VIP_SPACE: u32 = 65_534;
 
 /// Allocate a cluster-unique VIP for `id`, probing deterministic
 /// successors on a collision with an already-allocated VIP.
-fn allocate_vip(id: &ServiceId, allocated: &std::collections::HashSet<VirtualIP>) -> VirtualIP {
+fn allocate_vip(
+    id: &ServiceId,
+    allocated: &std::collections::HashSet<VirtualIP>,
+) -> Result<VirtualIP, super::types::OnionError> {
     let base = id.qualified();
     let vip = VirtualIP::from_qualified(&base);
     if !allocated.contains(&vip) {
-        return vip;
+        return Ok(vip);
     }
     for attempt in 1..VIP_SPACE {
         let candidate = VirtualIP::from_qualified(&format!("{base}#{attempt}"));
         if !allocated.contains(&candidate) {
-            return candidate;
+            return Ok(candidate);
         }
     }
-    // The whole /16 is occupied — 65k services on a node is far past any
-    // real limit. Fall back to the natural VIP; a shared VIP degrades
-    // routing for two services but never panics.
-    vip
+    Err(super::types::OnionError::VipSpaceExhausted { name: base })
 }
 
 #[cfg(test)]
@@ -154,11 +221,116 @@ mod tests {
 
     fn backend(node: &str, ip: [u8; 4], port: u16, healthy: bool) -> CatalogBackend {
         CatalogBackend {
+            execution: None,
             node_id: node.to_string(),
             node_ip: Ipv4Addr::from(ip),
             host_port: port,
             healthy,
         }
+    }
+
+    fn colliding_ids() -> (ServiceId, ServiceId) {
+        let mut seen = std::collections::HashMap::new();
+        let mut pair = (0..65_535)
+            .find_map(|index| {
+                let id = ServiceId::new("default", format!("collision-{index}"));
+                seen.insert(VirtualIP::from_service_id(&id), id.clone())
+                    .map(|first| [first, id])
+            })
+            .unwrap();
+        pair.sort_by_key(ServiceId::qualified);
+        (pair[0].clone(), pair[1].clone())
+    }
+
+    #[test]
+    fn reserved_vips_are_skipped_without_moving_existing_allocations() {
+        let (first, second) = colliding_ids();
+        let original = EndpointCatalog::rebuild([(first.clone(), 80, vec![])]).unwrap();
+        let reserved = original.resolve(&first).unwrap().vip;
+        let next = EndpointCatalog::default()
+            .reconcile_reserving([(second.clone(), 80, vec![])], [reserved])
+            .unwrap();
+        assert_ne!(next.resolve(&second).unwrap().vip, reserved);
+        let active = original
+            .reconcile_reserving(
+                [(first.clone(), 80, vec![]), (second.clone(), 80, vec![])],
+                [reserved],
+            )
+            .unwrap();
+        assert_eq!(active.resolve(&first).unwrap().vip, reserved);
+        assert_ne!(active.resolve(&second).unwrap().vip, reserved);
+        let released = EndpointCatalog::default()
+            .reconcile_reserving([(second.clone(), 80, vec![])], [])
+            .unwrap();
+        assert_eq!(released.resolve(&second).unwrap().vip, reserved);
+    }
+
+    #[test]
+    fn refresh_preserves_an_active_vip_when_a_colliding_service_arrives() {
+        let (first, second) = colliding_ids();
+        let previous = EndpointCatalog::rebuild([(second.clone(), 8080, vec![])]).unwrap();
+        let vip = previous.resolve(&second).unwrap().vip;
+        let updated = previous
+            .reconcile([
+                (first.clone(), 8080, vec![]),
+                (second.clone(), 8080, vec![]),
+            ])
+            .unwrap();
+        assert_eq!(
+            updated.resolve(&second).unwrap().vip,
+            vip,
+            "an existing service moved to a different VIP"
+        );
+        assert_ne!(updated.resolve(&first).unwrap().vip, vip);
+    }
+
+    #[test]
+    fn refresh_preserves_a_collision_resolved_vip_when_the_other_service_departs() {
+        let (first, second) = colliding_ids();
+        let previous =
+            EndpointCatalog::rebuild([(first, 8080, vec![]), (second.clone(), 8080, vec![])])
+                .unwrap();
+        let vip = previous.resolve(&second).unwrap().vip;
+        let updated = previous
+            .reconcile([(second.clone(), 8080, vec![])])
+            .unwrap();
+        assert_eq!(
+            updated.resolve(&second).unwrap().vip,
+            vip,
+            "a retained allocation was replaced by its natural hash"
+        );
+    }
+
+    #[test]
+    fn refresh_refuses_conflicting_original_allocations() {
+        let first = ServiceId::new("default", "first");
+        let second = ServiceId::new("default", "second");
+        let mut previous = EndpointCatalog::rebuild([
+            (first.clone(), 8080, vec![]),
+            (second.clone(), 8080, vec![]),
+        ])
+        .unwrap();
+        let vip = previous.resolve(&first).unwrap().vip;
+        previous.services.get_mut(&second.qualified()).unwrap().vip = vip;
+        assert!(
+            previous
+                .reconcile([(first, 8080, vec![]), (second, 8080, vec![])])
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn refresh_refuses_more_services_than_the_vip_space() {
+        assert!(
+            EndpointCatalog::new()
+                .reconcile((0..=VIP_SPACE).map(|i| (
+                    ServiceId::new("default", format!("service-{i}")),
+                    8080,
+                    vec![]
+                )))
+                .is_err(),
+            "exhaustion silently shared a VIP"
+        );
     }
 
     #[test]
@@ -174,7 +346,8 @@ mod tests {
                 3000,
                 vec![backend("node-b", [10, 0, 0, 2], 30002, true)],
             ),
-        ]);
+        ])
+        .unwrap();
 
         let d = cat.resolve(&ServiceId::new("default", "api")).unwrap();
         let p = cat.resolve(&ServiceId::new("payments", "api")).unwrap();
@@ -195,11 +368,13 @@ mod tests {
         let a = EndpointCatalog::rebuild([
             (ServiceId::new("default", "web"), 80, vec![]),
             (ServiceId::new("default", "api"), 3000, vec![]),
-        ]);
+        ])
+        .unwrap();
         let b = EndpointCatalog::rebuild([
             (ServiceId::new("default", "api"), 3000, vec![]),
             (ServiceId::new("default", "web"), 80, vec![]),
-        ]);
+        ])
+        .unwrap();
         assert_eq!(a, b, "catalogue must not depend on input order");
     }
 
@@ -210,7 +385,8 @@ mod tests {
         // collision, so assert the invariant on a rebuild: every VIP unique.
         let cat = EndpointCatalog::rebuild(
             (0..500).map(|i| (ServiceId::new("default", format!("svc-{i}")), 8080, vec![])),
-        );
+        )
+        .unwrap();
         let unique: std::collections::HashSet<_> = cat.services.values().map(|s| s.vip).collect();
         assert_eq!(
             unique.len(),
@@ -228,7 +404,8 @@ mod tests {
                 backend("node-a", [10, 0, 0, 1], 30001, true),
                 backend("node-b", [10, 0, 0, 2], 30002, false),
             ],
-        )]);
+        )])
+        .unwrap();
         let svc = cat.resolve(&ServiceId::new("default", "redis")).unwrap();
         assert_eq!(svc.port, 6379);
         assert_eq!(svc.backends.len(), 2);
@@ -250,7 +427,8 @@ mod tests {
             ServiceId::new("payments", "api"),
             3000,
             vec![backend("node-a", [10, 0, 0, 1], 30001, true)],
-        )]);
+        )])
+        .unwrap();
         let json = serde_json::to_string(&cat).unwrap();
         let back: EndpointCatalog = serde_json::from_str(&json).unwrap();
         assert_eq!(cat, back);

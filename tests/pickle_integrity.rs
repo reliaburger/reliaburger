@@ -37,6 +37,9 @@ impl Registry {
             catalog: Arc::new(RwLock::new(ManifestCatalog::default())),
             node_raft_id,
             council: None,
+            forwarder: None,
+            test_leases: Default::default(),
+            repository_writers: Default::default(),
             persist_path: None,
             auth: None,
             require_read_auth: false,
@@ -284,11 +287,11 @@ async fn old_catalogue_without_manifest_holders_is_healed_not_collected() {
     // One heal tick replicates the whole image — manifest blob
     // included — to a new peer and records the holders.
     let node2 = Registry::start(2).await;
+    *node2.state.catalog.write().await = node1.state.catalog.read().await.clone();
     let catalog_snapshot = node1.state.catalog.read().await.clone();
     let outcome = heal_tick(
         &catalog_snapshot,
-        &node1.state.store,
-        1,
+        &node1.state,
         &[node1.peer(1), node2.peer(2)],
         2,
         10,
@@ -304,17 +307,21 @@ async fn old_catalogue_without_manifest_holders_is_healed_not_collected() {
         node2.state.store.has_blob(&manifest_digest),
         "heal must replicate the manifest blob"
     );
-    let healed_manifest_holders = outcome
-        .updates
-        .iter()
-        .flat_map(|u| u.updates.iter())
-        .find(|(d, _)| d.as_str() == manifest_digest.as_str())
-        .map(|(_, holders)| holders.clone());
-    assert_eq!(
-        healed_manifest_holders,
-        Some([1u64, 2].into_iter().collect()),
-        "the heal update must record manifest-blob holders"
-    );
+    assert_eq!(outcome.confirmed_images, vec![manifest_digest.clone()]);
+    // These are independent standalone authorities. Each may add only itself;
+    // the real TLS cluster fixture separately proves their union at one leader.
+    for (registry, node_id) in [(&node1, 1u64), (&node2, 2u64)] {
+        assert_eq!(
+            registry
+                .state
+                .catalog
+                .read()
+                .await
+                .layer_holders(manifest_digest.as_str()),
+            [node_id].into_iter().collect(),
+            "each storage node must prove its own manifest copy"
+        );
+    }
 }
 
 /// IMG1: verification resolves the tag to a digest and the pull uses
@@ -439,6 +446,9 @@ async fn start_authenticated_registry(deployer_plaintext: &mut String) -> Regist
         catalog: Arc::new(RwLock::new(ManifestCatalog::default())),
         node_raft_id: 1,
         council: None,
+        forwarder: None,
+        test_leases: Default::default(),
+        repository_writers: Default::default(),
         persist_path: None,
         auth: Some(auth),
         require_read_auth: false,
@@ -589,6 +599,7 @@ async fn a_peer_committed_manifest_is_visible_through_the_authoritative_catalogu
     };
     council
         .write(RaftRequest::ManifestCommit(ManifestCommit {
+            observed_gc_generation: 0,
             manifest: manifest.clone(),
             tag: "v1".to_string(),
             holder_nodes: BTreeSet::from([2]),
@@ -610,6 +621,9 @@ async fn a_peer_committed_manifest_is_visible_through_the_authoritative_catalogu
         catalog: Arc::new(RwLock::new(ManifestCatalog::default())), // empty local
         node_raft_id: 1,
         council: Some(council.clone()),
+        forwarder: None,
+        test_leases: Default::default(),
+        repository_writers: Default::default(),
         persist_path: None,
         auth: None,
         require_read_auth: false,

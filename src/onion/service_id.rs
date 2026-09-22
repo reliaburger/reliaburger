@@ -24,7 +24,8 @@ const NAMESPACE_SEPARATOR: &str = "__";
 /// Use this as the map key rather than a bare `String`: the compiler
 /// then prevents accidentally looking a service up by name without a
 /// namespace, which is exactly the mix-up that caused the collision.
-#[derive(Debug, Clone, Hash, Eq, PartialEq)]
+#[derive(Debug, Clone, Hash, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ServiceId {
     /// Namespace the service lives in (`default`, `payments`, …).
     pub namespace: String,

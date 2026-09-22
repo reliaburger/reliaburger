@@ -5,13 +5,12 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use serde::{Deserialize, Serialize};
-use tokio::io::AsyncWriteExt;
 use tokio::sync::{Mutex, OwnedMutexGuard};
 
 use crate::meat::AppId;
 
 /// Current persisted and API schema version for test leases.
-pub const TEST_LEASE_SCHEMA_VERSION: u32 = 1;
+pub const TEST_LEASE_SCHEMA_VERSION: u32 = 5;
 
 /// Maximum live lease records accepted by one standalone node or cluster.
 pub const MAX_ACTIVE_TEST_LEASES: usize = 64;
@@ -22,14 +21,34 @@ pub const MAX_LEASED_RESOURCES: usize = 128;
 const CLEANUP_STEP_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
 const MAX_LOCAL_LEASE_STORE_BYTES: usize = 4 * 1024 * 1024;
 
+/// Location and resource kinds owned by a lease.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum LeaseScope {
+    /// Applications and their namespace or scoped credentials.
+    #[default]
+    Applications,
+    /// Jobs on the receiving node, including cron registrations.
+    NodeJobs,
+}
+
+/// Reserve node-job identifiers even when malformed; never forward them to Raft.
+pub fn is_node_job_lease(lease_id: &str) -> bool {
+    lease_id.starts_with("node-jobs-")
+}
+
 /// A resource whose lifecycle belongs to one server-side lease.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case", tag = "kind")]
 pub enum LeasedResource {
     /// A declarative or local application.
     App { app_id: AppId },
+    /// A node-local batch job or cron registration.
+    Job { job_id: AppId },
     /// A declarative namespace created for an owned app.
     Namespace { name: String },
+    /// An exact API credential, never a name-only deletion target.
+    ApiToken { name: String, fingerprint: [u8; 32] },
 }
 
 /// Whether a lease accepts new resources or is being reclaimed.
@@ -48,11 +67,25 @@ pub enum TestLeaseState {
     },
 }
 
+/// One node that may still own a leased application, including former placements.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+pub struct LeasedPlacement {
+    /// Exact application whose runtime resources must retire.
+    pub app_id: AppId,
+    /// Node that accepted or could have accepted the assignment.
+    pub node_id: crate::meat::NodeId,
+}
+
+/// Bound retained placement history without silently discarding an owner.
+pub const MAX_LEASED_PLACEMENTS: usize = 65_536;
+
 /// Durable server-owned lifetime for one isolated test namespace.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TestLease {
     /// Wire and persistence schema version.
     pub schema_version: u32,
+    /// Where the resources live and which kinds may attach.
+    pub scope: LeaseScope,
     /// Random, unguessable lease identifier.
     pub lease_id: String,
     /// Stable fingerprint of the exact credential which created the lease.
@@ -69,6 +102,13 @@ pub struct TestLease {
     pub expires_at_unix_ms: u64,
     /// Resources atomically associated with this lease.
     pub resources: BTreeSet<LeasedResource>,
+    /// All possible runtime owners, removed only by confirmed retirement.
+    pub placements: BTreeSet<LeasedPlacement>,
+    /// Repositories and every node that may hold uploads or metadata for them.
+    /// Empty owner sets remain until the global catalogue has been retired.
+    pub repositories: BTreeMap<String, BTreeSet<u64>>,
+    /// Confirmed workload retirement, required before repository deletion.
+    pub workloads_retired: bool,
 }
 
 impl TestLease {
@@ -81,20 +121,30 @@ impl TestLease {
         issued_at_unix_ms: u64,
         expires_at_unix_ms: u64,
     ) -> Result<Self, LeaseError> {
-        if lease_id.is_empty() {
-            return Err(LeaseError::InvalidId);
-        }
-        if owner_id.is_empty() || owner_name.is_empty() {
-            return Err(LeaseError::InvalidOwner);
-        }
-        if !valid_test_namespace(&namespace) {
-            return Err(LeaseError::InvalidNamespace);
-        }
-        if expires_at_unix_ms <= issued_at_unix_ms {
-            return Err(LeaseError::InvalidExpiry);
-        }
-        Ok(Self {
+        Self::new_scoped(
+            lease_id,
+            owner_id,
+            owner_name,
+            namespace,
+            issued_at_unix_ms,
+            expires_at_unix_ms,
+            LeaseScope::Applications,
+        )
+    }
+
+    /// Build a lease with an explicit resource scope.
+    pub fn new_scoped(
+        lease_id: String,
+        owner_id: String,
+        owner_name: String,
+        namespace: String,
+        issued_at_unix_ms: u64,
+        expires_at_unix_ms: u64,
+        scope: LeaseScope,
+    ) -> Result<Self, LeaseError> {
+        let lease = Self {
             schema_version: TEST_LEASE_SCHEMA_VERSION,
+            scope,
             lease_id,
             owner_id,
             owner_name,
@@ -103,7 +153,12 @@ impl TestLease {
             issued_at_unix_ms,
             expires_at_unix_ms,
             resources: BTreeSet::new(),
-        })
+            placements: BTreeSet::new(),
+            repositories: BTreeMap::new(),
+            workloads_retired: false,
+        };
+        lease.validate()?;
+        Ok(lease)
     }
 
     /// Whether the lease may still accept a mutation at `now_unix_ms`.
@@ -130,16 +185,194 @@ impl TestLease {
         if self.expires_at_unix_ms <= self.issued_at_unix_ms {
             return Err(LeaseError::InvalidExpiry);
         }
+        match self.scope {
+            LeaseScope::Applications
+                if is_node_job_lease(&self.lease_id)
+                    || self.namespace.starts_with("rbtest-node-") =>
+            {
+                return Err(LeaseError::InvalidScope);
+            }
+            LeaseScope::NodeJobs => {
+                let suffix = self
+                    .lease_id
+                    .strip_prefix("node-jobs-")
+                    .ok_or(LeaseError::InvalidScope)?;
+                if suffix.len() != 32
+                    || !suffix
+                        .bytes()
+                        .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+                    || self.namespace != format!("rbtest-node-{suffix}")
+                {
+                    return Err(LeaseError::InvalidScope);
+                }
+            }
+            _ => {}
+        }
+        if self.resources.iter().any(|resource| {
+            matches!(resource, LeasedResource::Job { .. }) != (self.scope == LeaseScope::NodeJobs)
+        }) {
+            return Err(LeaseError::InvalidScope);
+        }
         if self.resources.iter().any(|resource| match resource {
-            LeasedResource::App { app_id } => app_id.namespace != self.namespace,
+            LeasedResource::App { app_id } | LeasedResource::Job { job_id: app_id } => {
+                app_id.namespace != self.namespace
+            }
             LeasedResource::Namespace { name } => name != &self.namespace,
+            LeasedResource::ApiToken { name, .. } => {
+                !name.starts_with(&format!("{}-", self.namespace))
+            }
         }) {
             return Err(LeaseError::NamespaceMismatch);
         }
-        if self.resources.len() > MAX_LEASED_RESOURCES {
+        if self.placements.iter().any(|placement| {
+            placement.node_id.0.is_empty()
+                || !self.resources.contains(&LeasedResource::App {
+                    app_id: placement.app_id.clone(),
+                })
+                || self.scope != LeaseScope::Applications
+        }) {
+            return Err(LeaseError::InvalidScope);
+        }
+        if self.placements.len() > MAX_LEASED_PLACEMENTS {
+            return Err(LeaseError::ResourceLimit);
+        }
+        if (!self.repositories.is_empty() && self.scope != LeaseScope::Applications)
+            || self
+                .repositories
+                .keys()
+                .any(|name| !self.owns_repository_name(name))
+            || (self.workloads_retired
+                && (matches!(self.state, TestLeaseState::Active) || !self.placements.is_empty()))
+        {
+            return Err(LeaseError::InvalidScope);
+        }
+        if self.repositories.values().map(BTreeSet::len).sum::<usize>() > MAX_LEASED_PLACEMENTS {
+            return Err(LeaseError::ResourceLimit);
+        }
+        if self.resource_count() > MAX_LEASED_RESOURCES {
             return Err(LeaseError::ResourceLimit);
         }
         Ok(())
+    }
+
+    /// Count workload, credential and repository resources under the common cap.
+    pub fn resource_count(&self) -> usize {
+        self.resources.len().saturating_add(self.repositories.len())
+    }
+
+    /// Whether this canonical repository path belongs beneath this lease's namespace.
+    pub fn owns_repository_name(&self, repository: &str) -> bool {
+        let Some((namespace, path)) = repository.split_once('/') else {
+            return false;
+        };
+        namespace == self.namespace
+            && repository.len() <= 255
+            && path.split('/').all(|part| {
+                !part.is_empty()
+                    && part
+                        .as_bytes()
+                        .first()
+                        .is_some_and(u8::is_ascii_alphanumeric)
+                    && part
+                        .as_bytes()
+                        .last()
+                        .is_some_and(u8::is_ascii_alphanumeric)
+                    && part.bytes().all(|byte| {
+                        byte.is_ascii_lowercase()
+                            || byte.is_ascii_digit()
+                            || matches!(byte, b'.' | b'_' | b'-')
+                    })
+            })
+    }
+
+    /// Attach a possible storage owner before bytes are accepted. A node-only
+    /// replication claim may join an existing repository, never create one.
+    pub fn attach_registry_writer(
+        &mut self,
+        repository: &str,
+        node_id: u64,
+        owner_id: Option<&str>,
+        now_unix_ms: u64,
+    ) -> Result<(), LeaseError> {
+        if self.scope != LeaseScope::Applications || !self.owns_repository_name(repository) {
+            return Err(LeaseError::NamespaceMismatch);
+        }
+        if let Some(owner_id) = owner_id {
+            self.authorise_owner(owner_id, now_unix_ms)?;
+        } else if !self.is_active_at(now_unix_ms) || !self.repositories.contains_key(repository) {
+            return Err(LeaseError::NotActive);
+        }
+        let mut next = self.clone();
+        next.repositories
+            .entry(repository.into())
+            .or_default()
+            .insert(node_id);
+        next.validate()?;
+        *self = next;
+        Ok(())
+    }
+
+    /// Recheck publication against the committed lease and its writer receipt.
+    pub fn permits_registry_commit(
+        &self,
+        commit: &crate::pickle::types::ManifestCommit,
+        now_unix_ms: u64,
+    ) -> bool {
+        commit.holder_nodes == BTreeSet::from([commit.manifest.pushed_by])
+            && self.permits_registry_copy(
+                &commit.manifest.repository,
+                commit.manifest.pushed_by,
+                now_unix_ms,
+            )
+    }
+
+    /// Recheck that the exact repository writer still belongs to this active lease.
+    pub fn permits_registry_copy(&self, repository: &str, node_id: u64, now_unix_ms: u64) -> bool {
+        self.is_active_at(now_unix_ms)
+            && self.owns_repository_name(repository)
+            && self
+                .repositories
+                .get(repository)
+                .is_some_and(|owners| owners.contains(&node_id))
+    }
+
+    /// Whether every possible storage node has confirmed repository retirement.
+    pub fn registry_retirement_confirmed(&self) -> bool {
+        self.repositories.is_empty()
+            || (self.workloads_retired && self.repositories.values().all(BTreeSet::is_empty))
+    }
+
+    /// Validate a test credential before atomically attaching it in Raft.
+    pub fn token_resource(
+        &self,
+        token: &crate::sesame::types::ApiToken,
+        owner_id: &str,
+        now_unix_ms: u64,
+    ) -> Result<LeasedResource, LeaseError> {
+        self.authorise_owner(owner_id, now_unix_ms)?;
+        if self.scope != LeaseScope::Applications {
+            return Err(LeaseError::InvalidScope);
+        }
+        let expires = token
+            .expires_at
+            .and_then(|time| time.duration_since(std::time::UNIX_EPOCH).ok());
+        if !token.name.starts_with(&format!("{}-", self.namespace))
+            || token.role == crate::sesame::types::ApiRole::Admin
+            || token.scope.namespaces.as_deref() != Some(std::slice::from_ref(&self.namespace))
+            || expires.is_none_or(|expiry| {
+                expiry <= std::time::Duration::from_millis(now_unix_ms)
+                    || expiry > std::time::Duration::from_millis(self.expires_at_unix_ms)
+            })
+        {
+            return Err(LeaseError::InvalidToken);
+        }
+        if self.resource_count() >= MAX_LEASED_RESOURCES {
+            return Err(LeaseError::ResourceLimit);
+        }
+        Ok(LeasedResource::ApiToken {
+            name: token.name.clone(),
+            fingerprint: token_fingerprint(token),
+        })
     }
 
     /// Check ownership and active lifetime before attaching a resource.
@@ -154,6 +387,12 @@ impl TestLease {
     }
 }
 
+/// Public fingerprint used to fence cleanup against a replaced credential.
+pub fn token_fingerprint(token: &crate::sesame::types::ApiToken) -> [u8; 32] {
+    use sha2::{Digest, Sha256};
+    Sha256::digest(&token.token_hash).into()
+}
+
 /// Return whether a namespace is reserved and safe for lease-wide cleanup.
 pub fn valid_test_namespace(namespace: &str) -> bool {
     namespace.starts_with("rbtest-")
@@ -164,13 +403,44 @@ pub fn valid_test_namespace(namespace: &str) -> bool {
         && !namespace.ends_with('-')
 }
 
+/// A disposable image may only be used by its active owning application lease.
+/// The supplied observation time is part of the caller's committed admission decision.
+/// Ordinary images remain independent of test ownership.
+pub fn authorise_image_references<'a>(
+    images: impl IntoIterator<Item = &'a str>,
+    lease: Option<(&TestLease, u64)>,
+) -> Result<(), LeaseError> {
+    for image in images {
+        // An unparseable reference cannot resolve a repository in the image store.
+        let Ok(reference) = crate::grill::image::ImageReference::parse(image) else {
+            continue;
+        };
+        if !crate::pickle::lease::is_test_repository(&reference.repository) {
+            continue;
+        }
+        if !lease.is_some_and(|(lease, now)| {
+            lease.scope == LeaseScope::Applications
+                && lease.is_active_at(now)
+                && lease.owns_repository_name(&reference.repository)
+                && lease.repositories.contains_key(&reference.repository)
+        }) {
+            return Err(LeaseError::ImageOwnership);
+        }
+    }
+    Ok(())
+}
+
 /// Lease lifecycle or persistence failure.
 #[derive(Debug, thiserror::Error)]
 pub enum LeaseError {
+    #[error("leased image requires its active application lease and a registered repository")]
+    ImageOwnership,
     #[error("lease schema {found} is unsupported")]
     UnsupportedSchema { found: u32 },
     #[error("lease id is empty")]
     InvalidId,
+    #[error("lease scope does not allow this identifier, namespace or resource kind")]
+    InvalidScope,
     #[error("lease owner is empty")]
     InvalidOwner,
     #[error("lease namespace must be a DNS label beginning with rbtest-")]
@@ -187,14 +457,24 @@ pub enum LeaseError {
     NotFound,
     #[error("lease belongs to another principal")]
     WrongOwner,
+    #[error("lease has an in-flight operation; retry cleanup later")]
+    Busy,
+    #[error("lease cleanup is waiting for runtime retirement acknowledgements")]
+    CleanupPending,
     #[error("lease is expired or cleanup has started")]
     NotActive,
     #[error("app namespace does not match its lease")]
     NamespaceMismatch,
+    #[error(
+        "leased token must use its namespace prefix, a non-admin role, exactly its namespace scope and a positive lifetime within the lease"
+    )]
+    InvalidToken,
     #[error("lease resource limit reached")]
     ResourceLimit,
     #[error("local lease store exceeds 4 MiB")]
     StoreTooLarge,
+    #[error("lease persistence is uncertain; reopen the store before further mutations")]
+    PersistenceUncertain,
     #[error("lease persistence failed: {0}")]
     Persistence(#[from] std::io::Error),
     #[error("lease state is malformed: {0}")]
@@ -216,6 +496,12 @@ struct LocalLeaseInner {
     leases: BTreeMap<String, TestLease>,
     operation_locks: BTreeMap<String, Arc<Mutex<()>>>,
     path: Option<PathBuf>,
+    persistence_uncertain: bool,
+    #[cfg(test)]
+    before_commit: Option<(
+        tokio::sync::oneshot::Sender<()>,
+        std::sync::mpsc::Receiver<()>,
+    )>,
 }
 
 /// Proof that cleanup cannot overtake an in-flight standalone lease mutation.
@@ -243,6 +529,9 @@ impl LocalLeaseStore {
                 leases: BTreeMap::new(),
                 operation_locks: BTreeMap::new(),
                 path: None,
+                persistence_uncertain: false,
+                #[cfg(test)]
+                before_commit: None,
             })),
         }
     }
@@ -280,6 +569,9 @@ impl LocalLeaseStore {
                 leases,
                 operation_locks,
                 path: Some(path),
+                persistence_uncertain: false,
+                #[cfg(test)]
+                before_commit: None,
             })),
         })
     }
@@ -287,7 +579,7 @@ impl LocalLeaseStore {
     /// Insert a new lease and durably record it before returning.
     pub async fn create(&self, lease: TestLease) -> Result<(), LeaseError> {
         lease.validate()?;
-        let mut inner = self.inner.lock().await;
+        let inner = Arc::clone(&self.inner).lock_owned().await;
         if inner.leases.contains_key(&lease.lease_id) {
             return Err(LeaseError::AlreadyExists);
         }
@@ -304,17 +596,63 @@ impl LocalLeaseStore {
         let lease_id = lease.lease_id.clone();
         let mut next = inner.leases.clone();
         next.insert(lease_id.clone(), lease);
-        persist_leases(inner.path.as_deref(), &next).await?;
-        inner.leases = next;
-        inner
-            .operation_locks
-            .insert(lease_id, Arc::new(Mutex::new(())));
+        commit_leases(inner, next).await?;
         Ok(())
     }
 
     /// Read one current lease.
     pub async fn get(&self, lease_id: &str) -> Option<TestLease> {
         self.inner.lock().await.leases.get(lease_id).cloned()
+    }
+
+    /// Read a coherent ownership inventory, refusing uncertain persistence.
+    pub async fn snapshot(&self) -> Result<BTreeMap<String, TestLease>, LeaseError> {
+        let inner = self.inner.lock().await;
+        if inner.persistence_uncertain {
+            return Err(LeaseError::PersistenceUncertain);
+        }
+        Ok(inner.leases.clone())
+    }
+
+    /// Recheck a local publication while excluding lease cleanup until it persists.
+    pub async fn begin_registry_commit(
+        &self,
+        lease_id: &str,
+        commit: &crate::pickle::types::ManifestCommit,
+        now_unix_ms: u64,
+    ) -> Result<LocalLeaseOperation, LeaseError> {
+        let operation_guard = self.operation_lock(lease_id).await?.lock_owned().await;
+        let inner = self.inner.lock().await;
+        if inner.persistence_uncertain {
+            return Err(LeaseError::PersistenceUncertain);
+        }
+        let lease = inner.leases.get(lease_id).ok_or(LeaseError::NotFound)?;
+        if !lease.permits_registry_commit(commit, now_unix_ms) {
+            return Err(LeaseError::NotActive);
+        }
+        Ok(LocalLeaseOperation {
+            _guard: operation_guard,
+        })
+    }
+
+    /// Serialise local copy publication against lease cleanup and expiry.
+    pub async fn begin_registry_copy(
+        &self,
+        copy: &crate::pickle::types::ImageCopyConfirmation,
+    ) -> Result<LocalLeaseOperation, LeaseError> {
+        let id = copy.lease_id.as_ref().ok_or(LeaseError::NotFound)?;
+        let operation_guard = self.operation_lock(id).await?.lock_owned().await;
+        let inner = self.inner.lock().await;
+        if inner.persistence_uncertain {
+            return Err(LeaseError::PersistenceUncertain);
+        }
+        let lease = inner.leases.get(id).ok_or(LeaseError::NotFound)?;
+        if !lease.permits_registry_copy(&copy.repository, copy.node_id, copy.observed_at_unix_ms) {
+            return Err(LeaseError::NotActive);
+        }
+        Ok(LocalLeaseOperation {
+            _guard: operation_guard,
+        })
     }
 
     /// Attach an app atomically with the durable lease record.
@@ -340,32 +678,124 @@ impl LocalLeaseStore {
         app_ids: Vec<AppId>,
         now_unix_ms: u64,
     ) -> Result<LocalLeaseOperation, LeaseError> {
+        self.begin_workload_operation(
+            lease_id,
+            owner_id,
+            app_ids,
+            now_unix_ms,
+            LeaseScope::Applications,
+        )
+        .await
+    }
+
+    /// Durably attach jobs before deployment and hold off cleanup until completion.
+    pub async fn begin_job_operation(
+        &self,
+        lease_id: &str,
+        owner_id: &str,
+        job_ids: Vec<AppId>,
+        now_unix_ms: u64,
+    ) -> Result<LocalLeaseOperation, LeaseError> {
+        self.begin_workload_operation(
+            lease_id,
+            owner_id,
+            job_ids,
+            now_unix_ms,
+            LeaseScope::NodeJobs,
+        )
+        .await
+    }
+
+    async fn begin_workload_operation(
+        &self,
+        lease_id: &str,
+        owner_id: &str,
+        app_ids: Vec<AppId>,
+        now_unix_ms: u64,
+        scope: LeaseScope,
+    ) -> Result<LocalLeaseOperation, LeaseError> {
         let operation_lock = self.operation_lock(lease_id).await?;
         let operation_guard = operation_lock.lock_owned().await;
-        let mut inner = self.inner.lock().await;
+        let inner = Arc::clone(&self.inner).lock_owned().await;
         let mut next = inner.leases.clone();
         let lease = next.get_mut(lease_id).ok_or(LeaseError::NotFound)?;
         lease.authorise_owner(owner_id, now_unix_ms)?;
+        if lease.scope != scope {
+            return Err(LeaseError::InvalidScope);
+        }
         let resources: BTreeSet<_> = app_ids
             .into_iter()
             .map(|app_id| {
                 if app_id.namespace != lease.namespace {
                     Err(LeaseError::NamespaceMismatch)
                 } else {
-                    Ok(LeasedResource::App { app_id })
+                    Ok(match scope {
+                        LeaseScope::Applications => LeasedResource::App { app_id },
+                        LeaseScope::NodeJobs => LeasedResource::Job { job_id: app_id },
+                    })
                 }
             })
             .collect::<Result<_, _>>()?;
         let additional = resources.difference(&lease.resources).count();
-        if lease.resources.len().saturating_add(additional) > MAX_LEASED_RESOURCES {
+        if lease.resource_count().saturating_add(additional) > MAX_LEASED_RESOURCES {
             return Err(LeaseError::ResourceLimit);
         }
         lease.resources.extend(resources);
-        persist_leases(inner.path.as_deref(), &next).await?;
-        inner.leases = next;
+        commit_leases(inner, next).await?;
         Ok(LocalLeaseOperation {
             _guard: operation_guard,
         })
+    }
+
+    /// Persist a repository writer before accepting bytes on a standalone node.
+    pub async fn register_registry_writer(
+        &self,
+        lease_id: &str,
+        repository: &str,
+        node_id: u64,
+        owner_id: Option<&str>,
+        now_unix_ms: u64,
+    ) -> Result<(), LeaseError> {
+        let inner = Arc::clone(&self.inner).lock_owned().await;
+        let mut next = inner.leases.clone();
+        next.get_mut(lease_id)
+            .ok_or(LeaseError::NotFound)?
+            .attach_registry_writer(repository, node_id, owner_id, now_unix_ms)?;
+        commit_leases(inner, next).await
+    }
+
+    /// Persist the reaper's confirmation after every local workload retires.
+    /// Call only while holding the lease's cleanup operation guard.
+    pub async fn confirm_workloads_retired(&self, lease_id: &str) -> Result<(), LeaseError> {
+        let inner = Arc::clone(&self.inner).lock_owned().await;
+        let mut next = inner.leases.clone();
+        let lease = next.get_mut(lease_id).ok_or(LeaseError::NotFound)?;
+        if !matches!(lease.state, TestLeaseState::Cleaning { .. }) || !lease.placements.is_empty() {
+            return Err(LeaseError::CleanupPending);
+        }
+        lease.workloads_retired = true;
+        commit_leases(inner, next).await
+    }
+
+    /// Record confirmed local upload/metadata retirement for one exact repository.
+    pub async fn record_registry_retirement(
+        &self,
+        lease_id: &str,
+        repository: &str,
+        node_id: u64,
+    ) -> Result<(), LeaseError> {
+        let inner = Arc::clone(&self.inner).lock_owned().await;
+        let mut next = inner.leases.clone();
+        let lease = next.get_mut(lease_id).ok_or(LeaseError::NotFound)?;
+        if !matches!(lease.state, TestLeaseState::Cleaning { .. }) || !lease.workloads_retired {
+            return Err(LeaseError::CleanupPending);
+        }
+        lease
+            .repositories
+            .get_mut(repository)
+            .ok_or(LeaseError::NotFound)?
+            .remove(&node_id);
+        commit_leases(inner, next).await
     }
 
     /// Extend an active lease without letting a caller revive an expired one.
@@ -376,7 +806,7 @@ impl LocalLeaseStore {
         now_unix_ms: u64,
         expires_at_unix_ms: u64,
     ) -> Result<TestLease, LeaseError> {
-        let mut inner = self.inner.lock().await;
+        let inner = Arc::clone(&self.inner).lock_owned().await;
         let mut next = inner.leases.clone();
         let lease = next.get_mut(lease_id).ok_or(LeaseError::NotFound)?;
         lease.authorise_owner(owner_id, now_unix_ms)?;
@@ -385,8 +815,7 @@ impl LocalLeaseStore {
         }
         lease.expires_at_unix_ms = expires_at_unix_ms;
         let result = lease.clone();
-        persist_leases(inner.path.as_deref(), &next).await?;
-        inner.leases = next;
+        commit_leases(inner, next).await?;
         Ok(result)
     }
 
@@ -406,8 +835,10 @@ impl LocalLeaseStore {
         owner_id: Option<&str>,
     ) -> Result<(TestLease, LocalLeaseOperation), LeaseError> {
         let operation_lock = self.operation_lock(lease_id).await?;
-        let operation_guard = operation_lock.lock_owned().await;
-        let mut inner = self.inner.lock().await;
+        let operation_guard = operation_lock
+            .try_lock_owned()
+            .map_err(|_| LeaseError::Busy)?;
+        let inner = Arc::clone(&self.inner).lock_owned().await;
         let mut next = inner.leases.clone();
         let lease = next.get_mut(lease_id).ok_or(LeaseError::NotFound)?;
         if owner_id.is_some_and(|owner_id| owner_id != lease.owner_id) {
@@ -422,8 +853,7 @@ impl LocalLeaseStore {
             last_error: None,
         };
         let result = lease.clone();
-        persist_leases(inner.path.as_deref(), &next).await?;
-        inner.leases = next;
+        commit_leases(inner, next).await?;
         Ok((
             result,
             LocalLeaseOperation {
@@ -434,7 +864,7 @@ impl LocalLeaseStore {
 
     /// Retain an inconclusive cleanup for the next reaper attempt.
     pub async fn cleanup_failed(&self, lease_id: &str, reason: &str) -> Result<(), LeaseError> {
-        let mut inner = self.inner.lock().await;
+        let inner = Arc::clone(&self.inner).lock_owned().await;
         let mut next = inner.leases.clone();
         let lease = next.get_mut(lease_id).ok_or(LeaseError::NotFound)?;
         let attempts = match lease.state {
@@ -445,23 +875,23 @@ impl LocalLeaseStore {
             attempts,
             last_error: Some(reason.chars().take(512).collect()),
         };
-        persist_leases(inner.path.as_deref(), &next).await?;
-        inner.leases = next;
+        commit_leases(inner, next).await?;
         Ok(())
     }
 
     /// Delete a lease only after its caller confirmed cleanup.
     pub async fn finish_cleanup(&self, lease_id: &str) -> Result<(), LeaseError> {
-        let mut inner = self.inner.lock().await;
+        let inner = Arc::clone(&self.inner).lock_owned().await;
         let lease = inner.leases.get(lease_id).ok_or(LeaseError::NotFound)?;
         if !matches!(lease.state, TestLeaseState::Cleaning { .. }) {
             return Err(LeaseError::NotActive);
         }
+        if !lease.registry_retirement_confirmed() {
+            return Err(LeaseError::CleanupPending);
+        }
         let mut next = inner.leases.clone();
         next.remove(lease_id);
-        persist_leases(inner.path.as_deref(), &next).await?;
-        inner.leases = next;
-        inner.operation_locks.remove(lease_id);
+        commit_leases(inner, next).await?;
         Ok(())
     }
 
@@ -497,41 +927,66 @@ impl Default for LocalLeaseStore {
     }
 }
 
-async fn persist_leases(
+// Move the guard into the blocking transaction: cancelling its caller must not
+// release ownership while a rename can still publish the previous snapshot.
+async fn commit_leases(
+    mut inner: OwnedMutexGuard<LocalLeaseInner>,
+    next: BTreeMap<String, TestLease>,
+) -> Result<(), LeaseError> {
+    if inner.persistence_uncertain {
+        return Err(LeaseError::PersistenceUncertain);
+    }
+    tokio::task::spawn_blocking(move || {
+        #[cfg(test)]
+        if let Some((entered, release)) = inner.before_commit.take() {
+            let _ = entered.send(());
+            let _ = release.recv();
+        }
+        if let Err(error) = persist_leases(inner.path.as_deref(), &next) {
+            // A directory-sync error can occur after rename. Keep the last
+            // acknowledged view, but never overwrite possibly newer disk state.
+            inner.persistence_uncertain = true;
+            return Err(error);
+        }
+        inner.operation_locks.retain(|id, _| next.contains_key(id));
+        for id in next.keys() {
+            inner
+                .operation_locks
+                .entry(id.clone())
+                .or_insert_with(|| Arc::new(Mutex::new(())));
+        }
+        inner.leases = next;
+        Ok(())
+    })
+    .await
+    .map_err(|error| {
+        LeaseError::Persistence(std::io::Error::other(format!(
+            "lease write task failed: {error}"
+        )))
+    })?
+}
+
+fn persist_leases(
     path: Option<&Path>,
     leases: &BTreeMap<String, TestLease>,
 ) -> Result<(), LeaseError> {
     let Some(path) = path else {
         return Ok(());
     };
-    if let Some(parent) = path.parent() {
-        tokio::fs::create_dir_all(parent).await?;
-    }
-    let temporary = temporary_path(path);
     let bytes = serde_json::to_vec_pretty(&LocalLeaseFile {
         leases: leases.clone(),
     })?;
     if bytes.len() > MAX_LOCAL_LEASE_STORE_BYTES {
         return Err(LeaseError::StoreTooLarge);
     }
-    let mut options = tokio::fs::OpenOptions::new();
-    options.write(true).create(true).truncate(true);
-    #[cfg(unix)]
+    if let Some(parent) = path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
     {
-        options.mode(0o600);
+        std::fs::create_dir_all(parent)?;
     }
-    let mut file = options.open(&temporary).await?;
-    file.write_all(&bytes).await?;
-    file.sync_all().await?;
-    drop(file);
-    tokio::fs::rename(&temporary, path).await?;
+    crate::sesame::identity::atomic_write_mode(path, &bytes, Some(0o600))?;
     Ok(())
-}
-
-fn temporary_path(path: &Path) -> PathBuf {
-    let mut name = path.as_os_str().to_os_string();
-    name.push(".tmp");
-    PathBuf::from(name)
 }
 
 /// Current wall-clock time for lease API and reaper decisions.
@@ -554,11 +1009,11 @@ pub async fn cleanup_local_lease(
     let (lease, _operation) = store.begin_cleanup_operation(lease_id, owner_id).await?;
     for resource in lease.resources {
         match resource {
-            LeasedResource::App { app_id } => {
+            LeasedResource::App { app_id } | LeasedResource::Job { job_id: app_id } => {
                 let (response_tx, response_rx) = tokio::sync::oneshot::channel();
                 let cleanup = async {
                     cmd_tx
-                        .send(crate::bun::agent::AgentCommand::Stop {
+                        .send(crate::bun::agent::AgentCommand::RetireTestResources {
                             app_name: app_id.name,
                             namespace: app_id.namespace,
                             response: response_tx,
@@ -590,11 +1045,19 @@ pub async fn cleanup_local_lease(
                     }
                 }
             }
+            LeasedResource::ApiToken { .. } => {
+                let reason = "API token cleanup requires a council";
+                store.cleanup_failed(lease_id, reason).await?;
+                return Err(LeaseError::Cleanup(reason.into()));
+            }
             LeasedResource::Namespace { .. } => {
                 // Standalone namespace specs are validation input rather than
                 // durable agent state. Cluster mode removes its Raft record.
             }
         }
+    }
+    if !lease.repositories.is_empty() && !lease.workloads_retired {
+        store.confirm_workloads_retired(lease_id).await?;
     }
     store.finish_cleanup(lease_id).await
 }
@@ -646,6 +1109,22 @@ pub async fn cleanup_cluster_lease(
     };
     for resource in &resources {
         match resource {
+            LeasedResource::Job { .. } => return Err(LeaseError::InvalidScope),
+            LeasedResource::ApiToken { name, fingerprint } => {
+                if let Err(error) = write_cluster_lease_request(
+                    council,
+                    crate::council::RaftRequest::TestLeaseRevokeApiToken {
+                        lease_id: lease_id.to_string(),
+                        name: name.clone(),
+                        fingerprint: *fingerprint,
+                    },
+                )
+                .await
+                {
+                    record_cluster_cleanup_failure(council, lease_id, &error).await;
+                    return Err(error);
+                }
+            }
             LeasedResource::App { app_id } => {
                 if let Err(error) = write_cluster_lease_request(
                     council,
@@ -671,6 +1150,41 @@ pub async fn cleanup_cluster_lease(
                 }
             }
         }
+    }
+    if council
+        .desired_state()
+        .await
+        .test_leases
+        .get(lease_id)
+        .is_some_and(|lease| !lease.placements.is_empty())
+    {
+        return Err(LeaseError::CleanupPending);
+    }
+    if council
+        .desired_state()
+        .await
+        .test_leases
+        .get(lease_id)
+        .is_some_and(|lease| !lease.repositories.is_empty() && !lease.workloads_retired)
+    {
+        write_cluster_lease_request(
+            council,
+            crate::council::RaftRequest::TestLeaseWorkloadsRetired {
+                lease_id: lease_id.into(),
+            },
+        )
+        .await?;
+    }
+    // Storage retirement is asynchronous, just like placement retirement.
+    // BeginCleanup fences new writers, so outstanding receipts can only shrink.
+    if council
+        .desired_state()
+        .await
+        .test_leases
+        .get(lease_id)
+        .is_some_and(|lease| !lease.registry_retirement_confirmed())
+    {
+        return Err(LeaseError::CleanupPending);
     }
     let result = write_cluster_lease_request(
         council,
@@ -725,7 +1239,7 @@ async fn write_cluster_lease_request(
     }
 }
 
-/// Start the standalone expiry reaper. Cancellation stops new attempts but
+/// Start the node-local expiry reaper. Cancellation stops new attempts but
 /// leaves any incomplete record durable for the next Bun process.
 pub fn spawn_local_lease_reaper(
     store: LocalLeaseStore,
@@ -779,7 +1293,9 @@ pub fn spawn_cluster_lease_reaper(
                 .map(|lease| lease.lease_id.clone())
                 .collect();
             for lease_id in due {
-                if let Err(error) = cleanup_cluster_lease(&council, &lease_id, None).await {
+                if let Err(error) = cleanup_cluster_lease(&council, &lease_id, None).await
+                    && !matches!(error, LeaseError::CleanupPending)
+                {
                     eprintln!("bun: cluster test lease {lease_id} cleanup deferred: {error}");
                 }
             }
@@ -804,6 +1320,246 @@ mod tests {
     }
 
     #[test]
+    fn repository_admission_validates_owner_namespace_expiry_and_shared_limits() {
+        let original = lease("run1", 10, 100);
+        for repository in [
+            "rbtest-run2/web",
+            "rbtest-run1",
+            "rbtest-run1/../web",
+            "rbtest-run1//web",
+            "rbtest-run1/%77eb",
+            "rbtest-run1/Web",
+            "rbtest-run1/web/",
+        ] {
+            let mut record = original.clone();
+            assert!(
+                record
+                    .attach_registry_writer(repository, 1, Some("token:ci"), 20)
+                    .is_err()
+            );
+            assert_eq!(record, original);
+        }
+        for (owner, now) in [(Some("other"), 20), (Some("token:ci"), 100), (None, 20)] {
+            let mut record = original.clone();
+            assert!(
+                record
+                    .attach_registry_writer("rbtest-run1/web", 1, owner, now)
+                    .is_err()
+            );
+            assert_eq!(record, original);
+        }
+        let mut record = original;
+        record
+            .attach_registry_writer("rbtest-run1/team/web", 1, Some("token:ci"), 20)
+            .unwrap();
+        record
+            .attach_registry_writer("rbtest-run1/team/web", 2, None, 20)
+            .unwrap();
+        assert_eq!(
+            record.repositories["rbtest-run1/team/web"],
+            BTreeSet::from([1, 2])
+        );
+        assert_eq!(record.resource_count(), 1);
+        for index in 0..MAX_LEASED_RESOURCES - 1 {
+            record.resources.insert(LeasedResource::App {
+                app_id: AppId::new(format!("app-{index}"), "rbtest-run1"),
+            });
+        }
+        let full = record.clone();
+        assert!(
+            record
+                .attach_registry_writer("rbtest-run1/extra", 1, Some("token:ci"), 20)
+                .is_err()
+        );
+        assert_eq!(record, full);
+        record
+            .attach_registry_writer("rbtest-run1/team/web", 3, Some("token:ci"), 20)
+            .unwrap();
+        record.workloads_retired = true;
+        assert!(
+            record.validate().is_err(),
+            "an active lease cannot already have retired workloads"
+        );
+    }
+
+    #[tokio::test]
+    async fn local_registry_receipts_survive_reload_and_block_early_completion() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("leases.json");
+        let store = LocalLeaseStore::open(path.clone()).await.unwrap();
+        store.create(lease("run1", 10, 100)).await.unwrap();
+        store
+            .register_registry_writer("run1", "rbtest-run1/web", 1, Some("token:ci"), 20)
+            .await
+            .unwrap();
+        drop(store);
+        let store = LocalLeaseStore::open(path.clone()).await.unwrap();
+        assert_eq!(
+            store.get("run1").await.unwrap().repositories["rbtest-run1/web"],
+            BTreeSet::from([1])
+        );
+        store.begin_cleanup("run1", None).await.unwrap();
+        assert!(store.finish_cleanup("run1").await.is_err());
+        assert!(
+            store
+                .record_registry_retirement("run1", "rbtest-run1/web", 1)
+                .await
+                .is_err()
+        );
+        store.confirm_workloads_retired("run1").await.unwrap();
+        assert!(
+            store
+                .register_registry_writer("run1", "rbtest-run1/web", 2, Some("token:ci"), 20)
+                .await
+                .is_err()
+        );
+        assert!(store.finish_cleanup("run1").await.is_err());
+        store
+            .record_registry_retirement("run1", "rbtest-run1/web", 1)
+            .await
+            .unwrap();
+        drop(store);
+        let store = LocalLeaseStore::open(path.clone()).await.unwrap();
+        store.finish_cleanup("run1").await.unwrap();
+        assert!(
+            LocalLeaseStore::open(path.clone())
+                .await
+                .unwrap()
+                .get("run1")
+                .await
+                .is_none()
+        );
+    }
+
+    fn node_job_lease(now: u64, expires: u64) -> TestLease {
+        let suffix = "a123456789abcdefa123456789abcdef";
+        TestLease::new_scoped(
+            format!("node-jobs-{suffix}"),
+            "token:ci".into(),
+            "ci".into(),
+            format!("rbtest-node-{suffix}"),
+            now,
+            expires,
+            LeaseScope::NodeJobs,
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn node_job_lease_reserves_its_namespace_and_resource_kind() {
+        let mut record = node_job_lease(10, 20);
+        record.resources.insert(LeasedResource::App {
+            app_id: AppId::new("web", &record.namespace),
+        });
+        assert!(matches!(record.validate(), Err(LeaseError::InvalidScope)));
+        record.resources.clear();
+        record.scope = LeaseScope::Applications;
+        assert!(matches!(record.validate(), Err(LeaseError::InvalidScope)));
+        record.lease_id = "ordinary".into();
+        assert!(matches!(record.validate(), Err(LeaseError::InvalidScope)));
+        let mut record = node_job_lease(10, 20);
+        record.namespace.push('a');
+        assert!(matches!(record.validate(), Err(LeaseError::InvalidScope)));
+        let mut record = lease("ordinary", 10, 20);
+        record.resources.insert(LeasedResource::Job {
+            job_id: AppId::new("batch", &record.namespace),
+        });
+        assert!(matches!(record.validate(), Err(LeaseError::InvalidScope)));
+    }
+
+    #[tokio::test]
+    async fn node_job_lease_reaper_recovers_after_restart_and_lost_retirement_reply() {
+        use crate::bun::agent::AgentCommand;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("node-test-leases.json");
+        let store = LocalLeaseStore::open(path.clone()).await.unwrap();
+        let record = node_job_lease(10, 100);
+        let id = record.lease_id.clone();
+        let job_id = AppId::new("cron", &record.namespace);
+        store.create(record).await.unwrap();
+        assert!(matches!(
+            store
+                .begin_app_operation(&id, "token:ci", vec![job_id.clone()], 20)
+                .await,
+            Err(LeaseError::InvalidScope)
+        ));
+        assert!(matches!(
+            store
+                .begin_job_operation(&id, "token:other", vec![job_id.clone()], 20)
+                .await,
+            Err(LeaseError::WrongOwner)
+        ));
+        let operation = store
+            .begin_job_operation(&id, "token:ci", vec![job_id.clone()], 20)
+            .await
+            .unwrap();
+        assert!(matches!(
+            store.begin_cleanup(&id, None).await,
+            Err(LeaseError::Busy)
+        ));
+        drop(operation);
+        drop(store);
+        let store = LocalLeaseStore::open(path.clone()).await.unwrap();
+        let (tx, mut rx) = tokio::sync::mpsc::channel(4);
+        let shutdown = tokio_util::sync::CancellationToken::new();
+        let reaper = spawn_local_lease_reaper(store.clone(), tx, shutdown.clone());
+        let first = tokio::time::timeout(std::time::Duration::from_secs(3), rx.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        let AgentCommand::RetireTestResources {
+            app_name,
+            namespace,
+            response,
+        } = first
+        else {
+            panic!("expected retirement")
+        };
+        assert_eq!(
+            (app_name, namespace),
+            (job_id.name.clone(), job_id.namespace.clone())
+        );
+        drop(response);
+        let retry = tokio::time::timeout(std::time::Duration::from_secs(3), rx.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        let persisted = LocalLeaseStore::open(path.clone())
+            .await
+            .unwrap()
+            .get(&id)
+            .await
+            .unwrap();
+        assert!(matches!(persisted.state, TestLeaseState::Cleaning { .. }));
+        assert!(
+            persisted
+                .resources
+                .contains(&LeasedResource::Job { job_id })
+        );
+        let AgentCommand::RetireTestResources { response, .. } = retry else {
+            panic!("expected retry")
+        };
+        response.send(Ok(())).unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(3), async {
+            while store.get(&id).await.is_some() {
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap();
+        shutdown.cancel();
+        reaper.await.unwrap();
+        assert!(
+            LocalLeaseStore::open(path)
+                .await
+                .unwrap()
+                .get(&id)
+                .await
+                .is_none()
+        );
+    }
+
+    #[test]
     fn namespaces_are_reserved_dns_labels() {
         assert!(valid_test_namespace("rbtest-a1b2"));
         assert!(!valid_test_namespace("production"));
@@ -821,6 +1577,57 @@ mod tests {
             record.validate(),
             Err(LeaseError::NamespaceMismatch)
         ));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn durable_store_ignores_predictable_temporary_path() {
+        use std::os::unix::fs::{PermissionsExt, symlink};
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("leases.json");
+        let sentinel = dir.path().join("other-writer");
+        std::fs::write(&sentinel, b"untouched").unwrap();
+        symlink(&sentinel, dir.path().join("leases.json.tmp")).unwrap();
+        let store = LocalLeaseStore::open(path.clone()).await.unwrap();
+        store.create(lease("abc", 10, 20)).await.unwrap();
+        assert_eq!(std::fs::read(&sentinel).unwrap(), b"untouched");
+        assert_eq!(
+            std::fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+        assert!(
+            LocalLeaseStore::open(path)
+                .await
+                .unwrap()
+                .get("abc")
+                .await
+                .is_some()
+        );
+    }
+
+    #[tokio::test]
+    async fn cancelled_caller_cannot_release_a_live_write_transaction() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("leases.json");
+        let store = LocalLeaseStore::open(path.clone()).await.unwrap();
+        let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        store.inner.lock().await.before_commit = Some((entered_tx, release_rx));
+        let first = store.clone();
+        let caller = tokio::spawn(async move { first.create(lease("a", 10, 20)).await });
+        entered_rx.await.unwrap();
+        caller.abort();
+        let _ = caller.await;
+        let second = store.clone();
+        let writer = tokio::spawn(async move { second.create(lease("b", 10, 20)).await });
+        tokio::task::yield_now().await;
+        assert!(!writer.is_finished());
+        release_tx.send(()).unwrap();
+        writer.await.unwrap().unwrap();
+        for view in [store, LocalLeaseStore::open(path).await.unwrap()] {
+            assert!(view.get("a").await.is_some());
+            assert!(view.get("b").await.is_some());
+        }
     }
 
     #[tokio::test]
@@ -853,6 +1660,9 @@ mod tests {
                 leases: BTreeMap::new(),
                 operation_locks: BTreeMap::new(),
                 path: Some(blocker.join("leases.json")),
+                persistence_uncertain: false,
+                #[cfg(test)]
+                before_commit: None,
             })),
         };
 
@@ -861,6 +1671,10 @@ mod tests {
             Err(LeaseError::Persistence(_))
         ));
         assert!(store.get("abc").await.is_none());
+        assert!(matches!(
+            store.create(lease("second", 10, 20)).await,
+            Err(LeaseError::PersistenceUncertain)
+        ));
     }
 
     #[tokio::test]
@@ -872,16 +1686,42 @@ mod tests {
             .await
             .unwrap();
 
-        assert!(
-            tokio::time::timeout(
-                std::time::Duration::from_millis(10),
-                store.begin_cleanup("abc", None),
-            )
-            .await
-            .is_err()
-        );
+        assert!(matches!(
+            store.begin_cleanup("abc", None).await,
+            Err(LeaseError::Busy)
+        ));
         drop(operation);
         assert!(store.begin_cleanup("abc", None).await.is_ok());
+    }
+
+    #[tokio::test]
+    async fn busy_lease_does_not_block_reaping_other_expired_leases() {
+        let store = LocalLeaseStore::in_memory();
+        store.create(lease("a", 10, 20)).await.unwrap();
+        store.create(lease("b", 10, 20)).await.unwrap();
+        let operation = store
+            .begin_app_operation("a", "token:ci", vec![], 11)
+            .await
+            .unwrap();
+        let (commands, _receiver) = tokio::sync::mpsc::channel(1);
+        let shutdown = tokio_util::sync::CancellationToken::new();
+        let reaper = spawn_local_lease_reaper(store.clone(), commands, shutdown.clone());
+        let result = tokio::time::timeout(std::time::Duration::from_secs(1), async {
+            while store.get("b").await.is_some() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await;
+        shutdown.cancel();
+        reaper.abort();
+        let _ = reaper.await;
+        assert!(
+            result.is_ok(),
+            "busy lease a prevented cleanup of expired lease b"
+        );
+        assert_eq!(store.get("a").await.unwrap().state, TestLeaseState::Active);
+        drop(operation);
+        assert!(store.begin_cleanup("a", None).await.is_ok());
     }
 
     #[tokio::test]

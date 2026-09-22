@@ -85,6 +85,14 @@ pub struct BlobStore {
     base_dir: PathBuf,
 }
 
+/// Exclusive process ownership of a registry's temporary upload directory.
+/// Keep this guard alive until every registry writer has stopped.
+#[derive(Debug)]
+#[must_use = "keep the upload owner alive while registry writers can run"]
+pub struct UploadDirectoryOwner {
+    _lock: std::fs::File,
+}
+
 impl BlobStore {
     /// Create a new blob store rooted at `base_dir`.
     ///
@@ -94,6 +102,53 @@ impl BlobStore {
         Self {
             base_dir: base_dir.into(),
         }
+    }
+
+    /// Claim exclusive upload ownership and reclaim abandoned temporary files.
+    /// Call before starting any writer. Startup refuses competing owners,
+    /// unrecognised entries and cleanup errors without serving partial recovery.
+    pub async fn claim_upload_directory(&self) -> Result<UploadDirectoryOwner, PickleError> {
+        let directory = self.base_dir.clone();
+        tokio::task::spawn_blocking(move || -> Result<UploadDirectoryOwner, PickleError> {
+            std::fs::create_dir_all(&directory)?;
+            let mut options = std::fs::OpenOptions::new();
+            options.read(true).write(true).create(true).truncate(false);
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::OpenOptionsExt;
+                options.mode(0o600);
+            }
+            let lock = options.open(directory.join(".upload-owner.lock"))?;
+            lock.try_lock().map_err(|error| {
+                std::io::Error::other(format!("registry upload directory is busy: {error}"))
+            })?;
+            let uploads = directory.join("uploads");
+            std::fs::create_dir_all(&uploads)?;
+            if !std::fs::symlink_metadata(&uploads)?.file_type().is_dir() {
+                return Err(
+                    std::io::Error::other("upload directory must not be a symbolic link").into(),
+                );
+            }
+            for entry in std::fs::read_dir(&uploads)? {
+                let entry = entry?;
+                let name = entry.file_name();
+                let name = name.to_str().ok_or_else(|| {
+                    std::io::Error::other("upload directory contains a non-UTF-8 entry")
+                })?;
+                validate_upload_id(name)?;
+                if !entry.file_type()?.is_file() {
+                    return Err(std::io::Error::other(format!(
+                        "upload {name} is not a regular temporary file",
+                    ))
+                    .into());
+                }
+                std::fs::remove_file(entry.path())?;
+            }
+            std::fs::File::open(uploads)?.sync_all()?;
+            Ok(UploadDirectoryOwner { _lock: lock })
+        })
+        .await
+        .map_err(|error| std::io::Error::other(format!("upload recovery task failed: {error}")))?
     }
 
     /// Path to a blob on disk.
@@ -224,7 +279,7 @@ impl BlobStore {
         upload_id: &str,
         expected_digest: &Digest,
     ) -> Result<(), PickleError> {
-        self.complete_upload_guarded(upload_id, expected_digest, None)
+        self.complete_upload_guarded(upload_id, expected_digest, None, None)
             .await
     }
 
@@ -235,6 +290,7 @@ impl BlobStore {
         upload_id: &str,
         expected_digest: &Digest,
         writer: Option<tokio::sync::OwnedSemaphorePermit>,
+        repository_writer: Option<super::lease::RepositoryReadGuard>,
     ) -> Result<(), PickleError> {
         validate_upload_id(upload_id)?;
         let upload = self.upload_path(upload_id);
@@ -243,6 +299,7 @@ impl BlobStore {
         tokio::task::spawn_blocking(move || -> Result<(), PickleError> {
             use std::io::Read as _;
             let _writer = writer;
+            let _repository_writer = repository_writer;
             let mut file = std::fs::File::open(&upload)?;
             let mut hasher = Sha256::new();
             let mut buffer = [0u8; 64 * 1024];
@@ -329,12 +386,21 @@ impl BlobStore {
     }
 
     /// Cancel an upload session, cleaning up the temp file.
-    pub async fn cancel_upload(&self, upload_id: &str) {
-        if validate_upload_id(upload_id).is_err() {
-            return;
-        }
+    pub async fn cancel_upload(&self, upload_id: &str) -> Result<(), PickleError> {
+        validate_upload_id(upload_id)?;
         let path = self.upload_path(upload_id);
-        let _ = tokio::fs::remove_file(path).await;
+        match tokio::fs::remove_file(&path).await {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error.into()),
+        }
+        // Confirm durable retirement before the session owner is discarded.
+        match tokio::fs::File::open(self.base_dir.join("uploads")).await {
+            Ok(directory) => directory.sync_all().await?,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error.into()),
+        }
+        Ok(())
     }
 
     /// List all blob digests in the store.
@@ -561,6 +627,49 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn upload_directory_owner_excludes_competitors_and_reclaims_on_replacement() {
+        let (store, _dir) = test_store();
+        let owner = store.claim_upload_directory().await.unwrap();
+        let id = store.initiate_upload().await.unwrap();
+        store.write_upload_chunk(&id, b"active").await.unwrap();
+        assert!(store.claim_upload_directory().await.is_err());
+        assert_eq!(store.upload_size(&id).await.unwrap(), 6);
+        drop(owner);
+        let _replacement = store.claim_upload_directory().await.unwrap();
+        assert!(!store.upload_path(&id).exists());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn upload_recovery_never_follows_a_redirected_upload_directory() {
+        let (store, _dir) = test_store();
+        let outside = tempfile::tempdir().unwrap();
+        let sentinel = outside.path().join("a".repeat(32));
+        std::fs::write(&sentinel, b"not owned").unwrap();
+        std::os::unix::fs::symlink(outside.path(), store.base_dir.join("uploads")).unwrap();
+        assert!(store.claim_upload_directory().await.is_err());
+        assert_eq!(std::fs::read(sentinel).unwrap(), b"not owned");
+    }
+
+    #[tokio::test]
+    async fn upload_recovery_preserves_unrecognised_entries_and_refuses_startup() {
+        let (store, _dir) = test_store();
+        let uploads = store.base_dir.join("uploads");
+        std::fs::create_dir_all(&uploads).unwrap();
+        let unexpected = uploads.join("operator-file");
+        std::fs::write(&unexpected, b"keep").unwrap();
+        assert!(store.claim_upload_directory().await.is_err());
+        assert_eq!(std::fs::read(&unexpected).unwrap(), b"keep");
+        std::fs::remove_file(unexpected).unwrap();
+        let directory = uploads.join("a".repeat(32));
+        std::fs::create_dir(&directory).unwrap();
+        assert!(store.claim_upload_directory().await.is_err());
+        assert!(directory.is_dir());
+        std::fs::remove_dir(directory).unwrap();
+        let _owner = store.claim_upload_directory().await.unwrap();
+    }
+
+    #[tokio::test]
     async fn cancel_upload_cleans_up() {
         let (store, _dir) = test_store();
         let upload_id = store.initiate_upload().await.unwrap();
@@ -568,7 +677,8 @@ mod tests {
             .write_upload_chunk(&upload_id, b"partial")
             .await
             .unwrap();
-        store.cancel_upload(&upload_id).await;
+        store.cancel_upload(&upload_id).await.unwrap();
+        store.cancel_upload(&upload_id).await.unwrap();
 
         // Writing to cancelled session should fail
         let result = store.write_upload_chunk(&upload_id, b"more").await;

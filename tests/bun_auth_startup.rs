@@ -134,13 +134,15 @@ fn clustered_refuses_wildcard_listener_during_bootstrap() {
 fn standalone_allows_ip_literal_loopback_during_bootstrap() {
     let root = tempfile::tempdir().unwrap();
     let config = write_config(root.path());
-    let reserved = TcpListener::bind("127.0.0.1:0").unwrap();
-    let address: SocketAddr = reserved.local_addr().unwrap();
-    drop(reserved);
-
-    let mut child = bun_command(&config, &address.to_string(), false)
+    // Let Bun own its ephemeral port from the first bind. Reserving and
+    // releasing a candidate here races every other process on the CI host.
+    let stdout_path = root.path().join("bun.stdout");
+    let stdout = std::fs::File::create(&stdout_path).unwrap();
+    let mut child = bun_command(&config, "127.0.0.1:0", false)
+        .stdout(stdout)
         .spawn()
         .unwrap();
+    let mut address: Option<SocketAddr> = None;
     let deadline = Instant::now() + Duration::from_secs(30);
     let mut response = Vec::new();
     loop {
@@ -148,11 +150,26 @@ fn standalone_allows_ip_literal_loopback_during_bootstrap() {
             let output = child.wait_with_output().unwrap();
             panic!(
                 "bun exited before serving loopback ({status}); stdout={} stderr={}",
-                String::from_utf8_lossy(&output.stdout),
+                std::fs::read_to_string(&stdout_path).unwrap(),
                 String::from_utf8_lossy(&output.stderr)
             );
         }
-        if let Ok(mut stream) = TcpStream::connect_timeout(&address, Duration::from_millis(100)) {
+        if address.is_none() {
+            let stdout = std::fs::read_to_string(&stdout_path).unwrap();
+            address = stdout.lines().find_map(|line| {
+                line.strip_prefix("bun: API server listening on ")?
+                    .parse()
+                    .ok()
+            });
+            if address.is_some_and(|address| address.port() == 0) {
+                child.kill().unwrap();
+                child.wait().unwrap();
+                panic!("Bun reported the requested port 0 instead of its bound address");
+            }
+        }
+        if let Some(address) = address
+            && let Ok(mut stream) = TcpStream::connect_timeout(&address, Duration::from_millis(100))
+        {
             use std::io::Write as _;
             stream
                 .set_read_timeout(Some(Duration::from_millis(500)))
@@ -171,7 +188,7 @@ fn standalone_allows_ip_literal_loopback_during_bootstrap() {
             let output = child.wait_with_output().unwrap();
             panic!(
                 "bun did not serve the loopback bootstrap listener; stdout={} stderr={}",
-                String::from_utf8_lossy(&output.stdout),
+                std::fs::read_to_string(&stdout_path).unwrap(),
                 String::from_utf8_lossy(&output.stderr)
             );
         }

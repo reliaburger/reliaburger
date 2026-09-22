@@ -109,8 +109,8 @@ Client (docker push / crane push / build job)
 [4] Return to client
     │
     ├── 201 Created + `oci-replication: pending` (Raft committed), or
-    │   202 Accepted + `oci-replication: raft-uncommitted` (stored and
-    │   persisted locally, but the Raft proposal did not commit)
+    │   503 Service Unavailable (local bytes may exist, but cluster
+    │   acceptance is unconfirmed; the client must retry)
     │
     ▼
 [5] Meat considers the image schedulable once the manifest exists in Raft
@@ -548,7 +548,7 @@ Pickle implements the OCI Distribution Spec push flow:
 
 5. **Raft commit.** Propose the catalogue entry (manifest, tag, initial holder = receiving node) to the Raft state machine.
 
-6. **Return to client.** `201 Created` with `oci-replication: pending` when the Raft proposal committed, or `202 Accepted` with `oci-replication: raft-uncommitted` when it did not. The receiving node never waits on peers.
+6. **Return to client.** `201 Created` with `oci-replication: pending` when the Raft proposal committed, or `503 Service Unavailable` when cluster acceptance is unconfirmed. The receiving node never waits on peers.
 
 7. **Background replication.** The leader-only heal loop later replicates layers to peers until the configured redundancy is met (see §3.2). This is not part of the push response.
 
@@ -951,7 +951,7 @@ fn default_gc_retain_days() -> u32 { 7 }
 
 **Scenario:** A push arrives at Node A, which stores the layers locally and commits the manifest, but no peers are currently reachable to replicate to.
 
-**Behaviour:** The push still succeeds — replication is not on the push path. Node A stores the blobs, commits the manifest to Raft, and returns `201 Created` with `oci-replication: pending`. The image is immediately schedulable but under-replicated (only Node A holds the layers). If the Raft proposal itself fails on a council member, the response is `202 Accepted` with `oci-replication: raft-uncommitted` instead.
+**Behaviour:** The push still succeeds — replication is not on the push path. Node A stores the blobs, commits the manifest to Raft, and returns `201 Created` with `oci-replication: pending`. The image is immediately schedulable but under-replicated (only Node A holds the layers). If the Raft proposal itself fails or times out on a council member, the response is `503 Service Unavailable`; the client must retry before treating the image as accepted.
 
 **Recovery:** The leader-only heal loop (§3.2, ≈ every 60s) replicates the layers to peers once any are reachable, until `redundancy` is met. Capability and status reporting expose the under-replicated layer count so operators can see that replication is still pending.
 

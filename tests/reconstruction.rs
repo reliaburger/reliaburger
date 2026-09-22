@@ -97,6 +97,7 @@ fn build_aggregated(entries: Vec<(NodeId, Vec<(&str, &str)>)>) -> AggregatedStat
         let running_apps = apps
             .into_iter()
             .map(|(name, ns)| RunningApp {
+                execution: None,
                 app_name: name.to_string(),
                 namespace: ns.to_string(),
                 instance_id: 0,

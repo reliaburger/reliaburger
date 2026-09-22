@@ -228,7 +228,11 @@ pub struct BackendValue {
 
 ### BPF Map: `firewall_map`
 
-Maps `(source_cgroup_id, destination_app_id)` to an allow/deny decision. Used for both namespace isolation (default) and per-app `firewall.allow_from` rules.
+Maps `(source_cgroup_id, destination_app_id)` to an allow/deny decision. The
+implemented destination ID is the allocated service VIP represented as a
+host-order `u32`, including collision resolution, rather than a hash of the bare
+application name. This keeps same-named destinations in different namespaces
+from sharing a grant. Used for both namespace isolation (default) and per-app `firewall.allow_from` rules.
 
 ```
 Type:        BPF_MAP_TYPE_HASH

@@ -82,6 +82,16 @@ pub struct AppSpec {
     pub namespace: Option<String>,
 }
 
+impl AppSpec {
+    /// Every explicitly declared main or init image; omitted init images inherit the main image.
+    pub fn image_references(&self) -> impl Iterator<Item = &str> {
+        self.image
+            .iter()
+            .map(String::as_str)
+            .chain(self.init.iter().filter_map(|init| init.image.as_deref()))
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Sub-specs
 // ---------------------------------------------------------------------------

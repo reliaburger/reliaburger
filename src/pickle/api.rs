@@ -15,6 +15,7 @@ use futures_util::StreamExt;
 use serde::Deserialize;
 use tokio::sync::RwLock;
 
+use super::lease::{RegistryWriteAccess, RepositoryReadGuard};
 use super::registry_auth::{QuotaConfig, UploadSessions, WriteDenied};
 use super::store::{BlobStore, compute_sha256};
 use super::types::{Digest, ImageManifest, LayerDescriptor, ManifestCatalog, ManifestCommit};
@@ -40,6 +41,12 @@ pub struct PickleState {
     /// Council handle for proposing catalog changes to Raft (cluster
     /// council members only; `None` single-node).
     pub council: Option<Arc<crate::council::CouncilNode>>,
+    /// Present on every clustered node, including workers without a council.
+    pub forwarder: Option<super::authority::RegistryForwarder>,
+    /// Standalone lease authority, shared with the agent API and lease reaper.
+    pub test_leases: crate::testkit::lease::LocalLeaseStore,
+    /// Shared writer exclusion for lease-owned repository retirement.
+    pub repository_writers: super::lease::RepositoryWriters,
     /// Where to persist the catalog after each mutation, so image
     /// metadata survives restarts. `None` disables persistence (tests).
     pub persist_path: Option<std::path::PathBuf>,
@@ -74,25 +81,27 @@ impl PickleState {
             .map(str::to_string)
     }
 
-    /// Authorise a registry write (REG4). `Ok(())` means the request may
-    /// proceed; `Err(response)` is the 401/403 to return. No auth
-    /// configured means the gate is off (writes open).
+    /// Authenticate a writer and preserve the identity used for upload ownership.
+    /// `None` means anonymous standalone mode; errors carry the HTTP refusal.
     // `Response` is large but it IS the HTTP reply to send on failure —
     // boxing it would tax every call site for a value that lives one frame.
     #[allow(clippy::result_large_err)]
-    async fn authorise_write(&self, headers: &HeaderMap) -> Result<(), Response> {
+    async fn authorise_write(
+        &self,
+        headers: &HeaderMap,
+    ) -> Result<Option<crate::sesame::auth::AuthContext>, Response> {
         let Some(auth) = &self.auth else {
-            return Ok(());
+            return Ok(None);
         };
         let bearer = Self::bearer(headers);
-        match super::registry_auth::authorise_write(
+        match super::registry_auth::authenticate_writer(
             auth,
             bearer.as_deref(),
             self.allow_unauthenticated_bootstrap,
         )
         .await
         {
-            Ok(()) => Ok(()),
+            Ok(principal) => Ok(principal),
             Err(WriteDenied::Unauthenticated) => Err(oci_error(
                 StatusCode::UNAUTHORIZED,
                 "UNAUTHORIZED",
@@ -104,6 +113,29 @@ impl PickleState {
                 "insufficient permissions to push to the registry".to_string(),
             )),
         }
+    }
+
+    #[allow(clippy::result_large_err)]
+    async fn authorise_repository(
+        &self,
+        name: &str,
+        headers: &HeaderMap,
+        principal: Option<&crate::sesame::auth::AuthContext>,
+    ) -> Result<RegistryWriteAccess, Response> {
+        let lease = headers
+            .get("x-reliaburger-test-lease")
+            .map(|value| value.to_str())
+            .transpose()
+            .map_err(|_| {
+                registry_write_error(super::types::PickleError::LeaseDenied(
+                    "invalid lease header".into(),
+                ))
+            })?;
+        let owner = principal.map(|p| p.principal_id.as_str());
+        let internal = owner == Some(crate::sesame::auth::SYSTEM_PRINCIPAL);
+        self.admit_repository_write(name, lease, owner, internal)
+            .await
+            .map_err(registry_write_error)
     }
 
     /// Authorise a registry read (O1). A no-op unless the registry is bound
@@ -131,22 +163,29 @@ impl PickleState {
 
     /// The current stored size of a repository and of the whole registry,
     /// from the authoritative catalogue (REG4 quota accounting).
-    async fn stored_sizes(&self, repository: &str) -> (u64, u64) {
-        let catalog = self.catalog_snapshot().await;
-        let mut repo_bytes = 0u64;
-        let mut total_bytes = 0u64;
-        for (_, manifest) in &catalog.manifests {
-            total_bytes = total_bytes.saturating_add(manifest.total_size);
-            if manifest.repository == repository {
-                repo_bytes = repo_bytes.saturating_add(manifest.total_size);
-            }
+    async fn stored_sizes(
+        &self,
+        repository: &str,
+    ) -> Result<(u64, u64), super::types::PickleError> {
+        match self
+            .registry_query(super::authority::RegistryQuery::Usage {
+                repository: repository.into(),
+            })
+            .await?
+        {
+            super::authority::RegistryQueryResponse::Usage {
+                repository_bytes,
+                total_bytes,
+            } => Ok((repository_bytes, total_bytes)),
+            _ => Err(super::types::PickleError::ReplicationFailed(
+                "invalid registry usage response".into(),
+            )),
         }
-        (repo_bytes, total_bytes)
     }
 
     /// Enforce the storage quota for admitting `incoming` bytes into
     /// `repository` (REG4). `Ok(())` when unlimited or within limits;
-    /// `Err(response)` is the 413 to return.
+    /// `Err(response)` is 413 for a full quota or 503 for unavailable authority.
     // `Response` is large but it IS the HTTP reply to send on failure —
     // boxing it would tax every call site for a value that lives one frame.
     #[allow(clippy::result_large_err)]
@@ -154,7 +193,10 @@ impl PickleState {
         if self.quota.is_unlimited() {
             return Ok(());
         }
-        let (repo_current, total_current) = self.stored_sizes(repository).await;
+        let (repo_current, total_current) = self
+            .stored_sizes(repository)
+            .await
+            .map_err(registry_write_error)?;
         match super::registry_auth::check_quota(
             &self.quota,
             repository,
@@ -183,95 +225,263 @@ async fn store_blob_off_runtime(
     state: &PickleState,
     data: Vec<u8>,
     digest: Digest,
+    writer: Option<RepositoryReadGuard>,
 ) -> Result<(), super::types::PickleError> {
     let store = Arc::clone(&state.store);
-    tokio::task::spawn_blocking(move || store.write_blob(&data, &digest))
-        .await
-        .map_err(|e| super::types::PickleError::CatalogPersist(format!("hash task failed: {e}")))?
+    tokio::task::spawn_blocking(move || {
+        let _writer = writer;
+        store.write_blob(&data, &digest)
+    })
+    .await
+    .map_err(|e| super::types::PickleError::CatalogPersist(format!("hash task failed: {e}")))?
 }
 
 impl PickleState {
-    /// A point-in-time catalog view: the council's Raft-replicated
-    /// catalog when clustered, the local one otherwise. P2P pulls and
-    /// the pull-through cache plan against this.
-    pub async fn catalog_snapshot(&self) -> ManifestCatalog {
-        match &self.council {
-            Some(council) => council.manifest_catalog().await,
-            None => self.catalog.read().await.clone(),
+    /// A current repository view. Clustered workers and followers query the leader;
+    /// unavailable authority is an error, never an empty registry or cache miss.
+    pub async fn catalog_snapshot(
+        &self,
+        repository: &str,
+    ) -> Result<ManifestCatalog, super::types::PickleError> {
+        match self
+            .registry_query(super::authority::RegistryQuery::Repository {
+                repository: repository.into(),
+            })
+            .await?
+        {
+            super::authority::RegistryQueryResponse::Repository(catalog) => Ok(*catalog),
+            _ => Err(super::types::PickleError::ReplicationFailed(
+                "invalid registry catalogue response".into(),
+            )),
         }
     }
 }
 
-/// The durability a push achieved (REG7/D11).
-///
-/// The registry commits a push locally and to Raft, then the heal loop
-/// drives it up to the configured replica count. A push therefore reports
-/// what it *actually* achieved at commit time, never a durable-redundancy
-/// success it hasn't reached yet:
-///
-/// - `Authoritative` — committed to the cluster's Raft catalogue (or
-///   locally in single-node mode). Replication to the configured replica
-///   count is still pending and the heal loop will complete it.
-/// - `RaftUncommitted` — this node is a council member but the Raft
-///   proposal failed; the bytes are stored and the local catalogue is
-///   persisted, but the cluster catalogue does **not** yet know the push.
-///   The push is reported as accepted-but-not-durable, not a clean success.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum CommitOutcome {
-    Authoritative,
-    RaftUncommitted,
-}
-
-/// Record a committed manifest: apply to the local catalog, persist it
-/// to disk, and — when this node is a council member — propose it to
-/// Raft so the cluster-wide catalog tracks the real holder.
-///
-/// Returns the [`CommitOutcome`] so the caller can reflect it honestly
-/// (D11). A failed Raft proposal on a council member is surfaced, not
-/// silently swallowed: the local catalogue is still persisted (so a
-/// restart and the heal loop can recover), but the push did not reach the
-/// authoritative catalogue.
+/// Persist local ownership before publication. The blocking task owns the write
+/// guard through persistence, even when the HTTP caller is cancelled.
 pub(crate) async fn record_commit(
     state: &PickleState,
     manifest: ImageManifest,
     tag: String,
-) -> CommitOutcome {
-    let commit = ManifestCommit {
+) -> Result<(), super::types::PickleError> {
+    record_commit_with_access(state, manifest, tag, &RegistryWriteAccess::default()).await
+}
+
+async fn record_commit_with_access(
+    state: &PickleState,
+    manifest: ImageManifest,
+    tag: String,
+    access: &RegistryWriteAccess,
+) -> Result<(), super::types::PickleError> {
+    let state = state.clone();
+    let access = access.clone();
+    tokio::spawn(async move { record_commit_owned(&state, manifest, tag, &access).await })
+        .await
+        .map_err(|error| {
+            super::types::PickleError::CatalogPersist(format!(
+                "manifest publication task failed: {error}"
+            ))
+        })?
+}
+
+async fn record_commit_owned(
+    state: &PickleState,
+    manifest: ImageManifest,
+    tag: String,
+    access: &RegistryWriteAccess,
+) -> Result<(), super::types::PickleError> {
+    use super::types::PickleError;
+    if super::lease::is_test_repository(&manifest.repository) != access.lease_id.is_some() {
+        return Err(PickleError::LeaseDenied(
+            "manifest requires matching repository lease admission".into(),
+        ));
+    }
+    let mut commit = ManifestCommit {
+        observed_gc_generation: 0,
         manifest,
         tag,
         holder_nodes: std::collections::BTreeSet::from([state.node_raft_id]),
     };
-
-    let snapshot = {
-        let mut catalog = state.catalog.write().await;
-        catalog.apply_manifest_commit(&commit);
-        state.persist_path.as_ref().map(|_| catalog.clone())
-    };
-    if let (Some(path), Some(snapshot)) = (state.persist_path.clone(), snapshot) {
-        // File IO off the runtime; the catalog is small (KBs).
-        let _ = tokio::task::spawn_blocking(move || {
-            if let Err(e) = snapshot.persist_to(&path) {
-                eprintln!("pickle: failed to persist catalog: {e}");
-            }
-        })
-        .await;
-    }
-
-    if let Some(council) = &state.council {
-        if let Err(e) = council
-            .write(crate::council::types::RaftRequest::ManifestCommit(commit))
-            .await
-        {
-            eprintln!(
-                "pickle: manifest commit not written to raft ({e}); \
-                 local catalog persisted, replication will reconcile"
-            );
-            return CommitOutcome::RaftUncommitted;
+    let local_operation = if state.council.is_none() && state.forwarder.is_none() {
+        if let Some(lease_id) = &access.lease_id {
+            Some(
+                state
+                    .test_leases
+                    .begin_registry_commit(
+                        lease_id,
+                        &commit,
+                        crate::testkit::lease::now_unix_millis(),
+                    )
+                    .await
+                    .map_err(|e| PickleError::LeaseDenied(e.to_string()))?,
+            )
+        } else {
+            None
         }
-        return CommitOutcome::Authoritative;
+    } else {
+        None
+    };
+    let transaction_writer = access.guard.clone();
+    let lease_id = access.lease_id.clone();
+    let mut catalog = Arc::clone(&state.catalog).write_owned().await;
+    commit.observed_gc_generation = state.registry_gc_generation().await?;
+    let store = Arc::clone(&state.store);
+    let persist = state.persist_path.clone();
+    let local_commit = commit.clone();
+    let _catalog = tokio::task::spawn_blocking(move || {
+        let _writer = transaction_writer;
+        let _operation = local_operation;
+        if let Some(lease_id) = lease_id
+            && catalog
+                .repository_owners
+                .get(&local_commit.manifest.repository)
+                != Some(&lease_id)
+        {
+            return Err(PickleError::LeaseDenied(
+                "local repository generation changed".into(),
+            ));
+        }
+        // GC uses this same guard through physical deletion. A blob validated
+        // before waiting for the guard may have been collected in the meantime.
+        for digest in local_commit.manifest.referenced_digests() {
+            if !store.has_blob(digest) {
+                return Err(PickleError::MissingLayer(digest.clone()));
+            }
+        }
+        let mut next = catalog.clone();
+        next.apply_manifest_commit(&local_commit);
+        if let Some(path) = persist {
+            next.persist_to(&path)?;
+        }
+        *catalog = next;
+        Ok(catalog)
+    })
+    .await
+    .map_err(|error| PickleError::CatalogPersist(error.to_string()))??;
+
+    let mutation = match &access.lease_id {
+        Some(lease_id) => super::authority::RegistryMutation::LeasedManifest {
+            lease_id: lease_id.clone(),
+            observed_at_unix_ms: crate::testkit::lease::now_unix_millis(),
+            commit: Box::new(commit),
+        },
+        None => super::authority::RegistryMutation::Manifest(Box::new(commit)),
+    };
+    match state.propose(mutation).await? {
+        None
+        | Some(
+            crate::council::CouncilResponse::Ok | crate::council::CouncilResponse::Applied { .. },
+        ) => {}
+        Some(response) => super::lease::require_acceptance(response)?,
     }
-    // Single-node mode: the local catalogue *is* authoritative.
-    CommitOutcome::Authoritative
+
+    Ok(())
+}
+
+impl PickleState {
+    /// Query before proving bytes, while the caller excludes local collection.
+    pub(crate) async fn registry_gc_generation(&self) -> Result<u64, super::types::PickleError> {
+        match self
+            .registry_query(super::authority::RegistryQuery::GcGeneration)
+            .await?
+        {
+            super::authority::RegistryQueryResponse::GcGeneration(generation) => Ok(generation),
+            _ => Err(super::types::PickleError::ReplicationFailed(
+                "invalid registry GC generation response".into(),
+            )),
+        }
+    }
+
+    pub(crate) async fn propose(
+        &self,
+        mutation: super::authority::RegistryMutation,
+    ) -> Result<Option<crate::council::CouncilResponse>, super::types::PickleError> {
+        if let Some(forwarder) = &self.forwarder {
+            return forwarder
+                .write(self.council.as_ref(), mutation)
+                .await
+                .map(Some);
+        }
+        let Some(council) = &self.council else {
+            return Ok(None);
+        };
+        tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            council.write(mutation.request()),
+        )
+        .await
+        .map_err(|_| {
+            super::types::PickleError::ReplicationFailed(
+                "registry proposal timed out; retry to establish acceptance".into(),
+            )
+        })?
+        .map(Some)
+        .map_err(|error| super::types::PickleError::ReplicationFailed(error.to_string()))
+    }
+}
+
+impl PickleState {
+    /// Hold the manifest writer guard from arbitration through physical deletion.
+    /// Caller cancellation retains ownership; failed persistence deletes nothing.
+    pub async fn collect_garbage(
+        &self,
+        report: super::types::GcReport,
+    ) -> Result<Vec<Digest>, super::types::PickleError> {
+        let state = self.clone();
+        tokio::spawn(async move { state.collect_garbage_owned(report).await })
+            .await
+            .map_err(|error| {
+                super::types::PickleError::CatalogPersist(format!("GC task failed: {error}"))
+            })?
+    }
+
+    async fn collect_garbage_owned(
+        &self,
+        report: super::types::GcReport,
+    ) -> Result<Vec<Digest>, super::types::PickleError> {
+        use super::types::PickleError;
+        let mut catalog = Arc::clone(&self.catalog).write_owned().await;
+        let authoritative = match self
+            .propose(super::authority::RegistryMutation::GarbageCollection(
+                report.clone(),
+            ))
+            .await?
+        {
+            Some(crate::council::CouncilResponse::GcApproved { approved }) => Some(approved),
+            None => None,
+            Some(response) => {
+                return Err(PickleError::ReplicationFailed(format!(
+                    "GC arbitration refused: {response:?}"
+                )));
+            }
+        };
+        let store = Arc::clone(&self.store);
+        let persist = self.persist_path.clone();
+        tokio::task::spawn_blocking(move || {
+            let mut next = catalog.clone();
+            let approved = match authoritative {
+                Some(approved) => {
+                    next.apply_gc_report(&super::types::GcReport {
+                        node_id: report.node_id,
+                        deleted_layers: approved.clone(),
+                    });
+                    approved
+                }
+                None => next.apply_gc_report(&report),
+            };
+            if approved.is_empty() {
+                return Ok(Vec::new());
+            }
+            if let Some(path) = persist {
+                next.persist_to(&path)?;
+            }
+            *catalog = next;
+            let referenced = super::gc::referenced_digests(&catalog);
+            Ok(super::gc::delete_approved(&store, &approved, &referenced))
+        })
+        .await
+        .map_err(|error| PickleError::CatalogPersist(error.to_string()))?
+    }
 }
 
 /// Build the OCI Distribution API router.
@@ -280,7 +490,7 @@ pub(crate) async fn record_commit(
 /// — REG8). Axum can't put a wildcard *before* a fixed suffix like
 /// `/blobs/…`, so instead of one route per shape we capture the whole path
 /// after `/v2/` with a trailing wildcard and split off the OCI operation
-/// suffix ourselves in [`dispatch_v2`]. The repository name is then
+/// suffix ourselves in `dispatch_v2`. The repository name is then
 /// whatever precedes that suffix, however many segments it spans.
 pub fn router(state: PickleState) -> Router {
     let writers = Arc::new(tokio::sync::Semaphore::new(MAX_CONCURRENT_WRITES));
@@ -327,6 +537,8 @@ pub fn router(state: PickleState) -> Router {
 
 /// The parsed shape of an OCI `/v2/{name}/…` request.
 enum V2Route {
+    /// Internal storage-node confirmation of a complete existing image.
+    Copy { name: String, digest: String },
     /// `/v2/{name}/blobs/{digest}`
     Blob { name: String, digest: String },
     /// `/v2/{name}/blobs/uploads/`
@@ -371,6 +583,12 @@ fn parse_v2_route(rest: &str) -> Option<V2Route> {
             reference: reference.to_string(),
         });
     }
+    if let Some((name, digest)) = rest.rsplit_once("/copies/") {
+        return Some(V2Route::Copy {
+            name: name.to_string(),
+            digest: digest.to_string(),
+        });
+    }
     if let Some(name) = rest.strip_suffix("/tags/list") {
         return Some(V2Route::Tags {
             name: name.to_string(),
@@ -413,6 +631,34 @@ async fn dispatch_v2(
     }
 
     match (method, route) {
+        (Method::POST, V2Route::Copy { name, digest }) => {
+            let principal = match state.authorise_write(&headers).await {
+                Ok(principal) => principal,
+                Err(response) => return response,
+            };
+            let internal = principal.as_ref().is_some_and(|context| {
+                context.principal_id == crate::sesame::auth::SYSTEM_PRINCIPAL
+            });
+            let anonymous_local = principal.is_none()
+                && state.council.is_none()
+                && state.forwarder.is_none()
+                && state.allow_unauthenticated_bootstrap
+                && !super::lease::is_test_repository(&name);
+            if !internal && !anonymous_local {
+                return StatusCode::FORBIDDEN.into_response();
+            }
+            let digest = match Digest::new(&digest) {
+                Ok(digest) => digest,
+                Err(error) => return registry_write_error(error),
+            };
+            match tokio::time::timeout(UPLOAD_TIMEOUT, state.confirm_image_copy(&name, &digest))
+                .await
+            {
+                Ok(Ok(receipt)) => Json(receipt).into_response(),
+                Ok(Err(error)) => registry_write_error(error),
+                Err(_) => StatusCode::GATEWAY_TIMEOUT.into_response(),
+            }
+        }
         (Method::HEAD, V2Route::Blob { name, digest }) => blob_head(&state, &name, &digest).await,
         (Method::GET, V2Route::Blob { name, digest }) => blob_get(&state, &name, &digest).await,
         (Method::POST, V2Route::UploadInitiate { name }) => {
@@ -558,33 +804,43 @@ async fn blob_upload_initiate(
     body: axum::body::Body,
 ) -> Response {
     // Registry writes require a principal once auth is configured (REG4).
-    if let Err(response) = state.authorise_write(headers_in).await {
-        return response;
-    }
+    let principal = match state.authorise_write(headers_in).await {
+        Ok(principal) => principal,
+        Err(response) => return response,
+    };
+    let principal_id = principal
+        .as_ref()
+        .map(|context| context.principal_id.as_str());
+    let access = match state
+        .authorise_repository(name, headers_in, principal.as_ref())
+        .await
+    {
+        Ok(access) => access,
+        Err(response) => return response,
+    };
 
     // Register monolithic requests too, so cancellation is covered by the TTL reaper.
     if let Some(digest_str) = query.digest {
         if Digest::new(&digest_str).is_err() {
             return StatusCode::BAD_REQUEST.into_response();
         }
-        let upload_id = match state.store.initiate_upload().await {
+        let upload_id = match state
+            .initiate_owned_upload(name, principal_id, &access)
+            .await
+        {
             Ok(id) => id,
             Err(_) => return StatusCode::INTERNAL_SERVER_ERROR.into_response(),
         };
-        state
-            .sessions
-            .register(&upload_id, name, std::time::SystemTime::now())
-            .await;
+        drop(access);
         return blob_upload_complete(state, name, &upload_id, &digest_str, headers_in, body).await;
     }
 
     // Chunked upload: start a session and register it for TTL tracking.
-    match state.store.initiate_upload().await {
+    match state
+        .initiate_owned_upload(name, principal_id, &access)
+        .await
+    {
         Ok(upload_id) => {
-            state
-                .sessions
-                .register(&upload_id, name, std::time::SystemTime::now())
-                .await;
             let location = format!("/v2/{name}/blobs/uploads/{upload_id}");
             let mut headers = HeaderMap::new();
             headers.insert("location", location.parse().expect("ASCII header value"));
@@ -607,21 +863,37 @@ async fn blob_upload_patch(
     headers_in: &HeaderMap,
     body: axum::body::Body,
 ) -> Response {
-    if let Err(response) = state.authorise_write(headers_in).await {
-        return response;
-    }
-    let Some(writer) = state.sessions.claim_writer(upload_id, name).await else {
+    let principal = match state.authorise_write(headers_in).await {
+        Ok(principal) => principal,
+        Err(response) => return response,
+    };
+    let principal_id = principal
+        .as_ref()
+        .map(|context| context.principal_id.as_str());
+    let access = match state
+        .authorise_repository(name, headers_in, principal.as_ref())
+        .await
+    {
+        Ok(access) => access,
+        Err(response) => return response,
+    };
+    let Some(writer) = state
+        .sessions
+        .claim_writer(upload_id, name, principal_id)
+        .await
+    else {
         return oci_error(
             StatusCode::BAD_REQUEST,
             "BLOB_UPLOAD_UNKNOWN",
-            "upload session unknown, busy or belongs to another repository".to_string(),
+            "upload session unknown, busy or belongs to another repository or principal"
+                .to_string(),
         );
     };
     // An upload session that outlived its TTL is refused and swept (REG8),
     // so an abandoned push can't dribble chunks into a stale temp forever.
     let now = std::time::SystemTime::now();
     if !state.sessions.touch(upload_id, 0, now).await {
-        state.store.cancel_upload(upload_id).await;
+        discard_upload(state, upload_id).await;
         return oci_error(
             StatusCode::BAD_REQUEST,
             "BLOB_UPLOAD_UNKNOWN",
@@ -629,6 +901,7 @@ async fn blob_upload_patch(
         );
     }
     let _writer = writer;
+    let _repository_writer = access;
     match stream_upload(state, upload_id, body).await {
         Ok(total) => {
             let mut headers = HeaderMap::new();
@@ -656,6 +929,17 @@ async fn blob_upload_patch(
             (StatusCode::ACCEPTED, headers).into_response()
         }
         Err(response) => response,
+    }
+}
+
+/// The calling request owns the writer; retain a fenced session on cleanup error.
+async fn discard_upload(state: &PickleState, upload_id: &str) {
+    state.sessions.retire(upload_id).await;
+    match state.store.cancel_upload(upload_id).await {
+        Ok(()) => {
+            state.sessions.complete(upload_id).await;
+        }
+        Err(error) => eprintln!("pickle: upload {upload_id} cleanup will retry: {error}"),
     }
 }
 
@@ -692,8 +976,7 @@ async fn stream_upload(
         Err(_) => Err(StatusCode::REQUEST_TIMEOUT.into_response()),
     };
     if result.is_err() {
-        state.store.cancel_upload(upload_id).await;
-        state.sessions.complete(upload_id).await;
+        discard_upload(state, upload_id).await;
     }
     result
 }
@@ -715,14 +998,30 @@ async fn blob_upload_complete(
     headers_in: &HeaderMap,
     body: axum::body::Body,
 ) -> Response {
-    if let Err(response) = state.authorise_write(headers_in).await {
-        return response;
-    }
-    let Some(writer) = state.sessions.claim_writer(upload_id, name).await else {
+    let principal = match state.authorise_write(headers_in).await {
+        Ok(principal) => principal,
+        Err(response) => return response,
+    };
+    let principal_id = principal
+        .as_ref()
+        .map(|context| context.principal_id.as_str());
+    let access = match state
+        .authorise_repository(name, headers_in, principal.as_ref())
+        .await
+    {
+        Ok(access) => access,
+        Err(response) => return response,
+    };
+    let Some(writer) = state
+        .sessions
+        .claim_writer(upload_id, name, principal_id)
+        .await
+    else {
         return oci_error(
             StatusCode::BAD_REQUEST,
             "BLOB_UPLOAD_UNKNOWN",
-            "upload session unknown, busy or belongs to another repository".to_string(),
+            "upload session unknown, busy or belongs to another repository or principal"
+                .to_string(),
         );
     };
     if !state
@@ -730,7 +1029,7 @@ async fn blob_upload_complete(
         .touch(upload_id, 0, std::time::SystemTime::now())
         .await
     {
-        state.store.cancel_upload(upload_id).await;
+        discard_upload(state, upload_id).await;
         return oci_error(
             StatusCode::BAD_REQUEST,
             "BLOB_UPLOAD_UNKNOWN",
@@ -756,8 +1055,7 @@ async fn blob_upload_complete(
     match state.store.upload_size(upload_id).await {
         Ok(incoming) => {
             if let Err(response) = state.enforce_quota(name, incoming).await {
-                state.store.cancel_upload(upload_id).await;
-                state.sessions.complete(upload_id).await;
+                discard_upload(state, upload_id).await;
                 return response;
             }
         }
@@ -767,12 +1065,16 @@ async fn blob_upload_complete(
         Err(_) => return StatusCode::NOT_FOUND.into_response(),
     }
 
+    state.sessions.retire(upload_id).await;
     let result = state
         .store
-        .complete_upload_guarded(upload_id, &digest, Some(writer))
+        .complete_upload_guarded(upload_id, &digest, Some(writer), access.guard.clone())
         .await;
-    // Whatever the outcome, the session is finished (REG8).
-    state.sessions.complete(upload_id).await;
+    if result.is_ok() {
+        state.sessions.complete(upload_id).await;
+    } else {
+        discard_upload(state, upload_id).await;
+    }
     match result {
         Ok(()) => {
             let mut headers = HeaderMap::new();
@@ -841,6 +1143,15 @@ const INDEX_MEDIA_TYPES: [&str; 2] = [
     "application/vnd.oci.image.index.v1+json",
     "application/vnd.docker.distribution.manifest.list.v2+json",
 ];
+
+fn registry_write_error(error: super::types::PickleError) -> Response {
+    let status = match error {
+        super::types::PickleError::LeaseDenied(_) => StatusCode::FORBIDDEN,
+        super::types::PickleError::ReplicationFailed(_) => StatusCode::SERVICE_UNAVAILABLE,
+        _ => StatusCode::INTERNAL_SERVER_ERROR,
+    };
+    oci_error(status, "DENIED", error.to_string())
+}
 
 /// An OCI Distribution error body: `{"errors": [{code, message}]}` —
 /// the shape real clients (docker, podman, buildah) know how to print.
@@ -923,10 +1234,26 @@ async fn manifest_put(
     headers: &HeaderMap,
     body: axum::body::Bytes,
 ) -> Response {
-    // Registry writes require a principal once auth is configured (REG4).
-    if let Err(response) = state.authorise_write(headers).await {
-        return response;
+    let principal = match state.authorise_write(headers).await {
+        Ok(principal) => principal,
+        Err(response) => return response,
+    };
+    if super::lease::is_test_repository(name)
+        && principal
+            .as_ref()
+            .is_some_and(|p| p.principal_id == crate::sesame::auth::SYSTEM_PRINCIPAL)
+    {
+        return registry_write_error(super::types::PickleError::LeaseDenied(
+            "internal replication cannot publish a leased manifest".into(),
+        ));
     }
+    let access = match state
+        .authorise_repository(name, headers, principal.as_ref())
+        .await
+    {
+        Ok(access) => access,
+        Err(response) => return response,
+    };
 
     // The `cache/` namespace is reserved for the pull-through cache, filled
     // internally via record_commit (M3). A client push there would let a
@@ -1084,14 +1411,25 @@ async fn manifest_put(
     // Validation passed: store the exact bytes (content addressing must
     // see what the client sent, not a re-serialisation) off the runtime,
     // then commit.
-    if let Err(e) = store_blob_off_runtime(state, body.to_vec(), manifest_digest.clone()).await {
+    if let Err(e) = store_blob_off_runtime(
+        state,
+        body.to_vec(),
+        manifest_digest.clone(),
+        access.guard.clone(),
+    )
+    .await
+    {
         return (
             StatusCode::INTERNAL_SERVER_ERROR,
             Json(serde_json::json!({"error": format!("failed to store manifest blob: {e}")})),
         )
             .into_response();
     }
-    let outcome = record_commit(state, manifest, reference.to_string()).await;
+    if let Err(error) =
+        record_commit_with_access(state, manifest, reference.to_string(), &access).await
+    {
+        return registry_write_error(error);
+    }
 
     let mut headers = HeaderMap::new();
     headers.insert(
@@ -1101,82 +1439,47 @@ async fn manifest_put(
             .parse()
             .expect("ASCII header value"),
     );
-    // Honest push semantics (REG7/D11): the manifest is committed, but
-    // replication to the configured replica count is driven by the heal
-    // loop afterwards. Advertise that so a client (or an operator reading
-    // headers) never mistakes acceptance for full redundancy. A Raft
-    // proposal that failed on a council member is reported distinctly —
-    // the push is accepted locally but is not yet authoritative.
-    match outcome {
-        CommitOutcome::Authoritative => {
-            headers.insert(
-                "oci-replication",
-                "pending".parse().expect("ASCII header value"),
-            );
-            (StatusCode::CREATED, headers).into_response()
-        }
-        CommitOutcome::RaftUncommitted => {
-            headers.insert(
-                "oci-replication",
-                "raft-uncommitted".parse().expect("ASCII header value"),
-            );
-            // 202 Accepted: stored and persisted, but not yet in the
-            // authoritative cluster catalogue — not a clean 201.
-            (StatusCode::ACCEPTED, headers).into_response()
-        }
-    }
+    // Cluster metadata is committed. Blob redundancy still converges through
+    // the heal loop, so acceptance must not claim that replication has finished.
+    headers.insert(
+        "oci-replication",
+        axum::http::HeaderValue::from_static("pending"),
+    );
+    (StatusCode::CREATED, headers).into_response()
 }
 
 /// `GET /v2/{name}/manifests/{reference}` — pull a manifest.
 ///
 /// `reference` can be a tag (e.g. `latest`) or a digest (e.g. `sha256:abc...`).
 /// Docker pulls sub-manifests by digest when resolving manifest lists.
-async fn manifest_get(state: &PickleState, _name: &str, reference: &str) -> Response {
-    // If the reference looks like a digest, try reading it directly
-    // from the blob store (Docker pulls sub-manifests by digest).
-    if let Ok(digest) = Digest::new(reference)
-        && let Ok(data) = state.store.read_blob(&digest)
-    {
-        let content_type = detect_manifest_content_type(&data);
-        let mut headers = HeaderMap::new();
-        headers.insert(
-            "content-type",
-            content_type.parse().expect("ASCII header value"),
-        );
-        headers.insert(
-            "docker-content-digest",
-            reference.parse().expect("ASCII header value"),
-        );
-        return (StatusCode::OK, headers, data).into_response();
-    }
-
-    // Try the catalogue by tag. Read the *authoritative* catalogue (the
-    // council's Raft-replicated one when clustered, local otherwise) so a
-    // manifest committed by a peer — or by a non-council push forwarded to
-    // Raft — is visible here even before a heal tick reconciles the local
-    // projection (REG2).
-    let catalog = state.catalog_snapshot().await;
-    let manifest = catalog.get_manifest_by_tag(_name, reference);
-
-    match manifest {
-        Some(m) => match state.store.read_blob(&m.digest) {
-            Ok(data) => {
-                let content_type = detect_manifest_content_type(&data);
-                let mut headers = HeaderMap::new();
-                headers.insert(
-                    "content-type",
-                    content_type.parse().expect("ASCII header value"),
-                );
-                headers.insert(
-                    "docker-content-digest",
-                    m.digest.as_str().parse().expect("ASCII header value"),
-                );
-                (StatusCode::OK, headers, data).into_response()
-            }
-            Err(_) => StatusCode::NOT_FOUND.into_response(),
-        },
-        None => StatusCode::NOT_FOUND.into_response(),
-    }
+async fn manifest_get(state: &PickleState, name: &str, reference: &str) -> Response {
+    // Shared blob bytes do not establish that this repository still exists.
+    // Tags and digests must both resolve through its current metadata.
+    let catalog = match state.catalog_snapshot(name).await {
+        Ok(catalog) => catalog,
+        Err(error) => return registry_write_error(error),
+    };
+    let manifest = match Digest::new(reference) {
+        Ok(digest) => catalog.get_repository_manifest(name, digest.as_str()),
+        Err(_) => catalog.get_manifest_by_tag(name, reference),
+    };
+    let Some(manifest) = manifest else {
+        return StatusCode::NOT_FOUND.into_response();
+    };
+    let digest = manifest.digest.clone();
+    let store = state.store.clone();
+    let read_digest = digest.clone();
+    let data = match tokio::task::spawn_blocking(move || store.read_blob(&read_digest)).await {
+        Ok(Ok(data)) => data,
+        Ok(Err(_)) => return StatusCode::NOT_FOUND.into_response(),
+        Err(_) => return StatusCode::INTERNAL_SERVER_ERROR.into_response(),
+    };
+    axum::http::Response::builder()
+        .status(StatusCode::OK)
+        .header("content-type", detect_manifest_content_type(&data))
+        .header("docker-content-digest", digest.as_str())
+        .body(axum::body::Body::from(data))
+        .unwrap_or_else(|_| StatusCode::INTERNAL_SERVER_ERROR.into_response())
 }
 
 /// Detect the correct content-type for a manifest blob.
@@ -1197,7 +1500,10 @@ fn detect_manifest_content_type(data: &[u8]) -> &'static str {
 async fn tags_list(state: &PickleState, name: &str) -> Response {
     // Read the authoritative catalogue (REG2): a repository a peer pushed
     // must list its tags here too, not only where the PUT landed.
-    let catalog = state.catalog_snapshot().await;
+    let catalog = match state.catalog_snapshot(name).await {
+        Ok(catalog) => catalog,
+        Err(error) => return registry_write_error(error),
+    };
     let tags = catalog.tags_for_repository(name);
     Json(serde_json::json!({
         "name": name,
@@ -1216,6 +1522,111 @@ mod tests {
     use axum::body::Body;
     use http_body_util::BodyExt;
     use tower::ServiceExt;
+
+    #[tokio::test]
+    async fn copy_confirmation_rehashes_all_blobs_and_persists_without_replaying_tags() {
+        let (mut state, directory) = test_state();
+        state.persist_path = Some(directory.path().join("catalog.json"));
+        let config = compute_sha256(b"configuration");
+        state.store.write_blob(b"configuration", &config).unwrap();
+        let body = manifest_body(&config, 13);
+        let digest = compute_sha256(&body);
+        let app = router(state.clone());
+        assert_eq!(
+            put_manifest(&app, "/v2/ordinary/manifests/latest", body.clone())
+                .await
+                .status(),
+            StatusCode::CREATED
+        );
+        // Model committed metadata from another storage node.
+        for (_, holders) in &mut state.catalog.write().await.layer_locations {
+            *holders = std::collections::BTreeSet::from([99]);
+        }
+        let tags = state.catalog.read().await.tags.clone();
+        std::fs::write(state.store.blob_path(&config), b"corrupt").unwrap();
+        assert!(matches!(
+            state.confirm_image_copy("ordinary", &digest).await,
+            Err(super::super::types::PickleError::DigestMismatch { .. })
+        ));
+        assert_eq!(
+            state.catalog.read().await.layer_holders(digest.as_str()),
+            std::collections::BTreeSet::from([99])
+        );
+        std::fs::write(state.store.blob_path(&config), b"configuration").unwrap();
+        state.store.delete_blob(&digest).unwrap();
+        assert!(state.confirm_image_copy("ordinary", &digest).await.is_err());
+        state.store.write_blob(&body, &digest).unwrap();
+        let receipt = state.confirm_image_copy("ordinary", &digest).await.unwrap();
+        assert_eq!(receipt.node_id, state.node_raft_id);
+        let persisted = ManifestCatalog::load_from(state.persist_path.as_ref().unwrap()).unwrap();
+        for blob in [&config, &digest] {
+            assert_eq!(
+                persisted.layer_holders(blob.as_str()),
+                std::collections::BTreeSet::from([7, 99])
+            );
+        }
+        assert_eq!(persisted.tags, tags);
+        assert!(state.confirm_image_copy("missing", &digest).await.is_err());
+        state.catalog.write().await.retire_repository("ordinary");
+        assert!(state.confirm_image_copy("ordinary", &digest).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn copy_confirmation_requires_service_authority_when_authentication_is_configured() {
+        let (mut state, _directory) = test_state();
+        let token = crate::sesame::token::create_token(
+            "admin",
+            crate::sesame::types::ApiRole::Admin,
+            crate::sesame::types::TokenScope::default(),
+            None,
+        )
+        .unwrap();
+        let tokens = crate::sesame::auth::new_token_store();
+        tokens.write().await.push(token.token);
+        state.auth = Some(crate::sesame::auth::AuthState::new(
+            tokens,
+            Some("internal".into()),
+        ));
+        state.allow_unauthenticated_bootstrap = false;
+        let config = compute_sha256(b"config");
+        state.store.write_blob(b"config", &config).unwrap();
+        let body = manifest_body(&config, 6);
+        let digest = compute_sha256(&body);
+        // Use the same authenticated OCI publication path before testing the internal route.
+        let app = router(state.clone());
+        let response = app
+            .clone()
+            .oneshot(
+                axum::http::Request::put("/v2/ordinary/manifests/latest")
+                    .header("authorization", format!("Bearer {}", token.plaintext))
+                    .body(Body::from(body))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::CREATED);
+        for (bearer, expected) in [
+            (None, StatusCode::UNAUTHORIZED),
+            (Some(token.plaintext.as_str()), StatusCode::FORBIDDEN),
+            (Some("internal"), StatusCode::OK),
+        ] {
+            let mut request =
+                axum::http::Request::post(format!("/v2/ordinary/copies/{}", digest.as_str()));
+            if let Some(bearer) = bearer {
+                request = request.header("authorization", format!("Bearer {bearer}"));
+            }
+            let response = app
+                .clone()
+                .oneshot(request.body(Body::empty()).unwrap())
+                .await
+                .unwrap();
+            let status = response.status();
+            let body = axum::body::to_bytes(response.into_body(), 4096)
+                .await
+                .unwrap();
+            assert_eq!(status, expected, "{}", String::from_utf8_lossy(&body));
+        }
+    }
 
     #[tokio::test]
     async fn monolithic_upload_reaches_disk_before_the_request_finishes() {
@@ -1316,13 +1727,893 @@ mod tests {
         drop(writers);
     }
 
+    async fn serve_peer_body(
+        body: Vec<u8>,
+    ) -> (super::super::replication::Peer, tokio::task::JoinHandle<()>) {
+        let app = Router::new().fallback(axum::routing::get(move || {
+            let body = body.clone();
+            async move { body }
+        }));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let peer = super::super::replication::Peer {
+            node_id: 2,
+            base_url: format!("http://{}", listener.local_addr().unwrap()),
+        };
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        (peer, server)
+    }
+
+    #[tokio::test]
+    async fn peer_pull_cleans_up_corrupt_and_unpublishable_uploads() {
+        let digest = compute_sha256(b"valid");
+        for rename_failure in [false, true] {
+            let (state, directory) = test_state();
+            let bytes = if rename_failure { b"valid" } else { b"wrong" };
+            let (peer, server) = serve_peer_body(bytes.to_vec()).await;
+            if rename_failure {
+                std::fs::create_dir_all(state.store.blob_path(&digest)).unwrap();
+            }
+            assert!(
+                state
+                    .pull_peer_blob(
+                        &peer,
+                        "ordinary",
+                        &digest,
+                        &reqwest::Client::new(),
+                        std::time::Duration::from_secs(2)
+                    )
+                    .await
+                    .is_err()
+            );
+            assert_eq!(
+                std::fs::read_dir(directory.path().join("uploads"))
+                    .unwrap()
+                    .count(),
+                0
+            );
+            assert!(
+                state
+                    .sessions
+                    .sweep(std::time::SystemTime::now() + std::time::Duration::from_secs(7200))
+                    .await
+                    .is_empty()
+            );
+            server.abort();
+            let _ = server.await;
+        }
+    }
+
+    #[tokio::test]
+    async fn peer_pull_retains_failed_temporary_file_deletion_for_retry() {
+        let (state, directory) = test_state();
+        let (peer, server) = serve_peer_body(b"valid".to_vec()).await;
+        let pause = state.sessions.pause_registration().await;
+        let owner = state.clone();
+        let pull = tokio::spawn(async move {
+            owner
+                .pull_peer_blob(
+                    &peer,
+                    "ordinary",
+                    &compute_sha256(b"valid"),
+                    &reqwest::Client::new(),
+                    std::time::Duration::from_secs(2),
+                )
+                .await
+        });
+        let uploads = directory.path().join("uploads");
+        let file = tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            loop {
+                if let Ok(entries) = std::fs::read_dir(&uploads)
+                    && let Some(entry) = entries.flatten().next()
+                {
+                    break entry.path();
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .unwrap();
+        let id = file.file_name().unwrap().to_str().unwrap().to_owned();
+        std::fs::remove_file(&file).unwrap();
+        std::fs::create_dir(&file).unwrap();
+        drop(pause);
+        let error = pull.await.unwrap().unwrap_err();
+        assert!(
+            error.to_string().contains("cleanup remains pending"),
+            "{error}"
+        );
+        assert_eq!(
+            state.sessions.sweep(std::time::SystemTime::now()).await,
+            vec![id]
+        );
+        assert_eq!(
+            state
+                .sessions
+                .cleanup_expired(&state.store, std::time::SystemTime::now())
+                .await
+                .len(),
+            1
+        );
+        std::fs::remove_dir(&file).unwrap();
+        assert!(
+            state
+                .sessions
+                .cleanup_expired(&state.store, std::time::SystemTime::now())
+                .await
+                .is_empty()
+        );
+        assert!(
+            state
+                .sessions
+                .sweep(std::time::SystemTime::now())
+                .await
+                .is_empty()
+        );
+        server.abort();
+        let _ = server.await;
+    }
+
+    #[tokio::test]
+    async fn peer_pull_requires_active_repository_ownership_even_for_cached_bytes() {
+        let (state, directory, _owner, _other) = leased_registry_state().await;
+        let repository = "rbtest-run1/web";
+        let digest = compute_sha256(b"valid");
+        state.store.write_blob(b"valid", &digest).unwrap();
+        let peer = super::super::replication::Peer {
+            node_id: 2,
+            base_url: "http://127.0.0.1:1".into(),
+        };
+        let client = reqwest::Client::new();
+        let timeout = std::time::Duration::from_millis(50);
+        assert!(
+            state
+                .pull_peer_blob(&peer, repository, &digest, &client, timeout)
+                .await
+                .is_err()
+        );
+        let lease = state.test_leases.get("run1").await.unwrap();
+        state
+            .test_leases
+            .register_registry_writer(
+                "run1",
+                repository,
+                99,
+                Some(&lease.owner_id),
+                crate::testkit::lease::now_unix_millis(),
+            )
+            .await
+            .unwrap();
+        state
+            .pull_peer_blob(&peer, repository, &digest, &client, timeout)
+            .await
+            .unwrap();
+        assert!(
+            state.test_leases.get("run1").await.unwrap().repositories[repository]
+                .contains(&state.node_raft_id)
+        );
+        assert_eq!(
+            ManifestCatalog::load_from(&directory.path().join("catalog.json"))
+                .unwrap()
+                .repository_owners[repository],
+            "run1"
+        );
+        state.test_leases.begin_cleanup("run1", None).await.unwrap();
+        assert!(
+            state
+                .pull_peer_blob(&peer, repository, &digest, &client, timeout)
+                .await
+                .is_err()
+        );
+        assert_eq!(state.store.read_blob(&digest).unwrap(), b"valid");
+    }
+
+    #[tokio::test]
+    async fn admitted_parallel_pull_finishes_while_repository_cleanup_is_queued() {
+        let (state, _directory, _owner, _other) = leased_registry_state().await;
+        let repository = "rbtest-run1/web";
+        let lease = state.test_leases.get("run1").await.unwrap();
+        let access = state
+            .admit_repository_write(repository, Some("run1"), Some(&lease.owner_id), false)
+            .await
+            .unwrap();
+        state.test_leases.begin_cleanup("run1", None).await.unwrap();
+        state
+            .test_leases
+            .confirm_workloads_retired("run1")
+            .await
+            .unwrap();
+        let receipt = super::super::authority::RegistryRetirement {
+            lease_id: "run1".into(),
+            repository: repository.into(),
+        };
+        let mut retire = Box::pin(state.retire_registry_repository(&receipt));
+        assert!(futures_util::poll!(retire.as_mut()).is_pending());
+        let (peer, server) = serve_peer_body(b"valid".to_vec()).await;
+        let plan = super::super::p2p::DownloadPlan {
+            fetches: vec![super::super::p2p::LayerFetch {
+                digest: compute_sha256(b"valid"),
+                peer: peer.clone(),
+            }],
+            unavailable: vec![],
+        };
+        tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            super::super::p2p::pull_layers_parallel(
+                plan,
+                repository,
+                &ManifestCatalog::default(),
+                &[peer],
+                &state,
+                &access,
+                &reqwest::Client::new(),
+                1,
+                std::time::Duration::from_secs(1),
+            ),
+        )
+        .await
+        .expect("already-admitted pulls must reuse their guard behind a queued cleanup")
+        .unwrap();
+        drop(access);
+        retire.await.unwrap();
+        assert!(state.test_leases.get("run1").await.unwrap().repositories[repository].is_empty());
+        server.abort();
+        let _ = server.await;
+    }
+
+    #[tokio::test]
+    async fn peer_pull_stalled_body_expires_and_retires_its_upload() {
+        let (state, directory) = test_state();
+        let app = Router::new().fallback(axum::routing::get(|| async {
+            Body::from_stream(futures_util::stream::pending::<
+                Result<axum::body::Bytes, std::io::Error>,
+            >())
+        }));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let peer = super::super::replication::Peer {
+            node_id: 2,
+            base_url: format!("http://{}", listener.local_addr().unwrap()),
+        };
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        let error = state
+            .pull_peer_blob(
+                &peer,
+                "ordinary",
+                &compute_sha256(b"valid"),
+                &reqwest::Client::new(),
+                std::time::Duration::from_millis(150),
+            )
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("timed out"), "{error}");
+        assert_eq!(
+            std::fs::read_dir(directory.path().join("uploads"))
+                .unwrap()
+                .count(),
+            0
+        );
+        server.abort();
+        let _ = server.await;
+    }
+
+    #[tokio::test]
+    async fn cancelled_peer_pull_keeps_its_temporary_upload_owned() {
+        use futures_util::StreamExt as _;
+        let (state, directory) = test_state();
+        let release = Arc::new(tokio::sync::Notify::new());
+        let released = release.clone();
+        let digest = compute_sha256(b"first-last");
+        let app = Router::new().route(
+            &format!("/v2/ordinary/blobs/{}", digest.as_str()),
+            axum::routing::get(move || {
+                let release = released.clone();
+                async move {
+                    Body::from_stream(
+                        futures_util::stream::iter([Ok::<_, std::io::Error>(
+                            axum::body::Bytes::from_static(b"first-"),
+                        )])
+                        .chain(futures_util::stream::once(async move {
+                            release.notified().await;
+                            Ok::<_, std::io::Error>(axum::body::Bytes::from_static(b"last"))
+                        })),
+                    )
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let peer = super::super::replication::Peer {
+            node_id: 2,
+            base_url: format!("http://{}", listener.local_addr().unwrap()),
+        };
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        let owner = state.clone();
+        let requested = digest.clone();
+        let caller = tokio::spawn(async move {
+            owner
+                .pull_peer_blob(
+                    &peer,
+                    "ordinary",
+                    &requested,
+                    &reqwest::Client::new(),
+                    std::time::Duration::from_secs(5),
+                )
+                .await
+        });
+        let uploads = directory.path().join("uploads");
+        let id = tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            loop {
+                if let Ok(entries) = std::fs::read_dir(&uploads) {
+                    for entry in entries.flatten() {
+                        if entry.metadata().unwrap().len() == 6 {
+                            return entry.file_name().to_str().unwrap().to_owned();
+                        }
+                    }
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .unwrap();
+        assert!(
+            state
+                .sessions
+                .is_active(&id, std::time::SystemTime::now())
+                .await,
+            "a peer temporary file must have an upload owner before bytes arrive"
+        );
+        caller.abort();
+        assert!(caller.await.unwrap_err().is_cancelled());
+        release.notify_one();
+        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            while !state.store.has_blob(&digest)
+                || state
+                    .sessions
+                    .is_active(&id, std::time::SystemTime::now())
+                    .await
+            {
+                tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .unwrap();
+        assert_eq!(state.store.read_blob(&digest).unwrap(), b"first-last");
+        assert_eq!(std::fs::read_dir(&uploads).unwrap().count(), 0);
+        server.abort();
+        let _ = server.await;
+    }
+
+    #[tokio::test]
+    async fn test_repository_upload_requires_an_authenticated_lease_before_creating_files() {
+        let (state, _directory) = test_state();
+        let store = state.store.clone();
+        let response = router(state)
+            .oneshot(
+                axum::http::Request::builder()
+                    .method("POST")
+                    .uri("/v2/rbtest-unowned/web/blobs/uploads/")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+        let uploads = store.base_dir().join("uploads");
+        assert!(!uploads.exists() || std::fs::read_dir(uploads).unwrap().count() == 0);
+    }
+
+    async fn leased_registry_state() -> (PickleState, tempfile::TempDir, String, String) {
+        use crate::sesame::{
+            auth, token,
+            types::{ApiRole, TokenScope},
+        };
+        let (mut state, directory) = test_state();
+        let owner =
+            token::create_token("publisher", ApiRole::Deployer, TokenScope::default(), None)
+                .unwrap();
+        let other =
+            token::create_token("publisher", ApiRole::Deployer, TokenScope::default(), None)
+                .unwrap();
+        let principal =
+            auth::authenticate(&owner.plaintext, std::slice::from_ref(&owner.token)).unwrap();
+        let tokens = auth::new_token_store();
+        *tokens.write().await = vec![owner.token, other.token];
+        state.auth = Some(auth::AuthState::new(tokens, Some("internal".into())));
+        state.allow_unauthenticated_bootstrap = false;
+        state.persist_path = Some(directory.path().join("catalog.json"));
+        let now = crate::testkit::lease::now_unix_millis();
+        state
+            .test_leases
+            .create(
+                crate::testkit::lease::TestLease::new(
+                    "run1".into(),
+                    principal.principal_id,
+                    "publisher".into(),
+                    "rbtest-run1".into(),
+                    now,
+                    now + 60_000,
+                )
+                .unwrap(),
+            )
+            .await
+            .unwrap();
+        (state, directory, owner.plaintext, other.plaintext)
+    }
+
+    fn lease_request(
+        method: &str,
+        path: &str,
+        bearer: &str,
+        lease: Option<&str>,
+        body: Vec<u8>,
+    ) -> axum::http::Request<Body> {
+        let mut request = axum::http::Request::builder()
+            .method(method)
+            .uri(path)
+            .header("authorization", format!("Bearer {bearer}"))
+            .header("content-type", "application/vnd.oci.image.manifest.v1+json");
+        if let Some(lease) = lease {
+            request = request.header("x-reliaburger-test-lease", lease);
+        }
+        request.body(Body::from(body)).unwrap()
+    }
+
+    #[tokio::test]
+    async fn leased_registry_uploads_require_exact_owner_and_wait_for_workload_retirement() {
+        let (state, directory, owner, other) = leased_registry_state().await;
+        let app = router(state.clone());
+        let repository = "rbtest-run1/web";
+        let initiate = "/v2/rbtest-run1/web/blobs/uploads/";
+        for (bearer, lease) in [
+            (&other, Some("run1")),
+            (&owner, None),
+            (&owner, Some("missing")),
+            (&owner, Some("")),
+        ] {
+            assert_eq!(
+                app.clone()
+                    .oneshot(lease_request("POST", initiate, bearer, lease, vec![]))
+                    .await
+                    .unwrap()
+                    .status(),
+                StatusCode::FORBIDDEN
+            );
+        }
+        assert_eq!(
+            app.clone()
+                .oneshot(lease_request(
+                    "POST",
+                    "/v2/ordinary/blobs/uploads/",
+                    &owner,
+                    Some("run1"),
+                    vec![]
+                ))
+                .await
+                .unwrap()
+                .status(),
+            StatusCode::FORBIDDEN
+        );
+        assert!(
+            state
+                .test_leases
+                .get("run1")
+                .await
+                .unwrap()
+                .repositories
+                .is_empty()
+        );
+        let response = app
+            .clone()
+            .oneshot(lease_request(
+                "POST",
+                initiate,
+                &owner,
+                Some("run1"),
+                vec![],
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::ACCEPTED);
+        let location = response.headers()["location"].to_str().unwrap().to_owned();
+        let id = response.headers()["docker-upload-uuid"]
+            .to_str()
+            .unwrap()
+            .to_owned();
+        assert_eq!(
+            ManifestCatalog::load_from(&directory.path().join("catalog.json"))
+                .unwrap()
+                .repository_owners[repository],
+            "run1"
+        );
+        assert_eq!(
+            state.test_leases.get("run1").await.unwrap().repositories[repository],
+            std::collections::BTreeSet::from([state.node_raft_id])
+        );
+        assert_eq!(
+            app.clone()
+                .oneshot(lease_request(
+                    "PATCH",
+                    &location,
+                    &owner,
+                    Some("run1"),
+                    b"partial".to_vec()
+                ))
+                .await
+                .unwrap()
+                .status(),
+            StatusCode::ACCEPTED
+        );
+        state.test_leases.begin_cleanup("run1", None).await.unwrap();
+        state.reap_registry_leases_once().await.unwrap();
+        assert_eq!(
+            state.store.upload_size(&id).await.unwrap(),
+            7,
+            "Cleaning alone cannot delete an image still used by workloads"
+        );
+        assert_eq!(
+            app.clone()
+                .oneshot(lease_request(
+                    "PATCH",
+                    &location,
+                    &owner,
+                    Some("run1"),
+                    b"late".to_vec()
+                ))
+                .await
+                .unwrap()
+                .status(),
+            StatusCode::FORBIDDEN
+        );
+        assert_eq!(
+            app.oneshot(lease_request("POST", initiate, "internal", None, vec![]))
+                .await
+                .unwrap()
+                .status(),
+            StatusCode::FORBIDDEN
+        );
+        state
+            .test_leases
+            .confirm_workloads_retired("run1")
+            .await
+            .unwrap();
+        state.reap_registry_leases_once().await.unwrap();
+        assert!(state.store.upload_size(&id).await.is_err());
+        assert!(state.test_leases.get("run1").await.unwrap().repositories[repository].is_empty());
+        assert!(
+            !ManifestCatalog::load_from(&directory.path().join("catalog.json"))
+                .unwrap()
+                .repository_owners
+                .contains_key(repository)
+        );
+        state.test_leases.finish_cleanup("run1").await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn leased_manifest_cleanup_preserves_ordinary_shared_content() {
+        let (state, _directory, owner, _) = leased_registry_state().await;
+        let app = router(state.clone());
+        let config = compute_sha256(b"shared");
+        let complete = format!(
+            "/v2/rbtest-run1/web/blobs/uploads/?digest={}",
+            config.as_str()
+        );
+        assert_eq!(
+            app.clone()
+                .oneshot(lease_request(
+                    "POST",
+                    &complete,
+                    &owner,
+                    Some("run1"),
+                    b"shared".to_vec()
+                ))
+                .await
+                .unwrap()
+                .status(),
+            StatusCode::CREATED
+        );
+        let body = manifest_body(&config, 6);
+        let digest = compute_sha256(&body);
+        for (path, lease) in [
+            ("/v2/rbtest-run1/web/manifests/latest", Some("run1")),
+            ("/v2/ordinary/manifests/latest", None),
+        ] {
+            assert_eq!(
+                app.clone()
+                    .oneshot(lease_request("PUT", path, &owner, lease, body.clone()))
+                    .await
+                    .unwrap()
+                    .status(),
+                StatusCode::CREATED
+            );
+        }
+        // System replication may receive blobs, but cannot publish user manifests.
+        assert_eq!(
+            app.oneshot(lease_request(
+                "PUT",
+                "/v2/rbtest-run1/web/manifests/system",
+                "internal",
+                None,
+                body
+            ))
+            .await
+            .unwrap()
+            .status(),
+            StatusCode::FORBIDDEN
+        );
+        state.test_leases.begin_cleanup("run1", None).await.unwrap();
+        state
+            .test_leases
+            .confirm_workloads_retired("run1")
+            .await
+            .unwrap();
+        state.reap_registry_leases_once().await.unwrap();
+        let catalog = state.catalog.read().await;
+        assert!(
+            catalog
+                .get_manifest_by_tag("rbtest-run1/web", "latest")
+                .is_none()
+        );
+        assert!(catalog.get_manifest_by_tag("ordinary", "latest").is_some());
+        assert!(catalog.referenced_digest_set().contains(digest.as_str()));
+        drop(catalog);
+        assert!(
+            state
+                .collect_garbage(super::super::types::GcReport {
+                    node_id: state.node_raft_id,
+                    deleted_layers: vec![config.clone(), digest.clone()]
+                })
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        assert!(state.store.has_blob(&config));
+        assert!(state.store.has_blob(&digest));
+        let reader = router(state.clone());
+        for (repository, expected) in [
+            ("rbtest-run1/web", StatusCode::NOT_FOUND),
+            ("ordinary", StatusCode::OK),
+        ] {
+            let response = reader
+                .clone()
+                .oneshot(
+                    axum::http::Request::get(format!(
+                        "/v2/{repository}/manifests/{}",
+                        digest.as_str()
+                    ))
+                    .body(Body::empty())
+                    .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(
+                response.status(),
+                expected,
+                "digest reads must respect repository retirement"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn failed_registry_generation_persistence_never_creates_an_upload() {
+        let (mut state, directory, owner, _) = leased_registry_state().await;
+        let blocked = directory.path().join("blocked");
+        std::fs::write(&blocked, b"not a directory").unwrap();
+        state.persist_path = Some(blocked.join("catalog.json"));
+        let response = router(state.clone())
+            .oneshot(lease_request(
+                "POST",
+                "/v2/rbtest-run1/web/blobs/uploads/",
+                &owner,
+                Some("run1"),
+                vec![],
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        let uploads = state.store.base_dir().join("uploads");
+        assert!(!uploads.exists() || std::fs::read_dir(uploads).unwrap().count() == 0);
+        assert!(
+            !state
+                .test_leases
+                .get("run1")
+                .await
+                .unwrap()
+                .registry_retirement_confirmed()
+        );
+        assert!(state.catalog.read().await.repository_owners.is_empty());
+    }
+
+    #[tokio::test]
+    async fn failed_registry_retirement_retains_the_receipt_for_retry() {
+        let (mut state, directory, owner, _) = leased_registry_state().await;
+        let response = router(state.clone())
+            .oneshot(lease_request(
+                "POST",
+                "/v2/rbtest-run1/web/blobs/uploads/",
+                &owner,
+                Some("run1"),
+                vec![],
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::ACCEPTED);
+        let id = response.headers()["docker-upload-uuid"].to_str().unwrap();
+        let upload = directory.path().join("uploads").join(id);
+        std::fs::remove_file(&upload).unwrap();
+        std::fs::create_dir(&upload).unwrap();
+        state.test_leases.begin_cleanup("run1", None).await.unwrap();
+        state
+            .test_leases
+            .confirm_workloads_retired("run1")
+            .await
+            .unwrap();
+        assert!(state.reap_registry_leases_once().await.is_err());
+        assert!(state.test_leases.finish_cleanup("run1").await.is_err());
+        assert_eq!(
+            state.test_leases.get("run1").await.unwrap().repositories["rbtest-run1/web"],
+            std::collections::BTreeSet::from([state.node_raft_id])
+        );
+        std::fs::remove_dir(upload).unwrap();
+        let blocked = directory.path().join("blocked");
+        std::fs::write(&blocked, b"not a directory").unwrap();
+        state.persist_path = Some(blocked.join("catalog.json"));
+        assert!(state.reap_registry_leases_once().await.is_err());
+        assert_eq!(
+            state.catalog.read().await.repository_owners["rbtest-run1/web"],
+            "run1"
+        );
+        assert!(state.test_leases.finish_cleanup("run1").await.is_err());
+        state.persist_path = Some(directory.path().join("catalog.json"));
+        state.reap_registry_leases_once().await.unwrap();
+        state.test_leases.finish_cleanup("run1").await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn cancelled_upload_creation_remains_owned_until_registration_and_cleanup() {
+        let (state, directory, owner, _) = leased_registry_state().await;
+        let paused = state.sessions.pause_registration().await;
+        let app = router(state.clone());
+        let upload = tokio::spawn(async move {
+            app.oneshot(lease_request(
+                "POST",
+                "/v2/rbtest-run1/web/blobs/uploads/",
+                &owner,
+                Some("run1"),
+                vec![],
+            ))
+            .await
+        });
+        let uploads = directory.path().join("uploads");
+        tokio::time::timeout(std::time::Duration::from_secs(3), async {
+            loop {
+                if uploads.exists() && std::fs::read_dir(&uploads).unwrap().count() == 1 {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        upload.abort();
+        assert!(upload.await.unwrap_err().is_cancelled());
+        state.test_leases.begin_cleanup("run1", None).await.unwrap();
+        state
+            .test_leases
+            .confirm_workloads_retired("run1")
+            .await
+            .unwrap();
+        let mut cleanup = Box::pin(state.reap_registry_leases_once());
+        assert!(
+            futures_util::poll!(cleanup.as_mut()).is_pending(),
+            "unregistered creation still holds repository ownership"
+        );
+        drop(paused);
+        tokio::time::timeout(std::time::Duration::from_secs(3), cleanup)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(std::fs::read_dir(&uploads).unwrap().count(), 0);
+        assert!(
+            state
+                .test_leases
+                .get("run1")
+                .await
+                .unwrap()
+                .registry_retirement_confirmed()
+        );
+    }
+
+    #[tokio::test]
+    async fn standalone_manifest_commit_rechecks_cleanup_after_writer_admission() {
+        let (state, _directory, owner, _) = leased_registry_state().await;
+        let headers = lease_request("POST", "/", &owner, Some("run1"), vec![])
+            .headers()
+            .clone();
+        let principal = state.authorise_write(&headers).await.unwrap();
+        let access = state
+            .authorise_repository("rbtest-run1/web", &headers, principal.as_ref())
+            .await
+            .unwrap();
+        state.test_leases.begin_cleanup("run1", None).await.unwrap();
+        let digest = compute_sha256(b"content");
+        state.store.write_blob(b"content", &digest).unwrap();
+        let manifest = ImageManifest {
+            digest: digest.clone(),
+            config: LayerDescriptor {
+                digest,
+                size: 7,
+                media_type: "config".into(),
+            },
+            layers: vec![],
+            repository: "rbtest-run1/web".into(),
+            tags: Default::default(),
+            total_size: 7,
+            pushed_at: std::time::SystemTime::now(),
+            pushed_by: state.node_raft_id,
+            signature: None,
+        };
+        assert!(matches!(
+            record_commit_with_access(&state, manifest, "late".into(), &access).await,
+            Err(super::super::types::PickleError::LeaseDenied(_))
+        ));
+        assert!(state.catalog.read().await.manifests.is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_busy_registry_writer_does_not_starve_other_repository_retirements() {
+        let (state, _directory, owner, _) = leased_registry_state().await;
+        let headers = lease_request("POST", "/", &owner, Some("run1"), vec![])
+            .headers()
+            .clone();
+        let principal = state.authorise_write(&headers).await.unwrap();
+        let busy = state
+            .authorise_repository("rbtest-run1/a", &headers, principal.as_ref())
+            .await
+            .unwrap();
+        let response = router(state.clone())
+            .oneshot(lease_request(
+                "POST",
+                "/v2/rbtest-run1/z/blobs/uploads/",
+                &owner,
+                Some("run1"),
+                vec![],
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::ACCEPTED);
+        let id = response.headers()["docker-upload-uuid"].to_str().unwrap();
+        state.test_leases.begin_cleanup("run1", None).await.unwrap();
+        state
+            .test_leases
+            .confirm_workloads_retired("run1")
+            .await
+            .unwrap();
+        let mut cleanup = Box::pin(state.reap_registry_leases_once());
+        tokio::time::pause();
+        assert!(futures_util::poll!(cleanup.as_mut()).is_pending());
+        tokio::time::advance(std::time::Duration::from_secs(5)).await;
+        tokio::time::resume();
+        assert!(cleanup.await.is_err());
+        let lease = state.test_leases.get("run1").await.unwrap();
+        assert!(!lease.repositories["rbtest-run1/a"].is_empty());
+        assert!(lease.repositories["rbtest-run1/z"].is_empty());
+        assert!(state.store.upload_size(id).await.is_err());
+        drop(busy);
+        state.reap_registry_leases_once().await.unwrap();
+        state.test_leases.finish_cleanup("run1").await.unwrap();
+    }
+
     #[tokio::test]
     async fn upload_session_cannot_be_written_through_a_different_repository() {
         let (state, _dir) = test_state();
         let id = state.store.initiate_upload().await.unwrap();
         state
             .sessions
-            .register(&id, "team-a/web", std::time::SystemTime::now())
+            .register(&id, "team-a/web", None, std::time::SystemTime::now())
             .await;
         let store = Arc::clone(&state.store);
         let app = router(state);
@@ -1339,12 +2630,104 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn upload_session_belongs_to_the_exact_authenticated_credential() {
+        use crate::sesame::{
+            auth, token,
+            types::{ApiRole, TokenScope},
+        };
+        let (mut state, _directory) = test_state();
+        // Reusing the human-readable token name must not inherit ownership.
+        let alice =
+            token::create_token("publisher", ApiRole::Deployer, TokenScope::default(), None)
+                .unwrap();
+        let bob = token::create_token("publisher", ApiRole::Deployer, TokenScope::default(), None)
+            .unwrap();
+        let tokens = auth::new_token_store();
+        *tokens.write().await = vec![alice.token.clone(), bob.token.clone()];
+        state.auth = Some(auth::AuthState::new(
+            tokens.clone(),
+            Some("internal".into()),
+        ));
+        state.allow_unauthenticated_bootstrap = false;
+        let store = state.store.clone();
+        let app = router(state);
+        let request = |method: &str, uri: &str, bearer: &str, data: &'static str| {
+            axum::http::Request::builder()
+                .method(method)
+                .uri(uri)
+                .header("authorization", format!("Bearer {bearer}"))
+                .body(Body::from(data))
+                .unwrap()
+        };
+        let response = app
+            .clone()
+            .oneshot(request(
+                "POST",
+                "/v2/team/web/blobs/uploads/",
+                &alice.plaintext,
+                "",
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::ACCEPTED);
+        let location = response.headers()["location"].to_str().unwrap().to_owned();
+        let id = response.headers()["docker-upload-uuid"]
+            .to_str()
+            .unwrap()
+            .to_owned();
+        let digest = compute_sha256(b"owned");
+        let complete = format!("{location}?digest={}", digest.as_str());
+        for bearer in [&bob.plaintext, "internal"] {
+            for (method, uri) in [("PATCH", &location), ("PUT", &complete)] {
+                let response = app
+                    .clone()
+                    .oneshot(request(method, uri, bearer, "owned"))
+                    .await
+                    .unwrap();
+                assert_eq!(
+                    response.status(),
+                    StatusCode::BAD_REQUEST,
+                    "{method} must refuse another principal"
+                );
+                assert_eq!(store.upload_size(&id).await.unwrap(), 0);
+                assert!(!store.has_blob(&digest));
+            }
+        }
+        *tokens.write().await = vec![bob.token];
+        assert_eq!(
+            app.clone()
+                .oneshot(request("PATCH", &location, &alice.plaintext, "owned"))
+                .await
+                .unwrap()
+                .status(),
+            StatusCode::UNAUTHORIZED
+        );
+        tokens.write().await.push(alice.token);
+        assert_eq!(
+            app.clone()
+                .oneshot(request("PATCH", &location, &alice.plaintext, "owned"))
+                .await
+                .unwrap()
+                .status(),
+            StatusCode::ACCEPTED
+        );
+        assert_eq!(
+            app.oneshot(request("PUT", &complete, &alice.plaintext, ""))
+                .await
+                .unwrap()
+                .status(),
+            StatusCode::CREATED
+        );
+        assert_eq!(store.read_blob(&digest).unwrap(), b"owned");
+    }
+
+    #[tokio::test]
     async fn expired_upload_cannot_be_completed() {
         let (state, _dir) = test_state();
         let id = state.store.initiate_upload().await.unwrap();
         state
             .sessions
-            .register(&id, "web", std::time::SystemTime::UNIX_EPOCH)
+            .register(&id, "web", None, std::time::SystemTime::UNIX_EPOCH)
             .await;
         let digest = compute_sha256(b"data");
         let request = axum::http::Request::builder()
@@ -1363,6 +2746,529 @@ mod tests {
         assert!(!store.has_blob(&digest));
     }
 
+    #[tokio::test]
+    async fn a_manifest_push_requires_a_committed_cluster_catalogue() {
+        use crate::council::CouncilNode;
+        use crate::council::network::{InMemoryRaftNetworkFactory, InMemoryRaftRouter};
+        use crate::council::types::{CouncilConfig, CouncilNodeInfo};
+        let (mut state, directory) = test_state();
+        let network = InMemoryRaftRouter::new();
+        let council = Arc::new(
+            CouncilNode::new(
+                state.node_raft_id,
+                CouncilConfig::default(),
+                InMemoryRaftNetworkFactory::new(state.node_raft_id, network.clone()),
+                crate::council::log_store::MemLogStore::new(),
+                crate::council::state_machine::CouncilStateMachine::new(),
+                None,
+            )
+            .await
+            .unwrap(),
+        );
+        network
+            .register(state.node_raft_id, council.raft().clone())
+            .await;
+        state.council = Some(council.clone());
+        state.persist_path = Some(directory.path().join("catalog.json"));
+        let app = test_router(state.clone());
+        let config = push_blob(&app, "ordinary", b"config").await;
+        let body = manifest_body(&config, 6);
+        let response = put_manifest(&app, "/v2/ordinary/manifests/latest", body.clone()).await;
+        // OCI clients must receive a retryable error, not a success-class
+        // response that only a custom replication header contradicts.
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert!(council.manifest_catalog().await.manifests.is_empty());
+        assert!(state.store.has_blob(&config));
+        council
+            .initialize(std::collections::BTreeMap::from([(
+                state.node_raft_id,
+                CouncilNodeInfo {
+                    addr: "127.0.0.1:19001".parse().unwrap(),
+                    name: "registry".into(),
+                },
+            )]))
+            .await
+            .unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            while !council.is_leader().await {
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap();
+        assert_eq!(
+            put_manifest(&app, "/v2/ordinary/manifests/latest", body)
+                .await
+                .status(),
+            StatusCode::CREATED
+        );
+        assert!(
+            council
+                .manifest_catalog()
+                .await
+                .get_manifest_by_tag("ordinary", "latest")
+                .is_some()
+        );
+        council.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn failed_catalogue_persistence_does_not_acknowledge_or_publish_a_manifest() {
+        let (mut state, directory) = test_state();
+        let blocked = directory.path().join("catalog.json");
+        std::fs::create_dir(&blocked).unwrap();
+        state.persist_path = Some(blocked.clone());
+        let catalog = state.catalog.clone();
+        let app = test_router(state);
+        let config = b"config";
+        let digest = push_blob(&app, "myapp", config).await;
+        let body = serde_json::to_vec(&serde_json::json!({
+            "schemaVersion": 2,
+            "mediaType": "application/vnd.oci.image.manifest.v1+json",
+            "config": {"digest": digest.as_str(), "size": config.len()},
+            "layers": []
+        }))
+        .unwrap();
+        let response = put_manifest(&app, "/v2/myapp/manifests/latest", body.clone()).await;
+        assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        assert!(
+            catalog
+                .read()
+                .await
+                .get_manifest_by_tag("myapp", "latest")
+                .is_none()
+        );
+        std::fs::remove_dir(&blocked).unwrap();
+        let response = put_manifest(&app, "/v2/myapp/manifests/latest", body).await;
+        assert_eq!(response.status(), StatusCode::CREATED);
+        assert!(
+            ManifestCatalog::load_from(&blocked)
+                .unwrap()
+                .get_manifest_by_tag("myapp", "latest")
+                .is_some()
+        );
+    }
+
+    fn manifest_body(config: &Digest, size: usize) -> Vec<u8> {
+        serde_json::to_vec(&serde_json::json!({
+            "schemaVersion": 2,
+            "mediaType": "application/vnd.oci.image.manifest.v1+json",
+            "config": {"digest": config.as_str(), "size": size},
+            "layers": []
+        }))
+        .unwrap()
+    }
+
+    #[tokio::test]
+    async fn cancelled_manifest_publication_retains_its_catalogue_guard_until_authority_replies() {
+        cancelled_publication_owns_guard(false).await;
+    }
+
+    #[tokio::test]
+    async fn cancelled_copy_confirmation_retains_its_catalogue_guard_until_authority_replies() {
+        cancelled_publication_owns_guard(true).await;
+    }
+
+    async fn cancelled_publication_owns_guard(copy: bool) {
+        use super::super::authority::{
+            REGISTRY_PROPOSAL_PATH, REGISTRY_QUERY_PATH, RegistryForwarder, RegistryQueryResponse,
+        };
+        let (mut state, directory) = test_state();
+        state.persist_path = Some(directory.path().join("catalog.json"));
+        let digest = compute_sha256(b"publication");
+        state.store.write_blob(b"publication", &digest).unwrap();
+        let manifest = ImageManifest {
+            repository: "ordinary".into(),
+            digest: digest.clone(),
+            tags: Default::default(),
+            config: LayerDescriptor {
+                digest,
+                size: 11,
+                media_type: "config".into(),
+            },
+            layers: vec![],
+            total_size: 11,
+            pushed_by: state.node_raft_id,
+            pushed_at: std::time::SystemTime::now(),
+            signature: None,
+        };
+        if copy {
+            record_commit(&state, manifest.clone(), "latest".into())
+                .await
+                .unwrap();
+        }
+        let remote_catalogue = state.catalog.read().await.clone();
+        let proposed = Arc::new(tokio::sync::Notify::new());
+        let release = Arc::new(tokio::sync::Notify::new());
+        let seen = proposed.clone();
+        let released = release.clone();
+        let app = Router::new()
+            .route(
+                REGISTRY_QUERY_PATH,
+                axum::routing::post(
+                    move |Json(request): Json<super::super::authority::RegistryQueryRequest>| {
+                        let catalogue = remote_catalogue.clone();
+                        async move {
+                            match request.query {
+                                super::super::authority::RegistryQuery::Repository { .. } => {
+                                    Json(RegistryQueryResponse::Repository(Box::new(catalogue)))
+                                }
+                                super::super::authority::RegistryQuery::GcGeneration => {
+                                    Json(RegistryQueryResponse::GcGeneration(0))
+                                }
+                                other => panic!("unexpected query: {other:?}"),
+                            }
+                        }
+                    },
+                ),
+            )
+            .route(
+                REGISTRY_PROPOSAL_PATH,
+                axum::routing::post(
+                    move |Json(proposal): Json<super::super::authority::RegistryProposal>| {
+                        assert_eq!(
+                            matches!(
+                                proposal.mutation,
+                                super::super::authority::RegistryMutation::Copy(_)
+                            ),
+                            copy
+                        );
+                        let seen = seen.clone();
+                        let release = released.clone();
+                        async move {
+                            seen.notify_one();
+                            release.notified().await;
+                            Json(crate::council::CouncilResponse::Ok)
+                        }
+                    },
+                ),
+            );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        let (_tx, rx) = tokio::sync::watch::channel(crate::mustard::directory::NodeDirectory {
+            leader: Some(crate::mustard::message::LeaderHint {
+                node_id: crate::meat::NodeId::new("leader"),
+                term: 1,
+                api_address: address,
+                reporting_address: address,
+            }),
+            ..Default::default()
+        });
+        state.forwarder = Some(RegistryForwarder::new(
+            crate::cluster::ClusterHttp::plaintext().with_bearer(Some("internal".into())),
+            rx,
+        ));
+        let publisher = state.clone();
+        let caller = tokio::spawn(async move {
+            if copy {
+                publisher
+                    .confirm_image_copy("ordinary", &manifest.digest)
+                    .await
+                    .map(|_| ())
+            } else {
+                record_commit(&publisher, manifest, "latest".into()).await
+            }
+        });
+        tokio::time::timeout(std::time::Duration::from_secs(2), proposed.notified())
+            .await
+            .unwrap();
+        assert!(
+            state.catalog.try_write().is_err(),
+            "publication must own the local guard while authority is outstanding"
+        );
+        caller.abort();
+        let _ = caller.await;
+        assert!(
+            state.catalog.try_write().is_err(),
+            "a disconnected publisher must not release its pending transaction"
+        );
+        release.notify_one();
+        let completed =
+            tokio::time::timeout(std::time::Duration::from_secs(2), state.catalog.read())
+                .await
+                .unwrap();
+        assert!(
+            completed
+                .get_manifest_by_tag("ordinary", "latest")
+                .is_some()
+        );
+        assert!(
+            ManifestCatalog::load_from(&directory.path().join("catalog.json"))
+                .unwrap()
+                .get_manifest_by_tag("ordinary", "latest")
+                .is_some()
+        );
+        server.abort();
+        let _ = server.await;
+    }
+
+    #[tokio::test]
+    async fn gc_owns_the_catalogue_before_arbitration_and_through_caller_cancellation() {
+        use super::super::authority::{
+            REGISTRY_PROPOSAL_PATH, RegistryForwarder, RegistryMutation, RegistryProposal,
+        };
+        let (mut state, _directory) = test_state();
+        let digest = compute_sha256(b"collectable");
+        state.store.write_blob(b"collectable", &digest).unwrap();
+        let proposed = Arc::new(tokio::sync::Notify::new());
+        let release = Arc::new(tokio::sync::Notify::new());
+        let seen = proposed.clone();
+        let released = release.clone();
+        let app = Router::new().route(
+            REGISTRY_PROPOSAL_PATH,
+            axum::routing::post(move |Json(request): Json<RegistryProposal>| {
+                let seen = seen.clone();
+                let release = released.clone();
+                async move {
+                    let RegistryMutation::GarbageCollection(report) = request.mutation else {
+                        panic!("unexpected proposal");
+                    };
+                    seen.notify_one();
+                    release.notified().await;
+                    Json(crate::council::CouncilResponse::GcApproved {
+                        approved: report.deleted_layers,
+                    })
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        let (_tx, rx) = tokio::sync::watch::channel(crate::mustard::directory::NodeDirectory {
+            leader: Some(crate::mustard::message::LeaderHint {
+                node_id: crate::meat::NodeId::new("leader"),
+                term: 1,
+                api_address: address,
+                reporting_address: address,
+            }),
+            ..Default::default()
+        });
+        state.forwarder = Some(RegistryForwarder::new(
+            crate::cluster::ClusterHttp::plaintext().with_bearer(Some("internal".into())),
+            rx,
+        ));
+        let gate = state.catalog.write().await;
+        let owner = state.clone();
+        let collected = digest.clone();
+        let caller = tokio::spawn(async move {
+            owner
+                .collect_garbage(super::super::types::GcReport {
+                    node_id: owner.node_raft_id,
+                    deleted_layers: vec![collected],
+                })
+                .await
+        });
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(150), proposed.notified())
+                .await
+                .is_err(),
+            "GC must not request approval while another transaction owns its catalogue"
+        );
+        drop(gate);
+        tokio::time::timeout(std::time::Duration::from_secs(2), proposed.notified())
+            .await
+            .unwrap();
+        assert!(state.catalog.try_write().is_err());
+        caller.abort();
+        let _ = caller.await;
+        assert!(
+            state.catalog.try_write().is_err(),
+            "cancelling the caller must not release physical transaction ownership"
+        );
+        release.notify_one();
+        let _finished =
+            tokio::time::timeout(std::time::Duration::from_secs(2), state.catalog.write())
+                .await
+                .unwrap();
+        assert!(!state.store.has_blob(&digest));
+        server.abort();
+        let _ = server.await;
+    }
+
+    #[tokio::test]
+    async fn garbage_collection_persistence_failure_retains_blobs_until_retry() {
+        let (mut state, directory) = test_state();
+        let blocked = directory.path().join("catalog.json");
+        std::fs::create_dir(&blocked).unwrap();
+        state.persist_path = Some(blocked.clone());
+        let digest = compute_sha256(b"orphan");
+        state.store.write_blob(b"orphan", &digest).unwrap();
+        let report = super::super::types::GcReport {
+            node_id: state.node_raft_id,
+            deleted_layers: vec![digest.clone()],
+        };
+        assert!(state.collect_garbage(report.clone()).await.is_err());
+        assert!(state.store.has_blob(&digest));
+        std::fs::remove_dir(&blocked).unwrap();
+        assert_eq!(
+            state.collect_garbage(report).await.unwrap(),
+            vec![digest.clone()]
+        );
+        assert!(!state.store.has_blob(&digest));
+        assert!(
+            ManifestCatalog::load_from(&blocked)
+                .unwrap()
+                .manifests
+                .is_empty()
+        );
+    }
+
+    #[tokio::test]
+    async fn garbage_collection_retries_failed_deletion_after_reloading_its_decision() {
+        let (mut state, directory) = test_state();
+        let path = directory.path().join("catalog.json");
+        state.persist_path = Some(path.clone());
+        let digest = compute_sha256(b"extra");
+        let blob = state.store.blob_path(&digest);
+        // A directory at the blob path deterministically refuses file deletion,
+        // including when privileged qualification runs as root.
+        std::fs::create_dir_all(&blob).unwrap();
+        state.catalog.write().await.apply_update_locations(
+            &super::super::types::UpdateLayerLocations {
+                updates: vec![(
+                    digest.clone(),
+                    std::collections::BTreeSet::from([state.node_raft_id, 99]),
+                )],
+            },
+        );
+        let report = super::super::types::GcReport {
+            node_id: state.node_raft_id,
+            deleted_layers: vec![digest.clone()],
+        };
+        assert!(
+            state
+                .collect_garbage(report.clone())
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        state.catalog = Arc::new(RwLock::new(ManifestCatalog::load_from(&path).unwrap()));
+        assert_eq!(
+            state.catalog.read().await.layer_holders(digest.as_str()),
+            std::collections::BTreeSet::from([99])
+        );
+        std::fs::remove_dir(&blob).unwrap();
+        state.store.write_blob(b"extra", &digest).unwrap();
+        assert_eq!(
+            state.collect_garbage(report).await.unwrap(),
+            vec![digest.clone()]
+        );
+        assert!(!state.store.has_blob(&digest));
+    }
+
+    #[tokio::test]
+    async fn push_rechecks_blobs_after_waiting_for_garbage_collection() {
+        let (mut state, directory) = test_state();
+        state.persist_path = Some(directory.path().join("catalog.json"));
+        let app = test_router(state.clone());
+        let config = push_blob(&app, "myapp", b"config").await;
+        let body = manifest_body(&config, 6);
+        let manifest = compute_sha256(&body);
+        let guard = state.catalog.write().await;
+        let mut gc = Box::pin(state.collect_garbage(super::super::types::GcReport {
+            node_id: state.node_raft_id,
+            deleted_layers: vec![config.clone()],
+        }));
+        assert!(futures_util::poll!(gc.as_mut()).is_pending());
+        let push =
+            tokio::spawn(
+                async move { put_manifest(&app, "/v2/myapp/manifests/latest", body).await },
+            );
+        tokio::time::timeout(std::time::Duration::from_secs(3), async {
+            while !state.store.has_blob(&manifest) {
+                tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .unwrap();
+        // The HTTP path has validated and stored the manifest. FIFO lock
+        // admission lets already-queued GC finish before its catalogue commit.
+        drop(guard);
+        assert_eq!(gc.await.unwrap(), vec![config]);
+        assert_eq!(
+            push.await.unwrap().status(),
+            StatusCode::INTERNAL_SERVER_ERROR
+        );
+        assert!(
+            state
+                .catalog
+                .read()
+                .await
+                .get_manifest_by_tag("myapp", "latest")
+                .is_none()
+        );
+    }
+
+    #[tokio::test]
+    async fn stale_collection_report_preserves_a_committed_manifest_and_shared_config() {
+        let (state, _directory) = test_state();
+        let app = test_router(state.clone());
+        let config = push_blob(&app, "ordinary", b"shared").await;
+        let body = manifest_body(&config, 6);
+        let manifest = compute_sha256(&body);
+        assert_eq!(
+            put_manifest(&app, "/v2/ordinary/manifests/latest", body)
+                .await
+                .status(),
+            StatusCode::CREATED
+        );
+        let deleted = state
+            .collect_garbage(super::super::types::GcReport {
+                node_id: state.node_raft_id,
+                deleted_layers: vec![config.clone(), manifest.clone()],
+            })
+            .await
+            .unwrap();
+        assert!(deleted.is_empty());
+        assert!(state.store.has_blob(&config));
+        assert!(state.store.has_blob(&manifest));
+    }
+
+    #[tokio::test]
+    async fn simultaneous_pushes_leave_every_acknowledged_tag_on_disk() {
+        let (mut state, directory) = test_state();
+        let path = directory.path().join("catalog.json");
+        state.persist_path = Some(path.clone());
+        let app = test_router(state.clone());
+        let config = push_blob(&app, "ordinary", b"shared").await;
+        let body = manifest_body(&config, 6);
+        let guard = state.catalog.write().await;
+        let tasks: Vec<_> = (0..4)
+            .map(|index| {
+                let app = app.clone();
+                let body = body.clone();
+                tokio::spawn(async move {
+                    put_manifest(&app, &format!("/v2/ordinary/manifests/tag-{index}"), body).await
+                })
+            })
+            .collect();
+        drop(guard);
+        for task in tasks {
+            assert_eq!(task.await.unwrap().status(), StatusCode::CREATED);
+        }
+        let reloaded = ManifestCatalog::load_from(&path).unwrap();
+        for index in 0..4 {
+            assert!(
+                reloaded
+                    .get_manifest_by_tag("ordinary", &format!("tag-{index}"))
+                    .is_some()
+            );
+        }
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            assert_eq!(
+                std::fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+                0o600
+            );
+        }
+    }
+
     fn test_state() -> (PickleState, tempfile::TempDir) {
         let dir = tempfile::tempdir().unwrap();
         let store = BlobStore::new(dir.path());
@@ -1371,6 +3277,9 @@ mod tests {
             catalog: Arc::new(RwLock::new(ManifestCatalog::default())),
             node_raft_id: 7,
             council: None,
+            forwarder: None,
+            test_leases: Default::default(),
+            repository_writers: Default::default(),
             persist_path: None,
             auth: None,
             require_read_auth: false,
@@ -2124,6 +4033,41 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn unavailable_catalogue_authority_refuses_reads_and_quota_admission() {
+        let (mut state, _dir) = test_state();
+        let (_tx, rx) =
+            tokio::sync::watch::channel(crate::mustard::directory::NodeDirectory::default());
+        state.forwarder = Some(super::super::authority::RegistryForwarder::new(
+            crate::cluster::ClusterHttp::plaintext(),
+            rx,
+        ));
+        state.quota = QuotaConfig {
+            per_repository_bytes: 10,
+            total_bytes: 0,
+        };
+        assert_eq!(
+            state
+                .enforce_quota("ordinary", 1)
+                .await
+                .unwrap_err()
+                .status(),
+            StatusCode::SERVICE_UNAVAILABLE
+        );
+        let app = test_router(state.clone());
+        for path in ["/v2/ordinary/manifests/latest", "/v2/ordinary/tags/list"] {
+            assert_eq!(
+                app.clone()
+                    .oneshot(axum::http::Request::get(path).body(Body::empty()).unwrap())
+                    .await
+                    .unwrap()
+                    .status(),
+                StatusCode::SERVICE_UNAVAILABLE
+            );
+        }
+        assert!(state.catalog_snapshot("ordinary").await.is_err());
+    }
+
     /// REG4: a push that would breach the repository quota is refused with
     /// 413, and nothing is stored.
     #[tokio::test]
@@ -2135,6 +4079,9 @@ mod tests {
             catalog: Arc::new(RwLock::new(ManifestCatalog::default())),
             node_raft_id: 7,
             council: None,
+            forwarder: None,
+            test_leases: Default::default(),
+            repository_writers: Default::default(),
             persist_path: None,
             auth: None,
             require_read_auth: false,
@@ -2180,6 +4127,9 @@ mod tests {
             catalog: Arc::new(RwLock::new(ManifestCatalog::default())),
             node_raft_id: 7,
             council: None,
+            forwarder: None,
+            test_leases: Default::default(),
+            repository_writers: Default::default(),
             persist_path: None,
             auth: None,
             require_read_auth: false,
@@ -2252,6 +4202,9 @@ mod tests {
             catalog: Arc::new(RwLock::new(ManifestCatalog::default())),
             node_raft_id: 7,
             council: None,
+            forwarder: None,
+            test_leases: Default::default(),
+            repository_writers: Default::default(),
             persist_path: None,
             auth: None,
             require_read_auth: false,

@@ -74,10 +74,10 @@ fn free_udp_port(allocated: &mut HashSet<u16>) -> u16 {
     }
 }
 
-/// Copy the compiled bun in as `bun-{version}` with its `.version` sidecar.
-fn install_version(bin_dir: &Path, version: &str) {
+/// Copy the prepared executable as `bun-{version}` with its `.version` sidecar.
+fn install_version(source: &Path, bin_dir: &Path, version: &str) {
     let target = bin_dir.join(format!("bun-{version}"));
-    std::fs::copy(env!("CARGO_BIN_EXE_bun"), &target).unwrap();
+    std::fs::copy(source, &target).unwrap();
     std::fs::write(bin_dir.join(format!("bun-{version}.version")), version).unwrap();
 }
 
@@ -103,6 +103,27 @@ impl ClusterHarness {
     /// Boot `count` nodes: node 0 bootstraps, the rest join via gossip.
     async fn start(count: usize) -> Self {
         let root = tempfile::tempdir().unwrap();
+        // The registry deliberately caps each upload at 512 MiB. Debug symbols
+        // can exceed that on CI; remove them from this private fixture only,
+        // before copying, hashing or signing any candidate. Cargo's executable
+        // stays intact for backtraces in the other suites.
+        let source = root.path().join("bun-fixture");
+        std::fs::copy(env!("CARGO_BIN_EXE_bun"), &source).unwrap();
+        let stripped = std::process::Command::new("strip")
+            .arg("-S")
+            .arg(&source)
+            .output()
+            .expect("strip must be installed for cluster-upgrade acceptance");
+        assert!(
+            stripped.status.success(),
+            "strip failed: {}",
+            String::from_utf8_lossy(&stripped.stderr)
+        );
+        let fixture_size = std::fs::metadata(&source).unwrap().len();
+        assert!(
+            fixture_size <= 512 * 1024 * 1024,
+            "upgrade fixture is {fixture_size} bytes, above the registry upload limit"
+        );
         let (release_pkcs8, release_public) = signing::generate_keypair().unwrap();
         let (external_pkcs8, external_public) = signing::generate_keypair().unwrap();
 
@@ -131,8 +152,8 @@ impl ClusterHarness {
             let node_root = root.path().join(&name);
             let bin_dir = node_root.join("bin");
             std::fs::create_dir_all(&bin_dir).unwrap();
-            install_version(&bin_dir, "v0.1.0");
-            install_version(&bin_dir, "v0.2.0");
+            install_version(&source, &bin_dir, "v0.1.0");
+            install_version(&source, &bin_dir, "v0.2.0");
             std::os::unix::fs::symlink("bun-v0.1.0", bin_dir.join("bun")).unwrap();
 
             let api_port = free_tcp_port(&mut allocated_ports);
@@ -244,7 +265,11 @@ retain_versions = 3
         let harness = Self {
             _root: root,
             nodes,
-            client: reqwest::Client::new(),
+            client: reqwest::Client::builder()
+                .connect_timeout(Duration::from_secs(2))
+                .timeout(Duration::from_secs(5))
+                .build()
+                .unwrap(),
             release_pkcs8,
             external_pkcs8,
             service_token,
@@ -309,9 +334,9 @@ retain_versions = 3
     }
 
     /// Wait until the leader agrees that it is the leader and has archived
-    /// the previous operation. Another node can observe the committed
-    /// completion slightly earlier, but the next write must go through the
-    /// leader's local Raft state.
+    /// the previous operation and rebuilt its live membership. Another node
+    /// can observe completion earlier, but the next write must go through
+    /// the leader's local Raft and membership state.
     async fn wait_for_idle_leader(&self) -> String {
         let deadline = tokio::time::Instant::now() + WAIT;
         loop {
@@ -322,7 +347,29 @@ retain_versions = 3
                     .cluster_state_from(node)
                     .await
                     .is_some_and(|state| state["active"].is_null());
-                if leader_agrees && upgrade_idle {
+                let live_members = async {
+                    let response = self
+                        .client
+                        .get(format!("http://{}/v1/cluster/nodes", node.api))
+                        .send()
+                        .await
+                        .ok()?
+                        .error_for_status()
+                        .ok()?;
+                    response
+                        .json::<Vec<reliaburger::bun::agent::NodeStatus>>()
+                        .await
+                        .ok()
+                }
+                .await;
+                let membership_ready = live_members.is_some_and(|members| {
+                    self.nodes.iter().all(|expected| {
+                        members.iter().any(|member| {
+                            member.node_id == expected.name && member.state == "alive"
+                        })
+                    })
+                });
+                if leader_agrees && upgrade_idle && membership_ready {
                     return leader;
                 }
             }
@@ -396,15 +443,19 @@ retain_versions = 3
         let push = self
             .client
             .post(&push_url)
+            // Candidate uploads and hashing need a separate budget from the
+            // five-second status requests, even without debug symbols.
+            .timeout(Duration::from_secs(60))
             .header("authorization", format!("Bearer {}", self.service_token))
             .body(bytes.clone())
             .send()
             .await
             .expect("blob push");
+        let status = push.status();
         assert!(
-            push.status().is_success(),
-            "blob push failed: {}",
-            push.status()
+            status.is_success(),
+            "blob push failed: {status}: {}",
+            push.text().await.unwrap_or_default()
         );
 
         let request = serde_json::json!({

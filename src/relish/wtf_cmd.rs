@@ -50,8 +50,32 @@ fn validate_args(args: &WtfArgs) -> Result<(), RelishError> {
 
 async fn run_watch(args: &WtfArgs, client: &BunClient) -> Result<CommandOutcome, RelishError> {
     let mut first = true;
+    let mut last_outcome = CommandOutcome::Warnings;
+    let interrupt = tokio::signal::ctrl_c();
+    tokio::pin!(interrupt);
     loop {
-        let report = diagnose(&collect(client, args.app.as_deref()).await?);
+        let collected = tokio::select! {
+            biased;
+            signal = &mut interrupt => {
+                signal?;
+                return Ok(last_outcome);
+            }
+            collected = collect(client, args.app.as_deref()) => collected,
+        };
+        let report = match collected {
+            Ok(inputs) => {
+                let report = diagnose(&inputs);
+                last_outcome = report_outcome(&report);
+                report
+            }
+            Err(error) => {
+                // Lost evidence cannot turn previously observed problems clean.
+                if last_outcome != CommandOutcome::Problems {
+                    last_outcome = CommandOutcome::Warnings;
+                }
+                collection_failure_report(&error)
+            }
+        };
         if !first && std::io::stdout().is_terminal() {
             print!("\x1b[2J\x1b[H");
         }
@@ -59,12 +83,38 @@ async fn run_watch(args: &WtfArgs, client: &BunClient) -> Result<CommandOutcome,
         println!("{}", render_report(&report, OutputFormat::Human)?);
         std::io::stdout().flush()?;
         tokio::select! {
-            signal = tokio::signal::ctrl_c() => {
+            signal = &mut interrupt => {
                 signal?;
-                return Ok(CommandOutcome::Clean);
+                return Ok(last_outcome);
             }
             _ = tokio::time::sleep(Duration::from_secs(30)) => {}
         }
+    }
+}
+
+fn collection_failure_report(error: &RelishError) -> WtfReport {
+    WtfReport {
+        schema_version: super::wtf::WTF_SCHEMA_VERSION,
+        cluster_name: "unknown".into(),
+        collected_at: std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs(),
+        node_count: 0,
+        critical: Vec::new(),
+        warnings: Vec::new(),
+        unknown: vec![super::wtf::WtfUnknown {
+            source: "collection".into(),
+            reason: error.to_string(),
+            affected_resource: "cluster".into(),
+        }],
+        ok: Vec::new(),
+        summary: super::wtf::WtfSummary {
+            critical_count: 0,
+            warning_count: 0,
+            unknown_count: 1,
+            ok_count: 0,
+        },
     }
 }
 

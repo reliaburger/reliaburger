@@ -30,7 +30,7 @@ const SNAP_CHECKSUM_KEY: &str = "checksum";
 
 /// Snapshot format version this binary writes. Bump it when the persisted
 /// layout changes incompatibly; loading rejects versions it doesn't know.
-const SNAPSHOT_FORMAT_VERSION: u32 = 1;
+const SNAPSHOT_FORMAT_VERSION: u32 = crate::compatibility::CURRENT.state;
 
 /// Errors opening or validating the persisted snapshot store.
 ///
@@ -51,9 +51,7 @@ pub enum SnapshotStoreError {
     ChecksumMismatch { stored: String, computed: String },
     #[error("snapshot records format version {version} but no checksum")]
     MissingChecksum { version: u32 },
-    #[error(
-        "snapshot format version {found} is not supported (this binary supports up to {supported})"
-    )]
+    #[error("snapshot format version {found} is not supported (this binary requires {supported})")]
     UnsupportedVersion { found: u32, supported: u32 },
     #[error("snapshot version marker is malformed: expected 4 bytes, found {found}")]
     MalformedVersion { found: usize },
@@ -191,16 +189,117 @@ fn verify_snapshot_checksum(
 }
 
 impl StateMachineInner {
+    fn registry_publication_is_current(
+        &self,
+        commit: &crate::pickle::types::ManifestCommit,
+    ) -> bool {
+        commit.holder_nodes.iter().all(|node| {
+            self.state
+                .registry_gc_generations
+                .get(node)
+                .copied()
+                .unwrap_or(0)
+                == commit.observed_gc_generation
+        })
+    }
+
+    fn registry_node_retired(&self, node_id: u64) -> bool {
+        self.state
+            .security_state
+            .crl
+            .retired_nodes
+            .keys()
+            .any(|name| crate::cluster::identity::raft_id_from_name(name) == node_id)
+    }
+
+    fn lease_workloads_absent(&self, lease: &crate::testkit::lease::TestLease) -> bool {
+        use crate::testkit::lease::{LeasedResource, TestLeaseState};
+        matches!(lease.state, TestLeaseState::Cleaning { .. })
+            && lease.placements.is_empty()
+            && lease.resources.iter().all(|resource| match resource {
+                LeasedResource::App { app_id } => !self.state.apps.contains_key(app_id),
+                LeasedResource::Job { .. } => false,
+                LeasedResource::Namespace { name } => !self.state.namespaces.contains_key(name),
+                LeasedResource::ApiToken { name, .. } => !self
+                    .state
+                    .security_state
+                    .api_tokens
+                    .iter()
+                    .any(|token| token.name == *name),
+            })
+    }
+
     /// Apply a request. Returns a request-specific response for entries
     /// that carry a verdict back to the proposer (`AllocateSerial` gets
     /// its serial, `GcReport` gets the approved deletions); `None` means
     /// the generic `Applied` response.
     fn apply_request(&mut self, request: &RaftRequest) -> Option<CouncilResponse> {
         match request {
+            RaftRequest::ReserveNodeFault {
+                reservation,
+                membership_log_id,
+                unavailable_voters,
+            } => {
+                let membership = self.state.last_membership.membership();
+                let voters: std::collections::BTreeSet<_> = membership.voter_ids().collect();
+                let refuse = |reason: &str| {
+                    Some(CouncilResponse::Refused {
+                        reason: reason.into(),
+                    })
+                };
+                if self.state.last_membership.log_id() != membership_log_id
+                    || membership.get_joint_config().len() != 1
+                    || voters.is_empty()
+                {
+                    return refuse(
+                        "node fault safety requires a stable current council membership",
+                    );
+                }
+                if reservation
+                    .request
+                    .target_node
+                    .as_ref()
+                    .is_some_and(|node| {
+                        self.state
+                            .security_state
+                            .crl
+                            .retired_nodes
+                            .contains_key(node)
+                    })
+                {
+                    return refuse("node identity is retired");
+                }
+                // Pressure may starve a voter just as effectively as a transport
+                // fault. Drain alone only withdraws scheduler readiness.
+                let quorum_effect = !matches!(
+                    reservation.request.fault_type,
+                    crate::smoker::types::FaultType::NodeDrain
+                );
+                if quorum_effect
+                    && unavailable_voters.intersection(&voters).count() + 1 > (voters.len() - 1) / 2
+                {
+                    return refuse("node fault would risk council quorum");
+                }
+                if let Err(reason) = self.state.node_fault_reservations.reserve(reservation) {
+                    return Some(CouncilResponse::Refused { reason });
+                }
+            }
+            RaftRequest::ReleaseNodeFault { sequence } => {
+                if let Err(reason) = self.state.node_fault_reservations.release(*sequence) {
+                    return Some(CouncilResponse::Refused { reason });
+                }
+            }
             RaftRequest::AppSpec { app_id, spec } => {
                 if crate::testkit::lease::valid_test_namespace(&app_id.namespace) {
                     return Some(CouncilResponse::Refused {
                         reason: "test lease namespace requires a leased app write".to_string(),
+                    });
+                }
+                if let Err(error) =
+                    crate::testkit::lease::authorise_image_references(spec.image_references(), None)
+                {
+                    return Some(CouncilResponse::Refused {
+                        reason: error.to_string(),
                     });
                 }
                 self.apply_app_spec(app_id, spec);
@@ -220,6 +319,58 @@ impl StateMachineInner {
                     .retain(|key, _| !key.starts_with(&prefix));
             }
             RaftRequest::SchedulingDecision(decision) => {
+                if decision.placements.iter().any(|placement| {
+                    self.state
+                        .security_state
+                        .crl
+                        .retired_nodes
+                        .contains_key(&placement.node_id.0)
+                }) {
+                    return Some(CouncilResponse::Refused {
+                        reason: "placement targets a retired node identity".into(),
+                    });
+                }
+
+                if decision.app_id.namespace.starts_with("rbtest-") {
+                    let resource = crate::testkit::lease::LeasedResource::App {
+                        app_id: decision.app_id.clone(),
+                    };
+                    let Some(lease) = self
+                        .state
+                        .test_leases
+                        .values_mut()
+                        .find(|lease| lease.resources.contains(&resource))
+                    else {
+                        return Some(CouncilResponse::Refused {
+                            reason: "leased scheduling requires an owner".into(),
+                        });
+                    };
+                    if !matches!(lease.state, crate::testkit::lease::TestLeaseState::Active)
+                        || !self.state.apps.contains_key(&decision.app_id)
+                    {
+                        return Some(CouncilResponse::Refused {
+                            reason: "lease is cleaning or application was deleted".into(),
+                        });
+                    }
+                    let mut owners = lease.placements.clone();
+                    for placement in &decision.placements {
+                        if placement.node_id.0.is_empty() {
+                            return Some(CouncilResponse::Refused {
+                                reason: "placement node is empty".into(),
+                            });
+                        }
+                        owners.insert(crate::testkit::lease::LeasedPlacement {
+                            app_id: decision.app_id.clone(),
+                            node_id: placement.node_id.clone(),
+                        });
+                    }
+                    if owners.len() > crate::testkit::lease::MAX_LEASED_PLACEMENTS {
+                        return Some(CouncilResponse::Refused {
+                            reason: "lease placement history limit reached".into(),
+                        });
+                    }
+                    lease.placements = owners;
+                }
                 self.state
                     .scheduling
                     .insert(decision.app_id.clone(), decision.placements.clone());
@@ -228,18 +379,133 @@ impl StateMachineInner {
                 self.state.config.insert(key.clone(), value.clone());
             }
             RaftRequest::ManifestCommit(commit) => {
+                if !self.registry_publication_is_current(commit) {
+                    return Some(CouncilResponse::RegistryPublicationStale);
+                }
+                if commit
+                    .manifest
+                    .repository
+                    .split_once('/')
+                    .is_some_and(|(namespace, _)| namespace.starts_with("rbtest-"))
+                {
+                    return Some(CouncilResponse::Refused {
+                        reason: "test repositories require an active lease and writer receipt"
+                            .into(),
+                    });
+                }
+                if self
+                    .state
+                    .security_state
+                    .crl
+                    .retired_nodes
+                    .keys()
+                    .any(|name| {
+                        let id = crate::cluster::identity::raft_id_from_name(name);
+                        commit.manifest.pushed_by == id || commit.holder_nodes.contains(&id)
+                    })
+                {
+                    return Some(CouncilResponse::Refused {
+                        reason: "registry writer identity is retired".into(),
+                    });
+                }
                 self.state.manifest_catalog.apply_manifest_commit(commit);
             }
-            RaftRequest::UpdateLayerLocations(update) => {
-                self.state.manifest_catalog.apply_update_locations(update);
+            RaftRequest::UpdateLayerLocations(_) => {
+                return Some(CouncilResponse::Refused {
+                    reason: "holder replacement requires storage-node copy confirmation".into(),
+                });
+            }
+            RaftRequest::ConfirmImageCopy(copy) => {
+                if self.registry_node_retired(copy.node_id) {
+                    return Some(CouncilResponse::Refused {
+                        reason: "registry writer identity is retired".into(),
+                    });
+                }
+                if self
+                    .state
+                    .registry_gc_generations
+                    .get(&copy.node_id)
+                    .copied()
+                    .unwrap_or(0)
+                    != copy.observed_gc_generation
+                {
+                    return Some(CouncilResponse::RegistryPublicationStale);
+                }
+                let catalogue = &self.state.manifest_catalog;
+                let reserved = copy
+                    .repository
+                    .split_once('/')
+                    .is_some_and(|(namespace, _)| namespace.starts_with("rbtest-"));
+                let permitted = match &copy.lease_id {
+                    Some(id) => {
+                        reserved
+                            && catalogue.repository_owners.get(&copy.repository) == Some(id)
+                            && self.state.test_leases.get(id).is_some_and(|lease| {
+                                lease.permits_registry_copy(
+                                    &copy.repository,
+                                    copy.node_id,
+                                    copy.observed_at_unix_ms,
+                                )
+                            })
+                    }
+                    None => {
+                        !reserved && !catalogue.repository_owners.contains_key(&copy.repository)
+                    }
+                };
+                if !permitted {
+                    return Some(CouncilResponse::Refused {
+                        reason: "repository copy requires its active owner and writer receipt"
+                            .into(),
+                    });
+                }
+                if !self.state.manifest_catalog.add_manifest_holder(
+                    &copy.repository,
+                    &copy.manifest_digest,
+                    copy.node_id,
+                ) {
+                    return Some(CouncilResponse::Refused {
+                        reason: "repository manifest no longer exists".into(),
+                    });
+                }
             }
             RaftRequest::GcReport(report) => {
+                if self
+                    .state
+                    .security_state
+                    .crl
+                    .retired_nodes
+                    .keys()
+                    .any(|name| crate::cluster::identity::raft_id_from_name(name) == report.node_id)
+                {
+                    return Some(CouncilResponse::Refused {
+                        reason: "registry writer identity is retired".into(),
+                    });
+                }
                 // The state machine is the deletion arbiter (M2): apply
                 // runs serialised through the Raft log, so two nodes
                 // racing to delete the last two copies of a layer get
                 // their reports arbitrated in order — the second one is
                 // refused the digest that would lose its final holder.
-                let approved = self.state.manifest_catalog.apply_gc_report(report);
+                let mut next = self.state.manifest_catalog.clone();
+                let approved = next.apply_gc_report(report);
+                if !approved.is_empty() {
+                    let Some(generation) = self
+                        .state
+                        .registry_gc_generations
+                        .get(&report.node_id)
+                        .copied()
+                        .unwrap_or(0)
+                        .checked_add(1)
+                    else {
+                        return Some(CouncilResponse::Refused {
+                            reason: "registry GC generation exhausted".into(),
+                        });
+                    };
+                    self.state
+                        .registry_gc_generations
+                        .insert(report.node_id, generation);
+                    self.state.manifest_catalog = next;
+                }
                 return Some(CouncilResponse::GcApproved { approved });
             }
             RaftRequest::DeleteTag(delete) => {
@@ -285,6 +551,17 @@ impl StateMachineInner {
                 self.state.security_state = *ss.clone();
             }
             RaftRequest::CreateJoinToken(jt) => {
+                if self
+                    .state
+                    .security_state
+                    .crl
+                    .retired_nodes
+                    .contains_key(&jt.node_id)
+                {
+                    return Some(CouncilResponse::Refused {
+                        reason: "node identity is retired".into(),
+                    });
+                }
                 // Prune consumed tokens and cap the list so it can't grow
                 // without bound over a long-lived cluster (O5). Pruning keys on
                 // `consumed` (replicated state) and a fixed cap, not wall-clock
@@ -328,6 +605,17 @@ impl StateMachineInner {
                         reason: "join token not found".to_string(),
                     });
                 };
+                if self
+                    .state
+                    .security_state
+                    .crl
+                    .retired_nodes
+                    .contains_key(&token.node_id)
+                {
+                    return Some(CouncilResponse::Refused {
+                        reason: "node identity is retired".into(),
+                    });
+                }
                 if token.consumed {
                     return Some(CouncilResponse::Refused {
                         reason: "join token already consumed".to_string(),
@@ -339,6 +627,18 @@ impl StateMachineInner {
                 return Some(CouncilResponse::JoinTokenConsumed { serial });
             }
             RaftRequest::CreateApiToken(token) => {
+                if token.name.starts_with("rbtest-")
+                    || self
+                        .state
+                        .security_state
+                        .api_tokens
+                        .iter()
+                        .any(|existing| existing.name == token.name)
+                {
+                    return Some(CouncilResponse::Refused {
+                        reason: "token name already exists or requires a test lease".into(),
+                    });
+                }
                 self.state.security_state.api_tokens.push(token.clone());
             }
             RaftRequest::RevokeApiToken { name } => {
@@ -583,12 +883,179 @@ impl StateMachineInner {
             RaftRequest::PermissionDelete { name } => {
                 self.state.permissions.remove(name);
             }
-            RaftRequest::PublishEndpoints(catalog) => {
-                // Wholesale replacement: the leader is the single source of
-                // truth for the catalogue, so a later publish always wins.
+            RaftRequest::RegisterEndpointConsumer { node_id } => {
+                if let Err(reason) = crate::cluster::retirement::validate_node_id(node_id) {
+                    return Some(CouncilResponse::Refused {
+                        reason: reason.into(),
+                    });
+                }
+                if self
+                    .state
+                    .security_state
+                    .crl
+                    .retired_nodes
+                    .contains_key(node_id)
+                {
+                    return Some(CouncilResponse::Refused {
+                        reason: "node identity is retired; fresh enrolment is required".into(),
+                    });
+                }
+                if !self.state.endpoint_consumers.contains(node_id)
+                    && self.state.endpoint_consumers.len()
+                        >= crate::onion::catalog::MAX_ENDPOINT_CONSUMERS
+                {
+                    return Some(CouncilResponse::Refused {
+                        reason: "endpoint consumer limit reached".into(),
+                    });
+                }
+                self.state.endpoint_consumers.insert(node_id.clone());
+            }
+            RaftRequest::AcknowledgeEndpointWithdrawal {
+                node_id,
+                generation,
+            } => {
+                if let Err(reason) = crate::cluster::retirement::validate_node_id(node_id) {
+                    return Some(CouncilResponse::Refused {
+                        reason: reason.into(),
+                    });
+                }
+                if self
+                    .state
+                    .security_state
+                    .crl
+                    .retired_nodes
+                    .contains_key(node_id)
+                {
+                    return Some(CouncilResponse::Refused {
+                        reason: "node identity is retired; fresh enrolment is required".into(),
+                    });
+                }
+                if !self.state.endpoint_consumers.contains(node_id) {
+                    return Some(CouncilResponse::Refused {
+                        reason: "endpoint consumer is not registered".into(),
+                    });
+                }
+                if *generation == 0 || *generation >= self.state.endpoint_withdrawals.generation {
+                    return Some(CouncilResponse::Refused {
+                        reason: "endpoint receipt must name an original withdrawn generation"
+                            .into(),
+                    });
+                }
+                // Generations never repeat. Retried historical receipts are no-ops;
+                // they cannot discharge any current or later publication.
+                let pending = &mut self.state.endpoint_withdrawals.pending;
+                if let Some(withdrawal) = pending.get_mut(generation) {
+                    withdrawal.consumers.remove(node_id);
+                    if withdrawal.consumers.is_empty() {
+                        pending.remove(generation);
+                    }
+                }
+            }
+            RaftRequest::RetireEndpointExecution { node_id, execution } => {
+                if self
+                    .state
+                    .security_state
+                    .crl
+                    .retired_nodes
+                    .contains_key(node_id)
+                {
+                    return Some(CouncilResponse::Refused {
+                        reason: "node identity is retired; fresh enrolment is required".into(),
+                    });
+                }
+                let retirements = match self
+                    .state
+                    .producer_retirements
+                    .plan_retirement(node_id, execution)
+                {
+                    Ok(value) => value,
+                    Err(error) => {
+                        return Some(CouncilResponse::Refused {
+                            reason: error.to_string(),
+                        });
+                    }
+                };
+                let catalog = retirements.withdraw(&self.state.endpoint_catalog);
+                let withdrawals = match self.state.endpoint_withdrawals.plan_publication(
+                    &self.state.endpoint_catalog,
+                    &catalog,
+                    &self.state.endpoint_consumers,
+                ) {
+                    Ok(value) => value,
+                    Err(error) => {
+                        return Some(CouncilResponse::Refused {
+                            reason: error.to_string(),
+                        });
+                    }
+                };
+                let released = retirements.release_confirmed(node_id, execution, &withdrawals);
+                self.state.producer_retirements = retirements;
+                self.state.endpoint_catalog = catalog;
+                self.state.endpoint_withdrawals = withdrawals;
+                return Some(CouncilResponse::EndpointExecutionRetired { released });
+            }
+            RaftRequest::PublishEndpoints {
+                expected_generation,
+                catalog,
+            } => {
+                if *expected_generation != self.state.endpoint_withdrawals.generation {
+                    return Some(CouncilResponse::Refused {
+                        reason: format!(
+                            "endpoint publication generation changed: expected {}, current {}; rebuild from committed state",
+                            expected_generation, self.state.endpoint_withdrawals.generation,
+                        ),
+                    });
+                }
+                if catalog.services.values().any(|service| {
+                    service.backends.iter().any(|backend| {
+                        self.state
+                            .security_state
+                            .crl
+                            .retired_nodes
+                            .contains_key(&backend.node_id)
+                    })
+                }) {
+                    return Some(CouncilResponse::Refused {
+                        reason: "endpoint catalogue targets a retired node identity".into(),
+                    });
+                }
+                if catalog.services.values().any(|service| {
+                    service.backends.iter().any(|backend| {
+                        self.state
+                            .producer_retirements
+                            .blocks(&backend.node_id, backend.execution.as_ref())
+                    })
+                }) {
+                    return Some(CouncilResponse::Refused { reason: "endpoint catalogue targets a retired or uncorrelated producer execution".into() });
+                }
+                let withdrawals = match self.state.endpoint_withdrawals.plan_publication(
+                    &self.state.endpoint_catalog,
+                    catalog,
+                    &self.state.endpoint_consumers,
+                ) {
+                    Ok(withdrawals) => withdrawals,
+                    Err(error) => {
+                        return Some(CouncilResponse::Refused {
+                            reason: error.to_string(),
+                        });
+                    }
+                };
+                self.state.endpoint_withdrawals = withdrawals;
                 self.state.endpoint_catalog = *catalog.clone();
             }
             RaftRequest::TestLeaseCreate(lease) => {
+                if !lease.repositories.is_empty() || lease.workloads_retired {
+                    return Some(CouncilResponse::Refused {
+                        reason:
+                            "a new lease cannot carry registry receipts or retirement confirmations"
+                                .into(),
+                    });
+                }
+                if lease.scope != crate::testkit::lease::LeaseScope::Applications {
+                    return Some(CouncilResponse::Refused {
+                        reason: "node job leases must remain on their owning node".to_string(),
+                    });
+                }
                 if let Err(error) = lease.validate() {
                     return Some(CouncilResponse::Refused {
                         reason: error.to_string(),
@@ -618,6 +1085,104 @@ impl StateMachineInner {
                     .test_leases
                     .insert(lease.lease_id.clone(), lease.clone());
             }
+            RaftRequest::TestLeaseRegistryWriter {
+                lease_id,
+                repository,
+                node_id,
+                owner_id,
+                observed_at_unix_ms,
+            } => {
+                if self.registry_node_retired(*node_id) {
+                    return Some(CouncilResponse::Refused {
+                        reason: "registry writer identity is retired".into(),
+                    });
+                }
+                let Some(lease) = self.state.test_leases.get_mut(lease_id) else {
+                    return Some(CouncilResponse::Refused {
+                        reason: "lease not found".into(),
+                    });
+                };
+                if let Err(error) = lease.attach_registry_writer(
+                    repository,
+                    *node_id,
+                    owner_id.as_deref(),
+                    *observed_at_unix_ms,
+                ) {
+                    return Some(CouncilResponse::Refused {
+                        reason: error.to_string(),
+                    });
+                }
+            }
+            RaftRequest::TestLeaseManifestCommit {
+                lease_id,
+                observed_at_unix_ms,
+                commit,
+            } => {
+                if !self.registry_publication_is_current(commit) {
+                    return Some(CouncilResponse::RegistryPublicationStale);
+                }
+                if self.registry_node_retired(commit.manifest.pushed_by)
+                    || !self.state.test_leases.get(lease_id).is_some_and(|lease| {
+                        lease.permits_registry_commit(commit, *observed_at_unix_ms)
+                    })
+                {
+                    return Some(CouncilResponse::Refused {
+                        reason: "repository lease or writer is not active".into(),
+                    });
+                }
+                if let Err(error) = self
+                    .state
+                    .manifest_catalog
+                    .claim_repository(&commit.manifest.repository, lease_id)
+                {
+                    return Some(CouncilResponse::Refused {
+                        reason: error.to_string(),
+                    });
+                }
+                self.state.manifest_catalog.apply_manifest_commit(commit);
+            }
+            RaftRequest::TestLeaseWorkloadsRetired { lease_id } => {
+                let Some(lease) = self.state.test_leases.get(lease_id) else {
+                    return Some(CouncilResponse::Refused {
+                        reason: "lease not found".into(),
+                    });
+                };
+                if !self.lease_workloads_absent(lease) {
+                    return Some(CouncilResponse::Refused {
+                        reason: "lease still owns workloads or placement obligations".into(),
+                    });
+                }
+                if let Some(lease) = self.state.test_leases.get_mut(lease_id) {
+                    lease.workloads_retired = true;
+                }
+            }
+            RaftRequest::TestLeaseRegistryRetired {
+                lease_id,
+                repository,
+                node_id,
+            } => {
+                let Some(lease) = self.state.test_leases.get_mut(lease_id) else {
+                    return Some(CouncilResponse::Refused {
+                        reason: "lease not found".into(),
+                    });
+                };
+                if !lease.workloads_retired
+                    || !matches!(
+                        lease.state,
+                        crate::testkit::lease::TestLeaseState::Cleaning { .. }
+                    )
+                {
+                    return Some(CouncilResponse::Refused {
+                        reason: "lease workloads have not retired".into(),
+                    });
+                }
+                let Some(owners) = lease.repositories.get_mut(repository) else {
+                    return Some(CouncilResponse::Refused {
+                        reason: "repository does not belong to lease".into(),
+                    });
+                };
+                owners.remove(node_id);
+            }
             RaftRequest::TestLeaseAppSpec {
                 lease_id,
                 observed_at_unix_ms,
@@ -639,12 +1204,20 @@ impl StateMachineInner {
                         reason: "app namespace does not match its lease".to_string(),
                     });
                 }
+                if let Err(error) = crate::testkit::lease::authorise_image_references(
+                    spec.image_references(),
+                    Some((lease, *observed_at_unix_ms)),
+                ) {
+                    return Some(CouncilResponse::Refused {
+                        reason: error.to_string(),
+                    });
+                }
                 let resource = crate::testkit::lease::LeasedResource::App {
                     app_id: app_id.clone(),
                 };
                 let already_owned = lease.resources.contains(&resource);
                 if !already_owned
-                    && lease.resources.len() >= crate::testkit::lease::MAX_LEASED_RESOURCES
+                    && lease.resource_count() >= crate::testkit::lease::MAX_LEASED_RESOURCES
                 {
                     return Some(CouncilResponse::Refused {
                         reason: "lease resource limit reached".to_string(),
@@ -688,7 +1261,7 @@ impl StateMachineInner {
                     crate::testkit::lease::LeasedResource::Namespace { name: name.clone() };
                 let already_owned = lease.resources.contains(&resource);
                 if !already_owned
-                    && lease.resources.len() >= crate::testkit::lease::MAX_LEASED_RESOURCES
+                    && lease.resource_count() >= crate::testkit::lease::MAX_LEASED_RESOURCES
                 {
                     return Some(CouncilResponse::Refused {
                         reason: "lease resource limit reached".to_string(),
@@ -703,6 +1276,78 @@ impl StateMachineInner {
                     lease.resources.insert(resource);
                 }
                 self.state.namespaces.insert(name.clone(), *spec.clone());
+            }
+            RaftRequest::TestLeaseApiToken {
+                lease_id,
+                owner_id,
+                observed_at_unix_ms,
+                token,
+            } => {
+                let Some(lease) = self.state.test_leases.get(lease_id) else {
+                    return Some(CouncilResponse::Refused {
+                        reason: "lease not found".into(),
+                    });
+                };
+                let resource = match lease.token_resource(token, owner_id, *observed_at_unix_ms) {
+                    Ok(resource) => resource,
+                    Err(error) => {
+                        return Some(CouncilResponse::Refused {
+                            reason: error.to_string(),
+                        });
+                    }
+                };
+                let name_owned = self.state.test_leases.values().any(|lease| lease.resources.iter().any(|resource| {
+                    matches!(resource, crate::testkit::lease::LeasedResource::ApiToken { name, .. } if name == &token.name)
+                }));
+                if name_owned
+                    || self
+                        .state
+                        .security_state
+                        .api_tokens
+                        .iter()
+                        .any(|existing| existing.name == token.name)
+                {
+                    return Some(CouncilResponse::Refused {
+                        reason: "token name already exists or is lease-owned".into(),
+                    });
+                }
+                if let Some(lease) = self.state.test_leases.get_mut(lease_id) {
+                    lease.resources.insert(resource);
+                }
+                self.state.security_state.api_tokens.push(*token.clone());
+            }
+            RaftRequest::TestLeaseRevokeApiToken {
+                lease_id,
+                name,
+                fingerprint,
+            } => {
+                let resource = crate::testkit::lease::LeasedResource::ApiToken {
+                    name: name.clone(),
+                    fingerprint: *fingerprint,
+                };
+                if !self.state.test_leases.get(lease_id).is_some_and(|lease| {
+                    matches!(
+                        lease.state,
+                        crate::testkit::lease::TestLeaseState::Cleaning { .. }
+                    ) && lease.resources.contains(&resource)
+                }) {
+                    return Some(CouncilResponse::Refused {
+                        reason: "token is not owned by this cleaning lease".into(),
+                    });
+                }
+                if self.state.security_state.api_tokens.iter().any(|token| {
+                    &token.name == name
+                        && (crate::testkit::lease::token_fingerprint(token) != *fingerprint
+                            || token.role == crate::sesame::types::ApiRole::Admin)
+                }) {
+                    return Some(CouncilResponse::Refused {
+                        reason: "owned token has been replaced; refusing to revoke it".into(),
+                    });
+                }
+                self.state
+                    .security_state
+                    .api_tokens
+                    .retain(|token| &token.name != name);
             }
             RaftRequest::TestLeaseRenew {
                 lease_id,
@@ -744,6 +1389,198 @@ impl StateMachineInner {
                     last_error: None,
                 };
             }
+            RaftRequest::DecommissionNode {
+                node_id,
+                retired_by,
+                reason,
+                retired_at_unix_ms,
+                membership_log_id,
+            } => {
+                use crate::cluster::retirement::{
+                    DecommissionRequest, MAX_RETIRED_NODES, NodeRetirement,
+                };
+                let request = DecommissionRequest {
+                    node_id: node_id.clone(),
+                    workloads_stopped: true,
+                    reason: reason.clone(),
+                };
+                if request.validate().is_err()
+                    || retired_by.is_empty()
+                    || retired_by.len() > 256
+                    || *retired_at_unix_ms == 0
+                {
+                    return Some(CouncilResponse::Refused {
+                        reason: "invalid node retirement record".into(),
+                    });
+                }
+                if let Some(retirement) = self.state.security_state.crl.retired_nodes.get(node_id) {
+                    return Some(CouncilResponse::NodeDecommissioned {
+                        retirement: Box::new(retirement.clone()),
+                    });
+                }
+                if self.state.security_state.crl.retired_nodes.len() >= MAX_RETIRED_NODES {
+                    return Some(CouncilResponse::Refused {
+                        reason: "retired identity limit reached".into(),
+                    });
+                }
+                let membership = self.state.last_membership.membership();
+                if self.state.last_membership.log_id() != membership_log_id
+                    || membership.get_joint_config().len() > 1
+                {
+                    return Some(CouncilResponse::Refused {
+                        reason: "membership changed; retry decommissioning".into(),
+                    });
+                }
+                if self
+                    .state
+                    .node_fault_reservations
+                    .active
+                    .as_ref()
+                    .is_some_and(|active| {
+                        active.request.target_node.as_deref() != Some(node_id.as_str())
+                    })
+                {
+                    return Some(CouncilResponse::Refused {
+                        reason: "decommissioning waits for another node's fault reversal".into(),
+                    });
+                }
+                for voters in membership.get_joint_config() {
+                    let remaining = voters
+                        .iter()
+                        .filter(|id| {
+                            membership.get_node(id).is_some_and(|node| {
+                                node.name != *node_id
+                                    && !self
+                                        .state
+                                        .security_state
+                                        .crl
+                                        .retired_nodes
+                                        .contains_key(&node.name)
+                            })
+                        })
+                        .count();
+                    if !voters.is_empty() && remaining < voters.len() / 2 + 1 {
+                        return Some(CouncilResponse::Refused { reason: "decommissioning would remove the remaining quorum; add replacement voters first".into() });
+                    }
+                }
+                // Validate discovery retirement before changing any lease or membership evidence.
+                let mut catalog = self.state.endpoint_catalog.clone();
+                for service in catalog.services.values_mut() {
+                    service
+                        .backends
+                        .retain(|backend| backend.node_id != *node_id);
+                }
+                let mut consumers = self.state.endpoint_consumers.clone();
+                consumers.remove(node_id);
+                let mut withdrawals = self.state.endpoint_withdrawals.clone();
+                withdrawals.retire_consumer(node_id);
+                let withdrawals = match withdrawals.plan_publication(
+                    &self.state.endpoint_catalog,
+                    &catalog,
+                    &consumers,
+                ) {
+                    Ok(withdrawals) => withdrawals,
+                    Err(error) => {
+                        return Some(CouncilResponse::Refused {
+                            reason: error.to_string(),
+                        });
+                    }
+                };
+                let mut released_placements = std::collections::BTreeMap::new();
+                let mut released_registry_writers = std::collections::BTreeMap::new();
+                let registry_node_id = crate::cluster::identity::raft_id_from_name(node_id);
+                for (lease_id, lease) in &mut self.state.test_leases {
+                    let mut registry_count = 0u64;
+                    for owners in lease.repositories.values_mut() {
+                        registry_count += u64::from(owners.remove(&registry_node_id));
+                    }
+                    if registry_count > 0 {
+                        released_registry_writers.insert(lease_id.clone(), registry_count);
+                    }
+                    let before = lease.placements.len();
+                    lease.placements.retain(|owner| owner.node_id.0 != *node_id);
+                    let released = before - lease.placements.len();
+                    if released > 0 {
+                        released_placements.insert(lease_id.clone(), released as u64);
+                    }
+                }
+                for placements in self.state.scheduling.values_mut() {
+                    placements.retain(|placement| placement.node_id.0 != *node_id);
+                }
+                self.state.endpoint_catalog = catalog;
+                self.state.endpoint_withdrawals = withdrawals;
+                let released_node_fault = self
+                    .state
+                    .node_fault_reservations
+                    .active
+                    .take()
+                    .map(|active| active.sequence);
+                let released_endpoint_consumer = self.state.endpoint_consumers.remove(node_id);
+                let retirement = NodeRetirement {
+                    node_id: node_id.clone(),
+                    retired_by: retired_by.clone(),
+                    reason: reason.clone(),
+                    retired_at_unix_ms: *retired_at_unix_ms,
+                    released_placements,
+                    released_registry_writers,
+                    released_node_fault,
+                    released_endpoint_consumer,
+                };
+                self.state
+                    .security_state
+                    .crl
+                    .retired_nodes
+                    .insert(node_id.clone(), retirement.clone());
+                self.state.security_state.crl.version += 1;
+                self.state.security_state.crl.updated_at = std::time::SystemTime::UNIX_EPOCH
+                    + std::time::Duration::from_millis(*retired_at_unix_ms);
+                return Some(CouncilResponse::NodeDecommissioned {
+                    retirement: Box::new(retirement),
+                });
+            }
+            RaftRequest::AllocateNodeSerial { node_id } => {
+                if self
+                    .state
+                    .security_state
+                    .crl
+                    .retired_nodes
+                    .contains_key(node_id)
+                {
+                    return Some(CouncilResponse::Refused {
+                        reason: "node identity is retired".into(),
+                    });
+                }
+                let serial = self.state.security_state.next_serial;
+                self.state.security_state.next_serial += 1;
+                return Some(CouncilResponse::SerialAllocated { serial });
+            }
+            RaftRequest::TestLeasePlacementRetired {
+                lease_id,
+                placement,
+            } => {
+                let Some(lease) = self.state.test_leases.get_mut(lease_id) else {
+                    return Some(CouncilResponse::Refused {
+                        reason: "lease not found".into(),
+                    });
+                };
+                if !matches!(
+                    lease.state,
+                    crate::testkit::lease::TestLeaseState::Cleaning { .. }
+                ) || self.state.apps.contains_key(&placement.app_id)
+                    || !lease
+                        .resources
+                        .contains(&crate::testkit::lease::LeasedResource::App {
+                            app_id: placement.app_id.clone(),
+                        })
+                {
+                    return Some(CouncilResponse::Refused {
+                        reason: "lease application is not retiring".into(),
+                    });
+                }
+                // Retried acknowledgements are harmless; a different lease ID
+                // cannot clear this generation's ownership.
+                lease.placements.remove(placement);
+            }
             RaftRequest::TestLeaseFinishCleanup { lease_id } => {
                 let Some(lease) = self.state.test_leases.get(lease_id) else {
                     return Some(CouncilResponse::Refused {
@@ -758,6 +1595,11 @@ impl StateMachineInner {
                         reason: "lease cleanup has not started".to_string(),
                     });
                 }
+                if !lease.placements.is_empty() {
+                    return Some(CouncilResponse::Refused {
+                        reason: "lease still owns unconfirmed runtime placements".into(),
+                    });
+                }
                 // Defence in depth against the cleanup-snapshot race: never
                 // destroy the ownership record while a resource it owns still
                 // exists. A driver that snapshotted the lease before an app
@@ -769,6 +1611,19 @@ impl StateMachineInner {
                 let remaining: Vec<String> = resources
                     .iter()
                     .filter_map(|resource| match resource {
+                        crate::testkit::lease::LeasedResource::Job { job_id } => {
+                            Some(format!("node job {job_id}"))
+                        }
+                        crate::testkit::lease::LeasedResource::ApiToken { name, .. }
+                            if self
+                                .state
+                                .security_state
+                                .api_tokens
+                                .iter()
+                                .any(|token| &token.name == name) =>
+                        {
+                            Some(format!("token {name}"))
+                        }
                         crate::testkit::lease::LeasedResource::App { app_id }
                             if self.state.apps.contains_key(app_id) =>
                         {
@@ -789,6 +1644,26 @@ impl StateMachineInner {
                             remaining.join(", ")
                         ),
                     });
+                }
+                if !lease.registry_retirement_confirmed() {
+                    return Some(CouncilResponse::Refused {
+                        reason: "lease still owns unconfirmed registry writers".into(),
+                    });
+                }
+                // Check every generation before mutating any repository.
+                for repository in lease.repositories.keys() {
+                    if let Err(error) = self
+                        .state
+                        .manifest_catalog
+                        .check_repository_owner(repository, lease_id)
+                    {
+                        return Some(CouncilResponse::Refused {
+                            reason: error.to_string(),
+                        });
+                    }
+                }
+                for repository in lease.repositories.keys() {
+                    self.state.manifest_catalog.retire_repository(repository);
                 }
                 self.state.test_leases.remove(lease_id);
             }
@@ -967,25 +1842,33 @@ impl CouncilStateMachine {
     /// desired and security state.
     #[allow(clippy::result_large_err)]
     pub fn snapshot_present(db: &Database) -> Result<bool, SnapshotStoreError> {
-        // Materialise the table so the read doesn't error on a fresh store.
-        let wtx = db.begin_write()?;
-        {
-            wtx.open_table(SNAPSHOT)?;
-        }
-        wtx.commit()?;
         let rtx = db.begin_read()?;
-        let t = rtx.open_table(SNAPSHOT)?;
-        Ok(t.get(SNAP_DATA_KEY)?.is_some())
+        let table = match rtx.open_table(SNAPSHOT) {
+            Ok(table) => table,
+            Err(redb::TableError::TableDoesNotExist(_)) => return Ok(false),
+            Err(error) => return Err(error.into()),
+        };
+        Ok(table.get(SNAP_DATA_KEY)?.is_some())
     }
 
     #[allow(clippy::result_large_err)]
     pub fn with_store(db: Arc<Database>) -> Result<Self, SnapshotStoreError> {
-        // Materialise the table so reads on a fresh store don't error.
-        let wtx = db.begin_write()?;
-        {
-            wtx.open_table(SNAPSHOT)?;
+        // Only a genuinely empty store needs a write before validation.
+        let table_exists = {
+            let rtx = db.begin_read()?;
+            match rtx.open_table(SNAPSHOT) {
+                Ok(_) => true,
+                Err(redb::TableError::TableDoesNotExist(_)) => false,
+                Err(error) => return Err(error.into()),
+            }
+        };
+        if !table_exists {
+            let wtx = db.begin_write()?;
+            {
+                wtx.open_table(SNAPSHOT)?;
+            }
+            wtx.commit()?;
         }
-        wtx.commit()?;
 
         let mut inner = StateMachineInner::default();
         {
@@ -994,13 +1877,12 @@ impl CouncilStateMachine {
             if let Some(data) = t.get(SNAP_DATA_KEY)? {
                 let bytes = data.value().to_vec();
                 match read_snapshot_version(&t)? {
-                    // Legacy pre-envelope snapshot: no version, no checksum.
-                    // Load it as before; the next persist rewrites it in the
-                    // enveloped format (version + checksum, one transaction).
-                    None => eprintln!(
-                        "council: snapshot has no version/checksum envelope (pre-12b format); \
-                         loading as legacy, it will be rewritten on the next snapshot"
-                    ),
+                    None => {
+                        return Err(SnapshotStoreError::UnsupportedVersion {
+                            found: 0,
+                            supported: SNAPSHOT_FORMAT_VERSION,
+                        });
+                    }
                     Some(SNAPSHOT_FORMAT_VERSION) => verify_snapshot_checksum(&t, &bytes)?,
                     Some(found) => {
                         return Err(SnapshotStoreError::UnsupportedVersion {
@@ -1290,6 +2172,120 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn node_fault_capacity_survives_snapshot_and_leader_term_changes() {
+        use crate::smoker::reservation::NodeFaultReservation;
+        use crate::smoker::types::{FaultRequest, FaultType};
+        let mut sm = CouncilStateMachine::new();
+        sm.apply(vec![openraft::Entry {
+            log_id: log_id(1, 1),
+            payload: EntryPayload::Membership(Membership::new(
+                vec![std::collections::BTreeSet::from([1, 2, 3])],
+                None::<std::collections::BTreeSet<u64>>,
+            )),
+        }])
+        .await
+        .unwrap();
+        let grant = NodeFaultReservation {
+            sequence: 1,
+            boot_id: "boot-a".into(),
+            cleanup_after_unix_ms: 1,
+            request: FaultRequest {
+                fault_type: FaultType::NodeKill {
+                    kill_containers: false,
+                },
+                target_node: Some("node-a".into()),
+                target_service: String::new(),
+                target_instance: None,
+                namespace: None,
+                duration: std::time::Duration::from_secs(1),
+                injected_by: "operator".into(),
+                reason: None,
+                include_leader: true,
+                override_safety: true,
+                acknowledged: true,
+            },
+        };
+        let reserve = |reservation: NodeFaultReservation, membership_log_id, unavailable_voters| {
+            RaftRequest::ReserveNodeFault {
+                reservation: Box::new(reservation),
+                membership_log_id,
+                unavailable_voters,
+            }
+        };
+        let stale = sm
+            .apply(vec![normal_entry(
+                1,
+                2,
+                reserve(grant.clone(), None, Default::default()),
+            )])
+            .await
+            .unwrap();
+        assert!(matches!(stale[0], CouncilResponse::Refused { .. }));
+        let risk = sm
+            .apply(vec![normal_entry(
+                1,
+                3,
+                reserve(grant.clone(), Some(log_id(1, 1)), [2].into()),
+            )])
+            .await
+            .unwrap();
+        assert!(matches!(risk[0], CouncilResponse::Refused { .. }));
+        let admitted = sm
+            .apply(vec![normal_entry(
+                1,
+                4,
+                reserve(grant.clone(), Some(log_id(1, 1)), Default::default()),
+            )])
+            .await
+            .unwrap();
+        assert!(matches!(admitted[0], CouncilResponse::Applied { .. }));
+        let mut builder = sm.get_snapshot_builder().await;
+        let snapshot = builder.build_snapshot().await.unwrap();
+        let mut restored = CouncilStateMachine::new();
+        restored
+            .install_snapshot(&snapshot.meta, snapshot.snapshot)
+            .await
+            .unwrap();
+        let mut other = grant.clone();
+        other.sequence = 2;
+        other.request.target_node = Some("node-b".into());
+        let refused = restored
+            .apply(vec![normal_entry(
+                2,
+                5,
+                reserve(other.clone(), Some(log_id(1, 1)), Default::default()),
+            )])
+            .await
+            .unwrap();
+        assert!(matches!(refused[0], CouncilResponse::Refused { .. }));
+        assert_eq!(
+            restored
+                .desired_state()
+                .await
+                .node_fault_reservations
+                .active,
+            Some(grant)
+        );
+        restored
+            .apply(vec![normal_entry(
+                2,
+                6,
+                RaftRequest::ReleaseNodeFault { sequence: 1 },
+            )])
+            .await
+            .unwrap();
+        let admitted = restored
+            .apply(vec![normal_entry(
+                2,
+                7,
+                reserve(other, Some(log_id(1, 1)), Default::default()),
+            )])
+            .await
+            .unwrap();
+        assert!(matches!(admitted[0], CouncilResponse::Applied { .. }));
+    }
+
+    #[tokio::test]
     async fn apply_app_spec_adds_to_state() {
         let mut sm = CouncilStateMachine::new();
         let app_id = AppId::new("web", "prod");
@@ -1485,12 +2481,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn legacy_snapshot_without_envelope_still_loads_and_is_rewritten() {
-        // Fixture: a snapshot exactly as a pre-envelope binary wrote it —
-        // raw `DesiredState` JSON under "data" plus the counter under
-        // "index", no version or checksum keys. Existing dev clusters and
-        // the Lima rigs carry this format; it must keep loading (with a
-        // warning), and the next persist must upgrade it in place.
+    async fn legacy_snapshot_without_envelope_is_refused_and_preserved() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("legacy.redb");
         let app_id = AppId::new("web", "prod");
@@ -1517,21 +2508,15 @@ mod tests {
         }
 
         let db = std::sync::Arc::new(Database::create(&path).unwrap());
-        let mut sm = CouncilStateMachine::with_store(db.clone()).expect("legacy snapshot loads");
-        let state = sm.desired_state().await;
-        assert_eq!(
-            state.apps.get(&app_id).unwrap().image,
-            Some("legacy:v1".to_string())
-        );
-        assert_eq!(sm.snapshot_last_applied().await, Some(log_id(1, 3)));
-
-        // The next snapshot persist rewrites the store in the new format.
-        let mut builder = sm.get_snapshot_builder().await;
-        builder.build_snapshot().await.unwrap();
+        assert!(matches!(
+            CouncilStateMachine::with_store(db.clone()),
+            Err(SnapshotStoreError::UnsupportedVersion { found: 0, .. })
+        ));
         let rtx = db.begin_read().unwrap();
-        let t = rtx.open_table(SNAPSHOT).unwrap();
-        assert!(t.get(SNAP_VERSION_KEY).unwrap().is_some());
-        assert!(t.get(SNAP_CHECKSUM_KEY).unwrap().is_some());
+        let table = rtx.open_table(SNAPSHOT).unwrap();
+        assert_eq!(table.get(SNAP_DATA_KEY).unwrap().unwrap().value(), payload);
+        assert!(table.get(SNAP_VERSION_KEY).unwrap().is_none());
+        assert!(table.get(SNAP_CHECKSUM_KEY).unwrap().is_none());
     }
 
     #[tokio::test]
@@ -1540,6 +2525,206 @@ mod tests {
         let db = std::sync::Arc::new(Database::create(dir.path().join("bare.redb")).unwrap());
         let sm = CouncilStateMachine::with_store(db).unwrap();
         assert_eq!(sm.snapshot_last_applied().await, None);
+    }
+
+    #[test]
+    fn copy_confirmation_adds_only_its_node_and_fences_gc_and_retirement() {
+        use crate::pickle::types::ImageCopyConfirmation;
+        let mut inner = StateMachineInner::default();
+        let commit = test_manifest_commit();
+        inner.state.manifest_catalog.apply_manifest_commit(&commit);
+        let mut copy = ImageCopyConfirmation {
+            repository: commit.manifest.repository.clone(),
+            manifest_digest: commit.manifest.digest.clone(),
+            node_id: 3,
+            lease_id: None,
+            observed_gc_generation: 0,
+            observed_at_unix_ms: 20,
+        };
+        let tags = inner.state.manifest_catalog.tags.clone();
+        assert!(
+            inner
+                .apply_request(&RaftRequest::ConfirmImageCopy(copy.clone()))
+                .is_none()
+        );
+        assert!(
+            inner
+                .apply_request(&RaftRequest::ConfirmImageCopy(copy.clone()))
+                .is_none()
+        );
+        for digest in commit.manifest.referenced_digests() {
+            assert_eq!(
+                inner.state.manifest_catalog.layer_holders(digest.as_str()),
+                std::collections::BTreeSet::from([1, 2, 3])
+            );
+        }
+        assert_eq!(inner.state.manifest_catalog.tags, tags);
+        copy.node_id = 4;
+        inner.state.registry_gc_generations.insert(4, 1);
+        assert_eq!(
+            inner.apply_request(&RaftRequest::ConfirmImageCopy(copy.clone())),
+            Some(CouncilResponse::RegistryPublicationStale)
+        );
+        copy.observed_gc_generation = 1;
+        assert!(
+            inner
+                .apply_request(&RaftRequest::ConfirmImageCopy(copy.clone()))
+                .is_none()
+        );
+        let valid = copy.clone();
+        for (repository, digest, lease) in [
+            ("unknown".to_owned(), copy.manifest_digest.clone(), None),
+            (copy.repository.clone(), test_digest("unknown"), None),
+            (
+                copy.repository.clone(),
+                copy.manifest_digest.clone(),
+                Some("wrong".to_owned()),
+            ),
+        ] {
+            let invalid = ImageCopyConfirmation {
+                repository,
+                manifest_digest: digest,
+                lease_id: lease,
+                ..valid.clone()
+            };
+            assert!(matches!(
+                inner.apply_request(&RaftRequest::ConfirmImageCopy(invalid)),
+                Some(CouncilResponse::Refused { .. })
+            ));
+        }
+        let node = "retired-copy-node";
+        copy.node_id = crate::cluster::identity::raft_id_from_name(node);
+        copy.observed_gc_generation = 0;
+        assert!(matches!(
+            inner.apply_request(&RaftRequest::DecommissionNode {
+                node_id: node.into(),
+                retired_by: "operator".into(),
+                reason: "isolated".into(),
+                retired_at_unix_ms: 20,
+                membership_log_id: None,
+            }),
+            Some(CouncilResponse::NodeDecommissioned { .. })
+        ));
+        assert!(matches!(
+            inner.apply_request(&RaftRequest::ConfirmImageCopy(copy)),
+            Some(CouncilResponse::Refused { .. })
+        ));
+    }
+
+    #[test]
+    fn leased_copy_confirmation_requires_exact_live_owner_and_writer_receipt() {
+        use crate::pickle::types::ImageCopyConfirmation;
+        let mut inner = StateMachineInner::default();
+        inner.apply_request(&RaftRequest::TestLeaseCreate(test_lease("run1", 100)));
+        let mut commit = test_manifest_commit();
+        commit.manifest.repository = "rbtest-run1/web".into();
+        commit.holder_nodes = std::collections::BTreeSet::from([1]);
+        for node_id in [1, 2] {
+            assert!(
+                inner
+                    .apply_request(&RaftRequest::TestLeaseRegistryWriter {
+                        lease_id: "run1".into(),
+                        repository: commit.manifest.repository.clone(),
+                        node_id,
+                        owner_id: Some("token:ci".into()),
+                        observed_at_unix_ms: 20,
+                    })
+                    .is_none()
+            );
+        }
+        assert!(
+            inner
+                .apply_request(&RaftRequest::TestLeaseManifestCommit {
+                    lease_id: "run1".into(),
+                    observed_at_unix_ms: 20,
+                    commit: Box::new(commit.clone()),
+                })
+                .is_none()
+        );
+        let copy = ImageCopyConfirmation {
+            repository: commit.manifest.repository.clone(),
+            manifest_digest: commit.manifest.digest.clone(),
+            node_id: 2,
+            lease_id: Some("run1".into()),
+            observed_gc_generation: 0,
+            observed_at_unix_ms: 20,
+        };
+        for invalid in [
+            ImageCopyConfirmation {
+                lease_id: None,
+                ..copy.clone()
+            },
+            ImageCopyConfirmation {
+                lease_id: Some("wrong".into()),
+                ..copy.clone()
+            },
+            ImageCopyConfirmation {
+                node_id: 3,
+                ..copy.clone()
+            },
+            ImageCopyConfirmation {
+                observed_at_unix_ms: 101,
+                ..copy.clone()
+            },
+        ] {
+            assert!(matches!(
+                inner.apply_request(&RaftRequest::ConfirmImageCopy(invalid)),
+                Some(CouncilResponse::Refused { .. })
+            ));
+        }
+        assert!(
+            inner
+                .apply_request(&RaftRequest::ConfirmImageCopy(copy.clone()))
+                .is_none()
+        );
+        inner.apply_request(&RaftRequest::TestLeaseBeginCleanup {
+            lease_id: "run1".into(),
+        });
+        assert!(matches!(
+            inner.apply_request(&RaftRequest::ConfirmImageCopy(copy.clone())),
+            Some(CouncilResponse::Refused { .. })
+        ));
+        inner
+            .state
+            .manifest_catalog
+            .retire_leased_repository(&copy.repository, "run1")
+            .unwrap();
+        assert!(matches!(
+            inner.apply_request(&RaftRequest::ConfirmImageCopy(copy)),
+            Some(CouncilResponse::Refused { .. })
+        ));
+        assert!(
+            inner
+                .state
+                .manifest_catalog
+                .get_repository_manifest(
+                    &commit.manifest.repository,
+                    commit.manifest.digest.as_str()
+                )
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn unscoped_registry_holder_replacement_is_refused() {
+        let mut inner = StateMachineInner::default();
+        let commit = test_manifest_commit();
+        inner.state.manifest_catalog.apply_manifest_commit(&commit);
+        let digest = commit.manifest.digest;
+        let before = inner.state.manifest_catalog.layer_holders(digest.as_str());
+        let response = inner.apply_request(&RaftRequest::UpdateLayerLocations(
+            crate::pickle::types::UpdateLayerLocations {
+                updates: vec![(digest.clone(), std::collections::BTreeSet::from([99]))],
+            },
+        ));
+        assert!(
+            matches!(response, Some(CouncilResponse::Refused { .. })),
+            "an old full holder set cannot establish present storage ownership"
+        );
+        assert_eq!(
+            inner.state.manifest_catalog.layer_holders(digest.as_str()),
+            before
+        );
     }
 
     #[test]
@@ -1773,6 +2958,774 @@ mod tests {
         assert_eq!(placements.len(), 2);
     }
 
+    fn withdrawal_fixture_catalogue() -> crate::onion::catalog::EndpointCatalog {
+        use crate::onion::catalog::{CatalogBackend, EndpointCatalog};
+        use crate::onion::service_id::ServiceId;
+        EndpointCatalog::rebuild([(
+            ServiceId::new("default", "api"),
+            80,
+            vec![CatalogBackend {
+                node_id: "producer".into(),
+                node_ip: "10.0.0.1".parse().unwrap(),
+                host_port: 30001,
+                healthy: true,
+                execution: Some(crate::grill::RuntimeExecution {
+                    instance_id: crate::grill::InstanceId("default__api-0".into()),
+                    generation: "a".repeat(64).try_into().unwrap(),
+                }),
+            }],
+        )])
+        .unwrap()
+    }
+
+    fn retire_endpoint(node_id: &str, execution: &crate::grill::RuntimeExecution) -> RaftRequest {
+        serde_json::from_value(serde_json::json!({"RetireEndpointExecution": {
+            "node_id": node_id, "execution": execution
+        }}))
+        .unwrap()
+    }
+
+    fn released(response: Option<CouncilResponse>, expected: bool) {
+        assert_eq!(
+            serde_json::to_value(response.unwrap()).unwrap(),
+            serde_json::json!({"EndpointExecutionRetired": {"released": expected}})
+        );
+    }
+
+    #[test]
+    fn producer_retirement_fences_reports_and_waits_for_every_original_consumer() {
+        let mut inner = StateMachineInner::default();
+        inner
+            .state
+            .endpoint_consumers
+            .extend(["reader".into(), "offline".into()]);
+        let first = withdrawal_fixture_catalogue();
+        let execution = first.services["default__api"].backends[0]
+            .execution
+            .clone()
+            .unwrap();
+        assert!(
+            inner
+                .apply_request(&RaftRequest::PublishEndpoints {
+                    expected_generation: 0,
+                    catalog: Box::new(first.clone())
+                })
+                .is_none()
+        );
+        let request = retire_endpoint("producer", &execution);
+        released(inner.apply_request(&request), false);
+        assert!(
+            inner.state.endpoint_catalog.services["default__api"]
+                .backends
+                .is_empty()
+        );
+        assert_eq!(inner.state.endpoint_withdrawals.generation, 2);
+        let before = serde_json::to_value(&inner.state).unwrap();
+        released(inner.apply_request(&request), false);
+        assert_eq!(serde_json::to_value(&inner.state).unwrap(), before);
+        for unknown in [false, true] {
+            let mut stale = first.clone();
+            if unknown {
+                stale.services.get_mut("default__api").unwrap().backends[0].execution = None;
+            }
+            assert!(matches!(
+                inner.apply_request(&RaftRequest::PublishEndpoints {
+                    expected_generation: 2,
+                    catalog: Box::new(stale)
+                }),
+                Some(CouncilResponse::Refused { .. })
+            ));
+            assert_eq!(serde_json::to_value(&inner.state).unwrap(), before);
+        }
+        assert!(
+            inner
+                .apply_request(&endpoint_receipt("reader", 1))
+                .is_none()
+        );
+        released(inner.apply_request(&request), false);
+        assert!(matches!(
+            inner.apply_request(&RaftRequest::DecommissionNode {
+                node_id: "offline".into(),
+                retired_by: "operator".into(),
+                reason: "fenced".into(),
+                retired_at_unix_ms: 1,
+                membership_log_id: None,
+            }),
+            Some(CouncilResponse::NodeDecommissioned { .. })
+        ));
+        released(inner.apply_request(&request), true);
+        let mut successor = first.clone();
+        successor.services.get_mut("default__api").unwrap().backends[0]
+            .execution
+            .as_mut()
+            .unwrap()
+            .generation = "b".repeat(64).try_into().unwrap();
+        assert!(
+            inner
+                .apply_request(&RaftRequest::PublishEndpoints {
+                    expected_generation: 2,
+                    catalog: Box::new(successor.clone())
+                })
+                .is_none()
+        );
+        released(inner.apply_request(&request), true);
+        assert_eq!(inner.state.endpoint_catalog, successor);
+        assert!(matches!(
+            inner.apply_request(&RaftRequest::PublishEndpoints {
+                expected_generation: 3,
+                catalog: Box::new(first)
+            }),
+            Some(CouncilResponse::Refused { .. })
+        ));
+    }
+
+    #[test]
+    fn producer_retirement_checks_all_historical_exposures_and_refuses_atomically_at_capacity() {
+        let mut inner = StateMachineInner::default();
+        inner.state.endpoint_consumers.insert("reader".into());
+        let mut catalog = withdrawal_fixture_catalogue();
+        let execution = catalog.services["default__api"].backends[0]
+            .execution
+            .clone()
+            .unwrap();
+        for generation in 0..3 {
+            catalog.services.get_mut("default__api").unwrap().backends[0].host_port += 1;
+            assert!(
+                inner
+                    .apply_request(&RaftRequest::PublishEndpoints {
+                        expected_generation: generation,
+                        catalog: Box::new(catalog.clone())
+                    })
+                    .is_none()
+            );
+        }
+        let request = retire_endpoint("producer", &execution);
+        released(inner.apply_request(&request), false);
+        for generation in [3, 1] {
+            inner.apply_request(&endpoint_receipt("reader", generation));
+            released(inner.apply_request(&request), false);
+        }
+        inner.apply_request(&endpoint_receipt("reader", 2));
+        released(inner.apply_request(&request), true);
+
+        let mut full = StateMachineInner::default();
+        let mut wire = serde_json::to_value(&full.state).unwrap();
+        let entries: serde_json::Map<String, serde_json::Value> = (0..65_536)
+            .map(|n| (format!("{n:064x}"), serde_json::json!("default__api-0")))
+            .collect();
+        wire["producer_retirements"] = serde_json::json!({"executions": {"producer": entries}});
+        full.state = serde_json::from_value(wire).unwrap();
+        let before = serde_json::to_value(&full.state).unwrap();
+        assert!(matches!(
+            full.apply_request(&request),
+            Some(CouncilResponse::Refused { .. })
+        ));
+        assert_eq!(serde_json::to_value(&full.state).unwrap(), before);
+    }
+
+    #[test]
+    fn producer_retirement_withdrawal_failure_preserves_catalogue_fence_and_history() {
+        let mut inner = StateMachineInner::default();
+        inner.state.endpoint_catalog = withdrawal_fixture_catalogue();
+        inner.state.endpoint_withdrawals.generation = u64::MAX;
+        let execution = inner.state.endpoint_catalog.services["default__api"].backends[0]
+            .execution
+            .clone()
+            .unwrap();
+        let before = serde_json::to_value(&inner.state).unwrap();
+        assert!(matches!(
+            inner.apply_request(&retire_endpoint("producer", &execution)),
+            Some(CouncilResponse::Refused { .. })
+        ));
+        assert_eq!(serde_json::to_value(&inner.state).unwrap(), before);
+    }
+
+    #[tokio::test]
+    async fn producer_retirement_and_delayed_report_fences_survive_raft_snapshot() {
+        let mut sm = CouncilStateMachine::new();
+        let catalog = withdrawal_fixture_catalogue();
+        let execution = catalog.services["default__api"].backends[0]
+            .execution
+            .clone()
+            .unwrap();
+        let retirement = retire_endpoint("producer", &execution);
+        // Never-published executions must also acquire a fence before addresses can be reused.
+        let responses = sm
+            .apply(vec![normal_entry(1, 1, retirement.clone())])
+            .await
+            .unwrap();
+        released(Some(responses[0].clone()), true);
+        let mut builder = sm.get_snapshot_builder().await;
+        let snapshot = builder.build_snapshot().await.unwrap();
+        let mut restored = CouncilStateMachine::new();
+        restored
+            .install_snapshot(&snapshot.meta, snapshot.snapshot)
+            .await
+            .unwrap();
+        let responses = restored
+            .apply(vec![
+                normal_entry(
+                    1,
+                    2,
+                    RaftRequest::PublishEndpoints {
+                        expected_generation: 0,
+                        catalog: Box::new(catalog),
+                    },
+                ),
+                normal_entry(1, 3, retirement),
+            ])
+            .await
+            .unwrap();
+        assert!(matches!(responses[0], CouncilResponse::Refused { .. }));
+        released(Some(responses[1].clone()), true);
+    }
+
+    fn endpoint_receipt(node_id: &str, generation: u64) -> RaftRequest {
+        serde_json::from_value(serde_json::json!({
+            "AcknowledgeEndpointWithdrawal": {"node_id": node_id, "generation": generation}
+        }))
+        .unwrap()
+    }
+
+    #[test]
+    fn endpoint_receipts_refuse_invalid_identities_and_nonhistorical_generations_atomically() {
+        let mut inner = StateMachineInner::default();
+        inner.state.endpoint_consumers.insert("reader".into());
+        let first = withdrawal_fixture_catalogue();
+        for (expected_generation, catalog) in [first, Default::default()].into_iter().enumerate() {
+            assert!(
+                inner
+                    .apply_request(&RaftRequest::PublishEndpoints {
+                        expected_generation: expected_generation as u64,
+                        catalog: Box::new(catalog),
+                    })
+                    .is_none()
+            );
+        }
+        assert!(matches!(
+            inner.apply_request(&RaftRequest::DecommissionNode {
+                node_id: "retired".into(),
+                retired_by: "operator".into(),
+                reason: "fenced".into(),
+                retired_at_unix_ms: 1,
+                membership_log_id: None,
+            }),
+            Some(CouncilResponse::NodeDecommissioned { .. })
+        ));
+        let original = serde_json::to_value(&inner.state).unwrap();
+        for (node, generation) in [
+            ("reader", 0),
+            ("reader", 2),
+            ("reader", u64::MAX),
+            ("unregistered", 1),
+            ("retired", 1),
+            ("../reader", 1),
+        ] {
+            assert!(
+                matches!(
+                    inner.apply_request(&endpoint_receipt(node, generation)),
+                    Some(CouncilResponse::Refused { .. })
+                ),
+                "{node}/{generation} must refuse"
+            );
+            assert_eq!(serde_json::to_value(&inner.state).unwrap(), original);
+        }
+    }
+
+    #[tokio::test]
+    async fn endpoint_receipts_survive_snapshot_and_replay_without_discharging_other_consumers() {
+        let mut sm = CouncilStateMachine::new();
+        let requests = [
+            RaftRequest::RegisterEndpointConsumer {
+                node_id: "reader".into(),
+            },
+            RaftRequest::RegisterEndpointConsumer {
+                node_id: "offline".into(),
+            },
+            RaftRequest::PublishEndpoints {
+                expected_generation: 0,
+                catalog: Box::new(withdrawal_fixture_catalogue()),
+            },
+            RaftRequest::PublishEndpoints {
+                expected_generation: 1,
+                catalog: Box::default(),
+            },
+            endpoint_receipt("reader", 1),
+        ];
+        for (index, request) in requests.into_iter().enumerate() {
+            let response = sm
+                .apply(vec![normal_entry(1, index as u64 + 1, request)])
+                .await
+                .unwrap();
+            assert!(matches!(response[0], CouncilResponse::Applied { .. }));
+        }
+        let before = sm.desired_state().await;
+        assert_eq!(
+            before.endpoint_withdrawals.pending[&1].consumers,
+            std::collections::BTreeSet::from(["offline".into()])
+        );
+        let mut builder = sm.get_snapshot_builder().await;
+        let snapshot = builder.build_snapshot().await.unwrap();
+        let mut restored = CouncilStateMachine::new();
+        restored
+            .install_snapshot(&snapshot.meta, snapshot.snapshot)
+            .await
+            .unwrap();
+        let response = restored
+            .apply(vec![normal_entry(2, 6, endpoint_receipt("reader", 1))])
+            .await
+            .unwrap();
+        assert!(matches!(response[0], CouncilResponse::Applied { .. }));
+        let replayed = restored.desired_state().await;
+        assert_eq!(replayed.endpoint_withdrawals, before.endpoint_withdrawals);
+        assert_eq!(replayed.endpoint_consumers, before.endpoint_consumers);
+        let response = restored
+            .apply(vec![normal_entry(2, 7, endpoint_receipt("offline", 1))])
+            .await
+            .unwrap();
+        assert!(matches!(response[0], CouncilResponse::Applied { .. }));
+        let after = restored.desired_state().await;
+        assert!(after.endpoint_withdrawals.pending.is_empty());
+        assert_eq!(after.endpoint_withdrawals.generation, 2);
+        assert_eq!(after.endpoint_consumers, before.endpoint_consumers);
+        assert!(after.endpoint_catalog.is_empty());
+    }
+
+    #[test]
+    fn endpoint_publication_generation_rejects_old_and_future_writers_atomically() {
+        let mut inner = StateMachineInner::default();
+        inner.state.endpoint_consumers.insert("reader".into());
+        let first = withdrawal_fixture_catalogue();
+        assert!(
+            inner
+                .apply_request(&RaftRequest::PublishEndpoints {
+                    expected_generation: 0,
+                    catalog: Box::new(first.clone())
+                })
+                .is_none()
+        );
+        let mut second = first.clone();
+        second.services.get_mut("default__api").unwrap().backends[0].host_port = 30002;
+        assert!(
+            inner
+                .apply_request(&RaftRequest::PublishEndpoints {
+                    expected_generation: 1,
+                    catalog: Box::new(second.clone())
+                })
+                .is_none()
+        );
+        assert_eq!(inner.state.endpoint_withdrawals.pending.len(), 1);
+        let before = serde_json::to_value(&inner.state).unwrap();
+        let mut candidate = second;
+        candidate.services.get_mut("default__api").unwrap().backends[0].host_port = 30003;
+        for expected_generation in [1, 3] {
+            assert!(matches!(
+                inner.apply_request(&RaftRequest::PublishEndpoints {
+                    expected_generation,
+                    catalog: Box::new(candidate.clone())
+                }),
+                Some(CouncilResponse::Refused { .. })
+            ));
+            assert_eq!(serde_json::to_value(&inner.state).unwrap(), before);
+        }
+    }
+
+    #[test]
+    fn endpoint_publication_generation_requires_current_evidence_even_for_noops() {
+        let mut inner = StateMachineInner::default();
+        assert!(matches!(
+            inner.apply_request(&RaftRequest::PublishEndpoints {
+                expected_generation: 1,
+                catalog: Box::default()
+            }),
+            Some(CouncilResponse::Refused { .. })
+        ));
+        let first = withdrawal_fixture_catalogue();
+        let request = RaftRequest::PublishEndpoints {
+            expected_generation: 0,
+            catalog: Box::new(first.clone()),
+        };
+        assert!(inner.apply_request(&request).is_none());
+        let before = serde_json::to_value(&inner.state).unwrap();
+        assert!(matches!(
+            inner.apply_request(&request),
+            Some(CouncilResponse::Refused { .. })
+        ));
+        assert_eq!(serde_json::to_value(&inner.state).unwrap(), before);
+        assert!(
+            inner
+                .apply_request(&RaftRequest::PublishEndpoints {
+                    expected_generation: 1,
+                    catalog: Box::new(first)
+                })
+                .is_none()
+        );
+        assert_eq!(serde_json::to_value(&inner.state).unwrap(), before);
+    }
+
+    #[tokio::test]
+    async fn endpoint_publication_generation_survives_snapshot_for_stale_noop_refusal() {
+        let mut sm = CouncilStateMachine::new();
+        let request = RaftRequest::PublishEndpoints {
+            expected_generation: 0,
+            catalog: Box::new(withdrawal_fixture_catalogue()),
+        };
+        let applied = sm
+            .apply(vec![normal_entry(1, 1, request.clone())])
+            .await
+            .unwrap();
+        assert!(matches!(applied[0], CouncilResponse::Applied { .. }));
+        let original = sm.desired_state().await;
+        let mut builder = sm.get_snapshot_builder().await;
+        let snapshot = builder.build_snapshot().await.unwrap();
+        let mut restored = CouncilStateMachine::new();
+        restored
+            .install_snapshot(&snapshot.meta, snapshot.snapshot)
+            .await
+            .unwrap();
+        let response = restored
+            .apply(vec![normal_entry(2, 2, request)])
+            .await
+            .unwrap();
+        assert!(matches!(response[0], CouncilResponse::Refused { .. }));
+        let state = restored.desired_state().await;
+        assert_eq!(state.endpoint_catalog, original.endpoint_catalog);
+        assert_eq!(state.endpoint_withdrawals, original.endpoint_withdrawals);
+    }
+
+    #[test]
+    fn endpoint_publication_generation_observes_decommission_changes() {
+        let mut inner = StateMachineInner::default();
+        inner.state.endpoint_consumers.insert("reader".into());
+        let first = withdrawal_fixture_catalogue();
+        assert!(
+            inner
+                .apply_request(&RaftRequest::PublishEndpoints {
+                    expected_generation: 0,
+                    catalog: Box::new(first.clone())
+                })
+                .is_none()
+        );
+        let request = RaftRequest::DecommissionNode {
+            node_id: "producer".into(),
+            retired_by: "operator".into(),
+            reason: "powered off".into(),
+            retired_at_unix_ms: 10,
+            membership_log_id: None,
+        };
+        assert!(matches!(
+            inner.apply_request(&request),
+            Some(CouncilResponse::NodeDecommissioned { .. })
+        ));
+        assert_eq!(inner.state.endpoint_withdrawals.generation, 2);
+        let mut candidate = first;
+        let backend = &mut candidate.services.get_mut("default__api").unwrap().backends[0];
+        backend.node_id = "replacement".into();
+        backend.node_ip = "10.0.0.2".parse().unwrap();
+        let before = serde_json::to_value(&inner.state).unwrap();
+        assert!(matches!(
+            inner.apply_request(&RaftRequest::PublishEndpoints {
+                expected_generation: 1,
+                catalog: Box::new(candidate.clone())
+            }),
+            Some(CouncilResponse::Refused { .. })
+        ));
+        assert_eq!(serde_json::to_value(&inner.state).unwrap(), before);
+        assert!(
+            inner
+                .apply_request(&RaftRequest::PublishEndpoints {
+                    expected_generation: 2,
+                    catalog: Box::new(candidate)
+                })
+                .is_none()
+        );
+        assert_eq!(inner.state.endpoint_withdrawals.generation, 3);
+        assert_eq!(
+            inner.state.endpoint_withdrawals.pending,
+            serde_json::from_value::<DesiredState>(before)
+                .unwrap()
+                .endpoint_withdrawals
+                .pending
+        );
+    }
+
+    #[tokio::test]
+    async fn endpoint_withdrawals_survive_raft_snapshot_and_fenced_consumer_retirement() {
+        let mut sm = CouncilStateMachine::new();
+        let catalogue = withdrawal_fixture_catalogue();
+        let requests = [
+            RaftRequest::RegisterEndpointConsumer {
+                node_id: "offline".into(),
+            },
+            RaftRequest::RegisterEndpointConsumer {
+                node_id: "survivor".into(),
+            },
+            RaftRequest::PublishEndpoints {
+                expected_generation: 0,
+                catalog: Box::new(catalogue.clone()),
+            },
+            RaftRequest::PublishEndpoints {
+                expected_generation: 1,
+                catalog: Box::default(),
+            },
+            RaftRequest::RegisterEndpointConsumer {
+                node_id: "late-reader".into(),
+            },
+        ];
+        for (index, request) in requests.into_iter().enumerate() {
+            let responses = sm
+                .apply(vec![normal_entry(1, index as u64 + 1, request)])
+                .await
+                .unwrap();
+            assert!(matches!(responses[0], CouncilResponse::Applied { .. }));
+        }
+        let original = sm.desired_state().await.endpoint_withdrawals;
+        assert_eq!(original.generation, 2);
+        assert_eq!(
+            original.pending[&1].consumers,
+            std::collections::BTreeSet::from(["offline".into(), "survivor".into()])
+        );
+        assert_eq!(
+            original.pending[&1].services["default__api"].service,
+            catalogue.services["default__api"]
+        );
+        let mut builder = sm.get_snapshot_builder().await;
+        let snapshot = builder.build_snapshot().await.unwrap();
+        let mut restored = CouncilStateMachine::new();
+        restored
+            .install_snapshot(&snapshot.meta, snapshot.snapshot)
+            .await
+            .unwrap();
+        assert_eq!(
+            restored.desired_state().await.endpoint_withdrawals,
+            original
+        );
+        let request = RaftRequest::DecommissionNode {
+            node_id: "offline".into(),
+            retired_by: "operator".into(),
+            reason: "powered off".into(),
+            retired_at_unix_ms: 10,
+            membership_log_id: None,
+        };
+        let first = restored
+            .apply(vec![normal_entry(1, 6, request.clone())])
+            .await
+            .unwrap();
+        assert!(matches!(
+            first[0],
+            CouncilResponse::NodeDecommissioned { .. }
+        ));
+        let after = restored.desired_state().await.endpoint_withdrawals;
+        assert_eq!(
+            after.pending[&1].consumers,
+            std::collections::BTreeSet::from(["survivor".into()])
+        );
+        assert_eq!(after.generation, 2);
+        assert_eq!(
+            restored
+                .apply(vec![normal_entry(1, 7, request)])
+                .await
+                .unwrap(),
+            first
+        );
+        assert_eq!(restored.desired_state().await.endpoint_withdrawals, after);
+    }
+
+    #[test]
+    fn endpoint_withdrawals_on_decommission_retain_other_consumers_of_the_fenced_producer() {
+        let mut inner = StateMachineInner::default();
+        for node in ["producer", "reader"] {
+            inner.apply_request(&RaftRequest::RegisterEndpointConsumer {
+                node_id: node.into(),
+            });
+        }
+        let catalogue = withdrawal_fixture_catalogue();
+        inner.apply_request(&RaftRequest::PublishEndpoints {
+            expected_generation: 0,
+            catalog: Box::new(catalogue.clone()),
+        });
+        let request = RaftRequest::DecommissionNode {
+            node_id: "producer".into(),
+            retired_by: "operator".into(),
+            reason: "powered off".into(),
+            retired_at_unix_ms: 10,
+            membership_log_id: None,
+        };
+        assert!(matches!(
+            inner.apply_request(&request),
+            Some(CouncilResponse::NodeDecommissioned { .. })
+        ));
+        let pending = &inner.state.endpoint_withdrawals.pending[&1];
+        assert_eq!(
+            pending.consumers,
+            std::collections::BTreeSet::from(["reader".into()])
+        );
+        assert_eq!(
+            pending.services["default__api"].service,
+            catalogue.services["default__api"]
+        );
+        assert!(!pending.services["default__api"].retire_vip);
+        assert!(
+            inner.state.endpoint_catalog.services["default__api"]
+                .backends
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn retired_vip_publication_is_refused_without_changing_committed_state() {
+        let mut inner = StateMachineInner::default();
+        inner.state.endpoint_consumers.insert("reader".into());
+        let original = withdrawal_fixture_catalogue();
+        inner.apply_request(&RaftRequest::PublishEndpoints {
+            expected_generation: 0,
+            catalog: Box::new(original.clone()),
+        });
+        inner.apply_request(&RaftRequest::PublishEndpoints {
+            expected_generation: 1,
+            catalog: Box::default(),
+        });
+        let before = serde_json::to_value(&inner.state).unwrap();
+        assert!(matches!(
+            inner.apply_request(&RaftRequest::PublishEndpoints {
+                expected_generation: 2,
+                catalog: Box::new(original)
+            }),
+            Some(CouncilResponse::Refused { .. })
+        ));
+        assert_eq!(serde_json::to_value(&inner.state).unwrap(), before);
+    }
+
+    #[test]
+    fn endpoint_withdrawal_refusal_leaves_publication_and_decommission_atomic() {
+        let mut inner = StateMachineInner::default();
+        inner.state.endpoint_consumers.insert("reader".into());
+        inner.state.endpoint_catalog = withdrawal_fixture_catalogue();
+        inner.state.endpoint_withdrawals.generation = u64::MAX;
+        let before = serde_json::to_value(&inner.state).unwrap();
+        for request in [
+            RaftRequest::PublishEndpoints {
+                expected_generation: u64::MAX,
+                catalog: Box::default(),
+            },
+            RaftRequest::DecommissionNode {
+                node_id: "producer".into(),
+                retired_by: "operator".into(),
+                reason: "powered off".into(),
+                retired_at_unix_ms: 10,
+                membership_log_id: None,
+            },
+        ] {
+            assert!(matches!(
+                inner.apply_request(&request),
+                Some(CouncilResponse::Refused { .. })
+            ));
+            assert_eq!(serde_json::to_value(&inner.state).unwrap(), before);
+        }
+    }
+
+    #[tokio::test]
+    async fn endpoint_consumers_survive_snapshot_and_require_explicit_decommission() {
+        let mut sm = CouncilStateMachine::new();
+        for (index, node) in ["offline", "survivor", "offline"].into_iter().enumerate() {
+            let responses = sm
+                .apply(vec![normal_entry(
+                    1,
+                    index as u64 + 1,
+                    RaftRequest::RegisterEndpointConsumer {
+                        node_id: node.into(),
+                    },
+                )])
+                .await
+                .unwrap();
+            assert!(matches!(responses[0], CouncilResponse::Applied { .. }));
+        }
+        let mut builder = sm.get_snapshot_builder().await;
+        let snapshot = builder.build_snapshot().await.unwrap();
+        let mut restored = CouncilStateMachine::new();
+        restored
+            .install_snapshot(&snapshot.meta, snapshot.snapshot)
+            .await
+            .unwrap();
+        assert_eq!(
+            restored.desired_state().await.endpoint_consumers,
+            std::collections::BTreeSet::from(["offline".into(), "survivor".into()])
+        );
+        let request = RaftRequest::DecommissionNode {
+            node_id: "offline".into(),
+            retired_by: "operator".into(),
+            reason: "powered off".into(),
+            retired_at_unix_ms: 10,
+            membership_log_id: None,
+        };
+        let response = restored
+            .apply(vec![normal_entry(1, 4, request.clone())])
+            .await
+            .unwrap();
+        assert!(matches!(
+            response[0],
+            CouncilResponse::NodeDecommissioned { .. }
+        ));
+        assert_eq!(
+            restored.desired_state().await.endpoint_consumers,
+            std::collections::BTreeSet::from(["survivor".into()])
+        );
+        let repeated = restored
+            .apply(vec![normal_entry(1, 5, request)])
+            .await
+            .unwrap();
+        assert_eq!(repeated, response);
+        assert!(
+            restored
+                .desired_state()
+                .await
+                .security_state
+                .crl
+                .retired_nodes["offline"]
+                .released_endpoint_consumer
+        );
+        let refused = restored
+            .apply(vec![normal_entry(
+                1,
+                6,
+                RaftRequest::RegisterEndpointConsumer {
+                    node_id: "offline".into(),
+                },
+            )])
+            .await
+            .unwrap();
+        assert!(matches!(refused[0], CouncilResponse::Refused { .. }));
+    }
+
+    #[test]
+    fn endpoint_consumer_registration_is_bounded_and_never_evicts_existing_owners() {
+        let mut inner = StateMachineInner::default();
+        for node in ["", "invalid\nidentity"] {
+            assert!(matches!(
+                inner.apply_request(&RaftRequest::RegisterEndpointConsumer {
+                    node_id: node.into()
+                }),
+                Some(CouncilResponse::Refused { .. })
+            ));
+        }
+        inner.state.endpoint_consumers = (0..65_536).map(|n| format!("worker-{n}")).collect();
+        assert!(matches!(
+            inner.apply_request(&RaftRequest::RegisterEndpointConsumer {
+                node_id: "overflow".into()
+            }),
+            Some(CouncilResponse::Refused { .. })
+        ));
+        assert!(
+            inner
+                .apply_request(&RaftRequest::RegisterEndpointConsumer {
+                    node_id: "worker-0".into()
+                })
+                .is_none()
+        );
+        assert_eq!(inner.state.endpoint_consumers.len(), 65_536);
+        assert!(!inner.state.endpoint_consumers.contains("overflow"));
+    }
+
     #[tokio::test]
     async fn apply_publish_endpoints_replaces_catalogue() {
         use crate::onion::catalog::{CatalogBackend, EndpointCatalog};
@@ -1786,6 +3739,7 @@ mod tests {
                 ServiceId::new("default", "api"),
                 3000,
                 vec![CatalogBackend {
+                    execution: None,
                     node_id: "node-a".to_string(),
                     node_ip: std::net::Ipv4Addr::new(10, 0, 0, 1),
                     host_port: 30001,
@@ -1796,14 +3750,23 @@ mod tests {
                 ServiceId::new("payments", "api"),
                 3000,
                 vec![CatalogBackend {
+                    execution: None,
                     node_id: "node-b".to_string(),
                     node_ip: std::net::Ipv4Addr::new(10, 0, 0, 2),
                     host_port: 30002,
                     healthy: true,
                 }],
             ),
-        ]);
-        let entry = normal_entry(1, 1, RaftRequest::PublishEndpoints(Box::new(catalog)));
+        ])
+        .unwrap();
+        let entry = normal_entry(
+            1,
+            1,
+            RaftRequest::PublishEndpoints {
+                expected_generation: 0,
+                catalog: Box::new(catalog),
+            },
+        );
         sm.apply(vec![entry]).await.unwrap();
 
         let state = sm.desired_state().await;
@@ -1824,8 +3787,15 @@ mod tests {
 
         // A later publish wholly replaces the catalogue (leader is authoritative).
         let replacement =
-            EndpointCatalog::rebuild([(ServiceId::new("default", "web"), 80, vec![])]);
-        let entry2 = normal_entry(2, 1, RaftRequest::PublishEndpoints(Box::new(replacement)));
+            EndpointCatalog::rebuild([(ServiceId::new("default", "web"), 80, vec![])]).unwrap();
+        let entry2 = normal_entry(
+            2,
+            1,
+            RaftRequest::PublishEndpoints {
+                expected_generation: 1,
+                catalog: Box::new(replacement),
+            },
+        );
         sm.apply(vec![entry2]).await.unwrap();
         let state = sm.desired_state().await;
         assert!(
@@ -2014,6 +3984,7 @@ mod tests {
 
     fn test_manifest_commit() -> crate::pickle::types::ManifestCommit {
         crate::pickle::types::ManifestCommit {
+            observed_gc_generation: 0,
             manifest: crate::pickle::types::ImageManifest {
                 digest: test_digest("m1"),
                 config: crate::pickle::types::LayerDescriptor {
@@ -2038,6 +4009,124 @@ mod tests {
         }
     }
 
+    #[test]
+    fn a_delayed_manifest_cannot_publish_across_a_gc_generation() {
+        let mut inner = StateMachineInner::default();
+        let report = crate::pickle::types::GcReport {
+            node_id: 1,
+            deleted_layers: vec![test_digest("orphan")],
+        };
+        assert!(
+            matches!(inner.apply_request(&RaftRequest::GcReport(report)), Some(CouncilResponse::GcApproved { approved }) if approved.len() == 1)
+        );
+        let mut commit = serde_json::to_value(test_manifest_commit()).unwrap();
+        commit["holder_nodes"] = serde_json::json!([1]);
+        commit["observed_gc_generation"] = serde_json::json!(0);
+        let request: RaftRequest =
+            serde_json::from_value(serde_json::json!({ "ManifestCommit": commit })).unwrap();
+        assert!(
+            matches!(
+                inner.apply_request(&request),
+                Some(CouncilResponse::RegistryPublicationStale)
+            ),
+            "a publication verified before GC must not restore its old holdings"
+        );
+        assert!(inner.state.manifest_catalog.manifests.is_empty());
+    }
+
+    #[test]
+    fn exhausted_gc_generation_refuses_without_mutating_the_catalogue() {
+        let mut inner = StateMachineInner::default();
+        let mut encoded = serde_json::to_value(&inner.state).unwrap();
+        encoded["registry_gc_generations"] = serde_json::json!({"1": u64::MAX});
+        inner.state = serde_json::from_value(encoded).unwrap();
+        let before = serde_json::to_value(&inner.state.manifest_catalog).unwrap();
+        let report = crate::pickle::types::GcReport {
+            node_id: 1,
+            deleted_layers: vec![test_digest("orphan")],
+        };
+        assert!(
+            matches!(
+                inner.apply_request(&RaftRequest::GcReport(report)),
+                Some(CouncilResponse::Refused { .. })
+            ),
+            "collection needs a fresh fencing generation before it can delete bytes"
+        );
+        assert_eq!(
+            serde_json::to_value(&inner.state.manifest_catalog).unwrap(),
+            before
+        );
+    }
+
+    #[tokio::test]
+    async fn gc_generation_survives_snapshot_and_only_advances_for_approved_deletions() {
+        let mut sm = CouncilStateMachine::new();
+        sm.apply(vec![normal_entry(
+            1,
+            1,
+            RaftRequest::GcReport(crate::pickle::types::GcReport {
+                node_id: 1,
+                deleted_layers: vec![test_digest("orphan")],
+            }),
+        )])
+        .await
+        .unwrap();
+        let mut builder = sm.get_snapshot_builder().await;
+        let snapshot = builder.build_snapshot().await.unwrap();
+        let mut restored = CouncilStateMachine::new();
+        restored
+            .install_snapshot(&snapshot.meta, snapshot.snapshot)
+            .await
+            .unwrap();
+        assert_eq!(
+            restored.desired_state().await.registry_gc_generations[&1],
+            1
+        );
+        let mut commit = test_manifest_commit();
+        commit.holder_nodes = std::collections::BTreeSet::from([1]);
+        let refused = restored
+            .apply(vec![normal_entry(
+                1,
+                2,
+                RaftRequest::ManifestCommit(commit.clone()),
+            )])
+            .await
+            .unwrap();
+        assert!(matches!(
+            refused[0],
+            CouncilResponse::RegistryPublicationStale
+        ));
+        commit.observed_gc_generation = 1;
+        let digest = commit.manifest.digest.clone();
+        let accepted = restored
+            .apply(vec![normal_entry(
+                1,
+                3,
+                RaftRequest::ManifestCommit(commit),
+            )])
+            .await
+            .unwrap();
+        assert!(matches!(accepted[0], CouncilResponse::Applied { .. }));
+        let response = restored
+            .apply(vec![normal_entry(
+                1,
+                4,
+                RaftRequest::GcReport(crate::pickle::types::GcReport {
+                    node_id: 1,
+                    deleted_layers: vec![digest],
+                }),
+            )])
+            .await
+            .unwrap();
+        assert!(
+            matches!(&response[0], CouncilResponse::GcApproved { approved } if approved.is_empty())
+        );
+        assert_eq!(
+            restored.desired_state().await.registry_gc_generations[&1],
+            1
+        );
+    }
+
     #[tokio::test]
     async fn apply_manifest_commit_updates_catalog() {
         let mut sm = CouncilStateMachine::new();
@@ -2055,19 +4144,56 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn apply_update_layer_locations() {
-        let mut sm = CouncilStateMachine::new();
-        let digest = test_digest("layer1");
-        let update = crate::pickle::types::UpdateLayerLocations {
-            updates: vec![(digest.clone(), std::collections::BTreeSet::from([3, 4]))],
-        };
-        let entry = normal_entry(1, 1, RaftRequest::UpdateLayerLocations(update));
-
-        sm.apply(vec![entry]).await.unwrap();
-
-        let state = sm.desired_state().await;
-        let holders = state.manifest_catalog.layer_holders(digest.as_str());
-        assert_eq!(holders, std::collections::BTreeSet::from([3, 4]));
+    async fn repository_ownership_survives_snapshot_and_independent_tag_retirement() {
+        let mut state_machine = CouncilStateMachine::new();
+        let original = test_manifest_commit();
+        let mut copy = original.clone();
+        copy.manifest.repository = "team-copy/app".into();
+        state_machine
+            .apply(vec![
+                normal_entry(1, 1, RaftRequest::ManifestCommit(original)),
+                normal_entry(1, 2, RaftRequest::ManifestCommit(copy)),
+            ])
+            .await
+            .unwrap();
+        assert_eq!(
+            state_machine
+                .desired_state()
+                .await
+                .manifest_catalog
+                .manifests
+                .len(),
+            2
+        );
+        let mut builder = state_machine.get_snapshot_builder().await;
+        let snapshot = builder.build_snapshot().await.unwrap();
+        let mut restored = CouncilStateMachine::new();
+        restored
+            .install_snapshot(&snapshot.meta, snapshot.snapshot)
+            .await
+            .unwrap();
+        restored
+            .apply(vec![normal_entry(
+                1,
+                3,
+                RaftRequest::DeleteTag(crate::pickle::types::DeleteTag {
+                    repository: "team-copy/app".into(),
+                    tag: "latest".into(),
+                }),
+            )])
+            .await
+            .unwrap();
+        let state = restored.desired_state().await;
+        assert_eq!(state.manifest_catalog.manifests.len(), 1);
+        let retained = state
+            .manifest_catalog
+            .get_manifest_by_tag("myapp", "latest")
+            .unwrap();
+        assert_eq!(retained.repository, "myapp");
+        assert_eq!(
+            retained.tags,
+            std::collections::BTreeSet::from(["latest".into()])
+        );
     }
 
     #[tokio::test]
@@ -2079,13 +4205,12 @@ mod tests {
         let update = crate::pickle::types::UpdateLayerLocations {
             updates: vec![(digest.clone(), std::collections::BTreeSet::from([1, 2, 3]))],
         };
-        sm.apply(vec![normal_entry(
-            1,
-            1,
-            RaftRequest::UpdateLayerLocations(update),
-        )])
-        .await
-        .unwrap();
+        sm.inner
+            .write()
+            .await
+            .state
+            .manifest_catalog
+            .apply_update_locations(&update);
 
         // Then: GC report removes node 2
         let report = crate::pickle::types::GcReport {
@@ -2120,13 +4245,12 @@ mod tests {
         let update = crate::pickle::types::UpdateLayerLocations {
             updates: vec![(digest.clone(), std::collections::BTreeSet::from([1, 2]))],
         };
-        sm.apply(vec![normal_entry(
-            1,
-            1,
-            RaftRequest::UpdateLayerLocations(update),
-        )])
-        .await
-        .unwrap();
+        sm.inner
+            .write()
+            .await
+            .state
+            .manifest_catalog
+            .apply_update_locations(&update);
 
         // Both nodes nominate the layer, in log order.
         let report_from_1 = crate::pickle::types::GcReport {
@@ -3158,6 +5282,478 @@ mod tests {
         );
     }
 
+    fn leased_token() -> crate::sesame::types::ApiToken {
+        crate::sesame::types::ApiToken {
+            name: "rbtest-run1-scope".into(),
+            token_hash: vec![1; 32],
+            token_salt: vec![2; 16],
+            role: crate::sesame::types::ApiRole::Deployer,
+            scope: crate::sesame::types::TokenScope {
+                apps: None,
+                namespaces: Some(vec!["rbtest-run1".into()]),
+            },
+            expires_at: Some(
+                std::time::SystemTime::UNIX_EPOCH + std::time::Duration::from_millis(100),
+            ),
+            created_at: std::time::SystemTime::UNIX_EPOCH,
+        }
+    }
+
+    fn leased_token_request(token: crate::sesame::types::ApiToken) -> RaftRequest {
+        RaftRequest::TestLeaseApiToken {
+            lease_id: "run1".into(),
+            owner_id: "token:ci".into(),
+            observed_at_unix_ms: 20,
+            token: Box::new(token),
+        }
+    }
+
+    #[test]
+    fn leased_token_refuses_invalid_authority_scope_expiry_and_existing_names() {
+        let mut inner = StateMachineInner::default();
+        inner.apply_request(&RaftRequest::TestLeaseCreate(test_lease("run1", 100)));
+        let mut invalid = Vec::new();
+        let mut token = leased_token();
+        token.role = crate::sesame::types::ApiRole::Admin;
+        invalid.push(token);
+        let mut token = leased_token();
+        token.scope.namespaces = None;
+        invalid.push(token);
+        let mut token = leased_token();
+        token.scope.namespaces = Some(vec!["outside".into()]);
+        invalid.push(token);
+        let mut token = leased_token();
+        token.expires_at = None;
+        invalid.push(token);
+        let mut token = leased_token();
+        token.expires_at =
+            Some(std::time::SystemTime::UNIX_EPOCH + std::time::Duration::from_millis(101));
+        invalid.push(token);
+        let mut token = leased_token();
+        token.expires_at = Some(std::time::SystemTime::UNIX_EPOCH);
+        invalid.push(token);
+        let mut token = leased_token();
+        token.name = "operator-token".into();
+        invalid.push(token);
+        for token in invalid {
+            assert!(matches!(
+                inner.apply_request(&leased_token_request(token)),
+                Some(CouncilResponse::Refused { .. })
+            ));
+            assert!(inner.state.security_state.api_tokens.is_empty());
+            assert!(inner.state.test_leases["run1"].resources.is_empty());
+        }
+        for (owner, observed) in [("other", 20), ("token:ci", 100)] {
+            assert!(matches!(
+                inner.apply_request(&RaftRequest::TestLeaseApiToken {
+                    lease_id: "run1".into(),
+                    owner_id: owner.into(),
+                    observed_at_unix_ms: observed,
+                    token: Box::new(leased_token()),
+                }),
+                Some(CouncilResponse::Refused { .. })
+            ));
+        }
+        inner.state.security_state.api_tokens.push(leased_token());
+        assert!(matches!(
+            inner.apply_request(&leased_token_request(leased_token())),
+            Some(CouncilResponse::Refused { .. })
+        ));
+        assert!(inner.state.test_leases["run1"].resources.is_empty());
+    }
+
+    #[test]
+    fn leased_token_expiry_does_not_extend_on_renewal_and_revocation_does_not_release_ownership() {
+        let mut inner = StateMachineInner::default();
+        inner.apply_request(&RaftRequest::TestLeaseCreate(test_lease("run1", 100)));
+        inner.apply_request(&leased_token_request(leased_token()));
+        inner.apply_request(&RaftRequest::TestLeaseRenew {
+            lease_id: "run1".into(),
+            owner_id: "token:ci".into(),
+            renewed_at_unix_ms: 30,
+            expires_at_unix_ms: 200,
+        });
+        assert_eq!(
+            inner.state.security_state.api_tokens[0].expires_at,
+            leased_token().expires_at
+        );
+        inner.apply_request(&RaftRequest::RevokeApiToken {
+            name: leased_token().name,
+        });
+        assert!(inner.state.security_state.api_tokens.is_empty());
+        assert!(matches!(
+            inner.apply_request(&leased_token_request(leased_token())),
+            Some(CouncilResponse::Refused { .. })
+        ));
+        let mut replacement = leased_token();
+        replacement.name = "rbtest-run1-next".into();
+        assert!(!matches!(
+            inner.apply_request(&leased_token_request(replacement)),
+            Some(CouncilResponse::Refused { .. })
+        ));
+    }
+
+    #[tokio::test]
+    async fn leased_token_snapshot_preserves_cleanup_fences_and_exact_credential() {
+        let mut sm = CouncilStateMachine::new();
+        sm.apply(vec![
+            normal_entry(1, 1, RaftRequest::TestLeaseCreate(test_lease("run1", 100))),
+            normal_entry(1, 2, leased_token_request(leased_token())),
+        ])
+        .await
+        .unwrap();
+        let state = sm.desired_state().await;
+        let resource = state.test_leases["run1"]
+            .resources
+            .iter()
+            .next()
+            .unwrap()
+            .clone();
+        let crate::testkit::lease::LeasedResource::ApiToken { name, fingerprint } = resource else {
+            panic!("wrong resource")
+        };
+        let mut builder = sm.get_snapshot_builder().await;
+        let snapshot = builder.build_snapshot().await.unwrap();
+        let mut restored = CouncilStateMachine::new();
+        restored
+            .install_snapshot(&snapshot.meta, snapshot.snapshot)
+            .await
+            .unwrap();
+        let mut inner = restored.inner.write().await;
+        let cleanup = RaftRequest::TestLeaseRevokeApiToken {
+            lease_id: "run1".into(),
+            name: name.clone(),
+            fingerprint,
+        };
+        assert!(matches!(
+            inner.apply_request(&cleanup),
+            Some(CouncilResponse::Refused { .. })
+        ));
+        inner.apply_request(&RaftRequest::TestLeaseBeginCleanup {
+            lease_id: "run1".into(),
+        });
+        assert!(matches!(
+            inner.apply_request(&leased_token_request(leased_token())),
+            Some(CouncilResponse::Refused { .. })
+        ));
+        assert!(matches!(
+            inner.apply_request(&RaftRequest::TestLeaseFinishCleanup {
+                lease_id: "run1".into()
+            }),
+            Some(CouncilResponse::Refused { .. })
+        ));
+        // Even corrupt/external replacement state must never cause name-only deletion.
+        inner.state.security_state.api_tokens[0].token_hash = vec![3; 32];
+        assert!(matches!(
+            inner.apply_request(&cleanup),
+            Some(CouncilResponse::Refused { .. })
+        ));
+        assert_eq!(
+            inner.state.security_state.api_tokens[0].token_hash,
+            vec![3; 32]
+        );
+        inner.state.security_state.api_tokens[0] = leased_token();
+        assert!(!matches!(
+            inner.apply_request(&cleanup),
+            Some(CouncilResponse::Refused { .. })
+        ));
+        assert!(inner.state.security_state.api_tokens.is_empty());
+        assert!(!matches!(
+            inner.apply_request(&cleanup),
+            Some(CouncilResponse::Refused { .. })
+        ));
+        assert!(matches!(
+            inner.apply_request(&RaftRequest::CreateApiToken(leased_token())),
+            Some(CouncilResponse::Refused { .. })
+        ));
+        inner.apply_request(&RaftRequest::TestLeaseFinishCleanup {
+            lease_id: "run1".into(),
+        });
+        assert!(inner.state.test_leases.is_empty());
+    }
+
+    #[test]
+    fn ordinary_manifest_commits_cannot_bypass_a_reserved_test_repository() {
+        let mut inner = StateMachineInner::default();
+        let mut commit = test_manifest_commit();
+        commit.manifest.repository = "rbtest-run1/web".into();
+        assert!(matches!(
+            inner.apply_request(&RaftRequest::ManifestCommit(commit)),
+            Some(CouncilResponse::Refused { .. })
+        ));
+        assert!(inner.state.manifest_catalog.manifests.is_empty());
+    }
+
+    #[test]
+    fn registry_writer_receipts_fence_late_commits_and_delay_lease_completion() {
+        let mut inner = StateMachineInner::default();
+        inner.apply_request(&RaftRequest::TestLeaseCreate(test_lease("run1", 100)));
+        let writer = |node, owner: &str| {
+            serde_json::from_value::<RaftRequest>(serde_json::json!({
+                "TestLeaseRegistryWriter": {
+                    "lease_id": "run1", "repository": "rbtest-run1/web", "node_id": node,
+                    "owner_id": owner, "observed_at_unix_ms": 20
+                }
+            }))
+            .expect("Raft must record a repository's possible storage owners")
+        };
+        assert!(matches!(
+            inner.apply_request(&writer(1, "wrong")),
+            Some(CouncilResponse::Refused { .. })
+        ));
+        assert!(inner.apply_request(&writer(1, "token:ci")).is_none());
+        assert!(inner.apply_request(&writer(2, "token:ci")).is_none());
+        assert!(inner.apply_request(&writer(1, "token:ci")).is_none());
+        let mut commit = test_manifest_commit();
+        commit.manifest.repository = "rbtest-run1/web".into();
+        commit.manifest.pushed_by = 1;
+        commit.holder_nodes = std::collections::BTreeSet::from([1]);
+        let publish = serde_json::from_value::<RaftRequest>(serde_json::json!({
+            "TestLeaseManifestCommit": {"lease_id":"run1", "observed_at_unix_ms":20, "commit":commit}
+        })).unwrap();
+        assert!(inner.apply_request(&publish).is_none());
+        inner.apply_request(&RaftRequest::TestLeaseBeginCleanup {
+            lease_id: "run1".into(),
+        });
+        assert!(matches!(
+            inner.apply_request(&writer(3, "token:ci")),
+            Some(CouncilResponse::Refused { .. })
+        ));
+        assert!(matches!(
+            inner.apply_request(&publish),
+            Some(CouncilResponse::Refused { .. })
+        ));
+        let finish = RaftRequest::TestLeaseFinishCleanup {
+            lease_id: "run1".into(),
+        };
+        assert!(matches!(
+            inner.apply_request(&finish),
+            Some(CouncilResponse::Refused { .. })
+        ));
+        let ack = |node| {
+            serde_json::from_value::<RaftRequest>(serde_json::json!({
+            "TestLeaseRegistryRetired": {"lease_id":"run1", "repository":"rbtest-run1/web", "node_id":node}
+        })).unwrap()
+        };
+        // Cleaning alone does not establish that workloads have stopped.
+        assert!(matches!(
+            inner.apply_request(&ack(1)),
+            Some(CouncilResponse::Refused { .. })
+        ));
+        let ready = serde_json::from_value::<RaftRequest>(serde_json::json!({
+            "TestLeaseWorkloadsRetired": {"lease_id":"run1"}
+        }))
+        .unwrap();
+        assert!(inner.apply_request(&ready).is_none());
+        assert!(inner.apply_request(&ack(1)).is_none());
+        assert!(inner.apply_request(&ack(1)).is_none());
+        assert!(matches!(
+            inner.apply_request(&finish),
+            Some(CouncilResponse::Refused { .. })
+        ));
+        assert!(inner.apply_request(&ack(2)).is_none());
+        assert!(inner.apply_request(&finish).is_none());
+        assert!(inner.state.test_leases.is_empty());
+        assert!(inner.state.manifest_catalog.manifests.is_empty());
+    }
+
+    #[tokio::test]
+    async fn registry_receipts_survive_snapshots_and_decommission_releases_only_the_retired_node() {
+        let mut sm = CouncilStateMachine::new();
+        let retired = crate::cluster::identity::raft_id_from_name("old-worker");
+        let surviving = crate::cluster::identity::raft_id_from_name("worker");
+        let request = |node| RaftRequest::TestLeaseRegistryWriter {
+            lease_id: "run1".into(),
+            repository: "rbtest-run1/web".into(),
+            node_id: node,
+            owner_id: Some("token:ci".into()),
+            observed_at_unix_ms: 20,
+        };
+        for (index, request) in [
+            RaftRequest::TestLeaseCreate(test_lease("run1", 100)),
+            request(retired),
+            request(surviving),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let response = sm
+                .apply(vec![normal_entry(1, index as u64 + 1, request)])
+                .await
+                .unwrap();
+            assert!(!matches!(response[0], CouncilResponse::Refused { .. }));
+        }
+        let mut builder = sm.get_snapshot_builder().await;
+        let snapshot = builder.build_snapshot().await.unwrap();
+        let mut restored = CouncilStateMachine::new();
+        restored
+            .install_snapshot(&snapshot.meta, snapshot.snapshot)
+            .await
+            .unwrap();
+        let mut inner = restored.inner.write().await;
+        assert_eq!(
+            inner.state.test_leases["run1"].repositories["rbtest-run1/web"].len(),
+            2
+        );
+        let retire = RaftRequest::DecommissionNode {
+            node_id: "old-worker".into(),
+            retired_by: "operator".into(),
+            reason: "powered off".into(),
+            retired_at_unix_ms: 30,
+            membership_log_id: None,
+        };
+        assert!(matches!(
+            inner.apply_request(&retire),
+            Some(CouncilResponse::NodeDecommissioned { .. })
+        ));
+        assert_eq!(
+            inner.state.test_leases["run1"].repositories["rbtest-run1/web"],
+            std::collections::BTreeSet::from([surviving])
+        );
+        let audit = inner.state.security_state.crl.retired_nodes["old-worker"].clone();
+        assert_eq!(audit.released_registry_writers["run1"], 1);
+        inner.apply_request(&retire);
+        assert_eq!(
+            inner.state.security_state.crl.retired_nodes["old-worker"],
+            audit
+        );
+        assert!(matches!(
+            inner.apply_request(&request(retired)),
+            Some(CouncilResponse::Refused { .. })
+        ));
+    }
+
+    #[test]
+    fn registry_cleanup_waits_for_desired_apps_and_every_former_placement() {
+        use crate::testkit::lease::{LeasedPlacement, LeasedResource};
+        let mut inner = StateMachineInner::default();
+        let mut lease = test_lease("run1", 100);
+        let app_id = AppId::new("web", "rbtest-run1");
+        lease.resources.insert(LeasedResource::App {
+            app_id: app_id.clone(),
+        });
+        lease.placements.insert(LeasedPlacement {
+            app_id: app_id.clone(),
+            node_id: NodeId::new("worker"),
+        });
+        inner.apply_request(&RaftRequest::TestLeaseCreate(lease));
+        inner.state.apps.insert(app_id.clone(), default_spec());
+        inner.apply_request(&RaftRequest::TestLeaseBeginCleanup {
+            lease_id: "run1".into(),
+        });
+        let ready = RaftRequest::TestLeaseWorkloadsRetired {
+            lease_id: "run1".into(),
+        };
+        assert!(matches!(
+            inner.apply_request(&ready),
+            Some(CouncilResponse::Refused { .. })
+        ));
+        inner.apply_request(&RaftRequest::AppDelete {
+            app_id: app_id.clone(),
+        });
+        assert!(matches!(
+            inner.apply_request(&ready),
+            Some(CouncilResponse::Refused { .. })
+        ));
+        inner.apply_request(&RaftRequest::TestLeasePlacementRetired {
+            lease_id: "run1".into(),
+            placement: LeasedPlacement {
+                app_id,
+                node_id: NodeId::new("worker"),
+            },
+        });
+        assert!(inner.apply_request(&ready).is_none());
+    }
+
+    #[test]
+    fn ordinary_app_specs_cannot_acquire_leased_images() {
+        for init in [false, true] {
+            let mut inner = StateMachineInner::default();
+            let mut spec = default_spec();
+            if init {
+                spec.init = vec![crate::config::app::InitContainerSpec {
+                    image: Some("rbtest-run1/web:latest".into()),
+                    command: vec![],
+                }];
+            } else {
+                spec.image = Some("registry.example:5050/rbtest-run1/web:latest".into());
+            }
+            let result = inner.apply_request(&RaftRequest::AppSpec {
+                app_id: AppId::new("ordinary", "default"),
+                spec: Box::new(spec),
+            });
+            assert!(
+                matches!(result, Some(CouncilResponse::Refused { .. })),
+                "ordinary app acquired a disposable image (init={init})"
+            );
+            assert!(inner.state.apps.is_empty());
+        }
+    }
+
+    #[test]
+    fn leased_images_require_the_same_active_application_lease_and_registered_repository() {
+        let mut inner = StateMachineInner::default();
+        for id in ["run1", "run2"] {
+            inner.apply_request(&RaftRequest::TestLeaseCreate(test_lease(id, 100)));
+            inner.apply_request(&RaftRequest::TestLeaseRegistryWriter {
+                lease_id: id.into(),
+                repository: format!("rbtest-{id}/web"),
+                node_id: 1,
+                owner_id: Some("token:ci".into()),
+                observed_at_unix_ms: 20,
+            });
+        }
+        for init in [false, true] {
+            for (image, allowed) in [
+                ("nginx:latest", true),
+                ("rbtest-run1/web:latest", true),
+                ("registry.example:5050/rbtest-run1/web@sha256:content", true),
+                ("rbtest-run2/web:latest", false),
+                ("rbtest-run1/missing:latest", false),
+            ] {
+                let mut spec = default_spec();
+                if init {
+                    spec.init = vec![crate::config::app::InitContainerSpec {
+                        image: Some(image.into()),
+                        command: vec![],
+                    }];
+                } else {
+                    spec.image = Some(image.into());
+                }
+                let result = inner.apply_request(&RaftRequest::TestLeaseAppSpec {
+                    lease_id: "run1".into(),
+                    observed_at_unix_ms: 20,
+                    app_id: AppId::new(if init { "init" } else { "main" }, "rbtest-run1"),
+                    spec: Box::new(spec),
+                });
+                assert_eq!(
+                    result.is_none(),
+                    allowed,
+                    "{image}, init={init}: {result:?}"
+                );
+            }
+        }
+        let owned = &inner.state.test_leases["run1"];
+        assert!(
+            crate::testkit::lease::authorise_image_references(
+                ["rbtest-run1/web:latest"],
+                Some((owned, 100))
+            )
+            .is_err()
+        );
+        inner.apply_request(&RaftRequest::TestLeaseBeginCleanup {
+            lease_id: "run1".into(),
+        });
+        let owned = &inner.state.test_leases["run1"];
+        assert!(
+            crate::testkit::lease::authorise_image_references(
+                ["rbtest-run1/web:latest"],
+                Some((owned, 20))
+            )
+            .is_err()
+        );
+    }
+
     fn test_lease(id: &str, expires_at_unix_ms: u64) -> crate::testkit::lease::TestLease {
         crate::testkit::lease::TestLease::new(
             id.to_string(),
@@ -3168,6 +5764,32 @@ mod tests {
             expires_at_unix_ms,
         )
         .unwrap()
+    }
+
+    #[tokio::test]
+    async fn node_job_leases_never_enter_replicated_state() {
+        let mut sm = CouncilStateMachine::new();
+        let suffix = "0123456789abcdef0123456789abcdef";
+        let lease = crate::testkit::lease::TestLease::new_scoped(
+            format!("node-jobs-{suffix}"),
+            "owner".into(),
+            "owner".into(),
+            format!("rbtest-node-{suffix}"),
+            10,
+            100,
+            crate::testkit::lease::LeaseScope::NodeJobs,
+        )
+        .unwrap();
+        let responses = sm
+            .apply(vec![normal_entry(
+                1,
+                1,
+                RaftRequest::TestLeaseCreate(lease),
+            )])
+            .await
+            .unwrap();
+        assert!(matches!(responses[0], CouncilResponse::Refused { .. }));
+        assert!(sm.inner.read().await.state.test_leases.is_empty());
     }
 
     #[tokio::test]
@@ -3421,6 +6043,478 @@ mod tests {
         assert!(sm.desired_state().await.test_leases.is_empty());
     }
 
+    #[test]
+    fn lease_placement_limit_refuses_new_owners_without_losing_existing_work() {
+        use crate::testkit::lease::{LeasedPlacement, LeasedResource, MAX_LEASED_PLACEMENTS};
+        let mut inner = StateMachineInner::default();
+        let app_id = AppId::new("web", "rbtest-run1");
+        let mut lease = test_lease("run1", 100);
+        lease.resources.insert(LeasedResource::App {
+            app_id: app_id.clone(),
+        });
+        lease.placements = (0..MAX_LEASED_PLACEMENTS)
+            .map(|index| LeasedPlacement {
+                app_id: app_id.clone(),
+                node_id: NodeId::new(format!("worker-{index}")),
+            })
+            .collect();
+        assert!(lease.validate().is_ok());
+        inner.state.apps.insert(app_id.clone(), default_spec());
+        inner.state.test_leases.insert("run1".into(), lease);
+        let decision = |node: &str| {
+            RaftRequest::SchedulingDecision(SchedulingDecision {
+                app_id: app_id.clone(),
+                placements: vec![Placement {
+                    node_id: NodeId::new(node),
+                    resources: Resources::new(1, 1, 0),
+                }],
+            })
+        };
+        assert!(inner.apply_request(&decision("worker-0")).is_none());
+        for rejected in ["", "overflow-worker"] {
+            assert!(matches!(
+                inner.apply_request(&decision(rejected)),
+                Some(CouncilResponse::Refused { .. })
+            ));
+            assert_eq!(
+                inner.state.scheduling[&app_id][0].node_id,
+                NodeId::new("worker-0")
+            );
+            assert_eq!(
+                inner.state.test_leases["run1"].placements.len(),
+                MAX_LEASED_PLACEMENTS
+            );
+        }
+    }
+
+    #[test]
+    fn decommission_resolves_only_the_fenced_nodes_fault_obligation() {
+        use crate::smoker::{
+            reservation::NodeFaultReservation,
+            types::{FaultRequest, FaultType},
+        };
+        let mut inner = StateMachineInner::default();
+        inner.state.node_fault_reservations.last_sequence = 1;
+        inner.state.node_fault_reservations.active = Some(NodeFaultReservation {
+            sequence: 1,
+            boot_id: "old-boot".into(),
+            cleanup_after_unix_ms: 100,
+            request: FaultRequest {
+                fault_type: FaultType::NodeKill {
+                    kill_containers: false,
+                },
+                target_service: String::new(),
+                namespace: None,
+                target_instance: None,
+                target_node: Some("old-worker".into()),
+                duration: std::time::Duration::from_secs(30),
+                injected_by: "operator".into(),
+                reason: None,
+                include_leader: true,
+                override_safety: true,
+                acknowledged: true,
+            },
+        });
+        let retire = |node: &str| RaftRequest::DecommissionNode {
+            node_id: node.into(),
+            retired_by: "operator".into(),
+            reason: "powered off".into(),
+            retired_at_unix_ms: 30,
+            membership_log_id: None,
+        };
+        assert!(matches!(
+            inner.apply_request(&retire("other-worker")),
+            Some(CouncilResponse::Refused { .. })
+        ));
+        assert!(inner.state.node_fault_reservations.active.is_some());
+        let response = inner.apply_request(&retire("old-worker"));
+        assert!(
+            matches!(response, Some(CouncilResponse::NodeDecommissioned { .. })),
+            "{response:?}"
+        );
+        assert!(inner.state.node_fault_reservations.active.is_none());
+        assert_eq!(inner.state.node_fault_reservations.last_sequence, 1);
+        let record =
+            serde_json::to_value(&inner.state.security_state.crl.retired_nodes["old-worker"])
+                .unwrap();
+        assert_eq!(record["released_node_fault"], 1);
+    }
+
+    #[test]
+    fn decommission_refuses_stale_membership_and_quorum_loss_without_mutation() {
+        let mut inner = StateMachineInner::default();
+        let members: std::collections::BTreeMap<_, _> = (1..=3)
+            .map(|id| {
+                (
+                    id,
+                    CouncilNodeInfo::new("127.0.0.1:9000".parse().unwrap(), format!("node-{id}")),
+                )
+            })
+            .collect();
+        inner.state.last_membership = StoredMembership::new(
+            Some(log_id(1, 1)),
+            Membership::new(vec![std::collections::BTreeSet::from([1, 2, 3])], members),
+        );
+        let request = |node: &str, observed| RaftRequest::DecommissionNode {
+            node_id: node.into(),
+            retired_by: "operator".into(),
+            reason: "powered off".into(),
+            retired_at_unix_ms: 30,
+            membership_log_id: observed,
+        };
+        assert!(matches!(
+            inner.apply_request(&request("node-3", None)),
+            Some(CouncilResponse::Refused { .. })
+        ));
+        assert!(inner.state.security_state.crl.retired_nodes.is_empty());
+        assert!(matches!(
+            inner.apply_request(&request("node-3", Some(log_id(1, 1)))),
+            Some(CouncilResponse::NodeDecommissioned { .. })
+        ));
+        assert!(matches!(
+            inner.apply_request(&request("node-2", Some(log_id(1, 1)))),
+            Some(CouncilResponse::Refused { .. })
+        ));
+        assert_eq!(inner.state.security_state.crl.retired_nodes.len(), 1);
+        // A repeat keeps its original outcome even after membership has moved.
+        assert!(matches!(
+            inner.apply_request(&request("node-3", None)),
+            Some(CouncilResponse::NodeDecommissioned { .. })
+        ));
+    }
+
+    #[test]
+    fn decommission_fences_registry_proposals_at_commit_time() {
+        let mut inner = StateMachineInner::default();
+        inner.apply_request(&RaftRequest::DecommissionNode {
+            node_id: "old-writer".into(),
+            retired_by: "operator".into(),
+            reason: "powered off".into(),
+            retired_at_unix_ms: 30,
+            membership_log_id: None,
+        });
+        let id = crate::cluster::identity::raft_id_from_name("old-writer");
+        let mut commit = test_manifest_commit();
+        commit.manifest.pushed_by = id;
+        commit.holder_nodes = std::collections::BTreeSet::from([id]);
+        for request in [
+            RaftRequest::ManifestCommit(commit),
+            RaftRequest::GcReport(crate::pickle::types::GcReport {
+                node_id: id,
+                deleted_layers: vec![test_digest("orphan")],
+            }),
+        ] {
+            assert!(
+                matches!(
+                    inner.apply_request(&request),
+                    Some(CouncilResponse::Refused { .. })
+                ),
+                "an in-flight proposal was accepted after its writer retired"
+            );
+        }
+        assert!(inner.state.manifest_catalog.manifests.is_empty());
+    }
+
+    #[test]
+    fn decommission_fences_join_tokens_and_renewal_serials_at_commit_time() {
+        let mut inner = StateMachineInner::default();
+        let (_, token) = crate::sesame::join::create_join_token(
+            std::time::Duration::from_secs(60),
+            "old-worker",
+        )
+        .unwrap();
+        inner.apply_request(&RaftRequest::CreateJoinToken(token.clone()));
+        inner.apply_request(&RaftRequest::DecommissionNode {
+            node_id: "old-worker".into(),
+            retired_by: "operator".into(),
+            reason: "powered off".into(),
+            retired_at_unix_ms: 30,
+            membership_log_id: None,
+        });
+        for request in [
+            RaftRequest::CreateJoinToken(token.clone()),
+            RaftRequest::ConsumeJoinTokenForIssue {
+                token_hash: token.token_hash,
+            },
+            RaftRequest::AllocateNodeSerial {
+                node_id: "old-worker".into(),
+            },
+        ] {
+            assert!(matches!(
+                inner.apply_request(&request),
+                Some(CouncilResponse::Refused { .. })
+            ));
+        }
+        assert_eq!(inner.state.security_state.next_serial, 0);
+        assert!(!inner.state.security_state.join_tokens[0].consumed);
+        let (_, fresh) = crate::sesame::join::create_join_token(
+            std::time::Duration::from_secs(60),
+            "fresh-worker",
+        )
+        .unwrap();
+        assert!(
+            inner
+                .apply_request(&RaftRequest::CreateJoinToken(fresh.clone()))
+                .is_none()
+        );
+        assert!(matches!(
+            inner.apply_request(&RaftRequest::ConsumeJoinTokenForIssue {
+                token_hash: fresh.token_hash
+            }),
+            Some(CouncilResponse::JoinTokenConsumed { .. })
+        ));
+    }
+
+    #[tokio::test]
+    async fn decommission_resolves_all_node_owners_and_survives_snapshot_restoration() {
+        use crate::testkit::lease::LeasedPlacement;
+        let mut sm = CouncilStateMachine::new();
+        let mut requests = Vec::new();
+        for lease_id in ["run1", "run2"] {
+            let app_id = AppId::new("web", format!("rbtest-{lease_id}"));
+            requests.extend([
+                RaftRequest::TestLeaseCreate(test_lease(lease_id, 100)),
+                RaftRequest::TestLeaseAppSpec {
+                    lease_id: lease_id.into(),
+                    observed_at_unix_ms: 20,
+                    app_id: app_id.clone(),
+                    spec: Box::new(default_spec()),
+                },
+                RaftRequest::SchedulingDecision(SchedulingDecision {
+                    app_id: app_id.clone(),
+                    placements: ["retired-worker", "surviving-worker"]
+                        .into_iter()
+                        .map(|node| Placement {
+                            node_id: NodeId::new(node),
+                            resources: Resources::new(1, 1, 0),
+                        })
+                        .collect(),
+                }),
+            ]);
+        }
+        requests.push(RaftRequest::TestLeaseBeginCleanup {
+            lease_id: "run1".into(),
+        });
+        requests.push(RaftRequest::AppDelete {
+            app_id: AppId::new("web", "rbtest-run1"),
+        });
+        for (index, request) in requests.into_iter().enumerate() {
+            let response = sm
+                .apply(vec![normal_entry(1, index as u64 + 1, request)])
+                .await
+                .unwrap();
+            assert!(!matches!(response[0], CouncilResponse::Refused { .. }));
+        }
+        let request: RaftRequest = serde_json::from_value(serde_json::json!({
+            "DecommissionNode": {"node_id":"retired-worker", "retired_by":"token:operator",
+                "reason":"powered off for maintenance", "retired_at_unix_ms":30,
+                "membership_log_id":null}
+        }))
+        .expect("Raft must expose durable node decommissioning");
+        let response = sm
+            .apply(vec![normal_entry(1, 20, request.clone())])
+            .await
+            .unwrap();
+        assert!(!matches!(response[0], CouncilResponse::Refused { .. }));
+        let mut builder = sm.get_snapshot_builder().await;
+        let snapshot = builder.build_snapshot().await.unwrap();
+        let mut restored = CouncilStateMachine::new();
+        restored
+            .install_snapshot(&snapshot.meta, snapshot.snapshot)
+            .await
+            .unwrap();
+        let mut inner = restored.inner.write().await;
+        for lease_id in ["run1", "run2"] {
+            let lease = &inner.state.test_leases[lease_id];
+            assert_eq!(lease.placements.len(), 1);
+            assert_eq!(
+                lease.placements.first().unwrap().node_id,
+                NodeId::new("surviving-worker")
+            );
+        }
+        let record = serde_json::to_value(&inner.state.security_state.crl).unwrap()["retired_nodes"]["retired-worker"].clone();
+        assert_eq!(record["retired_by"], "token:operator");
+        assert_eq!(
+            record["released_placements"],
+            serde_json::json!({"run1":1,"run2":1})
+        );
+        inner.apply_request(&request);
+        assert_eq!(
+            serde_json::to_value(&inner.state.security_state.crl).unwrap()["retired_nodes"]["retired-worker"],
+            record
+        );
+        let app_id = AppId::new("web", "rbtest-run2");
+        let schedule = |node| {
+            RaftRequest::SchedulingDecision(SchedulingDecision {
+                app_id: app_id.clone(),
+                placements: vec![Placement {
+                    node_id: NodeId::new(node),
+                    resources: Resources::new(1, 1, 0),
+                }],
+            })
+        };
+        assert!(matches!(
+            inner.apply_request(&schedule("retired-worker")),
+            Some(CouncilResponse::Refused { .. })
+        ));
+        assert!(
+            inner
+                .apply_request(&schedule("replacement-worker"))
+                .is_none()
+        );
+        assert!(
+            inner.state.test_leases["run2"]
+                .placements
+                .contains(&LeasedPlacement {
+                    app_id,
+                    node_id: NodeId::new("replacement-worker"),
+                })
+        );
+    }
+
+    #[tokio::test]
+    async fn lease_cleanup_retains_former_placement_owners_after_rescheduling() {
+        let mut sm = CouncilStateMachine::new();
+        let app_id = AppId::new("web", "rbtest-run1");
+        let schedule = |node: &str| {
+            RaftRequest::SchedulingDecision(SchedulingDecision {
+                app_id: app_id.clone(),
+                placements: vec![Placement {
+                    node_id: NodeId::new(node),
+                    resources: Resources::new(500, 256 * 1024 * 1024, 0),
+                }],
+            })
+        };
+        let requests = vec![
+            RaftRequest::TestLeaseCreate(test_lease("run1", 100)),
+            RaftRequest::TestLeaseAppSpec {
+                lease_id: "run1".into(),
+                observed_at_unix_ms: 20,
+                app_id: app_id.clone(),
+                spec: Box::new(default_spec()),
+            },
+            schedule("old-worker"),
+            schedule("new-worker"),
+            RaftRequest::TestLeaseBeginCleanup {
+                lease_id: "run1".into(),
+            },
+            RaftRequest::AppDelete {
+                app_id: app_id.clone(),
+            },
+        ];
+        for (index, request) in requests.into_iter().enumerate() {
+            let result = sm
+                .apply(vec![normal_entry(1, index as u64 + 1, request)])
+                .await
+                .unwrap();
+            assert!(
+                !matches!(result[0], CouncilResponse::Refused { .. }),
+                "{result:?}"
+            );
+        }
+        let result = sm
+            .apply(vec![normal_entry(
+                1,
+                7,
+                RaftRequest::TestLeaseFinishCleanup {
+                    lease_id: "run1".into(),
+                },
+            )])
+            .await
+            .unwrap();
+        assert!(
+            matches!(result[0], CouncilResponse::Refused { .. }),
+            "runtime owners must outlive desired-state deletion: {result:?}"
+        );
+        assert!(sm.desired_state().await.test_leases.contains_key("run1"));
+        let result = sm
+            .apply(vec![normal_entry(1, 8, schedule("late-worker"))])
+            .await
+            .unwrap();
+        assert!(
+            matches!(result[0], CouncilResponse::Refused { .. }),
+            "cleanup must fence stale scheduling decisions"
+        );
+        // A new leader must retain former owners even though desired placement
+        // now contains neither node. Exercise the real snapshot codec.
+        let mut builder = sm.get_snapshot_builder().await;
+        let snapshot = builder.build_snapshot().await.unwrap();
+        let mut restored = CouncilStateMachine::new();
+        restored
+            .install_snapshot(&snapshot.meta, snapshot.snapshot)
+            .await
+            .unwrap();
+        let mut inner = restored.inner.write().await;
+        assert_eq!(inner.state.test_leases["run1"].placements.len(), 2);
+        let acknowledge = |lease: &str, node: &str| RaftRequest::TestLeasePlacementRetired {
+            lease_id: lease.into(),
+            placement: crate::testkit::lease::LeasedPlacement {
+                app_id: app_id.clone(),
+                node_id: NodeId::new(node),
+            },
+        };
+        assert!(matches!(
+            inner.apply_request(&acknowledge("another-lease", "old-worker")),
+            Some(CouncilResponse::Refused { .. })
+        ));
+        assert_eq!(inner.state.test_leases["run1"].placements.len(), 2);
+        assert!(
+            inner
+                .apply_request(&acknowledge("run1", "new-worker"))
+                .is_none()
+        );
+        assert!(
+            inner
+                .apply_request(&acknowledge("run1", "new-worker"))
+                .is_none()
+        );
+        assert!(matches!(
+            inner.apply_request(&RaftRequest::TestLeaseFinishCleanup {
+                lease_id: "run1".into()
+            }),
+            Some(CouncilResponse::Refused { .. })
+        ));
+        assert!(
+            inner
+                .apply_request(&acknowledge("run1", "old-worker"))
+                .is_none()
+        );
+        assert!(
+            inner
+                .apply_request(&RaftRequest::TestLeaseFinishCleanup {
+                    lease_id: "run1".into()
+                })
+                .is_none()
+        );
+        let mut replacement = test_lease("run2", 100);
+        replacement.namespace = "rbtest-run1".into();
+        assert!(
+            inner
+                .apply_request(&RaftRequest::TestLeaseCreate(replacement))
+                .is_none()
+        );
+        assert!(
+            inner
+                .apply_request(&RaftRequest::TestLeaseAppSpec {
+                    lease_id: "run2".into(),
+                    observed_at_unix_ms: 20,
+                    app_id: app_id.clone(),
+                    spec: Box::new(default_spec())
+                })
+                .is_none()
+        );
+        assert!(inner.apply_request(&schedule("old-worker")).is_none());
+        assert!(matches!(
+            inner.apply_request(&acknowledge("run1", "old-worker")),
+            Some(CouncilResponse::Refused { .. })
+        ));
+        assert!(matches!(
+            inner.apply_request(&acknowledge("run2", "old-worker")),
+            Some(CouncilResponse::Refused { .. })
+        ));
+        assert_eq!(inner.state.test_leases["run2"].placements.len(), 1);
+    }
+
     /// The cleanup-snapshot race made executable. A cleanup driver snapshots
     /// the lease's resources, but an app can attach in the window before
     /// `TestLeaseBeginCleanup` commits. Re-reading desired state after
@@ -3549,12 +6643,9 @@ mod tests {
         assert!(reloaded.test_leases.is_empty());
     }
 
-    /// The same rule end to end through the persisted store: a legacy
-    /// pre-envelope snapshot without the tracker fields loads through
-    /// `with_store` (the #83 envelope loader), and the trackers start
-    /// from their defaults.
+    /// Missing tracker fields do not authorise migration of development state.
     #[tokio::test]
-    async fn pre_12b2_persisted_snapshot_loads_through_the_envelope_loader() {
+    async fn pre_12b2_persisted_snapshot_is_refused() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("pre12b2.redb");
         let app_id = AppId::new("web", "prod");
@@ -3582,12 +6673,10 @@ mod tests {
         }
 
         let db = std::sync::Arc::new(Database::create(&path).unwrap());
-        let sm = CouncilStateMachine::with_store(db).expect("pre-12b.2 snapshot loads");
-        let state = sm.desired_state().await;
-        assert!(state.apps.contains_key(&app_id));
-        assert_eq!(state.batch_state.next_batch_id, 1);
-        assert_eq!(state.build_state.next_build_id, 1);
-        assert!(state.test_leases.is_empty());
+        assert!(matches!(
+            CouncilStateMachine::with_store(db),
+            Err(SnapshotStoreError::UnsupportedVersion { found: 0, .. })
+        ));
     }
 
     /// O5: the CRL is replicated in every snapshot and scanned on every TLS

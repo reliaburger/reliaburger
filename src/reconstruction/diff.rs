@@ -142,6 +142,7 @@ mod tests {
             let running_apps = apps
                 .into_iter()
                 .map(|(name, namespace)| RunningApp {
+                    execution: None,
                     app_name: name,
                     namespace,
                     instance_id: 0,

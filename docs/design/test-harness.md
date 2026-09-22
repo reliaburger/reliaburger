@@ -61,7 +61,7 @@ be visible until we remove its race.
 | `make test-cluster` | Gossip, placement, failover, healing, recovery and chaos | Linux, serial resource group |
 | `make test-upgrade-node` | Real single-node binary replacement | Linux |
 | `make test-upgrade-cluster` | Real rolling cluster replacement | Linux |
-| `make test-apple` | Apple Container runtime | Manual Apple-silicon MacBook check |
+| `make test-apple` | Deferred Apple adapter | Manual Apple-silicon development check, outside 0.1.0 |
 | `make bench` | Criterion transport and 5–250-node measurements | Pull requests |
 | `make bench-large` | Criterion 500- and 1,000-node measurements | Pull requests |
 | `make bench-10k` | Deterministic 10,000-member per-node scale acceptance | Pull requests |
@@ -69,9 +69,11 @@ be visible until we remove its race.
 | `make audit` | Current RustSec database, with new vulnerabilities and maintenance warnings denied | Pull requests, release gate and weekly schedule |
 | `make examples` | Every checked-in workload config parses, validates and plans through Relish without deployment | Linux pull requests |
 
-Apple Container is the only manual runtime exception. GitHub's hosted macOS runners cannot
-provide its nested virtualisation. Everything else runs on a pull request and release tags
-must pass the same reusable validation workflow before publication.
+Direct Apple Container is disabled for 0.1.0. Its manual development tests remain
+separate because hosted macOS runners cannot provide its nested virtualisation.
+The supported runtime gates run on pull requests, and release tags must pass the
+same reusable validation workflow before publication. Managed macOS laptop
+acceptance uses Linux VMs (see V04 in the release checklist).
 
 The dependency audit refreshes its database on every run. It denies new
 vulnerabilities, unsoundness, yanked packages and unmaintained-package notices.

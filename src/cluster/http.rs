@@ -35,6 +35,16 @@ impl ClusterHttp {
         }
     }
 
+    /// Plaintext HTTP with an explicitly configured client, for local control
+    /// transports which need bounded or non-redirecting request behaviour.
+    pub fn plaintext_with_client(client: Client) -> Self {
+        Self {
+            scheme: "http",
+            client,
+            bearer: None,
+        }
+    }
+
     /// `https` with a CA-trusting client (mTLS on).
     pub fn secure(client: Client) -> Self {
         Self {

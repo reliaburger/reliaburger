@@ -23,6 +23,7 @@ pub mod node_fault;
 pub mod node_pressure;
 pub mod process;
 pub mod registry;
+pub mod reservation;
 pub mod resource;
 pub mod safety;
 pub mod scenario;

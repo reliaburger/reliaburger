@@ -82,12 +82,41 @@ pub struct OciLinux {
     pub namespaces: Vec<OciNamespace>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub resources: Option<OciResources>,
+    /// Absolute path within the cgroup hierarchy, excluding its host mount point.
     #[serde(rename = "cgroupsPath", skip_serializing_if = "Option::is_none")]
     pub cgroups_path: Option<String>,
     #[serde(rename = "uidMappings", skip_serializing_if = "Option::is_none")]
     pub uid_mappings: Option<Vec<OciIdMapping>>,
     #[serde(rename = "gidMappings", skip_serializing_if = "Option::is_none")]
     pub gid_mappings: Option<Vec<OciIdMapping>>,
+}
+
+impl OciLinux {
+    /// Resolve an explicit OCI hierarchy path to its host cgroup v2 directory.
+    /// Relative, root, non-canonical and legacy host-prefixed paths refuse:
+    /// none gives Reliaburger an unambiguous workload identity.
+    pub fn host_cgroup_path(&self) -> Option<PathBuf> {
+        let path = self.cgroups_path.as_deref()?;
+        let relative = path.strip_prefix('/')?;
+        if relative.is_empty()
+            || relative
+                .split('/')
+                .any(|part| part.is_empty() || part == "." || part == "..")
+            || Path::new(path).starts_with("/sys/fs/cgroup")
+        {
+            return None;
+        }
+        Some(Path::new("/sys/fs/cgroup").join(relative))
+    }
+}
+
+// The generators receive the host path Bun uses for policy and resource files;
+// OCI instead resolves an absolute cgroupsPath from the cgroup mount point.
+fn hierarchy_cgroup_path(host_path: &str) -> String {
+    match host_path.strip_prefix("/sys/fs/cgroup/") {
+        Some(relative) => format!("/{relative}"),
+        None => host_path.to_owned(),
+    }
 }
 
 /// UID/GID mapping for user namespaces.
@@ -253,7 +282,7 @@ pub fn generate_oci_spec_with_decryptor(
         linux: OciLinux {
             namespaces,
             resources,
-            cgroups_path: Some(cgroup_path.to_string()),
+            cgroups_path: Some(hierarchy_cgroup_path(cgroup_path)),
             uid_mappings: None,
             gid_mappings: None,
         },
@@ -588,7 +617,7 @@ pub fn generate_job_oci_spec(
         linux: OciLinux {
             namespaces: standard_namespaces(netns_path),
             resources,
-            cgroups_path: Some(cgroup_path.to_string()),
+            cgroups_path: Some(hierarchy_cgroup_path(cgroup_path)),
             uid_mappings: None,
             gid_mappings: None,
         },
@@ -630,7 +659,7 @@ pub fn generate_init_oci_spec(
         linux: OciLinux {
             namespaces: standard_namespaces(netns_path),
             resources: None,
-            cgroups_path: Some(cgroup_path.to_string()),
+            cgroups_path: Some(hierarchy_cgroup_path(cgroup_path)),
             uid_mappings: None,
             gid_mappings: None,
         },
@@ -1075,7 +1104,7 @@ mod tests {
 
         assert_eq!(
             oci.linux.cgroups_path,
-            Some("/sys/fs/cgroup/reliaburger/default/web/0".to_string())
+            Some("/reliaburger/default/web/0".to_string())
         );
     }
 
@@ -1500,5 +1529,57 @@ mod tests {
 
         let env = build_env_with_decryptor(&spec, None).unwrap();
         assert!(env.contains(&"SECRET=ENC[AGE:abc123]".to_string()));
+    }
+
+    #[test]
+    fn all_workload_generators_preserve_the_host_cgroup_identity() {
+        let path = "/sys/fs/cgroup/reliaburger/test/web/3";
+        let specifications = [
+            generate_oci_spec(
+                "web",
+                "test",
+                &minimal_app(),
+                "test__web-3",
+                None,
+                path,
+                None,
+                None,
+            ),
+            generate_job_oci_spec("web", "test", &minimal_job(), path, None),
+            generate_init_oci_spec(&["true".into()], "test", "web", None, path, None),
+        ];
+        for specification in specifications {
+            assert_eq!(
+                specification.linux.cgroups_path.as_deref(),
+                Some("/reliaburger/test/web/3")
+            );
+            assert_eq!(
+                specification.linux.host_cgroup_path().as_deref(),
+                Some(Path::new(path))
+            );
+        }
+    }
+
+    #[test]
+    fn recovered_cgroup_paths_refuse_ambiguous_or_legacy_identity() {
+        let mut specification = generate_init_oci_spec(&[], "test", "web", None, "/unused", None);
+        for invalid in [
+            "",
+            "/",
+            "relative",
+            "/a/../b",
+            "/a/./b",
+            "/a//b",
+            "/a/",
+            "/sys/fs/cgroup/web",
+        ] {
+            specification.linux.cgroups_path = Some(invalid.into());
+            assert!(
+                specification.linux.host_cgroup_path().is_none(),
+                "accepted {invalid:?}"
+            );
+        }
+        specification.linux.cgroups_path = None;
+        assert!(specification.linux.host_cgroup_path().is_none());
     }
 }

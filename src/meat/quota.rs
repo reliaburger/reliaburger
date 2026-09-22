@@ -201,10 +201,9 @@ pub fn ledger_from_namespaces(
 /// footprint, not a clean slate. Without this a namespace could hold two
 /// apps that each fit alone but together bust the budget.
 ///
-/// The quota table is *injected*. Namespace resources are not yet
-/// desired state (that lands with T6 declarative resources), so in
-/// production the table is empty today and every app is admitted — the
-/// enforcement seam is wired and tested here, ready for T6 to feed it.
+/// The leader builds this table from replicated desired-state namespaces with
+/// [`ledger_from_namespaces`]. Namespaces without configured limits are unlimited;
+/// declared limits apply cumulatively across the scheduling pass.
 #[derive(Debug, Default)]
 pub struct QuotaLedger {
     quotas: HashMap<String, NamespaceQuota>,
@@ -252,7 +251,7 @@ impl QuotaLedger {
     /// is admitted.
     ///
     /// The leader's scheduling pass skips apps that are already converged, so
-    /// they never reach [`try_admit`]; seeding them here first is what stops a
+    /// they never reach [`Self::try_admit`]; seeding them here first is what stops a
     /// namespace's budget being bypassed once its apps converge (a later new
     /// app would otherwise be checked against a clean slate). Already-running
     /// apps are never rejected — hence no check.

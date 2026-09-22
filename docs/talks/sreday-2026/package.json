@@ -1,0 +1,12 @@
+{
+  "name": "reliaburger-sreday-2026",
+  "private": true,
+  "description": "Generates the Reliaburger SREday keynote deck (.pptx)",
+  "license": "Apache-2.0",
+  "scripts": {
+    "build": "node build.js"
+  },
+  "dependencies": {
+    "pptxgenjs": "4.0.1"
+  }
+}

@@ -132,6 +132,10 @@ pub const ROUTE_MATRIX: &[Route] = &[
     route(Get, "/v1/logs/query/{app}/{namespace}", AnyToken),
     route(Post, "/v1/exec/{app}/{namespace}", Deployer),
     // Cluster + upgrade.
+    // Renewal additionally requires the existing node TLS peer certificate.
+    route(Post, "/v1/cluster/renew", System),
+    route(Post, "/v1/registry/propose", System),
+    route(Post, "/v1/registry/query", System),
     route(Get, "/v1/capabilities", AnyToken),
     route(Get, "/v1/capabilities/cluster", AnyToken),
     route(Get, "/v1/diagnostics", AnyToken),
@@ -153,6 +157,8 @@ pub const ROUTE_MATRIX: &[Route] = &[
     route(Post, "/v1/cluster/elect", Admin),
     // Chaos.
     route(Post, "/v1/chaos/partition", Admin),
+    route(Post, "/v1/chaos/reserve", System),
+    route(Post, "/v1/chaos/fence", System),
     route(Post, "/v1/chaos/heal", Admin),
     route(Get, "/v1/chaos/status", AnyToken),
     // Snapshots. Reads need any token, mutations a Deployer; both are
@@ -167,6 +173,8 @@ pub const ROUTE_MATRIX: &[Route] = &[
     route(Get, "/v1/fault", AnyToken),
     route(Delete, "/v1/fault/{id}", Deployer),
     // Discovery + routing.
+    route(Post, "/v1/discovery/retire", System),
+    route(Post, "/v1/discovery/withdrawn", System),
     route(Get, "/v1/resolve", AnyToken),
     route(Get, "/v1/resolve/{name}", AnyToken),
     route(Get, "/v1/routes", AnyToken),
@@ -175,6 +183,7 @@ pub const ROUTE_MATRIX: &[Route] = &[
     route(Get, "/v1/metrics/summary", AnyToken),
     route(Get, "/v1/metrics/keys", AnyToken),
     route(Get, "/v1/metrics/rollup", AnyToken),
+    route(Get, "/v1/metrics/rollup/owned", AnyToken),
     route(Get, "/v1/metrics/cluster", AnyToken),
     route(Get, "/v1/metrics/app/{app}/{namespace}", AnyToken),
     route(Get, "/v1/alerts", AnyToken),
@@ -182,9 +191,12 @@ pub const ROUTE_MATRIX: &[Route] = &[
     route(Post, "/v1/logs/export", Admin),
     route(Get, "/v1/deploys/active", AnyToken),
     route(Get, "/v1/deploys/operations", AnyToken),
+    route(Post, "/v1/deploys/operations/{id}/cancel", Deployer),
     route(Get, "/v1/deploys/history/{app}", AnyToken),
     route(Post, "/v1/rollback/{app}/{namespace}", Deployer),
     route(Get, "/v1/placements/{node_id}", AnyToken),
+    route(Post, "/v1/test/leases/retired", System),
+    route(Post, "/v1/nodes/decommission", Admin),
     route(Get, "/v1/images", AnyToken),
     // Batch + build. `run`/`report`/`track` are node-to-node (System).
     route(Post, "/v1/batch", Deployer),
@@ -200,10 +212,12 @@ pub const ROUTE_MATRIX: &[Route] = &[
     // Operator-only (Admin). The service principal is refused here (AUTH4),
     // so despite being a signing route it isn't a node-to-node one.
     route(Post, "/v1/identity/sign", Admin),
+    // Credential and trust management additionally requires an unscoped user.
     route(Post, "/v1/token/create", Admin),
     route(Get, "/v1/token/list", Admin),
     route(Post, "/v1/token/revoke", Admin),
     route(Post, "/v1/join-token/create", Admin),
+    route(Get, "/v1/secret/public-key", AnyToken),
     route(Post, "/v1/secret/rotate", Admin),
 ];
 
@@ -255,6 +269,7 @@ mod tests {
     #[test]
     fn node_to_node_routes_require_the_system_principal() {
         for path in [
+            "/v1/cluster/renew",
             "/v1/batch/run",
             "/v1/batch/{id}/report",
             "/v1/build/run",
@@ -274,7 +289,9 @@ mod tests {
             // router.route("/comment", post(handler));
             let text = ".route(\"/string\", post(handler))";
             router.route("/v1/status", get(read).post(write))
-                .route("/v1/health", axum::routing::get(health));
+                .route("/v1/health", axum::routing::get(health))
+                .route("/v1/cluster/renew", post(renew).layer(body_limit))
+                .route("/layered", get(read).route_layer(auth).post(write));
         }"#;
         assert_eq!(
             mounted_route_methods(source),
@@ -282,9 +299,22 @@ mod tests {
                 ("get".into(), "/v1/status".into()),
                 ("post".into(), "/v1/status".into()),
                 ("get".into(), "/v1/health".into()),
+                ("post".into(), "/v1/cluster/renew".into()),
+                ("get".into(), "/layered".into()),
+                ("post".into(), "/layered".into()),
             ]
         );
         assert_eq!(required_principal(Method::Post, "/v1/status"), None);
+    }
+
+    #[test]
+    fn route_scan_still_refuses_unrecognised_method_wrappers() {
+        assert!(
+            std::panic::catch_unwind(|| mounted_route_methods(
+                r#"fn routes() { router.route("/hidden", get(read).unknown_wrapper(handler)); }"#,
+            ))
+            .is_err()
+        );
     }
 
     fn mounted_route_methods(source: &str) -> Vec<(String, String)> {
@@ -297,6 +327,9 @@ mod tests {
                 },
                 syn::Expr::MethodCall(call) => {
                     methods(&call.receiver, found);
+                    if call.method == "layer" || call.method == "route_layer" {
+                        return;
+                    }
                     call.method.to_string()
                 }
                 syn::Expr::Paren(paren) => return methods(&paren.expr, found),

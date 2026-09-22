@@ -38,8 +38,8 @@ pub fn filter_nodes(
 /// ready so `filter_nodes` skips them. Call after populating the cache,
 /// with `active_upgrade` from the Raft `DesiredState`.
 ///
-/// TODO(wiring): call from the leader's scheduling path once the binary
-/// populates a `ClusterStateCache` from gossip + reports.
+/// The leader's orchestration pass applies this to its populated cache before
+/// scheduling, using the active upgrade from replicated desired state.
 pub fn apply_upgrade_cordon(
     cluster: &mut ClusterStateCache,
     upgrade: Option<&crate::upgrade::types::ClusterUpgradeState>,

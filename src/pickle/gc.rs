@@ -131,8 +131,8 @@ pub fn gc_candidates(
                 orphan_grace_count += 1;
                 continue;
             }
-        } else if holders.len() == 1 {
-            // Sole copy: never nominate. The arbiter re-checks this
+        } else if holders.len() == 1 && holders.contains(&config.node_id) {
+            // This node owns the sole advertised copy: never nominate. The arbiter re-checks this
             // authoritatively; skipping here just avoids pointless
             // round-trips.
             sole_copy_count += 1;
@@ -313,6 +313,7 @@ mod tests {
             .map(|d| d.0.clone())
             .collect();
         catalog.apply_manifest_commit(&ManifestCommit {
+            observed_gc_generation: 0,
             manifest,
             tag: "latest".to_string(),
             holder_nodes: BTreeSet::from([1]),
@@ -361,6 +362,7 @@ mod tests {
         let manifest_digest = manifest.digest.clone();
 
         catalog.apply_manifest_commit(&ManifestCommit {
+            observed_gc_generation: 0,
             manifest,
             tag: "latest".to_string(),
             holder_nodes: BTreeSet::from([1, 2]),
@@ -390,6 +392,7 @@ mod tests {
         }
 
         catalog.apply_manifest_commit(&ManifestCommit {
+            observed_gc_generation: 0,
             manifest,
             tag: "latest".to_string(),
             holder_nodes: BTreeSet::from([1, 2]),
@@ -411,6 +414,7 @@ mod tests {
         }
 
         catalog.apply_manifest_commit(&ManifestCommit {
+            observed_gc_generation: 0,
             manifest,
             tag: "latest".to_string(),
             holder_nodes: BTreeSet::from([1, 2]),
@@ -442,6 +446,21 @@ mod tests {
         assert!(result.candidates.is_empty());
         assert_eq!(result.sole_copy_protected, 1);
         assert!(store.has_blob(&orphan));
+    }
+
+    #[test]
+    fn gc_nominates_an_extra_copy_after_its_holder_was_retired() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = BlobStore::new(dir.path());
+        let mut catalog = ManifestCatalog::default();
+        let digest = test_digest("extra1");
+        write_fake_blob(&store, &digest);
+        catalog.apply_update_locations(&crate::pickle::types::UpdateLayerLocations {
+            updates: vec![(digest.clone(), BTreeSet::from([2]))],
+        });
+        let result = gc_candidates(&store, &catalog, &HashSet::new(), &default_config()).unwrap();
+        assert_eq!(result.candidates, vec![digest]);
+        assert_eq!(result.sole_copy_protected, 0);
     }
 
     #[test]

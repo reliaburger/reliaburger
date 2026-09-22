@@ -50,6 +50,7 @@ const RUN_BEFORE_TIMEOUT_SECS: u64 = 600;
 /// cron tick runs every second but a schedule matches to minute resolution, so
 /// we only fire when the stamp changes — otherwise a `* * * * *` job would fire
 /// sixty times a minute.
+#[derive(Debug, Clone, PartialEq)]
 struct ScheduledJob {
     name: String,
     namespace: String,
@@ -98,7 +99,7 @@ async fn drain_and_stop_instance<G: Grill>(
     grill: &G,
     id: &InstanceId,
     drain_timeout: std::time::Duration,
-) {
+) -> Result<(), BunError> {
     let cmd = crate::wrapper::draining::DrainCommand {
         app_name: String::new(),
         instance_id: id.0.clone(),
@@ -107,16 +108,63 @@ async fn drain_and_stop_instance<G: Grill>(
     drains.start_drain(&cmd).await;
     drains.wait_drained(&id.0).await;
 
-    let _ = grill.stop(id).await;
-    let deadline = Instant::now() + drain_timeout;
-    while Instant::now() < deadline {
-        if matches!(grill.state(id).await, Ok(ContainerState::Stopped)) {
-            return;
-        }
-        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    stop_runtime_instance(grill, id, drain_timeout).await
+}
+
+/// Stop one instance, requiring observed exit even after force-kill.
+async fn stop_runtime_instance<G: Grill>(
+    grill: &G,
+    id: &InstanceId,
+    grace: std::time::Duration,
+) -> Result<(), BunError> {
+    let signal_timeout = std::time::Duration::from_secs(2);
+    tokio::time::timeout(signal_timeout, grill.stop(id))
+        .await
+        .map_err(|_| BunError::StopUnconfirmed {
+            instance_id: id.clone(),
+            reason: "graceful stop request timed out",
+        })??;
+    if observe_runtime_exit(grill, id, grace).await? {
+        return Ok(());
     }
-    if !matches!(grill.state(id).await, Ok(ContainerState::Stopped)) {
-        let _ = grill.kill(id).await;
+    kill_runtime_instance(grill, id).await
+}
+
+/// Preserve ownership until both force-kill and observed runtime exit succeed.
+async fn kill_runtime_instance<G: Grill>(grill: &G, id: &InstanceId) -> Result<(), BunError> {
+    let signal_timeout = std::time::Duration::from_secs(2);
+    tokio::time::timeout(signal_timeout, grill.kill(id))
+        .await
+        .map_err(|_| BunError::StopUnconfirmed {
+            instance_id: id.clone(),
+            reason: "force-kill request timed out",
+        })??;
+    if observe_runtime_exit(grill, id, signal_timeout).await? {
+        return Ok(());
+    }
+    Err(BunError::StopUnconfirmed {
+        instance_id: id.clone(),
+        reason: "runtime did not confirm exit after force-kill",
+    })
+}
+
+/// Bound the whole observation loop, including a stalled runtime query.
+async fn observe_runtime_exit<G: Grill>(
+    grill: &G,
+    id: &InstanceId,
+    wait: std::time::Duration,
+) -> Result<bool, BunError> {
+    let observation = async {
+        loop {
+            if grill.state(id).await? == ContainerState::Stopped {
+                return Ok::<(), BunError>(());
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        }
+    };
+    match tokio::time::timeout(wait, observation).await {
+        Ok(result) => result.map(|()| true),
+        Err(_) => Ok(false),
     }
 }
 
@@ -252,8 +300,26 @@ pub enum AgentCommand {
         config: Config,
         events: mpsc::Sender<ApplyEvent>,
     },
+    /// Explicit operator authorisation to rerun unknown node-local jobs.
+    RerunJobs {
+        config: Config,
+        events: mpsc::Sender<ApplyEvent>,
+    },
     /// Stop all instances of an app in a namespace.
     Stop {
+        app_name: String,
+        namespace: String,
+        response: oneshot::Sender<Result<(), BunError>>,
+    },
+    /// Stop and retire an app removed from desired state or a resource lease.
+    /// Successful retirement also releases its status and port ownership.
+    Retire {
+        app_name: String,
+        namespace: String,
+        response: oneshot::Sender<Result<(), BunError>>,
+    },
+    /// Retire a cleaning lease's runtime and its disposable managed storage.
+    RetireTestResources {
         app_name: String,
         namespace: String,
         response: oneshot::Sender<Result<(), BunError>>,
@@ -283,6 +349,11 @@ pub enum AgentCommand {
     /// Snapshot active and recent real deploy operations.
     DeployOperations {
         response: oneshot::Sender<crate::bun::deploy_operations::DeployOperationSnapshot>,
+    },
+    /// Request cancellation of an operation owned by this node.
+    CancelDeploy {
+        operation_id: crate::bun::deploy_operations::DeployOperationId,
+        response: oneshot::Sender<Option<crate::bun::deploy_operations::DeployOperation>>,
     },
     /// Get logs for an app.
     Logs {
@@ -336,6 +407,7 @@ pub enum AgentCommand {
     },
     /// Inject a network partition (chaos testing).
     InjectPartition {
+        reservation: Option<crate::smoker::reservation::NodeFaultReservation>,
         peers: Vec<String>,
         duration_secs: u64,
         injected_by: String,
@@ -393,15 +465,42 @@ pub enum AgentCommand {
     /// from the leader. The agent overlays it onto its local service map so
     /// DNS and ingress resolve services running on other nodes.
     SyncClusterCatalog {
+        generation: u64,
         catalog: Box<crate::onion::catalog::EndpointCatalog>,
         ingress: Vec<crate::cluster::orchestrate::IngressAssignment>,
+        response: oneshot::Sender<Result<(), BunError>>,
+    },
+    /// Reconcile enrolled durable consumer views and exact withdrawal obligations.
+    SyncClusterConsumer {
+        generation: u64,
+        catalog: Box<crate::onion::catalog::EndpointCatalog>,
+        ingress: Vec<crate::cluster::orchestrate::IngressAssignment>,
+        withdrawals: Vec<crate::onion::withdrawal::EndpointWithdrawalInstruction>,
+        response: oneshot::Sender<Result<ConsumerUpdate, BunError>>,
+    },
+    /// Confirm the leader acknowledged one original, locally proven receipt.
+    ConfirmConsumerReceipt {
+        generation: u64,
+        response: oneshot::Sender<Result<(), BunError>>,
     },
     /// List all ingress routes.
     Routes {
         response: oneshot::Sender<Vec<crate::wrapper::types::RouteInfo>>,
     },
-    /// Inject a fault (Smoker).
+    /// Prepare the canonical request and identify this target process.
+    PrepareNodeFault {
+        request: crate::smoker::types::FaultRequest,
+        response: oneshot::Sender<Result<(String, crate::smoker::types::FaultRequest), BunError>>,
+    },
+    /// Fence delayed activation and confirm reversal before releasing capacity.
+    FenceNodeFault {
+        only_if_finished: bool,
+        reservation: crate::smoker::reservation::NodeFaultReservation,
+        response: oneshot::Sender<Result<(), BunError>>,
+    },
+    /// Apply a workload fault, or a node fault carrying a committed grant.
     InjectFault {
+        reservation: Option<crate::smoker::reservation::NodeFaultReservation>,
         request: crate::smoker::types::FaultRequest,
         response: oneshot::Sender<Result<crate::smoker::types::FaultSummary, BunError>>,
     },
@@ -462,6 +561,7 @@ pub enum AgentCommand {
     /// Commits on success; flags revert and exits on failure.
     UpgradeVerify {
         marker: crate::upgrade::marker::UpgradeMarker,
+        rejoin: Result<(), String>,
         response: oneshot::Sender<Result<bool, BunError>>,
     },
 }
@@ -477,6 +577,11 @@ pub enum AgentCommand {
 /// back as one of these ops. Each carries a `oneshot` the loop replies on, so
 /// the task drives the sequence while the loop applies it.
 enum DeployOp {
+    /// A prerequisite's observed success must be durable before its dependent app runs.
+    ConfirmJobSuccess {
+        instance_id: InstanceId,
+        reply: oneshot::Sender<Result<(), BunError>>,
+    },
     /// A bounded probe completes off-loop; only the agent mutates health state.
     HealthProbeResult {
         instance_id: InstanceId,
@@ -488,21 +593,24 @@ enum DeployOp {
         spec: Box<AppSpec>,
         reply: oneshot::Sender<Result<Option<String>, String>>,
     },
-    /// Record the deployed spec for the Brioche UI.
+    /// Admit the app kind before recording the deployed spec for the Brioche UI.
     StoreDeployedSpec {
         app_name: String,
         namespace: String,
         spec: Box<AppSpec>,
-        reply: oneshot::Sender<()>,
+        reply: oneshot::Sender<Result<(), BunError>>,
     },
-    /// Active (non-terminal) instance ids for an app in a namespace.
-    ListExistingActive {
+    /// Every owned instance id, including terminal instances awaiting cleanup.
+    ListExistingOwned {
         app_name: String,
         namespace: String,
         reply: oneshot::Sender<Vec<InstanceId>>,
     },
     /// Reserve and return the next rolling-redeploy generation counter.
-    NextDeployGen { reply: oneshot::Sender<u64> },
+    NextDeployGen {
+        app_name: String,
+        reply: oneshot::Sender<Result<u64, BunError>>,
+    },
     /// Create supervisor-tracked instances for a fresh app deploy.
     SupervisorDeployApp {
         app_name: String,
@@ -512,6 +620,7 @@ enum DeployOp {
     },
     /// Create supervisor-tracked instances for a job deploy.
     SupervisorDeployJob {
+        rerun_unknown: bool,
         job_name: String,
         namespace: String,
         spec: Box<JobSpec>,
@@ -523,7 +632,7 @@ enum DeployOp {
         namespace: String,
         port: u16,
         firewall: Option<Vec<String>>,
-        reply: oneshot::Sender<()>,
+        reply: oneshot::Sender<Result<(), BunError>>,
     },
     /// Store an app's ingress config for the routing table.
     StoreIngress {
@@ -549,12 +658,24 @@ enum DeployOp {
         oci_spec: Box<crate::grill::oci::OciSpec>,
         reply: oneshot::Sender<()>,
     },
-    /// Program egress before the workload runs (create → program → start). On
+    /// Reserve an auxiliary identity before its runtime can be created.
+    RegisterInitialiser {
+        instance_id: InstanceId,
+        index: usize,
+        reply: oneshot::Sender<Result<InstanceId, BunError>>,
+    },
+    /// Release an initialiser only after confirmed runtime retirement.
+    ForgetInitialiser {
+        instance_id: InstanceId,
+        initialiser: InstanceId,
+        reply: oneshot::Sender<Result<(), BunError>>,
+    },
+    /// Program source and egress policy before create → program → start. On
     /// failure the caller stops the created container and fails the deploy.
-    ApplyEgressPreStart {
+    ApplyNetworkPreStart {
         instance_id: InstanceId,
         app_name: String,
-        spec: Box<AppSpec>,
+        spec: Option<Box<AppSpec>>,
         cgroup_path: PathBuf,
         reply: oneshot::Sender<Result<(), BunError>>,
     },
@@ -582,6 +703,14 @@ enum DeployOp {
         is_job: bool,
         reply: oneshot::Sender<()>,
     },
+    /// Claim replacement ownership before allocating identity or runtime resources.
+    ReserveRollingInstance {
+        instance_id: InstanceId,
+        app_name: String,
+        namespace: String,
+        spec: Box<AppSpec>,
+        reply: oneshot::Sender<Result<Option<u16>, BunError>>,
+    },
     /// Fast pre-create bookkeeping for a rolling-redeploy instance: fail closed
     /// on undecryptable secrets, prepare its identity dir, build the OCI spec.
     PrepareRollingInstance {
@@ -590,46 +719,17 @@ enum DeployOp {
         namespace: String,
         spec: Box<AppSpec>,
         host_port: Option<u16>,
-        index: u32,
         reply: oneshot::Sender<Result<crate::grill::oci::OciSpec, BunError>>,
     },
-    /// Lift an instance's egress enforcement.
-    ClearEgress {
-        instance_id: InstanceId,
-        reply: oneshot::Sender<()>,
-    },
-    /// Post-start bookkeeping for a healthy rolling instance: log forwarder,
-    /// on-disk record, provision identity.
+    /// Persist a started replacement before health wait or traffic publication.
     RegisterRollingInstance {
-        instance_id: InstanceId,
-        app_name: String,
-        namespace: String,
-        reply: oneshot::Sender<()>,
+        instance: Box<RollingInstance>,
+        reply: oneshot::Sender<Result<(), BunError>>,
     },
-    /// Roll a failed rolling redeploy back: kill and clean up the new
-    /// instances, release their ports, drop their identity dirs, record it.
-    RollbackRollingDeploy {
-        app_name: String,
-        namespace: String,
-        spec: Box<AppSpec>,
-        new_ids: Vec<InstanceId>,
-        new_prepared: Vec<InstanceId>,
-        new_ports: std::collections::HashMap<InstanceId, Option<u16>>,
-        replica_count: u32,
-        reply: oneshot::Sender<()>,
-    },
-    /// Halt a failed rolling deploy without reverting (`auto_rollback = false`):
-    /// keep the healthy new + surviving old instances, tear down only the
-    /// incomplete one, record a `Halted` result.
-    HaltRollingDeploy {
-        app_name: String,
-        namespace: String,
-        spec: Box<AppSpec>,
-        new_ids: Vec<InstanceId>,
-        new_prepared: Vec<InstanceId>,
-        new_ports: std::collections::HashMap<InstanceId, Option<u16>>,
-        replica_count: u32,
-        reply: oneshot::Sender<()>,
+    /// Keep a started replacement reachable through ordinary Stop after a failed cut-over.
+    RetainRollingInstance {
+        instance: Box<RollingInstance>,
+        reply: oneshot::Sender<Result<(), BunError>>,
     },
     /// Forget the already-stopped old instances and register the healthy new
     /// ones: service map, health config, backends, kernel networking, ingress,
@@ -645,7 +745,7 @@ enum DeployOp {
         new_ips: std::collections::HashMap<InstanceId, Option<std::net::Ipv4Addr>>,
         new_specs: std::collections::HashMap<InstanceId, crate::grill::oci::OciSpec>,
         now: Instant,
-        reply: oneshot::Sender<()>,
+        reply: oneshot::Sender<Result<(), BunError>>,
     },
     /// Publish one freshly-healthy replacement as a routable backend (M7).
     ///
@@ -659,7 +759,7 @@ enum DeployOp {
         host_port: Option<u16>,
         container_ip: Option<std::net::Ipv4Addr>,
         has_port: bool,
-        reply: oneshot::Sender<()>,
+        reply: oneshot::Sender<Result<(), BunError>>,
     },
     /// Finish retiring one old instance: the fast `&mut self` bookkeeping
     /// (lift egress, clean identity, drop the record + supervisor entry) after
@@ -668,7 +768,12 @@ enum DeployOp {
     /// every command for its duration per retired instance.
     FinishRetire {
         old_id: InstanceId,
-        reply: oneshot::Sender<()>,
+        reply: oneshot::Sender<Result<(), BunError>>,
+    },
+    /// Fence restarts before the worker starts draining or signalling an old instance.
+    BeginRetire {
+        old_id: InstanceId,
+        reply: oneshot::Sender<Result<(), BunError>>,
     },
     /// Append an entry to the deploy history.
     PushDeployHistory {
@@ -694,11 +799,20 @@ enum DeployOp {
     },
 }
 
+/// Launch data owned by the deploy worker before supervisor registration.
+struct RollingInstance {
+    instance_id: InstanceId,
+    app_name: String,
+    namespace: String,
+    spec: AppSpec,
+    oci_spec: crate::grill::oci::OciSpec,
+    host_port: Option<u16>,
+}
+
 /// The fast pre-create outputs the loop hands back for a fresh instance.
 struct PreparedInstance {
     oci_spec: crate::grill::oci::OciSpec,
     cgroup_path: PathBuf,
-    cgroup_str: String,
     has_init: bool,
 }
 
@@ -736,7 +850,12 @@ impl DeployOps {
         .await
     }
 
-    async fn store_deployed_spec(&self, app_name: &str, namespace: &str, spec: &AppSpec) {
+    async fn store_deployed_spec(
+        &self,
+        app_name: &str,
+        namespace: &str,
+        spec: &AppSpec,
+    ) -> Result<(), BunError> {
         self.call(
             |reply| DeployOp::StoreDeployedSpec {
                 app_name: app_name.to_string(),
@@ -744,14 +863,17 @@ impl DeployOps {
                 spec: Box::new(spec.clone()),
                 reply,
             },
-            (),
+            Err(BunError::DeployFailed {
+                app_name: app_name.into(),
+                reason: "agent shutting down".into(),
+            }),
         )
         .await
     }
 
-    async fn list_existing_active(&self, app_name: &str, namespace: &str) -> Vec<InstanceId> {
+    async fn list_existing_owned(&self, app_name: &str, namespace: &str) -> Vec<InstanceId> {
         self.call(
-            |reply| DeployOp::ListExistingActive {
+            |reply| DeployOp::ListExistingOwned {
                 app_name: app_name.to_string(),
                 namespace: namespace.to_string(),
                 reply,
@@ -761,9 +883,18 @@ impl DeployOps {
         .await
     }
 
-    async fn next_deploy_gen(&self) -> u64 {
-        self.call(|reply| DeployOp::NextDeployGen { reply }, 0)
-            .await
+    async fn next_deploy_gen(&self, app_name: &str) -> Result<u64, BunError> {
+        self.call(
+            |reply| DeployOp::NextDeployGen {
+                app_name: app_name.into(),
+                reply,
+            },
+            Err(BunError::DeployFailed {
+                app_name: app_name.into(),
+                reason: "agent loop closed before reserving rollout identity".into(),
+            }),
+        )
+        .await
     }
 
     async fn supervisor_deploy_app(
@@ -784,14 +915,29 @@ impl DeployOps {
         .await
     }
 
+    async fn confirm_job_success(&self, instance_id: &InstanceId) -> Result<(), BunError> {
+        self.call(
+            |reply| DeployOp::ConfirmJobSuccess {
+                instance_id: instance_id.clone(),
+                reply,
+            },
+            Err(BunError::JobState(
+                "agent unavailable before job success was persisted".into(),
+            )),
+        )
+        .await
+    }
+
     async fn supervisor_deploy_job(
         &self,
         job_name: &str,
         namespace: &str,
         spec: &JobSpec,
+        rerun_unknown: bool,
     ) -> Result<Vec<InstanceId>, BunError> {
         self.call(
             |reply| DeployOp::SupervisorDeployJob {
+                rerun_unknown,
                 job_name: job_name.to_string(),
                 namespace: namespace.to_string(),
                 spec: Box::new(spec.clone()),
@@ -808,7 +954,7 @@ impl DeployOps {
         namespace: &str,
         port: u16,
         firewall: Option<Vec<String>>,
-    ) {
+    ) -> Result<(), BunError> {
         self.call(
             |reply| DeployOp::RegisterServiceApp {
                 app_name: app_name.to_string(),
@@ -817,7 +963,10 @@ impl DeployOps {
                 firewall,
                 reply,
             },
-            (),
+            Err(BunError::BackendPublication {
+                service: crate::onion::service_id::ServiceId::new(namespace, app_name),
+                reason: "agent loop closed before service registration".into(),
+            }),
         )
         .await
     }
@@ -874,22 +1023,60 @@ impl DeployOps {
         .await
     }
 
-    async fn apply_egress_pre_start(
+    async fn register_initialiser(
+        &self,
+        instance_id: &InstanceId,
+        index: usize,
+    ) -> Result<InstanceId, BunError> {
+        self.call(
+            |reply| DeployOp::RegisterInitialiser {
+                instance_id: instance_id.clone(),
+                index,
+                reply,
+            },
+            Err(BunError::InstanceNotFound {
+                instance_id: instance_id.clone(),
+            }),
+        )
+        .await
+    }
+
+    async fn forget_initialiser(
+        &self,
+        instance_id: &InstanceId,
+        initialiser: &InstanceId,
+    ) -> Result<(), BunError> {
+        self.call(
+            |reply| DeployOp::ForgetInitialiser {
+                instance_id: instance_id.clone(),
+                initialiser: initialiser.clone(),
+                reply,
+            },
+            Err(BunError::InstanceNotFound {
+                instance_id: instance_id.clone(),
+            }),
+        )
+        .await
+    }
+
+    async fn apply_network_pre_start(
         &self,
         instance_id: &InstanceId,
         app_name: &str,
-        spec: &AppSpec,
+        spec: Option<&AppSpec>,
         cgroup_path: &std::path::Path,
     ) -> Result<(), BunError> {
         self.call(
-            |reply| DeployOp::ApplyEgressPreStart {
+            |reply| DeployOp::ApplyNetworkPreStart {
                 instance_id: instance_id.clone(),
                 app_name: app_name.to_string(),
-                spec: Box::new(spec.clone()),
+                spec: spec.cloned().map(Box::new),
                 cgroup_path: cgroup_path.to_path_buf(),
                 reply,
             },
-            Ok(()),
+            Err(BunError::InstanceNotFound {
+                instance_id: instance_id.clone(),
+            }),
         )
         .await
     }
@@ -951,23 +1138,19 @@ impl DeployOps {
     }
 
     #[allow(clippy::too_many_arguments)]
-    async fn prepare_rolling_instance(
+    async fn reserve_rolling_instance(
         &self,
         instance_id: &InstanceId,
         app_name: &str,
         namespace: &str,
         spec: &AppSpec,
-        host_port: Option<u16>,
-        index: u32,
-    ) -> Result<crate::grill::oci::OciSpec, BunError> {
+    ) -> Result<Option<u16>, BunError> {
         self.call(
-            |reply| DeployOp::PrepareRollingInstance {
+            |reply| DeployOp::ReserveRollingInstance {
                 instance_id: instance_id.clone(),
-                app_name: app_name.to_string(),
-                namespace: namespace.to_string(),
+                app_name: app_name.into(),
+                namespace: namespace.into(),
                 spec: Box::new(spec.clone()),
-                host_port,
-                index,
                 reply,
             },
             Err(BunError::InstanceNotFound {
@@ -977,85 +1160,54 @@ impl DeployOps {
         .await
     }
 
-    async fn clear_egress(&self, instance_id: &InstanceId) {
-        self.call(
-            |reply| DeployOp::ClearEgress {
-                instance_id: instance_id.clone(),
-                reply,
-            },
-            (),
-        )
-        .await
-    }
-
-    async fn register_rolling_instance(
+    async fn prepare_rolling_instance(
         &self,
         instance_id: &InstanceId,
         app_name: &str,
         namespace: &str,
-    ) {
+        spec: &AppSpec,
+        host_port: Option<u16>,
+    ) -> Result<crate::grill::oci::OciSpec, BunError> {
         self.call(
-            |reply| DeployOp::RegisterRollingInstance {
+            |reply| DeployOp::PrepareRollingInstance {
                 instance_id: instance_id.clone(),
                 app_name: app_name.to_string(),
                 namespace: namespace.to_string(),
+                spec: Box::new(spec.clone()),
+                host_port,
                 reply,
             },
-            (),
+            Err(BunError::InstanceNotFound {
+                instance_id: instance_id.clone(),
+            }),
         )
         .await
     }
 
-    #[allow(clippy::too_many_arguments)]
-    async fn rollback_rolling_deploy(
-        &self,
-        app_name: &str,
-        namespace: &str,
-        spec: &AppSpec,
-        new_ids: Vec<InstanceId>,
-        new_prepared: Vec<InstanceId>,
-        new_ports: std::collections::HashMap<InstanceId, Option<u16>>,
-        replica_count: u32,
-    ) {
+    async fn register_rolling_instance(&self, instance: RollingInstance) -> Result<(), BunError> {
+        let missing = BunError::InstanceNotFound {
+            instance_id: instance.instance_id.clone(),
+        };
         self.call(
-            |reply| DeployOp::RollbackRollingDeploy {
-                app_name: app_name.to_string(),
-                namespace: namespace.to_string(),
-                spec: Box::new(spec.clone()),
-                new_ids,
-                new_prepared,
-                new_ports,
-                replica_count,
+            |reply| DeployOp::RegisterRollingInstance {
+                instance: Box::new(instance),
                 reply,
             },
-            (),
+            Err(missing),
         )
         .await
     }
 
-    #[allow(clippy::too_many_arguments)]
-    async fn halt_rolling_deploy(
-        &self,
-        app_name: &str,
-        namespace: &str,
-        spec: &AppSpec,
-        new_ids: Vec<InstanceId>,
-        new_prepared: Vec<InstanceId>,
-        new_ports: std::collections::HashMap<InstanceId, Option<u16>>,
-        replica_count: u32,
-    ) {
+    async fn retain_rolling_instance(&self, instance: RollingInstance) -> Result<(), BunError> {
+        let missing = BunError::InstanceNotFound {
+            instance_id: instance.instance_id.clone(),
+        };
         self.call(
-            |reply| DeployOp::HaltRollingDeploy {
-                app_name: app_name.to_string(),
-                namespace: namespace.to_string(),
-                spec: Box::new(spec.clone()),
-                new_ids,
-                new_prepared,
-                new_ports,
-                replica_count,
+            |reply| DeployOp::RetainRollingInstance {
+                instance: Box::new(instance),
                 reply,
             },
-            (),
+            Err(missing),
         )
         .await
     }
@@ -1072,7 +1224,7 @@ impl DeployOps {
         new_ips: std::collections::HashMap<InstanceId, Option<std::net::Ipv4Addr>>,
         new_specs: std::collections::HashMap<InstanceId, crate::grill::oci::OciSpec>,
         now: Instant,
-    ) {
+    ) -> Result<(), BunError> {
         self.call(
             |reply| DeployOp::FinaliseRollingDeploy {
                 app_name: app_name.to_string(),
@@ -1086,7 +1238,10 @@ impl DeployOps {
                 now,
                 reply,
             },
-            (),
+            Err(BunError::DeployFailed {
+                app_name: app_name.into(),
+                reason: "agent loop closed before finalisation".into(),
+            }),
         )
         .await
     }
@@ -1100,7 +1255,7 @@ impl DeployOps {
         host_port: Option<u16>,
         container_ip: Option<std::net::Ipv4Addr>,
         has_port: bool,
-    ) {
+    ) -> Result<(), BunError> {
         self.call(
             |reply| DeployOp::PublishNewBackend {
                 app_name: app_name.to_string(),
@@ -1111,20 +1266,40 @@ impl DeployOps {
                 has_port,
                 reply,
             },
-            (),
+            Err(BunError::BackendPublication {
+                service: crate::onion::service_id::ServiceId::new(namespace, app_name),
+                reason: "agent loop closed before backend publication".into(),
+            }),
+        )
+        .await
+    }
+
+    async fn begin_retire(&self, old_id: &InstanceId) -> Result<(), BunError> {
+        self.call(
+            |reply| DeployOp::BeginRetire {
+                old_id: old_id.clone(),
+                reply,
+            },
+            Err(BunError::RetirementState {
+                instance_id: old_id.clone(),
+                reason: "agent loop closed before retirement began".into(),
+            }),
         )
         .await
     }
 
     /// Bookkeeping-only op sent after the worker has already drained+stopped
     /// the instance off the loop (M7).
-    async fn finish_retire(&self, old_id: &InstanceId) {
+    async fn finish_retire(&self, old_id: &InstanceId) -> Result<(), BunError> {
         self.call(
             |reply| DeployOp::FinishRetire {
                 old_id: old_id.clone(),
                 reply,
             },
-            (),
+            Err(BunError::RetirementState {
+                instance_id: old_id.clone(),
+                reason: "agent loop closed before retirement".into(),
+            }),
         )
         .await
     }
@@ -1275,6 +1450,10 @@ pub struct NodeStatus {
     pub node_id: String,
     /// Node address (gossip endpoint).
     pub address: String,
+    /// Agent API endpoint supplied by the cluster's resolved peer directory.
+    /// Missing evidence must not be replaced with a guessed port by clients.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub api_address: Option<std::net::SocketAddr>,
     /// Current SWIM state: "alive", "suspect", "dead", or "left".
     pub state: String,
     /// SWIM incarnation number.
@@ -1318,6 +1497,8 @@ pub struct CouncilStatus {
 /// Holds communication channels to gossip, Raft, and reporting subsystems.
 /// `None` when running in single-node mode (no cluster config).
 pub struct ClusterHandle {
+    /// Original node identity, available before council membership is established.
+    pub local_node_id: crate::meat::NodeId,
     /// Membership snapshots from the gossip layer.
     pub membership_rx: watch::Receiver<Vec<MembershipSnapshot>>,
     /// Raft metrics (if this node is a council member).
@@ -1351,18 +1532,16 @@ pub struct PartitionBlocklists {
     pub node_gate: crate::smoker::node_fault::NodeTransportGate,
 }
 
-/// Egress enforcement bound to a running instance's cgroup (L16).
 #[cfg(all(feature = "ebpf", target_os = "linux"))]
-#[derive(Clone)]
-struct EgressBinding {
-    /// The instance's cgroup id (key into the egress maps).
-    cgroup_id: u64,
-    /// The raw `[egress] allow` list, re-resolved periodically.
-    allow: Vec<String>,
-    /// The destinations currently programmed into the egress maps
-    /// (exact v4/v6 and CIDR).
-    resolved: Vec<crate::sesame::egress::EgressDestination>,
-}
+use super::egress_owners::{EgressBinding, PolicyPhase};
+mod consumer;
+mod startup_recovery;
+pub use consumer::ConsumerUpdate;
+mod discovery_ownership;
+mod discovery_recovery;
+mod egress_ownership;
+mod producer_release;
+use discovery_ownership::DiscoveryOwnership;
 
 /// An immutable, owned connectivity trace that can run outside the agent
 /// command loop. Workload probes have explicit timeouts, but even a bounded
@@ -1390,6 +1569,8 @@ pub struct BunAgent<G: Grill> {
     shutdown: CancellationToken,
     /// Process-wide long-lived-task evidence shared with the API and reporter.
     readiness: Option<crate::bun::readiness::ReadinessTracker>,
+    #[cfg(test)]
+    egress_observation_count: std::sync::atomic::AtomicUsize,
     /// Hard per-node concurrency bound for workload connectivity traces.
     trace_slots: std::sync::Arc<tokio::sync::Semaphore>,
     volumes_dir: PathBuf,
@@ -1401,6 +1582,7 @@ pub struct BunAgent<G: Grill> {
     /// Smoker duration limits (`[smoker]`): default + maximum fault lifetime.
     smoker_config: crate::smoker::config::SmokerConfig,
     /// Reference-counted node drains, independent from binary-upgrade drains.
+    node_fault_fence: crate::smoker::reservation::NodeFaultFence,
     node_drain_gate: crate::smoker::node_fault::NodeDrainGate,
     /// Owned helper processes and cgroups for node-scoped capacity pressure.
     node_pressure: crate::smoker::node_pressure::NodePressureController,
@@ -1414,6 +1596,9 @@ pub struct BunAgent<G: Grill> {
     /// DNS changes (L16).
     #[cfg(all(feature = "ebpf", target_os = "linux"))]
     egress_bindings: std::collections::HashMap<InstanceId, EgressBinding>,
+    /// Block policy mutations until restart resolves an uncertain checkpoint write.
+    #[cfg(all(feature = "ebpf", target_os = "linux"))]
+    egress_store_uncertain: bool,
     /// Workloads fenced by the current live-enforcement incident. Kept after
     /// stop so the next capability report records what happened; cleared only
     /// after every required hook and pre-start guarantee recovers.
@@ -1423,9 +1608,8 @@ pub struct BunAgent<G: Grill> {
     #[cfg(all(feature = "ebpf", target_os = "linux"))]
     egress_reresolve_ticks: u32,
     /// Kernel-truth sweep interval in seconds (`[ebpf] sweep_interval_secs`,
-    /// 0 disables). The sweep deletes egress/namespace map entries whose
-    /// cgroup no longer maps to a live instance and reinstalls entries a
-    /// live instance lost.
+    /// 0 disables). The sweep reconciles external egress against original
+    /// owners. Namespace retirement requires explicit source ownership.
     #[cfg(all(feature = "ebpf", target_os = "linux"))]
     ebpf_sweep_interval_secs: u64,
     /// Ticks since the last kernel-truth sweep.
@@ -1441,11 +1625,17 @@ pub struct BunAgent<G: Grill> {
     cgroup_ns_bpf_keys: std::collections::HashSet<u64>,
     /// Onion service map: app names → VIPs + backends.
     service_map: crate::onion::service_map::ServiceMap,
+    /// Exclusive publication checkpoint, or a fence after an uncertain write.
+    discovery_ownership: DiscoveryOwnership,
+    /// Enrolled transport used by the opt-in durable producer retirement gate.
+    producer_release_client: Option<crate::cluster::producer::ProducerReleaseClient>,
     /// Cluster-wide endpoint catalogue (12b.4), replicated from the leader.
     /// Overlaid onto the local `service_map` when publishing the DNS/routing
     /// snapshot so this node resolves services whose backends live elsewhere.
     /// Empty on a single node — the local map is then the whole picture.
     cluster_catalog: crate::onion::catalog::EndpointCatalog,
+    /// Last confirmed catalogue generation; restart recovery must restore its durable fence.
+    cluster_catalog_generation: Option<u64>,
     /// Publisher for service-map snapshots (DNS responder subscribes).
     service_map_tx: tokio::sync::watch::Sender<crate::onion::service_map::ServiceMap>,
     /// Publisher for the set of services under a Smoker `DnsNxdomain` fault.
@@ -1455,7 +1645,7 @@ pub struct BunAgent<G: Grill> {
     /// every apply/clear/expire and the responder returns NXDOMAIN for any
     /// service in the set. See [`crate::onion::dns::DnsFaultState`].
     dns_faults_tx: tokio::sync::watch::Sender<crate::onion::dns::DnsFaultState>,
-    /// Wrapper routing table (shared with the proxy via Arc<RwLock>).
+    /// Wrapper routing table (shared with the proxy via `Arc<RwLock<_>>`).
     routing_table: std::sync::Arc<tokio::sync::RwLock<crate::wrapper::routing::RoutingTable>>,
     /// Ingress configs for deployed apps (app_name → IngressSpec).
     /// Ingress specs keyed by `(namespace, app_name)` so same-named apps
@@ -1474,6 +1664,16 @@ pub struct BunAgent<G: Grill> {
         Arc<tokio::sync::RwLock<Vec<crate::meat::deploy_types::DeployHistoryEntry>>>,
     /// Real apply-worker activity and bounded terminal outcomes for the API.
     deploy_operations: crate::bun::deploy_operations::DeployOperationTracker,
+    /// Initialisers whose runtime must retire before parent policy and records.
+    initialisers: std::collections::HashMap<InstanceId, std::collections::HashSet<InstanceId>>,
+    /// Captured before startup; a recovered runtime hold needs original discovery
+    /// reconciliation rather than an empty in-memory map authorising release.
+    /// Original executions awaiting cluster cleanup after the API becomes available.
+    startup_retirements: std::collections::VecDeque<crate::grill::RuntimeLaunch>,
+    /// Keep admission fenced until empty-allocation retirement also succeeds.
+    startup_cleanup_pending: bool,
+    network_references:
+        std::collections::HashMap<InstanceId, crate::grill::runc_intent::NetworkReference>,
     /// Pre-created network namespace paths for instances (Linux + runc only).
     /// When present, the namespace path is passed to `generate_oci_spec` so
     /// the container joins the pre-created namespace instead of creating one.
@@ -1484,11 +1684,13 @@ pub struct BunAgent<G: Grill> {
     deployed_specs: std::collections::HashMap<(String, String), AppSpec>,
     /// Monotonic counter tagging each rolling-redeploy's new instance IDs.
     /// A wall-clock generation collided when two redeploys landed in the
-    /// same second; this never repeats within a process.
+    /// same second; reservations advance beyond both this counter and all restored owners.
     next_deploy_gen: u64,
     /// Jobs carrying a `schedule`, registered on apply and fired by the cron
     /// tick. Keyed by (name, namespace) so a re-apply replaces the entry.
     scheduled_jobs: std::collections::HashMap<(String, String), ScheduledJob>,
+    /// A failed or cancelled write must be resolved by reloading at startup.
+    scheduled_jobs_store_uncertain: bool,
     /// Sink for container log lines. When set, each started instance spawns a
     /// forwarder that streams its output here (drained into the LogStore).
     log_tx: Option<mpsc::Sender<crate::ketchup::types::LogRecord>>,
@@ -1508,6 +1710,8 @@ pub struct BunAgent<G: Grill> {
     /// crash restart or a self-upgrade exec) can adopt them instead of
     /// restarting them. `None` disables recording and adoption.
     records_dir: Option<PathBuf>,
+    recorded_jobs: BTreeMap<String, super::jobs::RecordedJob>,
+    job_store_uncertain: bool,
     /// Self-upgrade manager. `None` when upgrades are not configured
     /// (upgrade commands then answer with an error).
     upgrade: Option<crate::upgrade::manager::UpgradeManager>,
@@ -1567,18 +1771,23 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
             command_rx,
             shutdown,
             readiness: None,
+            #[cfg(test)]
+            egress_observation_count: std::sync::atomic::AtomicUsize::new(0),
             trace_slots: std::sync::Arc::new(tokio::sync::Semaphore::new(MAX_CONCURRENT_TRACES)),
             volumes_dir: crate::config::node::StorageSection::default().volumes,
             cluster: None,
             trust_domain: "default".to_string(),
             fault_registry: crate::smoker::registry::FaultRegistry::new(),
             smoker_config: crate::smoker::config::SmokerConfig::default(),
+            node_fault_fence: crate::smoker::reservation::NodeFaultFence::default(),
             node_drain_gate: crate::smoker::node_fault::NodeDrainGate::new(),
             node_pressure: crate::smoker::node_pressure::NodePressureController::default(),
             #[cfg(all(feature = "ebpf", target_os = "linux"))]
             onion_ebpf: None,
             #[cfg(all(feature = "ebpf", target_os = "linux"))]
             egress_bindings: std::collections::HashMap::new(),
+            #[cfg(all(feature = "ebpf", target_os = "linux"))]
+            egress_store_uncertain: false,
             #[cfg(all(feature = "ebpf", target_os = "linux"))]
             egress_affected_workloads: std::collections::BTreeSet::new(),
             #[cfg(all(feature = "ebpf", target_os = "linux"))]
@@ -1592,7 +1801,10 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
             #[cfg(all(feature = "ebpf", target_os = "linux"))]
             cgroup_ns_bpf_keys: std::collections::HashSet::new(),
             service_map: crate::onion::service_map::ServiceMap::new(),
+            discovery_ownership: DiscoveryOwnership::default(),
+            producer_release_client: None,
             cluster_catalog: crate::onion::catalog::EndpointCatalog::new(),
+            cluster_catalog_generation: None,
             service_map_tx: tokio::sync::watch::channel(
                 crate::onion::service_map::ServiceMap::new(),
             )
@@ -1612,16 +1824,23 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
             last_firewall_nodes: None,
             deploy_history: Arc::new(tokio::sync::RwLock::new(Vec::new())),
             deploy_operations: crate::bun::deploy_operations::DeployOperationTracker::default(),
+            initialisers: std::collections::HashMap::new(),
+            startup_retirements: Default::default(),
+            startup_cleanup_pending: false,
+            network_references: std::collections::HashMap::new(),
             netns_paths: std::collections::HashMap::new(),
             deployed_specs: std::collections::HashMap::new(),
             next_deploy_gen: 1,
             scheduled_jobs: std::collections::HashMap::new(),
+            scheduled_jobs_store_uncertain: false,
             log_tx: None,
             events: None,
             capacity_cpu_millicores: 0,
             capacity_memory_mb: 0,
             trust_policy: crate::config::node::TrustPolicySection::default(),
             records_dir: None,
+            recorded_jobs: BTreeMap::new(),
+            job_store_uncertain: false,
             upgrade: None,
             draining: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             identity_retry_ticks: 0,
@@ -1651,18 +1870,23 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
             command_rx,
             shutdown,
             readiness: None,
+            #[cfg(test)]
+            egress_observation_count: std::sync::atomic::AtomicUsize::new(0),
             trace_slots: std::sync::Arc::new(tokio::sync::Semaphore::new(MAX_CONCURRENT_TRACES)),
             volumes_dir: crate::config::node::StorageSection::default().volumes,
             cluster: Some(cluster),
             trust_domain,
             fault_registry: crate::smoker::registry::FaultRegistry::new(),
             smoker_config: crate::smoker::config::SmokerConfig::default(),
+            node_fault_fence: crate::smoker::reservation::NodeFaultFence::default(),
             node_drain_gate: crate::smoker::node_fault::NodeDrainGate::new(),
             node_pressure: crate::smoker::node_pressure::NodePressureController::default(),
             #[cfg(all(feature = "ebpf", target_os = "linux"))]
             onion_ebpf: None,
             #[cfg(all(feature = "ebpf", target_os = "linux"))]
             egress_bindings: std::collections::HashMap::new(),
+            #[cfg(all(feature = "ebpf", target_os = "linux"))]
+            egress_store_uncertain: false,
             #[cfg(all(feature = "ebpf", target_os = "linux"))]
             egress_affected_workloads: std::collections::BTreeSet::new(),
             #[cfg(all(feature = "ebpf", target_os = "linux"))]
@@ -1676,7 +1900,10 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
             #[cfg(all(feature = "ebpf", target_os = "linux"))]
             cgroup_ns_bpf_keys: std::collections::HashSet::new(),
             service_map: crate::onion::service_map::ServiceMap::new(),
+            discovery_ownership: DiscoveryOwnership::default(),
+            producer_release_client: None,
             cluster_catalog: crate::onion::catalog::EndpointCatalog::new(),
+            cluster_catalog_generation: None,
             service_map_tx: tokio::sync::watch::channel(
                 crate::onion::service_map::ServiceMap::new(),
             )
@@ -1707,16 +1934,23 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
             last_firewall_nodes: None,
             deploy_history: Arc::new(tokio::sync::RwLock::new(Vec::new())),
             deploy_operations: crate::bun::deploy_operations::DeployOperationTracker::default(),
+            initialisers: std::collections::HashMap::new(),
+            startup_retirements: Default::default(),
+            startup_cleanup_pending: false,
+            network_references: std::collections::HashMap::new(),
             netns_paths: std::collections::HashMap::new(),
             deployed_specs: std::collections::HashMap::new(),
             next_deploy_gen: 1,
             scheduled_jobs: std::collections::HashMap::new(),
+            scheduled_jobs_store_uncertain: false,
             log_tx: None,
             events: None,
             capacity_cpu_millicores: 0,
             capacity_memory_mb: 0,
             trust_policy: crate::config::node::TrustPolicySection::default(),
             records_dir: None,
+            recorded_jobs: BTreeMap::new(),
+            job_store_uncertain: false,
             upgrade: None,
             draining: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             identity_retry_ticks: 0,
@@ -1799,9 +2033,8 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
     /// Republish the current `DnsNxdomain` fault set to the DNS responder.
     ///
     /// Rebuilt from the fault registry so it always reflects reality after an
-    /// apply, clear, or expiry. Keyed by bare service name (`target_service`),
-    /// which is how the resolver checks it. Cheap: the set is tiny and this
-    /// only runs when a fault changes.
+    /// apply, clear, or expiry. Namespace-qualified identities prevent an
+    /// authorised fault in one tenant from affecting another tenant's service.
     fn publish_dns_faults(&self) {
         let faults = self
             .fault_registry
@@ -1812,7 +2045,15 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
                     crate::smoker::types::FaultType::DnsNxdomain
                 )
             })
-            .map(|rule| (rule.target_service.clone(), rule.expires_at_ns));
+            .filter_map(|rule| {
+                Some((
+                    crate::onion::service_id::ServiceId::new(
+                        rule.namespace.as_ref()?,
+                        &rule.target_service,
+                    ),
+                    rule.expires_at_ns,
+                ))
+            });
         let _ = self
             .dns_faults_tx
             .send(crate::onion::dns::DnsFaultState::from_faults(faults));
@@ -1964,51 +2205,115 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
     #[cfg(not(all(feature = "ebpf", target_os = "linux")))]
     pub fn set_ebpf_sweep_interval(&mut self, _secs: u64) {}
 
-    /// Mirror an app's current service-map entry into the kernel
-    /// `backend_map` so the eBPF connect hook rewrites its VIP to live
-    /// backends (L8 completeness). Called after every service-map add /
-    /// health change. A no-op without the eBPF data path loaded.
+    /// Require successful kernel publication before acknowledging deployment.
+    async fn publish_backend_ebpf(
+        &mut self,
+        id: &crate::onion::service_id::ServiceId,
+    ) -> Result<(), BunError> {
+        let services = self.service_map.clone();
+        self.publish_backend_snapshot(id, &services).await
+    }
+
+    /// Journal attempted routing before acknowledging its kernel publication.
+    async fn publish_backend_snapshot(
+        &mut self,
+        id: &crate::onion::service_id::ServiceId,
+        services: &crate::onion::service_map::ServiceMap,
+    ) -> Result<(), BunError> {
+        self.persist_discovery_publication(id, services).await?;
+        if self.consumer_controls_views() {
+            return self.invalidate_consumer_view().await;
+        }
+        self.publish_backend_kernel(id, services).await
+    }
+
+    /// Publish a validated candidate before exposing it to userspace readers.
     #[cfg(all(feature = "ebpf", target_os = "linux"))]
-    async fn sync_backend_ebpf(&self, id: &crate::onion::service_id::ServiceId) {
+    async fn publish_backend_kernel(
+        &self,
+        id: &crate::onion::service_id::ServiceId,
+        services: &crate::onion::service_map::ServiceMap,
+    ) -> Result<(), BunError> {
         let Some(handle) = self.onion_ebpf.as_ref() else {
-            return;
+            return Ok(());
         };
-        let Some(entry) = self.service_map.resolve(id).cloned() else {
-            return;
+        let Some(entry) = services.resolve(id).cloned() else {
+            return Ok(());
         };
         let bpf = crate::onion::ebpf::maps::BpfServiceMap::new();
         let mut ebpf = handle.lock().await;
-        if let Err(e) = bpf.update_backends_bpf(&mut ebpf, entry.vip, entry.port, &entry) {
-            eprintln!("onion: backend map sync failed for {id}: {e}");
-        }
+        bpf.update_backends_bpf(&mut ebpf, entry.vip, entry.port, &entry)
+            .map_err(|error| BunError::BackendPublication {
+                service: id.clone(),
+                reason: error.to_string(),
+            })
     }
 
     #[cfg(not(all(feature = "ebpf", target_os = "linux")))]
-    async fn sync_backend_ebpf(&self, _id: &crate::onion::service_id::ServiceId) {}
+    async fn publish_backend_kernel(
+        &self,
+        _id: &crate::onion::service_id::ServiceId,
+        _services: &crate::onion::service_map::ServiceMap,
+    ) -> Result<(), BunError> {
+        Ok(())
+    }
 
-    /// Drop an app's `backend_map` entry. Must be called *before* the app
-    /// is unregistered from the service map, while its VIP/port are still
-    /// known. A no-op without the eBPF data path loaded.
+    /// Withdraw a service's backend and destination grants before releasing
+    /// its allocated VIP. A failed removal retains the original service entry.
+    /// A no-op without the eBPF data path loaded.
     #[cfg(all(feature = "ebpf", target_os = "linux"))]
-    async fn remove_backend_ebpf(&self, id: &crate::onion::service_id::ServiceId) {
-        let Some(handle) = self.onion_ebpf.as_ref() else {
-            return;
-        };
+    async fn withdraw_service_ebpf(
+        &self,
+        id: &crate::onion::service_id::ServiceId,
+    ) -> Result<(), BunError> {
         // Read the VIP + port straight from the live entry: the VIP is
         // whatever the map allocated (which may have probed off the natural
         // hash on a collision), so we must not re-derive it here.
-        let Some((vip, port)) = self.service_map.resolve(id).map(|e| (e.vip, e.port)) else {
-            return;
+        let Some(entry) = self.service_map.resolve(id) else {
+            return Ok(());
         };
+        self.withdraw_discovery_entry(entry).await
+    }
+
+    #[cfg(all(feature = "ebpf", target_os = "linux"))]
+    async fn withdraw_discovery_entry(
+        &self,
+        entry: &crate::onion::types::ServiceEntry,
+    ) -> Result<(), BunError> {
+        let Some(handle) = self.onion_ebpf.as_ref() else {
+            return Ok(());
+        };
+        let id = crate::onion::service_id::ServiceId::new(&entry.namespace, &entry.app_name);
+        let (vip, port, destination) = (entry.vip, entry.port, entry.app_id);
         let bpf = crate::onion::ebpf::maps::BpfServiceMap::new();
         let mut ebpf = handle.lock().await;
-        if let Err(e) = bpf.remove_backends_bpf(&mut ebpf, vip, port) {
-            eprintln!("onion: backend map removal failed for {id}: {e}");
-        }
+        bpf.remove_backends_bpf(&mut ebpf, vip, port)
+            .map_err(|error| BunError::BackendRetirement {
+                service: id.clone(),
+                reason: error.to_string(),
+            })?;
+        crate::sesame::firewall::delete_destination_firewall_state(&mut ebpf.bpf, destination)
+            .map_err(|error| BunError::DestinationRetirement {
+                service: id.clone(),
+                reason: error.to_string(),
+            })
     }
 
     #[cfg(not(all(feature = "ebpf", target_os = "linux")))]
-    async fn remove_backend_ebpf(&self, _id: &crate::onion::service_id::ServiceId) {}
+    async fn withdraw_service_ebpf(
+        &self,
+        _id: &crate::onion::service_id::ServiceId,
+    ) -> Result<(), BunError> {
+        Ok(())
+    }
+
+    #[cfg(not(all(feature = "ebpf", target_os = "linux")))]
+    async fn withdraw_discovery_entry(
+        &self,
+        _entry: &crate::onion::types::ServiceEntry,
+    ) -> Result<(), BunError> {
+        Ok(())
+    }
 
     /// Reconcile the namespace-firewall eBPF maps against current state (NET5).
     ///
@@ -2021,6 +2326,9 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
     /// *source*), deleting keys no longer desired. A no-op without eBPF.
     #[cfg(all(feature = "ebpf", target_os = "linux"))]
     async fn sync_firewall_ebpf(&mut self) {
+        if self.egress_store_uncertain {
+            return;
+        }
         let Some(handle) = self.onion_ebpf.clone() else {
             return;
         };
@@ -2029,7 +2337,7 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
         // Keying by the namespace-qualified identity — not the bare app name —
         // is what stops same-named apps in different namespaces from sharing a
         // firewall rule or a namespace mapping (H9). Collect the pairs first so
-        // the `list_instances` borrow is released before the async `pid` lookups.
+        // the `list_instances` borrow is released before the async workload-identity lookups.
         let pairs: Vec<((String, String), InstanceId)> = self
             .supervisor
             .list_instances()
@@ -2039,62 +2347,46 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
         let mut cgroup_ids: std::collections::HashMap<(String, String), Vec<u64>> =
             std::collections::HashMap::new();
         for (key, id) in pairs {
-            if let Some(pid) = self.supervisor.grill().pid(&id).await
-                && let Some(cg) = crate::sesame::egress::cgroup_id_of_pid(pid)
+            if let Some(owner) = self.egress_bindings.get(&id)
+                && owner.phase == PolicyPhase::Owned
+                && owner.source_namespace.is_some()
             {
-                cgroup_ids.entry(key).or_default().push(cg);
+                cgroup_ids.entry(key).or_default().push(owner.cgroup_id);
+                continue;
+            }
+            match self.supervisor.grill().workload_cgroup(&id).await {
+                Ok(Some(cgroup)) => cgroup_ids.entry(key).or_default().push(cgroup),
+                Ok(None) => {}
+                Err(error) => {
+                    // Unavailable source evidence cannot authorise erasing
+                    // previously installed namespace/firewall bindings.
+                    eprintln!("sesame: source identity for {id} is unavailable: {error}");
+                    return;
+                }
             }
         }
 
         let services: Vec<crate::onion::types::ServiceEntry> = self
-            .service_map
+            .merged_service_map()
             .resolve_all()
             .into_iter()
             .cloned()
             .collect();
-        let ns_entries =
-            crate::sesame::firewall::resolve_cgroup_namespace_entries(&services, &cgroup_ids);
+        let ns_entries = crate::sesame::firewall::resolve_cgroup_namespace_entries(&cgroup_ids);
         let fw_entries = crate::sesame::firewall::rules_to_bpf_entries(
             &crate::sesame::firewall::resolve_firewall_rules(&services, &cgroup_ids),
         );
 
-        let desired_ns_keys: std::collections::HashSet<u64> =
-            ns_entries.iter().map(|e| e.cgroup_id).collect();
-        let desired_fw_keys: std::collections::HashSet<crate::onion::types::FirewallKey> =
-            fw_entries.iter().map(|(k, _)| *k).collect();
-        let ns_to_delete =
-            crate::sesame::firewall::keys_to_delete(&self.cgroup_ns_bpf_keys, &desired_ns_keys);
-        let fw_to_delete =
-            crate::sesame::firewall::keys_to_delete(&self.firewall_bpf_keys, &desired_fw_keys);
-
-        {
-            let mut ebpf = handle.lock().await;
-            for entry in &ns_entries {
-                if let Err(e) = crate::sesame::firewall::write_cgroup_namespace_entry(
-                    &mut ebpf.bpf,
-                    entry.cgroup_id,
-                    entry.namespace_id,
-                ) {
-                    eprintln!("sesame: cgroup-namespace map write failed: {e}");
-                }
-            }
-            for (key, value) in &fw_entries {
-                if let Err(e) =
-                    crate::sesame::firewall::write_firewall_entry(&mut ebpf.bpf, *key, *value)
-                {
-                    eprintln!("sesame: firewall map write failed: {e}");
-                }
-            }
-            for cg in &ns_to_delete {
-                let _ = crate::sesame::firewall::delete_cgroup_namespace_entry(&mut ebpf.bpf, *cg);
-            }
-            for key in &fw_to_delete {
-                let _ = crate::sesame::firewall::delete_firewall_entry(&mut ebpf.bpf, *key);
-            }
+        let mut ebpf = handle.lock().await;
+        if let Err(error) = crate::sesame::firewall::reconcile_firewall_maps(
+            &mut ebpf.bpf,
+            &ns_entries,
+            &fw_entries,
+            &mut self.cgroup_ns_bpf_keys,
+            &mut self.firewall_bpf_keys,
+        ) {
+            eprintln!("sesame: firewall reconciliation failed: {error}");
         }
-
-        self.cgroup_ns_bpf_keys = desired_ns_keys;
-        self.firewall_bpf_keys = desired_fw_keys;
     }
 
     #[cfg(not(all(feature = "ebpf", target_os = "linux")))]
@@ -2165,28 +2457,280 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
         Ok(())
     }
 
-    /// Write (or refresh) the instance record used for adoption after a bun
-    /// restart or self-upgrade exec. Best-effort: a failed record write must
-    /// never fail a deploy, but it is logged.
-    async fn persist_instance_record(&self, instance_id: &InstanceId) {
-        let Some(dir) = &self.records_dir else { return };
-        let Some(instance) = self.supervisor.get_instance(instance_id) else {
-            return;
+    /// Keep job evidence durable before runtime mutation or retry admission.
+    async fn commit_jobs(
+        &mut self,
+        next: BTreeMap<String, super::jobs::RecordedJob>,
+    ) -> Result<(), BunError> {
+        if self.job_store_uncertain {
+            return Err(BunError::JobState(
+                "a previous write is uncertain; restart Bun to reload it".into(),
+            ));
+        }
+        if next == self.recorded_jobs {
+            return Ok(());
+        }
+        if let Some(directory) = self.records_dir.clone() {
+            self.job_store_uncertain = true;
+            for (id, job) in &next {
+                self.recorded_jobs
+                    .entry(id.clone())
+                    .or_insert_with(|| job.clone());
+            }
+            let records = next.clone();
+            tokio::task::spawn_blocking(move || super::jobs::persist(&directory, records))
+                .await
+                .map_err(|error| BunError::JobState(error.to_string()))?
+                .map_err(|error| BunError::JobState(error.to_string()))?;
+        }
+        self.recorded_jobs = next;
+        self.job_store_uncertain = false;
+        Ok(())
+    }
+
+    async fn record_observed_job_exit(
+        &mut self,
+        id: &InstanceId,
+        phase: super::jobs::JobPhase,
+    ) -> Result<(), BunError> {
+        let mut next = self.recorded_jobs.clone();
+        let job = next
+            .get_mut(&id.0)
+            .ok_or_else(|| BunError::JobState(format!("missing attempt for {id}")))?;
+        job.phase = phase;
+        // A short process can exit before a PID adoption record is available.
+        // Persist its positive exit observation with the outcome, rather than
+        // asking a replacement ProcessGrill to signal an unadoptable handle.
+        // OCI runtimes retain named container resources after process exit.
+        if job.runtime == crate::grill::records::RuntimeKind::Process {
+            job.runtime_absent = true;
+        }
+        self.commit_jobs(next).await
+    }
+
+    async fn record_job_runtime_absent(&mut self, id: &InstanceId) -> Result<(), BunError> {
+        let mut jobs = self.recorded_jobs.clone();
+        if let Some(job) = jobs.get_mut(&id.0) {
+            job.runtime_absent = true;
+        }
+        self.commit_jobs(jobs).await
+    }
+
+    /// A new run may replace terminal evidence only after old runtime cleanup.
+    async fn prepare_job_run(
+        &mut self,
+        name: &str,
+        namespace: &str,
+        spec: &JobSpec,
+        rerun_unknown: bool,
+    ) -> Result<Vec<InstanceId>, BunError> {
+        use super::jobs::{JobPhase, RecordedJob};
+        let id = crate::grill::InstanceIdentity::new(namespace, name, 0).instance_id();
+        let refuse = |reason: &str| BunError::JobState(format!("{namespace}/{name}: {reason}"));
+        if self.job_store_uncertain {
+            return Err(refuse("checkpoint is uncertain; restart Bun"));
+        }
+        if let Some(instance) = self.supervisor.get_instance(&id) {
+            if !instance.is_job || instance.app_name != name || instance.namespace != namespace {
+                return Err(refuse("instance id belongs to another workload"));
+            }
+            if !rerun_unknown
+                && !matches!(
+                    instance.state,
+                    ContainerState::Stopped | ContainerState::Failed
+                )
+            {
+                return Err(refuse(
+                    "previous job still owns its runtime; stop it before applying again",
+                ));
+            }
+        }
+        let previous = self.recorded_jobs.get(&id.0).cloned();
+        let next_cron_occurrence = self
+            .scheduled_jobs
+            .contains_key(&(name.into(), namespace.into()))
+            && previous.as_ref().is_some_and(|job| job.runtime_absent);
+        if previous.as_ref().is_some_and(|job| {
+            matches!(
+                job.phase,
+                JobPhase::Unknown | JobPhase::Preparing | JobPhase::Launching
+            )
+        }) && !rerun_unknown
+            && !next_cron_occurrence
+        {
+            return Err(refuse(
+                "previous outcome is unknown; use apply --rerun-jobs for an explicit rerun",
+            ));
+        }
+        let generation = match &previous {
+            Some(job) => job
+                .generation
+                .checked_add(1)
+                .ok_or_else(|| refuse("job generation exhausted"))?,
+            None => 1,
         };
-        let Some(pid) = self.supervisor.grill().pid(instance_id).await else {
-            return;
+        if let Some(job) = &previous {
+            if !job.runtime_absent {
+                self.kill_and_wait_for_exit(&id).await?;
+            }
+            self.record_job_runtime_absent(&id).await?;
+            self.retire_instance_artifacts(&id).await?;
+            self.supervisor.retire_instance(&id).await;
+        }
+        let ids = self
+            .supervisor
+            .deploy_job(name, namespace, spec, Instant::now())
+            .await?;
+        let mut next = self.recorded_jobs.clone();
+        next.insert(
+            id.0.clone(),
+            RecordedJob {
+                name: name.into(),
+                namespace: namespace.into(),
+                spec: spec.clone(),
+                runtime: self.supervisor.grill().runtime_kind(),
+                generation,
+                restart_count: 0,
+                phase: JobPhase::Preparing,
+                runtime_absent: false,
+            },
+        );
+        self.commit_jobs(next).await?;
+        Ok(ids)
+    }
+
+    /// Retrying spends the budget before create/start, after retiring the old record.
+    async fn claim_job_retry(&mut self, id: &InstanceId) -> Result<(), BunError> {
+        use super::jobs::{JobPhase, MAX_RETRIES};
+        let count = self
+            .supervisor
+            .get_instance(id)
+            .ok_or_else(|| BunError::InstanceNotFound {
+                instance_id: id.clone(),
+            })?
+            .restart_count;
+        let mut next = self.recorded_jobs.clone();
+        let job = next
+            .get_mut(&id.0)
+            .ok_or_else(|| BunError::JobState(format!("missing attempt for {id}")))?;
+        if count > MAX_RETRIES
+            || count < job.restart_count
+            || matches!(
+                job.phase,
+                JobPhase::Unknown
+                    | JobPhase::Stopping
+                    | JobPhase::Stopped
+                    | JobPhase::Exited { code: 0 }
+            )
+        {
+            return Err(BunError::JobState(format!(
+                "automatic retry refused for {id}"
+            )));
+        }
+        job.restart_count = count;
+        job.phase = JobPhase::Preparing;
+        job.runtime_absent = false;
+        self.commit_jobs(next).await
+    }
+
+    /// Commit permission to execute only after the runtime has prepared this attempt.
+    async fn transition_deploy_state(
+        &mut self,
+        id: &InstanceId,
+        to: ContainerState,
+    ) -> Result<(), BunError> {
+        let instance =
+            self.supervisor
+                .get_instance(id)
+                .ok_or_else(|| BunError::InstanceNotFound {
+                    instance_id: id.clone(),
+                })?;
+        let state = instance.state.transition_to(to)?;
+        if instance.is_job && to == ContainerState::Starting {
+            if self.job_store_uncertain {
+                return Err(BunError::JobState(
+                    "checkpoint is uncertain; restart Bun".into(),
+                ));
+            }
+            let mut jobs = self.recorded_jobs.clone();
+            let job = jobs
+                .get_mut(&id.0)
+                .ok_or_else(|| BunError::JobState(format!("missing attempt for {id}")))?;
+            if job.phase != super::jobs::JobPhase::Preparing || job.runtime_absent {
+                return Err(BunError::JobState(format!(
+                    "job {id} has no prepared attempt"
+                )));
+            }
+            job.phase = super::jobs::JobPhase::Launching;
+            self.commit_jobs(jobs).await?;
+        }
+        let instance =
+            self.supervisor
+                .get_instance_mut(id)
+                .ok_or_else(|| BunError::InstanceNotFound {
+                    instance_id: id.clone(),
+                })?;
+        instance.state = state;
+        Ok(())
+    }
+
+    fn job_state_label(&self, instance: &WorkloadInstance) -> String {
+        if (instance.is_job && self.job_store_uncertain)
+            || self
+                .recorded_jobs
+                .get(&instance.id.0)
+                .is_some_and(|job| job.phase == super::jobs::JobPhase::Unknown)
+        {
+            "unknown".into()
+        } else {
+            instance.state.to_string()
+        }
+    }
+
+    /// Write (or refresh) the instance record used for adoption after a bun
+    /// restart or self-upgrade exec. Application acknowledgement requires this
+    /// metadata; short jobs recover through their separate attempt record.
+    async fn persist_instance_record(&self, instance_id: &InstanceId) -> Result<(), BunError> {
+        let Some(dir) = self.records_dir.clone() else {
+            return Ok(());
+        };
+        let fail = |reason: &str| {
+            BunError::AdoptionState(format!("cannot record {instance_id}: {reason}"))
+        };
+        let instance = self
+            .supervisor
+            .get_instance(instance_id)
+            .ok_or_else(|| fail("instance is missing"))?;
+        let runtime = self.supervisor.grill().runtime_kind();
+        // Apple workloads live in VMs. Record the launcher for provenance;
+        // Apple adoption checks the named container, never this host PID.
+        let pid = if runtime == crate::grill::records::RuntimeKind::Apple {
+            Some(std::process::id())
+        } else {
+            self.supervisor.grill().pid(instance_id).await
+        };
+        let Some(pid) = pid else {
+            return if instance.is_job {
+                Ok(())
+            } else {
+                Err(fail("runtime process identity is unavailable"))
+            };
         };
         let Some(pid_started_at) = crate::grill::records::process_start_time(pid) else {
-            return;
+            return if instance.is_job {
+                Ok(())
+            } else {
+                Err(fail("runtime process identity could not be observed"))
+            };
         };
-        let Some(oci_spec) = instance.oci_spec.clone() else {
-            return;
-        };
+        let oci_spec = instance
+            .oci_spec
+            .clone()
+            .ok_or_else(|| fail("runtime specification is missing"))?;
 
         let replica_index = crate::grill::InstanceIdentity::parse(&instance_id.0)
             .map(|ident| ident.ordinal)
             .unwrap_or(0);
-        let runtime = self.supervisor.grill().runtime_kind();
         let rootless_network = self
             .supervisor
             .grill()
@@ -2215,18 +2759,176 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
             oci_spec,
             rootless_network,
         };
-        if let Err(e) = crate::grill::records::write_record(dir, &record) {
-            eprintln!("bun: warning: failed to write instance record for {instance_id}: {e}");
-        }
+        tokio::task::spawn_blocking(move || crate::grill::records::write_record(&dir, &record))
+            .await
+            .map_err(|error| fail(&error.to_string()))?
+            .map_err(|error| fail(&error.to_string()))
     }
 
-    /// Remove an instance's adoption record (instance stopped for good).
-    fn remove_instance_record(&self, instance_id: &InstanceId) {
-        if let Some(dir) = &self.records_dir
-            && let Err(e) = crate::grill::records::remove_record(dir, &instance_id.0)
-        {
-            eprintln!("bun: warning: failed to remove instance record for {instance_id}: {e}");
+    /// Persist launch evidence while the replacement is still owned by its
+    /// rolling worker, before health wait or traffic publication.
+    async fn persist_rolling_instance(&self, instance: &RollingInstance) -> Result<(), BunError> {
+        let Some(directory) = self.records_dir.clone() else {
+            return Ok(());
+        };
+        let fail = |reason: String| BunError::DeployFailed {
+            app_name: instance.app_name.clone(),
+            reason,
+        };
+        let grill = self.supervisor.grill();
+        let runtime = grill.runtime_kind();
+        let pid = if runtime == crate::grill::records::RuntimeKind::Apple {
+            Some(std::process::id())
+        } else {
+            grill.pid(&instance.instance_id).await
         }
+        .ok_or_else(|| {
+            fail(
+                "runtime did not expose a process identity for durable replacement adoption".into(),
+            )
+        })?;
+        let pid_started_at = crate::grill::records::process_start_time(pid).ok_or_else(|| {
+            fail("replacement process exited before its identity could be recorded".into())
+        })?;
+        let identity = crate::grill::InstanceIdentity::parse(&instance.instance_id.0)
+            .ok_or_else(|| fail("replacement has an invalid instance identity".into()))?;
+        let record = crate::grill::records::InstanceRecord {
+            schema: 2,
+            instance_id: instance.instance_id.0.clone(),
+            namespace: instance.namespace.clone(),
+            app_name: instance.app_name.clone(),
+            replica_index: identity.ordinal,
+            is_job: false,
+            image: instance.spec.image.clone().unwrap_or_default(),
+            runtime,
+            pid,
+            pid_started_at,
+            runc_container_id: matches!(runtime, crate::grill::records::RuntimeKind::Runc)
+                .then(|| instance.instance_id.0.clone()),
+            log_stem: grill.log_stem(&instance.instance_id).await,
+            host_port: instance.host_port,
+            app_spec: Some(instance.spec.clone()),
+            oci_spec: instance.oci_spec.clone(),
+            rootless_network: grill.rootless_network_record(&instance.instance_id).await,
+        };
+        tokio::task::spawn_blocking(move || {
+            crate::grill::records::write_record(&directory, &record)
+        })
+        .await
+        .map_err(|error| fail(format!("persist replacement record: {error}")))?
+        .map_err(|error| fail(format!("persist replacement record: {error}")))
+    }
+
+    /// Reconcile launches that reached the runtime before agent adoption was durable.
+    async fn reconcile_runtime_launches(
+        &mut self,
+        records: &[crate::grill::records::InstanceRecord],
+        jobs: &mut std::collections::BTreeMap<String, super::jobs::RecordedJob>,
+        launches: &[crate::grill::RuntimeLaunch],
+    ) -> Result<(), BunError> {
+        use super::jobs::JobPhase;
+        let inventory: std::collections::HashMap<_, _> = launches
+            .iter()
+            .map(|launch| (launch.instance_id.0.as_str(), launch))
+            .collect();
+        if inventory.len() != launches.len() {
+            return Err(BunError::AdoptionState(
+                "duplicate runtime launch identity".into(),
+            ));
+        }
+        let recorded: std::collections::HashSet<_> = records
+            .iter()
+            .map(|record| record.instance_id.as_str())
+            .collect();
+        // Validate all cross-record relationships before retiring any owner.
+        for record in records {
+            let launch = inventory.get(record.instance_id.as_str()).ok_or_else(|| {
+                BunError::AdoptionState(format!(
+                    "instance {} has no runtime launch intent",
+                    record.instance_id
+                ))
+            })?;
+            if launch.spec != record.oci_spec
+                || jobs
+                    .get(&record.instance_id)
+                    .is_some_and(|job| job.phase == JobPhase::Preparing)
+            {
+                return Err(BunError::AdoptionState(format!(
+                    "instance {} conflicts with runtime preparation",
+                    record.instance_id
+                )));
+            }
+        }
+        for (id, job) in jobs.iter() {
+            if !inventory.contains_key(id.as_str())
+                && !job.runtime_absent
+                && job.phase != JobPhase::Preparing
+            {
+                return Err(BunError::AdoptionState(format!(
+                    "job {id} has no runtime launch intent"
+                )));
+            }
+        }
+        let mut retired = Vec::new();
+        for launch in launches {
+            let id = &launch.instance_id;
+            if recorded.contains(id.0.as_str()) {
+                continue;
+            }
+            let state = tokio::time::timeout(
+                std::time::Duration::from_secs(10),
+                self.supervisor.grill().state(id),
+            )
+            .await
+            .map_err(|_| {
+                BunError::AdoptionState(format!("runtime inspection timed out for {id}"))
+            })??;
+            if state != ContainerState::Stopped
+                && jobs.get(&id.0).is_some_and(|job| job.runtime_absent)
+            {
+                return Err(BunError::AdoptionState(format!(
+                    "job {id} has conflicting live and terminal evidence"
+                )));
+            }
+            // Without the agent's acknowledgement record an active launch has
+            // an uncertain outcome. Fence it before ordinary desired-state
+            // reconciliation can authorise any replacement.
+            if state != ContainerState::Stopped {
+                kill_runtime_instance(self.supervisor.grill(), id).await?;
+            }
+            if let Some(job) = jobs.get_mut(&id.0) {
+                job.runtime_absent = true;
+                job.phase = match job.phase {
+                    JobPhase::Launching if state == ContainerState::Stopped => {
+                        match self.supervisor.grill().exit_code(id).await {
+                            Some(code) => JobPhase::Exited { code },
+                            None => JobPhase::Unknown,
+                        }
+                    }
+                    JobPhase::Preparing | JobPhase::Launching => JobPhase::Unknown,
+                    JobPhase::Stopping => JobPhase::Stopped,
+                    ref phase => phase.clone(),
+                };
+                self.commit_jobs(jobs.clone()).await?;
+            }
+            retired.push(id.clone());
+        }
+        // An unacknowledged init can share its parent's cgroup. Retiring
+        // parent artifacts first would lift policy while that init still runs.
+        for id in retired {
+            if !self.defer_startup_retirement(&id).await? {
+                self.retire_instance_artifacts(&id).await?;
+            }
+        }
+        for (id, job) in jobs.iter_mut() {
+            if !inventory.contains_key(id.as_str()) && job.phase == JobPhase::Preparing {
+                // A complete mandatory intent inventory plus the pre-execution
+                // phase proves no runtime was activated for this preparation.
+                job.phase = JobPhase::Unknown;
+                job.runtime_absent = true;
+            }
+        }
+        self.commit_jobs(jobs.clone()).await
     }
 
     /// Adopt still-running workloads recorded by a previous bun process.
@@ -2235,70 +2937,221 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
     /// are seeded into the supervisor as Running so they don't get
     /// double-started. Records whose process is gone are deleted (the
     /// instance reschedules through the normal path). Returns the number
-    /// of instances adopted.
+    /// of instances adopted. Any uncertain observation refuses startup and
+    /// preserves durable records and identity material for recovery.
     ///
-    /// Restart backoff counters start fresh for adopted instances, and
-    /// cluster routing is rebuilt by the normal reconcile paths.
-    pub async fn adopt_recorded_instances(&mut self) -> usize {
+    /// Jobs restore durable retry budgets and retain unknown outcomes. App
+    /// backoff starts fresh; normal reconciliation rebuilds cluster routing.
+    pub async fn adopt_recorded_instances(&mut self) -> Result<usize, BunError> {
         let Some(dir) = self.records_dir.clone() else {
-            return 0;
+            return Ok(0);
         };
         let now = Instant::now();
         let mut adopted_count = 0;
 
-        for record in crate::grill::records::load_records(&dir) {
-            // The runtime knows the still-running container by the id it was
-            // started under, which is what the record stores. The supervisor
-            // and everything downstream key on the canonical id: for a fresh
-            // record they're the same; for a legacy record (this node
-            // upgraded across the identity change with workloads running) the
-            // canonical id is rebuilt from the record's structured fields so
-            // the adopted instance lands under a namespace-safe key.
+        let records_dir = dir.clone();
+        let (records, schedules, jobs) = tokio::task::spawn_blocking(move || {
+            let records = crate::grill::records::load_records(&records_dir)?;
+            let schedules = super::schedules::load(&records_dir)?;
+            let jobs = super::jobs::load(&records_dir)?;
+            Ok::<_, std::io::Error>((records, schedules, jobs))
+        })
+        .await
+        .map_err(|error| BunError::AdoptionState(error.to_string()))?
+        .map_err(|error| BunError::AdoptionState(error.to_string()))?;
+        self.require_discovery_recovery(!records.is_empty(), false)?;
+        for job in jobs.values() {
+            if job.runtime != self.supervisor.grill().runtime_kind() {
+                return Err(BunError::AdoptionState(
+                    "job attempt belongs to another runtime".into(),
+                ));
+            }
+        }
+        // Validate the entire inventory before adopting or deleting any owner.
+        for record in &records {
+            if record.is_job && !jobs.contains_key(&record.instance_id) {
+                return Err(BunError::AdoptionState(format!(
+                    "job {} has no durable attempt",
+                    record.instance_id
+                )));
+            }
+            if let Some(job) = jobs.get(&record.instance_id)
+                && (!record.is_job
+                    || record.namespace != job.namespace
+                    || record.app_name != job.name
+                    || record.image != job.spec.image.clone().unwrap_or_default())
+            {
+                return Err(BunError::AdoptionState(
+                    "job record conflicts with attempt ownership".into(),
+                ));
+            }
+            let base = crate::grill::InstanceIdentity::new(
+                &record.namespace,
+                &record.app_name,
+                record.replica_index,
+            );
+            let generation = record
+                .instance_id
+                .strip_prefix(&format!("{}__{}-g", record.namespace, record.app_name))
+                .and_then(|suffix| suffix.strip_suffix(&format!("-{}", record.replica_index)))
+                .and_then(|value| value.parse::<u64>().ok());
+            let matches_generation = generation.is_some_and(|generation| {
+                crate::grill::InstanceIdentity::canary(
+                    &record.namespace,
+                    &record.app_name,
+                    generation,
+                    record.replica_index,
+                )
+                .instance_id()
+                .0 == record.instance_id
+            });
+            if !crate::config::valid_workload_label(&record.namespace)
+                || !crate::config::valid_workload_label(&record.app_name)
+                || (base.instance_id().0 != record.instance_id && !matches_generation)
+                || record
+                    .app_spec
+                    .as_ref()
+                    .and_then(|spec| spec.namespace.as_ref())
+                    .is_some_and(|namespace| namespace != &record.namespace)
+            {
+                return Err(BunError::AdoptionState(format!(
+                    "unsupported or inconsistent workload identity in record {:?}; the record and runtime are preserved",
+                    record.instance_id,
+                )));
+            }
+            if record.runtime != self.supervisor.grill().runtime_kind() {
+                return Err(BunError::AdoptionState(format!(
+                    "instance {} belongs to {:?}, but the selected runtime is {:?}",
+                    record.instance_id,
+                    record.runtime,
+                    self.supervisor.grill().runtime_kind(),
+                )));
+            }
+        }
+        let mut restored = std::collections::HashMap::new();
+        for stored in schedules {
+            let namespace = stored.spec.namespace.as_deref().unwrap_or("default");
+            if namespace != stored.namespace
+                || stored.name.is_empty()
+                || stored.last_fired_minute.is_some_and(|minute| minute < 0)
+            {
+                return Err(BunError::AdoptionState(
+                    "invalid scheduled-job identity or firing stamp".into(),
+                ));
+            }
+            let mut config = Config::default();
+            config.job.insert(stored.name.clone(), stored.spec.clone());
+            config
+                .validate()
+                .map_err(|error| BunError::AdoptionState(error.to_string()))?;
+            let expression = stored.spec.schedule.as_deref().ok_or_else(|| {
+                BunError::AdoptionState("recorded cron job has no schedule".into())
+            })?;
+            let schedule = crate::meat::cron::CronSchedule::parse(expression)
+                .map_err(|error| BunError::AdoptionState(error.to_string()))?;
+            let key = (stored.name.clone(), stored.namespace.clone());
+            let job = ScheduledJob {
+                name: stored.name,
+                namespace: stored.namespace,
+                spec: stored.spec,
+                schedule,
+                last_fired_minute: stored.last_fired_minute,
+            };
+            if restored.insert(key, job).is_some() {
+                return Err(BunError::AdoptionState(
+                    "duplicate scheduled-job identity".into(),
+                ));
+            }
+        }
+        self.scheduled_jobs = restored;
+        self.scheduled_jobs_store_uncertain = false;
+        self.recorded_jobs = jobs.clone();
+        self.job_store_uncertain = false;
+        let mut recovered_jobs = jobs;
+        let launch_inventory = self.supervisor.grill().launch_inventory().await?;
+        self.require_discovery_recovery(
+            !records.is_empty(),
+            launch_inventory
+                .as_ref()
+                .is_some_and(|launches| !launches.is_empty()),
+        )?;
+        self.validate_recovered_discovery(&records, launch_inventory.as_deref())?;
+        self.restore_egress_owners(&records, launch_inventory.as_deref())
+            .await?;
+        self.replay_discovery_releases().await?;
+        if let Some(launches) = &launch_inventory {
+            self.reconcile_runtime_launches(&records, &mut recovered_jobs, launches)
+                .await?;
+        }
+        let mut adopted_jobs = std::collections::HashSet::new();
+        for record in records {
+            // Startup preflight proved that runtime, record and supervisor
+            // share the same identity. Never invent an alias for an old owner.
             let runtime_id = InstanceId(record.instance_id.clone());
-            let instance_id =
-                if crate::grill::InstanceIdentity::parse(&record.instance_id).is_some() {
-                    runtime_id.clone()
-                } else {
-                    let mut ident = crate::grill::InstanceIdentity::new(
-                        &record.namespace,
-                        &record.app_name,
-                        record.replica_index,
-                    );
-                    // Preserve a legacy canary generation if the id carried one.
-                    if let Some(legacy) = crate::grill::InstanceIdentity::parse_legacy(
-                        &record.instance_id,
-                        &record.namespace,
-                    ) && legacy.app == record.app_name
-                    {
-                        ident.generation = legacy.generation;
-                    }
-                    ident.instance_id()
-                };
+            let instance_id = runtime_id.clone();
             // Never clobber an instance the current process already tracks.
             if self.supervisor.get_instance(&instance_id).is_some() {
-                continue;
-            }
-
-            let adopted = matches!(
-                self.supervisor.grill().adopt(&runtime_id, &record).await,
-                Ok(true)
-            );
-            if !adopted {
-                let _ = crate::grill::records::remove_record(&dir, &record.instance_id);
-                // The instance is gone for good — its key material goes
-                // with it (PKI7). The identity dir was created under the id
-                // the container ran as (the runtime id), which for a legacy
-                // record differs from the canonical supervisor key.
-                let identity_dir = self.instance_identity_dir(&runtime_id);
-                if let Err(e) = crate::sesame::identity::cleanup_identity_dir(&identity_dir) {
-                    eprintln!("bun: warning: failed to remove identity dir for {runtime_id}: {e}");
+                if record.is_job {
+                    adopted_jobs.insert(instance_id.0.clone());
                 }
                 continue;
             }
 
+            let adopted = tokio::time::timeout(
+                std::time::Duration::from_secs(10),
+                self.supervisor.grill().adopt(&runtime_id, &record),
+            )
+            .await
+            .map_err(|_| {
+                BunError::AdoptionState(format!("runtime adoption timed out for {runtime_id}"))
+            })??;
+            if !adopted {
+                if let Some(job) = recovered_jobs.get_mut(&runtime_id.0) {
+                    job.runtime_absent = true;
+                    if matches!(
+                        job.phase,
+                        super::jobs::JobPhase::Preparing | super::jobs::JobPhase::Launching
+                    ) {
+                        job.phase = if launch_inventory.is_some()
+                            && job.phase == super::jobs::JobPhase::Launching
+                        {
+                            match self.supervisor.grill().exit_code(&runtime_id).await {
+                                Some(code) => super::jobs::JobPhase::Exited { code },
+                                None => super::jobs::JobPhase::Unknown,
+                            }
+                        } else {
+                            super::jobs::JobPhase::Unknown
+                        };
+                    }
+                    // Preserve the positive observation before deleting the
+                    // only record that let this runtime prove absence.
+                    self.commit_jobs(recovered_jobs.clone()).await?;
+                }
+                if !self.defer_startup_retirement(&runtime_id).await? {
+                    self.retire_instance_artifacts(&runtime_id).await?;
+                }
+                continue;
+            }
+
+            if let Err(error) = self.restore_live_egress(&runtime_id, &record).await {
+                // Adoption has proved this is our surviving runtime. Do not
+                // publish it as Running without confirmed policy ownership.
+                kill_runtime_instance(self.supervisor.grill(), &runtime_id).await?;
+                return Err(error);
+            }
+
+            let recorded_job = recovered_jobs.get(&runtime_id.0);
+            if let Some(job) = recorded_job {
+                if matches!(job.phase, super::jobs::JobPhase::Exited { .. }) || job.runtime_absent {
+                    return Err(BunError::AdoptionState(format!(
+                        "job {runtime_id} has conflicting live and terminal evidence"
+                    )));
+                }
+                adopted_jobs.insert(runtime_id.0.clone());
+            }
             // The surviving instance still holds its port.
             if let Some(port) = record.host_port {
-                let _ = self.supervisor.port_allocator.reserve(port).await;
+                self.supervisor.port_allocator.reserve(port).await?;
             }
 
             // Rebuild the health check from the recorded app spec.
@@ -2316,7 +3169,7 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
             // its per-instance directory, so an adopted instance keeps
             // rotating on time instead of coming back with
             // `identity: None` (D9). The directory was created under the
-            // runtime id, so a legacy record still finds its keys. An
+            // runtime id, which is also the supervisor key. An
             // unprovisioned directory loads as `None` and the rotation loop
             // provisions afresh.
             let identity_dir = self.instance_identity_dir(&runtime_id);
@@ -2334,16 +3187,30 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
                 id: instance_id.clone(),
                 app_name: record.app_name.clone(),
                 namespace: record.namespace.clone(),
-                state: ContainerState::Running,
+                state: if recorded_job.is_some_and(|job| {
+                    matches!(
+                        job.phase,
+                        super::jobs::JobPhase::Stopping | super::jobs::JobPhase::Stopped
+                    )
+                }) {
+                    ContainerState::Stopping
+                } else {
+                    ContainerState::Running
+                },
                 health_counters: super::health::HealthCounters::new(),
-                restart_count: 0,
+                restart_count: recorded_job.map_or(0, |job| job.restart_count),
                 last_restart: None,
                 host_port: record.host_port,
                 container_ip: None,
                 created_at: now,
-                restart_policy: super::restart::RestartPolicy::default(),
+                restart_policy: if record.is_job {
+                    super::restart::RestartPolicy::for_job(super::jobs::MAX_RETRIES)
+                } else {
+                    super::restart::RestartPolicy::default()
+                },
                 health_config,
                 is_job: record.is_job,
+                retry_pending: false,
                 image: record.image.clone(),
                 oci_spec: Some(record.oci_spec.clone()),
                 identity,
@@ -2366,15 +3233,69 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
             adopted_count += 1;
         }
 
+        for (id, job) in &mut recovered_jobs {
+            if !adopted_jobs.contains(id)
+                && matches!(
+                    job.phase,
+                    super::jobs::JobPhase::Preparing | super::jobs::JobPhase::Launching
+                )
+            {
+                job.phase = super::jobs::JobPhase::Unknown;
+            }
+        }
+        self.commit_jobs(recovered_jobs).await?;
+        // Keep terminal/unknown evidence visible even after its runtime is gone.
+        for (id, job) in self.recorded_jobs.clone() {
+            let instance_id = InstanceId(id);
+            if self.supervisor.get_instance(&instance_id).is_some() {
+                continue;
+            }
+            self.supervisor
+                .deploy_job(&job.name, &job.namespace, &job.spec, now)
+                .await?;
+            let cgroup = crate::grill::cgroup::instance_cgroup_path(
+                &job.namespace,
+                &job.name,
+                &instance_id,
+            )?;
+            let spec = generate_job_oci_spec(
+                &job.name,
+                &job.namespace,
+                &job.spec,
+                &cgroup.to_string_lossy(),
+                None,
+            );
+            if let Some(instance) = self.supervisor.get_instance_mut(&instance_id) {
+                instance.restart_count = job.restart_count;
+                instance.restart_policy =
+                    super::restart::RestartPolicy::for_job(super::jobs::MAX_RETRIES);
+                instance.state = match job.phase {
+                    super::jobs::JobPhase::Unknown => ContainerState::Failed,
+                    super::jobs::JobPhase::Exited { code }
+                        if code != 0 && job.restart_count >= super::jobs::MAX_RETRIES =>
+                    {
+                        ContainerState::Failed
+                    }
+                    super::jobs::JobPhase::Stopping => ContainerState::Stopping,
+                    _ => ContainerState::Stopped,
+                };
+                instance.retry_pending = matches!(job.phase, super::jobs::JobPhase::Exited { code } if code != 0)
+                    && job.restart_count < super::jobs::MAX_RETRIES;
+                instance.oci_spec = Some(spec);
+                instance.last_restart = Some(now);
+            }
+        }
+
         if adopted_count > 0 {
             println!("bun: adopted {adopted_count} running instance(s) from a previous process");
         }
 
         // Identity dirs with no live owner — legacy app-scoped layouts and
         // instances that died while bun was down — are stale key material.
+        self.finish_discovery_recovery().await?;
         self.sweep_orphaned_identity_dirs();
 
-        adopted_count
+        Ok(adopted_count)
     }
 
     /// Spawn a background forwarder that streams a started instance's log lines
@@ -2416,11 +3337,24 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
 
     /// Run the agent event loop until shutdown is requested.
     pub async fn run(&mut self) {
+        self.run_loop(None).await;
+    }
+
+    /// Run the agent, acknowledging readiness after initial capability collection.
+    pub async fn run_with_readiness(&mut self, ready: super::readiness::ReadySignal) {
+        self.run_loop(Some(ready)).await;
+    }
+
+    async fn run_loop(&mut self, ready: Option<super::readiness::ReadySignal>) {
         let mut health_interval = tokio::time::interval(std::time::Duration::from_secs(1));
 
         if let Some(readiness) = self.readiness.clone() {
             let (capabilities, _) = self.live_egress_report_state().await;
             readiness.set_capabilities(capabilities).await;
+        }
+
+        if let Some(ready) = ready {
+            ready.ready();
         }
 
         loop {
@@ -2439,11 +3373,8 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
                     self.handle_snapshot_request(req).await;
                 }
                 _ = health_interval.tick() => {
-                    self.enforce_live_egress_or_stop().await;
-                    if let Some(readiness) = self.readiness.clone() {
-                        let (capabilities, _) = self.live_egress_report_state().await;
-                        readiness.set_capabilities(capabilities).await;
-                    }
+                    self.drive_startup_retirements().await;
+                    self.refresh_egress_readiness().await;
                     self.run_health_checks().await;
                     self.check_jobs().await;
                     self.fire_due_jobs().await;
@@ -2456,6 +3387,19 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
                     self.check_identity_rotation().await;
                 }
             }
+        }
+    }
+
+    /// Enforce the current kernel boundary and publish this tick's capabilities.
+    async fn refresh_egress_readiness(&mut self) {
+        let egress = self.enforce_live_egress_or_stop().await;
+        if let Some(readiness) = self.readiness.clone() {
+            readiness
+                .set_capabilities(crate::meat::cluster_state::NodeCapabilities {
+                    egress,
+                    dns: self.supervisor.dns_capability(),
+                })
+                .await;
         }
     }
 
@@ -2488,6 +3432,24 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
         #[cfg(not(all(feature = "ebpf", target_os = "linux")))]
         let egress_affected_workloads = Vec::new();
 
+        // The report deadline is two seconds. Bound the evidence read without
+        // hiding capacity when inventory is unavailable or internally ambiguous.
+        let launches = match tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            self.supervisor.grill().launch_inventory(),
+        )
+        .await
+        {
+            Ok(Ok(Some(launches))) => {
+                let count = launches.len();
+                let by_instance: std::collections::HashMap<_, _> = launches
+                    .into_iter()
+                    .map(|launch| (launch.instance_id.clone(), launch))
+                    .collect();
+                (by_instance.len() == count).then_some(by_instance)
+            }
+            _ => None,
+        };
         let instances = self.supervisor.list_instances();
         let snapshot = AgentSnapshot {
             instances: instances
@@ -2526,6 +3488,14 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
                     };
 
                     InstanceSnapshot {
+                        execution: launches
+                            .as_ref()
+                            .and_then(|known| known.get(&inst.id))
+                            .filter(|launch| inst.oci_spec.as_ref() == Some(&launch.spec))
+                            .map(|launch| crate::grill::RuntimeExecution {
+                                instance_id: launch.instance_id.clone(),
+                                generation: launch.generation.clone(),
+                            }),
                         app_name: inst.app_name.clone(),
                         namespace: inst.namespace.clone(),
                         instance_id,
@@ -2574,6 +3544,9 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
         crate::meat::cluster_state::NodeCapabilities,
         std::collections::HashSet<InstanceId>,
     ) {
+        #[cfg(test)]
+        self.egress_observation_count
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let Some(handle) = self.onion_ebpf.as_ref() else {
             return (
                 crate::meat::cluster_state::NodeCapabilities {
@@ -2599,7 +3572,9 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
         let enforced = self
             .egress_bindings
             .iter()
-            .filter(|(_, binding)| enforced_cgroups.contains(&binding.cgroup_id))
+            .filter(|(_, binding)| {
+                binding.phase == PolicyPhase::Owned && enforced_cgroups.contains(&binding.cgroup_id)
+            })
             .map(|(instance_id, _)| instance_id.clone())
             .collect();
         (capabilities, enforced)
@@ -2613,6 +3588,9 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
         crate::meat::cluster_state::NodeCapabilities,
         std::collections::HashSet<InstanceId>,
     ) {
+        #[cfg(test)]
+        self.egress_observation_count
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         (
             crate::meat::cluster_state::NodeCapabilities {
                 dns: self.supervisor.dns_capability(),
@@ -2667,6 +3645,7 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
                 NodeStatus {
                     node_id: name,
                     address: m.address.to_string(),
+                    api_address: None,
                     state: m.state.to_string(),
                     incarnation: m.incarnation,
                     is_council,
@@ -2729,130 +3708,247 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
         }
     }
 
+    fn validate_deploy_names(&self, config: &Config) -> Result<(), String> {
+        use crate::bun::deploy_operations::DeployTargetKind;
+        config
+            .validate_workload_names()
+            .map_err(|error| error.to_string())?;
+        for (name, spec) in &config.app {
+            let namespace = spec.namespace.as_deref().unwrap_or("default");
+            if self
+                .scheduled_jobs
+                .contains_key(&(name.clone(), namespace.to_string()))
+            {
+                return Err(format!(
+                    "workload {namespace}/{name} belongs to a registered cron job; stop it before deploying an app with that name"
+                ));
+            }
+            self.supervisor
+                .admit_workload_kind(
+                    name,
+                    spec.namespace.as_deref().unwrap_or("default"),
+                    DeployTargetKind::App,
+                )
+                .map_err(|error| error.to_string())?;
+        }
+        for (name, spec) in &config.job {
+            self.supervisor
+                .admit_workload_kind(
+                    name,
+                    spec.namespace.as_deref().unwrap_or("default"),
+                    DeployTargetKind::Job,
+                )
+                .map_err(|error| error.to_string())?;
+        }
+        Ok(())
+    }
+
+    /// Admit and track either an operator apply or one cron firing through
+    /// worker completion, including rollback and cancellation.
+    async fn begin_deploy(
+        &mut self,
+        config: Config,
+        events: mpsc::Sender<ApplyEvent>,
+        register_schedule: bool,
+        rerun_unknown_jobs: bool,
+    ) {
+        if self.startup_cleanup_pending {
+            let _ = events
+                .send(ApplyEvent::Error {
+                    message: "startup cleanup still owns runtime allocations; retry after recovery"
+                        .into(),
+                })
+                .await;
+            return;
+        }
+        if rerun_unknown_jobs && let Err(message) = super::jobs::validate_rerun(&config) {
+            let _ = events
+                .send(ApplyEvent::Error {
+                    message: message.into(),
+                })
+                .await;
+            return;
+        }
+        if let Err(message) = self.validate_deploy_names(&config) {
+            let _ = events.send(ApplyEvent::Error { message }).await;
+            return;
+        }
+        let operation = match self.deploy_operations.start(&config).await {
+            Ok(operation) => operation,
+            Err(error) => {
+                let message = format!("deploy refused: {error}");
+                self.record_event(
+                    crate::bun::events::EventKind::Deploy,
+                    crate::bun::events::EventSeverity::Critical,
+                    None,
+                    None,
+                    message.clone(),
+                )
+                .await;
+                let _ = events.send(ApplyEvent::Error { message }).await;
+                return;
+            }
+        };
+        let _ = events
+            .send(ApplyEvent::Accepted {
+                operation_id: operation.id().to_string(),
+            })
+            .await;
+        if self.draining.load(std::sync::atomic::Ordering::Relaxed) {
+            let message = "node is draining for a binary upgrade; retry shortly".to_string();
+            self.record_event(
+                crate::bun::events::EventKind::Deploy,
+                crate::bun::events::EventSeverity::Critical,
+                None,
+                None,
+                "deploy refused while node is draining".to_string(),
+            )
+            .await;
+            operation
+                .finish(
+                    crate::bun::deploy_operations::DeployOperationOutcome::Failed,
+                    message.clone(),
+                )
+                .await;
+            let _ = events.send(ApplyEvent::Error { message }).await;
+            return;
+        }
+        // Register any cron-scheduled jobs so the event loop fires them
+        // on their schedule rather than at deploy time (E).
+        if register_schedule && let Err(error) = self.register_scheduled_jobs(&config).await {
+            let message = error.to_string();
+            operation
+                .finish(
+                    crate::bun::deploy_operations::DeployOperationOutcome::Failed,
+                    message.clone(),
+                )
+                .await;
+            let _ = events.send(ApplyEvent::Error { message }).await;
+            return;
+        }
+
+        // Forward deploy events to the caller, mirroring errors into the
+        // event store. The deploy itself runs on its own task so a slow
+        // pull or a rolling health wait can't wedge this loop
+        // (DEP4/codex-M3); it drives its authoritative steps back
+        // through `deploy_ops_tx`.
+        let (forward_tx, mut forward_rx) = mpsc::channel(64);
+        let event_store = self.events.clone();
+        let observed_operation = operation.clone();
+        let worker = DeployWorker {
+            rerun_unknown_jobs,
+            grill: self.supervisor.grill().clone(),
+            ops: DeployOps {
+                tx: self.deploy_ops_tx.clone(),
+            },
+            drains: self.drains.clone(),
+            operation: Some(operation),
+        };
+        let worker_task = tokio::spawn(async move {
+            worker.run_deploy(config, forward_tx).await;
+        });
+        tokio::spawn(async move {
+            use crate::bun::deploy_operations::DeployOperationOutcome;
+            let mut outcome = DeployOperationOutcome::Unknown;
+            let mut message = "deploy worker ended without a terminal event".to_string();
+            let mut completion = None;
+            let mut events = Some(events);
+            while let Some(event) = forward_rx.recv().await {
+                match &event {
+                    ApplyEvent::Complete { created, .. } => {
+                        if outcome != DeployOperationOutcome::Failed {
+                            outcome = DeployOperationOutcome::Completed;
+                            message = format!("deploy completed ({created} instances)");
+                            // Success becomes visible only after all trailing
+                            // bookkeeping and the worker itself have finished.
+                            completion = Some(event);
+                        }
+                        continue;
+                    }
+                    ApplyEvent::Error { message: error } => {
+                        outcome = DeployOperationOutcome::Failed;
+                        message = error.clone();
+                        completion = None;
+                        if let Some(store) = &event_store {
+                            let timestamp = SystemTime::now()
+                                .duration_since(SystemTime::UNIX_EPOCH)
+                                .unwrap_or_default()
+                                .as_secs();
+                            store.write().await.record(
+                                timestamp,
+                                crate::bun::events::EventKind::Deploy,
+                                crate::bun::events::EventSeverity::Critical,
+                                None,
+                                None,
+                                None,
+                                error.clone(),
+                            );
+                        }
+                    }
+                    _ => {}
+                }
+                // A stalled or disconnected observer cannot hold the
+                // worker's outcome hostage. Close a full stream; its
+                // client sees an incomplete stream and can query the ID.
+                if let Some(sender) = &events
+                    && sender.try_send(event).is_err()
+                {
+                    events = None;
+                }
+            }
+            if let Err(error) = worker_task.await {
+                outcome = DeployOperationOutcome::Unknown;
+                message = format!("deploy worker ended unexpectedly: {error}");
+                completion = None;
+            } else if observed_operation.cancellation_observed() {
+                outcome = DeployOperationOutcome::Cancelled;
+                message = "deploy cancelled; in-flight work has finished".into();
+                completion = None;
+            }
+            // Error events can precede rollback. Release target ownership
+            // only after the worker has completed every mutation.
+            observed_operation.finish(outcome, message.clone()).await;
+            if let Some(sender) = events {
+                if let Some(event) = completion {
+                    let _ = sender.try_send(event);
+                } else if outcome == DeployOperationOutcome::Unknown {
+                    let _ = sender.try_send(ApplyEvent::Error { message });
+                }
+            }
+        });
+    }
+
     /// Handle a single command.
     async fn handle_command(&mut self, cmd: AgentCommand) {
         match cmd {
             AgentCommand::Deploy { config, events } => {
-                let operation = match self.deploy_operations.start(&config).await {
-                    Ok(operation) => operation,
-                    Err(error) => {
-                        let message = format!("deploy refused: {error}");
-                        self.record_event(
-                            crate::bun::events::EventKind::Deploy,
-                            crate::bun::events::EventSeverity::Critical,
-                            None,
-                            None,
-                            message.clone(),
-                        )
-                        .await;
-                        let _ = events.send(ApplyEvent::Error { message }).await;
-                        return;
-                    }
-                };
-                let _ = events
-                    .send(ApplyEvent::Accepted {
-                        operation_id: operation.id().to_string(),
-                    })
-                    .await;
-                if self.draining.load(std::sync::atomic::Ordering::Relaxed) {
-                    let message =
-                        "node is draining for a binary upgrade; retry shortly".to_string();
-                    self.record_event(
-                        crate::bun::events::EventKind::Deploy,
-                        crate::bun::events::EventSeverity::Critical,
-                        None,
-                        None,
-                        "deploy refused while node is draining".to_string(),
-                    )
-                    .await;
-                    operation
-                        .finish(
-                            crate::bun::deploy_operations::DeployOperationOutcome::Failed,
-                            message.clone(),
-                        )
-                        .await;
-                    let _ = events.send(ApplyEvent::Error { message }).await;
-                    return;
-                }
-                // Register any cron-scheduled jobs so the event loop fires them
-                // on their schedule rather than at deploy time (E).
-                self.register_scheduled_jobs(&config);
-
-                // Forward deploy events to the caller, mirroring errors into the
-                // event store. The deploy itself runs on its own task so a slow
-                // pull or a rolling health wait can't wedge this loop
-                // (DEP4/codex-M3); it drives its authoritative steps back
-                // through `deploy_ops_tx`.
-                let (forward_tx, mut forward_rx) = mpsc::channel(64);
-                let event_store = self.events.clone();
-                let observed_operation = operation.clone();
-                tokio::spawn(async move {
-                    while let Some(event) = forward_rx.recv().await {
-                        match &event {
-                            ApplyEvent::Complete { created, .. } => {
-                                observed_operation
-                                    .finish(
-                                        crate::bun::deploy_operations::DeployOperationOutcome::Completed,
-                                        format!("deploy completed ({created} instances)"),
-                                    )
-                                    .await;
-                            }
-                            ApplyEvent::Error { message } => {
-                                observed_operation
-                                    .finish(
-                                        crate::bun::deploy_operations::DeployOperationOutcome::Failed,
-                                        message.clone(),
-                                    )
-                                    .await;
-                                if let Some(store) = &event_store {
-                                    let timestamp = SystemTime::now()
-                                        .duration_since(SystemTime::UNIX_EPOCH)
-                                        .unwrap_or_default()
-                                        .as_secs();
-                                    store.write().await.record(
-                                        timestamp,
-                                        crate::bun::events::EventKind::Deploy,
-                                        crate::bun::events::EventSeverity::Critical,
-                                        None,
-                                        None,
-                                        None,
-                                        message.clone(),
-                                    );
-                                }
-                            }
-                            _ => {}
-                        }
-                        // A disconnected SSE client doesn't cancel the deploy or
-                        // its evidence. Keep draining the worker to a terminal
-                        // outcome even when this send fails.
-                        let _ = events.send(event).await;
-                    }
-                    observed_operation
-                        .finish(
-                            crate::bun::deploy_operations::DeployOperationOutcome::Unknown,
-                            "deploy worker ended without a terminal event",
-                        )
-                        .await;
-                });
-                let worker = DeployWorker {
-                    grill: self.supervisor.grill().clone(),
-                    port_allocator: self.supervisor.port_allocator(),
-                    ops: DeployOps {
-                        tx: self.deploy_ops_tx.clone(),
-                    },
-                    drains: self.drains.clone(),
-                    operation: Some(operation),
-                };
-                tokio::spawn(async move {
-                    worker.run_deploy(config, forward_tx).await;
-                });
+                self.begin_deploy(config, events, true, false).await;
+            }
+            AgentCommand::RerunJobs { config, events } => {
+                self.begin_deploy(config, events, true, true).await;
             }
             AgentCommand::Stop {
                 app_name,
                 namespace,
                 response,
             } => {
-                let result = self.stop_app(&app_name, &namespace).await;
+                let result = self.stop_workload_when_idle(&app_name, &namespace).await;
+                let _ = response.send(result);
+            }
+            AgentCommand::Retire {
+                app_name,
+                namespace,
+                response,
+            } => {
+                let result = self.retire_workload(&app_name, &namespace).await;
+                let _ = response.send(result);
+            }
+            AgentCommand::RetireTestResources {
+                app_name,
+                namespace,
+                response,
+            } => {
+                let result = self.retire_test_resources(&app_name, &namespace).await;
                 let _ = response.send(result);
             }
             AgentCommand::Status { response } => {
@@ -2922,6 +4018,16 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
                     .filter(|image| !image.is_empty())
                     .collect();
                 let _ = response.send(images);
+            }
+            AgentCommand::CancelDeploy {
+                operation_id,
+                response,
+            } => {
+                let operation = self
+                    .deploy_operations
+                    .request_cancellation(&operation_id)
+                    .await;
+                let _ = response.send(operation);
             }
             AgentCommand::DeployOperations { response } => {
                 let _ = response.send(self.deploy_operations.snapshot().await);
@@ -3015,25 +4121,36 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
                 let _ = response.send(result);
             }
             AgentCommand::InjectPartition {
+                reservation,
                 peers,
                 duration_secs,
                 injected_by,
                 response,
             } => {
-                // Legacy chaos API — create a partition fault in the registry
-                let request = crate::smoker::types::FaultRequest {
-                    fault_type: crate::smoker::types::FaultType::CouncilPartition,
-                    target_service: peers.join(","),
-                    namespace: None,
-                    target_instance: None,
-                    target_node: None,
-                    duration: std::time::Duration::from_secs(duration_secs),
-                    injected_by,
-                    reason: Some("legacy chaos partition".into()),
-                    include_leader: false,
-                    override_safety: false,
-                    acknowledged: false,
+                let Some(grant) = reservation else {
+                    let _ = response.send(Err(BunError::FaultRejected {
+                        reason: "partitions require a committed cluster reservation".into(),
+                    }));
+                    return;
                 };
+                let request = grant.request.clone();
+                if request.target_service != peers.join(",")
+                    || request.duration != std::time::Duration::from_secs(duration_secs)
+                    || request.injected_by != injected_by
+                    || !matches!(
+                        request.fault_type,
+                        crate::smoker::types::FaultType::CouncilPartition
+                    )
+                {
+                    let _ = response.send(Err(BunError::FaultRejected {
+                        reason: "partition grant does not match the operation".into(),
+                    }));
+                    return;
+                }
+                if let Err(reason) = self.node_fault_fence.activate(&grant, &request) {
+                    let _ = response.send(Err(BunError::FaultRejected { reason }));
+                    return;
+                }
                 // Safety rails apply to the legacy path too (M1): a partition
                 // that would strand quorum must be refused, not waved through
                 // just because it came in on the old chaos API.
@@ -3048,6 +4165,7 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
                     return;
                 }
                 let rule = self.fault_registry.insert(&request);
+                self.node_fault_fence.active = Some((grant.sequence, rule.id));
                 // L15: actually partition. Resolve each peer (by name)
                 // to its gossip address from membership, then block both
                 // the gossip and Raft transports to it — the old code
@@ -3164,7 +4282,35 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
                     );
                 });
             }
+            AgentCommand::PrepareNodeFault {
+                mut request,
+                response,
+            } => {
+                let result = crate::smoker::config::effective_duration(
+                    request.duration,
+                    false,
+                    &self.smoker_config,
+                )
+                .map(|duration| {
+                    request.duration = duration;
+                    (self.node_fault_fence.boot_id.clone(), request)
+                })
+                .map_err(|reason| BunError::FaultRejected { reason });
+                let _ = response.send(result);
+            }
+            AgentCommand::FenceNodeFault {
+                only_if_finished,
+                reservation,
+                response,
+            } => {
+                let result = self
+                    .fence_node_fault(&reservation, only_if_finished)
+                    .await
+                    .map_err(|reason| BunError::FaultRejected { reason });
+                let _ = response.send(result);
+            }
             AgentCommand::InjectFault {
+                reservation,
                 mut request,
                 response,
             } => {
@@ -3178,6 +4324,19 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
                 ) {
                     Ok(effective) => request.duration = effective,
                     Err(reason) => {
+                        let _ = response.send(Err(BunError::FaultRejected { reason }));
+                        return;
+                    }
+                }
+
+                if request.fault_type.is_node_targeted() {
+                    let result = reservation
+                        .as_ref()
+                        .ok_or_else(|| {
+                            "node faults require a committed cluster reservation".to_string()
+                        })
+                        .and_then(|grant| self.node_fault_fence.activate(grant, &request));
+                    if let Err(reason) = result {
                         let _ = response.send(Err(BunError::FaultRejected { reason }));
                         return;
                     }
@@ -3204,6 +4363,9 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
                 // be applied must not report success (the old code
                 // recorded everything, injecting nothing).
                 let rule = self.fault_registry.insert(&request);
+                if let Some(grant) = &reservation {
+                    self.node_fault_fence.active = Some((grant.sequence, rule.id));
+                }
                 match self.apply_fault(&rule).await {
                     Ok(()) => {
                         let summary = crate::smoker::types::FaultSummary::from(&rule);
@@ -3323,17 +4485,49 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
                     .collect();
                 let _ = response.send(results);
             }
-            AgentCommand::SyncClusterCatalog { catalog, ingress } => {
-                let ingress = ingress
-                    .into_iter()
-                    .map(|route| ((route.namespace, route.name), route.config))
-                    .collect();
-                // Route changes must propagate even when endpoints stay unchanged.
-                if self.cluster_catalog != *catalog || self.cluster_ingress_configs != ingress {
-                    self.cluster_catalog = *catalog;
-                    self.cluster_ingress_configs = ingress;
-                    self.rebuild_routing_table().await;
-                }
+            AgentCommand::SyncClusterCatalog {
+                generation,
+                catalog,
+                ingress,
+                response,
+            } => {
+                let result = self
+                    .publish_cluster_catalogue(generation, *catalog, ingress)
+                    .await;
+                let _ = response.send(result);
+            }
+            AgentCommand::SyncClusterConsumer {
+                generation,
+                catalog,
+                ingress,
+                withdrawals,
+                response,
+            } => {
+                let result = self
+                    .synchronise_consumer(generation, *catalog, ingress, withdrawals)
+                    .await;
+                let result = match result {
+                    Err(error) => {
+                        let retry = self.consumer_update(false);
+                        if retry.receipts.is_empty() {
+                            Err(error)
+                        } else {
+                            // Capacity or candidate refusal must not starve
+                            // already-proven receipts needed to free capacity.
+                            eprintln!("bun: consumer publication awaits retry: {error}");
+                            Ok(retry)
+                        }
+                    }
+                    success => success,
+                };
+                let _ = response.send(result);
+            }
+            AgentCommand::ConfirmConsumerReceipt {
+                generation,
+                response,
+            } => {
+                let result = self.confirm_consumer_receipt(generation).await;
+                let _ = response.send(result);
             }
             AgentCommand::Routes { response } => {
                 let table = self.routing_table.read().await;
@@ -3370,8 +4564,12 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
             AgentCommand::UpgradeRollback { version, response } => {
                 self.handle_upgrade_rollback(version, response).await;
             }
-            AgentCommand::UpgradeVerify { marker, response } => {
-                self.handle_upgrade_verify(marker, response).await;
+            AgentCommand::UpgradeVerify {
+                marker,
+                rejoin,
+                response,
+            } => {
+                self.handle_upgrade_verify(marker, rejoin, response).await;
             }
         }
     }
@@ -3443,7 +4641,7 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
         self.draining
             .store(true, std::sync::atomic::Ordering::Relaxed);
         let inventory = self.upgrade_inventory().await;
-        let prepared = match manager.prepare_rollback(version, inventory) {
+        let prepared = match manager.prepare_rollback(version, inventory).await {
             Ok(prepared) => prepared,
             Err(e) => {
                 self.draining
@@ -3473,6 +4671,7 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
     async fn handle_upgrade_verify(
         &mut self,
         marker: crate::upgrade::marker::UpgradeMarker,
+        rejoin: Result<(), String>,
         response: oneshot::Sender<Result<bool, BunError>>,
     ) {
         let Some(manager) = self.upgrade.clone() else {
@@ -3480,11 +4679,25 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
             return;
         };
 
+        if let Err(reason) = rejoin {
+            match manager.mark_revert_pending(&marker, &reason) {
+                Ok(()) => {
+                    let _ = response.send(Ok(false));
+                    eprintln!("bun: {reason}; restarting into the previous binary");
+                    std::process::exit(1);
+                }
+                Err(error) => {
+                    let _ = response.send(Err(BunError::Upgrade(error)));
+                }
+            }
+            return;
+        }
+
         // In cluster mode, workload placement is the cluster's decision:
         // the scheduler may legitimately move an app off this node while it
         // bounces, so a missing pre-upgrade instance is NOT an upgrade
-        // failure. We surviving the boot-grace period (this command runs on
-        // the new binary) is the liveness proof; genuine boot failures are
+        // failure. Boot grace and fresh gossip acknowledgement provide
+        // separate local and cluster liveness proofs; boot failures are
         // caught by the crash-loop budget, which reverts before we ever get
         // here. Single-node keeps the strict check as a local safety net —
         // there is no cluster to reschedule, so a vanished workload really
@@ -3814,6 +5027,12 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
                 })
             }
             FaultType::DnsNxdomain => {
+                if rule.namespace.as_deref().is_none_or(str::is_empty) {
+                    return Err("DNS faults require an explicit namespace".into());
+                }
+                if rule.target_instance.is_some() {
+                    return Err("DNS faults target a namespace-qualified service, not an individual instance".into());
+                }
                 // DNS resolution lives in the userspace responder
                 // (src/onion/dns.rs), so this fault does too. Republish the
                 // faulted-service set and the responder starts returning
@@ -4031,15 +5250,8 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
         pids
     }
 
-    /// The `(instance id, cgroup path)` pairs a resource fault should target.
-    ///
-    /// A resource fault names a service (and optionally one instance); the
-    /// cgroup a limit must be written to is `cgroup_path(namespace, app,
-    /// ordinal)` for each matching running instance. We take namespace and app
-    /// straight from the `WorkloadInstance`, and recover the ordinal from the
-    /// canonical instance id (falling back to `0` for a legacy id). This is
-    /// what threads instance metadata into `apply_fault` (CHAOS1): the fault
-    /// arrives with only a service name, and we turn it into concrete cgroups.
+    /// Original `(instance id, cgroup path)` pairs for matching workloads.
+    /// Rollout generations must never share their predecessor's target path.
     #[cfg(target_os = "linux")]
     fn target_instance_cgroups(
         &self,
@@ -4053,12 +5265,11 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
                     && rule.matches_namespace(&i.namespace)
                     && rule.target_instance.as_ref().is_none_or(|t| &i.id.0 == t)
             })
-            .map(|i| {
-                let ordinal = crate::grill::InstanceIdentity::parse(&i.id.0)
-                    .map(|ident| ident.ordinal)
-                    .unwrap_or(0);
-                let path = crate::grill::cgroup::cgroup_path(&i.namespace, &i.app_name, ordinal);
-                (i.id.clone(), path)
+            .filter_map(|instance| {
+                Some((
+                    instance.id.clone(),
+                    instance.oci_spec.as_ref()?.linux.host_cgroup_path()?,
+                ))
             })
             .collect()
     }
@@ -4157,6 +5368,66 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
         "8:0".to_string()
     }
 
+    /// Serialise the fence with activation and retain ownership if cleanup fails.
+    async fn fence_node_fault(
+        &mut self,
+        grant: &crate::smoker::reservation::NodeFaultReservation,
+        only_if_finished: bool,
+    ) -> Result<(), String> {
+        if only_if_finished
+            && (!self.node_fault_fence.consumed(grant)
+                || (grant.boot_id == self.node_fault_fence.boot_id
+                    && self.node_fault_fence.active.is_some_and(|(sequence, id)| {
+                        sequence == grant.sequence && self.fault_registry.get(id).is_some()
+                    })))
+        {
+            return Err("node fault activation or reversal is still pending".into());
+        }
+        if let Some(id) = self.node_fault_fence.fence(grant) {
+            if matches!(
+                grant.request.fault_type,
+                crate::smoker::types::FaultType::CouncilPartition
+            ) {
+                // The single node-experiment slot owns these transport lists.
+                // Peer addresses may have changed since activation; removing
+                // only today's addresses cannot prove the old entries are gone.
+                self.clear_partition().await;
+            }
+            if matches!(
+                grant.request.fault_type,
+                crate::smoker::types::FaultType::NodePressure { .. }
+            ) {
+                self.node_pressure.clear(id).await?;
+            }
+            if let Some(rule) = self.fault_registry.get(id).cloned() {
+                if !matches!(
+                    rule.fault_type,
+                    crate::smoker::types::FaultType::NodePressure { .. }
+                ) {
+                    self.reverse_fault(&rule).await;
+                }
+                self.fault_registry.remove(id);
+            }
+            // A failed apply or expiry may have removed its registry entry;
+            // inspect pressure helpers independently before acknowledging.
+        }
+        if matches!(
+            grant.request.fault_type,
+            crate::smoker::types::FaultType::NodePressure { .. }
+        ) {
+            self.node_pressure.confirm_no_helpers().await?;
+        }
+        if self
+            .node_fault_fence
+            .active
+            .is_some_and(|(sequence, _)| sequence <= grant.sequence)
+            && self.node_fault_fence.boot_id == grant.boot_id
+        {
+            self.node_fault_fence.active = None;
+        }
+        Ok(())
+    }
+
     /// Reverse a cleared or expired fault's persistent effect.
     ///
     /// eBPF network faults are undone by `delete_fault_bpf_entry`; this handles
@@ -4178,7 +5449,7 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
                 }
             }
             FaultReversal::CpuMax(saved) => {
-                for (_id, cgroup, value) in Self::rejoin_cgroups(rule, saved) {
+                for (_id, cgroup, value) in self.rejoin_cgroups(rule, saved) {
                     if let Err(e) = crate::smoker::resource::restore_cpu_max(&cgroup, &value) {
                         eprintln!(
                             "smoker: restore cpu.max on {} failed: {e}",
@@ -4188,7 +5459,7 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
                 }
             }
             FaultReversal::MemoryHigh(saved) => {
-                for (_id, cgroup, value) in Self::rejoin_cgroups(rule, saved) {
+                for (_id, cgroup, value) in self.rejoin_cgroups(rule, saved) {
                     if let Err(e) = crate::smoker::resource::restore_memory_high(&cgroup, &value) {
                         eprintln!(
                             "smoker: restore memory.high on {} failed: {e}",
@@ -4224,6 +5495,12 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
             FaultReversal::NodeQuiesce => {
                 if let Some(cluster) = &self.cluster {
                     cluster.partition_blocklists.node_gate.restore();
+                    eprintln!(
+                        "smoker: reversed node fault {} on {:?}; transports quiesced={}",
+                        rule.id,
+                        rule.target_node,
+                        cluster.partition_blocklists.node_gate.is_quiesced()
+                    );
                 }
             }
             FaultReversal::NodePressure => {
@@ -4239,19 +5516,24 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
 
     /// Pair each saved `(instance id, value)` with the instance's cgroup path.
     ///
-    /// The cgroup path is recomputed from the *current* target-instance list so
+    /// The cgroup path comes from the current instance's original OCI specification so
     /// reversal writes to the same directory the fault wrote to. An instance
     /// that has since gone away is dropped (nothing to restore).
     fn rejoin_cgroups(
+        &self,
         rule: &crate::smoker::types::FaultRule,
         saved: &[(String, String)],
     ) -> Vec<(String, std::path::PathBuf, String)> {
         saved
             .iter()
             .filter_map(|(id, value)| {
-                let ident = crate::grill::InstanceIdentity::parse(id)?;
-                let path =
-                    crate::grill::cgroup::cgroup_path(&ident.namespace, &ident.app, ident.ordinal);
+                let instance = self.supervisor.get_instance(&InstanceId(id.clone()))?;
+                if instance.app_name != rule.target_service
+                    || !rule.matches_namespace(&instance.namespace)
+                {
+                    return None;
+                }
+                let path = instance.oci_spec.as_ref()?.linux.host_cgroup_path()?;
                 // A specific instance target still restores only its own cgroup.
                 if rule.target_instance.as_ref().is_some_and(|t| t != id) {
                     return None;
@@ -4382,18 +5664,18 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
 
         let mut cgroup_ids = Vec::with_capacity(instances.len());
         for instance in instances {
-            let pid = self
+            let cgroup_id = self
                 .supervisor
                 .grill()
-                .pid(&instance)
+                .workload_cgroup(&instance)
                 .await
-                .ok_or_else(|| format!("source instance {} has no running PID", instance.0))?;
-            let cgroup_id = crate::sesame::egress::cgroup_id_of_pid(pid).ok_or_else(|| {
-                format!(
-                    "could not resolve the cgroup id for source instance {}",
-                    instance.0
-                )
-            })?;
+                .map_err(|error| format!("source instance {}: {error}", instance.0))?
+                .ok_or_else(|| {
+                    format!(
+                        "source instance {} has no verified workload cgroup",
+                        instance.0
+                    )
+                })?;
             cgroup_ids.push(cgroup_id);
         }
         cgroup_ids.sort_unstable();
@@ -4685,10 +5967,15 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
     /// backend into `backend_map` (L8) and reconcile namespace-firewall maps
     /// (NET5). Egress is deliberately absent here: it must already have been
     /// programmed before `start`, never repaired in post-start bookkeeping.
-    async fn finish_instance_networking(&mut self, app_name: &str, namespace: &str) {
+    async fn finish_instance_networking(
+        &mut self,
+        app_name: &str,
+        namespace: &str,
+    ) -> Result<(), BunError> {
         let service_id = crate::onion::service_id::ServiceId::new(namespace, app_name);
-        self.sync_backend_ebpf(&service_id).await;
+        self.publish_backend_ebpf(&service_id).await?;
         self.sync_firewall_ebpf().await;
+        Ok(())
     }
 
     /// Fast pre-create bookkeeping for a fresh instance (the loop side of the
@@ -4719,14 +6006,8 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
             .get_instance(instance_id)
             .and_then(|i| i.host_port);
 
-        // Extract the replica index from the canonical id's ordinal.
-        let instance_index: u32 = instance_id
-            .0
-            .rsplit('-')
-            .next()
-            .and_then(|s| s.parse().ok())
-            .unwrap_or(0);
-        let cgroup_path = crate::grill::cgroup::cgroup_path(namespace, app_name, instance_index);
+        let cgroup_path =
+            crate::grill::cgroup::instance_cgroup_path(namespace, app_name, instance_id)?;
         let cgroup_str = cgroup_path.to_string_lossy().into_owned();
         let netns_path = self
             .netns_paths
@@ -4740,39 +6021,8 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
                     .to_string(),
             });
         }
-        // Managed volumes must exist before the bind mounts reference them
-        // (runc fails create on a missing bind source, review M21).
-        let managed: Vec<crate::config::types::VolumeSpec> = spec
-            .volumes
-            .iter()
-            .filter(|v| v.source.is_none())
-            .cloned()
-            .collect();
-        if !managed.is_empty() {
-            let manager = crate::grill::volume::VolumeManager::new(self.volumes_dir.clone());
-            let volume_ns = namespace.to_string();
-            let volume_app = app_name.to_string();
-            tokio::task::spawn_blocking(move || {
-                for vol in &managed {
-                    manager.create_managed_volume(
-                        &volume_ns,
-                        &volume_app,
-                        &vol.path,
-                        vol.size.as_deref(),
-                    )?;
-                }
-                Ok::<(), crate::grill::volume::VolumeError>(())
-            })
-            .await
-            .map_err(|e| BunError::DeployFailed {
-                app_name: app_name.to_string(),
-                reason: format!("volume preparation task failed: {e}"),
-            })?
-            .map_err(|e| BunError::DeployFailed {
-                app_name: app_name.to_string(),
-                reason: format!("managed volume: {e}"),
-            })?;
-        }
+        // Claim test storage and provision every bind source before launch.
+        self.prepare_storage(app_name, namespace, spec).await?;
 
         // The per-instance identity dir must exist before create (PKI7).
         if let Err(e) = self.prepare_instance_identity(instance_id) {
@@ -4794,7 +6044,6 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
         Ok(PreparedInstance {
             oci_spec,
             cgroup_path,
-            cgroup_str,
             has_init: !spec.init.is_empty(),
         })
     }
@@ -4811,7 +6060,7 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
         container_ip: Option<std::net::Ipv4Addr>,
     ) -> Result<(), BunError> {
         self.spawn_log_forwarder(instance_id, app_name, namespace);
-        self.persist_instance_record(instance_id).await;
+        self.persist_instance_record(instance_id).await?;
 
         if let Some(instance) = self.supervisor.get_instance_mut(instance_id) {
             instance.container_ip = container_ip;
@@ -4842,16 +6091,68 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
                 host_port,
                 instance.state == ContainerState::Running,
             );
-            if let Err(e) = self.service_map.add_backend(
-                &crate::onion::service_id::ServiceId::new(namespace, app_name),
-                backend,
-            ) {
-                eprintln!("onion: backend not registered for {namespace}/{app_name}: {e}");
-            }
+            self.service_map
+                .add_backend(&service_id, backend)
+                .map_err(|error| BunError::BackendPublication {
+                    service: service_id,
+                    reason: error.to_string(),
+                })?;
         }
 
-        self.finish_instance_networking(app_name, namespace).await;
+        self.finish_instance_networking(app_name, namespace).await?;
         Ok(())
+    }
+
+    async fn reserve_rolling_instance(
+        &mut self,
+        id: &InstanceId,
+        app_name: &str,
+        namespace: &str,
+        spec: &AppSpec,
+    ) -> Result<Option<u16>, BunError> {
+        if let Some(owner) = self.supervisor.get_instance(id) {
+            return Err(BunError::DeployFailed {
+                app_name: app_name.into(),
+                reason: format!(
+                    "instance {id} is still owned by {}/{}",
+                    owner.namespace, owner.app_name
+                ),
+            });
+        }
+        let host_port = if spec.port.is_some() {
+            Some(self.supervisor.port_allocator.allocate().await?)
+        } else {
+            None
+        };
+        self.supervisor.instances.insert(
+            id.clone(),
+            super::supervisor::WorkloadInstance {
+                id: id.clone(),
+                app_name: app_name.into(),
+                namespace: namespace.into(),
+                state: ContainerState::Preparing,
+                health_counters: Default::default(),
+                restart_count: 0,
+                last_restart: None,
+                host_port,
+                container_ip: None,
+                created_at: Instant::now(),
+                restart_policy: Default::default(),
+                health_config: None,
+                is_job: false,
+                retry_pending: false,
+                image: spec.image.clone().unwrap_or_default(),
+                oci_spec: None,
+                identity: None,
+                identity_mount: None,
+            },
+        );
+        self.supervisor
+            .app_instances
+            .entry((app_name.into(), namespace.into()))
+            .or_default()
+            .push(id.clone());
+        Ok(host_port)
     }
 
     /// Fast pre-create bookkeeping for a rolling-redeploy instance: fail closed
@@ -4864,7 +6165,6 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
         namespace: &str,
         spec: &AppSpec,
         host_port: Option<u16>,
-        index: u32,
     ) -> Result<crate::grill::oci::OciSpec, BunError> {
         let identities = self.decrypt_identities(namespace).await;
         if identities.is_empty() && spec.env.values().any(|v| v.is_encrypted()) {
@@ -4876,11 +6176,13 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
                 ),
             });
         }
+        self.prepare_storage(app_name, namespace, spec).await?;
         if let Err(e) = self.prepare_instance_identity(instance_id) {
             eprintln!("bun: warning: {e}");
         }
-        let cgroup_path = crate::grill::cgroup::cgroup_path(namespace, app_name, index);
-        Self::oci_spec_with_secrets(
+        let cgroup_path =
+            crate::grill::cgroup::instance_cgroup_path(namespace, app_name, instance_id)?;
+        let oci_spec = Self::oci_spec_with_secrets(
             app_name,
             namespace,
             spec,
@@ -4890,99 +6192,15 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
             Some(&self.volumes_dir),
             None,
             identities,
-        )
-    }
-
-    /// Roll a failed rolling redeploy back: kill and clean up the new
-    /// instances (grill-created but never supervisor-tracked), release their
-    /// ports and identity dirs, and record the rollback in history.
-    #[allow(clippy::too_many_arguments)]
-    async fn rollback_rolling_deploy(
-        &mut self,
-        app_name: &str,
-        namespace: &str,
-        spec: &AppSpec,
-        new_ids: &[InstanceId],
-        new_prepared: &[InstanceId],
-        new_ports: &std::collections::HashMap<InstanceId, Option<u16>>,
-        replica_count: u32,
-    ) {
-        for new_id in new_ids {
-            let _ = self.supervisor.grill().kill(new_id).await;
-            self.clear_egress(new_id).await;
-            if let Some(port) = new_ports.get(new_id).copied().flatten() {
-                let _ = self.supervisor.port_allocator.release(port).await;
-            }
-        }
-        for new_id in new_prepared {
-            self.cleanup_instance_identity(new_id);
-        }
-        let entry = crate::meat::deploy_types::DeployHistoryEntry {
-            id: crate::meat::deploy_types::DeployId(
-                SystemTime::now()
-                    .duration_since(SystemTime::UNIX_EPOCH)
-                    .unwrap_or_default()
-                    .as_secs(),
-            ),
-            app_id: crate::meat::types::AppId::new(app_name, namespace),
-            image: spec.image.clone().unwrap_or_default(),
-            result: crate::meat::deploy_types::DeployResult::RolledBack,
-            created_at: SystemTime::now(),
-            completed_at: SystemTime::now(),
-            steps_completed: 0,
-            steps_total: replica_count as usize,
-            spec: Some(Box::new(spec.clone())),
-        };
-        self.deploy_history.write().await.push(entry);
-    }
-
-    /// Halt a failed rolling deploy without reverting (`auto_rollback = false`).
-    ///
-    /// Unlike [`rollback_rolling_deploy`], the healthy new instances that were
-    /// already published stay in service alongside the surviving old ones — the
-    /// operator inspects the mixed state and decides. Only the incomplete
-    /// instance (prepared but never made healthy, so not in `new_ids`) is torn
-    /// down, so a failed replacement can't leak its container, port or identity
-    /// dir.
-    #[allow(clippy::too_many_arguments)]
-    async fn halt_rolling_deploy(
-        &mut self,
-        app_name: &str,
-        namespace: &str,
-        spec: &AppSpec,
-        new_ids: &[InstanceId],
-        new_prepared: &[InstanceId],
-        new_ports: &std::collections::HashMap<InstanceId, Option<u16>>,
-        replica_count: u32,
-    ) {
-        for prepared in new_prepared {
-            if new_ids.contains(prepared) {
-                continue; // healthy and serving — leave it running
-            }
-            let _ = self.supervisor.grill().kill(prepared).await;
-            self.clear_egress(prepared).await;
-            if let Some(port) = new_ports.get(prepared).copied().flatten() {
-                let _ = self.supervisor.port_allocator.release(port).await;
-            }
-            self.cleanup_instance_identity(prepared);
-        }
-        let entry = crate::meat::deploy_types::DeployHistoryEntry {
-            id: crate::meat::deploy_types::DeployId(
-                SystemTime::now()
-                    .duration_since(SystemTime::UNIX_EPOCH)
-                    .unwrap_or_default()
-                    .as_secs(),
-            ),
-            app_id: crate::meat::types::AppId::new(app_name, namespace),
-            image: spec.image.clone().unwrap_or_default(),
-            result: crate::meat::deploy_types::DeployResult::Halted,
-            created_at: SystemTime::now(),
-            completed_at: SystemTime::now(),
-            steps_completed: new_ids.len(),
-            steps_total: replica_count as usize,
-            spec: Some(Box::new(spec.clone())),
-        };
-        self.deploy_history.write().await.push(entry);
+        )?;
+        let owner = self
+            .supervisor
+            .get_instance_mut(instance_id)
+            .ok_or_else(|| BunError::InstanceNotFound {
+                instance_id: instance_id.clone(),
+            })?;
+        owner.oci_spec = Some(oci_spec.clone());
+        Ok(oci_spec)
     }
 
     /// Forget the old instances and register the healthy new ones after a
@@ -5004,11 +6222,16 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
         new_ips: &std::collections::HashMap<InstanceId, Option<std::net::Ipv4Addr>>,
         mut new_specs: std::collections::HashMap<InstanceId, crate::grill::oci::OciSpec>,
         now: Instant,
-    ) {
+    ) -> Result<(), BunError> {
         // DEP5: the worker routed traffic to the fresh instances (published
         // backends) before draining and stopping the old ones, so by the time
         // this op runs the cut-over has already happened. What's left is to
         // tear the old bookkeeping down and install the new.
+        // A failed first cleanup must not leave another exited old instance
+        // eligible for the crash-restart driver.
+        for old_id in existing {
+            self.retain_stopped_instance(old_id);
+        }
         let service_id = crate::onion::service_id::ServiceId::new(namespace, app_name);
         // M7: publishing backends and retiring old instances now happen
         // incrementally as the rollout steps, so by the time we get here both
@@ -5025,24 +6248,21 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
                         host_port,
                         true,
                     );
-                    if let Err(e) = self.service_map.add_backend(&service_id, backend) {
-                        eprintln!("onion: backend not registered for {service_id:?}: {e}");
-                    }
+                    self.service_map
+                        .add_backend(&service_id, backend)
+                        .map_err(|error| BunError::BackendPublication {
+                            service: service_id.clone(),
+                            reason: error.to_string(),
+                        })?;
                 }
             }
             self.rebuild_routing_table().await;
         }
 
         for old_id in existing {
-            // NET6: lift the retiring instance's egress enforcement.
-            self.clear_egress(old_id).await;
-            self.cleanup_instance_identity(old_id);
+            self.finish_retire_bookkeeping(old_id).await?;
         }
-        self.supervisor.remove_app(app_name, namespace).await;
-        self.remove_backend_ebpf(&service_id).await;
-        for old_id in existing {
-            self.remove_instance_record(old_id);
-        }
+        self.withdraw_service_ebpf(&service_id).await?;
         let _ = self.service_map.unregister(&service_id);
 
         for new_id in new_ids {
@@ -5056,6 +6276,11 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
                 self.supervisor
                     .register_health(new_id.clone(), cfg.clone(), now);
             }
+            let (identity, identity_mount) = self
+                .supervisor
+                .get_instance_mut(new_id)
+                .map(|owner| (owner.identity.take(), owner.identity_mount.take()))
+                .unwrap_or_default();
             self.supervisor.instances.insert(
                 new_id.clone(),
                 super::supervisor::WorkloadInstance {
@@ -5072,10 +6297,11 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
                     restart_policy: crate::bun::restart::RestartPolicy::default(),
                     health_config,
                     is_job: false,
+                    retry_pending: false,
                     image: spec.image.clone().unwrap_or_default(),
                     oci_spec: new_specs.remove(new_id),
-                    identity: None,
-                    identity_mount: None,
+                    identity,
+                    identity_mount,
                 },
             );
         }
@@ -5090,7 +6316,7 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
                     Some(f.allow_from.clone())
                 }
             });
-            let _ = self.service_map.register(&service_id, port, firewall);
+            self.register_local_service(&service_id, port, firewall)?;
 
             for new_id in new_ids {
                 if let Some(host_port) = new_ports.get(new_id).copied().flatten() {
@@ -5101,14 +6327,17 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
                         host_port,
                         true,
                     );
-                    if let Err(e) = self.service_map.add_backend(&service_id, backend) {
-                        eprintln!("onion: backend not registered for {service_id:?}: {e}");
-                    }
+                    self.service_map
+                        .add_backend(&service_id, backend)
+                        .map_err(|error| BunError::BackendPublication {
+                            service: service_id.clone(),
+                            reason: error.to_string(),
+                        })?;
                 }
             }
         }
 
-        self.finish_instance_networking(app_name, namespace).await;
+        self.finish_instance_networking(app_name, namespace).await?;
         if let Some(ref ingress) = spec.ingress {
             self.ingress_configs.insert(
                 (namespace.to_string(), app_name.to_string()),
@@ -5133,6 +6362,7 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
             spec: Some(Box::new(spec.clone())),
         };
         self.deploy_history.write().await.push(entry);
+        Ok(())
     }
 
     /// Post-start bookkeeping for a job instance (the loop side of the former
@@ -5148,17 +6378,8 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
         if let Some(instance) = self.supervisor.get_instance_mut(instance_id) {
             instance.oci_spec = Some(oci_spec);
         }
-        {
-            let instance = self
-                .supervisor
-                .get_instance_mut(instance_id)
-                .ok_or_else(|| BunError::InstanceNotFound {
-                    instance_id: instance_id.clone(),
-                })?;
-            instance.state = instance.state.transition_to(ContainerState::Starting)?;
-        }
         self.spawn_log_forwarder(instance_id, job_name, namespace);
-        self.persist_instance_record(instance_id).await;
+        self.persist_instance_record(instance_id).await?;
         {
             let instance = self
                 .supervisor
@@ -5184,16 +6405,19 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
     /// required but cannot be guaranteed (connect6 missing, cgroup id
     /// unresolvable, map programming failed).
     #[cfg(all(feature = "ebpf", target_os = "linux"))]
-    async fn apply_egress_pre_start(
+    async fn apply_network_pre_start(
         &mut self,
         instance_id: &InstanceId,
         app_name: &str,
-        spec: &AppSpec,
+        spec: Option<&AppSpec>,
         cgroup_path: &std::path::Path,
     ) -> Result<(), BunError> {
+        self.retain_network_reference(instance_id, spec).await?;
         use crate::sesame::egress::{self, PreStartEgress};
 
-        let has_allowlist = spec.egress.as_ref().is_some_and(|e| !e.allow.is_empty());
+        let has_allowlist = spec
+            .and_then(|spec| spec.egress.as_ref())
+            .is_some_and(|e| !e.allow.is_empty());
         let capability = match self.onion_ebpf.as_ref() {
             Some(handle) => {
                 let handle = handle.lock().await;
@@ -5212,14 +6436,24 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
         // inode — the id `bpf_get_current_cgroup_id()` will report — is
         // known before the process exists. runc joins an existing
         // `cgroupsPath` directory untouched, keeping the inode stable.
-        let cgroup_id = if has_allowlist && capability.can_enforce_allowlist() {
+        let cgroup_id = if capability.can_enforce_allowlist() {
             let _ = tokio::fs::create_dir_all(cgroup_path).await;
             egress::cgroup_id_of_path(cgroup_path)
         } else {
             None
         };
 
+        let require_source =
+            self.onion_ebpf.is_some() && self.supervisor.grill().honours_cgroup_path();
         match egress::plan_pre_start_egress(has_allowlist, capability, cgroup_id) {
+            PreStartEgress::NoPolicy if require_source => {
+                let cgroup_id = cgroup_id.ok_or_else(|| BunError::DeployFailed {
+                    app_name: app_name.into(),
+                    reason: "source namespace cgroup could not be prepared".into(),
+                })?;
+                self.program_egress_pre_start(instance_id, app_name, spec, cgroup_id)
+                    .await
+            }
             PreStartEgress::NoPolicy => Ok(()),
             PreStartEgress::Refuse { reason } => Err(BunError::DeployFailed {
                 app_name: app_name.to_string(),
@@ -5232,16 +6466,84 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
         }
     }
 
+    async fn retain_network_reference(
+        &mut self,
+        id: &InstanceId,
+        spec: Option<&AppSpec>,
+    ) -> Result<(), BunError> {
+        if spec.is_none_or(|spec| spec.port.is_none()) {
+            return Ok(());
+        }
+        if let Some(reference) = self.supervisor.grill().retain_network_reference(id).await? {
+            if reference.instance_id != *id {
+                return Err(BunError::RetirementState {
+                    instance_id: id.clone(),
+                    reason: "runtime returned another instance's network reference".into(),
+                });
+            }
+            if self
+                .network_references
+                .get(id)
+                .is_some_and(|original| original != &reference)
+            {
+                return Err(BunError::RetirementState {
+                    instance_id: id.clone(),
+                    reason: "original network reference still belongs to another generation".into(),
+                });
+            }
+            self.persist_discovery_reference(&reference).await?;
+            self.network_references.insert(id.clone(), reference);
+        }
+        Ok(())
+    }
+
+    async fn release_network_reference(
+        &mut self,
+        id: &InstanceId,
+        remote: Option<&crate::onion::producer::ProducerReleaseConfirmation>,
+    ) -> Result<(), BunError> {
+        let Some(reference) = self.network_references.get(id).cloned() else {
+            if self
+                .supervisor
+                .grill()
+                .network_reference(id)
+                .await?
+                .is_some()
+            {
+                return Err(BunError::RetirementState {
+                    instance_id: id.clone(),
+                    reason: "retained network reference requires original discovery reconciliation"
+                        .into(),
+                });
+            }
+            return Ok(());
+        };
+        self.authorise_local_discovery_release(&reference, remote)
+            .await?;
+        self.require_discovery_release_permission(&reference)?;
+        self.supervisor
+            .grill()
+            .release_network_reference(&reference)
+            .await?;
+        self.forget_released_discovery_reference(&reference).await?;
+        self.network_references.remove(id);
+        Ok(())
+    }
+
     /// A build without the eBPF data path cannot enforce an allowlist.
     #[cfg(not(all(feature = "ebpf", target_os = "linux")))]
-    async fn apply_egress_pre_start(
+    async fn apply_network_pre_start(
         &mut self,
-        _instance_id: &InstanceId,
+        instance_id: &InstanceId,
         app_name: &str,
-        spec: &AppSpec,
+        spec: Option<&AppSpec>,
         _cgroup_path: &std::path::Path,
     ) -> Result<(), BunError> {
-        if spec.egress.as_ref().is_some_and(|e| !e.allow.is_empty()) {
+        self.retain_network_reference(instance_id, spec).await?;
+        if spec
+            .and_then(|spec| spec.egress.as_ref())
+            .is_some_and(|e| !e.allow.is_empty())
+        {
             return Err(BunError::DeployFailed {
                 app_name: app_name.to_string(),
                 reason: "egress allowlist requires an eBPF-enabled binary".to_string(),
@@ -5260,154 +6562,112 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
         &mut self,
         instance_id: &InstanceId,
         app_name: &str,
-        spec: &AppSpec,
+        spec: Option<&AppSpec>,
         cgroup_id: u64,
     ) -> Result<(), BunError> {
-        use crate::sesame::egress;
-
-        let Some(handle) = self.onion_ebpf.clone() else {
-            return Err(BunError::DeployFailed {
-                app_name: app_name.to_string(),
-                reason: "eBPF disappeared before pre-start egress programming".to_string(),
-            });
-        };
-        let Some(egress_spec) = spec.egress.as_ref().filter(|e| !e.allow.is_empty()) else {
-            return Ok(());
-        };
-
-        // A previous life of this instance (crash restart) programmed a
-        // different cgroup id — the directory was recreated. Scrub it.
-        self.clear_egress(instance_id).await;
-
-        let allow = egress_spec.allow.clone();
-        let allow_for_resolve = allow.clone();
-        let resolved = match tokio::task::spawn_blocking(move || {
-            egress::resolve_egress_entries(&allow_for_resolve)
-        })
-        .await
-        {
-            Ok(Ok(entries)) => entries,
-            Ok(Err(e)) => {
-                eprintln!(
-                    "sesame: egress resolution failed for {}; starting deny-all: {e}",
-                    instance_id.0
-                );
-                return self
-                    .deny_all_pre_start(&handle, instance_id, app_name, cgroup_id, allow)
-                    .await;
+        let allow = spec
+            .and_then(|spec| spec.egress.as_ref())
+            .map(|policy| policy.allow.as_slice())
+            .unwrap_or_default();
+        self.clear_egress(instance_id).await?;
+        let resolved = Self::resolve_owned_egress(allow).await;
+        let union: Vec<_> = self
+            .egress_bindings
+            .values()
+            .filter(|binding| binding.phase == PolicyPhase::Owned && binding.cgroup_id == cgroup_id)
+            .flat_map(|binding| binding.resolved.iter().copied())
+            .chain(resolved.iter().copied())
+            .collect();
+        crate::sesame::egress::merge_cidr_ports(&union).map_err(|error| {
+            BunError::DeployFailed {
+                app_name: app_name.into(),
+                reason: error.to_string(),
             }
-            Err(_) => {
-                return self
-                    .deny_all_pre_start(&handle, instance_id, app_name, cgroup_id, allow)
-                    .await;
-            }
-        };
-
-        // Representation errors (too many ports on one CIDR) are permanent
-        // config problems, not transient failures: fail the deploy.
-        let merged = match egress::merge_cidr_ports(&resolved) {
-            Ok(merged) => merged,
-            Err(e) => {
-                return Err(BunError::DeployFailed {
-                    app_name: app_name.to_string(),
-                    reason: format!(
-                        "egress allowlist for {} cannot be programmed: {e}",
-                        instance_id.0
-                    ),
-                });
-            }
-        };
-
-        let mut ebpf = handle.lock().await;
-        // Cgroup ids are kernel inode numbers and can be recycled. Scrub every
-        // old exact/CIDR entry before enabling this instance, otherwise a
-        // stale allow from an unclean predecessor could survive into the new
-        // policy (or into a DNS-failure deny-all start).
-        if let Err(e) = egress::delete_cgroup_egress_state(&mut ebpf.bpf, cgroup_id) {
-            return Err(BunError::DeployFailed {
-                app_name: app_name.to_string(),
-                reason: format!(
-                    "could not scrub recycled cgroup state for {}: {e}",
-                    instance_id.0
-                ),
-            });
-        }
-        if let Err(e) = egress::set_egress_enforced(&mut ebpf.bpf, cgroup_id) {
-            return Err(BunError::DeployFailed {
-                app_name: app_name.to_string(),
-                reason: format!(
-                    "could not enable egress enforcement for {}: {e}",
-                    instance_id.0
-                ),
-            });
-        }
-        if let Err(e) =
-            egress::write_egress_destinations(&mut ebpf.bpf, cgroup_id, &resolved, &merged)
-        {
-            // Fail the deploy and leave nothing half-programmed behind.
-            let _ = egress::delete_cgroup_egress_state(&mut ebpf.bpf, cgroup_id);
-            return Err(BunError::DeployFailed {
-                app_name: app_name.to_string(),
-                reason: format!("egress map programming failed for {}: {e}", instance_id.0),
-            });
-        }
-        drop(ebpf);
-
+        })?;
+        let original_spec = self
+            .supervisor
+            .get_instance(instance_id)
+            .and_then(|instance| instance.oci_spec.clone())
+            .ok_or_else(|| {
+                BunError::AdoptionState(format!(
+                    "egress owner {instance_id} has no original runtime input"
+                ))
+            })?;
+        let source_identity = self
+            .supervisor
+            .get_instance(instance_id)
+            .map(|instance| (instance.namespace.clone(), instance.app_name.clone()))
+            .ok_or_else(|| BunError::InstanceNotFound {
+                instance_id: instance_id.clone(),
+            })?;
+        let source_namespace = crate::onion::vip::name_to_id(&source_identity.0);
+        let boot_id = tokio::task::spawn_blocking(super::egress_owners::boot_id)
+            .await
+            .map_err(|error| BunError::AdoptionState(error.to_string()))?
+            .map_err(|error| BunError::AdoptionState(error.to_string()))?;
         self.egress_bindings.insert(
             instance_id.clone(),
             EgressBinding {
+                phase: PolicyPhase::Owned,
                 cgroup_id,
-                allow,
+                source_namespace: Some(source_namespace),
+                allow: allow.to_vec(),
                 resolved,
+                original_spec,
+                runtime: self.supervisor.grill().runtime_kind(),
+                boot_id,
             },
         );
-        Ok(())
-    }
-
-    /// Pre-start deny-all: enforcement on, no allow entries. Unlike the
-    /// post-start variant, a failure here fails the deploy — the process
-    /// has not started yet, so refusing is still possible.
-    #[cfg(all(feature = "ebpf", target_os = "linux"))]
-    async fn deny_all_pre_start(
-        &mut self,
-        handle: &std::sync::Arc<tokio::sync::Mutex<crate::onion::ebpf::loader::OnionEbpf>>,
-        instance_id: &InstanceId,
-        app_name: &str,
-        cgroup_id: u64,
-        allow: Vec<String>,
-    ) -> Result<(), BunError> {
-        {
-            let mut ebpf = handle.lock().await;
-            if let Err(e) =
-                crate::sesame::egress::delete_cgroup_egress_state(&mut ebpf.bpf, cgroup_id)
-            {
-                return Err(BunError::DeployFailed {
-                    app_name: app_name.to_string(),
-                    reason: format!(
-                        "could not scrub recycled cgroup state for {}: {e}",
-                        instance_id.0
-                    ),
-                });
-            }
-            if let Err(e) = crate::sesame::egress::set_egress_enforced(&mut ebpf.bpf, cgroup_id) {
-                return Err(BunError::DeployFailed {
-                    app_name: app_name.to_string(),
-                    reason: format!(
-                        "could not enable egress enforcement for {}: {e}",
-                        instance_id.0
-                    ),
-                });
-            }
+        self.persist_egress_owners(self.egress_bindings.clone())
+            .await?;
+        let handle = self
+            .onion_ebpf
+            .clone()
+            .ok_or_else(|| BunError::DeployFailed {
+                app_name: app_name.into(),
+                reason: "kernel source policy is unavailable".into(),
+            })?;
+        self.cgroup_ns_bpf_keys.insert(cgroup_id);
+        crate::sesame::firewall::write_cgroup_namespace_entry(
+            &mut handle.lock().await.bpf,
+            cgroup_id,
+            source_namespace,
+        )
+        .map_err(|error| BunError::DeployFailed {
+            app_name: app_name.into(),
+            reason: error.to_string(),
+        })?;
+        let services = self
+            .service_map
+            .resolve_all()
+            .into_iter()
+            .cloned()
+            .collect::<Vec<_>>();
+        let sources = std::collections::HashMap::from([(source_identity, vec![cgroup_id])]);
+        let entries = crate::sesame::firewall::rules_to_bpf_entries(
+            &crate::sesame::firewall::resolve_firewall_rules(&services, &sources),
+        );
+        for (key, value) in entries {
+            // Remember partial publication before attempting the write. The
+            // durable source owner retains every grant until confirmed cleanup.
+            self.firewall_bpf_keys.insert(key);
+            crate::sesame::firewall::write_firewall_entry(&mut handle.lock().await.bpf, key, value)
+                .map_err(|error| BunError::DeployFailed {
+                    app_name: app_name.into(),
+                    reason: error.to_string(),
+                })?;
         }
-        self.egress_bindings.insert(
-            instance_id.clone(),
-            EgressBinding {
-                cgroup_id,
-                allow,
-                resolved: Vec::new(),
-            },
-        );
-        Ok(())
+        if allow.is_empty() {
+            return Ok(());
+        }
+        // Keep the enable flag while rebuilding. During a rollout the old and
+        // new instances may share a cgroup, so removing it would open a gap.
+        self.reprogram_cgroup_egress(cgroup_id, None)
+            .await
+            .map_err(|error| BunError::DeployFailed {
+                app_name: app_name.into(),
+                reason: format!("egress map programming failed for {instance_id}: {error}"),
+            })
     }
 
     /// Lift egress enforcement for a stopped instance's cgroup (L16).
@@ -5419,74 +6679,191 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
     /// cgroup path — deleting one instance's entries directly would wipe a
     /// co-tenant's policy.
     #[cfg(all(feature = "ebpf", target_os = "linux"))]
-    async fn clear_egress(&mut self, instance_id: &InstanceId) {
-        let Some(binding) = self.egress_bindings.remove(instance_id) else {
-            return;
+    async fn clear_egress(&mut self, instance_id: &InstanceId) -> Result<(), BunError> {
+        if self.egress_store_uncertain {
+            return Err(BunError::AdoptionState(
+                "egress ownership persistence is uncertain; restart to recover the checkpoint"
+                    .into(),
+            ));
+        }
+        let Some(binding) = self.egress_bindings.get(instance_id).cloned() else {
+            return Ok(());
         };
-        self.reprogram_cgroup_egress(binding.cgroup_id).await;
+        if binding.phase == PolicyPhase::Retired {
+            return Ok(());
+        }
+        let boot_id = tokio::task::spawn_blocking(super::egress_owners::boot_id)
+            .await
+            .map_err(|error| BunError::AdoptionState(error.to_string()))?
+            .map_err(|error| BunError::AdoptionState(error.to_string()))?;
+        if binding.boot_id == boot_id {
+            self.reprogram_cgroup_egress(binding.cgroup_id, Some(instance_id))
+                .await
+                .map_err(|error| BunError::RetirementState {
+                    instance_id: instance_id.clone(),
+                    reason: error.to_string(),
+                })?;
+        }
+        if binding.boot_id == boot_id
+            && binding.source_namespace.is_some()
+            && !self.egress_bindings.iter().any(|(id, owner)| {
+                id != instance_id
+                    && owner.phase == PolicyPhase::Owned
+                    && owner.cgroup_id == binding.cgroup_id
+            })
+        {
+            let handle = self
+                .onion_ebpf
+                .clone()
+                .ok_or_else(|| BunError::RetirementState {
+                    instance_id: instance_id.clone(),
+                    reason: "kernel source policy is unavailable".into(),
+                })?;
+            crate::sesame::firewall::delete_cgroup_firewall_state(
+                &mut handle.lock().await.bpf,
+                binding.cgroup_id,
+            )
+            .map_err(|error| BunError::RetirementState {
+                instance_id: instance_id.clone(),
+                reason: error.to_string(),
+            })?;
+            self.cgroup_ns_bpf_keys.remove(&binding.cgroup_id);
+            self.firewall_bpf_keys
+                .retain(|key| key.src_cgroup_id != binding.cgroup_id);
+        }
+        // The caller has retired the previous workload. A different boot proves the
+        // old kernel maps are gone; never delete a recycled current-boot key.
+        let mut confirmed = binding;
+        confirmed.phase = PolicyPhase::Retired;
+        confirmed.resolved.clear();
+        let mut owners = self.egress_bindings.clone();
+        owners.insert(instance_id.clone(), confirmed.clone());
+        self.persist_egress_owners(owners).await?;
+        self.egress_bindings.insert(instance_id.clone(), confirmed);
+        Ok(())
     }
 
     /// No-op without the eBPF data path.
     #[cfg(not(all(feature = "ebpf", target_os = "linux")))]
-    async fn clear_egress(&mut self, _instance_id: &InstanceId) {}
+    async fn clear_egress(&mut self, _instance_id: &InstanceId) -> Result<(), BunError> {
+        Ok(())
+    }
 
-    /// Rebuild the kernel egress state for one cgroup id from the current
-    /// bindings: delete every entry for the cgroup, then write the union
-    /// of what the surviving bindings allow (and the enforcement flag).
-    /// With no surviving binding the cgroup is scrubbed completely.
-    /// Failures leave the cgroup denying more than intended, never less.
+    /// Rebuild one cgroup's policy, excluding a retiring instance only from the
+    /// proposed kernel state. Its binding remains owned until every write succeeds.
     #[cfg(all(feature = "ebpf", target_os = "linux"))]
-    async fn reprogram_cgroup_egress(&mut self, cgroup_id: u64) {
+    async fn reprogram_cgroup_egress(
+        &mut self,
+        cgroup_id: u64,
+        excluding: Option<&InstanceId>,
+    ) -> Result<(), crate::sesame::egress::EgressMapError> {
         use crate::sesame::egress;
+        if self.egress_store_uncertain {
+            return Err(egress::EgressMapError::Unavailable);
+        }
+        let handle = self
+            .onion_ebpf
+            .clone()
+            .ok_or(egress::EgressMapError::Unavailable)?;
+        let survivors: Vec<_> = self
+            .egress_bindings
+            .iter()
+            .filter(|(id, binding)| {
+                binding.phase == PolicyPhase::Owned
+                    && !binding.allow.is_empty()
+                    && Some(*id) != excluding
+                    && binding.cgroup_id == cgroup_id
+            })
+            .map(|(_, binding)| binding)
+            .collect();
+        let mut ebpf = handle.lock().await;
+        if survivors.is_empty() {
+            return egress::delete_cgroup_egress_state(&mut ebpf.bpf, cgroup_id);
+        }
+        let union: Vec<_> = survivors
+            .iter()
+            .flat_map(|binding| binding.resolved.iter().copied())
+            .collect::<std::collections::BTreeSet<_>>()
+            .into_iter()
+            .collect();
+        let merged = egress::merge_cidr_ports(&union)?;
+        egress::set_egress_enforced(&mut ebpf.bpf, cgroup_id)?;
+        egress::delete_cgroup_egress_entries(&mut ebpf.bpf, cgroup_id)?;
+        egress::write_egress_destinations(&mut ebpf.bpf, cgroup_id, &union, &merged)
+    }
 
+    /// Stop every workload affected by an unconfirmed policy rewrite.
+    #[cfg(all(feature = "ebpf", target_os = "linux"))]
+    async fn handle_egress_rewrite_failure(
+        &mut self,
+        cgroup_id: u64,
+        error: crate::sesame::egress::EgressMapError,
+    ) {
+        eprintln!("sesame: egress rewrite failed for cgroup {cgroup_id}: {error}");
+        let affected = self
+            .egress_bindings
+            .iter()
+            .filter(|(_, binding)| {
+                binding.phase == PolicyPhase::Owned && binding.cgroup_id == cgroup_id
+            })
+            .map(|(id, _)| id.clone())
+            .collect();
+        self.stop_instances_after_egress_loss(affected).await;
+    }
+
+    /// Fence executing workloads whose original namespace identity is unavailable.
+    #[cfg(all(feature = "ebpf", target_os = "linux"))]
+    async fn enforce_live_source_or_stop(&mut self) {
+        if !self.supervisor.grill().honours_cgroup_path() {
+            return;
+        }
         let Some(handle) = self.onion_ebpf.clone() else {
             return;
         };
-        let union: Vec<egress::EgressDestination> = {
-            let mut set = std::collections::BTreeSet::new();
-            for binding in self
+        let instances: Vec<_> = self
+            .supervisor
+            .list_instances()
+            .into_iter()
+            .filter(|instance| {
+                !matches!(
+                    instance.state,
+                    ContainerState::Pending
+                        | ContainerState::Preparing
+                        | ContainerState::Stopped
+                        | ContainerState::Failed
+                )
+            })
+            .map(|instance| instance.id.clone())
+            .collect();
+        let mut failed = std::collections::HashSet::new();
+        let mut handle = handle.lock().await;
+        let hooks = handle.is_attached()
+            && handle.connect6_attached()
+            && handle.sendmsg4_attached()
+            && handle.sendmsg6_attached();
+        for id in instances {
+            let original = self
                 .egress_bindings
-                .values()
-                .filter(|b| b.cgroup_id == cgroup_id)
-            {
-                set.extend(binding.resolved.iter().copied());
-            }
-            set.into_iter().collect()
-        };
-        let survivors = self
-            .egress_bindings
-            .values()
-            .any(|b| b.cgroup_id == cgroup_id);
-
-        let mut ebpf = handle.lock().await;
-        if !survivors {
-            if let Err(e) = egress::delete_cgroup_egress_state(&mut ebpf.bpf, cgroup_id) {
-                eprintln!("sesame: could not scrub egress state for cgroup {cgroup_id}: {e}");
-            }
-            return;
-        }
-
-        if let Err(e) = egress::delete_cgroup_egress_entries(&mut ebpf.bpf, cgroup_id) {
-            eprintln!("sesame: could not clear egress entries for cgroup {cgroup_id}: {e}");
-        }
-        match egress::merge_cidr_ports(&union) {
-            Ok(merged) => {
-                if let Err(e) =
-                    egress::write_egress_destinations(&mut ebpf.bpf, cgroup_id, &union, &merged)
-                {
-                    eprintln!(
-                        "sesame: egress rewrite failed for cgroup {cgroup_id} \
-                         (unwritten destinations stay denied): {e}"
-                    );
-                }
-            }
-            Err(e) => {
-                eprintln!("sesame: egress CIDR merge failed for cgroup {cgroup_id}: {e}");
+                .get(&id)
+                .filter(|owner| owner.phase == PolicyPhase::Owned)
+                .and_then(|owner| {
+                    owner
+                        .source_namespace
+                        .map(|namespace| (owner.cgroup_id, namespace))
+                });
+            let valid = if let Some((cgroup, namespace)) = original {
+                hooks
+                    && crate::sesame::firewall::read_firewall_state(&mut handle.bpf, cgroup, 0)
+                        .is_ok_and(|state| state.source_namespace_id == Some(namespace))
+            } else {
+                false
+            };
+            if !valid {
+                failed.insert(id);
             }
         }
-        if let Err(e) = egress::set_egress_enforced(&mut ebpf.bpf, cgroup_id) {
-            eprintln!("sesame: could not re-enable egress enforcement for cgroup {cgroup_id}: {e}");
-        }
+        drop(handle);
+        self.stop_instances_after_egress_loss(failed).await;
     }
 
     /// Verify the security boundary on every event-loop tick. Map drift gets
@@ -5495,9 +6872,19 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
     /// affected workload. Keeping it running would turn its allowlist into a
     /// label rather than a control.
     #[cfg(all(feature = "ebpf", target_os = "linux"))]
-    async fn enforce_live_egress_or_stop(&mut self) {
+    async fn enforce_live_egress_or_stop(
+        &mut self,
+    ) -> crate::sesame::egress::EgressEnforcementCapability {
+        #[cfg(test)]
+        self.egress_observation_count
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         use crate::sesame::egress;
 
+        self.enforce_live_source_or_stop().await;
+
+        // Pending/preparing work cannot execute yet. The deployment driver
+        // installs policy before entering Initialising or Starting; monitoring
+        // must not race that installation while an image is still being pulled.
         let unbound: std::collections::HashSet<InstanceId> = self
             .supervisor
             .list_instances()
@@ -5505,10 +6892,17 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
             .filter(|instance| {
                 !matches!(
                     instance.state,
-                    ContainerState::Stopped | ContainerState::Failed
+                    ContainerState::Pending
+                        | ContainerState::Preparing
+                        | ContainerState::Stopped
+                        | ContainerState::Failed
                 )
             })
-            .filter(|instance| !self.egress_bindings.contains_key(&instance.id))
+            .filter(|instance| {
+                self.egress_bindings
+                    .get(&instance.id)
+                    .is_none_or(|binding| binding.phase != PolicyPhase::Owned)
+            })
             .filter(|instance| {
                 self.deployed_specs
                     .get(&(instance.app_name.clone(), instance.namespace.clone()))
@@ -5521,14 +6915,22 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
             .collect();
         let Some(handle) = self.onion_ebpf.clone() else {
             self.supervisor.set_egress_capability(Default::default());
-            let mut affected: std::collections::HashSet<InstanceId> =
-                self.egress_bindings.keys().cloned().collect();
+            let mut affected: std::collections::HashSet<InstanceId> = self
+                .egress_bindings
+                .iter()
+                .filter(|(_, binding)| binding.phase == PolicyPhase::Owned)
+                .map(|(id, _)| id.clone())
+                .collect();
             affected.extend(unbound);
             self.stop_instances_after_egress_loss(affected).await;
-            return;
+            return Default::default();
         };
-        let expected: std::collections::HashSet<u64> =
-            self.egress_bindings.values().map(|b| b.cgroup_id).collect();
+        let expected: std::collections::HashSet<u64> = self
+            .egress_bindings
+            .values()
+            .filter(|binding| binding.phase == PolicyPhase::Owned && !binding.allow.is_empty())
+            .map(|b| b.cgroup_id)
+            .collect();
         let (capability, kernel_enforced) = {
             let mut ebpf = handle.lock().await;
             let capability = egress::EgressEnforcementCapability {
@@ -5546,13 +6948,15 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
             if capability.can_enforce_allowlist() {
                 self.egress_affected_workloads.clear();
             }
-            return;
+            return capability;
         }
 
         let plan = egress::plan_live_egress_health(capability, &expected, &kernel_enforced);
         for cgroup_id in &plan.repair {
             eprintln!("sesame: live check restoring egress enforcement for cgroup {cgroup_id}");
-            self.reprogram_cgroup_egress(*cgroup_id).await;
+            if let Err(error) = self.reprogram_cgroup_egress(*cgroup_id, None).await {
+                self.handle_egress_rewrite_failure(*cgroup_id, error).await;
+            }
         }
 
         let mut fence: std::collections::HashSet<u64> = plan.fence.into_iter().collect();
@@ -5565,17 +6969,20 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
         }
         if fence.is_empty() && unbound.is_empty() {
             self.egress_affected_workloads.clear();
-            return;
+            return capability;
         }
 
         let mut affected_ids: std::collections::HashSet<InstanceId> = self
             .egress_bindings
             .iter()
-            .filter(|(_, binding)| fence.contains(&binding.cgroup_id))
+            .filter(|(_, binding)| {
+                binding.phase == PolicyPhase::Owned && fence.contains(&binding.cgroup_id)
+            })
             .map(|(id, _)| id.clone())
             .collect();
         affected_ids.extend(unbound);
         self.stop_instances_after_egress_loss(affected_ids).await;
+        capability
     }
 
     #[cfg(all(feature = "ebpf", target_os = "linux"))]
@@ -5596,18 +7003,91 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
         self.egress_affected_workloads
             .extend(affected_apps.iter().cloned());
         for (app_name, namespace) in affected_apps {
-            eprintln!("sesame: stopping {namespace}/{app_name}: live egress enforcement was lost");
+            eprintln!("sesame: stopping {namespace}/{app_name}: live kernel policy was lost");
             if let Err(error) = self.stop_app(&app_name, &namespace).await {
                 eprintln!(
                     "sesame: failed to stop {namespace}/{app_name} after egress loss: {error}"
                 );
+                if let Err(error) = self.fence_app_execution(&app_name, &namespace).await {
+                    eprintln!(
+                        "sesame: execution fencing remains unconfirmed for {namespace}/{app_name}: {error}"
+                    );
+                }
             }
         }
     }
 
+    /// Stop unsafe execution while preserving refused discovery and policy cleanup.
+    #[cfg(all(feature = "ebpf", target_os = "linux"))]
+    async fn fence_app_execution(
+        &mut self,
+        app_name: &str,
+        namespace: &str,
+    ) -> Result<(), BunError> {
+        let instances: Vec<_> = self
+            .supervisor
+            .list_instances()
+            .iter()
+            .filter(|instance| {
+                instance.app_name == app_name
+                    && instance.namespace == namespace
+                    && instance.state != ContainerState::Stopped
+            })
+            .map(|instance| {
+                (
+                    instance.id.clone(),
+                    instance.container_ip.is_some() && instance.host_port.is_some(),
+                )
+            })
+            .collect();
+        self.supervisor.stop_app(app_name, namespace).await?;
+        let mut first_error = None;
+        for (id, publishes_address) in instances {
+            let result = async {
+                if publishes_address {
+                    let reference = self.supervisor.grill().network_reference(&id).await?;
+                    if reference.is_none()
+                        || self
+                            .network_references
+                            .get(&id)
+                            .is_some_and(|original| reference.as_ref() != Some(original))
+                    {
+                        return Err(BunError::RetirementState {
+                            instance_id: id.clone(),
+                            reason: "execution fencing requires the original retained address"
+                                .into(),
+                        });
+                    }
+                }
+                self.retire_initialisers(&id).await?;
+                self.kill_and_wait_for_exit(&id).await
+            }
+            .await;
+            if let Err(error) = result {
+                first_error.get_or_insert(error);
+                continue;
+            }
+            if let Some(instance) = self.supervisor.get_instance_mut(&id)
+                && instance.state.can_transition_to(ContainerState::Stopped)
+            {
+                instance.state = ContainerState::Stopped;
+            }
+        }
+        // Address holds, service keys, grants and adoption records remain owned.
+        // An execution stop is not an acknowledgement of their retirement.
+        first_error.map_or(Ok(()), Err)
+    }
+
     /// Portable builds cannot have live egress bindings.
     #[cfg(not(all(feature = "ebpf", target_os = "linux")))]
-    async fn enforce_live_egress_or_stop(&mut self) {}
+    async fn enforce_live_egress_or_stop(
+        &mut self,
+    ) -> crate::sesame::egress::EgressEnforcementCapability {
+        #[cfg(test)]
+        self.egress_observation_count
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        Default::default()
+    }
 
     /// Periodically re-resolve DNS-based egress allowlists and reprogram the
     /// eBPF egress maps when an app's destination IPs change (L16). Rate-
@@ -5615,6 +7095,9 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
     /// enforces egress.
     #[cfg(all(feature = "ebpf", target_os = "linux"))]
     async fn reresolve_egress(&mut self) {
+        if self.egress_store_uncertain {
+            return;
+        }
         // ~5 minutes at the 1s event-loop tick.
         const RERESOLVE_EVERY_TICKS: u32 = 300;
         self.egress_reresolve_ticks += 1;
@@ -5630,6 +7113,7 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
         let bindings: Vec<(InstanceId, EgressBinding)> = self
             .egress_bindings
             .iter()
+            .filter(|(_, binding)| binding.phase == PolicyPhase::Owned)
             .map(|(k, v)| (k.clone(), v.clone()))
             .collect();
 
@@ -5657,7 +7141,10 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
             if let Some(b) = self.egress_bindings.get_mut(&instance_id) {
                 b.resolved = new_resolved;
             }
-            self.reprogram_cgroup_egress(binding.cgroup_id).await;
+            if let Err(error) = self.reprogram_cgroup_egress(binding.cgroup_id, None).await {
+                self.handle_egress_rewrite_failure(binding.cgroup_id, error)
+                    .await;
+            }
         }
     }
 
@@ -5668,14 +7155,17 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
     /// Reconcile kernel truth against live instances (the sweep half of the
     /// network-policy theme): scrub egress state whose cgroup no longer maps
     /// to a live instance, rewrite every live binding (idempotent repairs),
-    /// and prune stale `cgroup_namespace_map` keys. The one-second live check
+    /// while retaining unknown namespace keys. The one-second live check
     /// fences adopted policy-bearing workloads with no trustworthy binding;
     /// the sweep never installs their policy after they have already run.
     #[cfg(all(feature = "ebpf", target_os = "linux"))]
     async fn sweep_kernel_networking(&mut self) {
         use crate::sesame::egress;
 
-        if self.ebpf_sweep_interval_secs == 0 || self.onion_ebpf.is_none() {
+        if self.egress_store_uncertain
+            || self.ebpf_sweep_interval_secs == 0
+            || self.onion_ebpf.is_none()
+        {
             return;
         }
         self.ebpf_sweep_ticks += 1;
@@ -5698,11 +7188,17 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
             .filter(|i| {
                 !matches!(
                     i.state,
-                    crate::grill::state::ContainerState::Stopped
+                    crate::grill::state::ContainerState::Pending
+                        | crate::grill::state::ContainerState::Preparing
+                        | crate::grill::state::ContainerState::Stopped
                         | crate::grill::state::ContainerState::Failed
                 )
             })
-            .filter(|i| !self.egress_bindings.contains_key(&i.id))
+            .filter(|i| {
+                self.egress_bindings
+                    .get(&i.id)
+                    .is_none_or(|binding| binding.phase != PolicyPhase::Owned)
+            })
             .filter_map(|i| {
                 self.deployed_specs
                     .get(&(i.app_name.clone(), i.namespace.clone()))
@@ -5719,8 +7215,12 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
         self.stop_instances_after_egress_loss(missing).await;
 
         // 2. Kernel truth vs expected cgroups.
-        let expected: std::collections::HashSet<u64> =
-            self.egress_bindings.values().map(|b| b.cgroup_id).collect();
+        let expected: std::collections::HashSet<u64> = self
+            .egress_bindings
+            .values()
+            .filter(|binding| binding.phase == PolicyPhase::Owned && !binding.allow.is_empty())
+            .map(|b| b.cgroup_id)
+            .collect();
         let (kernel_enforced, kernel_entries) = {
             let mut ebpf = handle.lock().await;
             let enforced = match egress::list_enforced_cgroups(&mut ebpf.bpf) {
@@ -5758,31 +7258,14 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
         // only way lost entries (as opposed to a lost flag) come back.
         let live_cgroups: std::collections::HashSet<u64> = expected;
         for cgroup_id in live_cgroups {
-            self.reprogram_cgroup_egress(cgroup_id).await;
-        }
-
-        // 3. Namespace map: delete kernel keys no reconcile pass wrote,
-        //    then rebuild the desired state.
-        let desired_ns = self.cgroup_ns_bpf_keys.clone();
-        {
-            let mut ebpf = handle.lock().await;
-            match crate::sesame::firewall::list_cgroup_namespace_keys(&mut ebpf.bpf) {
-                Ok(kernel_ns) => {
-                    for cgroup_id in kernel_ns.difference(&desired_ns) {
-                        eprintln!(
-                            "sesame: sweep deleting stale cgroup-namespace entry {cgroup_id}"
-                        );
-                        let _ = crate::sesame::firewall::delete_cgroup_namespace_entry(
-                            &mut ebpf.bpf,
-                            *cgroup_id,
-                        );
-                    }
-                }
-                Err(e) => {
-                    eprintln!("sesame: sweep could not list cgroup-namespace keys: {e}");
-                }
+            if let Err(error) = self.reprogram_cgroup_egress(cgroup_id, None).await {
+                self.handle_egress_rewrite_failure(cgroup_id, error).await;
             }
         }
+
+        // Unknown kernel keys are not proof of abandoned ownership. Retained
+        // source owners authorise individual retirement; reconciliation retries
+        // only the keys it already owns.
         self.sync_firewall_ebpf().await;
     }
 
@@ -5868,50 +7351,33 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
         };
         let transition = self.supervisor.process_health_result(&instance_id, status);
 
-        // Propagate health transitions to the service map, noting the
-        // service so we can re-sync its eBPF backend_map entry afterwards.
-        let mut health_changed_service: Option<crate::onion::service_id::ServiceId> = None;
-        match &transition {
-            Ok(Some(ContainerState::Running)) => {
-                if let Some(inst) = self.supervisor.get_instance(&instance_id) {
-                    let service_id = crate::onion::service_id::ServiceId::new(
-                        inst.namespace.clone(),
-                        inst.app_name.clone(),
-                    );
-                    let _ = self
-                        .service_map
-                        .set_backend_health(&service_id, &instance_id.0, true);
-                    health_changed_service = Some(service_id);
-                }
-            }
-            Ok(Some(ContainerState::Unhealthy)) => {
-                if let Some(inst) = self.supervisor.get_instance(&instance_id) {
-                    let app = inst.app_name.clone();
-                    let namespace = inst.namespace.clone();
-                    let service_id =
-                        crate::onion::service_id::ServiceId::new(namespace.clone(), app.clone());
-                    let _ = self
-                        .service_map
-                        .set_backend_health(&service_id, &instance_id.0, false);
-                    self.record_event(
-                        crate::bun::events::EventKind::Health,
-                        crate::bun::events::EventSeverity::Warning,
-                        Some(app),
-                        Some(namespace),
-                        format!("instance {} became unhealthy", instance_id.0),
-                    )
-                    .await;
-                    health_changed_service = Some(service_id);
-                }
-            }
-            _ => {}
+        if let Ok(Some(ContainerState::Unhealthy)) = transition
+            && let Some(instance) = self.supervisor.get_instance(&instance_id)
+        {
+            self.record_event(
+                crate::bun::events::EventKind::Health,
+                crate::bun::events::EventSeverity::Warning,
+                Some(instance.app_name.clone()),
+                Some(instance.namespace.clone()),
+                format!("instance {} became unhealthy", instance_id.0),
+            )
+            .await;
         }
-        if let Some(service_id) = health_changed_service {
-            self.sync_backend_ebpf(&service_id).await;
+        // Retry publication even when health state already changed on an earlier
+        // probe. A refused withdrawal must not advance the restart state machine.
+        if let Err(error) = self.publish_instance_health(&instance_id).await {
+            eprintln!("bun: {error}");
+            self.supervisor
+                .health_checker_mut()
+                .schedule_next(instance_id, now);
+            return;
         }
 
-        // Handle restart if unhealthy
-        if let Ok(Some(ContainerState::Unhealthy)) = transition
+        // A later probe can complete publication that the transition probe failed.
+        if self
+            .supervisor
+            .get_instance(&instance_id)
+            .is_some_and(|instance| instance.state == ContainerState::Unhealthy)
             && self
                 .supervisor
                 .maybe_restart(&instance_id, now)
@@ -5937,45 +7403,108 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
             .schedule_next(instance_id, now);
     }
 
-    /// Register (or refresh) the cron-scheduled jobs from an applied config.
-    ///
-    /// A job with a `schedule` is not run at deploy time; it's parked here and
-    /// fired by [`fire_due_jobs`](Self::fire_due_jobs) when its cron matches.
-    /// Re-applying an unchanged schedule preserves its last-fired stamp so the
-    /// same minute doesn't fire twice; a parse failure is logged and skipped.
-    fn register_scheduled_jobs(&mut self, config: &Config) {
+    /// Confirm health publication before routing changes or automatic restart.
+    async fn publish_instance_health(&mut self, id: &InstanceId) -> Result<(), BunError> {
+        let instance =
+            self.supervisor
+                .get_instance(id)
+                .ok_or_else(|| BunError::InstanceNotFound {
+                    instance_id: id.clone(),
+                })?;
+        if instance.host_port.is_none() {
+            return Ok(());
+        }
+        let service =
+            crate::onion::service_id::ServiceId::new(&instance.namespace, &instance.app_name);
+        let mut candidate = self.service_map.clone();
+        candidate
+            .set_backend_health(&service, &id.0, instance.state == ContainerState::Running)
+            .map_err(|error| BunError::BackendPublication {
+                service: service.clone(),
+                reason: error.to_string(),
+            })?;
+        self.publish_backend_snapshot(&service, &candidate).await?;
+        self.service_map = candidate;
+        self.rebuild_routing_table().await;
+        Ok(())
+    }
+
+    /// Replace the schedule inventory only after its checkpoint is durable.
+    async fn commit_scheduled_jobs(
+        &mut self,
+        next: std::collections::HashMap<(String, String), ScheduledJob>,
+    ) -> Result<(), BunError> {
+        if self.scheduled_jobs_store_uncertain {
+            return Err(BunError::ScheduleState(
+                "a previous write is uncertain; restart Bun to reload the checkpoint".into(),
+            ));
+        }
+        if next == self.scheduled_jobs {
+            return Ok(());
+        }
+        if let Some(directory) = self.records_dir.clone() {
+            let records = next
+                .values()
+                .map(|job| super::schedules::RecordedSchedule {
+                    name: job.name.clone(),
+                    namespace: job.namespace.clone(),
+                    spec: job.spec.clone(),
+                    last_fired_minute: job.last_fired_minute,
+                })
+                .collect();
+            // spawn_blocking can finish after its caller is cancelled. Fence
+            // scheduling before the await until memory and disk agree again.
+            self.scheduled_jobs_store_uncertain = true;
+            // Keep both old and proposed owners reachable if writing fails or
+            // is cancelled. Retirement must not mistake either set for absent.
+            for (key, job) in &next {
+                self.scheduled_jobs
+                    .entry(key.clone())
+                    .or_insert_with(|| job.clone());
+            }
+            tokio::task::spawn_blocking(move || super::schedules::persist(&directory, records))
+                .await
+                .map_err(|error| BunError::ScheduleState(error.to_string()))?
+                .map_err(|error| BunError::ScheduleState(error.to_string()))?;
+        }
+        self.scheduled_jobs = next;
+        self.scheduled_jobs_store_uncertain = false;
+        Ok(())
+    }
+
+    /// Persist registrations and retire schedules removed by an explicit apply.
+    async fn register_scheduled_jobs(&mut self, config: &Config) -> Result<(), BunError> {
+        if config.job.is_empty() {
+            return Ok(());
+        }
+        let mut next = self.scheduled_jobs.clone();
         for (name, spec) in &config.job {
-            let Some(expression) = spec.schedule.as_deref() else {
-                continue;
-            };
             let namespace = spec
                 .namespace
                 .clone()
                 .unwrap_or_else(|| "default".to_string());
-            match crate::meat::cron::CronSchedule::parse(expression) {
-                Ok(schedule) => {
-                    let key = (name.clone(), namespace.clone());
-                    let last_fired_minute = self
-                        .scheduled_jobs
-                        .get(&key)
-                        .filter(|existing| existing.schedule == schedule)
-                        .and_then(|existing| existing.last_fired_minute);
-                    self.scheduled_jobs.insert(
-                        key,
-                        ScheduledJob {
-                            name: name.clone(),
-                            namespace,
-                            schedule,
-                            spec: spec.clone(),
-                            last_fired_minute,
-                        },
-                    );
-                }
-                Err(error) => {
-                    eprintln!("cron: job {name} has invalid schedule {expression:?}: {error}");
-                }
-            }
+            let key = (name.clone(), namespace.clone());
+            let Some(expression) = spec.schedule.as_deref() else {
+                next.remove(&key);
+                continue;
+            };
+            let schedule = crate::meat::cron::CronSchedule::parse(expression)
+                .map_err(|error| BunError::ScheduleState(error.to_string()))?;
+            let last_fired_minute = next
+                .get(&key)
+                .and_then(|existing| existing.last_fired_minute);
+            next.insert(
+                key,
+                ScheduledJob {
+                    name: name.clone(),
+                    namespace,
+                    schedule,
+                    spec: spec.clone(),
+                    last_fired_minute,
+                },
+            );
         }
+        self.commit_scheduled_jobs(next).await
     }
 
     /// Fire every scheduled job whose cron matches the current UTC minute.
@@ -5985,15 +7514,28 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
     /// its epoch-minute stamp). Firing reuses the normal job deploy path with
     /// the `schedule` cleared, so the job actually runs this time.
     async fn fire_due_jobs(&mut self) {
-        if self.scheduled_jobs.is_empty() {
+        if self.scheduled_jobs.is_empty() || self.scheduled_jobs_store_uncertain {
             return;
         }
         let now = time::OffsetDateTime::now_utc();
         let minute_stamp = now.unix_timestamp().div_euclid(60);
 
         let mut due: Vec<(String, String, JobSpec)> = Vec::new();
-        for job in self.scheduled_jobs.values_mut() {
-            if job.last_fired_minute == Some(minute_stamp) {
+        let mut next = self.scheduled_jobs.clone();
+        let active = self.deploy_operations.snapshot().await.active_deploys;
+        for job in next.values_mut() {
+            if active.iter().any(|operation| {
+                operation
+                    .targets
+                    .iter()
+                    .any(|target| target.name == job.name && target.namespace == job.namespace)
+            }) {
+                continue;
+            }
+            if job
+                .last_fired_minute
+                .is_some_and(|previous| previous >= minute_stamp)
+            {
                 continue;
             }
             if job.schedule.matches(now) {
@@ -6004,6 +7546,13 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
             }
         }
 
+        if due.is_empty() {
+            return;
+        }
+        if let Err(error) = self.commit_scheduled_jobs(next).await {
+            eprintln!("cron: firing refused: {error}");
+            return;
+        }
         for (name, namespace, spec) in due {
             self.record_event(
                 crate::bun::events::EventKind::Deploy,
@@ -6016,28 +7565,15 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
 
             let mut config = Config::default();
             config.job.insert(name, spec);
-            self.spawn_scheduled_job_deploy(config);
+            self.spawn_scheduled_job_deploy(config).await;
         }
     }
 
-    /// Spawn a one-off deploy of a cron-fired job on its own task, draining the
-    /// event stream. Mirrors the worker construction in the deploy command path.
-    fn spawn_scheduled_job_deploy(&self, config: Config) {
+    /// Admit a cron firing without changing the registered schedule.
+    async fn spawn_scheduled_job_deploy(&mut self, config: Config) {
         let (events_tx, mut events_rx) = mpsc::channel::<ApplyEvent>(64);
         tokio::spawn(async move { while events_rx.recv().await.is_some() {} });
-
-        let worker = DeployWorker {
-            grill: self.supervisor.grill().clone(),
-            port_allocator: self.supervisor.port_allocator(),
-            ops: DeployOps {
-                tx: self.deploy_ops_tx.clone(),
-            },
-            drains: self.drains.clone(),
-            operation: None,
-        };
-        tokio::spawn(async move {
-            worker.run_deploy(config, events_tx).await;
-        });
+        self.begin_deploy(config, events_tx, false, false).await;
     }
 
     /// Monitor running job instances for process exit.
@@ -6054,7 +7590,14 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
             .supervisor
             .list_instances()
             .iter()
-            .filter(|i| i.is_job && i.state == ContainerState::Running)
+            .filter(|i| {
+                i.is_job
+                    && i.state == ContainerState::Running
+                    && self
+                        .recorded_jobs
+                        .get(&i.id.0)
+                        .is_some_and(|job| job.phase == super::jobs::JobPhase::Launching)
+            })
             .map(|i| i.id.clone())
             .collect();
 
@@ -6066,9 +7609,18 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
 
             if grill_state == ContainerState::Stopped {
                 let exit_code = self.supervisor.grill().exit_code(&id).await;
+                let phase = match exit_code {
+                    Some(code) => super::jobs::JobPhase::Exited { code },
+                    None => super::jobs::JobPhase::Unknown,
+                };
+                if let Err(error) = self.record_observed_job_exit(&id, phase).await {
+                    eprintln!("bun: job outcome retained as uncertain for {id}: {error}");
+                    continue;
+                }
 
                 // Transition Running → Stopping → Stopped
                 if let Some(instance) = self.supervisor.get_instance_mut(&id) {
+                    instance.retry_pending = exit_code.is_some_and(|code| code != 0);
                     if let Ok(s) = instance.state.transition_to(ContainerState::Stopping) {
                         instance.state = s;
                     }
@@ -6077,6 +7629,17 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
                     }
                 }
 
+                if exit_code.is_none() {
+                    self.record_event(
+                        crate::bun::events::EventKind::JobFailed,
+                        crate::bun::events::EventSeverity::Warning,
+                        None,
+                        None,
+                        format!("job {id} outcome unknown; explicit rerun required"),
+                    )
+                    .await;
+                    continue;
+                }
                 if exit_code == Some(0) {
                     // Job completed successfully — stays in Stopped
                     if let Some(instance) = self.supervisor.get_instance(&id) {
@@ -6119,6 +7682,7 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
                             && let Ok(s) = instance.state.transition_to(ContainerState::Failed)
                         {
                             instance.state = s;
+                            instance.retry_pending = false;
                         }
                         if let Some(instance) = self.supervisor.get_instance(&id) {
                             self.record_event(
@@ -6130,56 +7694,6 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
                             )
                             .await;
                         }
-                    }
-                }
-            }
-        }
-
-        // Retry stopped failed jobs waiting for backoff
-        let stopped_jobs: Vec<InstanceId> = self
-            .supervisor
-            .list_instances()
-            .iter()
-            .filter(|i| i.is_job && i.state == ContainerState::Stopped && i.restart_count > 0)
-            .map(|i| i.id.clone())
-            .collect();
-
-        for id in stopped_jobs {
-            match self.supervisor.maybe_restart(&id, now).await {
-                Ok(true) => {
-                    // Now in Pending — drive_pending_restarts will handle it
-                    if let Some(instance) = self.supervisor.get_instance(&id) {
-                        self.record_event(
-                            crate::bun::events::EventKind::Restart,
-                            crate::bun::events::EventSeverity::Warning,
-                            Some(instance.app_name.clone()),
-                            Some(instance.namespace.clone()),
-                            format!(
-                                "instance {} restarted (attempt {})",
-                                id.0, instance.restart_count
-                            ),
-                        )
-                        .await;
-                    }
-                }
-                Ok(false) => {
-                    // Still in backoff
-                }
-                Err(_) => {
-                    if let Some(instance) = self.supervisor.get_instance_mut(&id)
-                        && let Ok(s) = instance.state.transition_to(ContainerState::Failed)
-                    {
-                        instance.state = s;
-                    }
-                    if let Some(instance) = self.supervisor.get_instance(&id) {
-                        self.record_event(
-                            crate::bun::events::EventKind::JobFailed,
-                            crate::bun::events::EventSeverity::Warning,
-                            Some(instance.app_name.clone()),
-                            Some(instance.namespace.clone()),
-                            format!("job {} failed", instance.app_name),
-                        )
-                        .await;
                     }
                 }
             }
@@ -6213,6 +7727,7 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
 
             // The process exited unexpectedly. Mark it Stopped, then restart.
             if let Some(instance) = self.supervisor.get_instance_mut(&id) {
+                instance.retry_pending = true;
                 if let Ok(s) = instance.state.transition_to(ContainerState::Stopping) {
                     instance.state = s;
                 }
@@ -6236,6 +7751,90 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
     /// this method picks it up and drives it through the startup
     /// sequence again using the stored OCI spec.
     async fn drive_pending_restarts(&mut self) {
+        // Partial startup can have changed the runtime even when its call
+        // failed. Keep ownership until cleanup is observed; then apply the
+        // same budget and backoff as any other failed execution.
+        let retrying: Vec<_> = self
+            .supervisor
+            .list_instances()
+            .iter()
+            .filter(|instance| {
+                instance.retry_pending
+                    && (!instance.is_job || !self.job_store_uncertain)
+                    && matches!(
+                        instance.state,
+                        ContainerState::Stopping | ContainerState::Stopped
+                    )
+            })
+            .map(|instance| (instance.id.clone(), instance.state))
+            .collect();
+        for (id, state) in retrying {
+            if state == ContainerState::Stopping {
+                match self
+                    .poll_instance_withdrawal(&id, std::time::Duration::from_secs(STOP_GRACE_SECS))
+                    .await
+                {
+                    Ok(true) => {}
+                    Ok(false) => continue,
+                    Err(error) => {
+                        eprintln!(
+                            "bun: failed restart of {id} awaits discovery withdrawal: {error}"
+                        );
+                        continue;
+                    }
+                }
+                if let Err(error) = self.kill_and_wait_for_exit(&id).await {
+                    eprintln!("bun: failed restart of {id} awaits runtime cleanup: {error}");
+                    continue;
+                }
+                if let Some(instance) = self.supervisor.get_instance_mut(&id) {
+                    let Ok(stopped) = instance.state.transition_to(ContainerState::Stopped) else {
+                        continue;
+                    };
+                    instance.state = stopped;
+                }
+            }
+            match self.supervisor.maybe_restart(&id, Instant::now()).await {
+                Ok(true) => {
+                    if let Some(instance) = self.supervisor.get_instance(&id) {
+                        self.record_event(
+                            crate::bun::events::EventKind::Restart,
+                            crate::bun::events::EventSeverity::Warning,
+                            Some(instance.app_name.clone()),
+                            Some(instance.namespace.clone()),
+                            format!(
+                                "instance {id} restarted (attempt {})",
+                                instance.restart_count
+                            ),
+                        )
+                        .await;
+                    }
+                }
+                Ok(false) => {}
+                Err(BunError::RestartLimitExceeded { .. }) => {
+                    if let Some(instance) = self.supervisor.get_instance_mut(&id)
+                        && let Ok(failed) = instance.state.transition_to(ContainerState::Failed)
+                    {
+                        instance.state = failed;
+                        instance.retry_pending = false;
+                    }
+                    if let Some(instance) = self.supervisor.get_instance(&id) {
+                        self.record_event(
+                            crate::bun::events::EventKind::JobFailed,
+                            crate::bun::events::EventSeverity::Warning,
+                            Some(instance.app_name.clone()),
+                            Some(instance.namespace.clone()),
+                            format!(
+                                "workload {} exhausted its restart budget",
+                                instance.app_name
+                            ),
+                        )
+                        .await;
+                    }
+                }
+                Err(error) => eprintln!("bun: cannot retry {id}: {error}"),
+            }
+        }
         #[allow(clippy::type_complexity)]
         let pending_restarts: Vec<(
             InstanceId,
@@ -6247,7 +7846,11 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
             .supervisor
             .list_instances()
             .iter()
-            .filter(|i| i.state == ContainerState::Pending && i.restart_count > 0)
+            .filter(|i| {
+                i.state == ContainerState::Pending
+                    && i.restart_count > 0
+                    && (!i.is_job || !self.job_store_uncertain)
+            })
             .filter_map(|i| {
                 i.oci_spec.as_ref().map(|spec| {
                     (
@@ -6262,11 +7865,49 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
             .collect();
 
         for (id, oci_spec, app_name, namespace, host_port) in pending_restarts {
+            match self
+                .poll_instance_withdrawal(&id, std::time::Duration::from_secs(STOP_GRACE_SECS))
+                .await
+            {
+                Ok(true) => {}
+                Ok(false) => continue,
+                Err(error) => {
+                    eprintln!("bun: restart of {id} awaits discovery withdrawal: {error}");
+                    continue;
+                }
+            }
             // Tear down the old container first. Without this, the same-id
             // create is rejected (ProcessGrill: stale-Running entry) or fails
             // (runc/apple: container still exists), leaving the instance wedged
             // in Preparing and the old process leaked.
-            let _ = self.supervisor.grill().kill(&id).await;
+            if let Err(error) = self.kill_and_wait_for_exit(&id).await {
+                eprintln!("bun: restart of {id} awaits runtime cleanup: {error}");
+                continue;
+            }
+
+            if self
+                .supervisor
+                .get_instance(&id)
+                .is_some_and(|instance| instance.is_job)
+            {
+                if let Err(error) = self.record_job_runtime_absent(&id).await {
+                    eprintln!("bun: job retry cannot persist runtime absence for {id}: {error}");
+                    continue;
+                }
+                if let Err(error) = self.retire_instance_artifacts(&id).await {
+                    eprintln!("bun: job retry retains artifacts for {id}: {error}");
+                    continue;
+                }
+                if let Err(error) = self.claim_job_retry(&id).await {
+                    eprintln!("bun: job retry refused for {id}: {error}");
+                    continue;
+                }
+            } else if let Err(error) = self.retire_restart_artifacts(&id).await {
+                eprintln!(
+                    "bun: application restart retains predecessor artifacts for {id}: {error}"
+                );
+                continue;
+            }
 
             // Pending → Preparing
             if let Some(instance) = self.supervisor.get_instance_mut(&id) {
@@ -6276,13 +7917,8 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
                 }
             }
 
-            if self
-                .supervisor
-                .grill()
-                .create(&id, &oci_spec)
-                .await
-                .is_err()
-            {
+            if let Err(error) = self.supervisor.grill().create(&id, &oci_spec).await {
+                self.record_failed_restart(&id, &error.to_string()).await;
                 continue;
             }
 
@@ -6292,32 +7928,33 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
             // record, the cgroup path from the stored OCI spec. On failure
             // the created container is removed and the restart refused —
             // fail closed, same as a fresh deploy.
-            let restart_egress = if let Some(spec) = self
+            let restart_spec = self
                 .deployed_specs
                 .get(&(app_name.clone(), namespace.clone()))
-                .cloned()
-            {
-                match oci_spec.linux.cgroups_path.as_deref() {
-                    Some(cgroup_path) => {
-                        self.apply_egress_pre_start(
-                            &id,
-                            &app_name,
-                            &spec,
-                            std::path::Path::new(cgroup_path),
-                        )
-                        .await
-                    }
-                    None if spec.egress.as_ref().is_some_and(|e| !e.allow.is_empty()) => {
-                        Err(BunError::DeployFailed {
-                            app_name: app_name.clone(),
-                            reason: "restart has no cgroup path for pre-start egress programming"
-                                .to_string(),
-                        })
-                    }
-                    None => Ok(()),
+                .cloned();
+            let restart_egress = match oci_spec.linux.host_cgroup_path() {
+                Some(cgroup_path) => {
+                    self.apply_network_pre_start(
+                        &id,
+                        &app_name,
+                        restart_spec.as_ref(),
+                        &cgroup_path,
+                    )
+                    .await
                 }
-            } else {
-                Ok(())
+                None if self.supervisor.grill().honours_cgroup_path()
+                    || restart_spec
+                        .as_ref()
+                        .and_then(|spec| spec.egress.as_ref())
+                        .is_some_and(|policy| !policy.allow.is_empty()) =>
+                {
+                    Err(BunError::DeployFailed {
+                        app_name: app_name.clone(),
+                        reason: "restart has no original cgroup path for network preparation"
+                            .into(),
+                    })
+                }
+                None => Ok(()),
             };
             if let Err(e) = restart_egress {
                 eprintln!("bun: restart of {} refused: {e}", id.0);
@@ -6330,20 +7967,25 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
                 continue;
             }
 
-            // Preparing → Starting
-            if let Some(instance) = self.supervisor.get_instance_mut(&id) {
-                match instance.state.transition_to(ContainerState::Starting) {
-                    Ok(s) => instance.state = s,
-                    Err(_) => continue,
-                }
+            // The durable job permit must precede every retry's start too.
+            if let Err(error) = self
+                .transition_deploy_state(&id, ContainerState::Starting)
+                .await
+            {
+                self.record_failed_restart(&id, &error.to_string()).await;
+                continue;
             }
 
-            if self.supervisor.grill().start(&id).await.is_err() {
+            if let Err(error) = self.supervisor.grill().start(&id).await {
+                self.record_failed_restart(&id, &error.to_string()).await;
                 continue;
             }
             // Re-wire the restarted instance: stream its logs and keep it routable.
             self.spawn_log_forwarder(&id, &app_name, &namespace);
-            self.persist_instance_record(&id).await;
+            if let Err(error) = self.persist_instance_record(&id).await {
+                self.record_failed_restart(&id, &error.to_string()).await;
+                continue;
+            }
             // A re-created container may get a fresh IP; refresh it before
             // registering the backend so routing points at the live address.
             let container_ip = self.supervisor.grill().container_ip(&id).await;
@@ -6351,15 +7993,27 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
                 instance.container_ip = container_ip;
             }
             let service_id = crate::onion::service_id::ServiceId::new(&namespace, &app_name);
+            let mut candidate = self.service_map.clone();
             if let Some(port) = host_port {
-                let backend = self.local_backend(&id, &service_id, container_ip, port, true);
-                if let Err(e) = self.service_map.add_backend(&service_id, backend) {
-                    eprintln!("onion: backend not registered for {service_id:?}: {e}");
+                let healthy = self
+                    .supervisor
+                    .get_instance(&id)
+                    .is_some_and(|instance| instance.health_config.is_none());
+                let backend = self.local_backend(&id, &service_id, container_ip, port, healthy);
+                if let Err(error) = candidate.add_backend(&service_id, backend) {
+                    self.record_failed_restart(&id, &error.to_string()).await;
+                    continue;
                 }
             }
-            // Egress was applied before `start` above. Post-start networking
-            // only refreshes the service and namespace-firewall maps.
-            self.finish_instance_networking(&app_name, &namespace).await;
+            // Keep every reader on the confirmed view. A runtime restart can
+            // change its address, but does not establish application health.
+            if let Err(error) = self.publish_backend_snapshot(&service_id, &candidate).await {
+                self.record_failed_restart(&id, &error.to_string()).await;
+                continue;
+            }
+            self.service_map = candidate;
+            self.sync_firewall_ebpf().await;
+            self.rebuild_routing_table().await;
 
             // Starting → HealthWait, then Running if no health checks
             if let Some(instance) = self.supervisor.get_instance_mut(&id) {
@@ -6375,8 +8029,157 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
         }
     }
 
+    /// Retain a partially created runtime for observed cleanup and bounded retry.
+    async fn record_failed_restart(&mut self, id: &InstanceId, reason: &str) {
+        if let Some(instance) = self.supervisor.get_instance_mut(id)
+            && let Ok(stopping) = instance.state.transition_to(ContainerState::Stopping)
+        {
+            instance.state = stopping;
+            instance.retry_pending = true;
+        }
+        if let Some(instance) = self.supervisor.get_instance(id) {
+            self.record_event(
+                crate::bun::events::EventKind::Restart,
+                crate::bun::events::EventSeverity::Warning,
+                Some(instance.app_name.clone()),
+                Some(instance.namespace.clone()),
+                format!("restart of {id} failed and awaits cleanup: {reason}"),
+            )
+            .await;
+        }
+    }
+
+    /// Refuse user/cleanup stops while a deploy can still mutate the target.
+    async fn stop_workload_when_idle(
+        &mut self,
+        app_name: &str,
+        namespace: &str,
+    ) -> Result<(), BunError> {
+        // Worker completion releases ownership only after its last runtime
+        // mutation. Refuse before retiring a schedule or claiming a stop.
+        // Both command admission and cron firing run on this same event loop.
+        if let Some(operation) = self
+            .deploy_operations
+            .snapshot()
+            .await
+            .active_deploys
+            .into_iter()
+            .find(|operation| {
+                operation
+                    .targets
+                    .iter()
+                    .any(|target| target.name == app_name && target.namespace == namespace)
+            })
+        {
+            return Err(BunError::WorkloadBusy {
+                app_name: app_name.to_owned(),
+                namespace: namespace.to_owned(),
+                operation_id: operation.id,
+            });
+        }
+        self.stop_app(app_name, namespace).await
+    }
+
+    /// Forget ownership only after stop has confirmed every instance's exit.
+    async fn retire_workload(&mut self, app_name: &str, namespace: &str) -> Result<(), BunError> {
+        match self.stop_workload_when_idle(app_name, namespace).await {
+            Ok(()) | Err(BunError::AppNotFound { .. }) => {}
+            Err(error) => return Err(error),
+        }
+        let instances: Vec<_> = self
+            .supervisor
+            .list_instances()
+            .into_iter()
+            .filter(|instance| instance.app_name == app_name && instance.namespace == namespace)
+            .map(|instance| instance.id.clone())
+            .collect();
+        for id in instances {
+            self.supervisor.retire_instance(&id).await;
+        }
+        self.deployed_specs
+            .remove(&(app_name.to_string(), namespace.to_string()));
+        let mut jobs = self.recorded_jobs.clone();
+        jobs.retain(|_, job| job.name != app_name || job.namespace != namespace);
+        if jobs.len() != self.recorded_jobs.len() {
+            self.commit_jobs(jobs).await?;
+        }
+        Ok(())
+    }
+
+    async fn retire_test_resources(
+        &mut self,
+        app_name: &str,
+        namespace: &str,
+    ) -> Result<(), BunError> {
+        if !crate::testkit::lease::valid_test_namespace(namespace) {
+            return Err(BunError::RetirementState {
+                instance_id: InstanceId(format!("{namespace}/{app_name}")),
+                reason: "managed storage retirement requires an owned test namespace".into(),
+            });
+        }
+        self.retire_workload(app_name, namespace).await?;
+        let manager = crate::grill::volume::VolumeManager::new(self.volumes_dir.clone());
+        let namespace = namespace.to_string();
+        let app = app_name.to_string();
+        tokio::task::spawn_blocking(move || manager.retire_test_storage(&namespace, &app))
+            .await
+            .map_err(|error| BunError::DeployFailed {
+                app_name: app_name.into(),
+                reason: error.to_string(),
+            })?
+            .map_err(|error| BunError::DeployFailed {
+                app_name: app_name.into(),
+                reason: error.to_string(),
+            })
+    }
+
+    async fn prepare_storage(
+        &self,
+        app_name: &str,
+        namespace: &str,
+        spec: &AppSpec,
+    ) -> Result<(), BunError> {
+        let manager = crate::grill::volume::VolumeManager::new(self.volumes_dir.clone());
+        let namespace = namespace.to_string();
+        let app = app_name.to_string();
+        let spec = spec.clone();
+        tokio::task::spawn_blocking(move || {
+            if crate::testkit::lease::valid_test_namespace(&namespace) {
+                manager.prepare_test_storage(&namespace, &app, &spec)?;
+            } else {
+                for volume in spec.volumes.iter().filter(|volume| volume.source.is_none()) {
+                    manager.create_managed_volume(
+                        &namespace,
+                        &app,
+                        &volume.path,
+                        volume.size.as_deref(),
+                    )?;
+                }
+            }
+            Ok::<(), crate::grill::volume::VolumeError>(())
+        })
+        .await
+        .map_err(|error| BunError::DeployFailed {
+            app_name: app_name.into(),
+            reason: error.to_string(),
+        })?
+        .map_err(|error| BunError::DeployFailed {
+            app_name: app_name.into(),
+            reason: error.to_string(),
+        })
+    }
+
     /// Stop an app's instances.
     async fn stop_app(&mut self, app_name: &str, namespace: &str) -> Result<(), BunError> {
+        // A schedule exists before its first instance. Retire future firings
+        // even when there is no running process (or runtime cleanup fails).
+        let mut next = self.scheduled_jobs.clone();
+        let had_schedule = next
+            .remove(&(app_name.to_string(), namespace.to_string()))
+            .is_some();
+        if had_schedule {
+            self.commit_scheduled_jobs(next).await?;
+        }
         // Get instance IDs for this app
         let instances: Vec<InstanceId> = self
             .supervisor
@@ -6386,23 +8189,59 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
             .map(|i| i.id.clone())
             .collect();
 
-        if instances.is_empty() {
+        if instances.is_empty() && !had_schedule {
             return Err(BunError::AppNotFound {
                 app_name: app_name.to_string(),
                 namespace: namespace.to_string(),
             });
         }
 
+        let owns_job = instances
+            .iter()
+            .any(|id| self.recorded_jobs.contains_key(&id.0));
+        let mut jobs = self.recorded_jobs.clone();
+        for id in &instances {
+            if let Some(job) = jobs.get_mut(&id.0)
+                && job.phase != super::jobs::JobPhase::Unknown
+            {
+                job.phase = super::jobs::JobPhase::Stopping;
+            }
+        }
+        if owns_job {
+            self.commit_jobs(jobs).await?;
+        }
+
+        // Runtime retirement can release a reusable container address. Refuse
+        // before that happens if an old VIP can still route to the address.
+        let service_id = crate::onion::service_id::ServiceId::new(namespace, app_name);
+        self.withdraw_service_ebpf(&service_id).await?;
+        for id in &instances {
+            let _ = self.service_map.remove_backend(&service_id, &id.0);
+        }
+        self.rebuild_routing_table().await;
+
         // Stop via supervisor (moves the tracked state to Stopping).
-        self.supervisor.stop_app(app_name, namespace).await?;
+        if !instances.is_empty() {
+            self.supervisor.stop_app(app_name, namespace).await?;
+        }
 
         // DEP6: SIGTERM, wait for the runtime to confirm exit, escalate to
         // SIGKILL on timeout. Only then do we record Stopped. Recording it
         // before the process exits let container and supervisor state
         // diverge — a "stopped" app whose process was still serving traffic.
+        let mut first_error = None;
         for id in &instances {
-            self.stop_and_wait_for_exit(id, std::time::Duration::from_secs(STOP_GRACE_SECS))
-                .await;
+            if let Err(error) = self
+                .stop_and_wait_for_exit(id, std::time::Duration::from_secs(STOP_GRACE_SECS))
+                .await
+            {
+                first_error.get_or_insert(error);
+            }
+        }
+        // Try every replica, but preserve ownership and enforcement until all
+        // exits are confirmed. A later stop can retry the incomplete cleanup.
+        if let Some(error) = first_error {
+            return Err(error);
         }
 
         // Transition Stopping → Stopped now the exit is confirmed.
@@ -6419,21 +8258,25 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
             }
         }
 
-        // Stopped for good: nothing left to adopt after a restart.
+        let mut jobs = self.recorded_jobs.clone();
         for id in &instances {
-            self.remove_instance_record(id);
+            if let Some(job) = jobs.get_mut(&id.0) {
+                if job.phase != super::jobs::JobPhase::Unknown {
+                    job.phase = super::jobs::JobPhase::Stopped;
+                }
+                job.runtime_absent = true;
+            }
+        }
+        if owns_job {
+            self.commit_jobs(jobs).await?;
         }
 
-        // Remove backends and unregister from the service map
-        let service_id = crate::onion::service_id::ServiceId::new(namespace, app_name);
+        // A failed artifact cleanup retains the empty service's key for retry.
         for id in &instances {
-            let _ = self.service_map.remove_backend(&service_id, &id.0);
-            self.clear_egress(id).await;
-            // Key material must not outlive the instance (PKI7): remove
-            // the identity dir and unmount its tmpfs backing.
-            self.cleanup_instance_identity(id);
+            self.retire_instance_artifacts(id).await?;
         }
-        self.remove_backend_ebpf(&service_id).await;
+
+        self.retire_discovery_service(&service_id).await?;
         let _ = self.service_map.unregister(&service_id);
         // NET5: prune this app's cgroup-namespace + firewall entries now it's
         // gone, so a reused cgroup inode can't inherit its isolation identity.
@@ -6454,19 +8297,81 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
         Ok(())
     }
 
-    fn merged_service_map(&self) -> crate::onion::service_map::ServiceMap {
-        let local_name = self.cluster.as_ref().and_then(|cluster| {
-            cluster.raft_metrics_rx.as_ref().and_then(|receiver| {
-                let metrics = receiver.borrow();
-                metrics
-                    .membership_config
-                    .membership()
-                    .get_node(&metrics.id)
-                    .map(|node| node.name.clone())
+    /// Prepare every view before replacing any confirmed cluster publication.
+    async fn publish_cluster_catalogue(
+        &mut self,
+        generation: u64,
+        catalog: crate::onion::catalog::EndpointCatalog,
+        ingress: Vec<crate::cluster::orchestrate::IngressAssignment>,
+    ) -> Result<(), BunError> {
+        if self.consumer_controls_views() {
+            return Err(BunError::ClusterPublication(
+                "durable consumer publication requires withdrawal instructions".into(),
+            ));
+        }
+        if (generation == 0 && !catalog.is_empty())
+            || self.cluster_catalog_generation.is_some_and(|confirmed| {
+                generation < confirmed
+                    || (generation == confirmed && catalog != self.cluster_catalog)
             })
-        });
+        {
+            return Err(BunError::ClusterPublication(
+                "catalogue generation is stale or conflicts with confirmed publication".into(),
+            ));
+        }
+        catalog
+            .validate_allocations()
+            .map_err(|error| BunError::ClusterPublication(error.to_string()))?;
+        let cluster_ingress: std::collections::HashMap<_, _> = ingress
+            .into_iter()
+            .map(|route| ((route.namespace, route.name), route.config))
+            .collect();
+        let local_name = self
+            .cluster
+            .as_ref()
+            .map(|cluster| cluster.local_node_id.0.as_str());
+        let merged = self
+            .service_map
+            .with_cluster_catalog_excluding_node(&catalog, local_name);
+        let entries: Vec<_> = merged.resolve_all().into_iter().cloned().collect();
+        crate::onion::service_map::ServiceMap::from_snapshot(&entries)
+            .map_err(|error| BunError::ClusterPublication(error.to_string()))?;
+        if self.cluster_catalog == catalog && self.cluster_ingress_configs == cluster_ingress {
+            // Even an identical catalogue can advance after an intermediate
+            // publication. Delayed replies must not regress that confirmation.
+            self.cluster_catalog_generation = Some(generation);
+            return Ok(());
+        }
+        let mut ingress = self.ingress_configs.clone();
+        ingress.extend(cluster_ingress.clone());
+        let mut candidate = crate::wrapper::routing::RoutingTable::new();
+        candidate
+            .rebuild(&merged, &ingress)
+            .map_err(|error| BunError::ClusterPublication(error.to_string()))?;
+
+        // Readers may retain old request guards. This commits the new views,
+        // but is not evidence that those older requests have drained.
+        let mut table = self.routing_table.write().await;
+        *table = candidate;
+        self.cluster_catalog = catalog;
+        self.cluster_catalog_generation = Some(generation);
+        self.cluster_ingress_configs = cluster_ingress;
+        self.service_map_tx.send_replace(merged);
+        Ok(())
+    }
+
+    fn merged_service_map(&self) -> crate::onion::service_map::ServiceMap {
+        if self.consumer_controls_views() {
+            return self.service_map_tx.borrow().clone();
+        }
+        // Membership can lag or omit a non-voter. Local retirement must not
+        // depend on the council having already learned this node's identity.
+        let local_name = self
+            .cluster
+            .as_ref()
+            .map(|cluster| cluster.local_node_id.0.as_str());
         self.service_map
-            .with_cluster_catalog_excluding_node(&self.cluster_catalog, local_name.as_deref())
+            .with_cluster_catalog_excluding_node(&self.cluster_catalog, local_name)
     }
 
     /// Use the container port for direct netns traffic, and the published port
@@ -6504,6 +8409,9 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
     /// nodes. The local map alone still drives eBPF backend-map syncing —
     /// this merge only affects what DNS/ingress resolve.
     async fn rebuild_routing_table(&self) {
+        if self.consumer_controls_views() {
+            return;
+        }
         let merged = self.merged_service_map();
 
         let mut table = self.routing_table.write().await;
@@ -6517,9 +8425,8 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
         }
         drop(table);
 
-        // Publish the merged service-map snapshot for out-of-loop readers (DNS).
-        // send() only errs when no receiver exists, which is fine.
-        let _ = self.service_map_tx.send(merged);
+        // Retain the latest view even before the first DNS subscriber attaches.
+        self.service_map_tx.send_replace(merged);
     }
 
     /// Reconcile the perimeter firewall if cluster membership changed.
@@ -6589,17 +8496,91 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
         })
     }
 
-    /// Remove an instance's identity directory (and drop the in-memory
-    /// identity), so key material never outlives the instance (PKI7).
-    fn cleanup_instance_identity(&mut self, instance_id: &InstanceId) {
-        let dir = self.instance_identity_dir(instance_id);
-        if let Err(e) = crate::sesame::identity::cleanup_identity_dir(&dir) {
-            eprintln!("bun: warning: failed to remove identity dir for {instance_id}: {e}");
+    /// Remove predecessor execution/policy evidence before an automatic restart.
+    /// Runtime retirement must already be confirmed. The same logical workload
+    /// keeps its identity bundle and mount; final retirement removes those too.
+    async fn retire_restart_artifacts(&mut self, instance_id: &InstanceId) -> Result<(), BunError> {
+        let remote = self.confirm_producer_release(instance_id).await?;
+        self.clear_egress(instance_id).await?;
+        self.release_network_reference(instance_id, remote.as_ref())
+            .await?;
+        if let Some(directory) = self.records_dir.clone() {
+            let id = instance_id.0.clone();
+            tokio::task::spawn_blocking(move || {
+                crate::grill::records::remove_record(&directory, &id)
+            })
+            .await
+            .map_err(|error| BunError::RetirementState {
+                instance_id: instance_id.clone(),
+                reason: error.to_string(),
+            })?
+            .map_err(|error| BunError::RetirementState {
+                instance_id: instance_id.clone(),
+                reason: error.to_string(),
+            })?;
         }
-        if let Some(inst) = self.supervisor.get_instance_mut(instance_id) {
-            inst.identity = None;
-            inst.identity_mount = None;
+        self.forget_retired_egress_owner(instance_id).await?;
+        // Validate the mount source before a new runtime can consume it. The
+        // preparation is idempotent and preserves this workload's credentials.
+        self.prepare_instance_identity(instance_id)
+    }
+
+    async fn retire_initialisers(&mut self, parent: &InstanceId) -> Result<(), BunError> {
+        let children = self.initialisers.get(parent).cloned().unwrap_or_default();
+        for child in children {
+            kill_runtime_instance(self.supervisor.grill(), &child).await?;
+            if let Some(remaining) = self.initialisers.get_mut(parent) {
+                remaining.remove(&child);
+            }
         }
+        self.initialisers.remove(parent);
+        Ok(())
+    }
+
+    /// Retire durable artifacts before allowing the caller to forget an owner.
+    async fn retire_instance_artifacts(
+        &mut self,
+        instance_id: &InstanceId,
+    ) -> Result<(), BunError> {
+        self.retire_initialisers(instance_id).await?;
+        if !self
+            .poll_instance_withdrawal(instance_id, std::time::Duration::ZERO)
+            .await?
+        {
+            return Err(BunError::RetirementState {
+                instance_id: instance_id.clone(),
+                reason: "captured ingress requests still require confirmed release".into(),
+            });
+        }
+        let remote = self.confirm_producer_release(instance_id).await?;
+        self.clear_egress(instance_id).await?;
+        self.release_network_reference(instance_id, remote.as_ref())
+            .await?;
+        let identity_dir = self.instance_identity_dir(instance_id);
+        let records_dir = self.records_dir.clone();
+        let id = instance_id.0.clone();
+        let cleanup = tokio::task::spawn_blocking(move || {
+            crate::sesame::identity::cleanup_identity_dir(&identity_dir)?;
+            if let Some(directory) = records_dir {
+                crate::grill::records::remove_record(&directory, &id)?;
+            }
+            Ok::<(), std::io::Error>(())
+        })
+        .await
+        .map_err(|error| BunError::RetirementState {
+            instance_id: instance_id.clone(),
+            reason: error.to_string(),
+        })?;
+        cleanup.map_err(|error| BunError::RetirementState {
+            instance_id: instance_id.clone(),
+            reason: error.to_string(),
+        })?;
+        self.forget_retired_egress_owner(instance_id).await?;
+        if let Some(instance) = self.supervisor.get_instance_mut(instance_id) {
+            instance.identity = None;
+            instance.identity_mount = None;
+        }
+        Ok(())
     }
 
     /// Remove identity directories that don't belong to any tracked
@@ -6617,7 +8598,12 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
                 .supervisor
                 .get_instance(&InstanceId(name.clone()))
                 .is_some();
-            if tracked {
+            if tracked
+                || self
+                    .startup_retirements
+                    .iter()
+                    .any(|pending| pending.instance_id.0 == name)
+            {
                 continue;
             }
             if let Err(e) = crate::sesame::identity::cleanup_identity_dir(&entry.path()) {
@@ -6804,9 +8790,13 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
             }
         };
 
-        // Re-read the state after the commit so the CA material reflects the
-        // committed serial counter, then sign the joiner's CSR.
-        let security_state = council.security_state().await;
+        // Confirm the identity still has authority after consuming the token.
+        let security_state = council
+            .security_state_linearizable()
+            .await
+            .map_err(|error| BunError::SecurityError {
+                reason: error.to_string(),
+            })?;
         let join_result =
             crate::sesame::join::sign_join_csr(csr_der, node_id, serial, &security_state, ikm)
                 .map_err(|e| BunError::SecurityError {
@@ -6960,12 +8950,16 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
         let mut statuses = Vec::new();
         for instance in self.supervisor.list_instances() {
             let pid = self.supervisor.grill().pid(&instance.id).await;
-            let exit_code = self.supervisor.grill().exit_code(&instance.id).await;
+            let exit_code = match self.recorded_jobs.get(&instance.id.0).map(|job| &job.phase) {
+                Some(super::jobs::JobPhase::Exited { code }) => Some(*code),
+                Some(super::jobs::JobPhase::Unknown) => None,
+                _ => self.supervisor.grill().exit_code(&instance.id).await,
+            };
             statuses.push(InstanceStatus {
                 id: instance.id.0.clone(),
                 app_name: instance.app_name.clone(),
                 namespace: instance.namespace.clone(),
-                state: instance.state.to_string(),
+                state: self.job_state_label(instance),
                 restart_count: instance.restart_count,
                 host_port: instance.host_port,
                 exit_code,
@@ -6985,7 +8979,7 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
                 namespace: instance.namespace.clone(),
                 instance_id: instance.id.0.clone(),
                 image: instance.image.clone(),
-                state: instance.state.to_string(),
+                state: self.job_state_label(instance),
                 restart_count: instance.restart_count,
                 age_seconds: instance.created_at.elapsed().as_secs(),
             })
@@ -7409,11 +9403,14 @@ impl<G: Grill + Clone + 'static> PreparedTrace<G> {
 
         #[cfg(all(feature = "ebpf", target_os = "linux"))]
         if let Some(handle) = &self.onion_ebpf {
-            let Some(pid) = self.grill.pid(source_instance).await else {
-                return unknown("runtime does not expose the source workload PID".to_string());
-            };
-            let Some(cgroup_id) = crate::sesame::egress::cgroup_id_of_pid(pid) else {
-                return unknown("source workload cgroup id could not be resolved".to_string());
+            let cgroup_id = match self.grill.workload_cgroup(source_instance).await {
+                Ok(Some(cgroup_id)) => cgroup_id,
+                Ok(None) => {
+                    return unknown("runtime does not expose a verified workload cgroup".into());
+                }
+                Err(error) => {
+                    return unknown(format!("source workload identity is unavailable: {error}"));
+                }
             };
             let mut ebpf = handle.lock().await;
             if !internal_destination {
@@ -7469,31 +9466,50 @@ impl<G: Grill + Clone + 'static> PreparedTrace<G> {
 }
 
 impl<G: Grill + Clone + 'static> BunAgent<G> {
-    /// Stop one instance and wait for it to actually exit (DEP6).
-    ///
-    /// SIGTERM first, then poll the runtime until the container reports
-    /// `Stopped` or `grace` elapses, then SIGKILL whatever is still running.
-    /// Returns only once the runtime confirms the exit (or the kill lands),
-    /// so the supervisor never records `Stopped` for a process that is still
-    /// alive — container and supervisor state stay in step.
-    async fn stop_and_wait_for_exit(&self, id: &InstanceId, grace: std::time::Duration) {
-        let _ = self.supervisor.grill().stop(id).await;
-        let deadline = Instant::now() + grace;
-        while Instant::now() < deadline {
-            if matches!(
-                self.supervisor.grill().state(id).await,
-                Ok(ContainerState::Stopped)
-            ) {
-                return;
-            }
-            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    /// Stop one instance, requiring observed exit even after force-kill.
+    async fn stop_and_wait_for_exit(
+        &self,
+        id: &InstanceId,
+        grace: std::time::Duration,
+    ) -> Result<(), BunError> {
+        if self
+            .recorded_jobs
+            .get(&id.0)
+            .is_some_and(|job| job.runtime_absent)
+        {
+            return Ok(());
         }
-        if !matches!(
-            self.supervisor.grill().state(id).await,
-            Ok(ContainerState::Stopped)
-        ) {
-            let _ = self.supervisor.grill().kill(id).await;
+        drain_and_stop_instance(&self.drains, self.supervisor.grill(), id, grace).await
+    }
+
+    /// Withdraw local routing and poll request release without blocking the agent loop.
+    async fn poll_instance_withdrawal(
+        &mut self,
+        id: &InstanceId,
+        timeout: std::time::Duration,
+    ) -> Result<bool, BunError> {
+        self.withdraw_instance_backend(id).await?;
+        self.drains
+            .start_drain(&crate::wrapper::draining::DrainCommand {
+                app_name: String::new(),
+                instance_id: id.0.clone(),
+                timeout,
+            })
+            .await;
+        self.drains.check_completions().await;
+        Ok(!self.drains.is_draining(&id.0).await)
+    }
+
+    /// Preserve ownership until both force-kill and observed runtime exit succeed.
+    async fn kill_and_wait_for_exit(&self, id: &InstanceId) -> Result<(), BunError> {
+        if self
+            .recorded_jobs
+            .get(&id.0)
+            .is_some_and(|job| job.runtime_absent)
+        {
+            return Ok(());
         }
+        kill_runtime_instance(self.supervisor.grill(), id).await
     }
 
     /// Add one freshly-healthy replacement to the service map and rebuild the
@@ -7506,19 +9522,110 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
         host_port: Option<u16>,
         container_ip: Option<std::net::Ipv4Addr>,
         has_port: bool,
-    ) {
+    ) -> Result<(), BunError> {
         if !has_port {
-            return;
+            return Ok(());
         }
         let Some(host_port) = host_port else {
-            return;
+            return Err(BunError::BackendPublication {
+                service: crate::onion::service_id::ServiceId::new(namespace, app_name),
+                reason: "replacement has no allocated port".into(),
+            });
         };
         let service_id = crate::onion::service_id::ServiceId::new(namespace, app_name);
         let backend = self.local_backend(new_id, &service_id, container_ip, host_port, true);
-        if let Err(e) = self.service_map.add_backend(&service_id, backend) {
-            eprintln!("onion: backend not registered for {service_id:?}: {e}");
+        let mut candidate = self.service_map.clone();
+        candidate
+            .add_backend(&service_id, backend)
+            .map_err(|error| BunError::BackendPublication {
+                service: service_id.clone(),
+                reason: error.to_string(),
+            })?;
+        self.publish_backend_snapshot(&service_id, &candidate)
+            .await?;
+        self.service_map = candidate;
+        self.rebuild_routing_table().await;
+        Ok(())
+    }
+
+    /// Confirm one backend's withdrawal before runtime cleanup can reuse its address.
+    async fn withdraw_instance_backend(&mut self, id: &InstanceId) -> Result<(), BunError> {
+        let Some(owner) = self.supervisor.get_instance(id) else {
+            return Ok(());
+        };
+        let service = crate::onion::service_id::ServiceId::new(&owner.namespace, &owner.app_name);
+        let Some(mut entry) = self.service_map.resolve(&service).cloned() else {
+            return Ok(());
+        };
+        let had_backend = entry
+            .backends
+            .iter()
+            .any(|backend| backend.instance_id == id.0);
+        entry.backends.retain(|backend| backend.instance_id != id.0);
+        if self.consumer_controls_views() {
+            self.invalidate_consumer_view().await?;
+            // A prior attempt may have removed the local backend before remote
+            // consumers confirmed. Retrying still fences the whole consumer view.
+            if had_backend {
+                self.service_map
+                    .remove_backend(&service, &id.0)
+                    .map_err(|error| BunError::BackendRetirement {
+                        service,
+                        reason: error.to_string(),
+                    })?;
+            }
+            return Ok(());
+        }
+        // Keep the original userspace owner on refusal. A retry must still know
+        // the exact allocated key and the backend whose removal is outstanding.
+        #[cfg(all(feature = "ebpf", target_os = "linux"))]
+        if let Some(handle) = self.onion_ebpf.as_ref() {
+            let mut ebpf = handle.lock().await;
+            let map = crate::onion::ebpf::maps::BpfServiceMap::new();
+            let failure =
+                |error: crate::onion::ebpf::maps::BpfMapError| BunError::BackendRetirement {
+                    service: service.clone(),
+                    reason: error.to_string(),
+                };
+            // A missing userspace backend is not evidence that an earlier kernel
+            // rewrite succeeded. Conversely, never recreate a confirmed absent key.
+            if map
+                .read_backends(&mut ebpf, entry.vip, entry.port)
+                .map_err(failure)?
+                .is_some()
+            {
+                map.update_backends_bpf(&mut ebpf, entry.vip, entry.port, &entry)
+                    .map_err(failure)?;
+            }
+        }
+        if had_backend {
+            self.service_map
+                .remove_backend(&service, &id.0)
+                .map_err(|error| BunError::BackendRetirement {
+                    service,
+                    reason: error.to_string(),
+                })?;
         }
         self.rebuild_routing_table().await;
+        Ok(())
+    }
+
+    /// Withdraw traffic before fencing supervision and permitting an off-loop stop.
+    async fn begin_instance_retirement(&mut self, id: &InstanceId) -> Result<(), BunError> {
+        if self.supervisor.get_instance(id).is_none() {
+            return Err(BunError::InstanceNotFound {
+                instance_id: id.clone(),
+            });
+        }
+        self.withdraw_instance_backend(id).await?;
+        if let Some(instance) = self.supervisor.get_instance_mut(id) {
+            instance.retry_pending = false;
+            if instance.state.can_transition_to(ContainerState::Stopping) {
+                instance.state = ContainerState::Stopping;
+            }
+        }
+        self.supervisor.health_checker_mut().unregister(id);
+        Ok(())
     }
 
     /// Drain, stop and forget one old instance (M7).
@@ -7528,15 +9635,25 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
     /// this only lifts egress, cleans identity, and drops the record and
     /// supervisor entry. Interleaving it with replacement is what gives
     /// `max_surge` and `max_unavailable` their meaning.
-    async fn finish_retire_bookkeeping(&mut self, old_id: &InstanceId) {
-        // NET6: lift the retiring instance's egress enforcement.
-        self.clear_egress(old_id).await;
-        self.cleanup_instance_identity(old_id);
-        self.remove_instance_record(old_id);
-        // Drop it from the supervisor in this same turn. A stopped instance
-        // still listed there looks exactly like a crashed one to the restart
-        // driver, which gets a chance to run between two retirement ops.
+    async fn finish_retire_bookkeeping(&mut self, old_id: &InstanceId) -> Result<(), BunError> {
+        // The worker already observed exit. Preserve a stopped cleanup owner,
+        // so a filesystem failure cannot make the restart driver revive it.
+        self.retain_stopped_instance(old_id);
+        self.withdraw_instance_backend(old_id).await?;
+        self.retire_instance_artifacts(old_id).await?;
         self.supervisor.retire_instance(old_id).await;
+        self.sync_firewall_ebpf().await;
+        self.rebuild_routing_table().await;
+        Ok(())
+    }
+
+    /// Retain cleanup ownership after observed runtime exit without restarting it.
+    fn retain_stopped_instance(&mut self, old_id: &InstanceId) {
+        if let Some(instance) = self.supervisor.get_instance_mut(old_id) {
+            instance.state = ContainerState::Stopped;
+            instance.retry_pending = false;
+        }
+        self.supervisor.health_checker_mut().unregister(old_id);
     }
 
     /// Gracefully stop all instances.
@@ -7552,12 +9669,18 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
         }
         self.publish_dns_faults();
 
-        let ids: Vec<InstanceId> = self
+        let mut ids: Vec<InstanceId> = self
             .supervisor
             .list_instances()
             .iter()
             .map(|i| i.id.clone())
             .collect();
+
+        ids.extend(
+            self.initialisers
+                .values()
+                .flat_map(|children| children.iter().cloned()),
+        );
 
         // Ask everything to stop (SIGTERM), wait (up to a grace period, but no
         // longer than needed) for it to exit, then force-kill (SIGKILL) whatever
@@ -7616,10 +9739,17 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
                 spec,
                 reply,
             } => {
-                self.deployed_specs.insert((app_name, namespace), *spec);
-                let _ = reply.send(());
+                let result = self.supervisor.admit_workload_kind(
+                    &app_name,
+                    &namespace,
+                    crate::bun::deploy_operations::DeployTargetKind::App,
+                );
+                if result.is_ok() {
+                    self.deployed_specs.insert((app_name, namespace), *spec);
+                }
+                let _ = reply.send(result);
             }
-            DeployOp::ListExistingActive {
+            DeployOp::ListExistingOwned {
                 app_name,
                 namespace,
                 reply,
@@ -7628,22 +9758,41 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
                     .supervisor
                     .list_instances()
                     .iter()
-                    .filter(|i| i.app_name == app_name && i.namespace == namespace)
-                    .filter(|i| {
-                        !matches!(
-                            i.state,
-                            crate::grill::state::ContainerState::Stopped
-                                | crate::grill::state::ContainerState::Failed
-                        )
-                    })
+                    .filter(|i| !i.is_job && i.app_name == app_name && i.namespace == namespace)
                     .map(|i| i.id.clone())
                     .collect();
                 let _ = reply.send(ids);
             }
-            DeployOp::NextDeployGen { reply } => {
-                let deploy_gen = self.next_deploy_gen;
-                self.next_deploy_gen += 1;
-                let _ = reply.send(deploy_gen);
+            DeployOp::NextDeployGen { app_name, reply } => {
+                // Adoption restores owners, not the previous process's counter.
+                // Use the structured app name to distinguish an ordinary app
+                // named `worker-g9` from generation 9 of an app named `worker`.
+                let highest_owned = self
+                    .supervisor
+                    .list_instances()
+                    .iter()
+                    .filter_map(|instance| {
+                        let prefix = format!("{}__{}-g", instance.namespace, instance.app_name);
+                        let suffix = instance.id.0.strip_prefix(&prefix)?;
+                        let (generation, _) = suffix.split_once('-')?;
+                        generation.parse::<u64>().ok()
+                    })
+                    .max()
+                    .unwrap_or(0);
+                let next = highest_owned
+                    .checked_add(1)
+                    .and_then(|after_owned| self.next_deploy_gen.max(after_owned).checked_add(1));
+                let result = match next {
+                    Some(next) => {
+                        self.next_deploy_gen = next;
+                        Ok(next - 1)
+                    }
+                    None => Err(BunError::DeployFailed {
+                        app_name,
+                        reason: "rollout generation exhausted; ownership preserved".into(),
+                    }),
+                };
+                let _ = reply.send(result);
             }
             DeployOp::SupervisorDeployApp {
                 app_name,
@@ -7658,16 +9807,35 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
                     .await;
                 let _ = reply.send(result);
             }
+            DeployOp::ConfirmJobSuccess { instance_id, reply } => {
+                let result = self
+                    .record_observed_job_exit(
+                        &instance_id,
+                        super::jobs::JobPhase::Exited { code: 0 },
+                    )
+                    .await;
+                if result.is_ok()
+                    && let Some(instance) = self.supervisor.get_instance_mut(&instance_id)
+                {
+                    instance.retry_pending = false;
+                    if instance.state.can_transition_to(ContainerState::Stopping) {
+                        instance.state = ContainerState::Stopping;
+                    }
+                    if instance.state.can_transition_to(ContainerState::Stopped) {
+                        instance.state = ContainerState::Stopped;
+                    }
+                }
+                let _ = reply.send(result);
+            }
             DeployOp::SupervisorDeployJob {
+                rerun_unknown,
                 job_name,
                 namespace,
                 spec,
                 reply,
             } => {
-                let now = Instant::now();
                 let result = self
-                    .supervisor
-                    .deploy_job(&job_name, &namespace, &spec, now)
+                    .prepare_job_run(&job_name, &namespace, &spec, rerun_unknown)
                     .await;
                 let _ = reply.send(result);
             }
@@ -7679,10 +9847,14 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
                 reply,
             } => {
                 let service_id = crate::onion::service_id::ServiceId::new(&namespace, &app_name);
-                let _ = self.service_map.register(&service_id, port, firewall);
-                self.sync_backend_ebpf(&service_id).await;
-                self.sync_firewall_ebpf().await;
-                let _ = reply.send(());
+                let result = async {
+                    self.register_local_service(&service_id, port, firewall)?;
+                    self.publish_backend_ebpf(&service_id).await?;
+                    self.sync_firewall_ebpf().await;
+                    Ok(())
+                }
+                .await;
+                let _ = reply.send(result);
             }
             DeployOp::StoreIngress {
                 app_name,
@@ -7715,7 +9887,60 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
                 }
                 let _ = reply.send(());
             }
-            DeployOp::ApplyEgressPreStart {
+            DeployOp::RegisterInitialiser {
+                instance_id,
+                index,
+                reply,
+            } => {
+                let result = match self.supervisor.get_instance(&instance_id) {
+                    Some(instance) if instance.state == ContainerState::Initialising => {
+                        // DNS workload labels cannot contain this auxiliary separator.
+                        let initialiser = InstanceId(format!("{}__init-{index}", instance_id.0));
+                        if self
+                            .initialisers
+                            .entry(instance_id.clone())
+                            .or_default()
+                            .insert(initialiser.clone())
+                        {
+                            Ok(initialiser)
+                        } else {
+                            Err(BunError::RetirementState {
+                                instance_id,
+                                reason: "initialiser still owns its previous runtime".into(),
+                            })
+                        }
+                    }
+                    _ => Err(BunError::InstanceNotFound { instance_id }),
+                };
+                let _ = reply.send(result);
+            }
+            DeployOp::ForgetInitialiser {
+                instance_id,
+                initialiser,
+                reply,
+            } => {
+                let result = if self
+                    .initialisers
+                    .get_mut(&instance_id)
+                    .is_some_and(|children| children.remove(&initialiser))
+                {
+                    if self
+                        .initialisers
+                        .get(&instance_id)
+                        .is_some_and(|children| children.is_empty())
+                    {
+                        self.initialisers.remove(&instance_id);
+                    }
+                    Ok(())
+                } else {
+                    Err(BunError::RetirementState {
+                        instance_id,
+                        reason: "initialiser ownership changed before confirmation".into(),
+                    })
+                };
+                let _ = reply.send(result);
+            }
+            DeployOp::ApplyNetworkPreStart {
                 instance_id,
                 app_name,
                 spec,
@@ -7723,7 +9948,7 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
                 reply,
             } => {
                 let result = self
-                    .apply_egress_pre_start(&instance_id, &app_name, &spec, &cgroup_path)
+                    .apply_network_pre_start(&instance_id, &app_name, spec.as_deref(), &cgroup_path)
                     .await;
                 // On failure, mirror the fresh path's clean-up: mark Failed and
                 // stop the created container so no half-started workload lingers.
@@ -7742,16 +9967,7 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
                 to,
                 reply,
             } => {
-                let result = match self.supervisor.get_instance_mut(&instance_id) {
-                    Some(instance) => match instance.state.transition_to(to) {
-                        Ok(state) => {
-                            instance.state = state;
-                            Ok(())
-                        }
-                        Err(e) => Err(BunError::from(e)),
-                    },
-                    None => Err(BunError::InstanceNotFound { instance_id }),
-                };
+                let result = self.transition_deploy_state(&instance_id, to).await;
                 let _ = reply.send(result);
             }
             DeployOp::FinishFreshInstance {
@@ -7787,84 +10003,70 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
                 while drain.recv().await.is_some() {}
                 let _ = reply.send(());
             }
+            DeployOp::ReserveRollingInstance {
+                instance_id,
+                app_name,
+                namespace,
+                spec,
+                reply,
+            } => {
+                let result = self
+                    .reserve_rolling_instance(&instance_id, &app_name, &namespace, &spec)
+                    .await;
+                let _ = reply.send(result);
+            }
             DeployOp::PrepareRollingInstance {
                 instance_id,
                 app_name,
                 namespace,
                 spec,
                 host_port,
-                index,
                 reply,
             } => {
                 let result = self
-                    .prepare_rolling_instance(
-                        &instance_id,
-                        &app_name,
-                        &namespace,
-                        &spec,
-                        host_port,
-                        index,
-                    )
+                    .prepare_rolling_instance(&instance_id, &app_name, &namespace, &spec, host_port)
                     .await;
                 let _ = reply.send(result);
             }
-            DeployOp::ClearEgress { instance_id, reply } => {
-                self.clear_egress(&instance_id).await;
-                let _ = reply.send(());
+            DeployOp::RegisterRollingInstance { instance, reply } => {
+                let result = self.persist_rolling_instance(&instance).await;
+                if result.is_ok() {
+                    self.spawn_log_forwarder(
+                        &instance.instance_id,
+                        &instance.app_name,
+                        &instance.namespace,
+                    );
+                }
+                let _ = reply.send(result);
             }
-            DeployOp::RegisterRollingInstance {
-                instance_id,
-                app_name,
-                namespace,
-                reply,
-            } => {
-                self.spawn_log_forwarder(&instance_id, &app_name, &namespace);
-                self.persist_instance_record(&instance_id).await;
-                let _ = reply.send(());
-            }
-            DeployOp::RollbackRollingDeploy {
-                app_name,
-                namespace,
-                spec,
-                new_ids,
-                new_prepared,
-                new_ports,
-                replica_count,
-                reply,
-            } => {
-                self.rollback_rolling_deploy(
-                    &app_name,
-                    &namespace,
-                    &spec,
-                    &new_ids,
-                    &new_prepared,
-                    &new_ports,
-                    replica_count,
-                )
-                .await;
-                let _ = reply.send(());
-            }
-            DeployOp::HaltRollingDeploy {
-                app_name,
-                namespace,
-                spec,
-                new_ids,
-                new_prepared,
-                new_ports,
-                replica_count,
-                reply,
-            } => {
-                self.halt_rolling_deploy(
-                    &app_name,
-                    &namespace,
-                    &spec,
-                    &new_ids,
-                    &new_prepared,
-                    &new_ports,
-                    replica_count,
-                )
-                .await;
-                let _ = reply.send(());
+            DeployOp::RetainRollingInstance { instance, reply } => {
+                let id = instance.instance_id.clone();
+                let container_ip = self.supervisor.grill().container_ip(&id).await;
+                let result = match self.supervisor.get_instance_mut(&id) {
+                    Some(owner)
+                        if owner.app_name == instance.app_name
+                            && owner.namespace == instance.namespace =>
+                    {
+                        owner.state = ContainerState::Running;
+                        owner.container_ip = container_ip;
+                        owner.retry_pending = false;
+                        owner.oci_spec = Some(instance.oci_spec);
+                        let health_config =
+                            instance.spec.health.as_ref().zip(instance.spec.port).map(
+                                |(health, port)| {
+                                    crate::bun::health::HealthCheckConfig::from_spec(health, port)
+                                },
+                            );
+                        owner.health_config = health_config.clone();
+                        if let Some(config) = health_config {
+                            self.supervisor
+                                .register_health(id.clone(), config, Instant::now());
+                        }
+                        Ok(())
+                    }
+                    _ => Err(BunError::InstanceNotFound { instance_id: id }),
+                };
+                let _ = reply.send(result);
             }
             DeployOp::FinaliseRollingDeploy {
                 app_name,
@@ -7878,12 +10080,13 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
                 now,
                 reply,
             } => {
-                self.finalise_rolling_deploy(
-                    &app_name, &namespace, &spec, &existing, &new_ids, &new_ports, &new_ips,
-                    new_specs, now,
-                )
-                .await;
-                let _ = reply.send(());
+                let result = self
+                    .finalise_rolling_deploy(
+                        &app_name, &namespace, &spec, &existing, &new_ids, &new_ports, &new_ips,
+                        new_specs, now,
+                    )
+                    .await;
+                let _ = reply.send(result);
             }
             DeployOp::PublishNewBackend {
                 app_name,
@@ -7894,20 +10097,25 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
                 has_port,
                 reply,
             } => {
-                self.publish_new_backend(
-                    &app_name,
-                    &namespace,
-                    &new_id,
-                    host_port,
-                    container_ip,
-                    has_port,
-                )
-                .await;
-                let _ = reply.send(());
+                let result = self
+                    .publish_new_backend(
+                        &app_name,
+                        &namespace,
+                        &new_id,
+                        host_port,
+                        container_ip,
+                        has_port,
+                    )
+                    .await;
+                let _ = reply.send(result);
+            }
+            DeployOp::BeginRetire { old_id, reply } => {
+                let result = self.begin_instance_retirement(&old_id).await;
+                let _ = reply.send(result);
             }
             DeployOp::FinishRetire { old_id, reply } => {
-                self.finish_retire_bookkeeping(&old_id).await;
-                let _ = reply.send(());
+                let result = self.finish_retire_bookkeeping(&old_id).await;
+                let _ = reply.send(result);
             }
             DeployOp::PushDeployHistory { entry, reply } => {
                 self.deploy_history.write().await.push(*entry);
@@ -7964,8 +10172,8 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
 /// loop as a `DeployOp` through `ops`, so the loop stays the single owner of
 /// supervisor / service-map / networking state.
 struct DeployWorker<G: Grill> {
+    rerun_unknown_jobs: bool,
     grill: G,
-    port_allocator: PortAllocator,
     ops: DeployOps,
     /// Shared drain tracker, so the worker can drain-and-stop a retiring
     /// instance off the command loop (M7) rather than sending the whole wait
@@ -7975,9 +10183,47 @@ struct DeployWorker<G: Grill> {
 }
 
 impl<G: Grill + Clone + 'static> DeployWorker<G> {
+    async fn report_cancellation(&self, events: &mpsc::Sender<ApplyEvent>) -> bool {
+        if self
+            .operation
+            .as_ref()
+            .is_some_and(|operation| operation.cancellation_requested())
+        {
+            let _ = events
+                .send(ApplyEvent::Error {
+                    message: "deploy cancellation requested; finishing owned cleanup".into(),
+                })
+                .await;
+            return true;
+        }
+        false
+    }
+
+    async fn wait_for_deploy_health(
+        &self,
+        id: &InstanceId,
+        spec: &AppSpec,
+        container_ip: Option<std::net::Ipv4Addr>,
+        wait: std::time::Duration,
+    ) -> Result<(), String> {
+        let health = wait_instance_healthy(&self.grill, id, spec, container_ip, wait);
+        if let Some(operation) = &self.operation {
+            tokio::select! {
+                biased;
+                _ = operation.cancelled() => Err("deploy cancellation requested; finishing owned cleanup".into()),
+                result = health => result,
+            }
+        } else {
+            health.await
+        }
+    }
+
     /// Deploy all apps and jobs from a config, streaming progress events. The
     /// mirror of the former `BunAgent::deploy`, but off the command loop.
     async fn run_deploy(self, config: Config, events: mpsc::Sender<ApplyEvent>) {
+        if self.report_cancellation(&events).await {
+            return;
+        }
         let now = Instant::now();
         let mut all_ids: Vec<String> = Vec::new();
         // Jobs already run as `run_before` prerequisites, so the regular jobs
@@ -8009,6 +10255,9 @@ impl<G: Grill + Clone + 'static> DeployWorker<G> {
         }
 
         for (app_name, spec) in &config.app {
+            if self.report_cancellation(&events).await {
+                return;
+            }
             let namespace = spec.namespace.as_deref().unwrap_or("default");
 
             // run_before (E): jobs declaring `run_before = ["app.<name>"]` must
@@ -8041,6 +10290,9 @@ impl<G: Grill + Clone + 'static> DeployWorker<G> {
                     return;
                 }
                 ran_prereqs.insert(job_name.clone());
+            }
+            if self.report_cancellation(&events).await {
+                return;
             }
 
             if let Some(operation) = &self.operation {
@@ -8075,11 +10327,20 @@ impl<G: Grill + Clone + 'static> DeployWorker<G> {
                 }
             };
 
-            self.ops
+            if let Err(error) = self
+                .ops
                 .store_deployed_spec(app_name, namespace, spec)
-                .await;
+                .await
+            {
+                let _ = events
+                    .send(ApplyEvent::Error {
+                        message: error.to_string(),
+                    })
+                    .await;
+                return;
+            }
 
-            let existing = self.ops.list_existing_active(app_name, namespace).await;
+            let existing = self.ops.list_existing_owned(app_name, namespace).await;
 
             if !existing.is_empty() {
                 // Dispatch on deploy strategy (E): blue-green stands up the
@@ -8106,7 +10367,7 @@ impl<G: Grill + Clone + 'static> DeployWorker<G> {
                 }
                 all_ids.extend(
                     self.ops
-                        .list_existing_active(app_name, namespace)
+                        .list_existing_owned(app_name, namespace)
                         .await
                         .iter()
                         .map(|id| id.0.clone()),
@@ -8145,9 +10406,18 @@ impl<G: Grill + Clone + 'static> DeployWorker<G> {
                         Some(f.allow_from.clone())
                     }
                 });
-                self.ops
+                if let Err(error) = self
+                    .ops
                     .register_service_app(app_name, namespace, port, firewall)
-                    .await;
+                    .await
+                {
+                    let _ = events
+                        .send(ApplyEvent::Error {
+                            message: error.to_string(),
+                        })
+                        .await;
+                    return;
+                }
             }
 
             if let Some(ref ingress) = spec.ingress {
@@ -8220,6 +10490,9 @@ impl<G: Grill + Clone + 'static> DeployWorker<G> {
         }
 
         for (job_name, spec) in &config.job {
+            if self.report_cancellation(&events).await {
+                return;
+            }
             // Already run to completion as a run_before prerequisite above, or a
             // cron-scheduled job that fires on its schedule rather than now.
             if ran_prereqs.contains(job_name) || spec.schedule.is_some() {
@@ -8247,7 +10520,7 @@ impl<G: Grill + Clone + 'static> DeployWorker<G> {
 
             let ids = match self
                 .ops
-                .supervisor_deploy_job(job_name, namespace, spec)
+                .supervisor_deploy_job(job_name, namespace, spec, self.rerun_unknown_jobs)
                 .await
             {
                 Ok(ids) => ids,
@@ -8288,6 +10561,9 @@ impl<G: Grill + Clone + 'static> DeployWorker<G> {
             all_ids.extend(ids.iter().map(|id| id.0.clone()));
         }
 
+        if self.report_cancellation(&events).await {
+            return;
+        }
         if let Some(operation) = &self.operation {
             operation
                 .advance(
@@ -8308,6 +10584,73 @@ impl<G: Grill + Clone + 'static> DeployWorker<G> {
         for (app, namespace) in deployed_apps {
             self.ops.record_deployed_event(&app, &namespace).await;
         }
+    }
+
+    /// Run the same owned init chain for fresh and rolling replacements.
+    async fn drive_initialisers(
+        &self,
+        instance_id: &InstanceId,
+        app_name: &str,
+        namespace: &str,
+        spec: &AppSpec,
+        cgroup_path: &std::path::Path,
+    ) -> Result<(), BunError> {
+        if spec.init.is_empty() {
+            return Ok(());
+        }
+        self.ops
+            .transition_state(instance_id, ContainerState::Initialising)
+            .await?;
+        for (i, init_spec) in spec.init.iter().enumerate() {
+            let init_id = self.ops.register_initialiser(instance_id, i).await?;
+            let init_oci = crate::grill::oci::generate_init_oci_spec(
+                &init_spec.command,
+                namespace,
+                app_name,
+                spec.image.as_deref(),
+                &cgroup_path.to_string_lossy(),
+                None,
+            );
+            self.grill.create(&init_id, &init_oci).await?;
+            self.grill.start(&init_id).await?;
+
+            // Bounded wait: a hung init can't wedge the deploy forever (and
+            // no longer wedges the loop at all — this poll is off it).
+            let deadline =
+                std::time::Instant::now() + std::time::Duration::from_secs(INIT_TIMEOUT_SECS);
+            let failed = loop {
+                tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+                let state = self.grill.state(&init_id).await?;
+                if state == ContainerState::Stopped {
+                    let exit_code = self.grill.exit_code(&init_id).await;
+                    break exit_code != Some(0);
+                }
+                if std::time::Instant::now() >= deadline {
+                    let _ = self.grill.kill(&init_id).await;
+                    break true;
+                }
+            };
+
+            if failed {
+                let _ = self
+                    .ops
+                    .transition_state(instance_id, ContainerState::Failed)
+                    .await;
+                return Err(BunError::InitContainerFailed {
+                    instance_id: instance_id.clone(),
+                    init_index: i,
+                });
+            }
+            kill_runtime_instance(&self.grill, &init_id).await?;
+            self.ops.forget_initialiser(instance_id, &init_id).await?;
+            // Runc can remove the shared cgroup when an init exits. Its
+            // successor must receive policy for the new kernel identity
+            // before either another init or the main workload executes.
+            self.ops
+                .apply_network_pre_start(instance_id, app_name, Some(spec), cgroup_path)
+                .await?;
+        }
+        Ok(())
     }
 
     /// Drive a fresh instance through create → egress → init → start →
@@ -8334,54 +10677,18 @@ impl<G: Grill + Clone + 'static> DeployWorker<G> {
         // create → program → start: the workload never runs ahead of its
         // egress policy (#86). On failure the loop stops the container.
         self.ops
-            .apply_egress_pre_start(instance_id, app_name, spec, &prepared.cgroup_path)
+            .apply_network_pre_start(instance_id, app_name, Some(spec), &prepared.cgroup_path)
             .await?;
 
         if prepared.has_init {
-            self.ops
-                .transition_state(instance_id, ContainerState::Initialising)
-                .await?;
-            for (i, init_spec) in spec.init.iter().enumerate() {
-                let init_id = InstanceId(format!("{}-init-{i}", instance_id.0));
-                let init_oci = crate::grill::oci::generate_init_oci_spec(
-                    &init_spec.command,
-                    namespace,
-                    app_name,
-                    spec.image.as_deref(),
-                    &prepared.cgroup_str,
-                    None,
-                );
-                self.grill.create(&init_id, &init_oci).await?;
-                self.grill.start(&init_id).await?;
-
-                // Bounded wait: a hung init can't wedge the deploy forever (and
-                // no longer wedges the loop at all — this poll is off it).
-                let deadline =
-                    std::time::Instant::now() + std::time::Duration::from_secs(INIT_TIMEOUT_SECS);
-                let failed = loop {
-                    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-                    let state = self.grill.state(&init_id).await?;
-                    if state == ContainerState::Stopped {
-                        let exit_code = self.grill.exit_code(&init_id).await;
-                        break exit_code != Some(0);
-                    }
-                    if std::time::Instant::now() >= deadline {
-                        let _ = self.grill.kill(&init_id).await;
-                        break true;
-                    }
-                };
-
-                if failed {
-                    let _ = self
-                        .ops
-                        .transition_state(instance_id, ContainerState::Failed)
-                        .await;
-                    return Err(BunError::InitContainerFailed {
-                        instance_id: instance_id.clone(),
-                        init_index: i,
-                    });
-                }
-            }
+            self.drive_initialisers(
+                instance_id,
+                app_name,
+                namespace,
+                spec,
+                &prepared.cgroup_path,
+            )
+            .await?;
         }
 
         self.ops
@@ -8395,8 +10702,8 @@ impl<G: Grill + Clone + 'static> DeployWorker<G> {
             .await
     }
 
-    /// Drive a job instance through create → start → Running. Jobs skip
-    /// health checks and egress programming (the former `drive_job_startup`).
+    /// Drive a job through create → source policy → start → Running.
+    /// Jobs have no external allowlist or health checks.
     async fn drive_job(
         &self,
         instance_id: &InstanceId,
@@ -8408,17 +10715,19 @@ impl<G: Grill + Clone + 'static> DeployWorker<G> {
             .transition_state(instance_id, ContainerState::Preparing)
             .await?;
 
-        let instance_index: u32 = instance_id
-            .0
-            .rsplit('-')
-            .next()
-            .and_then(|s| s.parse().ok())
-            .unwrap_or(0);
-        let cgroup_path = crate::grill::cgroup::cgroup_path(namespace, job_name, instance_index);
+        let cgroup_path =
+            crate::grill::cgroup::instance_cgroup_path(namespace, job_name, instance_id)?;
         let cgroup_str = cgroup_path.to_string_lossy();
         let oci_spec = generate_job_oci_spec(job_name, namespace, spec, &cgroup_str, None);
 
         self.grill.create(instance_id, &oci_spec).await?;
+        self.ops.store_oci_spec(instance_id, oci_spec.clone()).await;
+        self.ops
+            .apply_network_pre_start(instance_id, job_name, None, &cgroup_path)
+            .await?;
+        self.ops
+            .transition_state(instance_id, ContainerState::Starting)
+            .await?;
         self.grill.start(instance_id).await?;
         self.ops
             .finish_job_instance(instance_id, job_name, namespace, oci_spec)
@@ -8437,7 +10746,7 @@ impl<G: Grill + Clone + 'static> DeployWorker<G> {
     ) -> Result<(), BunError> {
         let ids = self
             .ops
-            .supervisor_deploy_job(job_name, namespace, spec)
+            .supervisor_deploy_job(job_name, namespace, spec, self.rerun_unknown_jobs)
             .await?;
         for id in &ids {
             self.drive_job(id, job_name, namespace, spec).await?;
@@ -8450,6 +10759,7 @@ impl<G: Grill + Clone + 'static> DeployWorker<G> {
                 if state == ContainerState::Stopped {
                     let exit_code = self.grill.exit_code(id).await;
                     if exit_code == Some(0) {
+                        self.ops.confirm_job_success(id).await?;
                         break;
                     }
                     return Err(BunError::DeployFailed {
@@ -8504,7 +10814,17 @@ impl<G: Grill + Clone + 'static> DeployWorker<G> {
             .map(crate::meat::deploy_types::DeployConfig::from_spec)
             .unwrap_or_default();
 
-        let deploy_gen = self.ops.next_deploy_gen().await;
+        let deploy_gen = match self.ops.next_deploy_gen(app_name).await {
+            Ok(generation) => generation,
+            Err(error) => {
+                let _ = events
+                    .send(ApplyEvent::Error {
+                        message: error.to_string(),
+                    })
+                    .await;
+                return std::ops::ControlFlow::Break(());
+            }
+        };
         let replica_count = match spec.replicas {
             crate::config::types::Replicas::Fixed(n) => n,
             crate::config::types::Replicas::DaemonSet => 1,
@@ -8518,6 +10838,7 @@ impl<G: Grill + Clone + 'static> DeployWorker<G> {
         let mut new_ips: std::collections::HashMap<InstanceId, Option<std::net::Ipv4Addr>> =
             std::collections::HashMap::new();
         let mut new_prepared: Vec<InstanceId> = Vec::new();
+        let mut runtime_attempted = std::collections::HashSet::new();
         let mut new_failed = false;
 
         // M7: drive the rollout through `plan_rolling_step` rather than
@@ -8533,6 +10854,10 @@ impl<G: Grill + Clone + 'static> DeployWorker<G> {
         let mut retired: usize = 0;
         let mut next_replica_index: u32 = 0;
         loop {
+            if self.report_cancellation(events).await {
+                new_failed = true;
+                break;
+            }
             let step = crate::meat::deploy_types::plan_rolling_step(
                 replica_count,
                 new_ids.len() as u32,
@@ -8571,14 +10896,52 @@ impl<G: Grill + Clone + 'static> DeployWorker<G> {
                     // Drain and stop the old instance on this spawned deploy
                     // task (M7), then send only the fast bookkeeping to the
                     // command loop — the wait no longer stalls every command.
-                    drain_and_stop_instance(
-                        &self.drains,
-                        &self.grill,
-                        &old_id,
-                        deploy_config.drain_timeout,
-                    )
-                    .await;
-                    self.ops.finish_retire(&old_id).await;
+                    if let Err(error) = self
+                        .retire_old_instance(&old_id, deploy_config.drain_timeout)
+                        .await
+                    {
+                        let retention = self
+                            .retain_started_replacements(
+                                app_name, namespace, spec, &new_ids, &new_ports, &new_specs,
+                            )
+                            .await;
+                        let _ = events
+                            .send(ApplyEvent::Error {
+                                message: format!(
+                                    "old instance retirement unconfirmed: {error}; {}",
+                                    match retention {
+                                        Ok(()) =>
+                                            "started replacements retained for cleanup".to_string(),
+                                        Err(error) => format!(
+                                            "could not retain replacement ownership: {error}"
+                                        ),
+                                    }
+                                ),
+                            })
+                            .await;
+                        return std::ops::ControlFlow::Break(());
+                    }
+                    if let Err(error) = self.ops.finish_retire(&old_id).await {
+                        let retention = self
+                            .retain_started_replacements(
+                                app_name, namespace, spec, &new_ids, &new_ports, &new_specs,
+                            )
+                            .await;
+                        let detail = match retention {
+                            Ok(()) => "started replacements retained for cleanup".into(),
+                            Err(error) => {
+                                format!("could not retain replacement ownership: {error}")
+                            }
+                        };
+                        let _ = events
+                            .send(ApplyEvent::Error {
+                                message: format!(
+                                    "old instance artifact retirement failed: {error}; {detail}"
+                                ),
+                            })
+                            .await;
+                        return std::ops::ControlFlow::Break(());
+                    }
                     retired += 1;
                     continue;
                 }
@@ -8595,27 +10958,28 @@ impl<G: Grill + Clone + 'static> DeployWorker<G> {
                 })
                 .await;
 
-            let host_port = if spec.port.is_some() {
-                match self.port_allocator.allocate().await {
-                    Ok(p) => Some(p),
-                    Err(e) => {
-                        let _ = events
-                            .send(ApplyEvent::Error {
-                                message: format!("port allocation failed: {e}"),
-                            })
-                            .await;
-                        new_failed = true;
-                        break;
-                    }
+            let host_port = match self
+                .ops
+                .reserve_rolling_instance(&new_id, app_name, namespace, spec)
+                .await
+            {
+                Ok(port) => port,
+                Err(error) => {
+                    let _ = events
+                        .send(ApplyEvent::Error {
+                            message: error.to_string(),
+                        })
+                        .await;
+                    new_failed = true;
+                    break;
                 }
-            } else {
-                None
             };
 
+            new_ports.insert(new_id.clone(), host_port);
             new_prepared.push(new_id.clone());
             let oci_spec = match self
                 .ops
-                .prepare_rolling_instance(&new_id, app_name, namespace, spec, host_port, i)
+                .prepare_rolling_instance(&new_id, app_name, namespace, spec, host_port)
                 .await
             {
                 Ok(oci_spec) => oci_spec,
@@ -8629,8 +10993,20 @@ impl<G: Grill + Clone + 'static> DeployWorker<G> {
                     break;
                 }
             };
-            let cgroup_path = crate::grill::cgroup::cgroup_path(namespace, app_name, i);
+            let Some(cgroup_path) = oci_spec.linux.host_cgroup_path() else {
+                let _ = events
+                    .send(ApplyEvent::Error {
+                        message: format!(
+                            "replacement {} has no valid original cgroup path",
+                            new_id.0
+                        ),
+                    })
+                    .await;
+                new_failed = true;
+                break;
+            };
 
+            runtime_attempted.insert(new_id.clone());
             if let Err(e) = self.grill.create(&new_id, &oci_spec).await {
                 let _ = events
                     .send(ApplyEvent::Error {
@@ -8643,7 +11019,7 @@ impl<G: Grill + Clone + 'static> DeployWorker<G> {
             // Same create → program → start ordering as the fresh path (#86).
             if let Err(e) = self
                 .ops
-                .apply_egress_pre_start(&new_id, app_name, spec, &cgroup_path)
+                .apply_network_pre_start(&new_id, app_name, Some(spec), &cgroup_path)
                 .await
             {
                 let _ = events
@@ -8651,7 +11027,23 @@ impl<G: Grill + Clone + 'static> DeployWorker<G> {
                         message: format!("failed to program egress for {}: {e}", new_id.0),
                     })
                     .await;
-                let _ = self.grill.stop(&new_id).await;
+                new_failed = true;
+                break;
+            }
+            let initialised = async {
+                self.drive_initialisers(&new_id, app_name, namespace, spec, &cgroup_path)
+                    .await?;
+                self.ops
+                    .transition_state(&new_id, ContainerState::Starting)
+                    .await
+            }
+            .await;
+            if let Err(error) = initialised {
+                let _ = events
+                    .send(ApplyEvent::Error {
+                        message: format!("failed to initialise {}: {error}", new_id.0),
+                    })
+                    .await;
                 new_failed = true;
                 break;
             }
@@ -8661,13 +11053,29 @@ impl<G: Grill + Clone + 'static> DeployWorker<G> {
                         message: format!("failed to start {}: {e}", new_id.0),
                     })
                     .await;
-                self.ops.clear_egress(&new_id).await;
                 new_failed = true;
                 break;
             }
-            self.ops
-                .register_rolling_instance(&new_id, app_name, namespace)
-                .await;
+            if let Err(error) = self
+                .ops
+                .register_rolling_instance(RollingInstance {
+                    instance_id: new_id.clone(),
+                    app_name: app_name.to_string(),
+                    namespace: namespace.to_string(),
+                    spec: spec.clone(),
+                    oci_spec: oci_spec.clone(),
+                    host_port,
+                })
+                .await
+            {
+                let _ = events
+                    .send(ApplyEvent::Error {
+                        message: error.to_string(),
+                    })
+                    .await;
+                new_failed = true;
+                break;
+            }
 
             let container_ip = self.grill.container_ip(&new_id).await;
 
@@ -8679,7 +11087,10 @@ impl<G: Grill + Clone + 'static> DeployWorker<G> {
             // health check the operator configured, not merely because its
             // process came up.
             let wait = effective_health_wait(&deploy_config);
-            match wait_instance_healthy(&self.grill, &new_id, spec, container_ip, wait).await {
+            match self
+                .wait_for_deploy_health(&new_id, spec, container_ip, wait)
+                .await
+            {
                 Ok(()) => {
                     let _ = events
                         .send(ApplyEvent::Progress {
@@ -8692,8 +11103,6 @@ impl<G: Grill + Clone + 'static> DeployWorker<G> {
                 }
                 Err(message) => {
                     let _ = events.send(ApplyEvent::Error { message }).await;
-                    let _ = self.grill.kill(&new_id).await;
-                    self.ops.clear_egress(&new_id).await;
                     new_failed = true;
                     break;
                 }
@@ -8707,7 +11116,8 @@ impl<G: Grill + Clone + 'static> DeployWorker<G> {
             // `max_unavailable = 0` this is what makes the guarantee real —
             // retiring first and publishing later would leave a gap however
             // carefully the counts were tracked.
-            self.ops
+            if let Err(error) = self
+                .ops
                 .publish_new_backend(
                     app_name,
                     namespace,
@@ -8716,54 +11126,35 @@ impl<G: Grill + Clone + 'static> DeployWorker<G> {
                     container_ip,
                     spec.port.is_some(),
                 )
-                .await;
+                .await
+            {
+                let _ = events
+                    .send(ApplyEvent::Error {
+                        message: error.to_string(),
+                    })
+                    .await;
+                new_failed = true;
+                break;
+            }
             new_ids.push(new_id);
         }
 
         if new_failed {
-            if deploy_config.auto_rollback {
-                self.ops
-                    .rollback_rolling_deploy(
-                        app_name,
-                        namespace,
-                        spec,
-                        new_ids,
-                        new_prepared,
-                        new_ports,
-                        replica_count,
-                    )
-                    .await;
-                let _ = events
-                    .send(ApplyEvent::Error {
-                        message: "rolled back — old instances preserved".to_string(),
-                    })
-                    .await;
-            } else {
-                // auto_rollback = false: halt without reverting. Keep the
-                // healthy new instances and the surviving old ones in place for
-                // the operator to inspect; tear down only the incomplete one.
-                let new_live = new_ids.len();
-                let old_live = existing.len().saturating_sub(retired);
-                self.ops
-                    .halt_rolling_deploy(
-                        app_name,
-                        namespace,
-                        spec,
-                        new_ids,
-                        new_prepared,
-                        new_ports,
-                        replica_count,
-                    )
-                    .await;
-                let _ = events
-                    .send(ApplyEvent::Error {
-                        message: format!(
-                            "deploy halted (auto_rollback = false): {new_live} new and \
-                             {old_live} old instance(s) left running for inspection"
-                        ),
-                    })
-                    .await;
-            }
+            self.abort_rollout(
+                app_name,
+                namespace,
+                spec,
+                &new_ids,
+                &new_prepared,
+                &runtime_attempted,
+                &new_ports,
+                &new_specs,
+                deploy_config.auto_rollback,
+                retired,
+                replica_count,
+                events,
+            )
+            .await;
             return std::ops::ControlFlow::Break(());
         }
 
@@ -8779,28 +11170,62 @@ impl<G: Grill + Clone + 'static> DeployWorker<G> {
                     message: format!("stopping old instance {}", old_id.0),
                 })
                 .await;
-            drain_and_stop_instance(
-                &self.drains,
-                &self.grill,
-                old_id,
-                deploy_config.drain_timeout,
-            )
-            .await;
+            if let Err(error) = self
+                .retire_old_instance(old_id, deploy_config.drain_timeout)
+                .await
+            {
+                let retention = self
+                    .retain_started_replacements(
+                        app_name, namespace, spec, &new_ids, &new_ports, &new_specs,
+                    )
+                    .await;
+                let _ = events
+                    .send(ApplyEvent::Error {
+                        message: format!(
+                            "old instance retirement unconfirmed: {error}; {}",
+                            match retention {
+                                Ok(()) => "started replacements retained for cleanup".to_string(),
+                                Err(error) =>
+                                    format!("could not retain replacement ownership: {error}"),
+                            }
+                        ),
+                    })
+                    .await;
+                return std::ops::ControlFlow::Break(());
+            }
         }
 
-        self.ops
+        if let Err(error) = self
+            .ops
             .finalise_rolling_deploy(
                 app_name,
                 namespace,
                 spec,
                 outstanding,
                 new_ids.clone(),
-                new_ports,
+                new_ports.clone(),
                 new_ips,
-                new_specs,
+                new_specs.clone(),
                 now,
             )
-            .await;
+            .await
+        {
+            let retention = self
+                .retain_started_replacements(
+                    app_name, namespace, spec, &new_ids, &new_ports, &new_specs,
+                )
+                .await;
+            let detail = match retention {
+                Ok(()) => "started replacements retained for cleanup".into(),
+                Err(error) => format!("could not retain replacement ownership: {error}"),
+            };
+            let _ = events
+                .send(ApplyEvent::Error {
+                    message: format!("rollout finalisation failed: {error}; {detail}"),
+                })
+                .await;
+            return std::ops::ControlFlow::Break(());
+        }
 
         for new_id in &new_ids {
             let _ = events
@@ -8812,6 +11237,130 @@ impl<G: Grill + Clone + 'static> DeployWorker<G> {
         }
 
         std::ops::ControlFlow::Continue(())
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn abort_rollout(
+        &self,
+        app_name: &str,
+        namespace: &str,
+        spec: &AppSpec,
+        healthy: &[InstanceId],
+        prepared: &[InstanceId],
+        runtime_attempted: &std::collections::HashSet<InstanceId>,
+        ports: &std::collections::HashMap<InstanceId, Option<u16>>,
+        specs: &std::collections::HashMap<InstanceId, crate::grill::oci::OciSpec>,
+        auto_rollback: bool,
+        retired: usize,
+        replica_count: u32,
+        events: &mpsc::Sender<ApplyEvent>,
+    ) {
+        let mut errors = Vec::new();
+        if !auto_rollback
+            && let Err(error) = self
+                .retain_started_replacements(app_name, namespace, spec, healthy, ports, specs)
+                .await
+        {
+            errors.push(error.to_string());
+        }
+        for id in prepared {
+            if !auto_rollback && healthy.contains(id) {
+                continue;
+            }
+            let cleanup = async {
+                self.ops.begin_retire(id).await?;
+                // A failed create may already own runtime resources. Only a
+                // reservation that never attempted create proves their absence.
+                if runtime_attempted.contains(id) {
+                    kill_runtime_instance(&self.grill, id).await?;
+                }
+                self.ops.finish_retire(id).await
+            }
+            .await;
+            if let Err(error) = cleanup {
+                errors.push(format!("{id}: {error}"));
+            }
+        }
+        let (result, message) = if !errors.is_empty() {
+            (
+                crate::meat::deploy_types::DeployResult::Failed,
+                format!(
+                    "rollout cleanup incomplete; remaining owners retained: {}",
+                    errors.join("; ")
+                ),
+            )
+        } else if auto_rollback && retired == 0 {
+            (
+                crate::meat::deploy_types::DeployResult::RolledBack,
+                "rolled back — old instances preserved".to_string(),
+            )
+        } else {
+            (
+                crate::meat::deploy_types::DeployResult::Halted,
+                format!(
+                    "deploy halted: {} healthy new instance(s) left running; {retired} old instance(s) already retired",
+                    if auto_rollback { 0 } else { healthy.len() }
+                ),
+            )
+        };
+        self.ops
+            .push_deploy_history(crate::meat::deploy_types::DeployHistoryEntry {
+                id: crate::meat::deploy_types::DeployId(
+                    SystemTime::now()
+                        .duration_since(SystemTime::UNIX_EPOCH)
+                        .unwrap_or_default()
+                        .as_secs(),
+                ),
+                app_id: crate::meat::types::AppId::new(app_name, namespace),
+                image: spec.image.clone().unwrap_or_default(),
+                result,
+                created_at: SystemTime::now(),
+                completed_at: SystemTime::now(),
+                steps_completed: healthy.len(),
+                steps_total: replica_count as usize,
+                spec: Some(Box::new(spec.clone())),
+            })
+            .await;
+        let _ = events.send(ApplyEvent::Error { message }).await;
+    }
+
+    /// Publish retirement intent before runtime exit can trigger the restart driver.
+    async fn retire_old_instance(
+        &self,
+        id: &InstanceId,
+        drain_timeout: std::time::Duration,
+    ) -> Result<(), BunError> {
+        self.ops.begin_retire(id).await?;
+        drain_and_stop_instance(&self.drains, &self.grill, id, drain_timeout).await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn retain_started_replacements(
+        &self,
+        app_name: &str,
+        namespace: &str,
+        spec: &AppSpec,
+        ids: &[InstanceId],
+        ports: &std::collections::HashMap<InstanceId, Option<u16>>,
+        specs: &std::collections::HashMap<InstanceId, crate::grill::oci::OciSpec>,
+    ) -> Result<(), BunError> {
+        for id in ids {
+            let oci_spec = specs.get(id).ok_or_else(|| BunError::DeployFailed {
+                app_name: app_name.into(),
+                reason: format!("missing launch ownership for {id}"),
+            })?;
+            self.ops
+                .retain_rolling_instance(RollingInstance {
+                    instance_id: id.clone(),
+                    app_name: app_name.into(),
+                    namespace: namespace.into(),
+                    spec: spec.clone(),
+                    oci_spec: oci_spec.clone(),
+                    host_port: ports.get(id).copied().flatten(),
+                })
+                .await?;
+        }
+        Ok(())
     }
 
     /// Blue-green redeploy: start the whole new ("green") fleet in parallel to
@@ -8843,7 +11392,17 @@ impl<G: Grill + Clone + 'static> DeployWorker<G> {
             .as_ref()
             .map(crate::meat::deploy_types::DeployConfig::from_spec)
             .unwrap_or_default();
-        let deploy_gen = self.ops.next_deploy_gen().await;
+        let deploy_gen = match self.ops.next_deploy_gen(app_name).await {
+            Ok(generation) => generation,
+            Err(error) => {
+                let _ = events
+                    .send(ApplyEvent::Error {
+                        message: error.to_string(),
+                    })
+                    .await;
+                return std::ops::ControlFlow::Break(());
+            }
+        };
         let replica_count = match spec.replicas {
             crate::config::types::Replicas::Fixed(n) => n,
             crate::config::types::Replicas::DaemonSet => 1,
@@ -8857,12 +11416,17 @@ impl<G: Grill + Clone + 'static> DeployWorker<G> {
         let mut new_ips: std::collections::HashMap<InstanceId, Option<std::net::Ipv4Addr>> =
             std::collections::HashMap::new();
         let mut new_prepared: Vec<InstanceId> = Vec::new();
+        let mut runtime_attempted = std::collections::HashSet::new();
         let mut new_failed = false;
 
         // Start and health check the entire green fleet before touching blue.
         // Unlike the rolling planner, nothing retires here and nothing is
         // published to routing yet: green comes up dark, alongside blue.
         for i in 0..replica_count {
+            if self.report_cancellation(events).await {
+                new_failed = true;
+                break;
+            }
             let new_id = crate::grill::InstanceIdentity::canary(namespace, app_name, deploy_gen, i)
                 .instance_id();
             let _ = events
@@ -8871,27 +11435,28 @@ impl<G: Grill + Clone + 'static> DeployWorker<G> {
                 })
                 .await;
 
-            let host_port = if spec.port.is_some() {
-                match self.port_allocator.allocate().await {
-                    Ok(p) => Some(p),
-                    Err(e) => {
-                        let _ = events
-                            .send(ApplyEvent::Error {
-                                message: format!("port allocation failed: {e}"),
-                            })
-                            .await;
-                        new_failed = true;
-                        break;
-                    }
+            let host_port = match self
+                .ops
+                .reserve_rolling_instance(&new_id, app_name, namespace, spec)
+                .await
+            {
+                Ok(port) => port,
+                Err(error) => {
+                    let _ = events
+                        .send(ApplyEvent::Error {
+                            message: error.to_string(),
+                        })
+                        .await;
+                    new_failed = true;
+                    break;
                 }
-            } else {
-                None
             };
 
+            new_ports.insert(new_id.clone(), host_port);
             new_prepared.push(new_id.clone());
             let oci_spec = match self
                 .ops
-                .prepare_rolling_instance(&new_id, app_name, namespace, spec, host_port, i)
+                .prepare_rolling_instance(&new_id, app_name, namespace, spec, host_port)
                 .await
             {
                 Ok(oci_spec) => oci_spec,
@@ -8905,8 +11470,20 @@ impl<G: Grill + Clone + 'static> DeployWorker<G> {
                     break;
                 }
             };
-            let cgroup_path = crate::grill::cgroup::cgroup_path(namespace, app_name, i);
+            let Some(cgroup_path) = oci_spec.linux.host_cgroup_path() else {
+                let _ = events
+                    .send(ApplyEvent::Error {
+                        message: format!(
+                            "replacement {} has no valid original cgroup path",
+                            new_id.0
+                        ),
+                    })
+                    .await;
+                new_failed = true;
+                break;
+            };
 
+            runtime_attempted.insert(new_id.clone());
             if let Err(e) = self.grill.create(&new_id, &oci_spec).await {
                 let _ = events
                     .send(ApplyEvent::Error {
@@ -8918,7 +11495,7 @@ impl<G: Grill + Clone + 'static> DeployWorker<G> {
             }
             if let Err(e) = self
                 .ops
-                .apply_egress_pre_start(&new_id, app_name, spec, &cgroup_path)
+                .apply_network_pre_start(&new_id, app_name, Some(spec), &cgroup_path)
                 .await
             {
                 let _ = events
@@ -8926,7 +11503,6 @@ impl<G: Grill + Clone + 'static> DeployWorker<G> {
                         message: format!("failed to program egress for {}: {e}", new_id.0),
                     })
                     .await;
-                let _ = self.grill.stop(&new_id).await;
                 new_failed = true;
                 break;
             }
@@ -8936,13 +11512,29 @@ impl<G: Grill + Clone + 'static> DeployWorker<G> {
                         message: format!("failed to start {}: {e}", new_id.0),
                     })
                     .await;
-                self.ops.clear_egress(&new_id).await;
                 new_failed = true;
                 break;
             }
-            self.ops
-                .register_rolling_instance(&new_id, app_name, namespace)
-                .await;
+            if let Err(error) = self
+                .ops
+                .register_rolling_instance(RollingInstance {
+                    instance_id: new_id.clone(),
+                    app_name: app_name.to_string(),
+                    namespace: namespace.to_string(),
+                    spec: spec.clone(),
+                    oci_spec: oci_spec.clone(),
+                    host_port,
+                })
+                .await
+            {
+                let _ = events
+                    .send(ApplyEvent::Error {
+                        message: error.to_string(),
+                    })
+                    .await;
+                new_failed = true;
+                break;
+            }
 
             let container_ip = self.grill.container_ip(&new_id).await;
 
@@ -8951,7 +11543,10 @@ impl<G: Grill + Clone + 'static> DeployWorker<G> {
             // otherwise a green fleet that starts but can't serve replaces a
             // blue fleet that can.
             let wait = effective_health_wait(&deploy_config);
-            match wait_instance_healthy(&self.grill, &new_id, spec, container_ip, wait).await {
+            match self
+                .wait_for_deploy_health(&new_id, spec, container_ip, wait)
+                .await
+            {
                 Ok(()) => {
                     let _ = events
                         .send(ApplyEvent::Progress {
@@ -8964,8 +11559,6 @@ impl<G: Grill + Clone + 'static> DeployWorker<G> {
                 }
                 Err(message) => {
                     let _ = events.send(ApplyEvent::Error { message }).await;
-                    let _ = self.grill.kill(&new_id).await;
-                    self.ops.clear_egress(&new_id).await;
                     new_failed = true;
                     break;
                 }
@@ -8977,47 +11570,25 @@ impl<G: Grill + Clone + 'static> DeployWorker<G> {
             new_ids.push(new_id);
         }
 
+        if !new_failed && self.report_cancellation(events).await {
+            new_failed = true;
+        }
         if new_failed {
-            // Green never took over routing, so blue is still live regardless of
-            // auto_rollback. Rollback tears green down; halt leaves it up for
-            // inspection. Either way blue keeps serving.
-            if deploy_config.auto_rollback {
-                self.ops
-                    .rollback_rolling_deploy(
-                        app_name,
-                        namespace,
-                        spec,
-                        new_ids,
-                        new_prepared,
-                        new_ports,
-                        replica_count,
-                    )
-                    .await;
-                let _ = events
-                    .send(ApplyEvent::Error {
-                        message: "rolled back — blue fleet preserved".to_string(),
-                    })
-                    .await;
-            } else {
-                self.ops
-                    .halt_rolling_deploy(
-                        app_name,
-                        namespace,
-                        spec,
-                        new_ids,
-                        new_prepared,
-                        new_ports,
-                        replica_count,
-                    )
-                    .await;
-                let _ = events
-                    .send(ApplyEvent::Error {
-                        message: "deploy halted (auto_rollback = false): green fleet left running \
-                                  for inspection"
-                            .to_string(),
-                    })
-                    .await;
-            }
+            self.abort_rollout(
+                app_name,
+                namespace,
+                spec,
+                &new_ids,
+                &new_prepared,
+                &runtime_attempted,
+                &new_ports,
+                &new_specs,
+                deploy_config.auto_rollback,
+                0,
+                replica_count,
+                events,
+            )
+            .await;
             return std::ops::ControlFlow::Break(());
         }
 
@@ -9028,7 +11599,8 @@ impl<G: Grill + Clone + 'static> DeployWorker<G> {
         // command for up to fleet-size × drain_timeout), and finally send the
         // fast bookkeeping to the loop.
         for new_id in &new_ids {
-            self.ops
+            if let Err(error) = self
+                .ops
                 .publish_new_backend(
                     app_name,
                     namespace,
@@ -9037,30 +11609,87 @@ impl<G: Grill + Clone + 'static> DeployWorker<G> {
                     new_ips.get(new_id).copied().flatten(),
                     spec.port.is_some(),
                 )
+                .await
+            {
+                let _ = events
+                    .send(ApplyEvent::Error {
+                        message: error.to_string(),
+                    })
+                    .await;
+                self.abort_rollout(
+                    app_name,
+                    namespace,
+                    spec,
+                    &new_ids,
+                    &new_prepared,
+                    &runtime_attempted,
+                    &new_ports,
+                    &new_specs,
+                    deploy_config.auto_rollback,
+                    0,
+                    replica_count,
+                    events,
+                )
                 .await;
+                return std::ops::ControlFlow::Break(());
+            }
         }
         for old_id in &existing {
-            drain_and_stop_instance(
-                &self.drains,
-                &self.grill,
-                old_id,
-                deploy_config.drain_timeout,
-            )
-            .await;
+            if let Err(error) = self
+                .retire_old_instance(old_id, deploy_config.drain_timeout)
+                .await
+            {
+                let retention = self
+                    .retain_started_replacements(
+                        app_name, namespace, spec, &new_ids, &new_ports, &new_specs,
+                    )
+                    .await;
+                let _ = events
+                    .send(ApplyEvent::Error {
+                        message: format!(
+                            "old instance retirement unconfirmed: {error}; {}",
+                            match retention {
+                                Ok(()) => "started replacements retained for cleanup".to_string(),
+                                Err(error) =>
+                                    format!("could not retain replacement ownership: {error}"),
+                            }
+                        ),
+                    })
+                    .await;
+                return std::ops::ControlFlow::Break(());
+            }
         }
-        self.ops
+        if let Err(error) = self
+            .ops
             .finalise_rolling_deploy(
                 app_name,
                 namespace,
                 spec,
                 existing,
                 new_ids.clone(),
-                new_ports,
+                new_ports.clone(),
                 new_ips,
-                new_specs,
+                new_specs.clone(),
                 now,
             )
-            .await;
+            .await
+        {
+            let retention = self
+                .retain_started_replacements(
+                    app_name, namespace, spec, &new_ids, &new_ports, &new_specs,
+                )
+                .await;
+            let detail = match retention {
+                Ok(()) => "started replacements retained for cleanup".into(),
+                Err(error) => format!("could not retain replacement ownership: {error}"),
+            };
+            let _ = events
+                .send(ApplyEvent::Error {
+                    message: format!("rollout finalisation failed: {error}; {detail}"),
+                })
+                .await;
+            return std::ops::ControlFlow::Break(());
+        }
 
         for new_id in &new_ids {
             let _ = events
@@ -9120,15 +11749,20 @@ fn trace_probe_step(
     use crate::onion::trace::{TraceEvidence, TraceStep, TraceVerdict};
     match probe {
         Ok(probe) => {
+            let expected_answer = expected_value.is_none_or(|expected| {
+                expected
+                    .parse::<std::net::IpAddr>()
+                    .is_ok_and(|address| probe.dns_answers().contains(&address))
+            });
             let mut details = vec![format!("fixed workload probe target: {target}")];
             details.extend(probe.lines);
             let verdict = if probe.status == 0 {
                 if let Some(expected) = expected_value
-                    && !details.iter().any(|line| line.contains(expected))
+                    && !expected_answer
                 {
                     TraceVerdict::Fail {
                         reason: format!(
-                            "probe succeeded but its answer did not contain expected value {expected}"
+                            "probe succeeded but its DNS answers did not include exact address {expected}"
                         ),
                     }
                 } else {
@@ -9328,6 +11962,65 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn trace_requires_an_exact_dns_answer_not_server_or_name_text() {
+        let (mut agent, tx, shutdown, grill) = test_agent_with_grill();
+        let handle = tokio::spawn(async move { agent.run().await });
+        expect_complete(
+            &send_deploy(
+                &tx,
+                Config::parse(
+                    r#"
+            [app.source]
+            image = "source:v1"
+            [app.destination]
+            image = "destination:v1"
+            port = 8080
+        "#,
+                )
+                .unwrap(),
+            )
+            .await,
+        );
+        let vip = crate::onion::vip::VirtualIP::from_qualified("default__destination");
+        let mut verdicts = Vec::new();
+        for answer in [
+            format!(
+                "Server: resolver\nAddress: {vip}#53\nName: destination.default.internal\nAddress: 127.0.0.1"
+            ),
+            format!("Name: {vip}.invalid\nAddress: {vip}0"),
+        ] {
+            grill.set_exec_outputs([
+                format!("{answer}\n__RB_TRACE_DNS_STATUS__=0\n"),
+                "__RB_TRACE_TCP_STATUS__=0\n".into(),
+            ]);
+            let (response, receiver) = oneshot::channel();
+            tx.send(AgentCommand::Trace {
+                request: crate::onion::trace::TraceRequest {
+                    source: "source".into(),
+                    source_namespace: "default".into(),
+                    destination: "destination".into(),
+                    destination_namespace: "default".into(),
+                    port: None,
+                },
+                internal_destination: true,
+                source_node: "node-a".into(),
+                response,
+            })
+            .await
+            .unwrap();
+            verdicts.push(receiver.await.unwrap().unwrap().steps[0].verdict.clone());
+        }
+        shutdown.cancel();
+        handle.await.unwrap();
+        assert!(
+            verdicts
+                .iter()
+                .all(|verdict| matches!(verdict, crate::onion::trace::TraceVerdict::Fail { .. })),
+            "{verdicts:?}"
+        );
+    }
+
+    #[tokio::test]
     async fn trace_concurrency_is_bounded_without_queueing_more_workload_processes() {
         let (mut agent, tx, shutdown, grill) = test_agent_with_grill();
         let handle = tokio::spawn(async move { agent.run().await });
@@ -9444,17 +12137,1440 @@ mod tests {
         handle.await.unwrap();
     }
 
-    fn test_agent() -> (
-        BunAgent<MockGrill>,
-        mpsc::Sender<AgentCommand>,
-        CancellationToken,
-    ) {
+    #[cfg(all(feature = "ebpf", target_os = "linux"))]
+    #[tokio::test]
+    async fn egress_health_waits_for_preparation_but_fences_unbound_execution() {
+        for stage in [
+            ContainerState::Pending,
+            ContainerState::Preparing,
+            ContainerState::Initialising,
+            ContainerState::Starting,
+            ContainerState::HealthWait,
+            ContainerState::Running,
+            ContainerState::Unhealthy,
+            ContainerState::Stopping,
+        ] {
+            let (mut agent, _tx, _shutdown) = test_agent();
+            let mut spec = Config::parse("[app.web]\nimage = 'mock:image'\n")
+                .unwrap()
+                .app
+                .remove("web")
+                .unwrap();
+            let ids = agent
+                .supervisor
+                .deploy_app("web", "default", &spec, Instant::now())
+                .await
+                .unwrap();
+            spec.egress = Config::parse(
+                "[app.web]\nimage = 'mock:image'\n[app.web.egress]\nallow = ['203.0.113.9:443']\n",
+            )
+            .unwrap()
+            .app
+            .remove("web")
+            .unwrap()
+            .egress;
+            agent
+                .deployed_specs
+                .insert(("web".into(), "default".into()), spec);
+            agent.supervisor.get_instance_mut(&ids[0]).unwrap().state = stage;
+            // Missing kernel ownership is expected before pre-start programming,
+            // but must remain a fail-closed condition from init/start onwards.
+            agent.enforce_live_egress_or_stop().await;
+            let actual = agent.supervisor.get_instance(&ids[0]).unwrap().state;
+            if matches!(stage, ContainerState::Pending | ContainerState::Preparing) {
+                assert_eq!(
+                    actual, stage,
+                    "preparation was stopped before policy installation"
+                );
+                assert!(agent.egress_affected_workloads.is_empty());
+            } else {
+                assert!(
+                    matches!(actual, ContainerState::Stopping | ContainerState::Stopped),
+                    "{stage:?} remained {actual:?}"
+                );
+                assert!(
+                    agent
+                        .egress_affected_workloads
+                        .contains(&("web".into(), "default".into()))
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn health_tick_reuses_egress_evidence_but_later_reports_refresh_it() {
+        use std::sync::atomic::Ordering;
+        let (mut agent, _tx, _shutdown) = test_agent();
+        let readiness = crate::bun::readiness::ReadinessTracker::new();
+        agent.set_readiness_tracker(readiness.clone());
+        readiness
+            .set_capabilities(crate::meat::cluster_state::NodeCapabilities {
+                egress: crate::sesame::egress::EgressEnforcementCapability {
+                    connect_ipv4: true,
+                    connect_ipv6: true,
+                    udp_ipv4: true,
+                    udp_ipv6: true,
+                    pre_start: true,
+                },
+                ..Default::default()
+            })
+            .await;
+        agent.refresh_egress_readiness().await;
+        assert!(
+            !readiness
+                .capability_snapshot()
+                .await
+                .egress
+                .can_enforce_allowlist()
+        );
+        assert_eq!(agent.egress_observation_count.load(Ordering::Relaxed), 1);
+        agent.refresh_egress_readiness().await;
+        assert_eq!(agent.egress_observation_count.load(Ordering::Relaxed), 2);
+        let (capabilities, _) = agent.live_egress_report_state().await;
+        assert!(!capabilities.egress.can_enforce_allowlist());
+        assert_eq!(agent.egress_observation_count.load(Ordering::Relaxed), 3);
+    }
+
+    struct TestAgent {
+        agent: BunAgent<MockGrill>,
+        // Fields drop in declaration order: keep filesystem ownership through
+        // agent teardown, including when the fixture moves into a spawned task.
+        _volumes: tempfile::TempDir,
+    }
+
+    impl std::ops::Deref for TestAgent {
+        type Target = BunAgent<MockGrill>;
+
+        fn deref(&self) -> &Self::Target {
+            &self.agent
+        }
+    }
+
+    impl std::ops::DerefMut for TestAgent {
+        fn deref_mut(&mut self) -> &mut Self::Target {
+            &mut self.agent
+        }
+    }
+
+    fn test_agent() -> (TestAgent, mpsc::Sender<AgentCommand>, CancellationToken) {
         let (agent, tx, shutdown, _grill) = test_agent_with_grill();
         (agent, tx, shutdown)
     }
 
-    fn test_agent_with_grill() -> (
+    #[tokio::test]
+    async fn service_registration_refuses_a_closed_agent_channel() {
+        let (tx, rx) = mpsc::channel(1);
+        drop(rx);
+        let result = DeployOps { tx }
+            .register_service_app("api", "default", 8080, None)
+            .await;
+        assert!(matches!(result, Err(BunError::BackendPublication { .. })));
+    }
+
+    #[tokio::test]
+    async fn reporting_binds_execution_to_the_original_runtime_specification() {
+        let (mut agent, _, _, grill) = test_agent_with_grill();
+        expect_complete(&drain_deploy(&mut agent, basic_config()).await);
+        let id = InstanceId("default__web-0".into());
+        let spec = agent
+            .supervisor
+            .get_instance(&id)
+            .unwrap()
+            .oci_spec
+            .clone()
+            .unwrap();
+        for token in [
+            "first-original-generation",
+            "replacement-original-generation",
+        ] {
+            let launch = crate::grill::RuntimeLaunch {
+                instance_id: id.clone(),
+                spec: spec.clone(),
+                generation: crate::grill::RuntimeGeneration::process(token),
+                network_reference: None,
+            };
+            let expected = crate::grill::RuntimeExecution {
+                instance_id: id.clone(),
+                generation: launch.generation.clone(),
+            };
+            grill.set_launch_inventory(vec![launch.clone()]).await;
+            let (tx, rx) = oneshot::channel();
+            agent
+                .handle_snapshot_request(CollectSnapshotRequest { response: tx })
+                .await;
+            assert_eq!(rx.await.unwrap().instances[0].execution, Some(expected));
+            let mut wrong_spec = launch.clone();
+            wrong_spec
+                .spec
+                .process
+                .args
+                .push("different-runtime-spec".into());
+            for invalid in [vec![wrong_spec], vec![launch.clone(), launch], vec![]] {
+                grill.set_launch_inventory(invalid).await;
+                let (tx, rx) = oneshot::channel();
+                agent
+                    .handle_snapshot_request(CollectSnapshotRequest { response: tx })
+                    .await;
+                let report = rx.await.unwrap();
+                assert_eq!(
+                    report.instances.len(),
+                    1,
+                    "missing identity must not hide resource commitments"
+                );
+                assert!(report.instances[0].execution.is_none());
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn late_discovery_subscribers_receive_the_latest_service_snapshot() {
+        let (mut agent, _commands, _shutdown) = test_agent();
+        expect_complete(&drain_deploy(&mut agent, basic_config()).await);
+        let view = agent.service_map_watch();
+        let snapshot = view.borrow();
+        let service = crate::onion::service_id::ServiceId::new("default", "web");
+        let entry = snapshot
+            .resolve(&service)
+            .expect("late subscriber lost the completed deployment");
+        assert_eq!(entry.backends.len(), 1);
+        assert_eq!(entry.backends[0].instance_id, "default__web-0");
+        assert!(entry.backends[0].healthy);
+    }
+
+    #[tokio::test]
+    async fn fresh_discovery_refuses_adoption_without_original_inventory() {
+        let (mut original, _, _, grill) = test_agent_with_grill();
+        let records = tempfile::tempdir().unwrap();
+        original.set_records_dir(records.path().to_owned());
+        grill.set_pid(std::process::id());
+        expect_complete(&drain_deploy(&mut original, basic_config()).await);
+        let (mut replacement, _, _, recovered) = test_agent_with_grill();
+        replacement.set_records_dir(records.path().to_owned());
+        replacement
+            .enable_fresh_discovery_ownership(&records.path().join("discovery"))
+            .await
+            .unwrap();
+        let result = replacement.adopt_recorded_instances().await;
+        assert!(
+            matches!(result, Err(BunError::AdoptionState(_))),
+            "missing discovery recovery was accepted: {result:?}"
+        );
+        assert!(
+            !recovered
+                .calls()
+                .iter()
+                .any(|(operation, _)| operation == "adopt" || operation == "kill"),
+            "runtime recovery ran before original discovery reconciliation"
+        );
+        assert!(crate::grill::records::record_path(records.path(), "default__web-0").exists());
+    }
+
+    #[tokio::test]
+    async fn fresh_discovery_enablement_refuses_existing_consumer_obligations() {
+        let (mut agent, _, _) = test_agent();
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("discovery");
+        let journal = crate::bun::discovery_owners::DiscoveryJournal::open_async(&path)
+            .await
+            .unwrap();
+        let inventory = serde_json::from_value(serde_json::json!({
+            "services": [], "references": [], "consumer": {
+                "identity": {"node_id": "reader", "cluster_identity": vec![42_u8; 32]},
+                "publications": []
+            }
+        }))
+        .unwrap();
+        drop(journal.persist(inventory).await.unwrap());
+        assert!(agent.enable_fresh_discovery_ownership(&path).await.is_err());
+        assert!(matches!(
+            agent.discovery_ownership,
+            discovery_ownership::DiscoveryOwnership::Uncertain
+        ));
+    }
+
+    #[tokio::test]
+    async fn producer_agent_retains_process_port_and_owner_without_remote_confirmation() {
+        for has_inventory in [true, false] {
+            let (mut agent, _, _, grill) = test_agent_with_grill();
+            grill.set_pid(std::process::id());
+            let root = tempfile::tempdir().unwrap();
+            agent.set_volumes_dir(root.path().join("volumes"));
+            agent.set_records_dir(root.path().join("records"));
+            agent
+                .enable_fresh_discovery_ownership(&root.path().join("discovery"))
+                .await
+                .unwrap();
+            expect_complete(&drain_deploy(&mut agent, basic_config()).await);
+            let id = InstanceId("default__web-0".into());
+            let original = agent.supervisor.get_instance(&id).unwrap();
+            let original_port = original.host_port;
+            let original_spec = original.oci_spec.clone().unwrap();
+            if has_inventory {
+                grill
+                    .set_launch_inventory(vec![crate::grill::RuntimeLaunch {
+                        instance_id: id.clone(),
+                        generation: crate::grill::RuntimeGeneration::process("original"),
+                        spec: original_spec,
+                        network_reference: None,
+                    }])
+                    .await;
+            }
+            let (mut clustered, _, _) = test_cluster_fault_agent().await;
+            agent.cluster = clustered.cluster.take();
+            agent.kill_and_wait_for_exit(&id).await.unwrap();
+            assert!(
+                agent.finish_retire_bookkeeping(&id).await.is_err(),
+                "unconfirmed producer released its host port"
+            );
+            assert_eq!(
+                agent.supervisor.get_instance(&id).unwrap().host_port,
+                original_port
+            );
+            assert!(
+                crate::grill::records::record_path(&root.path().join("records"), &id.0).exists()
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn producer_agent_releases_process_ports_and_exact_runc_addresses_only_after_confirmation()
+     {
+        for runc in [false, true] {
+            let grill = MockGrill::new();
+            grill.set_pid(std::process::id());
+            let allocator = PortAllocator::new(30000, 30001);
+            let (_, receiver) = mpsc::channel(8);
+            let mut agent = BunAgent::new(
+                grill.clone(),
+                allocator.clone(),
+                receiver,
+                CancellationToken::new(),
+            );
+            let root = tempfile::tempdir().unwrap();
+            agent.set_volumes_dir(root.path().join("volumes"));
+            agent.set_records_dir(root.path().join("records"));
+            agent
+                .enable_fresh_discovery_ownership(&root.path().join("discovery"))
+                .await
+                .unwrap();
+            let reference = original_test_network_reference();
+            if runc {
+                grill.set_network_reference(reference.clone()).await;
+            }
+            expect_complete(&drain_deploy(&mut agent, basic_config()).await);
+            let id = reference.instance_id.clone();
+            let original = agent.supervisor.get_instance(&id).unwrap();
+            let host_port = original.host_port.unwrap();
+            let execution = crate::grill::RuntimeExecution {
+                instance_id: id.clone(),
+                generation: if runc {
+                    crate::grill::RuntimeGeneration::runc(reference.generation.as_str())
+                } else {
+                    crate::grill::RuntimeGeneration::process("original")
+                },
+            };
+            grill
+                .set_launch_inventory(vec![crate::grill::RuntimeLaunch {
+                    instance_id: id.clone(),
+                    generation: execution.generation.clone(),
+                    spec: original.oci_spec.clone().unwrap(),
+                    network_reference: runc.then(|| {
+                        crate::grill::runc_intent::NetworkReferenceState::Held(reference.clone())
+                    }),
+                }])
+                .await;
+            let (mut clustered, _, _) = test_cluster_fault_agent().await;
+            agent.cluster = clustered.cluster.take();
+            agent.kill_and_wait_for_exit(&id).await.unwrap();
+            let (client, task) = crate::cluster::producer::test_fixture(
+                axum::http::StatusCode::ACCEPTED,
+                String::new(),
+            )
+            .await;
+            agent.set_producer_release_client(client);
+            assert!(agent.finish_retire_bookkeeping(&id).await.is_err());
+            assert!(allocator.is_allocated(host_port).await);
+            assert!(agent.supervisor.get_instance(&id).is_some());
+            assert!(
+                !grill
+                    .calls()
+                    .iter()
+                    .any(|(operation, _)| operation == "release_network_reference")
+            );
+            task.abort();
+            let _ = task.await;
+            let confirmation =
+                serde_json::json!({"node_id": "test", "execution": execution}).to_string();
+            let (client, delayed_task) = crate::cluster::producer::test_delayed_fixture(
+                axum::http::StatusCode::OK,
+                confirmation.clone(),
+                std::time::Duration::from_secs(1),
+            )
+            .await;
+            agent.set_producer_release_client(client);
+            assert!(
+                tokio::time::timeout(
+                    std::time::Duration::from_millis(50),
+                    agent.finish_retire_bookkeeping(&id)
+                )
+                .await
+                .is_err()
+            );
+            assert!(allocator.is_allocated(host_port).await);
+            assert!(agent.supervisor.get_instance(&id).is_some());
+            assert!(
+                !grill
+                    .calls()
+                    .iter()
+                    .any(|(operation, _)| operation == "release_network_reference")
+            );
+            delayed_task.abort();
+            let _ = delayed_task.await;
+            let (client, task) =
+                crate::cluster::producer::test_fixture(axum::http::StatusCode::OK, confirmation)
+                    .await;
+            agent.set_producer_release_client(client);
+            agent.finish_retire_bookkeeping(&id).await.unwrap();
+            assert!(!allocator.is_allocated(host_port).await);
+            assert!(agent.supervisor.get_instance(&id).is_none());
+            assert!(
+                !crate::grill::records::record_path(&root.path().join("records"), &id.0).exists()
+            );
+            assert_eq!(
+                grill
+                    .calls()
+                    .iter()
+                    .any(|(operation, _)| operation == "release_network_reference"),
+                runc
+            );
+            task.abort();
+            let _ = task.await;
+        }
+    }
+
+    fn original_test_network_reference() -> crate::grill::runc_intent::NetworkReference {
+        serde_json::from_value(serde_json::json!({
+            "instance_id": "default__web-0", "generation": "1234567890abcdef1234567890abcdef", "container_index": 7
+        })).unwrap()
+    }
+
+    #[tokio::test]
+    async fn failed_release_permission_checkpoint_preserves_the_runtime_hold() {
+        let (mut agent, _, _, grill) = test_agent_with_grill();
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("discovery");
+        agent.enable_fresh_discovery_ownership(&path).await.unwrap();
+        let reference = original_test_network_reference();
+        grill.set_network_reference(reference.clone()).await;
+        expect_complete(&drain_deploy(&mut agent, basic_config()).await);
+        let checkpoint = path.join("discovery.json");
+        std::fs::remove_file(&checkpoint).unwrap();
+        std::fs::create_dir(&checkpoint).unwrap();
+        assert!(agent.stop_app("web", "default").await.is_err());
+        assert!(
+            !grill
+                .calls()
+                .iter()
+                .any(|(operation, _)| operation == "release_network_reference")
+        );
+        assert_eq!(
+            grill
+                .network_reference(&reference.instance_id)
+                .await
+                .unwrap(),
+            Some(reference)
+        );
+    }
+
+    #[tokio::test]
+    async fn standalone_release_persists_permission_before_runtime_acknowledgement() {
+        let (mut agent, _, _, grill) = test_agent_with_grill();
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("discovery");
+        agent.enable_fresh_discovery_ownership(&path).await.unwrap();
+        let reference = original_test_network_reference();
+        grill.set_network_reference(reference.clone()).await;
+        expect_complete(&drain_deploy(&mut agent, basic_config()).await);
+        grill.block_network_releases();
+        let mut task = tokio::spawn(async move {
+            let result = agent.stop_app("web", "default").await;
+            (agent, result)
+        });
+        tokio::select! {
+            result = &mut task => panic!("standalone retirement returned before authorised release: {:?}", result.unwrap().1),
+            result = tokio::time::timeout(std::time::Duration::from_secs(2), grill.wait_for_network_release()) => result.unwrap(),
+        }
+        let checkpoint: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(path.join("discovery.json")).unwrap()).unwrap();
+        let inventory: crate::bun::discovery_owners::DiscoveryInventory =
+            serde_json::from_value(checkpoint["inventory"].clone()).unwrap();
+        assert_eq!(inventory.references[0].reference, reference);
+        assert_eq!(
+            inventory.references[0].phase,
+            crate::bun::discovery_owners::ReferencePhase::ReleaseAuthorised
+        );
+        assert!(
+            !inventory.services[0]
+                .entry
+                .backends
+                .iter()
+                .any(|backend| backend.instance_id == reference.instance_id.0)
+        );
+        assert_eq!(
+            grill
+                .network_reference(&reference.instance_id)
+                .await
+                .unwrap(),
+            Some(reference.clone())
+        );
+        grill.resume_network_release();
+        let (agent, result) = tokio::time::timeout(std::time::Duration::from_secs(2), task)
+            .await
+            .unwrap()
+            .unwrap();
+        result.unwrap();
+        drop(agent);
+        let journal = crate::bun::discovery_owners::DiscoveryJournal::open(&path).unwrap();
+        assert!(journal.inventory().references.is_empty());
+        assert!(
+            grill
+                .network_reference(&reference.instance_id)
+                .await
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[tokio::test]
+    async fn clustered_discovery_requires_remote_proof_before_release_permission() {
+        let (mut agent, _, _, grill) = test_agent_with_grill();
+        let directory = tempfile::tempdir().unwrap();
+        agent
+            .enable_fresh_discovery_ownership(&directory.path().join("discovery"))
+            .await
+            .unwrap();
+        let reference = original_test_network_reference();
+        grill.set_network_reference(reference.clone()).await;
+        expect_complete(&drain_deploy(&mut agent, basic_config()).await);
+        grill
+            .set_launch_inventory(vec![crate::grill::RuntimeLaunch {
+                instance_id: reference.instance_id.clone(),
+                generation: crate::grill::RuntimeGeneration::runc(reference.generation.as_str()),
+                spec: agent
+                    .supervisor
+                    .get_instance(&reference.instance_id)
+                    .unwrap()
+                    .oci_spec
+                    .clone()
+                    .unwrap(),
+                network_reference: Some(crate::grill::runc_intent::NetworkReferenceState::Held(
+                    reference.clone(),
+                )),
+            }])
+            .await;
+        let (mut cluster_agent, _, _) = test_cluster_fault_agent().await;
+        agent.cluster = cluster_agent.cluster.take();
+        let result = agent.stop_app("web", "default").await;
+        assert!(
+            matches!(result, Err(BunError::RetirementState { ref reason, .. }) if reason.contains("producer release transport")),
+            "held reference was not fenced by its durable owner: {result:?}"
+        );
+        assert_eq!(
+            grill
+                .network_reference(&reference.instance_id)
+                .await
+                .unwrap(),
+            Some(reference)
+        );
+    }
+
+    #[tokio::test]
+    async fn durable_discovery_captures_the_original_runtime_reference_before_launch() {
+        let (mut agent, _, _, grill) = test_agent_with_grill();
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("discovery");
+        agent.enable_fresh_discovery_ownership(&path).await.unwrap();
+        let reference = original_test_network_reference();
+        grill.set_network_reference(reference.clone()).await;
+        expect_complete(&drain_deploy(&mut agent, basic_config()).await);
+        drop(agent);
+        let journal = crate::bun::discovery_owners::DiscoveryJournal::open(&path).unwrap();
+        let references = &journal.inventory().references;
+        assert_eq!(
+            references.len(),
+            1,
+            "runtime started without a durable original reference"
+        );
+        assert_eq!(references[0].reference, reference);
+        assert_eq!(
+            references[0].service,
+            crate::onion::service_id::ServiceId::new("default", "web")
+        );
+        assert_eq!(
+            references[0].phase,
+            crate::bun::discovery_owners::ReferencePhase::Held
+        );
+    }
+
+    #[tokio::test]
+    async fn failed_runtime_reference_checkpoint_prevents_start_and_retains_the_address() {
+        let (mut agent, _, _, grill) = test_agent_with_grill();
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("discovery");
+        agent.enable_fresh_discovery_ownership(&path).await.unwrap();
+        let reference = original_test_network_reference();
+        grill.set_network_reference(reference.clone()).await;
+        grill.block_creates();
+        let task = tokio::spawn(async move {
+            let events = drain_deploy(&mut agent, basic_config()).await;
+            (agent, events)
+        });
+        tokio::time::timeout(std::time::Duration::from_secs(2), grill.wait_for_creates(1))
+            .await
+            .unwrap();
+        let checkpoint = path.join("discovery.json");
+        std::fs::remove_file(&checkpoint).unwrap();
+        std::fs::create_dir(&checkpoint).unwrap();
+        grill.release_creates(1);
+        let (_agent, events) = tokio::time::timeout(std::time::Duration::from_secs(5), task)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(
+            events
+                .iter()
+                .any(|event| matches!(event, ApplyEvent::Error { .. }))
+        );
+        assert!(
+            !grill
+                .calls()
+                .iter()
+                .any(|(operation, _)| operation == "start"),
+            "runtime started after original-reference persistence failed"
+        );
+        assert_eq!(
+            grill
+                .network_reference(&reference.instance_id)
+                .await
+                .unwrap(),
+            Some(reference)
+        );
+    }
+
+    #[tokio::test]
+    async fn durable_publication_records_the_exact_service_before_acknowledgement() {
+        let (mut agent, _commands, _shutdown) = test_agent();
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("discovery");
+        agent.enable_fresh_discovery_ownership(&path).await.unwrap();
+        expect_complete(&drain_deploy(&mut agent, basic_config()).await);
+        let service = crate::onion::service_id::ServiceId::new("default", "web");
+        let expected = agent.service_map.resolve(&service).unwrap().clone();
+        drop(agent);
+        let journal = crate::bun::discovery_owners::DiscoveryJournal::open(&path).unwrap();
+        let entries = &journal.inventory().services;
+        assert_eq!(
+            entries.len(),
+            1,
+            "acknowledged routing has no durable service owner"
+        );
+        assert_eq!(
+            serde_json::to_value(&entries[0].entry).unwrap(),
+            serde_json::to_value(&expected).unwrap()
+        );
+        assert_eq!(
+            entries[0].phase,
+            crate::bun::discovery_owners::ServicePhase::Owned
+        );
+    }
+
+    async fn discovery_recovery_fixture() -> (
         BunAgent<MockGrill>,
+        MockGrill,
+        tempfile::TempDir,
+        crate::grill::runc_intent::NetworkReference,
+    ) {
+        let (mut original, _, _, grill) = test_agent_with_grill();
+        let root = tempfile::tempdir().unwrap();
+        original.set_records_dir(root.path().join("records"));
+        original.set_volumes_dir(root.path().join("volumes"));
+        original
+            .enable_fresh_discovery_ownership(&root.path().join("discovery"))
+            .await
+            .unwrap();
+        let reference = original_test_network_reference();
+        grill.set_pid(std::process::id());
+        grill.set_container_ip("10.0.2.5".parse().unwrap());
+        grill.set_network_reference(reference.clone()).await;
+        expect_complete(&drain_deploy(&mut original, basic_config()).await);
+        let spec = original
+            .supervisor
+            .get_instance(&reference.instance_id)
+            .unwrap()
+            .oci_spec
+            .clone()
+            .unwrap();
+        grill
+            .set_launch_inventory(vec![crate::grill::RuntimeLaunch {
+                generation: crate::grill::RuntimeGeneration::runc(reference.generation.as_str()),
+                instance_id: reference.instance_id.clone(),
+                spec,
+                network_reference: Some(crate::grill::runc_intent::NetworkReferenceState::Held(
+                    reference.clone(),
+                )),
+            }])
+            .await;
+        drop(original);
+        let (_, receiver) = mpsc::channel(32);
+        let mut recovered = BunAgent::new(
+            grill.clone(),
+            PortAllocator::new(30000, 31000),
+            receiver,
+            CancellationToken::new(),
+        );
+        recovered.set_records_dir(root.path().join("records"));
+        recovered.set_volumes_dir(root.path().join("volumes"));
+        (recovered, grill, root, reference)
+    }
+
+    #[tokio::test]
+    async fn discovery_recovery_reserves_original_vip_before_republishing_adopted_runtime() {
+        let (mut agent, grill, root, reference) = discovery_recovery_fixture().await;
+        let service = crate::onion::service_id::ServiceId::new("default", "web");
+        let saved =
+            crate::bun::discovery_owners::DiscoveryJournal::open(&root.path().join("discovery"))
+                .unwrap();
+        let original_vip = saved.inventory().services[0].entry.vip;
+        drop(saved);
+        grill.set_adopt_result(&reference.instance_id, true);
+        agent
+            .recover_discovery_ownership(&root.path().join("discovery"))
+            .await
+            .unwrap();
+        assert_eq!(
+            agent.service_map.resolve(&service).unwrap().vip,
+            original_vip
+        );
+        assert!(
+            agent
+                .service_map
+                .resolve(&service)
+                .unwrap()
+                .backends
+                .is_empty()
+        );
+        assert!(
+            agent
+                .service_map_watch()
+                .borrow()
+                .resolve(&service)
+                .is_none()
+        );
+        assert_eq!(agent.adopt_recorded_instances().await.unwrap(), 1);
+        let view = agent.service_map_watch();
+        let map = view.borrow();
+        let live = map.resolve(&service).unwrap();
+        assert_eq!(live.vip, original_vip);
+        assert_eq!(live.backends[0].node_ip.to_string(), "10.0.2.5");
+        assert!(live.backends[0].healthy);
+        drop(map);
+        agent.retire_workload("web", "default").await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn discovery_recovery_does_not_publish_historical_health() {
+        let (mut agent, grill, root, reference) = discovery_recovery_fixture().await;
+        let records = root.path().join("records");
+        let mut record = crate::grill::records::load_records(&records)
+            .unwrap()
+            .remove(0);
+        record.app_spec.as_mut().unwrap().health = config_with_health().app["web"].health.clone();
+        crate::grill::records::write_record(&records, &record).unwrap();
+        grill.set_adopt_result(&reference.instance_id, true);
+        agent
+            .recover_discovery_ownership(&root.path().join("discovery"))
+            .await
+            .unwrap();
+        assert_eq!(agent.adopt_recorded_instances().await.unwrap(), 1);
+        let service = crate::onion::service_id::ServiceId::new("default", "web");
+        assert!(
+            !agent
+                .service_map_watch()
+                .borrow()
+                .resolve(&service)
+                .unwrap()
+                .backends[0]
+                .healthy
+        );
+        assert_eq!(
+            agent
+                .supervisor
+                .get_instance(&reference.instance_id)
+                .unwrap()
+                .state,
+            ContainerState::HealthWait
+        );
+        agent.retire_workload("web", "default").await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn discovery_recovery_retires_unrecorded_original_runtime_and_allocation() {
+        let (mut agent, grill, root, reference) = discovery_recovery_fixture().await;
+        crate::grill::records::remove_record(
+            &root.path().join("records"),
+            &reference.instance_id.0,
+        )
+        .unwrap();
+        agent
+            .recover_discovery_ownership(&root.path().join("discovery"))
+            .await
+            .unwrap();
+        assert_eq!(agent.adopt_recorded_instances().await.unwrap(), 0);
+        assert!(
+            grill
+                .network_reference(&reference.instance_id)
+                .await
+                .unwrap()
+                .is_none()
+        );
+        drop(agent);
+        let journal =
+            crate::bun::discovery_owners::DiscoveryJournal::open(&root.path().join("discovery"))
+                .unwrap();
+        assert!(journal.inventory().references.is_empty());
+        assert!(journal.inventory().services.is_empty());
+    }
+
+    #[tokio::test]
+    async fn discovery_recovery_replays_original_permission_without_a_new_launch() {
+        let (mut agent, grill, root, reference) = discovery_recovery_fixture().await;
+        grill.set_state(&reference.instance_id, ContainerState::Stopped);
+        let journal =
+            crate::bun::discovery_owners::DiscoveryJournal::open(&root.path().join("discovery"))
+                .unwrap();
+        let mut inventory = journal.inventory().clone();
+        inventory.references[0].phase =
+            crate::bun::discovery_owners::ReferencePhase::ReleaseAuthorised;
+        inventory.services[0].entry.backends.clear();
+        drop(journal.persist(inventory).await.unwrap());
+        let before = grill.calls().len();
+        agent
+            .recover_discovery_ownership(&root.path().join("discovery"))
+            .await
+            .unwrap();
+        assert_eq!(agent.adopt_recorded_instances().await.unwrap(), 0);
+        assert!(
+            grill
+                .network_reference(&reference.instance_id)
+                .await
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            !grill.calls()[before..]
+                .iter()
+                .any(|(op, _)| op == "create" || op == "start")
+        );
+    }
+
+    #[tokio::test]
+    async fn clustered_recovery_replays_durable_release_without_contacting_leader() {
+        let (mut agent, grill, root, reference) = discovery_recovery_fixture().await;
+        grill.set_state(&reference.instance_id, ContainerState::Stopped);
+        let journal =
+            crate::bun::discovery_owners::DiscoveryJournal::open(&root.path().join("discovery"))
+                .unwrap();
+        let mut inventory = journal.inventory().clone();
+        inventory.references[0].phase =
+            crate::bun::discovery_owners::ReferencePhase::ReleaseAuthorised;
+        inventory.services[0].entry.backends.clear();
+        let identity = crate::bun::consumer_owners::ConsumerIdentity {
+            node_id: crate::meat::NodeId::new("test"),
+            cluster_identity: [42; 32],
+        };
+        inventory.consumer = Some(crate::bun::consumer_owners::ConsumerOwnership {
+            identity: identity.clone(),
+            publications: vec![],
+            phase: crate::bun::consumer_owners::ConsumerPhase::Withdrawn,
+            receipts: Default::default(),
+        });
+        drop(journal.persist(inventory).await.unwrap());
+        let (mut clustered, _, _) = test_cluster_fault_agent().await;
+        agent.cluster = clustered.cluster.take();
+        agent
+            .recover_consumer_ownership(&root.path().join("discovery"), identity)
+            .await
+            .unwrap();
+        agent.replay_discovery_releases().await.unwrap();
+        assert!(
+            grill
+                .network_reference(&reference.instance_id)
+                .await
+                .unwrap()
+                .is_none()
+        );
+        assert!(agent.network_references.is_empty());
+    }
+
+    #[tokio::test]
+    async fn discovery_recovery_refuses_changed_runtime_before_adoption_or_cleanup() {
+        let (mut agent, grill, root, reference) = discovery_recovery_fixture().await;
+        let mut launches = grill.launch_inventory().await.unwrap().unwrap();
+        let mut changed = reference.clone();
+        changed.container_index += 1;
+        launches[0].network_reference = Some(
+            crate::grill::runc_intent::NetworkReferenceState::Held(changed),
+        );
+        grill.set_launch_inventory(launches).await;
+        let before = grill.calls().len();
+        assert!(
+            agent
+                .recover_discovery_ownership(&root.path().join("discovery"))
+                .await
+                .is_err()
+        );
+        assert!(agent.adopt_recorded_instances().await.is_err());
+        assert_eq!(grill.calls().len(), before);
+        assert_eq!(
+            grill
+                .network_reference(&reference.instance_id)
+                .await
+                .unwrap(),
+            Some(reference)
+        );
+        assert!(agent.service_map_watch().borrow().resolve_all().is_empty());
+    }
+
+    #[tokio::test]
+    async fn confirmed_stop_forgets_durable_service_allocation() {
+        let (mut agent, _, _) = test_agent();
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("discovery");
+        agent.enable_fresh_discovery_ownership(&path).await.unwrap();
+        expect_complete(&drain_deploy(&mut agent, basic_config()).await);
+        agent.stop_app("web", "default").await.unwrap();
+        drop(agent);
+        let journal = crate::bun::discovery_owners::DiscoveryJournal::open(&path).unwrap();
+        assert!(
+            journal.inventory().services.is_empty(),
+            "confirmed stop retained its allocation"
+        );
+    }
+
+    #[tokio::test]
+    async fn failed_service_retirement_checkpoint_keeps_the_allocated_vip() {
+        let (mut agent, _, _) = test_agent();
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("discovery");
+        agent.enable_fresh_discovery_ownership(&path).await.unwrap();
+        expect_complete(&drain_deploy(&mut agent, basic_config()).await);
+        let service = crate::onion::service_id::ServiceId::new("default", "web");
+        let original = agent.service_map.resolve(&service).unwrap().vip;
+        let checkpoint = path.join("discovery.json");
+        std::fs::remove_file(&checkpoint).unwrap();
+        std::fs::create_dir(&checkpoint).unwrap();
+        assert!(
+            agent.stop_app("web", "default").await.is_err(),
+            "stop acknowledged failed service retirement"
+        );
+        assert_eq!(agent.service_map.resolve(&service).unwrap().vip, original);
+    }
+
+    #[tokio::test]
+    async fn clustered_service_retirement_requires_remote_proof_without_runtime_references() {
+        let (mut agent, _, _) = test_agent();
+        let directory = tempfile::tempdir().unwrap();
+        agent
+            .enable_fresh_discovery_ownership(&directory.path().join("discovery"))
+            .await
+            .unwrap();
+        expect_complete(&drain_deploy(&mut agent, basic_config()).await);
+        let (mut cluster_agent, _, _) = test_cluster_fault_agent().await;
+        agent.cluster = cluster_agent.cluster.take();
+        assert!(
+            agent.stop_app("web", "default").await.is_err(),
+            "clustered stop forgot an unconfirmed allocation"
+        );
+        let service = crate::onion::service_id::ServiceId::new("default", "web");
+        assert!(agent.service_map.resolve(&service).is_some());
+    }
+
+    #[tokio::test]
+    async fn later_publication_preserves_unretired_discovery_allocations() {
+        let (mut agent, _commands, _shutdown) = test_agent();
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("discovery");
+        agent.enable_fresh_discovery_ownership(&path).await.unwrap();
+        expect_complete(&drain_deploy(&mut agent, basic_config()).await);
+        let service = crate::onion::service_id::ServiceId::new("default", "web");
+        let original = agent.service_map.resolve(&service).unwrap().clone();
+        // Simulate lost private metadata without confirmed retirement.
+        agent.service_map.unregister(&service).unwrap();
+        assert!(agent.service_map.resolve(&service).is_none());
+        let config = Config::parse("[app.other]\nimage = 'mock:image'\nport = 8081\n").unwrap();
+        expect_complete(&drain_deploy(&mut agent, config).await);
+        drop(agent);
+        let journal = crate::bun::discovery_owners::DiscoveryJournal::open(&path).unwrap();
+        assert_eq!(journal.inventory().services.len(), 2);
+        let retained = journal
+            .inventory()
+            .services
+            .iter()
+            .find(|owner| owner.entry.app_name == "web")
+            .unwrap();
+        assert_eq!(retained.entry.vip, original.vip);
+        assert_eq!(
+            retained.phase,
+            crate::bun::discovery_owners::ServicePhase::Owned
+        );
+    }
+
+    #[tokio::test]
+    async fn failed_discovery_checkpoint_refuses_launch_and_fences_later_publication() {
+        let (mut agent, _commands, _shutdown, grill) = test_agent_with_grill();
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("discovery");
+        agent.enable_fresh_discovery_ownership(&path).await.unwrap();
+        let checkpoint = path.join("discovery.json");
+        std::fs::remove_file(&checkpoint).unwrap();
+        std::fs::create_dir(&checkpoint).unwrap();
+        let events = drain_deploy(&mut agent, basic_config()).await;
+        assert!(
+            events
+                .iter()
+                .any(|event| matches!(event, ApplyEvent::Error { .. })),
+            "deployment acknowledged a failed discovery checkpoint"
+        );
+        assert!(
+            !grill
+                .calls()
+                .iter()
+                .any(|(operation, _)| operation == "create" || operation == "start")
+        );
+        std::fs::remove_dir(&checkpoint).unwrap();
+        // Repairing the path does not establish what an interrupted write published.
+        let service = crate::onion::service_id::ServiceId::new("default", "web");
+        assert!(agent.publish_backend_ebpf(&service).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn stopped_runtime_keeps_artifacts_until_captured_ingress_releases() {
+        let (mut agent, _commands, _shutdown, grill) = test_agent_with_grill();
+        let records = tempfile::tempdir().unwrap();
+        agent.set_records_dir(records.path().to_owned());
+        grill.set_pid(std::process::id());
+        expect_complete(&drain_deploy(&mut agent, basic_config()).await);
+        let id = InstanceId("default__web-0".into());
+        let record = crate::grill::records::record_path(records.path(), &id.0);
+        let identity = agent.instance_identity_dir(&id);
+        assert!(record.exists() && identity.exists());
+        let drains = agent.drains.clone();
+        let tokens = drains
+            .capture_requests(std::slice::from_ref(&id.0), false)
+            .await
+            .unwrap();
+        grill.set_state(&id, ContainerState::Stopped);
+        let result = agent.retire_instance_artifacts(&id).await;
+        assert!(
+            matches!(result, Err(BunError::RetirementState { .. })),
+            "stopped-runtime cleanup discarded ownership before request release: {result:?}"
+        );
+        assert!(record.exists() && identity.exists());
+        assert!(
+            tokens[0].is_cancelled(),
+            "an absent runtime's captured requests were not cancelled"
+        );
+        drains.decrement_connections(&id.0).await;
+        agent.retire_instance_artifacts(&id).await.unwrap();
+        assert!(!record.exists() && !identity.exists());
+        agent.retire_workload("web", "default").await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn explicit_stop_waits_for_captured_ingress_before_runtime_retirement() {
+        let (mut agent, _commands, _shutdown, grill) = test_agent_with_grill();
+        expect_complete(&drain_deploy(&mut agent, basic_config()).await);
+        let id = InstanceId("default__web-0".into());
+        let drains = agent.drains.clone();
+        let _tokens = drains
+            .capture_requests(std::slice::from_ref(&id.0), false)
+            .await
+            .unwrap();
+        let mut task = tokio::spawn(async move {
+            let result = agent.stop_app("web", "default").await;
+            (agent, result)
+        });
+        tokio::select! {
+            result = &mut task => panic!("stop returned before captured request release: {:?}", result.unwrap().1),
+            result = tokio::time::timeout(std::time::Duration::from_secs(2), async {
+                while !drains.is_draining(&id.0).await { tokio::task::yield_now().await; }
+            }) => result.expect("stop did not start an ingress drain"),
+        }
+        assert!(
+            !grill
+                .calls()
+                .iter()
+                .any(|(operation, instance)| instance == &id
+                    && matches!(operation.as_str(), "stop" | "kill")),
+            "runtime retired before ingress request release"
+        );
+        drains.decrement_connections(&id.0).await;
+        let (_agent, result) = tokio::time::timeout(std::time::Duration::from_secs(2), task)
+            .await
+            .unwrap()
+            .unwrap();
+        result.unwrap();
+    }
+
+    #[tokio::test]
+    async fn automatic_restart_defers_runtime_retirement_until_captured_ingress_releases() {
+        let (mut agent, grill, id, _directory) = failed_restart_fixture().await;
+        let drains = agent.drains.clone();
+        let view = agent.service_map_watch();
+        let _tokens = drains
+            .capture_requests(std::slice::from_ref(&id.0), false)
+            .await
+            .unwrap();
+        tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            agent.drive_pending_restarts(),
+        )
+        .await
+        .expect("waiting for ingress blocked the agent loop");
+        assert!(
+            !grill
+                .calls()
+                .iter()
+                .any(|(operation, instance)| instance == &id && operation == "kill"),
+            "restart retired its predecessor before request release"
+        );
+        assert_eq!(
+            agent.supervisor.get_instance(&id).unwrap().state,
+            ContainerState::Pending
+        );
+        let service = crate::onion::service_id::ServiceId::new("default", "retry");
+        assert!(view.borrow().resolve(&service).unwrap().backends.is_empty());
+        assert!(drains.is_draining(&id.0).await);
+        drains.decrement_connections(&id.0).await;
+        agent.drive_pending_restarts().await;
+        assert_eq!(
+            agent.supervisor.get_instance(&id).unwrap().state,
+            ContainerState::Running
+        );
+        agent.stop_app("retry", "default").await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn automatic_restart_releases_original_address_before_successor_creation() {
+        let (mut agent, _, _, grill) = test_agent_with_grill();
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("discovery");
+        agent.enable_fresh_discovery_ownership(&path).await.unwrap();
+        let original = original_test_network_reference();
+        grill.set_network_reference(original.clone()).await;
+        expect_complete(&drain_deploy(&mut agent, basic_config()).await);
+        grill.set_state(&original.instance_id, ContainerState::Stopped);
+        agent.check_apps().await;
+        agent.drive_pending_restarts().await;
+        let calls = grill.calls();
+        let release = calls.iter().position(|(operation, id)| {
+            operation == "release_network_reference" && id == &original.instance_id
+        });
+        let successor = calls
+            .iter()
+            .rposition(|(operation, id)| operation == "create" && id == &original.instance_id)
+            .unwrap();
+        assert!(
+            release.is_some_and(|release| release < successor),
+            "successor creation preceded original address release: {calls:?}"
+        );
+        assert!(!agent.network_references.contains_key(&original.instance_id));
+        assert_eq!(
+            agent
+                .supervisor
+                .get_instance(&original.instance_id)
+                .unwrap()
+                .state,
+            ContainerState::Running
+        );
+        agent.retire_workload("web", "default").await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn automatic_restart_retains_original_address_when_release_permission_fails() {
+        let (mut agent, _, _, grill) = test_agent_with_grill();
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("discovery");
+        agent.enable_fresh_discovery_ownership(&path).await.unwrap();
+        let original = original_test_network_reference();
+        grill.set_network_reference(original.clone()).await;
+        expect_complete(&drain_deploy(&mut agent, basic_config()).await);
+        grill.set_state(&original.instance_id, ContainerState::Stopped);
+        agent.check_apps().await;
+        let checkpoint = path.join("discovery.json");
+        std::fs::remove_file(&checkpoint).unwrap();
+        std::fs::create_dir(&checkpoint).unwrap();
+        agent.drive_pending_restarts().await;
+        assert_eq!(
+            grill
+                .calls()
+                .iter()
+                .filter(|(operation, id)| operation == "create" && id == &original.instance_id)
+                .count(),
+            1,
+            "successor created without release permission"
+        );
+        assert_eq!(
+            grill
+                .network_reference(&original.instance_id)
+                .await
+                .unwrap(),
+            Some(original.clone())
+        );
+        assert_eq!(
+            agent
+                .supervisor
+                .get_instance(&original.instance_id)
+                .unwrap()
+                .state,
+            ContainerState::Pending
+        );
+    }
+
+    #[tokio::test]
+    async fn automatic_restart_publishes_the_replacement_address() {
+        let (mut agent, _commands, _shutdown, grill) = test_agent_with_grill();
+        let old_ip = std::net::Ipv4Addr::new(10, 0, 2, 5);
+        let new_ip = std::net::Ipv4Addr::new(10, 0, 2, 6);
+        grill.set_container_ip(old_ip);
+        expect_complete(&drain_deploy(&mut agent, basic_config()).await);
+        let view = agent.service_map_watch();
+        let id = InstanceId("default__web-0".into());
+        let service = crate::onion::service_id::ServiceId::new("default", "web");
+        grill.set_state(&id, ContainerState::Stopped);
+        agent.check_apps().await;
+        grill.set_container_ip(new_ip);
+        agent.drive_pending_restarts().await;
+        assert_eq!(
+            agent.supervisor.get_instance(&id).unwrap().state,
+            ContainerState::Running
+        );
+        assert_eq!(
+            view.borrow().resolve(&service).unwrap().backends[0].node_ip,
+            new_ip
+        );
+        assert!(view.borrow().resolve(&service).unwrap().backends[0].healthy);
+        agent.retire_workload("web", "default").await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn automatic_restart_waits_for_health_before_publishing_a_healthy_backend() {
+        let (mut agent, _commands, _shutdown) = test_agent();
+        expect_complete(&drain_deploy(&mut agent, basic_config()).await);
+        let view = agent.service_map_watch();
+        let id = InstanceId("default__web-0".into());
+        let service = crate::onion::service_id::ServiceId::new("default", "web");
+        let mut health = super::super::health::HealthCheckConfig::from_spec(
+            config_with_health().app["web"].health.as_ref().unwrap(),
+            8080,
+        );
+        health.threshold_unhealthy = 1;
+        health.threshold_healthy = 1;
+        let instance = agent.supervisor.get_instance_mut(&id).unwrap();
+        instance.health_config = Some(health);
+        let created_at = instance.created_at;
+        agent
+            .complete_health_probe(
+                id.clone(),
+                created_at,
+                Ok(super::super::health::HealthStatus::Unhealthy),
+            )
+            .await;
+        agent.drive_pending_restarts().await;
+        assert_eq!(
+            agent.supervisor.get_instance(&id).unwrap().state,
+            ContainerState::HealthWait
+        );
+        assert!(
+            !agent.service_map.resolve(&service).unwrap().backends[0].healthy,
+            "restart published a healthy backend before its first successful probe"
+        );
+        assert!(!view.borrow().resolve(&service).unwrap().backends[0].healthy);
+        let created_at = agent.supervisor.get_instance(&id).unwrap().created_at;
+        agent
+            .complete_health_probe(
+                id,
+                created_at,
+                Ok(super::super::health::HealthStatus::Healthy),
+            )
+            .await;
+        assert!(view.borrow().resolve(&service).unwrap().backends[0].healthy);
+        agent.retire_workload("web", "default").await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn deployment_refuses_backend_overflow_without_losing_runtime_owners() {
+        let (mut agent, _commands, _shutdown, grill) = test_agent_with_grill();
+        let mut config = basic_config();
+        config.app.get_mut("web").unwrap().replicas =
+            crate::config::Replicas::Fixed(crate::onion::types::MAX_BACKENDS as u32 + 1);
+        let events = drain_deploy(&mut agent, config).await;
+        let owners: std::collections::HashSet<_> = agent
+            .supervisor
+            .list_instances()
+            .iter()
+            .map(|instance| instance.id.clone())
+            .collect();
+        let unowned: Vec<_> = grill
+            .calls()
+            .into_iter()
+            .filter(|(call, id)| call == "create" && !owners.contains(id))
+            .collect();
+        agent.retire_workload("web", "default").await.unwrap();
+        assert!(
+            unowned.is_empty(),
+            "created runtimes lost their cleanup owner: {unowned:?}"
+        );
+        assert!(
+            !events
+                .iter()
+                .any(|event| matches!(event, ApplyEvent::Complete { .. })),
+            "deployment completed despite refusing an endpoint: {events:?}"
+        );
+        assert!(events.iter().any(|event| matches!(event, ApplyEvent::Error { message } if message.contains("cannot publish backend"))));
+    }
+
+    #[tokio::test]
+    async fn health_transitions_publish_the_confirmed_userspace_view() {
+        let (mut agent, _commands, _shutdown) = test_agent();
+        let view = agent.service_map_watch();
+        expect_complete(&drain_deploy(&mut agent, basic_config()).await);
+        let id = InstanceId("default__web-0".into());
+        let service = crate::onion::service_id::ServiceId::new("default", "web");
+        let mut health = super::super::health::HealthCheckConfig::from_spec(
+            config_with_health().app["web"].health.as_ref().unwrap(),
+            8080,
+        );
+        health.threshold_unhealthy = 1;
+        let instance = agent.supervisor.get_instance_mut(&id).unwrap();
+        instance.health_config = Some(health);
+        instance.restart_policy.max_restarts = Some(0);
+        let created_at = instance.created_at;
+        agent
+            .complete_health_probe(
+                id.clone(),
+                created_at,
+                Ok(super::super::health::HealthStatus::Unhealthy),
+            )
+            .await;
+        assert!(
+            !view.borrow().resolve(&service).unwrap().backends[0].healthy,
+            "DNS/ingress retained a backend after its health withdrawal"
+        );
+        agent
+            .complete_health_probe(
+                id,
+                created_at,
+                Ok(super::super::health::HealthStatus::Healthy),
+            )
+            .await;
+        assert!(view.borrow().resolve(&service).unwrap().backends[0].healthy);
+    }
+
+    #[tokio::test]
+    async fn a_later_probe_retries_publication_before_starting_restart() {
+        let (mut agent, _commands, _shutdown) = test_agent();
+        let view = agent.service_map_watch();
+        expect_complete(&drain_deploy(&mut agent, basic_config()).await);
+        let id = InstanceId("default__web-0".into());
+        let service = crate::onion::service_id::ServiceId::new("default", "web");
+        let mut health = super::super::health::HealthCheckConfig::from_spec(
+            config_with_health().app["web"].health.as_ref().unwrap(),
+            8080,
+        );
+        health.threshold_unhealthy = 1;
+        let instance = agent.supervisor.get_instance_mut(&id).unwrap();
+        instance.health_config = Some(health);
+        let created_at = instance.created_at;
+        let original = agent.service_map.clone();
+        // Missing original allocation must refuse publication. Restore the same
+        // evidence before retrying, rather than inventing a replacement VIP.
+        agent.service_map = crate::onion::service_map::ServiceMap::new();
+        agent
+            .complete_health_probe(
+                id.clone(),
+                created_at,
+                Ok(super::super::health::HealthStatus::Unhealthy),
+            )
+            .await;
+        let instance = agent.supervisor.get_instance(&id).unwrap();
+        assert_eq!(instance.state, ContainerState::Unhealthy);
+        assert_eq!(instance.restart_count, 0);
+        assert!(view.borrow().resolve(&service).unwrap().backends[0].healthy);
+        agent.service_map = original;
+        agent
+            .complete_health_probe(
+                id.clone(),
+                created_at,
+                Ok(super::super::health::HealthStatus::Unhealthy),
+            )
+            .await;
+        let instance = agent.supervisor.get_instance(&id).unwrap();
+        assert_eq!(instance.state, ContainerState::Pending);
+        assert_eq!(instance.restart_count, 1);
+        assert!(!view.borrow().resolve(&service).unwrap().backends[0].healthy);
+    }
+
+    #[tokio::test]
+    async fn replacement_publication_refuses_a_closed_agent_channel() {
+        let (tx, rx) = mpsc::channel(1);
+        drop(rx);
+        let ops = DeployOps { tx };
+        let result = ops
+            .publish_new_backend(
+                "api",
+                "default",
+                &InstanceId("default__api-g1-0".into()),
+                Some(8080),
+                None,
+                true,
+            )
+            .await;
+        assert!(matches!(result, Err(BunError::BackendPublication { .. })));
+    }
+
+    #[tokio::test]
+    async fn replacement_publication_refuses_missing_service_or_port() {
+        let (mut agent, _commands, _shutdown) = test_agent();
+        let id = InstanceId("default__api-g1-0".into());
+        let service = crate::onion::service_id::ServiceId::new("default", "api");
+        let view = agent.service_map_watch();
+        assert!(
+            agent
+                .publish_new_backend("api", "default", &id, Some(8080), None, true)
+                .await
+                .is_err()
+        );
+        agent.service_map.register(&service, 8080, None).unwrap();
+        assert!(
+            agent
+                .publish_new_backend("api", "default", &id, None, None, true)
+                .await
+                .is_err()
+        );
+        assert!(
+            agent
+                .service_map
+                .resolve(&service)
+                .unwrap()
+                .backends
+                .is_empty()
+        );
+        assert!(view.borrow().resolve(&service).is_none());
+    }
+
+    fn test_agent_with_grill() -> (
+        TestAgent,
         mpsc::Sender<AgentCommand>,
         CancellationToken,
         MockGrill,
@@ -9464,7 +13580,13 @@ mod tests {
         let grill = MockGrill::new();
         let grill_handle = grill.clone();
         let port_allocator = PortAllocator::new(30000, 31000);
-        let agent = BunAgent::new(grill, port_allocator, rx, shutdown.clone());
+        let mut agent = BunAgent::new(grill, port_allocator, rx, shutdown.clone());
+        let volumes = tempfile::tempdir().unwrap();
+        agent.set_volumes_dir(volumes.path().to_path_buf());
+        let agent = TestAgent {
+            agent,
+            _volumes: volumes,
+        };
         (agent, tx, shutdown, grill_handle)
     }
 
@@ -9478,6 +13600,7 @@ mod tests {
         let (_command_tx, command_rx) = mpsc::channel(8);
         let node_gate = crate::smoker::node_fault::NodeTransportGate::new();
         let cluster = ClusterHandle {
+            local_node_id: crate::meat::NodeId::new("test"),
             membership_rx,
             raft_metrics_rx: None,
             council: None,
@@ -9511,9 +13634,18 @@ mod tests {
         /// those ops inline until the deploy's events channel closes. Keeps the
         /// direct-`deploy` unit tests working without standing up a full loop.
         async fn deploy(&mut self, config: Config, events: &mpsc::Sender<ApplyEvent>) {
+            self.deploy_with_rerun(config, events, false).await;
+        }
+
+        async fn deploy_with_rerun(
+            &mut self,
+            config: Config,
+            events: &mpsc::Sender<ApplyEvent>,
+            rerun_unknown_jobs: bool,
+        ) {
             let worker = DeployWorker {
+                rerun_unknown_jobs,
                 grill: self.supervisor.grill().clone(),
-                port_allocator: self.supervisor.port_allocator(),
                 ops: DeployOps {
                     tx: self.deploy_ops_tx.clone(),
                 },
@@ -9538,6 +13670,498 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[tokio::test]
+    async fn lease_storage_waits_for_confirmed_runtime_retirement() {
+        use crate::testkit::lease::{
+            LeasedResource, LocalLeaseStore, TestLease, cleanup_local_lease,
+        };
+        let (mut agent, tx, shutdown, grill) = test_agent_with_grill();
+        let volumes = tempfile::tempdir().unwrap();
+        agent.set_volumes_dir(volumes.path().to_path_buf());
+        let task = tokio::spawn(async move { agent.run().await });
+        let config = Config::parse("[app.web]\nimage = 'test:v1'\nnamespace = 'rbtest-cleanup'\n[app.web.deploy]\ndrain_timeout = '0s'\n[[app.web.volumes]]\npath = '/data'\n").unwrap();
+        expect_complete(&send_deploy(&tx, config).await);
+        let marker = volumes.path().join("rbtest-cleanup/web/data/marker");
+        std::fs::write(&marker, "live").unwrap();
+        let store = LocalLeaseStore::in_memory();
+        let mut lease = TestLease::new(
+            "cleanup".into(),
+            "owner".into(),
+            "owner".into(),
+            "rbtest-cleanup".into(),
+            1,
+            2,
+        )
+        .unwrap();
+        lease.resources.insert(LeasedResource::App {
+            app_id: crate::meat::AppId::new("web", "rbtest-cleanup"),
+        });
+        store.create(lease).await.unwrap();
+        grill.set_ignore_stop(true);
+        grill.set_ignore_kill(true);
+        let refused = cleanup_local_lease(&store, &tx, "cleanup", Some("owner")).await;
+        assert!(refused.is_err());
+        assert!(store.get("cleanup").await.is_some());
+        assert_eq!(std::fs::read_to_string(&marker).unwrap(), "live");
+        assert!(
+            volumes
+                .path()
+                .join(".test-storage/rbtest-cleanup__web.checkpoint")
+                .exists()
+        );
+        grill.set_ignore_stop(false);
+        grill.set_ignore_kill(false);
+        cleanup_local_lease(&store, &tx, "cleanup", Some("owner"))
+            .await
+            .unwrap();
+        assert!(!marker.exists());
+        assert!(store.get("cleanup").await.is_none());
+        shutdown.cancel();
+        task.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn lease_retirement_removes_only_owned_test_volumes_after_stop_preserves_them() {
+        use crate::testkit::lease::{
+            LeasedResource, LocalLeaseStore, TestLease, cleanup_local_lease,
+        };
+        let (mut agent, tx, shutdown) = test_agent();
+        let volumes = tempfile::tempdir().unwrap();
+        agent.set_volumes_dir(volumes.path().to_path_buf());
+        let task = tokio::spawn(async move { agent.run().await });
+        for namespace in ["rbtest-cleanup", "default"] {
+            let config = Config::parse(&format!(
+                "[app.web]\nimage = 'test:v1'\nnamespace = '{namespace}'\n[[app.web.volumes]]\npath = '/data'\n"
+            )).unwrap();
+            expect_complete(&send_deploy(&tx, config).await);
+            std::fs::write(
+                volumes.path().join(namespace).join("web/data/marker"),
+                namespace,
+            )
+            .unwrap();
+        }
+        let (response, stopped) = oneshot::channel();
+        tx.send(AgentCommand::Stop {
+            app_name: "web".into(),
+            namespace: "rbtest-cleanup".into(),
+            response,
+        })
+        .await
+        .unwrap();
+        stopped.await.unwrap().unwrap();
+        assert!(
+            volumes
+                .path()
+                .join("rbtest-cleanup/web/data/marker")
+                .is_file()
+        );
+        let store = LocalLeaseStore::in_memory();
+        let mut lease = TestLease::new(
+            "cleanup".into(),
+            "owner".into(),
+            "owner".into(),
+            "rbtest-cleanup".into(),
+            1,
+            2,
+        )
+        .unwrap();
+        lease.resources.insert(LeasedResource::App {
+            app_id: crate::meat::AppId::new("web", "rbtest-cleanup"),
+        });
+        store.create(lease).await.unwrap();
+        let cleanup = cleanup_local_lease(&store, &tx, "cleanup", Some("owner")).await;
+        shutdown.cancel();
+        task.await.unwrap();
+        cleanup.unwrap();
+        assert!(!volumes.path().join("rbtest-cleanup/web/data").exists());
+        assert_eq!(
+            std::fs::read_to_string(volumes.path().join("default/web/data/marker")).unwrap(),
+            "default"
+        );
+        assert!(store.get("cleanup").await.is_none());
+    }
+
+    #[tokio::test]
+    async fn lease_cleanup_retires_owned_instances_without_erasing_another_namespace() {
+        use crate::testkit::lease::{
+            LeasedResource, LocalLeaseStore, TestLease, cleanup_local_lease,
+        };
+        let (mut agent, tx, shutdown) = test_agent();
+        let volumes = tempfile::tempdir().unwrap();
+        agent.set_volumes_dir(volumes.path().to_path_buf());
+        let task = tokio::spawn(async move { agent.run().await });
+        for namespace in ["rbtest-cleanup", "rbtest-keep"] {
+            let config = Config::parse(&format!(
+                "[app.web]\nimage = 'test:v1'\nnamespace = '{namespace}'\n"
+            ))
+            .unwrap();
+            expect_complete(&send_deploy(&tx, config).await);
+        }
+        let store = LocalLeaseStore::in_memory();
+        let mut lease = TestLease::new(
+            "cleanup".into(),
+            "owner".into(),
+            "owner".into(),
+            "rbtest-cleanup".into(),
+            1,
+            2,
+        )
+        .unwrap();
+        lease.resources.insert(LeasedResource::App {
+            app_id: crate::meat::AppId::new("web", "rbtest-cleanup"),
+        });
+        store.create(lease).await.unwrap();
+        cleanup_local_lease(&store, &tx, "cleanup", Some("owner"))
+            .await
+            .unwrap();
+        let (response, result) = oneshot::channel();
+        tx.send(AgentCommand::Status { response }).await.unwrap();
+        let instances = result.await.unwrap();
+        shutdown.cancel();
+        task.await.unwrap();
+        assert!(store.get("cleanup").await.is_none());
+        assert_eq!(
+            instances.len(),
+            1,
+            "cleanup must retire its status record too"
+        );
+        assert_eq!(instances[0].namespace, "rbtest-keep");
+        assert_eq!(instances[0].state, "running");
+    }
+
+    #[tokio::test]
+    async fn cron_registration_and_stop_survive_agent_replacement() {
+        let directory = tempfile::tempdir().unwrap();
+        let records = directory.path().join("instances");
+        let (mut agent, tx, _shutdown) = test_agent();
+        agent.set_records_dir(records.clone());
+        agent.set_volumes_dir(directory.path().join("volumes"));
+        let task = tokio::spawn(async move { agent.run().await });
+        for namespace in ["red", "blue"] {
+            let config = Config::parse(&format!(
+                "[job.backup]\nimage = 'test:v1'\nschedule = '0 0 30 2 *'\nnamespace = '{namespace}'\n"
+            )).unwrap();
+            expect_complete(&send_deploy(&tx, config).await);
+        }
+        let (response, stopped) = oneshot::channel();
+        tx.send(AgentCommand::Stop {
+            app_name: "backup".into(),
+            namespace: "red".into(),
+            response,
+        })
+        .await
+        .unwrap();
+        stopped.await.unwrap().unwrap();
+        task.abort();
+        assert!(task.await.unwrap_err().is_cancelled());
+
+        let (mut replacement, tx, shutdown) = test_agent();
+        replacement.set_records_dir(records);
+        replacement.set_volumes_dir(directory.path().join("volumes"));
+        replacement.adopt_recorded_instances().await.unwrap();
+        let task = tokio::spawn(async move { replacement.run().await });
+        let conflicting =
+            Config::parse("[app.backup]\nimage = 'test:v1'\nnamespace = 'blue'\n").unwrap();
+        let events = send_deploy(&tx, conflicting).await;
+        assert!(events.iter().any(|event| matches!(event, ApplyEvent::Error { message } if message.contains("registered cron job"))));
+        for (namespace, exists) in [("red", false), ("blue", true)] {
+            let (response, stopped) = oneshot::channel();
+            tx.send(AgentCommand::Stop {
+                app_name: "backup".into(),
+                namespace: namespace.into(),
+                response,
+            })
+            .await
+            .unwrap();
+            let result = stopped.await.unwrap();
+            assert_eq!(result.is_ok(), exists, "{namespace}: {result:?}");
+        }
+        shutdown.cancel();
+        task.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn cron_claim_is_durable_before_launch_and_is_not_repeated_after_crash() {
+        let seconds = time::OffsetDateTime::now_utc().second();
+        if seconds >= 50 {
+            tokio::time::sleep(std::time::Duration::from_secs(u64::from(61 - seconds))).await;
+        }
+        let directory = tempfile::tempdir().unwrap();
+        let records = directory.path().join("instances");
+        let (mut agent, tx, _shutdown, grill) = test_agent_with_grill();
+        agent.set_records_dir(records.clone());
+        agent.set_volumes_dir(directory.path().join("volumes"));
+        grill.block_creates();
+        let task = tokio::spawn(async move { agent.run().await });
+        let config =
+            Config::parse("[job.once]\nimage = 'test:v1'\nschedule = '* * * * *'\n").unwrap();
+        expect_complete(&send_deploy(&tx, config).await);
+        tokio::time::timeout(std::time::Duration::from_secs(3), grill.wait_for_creates(1))
+            .await
+            .unwrap();
+        let checkpoint: serde_json::Value = serde_json::from_slice(
+            &std::fs::read(records.join("scheduled-jobs.checkpoint")).unwrap(),
+        )
+        .unwrap();
+        let claimed = checkpoint["jobs"][0]["last_fired_minute"].as_i64().unwrap();
+        assert_eq!(
+            claimed,
+            time::OffsetDateTime::now_utc()
+                .unix_timestamp()
+                .div_euclid(60)
+        );
+        task.abort();
+        assert!(task.await.unwrap_err().is_cancelled());
+        grill.release_creates(1);
+
+        let (mut replacement, _tx, shutdown, runtime) = test_agent_with_grill();
+        replacement.set_records_dir(records);
+        replacement.set_volumes_dir(directory.path().join("volumes"));
+        replacement.adopt_recorded_instances().await.unwrap();
+        let task = tokio::spawn(async move { replacement.run().await });
+        tokio::time::sleep(std::time::Duration::from_millis(2200)).await;
+        shutdown.cancel();
+        task.await.unwrap();
+        assert_eq!(
+            claimed,
+            time::OffsetDateTime::now_utc()
+                .unix_timestamp()
+                .div_euclid(60),
+            "fixture crossed the minute boundary"
+        );
+        assert!(
+            !runtime
+                .calls()
+                .iter()
+                .any(|(operation, _)| operation == "create"),
+            "recovery repeated a claimed firing"
+        );
+    }
+
+    #[tokio::test]
+    async fn failed_cron_stop_retains_checkpoint_and_fences_later_changes() {
+        let directory = tempfile::tempdir().unwrap();
+        let records = directory.path().join("instances");
+        let (mut agent, tx, shutdown) = test_agent();
+        agent.set_records_dir(records.clone());
+        agent.set_volumes_dir(directory.path().join("volumes"));
+        let task = tokio::spawn(async move { agent.run().await });
+        let config =
+            Config::parse("[job.backup]\nimage = 'test:v1'\nschedule = '0 0 30 2 *'\n").unwrap();
+        expect_complete(&send_deploy(&tx, config.clone()).await);
+        let saved = directory.path().join("saved");
+        std::fs::rename(&records, &saved).unwrap();
+        std::fs::write(&records, "blocked").unwrap();
+        let (response, stopped) = oneshot::channel();
+        tx.send(AgentCommand::Stop {
+            app_name: "backup".into(),
+            namespace: "default".into(),
+            response,
+        })
+        .await
+        .unwrap();
+        assert!(stopped.await.unwrap().is_err());
+        std::fs::remove_file(&records).unwrap();
+        std::fs::rename(&saved, &records).unwrap();
+        let events = send_deploy(&tx, config).await;
+        assert!(events.iter().any(|event| matches!(event, ApplyEvent::Error { message } if message.contains("previous write is uncertain"))));
+        shutdown.cancel();
+        task.await.unwrap();
+        let (mut replacement, _tx, _shutdown) = test_agent();
+        replacement.set_records_dir(records);
+        replacement.set_volumes_dir(directory.path().join("volumes"));
+        replacement.adopt_recorded_instances().await.unwrap();
+        assert!(
+            replacement
+                .scheduled_jobs
+                .contains_key(&("backup".into(), "default".into()))
+        );
+    }
+
+    #[tokio::test]
+    async fn cron_checkpoint_corruption_refuses_startup() {
+        let job = serde_json::json!({"name":"backup", "namespace":"default", "spec":{"image":"test:v1", "schedule":"* * * * *"}, "last_fired_minute":null});
+        let mut wrong_namespace = job.clone();
+        wrong_namespace["namespace"] = "other".into();
+        let mut invalid_schedule = job.clone();
+        invalid_schedule["spec"]["schedule"] = "bad".into();
+        let mut invalid_stamp = job.clone();
+        invalid_stamp["last_fired_minute"] = (-1).into();
+        for contents in [
+            "{broken".to_string(),
+            serde_json::json!({"schema":999,"jobs":[]}).to_string(),
+            serde_json::json!({"schema":1,"jobs":[job.clone(),job]}).to_string(),
+            serde_json::json!({"schema":1,"jobs":[wrong_namespace]}).to_string(),
+            serde_json::json!({"schema":1,"jobs":[invalid_schedule]}).to_string(),
+            serde_json::json!({"schema":1,"jobs":[invalid_stamp]}).to_string(),
+        ] {
+            let directory = tempfile::tempdir().unwrap();
+            let path = directory.path().join("scheduled-jobs.checkpoint");
+            std::fs::write(&path, &contents).unwrap();
+            let (mut agent, _tx, _shutdown) = test_agent();
+            agent.set_records_dir(directory.path().to_path_buf());
+            agent.set_volumes_dir(directory.path().join("volumes"));
+            assert!(
+                agent.adopt_recorded_instances().await.is_err(),
+                "invalid checkpoint was accepted: {contents}"
+            );
+            assert_eq!(std::fs::read_to_string(path).unwrap(), contents);
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn cron_checkpoint_refuses_symlinks_and_nonregular_files() {
+        let directory = tempfile::tempdir().unwrap();
+        let checkpoint = directory.path().join("scheduled-jobs.checkpoint");
+        let source = directory.path().join("source");
+        std::fs::write(&source, r#"{"schema":1,"jobs":[]}"#).unwrap();
+        for kind in 0..3 {
+            match kind {
+                0 => std::os::unix::fs::symlink(&source, &checkpoint).unwrap(),
+                1 => nix::unistd::mkfifo(&checkpoint, nix::sys::stat::Mode::S_IRUSR).unwrap(),
+                _ => std::fs::create_dir(&checkpoint).unwrap(),
+            }
+            let (mut agent, _tx, _shutdown) = test_agent();
+            agent.set_records_dir(directory.path().to_path_buf());
+            agent.set_volumes_dir(directory.path().join("volumes"));
+            assert!(
+                tokio::time::timeout(
+                    std::time::Duration::from_secs(2),
+                    agent.adopt_recorded_instances()
+                )
+                .await
+                .unwrap()
+                .is_err()
+            );
+            if kind == 2 {
+                std::fs::remove_dir(&checkpoint).unwrap();
+            } else {
+                std::fs::remove_file(&checkpoint).unwrap();
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn cron_registration_refuses_when_ownership_cannot_be_persisted() {
+        let directory = tempfile::tempdir().unwrap();
+        let records = directory.path().join("instances");
+        std::fs::write(&records, "not a directory").unwrap();
+        let (mut agent, tx, shutdown) = test_agent();
+        agent.set_records_dir(records);
+        agent.set_volumes_dir(directory.path().join("volumes"));
+        let task = tokio::spawn(async move { agent.run().await });
+        let config =
+            Config::parse("[job.backup]\nimage = 'test:v1'\nschedule = '0 0 30 2 *'\n").unwrap();
+        let events = send_deploy(&tx, config).await;
+        let (response, stopped) = oneshot::channel();
+        tx.send(AgentCommand::Stop {
+            app_name: "backup".into(),
+            namespace: "default".into(),
+            response,
+        })
+        .await
+        .unwrap();
+        assert!(
+            matches!(stopped.await.unwrap(), Err(BunError::ScheduleState(_))),
+            "an uncertain new registration must retain ownership"
+        );
+        shutdown.cancel();
+        task.await.unwrap();
+        assert!(
+            events
+                .iter()
+                .any(|event| matches!(event, ApplyEvent::Error { .. })),
+            "schedule was acknowledged without durable ownership: {events:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn reapplying_a_job_without_schedule_retires_only_its_previous_cron() {
+        let (mut agent, tx, shutdown) = test_agent();
+        let task = tokio::spawn(async move {
+            agent.run().await;
+            agent
+        });
+        for namespace in ["red", "blue"] {
+            let config = Config::parse(&format!(
+                "[job.backup]\nimage = 'test:v1'\nschedule = '0 0 30 2 *'\nnamespace = '{namespace}'\n"
+            )).unwrap();
+            expect_complete(&send_deploy(&tx, config).await);
+        }
+        let config = Config::parse("[job.backup]\nimage = 'test:v2'\nnamespace = 'red'\n").unwrap();
+        expect_complete(&send_deploy(&tx, config).await);
+        shutdown.cancel();
+        let agent = task.await.unwrap();
+        assert!(
+            !agent
+                .scheduled_jobs
+                .contains_key(&("backup".into(), "red".into())),
+            "removing schedule from the applied job must retire its old cron"
+        );
+        assert!(
+            agent
+                .scheduled_jobs
+                .contains_key(&("backup".into(), "blue".into()))
+        );
+    }
+
+    #[tokio::test]
+    async fn stopping_a_scheduled_job_before_its_first_run_retires_only_its_namespace() {
+        let (tx, rx) = mpsc::channel(32);
+        let shutdown = CancellationToken::new();
+        let mut agent = BunAgent::new(
+            crate::grill::mock::MockGrill::new(),
+            PortAllocator::new(30000, 31000),
+            rx,
+            shutdown.clone(),
+        );
+        let task = tokio::spawn(async move {
+            agent.run().await;
+            agent
+        });
+        for namespace in ["red", "blue"] {
+            // February 30 never matches, so this tests the pre-first-run path
+            // without depending on which minute CI happens to execute it.
+            let config = Config::parse(&format!(
+                "[job.backup]\nimage = \"busybox:latest\"\ncommand = [\"true\"]\nschedule = \"0 0 30 2 *\"\nnamespace = \"{namespace}\"\n"
+            )).unwrap();
+            let events = send_deploy(&tx, config).await;
+            assert!(
+                events
+                    .iter()
+                    .any(|event| matches!(event, ApplyEvent::Complete { .. })),
+                "{events:?}"
+            );
+        }
+        let (response, result) = oneshot::channel();
+        tx.send(AgentCommand::Stop {
+            app_name: "backup".into(),
+            namespace: "red".into(),
+            response,
+        })
+        .await
+        .unwrap();
+        let stopped = result.await.unwrap();
+        shutdown.cancel();
+        let agent = task.await.unwrap();
+        assert!(
+            stopped.is_ok(),
+            "stopping a registered schedule failed: {stopped:?}"
+        );
+        assert!(
+            !agent
+                .scheduled_jobs
+                .contains_key(&("backup".into(), "red".into()))
+        );
+        assert!(
+            agent
+                .scheduled_jobs
+                .contains_key(&("backup".into(), "blue".into()))
+        );
+        assert!(agent.supervisor.list_instances().is_empty());
     }
 
     /// Send a Deploy command and collect all events. Returns the list
@@ -9959,6 +14583,269 @@ interval = 1
     }
 
     #[tokio::test]
+    async fn cancellation_waits_for_in_flight_create_before_releasing_ownership() {
+        let (mut agent, tx, shutdown, grill) = test_agent_with_grill();
+        let task = tokio::spawn(async move { agent.run().await });
+        grill.block_creates();
+        let (events, mut stream) = mpsc::channel(64);
+        tx.send(AgentCommand::Deploy {
+            config: basic_config(),
+            events,
+        })
+        .await
+        .unwrap();
+        let ApplyEvent::Accepted { operation_id } = stream.recv().await.unwrap() else {
+            panic!("no ID")
+        };
+        tokio::time::timeout(std::time::Duration::from_secs(2), grill.wait_for_creates(1))
+            .await
+            .unwrap();
+        let (response, result) = oneshot::channel();
+        tx.send(AgentCommand::CancelDeploy {
+            operation_id: operation_id.clone().into(),
+            response,
+        })
+        .await
+        .unwrap();
+        let receipt = result.await.unwrap().unwrap();
+        assert!(receipt.cancellation_requested_at.is_some());
+        assert!(receipt.outcome.is_none());
+        let conflict = send_deploy(&tx, basic_config()).await;
+        assert!(conflict.iter().any(|event| matches!(event, ApplyEvent::Error { message } if message.contains(&operation_id))));
+        grill.release_creates(1);
+        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            while stream.recv().await.is_some() {}
+        })
+        .await
+        .unwrap();
+        let (response, result) = oneshot::channel();
+        tx.send(AgentCommand::DeployOperations { response })
+            .await
+            .unwrap();
+        assert_eq!(
+            result.await.unwrap().history[0].outcome,
+            Some(crate::bun::deploy_operations::DeployOperationOutcome::Cancelled)
+        );
+        expect_complete(&send_deploy(&tx, basic_config()).await);
+        shutdown.cancel();
+        task.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn cancellation_interrupts_health_wait_and_holds_ownership_through_rollback() {
+        for strategy in ["rolling", "blue-green"] {
+            let port = spawn_health_responder(500).await;
+            let (mut agent, tx, shutdown, grill) = test_agent_with_grill();
+            let task = tokio::spawn(async move { agent.run().await });
+            expect_complete(&send_deploy(&tx, no_health_config(port)).await);
+            let mut config = health_gated_config(port, strategy);
+            config
+                .app
+                .get_mut("web")
+                .unwrap()
+                .deploy
+                .as_mut()
+                .unwrap()
+                .health_timeout = Some("30s".into());
+            let (events, mut stream) = mpsc::channel(64);
+            tx.send(AgentCommand::Deploy { config, events })
+                .await
+                .unwrap();
+            let ApplyEvent::Accepted { operation_id } = stream.recv().await.unwrap() else {
+                panic!("no ID")
+            };
+            let canary =
+                crate::grill::InstanceIdentity::canary("default", "web", 1, 0).instance_id();
+            tokio::time::timeout(std::time::Duration::from_secs(2), async {
+                while !grill
+                    .calls()
+                    .iter()
+                    .any(|(call, id)| call == "start" && id == &canary)
+                {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .unwrap();
+            grill.block_kills();
+            let (response, result) = oneshot::channel();
+            tx.send(AgentCommand::CancelDeploy {
+                operation_id: operation_id.clone().into(),
+                response,
+            })
+            .await
+            .unwrap();
+            assert!(
+                result
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .cancellation_requested_at
+                    .is_some()
+            );
+            tokio::time::timeout(std::time::Duration::from_secs(2), grill.wait_for_kills(1))
+                .await
+                .expect("cancellation did not interrupt the 30-second health wait");
+            let (response, result) = oneshot::channel();
+            tx.send(AgentCommand::DeployOperations { response })
+                .await
+                .unwrap();
+            let snapshot = result.await.unwrap();
+            grill.release_kills(1);
+            assert!(
+                snapshot
+                    .active_deploys
+                    .iter()
+                    .any(|op| op.id.as_str() == operation_id)
+            );
+            tokio::time::timeout(std::time::Duration::from_secs(2), async {
+                while stream.recv().await.is_some() {}
+            })
+            .await
+            .unwrap();
+            let (response, result) = oneshot::channel();
+            tx.send(AgentCommand::DeployOperations { response })
+                .await
+                .unwrap();
+            assert_eq!(
+                result.await.unwrap().history[0].outcome,
+                Some(crate::bun::deploy_operations::DeployOperationOutcome::Cancelled)
+            );
+            expect_complete(&send_deploy(&tx, no_health_config(port)).await);
+            shutdown.cancel();
+            task.await.unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn app_deploy_does_not_roll_over_an_existing_job() {
+        let (mut agent, tx, shutdown, grill) = test_agent_with_grill();
+        let task = tokio::spawn(async move { agent.run().await });
+        let job = Config::parse("[job.web]\nimage = 'job:v1'\n").unwrap();
+        expect_complete(&send_deploy(&tx, job).await);
+        let events = send_deploy(&tx, basic_config()).await;
+        let calls_before_shutdown = grill.calls();
+        shutdown.cancel();
+        task.await.unwrap();
+        assert!(
+            events
+                .iter()
+                .any(|event| matches!(event, ApplyEvent::Error { .. })),
+            "an app rollout accepted a live job as its previous generation"
+        );
+        assert!(
+            !calls_before_shutdown
+                .iter()
+                .any(|(call, _)| call == "stop" || call == "kill"),
+            "the conflicting deploy changed the existing job"
+        );
+    }
+
+    #[tokio::test]
+    async fn failed_deploy_keeps_target_ownership_until_rollback_finishes() {
+        for strategy in ["rolling", "blue-green"] {
+            let port = spawn_health_responder(500).await;
+            let (mut agent, tx, shutdown, grill) = test_agent_with_grill();
+            let task = tokio::spawn(async move { agent.run().await });
+            expect_complete(&send_deploy(&tx, no_health_config(port)).await);
+            grill.block_kills();
+            let (events, mut event_rx) = mpsc::channel(64);
+            tx.send(AgentCommand::Deploy {
+                config: health_gated_config(port, strategy),
+                events,
+            })
+            .await
+            .unwrap();
+            let operation_id = match event_rx.recv().await.unwrap() {
+                ApplyEvent::Accepted { operation_id } => operation_id,
+                event => panic!("expected acceptance, got {event:?}"),
+            };
+            tokio::time::timeout(std::time::Duration::from_secs(3), async {
+                while let Some(event) = event_rx.recv().await {
+                    if matches!(event, ApplyEvent::Error { .. }) {
+                        break;
+                    }
+                }
+                grill.wait_for_kills(1).await;
+            })
+            .await
+            .expect("failed replacement did not enter cleanup");
+            let (response, result) = oneshot::channel();
+            tx.send(AgentCommand::DeployOperations { response })
+                .await
+                .unwrap();
+            let snapshot = result.await.unwrap();
+            // Release the fixture even when the assertion below fails.
+            grill.release_kills(1);
+            assert!(
+                snapshot
+                    .active_deploys
+                    .iter()
+                    .any(|op| op.id.as_str() == operation_id),
+                "{strategy} released target ownership while rollback still owned its runtime mutation"
+            );
+            assert!(
+                !snapshot
+                    .history
+                    .iter()
+                    .any(|op| op.id.as_str() == operation_id)
+            );
+            while event_rx.recv().await.is_some() {}
+            let (response, result) = oneshot::channel();
+            tx.send(AgentCommand::DeployOperations { response })
+                .await
+                .unwrap();
+            let snapshot = result.await.unwrap();
+            assert_eq!(
+                snapshot
+                    .history
+                    .iter()
+                    .find(|op| op.id.as_str() == operation_id)
+                    .unwrap()
+                    .outcome,
+                Some(crate::bun::deploy_operations::DeployOperationOutcome::Failed)
+            );
+            expect_complete(&send_deploy(&tx, no_health_config(port)).await);
+            shutdown.cancel();
+            task.await.unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn stalled_event_consumer_cannot_pin_deployment_ownership() {
+        let (mut agent, tx, shutdown, _) = test_agent_with_grill();
+        let task = tokio::spawn(async move { agent.run().await });
+        // Acceptance fills this queue. Keep its receiver alive without reading.
+        let (events, _event_rx) = mpsc::channel(1);
+        tx.send(AgentCommand::Deploy {
+            config: basic_config(),
+            events,
+        })
+        .await
+        .unwrap();
+        let outcome = tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            loop {
+                let (response, result) = oneshot::channel();
+                tx.send(AgentCommand::DeployOperations { response })
+                    .await
+                    .unwrap();
+                let snapshot = result.await.unwrap();
+                if let Some(operation) = snapshot.history.first() {
+                    break operation.outcome;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await;
+        shutdown.cancel();
+        task.await.unwrap();
+        assert_eq!(
+            outcome.expect("client backpressure prevented terminal history"),
+            Some(crate::bun::deploy_operations::DeployOperationOutcome::Completed)
+        );
+    }
+
+    #[tokio::test]
     async fn deploy_operations_track_live_phase_conflicts_and_disconnected_clients() {
         let (tx, rx) = mpsc::channel(32);
         let shutdown = CancellationToken::new();
@@ -10214,7 +15101,9 @@ interval = 1
         let shutdown = CancellationToken::new();
         let grill = crate::grill::process::ProcessGrill::new();
         let port_allocator = PortAllocator::new(30000, 31000);
+        let volumes = tempfile::tempdir().unwrap();
         let mut agent = BunAgent::new(grill, port_allocator, rx, shutdown);
+        agent.set_volumes_dir(volumes.path().to_path_buf());
 
         let config = Config::parse(&format!(
             "[app.web]\nimage = \"proc-grill:ignored\"\ncommand = [\"sleep\", \"60\"]\nport = {port}\n\n[app.web.health]\npath = \"/healthz\"\n\n[app.web.deploy]\nhealth_timeout = \"5s\"\n",
@@ -10254,13 +15143,306 @@ interval = 1
         agent.stop_app("web", "default").await.unwrap();
     }
 
+    async fn restart_preserves_uncertain_cleanup(inject: fn(&MockGrill)) {
+        let (mut agent, _tx, _shutdown, grill) = test_agent_with_grill();
+        grill.set_pid(std::process::id());
+        let directory = tempfile::tempdir().unwrap();
+        agent.set_volumes_dir(directory.path().join("volumes"));
+        let records = directory.path().join("instances");
+        agent.set_records_dir(records.clone());
+        let config = Config::parse("[app.restart]\nimage = \"mock:image\"\nport = 8080\n").unwrap();
+        let (events, _received) = mpsc::channel(256);
+        agent.deploy(config, &events).await;
+        assert_eq!(
+            agent.supervisor.list_instances()[0].state,
+            ContainerState::Running
+        );
+        let id = agent.supervisor.list_instances()[0].id.clone();
+        let port = agent.supervisor.get_instance(&id).unwrap().host_port;
+        assert!(port.is_some());
+        std::fs::create_dir_all(&records).unwrap();
+        let record = crate::grill::records::record_path(&records, &id.0);
+        std::fs::write(&record, "retained ownership").unwrap();
+        agent.supervisor.get_instance_mut(&id).unwrap().state = ContainerState::Unhealthy;
+        assert!(
+            agent
+                .supervisor
+                .maybe_restart(&id, Instant::now())
+                .await
+                .unwrap()
+        );
+        let before = grill.calls().len();
+        inject(&grill);
+        tokio::time::timeout(
+            std::time::Duration::from_secs(6),
+            agent.drive_pending_restarts(),
+        )
+        .await
+        .expect("restart cleanup stalled the agent");
+        assert_eq!(
+            agent.supervisor.get_instance(&id).unwrap().state,
+            ContainerState::Pending
+        );
+        assert_eq!(agent.supervisor.get_instance(&id).unwrap().host_port, port);
+        assert_eq!(
+            std::fs::read_to_string(&record).unwrap(),
+            "retained ownership"
+        );
+        assert!(
+            !grill.calls()[before..]
+                .iter()
+                .any(|(operation, _)| operation == "create" || operation == "start")
+        );
+
+        grill.set_fail_kill(false);
+        grill.set_ignore_kill(false);
+        grill.set_fail_state(false);
+        grill.release_kills(1);
+        agent.drive_pending_restarts().await;
+        assert_eq!(
+            agent.supervisor.get_instance(&id).unwrap().state,
+            ContainerState::Running
+        );
+        assert_eq!(agent.supervisor.get_instance(&id).unwrap().restart_count, 1);
+        agent.stop_app("restart", "default").await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn restart_retains_owner_after_failed_kill() {
+        restart_preserves_uncertain_cleanup(|grill| grill.set_fail_kill(true)).await;
+    }
+
+    #[tokio::test]
+    async fn restart_retains_owner_after_unconfirmed_kill() {
+        restart_preserves_uncertain_cleanup(|grill| grill.set_ignore_kill(true)).await;
+    }
+
+    #[tokio::test]
+    async fn restart_retains_owner_after_failed_observation() {
+        restart_preserves_uncertain_cleanup(|grill| grill.set_fail_state(true)).await;
+    }
+
+    #[tokio::test]
+    async fn restart_retains_owner_after_stalled_kill() {
+        restart_preserves_uncertain_cleanup(MockGrill::block_kills).await;
+    }
+
+    async fn failed_restart_fixture() -> (TestAgent, MockGrill, InstanceId, tempfile::TempDir) {
+        let (mut agent, _tx, _shutdown, grill) = test_agent_with_grill();
+        let directory = tempfile::tempdir().unwrap();
+        agent.set_volumes_dir(directory.path().join("volumes"));
+        let config = Config::parse("[app.retry]\nimage = \"mock:image\"\nport = 8080\n").unwrap();
+        let (events, _received) = mpsc::channel(256);
+        agent.deploy(config, &events).await;
+        let id = agent.supervisor.list_instances()[0].id.clone();
+        agent.supervisor.get_instance_mut(&id).unwrap().state = ContainerState::Unhealthy;
+        assert!(
+            agent
+                .supervisor
+                .maybe_restart(&id, Instant::now())
+                .await
+                .unwrap()
+        );
+        (agent, grill, id, directory)
+    }
+
+    async fn failed_restart_recovers(inject: fn(&MockGrill)) {
+        let (mut agent, grill, id, _directory) = failed_restart_fixture().await;
+        let port = agent.supervisor.get_instance(&id).unwrap().host_port;
+        inject(&grill);
+        agent.drive_pending_restarts().await;
+        assert_eq!(
+            agent.supervisor.get_instance(&id).unwrap().state,
+            ContainerState::Stopping
+        );
+        assert_eq!(agent.supervisor.get_instance(&id).unwrap().host_port, port);
+        let creates = grill
+            .calls()
+            .iter()
+            .filter(|(op, _)| op == "create")
+            .count();
+        grill.set_fail_kill(true);
+        agent.drive_pending_restarts().await;
+        assert_eq!(
+            agent.supervisor.get_instance(&id).unwrap().state,
+            ContainerState::Stopping
+        );
+        assert_eq!(
+            grill
+                .calls()
+                .iter()
+                .filter(|(op, _)| op == "create")
+                .count(),
+            creates
+        );
+        grill.set_fail_kill(false);
+        agent.drive_pending_restarts().await;
+        assert_eq!(
+            agent.supervisor.get_instance(&id).unwrap().state,
+            ContainerState::Stopped
+        );
+        assert_eq!(agent.supervisor.get_instance(&id).unwrap().restart_count, 1);
+        assert_eq!(
+            grill
+                .calls()
+                .iter()
+                .filter(|(op, _)| op == "create")
+                .count(),
+            creates
+        );
+        grill.set_fail_create(false);
+        grill.set_fail_start(false);
+        agent.supervisor.get_instance_mut(&id).unwrap().last_restart =
+            Some(Instant::now() - std::time::Duration::from_secs(600));
+        agent.drive_pending_restarts().await;
+        assert_eq!(
+            agent.supervisor.get_instance(&id).unwrap().state,
+            ContainerState::Running
+        );
+        assert_eq!(agent.supervisor.get_instance(&id).unwrap().restart_count, 2);
+        agent.stop_app("retry", "default").await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn restart_create_failure_recovers_after_cleanup_and_backoff() {
+        failed_restart_recovers(|grill| grill.set_fail_create(true)).await;
+    }
+
+    #[tokio::test]
+    async fn restart_start_failure_recovers_after_cleanup_and_backoff() {
+        failed_restart_recovers(|grill| grill.set_fail_start(true)).await;
+    }
+
+    #[tokio::test]
+    async fn restart_start_failures_exhaust_job_budget() {
+        let (mut agent, _, _, grill) = test_agent_with_grill();
+        let directory = tempfile::tempdir().unwrap();
+        agent.set_records_dir(directory.path().to_path_buf());
+        grill.set_pid(std::process::id());
+        expect_complete(
+            &drain_deploy(
+                &mut agent,
+                Config::parse("[job.retry]\nimage = 'test:v1'\n").unwrap(),
+            )
+            .await,
+        );
+        let id = InstanceId("default__retry-0".into());
+        grill.set_state(&id, ContainerState::Stopped);
+        grill.set_exit_code(&id, Some(1));
+        agent.check_jobs().await;
+        grill.set_fail_start(true);
+        for _ in 0..4 {
+            agent.supervisor.get_instance_mut(&id).unwrap().last_restart =
+                Some(Instant::now() - std::time::Duration::from_secs(600));
+            agent.drive_pending_restarts().await;
+        }
+        let instance = agent.supervisor.get_instance(&id).unwrap();
+        assert_eq!(instance.state, ContainerState::Failed);
+        assert_eq!(instance.restart_count, 3);
+        assert_eq!(
+            grill.calls().iter().filter(|(op, _)| op == "start").count(),
+            4
+        );
+    }
+
+    #[tokio::test]
+    async fn explicit_stop_cancels_failed_restart_recovery() {
+        let (mut agent, grill, id, _directory) = failed_restart_fixture().await;
+        grill.set_fail_start(true);
+        agent.drive_pending_restarts().await;
+        agent.stop_app("retry", "default").await.unwrap();
+        assert_eq!(
+            agent.supervisor.get_instance(&id).unwrap().state,
+            ContainerState::Stopped
+        );
+        let calls = grill.calls().len();
+        agent.drive_pending_restarts().await;
+        assert_eq!(grill.calls().len(), calls);
+    }
+
+    #[tokio::test]
+    async fn explicit_stop_cancels_pending_restart_before_creation() {
+        let (mut agent, grill, id, _directory) = failed_restart_fixture().await;
+        agent.stop_app("retry", "default").await.unwrap();
+        assert_eq!(
+            agent.supervisor.get_instance(&id).unwrap().state,
+            ContainerState::Stopped
+        );
+        let calls = grill.calls().len();
+        agent.drive_pending_restarts().await;
+        assert_eq!(grill.calls().len(), calls);
+    }
+
+    #[tokio::test]
+    async fn real_process_restart_recovers_when_executable_returns() {
+        use std::os::unix::fs::PermissionsExt;
+        let directory = tempfile::tempdir().unwrap();
+        let program = directory.path().join("worker");
+        let install = || {
+            std::fs::write(&program, "#!/bin/sh\nexec sleep 60\n").unwrap();
+            std::fs::set_permissions(&program, std::fs::Permissions::from_mode(0o700)).unwrap();
+        };
+        install();
+        let (_tx, rx) = mpsc::channel(32);
+        let grill = crate::grill::process::ProcessGrill::new();
+        let mut agent = BunAgent::new(
+            grill.clone(),
+            PortAllocator::new(30000, 31000),
+            rx,
+            CancellationToken::new(),
+        );
+        agent.set_volumes_dir(directory.path().join("volumes"));
+        let config = Config::parse(&format!(
+            "[app.retry]\nimage = 'proc-grill:ignored'\ncommand = [{:?}]\n",
+            program.to_str().unwrap()
+        ))
+        .unwrap();
+        let (events, _received) = mpsc::channel(256);
+        agent.deploy(config, &events).await;
+        let id = agent.supervisor.list_instances()[0].id.clone();
+        grill.kill(&id).await.unwrap();
+        std::fs::remove_file(&program).unwrap();
+        agent.check_apps().await;
+        agent.drive_pending_restarts().await;
+        assert_eq!(
+            agent.supervisor.get_instance(&id).unwrap().state,
+            ContainerState::Stopping
+        );
+        agent.drive_pending_restarts().await;
+        assert_eq!(
+            agent.supervisor.get_instance(&id).unwrap().state,
+            ContainerState::Stopped
+        );
+        install();
+        agent.supervisor.get_instance_mut(&id).unwrap().last_restart =
+            Some(Instant::now() - std::time::Duration::from_secs(600));
+        agent.drive_pending_restarts().await;
+        assert_eq!(grill.state(&id).await.unwrap(), ContainerState::Running);
+        assert_eq!(agent.supervisor.get_instance(&id).unwrap().restart_count, 2);
+        // A second crash during backoff must stay eligible for a later tick.
+        grill.kill(&id).await.unwrap();
+        agent.check_apps().await;
+        assert_eq!(
+            agent.supervisor.get_instance(&id).unwrap().state,
+            ContainerState::Stopped
+        );
+        agent.supervisor.get_instance_mut(&id).unwrap().last_restart =
+            Some(Instant::now() - std::time::Duration::from_secs(600));
+        agent.drive_pending_restarts().await;
+        assert_eq!(grill.state(&id).await.unwrap(), ContainerState::Running);
+        assert_eq!(agent.supervisor.get_instance(&id).unwrap().restart_count, 3);
+        agent.stop_app("retry", "default").await.unwrap();
+    }
+
     #[tokio::test]
     async fn redeployed_instance_restarts_after_a_crash() {
         let (_tx, rx) = mpsc::channel(32);
         let shutdown = CancellationToken::new();
         let grill = crate::grill::process::ProcessGrill::new();
         let port_allocator = PortAllocator::new(30000, 31000);
+        let volumes = tempfile::tempdir().unwrap();
         let mut agent = BunAgent::new(grill, port_allocator, rx, shutdown);
+        agent.set_volumes_dir(volumes.path().to_path_buf());
 
         let config = Config::parse(
             "[app.web]\nimage = \"proc-grill:ignored\"\ncommand = [\"sleep\", \"60\"]\n",
@@ -10313,6 +15495,305 @@ interval = 1
         agent.stop_app("web", "default").await.unwrap();
     }
 
+    fn cluster_publication_fixture() -> (
+        crate::onion::catalog::EndpointCatalog,
+        Vec<crate::cluster::orchestrate::IngressAssignment>,
+    ) {
+        let config: crate::config::app::IngressSpec =
+            toml::from_str("host = \"remote.local\"\ntls = \"disabled\"").unwrap();
+        let catalog = crate::onion::catalog::EndpointCatalog::rebuild([(
+            crate::onion::service_id::ServiceId::new("default", "remote"),
+            8080,
+            vec![crate::onion::catalog::CatalogBackend {
+                execution: None,
+                node_id: "other-node".into(),
+                node_ip: "192.168.1.2".parse().unwrap(),
+                host_port: 30001,
+                healthy: true,
+            }],
+        )])
+        .unwrap();
+        (
+            catalog,
+            vec![crate::cluster::orchestrate::IngressAssignment {
+                namespace: "default".into(),
+                name: "remote".into(),
+                config,
+            }],
+        )
+    }
+
+    #[tokio::test]
+    async fn cluster_consumer_refuses_stale_and_rewritten_generations_without_changing_views() {
+        let (mut agent, _, _) = test_agent();
+        let (original, ingress) = cluster_publication_fixture();
+        agent
+            .publish_cluster_catalogue(4, original.clone(), ingress.clone())
+            .await
+            .unwrap();
+        let mut changed = original.clone();
+        changed
+            .services
+            .get_mut("default__remote")
+            .unwrap()
+            .backends[0]
+            .host_port = 30002;
+        for (generation, catalog) in [
+            (3, original.clone()),
+            (3, changed.clone()),
+            (4, changed.clone()),
+        ] {
+            assert!(
+                agent
+                    .publish_cluster_catalogue(generation, catalog, ingress.clone())
+                    .await
+                    .is_err(),
+                "accepted stale or rewritten generation {generation}"
+            );
+            assert_eq!(agent.cluster_catalog, original);
+            assert_eq!(
+                agent
+                    .routing_table
+                    .read()
+                    .await
+                    .lookup("remote.local", "/")
+                    .unwrap()
+                    .backends[0]
+                    .addr
+                    .port(),
+                30001
+            );
+            assert_eq!(
+                agent.service_map_tx.borrow().resolve_all()[0].backends[0].host_port,
+                30001
+            );
+        }
+        agent
+            .publish_cluster_catalogue(5, changed.clone(), ingress)
+            .await
+            .unwrap();
+        assert_eq!(agent.cluster_catalog, changed);
+    }
+
+    #[tokio::test]
+    async fn cluster_consumer_advances_identical_generations_and_does_not_consume_refused_updates()
+    {
+        let (mut agent, _, _) = test_agent();
+        let (original, ingress) = cluster_publication_fixture();
+        agent
+            .publish_cluster_catalogue(1, original.clone(), ingress.clone())
+            .await
+            .unwrap();
+        agent
+            .publish_cluster_catalogue(4, original.clone(), ingress.clone())
+            .await
+            .unwrap();
+        assert!(
+            agent
+                .publish_cluster_catalogue(3, original.clone(), ingress.clone())
+                .await
+                .is_err()
+        );
+        let mut changed = original.clone();
+        changed
+            .services
+            .get_mut("default__remote")
+            .unwrap()
+            .backends[0]
+            .host_port = 30002;
+        let mut invalid = ingress.clone();
+        invalid[0].config.rate_limit_rps = Some(0);
+        assert!(
+            agent
+                .publish_cluster_catalogue(6, changed.clone(), invalid)
+                .await
+                .is_err()
+        );
+        agent
+            .publish_cluster_catalogue(5, changed.clone(), ingress.clone())
+            .await
+            .unwrap();
+        agent
+            .publish_cluster_catalogue(5, changed.clone(), vec![])
+            .await
+            .unwrap();
+        assert!(
+            agent
+                .routing_table
+                .read()
+                .await
+                .lookup("remote.local", "/")
+                .is_none()
+        );
+        agent
+            .publish_cluster_catalogue(5, changed, ingress)
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn cluster_consumer_zero_generation_requires_an_empty_catalogue() {
+        let (mut agent, _, _) = test_agent();
+        let (catalog, ingress) = cluster_publication_fixture();
+        assert!(
+            agent
+                .publish_cluster_catalogue(0, catalog, ingress)
+                .await
+                .is_err()
+        );
+        assert!(agent.cluster_catalog.is_empty());
+        agent
+            .publish_cluster_catalogue(0, Default::default(), vec![])
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn cluster_consumer_refuses_collisions_in_the_effective_local_and_remote_view() {
+        let (mut agent, _, _) = test_agent();
+        let local = crate::onion::service_id::ServiceId::new("default", "local");
+        let vip = agent.service_map.register(&local, 8080, None).unwrap();
+        let (mut catalog, ingress) = cluster_publication_fixture();
+        catalog.services.get_mut("default__remote").unwrap().vip = vip;
+        catalog.validate_allocations().unwrap();
+        assert!(
+            agent
+                .publish_cluster_catalogue(1, catalog, ingress)
+                .await
+                .is_err()
+        );
+        assert!(agent.cluster_catalog.is_empty());
+        assert!(agent.service_map_tx.borrow().resolve_all().is_empty());
+        assert!(
+            agent
+                .routing_table
+                .read()
+                .await
+                .lookup("remote.local", "/")
+                .is_none()
+        );
+    }
+
+    #[tokio::test]
+    async fn cluster_publication_refusal_preserves_the_confirmed_catalogue_dns_and_ingress() {
+        let (mut agent, _, _) = test_agent();
+        let (original, ingress) = cluster_publication_fixture();
+        let (response, reply) = oneshot::channel();
+        agent
+            .handle_command(AgentCommand::SyncClusterCatalog {
+                generation: 1,
+                response,
+                catalog: Box::new(original.clone()),
+                ingress: ingress.clone(),
+            })
+            .await;
+        reply.await.unwrap().unwrap();
+        let mut changed = original.clone();
+        changed
+            .services
+            .get_mut("default__remote")
+            .unwrap()
+            .backends[0]
+            .host_port = 30002;
+        let mut invalid = ingress.clone();
+        invalid[0].config.rate_limit_rps = Some(0);
+        let (response, reply) = oneshot::channel();
+        agent
+            .handle_command(AgentCommand::SyncClusterCatalog {
+                generation: 2,
+                response,
+                catalog: Box::new(changed.clone()),
+                ingress: invalid,
+            })
+            .await;
+        assert!(reply.await.unwrap().is_err());
+        assert_eq!(
+            agent.cluster_catalog, original,
+            "a refused route changed the installed catalogue"
+        );
+        assert_eq!(
+            agent
+                .service_map_tx
+                .borrow()
+                .resolve(&crate::onion::service_id::ServiceId::new(
+                    "default", "remote"
+                ))
+                .unwrap()
+                .backends[0]
+                .host_port,
+            30001
+        );
+        let table = agent.routing_table.read().await;
+        let route = table
+            .lookup("remote.local", "/")
+            .expect("last confirmed ingress was lost");
+        assert_eq!(route.backends[0].addr.port(), 30001);
+        assert!(route.rate_limit.is_none());
+        drop(table);
+        let (response, reply) = oneshot::channel();
+        agent
+            .handle_command(AgentCommand::SyncClusterCatalog {
+                generation: 2,
+                catalog: Box::new(changed.clone()),
+                ingress,
+                response,
+            })
+            .await;
+        reply.await.unwrap().unwrap();
+        assert_eq!(agent.cluster_catalog, changed);
+        assert_eq!(
+            agent
+                .service_map_tx
+                .borrow()
+                .resolve(&crate::onion::service_id::ServiceId::new(
+                    "default", "remote"
+                ))
+                .unwrap()
+                .backends[0]
+                .host_port,
+            30002
+        );
+        assert_eq!(
+            agent
+                .routing_table
+                .read()
+                .await
+                .lookup("remote.local", "/")
+                .unwrap()
+                .backends[0]
+                .addr
+                .port(),
+            30002
+        );
+    }
+
+    #[tokio::test]
+    async fn cluster_publication_refuses_invalid_allocations_before_any_view_changes() {
+        let (mut agent, _, _) = test_agent();
+        let (mut invalid, ingress) = cluster_publication_fixture();
+        invalid.services.get_mut("default__remote").unwrap().vip.0 = std::net::Ipv4Addr::LOCALHOST;
+        let (response, reply) = oneshot::channel();
+        agent
+            .handle_command(AgentCommand::SyncClusterCatalog {
+                generation: 1,
+                response,
+                catalog: Box::new(invalid),
+                ingress,
+            })
+            .await;
+        assert!(reply.await.unwrap().is_err());
+        assert!(agent.cluster_catalog.is_empty());
+        assert!(agent.service_map_tx.borrow().resolve_all().is_empty());
+        assert!(
+            agent
+                .routing_table
+                .read()
+                .await
+                .lookup("remote.local", "/")
+                .is_none()
+        );
+    }
+
     #[tokio::test]
     async fn ingress_routes_are_installed_without_a_local_replica_and_removed_on_update() {
         let (mut agent, _tx, _shutdown) = test_agent();
@@ -10329,14 +15810,19 @@ host = "remote.local"
             crate::onion::service_id::ServiceId::new("default", "remote"),
             8080,
             vec![crate::onion::catalog::CatalogBackend {
+                execution: None,
                 node_id: "other-node".into(),
                 node_ip: "192.168.1.2".parse().unwrap(),
                 host_port: 30001,
                 healthy: true,
             }],
-        )]);
+        )])
+        .unwrap();
+        let (response, reply) = oneshot::channel();
         agent
             .handle_command(AgentCommand::SyncClusterCatalog {
+                generation: 1,
+                response,
                 catalog: Box::new(catalog.clone()),
                 ingress: vec![crate::cluster::orchestrate::IngressAssignment {
                     name: "remote".into(),
@@ -10345,6 +15831,7 @@ host = "remote.local"
                 }],
             })
             .await;
+        reply.await.unwrap().unwrap();
         assert!(
             agent
                 .routing_table
@@ -10354,12 +15841,16 @@ host = "remote.local"
                 .is_some()
         );
         assert!(agent.supervisor.list_instances().is_empty());
+        let (response, reply) = oneshot::channel();
         agent
             .handle_command(AgentCommand::SyncClusterCatalog {
+                generation: 1,
+                response,
                 catalog: Box::new(catalog),
                 ingress: Vec::new(),
             })
             .await;
+        reply.await.unwrap().unwrap();
         assert!(
             agent
                 .routing_table
@@ -10585,6 +16076,8 @@ host = "remote.local"
     #[tokio::test]
     async fn stop_command_stops_instances() {
         let (mut agent, tx, shutdown) = test_agent();
+        let volumes = tempfile::tempdir().unwrap();
+        agent.set_volumes_dir(volumes.path().to_path_buf());
 
         let agent_handle = tokio::spawn(async move {
             agent.run().await;
@@ -10716,6 +16209,81 @@ host = "remote.local"
     }
 
     #[tokio::test]
+    async fn retirement_retains_ownership_until_durable_artifacts_are_removed() {
+        for block_identity in [false, true] {
+            let root = tempfile::tempdir().unwrap();
+            let records = root.path().join("records");
+            std::fs::create_dir(&records).unwrap();
+            let (mut agent, tx, shutdown, grill) = test_agent_with_grill();
+            grill.set_pid(std::process::id());
+            agent.set_records_dir(records.clone());
+            agent.set_volumes_dir(root.path().join("volumes"));
+            let id = InstanceId("default__web-0".into());
+            let identity = agent.instance_identity_dir(&id);
+            let task = tokio::spawn(async move {
+                agent.run().await;
+                agent
+            });
+            expect_complete(&send_deploy(&tx, basic_config()).await);
+            let record = crate::grill::records::record_path(&records, &id.0);
+            if block_identity {
+                crate::sesame::identity::cleanup_identity_dir(&identity).unwrap();
+                std::fs::write(&identity, "blocked identity cleanup").unwrap();
+                std::fs::write(&record, "owned until cleanup succeeds").unwrap();
+            } else {
+                std::fs::remove_file(&record).unwrap();
+                std::fs::create_dir(&record).unwrap();
+            }
+            let (response, result) = oneshot::channel();
+            tx.send(AgentCommand::Retire {
+                app_name: "web".into(),
+                namespace: "default".into(),
+                response,
+            })
+            .await
+            .unwrap();
+            let outcome = result.await.unwrap();
+            let durable_owner_retained = record.exists();
+            let (response, status) = oneshot::channel();
+            tx.send(AgentCommand::Status { response }).await.unwrap();
+            let retained = status.await.unwrap();
+            // Restore the injected filesystem fault before stopping the fixture.
+            if block_identity {
+                std::fs::remove_file(&identity).unwrap();
+            } else {
+                std::fs::remove_dir(&record).unwrap();
+            }
+            let (response, result) = oneshot::channel();
+            tx.send(AgentCommand::Retire {
+                app_name: "web".into(),
+                namespace: "default".into(),
+                response,
+            })
+            .await
+            .unwrap();
+            let retry = result.await.unwrap();
+            shutdown.cancel();
+            let agent = task.await.unwrap();
+            assert!(
+                outcome.is_err(),
+                "retirement succeeded despite failed artifact removal"
+            );
+            assert!(
+                durable_owner_retained,
+                "failed artifact cleanup discarded the adoption record"
+            );
+            assert_eq!(
+                retained.len(),
+                1,
+                "uncertain cleanup lost runtime ownership"
+            );
+            assert!(retry.is_ok(), "{retry:?}");
+            assert!(agent.supervisor.list_instances().is_empty());
+            assert!(!record.exists());
+        }
+    }
+
+    #[tokio::test]
     async fn stop_unknown_app_errors() {
         let (mut agent, tx, shutdown) = test_agent();
 
@@ -10844,6 +16412,41 @@ host = "remote.local"
 
         shutdown.cancel();
         agent_handle.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn halted_rollout_keeps_healthy_replacements_in_ordinary_supervision() {
+        for strategy in ["rolling", "blue-green"] {
+            let (mut agent, _tx, _shutdown, grill) = test_agent_with_grill();
+            let records = tempfile::tempdir().unwrap();
+            agent.set_records_dir(records.path().to_path_buf());
+            grill.set_pid(std::process::id());
+            let config =
+                Config::parse("[app.web]\nimage = 'web:v1'\nport = 8080\nreplicas = 2\n").unwrap();
+            expect_complete(&drain_deploy(&mut agent, config).await);
+            let failed = InstanceId("default__web-g1-1".into());
+            grill.set_state(&failed, ContainerState::Failed);
+            let replacement = Config::parse(&format!("[app.web]\nimage = 'web:v2'\nport = 8080\nreplicas = 2\n[app.web.deploy]\nstrategy = '{strategy}'\nauto_rollback = false\nhealth_timeout = '1s'\n")).unwrap();
+            let outcome = drain_deploy(&mut agent, replacement).await;
+            assert!(
+                matches!(outcome.last(), Some(ApplyEvent::Error { message }) if message.contains("halted")),
+                "{outcome:?}"
+            );
+            let healthy = InstanceId("default__web-g1-0".into());
+            let owner = agent.supervisor.get_instance(&healthy).unwrap();
+            assert_eq!(owner.state, ContainerState::Running);
+            assert!(owner.oci_spec.is_some());
+            assert!(agent.supervisor.get_instance(&failed).is_none());
+            assert!(crate::grill::records::record_path(records.path(), &healthy.0).exists());
+            agent.retire_workload("web", "default").await.unwrap();
+            assert!(agent.supervisor.instances.is_empty());
+            assert_eq!(agent.supervisor.port_allocator.allocated_count().await, 0);
+            assert!(
+                crate::grill::records::load_records(records.path())
+                    .unwrap()
+                    .is_empty()
+            );
+        }
     }
 
     #[tokio::test]
@@ -11039,6 +16642,391 @@ host = "remote.local"
             !grill.calls().iter().any(|(op, _)| op == "create"),
             "no container should be created for a scheduled job at deploy time"
         );
+    }
+
+    #[tokio::test]
+    async fn failed_rollout_retains_every_owner_until_cleanup_is_confirmed() {
+        for strategy in ["rolling", "blue-green"] {
+            for auto_rollback in [true, false] {
+                for fault in [
+                    "kill error",
+                    "kill ignored",
+                    "kill stalled",
+                    "inspection",
+                    "record",
+                    "identity",
+                ] {
+                    let root = tempfile::tempdir().unwrap();
+                    let records = root.path().join("records");
+                    let (mut agent, tx, shutdown, grill) = test_agent_with_grill();
+                    agent.set_volumes_dir(root.path().join("volumes"));
+                    agent.set_records_dir(records.clone());
+                    grill.set_pid(std::process::id());
+                    let new_id = InstanceId("default__web-g1-0".into());
+                    let record = crate::grill::records::record_path(&records, &new_id.0);
+                    let identity = agent.instance_identity_dir(&new_id);
+                    let history = agent.deploy_history_handle();
+                    let task = tokio::spawn(async move {
+                        agent.run().await;
+                        agent
+                    });
+                    expect_complete(&send_deploy(&tx, basic_config()).await);
+                    grill.set_state(&new_id, ContainerState::Failed);
+                    let config = Config::parse(&format!("[app.web]\nimage = 'web:v2'\nport = 8080\n[app.web.deploy]\nstrategy = '{strategy}'\nauto_rollback = {auto_rollback}\nhealth_timeout = '30s'\n")).unwrap();
+                    let (events, mut stream) = mpsc::channel(64);
+                    tx.send(AgentCommand::Deploy { config, events })
+                        .await
+                        .unwrap();
+                    let ApplyEvent::Accepted { operation_id } = stream.recv().await.unwrap() else {
+                        panic!("missing operation id")
+                    };
+                    tokio::time::timeout(std::time::Duration::from_secs(2), async {
+                        while !record.exists() {
+                            tokio::task::yield_now().await;
+                        }
+                    })
+                    .await
+                    .unwrap();
+                    let original_record = std::fs::read(&record).unwrap();
+                    match fault {
+                        "kill error" => grill.set_fail_kill(true),
+                        "kill ignored" => grill.set_ignore_kill(true),
+                        "kill stalled" => grill.block_kills(),
+                        "inspection" => grill.set_instance_inspection_failure(&new_id, true),
+                        "record" => {
+                            std::fs::remove_file(&record).unwrap();
+                            std::fs::create_dir(&record).unwrap();
+                        }
+                        _ => {
+                            crate::sesame::identity::cleanup_identity_dir(&identity).unwrap();
+                            std::fs::write(&identity, "blocked").unwrap();
+                        }
+                    }
+                    let (response, cancelled) = oneshot::channel();
+                    tx.send(AgentCommand::CancelDeploy {
+                        operation_id: operation_id.into(),
+                        response,
+                    })
+                    .await
+                    .unwrap();
+                    cancelled.await.unwrap().unwrap();
+                    let outcome = tokio::time::timeout(std::time::Duration::from_secs(6), async {
+                        let mut events = Vec::new();
+                        while let Some(event) = stream.recv().await {
+                            events.push(event);
+                        }
+                        events
+                    })
+                    .await;
+                    let (response, status) = oneshot::channel();
+                    tx.send(AgentCommand::Status { response }).await.unwrap();
+                    let retained =
+                        tokio::time::timeout(std::time::Duration::from_secs(1), status).await;
+                    let record_retained = record.exists();
+                    let claimed_rollback = history.read().await.iter().any(|entry| {
+                        entry.result == crate::meat::deploy_types::DeployResult::RolledBack
+                    });
+                    grill.set_fail_kill(false);
+                    grill.set_ignore_kill(false);
+                    grill.set_instance_inspection_failure(&new_id, false);
+                    grill.release_kills(4);
+                    if fault == "record" {
+                        std::fs::remove_dir(&record).unwrap();
+                        std::fs::write(&record, original_record).unwrap();
+                    }
+                    if fault == "identity" {
+                        std::fs::remove_file(&identity).unwrap();
+                    }
+                    grill.kill(&new_id).await.unwrap();
+                    let (response, retired) = oneshot::channel();
+                    tx.send(AgentCommand::Retire {
+                        app_name: "web".into(),
+                        namespace: "default".into(),
+                        response,
+                    })
+                    .await
+                    .unwrap();
+                    let recovery = retired.await.unwrap();
+                    shutdown.cancel();
+                    let agent = task.await.unwrap();
+                    let outcome = outcome.expect("rollback runtime cleanup must be bounded");
+                    let retained = retained
+                        .expect("rollback must leave the agent responsive")
+                        .unwrap();
+                    assert!(
+                        outcome
+                            .iter()
+                            .any(|event| matches!(event, ApplyEvent::Error { .. }))
+                    );
+                    assert_eq!(
+                        retained.len(),
+                        2,
+                        "{strategy}/{auto_rollback}/{fault} discarded a cleanup owner: {outcome:?}"
+                    );
+                    assert!(record_retained, "{fault} discarded adoption ownership");
+                    assert!(
+                        !claimed_rollback,
+                        "unconfirmed cleanup was recorded as rolled back"
+                    );
+                    assert!(recovery.is_ok(), "{recovery:?}");
+                    assert!(agent.supervisor.list_instances().is_empty());
+                    assert_eq!(agent.supervisor.port_allocator.allocated_count().await, 0);
+                    assert!(
+                        crate::grill::records::load_records(&records)
+                            .unwrap()
+                            .is_empty()
+                    );
+                }
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn rollout_retirement_fences_the_crash_restart_driver() {
+        for (strategy, replicas) in [("rolling", 1), ("rolling", 2), ("blue-green", 2)] {
+            let (mut agent, _tx, _shutdown, grill) = test_agent_with_grill();
+            let mut initial = basic_config();
+            initial.app.get_mut("web").unwrap().replicas = crate::config::Replicas::Fixed(replicas);
+            expect_complete(&drain_deploy(&mut agent, initial).await);
+            grill.set_ignore_stop(true);
+            grill.block_kills();
+            let config = Config::parse(&format!("[app.web]\nimage = 'web:v2'\nport = 8080\nreplicas = {replicas}\n[app.web.deploy]\nstrategy = '{strategy}'\ndrain_timeout = '0s'\n")).unwrap();
+            let (events, mut stream) = mpsc::channel(64);
+            agent.begin_deploy(config, events, true, false).await;
+            tokio::time::timeout(std::time::Duration::from_secs(2), async {
+                loop {
+                    tokio::select! {
+                        Some(op) = agent.deploy_ops_rx.recv() => agent.handle_deploy_op(op).await,
+                        () = grill.wait_for_kills(1) => break,
+                    }
+                }
+            })
+            .await
+            .unwrap();
+            let old_id = grill
+                .calls()
+                .into_iter()
+                .rev()
+                .find(|(call, _)| call == "kill")
+                .unwrap()
+                .1;
+            // Runtime exit can become observable before its request completes.
+            // Run the actual periodic restart driver at that exact boundary.
+            grill.set_state(&old_id, ContainerState::Stopped);
+            agent.check_apps().await;
+            let old = agent.supervisor.get_instance(&old_id).unwrap();
+            let observed = (old.state, old.restart_count, old.retry_pending);
+            grill.release_kills(1);
+            let outcome = tokio::time::timeout(std::time::Duration::from_secs(3), async {
+                let mut events = Vec::new();
+                loop {
+                    tokio::select! {
+                        Some(op) = agent.deploy_ops_rx.recv() => agent.handle_deploy_op(op).await,
+                        event = stream.recv() => match event {
+                            Some(event) => events.push(event),
+                            None => break events,
+                        }
+                    }
+                }
+            })
+            .await
+            .unwrap();
+            grill.set_ignore_stop(false);
+            agent.stop_app("web", "default").await.unwrap();
+            expect_complete(&outcome);
+            assert_eq!(
+                observed,
+                (ContainerState::Stopping, 0, false),
+                "{strategy} restarted a retiring instance"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn rollout_retains_old_owner_when_runtime_retirement_is_unconfirmed() {
+        for strategy in ["rolling", "blue-green"] {
+            for fault in [
+                "kill error",
+                "kill ignored",
+                "inspection error",
+                "kill stalled",
+            ] {
+                let volumes = tempfile::tempdir().unwrap();
+                let (mut agent, tx, shutdown, grill) = test_agent_with_grill();
+                agent.set_volumes_dir(volumes.path().to_path_buf());
+                let task = tokio::spawn(async move {
+                    agent.run().await;
+                    agent
+                });
+                expect_complete(&send_deploy(&tx, basic_config()).await);
+                let old_id = InstanceId("default__web-0".into());
+                grill.set_ignore_stop(true);
+                grill.set_state(&old_id, ContainerState::Running);
+                match fault {
+                    "kill error" => grill.set_fail_kill(true),
+                    "kill ignored" => grill.set_ignore_kill(true),
+                    "kill stalled" => grill.block_kills(),
+                    _ => grill.set_instance_inspection_failure(&old_id, true),
+                }
+                let config = Config::parse(&format!("[app.web]\nimage = 'web:v2'\nport = 8080\n[app.web.deploy]\nstrategy = '{strategy}'\ndrain_timeout = '0s'\nhealth_timeout = '100ms'\n")).unwrap();
+                let events = tokio::time::timeout(
+                    std::time::Duration::from_secs(10),
+                    send_deploy(&tx, config),
+                )
+                .await
+                .expect("runtime retirement must have a deadline");
+                let (response, result) = oneshot::channel();
+                tx.send(AgentCommand::Status { response }).await.unwrap();
+                let retained = result.await.unwrap();
+                grill.set_fail_kill(false);
+                grill.set_ignore_kill(false);
+                grill.set_instance_inspection_failure(&old_id, false);
+                grill.set_ignore_stop(false);
+                grill.release_kills(1);
+                grill.kill(&old_id).await.unwrap();
+                let (response, retired) = oneshot::channel();
+                tx.send(AgentCommand::Retire {
+                    app_name: "web".into(),
+                    namespace: "default".into(),
+                    response,
+                })
+                .await
+                .unwrap();
+                assert!(retired.await.unwrap().is_ok());
+                let (response, status) = oneshot::channel();
+                tx.send(AgentCommand::Status { response }).await.unwrap();
+                assert!(
+                    status.await.unwrap().is_empty(),
+                    "recovery left a replacement unowned"
+                );
+                shutdown.cancel();
+                task.await.unwrap();
+                assert!(
+                    !events
+                        .iter()
+                        .any(|event| matches!(event, ApplyEvent::Complete { .. })),
+                    "{strategy} accepted {fault}: {events:?}"
+                );
+                assert!(
+                    events
+                        .iter()
+                        .any(|event| matches!(event, ApplyEvent::Error { .. })),
+                    "missing retirement failure"
+                );
+                assert_eq!(
+                    retained.len(),
+                    2,
+                    "{strategy} must retain both the old owner and the started replacement after {fault}"
+                );
+                assert!(
+                    retained.iter().any(|instance| instance.id == old_id.0),
+                    "{strategy} forgot the unconfirmed owner after {fault}"
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn rollout_retains_owners_when_artifact_retirement_fails() {
+        for strategy in ["rolling", "blue-green"] {
+            for block_identity in [false, true] {
+                let root = tempfile::tempdir().unwrap();
+                let records = root.path().join("records");
+                let (mut agent, tx, shutdown, grill) = test_agent_with_grill();
+                agent.set_volumes_dir(root.path().join("volumes"));
+                agent.set_records_dir(records.clone());
+                grill.set_pid(std::process::id());
+                let artifacts: Vec<_> = (0..2)
+                    .map(|index| {
+                        let id = InstanceId(format!("default__web-{index}"));
+                        (
+                            agent.instance_identity_dir(&id),
+                            crate::grill::records::record_path(&records, &id.0),
+                        )
+                    })
+                    .collect();
+                let task = tokio::spawn(async move {
+                    agent.run().await;
+                    agent
+                });
+                let mut initial = basic_config();
+                initial.app.get_mut("web").unwrap().replicas = crate::config::Replicas::Fixed(2);
+                expect_complete(&send_deploy(&tx, initial).await);
+                let mut original_records = Vec::new();
+                // Block either possible first owner; HashMap iteration order
+                // must not decide whether this exercises the whole old fleet.
+                for (identity, record) in &artifacts {
+                    original_records.push(std::fs::read(record).unwrap());
+                    if block_identity {
+                        crate::sesame::identity::cleanup_identity_dir(identity).unwrap();
+                        std::fs::write(identity, "blocked identity cleanup").unwrap();
+                    } else {
+                        std::fs::remove_file(record).unwrap();
+                        std::fs::create_dir(record).unwrap();
+                    }
+                }
+                let config = Config::parse(&format!("[app.web]\nimage = 'web:v2'\nport = 8080\nreplicas = 2\n[app.web.deploy]\nstrategy = '{strategy}'\ndrain_timeout = '0s'\n")).unwrap();
+                let events = send_deploy(&tx, config).await;
+                let durable_owner_retained = artifacts.iter().all(|(_, record)| record.exists());
+                let (response, status) = oneshot::channel();
+                tx.send(AgentCommand::Status { response }).await.unwrap();
+                let retained = status.await.unwrap();
+                for ((identity, record), original_record) in artifacts.iter().zip(original_records)
+                {
+                    if block_identity {
+                        std::fs::remove_file(identity).unwrap();
+                    } else {
+                        std::fs::remove_dir(record).unwrap();
+                        std::fs::write(record, original_record).unwrap();
+                    }
+                }
+                let (response, retired) = oneshot::channel();
+                tx.send(AgentCommand::Retire {
+                    app_name: "web".into(),
+                    namespace: "default".into(),
+                    response,
+                })
+                .await
+                .unwrap();
+                let recovery = retired.await.unwrap();
+                shutdown.cancel();
+                let agent = task.await.unwrap();
+                assert!(
+                    !events
+                        .iter()
+                        .any(|event| matches!(event, ApplyEvent::Complete { .. })),
+                    "{strategy} ignored artifact failure: {events:?}"
+                );
+                assert!(durable_owner_retained);
+                assert_eq!(
+                    retained.len(),
+                    if strategy == "rolling" { 3 } else { 4 },
+                    "both generations need a cleanup owner"
+                );
+                if strategy == "blue-green" {
+                    assert!(
+                        retained
+                            .iter()
+                            .filter(|instance| !instance.id.contains("-g"))
+                            .all(|instance| instance.state == "stopped"),
+                        "every retired blue instance must be stopped: {retained:?}"
+                    );
+                }
+                assert!(
+                    retained
+                        .iter()
+                        .any(|instance| !instance.id.contains("-g") && instance.state == "stopped"),
+                    "the old instance must not be eligible for crash restart"
+                );
+                assert!(recovery.is_ok(), "{recovery:?}");
+                assert!(agent.supervisor.list_instances().is_empty());
+                assert!(
+                    crate::grill::records::load_records(&records)
+                        .unwrap()
+                        .is_empty()
+                );
+            }
+        }
     }
 
     #[tokio::test]
@@ -11404,6 +17392,464 @@ host = "remote.local"
     }
 
     #[tokio::test]
+    async fn uncertain_job_checkpoint_does_not_block_unrelated_app_retirement() {
+        let records = tempfile::tempdir().unwrap();
+        let (mut agent, _, _, grill) = test_agent_with_grill();
+        agent.set_records_dir(records.path().to_path_buf());
+        grill.set_pid(std::process::id());
+        expect_complete(&drain_deploy(&mut agent, basic_config()).await);
+        std::fs::create_dir(records.path().join(super::super::jobs::CHECKPOINT_FILE)).unwrap();
+        let events = drain_deploy(
+            &mut agent,
+            Config::parse("[job.work]\nimage = 'test:v1'\n").unwrap(),
+        )
+        .await;
+        assert!(matches!(events.last(), Some(ApplyEvent::Error { .. })));
+        agent.retire_workload("web", "default").await.unwrap();
+        assert!(
+            agent
+                .supervisor
+                .get_instance(&InstanceId("default__web-0".into()))
+                .is_none()
+        );
+        assert!(agent.job_store_uncertain);
+        assert_eq!(agent.get_job_status()[0].state, "unknown");
+    }
+
+    #[tokio::test]
+    async fn job_launch_refuses_uncertain_checkpoint_without_runtime_mutation() {
+        let records = tempfile::tempdir().unwrap();
+        std::fs::create_dir(records.path().join(super::super::jobs::CHECKPOINT_FILE)).unwrap();
+        let (mut agent, _, _, grill) = test_agent_with_grill();
+        agent.set_records_dir(records.path().to_path_buf());
+        let config = Config::parse("[job.work]\nimage = 'test:v1'\n").unwrap();
+        let events = drain_deploy(&mut agent, config.clone()).await;
+        assert!(matches!(events.last(), Some(ApplyEvent::Error { .. })));
+        assert!(
+            !grill
+                .calls()
+                .iter()
+                .any(|(op, _)| op == "create" || op == "start")
+        );
+        std::fs::remove_dir(records.path().join(super::super::jobs::CHECKPOINT_FILE)).unwrap();
+        let events = drain_deploy(&mut agent, config).await;
+        assert!(
+            matches!(events.last(), Some(ApplyEvent::Error { message }) if message.contains("uncertain"))
+        );
+        assert!(!grill.calls().iter().any(|(op, _)| op == "start"));
+    }
+
+    #[tokio::test]
+    async fn application_deploy_refuses_failed_adoption_record_write() {
+        let records = tempfile::tempdir().unwrap();
+        let (mut agent, _, _, grill) = test_agent_with_grill();
+        agent.set_records_dir(records.path().to_path_buf());
+        grill.set_pid(std::process::id());
+        std::fs::create_dir(records.path().join("default__web-0.json")).unwrap();
+        let events = drain_deploy(
+            &mut agent,
+            Config::parse("[app.web]\nimage = 'test:v1'\n").unwrap(),
+        )
+        .await;
+        assert!(
+            matches!(events.last(), Some(ApplyEvent::Error { .. })),
+            "{events:?}"
+        );
+        assert!(
+            !events
+                .iter()
+                .any(|event| matches!(event, ApplyEvent::Complete { .. }))
+        );
+    }
+
+    #[tokio::test]
+    async fn application_deploy_refuses_missing_runtime_identity_for_adoption() {
+        let records = tempfile::tempdir().unwrap();
+        let (mut agent, _, _, _) = test_agent_with_grill();
+        agent.set_records_dir(records.path().to_path_buf());
+        let events = drain_deploy(
+            &mut agent,
+            Config::parse("[app.web]\nimage = 'test:v1'\n").unwrap(),
+        )
+        .await;
+        assert!(
+            matches!(events.last(), Some(ApplyEvent::Error { .. })),
+            "{events:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn job_checkpoint_failure_after_create_refuses_execution() {
+        let records = tempfile::tempdir().unwrap();
+        let (mut agent, tx, shutdown, grill) = test_agent_with_grill();
+        agent.set_records_dir(records.path().to_path_buf());
+        grill.block_creates();
+        let task = tokio::spawn(async move { agent.run().await });
+        let (events, mut results) = mpsc::channel(32);
+        tx.send(AgentCommand::Deploy {
+            config: Config::parse("[job.work]\nimage = 'test:v1'\n").unwrap(),
+            events,
+        })
+        .await
+        .unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(5), grill.wait_for_creates(1))
+            .await
+            .unwrap();
+        let checkpoint = records.path().join(super::super::jobs::CHECKPOINT_FILE);
+        std::fs::remove_file(&checkpoint).unwrap();
+        std::fs::create_dir(&checkpoint).unwrap();
+        grill.release_creates(1);
+        let event = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            loop {
+                let event = results.recv().await.unwrap();
+                if matches!(
+                    event,
+                    ApplyEvent::Complete { .. } | ApplyEvent::Error { .. }
+                ) {
+                    break event;
+                }
+            }
+        })
+        .await
+        .unwrap();
+        shutdown.cancel();
+        task.await.unwrap();
+        assert!(matches!(event, ApplyEvent::Error { .. }), "{event:?}");
+        assert!(!grill.calls().iter().any(|(op, _)| op == "start"));
+    }
+
+    #[tokio::test]
+    async fn job_attempt_precedes_create_and_missing_record_stays_unknown() {
+        let records = tempfile::tempdir().unwrap();
+        let (mut agent, tx, shutdown, grill) = test_agent_with_grill();
+        agent.set_records_dir(records.path().to_path_buf());
+        grill.block_creates();
+        let task = tokio::spawn(async move { agent.run().await });
+        let (events, mut results) = mpsc::channel(32);
+        tx.send(AgentCommand::Deploy {
+            config: Config::parse("[job.work]\nimage = 'test:v1'\n").unwrap(),
+            events,
+        })
+        .await
+        .unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(5), grill.wait_for_creates(1))
+            .await
+            .unwrap();
+        let checkpoint = super::super::jobs::load(records.path()).unwrap();
+        assert_eq!(
+            checkpoint["default__work-0"].phase,
+            super::super::jobs::JobPhase::Preparing
+        );
+        assert!(
+            crate::grill::records::load_records(records.path())
+                .unwrap()
+                .is_empty()
+        );
+        // A separate directory captures exactly this physical crash window.
+        let crashed = tempfile::tempdir().unwrap();
+        super::super::jobs::persist(crashed.path(), checkpoint).unwrap();
+        for _ in 0..2 {
+            let (mut replacement, _, _, runtime) = test_agent_with_grill();
+            replacement.set_records_dir(crashed.path().to_path_buf());
+            replacement.adopt_recorded_instances().await.unwrap();
+            assert_eq!(replacement.get_job_status()[0].state, "unknown");
+            replacement.drive_pending_restarts().await;
+            assert!(runtime.calls().is_empty());
+        }
+        grill.release_creates(1);
+        while let Some(event) = results.recv().await {
+            if matches!(
+                event,
+                ApplyEvent::Complete { .. } | ApplyEvent::Error { .. }
+            ) {
+                break;
+            }
+        }
+        shutdown.cancel();
+        task.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn short_job_exit_without_an_adoption_record_keeps_absence_evidence() {
+        for code in [Some(0), Some(1), None] {
+            let records = tempfile::tempdir().unwrap();
+            let (mut agent, _, _, grill) = test_agent_with_grill();
+            agent.set_records_dir(records.path().to_path_buf());
+            expect_complete(
+                &drain_deploy(
+                    &mut agent,
+                    Config::parse("[job.work]\nimage = 'test:v1'\n").unwrap(),
+                )
+                .await,
+            );
+            assert!(
+                crate::grill::records::load_records(records.path())
+                    .unwrap()
+                    .is_empty()
+            );
+            let id = InstanceId("default__work-0".into());
+            grill.set_state(&id, ContainerState::Stopped);
+            grill.set_exit_code(&id, code);
+            agent.check_jobs().await;
+            assert!(super::super::jobs::load(records.path()).unwrap()[&id.0].runtime_absent);
+            let (mut replacement, _, _, runtime) = test_agent_with_grill();
+            replacement.set_records_dir(records.path().to_path_buf());
+            replacement.adopt_recorded_instances().await.unwrap();
+            runtime.set_fail_state(true);
+            replacement
+                .retire_workload("work", "default")
+                .await
+                .unwrap();
+            assert!(
+                runtime.calls().is_empty(),
+                "positive absence must not require an unadoptable runtime handle"
+            );
+            assert!(super::super::jobs::load(records.path()).unwrap().is_empty());
+        }
+    }
+
+    #[tokio::test]
+    async fn job_observed_exit_and_stop_survive_replacement() {
+        for code in [0, 1] {
+            let records = tempfile::tempdir().unwrap();
+            let (mut agent, _, _, grill) = test_agent_with_grill();
+            agent.set_records_dir(records.path().to_path_buf());
+            grill.set_pid(std::process::id());
+            expect_complete(
+                &drain_deploy(
+                    &mut agent,
+                    Config::parse("[job.work]\nimage = 'test:v1'\n").unwrap(),
+                )
+                .await,
+            );
+            let id = InstanceId("default__work-0".into());
+            grill.set_state(&id, ContainerState::Stopped);
+            grill.set_exit_code(&id, Some(code));
+            agent.check_jobs().await;
+            let (mut replacement, _, _, runtime) = test_agent_with_grill();
+            replacement.set_records_dir(records.path().to_path_buf());
+            replacement.adopt_recorded_instances().await.unwrap();
+            assert_eq!(replacement.get_status().await[0].exit_code, Some(code));
+            assert_eq!(
+                replacement
+                    .supervisor
+                    .get_instance(&id)
+                    .unwrap()
+                    .retry_pending,
+                code != 0
+            );
+            replacement.stop_app("work", "default").await.unwrap();
+            let (mut stopped, _, _, _) = test_agent_with_grill();
+            stopped.set_records_dir(records.path().to_path_buf());
+            stopped.adopt_recorded_instances().await.unwrap();
+            assert!(!stopped.supervisor.get_instance(&id).unwrap().retry_pending);
+            assert_eq!(stopped.get_job_status()[0].state, "stopped");
+            assert!(!runtime.calls().iter().any(|(op, _)| op == "start"));
+        }
+    }
+
+    #[tokio::test]
+    async fn job_explicit_rerun_retires_old_owner_and_claims_a_new_generation() {
+        let records = tempfile::tempdir().unwrap();
+        let (mut agent, _, _, grill) = test_agent_with_grill();
+        agent.set_records_dir(records.path().to_path_buf());
+        grill.set_pid(std::process::id());
+        let config = Config::parse("[job.work]\nimage = 'test:v1'\n").unwrap();
+        expect_complete(&drain_deploy(&mut agent, config.clone()).await);
+        let id = InstanceId("default__work-0".into());
+        grill.set_state(&id, ContainerState::Stopped);
+        grill.set_exit_code(&id, None);
+        agent.check_jobs().await;
+        let (mut replacement, _, _, runtime) = test_agent_with_grill();
+        replacement.set_records_dir(records.path().to_path_buf());
+        replacement.adopt_recorded_instances().await.unwrap();
+        let (events, mut results) = mpsc::channel(32);
+        replacement.deploy_with_rerun(config, &events, true).await;
+        drop(events);
+        let mut all = Vec::new();
+        while let Some(event) = results.recv().await {
+            all.push(event);
+        }
+        expect_complete(&all);
+        let job = &super::super::jobs::load(records.path()).unwrap()[&id.0];
+        assert_eq!(job.generation, 2);
+        assert_eq!(job.restart_count, 0);
+        assert_eq!(job.phase, super::super::jobs::JobPhase::Launching);
+        assert_eq!(
+            runtime
+                .calls()
+                .iter()
+                .filter(|(op, _)| op == "start")
+                .count(),
+            1
+        );
+        replacement
+            .retire_workload("work", "default")
+            .await
+            .unwrap();
+        assert!(super::super::jobs::load(records.path()).unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn job_adoption_persists_absence_before_retiring_runtime_evidence() {
+        let records = tempfile::tempdir().unwrap();
+        let volumes = tempfile::tempdir().unwrap();
+        let (mut agent, _, _, grill) = test_agent_with_grill();
+        agent.set_records_dir(records.path().to_path_buf());
+        grill.set_pid(std::process::id());
+        expect_complete(&drain_deploy(&mut agent, job_config()).await);
+        let id = "default__migrate-0";
+        let identity = crate::sesame::identity::instance_identity_dir(volumes.path(), id);
+        std::fs::create_dir_all(identity.parent().unwrap()).unwrap();
+        std::fs::write(&identity, b"blocked retirement").unwrap();
+        let (mut replacement, _, _, _) = test_agent_with_grill();
+        replacement.set_records_dir(records.path().to_path_buf());
+        replacement.set_volumes_dir(volumes.path().to_path_buf());
+        assert!(replacement.adopt_recorded_instances().await.is_err());
+        let checkpoint = super::super::jobs::load(records.path()).unwrap();
+        assert!(checkpoint[id].runtime_absent);
+        assert_eq!(checkpoint[id].phase, super::super::jobs::JobPhase::Unknown);
+        assert!(crate::grill::records::record_path(records.path(), id).exists());
+        std::fs::remove_file(identity).unwrap();
+        replacement.adopt_recorded_instances().await.unwrap();
+        assert_eq!(replacement.get_job_status()[0].state, "unknown");
+    }
+
+    #[tokio::test]
+    async fn job_checkpoint_rejects_corruption_before_adopting_any_runtime() {
+        for contents in ["{", "{\"schema\":99,\"jobs\":[]}"] {
+            let records = tempfile::tempdir().unwrap();
+            std::fs::write(
+                records.path().join(super::super::jobs::CHECKPOINT_FILE),
+                contents,
+            )
+            .unwrap();
+            let (mut agent, _, _, grill) = test_agent_with_grill();
+            agent.set_records_dir(records.path().to_path_buf());
+            assert!(agent.adopt_recorded_instances().await.is_err());
+            assert!(grill.calls().is_empty());
+        }
+    }
+
+    #[tokio::test]
+    async fn job_checkpoint_rejects_unsafe_and_ambiguous_files() {
+        for fault in ["duplicate", "budget", "symlink", "oversized"] {
+            let records = tempfile::tempdir().unwrap();
+            let (mut agent, _, _, grill) = test_agent_with_grill();
+            agent.set_records_dir(records.path().to_path_buf());
+            grill.set_pid(std::process::id());
+            expect_complete(&drain_deploy(&mut agent, job_config()).await);
+            let path = records.path().join(super::super::jobs::CHECKPOINT_FILE);
+            let original = std::fs::read(&path).unwrap();
+            match fault {
+                "duplicate" | "budget" => {
+                    let mut value: serde_json::Value = serde_json::from_slice(&original).unwrap();
+                    if fault == "duplicate" {
+                        let duplicate = value["jobs"][0].clone();
+                        value["jobs"].as_array_mut().unwrap().push(duplicate);
+                    } else {
+                        value["jobs"][0]["restart_count"] = serde_json::json!(4);
+                    }
+                    std::fs::write(&path, serde_json::to_vec(&value).unwrap()).unwrap();
+                }
+                "symlink" => {
+                    let target = records.path().join("foreign.checkpoint");
+                    std::fs::rename(&path, &target).unwrap();
+                    std::os::unix::fs::symlink(target, &path).unwrap();
+                }
+                "oversized" => std::fs::OpenOptions::new()
+                    .write(true)
+                    .open(&path)
+                    .unwrap()
+                    .set_len(17 * 1024 * 1024)
+                    .unwrap(),
+                _ => unreachable!(),
+            }
+            let (mut replacement, _, _, runtime) = test_agent_with_grill();
+            replacement.set_records_dir(records.path().to_path_buf());
+            assert!(
+                replacement.adopt_recorded_instances().await.is_err(),
+                "{fault}"
+            );
+            assert!(runtime.calls().is_empty(), "{fault}");
+            assert_eq!(
+                crate::grill::records::load_records(records.path())
+                    .unwrap()
+                    .len(),
+                1
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn job_retry_budget_survives_adoption() {
+        let records = tempfile::tempdir().unwrap();
+        let (mut agent, _, _, grill) = test_agent_with_grill();
+        agent.set_records_dir(records.path().to_path_buf());
+        grill.set_pid(std::process::id());
+        let config = Config::parse("[job.work]\nimage = 'test:v1'\n").unwrap();
+        expect_complete(&drain_deploy(&mut agent, config).await);
+        let id = InstanceId("default__work-0".into());
+        // Exercise the real retry driver so durable state must precede launch.
+        agent.supervisor.get_instance_mut(&id).unwrap().state = ContainerState::Pending;
+        agent
+            .supervisor
+            .get_instance_mut(&id)
+            .unwrap()
+            .restart_count = 3;
+        agent.drive_pending_restarts().await;
+        assert_eq!(
+            agent.supervisor.get_instance(&id).unwrap().state,
+            ContainerState::Running
+        );
+        let (mut replacement, _, _, runtime) = test_agent_with_grill();
+        replacement.set_records_dir(records.path().to_path_buf());
+        runtime.set_adopt_result(&id, true);
+        replacement.adopt_recorded_instances().await.unwrap();
+        let restored = replacement.supervisor.get_instance(&id).unwrap();
+        assert_eq!(restored.restart_count, 3);
+        assert_eq!(restored.restart_policy.max_restarts, Some(3));
+        runtime.set_state(&id, ContainerState::Stopped);
+        runtime.set_exit_code(&id, Some(1));
+        replacement.check_jobs().await;
+        replacement.drive_pending_restarts().await;
+        assert!(!runtime.calls().iter().any(|(op, _)| op == "start"));
+    }
+
+    #[tokio::test]
+    async fn job_unknown_exit_requires_explicit_rerun() {
+        let records = tempfile::tempdir().unwrap();
+        let (mut agent, _, _, grill) = test_agent_with_grill();
+        agent.set_records_dir(records.path().to_path_buf());
+        grill.set_pid(std::process::id());
+        expect_complete(
+            &drain_deploy(
+                &mut agent,
+                Config::parse("[job.work]\nimage = 'test:v1'\n").unwrap(),
+            )
+            .await,
+        );
+        let id = InstanceId("default__work-0".into());
+        grill.set_state(&id, ContainerState::Stopped);
+        grill.set_exit_code(&id, None);
+        agent.check_jobs().await;
+        assert_eq!(agent.get_job_status()[0].state, "unknown");
+        assert!(!agent.supervisor.get_instance(&id).unwrap().retry_pending);
+        let (mut replacement, _, _, _) = test_agent_with_grill();
+        replacement.set_records_dir(records.path().to_path_buf());
+        replacement.adopt_recorded_instances().await.unwrap();
+        assert_eq!(replacement.get_job_status()[0].state, "unknown");
+        let events = drain_deploy(
+            &mut replacement,
+            Config::parse("[job.work]\nimage = 'test:v1'\n").unwrap(),
+        )
+        .await;
+        assert!(
+            matches!(events.last(), Some(ApplyEvent::Error { message }) if message.contains("rerun"))
+        );
+    }
+
+    #[tokio::test]
     async fn deploy_job_creates_instance() {
         let (mut agent, tx, shutdown) = test_agent();
 
@@ -11446,6 +17892,85 @@ host = "remote.local"
     }
 
     #[tokio::test]
+    async fn fresh_workloads_cannot_replace_another_apps_generation_owner() {
+        for kind in ["app", "job"] {
+            for state in [ContainerState::Running, ContainerState::Stopped] {
+                let (mut agent, _tx, _shutdown, grill) = test_agent_with_grill();
+                let records = tempfile::tempdir().unwrap();
+                agent.set_records_dir(records.path().to_path_buf());
+                grill.set_pid(std::process::id());
+                for image in ["worker:v1", "worker:v2"] {
+                    let config =
+                        Config::parse(&format!("[app.worker]\nimage = '{image}'\nport = 8080\n"))
+                            .unwrap();
+                    expect_complete(&drain_deploy(&mut agent, config).await);
+                }
+                let id = InstanceId("default__worker-g1-0".into());
+                agent.supervisor.get_instance_mut(&id).unwrap().state = state;
+                grill.set_state(&id, state);
+                let original_port = agent.supervisor.get_instance(&id).unwrap().host_port;
+                let original_records = crate::grill::records::load_records(records.path()).unwrap();
+                let original_ports = agent.supervisor.port_allocator.allocated_count().await;
+                let calls_before = grill.calls().len();
+                let collision =
+                    Config::parse(&format!("[{kind}.worker-g1]\nimage = 'intruder:v1'\n")).unwrap();
+                let events = drain_deploy(&mut agent, collision).await;
+                assert!(
+                    matches!(events.last(), Some(ApplyEvent::Error { .. })),
+                    "{kind}/{state:?}: {events:?}"
+                );
+                let owner = agent.supervisor.get_instance(&id).unwrap();
+                assert_eq!(owner.app_name, "worker");
+                assert_eq!(owner.image, "worker:v2");
+                assert_eq!(owner.host_port, original_port);
+                assert_eq!(
+                    agent.supervisor.port_allocator.allocated_count().await,
+                    original_ports
+                );
+                assert_eq!(
+                    crate::grill::records::load_records(records.path()).unwrap(),
+                    original_records
+                );
+                assert!(
+                    !grill.calls()[calls_before..]
+                        .iter()
+                        .any(|(operation, _)| matches!(
+                            operation.as_str(),
+                            "create" | "start" | "stop" | "kill"
+                        ))
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn workload_labels_are_refused_before_runtime_mutation() {
+        for (name, namespace) in [("Bad", "default"), ("web", "bad__namespace")] {
+            let (mut agent, tx, shutdown, grill) = test_agent_with_grill();
+            let mut config = basic_config();
+            let mut spec = config.app.remove("web").unwrap();
+            spec.namespace = Some(namespace.into());
+            config.app.insert(name.into(), spec);
+            let handle = tokio::spawn(async move { agent.run().await });
+            let events = send_deploy(&tx, config).await;
+            shutdown.cancel();
+            handle.await.unwrap();
+            assert!(
+                events
+                    .iter()
+                    .any(|event| matches!(event, ApplyEvent::Error { .. })),
+                "invalid label was deployed: {events:?}"
+            );
+            assert!(
+                !grill
+                    .calls()
+                    .iter()
+                    .any(|(operation, _)| operation == "create")
+            );
+        }
+    }
+
+    #[tokio::test]
     async fn deploy_mixed_apps_and_jobs() {
         let (mut agent, tx, shutdown) = test_agent();
 
@@ -11482,11 +18007,147 @@ host = "remote.local"
     }
 
     #[tokio::test]
+    async fn initialiser_identity_cannot_replace_an_ordinary_application() {
+        let (mut agent, tx, shutdown, grill) = test_agent_with_grill();
+        let task = tokio::spawn(async move { agent.run().await });
+        let foreign = InstanceId("default__web-0-init-0".into());
+        let reserved = InstanceId("default__web-0__init-0".into());
+        let config =
+            Config::parse("[app.web-0-init]\nimage = 'foreign:image'\ncommand = ['sleep', '60']\n")
+                .unwrap();
+        expect_complete(&send_deploy(&tx, config).await);
+        grill.set_state(&reserved, ContainerState::Stopped);
+        grill.set_exit_code(&reserved, Some(0));
+        let events = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            send_deploy(&tx, config_with_init_container()),
+        )
+        .await;
+        let foreign_creates = grill
+            .calls()
+            .iter()
+            .filter(|(operation, id)| operation == "create" && id == &foreign)
+            .count();
+        shutdown.cancel();
+        task.await.unwrap();
+        expect_complete(&events.expect("initialiser reused the running application's identity"));
+        assert_eq!(
+            foreign_creates, 1,
+            "initialiser reused an ordinary workload identity"
+        );
+    }
+
+    #[tokio::test]
+    async fn uncertain_initialiser_keeps_parent_retirement_pending() {
+        let (mut agent, tx, shutdown, grill) = test_agent_with_grill();
+        let old = InstanceId("default__web-0-init-0".into());
+        let reserved = InstanceId("default__web-0__init-0".into());
+        grill.set_instance_inspection_failure(&old, true);
+        grill.set_instance_inspection_failure(&reserved, true);
+        let task = tokio::spawn(async move { agent.run().await });
+        let events = send_deploy(&tx, config_with_init_container()).await;
+        assert!(
+            events
+                .iter()
+                .any(|event| matches!(event, ApplyEvent::Error { .. }))
+        );
+        let initialiser = grill
+            .calls()
+            .into_iter()
+            .find_map(|(operation, id)| {
+                (operation == "create" && id.0 != "default__web-0").then_some(id)
+            })
+            .unwrap();
+        let (response, result) = oneshot::channel();
+        tx.send(AgentCommand::Retire {
+            app_name: "web".into(),
+            namespace: "default".into(),
+            response,
+        })
+        .await
+        .unwrap();
+        let first = result.await.unwrap();
+        grill.set_instance_inspection_failure(&old, false);
+        grill.set_instance_inspection_failure(&reserved, false);
+        let (response, result) = oneshot::channel();
+        tx.send(AgentCommand::Retire {
+            app_name: "web".into(),
+            namespace: "default".into(),
+            response,
+        })
+        .await
+        .unwrap();
+        let second = result.await.unwrap();
+        let stopped = grill.state(&initialiser).await.unwrap() == ContainerState::Stopped;
+        shutdown.cancel();
+        task.await.unwrap();
+        assert!(
+            first.is_err(),
+            "parent retired without observing its initialiser"
+        );
+        assert!(second.is_ok(), "confirmed retry failed: {second:?}");
+        assert!(
+            stopped,
+            "initialiser still owns execution after parent retirement"
+        );
+    }
+
+    #[tokio::test]
+    async fn rolling_replacement_runs_initialisers_and_refuses_main_after_init_failure() {
+        for exit_code in [0, 7] {
+            let (mut agent, tx, shutdown, grill) = test_agent_with_grill();
+            let task = tokio::spawn(async move { agent.run().await });
+            let mut fresh = config_with_init_container();
+            fresh.app.get_mut("web").unwrap().init.clear();
+            expect_complete(&send_deploy(&tx, fresh).await);
+            let main = InstanceId("default__web-g1-0".into());
+            let init = InstanceId(format!("{}__init-0", main.0));
+            grill.set_state(&init, ContainerState::Stopped);
+            grill.set_exit_code(&init, Some(exit_code));
+            let before = grill.calls().len();
+            let events = send_deploy(&tx, config_with_init_container()).await;
+            let calls = grill.calls()[before..].to_vec();
+            let init_started = calls
+                .iter()
+                .position(|(op, id)| op == "start" && id == &init);
+            let main_started = calls
+                .iter()
+                .position(|(op, id)| op == "start" && id == &main);
+            shutdown.cancel();
+            task.await.unwrap();
+            assert!(
+                init_started.is_some(),
+                "rolling replacement skipped its initialiser"
+            );
+            if exit_code == 0 {
+                expect_complete(&events);
+                assert!(main_started.is_some() && init_started < main_started);
+            } else {
+                assert!(
+                    events
+                        .iter()
+                        .any(|event| matches!(event, ApplyEvent::Error { .. }))
+                );
+                assert!(
+                    main_started.is_none(),
+                    "failed init allowed the main payload to start"
+                );
+                assert!(
+                    !calls
+                        .iter()
+                        .any(|(op, id)| (op == "stop" || op == "kill") && id.0 == "default__web-0"),
+                    "failed initialiser retired the original serving workload"
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
     async fn deploy_with_init_container_succeeds() {
         let (mut agent, tx, shutdown, grill) = test_agent_with_grill();
 
         // Pre-configure: init container exits successfully
-        let init_id = InstanceId("default__web-0-init-0".to_string());
+        let init_id = InstanceId("default__web-0__init-0".to_string());
         grill.set_state(&init_id, ContainerState::Stopped);
         grill.set_exit_code(&init_id, Some(0));
 
@@ -11515,7 +18176,7 @@ host = "remote.local"
         let (mut agent, tx, shutdown, grill) = test_agent_with_grill();
 
         // Pre-configure: init container exits with failure
-        let init_id = InstanceId("default__web-0-init-0".to_string());
+        let init_id = InstanceId("default__web-0__init-0".to_string());
         grill.set_state(&init_id, ContainerState::Stopped);
         grill.set_exit_code(&init_id, Some(1));
 
@@ -11593,6 +18254,7 @@ host = "remote.local"
         let status = NodeStatus {
             node_id: "node-1".to_string(),
             address: "192.168.1.1:9116".to_string(),
+            api_address: None,
             state: "alive".to_string(),
             incarnation: 42,
             is_council: true,
@@ -11708,6 +18370,239 @@ host = "remote.local"
     }
 
     #[tokio::test]
+    async fn portless_redeploy_after_adoption_never_reuses_an_owned_generation() {
+        for (runtime_id, generation) in [("default__web-g1-0", 1), ("default__web-g17-0", 17)] {
+            let records = tempfile::tempdir().unwrap();
+            let (mut agent, _tx, _shutdown, grill) = test_agent_with_grill();
+            agent.set_records_dir(records.path().to_path_buf());
+            let mut record = adoption_record(runtime_id, "web", false);
+            record.host_port = None;
+            crate::grill::records::write_record(records.path(), &record).unwrap();
+            grill.set_adopt_result(&InstanceId(runtime_id.into()), true);
+            grill.set_pid(std::process::id());
+            assert_eq!(agent.adopt_recorded_instances().await.unwrap(), 1);
+            // Generation continuity needs no service recovery or guessed VIP.
+            let mut config = basic_config();
+            config.app.get_mut("web").unwrap().port = None;
+            let events = drain_deploy(&mut agent, config).await;
+            let expected = format!("default__web-g{}-0", generation + 1);
+            let created: Vec<_> = grill
+                .calls()
+                .into_iter()
+                .filter(|(call, _)| call == "create")
+                .map(|(_, id)| id.0)
+                .collect();
+            let persisted = crate::grill::records::load_records(records.path()).unwrap();
+            agent.stop_app("web", "default").await.unwrap();
+            expect_complete(&events);
+            assert_eq!(
+                created,
+                vec![expected.clone()],
+                "adoption must advance rollout identity"
+            );
+            assert_eq!(persisted.len(), 1);
+            assert_eq!(persisted[0].instance_id, expected);
+        }
+    }
+
+    #[tokio::test]
+    async fn exhausted_rollout_generation_refuses_without_mutating_the_old_instance() {
+        let (mut agent, _tx, _shutdown, grill) = test_agent_with_grill();
+        expect_complete(&drain_deploy(&mut agent, basic_config()).await);
+        agent.next_deploy_gen = u64::MAX;
+        let before = grill.calls().len();
+        let events = drain_deploy(&mut agent, basic_config()).await;
+        let calls = grill.calls();
+        agent.stop_app("web", "default").await.unwrap();
+        assert!(events.iter().any(|event| matches!(event, ApplyEvent::Error { message } if message.contains("generation exhausted"))), "{events:?}");
+        assert_eq!(calls.len(), before);
+    }
+
+    #[tokio::test]
+    async fn redeploy_does_not_overwrite_a_stopped_or_failed_cleanup_owner() {
+        for state in [ContainerState::Stopped, ContainerState::Failed] {
+            let records = tempfile::tempdir().unwrap();
+            let (mut agent, _tx, _shutdown, grill) = test_agent_with_grill();
+            agent.set_records_dir(records.path().to_path_buf());
+            grill.set_pid(std::process::id());
+            expect_complete(&drain_deploy(&mut agent, basic_config()).await);
+            let old = InstanceId("default__web-0".into());
+            let path = crate::grill::records::record_path(records.path(), &old.0);
+            let original = std::fs::read(&path).unwrap();
+            std::fs::remove_file(&path).unwrap();
+            std::fs::create_dir(&path).unwrap();
+            assert!(agent.stop_app("web", "default").await.is_err());
+            agent.supervisor.get_instance_mut(&old).unwrap().state = state;
+            let events = drain_deploy(&mut agent, basic_config()).await;
+            let owned = agent.supervisor.list_instances().len();
+            let old_creates = grill
+                .calls()
+                .iter()
+                .filter(|(call, id)| call == "create" && id == &old)
+                .count();
+            std::fs::remove_dir(&path).unwrap();
+            std::fs::write(&path, original).unwrap();
+            agent.retire_workload("web", "default").await.unwrap();
+            assert!(
+                !events
+                    .iter()
+                    .any(|event| matches!(event, ApplyEvent::Complete { .. })),
+                "{state}: {events:?}"
+            );
+            assert_eq!(owned, 2, "must retain both owners after cleanup fails");
+            assert_eq!(old_creates, 1, "the original identity was created twice");
+            assert_eq!(agent.supervisor.port_allocator.allocated_count().await, 0);
+        }
+    }
+
+    #[tokio::test]
+    async fn rolling_replacement_persists_its_launch_spec_for_adoption() {
+        let (mut agent, _tx, _shutdown, grill) = test_agent_with_grill();
+        let records = tempfile::tempdir().unwrap();
+        let volumes = tempfile::tempdir().unwrap();
+        agent.set_records_dir(records.path().to_path_buf());
+        agent.set_volumes_dir(volumes.path().to_path_buf());
+        grill.set_pid(std::process::id());
+        let (events, _receiver) = mpsc::channel(128);
+        agent.deploy(basic_config(), &events).await;
+        let mut replacement = basic_config();
+        replacement.app.get_mut("web").unwrap().image = Some("web:v2".to_string());
+        let (rolling_events, mut rolling_rx) = mpsc::channel(1);
+        let mut deployment = Box::pin(agent.deploy(replacement, &rolling_events));
+        let mut observed_during_rollout = false;
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            loop {
+                tokio::select! {
+                    Some(event) = rolling_rx.recv() => {
+                        if let ApplyEvent::Progress { message } = event
+                            && message.contains("healthy")
+                        {
+                            assert!(crate::grill::records::load_records(records.path()).unwrap().iter()
+                                .any(|record| record.image == "web:v2"));
+                            observed_during_rollout = true;
+                        }
+                    }
+                    _ = &mut deployment => break,
+                }
+            }
+        })
+        .await
+        .unwrap();
+        drop(deployment);
+        assert!(observed_during_rollout);
+        let persisted = crate::grill::records::load_records(records.path()).unwrap();
+        assert_eq!(
+            persisted.len(),
+            1,
+            "the replacement must retain an adoption record"
+        );
+        assert_eq!(persisted[0].image, "web:v2");
+        assert_eq!(
+            persisted[0].app_spec.as_ref().unwrap().image.as_deref(),
+            Some("web:v2")
+        );
+        let (mut restarted, _tx, _shutdown, runtime) = test_agent_with_grill();
+        restarted.set_records_dir(records.path().to_path_buf());
+        restarted.set_volumes_dir(volumes.path().to_path_buf());
+        let id = InstanceId(persisted[0].instance_id.clone());
+        runtime.set_adopt_result(&id, true);
+        assert_eq!(restarted.adopt_recorded_instances().await.unwrap(), 1);
+        assert!(restarted.supervisor.get_instance(&id).is_some());
+        assert!(
+            !runtime
+                .calls()
+                .iter()
+                .any(|(operation, _)| operation == "create")
+        );
+    }
+
+    #[tokio::test]
+    async fn rolling_record_failure_retains_cleanup_ownership_until_directory_recovery() {
+        for strategy in ["rolling", "blue-green"] {
+            let (mut agent, _tx, _shutdown, grill) = test_agent_with_grill();
+            let records = tempfile::tempdir().unwrap();
+            let volumes = tempfile::tempdir().unwrap();
+            agent.set_records_dir(records.path().to_path_buf());
+            agent.set_volumes_dir(volumes.path().to_path_buf());
+            grill.set_pid(std::process::id());
+            let initial = drain_deploy(&mut agent, basic_config()).await;
+            assert!(matches!(initial.last(), Some(ApplyEvent::Complete { .. })));
+            let allocated_before = agent.supervisor.port_allocator.allocated_count().await;
+            let blocked = tempfile::NamedTempFile::new().unwrap();
+            agent.set_records_dir(blocked.path().to_path_buf());
+            let replacement = Config::parse(&format!(
+                "[app.web]\nimage = \"web:v2\"\nport = 8080\n[app.web.deploy]\nstrategy = \"{strategy}\"\n"
+            )).unwrap();
+            let outcome = drain_deploy(&mut agent, replacement).await;
+            assert!(outcome.iter().any(|event| matches!(event, ApplyEvent::Error { message } if message.contains("persist replacement record"))), "{outcome:?}");
+            assert!(
+                agent
+                    .supervisor
+                    .get_instance(&InstanceId("default__web-0".into()))
+                    .is_some()
+            );
+            assert_eq!(
+                agent.supervisor.port_allocator.allocated_count().await,
+                allocated_before + 1
+            );
+            let created: Vec<_> = grill
+                .calls()
+                .into_iter()
+                .filter(|(op, id)| op == "create" && id.0 != "default__web-0")
+                .collect();
+            assert_eq!(created.len(), 1);
+            let owner = agent.supervisor.get_instance(&created[0].1).unwrap();
+            assert_eq!(owner.state, ContainerState::Stopped);
+            agent.set_records_dir(records.path().to_path_buf());
+            agent
+                .finish_retire_bookkeeping(&created[0].1)
+                .await
+                .unwrap();
+            assert_eq!(
+                agent.supervisor.port_allocator.allocated_count().await,
+                allocated_before
+            );
+            assert!(agent.supervisor.get_instance(&created[0].1).is_none());
+            assert!(
+                agent
+                    .supervisor
+                    .get_instance(&InstanceId("default__web-0".into()))
+                    .is_some()
+            );
+
+            assert!(
+                grill
+                    .calls()
+                    .contains(&("kill".to_string(), created[0].1.clone()))
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn apple_launches_persist_records_without_a_host_workload_pid() {
+        let (mut agent, _tx, _shutdown, grill) = test_agent_with_grill();
+        let records = tempfile::tempdir().unwrap();
+        let volumes = tempfile::tempdir().unwrap();
+        agent.set_records_dir(records.path().to_path_buf());
+        agent.set_volumes_dir(volumes.path().to_path_buf());
+        grill.set_runtime_kind(crate::grill::records::RuntimeKind::Apple);
+        let (events, _receiver) = mpsc::channel(128);
+        agent.deploy(basic_config(), &events).await;
+        assert_eq!(
+            crate::grill::records::load_records(records.path())
+                .unwrap()
+                .len(),
+            1
+        );
+        agent.deploy(basic_config(), &events).await;
+        let saved = crate::grill::records::load_records(records.path()).unwrap();
+        assert_eq!(saved.len(), 1);
+        assert_eq!(saved[0].runtime, crate::grill::records::RuntimeKind::Apple);
+        assert_eq!(saved[0].pid, std::process::id());
+        assert!(saved[0].instance_id.contains("-g"));
+    }
+
+    #[tokio::test]
     async fn started_rootless_instance_persists_network_recreation_state() {
         let (mut agent, _tx, _shutdown, grill) = test_agent_with_grill();
         let records = tempfile::tempdir().unwrap();
@@ -11733,10 +18628,129 @@ host = "remote.local"
         drop(events);
         while event_rx.recv().await.is_some() {}
 
-        let persisted = crate::grill::records::load_records(records.path());
+        let persisted = crate::grill::records::load_records(records.path()).unwrap();
         assert_eq!(persisted.len(), 1);
         assert_eq!(persisted[0].schema, 2);
         assert_eq!(persisted[0].rootless_network, Some(rootless_network));
+    }
+
+    #[tokio::test]
+    async fn adoption_refuses_conflicting_port_ownership() {
+        let (mut agent, _tx, _shutdown, grill) = test_agent_with_grill();
+        let records = tempfile::tempdir().unwrap();
+        agent.set_records_dir(records.path().to_path_buf());
+        for app in ["web", "api"] {
+            let record = adoption_record(&format!("default__{app}-0"), app, false);
+            crate::grill::records::write_record(records.path(), &record).unwrap();
+            grill.set_adopt_result(&InstanceId(record.instance_id), true);
+        }
+        assert!(agent.adopt_recorded_instances().await.is_err());
+        assert_eq!(agent.supervisor.list_instances().len(), 1);
+        assert_eq!(
+            crate::grill::records::load_records(records.path())
+                .unwrap()
+                .len(),
+            2
+        );
+    }
+
+    #[tokio::test]
+    async fn adoption_refuses_a_different_runtime_without_touching_the_record() {
+        let (mut agent, _tx, _shutdown, grill) = test_agent_with_grill();
+        let records = tempfile::tempdir().unwrap();
+        let mut record = adoption_record("default__web-0", "web", false);
+        record.runtime = crate::grill::records::RuntimeKind::Runc;
+        crate::grill::records::write_record(records.path(), &record).unwrap();
+        agent.set_records_dir(records.path().to_path_buf());
+        assert!(agent.adopt_recorded_instances().await.is_err());
+        assert!(grill.calls().is_empty());
+        assert_eq!(
+            crate::grill::records::load_records(records.path()).unwrap(),
+            vec![record]
+        );
+    }
+
+    #[tokio::test]
+    async fn adoption_retains_dead_owner_record_until_identity_cleanup_succeeds() {
+        let (mut agent, _tx, _shutdown, _grill) = test_agent_with_grill();
+        let records = tempfile::tempdir().unwrap();
+        let volumes = tempfile::tempdir().unwrap();
+        let record = adoption_record("default__web-0", "web", false);
+        crate::grill::records::write_record(records.path(), &record).unwrap();
+        agent.set_records_dir(records.path().to_path_buf());
+        agent.set_volumes_dir(volumes.path().to_path_buf());
+        let identity =
+            crate::sesame::identity::instance_identity_dir(volumes.path(), &record.instance_id);
+        std::fs::create_dir_all(identity.parent().unwrap()).unwrap();
+        std::fs::write(&identity, b"not a directory").unwrap();
+        assert!(agent.adopt_recorded_instances().await.is_err());
+        assert!(crate::grill::records::record_path(records.path(), &record.instance_id).exists());
+        std::fs::remove_file(identity).unwrap();
+        assert_eq!(agent.adopt_recorded_instances().await.unwrap(), 0);
+        assert!(
+            crate::grill::records::load_records(records.path())
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[tokio::test]
+    async fn uncertain_adoption_preserves_the_record_and_identity_for_retry() {
+        let (mut agent, _tx, _shutdown, grill) = test_agent_with_grill();
+        let records = tempfile::tempdir().unwrap();
+        let volumes = tempfile::tempdir().unwrap();
+        let record = adoption_record("default__web-0", "web", false);
+        crate::grill::records::write_record(records.path(), &record).unwrap();
+        write_test_identity(volumes.path(), &record.instance_id);
+        agent.set_records_dir(records.path().to_path_buf());
+        agent.set_volumes_dir(volumes.path().to_path_buf());
+        grill.set_fail_state(true);
+        assert!(agent.adopt_recorded_instances().await.is_err());
+        assert!(
+            crate::grill::records::record_path(records.path(), &record.instance_id).exists(),
+            "uncertain runtime inspection discarded durable ownership"
+        );
+        let identity =
+            crate::sesame::identity::instance_identity_dir(volumes.path(), &record.instance_id);
+        assert!(
+            crate::sesame::identity::load_identity(&identity)
+                .unwrap()
+                .is_some(),
+            "uncertain runtime inspection swept a surviving owner's identity"
+        );
+        grill.set_fail_state(false);
+        grill.set_adopt_result(&InstanceId(record.instance_id.clone()), true);
+        agent.adopt_recorded_instances().await.unwrap();
+        assert!(
+            agent
+                .supervisor
+                .get_instance(&InstanceId(record.instance_id))
+                .is_some()
+        );
+    }
+
+    #[tokio::test]
+    async fn corrupt_adoption_record_never_sweeps_its_workload_identity() {
+        let (mut agent, _tx, _shutdown, _grill) = test_agent_with_grill();
+        let records = tempfile::tempdir().unwrap();
+        let volumes = tempfile::tempdir().unwrap();
+        let instance = "default__web-0";
+        std::fs::write(
+            records.path().join(format!("{instance}.json")),
+            b"{incomplete",
+        )
+        .unwrap();
+        write_test_identity(volumes.path(), instance);
+        agent.set_records_dir(records.path().to_path_buf());
+        agent.set_volumes_dir(volumes.path().to_path_buf());
+        assert!(agent.adopt_recorded_instances().await.is_err());
+        let identity = crate::sesame::identity::instance_identity_dir(volumes.path(), instance);
+        assert!(
+            crate::sesame::identity::load_identity(&identity)
+                .unwrap()
+                .is_some(),
+            "unreadable ownership was incorrectly treated as absence"
+        );
     }
 
     #[tokio::test]
@@ -11750,7 +18764,7 @@ host = "remote.local"
         let id = InstanceId("default__web-0".to_string());
         grill.set_adopt_result(&id, true);
 
-        assert_eq!(agent.adopt_recorded_instances().await, 1);
+        assert_eq!(agent.adopt_recorded_instances().await.unwrap(), 1);
 
         let instance = agent.supervisor.get_instance(&id).unwrap();
         assert_eq!(instance.state, ContainerState::Running);
@@ -11763,40 +18777,63 @@ host = "remote.local"
     }
 
     #[tokio::test]
-    async fn legacy_record_adopts_under_a_canonical_key() {
-        // In-place upgrade across the identity change: an old bun left a
-        // record whose instance_id has no namespace prefix (`web-0`). The
-        // runtime still knows the container by that legacy id, but the
-        // supervisor must key the adopted instance canonically so it can't
-        // collide with a same-name app in another namespace (DEP1).
-        let (mut agent, _tx, _shutdown, grill) = test_agent_with_grill();
-        let dir = tempfile::tempdir().unwrap();
-        let record = adoption_record("web-0", "web", false); // legacy, bare id
-        crate::grill::records::write_record(dir.path(), &record).unwrap();
-        agent.set_records_dir(dir.path().to_path_buf());
+    async fn adoption_refuses_unsupported_or_inconsistent_identities_before_mutation() {
+        for (instance, app, namespace, ordinal) in [
+            ("web-0", "web", "default", 0),
+            ("web-g9-0", "web", "default", 0),
+            ("default__web-0", "other", "default", 0),
+            ("default__web-0", "web", "other", 0),
+            ("default__web-0", "web", "default", 1),
+            ("default__Bad-0", "Bad", "default", 0),
+            ("bad__namespace__web-0", "web", "bad__namespace", 0),
+            ("default__web-g01-0", "web", "default", 0),
+            ("payments__web-0", "web", "payments", 0),
+        ] {
+            let (mut agent, _tx, _shutdown, grill) = test_agent_with_grill();
+            let dir = tempfile::tempdir().unwrap();
+            let mut record = adoption_record(instance, app, false);
+            record.namespace = namespace.into();
+            record.replica_index = ordinal;
+            if namespace == "payments" {
+                record.app_spec.as_mut().unwrap().namespace = Some("other".into());
+            }
+            crate::grill::records::write_record(dir.path(), &record).unwrap();
+            agent.set_records_dir(dir.path().to_path_buf());
+            let runtime_id = InstanceId(instance.into());
+            grill.set_adopt_result(&runtime_id, true);
+            let result = agent.adopt_recorded_instances().await;
+            assert!(result.is_err(), "accepted {record:?}: {result:?}");
+            assert!(
+                grill.calls().is_empty(),
+                "invalid ownership reached the runtime"
+            );
+            assert!(agent.supervisor.instances.is_empty());
+            assert_eq!(
+                crate::grill::records::load_records(dir.path()).unwrap(),
+                vec![record]
+            );
+        }
+    }
 
-        // The runtime adopts by the id it ran under: the legacy one.
-        let runtime_id = InstanceId("web-0".to_string());
-        grill.set_adopt_result(&runtime_id, true);
-
-        assert_eq!(agent.adopt_recorded_instances().await, 1);
-
-        // But the supervisor keys it canonically.
-        let canonical = InstanceId("default__web-0".to_string());
-        let instance = agent
-            .supervisor
-            .get_instance(&canonical)
-            .expect("adopted under the canonical key");
-        assert_eq!(instance.namespace, "default");
-        assert_eq!(instance.app_name, "web");
-        // The legacy key resolves to nothing.
-        assert!(agent.supervisor.get_instance(&runtime_id).is_none());
-        // The runtime was asked to adopt the legacy container id, not to
-        // create or start a fresh one.
-        let calls = grill.calls();
-        assert!(calls.contains(&("adopt".to_string(), runtime_id.clone())));
-        assert!(!calls.contains(&("create".to_string(), runtime_id.clone())));
-        assert!(!calls.contains(&("start".to_string(), runtime_id)));
+    #[tokio::test]
+    async fn adoption_uses_structured_names_to_validate_generation_like_suffixes() {
+        for instance in ["default__worker-g9-0", "default__worker-g9-g17-0"] {
+            let (mut agent, _tx, _shutdown, grill) = test_agent_with_grill();
+            let dir = tempfile::tempdir().unwrap();
+            let record = adoption_record(instance, "worker-g9", false);
+            crate::grill::records::write_record(dir.path(), &record).unwrap();
+            agent.set_records_dir(dir.path().to_path_buf());
+            let id = InstanceId(instance.into());
+            grill.set_adopt_result(&id, true);
+            assert_eq!(agent.adopt_recorded_instances().await.unwrap(), 1);
+            let owner = agent.supervisor.get_instance(&id).unwrap();
+            assert_eq!(owner.app_name, "worker-g9");
+            assert_eq!(owner.namespace, "default");
+            assert_eq!(
+                crate::grill::records::load_records(dir.path()).unwrap(),
+                vec![record]
+            );
+        }
     }
 
     #[tokio::test]
@@ -11807,12 +18844,17 @@ host = "remote.local"
         let record = adoption_record("default__web-0", "web", false);
         crate::grill::records::write_record(dir.path(), &record).unwrap();
         agent.set_records_dir(dir.path().to_path_buf());
+        agent.set_volumes_dir(dir.path().join("volumes"));
 
-        assert_eq!(agent.adopt_recorded_instances().await, 0);
+        assert_eq!(agent.adopt_recorded_instances().await.unwrap(), 0);
 
         // The stale record is gone and nothing was seeded: the normal
         // reconcile path is free to reschedule the instance.
-        assert!(crate::grill::records::load_records(dir.path()).is_empty());
+        assert!(
+            crate::grill::records::load_records(dir.path())
+                .unwrap()
+                .is_empty()
+        );
         assert!(
             agent
                 .supervisor
@@ -11878,7 +18920,7 @@ host = "remote.local"
         let id = InstanceId("default__web-0".to_string());
         grill.set_adopt_result(&id, true);
 
-        assert_eq!(agent.adopt_recorded_instances().await, 1);
+        assert_eq!(agent.adopt_recorded_instances().await.unwrap(), 1);
 
         let instance = agent.supervisor.get_instance(&id).unwrap();
         let restored = instance
@@ -11940,7 +18982,7 @@ host = "remote.local"
         let id = InstanceId("default__web-0".to_string());
         grill.set_adopt_result(&id, true);
 
-        assert_eq!(agent.adopt_recorded_instances().await, 1);
+        assert_eq!(agent.adopt_recorded_instances().await.unwrap(), 1);
 
         assert_eq!(
             identity_dir_names(volumes.path()),
@@ -11959,7 +19001,7 @@ host = "remote.local"
 
         let id = InstanceId("default__web-0".to_string());
         grill.set_adopt_result(&id, true);
-        assert_eq!(agent.adopt_recorded_instances().await, 1);
+        assert_eq!(agent.adopt_recorded_instances().await.unwrap(), 1);
 
         let instance = agent.supervisor.get_instance(&id).unwrap();
         assert!(instance.health_config.is_some());
@@ -11975,7 +19017,7 @@ host = "remote.local"
 
         let id = InstanceId("default__web-0".to_string());
         grill.set_adopt_result(&id, true);
-        assert_eq!(agent.adopt_recorded_instances().await, 1);
+        assert_eq!(agent.adopt_recorded_instances().await.unwrap(), 1);
 
         // The adopted instance's port must not be handed out again.
         assert!(agent.supervisor.port_allocator.is_allocated(30123).await);
@@ -12000,7 +19042,7 @@ host = "remote.local"
         crate::grill::records::write_record(dir.path(), &record).unwrap();
         grill.set_adopt_result(&id, true);
 
-        assert_eq!(agent.adopt_recorded_instances().await, 0);
+        assert_eq!(agent.adopt_recorded_instances().await.unwrap(), 0);
     }
 
     // ---------------------------------------------------------------------
@@ -12013,6 +19055,8 @@ host = "remote.local"
     #[tokio::test]
     async fn stop_escalates_to_kill_when_process_ignores_sigterm() {
         let (mut agent, _tx, _shutdown, grill) = test_agent_with_grill();
+        let volumes = tempfile::tempdir().unwrap();
+        agent.set_volumes_dir(volumes.path().to_path_buf());
 
         let (ev_tx, mut ev_rx) = mpsc::channel(64);
         agent.deploy(basic_config(), &ev_tx).await;
@@ -12043,6 +19087,8 @@ host = "remote.local"
     #[tokio::test]
     async fn stop_reports_stopped_after_exit_without_kill() {
         let (mut agent, _tx, _shutdown, grill) = test_agent_with_grill();
+        let volumes = tempfile::tempdir().unwrap();
+        agent.set_volumes_dir(volumes.path().to_path_buf());
 
         let (ev_tx, mut ev_rx) = mpsc::channel(64);
         agent.deploy(basic_config(), &ev_tx).await;
@@ -12120,7 +19166,8 @@ host = "remote.local"
         drains.decrement_connections(&id.0).await;
         tokio::time::timeout(std::time::Duration::from_secs(2), &mut retire)
             .await
-            .expect("retire did not complete after the request drained");
+            .expect("retire did not complete after the request drained")
+            .unwrap();
         let calls = grill.calls();
         assert!(
             calls.iter().any(|(op, i)| op == "stop" && i == &id),
@@ -12176,7 +19223,8 @@ host = "remote.local"
         drains.decrement_websocket(&id.0).await;
         tokio::time::timeout(std::time::Duration::from_secs(2), &mut retire)
             .await
-            .expect("retire did not complete after the WebSocket closed");
+            .expect("retire did not complete after the WebSocket closed")
+            .unwrap();
         assert!(
             grill.calls().iter().any(|(op, i)| op == "stop" && i == &id),
             "retire must stop the drained instance once the WebSocket closed"
@@ -12387,6 +19435,193 @@ host = "remote.local"
     }
 
     #[tokio::test]
+    async fn dns_fault_refuses_unknown_namespace_or_instance_scope_without_recording_it() {
+        let (mut agent, _tx, _shutdown) = test_agent();
+        for (namespace, target_instance) in
+            [(None, None), (Some("red".into()), Some("redis-0".into()))]
+        {
+            let (response, result) = oneshot::channel();
+            agent
+                .handle_command(AgentCommand::InjectFault {
+                    reservation: None,
+                    request: crate::smoker::types::FaultRequest {
+                        fault_type: crate::smoker::types::FaultType::DnsNxdomain,
+                        target_service: "redis".into(),
+                        namespace,
+                        target_instance,
+                        target_node: None,
+                        duration: std::time::Duration::from_secs(60),
+                        injected_by: "test".into(),
+                        reason: None,
+                        include_leader: false,
+                        override_safety: false,
+                        acknowledged: true,
+                    },
+                    response,
+                })
+                .await;
+            assert!(result.await.unwrap().is_err());
+            assert_eq!(agent.fault_registry.iter().count(), 0);
+        }
+    }
+
+    #[tokio::test]
+    async fn dns_fault_keeps_its_namespace_and_each_owner_until_clear() {
+        use crate::onion::dns::{BoundDnsResponder, DnsConfig};
+        let (mut agent, _tx, shutdown) = test_agent();
+        let mut map = crate::onion::service_map::ServiceMap::new();
+        map.register_app("redis", "red", 6379, None).unwrap();
+        map.register_app("redis", "blue", 6379, None).unwrap();
+        let (_map_tx, map_rx) = tokio::sync::watch::channel(map);
+        let responder = BoundDnsResponder::bind(DnsConfig {
+            listen_addr: "127.0.0.1:0".parse().unwrap(),
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+        let address = responder.local_addr().unwrap();
+        let task = tokio::spawn(responder.run(map_rx, agent.dns_faults_watch(), shutdown.clone()));
+        async fn query(address: std::net::SocketAddr, name: &str) -> u8 {
+            let mut packet = vec![0x12, 0x34, 1, 0, 0, 1, 0, 0, 0, 0, 0, 0];
+            for label in name.split('.') {
+                packet.push(label.len() as u8);
+                packet.extend_from_slice(label.as_bytes());
+            }
+            packet.extend_from_slice(&[0, 0, 1, 0, 1]);
+            let socket = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+            socket.send_to(&packet, address).await.unwrap();
+            let mut answer = [0; 1500];
+            tokio::time::timeout(
+                std::time::Duration::from_secs(2),
+                socket.recv_from(&mut answer),
+            )
+            .await
+            .unwrap()
+            .unwrap();
+            answer[3] & 0xf
+        }
+        let mut owners = Vec::new();
+        for _ in 0..2 {
+            let (response, result) = oneshot::channel();
+            agent
+                .handle_command(AgentCommand::InjectFault {
+                    reservation: None,
+                    request: crate::smoker::types::FaultRequest {
+                        fault_type: crate::smoker::types::FaultType::DnsNxdomain,
+                        target_service: "redis".into(),
+                        namespace: Some("red".into()),
+                        target_instance: None,
+                        target_node: None,
+                        duration: std::time::Duration::from_secs(60),
+                        injected_by: "test".into(),
+                        reason: None,
+                        include_leader: false,
+                        override_safety: false,
+                        acknowledged: true,
+                    },
+                    response,
+                })
+                .await;
+            owners.push(result.await.unwrap().unwrap().id);
+        }
+        assert_eq!(query(address, "redis.red.internal").await, 3);
+        assert_eq!(query(address, "redis.blue.internal").await, 0);
+        for (index, id) in owners.into_iter().enumerate() {
+            let (response, result) = oneshot::channel();
+            agent
+                .handle_command(AgentCommand::ClearFault {
+                    fault_id: id,
+                    allow_workload_fault: true,
+                    allow_node_fault: false,
+                    allow_node_pressure: false,
+                    response,
+                })
+                .await;
+            result.await.unwrap().unwrap();
+            assert_eq!(
+                query(address, "redis.red.internal").await,
+                if index == 0 { 3 } else { 0 }
+            );
+            assert_eq!(query(address, "redis.blue.internal").await, 0);
+        }
+        shutdown.cancel();
+        task.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn node_fault_fence_reverses_before_acknowledging_and_blocks_late_activation() {
+        use crate::smoker::{
+            reservation::NodeFaultReservation,
+            types::{FaultRequest, FaultType},
+        };
+        let (mut agent, gate, _) = test_cluster_fault_agent().await;
+        let request = FaultRequest {
+            fault_type: FaultType::NodeKill {
+                kill_containers: false,
+            },
+            target_service: String::new(),
+            namespace: None,
+            target_instance: None,
+            target_node: Some("node-a".into()),
+            duration: std::time::Duration::from_secs(30),
+            injected_by: "operator".into(),
+            reason: None,
+            include_leader: true,
+            override_safety: true,
+            acknowledged: true,
+        };
+        let mut grant = NodeFaultReservation {
+            sequence: 1,
+            boot_id: agent.node_fault_fence.boot_id.clone(),
+            cleanup_after_unix_ms: 30_000,
+            request: request.clone(),
+        };
+        assert!(agent.fence_node_fault(&grant, true).await.is_err());
+        let (response, result) = oneshot::channel();
+        agent
+            .handle_command(AgentCommand::InjectFault {
+                reservation: Some(grant.clone()),
+                request: request.clone(),
+                response,
+            })
+            .await;
+        result.await.unwrap().unwrap();
+        assert!(gate.is_quiesced());
+        assert!(agent.fence_node_fault(&grant, true).await.is_err());
+        agent.fence_node_fault(&grant, false).await.unwrap();
+        assert!(!gate.is_quiesced());
+        assert!(agent.fault_registry.iter().next().is_none());
+        let (response, result) = oneshot::channel();
+        agent
+            .handle_command(AgentCommand::InjectFault {
+                reservation: Some(grant.clone()),
+                request: request.clone(),
+                response,
+            })
+            .await;
+        assert!(result.await.unwrap().is_err());
+        assert!(!gate.is_quiesced());
+        let old = grant.clone();
+        grant.sequence = 2;
+        let (response, result) = oneshot::channel();
+        agent
+            .handle_command(AgentCommand::InjectFault {
+                reservation: Some(grant.clone()),
+                request,
+                response,
+            })
+            .await;
+        result.await.unwrap().unwrap();
+        agent.fence_node_fault(&old, false).await.unwrap();
+        assert!(
+            gate.is_quiesced(),
+            "an old fence must not reverse a later operation"
+        );
+        agent.fence_node_fault(&grant, false).await.unwrap();
+        assert!(!gate.is_quiesced());
+    }
+
+    #[tokio::test]
     async fn node_drain_stops_scheduling_but_keeps_cluster_transports() {
         let (mut agent, gate, readiness) = test_cluster_fault_agent().await;
         let rule = register_fault(
@@ -12423,6 +19658,24 @@ host = "remote.local"
 
         let stored = agent.fault_registry.get(rule.id).cloned().unwrap();
         agent.reverse_fault(&stored).await;
+        assert!(!gate.is_quiesced());
+    }
+
+    #[tokio::test]
+    async fn node_fault_expiry_restores_the_transport_gate() {
+        let (mut agent, gate, _) = test_cluster_fault_agent().await;
+        let rule = register_fault(
+            &mut agent,
+            crate::smoker::types::FaultType::NodeKill {
+                kill_containers: false,
+            },
+            std::time::Duration::from_millis(1),
+        );
+        agent.apply_fault(&rule).await.unwrap();
+        assert!(gate.is_quiesced());
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        agent.expire_faults().await;
+        assert!(agent.fault_registry.is_empty());
         assert!(!gate.is_quiesced());
     }
 
@@ -12674,5 +19927,532 @@ host = "remote.local"
             check.violation,
             Some(crate::smoker::types::SafetyViolation::ReplicaMinimum { .. })
         ));
+    }
+
+    #[tokio::test]
+    async fn application_restart_retires_predecessor_artifacts_before_successor_create() {
+        let (mut agent, _tx, _shutdown, grill) = test_agent_with_grill();
+        let records = tempfile::tempdir().unwrap();
+        let volumes = tempfile::tempdir().unwrap();
+        agent.set_records_dir(records.path().to_path_buf());
+        agent.set_volumes_dir(volumes.path().to_path_buf());
+        grill.set_pid(std::process::id());
+        expect_complete(&drain_deploy(&mut agent, basic_config()).await);
+        let id = InstanceId("default__web-0".into());
+        let record = crate::grill::records::record_path(records.path(), &id.0);
+        let identity = agent.instance_identity_dir(&id);
+        std::fs::write(identity.join("old-generation"), b"old identity material").unwrap();
+        let instance = agent.supervisor.get_instance_mut(&id).unwrap();
+        instance.state = ContainerState::Pending;
+        instance.restart_count = 1;
+        grill.block_creates();
+        let task = tokio::spawn(async move {
+            agent.drive_pending_restarts().await;
+        });
+        tokio::time::timeout(std::time::Duration::from_secs(5), grill.wait_for_creates(1))
+            .await
+            .unwrap();
+        let predecessor_record_retired = !record.exists();
+        let logical_identity_retained = identity.join("old-generation").exists();
+        let successor_identity_prepared = identity.is_dir();
+        task.abort();
+        assert!(task.await.unwrap_err().is_cancelled());
+        crate::sesame::identity::cleanup_identity_dir(&identity).unwrap();
+        assert!(
+            predecessor_record_retired,
+            "successor creation retained the predecessor adoption record"
+        );
+        assert!(
+            logical_identity_retained,
+            "automatic restart discarded the logical workload identity"
+        );
+        assert!(
+            successor_identity_prepared,
+            "successor creation has no identity mount source"
+        );
+    }
+
+    #[tokio::test]
+    async fn application_restart_refuses_successor_creation_until_artifact_cleanup_succeeds() {
+        let (mut agent, _tx, _shutdown, grill) = test_agent_with_grill();
+        let records = tempfile::tempdir().unwrap();
+        let volumes = tempfile::tempdir().unwrap();
+        agent.set_records_dir(records.path().to_path_buf());
+        agent.set_volumes_dir(volumes.path().to_path_buf());
+        grill.set_pid(std::process::id());
+        expect_complete(&drain_deploy(&mut agent, basic_config()).await);
+        let id = InstanceId("default__web-0".into());
+        let record = crate::grill::records::record_path(records.path(), &id.0);
+        let identity = agent.instance_identity_dir(&id);
+        let original = std::fs::read(&record).unwrap();
+        std::fs::remove_file(&record).unwrap();
+        std::fs::create_dir(&record).unwrap();
+        let instance = agent.supervisor.get_instance_mut(&id).unwrap();
+        instance.state = ContainerState::Pending;
+        instance.restart_count = 1;
+        agent.drive_pending_restarts().await;
+        let creates = grill
+            .calls()
+            .iter()
+            .filter(|(operation, instance)| operation == "create" && instance == &id)
+            .count();
+        let predecessor_retained = record.exists();
+        let pending = agent.supervisor.get_instance(&id).unwrap().state == ContainerState::Pending;
+        std::fs::remove_dir(&record).unwrap();
+        std::fs::write(&record, original).unwrap();
+        assert_eq!(
+            creates, 1,
+            "a successor was created despite failed artifact cleanup"
+        );
+        assert!(
+            predecessor_retained && pending,
+            "restart lost the predecessor cleanup obligation"
+        );
+        agent.drive_pending_restarts().await;
+        assert_eq!(
+            agent.supervisor.get_instance(&id).unwrap().state,
+            ContainerState::Running
+        );
+        assert!(record.exists() && identity.is_dir());
+        agent.retire_workload("web", "default").await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn rollout_generations_have_independent_cgroup_paths() {
+        for strategy in ["rolling", "blue-green"] {
+            let (mut agent, _tx, _shutdown, grill) = test_agent_with_grill();
+            let volumes = tempfile::tempdir().unwrap();
+            agent.set_volumes_dir(volumes.path().to_path_buf());
+            grill.set_pid(std::process::id());
+            expect_complete(&drain_deploy(&mut agent, basic_config()).await);
+            let previous = agent.supervisor.list_instances()[0]
+                .oci_spec
+                .as_ref()
+                .unwrap()
+                .linux
+                .cgroups_path
+                .clone();
+            let replacement = Config::parse(&format!(
+                "[app.web]\nimage = 'web:v2'\nport = 8080\n[app.web.deploy]\nstrategy = '{strategy}'\n"
+            )).unwrap();
+            expect_complete(&drain_deploy(&mut agent, replacement).await);
+            let current = agent.supervisor.list_instances()[0]
+                .oci_spec
+                .as_ref()
+                .unwrap()
+                .linux
+                .cgroups_path
+                .clone();
+            agent.retire_workload("web", "default").await.unwrap();
+            assert!(previous.is_some() && current.is_some());
+            assert_ne!(
+                previous, current,
+                "{strategy} reused its predecessor's cgroup"
+            );
+        }
+    }
+    #[tokio::test]
+    async fn durable_consumer_waits_for_http_and_websocket_release_then_recovers_receipt_retry() {
+        use crate::bun::consumer_owners::ConsumerIdentity;
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("discovery");
+        let identity = ConsumerIdentity {
+            node_id: crate::meat::NodeId::new("test"),
+            cluster_identity: [42; 32],
+        };
+        let (mut agent, _, _) = test_cluster_fault_agent().await;
+        agent.set_records_dir(root.path().to_owned());
+        agent.supervisor.grill().set_launch_inventory(vec![]).await;
+        agent
+            .recover_consumer_ownership(&path, identity.clone())
+            .await
+            .unwrap();
+        let (catalog, ingress) = cluster_publication_fixture();
+        let result = agent
+            .synchronise_consumer(1, catalog.clone(), ingress.clone(), vec![])
+            .await
+            .unwrap();
+        assert!(result.published && result.receipts.is_empty());
+        let backend = agent.service_map_tx.borrow().resolve_all()[0].backends[0]
+            .instance_id
+            .clone();
+        let http = agent
+            .drains
+            .capture_requests(std::slice::from_ref(&backend), false)
+            .await
+            .unwrap();
+        let websocket = agent
+            .drains
+            .capture_requests(std::slice::from_ref(&backend), true)
+            .await
+            .unwrap();
+        let instruction = crate::onion::withdrawal::EndpointWithdrawalInstruction {
+            generation: 1,
+            services: catalog
+                .services
+                .iter()
+                .map(|(id, service)| {
+                    (
+                        id.clone(),
+                        crate::onion::withdrawal::ServiceWithdrawal {
+                            service: service.clone(),
+                            retire_vip: true,
+                        },
+                    )
+                })
+                .collect(),
+        };
+        let result = agent
+            .synchronise_consumer(2, Default::default(), vec![], vec![instruction.clone()])
+            .await
+            .unwrap();
+        assert!(!result.published && result.receipts.is_empty());
+        assert!(
+            http.iter()
+                .chain(&websocket)
+                .all(|token| token.is_cancelled())
+        );
+        assert!(agent.service_map_tx.borrow().resolve_all().is_empty());
+        agent.drains.decrement_connections(&backend).await;
+        let result = agent
+            .synchronise_consumer(2, Default::default(), vec![], vec![instruction.clone()])
+            .await
+            .unwrap();
+        assert!(!result.published && result.receipts.is_empty());
+        agent.drains.decrement_connections(&backend).await;
+        agent.drains.decrement_websocket(&backend).await;
+        let result = agent
+            .synchronise_consumer(2, Default::default(), vec![], vec![instruction.clone()])
+            .await
+            .unwrap();
+        assert!(result.published);
+        assert_eq!(result.receipts, vec![1]);
+        drop(agent);
+        let (mut recovered, _, _) = test_cluster_fault_agent().await;
+        recovered.set_records_dir(root.path().to_owned());
+        recovered
+            .supervisor
+            .grill()
+            .set_launch_inventory(vec![])
+            .await;
+        recovered
+            .recover_consumer_ownership(&path, identity)
+            .await
+            .unwrap();
+        assert!(recovered.service_map_tx.borrow().resolve_all().is_empty());
+        assert!(
+            recovered
+                .synchronise_consumer(1, catalog, ingress, vec![])
+                .await
+                .is_err()
+        );
+        let result = recovered
+            .synchronise_consumer(2, Default::default(), vec![], vec![instruction])
+            .await
+            .unwrap();
+        assert_eq!(result.receipts, vec![1]);
+        let (response, reply) = oneshot::channel();
+        recovered
+            .handle_command(AgentCommand::SyncClusterConsumer {
+                generation: 0,
+                catalog: Box::default(),
+                ingress: vec![],
+                withdrawals: vec![],
+                response,
+            })
+            .await;
+        let retry = reply.await.unwrap().unwrap();
+        assert!(!retry.published);
+        assert_eq!(retry.receipts, vec![1]);
+        recovered.confirm_consumer_receipt(1).await.unwrap();
+        recovered.confirm_consumer_receipt(1).await.unwrap();
+        drop(recovered);
+        let journal = crate::bun::discovery_owners::DiscoveryJournal::open(&path).unwrap();
+        let consumer = journal.inventory().consumer.as_ref().unwrap();
+        assert!(consumer.receipts.is_empty());
+        assert_eq!(consumer.publications.len(), 1);
+        assert_eq!(consumer.publications[0].generation, 2);
+    }
+
+    #[tokio::test]
+    async fn durable_consumer_refuses_changed_enrolment_before_recovery() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("discovery");
+        let identity = crate::bun::consumer_owners::ConsumerIdentity {
+            node_id: crate::meat::NodeId::new("test"),
+            cluster_identity: [42; 32],
+        };
+        let (mut agent, _, _) = test_cluster_fault_agent().await;
+        agent.set_records_dir(root.path().to_owned());
+        agent.supervisor.grill().set_launch_inventory(vec![]).await;
+        agent
+            .recover_consumer_ownership(&path, identity.clone())
+            .await
+            .unwrap();
+        let (catalog, ingress) = cluster_publication_fixture();
+        agent
+            .synchronise_consumer(3, catalog, ingress, vec![])
+            .await
+            .unwrap();
+        drop(agent);
+        let original = std::fs::read(path.join("discovery.json")).unwrap();
+        let (mut replacement, _, _) = test_cluster_fault_agent().await;
+        replacement.set_records_dir(root.path().to_owned());
+        replacement
+            .supervisor
+            .grill()
+            .set_launch_inventory(vec![])
+            .await;
+        let mut changed = identity;
+        changed.cluster_identity = [43; 32];
+        assert!(
+            replacement
+                .recover_consumer_ownership(&path, changed)
+                .await
+                .is_err()
+        );
+        assert_eq!(
+            std::fs::read(path.join("discovery.json")).unwrap(),
+            original
+        );
+        assert!(replacement.service_map_tx.borrow().resolve_all().is_empty());
+    }
+    async fn clustered_allocation_fixture() -> (
+        BunAgent<MockGrill>,
+        tempfile::TempDir,
+        crate::onion::catalog::EndpointCatalog,
+    ) {
+        let (mut agent, _, _) = test_cluster_fault_agent().await;
+        let root = tempfile::tempdir().unwrap();
+        agent.set_records_dir(root.path().join("records"));
+        agent.supervisor.grill().set_launch_inventory(vec![]).await;
+        agent
+            .recover_consumer_ownership(
+                &root.path().join("discovery"),
+                crate::bun::consumer_owners::ConsumerIdentity {
+                    node_id: crate::meat::NodeId::new("test"),
+                    cluster_identity: [42; 32],
+                },
+            )
+            .await
+            .unwrap();
+        let (mut catalog, ingress) = cluster_publication_fixture();
+        catalog.services.get_mut("default__remote").unwrap().vip =
+            crate::onion::vip::VirtualIP("127.128.43.42".parse().unwrap());
+        agent
+            .synchronise_consumer(1, catalog.clone(), ingress, vec![])
+            .await
+            .unwrap();
+        (agent, root, catalog)
+    }
+
+    #[tokio::test]
+    async fn clustered_local_registration_uses_the_committed_vip() {
+        let (mut agent, _root, catalog) = clustered_allocation_fixture().await;
+        let (reply, result) = oneshot::channel();
+        agent
+            .handle_deploy_op(DeployOp::RegisterServiceApp {
+                app_name: "remote".into(),
+                namespace: "default".into(),
+                port: 8080,
+                firewall: None,
+                reply,
+            })
+            .await;
+        result.await.unwrap().unwrap();
+        let service = crate::onion::service_id::ServiceId::new("default", "remote");
+        assert_eq!(
+            agent.service_map.resolve(&service).unwrap().vip,
+            catalog.resolve(&service).unwrap().vip
+        );
+        let (reply, result) = oneshot::channel();
+        agent
+            .handle_deploy_op(DeployOp::RegisterServiceApp {
+                app_name: "uncommitted".into(),
+                namespace: "default".into(),
+                port: 8080,
+                firewall: None,
+                reply,
+            })
+            .await;
+        assert!(
+            result.await.unwrap().is_err(),
+            "invented an uncommitted cluster allocation"
+        );
+    }
+
+    #[tokio::test]
+    async fn clustered_local_allocation_retires_only_after_consumer_guards_release() {
+        let (mut agent, root, catalog) = clustered_allocation_fixture().await;
+        // Restore the exact local reservation; the public view also has a remote replica.
+        let mut entry = agent.service_map_tx.borrow().resolve_all()[0].clone();
+        let backend = entry.backends[0].instance_id.clone();
+        entry.backends.clear();
+        agent.service_map = crate::onion::service_map::ServiceMap::from_snapshot(&[entry]).unwrap();
+        let service = crate::onion::service_id::ServiceId::new("default", "remote");
+        agent
+            .persist_discovery_publication(&service, &agent.service_map.clone())
+            .await
+            .unwrap();
+        let guards = agent
+            .drains
+            .capture_requests(std::slice::from_ref(&backend), false)
+            .await
+            .unwrap();
+        assert!(agent.retire_discovery_service(&service).await.is_err());
+        assert!(guards[0].is_cancelled());
+        agent.drains.decrement_connections(&backend).await;
+        agent.retire_discovery_service(&service).await.unwrap();
+        agent.service_map.unregister(&service).unwrap();
+        assert!(agent.service_map_tx.borrow().resolve_all().is_empty());
+        assert!(
+            agent
+                .synchronise_consumer(1, catalog.clone(), vec![], vec![])
+                .await
+                .unwrap()
+                .published
+        );
+        assert_eq!(
+            agent.service_map_tx.borrow().resolve(&service).unwrap().vip,
+            catalog.resolve(&service).unwrap().vip
+        );
+        drop(agent);
+        let journal =
+            crate::bun::discovery_owners::DiscoveryJournal::open(&root.path().join("discovery"))
+                .unwrap();
+        assert!(journal.inventory().services.is_empty());
+        assert!(journal.inventory().consumer.is_some());
+    }
+    #[tokio::test]
+    async fn clustered_startup_retains_orphan_ports_until_api_driven_cleanup_can_finish() {
+        let (mut agent, grill, root, reference) = discovery_recovery_fixture().await;
+        crate::grill::records::remove_record(
+            &root.path().join("records"),
+            &reference.instance_id.0,
+        )
+        .unwrap();
+        let journal =
+            crate::bun::discovery_owners::DiscoveryJournal::open(&root.path().join("discovery"))
+                .unwrap();
+        let mut inventory = journal.inventory().clone();
+        let identity = crate::bun::consumer_owners::ConsumerIdentity {
+            node_id: crate::meat::NodeId::new("test"),
+            cluster_identity: [42; 32],
+        };
+        inventory.consumer = Some(crate::bun::consumer_owners::ConsumerOwnership {
+            identity: identity.clone(),
+            publications: vec![],
+            phase: crate::bun::consumer_owners::ConsumerPhase::Withdrawn,
+            receipts: Default::default(),
+        });
+        drop(journal.persist(inventory).await.unwrap());
+        let (mut clustered, _, _) = test_cluster_fault_agent().await;
+        agent.cluster = clustered.cluster.take();
+        agent
+            .recover_consumer_ownership(&root.path().join("discovery"), identity)
+            .await
+            .unwrap();
+        assert_eq!(agent.adopt_recorded_instances().await.unwrap(), 0);
+        let launch = grill.launch_inventory().await.unwrap().unwrap().remove(0);
+        assert!(
+            agent
+                .supervisor
+                .port_allocator
+                .is_allocated(launch.spec.port_mapping.unwrap().host_port)
+                .await
+        );
+        assert!(
+            grill
+                .network_reference(&reference.instance_id)
+                .await
+                .unwrap()
+                .is_some()
+        );
+        let (events, mut received) = mpsc::channel(8);
+        agent
+            .begin_deploy(basic_config(), events, true, false)
+            .await;
+        assert!(matches!(
+            received.recv().await,
+            Some(ApplyEvent::Error { .. })
+        ));
+        agent.drive_startup_retirements().await;
+        assert!(agent.startup_cleanup_pending);
+        assert!(
+            agent
+                .supervisor
+                .port_allocator
+                .is_allocated(launch.spec.port_mapping.unwrap().host_port)
+                .await
+        );
+        let confirmation = serde_json::json!({"node_id": "test", "execution": {"instance_id": reference.instance_id, "generation": launch.generation}}).to_string();
+        let (client, server) =
+            crate::cluster::producer::test_fixture(reqwest::StatusCode::OK, confirmation).await;
+        agent.set_producer_release_client(client);
+        agent.drive_startup_retirements().await;
+        assert!(!agent.startup_cleanup_pending);
+        assert!(
+            !agent
+                .supervisor
+                .port_allocator
+                .is_allocated(launch.spec.port_mapping.unwrap().host_port)
+                .await
+        );
+        assert!(agent.network_references.is_empty());
+        assert!(agent.service_map.resolve_all().is_empty());
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn rootless_discovery_adoption_restores_owned_host_forward_without_container_ip() {
+        let (mut agent, grill, root, reference) = discovery_recovery_fixture().await;
+        let mut launches = grill.launch_inventory().await.unwrap().unwrap();
+        launches[0].network_reference = None;
+        grill.release_network_reference(&reference).await.unwrap();
+        grill.set_launch_inventory(launches.clone()).await;
+        grill.set_adopt_result(&reference.instance_id, true);
+        grill.clear_container_ip();
+        grill.set_rootless_network(crate::grill::records::RootlessNetworkRecord {
+            api_socket: root.path().join("slirp.sock"),
+            owner_pid: std::process::id(),
+            owner_pid_started_at: 1,
+            container_pid: std::process::id(),
+            port_mapping: launches[0].spec.port_mapping,
+        });
+        let journal =
+            crate::bun::discovery_owners::DiscoveryJournal::open(&root.path().join("discovery"))
+                .unwrap();
+        let mut inventory = journal.inventory().clone();
+        inventory.references.clear();
+        let backend = &mut inventory.services[0].entry.backends[0];
+        backend.node_ip = std::net::Ipv4Addr::LOCALHOST;
+        backend.host_port = launches[0].spec.port_mapping.unwrap().host_port;
+        inventory.services[0].executions.insert(
+            reference.instance_id.0.clone(),
+            launches[0].generation.clone(),
+        );
+        drop(journal);
+        std::fs::write(
+            root.path().join("discovery/discovery.json"),
+            serde_json::to_vec(&serde_json::json!({"schema": 4, "inventory": inventory})).unwrap(),
+        )
+        .unwrap();
+        agent
+            .recover_discovery_ownership(&root.path().join("discovery"))
+            .await
+            .unwrap();
+        assert_eq!(agent.adopt_recorded_instances().await.unwrap(), 1);
+        let service = crate::onion::service_id::ServiceId::new("default", "web");
+        let entry = agent
+            .service_map_tx
+            .borrow()
+            .resolve(&service)
+            .unwrap()
+            .clone();
+        assert_eq!(entry.backends[0].node_ip, std::net::Ipv4Addr::LOCALHOST);
+        assert_eq!(
+            entry.backends[0].host_port,
+            launches[0].spec.port_mapping.unwrap().host_port
+        );
     }
 }

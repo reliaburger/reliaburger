@@ -1,3 +1,6 @@
+mod owned;
+pub use owned::{run_helper as run_owned_helper, run_hook as run_network_hook};
+
 /// Rootless OCI spec modifications (Linux only).
 ///
 /// Adjusts an OCI runtime spec to run under runc's rootless mode.
@@ -203,9 +206,9 @@ impl Slirp4netnsHandle {
     }
 
     /// Reclaim a surviving slirp4netns owner after Bun replacement.
-    pub fn adopt(record: &super::records::RootlessNetworkRecord) -> Option<Self> {
+    pub async fn adopt(record: &super::records::RootlessNetworkRecord) -> Option<Self> {
         if !super::records::process_matches(record.owner_pid, record.owner_pid_started_at)
-            || !record.api_socket.exists()
+            || !tokio::fs::try_exists(&record.api_socket).await.ok()?
         {
             return None;
         }
@@ -221,21 +224,74 @@ impl Slirp4netnsHandle {
     }
 
     /// Shut down the slirp4netns process without signalling a reused PID.
-    pub async fn shutdown(mut self) {
+    pub async fn shutdown(self) -> std::io::Result<()> {
+        self.shutdown_preserving_socket(None).await
+    }
+
+    /// Retire an old owner without unlinking a replacement's API socket.
+    pub(crate) async fn shutdown_preserving_socket(
+        mut self,
+        preserve: Option<&Path>,
+    ) -> std::io::Result<()> {
+        self.shutdown_retaining_owner(preserve).await
+    }
+
+    /// Keep the handle available when teardown fails or its caller is cancelled.
+    pub(crate) async fn shutdown_retaining_owner(
+        &mut self,
+        preserve: Option<&Path>,
+    ) -> std::io::Result<()> {
         match &mut self.process {
             SlirpProcess::Owned(child) => {
-                let _ = child.kill().await;
+                tokio::time::timeout(std::time::Duration::from_secs(2), child.kill())
+                    .await
+                    .map_err(|_| {
+                        std::io::Error::new(
+                            std::io::ErrorKind::TimedOut,
+                            "slirp4netns owner did not exit",
+                        )
+                    })??;
             }
             SlirpProcess::Adopted { pid, started_at } => {
-                if super::records::process_matches(*pid, *started_at) {
-                    let _ = nix::sys::signal::kill(
+                if super::records::poll_adopted_process(*pid, Some(*started_at))?.0 {
+                    if !super::records::process_matches(*pid, *started_at) {
+                        return Err(std::io::Error::other("cannot verify slirp4netns owner"));
+                    }
+                    nix::sys::signal::kill(
                         nix::unistd::Pid::from_raw(*pid as i32),
                         nix::sys::signal::Signal::SIGKILL,
-                    );
+                    )
+                    .or_else(|error| {
+                        if error == nix::errno::Errno::ESRCH {
+                            Ok(())
+                        } else {
+                            Err(error)
+                        }
+                    })?;
+                    tokio::time::timeout(std::time::Duration::from_secs(2), async {
+                        while super::records::poll_adopted_process(*pid, Some(*started_at))?.0 {
+                            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+                        }
+                        Ok::<(), std::io::Error>(())
+                    })
+                    .await
+                    .map_err(|_| {
+                        std::io::Error::new(
+                            std::io::ErrorKind::TimedOut,
+                            "retired slirp4netns owner did not exit",
+                        )
+                    })??;
                 }
             }
         }
-        let _ = tokio::fs::remove_file(&self.api_socket).await;
+        if preserve != Some(self.api_socket.as_path()) {
+            match tokio::fs::remove_file(&self.api_socket).await {
+                Ok(()) => {}
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => return Err(error),
+            }
+        }
+        Ok(())
     }
 }
 
@@ -265,12 +321,27 @@ pub async fn setup_slirp4netns(
     api_socket_path: &Path,
     port_mapping: Option<super::oci::PortMapping>,
 ) -> Result<Slirp4netnsHandle, std::io::Error> {
+    setup_slirp4netns_command(
+        tokio::process::Command::new("slirp4netns"),
+        pid,
+        api_socket_path,
+        port_mapping,
+    )
+    .await
+}
+
+async fn setup_slirp4netns_command(
+    mut command: tokio::process::Command,
+    pid: u32,
+    api_socket_path: &Path,
+    port_mapping: Option<super::oci::PortMapping>,
+) -> Result<Slirp4netnsHandle, std::io::Error> {
     match tokio::fs::remove_file(api_socket_path).await {
         Ok(()) => {}
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
         Err(error) => return Err(error),
     }
-    let mut child = tokio::process::Command::new("slirp4netns")
+    let child = command
         .args([
             "--configure",
             "--mtu=65520",
@@ -281,34 +352,67 @@ pub async fn setup_slirp4netns(
         .arg(pid.to_string())
         .arg("tap0")
         .spawn()?;
-
-    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(2);
-    while !api_socket_path.exists() {
-        if tokio::time::Instant::now() >= deadline {
-            let _ = child.kill().await;
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::TimedOut,
-                "slirp4netns did not create its API socket",
-            ));
+    // Startup has no durable owner yet. Cancellation must kill the process;
+    // only publishing a complete handle permits it to survive Bun handoff.
+    let mut pending = PendingSlirp { child: Some(child) };
+    let ready = tokio::time::timeout(std::time::Duration::from_secs(2), async {
+        while !tokio::fs::try_exists(api_socket_path).await? {
+            if let Some(child) = pending.child.as_mut()
+                && let Some(status) = child.try_wait()?
+            {
+                return Err(std::io::Error::other(format!(
+                    "slirp4netns exited before creating its API socket: {status}"
+                )));
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
         }
-        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
-    }
-
-    if let Some(mapping) = port_mapping
-        && let Err(error) =
-            add_slirp4netns_port_forward(api_socket_path, mapping.host_port, mapping.container_port)
-                .await
-    {
-        let _ = child.kill().await;
+        if let Some(mapping) = port_mapping {
+            add_slirp4netns_port_forward(
+                api_socket_path,
+                mapping.host_port,
+                mapping.container_port,
+            )
+            .await?;
+        }
+        Ok(())
+    })
+    .await
+    .unwrap_or_else(|_| {
+        Err(std::io::Error::new(
+            std::io::ErrorKind::TimedOut,
+            "slirp4netns network setup exceeded 2s",
+        ))
+    });
+    if let Err(error) = ready {
+        if let Some(child) = pending.child.as_mut() {
+            let _ = child.kill().await;
+        }
+        let _ = tokio::fs::remove_file(api_socket_path).await;
         return Err(error);
     }
-
+    let child = pending
+        .child
+        .take()
+        .ok_or_else(|| std::io::Error::other("slirp4netns startup owner is missing"))?;
     Ok(Slirp4netnsHandle {
         process: SlirpProcess::Owned(child),
         api_socket: api_socket_path.to_path_buf(),
         container_pid: pid,
         port_mapping,
     })
+}
+
+/// A startup-only owner; a published handle deliberately survives exec handoff.
+struct PendingSlirp {
+    child: Option<tokio::process::Child>,
+}
+
+impl Drop for PendingSlirp {
+    fn drop(&mut self) {
+        if let Some(child) = self.child.as_mut() {
+            let _ = child.start_kill();
+        }
+    }
 }
 
 /// Add a port forward via the slirp4netns API socket.
@@ -351,6 +455,89 @@ mod tests {
         OciLinux, OciMount, OciNamespace, OciProcess, OciResources, OciRoot, OciSpec, OciUser,
     };
     use std::path::PathBuf;
+
+    #[tokio::test]
+    async fn stalled_port_forward_is_bounded_and_reaps_its_owner() {
+        let tmp = tempfile::tempdir().unwrap();
+        let pid_file = tmp.path().join("pid");
+        let socket = tmp.path().join("api.sock");
+        let mut command = tokio::process::Command::new("python3");
+        command.args(["-c", "import os,sys,socket,time; open(os.environ['PID_FILE'],'w').write(str(os.getpid())); s=socket.socket(socket.AF_UNIX); s.bind(sys.argv[sys.argv.index('--api-socket')+1]); s.listen(); c,_=s.accept(); c.recv(4096); time.sleep(60)"])
+            .env("PID_FILE", &pid_file);
+        let result = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            setup_slirp4netns_command(
+                command,
+                1,
+                &socket,
+                Some(super::super::oci::PortMapping {
+                    host_port: 8080,
+                    container_port: 80,
+                }),
+            ),
+        )
+        .await
+        .unwrap();
+        assert!(matches!(result, Err(error) if error.kind() == std::io::ErrorKind::TimedOut));
+        let pid = tokio::fs::read_to_string(pid_file)
+            .await
+            .unwrap()
+            .parse::<u32>()
+            .unwrap();
+        assert!(
+            !super::super::records::poll_adopted_process(pid, None)
+                .unwrap()
+                .0
+        );
+        assert!(!tokio::fs::try_exists(socket).await.unwrap());
+    }
+
+    #[tokio::test]
+    async fn cancelled_network_start_does_not_leave_a_helper_running() {
+        let tmp = tempfile::tempdir().unwrap();
+        let pid_file = tmp.path().join("pid");
+        let socket = tmp.path().join("api.sock");
+        let mut command = tokio::process::Command::new("python3");
+        command.args(["-c", "import os,time; open(os.environ['PID_FILE'],'w').write(str(os.getpid())); time.sleep(60)"])
+            .env("PID_FILE", &pid_file);
+        let task =
+            tokio::spawn(async move { setup_slirp4netns_command(command, 1, &socket, None).await });
+        let pid = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            loop {
+                if let Ok(text) = tokio::fs::read_to_string(&pid_file).await
+                    && let Ok(pid) = text.parse::<u32>()
+                {
+                    break pid;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap();
+        task.abort();
+        assert!(matches!(task.await, Err(error) if error.is_cancelled()));
+        let stopped = tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            loop {
+                if !super::super::records::poll_adopted_process(pid, None)
+                    .unwrap()
+                    .0
+                {
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .is_ok();
+        // Clean the intentionally failing baseline too.
+        if !stopped {
+            let _ = nix::sys::signal::kill(
+                nix::unistd::Pid::from_raw(pid as i32),
+                nix::sys::signal::Signal::SIGKILL,
+            );
+        }
+        assert!(stopped, "cancelled setup orphaned its slirp helper");
+    }
 
     fn sample_spec() -> OciSpec {
         OciSpec {
@@ -442,9 +629,11 @@ mod tests {
         let record = original.adoption_record().unwrap();
         drop(original); // dropping Bun's handle must not kill the userspace network
 
-        let adopted = Slirp4netnsHandle::adopt(&record).expect("live owner should be reclaimed");
+        let adopted = Slirp4netnsHandle::adopt(&record)
+            .await
+            .expect("live owner should be reclaimed");
         assert_eq!(adopted.adoption_record().unwrap(), record);
-        adopted.shutdown().await;
+        adopted.shutdown().await.unwrap();
 
         for _ in 0..100 {
             if !super::super::records::process_matches(pid, started_at) {
@@ -459,8 +648,8 @@ mod tests {
         panic!("adopted owner was not stopped");
     }
 
-    #[test]
-    fn adoption_rejects_a_reused_owner_pid() {
+    #[tokio::test]
+    async fn adoption_rejects_a_reused_owner_pid() {
         let record = super::super::records::RootlessNetworkRecord {
             api_socket: PathBuf::from("/tmp/does-not-matter.sock"),
             owner_pid: std::process::id(),
@@ -468,7 +657,7 @@ mod tests {
             container_pid: 1234,
             port_mapping: None,
         };
-        assert!(Slirp4netnsHandle::adopt(&record).is_none());
+        assert!(Slirp4netnsHandle::adopt(&record).await.is_none());
     }
 
     #[test]

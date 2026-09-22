@@ -47,6 +47,112 @@ fn node_info(id: u64, port: u16) -> CouncilNodeInfo {
     )
 }
 
+/// A previous successful write is not evidence about the current committed state.
+#[tokio::test]
+async fn scheduler_repairs_a_catalogue_replaced_after_its_last_publication() {
+    use reliaburger::cluster::orchestrate::spawn_leader_scheduler;
+    use reliaburger::council::types::CouncilResponse;
+    use reliaburger::onion::service_id::ServiceId;
+
+    let router = InMemoryRaftRouter::new();
+    let council = std::sync::Arc::new(
+        CouncilNode::new(
+            1,
+            fast_council_config(),
+            InMemoryRaftNetworkFactory::new(1, router.clone()),
+            MemLogStore::new(),
+            CouncilStateMachine::new(),
+            None,
+        )
+        .await
+        .unwrap(),
+    );
+    router.register(1, council.raft().clone()).await;
+    council
+        .initialize(BTreeMap::from([(1, node_info(1, 9444))]))
+        .await
+        .unwrap();
+    let mut metrics = council.metrics();
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while metrics.borrow().current_leader != Some(1) {
+            metrics.changed().await.unwrap();
+        }
+    })
+    .await
+    .unwrap();
+    let response = council
+        .write(RaftRequest::AppSpec {
+            app_id: reliaburger::meat::AppId::new("api", "default"),
+            spec: Box::new(toml::from_str("image = 'example:v1'\nport = 8080").unwrap()),
+        })
+        .await
+        .unwrap();
+    assert!(matches!(response, CouncilResponse::Applied { .. }));
+    let shutdown = CancellationToken::new();
+    let (_members, membership_rx) = watch::channel(Vec::new());
+    let (_reports, reports_rx) = watch::channel(Default::default());
+    let _admission = spawn_leader_scheduler(
+        council.clone(),
+        membership_rx,
+        reports_rx,
+        false,
+        Default::default(),
+        shutdown.clone(),
+    );
+    let service = ServiceId::new("default", "api");
+    let result = tokio::time::timeout(Duration::from_secs(8), async {
+        loop {
+            if council
+                .desired_state()
+                .await
+                .endpoint_catalog
+                .resolve(&service)
+                .is_some()
+            {
+                break;
+            }
+            metrics.changed().await.unwrap();
+        }
+        let observed = council.desired_state().await;
+        let expected_generation = observed.endpoint_withdrawals.generation;
+        let original = observed.endpoint_catalog;
+        let response = council
+            .write(RaftRequest::PublishEndpoints {
+                expected_generation,
+                catalog: Box::default(),
+            })
+            .await
+            .unwrap();
+        assert!(matches!(response, CouncilResponse::Applied { .. }));
+        let stale = council
+            .write(RaftRequest::PublishEndpoints {
+                expected_generation,
+                catalog: Box::new(original.clone()),
+            })
+            .await
+            .unwrap();
+        assert!(matches!(stale, CouncilResponse::Refused { .. }));
+
+        loop {
+            if council.desired_state().await.endpoint_catalog == original {
+                break;
+            }
+            metrics.changed().await.unwrap();
+        }
+        // Unchanged committed state must not produce a Raft write every tick.
+        let settled = metrics.borrow().last_applied;
+        tokio::time::sleep(Duration::from_secs(3)).await;
+        assert_eq!(metrics.borrow().last_applied, settled);
+    })
+    .await;
+    shutdown.cancel();
+    council.shutdown().await.unwrap();
+    assert!(
+        result.is_ok(),
+        "scheduler trusted an obsolete publication cache"
+    );
+}
+
 /// Agent nodes endpoint returns gossip membership when cluster is wired.
 #[tokio::test]
 async fn agent_nodes_returns_membership() {
@@ -83,6 +189,7 @@ async fn agent_nodes_returns_membership() {
     let (cmd_tx, cmd_rx) = mpsc::channel(256);
 
     let cluster = ClusterHandle {
+        local_node_id: NodeId::new("node-1"),
         membership_rx,
         raft_metrics_rx: None,
         council: None,
@@ -94,6 +201,7 @@ async fn agent_nodes_returns_membership() {
 
     let grill = ProcessGrill::new();
     let port_allocator = PortAllocator::new(50000, 51000);
+    let volumes = tempfile::tempdir().unwrap();
     let mut agent = BunAgent::with_cluster(
         grill,
         port_allocator,
@@ -104,6 +212,7 @@ async fn agent_nodes_returns_membership() {
     );
     // Co-located test agents must not touch the shared host firewall.
     agent.set_perimeter_enabled(false);
+    agent.set_volumes_dir(volumes.path().to_path_buf());
 
     let handle = tokio::spawn(async move { agent.run().await });
 
@@ -177,6 +286,7 @@ async fn agent_council_returns_raft_state() {
     let (cmd_tx, cmd_rx) = mpsc::channel(256);
 
     let cluster = ClusterHandle {
+        local_node_id: NodeId::new("node-1"),
         membership_rx,
         raft_metrics_rx: Some(raft_metrics_rx),
         council: Some(council.clone()),
@@ -188,6 +298,7 @@ async fn agent_council_returns_raft_state() {
 
     let grill = ProcessGrill::new();
     let port_allocator = PortAllocator::new(50000, 51000);
+    let volumes = tempfile::tempdir().unwrap();
     let mut agent = BunAgent::with_cluster(
         grill,
         port_allocator,
@@ -198,6 +309,7 @@ async fn agent_council_returns_raft_state() {
     );
     // Co-located test agents must not touch the shared host firewall.
     agent.set_perimeter_enabled(false);
+    agent.set_volumes_dir(volumes.path().to_path_buf());
 
     let handle = tokio::spawn(async move { agent.run().await });
 
@@ -340,6 +452,7 @@ async fn agent_snapshot_request_returns_instances() {
     let (_cmd_tx, cmd_rx) = mpsc::channel(256);
 
     let cluster = ClusterHandle {
+        local_node_id: NodeId::new("node-1"),
         membership_rx,
         raft_metrics_rx: None,
         council: None,
@@ -351,6 +464,7 @@ async fn agent_snapshot_request_returns_instances() {
 
     let grill = ProcessGrill::new();
     let port_allocator = PortAllocator::new(50000, 51000);
+    let volumes = tempfile::tempdir().unwrap();
     let mut agent = BunAgent::with_cluster(
         grill,
         port_allocator,
@@ -361,6 +475,7 @@ async fn agent_snapshot_request_returns_instances() {
     );
     // Co-located test agents must not touch the shared host firewall.
     agent.set_perimeter_enabled(false);
+    agent.set_volumes_dir(volumes.path().to_path_buf());
 
     let handle = tokio::spawn(async move { agent.run().await });
 
@@ -382,4 +497,115 @@ async fn agent_snapshot_request_returns_instances() {
 
     shutdown.cancel();
     let _ = handle.await;
+}
+
+/// A delayed catalogue must not restore this worker's already retired endpoint.
+#[tokio::test]
+async fn worker_without_council_metrics_excludes_its_own_stale_endpoints() {
+    use reliaburger::cluster::orchestrate::IngressAssignment;
+    use reliaburger::onion::catalog::{CatalogBackend, EndpointCatalog};
+    use reliaburger::onion::service_id::ServiceId;
+
+    let shutdown = CancellationToken::new();
+    let (_membership_tx, membership_rx) = watch::channel(Vec::new());
+    let (_snapshot_tx, snapshot_rx) = mpsc::channel(1);
+    let (commands, command_rx) = mpsc::channel(8);
+    let cluster = ClusterHandle {
+        local_node_id: NodeId::new("worker"),
+        membership_rx,
+        raft_metrics_rx: None,
+        council: None,
+        snapshot_rx,
+        wrapping_ikm: None,
+        partition_blocklists: Default::default(),
+        crl_handle: Default::default(),
+    };
+    let volumes = tempfile::tempdir().unwrap();
+    let mut agent = BunAgent::with_cluster(
+        ProcessGrill::new(),
+        PortAllocator::new(50000, 51000),
+        command_rx,
+        shutdown.clone(),
+        cluster,
+        "default".into(),
+    );
+    agent.set_perimeter_enabled(false);
+    agent.set_volumes_dir(volumes.path().to_path_buf());
+    let dns = agent.service_map_watch();
+    let routes = agent.routing_table_handle();
+    let actor = tokio::spawn(async move { agent.run().await });
+
+    let shared = ServiceId::new("default", "shared");
+    let retired = ServiceId::new("default", "retired");
+    let local = CatalogBackend {
+        execution: None,
+        node_id: "worker".into(),
+        node_ip: "192.0.2.1".parse().unwrap(),
+        host_port: 30001,
+        healthy: true,
+    };
+    let remote = CatalogBackend {
+        execution: None,
+        node_id: "remote".into(),
+        node_ip: "192.0.2.2".parse().unwrap(),
+        host_port: 30002,
+        healthy: true,
+    };
+    let catalog = EndpointCatalog::rebuild([
+        (shared.clone(), 8080, vec![local.clone(), remote]),
+        (retired.clone(), 8080, vec![local]),
+    ])
+    .unwrap();
+    let result = tokio::time::timeout(Duration::from_secs(5), async {
+        let (response, confirmation) = oneshot::channel();
+        commands
+            .send(AgentCommand::SyncClusterCatalog {
+                generation: 1,
+                response,
+                catalog: Box::new(catalog),
+                ingress: vec![IngressAssignment {
+                    namespace: "default".into(),
+                    name: "shared".into(),
+                    config: toml::from_str("host = \"shared.test\"\ntls = \"disabled\"").unwrap(),
+                }],
+            })
+            .await
+            .unwrap();
+        confirmation.await.unwrap().unwrap();
+        let (response, reply) = oneshot::channel();
+        commands
+            .send(AgentCommand::ResolveAll { response })
+            .await
+            .unwrap();
+        reply.await.unwrap()
+    })
+    .await;
+    // Retire the actor before asserting so a regression cannot leak its tasks.
+    shutdown.cancel();
+    tokio::time::timeout(Duration::from_secs(5), actor)
+        .await
+        .unwrap()
+        .unwrap();
+    let resolved = result.expect("catalogue query timed out");
+    let shared_response = resolved
+        .iter()
+        .find(|entry| entry.app_name == "shared")
+        .unwrap();
+    assert_eq!(
+        shared_response.total_backends, 1,
+        "worker restored its own stale endpoint"
+    );
+    assert_eq!(shared_response.backends[0].host_port, 30002);
+    let retired_response = resolved
+        .iter()
+        .find(|entry| entry.app_name == "retired")
+        .unwrap();
+    assert_eq!(retired_response.total_backends, 0);
+    let snapshot = dns.borrow();
+    assert!(snapshot.resolve(&retired).unwrap().backends.is_empty());
+    assert_eq!(snapshot.resolve(&shared).unwrap().backends.len(), 1);
+    let table = routes.read().await;
+    let route = table.lookup("shared.test", "/").unwrap();
+    assert_eq!(route.backends.len(), 1);
+    assert_eq!(route.select_backend().unwrap().addr.port(), 30002);
 }

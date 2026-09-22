@@ -83,11 +83,7 @@ async fn run_with_client(
 
     render(&report, comparison.as_ref(), args.output)?;
 
-    if !report.failed.is_empty()
-        || comparison
-            .as_ref()
-            .is_some_and(|result| !result.informational && !result.regressions.is_empty())
-    {
+    if !report.failed.is_empty() || comparison.as_ref().is_some_and(BenchComparison::failed) {
         Ok(CommandOutcome::Problems)
     } else {
         Ok(CommandOutcome::Clean)
@@ -174,7 +170,7 @@ fn render_human(report: &BenchReport, comparison: Option<&BenchComparison>) -> S
     if let Some(comparison) = comparison {
         let verdict = if comparison.informational {
             "INFORMATIONAL"
-        } else if comparison.regressions.is_empty() {
+        } else if !comparison.failed() {
             "PASS"
         } else {
             "FAIL"
@@ -199,6 +195,15 @@ fn render_human(report: &BenchReport, comparison: Option<&BenchComparison>) -> S
                 change.current,
                 percent(change.change_percent)
             );
+        }
+        for name in &comparison.missing_in_current {
+            let _ = writeln!(
+                output,
+                "  MISSING     {name}: baseline metric was not measured"
+            );
+        }
+        for name in &comparison.missing_in_baseline {
+            let _ = writeln!(output, "  NEW         {name}: no baseline measurement");
         }
         for reason in &comparison.informational_reasons {
             let _ = writeln!(output, "  {reason}");
@@ -263,6 +268,32 @@ mod tests {
         assert!(rendered.contains("PASS  network_throughput"), "{rendered}");
         assert!(rendered.contains("SKIP  cluster_capacity"), "{rendered}");
         assert!(rendered.contains("FAIL  deploy_speed"), "{rendered}");
+    }
+
+    #[test]
+    fn vanished_metrics_fail_while_new_metrics_are_named_separately() {
+        let mut baseline = report();
+        baseline.failed.clear();
+        let mut current = baseline.clone();
+        current.metrics[0].name = "new_metric".into();
+        let mut comparison = compare(&baseline, &current, 0.10).unwrap();
+        assert!(comparison.failed());
+        let rendered = render_human(&current, Some(&comparison));
+        assert!(rendered.contains("comparison: FAIL"), "{rendered}");
+        assert!(
+            rendered.contains("MISSING     network_throughput"),
+            "{rendered}"
+        );
+        assert!(rendered.contains("NEW         new_metric"), "{rendered}");
+        comparison.informational = true;
+        assert!(!comparison.failed());
+        let rendered = render_human(&current, Some(&comparison));
+        assert!(rendered.contains("comparison: INFORMATIONAL"));
+        assert!(rendered.contains("MISSING     network_throughput"));
+        current.metrics.extend(baseline.metrics.clone());
+        let added_only = compare(&baseline, &current, 0.10).unwrap();
+        assert_eq!(added_only.missing_in_baseline, vec!["new_metric"]);
+        assert!(!added_only.failed());
     }
 
     #[test]

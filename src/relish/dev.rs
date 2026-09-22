@@ -31,6 +31,104 @@ fn default_runtime() -> String {
     "runc".to_string()
 }
 
+fn invalid_input(reason: impl Into<String>) -> RelishError {
+    RelishError::LimaError {
+        command: "validate development cluster".into(),
+        stderr: reason.into(),
+    }
+}
+
+fn path_text(path: &std::path::Path) -> Result<&str, RelishError> {
+    path.to_str()
+        .ok_or_else(|| invalid_input(format!("path is not valid UTF-8: {}", path.display())))
+}
+
+fn shell_word(value: &str) -> String {
+    format!("'{}'", value.replace('\'', "'\"'\"'"))
+}
+
+fn checkout_path() -> Result<PathBuf, RelishError> {
+    let path = std::env::current_dir()?;
+    path_text(&path)?;
+    Ok(path)
+}
+
+fn validate_name(name: &str) -> Result<(), RelishError> {
+    crate::config::node::ClusterSection {
+        name: name.into(),
+        ..Default::default()
+    }
+    .validate()
+    .map_err(|e| invalid_input(e.to_string()))
+}
+
+fn validate_resources(cpus: usize, memory: &str) -> Result<(), RelishError> {
+    if cpus == 0 {
+        return Err(invalid_input("cpus must be greater than zero"));
+    }
+    let amount = ["KiB", "MiB", "GiB", "TiB"]
+        .iter()
+        .find_map(|unit| memory.strip_suffix(unit))
+        .and_then(|digits| digits.parse::<u64>().ok());
+    if !amount.is_some_and(|amount| amount > 0) {
+        return Err(invalid_input(
+            "memory must be a positive whole size such as 2GiB",
+        ));
+    }
+    Ok(())
+}
+
+fn validate_runtime(runtime: &str) -> Result<(), RelishError> {
+    if !matches!(runtime, "runc" | "process") {
+        return Err(invalid_input("runtime must be runc or process"));
+    }
+    Ok(())
+}
+
+fn validate_cluster(cluster: &DevCluster, requested_name: &str) -> Result<(), RelishError> {
+    validate_name(requested_name)?;
+    if cluster.name != requested_name || cluster.nodes.is_empty() {
+        return Err(invalid_input(
+            "saved cluster name must match and nodes must not be empty",
+        ));
+    }
+    validate_runtime(&cluster.runtime)?;
+    for (index, node) in cluster.nodes.iter().enumerate() {
+        if node.name != format!("reliaburger-{requested_name}-{}", index + 1) {
+            return Err(invalid_input(format!(
+                "saved node {} does not belong to cluster {requested_name}",
+                node.name
+            )));
+        }
+        validate_resources(node.cpus, &node.memory)?;
+        if node
+            .ip
+            .as_deref()
+            .and_then(|ip| ip.parse::<std::net::Ipv4Addr>().ok())
+            .is_none()
+        {
+            return Err(invalid_input(format!(
+                "saved node {} is missing a valid IPv4 address",
+                node.name
+            )));
+        }
+    }
+    Ok(())
+}
+
+async fn require_cluster_vms(cluster: &DevCluster) -> Result<(), RelishError> {
+    let names = limactl(&["list", "--format", "{{.Name}}"]).await?;
+    for node in &cluster.nodes {
+        if !names.lines().any(|name| name.trim() == node.name) {
+            return Err(invalid_input(format!(
+                "saved node {} is missing from Lima; cluster state was preserved",
+                node.name
+            )));
+        }
+    }
+    Ok(())
+}
+
 // ---------------------------------------------------------------------------
 // Lima wrapper
 // ---------------------------------------------------------------------------
@@ -110,19 +208,14 @@ async fn get_vm_ip(name: &str) -> Result<String, RelishError> {
 /// Shared by `dev test` and `dev create` (which builds the cluster binaries
 /// here). Creating it is a one-time cost; it persists with its cargo cache.
 async fn ensure_build_vm() -> Result<(), RelishError> {
+    path_text(&std::env::temp_dir())?;
     let list = limactl(&["list", "--format", "{{.Name}}"]).await?;
     if !list.lines().any(|l| l.trim() == TEST_VM_NAME) {
         eprintln!("creating build VM ({TEST_VM_NAME})...");
         let yaml = generate_test_vm_yaml();
         let yaml_path = std::env::temp_dir().join("reliaburger-test.yaml");
         std::fs::write(&yaml_path, &yaml)?;
-        limactl(&[
-            "create",
-            "--name",
-            TEST_VM_NAME,
-            yaml_path.to_str().unwrap(),
-        ])
-        .await?;
+        limactl(&["create", "--name", TEST_VM_NAME, path_text(&yaml_path)?]).await?;
         limactl(&["start", TEST_VM_NAME]).await?;
         eprintln!("build VM ready.");
     }
@@ -146,22 +239,21 @@ fn vm_target_dir(repo_path: &str) -> String {
 /// Build `bun` and `relish` (release, Linux) inside the build VM and copy the
 /// artefacts out to host temp files. Returns `(bun_path, relish_path)`.
 async fn build_binaries_in_vm() -> Result<(PathBuf, PathBuf), RelishError> {
+    let repo_dir = checkout_path()?;
+    path_text(&std::env::temp_dir())?;
+    let repo_path = path_text(&repo_dir)?;
+    let vm_target = vm_target_dir(repo_path);
+    let quoted_repo = shell_word(repo_path);
+    let quoted_target = shell_word(&vm_target);
     ensure_build_vm().await?;
-
-    let repo_dir = std::env::current_dir().map_err(|e| RelishError::LimaError {
-        command: "get cwd".to_string(),
-        stderr: e.to_string(),
-    })?;
-    let repo_path = repo_dir.to_string_lossy();
-    let vm_target = vm_target_dir(&repo_path);
 
     println!("  building bun + relish for Linux in the build VM (first run is slow)...");
     // Debug build — much faster than release, and fine for a dev cluster.
     // Run with `sudo -E` to match `dev test`, so the shared cargo cache in the
     // VM has consistent (root) ownership and isn't half root / half user.
     let build_cmd = format!(
-        "cd {repo_path} && source $HOME/.cargo/env && mkdir -p {vm_target} && \
-         sudo -E env PATH=\"$PATH\" CARGO_TARGET_DIR={vm_target} \
+        "cd {quoted_repo} && source \"$HOME/.cargo/env\" && mkdir -p {quoted_target} && \
+         sudo -E env PATH=\"$PATH\" CARGO_TARGET_DIR={quoted_target} \
          cargo build --bin bun --bin relish -j 2"
     );
     // Stream build output so the user sees progress.
@@ -188,13 +280,13 @@ async fn build_binaries_in_vm() -> Result<(PathBuf, PathBuf), RelishError> {
     limactl(&[
         "copy",
         &format!("{TEST_VM_NAME}:{vm_target}/debug/bun"),
-        bun_path.to_str().unwrap(),
+        path_text(&bun_path)?,
     ])
     .await?;
     limactl(&[
         "copy",
         &format!("{TEST_VM_NAME}:{vm_target}/debug/relish"),
-        relish_path.to_str().unwrap(),
+        path_text(&relish_path)?,
     ])
     .await?;
     Ok((bun_path, relish_path))
@@ -287,7 +379,7 @@ provision:
       #!/bin/bash
       set -eux
       apt-get update -qq
-      apt-get install -y -qq runc uidmap btrfs-progs
+      apt-get install -y -qq runc uidmap btrfs-progs nftables iproute2
       mkdir -p /etc/reliaburger
 "#
     )
@@ -393,6 +485,7 @@ fn save_cluster(cluster: &DevCluster) -> Result<(), RelishError> {
 }
 
 fn load_cluster(name: &str) -> Result<DevCluster, RelishError> {
+    validate_name(name)?;
     let path = state_path(name);
     if !path.exists() {
         return Err(RelishError::DevClusterNotFound {
@@ -404,6 +497,7 @@ fn load_cluster(name: &str) -> Result<DevCluster, RelishError> {
         command: "load cluster state".to_string(),
         stderr: e.to_string(),
     })?;
+    validate_cluster(&cluster, name)?;
     Ok(cluster)
 }
 
@@ -425,13 +519,25 @@ pub async fn create(
     bun: Option<PathBuf>,
     relish: Option<PathBuf>,
 ) -> Result<(), RelishError> {
-    let cluster_identity = crate::config::node::ClusterSection {
-        name: name.to_string(),
-        ..crate::config::node::ClusterSection::default()
-    };
-    cluster_identity
-        .validate()
-        .map_err(|error| RelishError::InitFailed(error.to_string()))?;
+    validate_name(name)?;
+    if nodes == 0 {
+        return Err(invalid_input("nodes must be greater than zero"));
+    }
+    validate_resources(cpus, memory)?;
+    validate_runtime(runtime)?;
+    path_text(&std::env::temp_dir())?;
+    for binary in [&bun, &relish].into_iter().flatten() {
+        path_text(binary)?;
+        if !binary.is_file() {
+            return Err(invalid_input(format!(
+                "binary does not exist: {}",
+                binary.display()
+            )));
+        }
+    }
+    if bun.is_none() || relish.is_none() {
+        checkout_path()?;
+    }
     if !lima_available() {
         eprintln!("error: limactl not found in PATH");
         eprintln!();
@@ -476,7 +582,7 @@ pub async fn create(
                 "create",
                 "--name",
                 &node_name,
-                yaml_path.to_str().unwrap(),
+                path_text(&yaml_path)?,
                 "--tty=false",
             ])
             .await?;
@@ -498,7 +604,12 @@ pub async fn create(
         node.ip = Some(get_vm_ip(&node.name).await?);
     }
 
-    let first_ip = cluster.nodes[0].ip.as_deref().unwrap();
+    let first_ip = cluster
+        .nodes
+        .first()
+        .and_then(|node| node.ip.as_deref())
+        .ok_or_else(|| invalid_input("bootstrap node has no discovered IP address"))?;
+    validate_cluster(&cluster, name)?;
 
     // Generate the cluster's security material once, on the host. Every node
     // gets the master key (to build its wrapping IKM); only the bootstrap node
@@ -538,7 +649,7 @@ pub async fn create(
         std::fs::write(&config_path, &config)?;
         limactl(&[
             "copy",
-            config_path.to_str().unwrap(),
+            path_text(&config_path)?,
             &format!("{}:/tmp/node.toml", node.name),
         ])
         .await?;
@@ -570,14 +681,13 @@ pub async fn create(
     let _ = std::fs::remove_dir_all(&sec_dir);
 
     // Build (or use the provided) Linux binaries, then install on every node.
-    let need_build = bun.is_none() || relish.is_none();
-    let built = if need_build {
-        Some(build_binaries_in_vm().await?)
-    } else {
-        None
+    let (bun_path, relish_path) = match (bun, relish) {
+        (Some(bun), Some(relish)) => (bun, relish),
+        (bun, relish) => {
+            let (built_bun, built_relish) = build_binaries_in_vm().await?;
+            (bun.unwrap_or(built_bun), relish.unwrap_or(built_relish))
+        }
     };
-    let bun_path = bun.unwrap_or_else(|| built.as_ref().unwrap().0.clone());
-    let relish_path = relish.unwrap_or_else(|| built.unwrap().1);
 
     println!("  installing binaries on nodes...");
     for node in &cluster.nodes {
@@ -603,7 +713,11 @@ pub async fn create(
     // The nodes sit on Lima's user-v2 network, which the host can't route to,
     // so query the council from *inside* node 1 (where `relish` talks to the
     // local agent on 127.0.0.1). Best-effort — don't fail create if it's slow.
-    let first = &cluster.nodes[0].name;
+    let first = &cluster
+        .nodes
+        .first()
+        .ok_or_else(|| invalid_input("cluster has no nodes"))?
+        .name;
     println!();
     match limactl(&["shell", first, "relish", "council"]).await {
         Ok(out) if !out.trim().is_empty() => {
@@ -694,9 +808,10 @@ pub async fn shell(node_name: &str) -> Result<(), RelishError> {
 /// Stop all VMs in a dev cluster.
 pub async fn stop(name: &str) -> Result<(), RelishError> {
     let cluster = load_cluster(name)?;
+    require_cluster_vms(&cluster).await?;
     println!("Stopping {} nodes...", cluster.nodes.len());
     for node in &cluster.nodes {
-        let _ = limactl(&["stop", &node.name]).await;
+        limactl(&["stop", &node.name]).await?;
     }
     println!("Dev cluster \"{name}\" stopped.");
     Ok(())
@@ -705,6 +820,7 @@ pub async fn stop(name: &str) -> Result<(), RelishError> {
 /// Start all VMs in a stopped dev cluster.
 pub async fn start(name: &str) -> Result<(), RelishError> {
     let cluster = load_cluster(name)?;
+    require_cluster_vms(&cluster).await?;
     println!("Starting {} nodes...", cluster.nodes.len());
     for node in &cluster.nodes {
         limactl(&["start", &node.name]).await?;
@@ -723,10 +839,11 @@ pub async fn start(name: &str) -> Result<(), RelishError> {
 /// Destroy a dev cluster (stop and delete all VMs).
 pub async fn destroy(name: &str) -> Result<(), RelishError> {
     let cluster = load_cluster(name)?;
+    require_cluster_vms(&cluster).await?;
     println!("Stopping and deleting {} nodes...", cluster.nodes.len());
     for node in &cluster.nodes {
-        let _ = limactl(&["stop", &node.name]).await;
-        let _ = limactl(&["delete", &node.name, "-f"]).await;
+        limactl(&["stop", &node.name]).await?;
+        limactl(&["delete", &node.name, "-f"]).await?;
     }
     delete_cluster_state(name);
     println!("Dev cluster \"{name}\" destroyed.");
@@ -769,7 +886,7 @@ provision:
       #!/bin/bash
       set -eux
       apt-get update -qq
-      apt-get install -y -qq runc uidmap slirp4netns curl buildah btrfs-progs build-essential pkg-config libssl-dev clang llvm libbpf-dev linux-headers-$(uname -r)
+      apt-get install -y -qq runc uidmap nftables iproute2 slirp4netns curl buildah btrfs-progs build-essential pkg-config libssl-dev clang llvm libbpf-dev linux-headers-$(uname -r)
   - mode: user
     script: |
       #!/bin/bash
@@ -787,6 +904,17 @@ provision:
 /// repo is mounted from the host, so no code copying needed. The
 /// Rust toolchain and cargo cache persist inside the VM.
 pub async fn test(filter: Option<&str>, recreate: bool) -> Result<(), RelishError> {
+    let repo_dir = checkout_path()?;
+    path_text(&std::env::temp_dir())?;
+    let repo_path = path_text(&repo_dir)?;
+    let quoted_repo = shell_word(repo_path);
+    let quoted_target = shell_word(&vm_target_dir(repo_path));
+    if filter.is_some_and(|filter| filter.starts_with('-') || filter.contains('\0')) {
+        return Err(invalid_input(
+            "test filter must be a test name, not a command-line option",
+        ));
+    }
+
     if !lima_available() {
         eprintln!("error: limactl not found in PATH");
         eprintln!();
@@ -806,19 +934,6 @@ pub async fn test(filter: Option<&str>, recreate: bool) -> Result<(), RelishErro
     // Ensure the build/test VM exists and is running.
     ensure_build_vm().await?;
 
-    // Build the cargo test command
-    let repo_dir = std::env::current_dir().map_err(|e| RelishError::LimaError {
-        command: "get cwd".to_string(),
-        stderr: e.to_string(),
-    })?;
-    let repo_path = repo_dir.to_string_lossy();
-
-    // Use a VM-local target directory to avoid virtiofs overhead.
-    // The host-mounted repo has thousands of small files in target/
-    // that are very slow over the filesystem bridge. A native ext4
-    // target dir makes incremental builds 5-10x faster.
-    let vm_target = format!("/tmp/reliaburger-target{}", repo_path.replace('/', "-"));
-
     // Use sudo for tests that need root (netns, runc, eBPF).
     // Pass through the cargo env and HOME so rustup/cargo work.
     // Use --test-threads=1 because netns/veth tests can't run in
@@ -826,10 +941,10 @@ pub async fn test(filter: Option<&str>, recreate: bool) -> Result<(), RelishErro
     // Use -j 2 to limit parallel compile/link jobs — DataFusion + Arrow
     // produce large binaries and the linker can OOM the VM at -j 4.
     let mut test_cmd = format!(
-        "cd {repo_path} && source $HOME/.cargo/env && \
-         mkdir -p {vm_target} && \
+        "cd {quoted_repo} && source \"$HOME/.cargo/env\" && \
+         mkdir -p {quoted_target} && \
          sudo -E env PATH=\"$PATH\" \
-         CARGO_TARGET_DIR={vm_target} \
+         CARGO_TARGET_DIR={quoted_target} \
          RELIABURGER_RUNC_TESTS=1 \
          RELIABURGER_NETNS_TESTS=1 \
          RELIABURGER_EBPF_TESTS=1 \
@@ -840,7 +955,7 @@ pub async fn test(filter: Option<&str>, recreate: bool) -> Result<(), RelishErro
 
     if let Some(f) = filter {
         test_cmd.push(' ');
-        test_cmd.push_str(f);
+        test_cmd.push_str(&shell_word(f));
     }
     test_cmd.push_str(" -- --test-threads=1");
 

@@ -8,6 +8,8 @@ use std::path::{Path, PathBuf};
 
 use sha2::{Digest, Sha256};
 
+use super::oci_pull::retry_registry_read;
+
 /// A parsed OCI image reference.
 ///
 /// Normalises Docker Hub shorthand: `"alpine"` becomes
@@ -213,6 +215,12 @@ impl ImageStore {
         }
     }
 
+    /// Directory containing this runtime's selected image storage.
+    #[cfg(target_os = "linux")]
+    pub(crate) fn storage_directory(&self) -> &Path {
+        &self.store_root
+    }
+
     /// Install the cluster image source. Called once after the cluster
     /// subsystems start; later calls are ignored (`OnceLock`).
     pub fn set_cluster_source(&self, source: std::sync::Arc<dyn ClusterImageSource>) {
@@ -391,14 +399,17 @@ impl ImageStore {
         let client = oci_distribution::Client::new(client_config);
         let auth = oci_distribution::secrets::RegistryAuth::Anonymous;
 
-        // Pull the manifest (handles multi-platform resolution automatically)
-        let (manifest, _digest, _config) = client
-            .pull_manifest_and_config(&oci_ref, &auth)
-            .await
-            .map_err(|e| ImageError::ManifestPull {
+        // Verify the raw digest chain before publishing any cache metadata.
+        let verified = retry_registry_read(std::time::Duration::from_secs(30), || {
+            super::oci_pull::pull_verified_manifest(&client, &oci_ref, &auth)
+        })
+        .await
+        .map_err(|e| ImageError::ManifestPull {
             image: image_ref.full_reference(),
             reason: e.to_string(),
         })?;
+
+        let manifest = verified.manifest;
 
         // Save the manifest for cache validation
         let manifest_path = self.manifest_path(&image_ref);
@@ -416,8 +427,23 @@ impl ImageStore {
         for layer in &manifest.layers {
             let digest = &layer.digest;
             let blob_path = self.blob_path(digest);
-
+            let expected_size = u64::try_from(layer.size).map_err(|_| ImageError::LayerPull {
+                digest: digest.clone(),
+                reason: "negative layer size".into(),
+            })?;
+            let verify_size = |actual: u64| -> Result<(), ImageError> {
+                if actual != expected_size {
+                    return Err(ImageError::LayerPull {
+                        digest: digest.clone(),
+                        reason: format!(
+                            "layer size mismatch: expected {expected_size}, received {actual}"
+                        ),
+                    });
+                }
+                Ok(())
+            };
             if blob_path.exists() {
+                verify_size(tokio::fs::metadata(&blob_path).await?.len())?;
                 continue;
             }
 
@@ -425,14 +451,18 @@ impl ImageStore {
                 tokio::fs::create_dir_all(parent).await?;
             }
 
-            let mut blob_data: Vec<u8> = Vec::new();
-            client
-                .pull_blob(&oci_ref, layer, &mut blob_data)
-                .await
-                .map_err(|e| ImageError::LayerPull {
-                    digest: digest.clone(),
-                    reason: e.to_string(),
-                })?;
+            let blob_data = retry_registry_read(std::time::Duration::from_secs(120), || async {
+                // A failed transfer may have written a prefix. Each attempt
+                // owns a fresh buffer; no partial bytes reach the cache.
+                let mut blob_data = Vec::new();
+                client.pull_blob(&oci_ref, layer, &mut blob_data).await?;
+                Ok(blob_data)
+            })
+            .await
+            .map_err(|e| ImageError::LayerPull {
+                digest: digest.clone(),
+                reason: e.to_string(),
+            })?;
 
             // Verify the SHA-256 digest
             let computed = format!("sha256:{}", sha256_hex(&blob_data));
@@ -443,6 +473,8 @@ impl ImageStore {
                     actual: computed,
                 });
             }
+
+            verify_size(blob_data.len() as u64)?;
 
             // Write atomically (temp + rename) so a crash mid-write can't leave
             // a truncated blob at the final path that a later pull treats as a
@@ -1135,8 +1167,63 @@ mod tests {
 
     // -- Hermetic OCI distribution fixture ------------------------------------
 
+    #[derive(Clone, Copy)]
+    enum RegistryFaultTarget {
+        Manifest,
+        Configuration,
+        Layer,
+    }
+
+    #[derive(Clone)]
+    struct RegistryFault {
+        target: RegistryFaultTarget,
+        disconnect: bool,
+        status: StatusCode,
+        code: &'static str,
+        remaining: Arc<AtomicUsize>,
+        delay: std::time::Duration,
+        received: Arc<tokio::sync::Notify>,
+    }
+
+    fn registry_fault(
+        layer: bool,
+        status: StatusCode,
+        code: &'static str,
+        count: usize,
+    ) -> RegistryFault {
+        RegistryFault {
+            target: if layer {
+                RegistryFaultTarget::Layer
+            } else {
+                RegistryFaultTarget::Manifest
+            },
+            disconnect: false,
+            status,
+            code,
+            remaining: Arc::new(AtomicUsize::new(count)),
+            delay: std::time::Duration::ZERO,
+            received: Arc::new(tokio::sync::Notify::new()),
+        }
+    }
+
+    #[derive(Clone, Copy, Debug)]
+    enum RegistryIntegrityCase {
+        ChangedManifest,
+        ChangedConfiguration,
+        ChangedIndex,
+        ChangedChild,
+        ValidIndex,
+        Amd64Index,
+        WrongConfigurationSize,
+        WrongChildSize,
+        NegativeLayerSize,
+        OverflowingLayerSizes,
+        WrongLayerSize,
+    }
+
     #[derive(Clone)]
     struct RegistryState {
+        index: Option<(String, Vec<u8>)>,
         manifest_path: String,
         manifest: Vec<u8>,
         config_path: String,
@@ -1144,11 +1231,14 @@ mod tests {
         layer_path: String,
         layer: Vec<u8>,
         layer_requests: Arc<AtomicUsize>,
+        manifest_requests: Arc<AtomicUsize>,
+        fault: Option<RegistryFault>,
     }
 
     struct RegistryFixture {
         reference: String,
         layer_requests: Arc<AtomicUsize>,
+        manifest_requests: Arc<AtomicUsize>,
         shutdown: CancellationToken,
         task: tokio::task::JoinHandle<()>,
     }
@@ -1172,7 +1262,63 @@ mod tests {
                 .unwrap();
         }
 
-        let (body, content_type) = if path == state.manifest_path {
+        let is_index = state
+            .index
+            .as_ref()
+            .is_some_and(|(index_path, _)| index_path == path);
+        if path == state.manifest_path || is_index {
+            state.manifest_requests.fetch_add(1, Ordering::SeqCst);
+        }
+        if path == state.layer_path {
+            state.layer_requests.fetch_add(1, Ordering::SeqCst);
+        }
+        if let Some(fault) = &state.fault
+            && path
+                == match fault.target {
+                    RegistryFaultTarget::Manifest => &state.manifest_path,
+                    RegistryFaultTarget::Configuration => &state.config_path,
+                    RegistryFaultTarget::Layer => &state.layer_path,
+                }
+            && fault
+                .remaining
+                .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |remaining| {
+                    remaining.checked_sub(1)
+                })
+                .is_ok()
+        {
+            fault.received.notify_one();
+            tokio::time::sleep(fault.delay).await;
+            if fault.disconnect {
+                use futures_util::StreamExt;
+                let prefix = futures_util::stream::once(async {
+                    Ok::<_, std::io::Error>(axum::body::Bytes::from_static(b"partial response"))
+                });
+                let failure = futures_util::stream::once(async {
+                    tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+                    Err::<axum::body::Bytes, _>(std::io::Error::new(
+                        std::io::ErrorKind::ConnectionReset,
+                        "injected disconnect",
+                    ))
+                });
+                return Response::builder()
+                    .status(StatusCode::OK)
+                    .header(header::CONTENT_LENGTH, 1000)
+                    .body(Body::from_stream(prefix.chain(failure)))
+                    .unwrap();
+            }
+            return Response::builder()
+                .status(fault.status)
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(serde_json::json!({"errors": [{"code": fault.code, "message": "injected registry failure"}]}).to_string()))
+                .unwrap();
+        }
+
+        let (body, content_type) = if is_index {
+            (
+                state.index.as_ref().unwrap().1.clone(),
+                "application/vnd.oci.image.index.v1+json",
+            )
+        } else if path == state.manifest_path {
             (
                 state.manifest.clone(),
                 "application/vnd.oci.image.manifest.v1+json",
@@ -1183,7 +1329,6 @@ mod tests {
                 "application/vnd.oci.image.config.v1+json",
             )
         } else if path == state.layer_path {
-            state.layer_requests.fetch_add(1, Ordering::SeqCst);
             (
                 state.layer.clone(),
                 "application/vnd.oci.image.layer.v1.tar+gzip",
@@ -1195,8 +1340,13 @@ mod tests {
                 .unwrap();
         };
 
-        Response::builder()
-            .status(StatusCode::OK)
+        let mut response = Response::builder().status(StatusCode::OK);
+        if path == state.manifest_path || is_index {
+            // Deliberately claim the requested digest even for changed bytes.
+            // A client must hash the response instead of trusting this header.
+            response = response.header("Docker-Content-Digest", path.rsplit('/').next().unwrap());
+        }
+        response
             .header(header::CONTENT_TYPE, content_type)
             .header(header::CONTENT_LENGTH, body.len())
             .body(Body::from(body))
@@ -1204,6 +1354,17 @@ mod tests {
     }
 
     async fn start_registry_fixture() -> RegistryFixture {
+        start_registry_fixture_with_fault(None).await
+    }
+
+    async fn start_registry_fixture_with_fault(fault: Option<RegistryFault>) -> RegistryFixture {
+        start_registry_fixture_with_options(fault, None).await
+    }
+
+    async fn start_registry_fixture_with_options(
+        fault: Option<RegistryFault>,
+        integrity: Option<RegistryIntegrityCase>,
+    ) -> RegistryFixture {
         let dir = tempfile::tempdir().unwrap();
         let layer_path = dir.path().join("layer.tar.gz");
         create_test_layer_with_dirs(
@@ -1218,7 +1379,7 @@ mod tests {
             br#"{"architecture":"amd64","os":"linux","rootfs":{"type":"layers","diff_ids":[]}}"#
                 .to_vec();
         let config_digest = format!("sha256:{}", sha256_hex(&config));
-        let manifest = serde_json::to_vec(&serde_json::json!({
+        let mut manifest = serde_json::to_vec(&serde_json::json!({
             "schemaVersion": 2,
             "mediaType": "application/vnd.oci.image.manifest.v1+json",
             "config": {
@@ -1233,12 +1394,46 @@ mod tests {
             }],
         }))
         .unwrap();
+        if matches!(
+            integrity,
+            Some(RegistryIntegrityCase::WrongConfigurationSize)
+        ) {
+            let mut value: serde_json::Value = serde_json::from_slice(&manifest).unwrap();
+            value["config"]["size"] = serde_json::json!(config.len() + 1);
+            manifest = serde_json::to_vec(&value).unwrap();
+        }
+        if matches!(
+            integrity,
+            Some(
+                RegistryIntegrityCase::NegativeLayerSize
+                    | RegistryIntegrityCase::OverflowingLayerSizes
+                    | RegistryIntegrityCase::WrongLayerSize
+            )
+        ) {
+            let mut value: serde_json::Value = serde_json::from_slice(&manifest).unwrap();
+            match integrity.unwrap() {
+                RegistryIntegrityCase::NegativeLayerSize => {
+                    value["layers"][0]["size"] = serde_json::json!(-1)
+                }
+                RegistryIntegrityCase::WrongLayerSize => {
+                    value["layers"][0]["size"] = serde_json::json!(layer.len() + 1)
+                }
+                _ => {
+                    value["layers"][0]["size"] = serde_json::json!(i64::MAX);
+                    let layer = value["layers"][0].clone();
+                    value["layers"] = serde_json::json!([layer, layer, layer]);
+                }
+            }
+            manifest = serde_json::to_vec(&value).unwrap();
+        }
         let manifest_digest = format!("sha256:{}", sha256_hex(&manifest));
 
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap();
         let layer_requests = Arc::new(AtomicUsize::new(0));
-        let state = RegistryState {
+        let manifest_requests = Arc::new(AtomicUsize::new(0));
+        let mut state = RegistryState {
+            index: None,
             manifest_path: format!("/v2/fixture/manifests/{manifest_digest}"),
             manifest,
             config_path: format!("/v2/fixture/blobs/{config_digest}"),
@@ -1246,7 +1441,59 @@ mod tests {
             layer_path: format!("/v2/fixture/blobs/{layer_digest}"),
             layer,
             layer_requests: Arc::clone(&layer_requests),
+            manifest_requests: Arc::clone(&manifest_requests),
+            fault,
         };
+        let mut root_digest = manifest_digest.clone();
+        if matches!(
+            integrity,
+            Some(
+                RegistryIntegrityCase::ChangedIndex
+                    | RegistryIntegrityCase::ChangedChild
+                    | RegistryIntegrityCase::ValidIndex
+                    | RegistryIntegrityCase::Amd64Index
+                    | RegistryIntegrityCase::WrongChildSize
+            )
+        ) {
+            let mut entries = Vec::new();
+            for architecture in ["amd64", "arm64"] {
+                if matches!(integrity, Some(RegistryIntegrityCase::Amd64Index))
+                    && architecture != "amd64"
+                {
+                    continue;
+                }
+                entries.push(serde_json::json!({
+                        "mediaType": "application/vnd.oci.image.manifest.v1+json",
+                        "digest": manifest_digest,
+                        "size": state.manifest.len() + usize::from(matches!(integrity, Some(RegistryIntegrityCase::WrongChildSize))),
+                        "platform": {"os": "linux", "architecture": architecture}
+                    }));
+            }
+            let index = serde_json::to_vec(&serde_json::json!({
+                "schemaVersion": 2,
+                "mediaType": "application/vnd.oci.image.index.v1+json",
+                "manifests": entries
+            }))
+            .unwrap();
+            root_digest = format!("sha256:{}", sha256_hex(&index));
+            state.index = Some((format!("/v2/fixture/manifests/{root_digest}"), index));
+        }
+        let change_manifest = |bytes: &mut Vec<u8>| {
+            let mut manifest: serde_json::Value = serde_json::from_slice(bytes).unwrap();
+            manifest["annotations"] =
+                serde_json::json!({"fixture": "changed without changing the requested digest"});
+            *bytes = serde_json::to_vec(&manifest).unwrap();
+        };
+        match integrity {
+            Some(RegistryIntegrityCase::ChangedManifest | RegistryIntegrityCase::ChangedChild) => {
+                change_manifest(&mut state.manifest)
+            }
+            Some(RegistryIntegrityCase::ChangedConfiguration) => state.config = b"{}".to_vec(),
+            Some(RegistryIntegrityCase::ChangedIndex) => {
+                change_manifest(&mut state.index.as_mut().unwrap().1)
+            }
+            _ => {}
+        }
         let app = axum::Router::new()
             .fallback(registry_response)
             .with_state(state);
@@ -1260,11 +1507,492 @@ mod tests {
         });
 
         RegistryFixture {
-            reference: format!("{address}/fixture@{manifest_digest}"),
+            reference: format!("{address}/fixture@{root_digest}"),
             layer_requests,
+            manifest_requests,
             shutdown,
             task,
         }
+    }
+
+    #[tokio::test]
+    async fn upstream_layer_sizes_refuse_negative_and_overflowing_totals() {
+        use crate::pickle::upstream::UpstreamRegistry;
+        for case in [
+            RegistryIntegrityCase::NegativeLayerSize,
+            RegistryIntegrityCase::OverflowingLayerSizes,
+        ] {
+            let fixture = start_registry_fixture_with_options(None, Some(case)).await;
+            let upstream = crate::pickle::upstream::OciUpstream::insecure_http(Default::default());
+            let reference = ImageReference::parse(&fixture.reference).unwrap();
+            assert!(
+                upstream.fetch_manifest(&reference).await.is_err(),
+                "accepted {case:?}"
+            );
+            let directory = tempfile::tempdir().unwrap();
+            let store = ImageStore::new(directory.path().to_path_buf());
+            assert!(store.pull_and_unpack(&fixture.reference).await.is_err());
+            assert_eq!(fixture.layer_requests.load(Ordering::SeqCst), 0);
+            assert!(!store.manifest_path(&reference).exists());
+        }
+    }
+
+    #[tokio::test]
+    async fn upstream_layer_sizes_do_not_allocate_from_untrusted_descriptors() {
+        use crate::pickle::upstream::UpstreamRegistry;
+        let fixture = start_registry_fixture().await;
+        let upstream = crate::pickle::upstream::OciUpstream::insecure_http(Default::default());
+        let reference = ImageReference::parse(&fixture.reference).unwrap();
+        let manifest = upstream.fetch_manifest(&reference).await.unwrap();
+        let mut layer = manifest.layers[0].clone();
+        layer.size = u64::MAX;
+        assert!(upstream.fetch_blob(&reference, &layer).await.is_err());
+        assert_eq!(fixture.layer_requests.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn upstream_layer_sizes_match_direct_downloads_and_cached_blobs() {
+        for warm_cache in [false, true] {
+            let directory = tempfile::tempdir().unwrap();
+            let store = ImageStore::new(directory.path().to_path_buf());
+            if warm_cache {
+                let valid = start_registry_fixture().await;
+                store.pull_and_unpack(&valid.reference).await.unwrap();
+            }
+            let fixture = start_registry_fixture_with_options(
+                None,
+                Some(RegistryIntegrityCase::WrongLayerSize),
+            )
+            .await;
+            assert!(
+                store.pull_and_unpack(&fixture.reference).await.is_err(),
+                "accepted wrong layer size with warm_cache={warm_cache}"
+            );
+            let reference = ImageReference::parse(&fixture.reference).unwrap();
+            assert!(!store.rootfs_path(&reference).exists());
+            assert_eq!(
+                fixture.layer_requests.load(Ordering::SeqCst),
+                usize::from(!warm_cache)
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn upstream_layer_sizes_match_pull_through_downloads() {
+        use crate::pickle::upstream::UpstreamRegistry;
+        let fixture =
+            start_registry_fixture_with_options(None, Some(RegistryIntegrityCase::WrongLayerSize))
+                .await;
+        let upstream = crate::pickle::upstream::OciUpstream::insecure_http(Default::default());
+        let reference = ImageReference::parse(&fixture.reference).unwrap();
+        let manifest = upstream.fetch_manifest(&reference).await.unwrap();
+        assert!(
+            upstream
+                .fetch_blob(&reference, &manifest.layers[0])
+                .await
+                .is_err()
+        );
+    }
+
+    #[tokio::test]
+    async fn upstream_image_identity_is_verified_before_cache_publication() {
+        for case in [
+            RegistryIntegrityCase::ChangedConfiguration,
+            RegistryIntegrityCase::ChangedManifest,
+            RegistryIntegrityCase::ChangedIndex,
+            RegistryIntegrityCase::ChangedChild,
+            RegistryIntegrityCase::WrongConfigurationSize,
+            RegistryIntegrityCase::WrongChildSize,
+        ] {
+            let fixture = start_registry_fixture_with_options(None, Some(case)).await;
+            let directory = tempfile::tempdir().unwrap();
+            let store = ImageStore::new(directory.path().to_path_buf());
+            let result = store.pull_and_unpack(&fixture.reference).await;
+            assert!(result.is_err(), "{case:?} was accepted: {result:?}");
+            assert_eq!(
+                fixture.layer_requests.load(Ordering::SeqCst),
+                0,
+                "unverified metadata reached layer fetch"
+            );
+            let reference = ImageReference::parse(&fixture.reference).unwrap();
+            assert!(!store.manifest_path(&reference).exists());
+            assert!(!store.rootfs_path(&reference).exists());
+        }
+    }
+
+    #[tokio::test]
+    async fn upstream_pull_through_verifies_the_requested_digest_chain() {
+        use crate::pickle::upstream::UpstreamRegistry;
+        for case in [
+            RegistryIntegrityCase::ChangedIndex,
+            RegistryIntegrityCase::ChangedChild,
+            RegistryIntegrityCase::ChangedManifest,
+            RegistryIntegrityCase::ChangedConfiguration,
+            RegistryIntegrityCase::WrongConfigurationSize,
+            RegistryIntegrityCase::WrongChildSize,
+        ] {
+            let fixture = start_registry_fixture_with_options(None, Some(case)).await;
+            let upstream = crate::pickle::upstream::OciUpstream::insecure_http(Default::default());
+            let reference = ImageReference::parse(&fixture.reference).unwrap();
+            let result = upstream.fetch_manifest(&reference).await;
+            assert!(
+                result.is_err(),
+                "{case:?} was accepted by pull-through: {result:?}"
+            );
+            assert_eq!(fixture.layer_requests.load(Ordering::SeqCst), 0);
+        }
+    }
+
+    #[tokio::test]
+    async fn upstream_index_resolution_preserves_verified_child_bytes() {
+        use crate::pickle::upstream::UpstreamRegistry;
+        let fixture =
+            start_registry_fixture_with_options(None, Some(RegistryIntegrityCase::ValidIndex))
+                .await;
+        let directory = tempfile::tempdir().unwrap();
+        let store = ImageStore::new(directory.path().to_path_buf());
+        let rootfs = store.pull_and_unpack(&fixture.reference).await.unwrap();
+        assert_eq!(
+            std::fs::read(rootfs.join("bin/sh")).unwrap(),
+            b"fixture shell"
+        );
+        let upstream = crate::pickle::upstream::OciUpstream::insecure_http(Default::default());
+        let reference = ImageReference::parse(&fixture.reference).unwrap();
+        let manifest = upstream.fetch_manifest(&reference).await.unwrap();
+        assert_eq!(
+            crate::pickle::store::compute_sha256(&manifest.manifest_bytes),
+            manifest.digest
+        );
+        assert_eq!(
+            crate::pickle::store::compute_sha256(&manifest.config_bytes),
+            manifest.config.digest
+        );
+    }
+
+    #[tokio::test]
+    async fn upstream_selects_the_target_linux_architecture_before_fetching_blobs() {
+        use crate::pickle::upstream::{OciUpstream, UpstreamRegistry};
+        let fixture =
+            start_registry_fixture_with_options(None, Some(RegistryIntegrityCase::Amd64Index))
+                .await;
+        let reference = ImageReference::parse(&fixture.reference).unwrap();
+        for architecture in ["x86_64", "amd64"] {
+            let upstream = OciUpstream::insecure_http(Default::default())
+                .with_linux_architecture(architecture)
+                .unwrap();
+            assert!(upstream.fetch_manifest(&reference).await.is_ok());
+        }
+        let upstream = OciUpstream::insecure_http(Default::default())
+            .with_linux_architecture("aarch64")
+            .unwrap();
+        assert!(upstream.fetch_manifest(&reference).await.is_err());
+        assert!(
+            OciUpstream::new(Default::default())
+                .with_linux_architecture("unknown")
+                .is_err()
+        );
+        assert_eq!(fixture.layer_requests.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn pull_through_registry_retries_transient_metadata_reads() {
+        use crate::pickle::upstream::UpstreamRegistry;
+        for head in [true, false] {
+            let fixture = start_registry_fixture_with_fault(Some(registry_fault(
+                false,
+                StatusCode::TOO_MANY_REQUESTS,
+                "TOOMANYREQUESTS",
+                2,
+            )))
+            .await;
+            let upstream = crate::pickle::upstream::OciUpstream::insecure_http(Default::default());
+            let reference = ImageReference::parse(&fixture.reference).unwrap();
+            if head {
+                upstream.head_manifest_digest(&reference).await.unwrap();
+            } else {
+                upstream.fetch_manifest(&reference).await.unwrap();
+            }
+            assert_eq!(fixture.manifest_requests.load(Ordering::SeqCst), 3);
+        }
+    }
+
+    #[tokio::test]
+    async fn pull_through_registry_retries_interrupted_blobs_from_an_empty_buffer() {
+        use crate::pickle::upstream::UpstreamRegistry;
+        let mut fault = registry_fault(true, StatusCode::OK, "UNAVAILABLE", 1);
+        fault.disconnect = true;
+        let fixture = start_registry_fixture_with_fault(Some(fault)).await;
+        let upstream = crate::pickle::upstream::OciUpstream::insecure_http(Default::default());
+        let reference = ImageReference::parse(&fixture.reference).unwrap();
+        let manifest = upstream.fetch_manifest(&reference).await.unwrap();
+        let bytes = upstream
+            .fetch_blob(&reference, &manifest.layers[0])
+            .await
+            .unwrap();
+        assert_eq!(
+            crate::pickle::store::compute_sha256(&bytes),
+            manifest.layers[0].digest
+        );
+        assert_eq!(fixture.layer_requests.load(Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test]
+    async fn pull_through_registry_reads_keep_their_original_deadline() {
+        use crate::pickle::upstream::UpstreamRegistry;
+        for mode in ["head", "manifest", "layer"] {
+            let mut fault = registry_fault(
+                mode == "layer",
+                StatusCode::SERVICE_UNAVAILABLE,
+                "UNAVAILABLE",
+                1,
+            );
+            fault.delay = std::time::Duration::from_secs(3600);
+            let received = fault.received.clone();
+            let fixture = start_registry_fixture_with_fault(Some(fault)).await;
+            let upstream = crate::pickle::upstream::OciUpstream::insecure_http(Default::default());
+            let reference = ImageReference::parse(&fixture.reference).unwrap();
+            let layer = if mode == "layer" {
+                Some(upstream.fetch_manifest(&reference).await.unwrap().layers[0].clone())
+            } else {
+                None
+            };
+            let mut read = tokio::spawn(async move {
+                match mode {
+                    "head" => upstream.head_manifest_digest(&reference).await.map(|_| ()),
+                    "manifest" => upstream.fetch_manifest(&reference).await.map(|_| ()),
+                    _ => upstream
+                        .fetch_blob(&reference, &layer.unwrap())
+                        .await
+                        .map(|_| ()),
+                }
+            });
+            tokio::time::timeout(std::time::Duration::from_secs(5), received.notified())
+                .await
+                .unwrap();
+            tokio::time::pause();
+            tokio::time::advance(std::time::Duration::from_secs(if mode == "layer" {
+                121
+            } else {
+                31
+            }))
+            .await;
+            let outcome = tokio::time::timeout(std::time::Duration::from_secs(1), &mut read).await;
+            tokio::time::resume();
+            if outcome.is_err() {
+                read.abort();
+            }
+            let error = outcome
+                .expect("upstream read exceeded its original budget")
+                .unwrap()
+                .unwrap_err();
+            assert!(
+                error.to_string().contains("deadline exceeded"),
+                "{mode}: {error}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn pull_through_registry_persistent_throttling_has_four_attempts() {
+        use crate::pickle::upstream::UpstreamRegistry;
+        let fixture = start_registry_fixture_with_fault(Some(registry_fault(
+            false,
+            StatusCode::TOO_MANY_REQUESTS,
+            "TOOMANYREQUESTS",
+            usize::MAX,
+        )))
+        .await;
+        let upstream = crate::pickle::upstream::OciUpstream::insecure_http(Default::default());
+        let reference = ImageReference::parse(&fixture.reference).unwrap();
+        assert!(upstream.fetch_manifest(&reference).await.is_err());
+        assert_eq!(fixture.manifest_requests.load(Ordering::SeqCst), 4);
+    }
+
+    #[tokio::test]
+    async fn pull_through_registry_denial_and_integrity_errors_are_terminal() {
+        use crate::pickle::upstream::UpstreamRegistry;
+        let fixture = start_registry_fixture_with_fault(Some(registry_fault(
+            false,
+            StatusCode::FORBIDDEN,
+            "DENIED",
+            usize::MAX,
+        )))
+        .await;
+        let upstream = crate::pickle::upstream::OciUpstream::insecure_http(Default::default());
+        let reference = ImageReference::parse(&fixture.reference).unwrap();
+        assert!(upstream.fetch_manifest(&reference).await.is_err());
+        assert_eq!(fixture.manifest_requests.load(Ordering::SeqCst), 1);
+        let fixture =
+            start_registry_fixture_with_options(None, Some(RegistryIntegrityCase::WrongLayerSize))
+                .await;
+        let reference = ImageReference::parse(&fixture.reference).unwrap();
+        let manifest = upstream.fetch_manifest(&reference).await.unwrap();
+        assert!(
+            upstream
+                .fetch_blob(&reference, &manifest.layers[0])
+                .await
+                .is_err()
+        );
+        assert_eq!(fixture.layer_requests.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn registry_disconnect_retries_manifest_configuration_and_layer_reads() {
+        for target in [
+            RegistryFaultTarget::Manifest,
+            RegistryFaultTarget::Configuration,
+            RegistryFaultTarget::Layer,
+        ] {
+            let mut fault = registry_fault(false, StatusCode::OK, "UNAVAILABLE", 1);
+            fault.target = target;
+            fault.disconnect = true;
+            let fixture = start_registry_fixture_with_fault(Some(fault)).await;
+            let tmp = tempfile::tempdir().unwrap();
+            let store = ImageStore::new(tmp.path().to_path_buf());
+            let rootfs = store.pull_and_unpack(&fixture.reference).await.unwrap();
+            assert_eq!(
+                std::fs::read(rootfs.join("bin/sh")).unwrap(),
+                b"fixture shell"
+            );
+            assert_eq!(
+                fixture.manifest_requests.load(Ordering::SeqCst),
+                if matches!(target, RegistryFaultTarget::Layer) {
+                    1
+                } else {
+                    2
+                }
+            );
+            assert_eq!(
+                fixture.layer_requests.load(Ordering::SeqCst),
+                if matches!(target, RegistryFaultTarget::Layer) {
+                    2
+                } else {
+                    1
+                }
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn registry_complete_corrupt_responses_are_not_retried() {
+        for target in [
+            RegistryFaultTarget::Manifest,
+            RegistryFaultTarget::Configuration,
+            RegistryFaultTarget::Layer,
+        ] {
+            let mut fault = registry_fault(false, StatusCode::OK, "INVALID", usize::MAX);
+            fault.target = target;
+            let fixture = start_registry_fixture_with_fault(Some(fault)).await;
+            let tmp = tempfile::tempdir().unwrap();
+            let store = ImageStore::new(tmp.path().to_path_buf());
+            assert!(store.pull_and_unpack(&fixture.reference).await.is_err());
+            assert_eq!(fixture.manifest_requests.load(Ordering::SeqCst), 1);
+            assert_eq!(
+                fixture.layer_requests.load(Ordering::SeqCst),
+                usize::from(matches!(target, RegistryFaultTarget::Layer))
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn registry_rate_limited_manifest_is_retried_before_unpacking() {
+        let fixture = start_registry_fixture_with_fault(Some(registry_fault(
+            false,
+            StatusCode::TOO_MANY_REQUESTS,
+            "TOOMANYREQUESTS",
+            2,
+        )))
+        .await;
+        let tmp = tempfile::tempdir().unwrap();
+        let store = ImageStore::new(tmp.path().to_path_buf());
+        let rootfs = store.pull_and_unpack(&fixture.reference).await.unwrap();
+        assert!(rootfs.join("bin/sh").exists());
+        assert_eq!(fixture.manifest_requests.load(Ordering::SeqCst), 3);
+    }
+
+    #[tokio::test]
+    async fn registry_unavailable_layer_is_retried_and_verified() {
+        let fixture = start_registry_fixture_with_fault(Some(registry_fault(
+            true,
+            StatusCode::SERVICE_UNAVAILABLE,
+            "UNAVAILABLE",
+            1,
+        )))
+        .await;
+        let tmp = tempfile::tempdir().unwrap();
+        let store = ImageStore::new(tmp.path().to_path_buf());
+        let rootfs = store.pull_and_unpack(&fixture.reference).await.unwrap();
+        assert_eq!(
+            std::fs::read(rootfs.join("bin/sh")).unwrap(),
+            b"fixture shell"
+        );
+        assert_eq!(fixture.layer_requests.load(Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test]
+    async fn registry_persistent_rate_limit_has_a_bounded_attempt_count() {
+        let fixture = start_registry_fixture_with_fault(Some(registry_fault(
+            false,
+            StatusCode::TOO_MANY_REQUESTS,
+            "TOOMANYREQUESTS",
+            usize::MAX,
+        )))
+        .await;
+        let tmp = tempfile::tempdir().unwrap();
+        let store = ImageStore::new(tmp.path().to_path_buf());
+        let result = tokio::time::timeout(
+            std::time::Duration::from_secs(15),
+            store.pull_and_unpack(&fixture.reference),
+        )
+        .await
+        .unwrap();
+        assert!(matches!(result, Err(ImageError::ManifestPull { .. })));
+        assert_eq!(fixture.manifest_requests.load(Ordering::SeqCst), 4);
+        assert!(
+            !store
+                .rootfs_path(&ImageReference::parse(&fixture.reference).unwrap())
+                .exists()
+        );
+    }
+
+    #[tokio::test]
+    async fn registry_stalled_manifest_exhausts_the_original_deadline() {
+        let mut fault = registry_fault(false, StatusCode::SERVICE_UNAVAILABLE, "UNAVAILABLE", 1);
+        fault.delay = std::time::Duration::from_secs(60);
+        let received = fault.received.clone();
+        let fixture = start_registry_fixture_with_fault(Some(fault)).await;
+        let tmp = tempfile::tempdir().unwrap();
+        let store = ImageStore::new(tmp.path().to_path_buf());
+        let reference = fixture.reference.clone();
+        let pull = tokio::spawn(async move { store.pull_and_unpack(&reference).await });
+        tokio::time::timeout(std::time::Duration::from_secs(5), received.notified())
+            .await
+            .unwrap();
+        // Pause only after the real HTTP server receives the request, so
+        // simulated time cannot race socket readiness during setup.
+        tokio::time::pause();
+        tokio::time::advance(std::time::Duration::from_secs(30)).await;
+        let result = pull.await.unwrap();
+        tokio::time::resume();
+        assert!(
+            matches!(result, Err(ImageError::ManifestPull { reason, .. }) if reason.contains("deadline exceeded"))
+        );
+        assert_eq!(fixture.manifest_requests.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn registry_denial_is_not_retried() {
+        let fixture = start_registry_fixture_with_fault(Some(registry_fault(
+            false,
+            StatusCode::FORBIDDEN,
+            "DENIED",
+            usize::MAX,
+        )))
+        .await;
+        let tmp = tempfile::tempdir().unwrap();
+        let store = ImageStore::new(tmp.path().to_path_buf());
+        assert!(store.pull_and_unpack(&fixture.reference).await.is_err());
+        assert_eq!(fixture.manifest_requests.load(Ordering::SeqCst), 1);
     }
 
     #[tokio::test]

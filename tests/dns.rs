@@ -6,7 +6,8 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use reliaburger::onion::dns::{
-    BoundDnsResponder, DnsCapability, DnsConfig, DnsFaultState, bind_dns_responder, serve,
+    BoundDnsResponder, DnsCapability, DnsConfig, DnsFaultState, DnsSourceNamespaces,
+    bind_dns_responder, serve,
 };
 use reliaburger::onion::service_id::ServiceId;
 use reliaburger::onion::service_map::ServiceMap;
@@ -39,6 +40,11 @@ impl DnsHarness {
             listen_addr: "127.0.0.1:0".parse().unwrap(),
             upstream,
             upstream_timeout: Duration::from_millis(400),
+            source_namespaces: watch::channel(DnsSourceNamespaces::from_bindings([(
+                "127.0.0.1".parse().unwrap(),
+                "default".into(),
+            )]))
+            .1,
             ..DnsConfig::default()
         };
         let (socket, addr) = bind_dns_responder(&config).await.unwrap();
@@ -141,7 +147,10 @@ async fn dns_nxdomain_fault_forces_nxdomain_over_the_wire_then_reverses_on_clear
     // Publish the fault (no expiry) and expect NXDOMAIN.
     harness
         .fault_tx
-        .send(DnsFaultState::from_faults([("redis".to_string(), 0)]))
+        .send(DnsFaultState::from_faults([(
+            ServiceId::new("default", "redis"),
+            0,
+        )]))
         .unwrap();
     let during = harness
         .query(&build_query("redis.internal", QTYPE_A))
@@ -280,6 +289,11 @@ async fn run_dns_responder_fails_closed_when_it_cannot_bind() {
         listen_addr: taken,
         upstream: unroutable_upstream(),
         upstream_timeout: Duration::from_millis(400),
+        source_namespaces: watch::channel(DnsSourceNamespaces::from_bindings([(
+            "127.0.0.1".parse().unwrap(),
+            "default".into(),
+        )]))
+        .1,
         ..DnsConfig::default()
     };
     let (_tx, rx) = watch::channel(ServiceMap::new());
@@ -301,11 +315,38 @@ async fn startup_binding_requires_both_udp_and_tcp() {
     let taken = tcp.local_addr().unwrap();
     let config = DnsConfig {
         listen_addr: taken,
+        source_namespaces: watch::channel(DnsSourceNamespaces::from_bindings([(
+            "127.0.0.1".parse().unwrap(),
+            "default".into(),
+        )]))
+        .1,
         ..DnsConfig::default()
     };
 
     let result = BoundDnsResponder::bind(config).await;
     assert!(result.is_err(), "TCP bind conflict must fail readiness");
+}
+
+#[tokio::test]
+async fn automatic_dns_ports_reserve_both_transports_until_drop() {
+    let mut responders = Vec::new();
+    for _ in 0..64 {
+        let responder = BoundDnsResponder::bind(DnsConfig {
+            listen_addr: "127.0.0.1:0".parse().unwrap(),
+            ..DnsConfig::default()
+        })
+        .await
+        .unwrap();
+        let address = responder.local_addr().unwrap();
+        assert!(tokio::net::UdpSocket::bind(address).await.is_err());
+        assert!(tokio::net::TcpListener::bind(address).await.is_err());
+        responders.push(responder);
+    }
+    let address = responders.pop().unwrap().local_addr().unwrap();
+    // Dropping a successful pair releases both transport reservations.
+    let udp = tokio::net::UdpSocket::bind(address).await.unwrap();
+    let tcp = tokio::net::TcpListener::bind(address).await.unwrap();
+    drop((udp, tcp));
 }
 
 #[tokio::test]
@@ -316,6 +357,11 @@ async fn bound_responder_answers_internal_query_over_tcp_on_the_same_port() {
     let responder = BoundDnsResponder::bind(DnsConfig {
         listen_addr: "127.0.0.1:0".parse().unwrap(),
         upstream: unroutable_upstream(),
+        source_namespaces: watch::channel(DnsSourceNamespaces::from_bindings([(
+            "127.0.0.1".parse().unwrap(),
+            "default".into(),
+        )]))
+        .1,
         ..DnsConfig::default()
     })
     .await
@@ -423,4 +469,208 @@ async fn service_map_updates_are_visible_without_restart() {
 
     // Silence the unused-field lint path: address is used implicitly.
     let _ = harness.addr;
+}
+
+#[tokio::test]
+async fn udp_and_tcp_short_names_follow_live_source_identity() {
+    let mut map = ServiceMap::new();
+    let red = map.register_app("api", "red", 80, None).unwrap();
+    let blue = map.register_app("api", "blue", 80, None).unwrap();
+    let (_map_tx, map_rx) = watch::channel(map);
+    let (_fault_tx, fault_rx) = watch::channel(DnsFaultState::default());
+    let (sources_tx, source_namespaces) = watch::channel(DnsSourceNamespaces::default());
+    let shutdown = CancellationToken::new();
+    let responder = BoundDnsResponder::bind(DnsConfig {
+        listen_addr: "127.0.0.1:0".parse().unwrap(),
+        source_namespaces,
+        ..DnsConfig::default()
+    })
+    .await
+    .unwrap();
+    let addr = responder.local_addr().unwrap();
+    let task = tokio::spawn(responder.run(map_rx, fault_rx, shutdown.clone()));
+    for (bindings, expected) in [
+        (vec![], None),
+        (
+            vec![("127.0.0.1".parse().unwrap(), "red".into())],
+            Some(red),
+        ),
+        (
+            vec![("127.0.0.1".parse().unwrap(), "blue".into())],
+            Some(blue),
+        ),
+        (
+            vec![
+                ("127.0.0.1".parse().unwrap(), "red".into()),
+                ("127.0.0.1".parse().unwrap(), "blue".into()),
+            ],
+            None,
+        ),
+        (vec![], None),
+    ] {
+        sources_tx.send_replace(DnsSourceNamespaces::from_bindings(bindings));
+        for tcp in [false, true] {
+            let query = build_query("api.internal", QTYPE_A);
+            let response = tokio::time::timeout(Duration::from_secs(2), async {
+                if tcp {
+                    let mut stream = tokio::net::TcpStream::connect(addr).await.unwrap();
+                    stream.write_u16(query.len() as u16).await.unwrap();
+                    stream.write_all(&query).await.unwrap();
+                    let len = stream.read_u16().await.unwrap();
+                    let mut response = vec![0; len as usize];
+                    stream.read_exact(&mut response).await.unwrap();
+                    response
+                } else {
+                    let socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+                    socket.send_to(&query, addr).await.unwrap();
+                    let mut response = vec![0; 1500];
+                    let (len, _) = socket.recv_from(&mut response).await.unwrap();
+                    response.truncate(len);
+                    response
+                }
+            })
+            .await
+            .unwrap();
+            if let Some(vip) = expected {
+                assert_eq!(rcode(&response), 0);
+                assert_eq!(&response[response.len() - 4..], &vip.0.octets());
+            } else {
+                assert_eq!(rcode(&response), 5);
+            }
+        }
+    }
+    // A host with no workload identity must still be able to ask an explicit name.
+    let socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    socket
+        .send_to(&build_query("api.red.internal", QTYPE_A), addr)
+        .await
+        .unwrap();
+    let mut response = [0; 1500];
+    let (len, _) = tokio::time::timeout(Duration::from_secs(2), socket.recv_from(&mut response))
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(&response[len - 4..len], &red.0.octets());
+    shutdown.cancel();
+    task.await.unwrap();
+}
+
+#[tokio::test]
+async fn malformed_questions_cannot_receive_an_internal_answer() {
+    let valid = build_query_with_id("redis.internal", QTYPE_A, [0x56, 0x78]);
+    let base = build_query_with_id("redis.internal", QTYPE_A, [0x12, 0x34]);
+    let mut corpus = Vec::new();
+    for end in 0..base.len() {
+        corpus.push(("truncated packet", base[..end].to_vec()));
+    }
+    let mut trailing = base.clone();
+    trailing.push(0);
+    corpus.push(("unclaimed trailing data", trailing));
+    let mut looped = base[..12].to_vec();
+    looped.extend_from_slice(&[0xc0, 0x0c, 0, 1, 0, 1]);
+    corpus.push(("compression loop", looped));
+    let mut missing_opt = base.clone();
+    missing_opt[11] = 1;
+    corpus.push(("missing additional record", missing_opt));
+    let mut truncated = base.clone();
+    truncated.pop();
+    corpus.push(("truncated class", truncated));
+    for (name, offset, value) in [
+        ("response instead of query", 2, 0x81),
+        ("unsupported opcode", 2, 0x09),
+        ("two questions", 5, 2),
+        ("no question", 5, 0),
+        ("claimed answer", 7, 1),
+    ] {
+        let mut query = base.clone();
+        query[offset] = value;
+        corpus.push((name, query));
+    }
+    let mut wrong_class = base.clone();
+    *wrong_class.last_mut().unwrap() = 3;
+    corpus.push(("non-IN class", wrong_class));
+    let mut single_label = base[..12].to_vec();
+    single_label.push(14);
+    single_label.extend_from_slice(b"redis.internal");
+    single_label.extend_from_slice(&[0, 0, 1, 0, 1]);
+    corpus.push(("literal dot inside label", single_label));
+    let long_name = format!("{}.internal", vec!["a".repeat(63); 4].join("."));
+    corpus.push(("overlong name", build_query(&long_name, QTYPE_A)));
+
+    for (name, invalid) in corpus {
+        let harness = DnsHarness::start(unroutable_upstream(), map_with("redis")).await;
+        let socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        socket.send_to(&invalid, harness.addr).await.unwrap();
+        socket.send_to(&valid, harness.addr).await.unwrap();
+        let mut bytes = [0; 1500];
+        let (length, _) =
+            tokio::time::timeout(Duration::from_secs(2), socket.recv_from(&mut bytes))
+                .await
+                .unwrap()
+                .unwrap();
+        assert!(length >= 12);
+        assert_eq!(&bytes[..2], &valid[..2], "answered {name}");
+        assert_eq!(&bytes[6..8], &[0, 1], "valid query after {name} failed");
+    }
+}
+
+#[tokio::test]
+async fn edns_question_preserves_the_service_answer_and_negotiates_payload_size() {
+    let harness = DnsHarness::start(unroutable_upstream(), map_with("redis")).await;
+    let mut query = build_query("ReDiS.internal", QTYPE_A);
+    query[11] = 1;
+    query.extend_from_slice(&[0, 0, 41, 4, 208, 0, 0, 0, 0, 0, 0]);
+    let response = harness.query(&query).await.unwrap();
+    assert_eq!(&response[..2], &query[..2]);
+    assert_eq!(&response[4..12], &[0, 1, 0, 1, 0, 0, 0, 1]);
+    assert_eq!(rcode(&response), 0);
+    let vip = VirtualIP::from_service_id(&ServiceId::new("default", "redis"));
+    assert_eq!(
+        &response[response.len() - 15..response.len() - 11],
+        &vip.0.octets()
+    );
+    assert_eq!(
+        &response[response.len() - 11..],
+        &[0, 0, 41, 4, 208, 0, 0, 0, 0, 0, 0]
+    );
+}
+
+#[tokio::test]
+async fn tcp_refuses_a_truncated_question_and_keeps_the_listener_available() {
+    let (_map_tx, map_rx) = watch::channel(map_with("redis"));
+    let (_fault_tx, fault_rx) = watch::channel(DnsFaultState::default());
+    let shutdown = CancellationToken::new();
+    let responder = BoundDnsResponder::bind(DnsConfig {
+        listen_addr: "127.0.0.1:0".parse().unwrap(),
+        ..DnsConfig::default()
+    })
+    .await
+    .unwrap();
+    let address = responder.local_addr().unwrap();
+    let task = tokio::spawn(responder.run(map_rx, fault_rx, shutdown.clone()));
+    for malformed in [true, false] {
+        let mut query = build_query("redis.default.internal", QTYPE_A);
+        if malformed {
+            query.pop();
+        }
+        let mut socket = tokio::net::TcpStream::connect(address).await.unwrap();
+        socket
+            .write_all(&(query.len() as u16).to_be_bytes())
+            .await
+            .unwrap();
+        socket.write_all(&query).await.unwrap();
+        let mut response = Vec::new();
+        tokio::time::timeout(Duration::from_secs(2), socket.read_to_end(&mut response))
+            .await
+            .unwrap()
+            .unwrap();
+        if malformed {
+            assert!(response.is_empty(), "malformed query received a response");
+        } else {
+            assert!(response.len() > 14);
+            assert_eq!(&response[8..10], &[0, 1]);
+        }
+    }
+    shutdown.cancel();
+    task.await.unwrap();
 }

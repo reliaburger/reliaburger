@@ -182,7 +182,14 @@ impl BpfServiceMap {
             port: port.to_be(),
             _pad: 0,
         };
-        Ok(backend_map.get(&key, 0).ok())
+        match backend_map.get(&key, 0) {
+            Ok(value) => Ok(Some(value)),
+            Err(aya::maps::MapError::KeyNotFound) => Ok(None),
+            Err(source) => Err(BpfMapError::Operation {
+                name: "backend_map",
+                source,
+            }),
+        }
     }
 
     /// Whether the BPF maps have been initialised.

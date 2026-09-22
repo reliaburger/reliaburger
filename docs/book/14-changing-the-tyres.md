@@ -166,7 +166,7 @@ Tuple matching like this is why Rust people keep banging on about exhaustiveness
 
 ```rust
 pub const EMBEDDED_RELEASE_KEYS: &[&str] =
-    &["ed25519:kdNmHSKOupiiF2i5vCyNrNMmEeagWZzB4DOm/w3a1IY="];
+    &["ed25519:NCfgKCWG8/h7N57f3EEtle0NS/nJPr6QxBOtMnfvHDI="];
 ```
 
 Public keys are public; committing one is fine and pinning it in the binary is the point — a config file must never be able to widen what a production binary trusts. The *private* key lives outside the repository (generated with `relish dev keygen`, which chmods it 0600 and prints a warning to that effect).
@@ -372,33 +372,37 @@ A pid plus its start time is, for practical purposes, a unique process identity.
 
 ProcessGrill used to capture workload output with pipes: spawn with `Stdio::piped()`, read the other end in a tokio task. Follow the pieces through an exec. The reading task: gone (all threads). Bun's read-end FD: closed (CLOEXEC). The workload's write end: now points at a pipe nobody will ever read. The workload keeps serving happily until the pipe buffer fills or the kernel notices — and then its next `println!` gets **SIGPIPE, whose default action is process death**. The workload survives the upgrade and is then murdered by its own logging.
 
-The fix is the one runc used from day one: redirect stdout/stderr to *files*. A file doesn't care who reads it or whether the reader is alive; the workload appends through the swap without noticing, and the new bun just keeps reading from the recorded path. `ProcessGrill::with_log_dir` enables this mode (the binary uses it always; in-memory pipes remain for unit tests). This is the quiet lesson of the section: in a system where processes replace themselves, *shared state belongs in the filesystem, not in process plumbing*.
+The fix is the one runc used from day one: redirect stdout/stderr to *files*. A file doesn't care who reads it or whether the reader is alive; the workload appends through the swap without noticing, and the new bun just keeps reading from the recorded path. `ProcessGrill::with_owner` now enables file-backed capture and durable ownership in the binary; the earlier `with_log_dir` adapter remains for legacy tests. This is the quiet lesson of the section: in a system where processes replace themselves, *shared state belongs in the filesystem, not in process plumbing*.
 
 ### Problem 3: reaping — waitpid, ECHILD, and the two afterlives
 
-An adopted process has no `Child` handle, so someone must still collect its exit status when it dies — otherwise it lingers as a zombie. Here Unix hands us a fork in the road, because an adoptee has two possible histories:
+The first implementation reconstructed process ownership from a PID and start
+time. After an exec the workload was still Bun's child, so `waitpid` could reap
+it. After a full restart, init had adopted it and the replacement Bun could no
+longer collect its exit status. That difference made completed jobs look unknown.
+It also left a gap between spawn and the first adoption record.
 
-- **After an exec** (the upgrade path): it's still our child — same PID, remember. `waitpid(pid, WNOHANG)` works: it reports "still alive", or reaps the zombie and returns the exit code.
-- **After a full restart** (the crash path: the supervisor spawned a *new* bun process): the orphaned workload was reparented to init. `waitpid` returns `ECHILD` — "not your child" — and we fall back to `kill(pid, 0)`, the classic no-op signal that answers only "does this process exist?". The exit *code* is unknowable in this history; init reaped it.
+Production process mode now delegates to the durable foreground owner described
+in chapter 8. The owner retains the actual child across Bun exec and restart,
+records intent before activation, reaps the supported process group and persists
+the actual exit code. Bun controls it through a private generation-authenticated
+socket. The owner's short bootstrapper is reaped before launch is acknowledged;
+the long-lived owner is reparented to init, so Bun's exec cannot lose its reaper.
 
-```rust
-match waitpid(nix_pid, Some(WaitPidFlag::WNOHANG)) {
-    Ok(WaitStatus::StillAlive) => (true, None),
-    Ok(WaitStatus::Exited(_, code)) => (false, Some(code)),
-    Ok(_) => (false, None),                       // killed by signal, etc.
-    Err(Errno::ECHILD) => match kill(nix_pid, None) {
-        Ok(()) => (true, None),                   // alive, someone else's child
-        Err(_) => (false, None),                  // gone
-    },
-    Err(_) => (false, None),
-}
-```
+On Linux, `ECHILD` (no children) proves retirement only when reported to this
+owner after it has adopted and reaped the descendants. The same error in a new
+Bun process says nothing about somebody else's children. On macOS, the owner
+keeps its root child unreaped until a complete process-group snapshot contains
+no other members. Losing the owner remains uncertainty; a saved PID never grants
+a replacement permission to signal it. Logs remain readable for diagnosis.
 
-This is `poll_adopted_process`, and it's called from `state()` — which the supervisor polls continuously anyway, so polling doubles as reaping and no separate reaper task is needed. If you've only ever managed processes from Go's `os/exec` or Python's `subprocess`, this is the machinery those libraries hide from you; it stops being hideable the moment the process that called `spawn` isn't the process calling `wait`.
+The legacy PID-adoption helper remains in the older adapter and OCI paths.
+Those paths are separate from production process-mode ownership; C34 retains
+the remaining OCI launch/discovery recovery work.
 
-RunC adoption is the same story one level up, with one extra check: besides the `runc run` pid being live, `runc state <id>` must report the *container* as `running` — the pid check authenticates the process, the state check authenticates the container. Rootless runc has another process to own: `slirp4netns`. Its schema-v2 record carries the API socket, port mapping, container PID and the slirp PID/start-time pair. The adopter reclaims the exact live owner; if it died, Bun starts a replacement and restores the host forward before returning success. `make test-rootless-runc` kills that owner deliberately and proves the original host port still answers afterwards.
+RunC adoption currently uses a PID/start-time observation with an extra check: besides the `runc run` pid being live, `runc state <id>` must report the *container* as `running` — the pid check authenticates the process, the state check authenticates the container. Rootless runc has another process to own: `slirp4netns`. Its schema-v2 record carries the API socket, port mapping, container PID and the slirp PID/start-time pair. The adopter reclaims the exact live owner; if it died, Bun starts a replacement and restores the host forward before returning success. `make test-rootless-runc` kills that owner deliberately and proves the original host port still answers afterwards. Repeating adoption in the same Bun keeps its existing owner handle. Replacing a different owner first stops and reaps it, preserving the successor's socket; cancelled startup kills an unpublished helper. Chapter 3 explains why startup and handoff need different drop behaviour.
 
-Apple Container adoption drops the pid check entirely, and that's the interesting part. An Apple workload runs *inside a VM* managed by the `container` daemon; it was never a child of bun, so there's no pid to fingerprint. The recoverable handle is the container itself: `container inspect <id>` reporting `running` means the VM sailed through our exec, so we re-track the entry (rebuilt from the record's OCI spec) and re-discover its IP instead of tearing a perfectly good workload down. A vanished container declines adoption and reschedules the normal way. macOS exercises the pid-based path via ProcessGrill and the Apple path behind `make test-apple`.
+Apple Container adoption drops the pid check entirely, and that's the interesting part. An Apple workload runs *inside a VM* managed by the `container` daemon; it was never a child of bun, so there's no pid to fingerprint. The recoverable handle is the container itself: `container inspect <id>` reporting `running` means the VM sailed through our exec, so we re-track the entry (rebuilt from the record's OCI spec) and re-discover its IP instead of tearing a perfectly good workload down. A vanished container declines adoption and reschedules the normal way. macOS exercises durable process-owner recovery and the Apple path behind `make test-apple`.
 
 ### What we decided not to do
 
@@ -524,13 +528,19 @@ Two new log entries drive it, and their design follows the deploy machinery from
 
 Here's the part to read twice. The Raft log entries and the council's Raft RPC both carry `RaftRequest`, and `RaftRequest` is serialised as **self-describing JSON** — serde tags each enum variant by its *name* (`{"AppSpec": {...}}`), not by a numeric index. (This is the same reason the snapshot uses JSON, and the same lesson Chapter 2 learned the hard way: `RaftRequest` embeds config types like `replicas = "*"` that need serde's `deserialize_any`, which a positional format like bincode can't drive. So the log had to become self-describing.) Which sets the compatibility rule:
 
-**Never rename or remove a `RaftRequest` variant. Adding new variants is safe; give any new field a `#[serde(default)]` so old entries decode.**
+**A parseable entry is not a compatibility contract.** Renaming a variant breaks old log entries. Adding a variant can also break a rolling upgrade: a newly elected leader may emit it while an old follower still runs. Leader-last ordering reduces disruption; it cannot prevent an election.
 
-Because the tag is a name, an old node replaying the log — or receiving entries from a mixed-version peer during, say, *a rolling upgrade* — decodes each entry by matching the variant name it knows. A brand-new variant it's never heard of fails to decode (a clean error, not silent garbage), which is exactly why the leader upgrades last and workers first: by the time a variant only the new binary emits can appear, every follower already understands it. Rename `AppSpec` to `ApplicationSpec`, though, and every existing log entry with that tag becomes undecodable on the new binary. Remove a variant and the same happens on the old one. So the append-and-default discipline stands; only the mechanism differs from a positional format.
+For 0.1.0 we make a narrower promise. A binary advertises two independent integers, a protocol generation and a durable-state generation. State generation 3 and protocol generation 4 include durable node-chaos reservations and their target-side fencing contract. Older development generations lack that safety contract and must start fresh clusters. Reporting admission acknowledgements, introduced in protocol generation 3, remain required. Product versions may differ, but a rolling upgrade or rollback requires exact equality of both generations. An incompatible schema change must bump the affected generation. We do not yet provide cross-generation migration.
 
-The *snapshot* uses the same self-describing JSON, and its two upgrade fields carry `#[serde(default)]`. An old snapshot simply lacks those keys and they default to empty. That property is pinned by a test worth imitating — `old_snapshot_without_upgrade_fields_still_loads` serialises a current `DesiredState`, *deletes* the new keys to forge an old-format snapshot, and reloads it. Schema-evolution rules you don't test are schema-evolution rules you don't have.
+Run `bun --compatibility` to read the contract as JSON. This path returns before loading configuration or creating a Tokio runtime. The upgrade manager first verifies the release signatures, then writes those verified bytes to a private temporary executable and runs the query. Its output is capped at 4 KiB, and a ten-second deadline kills and reaps a stalled child. Only a matching response permits staging and an upgrade marker. Rollback checks its retained binary too.
 
-(Not everything on the wire is JSON. Gossip datagrams and the reporting-tree transport stay bincode — they're small, fixed-shape, and hot, and Chapter 2's trailing-bytes trick already handles their evolution. Only the paths that carry flexible config types, the Raft log and RPC and the snapshot, pay JSON's verbosity to buy `deserialize_any` and name-tagged evolution.)
+Why a private copy? Querying the download path and later reading it again would allow the file to change between verification and execution. `NamedTempFile::into_temp_path` gives us an owned path that deletes the file when it is dropped, while closing the writable descriptor before Linux executes it. An open writable descriptor causes `ETXTBSY` (text file busy). The child has `kill_on_drop` enabled so cancellation does not leave the query running.
+
+The same rule applies at other boundaries. Raft requests and responses carry both generations, and development requests cannot reach consensus. Reporting frames carry a fixed header before their bounded bincode payload. Gossip rejects either wrong generation before applying membership or directory updates. A joining client queries the pinned member before revealing its one-time token; the issuer checks the client's contract before consuming that token.
+
+On disk, the node writes a private, durable `state-format.json` stamp before opening subsystems. Unmarked development data is refused and left for the operator to preserve. A newly enrolled identity directory may precede the stamp. Snapshots and sealed backups have their own required generation; recovery refuses old sources and unmarked destinations before removing any log. A serde default can remain useful for a field whose absence has explicitly compatible semantics, but it does not authorise loading an arbitrary development snapshot.
+
+Tests cover incompatible gossip and Raft messages, legacy reporting, preserved development state, rejected joins, signed incompatible executables, rollback refusal and bounded query failure. The real-process rolling-upgrade suite uses two product versions with the same explicit formats to prove that this supported path still works.
 
 ### Cordoning
 
@@ -561,6 +571,30 @@ Every `step` begins by *polling reality* — `/v1/version` on each node it cares
 Failure detection also falls out of polling. A node that was `Verifying` and reappears on its *old* version, no upgrade in flight, has self-reverted (§14.4 did its job) — mark it `Failed`, pause the whole run. A node that vanishes entirely trips a stuck-node timeout. Per the design doc, cluster-level reaction to failure is deliberately *pause and tell the operator*, not auto-rollback of the fleet: one node's revert is contained, but yanking N healthy nodes back because one disagreed multiplies the blast radius on the worst day. `upgrade resume` returns `Failed` nodes to `Pending` (where the poll-first habit sorts out what actually needs doing) and re-enters the earliest unfinished group.
 
 One more thing has to be true before a node counts as *done*, and it's easy to miss: the node has to be back in the **gossip mesh**. HTTP-healthy at the target version is necessary but not sufficient — a process can come up, answer `/v1/health`, and still be isolated from the mesh (a firewall that didn't reopen, an interface that didn't come back). An isolated node takes no service traffic and its vote doesn't count; calling it "upgraded" and moving on would quietly shrink the cluster one node at a time. So the `Healthy` transition needs all three: target version, HTTP-healthy, *and* `Alive` in the current gossip snapshot. A node that's healthy-but-not-in-gossip is held in `Verifying` until it rejoins — and if it never does, the stuck-node timeout catches it and pauses the run, which is exactly the operator's cue that something's wrong with that box. The two unit tests spell out the difference: same probe (healthy, on target), one with the node in the gossip-alive set and one without — the first completes, the second doesn't.
+
+### The replacement must prove rejoin locally too
+
+The coordinator's check does not own the marker on a replaced node. We now
+require two independent facts before that process removes its marker: it survived
+`boot_grace_secs`, and its own gossip transport received a direct peer ACK within
+`gossip_rejoin_secs`. Restored membership, configured seeds and an HTTP response
+are not that evidence. Even a singleton running in cluster mode needs a peer;
+standalone mode retains its workload-only verification.
+
+A `watch::Receiver<bool>` carries this process-local observation. The receiver
+starts at `false`; only receipt of a direct acknowledgement changes it. It is
+never serialised or restored from disk. `tokio::join!` polls the boot-grace timer
+and the bounded gossip wait together, so a long grace period does not quietly
+extend the rejoin deadline. A closed channel is a failure too: the owner has
+stopped without proving rejoin.
+
+Failure writes `RevertPending` before exiting. If that write fails, the process
+reports the error and keeps the uncommitted marker; it cannot report success.
+The supervisor then uses the existing revert and workload-adoption machinery.
+The real-process regression runs a healthy isolated cluster node, upgrades it,
+checks that its marker survives boot grace, and verifies that the old binary
+returns with the same workload PID. Separate coordinator tests still require
+that node to appear alive before the rolling upgrade advances.
 
 ### The leader goes last — in place
 
@@ -679,3 +713,265 @@ the binary, and check that verification then fails. They also reject missing
 platforms and an untrusted key. The public release key stays out of the test
 fixture. See [the release procedure](../releasing.md) for the operator steps and
 remaining candidate-qualification gates.
+
+### Pin the compiler used to build a replacement
+
+A tag and a dependency lockfile don't identify the compiler. Release builds now
+use Rust 1.98.0 explicitly, while a separate CI job checks and tests the declared
+minimum, 1.97.0, with the locked graph and both feature configurations. Stacked
+PRs receive the same checks as PRs into main.
+
+Changing either compiler is a reviewed build-policy change: update the manifest
+minimum if necessary, update the workflow pins and documentation, then rerun
+minimum-compiler, release-build and upgrade qualification. Rebuild and publish a
+new candidate with its own checksum and provenance; don't replace bytes behind
+an existing release tag. Pinning Rust improves repeatability but does not claim
+bit-for-bit reproducibility across different operating systems or linkers.
+
+
+### Establishing the first supported release identity
+
+The development signing key's private half was unavailable when we prepared
+0.1.0. We generated a new Ed25519 identity, checked its public half into the
+trust list, verified a signature locally and configured the matching private key
+as the repository's release Actions secret. The private file stays outside Git,
+readable only by its owner. It also needs an encrypted offline backup.
+
+This works because 0.1.0 starts with fresh clusters. After a supported release,
+changing the public key alone would strand installed nodes: they would reject
+our next binary. That is why the trust list is a slice rather than one key.
+A future rotation first ships a release trusting both old and new identities,
+then changes the signer, then removes the retired public key in a later release.
+The packaging workflow refuses a signing key absent from the compiled trust list.
+
+
+### Give bulk uploads their own deadline
+
+The upgrade harness uses a five-second HTTP deadline so a stalled status endpoint
+cannot freeze the test. A debug Bun executable can be hundreds of MiB, though;
+uploading and hashing it is a different operation. A Linux qualification run
+failed in that upload before any rolling replacement began. The upload now has
+its own 60-second deadline. Status calls retain five seconds and the overall
+upgrade deadline is unchanged. The complete Linux suite passes with these bounds.
+
+
+### Wait for the replacement coordinator's membership view
+
+A completed rolling upgrade and a reachable new leader do not mean that leader
+has already rediscovered every peer. Gossip rebuilds its local view after exec.
+An immediate rollback request can therefore be correctly refused as targeting
+an unknown live member. The harness now waits for the leader to agree on its
+role, archive the previous operation, and see every target alive before asking
+for rollback. It keeps the same bounded wait and does not retry a mutation with
+an unknown outcome. All three Linux upgrade cases pass in 198.90 seconds with
+this preflight; the server continues to reject an incomplete authoritative view.
+
+Compatibility fixtures need two distinct jobs. A fixture for a *compatible*
+upgrade or join derives its declaration from `compatibility::CURRENT`, so a
+new state generation doesn't turn an unrelated signature or rollback test
+into an old-format rejection. Tests of incompatible binaries keep deliberately
+old or invalid declarations. This distinction caught up with us when leased
+tokens advanced the state format: three hard-coded fixtures caused ten CI
+failures, all at compatibility admission rather than the behaviour under test.
+We repaired the fixtures and retained the independent refusal tests.
+
+The real `bun --compatibility` integration test must follow the same rule.
+Placement ownership advanced durable state to generation 5, but this last
+fixture still required 4. Hosted CI caught it across both platforms. It now
+decodes the typed `Compatibility` response and compares it with `CURRENT`;
+the separate startup test still requires unmarked development state to be
+refused without changing its files.
+
+
+### A closed writer can still leave an executable busy
+
+The full Linux library run caught an upgrade preparation failing with
+`Text file busy`. We had already closed our writable temporary file before
+launching it. Another thread can fork during that write, though, briefly
+inheriting the descriptor until its own exec closes it. This is a
+[documented Rust process-launch race](https://github.com/rust-lang/rust/issues/114554)
+and is consistent with the failure we observed.
+
+The compatibility probe now retries only that operating-system error. It keeps
+the same private, signature-verified executable and shares one ten-second
+deadline between launch attempts and the compatibility response. Permission
+errors, invalid executables and incompatible declarations still fail. Retrying
+cannot turn an incompatible binary into an accepted one.
+
+Our regression prepares 32 signed candidates while four tasks repeatedly launch
+other processes. It passed before the repair too: a stress test does not force
+this race on every run. The failing full-suite checkpoint is the evidence for
+the original defect; the concurrent test protects the surrounding behaviour.
+Existing stalled-probe tests still check that preparation is bounded and leaves
+no staged upgrade behind.
+
+### An inspection error isn't a dead workload
+
+Suppose Bun restarts while the container runtime cannot answer its inspection
+request. The old adoption loop treated every result except `Ok(true)` as a dead
+workload. It removed the instance record, then swept identity files that no
+in-memory instance claimed. The process could still be running. We'd lost the
+information needed to recover it.
+
+Adoption now returns `Result<usize, BunError>`. The count belongs to the `Ok`
+case; an inspection error belongs to `Err` and propagates through startup's `?`.
+Only an explicit `Ok(false)` from the runtime permits dead-owner cleanup.
+Each runtime adoption call has a ten-second deadline. An error or timeout stops
+startup before Bun starts accepting API requests, leaving ownership records and
+identity material available for recovery. An incompatible runtime or conflicting
+host-port reservation also refuses. A later retry can adopt the same instance.
+
+The record loader follows the same rule. A fresh node may have no records
+directory, but an unreadable directory, malformed JSON, unknown schema or an
+identifier that disagrees with its filename isn't an empty inventory. Symlinks
+and non-regular records refuse too. On Unix, `O_NOFOLLOW` prevents opening a
+symlink target and `O_NONBLOCK` prevents a FIFO named `.json` from hanging the
+open. We check that the opened descriptor describes a regular file before
+parsing it. `BufReader` batches filesystem reads for the JSON parser.
+
+We load the complete inventory on `spawn_blocking` before adopting any record.
+The outer result reports a failed worker task; the inner result reports a failed
+filesystem read or parse. Both must succeed. For a confirmed dead owner, identity
+cleanup also runs off the async executor and must finish before we remove its
+record. A failed unmount or removal leaves a record that the next startup can
+retry.
+
+The two original regressions reproduce lost ownership and swept identity files
+before the repair. Further tests cover port conflicts, runtime mismatches,
+malformed records, symlinks, FIFOs and failed identity cleanup followed by retry.
+The actual-binary refusal fixture keeps its corrupt record intact and requires
+Bun to exit before announcing an API listener. These checks don't establish
+atomic process identity, nor do they excuse a runtime that incorrectly reports
+an inspection failure as `Ok(false)`. Those runtime boundaries need their own
+proof.
+
+The process and runc adoption boundaries now use the checked process poller,
+too. A positive liveness check can establish a running owner; an inspection
+error cannot establish a dead one. In particular, a corrupt record must not
+turn PID zero or an overflowing unsigned PID into a Unix group selector. The
+poller converts with `i32::try_from` and rejects non-positive values before any
+process inspection or syscall. Unlike `as`, this conversion reports overflow.
+Both runtimes propagate that error, and runc leaves its container resources
+untouched without even invoking its CLI. Tests exercise all three invalid PID
+boundaries alongside live, exited and reused processes.
+
+Apple Container needs different evidence because its workloads live in VMs.
+Its [inspection command](https://github.com/apple/container/blob/0.10.0/Sources/ContainerCommands/Container/ContainerInspect.swift)
+returns an empty JSON array when a successful daemon inventory doesn't contain
+the requested name. We verified that with the installed CLI as well. A failed
+command, malformed response or mismatched identity is an error, not absence.
+Only a matching running container is adopted; a matching stopped container or
+confirmed absence declines adoption. Created and paused containers refuse
+startup rather than losing their ownership records.
+
+Inspection has a ten-second deadline. `kill_on_drop(true)` tells Tokio to kill
+the CLI child if cancellation drops its handle, including when the deadline
+expires. Our stalled-command fixture verifies that the child disappears. The
+other fixture feeds daemon errors, malformed JSON, wrong identities and valid
+running/stopped/absent results through the public runtime interface. Neither
+test needs to stop the machine's actual container daemon to simulate failure.
+
+
+### Put the release endpoint where the lookup happens
+
+`relish upgrade check --url` selects the metadata endpoint. The CLI performs that
+lookup; Bun's node configuration doesn't control it. We remove the unused
+`[upgrades] release_url` field, which previously accepted an operator's URL and
+then ignored it. Existing `deny_unknown_fields` parsing now rejects the obsolete
+key by name. Remove it from development node configurations and pass the CLI
+option when using a different endpoint. A failing-first parsing regression checks
+that the unused setting can no longer appear to succeed.
+
+
+### Locate the API before uploading
+
+The gossip port identifies a membership listener, not the upgrade API. A
+cluster plan now takes each node's API address from the resolved peer directory.
+This supports different ports on one host and bracketed IPv6 addresses. If
+membership lacks an address, the CLI refuses before uploading; an operator can
+supply an explicit `--node-address id=host:port`. Reusing port 9117 for every
+node could send an upgrade to the wrong process.
+
+
+### Keep one identity across restart
+
+An old record says `web-0`, but the replacement Bun invents
+`default__web-0` for its supervisor map. Adoption can appear to work: the
+runtime still finds `web-0`. Later, retirement looks up the new name and misses
+the owner. Two names for one running workload are a recovery bug.
+
+Startup now checks the complete ownership inventory before adopting anything,
+removing stale records or sweeping identity directories. Each stored namespace
+and app name must satisfy the same label rules as deployment admission. The
+stored instance ID must exactly match those fields and its replica index,
+including an optional canonical deployment generation. An explicitly recorded
+app-spec namespace must agree too. Runtime selection is checked in the same
+preflight pass.
+
+We use the structured app name to resolve an ambiguity: an ordinary app named
+`worker-g9` and generation nine of an app named `worker` can have the same
+textual suffix. A heuristic split on `-g` cannot decide which owner a record
+means. The stored fields can. This validation preserves valid generation-like
+app names without silently relabelling them.
+
+Unsupported legacy aliases and inconsistent records refuse startup. The record,
+identity files and runtime remain untouched. This follows 0.1.0's fresh-cluster
+policy; we don't promise an implicit migration from development snapshots.
+Global collisions between two newly allocated IDs still need admission guards.
+
+The regression first demonstrates that Bun adopts the legacy alias. After the
+repair, it checks legacy, mismatched and invalid-label records and asserts that
+no runtime operation was attempted and the record is unchanged. Valid ordinary
+and rolling IDs for `worker-g9` remain adoptable. The real signed-exec test then
+checks a surviving generation-one workload and a generation-two deployment
+through the replacement Bun.
+
+### Keep test port reservations until launch
+
+The isolated-replacement qualification once failed before the upgrade began:
+Bun repeatedly reported an occupied address. The harness had released its API
+and registry reservations before choosing Raft and reporting ports, allowing
+a later allocation to reuse an earlier number. We keep the fixed sockets alive
+together until the supervisor launches Bun. Rust releases each socket when its
+owning value is dropped, so retaining those values retains the reservations.
+Pickle uses port zero because this fixture never addresses its registry directly;
+the kernel chooses an available port at the actual bind. Replacements reuse the
+fixed API and cluster addresses, preserving the test's original observation and
+rejoin deadlines. A port allocation failure is not evidence about rollback.
+
+### Carry runtime ownership through the actual swap
+
+The OCI qualification copies the compiled Bun into two versioned files, signs the
+candidate with a disposable test key, then invokes the real upgrade and rollback
+APIs. Both binaries use normal durable startup. The workload must keep its exact
+instance ID, PID and host port through both execs, and its main-command marker must
+appear only once. Rootful qualification also compares the original kernel manifest;
+rootless qualification requests the same forwarded HTTP endpoint after rollback.
+Finally, confirmed stop must clear discovery ownership. These checks cover actual
+runtime recovery during a successful upgrade and explicit rollback. A failed
+candidate's automatic revert and cluster rolling upgrades need their own OCI cases.
+
+The OCI matrix also poisons the candidate with the debug-only boot-failure sidecar.
+After the actual failed process exits, the fixture performs bounded supervisor
+restarts until Bun's original boot-attempt journal selects the previous binary.
+It requires a recorded `Reverted` outcome and unchanged workload identity, PID and
+host port. Both rootful and rootless paths then complete confirmed cleanup. The
+sidecar and throwaway signing key remain test-only; release binaries contain neither
+this failure trigger nor the test key override.
+
+### Three enrolled OCI nodes
+
+The next fixture creates three real Bun processes with Runc, pinned kernel policy
+and durable consumer journals. Peers enrol through single-use join tokens under
+an operator credential; the internal service principal deliberately cannot manage
+users or join tokens. The nodes share a private test network namespace and use
+consistent gossip-to-Raft/reporting port offsets, as council discovery requires.
+A placement label keeps the one OCI workload on its original node.
+
+We upgrade each node through its signed node API, with the leader last, then roll
+all three back. After every swap, all three consumers must republish the service,
+the producer must retain its original PID and port, and kernel manifests must
+match. Removing the desired app finally waits for all three journals to clear their
+release obligations. This isolates runtime recovery from the rolling planner;
+its separate ordering/pause tests and the independent-host release matrix remain
+necessary. The real sequence passes in 76.54 seconds on the qualification VM.

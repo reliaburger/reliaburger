@@ -250,7 +250,7 @@ pub fn require_role(ctx: &AuthContext, required: ApiRole) -> Result<(), (StatusC
 }
 
 /// The `AuthContext` for the internal service principal (Admin-equivalent).
-fn system_context() -> AuthContext {
+pub(crate) fn system_context() -> AuthContext {
     AuthContext {
         token_name: SYSTEM_PRINCIPAL.to_string(),
         principal_id: SYSTEM_PRINCIPAL.to_string(),
@@ -564,8 +564,7 @@ pub fn require_unscoped(ctx: Option<&AuthContext>) -> Result<(), Response> {
     }
     Err((
         StatusCode::FORBIDDEN,
-        "this endpoint reads across every app and namespace, so a scoped token \
-         cannot use it — query /v1/logs/query/{app}/{namespace} instead",
+        "this endpoint requires cluster-wide authority; scoped tokens cannot use it",
     )
         .into_response())
 }

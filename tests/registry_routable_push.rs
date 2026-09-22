@@ -47,6 +47,9 @@ async fn start_authenticated_registry() -> (u16, CancellationToken, tempfile::Te
         catalog: Arc::new(RwLock::new(ManifestCatalog::default())),
         node_raft_id: 1,
         council: None,
+        forwarder: None,
+        test_leases: Default::default(),
+        repository_writers: Default::default(),
         persist_path: None,
         auth: Some(AuthState::new(
             new_token_store(),

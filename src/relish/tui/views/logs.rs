@@ -20,6 +20,7 @@ pub fn lines(app: &TuiApp, height: usize) -> Vec<Line<'static>> {
         "{name} · {namespace} · follow {}",
         if app.log_follow { "on" } else { "off" }
     ))];
+    lines.push(Line::raw("live logs from the connected node"));
     if let Some(error) = &app.log_stream_down {
         lines.push(Line::raw(format!(
             "stream disconnected — reconnecting: {error}"

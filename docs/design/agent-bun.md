@@ -35,6 +35,17 @@ Grill is Bun's container runtime interface -- the abstraction layer between Bun'
 
 > **Decision log — Grill drives runtimes directly, not via containerd.** An earlier draft (still visible in a few listings below, e.g. §2 and §4.1) had Grill talk to `containerd` over its gRPC socket. The shipped Grill has three concrete backends and no containerd dependency: `runc` on Linux (Grill writes the OCI bundle and drives foreground `runc run` plus the state/exec commands itself), Apple Container on macOS, and a `process` backend that runs a host binary with no OCI runtime at all. We dropped containerd because it duplicated the exact state Bun already keeps (which container is where, in what state) and added a socket, a gRPC dependency, and a second thing to keep alive under memory pressure — for a single-binary orchestrator that already reconciles container state on restart, the shim earned its keep nowhere. Where the text below says "containerd," read "the Grill backend for this node's runtime." References to state surviving Bun restarts still hold: `runc`'s own `state` and the Apple VM outlive Bun, and Grill re-adopts them on startup.
 
+**0.1.0 process-mode scope (20 September 2026):** Native process workloads must
+run in the foreground and keep all children in the supervised process group.
+Daemonising, detached sessions/groups and hand-off to external service managers
+are unsupported. Use Linux containers for those workloads. This is a cooperative
+lifecycle contract, not containment. Production process mode uses a durable
+foreground owner: intent precedes execution, and startup reconciles every launch
+before adopting workloads or allowing replacements. Missing owners retain
+uncertainty; completed jobs preserve their exit code even without an agent PID
+record. C34 still tracks remaining runtime/discovery recovery and qualification.
+The broader process-isolation design below remains future work.
+
 **Key design decisions:**
 
 1. **Single binary, no sidecar model.** Bun is not a separate process from the orchestrator -- it IS the orchestrator on this node. All subsystems (Grill, Onion, Ketchup, Mayo, Pickle, Mustard, Wrapper, Brioche) run as async tasks within the same Tokio runtime. This eliminates IPC overhead and version compatibility concerns between components.
@@ -204,7 +215,7 @@ HealthChecker (periodic per workload)
 - Attaching to container stdio streams for log capture
 - Reconnecting to running containers after Bun restart
 
-**ProcessManager** handles non-container workloads. Today (the `process` Grill backend, `src/grill/process.rs`) it validates the binary against the allowlist and then spawns the host process directly (`std::process::Command`), in its own process group, with the spec's environment and stdout/stderr captured for Ketchup. Writing inline scripts to temporary files and marking them executable is real. The namespace/seccomp/user-drop machinery below is the **planned** design, not current behaviour:
+**ProcessManager** handles non-container workloads. Today (the `process` Grill backend, `src/grill/process.rs`) it validates the binary against the allowlist and then starts the host process through a durable owner and activation gate, in its own process group, with the spec's environment and stdout/stderr captured for Ketchup. Auxiliary exec commands have child owners, and application retirement waits for their confirmed cleanup too. Writing inline scripts to temporary files and marking them executable is real. The namespace/seccomp/user-drop machinery below is the **planned** design, not current behaviour:
 
 - Validating binaries against the allowlist in `node.toml` *(shipped)*
 - Writing inline scripts to temporary files and marking them executable *(shipped)*
@@ -767,8 +778,6 @@ pub struct UpgradeConfig {
     pub external_signing_key: Option<String>,
     /// Number of previous binary versions to retain on disk.
     pub retain_versions: u32,   // default: 3
-    /// Release metadata endpoint URL.
-    pub release_url: String,    // default: https://releases.reliaburger.dev/metadata.json
 }
 ```
 
@@ -961,7 +970,7 @@ before their Phase 15 cases can use this contract.
 
 ### 5.2 Process Workload Lifecycle
 
-> **Status: the isolation stack (steps 7-12) is planned — not yet implemented.** What ships today is the admission gate in step 3 (deny-by-default binary allowlist plus honest refusal of isolation a node can't provide) followed by a direct host `spawn` of the binary, in its own process group, with the spec's environment and stdout/stderr captured (`src/grill/process.rs`). The mount/PID/network/UTS namespaces, the seccomp profile, and dropping to the `burger` user (steps 7-12 below) describe the target design; a process workload currently runs as an ordinary child of the Bun process. Treat steps 7-12 as the roadmap, not a description of the running binary.
+> **Status: the isolation stack (steps 7-12) is planned — not yet implemented.** What ships today is the admission gate in step 3 (deny-by-default binary allowlist plus honest refusal of isolation a node can't provide) followed by a direct host `spawn` of the binary, in its own process group, with the spec's environment and stdout/stderr captured (`src/grill/process.rs`). The mount/PID/network/UTS namespaces, the seccomp profile, and dropping to the `burger` user (steps 7-12 below) describe the target design; a process workload currently runs as a child of its durable foreground owner, without that isolation stack. Treat steps 7-12 as the roadmap, not a description of the running binary.
 
 **Start a process workload:**
 
@@ -1277,7 +1286,6 @@ join = ["10.0.1.5:9443"]
 | `[process_workloads]` | `allow_globs` | `false` | bool | Allow glob patterns in `allowed_binaries`. |
 | `[upgrades]` | `external_signing_key` | (none) | `"ed25519:..."` | External signing key for dual-signature verification. Required for network upgrades. |
 | `[upgrades]` | `retain_versions` | `3` | 1-10 | Number of previous binary versions to keep on disk. |
-| `[upgrades]` | `release_url` | `"https://releases.reliaburger.dev/metadata.json"` | URL | Release metadata endpoint for version checks. |
 | `[testing]` | `external_probe_allowlist` | `[]` | exact `host:port` strings | External destinations `relish trace` may probe after its independent Admin, operation and protected-cluster checks; an empty list permits none. Wildcards and CIDRs do not match. |
 
 ---
@@ -1406,7 +1414,7 @@ join = ["10.0.1.5:9443"]
 
 ### 8.2 Trust Boundaries
 
-> **Note: the "Process workloads" boundary below is the planned target, not the current state.** Process workloads today run as ordinary children of the Bun process without the PID/network/mount/UTS namespaces, seccomp filter, restricted filesystem view, or `burger` user shown in that box. The container-workload boundary is real; the process-workload isolation is the roadmap described in §5.2.
+> **Note: the "Process workloads" boundary below is the planned target, not the current state.** Process workloads today run under durable foreground owners without the PID/network/mount/UTS namespaces, seccomp filter, restricted filesystem view, or `burger` user shown in that box. The container-workload boundary is real; the process-workload isolation is the roadmap described in §5.2.
 
 ```
 ┌─────────────────────────────────────────────────────┐
@@ -1785,3 +1793,7 @@ Bun Restart
 9. **Self-upgrade rollback detection timeout:** Currently, if the new Bun exits within 30 seconds or fails to rejoin gossip within 60 seconds, it auto-reverts. Are these timeouts appropriate for all environments? Should they be configurable in `node.toml`?
 
 10. **nftables vs pure eBPF for perimeter rules:** The current design uses nftables for perimeter enforcement (cluster boundary, management access, egress allowlists) and eBPF for inter-app rules. Could perimeter rules also move to eBPF, eliminating the nftables dependency entirely? This would simplify the dependency tree but may lose nftables' mature logging and accounting features.
+
+Release metadata lookup belongs to the CLI: use `relish upgrade check --url`
+to override its compiled default. Node TOML rejects the obsolete `release_url`
+key, which never controlled that lookup.

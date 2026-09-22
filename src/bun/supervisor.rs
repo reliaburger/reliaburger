@@ -53,6 +53,8 @@ pub struct WorkloadInstance {
     pub health_config: Option<HealthCheckConfig>,
     /// Whether this instance is a job (run-to-completion) rather than an app.
     pub is_job: bool,
+    /// A failed execution needs cleanup or retry, rather than an explicit stop.
+    pub retry_pending: bool,
     /// OCI image reference, e.g. "docker.io/library/nginx:latest".
     pub image: String,
     /// Stored OCI spec for restart re-drive. Set during initial startup.
@@ -354,6 +356,51 @@ impl<G: Grill> WorkloadSupervisor<G> {
         self.health_checker.register(id, config, now);
     }
 
+    /// Preserve the kind of every retained runtime owner before admitting work.
+    pub(crate) fn admit_workload_kind(
+        &self,
+        name: &str,
+        namespace: &str,
+        kind: super::deploy_operations::DeployTargetKind,
+    ) -> Result<(), BunError> {
+        let is_job = kind == super::deploy_operations::DeployTargetKind::Job;
+        if let Some(existing) = self.instances.values().find(|instance| {
+            instance.app_name == name
+                && instance.namespace == namespace
+                && instance.is_job != is_job
+        }) {
+            let owner = if existing.is_job { "job" } else { "app" };
+            return Err(BunError::DeployFailed {
+                app_name: name.into(),
+                reason: format!(
+                    "{namespace}/{name} is owned by an existing {owner}; apps and jobs must use distinct names"
+                ),
+            });
+        }
+        Ok(())
+    }
+
+    /// Keep textual IDs from replacing a different structured workload owner.
+    fn admit_instance_identity(
+        &self,
+        id: &InstanceId,
+        name: &str,
+        namespace: &str,
+    ) -> Result<(), BunError> {
+        if let Some(owner) = self.instances.get(id)
+            && (owner.app_name != name || owner.namespace != namespace)
+        {
+            return Err(BunError::DeployFailed {
+                app_name: name.into(),
+                reason: format!(
+                    "instance {id} is still owned by {}/{}; choose a different workload name or retire the existing owner",
+                    owner.namespace, owner.app_name,
+                ),
+            });
+        }
+        Ok(())
+    }
+
     /// Deploy an app, creating workload instances in Pending state.
     ///
     /// Creates one instance per replica. For `DaemonSet` mode, creates
@@ -368,12 +415,23 @@ impl<G: Grill> WorkloadSupervisor<G> {
         // Refuse anything this node can't honour before we allocate a thing:
         // an un-allowlisted host binary/script, a GPU we don't have, or a
         // resource limit rootless can't enforce.
+        self.admit_workload_kind(
+            app_name,
+            namespace,
+            super::deploy_operations::DeployTargetKind::App,
+        )?;
         self.admit_app(app_name, spec)?;
 
         let replica_count = match spec.replicas {
             Replicas::Fixed(n) => n,
             Replicas::DaemonSet => 1,
         };
+
+        // Preflight the whole fleet before reserving a port for any replica.
+        for index in 0..replica_count {
+            let id = crate::grill::InstanceIdentity::new(namespace, app_name, index).instance_id();
+            self.admit_instance_identity(&id, app_name, namespace)?;
+        }
 
         // Build every replica into locals FIRST, committing nothing to
         // `self` until they all succeed (M24). If a later replica's port
@@ -438,6 +496,7 @@ impl<G: Grill> WorkloadSupervisor<G> {
                 restart_policy: RestartPolicy::default(),
                 health_config,
                 is_job: false,
+                retry_pending: false,
                 image: spec.image.clone().unwrap_or_default(),
                 oci_spec: None,
                 identity: None,
@@ -478,12 +537,18 @@ impl<G: Grill> WorkloadSupervisor<G> {
         spec: &JobSpec,
         now: Instant,
     ) -> Result<Vec<InstanceId>, BunError> {
+        self.admit_workload_kind(
+            job_name,
+            namespace,
+            super::deploy_operations::DeployTargetKind::Job,
+        )?;
         // Same admission gate as apps (jobs have no GPU field, so only the
         // host-exec/script allowlist and rootless-limit checks apply).
         self.admit_process_workload(job_name, spec.exec.as_deref(), spec.script.as_deref())?;
         self.admit_rootless_limits(job_name, spec.memory.is_some() || spec.cpu.is_some())?;
 
         let instance_id = crate::grill::InstanceIdentity::new(namespace, job_name, 0).instance_id();
+        self.admit_instance_identity(&instance_id, job_name, namespace)?;
 
         let instance = WorkloadInstance {
             id: instance_id.clone(),
@@ -499,6 +564,7 @@ impl<G: Grill> WorkloadSupervisor<G> {
             restart_policy: RestartPolicy::for_job(3),
             health_config: None,
             is_job: true,
+            retry_pending: false,
             image: spec.image.clone().unwrap_or_default(),
             oci_spec: None,
             identity: None,
@@ -514,7 +580,7 @@ impl<G: Grill> WorkloadSupervisor<G> {
         Ok(vec![instance_id])
     }
 
-    /// Stop all instances of an app by transitioning Running/Unhealthy → Stopping.
+    /// Cancel retries and move nonterminal instances towards observed shutdown.
     pub async fn stop_app(&mut self, app_name: &str, namespace: &str) -> Result<(), BunError> {
         let key = (app_name.to_string(), namespace.to_string());
         let ids = self
@@ -534,10 +600,8 @@ impl<G: Grill> WorkloadSupervisor<G> {
                         instance_id: id.clone(),
                     })?;
 
-            if matches!(
-                instance.state,
-                ContainerState::Running | ContainerState::Unhealthy
-            ) {
+            instance.retry_pending = false;
+            if instance.state.can_transition_to(ContainerState::Stopping) {
                 instance.state = instance.state.transition_to(ContainerState::Stopping)?;
                 self.health_checker.unregister(id);
             }
@@ -546,44 +610,12 @@ impl<G: Grill> WorkloadSupervisor<G> {
         Ok(())
     }
 
-    /// Remove all instances of an app from the supervisor tracking.
+    /// Forget one confirmed retired instance without touching the rest of its app.
     ///
-    /// Kills running processes via the Grill and removes all state.
-    /// Used during redeploy to clear stale instances before creating fresh ones.
-    pub async fn remove_app(&mut self, app_name: &str, namespace: &str) {
-        let key = (app_name.to_string(), namespace.to_string());
-        let ids = match self.app_instances.remove(&key) {
-            Some(ids) => ids,
-            None => return,
-        };
-
-        for id in &ids {
-            // Force-kill the process (SIGKILL, immediate, sets state to Stopped)
-            let _ = self.grill.kill(id).await;
-            self.health_checker.unregister(id);
-            // Return the instance's host port to the pool before dropping it,
-            // otherwise the allocation leaks until the agent restarts.
-            if let Some(instance) = self.instances.get(id)
-                && let Some(port) = instance.host_port
-            {
-                let _ = self.port_allocator.release(port).await;
-            }
-            self.instances.remove(id);
-        }
-    }
-
-    /// Forget one retired instance without touching the rest of its app (M7).
-    ///
-    /// A rolling deploy retires old instances one at a time now, and an
-    /// instance that has been deliberately stopped but is still in
-    /// `instances` is indistinguishable from one that crashed — the restart
-    /// driver would bring it back. So retirement has to drop it here, in the
-    /// same command-loop turn that stopped it.
-    ///
-    /// The caller has already stopped the container; this releases the host
-    /// port, unregisters health checking and removes the bookkeeping, and
-    /// also drops the id from its app's instance list so a later
-    /// [`Self::remove_app`] doesn't try to kill it again.
+    /// The caller has already observed runtime exit and completed durable artifact
+    /// cleanup. This releases the host port, unregisters health checks and removes
+    /// the instance from both inventories. Until this call, a stopped instance can
+    /// retain ownership so failed cleanup remains retryable.
     pub async fn retire_instance(&mut self, id: &InstanceId) {
         self.health_checker.unregister(id);
         if let Some(instance) = self.instances.get(id) {
@@ -708,6 +740,7 @@ impl<G: Grill> WorkloadSupervisor<G> {
         }
 
         instance.state = instance.state.transition_to(ContainerState::Pending)?;
+        instance.retry_pending = false;
         instance.restart_count += 1;
         instance.last_restart = Some(now);
         instance.health_counters.reset();
@@ -728,13 +761,6 @@ impl<G: Grill> WorkloadSupervisor<G> {
     /// Access the underlying runtime.
     pub fn grill(&self) -> &G {
         &self.grill
-    }
-
-    /// Clone the port allocator. Cheap: the allocation set is behind an
-    /// `Arc<Mutex<_>>`, so the clone shares the same live reservation state.
-    /// A spawned deploy task allocates ports through this shared handle.
-    pub fn port_allocator(&self) -> PortAllocator {
-        self.port_allocator.clone()
     }
 }
 
@@ -852,7 +878,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn remove_app_releases_allocated_ports() {
+    async fn retirement_releases_allocated_ports() {
         let mut sup = test_supervisor();
         let spec = app_spec_with_replicas(3, Some(8080));
         sup.deploy_app("web", "default", &spec, Instant::now())
@@ -864,7 +890,19 @@ mod tests {
             "each replica should allocate a port"
         );
 
-        sup.remove_app("web", "default").await;
+        let ids: Vec<_> = sup
+            .list_instances()
+            .iter()
+            .map(|instance| instance.id.clone())
+            .collect();
+        for id in ids {
+            sup.grill().kill(&id).await.unwrap();
+            assert_eq!(
+                sup.grill().state(&id).await.unwrap(),
+                ContainerState::Stopped
+            );
+            sup.retire_instance(&id).await;
+        }
         assert_eq!(
             sup.port_allocator.allocated_count().await,
             0,
@@ -1232,6 +1270,35 @@ mod tests {
         "#,
         )
         .unwrap()
+    }
+
+    #[tokio::test]
+    async fn workload_kind_collision_preserves_existing_instances() {
+        for job_first in [false, true] {
+            let mut supervisor = test_supervisor();
+            let app = basic_app_spec(None);
+            let job = basic_job_spec();
+            let now = Instant::now();
+            let ids = if job_first {
+                supervisor
+                    .deploy_job("same", "default", &job, now)
+                    .await
+                    .unwrap()
+            } else {
+                supervisor
+                    .deploy_app("same", "default", &app, now)
+                    .await
+                    .unwrap()
+            };
+            let result = if job_first {
+                supervisor.deploy_app("same", "default", &app, now).await
+            } else {
+                supervisor.deploy_job("same", "default", &job, now).await
+            };
+            assert!(result.is_err(), "opposite kind replaced the original owner");
+            assert_eq!(supervisor.get_instance(&ids[0]).unwrap().is_job, job_first);
+            assert_eq!(supervisor.list_instances().len(), ids.len());
+        }
     }
 
     #[tokio::test]

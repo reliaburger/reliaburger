@@ -92,7 +92,8 @@ impl<'de> Deserialize<'de> for VirtualIP {
 
 /// Compute a deterministic u32 identifier from a name.
 ///
-/// Used for `app_id` and `namespace_id` fields in BPF maps.
+/// Used for namespace identifiers in BPF maps. Destination identities use
+/// allocated VIPs, whose collisions have already been resolved.
 /// Same hash function as VIP allocation but with different seeds.
 pub fn name_to_id(name: &str) -> u32 {
     let mut hasher = SipHasher24::new_with_keys(0x0123_4567_89AB_CDEF, 0xFEDC_BA98_7654_3210);

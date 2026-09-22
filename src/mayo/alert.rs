@@ -4,7 +4,9 @@
 //! State machine: Inactive → Pending → Firing. Five built-in rules
 //! cover the most common failure modes.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, BTreeSet, HashMap};
+
+use super::types::MetricKey;
 use std::time::{Duration, SystemTime};
 
 use serde::{Deserialize, Serialize};
@@ -70,6 +72,8 @@ pub enum AlertState {
 /// notifications.
 #[derive(Debug, Clone)]
 pub struct AlertTransition {
+    /// Labels identifying the metric series that changed state.
+    pub labels: BTreeMap<String, String>,
     pub rule_name: String,
     pub severity: AlertSeverity,
     pub description: String,
@@ -89,181 +93,215 @@ pub enum TransitionKind {
     Resolved,
 }
 
+/// Alert phase carried by the public API, without the evaluator's clock state.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum AlertPhase {
+    /// The condition is not currently met.
+    Inactive,
+    /// The condition is waiting for its configured duration.
+    Pending,
+    /// The condition has held long enough to alert.
+    Firing,
+}
+
+/// Complete response from the alert inventory endpoint.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AlertsResponse {
+    /// Observed statuses; a missing field is not evidence of an empty list.
+    pub alerts: Vec<AlertStatus>,
+}
+
 /// A snapshot of an alert for API responses.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AlertStatus {
+    /// Labels identifying this independent alert instance.
+    #[serde(default)]
+    pub labels: BTreeMap<String, String>,
+    /// Name of the evaluated rule.
     pub rule_name: String,
-    pub state: String,
+    /// Observed phase of this labelled instance.
+    pub state: AlertPhase,
+    /// Severity configured by the rule.
     pub severity: AlertSeverity,
+    /// Human-readable explanation of the condition.
     pub description: String,
+    /// Unix seconds when the current pending or firing phase began.
     pub since: Option<u64>,
 }
 
-/// Evaluates alert rules against current metric values.
+/// Identity of one rule evaluated against one labelled metric series.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+struct AlertInstance {
+    rule_name: String,
+    labels: BTreeMap<String, String>,
+}
+
+/// Evaluates alert rules independently for each labelled metric series.
 pub struct AlertEvaluator {
     rules: Vec<AlertRule>,
-    states: HashMap<String, AlertState>,
+    states: BTreeMap<AlertInstance, AlertState>,
 }
 
 impl AlertEvaluator {
     /// Create an evaluator with the given rules.
     pub fn new(rules: Vec<AlertRule>) -> Self {
-        let states = rules
-            .iter()
-            .map(|r| (r.name.clone(), AlertState::Inactive))
-            .collect();
-        Self { rules, states }
+        Self {
+            rules,
+            states: BTreeMap::new(),
+        }
     }
 
-    /// Create an evaluator with the 5 default built-in rules.
+    /// Create an evaluator with the five default built-in rules.
     pub fn with_defaults() -> Self {
         Self::new(default_rules())
     }
 
-    /// Evaluate all rules against the provided metric values.
-    ///
-    /// `latest_values` maps metric names to their latest value.
-    /// Call this on a timer (e.g. every 30s). Returns any state
-    /// transitions (Firing or Resolved) for webhook dispatch.
-    pub fn evaluate(&mut self, latest_values: &HashMap<String, f64>) -> Vec<AlertTransition> {
+    /// Evaluate fresh readings without combining different label sets.
+    /// Missing readings retain firing alerts and cancel inconclusive pending
+    /// alerts. A recovery requires an in-range reading from that same series.
+    pub fn evaluate(&mut self, latest_values: &HashMap<MetricKey, f64>) -> Vec<AlertTransition> {
         let now = SystemTime::now();
         let mut transitions = Vec::new();
-
         for rule in &self.rules {
-            let prev_state = self
-                .states
-                .get(&rule.name)
+            let observed: BTreeMap<_, _> = latest_values
+                .iter()
+                .filter(|(key, _)| key.name.0 == rule.metric_name)
+                .map(|(key, value)| (key.labels.clone(), *value))
+                .collect();
+            let labels: BTreeSet<_> = observed
+                .keys()
                 .cloned()
-                .unwrap_or(AlertState::Inactive);
-            let value = latest_values.get(&rule.metric_name).copied();
-
-            // Three-way, not two-way (OBS4). A missing metric is *not* the same
-            // as a metric below threshold. If an app dies and stops emitting,
-            // its telemetry goes stale; treating that as "recovered" would let a
-            // firing alert silently clear itself exactly when something is
-            // wrong. So we only resolve on a real, in-range reading.
-            let new_state = match (&prev_state, value) {
-                // No data at all.
-                (_, None) => match &prev_state {
-                    // A firing alert with stale telemetry stays firing: we can't
-                    // prove recovery, so we don't clear it.
-                    AlertState::Firing { .. } => prev_state.clone(),
-                    // A pending alert whose data vanished is inconclusive; drop
-                    // back to inactive rather than fire on nothing.
-                    _ => AlertState::Inactive,
-                },
-                // Data present and breaching the threshold.
-                (AlertState::Inactive, Some(v)) if rule.operator.eval(v, rule.threshold) => {
-                    AlertState::Pending { since: now }
-                }
-                (AlertState::Pending { since }, Some(v))
-                    if rule.operator.eval(v, rule.threshold) =>
-                {
-                    if now.duration_since(*since).unwrap_or_default() >= rule.for_duration {
-                        AlertState::Firing { since: *since }
-                    } else {
-                        prev_state.clone()
-                    }
-                }
-                (AlertState::Firing { .. }, Some(v)) if rule.operator.eval(v, rule.threshold) => {
-                    prev_state.clone()
-                }
-                // Data present and back in range: a genuine recovery.
-                (_, Some(_)) => AlertState::Inactive,
-            };
-
-            // Detect transitions for webhook dispatch.
-            let was_firing = matches!(prev_state, AlertState::Firing { .. });
-            let now_firing = matches!(new_state, AlertState::Firing { .. });
-
-            if now_firing && !was_firing {
-                transitions.push(AlertTransition {
+                .chain(
+                    self.states
+                        .keys()
+                        .filter(|key| key.rule_name == rule.name)
+                        .map(|key| key.labels.clone()),
+                )
+                .collect();
+            for labels in labels {
+                let instance = AlertInstance {
                     rule_name: rule.name.clone(),
-                    severity: rule.severity,
-                    description: rule.description.clone(),
-                    kind: TransitionKind::Firing,
-                    value,
-                    fired_at: match &new_state {
-                        AlertState::Firing { since } => Some(*since),
-                        _ => None,
-                    },
-                });
-            } else if was_firing && !now_firing {
-                transitions.push(AlertTransition {
-                    rule_name: rule.name.clone(),
-                    severity: rule.severity,
-                    description: rule.description.clone(),
-                    kind: TransitionKind::Resolved,
-                    value,
-                    fired_at: None,
-                });
+                    labels,
+                };
+                let previous = self
+                    .states
+                    .get(&instance)
+                    .cloned()
+                    .unwrap_or(AlertState::Inactive);
+                let value = observed
+                    .get(&instance.labels)
+                    .copied()
+                    .filter(|value| value.is_finite());
+                let next = next_state(rule, &previous, value, now);
+                let was_firing = matches!(previous, AlertState::Firing { .. });
+                let is_firing = matches!(next, AlertState::Firing { .. });
+                if was_firing != is_firing {
+                    transitions.push(AlertTransition {
+                        labels: instance.labels.clone(),
+                        rule_name: rule.name.clone(),
+                        severity: rule.severity,
+                        description: rule.description.clone(),
+                        kind: if is_firing {
+                            TransitionKind::Firing
+                        } else {
+                            TransitionKind::Resolved
+                        },
+                        value,
+                        fired_at: match next {
+                            AlertState::Firing { since } => Some(since),
+                            _ => None,
+                        },
+                    });
+                }
+                // Retired inactive series do not grow the state map indefinitely.
+                // Firing series remain until their own telemetry proves recovery.
+                if value.is_none() && next == AlertState::Inactive {
+                    self.states.remove(&instance);
+                } else {
+                    self.states.insert(instance, next);
+                }
             }
-
-            self.states.insert(rule.name.clone(), new_state);
         }
-
         transitions
     }
 
-    /// Get all active (firing) alerts.
+    /// Get all firing labelled alert instances.
     pub fn firing_alerts(&self) -> Vec<AlertStatus> {
-        self.rules
-            .iter()
-            .filter_map(|rule| {
-                let state = self.states.get(&rule.name)?;
-                match state {
-                    AlertState::Firing { since } => Some(AlertStatus {
-                        rule_name: rule.name.clone(),
-                        state: "firing".to_string(),
-                        severity: rule.severity,
-                        description: rule.description.clone(),
-                        since: since
-                            .duration_since(SystemTime::UNIX_EPOCH)
-                            .ok()
-                            .map(|d| d.as_secs()),
-                    }),
-                    _ => None,
-                }
-            })
+        self.all_statuses()
+            .into_iter()
+            .filter(|status| status.state == AlertPhase::Firing)
             .collect()
     }
 
-    /// Get all alert statuses (including inactive and pending).
+    /// Get every known series; an unobserved rule has one inactive status.
     pub fn all_statuses(&self) -> Vec<AlertStatus> {
-        self.rules
-            .iter()
-            .map(|rule| {
-                let state = self
-                    .states
-                    .get(&rule.name)
-                    .cloned()
-                    .unwrap_or(AlertState::Inactive);
-                let (state_str, since) = match &state {
-                    AlertState::Inactive => ("inactive".to_string(), None),
-                    AlertState::Pending { since } => (
-                        "pending".to_string(),
-                        since
-                            .duration_since(SystemTime::UNIX_EPOCH)
-                            .ok()
-                            .map(|d| d.as_secs()),
-                    ),
-                    AlertState::Firing { since } => (
-                        "firing".to_string(),
-                        since
-                            .duration_since(SystemTime::UNIX_EPOCH)
-                            .ok()
-                            .map(|d| d.as_secs()),
-                    ),
-                };
-                AlertStatus {
-                    rule_name: rule.name.clone(),
-                    state: state_str,
-                    severity: rule.severity,
-                    description: rule.description.clone(),
-                    since,
-                }
-            })
-            .collect()
+        let mut statuses = Vec::new();
+        for rule in &self.rules {
+            let mut found = false;
+            for (instance, state) in self
+                .states
+                .iter()
+                .filter(|(key, _)| key.rule_name == rule.name)
+            {
+                found = true;
+                statuses.push(status_for(rule, instance.labels.clone(), state));
+            }
+            if !found {
+                statuses.push(status_for(rule, BTreeMap::new(), &AlertState::Inactive));
+            }
+        }
+        statuses
+    }
+}
+
+fn next_state(
+    rule: &AlertRule,
+    previous: &AlertState,
+    value: Option<f64>,
+    now: SystemTime,
+) -> AlertState {
+    match (previous, value) {
+        (AlertState::Firing { .. }, None) => previous.clone(),
+        (_, None) => AlertState::Inactive,
+        (AlertState::Inactive, Some(value)) if rule.operator.eval(value, rule.threshold) => {
+            AlertState::Pending { since: now }
+        }
+        (AlertState::Pending { since }, Some(value))
+            if rule.operator.eval(value, rule.threshold) =>
+        {
+            if now.duration_since(*since).unwrap_or_default() >= rule.for_duration {
+                AlertState::Firing { since: *since }
+            } else {
+                previous.clone()
+            }
+        }
+        (AlertState::Firing { .. }, Some(value)) if rule.operator.eval(value, rule.threshold) => {
+            previous.clone()
+        }
+        (_, Some(_)) => AlertState::Inactive,
+    }
+}
+
+fn status_for(
+    rule: &AlertRule,
+    labels: BTreeMap<String, String>,
+    state: &AlertState,
+) -> AlertStatus {
+    let (phase, since) = match state {
+        AlertState::Inactive => (AlertPhase::Inactive, None),
+        AlertState::Pending { since } => (AlertPhase::Pending, Some(since)),
+        AlertState::Firing { since } => (AlertPhase::Firing, Some(since)),
+    };
+    AlertStatus {
+        rule_name: rule.name.clone(),
+        labels,
+        state: phase,
+        severity: rule.severity,
+        description: rule.description.clone(),
+        since: since
+            .and_then(|since| since.duration_since(SystemTime::UNIX_EPOCH).ok())
+            .map(|duration| duration.as_secs()),
     }
 }
 
@@ -322,8 +360,11 @@ pub fn default_rules() -> Vec<AlertRule> {
 mod tests {
     use super::*;
 
-    fn make_values(pairs: &[(&str, f64)]) -> HashMap<String, f64> {
-        pairs.iter().map(|(k, v)| (k.to_string(), *v)).collect()
+    fn make_values(pairs: &[(&str, f64)]) -> HashMap<MetricKey, f64> {
+        pairs
+            .iter()
+            .map(|(k, v)| (MetricKey::simple(*k), *v))
+            .collect()
     }
 
     fn simple_rule(name: &str, metric: &str, threshold: f64, op: AlertOperator) -> AlertRule {
@@ -339,6 +380,68 @@ mod tests {
     }
 
     #[test]
+    fn label_sets_have_independent_pending_firing_and_recovery() {
+        let a = MetricKey::with_labels(
+            "cpu",
+            BTreeMap::from([
+                ("namespace".into(), "a".into()),
+                ("app".into(), "web".into()),
+            ]),
+        );
+        let b = MetricKey::with_labels(
+            "cpu",
+            BTreeMap::from([
+                ("namespace".into(), "b".into()),
+                ("app".into(), "web".into()),
+            ]),
+        );
+        let mut evaluator = AlertEvaluator::new(vec![simple_rule(
+            "cpu-high",
+            "cpu",
+            80.0,
+            AlertOperator::GreaterThan,
+        )]);
+        assert!(
+            evaluator
+                .evaluate(&HashMap::from([(a.clone(), 95.0)]))
+                .is_empty()
+        );
+        let first = evaluator.evaluate(&HashMap::from([(a.clone(), 95.0), (b.clone(), 96.0)]));
+        assert_eq!(first.len(), 1);
+        assert_eq!(first[0].labels, a.labels);
+        assert_eq!(first[0].kind, TransitionKind::Firing);
+        assert!(
+            evaluator
+                .all_statuses()
+                .iter()
+                .any(|status| status.labels == b.labels && status.state == AlertPhase::Pending)
+        );
+        let second = evaluator.evaluate(&HashMap::from([(b.clone(), 96.0)]));
+        assert_eq!(second.len(), 1);
+        assert_eq!(second[0].labels, b.labels);
+        assert_eq!(
+            evaluator.firing_alerts().len(),
+            2,
+            "missing a-series data must not resolve it"
+        );
+        let recovery = evaluator.evaluate(&HashMap::from([(a.clone(), 10.0), (b.clone(), 96.0)]));
+        assert_eq!(recovery.len(), 1);
+        assert_eq!(recovery[0].labels, a.labels);
+        assert_eq!(recovery[0].kind, TransitionKind::Resolved);
+        assert_eq!(evaluator.firing_alerts()[0].labels, b.labels);
+        assert!(
+            evaluator
+                .evaluate(&HashMap::from([(b, f64::NAN)]))
+                .is_empty()
+        );
+        assert_eq!(
+            evaluator.firing_alerts().len(),
+            1,
+            "invalid data cannot prove recovery"
+        );
+    }
+
+    #[test]
     fn inactive_to_pending_on_breach() {
         let rule = AlertRule {
             for_duration: Duration::from_secs(60), // needs 60s to fire
@@ -348,7 +451,7 @@ mod tests {
         eval.evaluate(&make_values(&[("cpu", 95.0)]));
 
         let statuses = eval.all_statuses();
-        assert_eq!(statuses[0].state, "pending");
+        assert_eq!(statuses[0].state, AlertPhase::Pending);
     }
 
     #[test]
@@ -378,7 +481,7 @@ mod tests {
         assert_eq!(eval.firing_alerts().len(), 0);
 
         let statuses = eval.all_statuses();
-        assert_eq!(statuses[0].state, "inactive");
+        assert_eq!(statuses[0].state, AlertPhase::Inactive);
     }
 
     #[test]
@@ -390,10 +493,10 @@ mod tests {
         let mut eval = AlertEvaluator::new(vec![rule]);
 
         eval.evaluate(&make_values(&[("cpu", 95.0)])); // pending
-        assert_eq!(eval.all_statuses()[0].state, "pending");
+        assert_eq!(eval.all_statuses()[0].state, AlertPhase::Pending);
 
         eval.evaluate(&make_values(&[("cpu", 50.0)])); // recovery
-        assert_eq!(eval.all_statuses()[0].state, "inactive");
+        assert_eq!(eval.all_statuses()[0].state, AlertPhase::Inactive);
     }
 
     #[test]
@@ -417,12 +520,12 @@ mod tests {
         let mut eval = AlertEvaluator::new(vec![rule]);
 
         eval.evaluate(&make_values(&[("cpu", 95.0)])); // pending
-        assert_eq!(eval.all_statuses()[0].state, "pending");
+        assert_eq!(eval.all_statuses()[0].state, AlertPhase::Pending);
 
         // Data disappears while pending.
         let t = eval.evaluate(&HashMap::new());
         assert!(t.is_empty(), "pending→inactive is not a firing transition");
-        assert_eq!(eval.all_statuses()[0].state, "inactive");
+        assert_eq!(eval.all_statuses()[0].state, AlertPhase::Inactive);
     }
 
     #[test]
@@ -498,7 +601,7 @@ mod tests {
         let eval = AlertEvaluator::with_defaults();
         let statuses = eval.all_statuses();
         assert_eq!(statuses.len(), 5);
-        assert!(statuses.iter().all(|s| s.state == "inactive"));
+        assert!(statuses.iter().all(|s| s.state == AlertPhase::Inactive));
     }
 
     #[test]
@@ -518,8 +621,9 @@ mod tests {
     #[test]
     fn alert_status_serialises() {
         let status = AlertStatus {
+            labels: BTreeMap::new(),
             rule_name: "test".to_string(),
-            state: "firing".to_string(),
+            state: AlertPhase::Firing,
             severity: AlertSeverity::Critical,
             description: "test".to_string(),
             since: Some(1000),
