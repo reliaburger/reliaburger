@@ -1,23 +1,39 @@
 # PR #167 review fixes: plan
 
-**Status:** in progress. Decision E and T2.19 are done; decisions A–D are open.
-**Branch:** `codex/codebase-completion-fixes` (PR #167), reviewed at `9d8eb3d`.
+**Status:** in progress. PR #167 merged on 22 September 2026 (`435efc2`);
+decisions A–E are made, F is open. T2.19 is done.
+**Reviewed at:** `9d8eb3d` on `codex/codebase-completion-fixes`.
 **Written:** 22 September 2026, from a Claude review of the Codex-built branch.
 
-This is the working plan for getting PR #167 into a mergeable state. It's meant
-to be picked up across several sessions: each item has a checkbox, a location, the
-fix we intend and the test that proves it. Tick an item only when its commit is on
-the branch and `make ci` passes.
+This is the working plan for fixing what the PR #167 review found, now that the
+PR itself has merged. It's meant to be picked up across several sessions: each
+item has a checkbox, a location, the fix we intend and the test that proves it.
+Tick an item only when its commit is on the branch and `make ci` passes.
+
+Each tier is its own PR, stacked on the previous one:
+
+| Tier | Branch | Base |
+| --- | --- | --- |
+| 1 | `fix/tier-1-merge-blockers` | `main` |
+| 2 | `fix/tier-2-release-fixes` | `fix/tier-1-merge-blockers` |
+| 3 | `fix/tier-3-docs` | `fix/tier-2-release-fixes` |
+| 4 | `fix/tier-4-size` | `fix/tier-3-docs` |
+
+Line numbers below were recorded at `9d8eb3d`; re-find each location before
+editing, since earlier fixes move them.
 
 ## How to resume
 
-1. Read this file top to bottom, then `git log --oneline origin/main..HEAD | head`.
-2. Pick the first unticked item in the lowest open tier.
+1. Read this file top to bottom. Check out the lowest tier branch with unticked
+   items (create it from its base in the table above if it doesn't exist), then
+   `git log --oneline <base>..HEAD`.
+2. Pick the first unticked item in that tier.
 3. Write the failing test first, then the fix, then the book paragraph.
 4. `cargo fmt`, `make ci`, plus the gated target that matches what you touched
    (`make test-linux`, `make test-cluster`, `make test-rootless-runc`). Gated
    Linux suites need the Lima VM or hosted CI; macOS can't run them.
-5. One commit per item. Show the commit to Miko before committing. Never amend.
+5. One commit per item; within this approved plan, commit without re-asking.
+   Never amend. Push the tier branch and keep its PR description current.
 6. Tick the box here, with the commit hash, in the same commit.
 
 Local tooling note: the repo pins nextest 0.9.145. With an older local nextest,
@@ -51,28 +67,28 @@ subsystem review agents that traced the code; confirm each one before fixing it.
 
 ## Decisions needed before starting
 
-- [ ] **A. Dead-consumer policy (T1.2).** Recommended for 0.1.0: keep manual
+- [x] **A. Dead-consumer policy (T1.2).** Decided 22 September 2026, as
+      recommended. For 0.1.0: keep manual
       decommission, and add a loud metric, readiness signal and runbook. The
       alternative is automatic consumer expiry once gossip has confirmed the node
       dead for N minutes. That's friendlier, but a partitioned node that is still
       alive could serve stale routes while its VIPs get reused.
-- [ ] **B. Where fixes land.** Recommended: Tiers 1 and 2 as separate commits on
-      this branch, then Tier 3 docs, then merge.
-- [ ] **C. Merge style.** 343 commits, about 37 of them docs-only "Record
-      evidence" bookkeeping. Squash-merge, or keep the history and drop the
-      bookkeeping commits?
-- [ ] **D. Book condensing target.** Recommended: about 1–1.5k lines across the
-      affected chapters, down from 8.2k.
+- [x] **B. Where fixes land.** Decided 22 September 2026: one stacked PR per
+      tier (see the table above), one commit per item.
+- [x] **C. Merge style.** Resolved: PR #167 was merged as it stood on
+      22 September 2026, since its size made further review impractical.
+- [x] **D. Book condensing target.** Decided 22 September 2026: about
+      1–1.5k lines across the affected chapters, down from 8.2k.
 - [x] **E. Vendored `parquet`.** Decided 22 September 2026: drop it and
       upgrade DataFusion 45 → 55 (T2.19). See the dedicated section below.
-
 - [ ] **F. One Runc lifecycle (T4.2).** Recommended: yes, make owned Runc the
       only Linux Runc path, after the Tier 1 owner-recovery fixes (T1.3/T1.4)
       land, since those make the owned path safe to depend on everywhere.
 
-## Tier 1: fix before merge
+## Tier 1: merge blockers
 
-All of these are introduced or exposed by this PR.
+All of these were introduced or exposed by PR #167. The PR has merged, so
+this tier now blocks the 0.1.0 candidate rather than the merge.
 
 - [ ] **T1.1 ✔ Health probes blank DNS and ingress for the whole node (cluster
       mode).**
