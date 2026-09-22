@@ -44,6 +44,10 @@ struct Cli {
     #[arg(long, default_value = "auto")]
     runtime: String,
 
+    /// Standalone qualification of durable OCI ownership; not production activation.
+    #[arg(long, hide = true)]
+    experimental_owned_runc: bool,
+
     /// Join/form a cluster using the `[cluster]` config (gossip membership).
     /// Without this flag, bun runs as a single node, as before.
     #[arg(long)]
@@ -915,6 +919,22 @@ async fn run_agent(cli: Cli) -> anyhow::Result<()> {
 
     // Select runtime
     let runtime = select_runtime(&cli.runtime, &instances_dir, &pickle_dir).await?;
+    let runtime = if cli.experimental_owned_runc {
+        if cli.cluster {
+            anyhow::bail!(
+                "owned Runc qualification is standalone only; cluster recovery is not qualified"
+            );
+        }
+        match runtime {
+            #[cfg(target_os = "linux")]
+            AnyGrill::Runc(runtime) => {
+                AnyGrill::Runc(runtime.with_owner(std::env::current_exe()?)?)
+            }
+            _ => anyhow::bail!("owned Runc qualification requires the Linux runc runtime"),
+        }
+    } else {
+        runtime
+    };
     // DNS is a workload capability, not a best-effort side task. Select the
     // runtime first so we can derive its reachable resolver address, then bind
     // both sockets before starting the agent, reporting readiness or adopting

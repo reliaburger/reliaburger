@@ -3488,3 +3488,24 @@ kernel objects. It checks that the unknown outcome stays unknown, the prepared
 payload never runs, and the held address cannot be reused until explicit release.
 Finally it runs a replacement and refuses a delayed release from the old generation.
 The driver preserves both logs and the test binary's checksum across the reboot.
+
+### Kill the agent at the awkward moments
+
+`tests/oci_crash.rs` starts the actual Bun binary and actual Runc containers. Small
+`ip` and `runc` wrappers pause preparation, launch or namespace retirement at a
+known boundary; they still execute the real tools. Two more cases kill Bun while
+an initialiser runs and after the main workload has an adoption record. Dropping
+the in-flight HTTP apply request exercises caller cancellation before SIGKILL.
+
+Recovery must retire unadopted execution before serving a fresh apply. Neither the
+second initialiser nor the main payload may sneak through the interrupted chain.
+An already adopted main workload must survive with exactly one execution. Each
+case then performs an explicit retry and checks that the main payload runs once
+more. The fixture keeps its private logs, uses separate workload names and gives
+the non-root OCI user write access to its test bind mount.
+
+The hidden `--experimental-owned-runc` option selects the durable adapter for this
+standalone qualification. It refuses other runtimes and cluster mode. This is
+not production activation: durable consumer discovery recovery and pinned kernel
+recovery still have to meet their own contracts before the normal startup path
+can select them.
