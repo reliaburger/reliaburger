@@ -958,3 +958,20 @@ It requires a recorded `Reverted` outcome and unchanged workload identity, PID a
 host port. Both rootful and rootless paths then complete confirmed cleanup. The
 sidecar and throwaway signing key remain test-only; release binaries contain neither
 this failure trigger nor the test key override.
+
+### Three enrolled OCI nodes
+
+The next fixture creates three real Bun processes with Runc, pinned kernel policy
+and durable consumer journals. Peers enrol through single-use join tokens under
+an operator credential; the internal service principal deliberately cannot manage
+users or join tokens. The nodes share a private test network namespace and use
+consistent gossip-to-Raft/reporting port offsets, as council discovery requires.
+A placement label keeps the one OCI workload on its original node.
+
+We upgrade each node through its signed node API, with the leader last, then roll
+all three back. After every swap, all three consumers must republish the service,
+the producer must retain its original PID and port, and kernel manifests must
+match. Removing the desired app finally waits for all three journals to clear their
+release obligations. This isolates runtime recovery from the rolling planner;
+its separate ordering/pause tests and the independent-host release matrix remain
+necessary. The real sequence passes in 76.54 seconds on the qualification VM.

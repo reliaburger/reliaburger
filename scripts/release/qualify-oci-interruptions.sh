@@ -20,7 +20,7 @@ while IFS= read -r binary; do
     sha256sum "$binary" >> "$evidence/binaries.sha256"
     # Scope links, routing/firewall changes and namespace mount points to the
     # fixture. A failed test must not pollute the host's /run/netns directory.
-    timeout 240s sudo unshare --mount --net --propagation private bash -c '
+    timeout 420s sudo unshare --mount --net --propagation private bash -c '
         set -eu
         mkdir -p /run/netns
         mount -t tmpfs tmpfs /run/netns

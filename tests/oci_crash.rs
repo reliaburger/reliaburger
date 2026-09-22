@@ -74,6 +74,8 @@ impl Node {
                             &hex::decode(secret.trim()).unwrap().try_into().unwrap(),
                         )
                         .unwrap();
+                        let token =
+                            std::fs::read_to_string(root.join("operator-token")).unwrap_or(token);
                         BunClient::new_with_ca(
                             &format!("https://{address}"),
                             Some(&token),
@@ -836,6 +838,247 @@ async fn wait_cluster_publication(client: &BunClient) {
     })
     .await
     .expect("cluster never confirmed its workload publication");
+}
+
+#[cfg(feature = "ebpf")]
+async fn enrolled_upgrade_fixture(
+    root: &Path,
+    name: &str,
+    seed: Option<(&Path, &Node)>,
+) -> (Node, Vec<u8>) {
+    use reliaburger::config::node::NodeConfig;
+    durable_fixture(root);
+    let base = NodeConfig::from_file(&root.join("node.toml")).unwrap();
+    let mut config = if let Some((seed_root, seed_node)) = seed {
+        let mut config = NodeConfig::from_file(&seed_root.join("node.toml")).unwrap();
+        std::fs::copy(
+            seed_root.join("operator-token"),
+            root.join("operator-token"),
+        )
+        .unwrap();
+        let token = seed_node.client.join_token_create(name, 300).await.unwrap();
+        let identity = reliaburger::sesame::identity_store::load(&seed_root.join("identity"))
+            .unwrap()
+            .unwrap();
+        let fingerprint =
+            reliaburger::sesame::identity_store::root_ca_fingerprint(&identity.root_ca_der);
+        reliaburger::relish::commands::join(
+            &token,
+            seed_node.client.base_url(),
+            name,
+            Some(&root.join("identity")),
+            Some(&fingerprint),
+        )
+        .await
+        .unwrap();
+        std::fs::copy(
+            seed_root.join("activation-master.key"),
+            root.join("activation-master.key"),
+        )
+        .unwrap();
+        config.security.bootstrap_path = None;
+        config.security.identity_dir = Some(root.join("identity"));
+        config.security.master_key_path = Some(root.join("activation-master.key"));
+        config.cluster.join = vec![format!("127.0.0.1:{}", config.cluster.gossip_port)];
+        config
+    } else {
+        reliaburger::relish::commands::init(root, "activation", name).unwrap();
+        let admin = reliaburger::sesame::token::create_token(
+            "qualification-operator",
+            reliaburger::sesame::types::ApiRole::Admin,
+            Default::default(),
+            None,
+        )
+        .unwrap();
+        let path = root.join("activation-security-bootstrap.json");
+        let mut state: reliaburger::sesame::types::SecurityState =
+            serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        state.api_tokens.push(admin.token);
+        std::fs::write(path, serde_json::to_vec(&state).unwrap()).unwrap();
+        std::fs::write(root.join("operator-token"), admin.plaintext).unwrap();
+        std::fs::set_permissions(
+            root.join("operator-token"),
+            std::fs::Permissions::from_mode(0o600),
+        )
+        .unwrap();
+        NodeConfig::from_file(&root.join("reliaburger.toml")).unwrap()
+    };
+    config.node.name = Some(name.into());
+    config.node.labels.insert("fixture".into(), name.into());
+    config.storage = base.storage;
+    config.images = base.images;
+    config.ebpf = base.ebpf;
+    config.network.advertise_address = Some("127.0.0.1".into());
+    // Council discovery requires the same gossip-to-Raft offset on every node.
+    let (gossip, raft, reporting) = loop {
+        let gossip = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+        let port = gossip.local_addr().unwrap().port();
+        let Some(reporting_port) = port.checked_add(2) else {
+            continue;
+        };
+        let Ok(raft) = std::net::TcpListener::bind(("127.0.0.1", port + 1)) else {
+            continue;
+        };
+        let Ok(reporting) = std::net::TcpListener::bind(("127.0.0.1", reporting_port)) else {
+            continue;
+        };
+        break (gossip, raft, reporting);
+    };
+    config.cluster.gossip_port = gossip.local_addr().unwrap().port();
+    config.cluster.raft_port = raft.local_addr().unwrap().port();
+    config.cluster.reporting_port = reporting.local_addr().unwrap().port();
+    std::fs::write(root.join("node.toml"), toml::to_string(&config).unwrap()).unwrap();
+    std::fs::write(root.join("cluster"), "enrolled").unwrap();
+    let key = upgrade_fixture(root);
+    drop((gossip, raft, reporting));
+    (Node::start(root).await, key)
+}
+
+#[cfg(feature = "ebpf")]
+#[tokio::test]
+#[ignore = "requires isolated Linux root, bpffs, real runc/ip/nft and static BusyBox"]
+async fn three_enrolled_oci_nodes_preserve_ownership_through_upgrade_and_rollback() {
+    let root = tempfile::tempdir().unwrap().keep();
+    let roots: Vec<_> = (0..3)
+        .map(|i| {
+            let path = root.join(format!("node{i}"));
+            std::fs::create_dir(&path).unwrap();
+            path
+        })
+        .collect();
+    let mut nodes = Vec::new();
+    let mut keys = Vec::new();
+    let (node, key) = enrolled_upgrade_fixture(&roots[0], "rolling-0", None).await;
+    nodes.push(node);
+    keys.push(key);
+    for i in 1..3 {
+        let (node, key) = enrolled_upgrade_fixture(
+            &roots[i],
+            &format!("rolling-{i}"),
+            Some((&roots[0], &nodes[0])),
+        )
+        .await;
+        nodes.push(node);
+        keys.push(key);
+    }
+    let mut last_views = vec![];
+    tokio::time::timeout(Duration::from_secs(60), async {
+        loop {
+            let mut ready = true;
+            last_views.clear();
+            for node in &nodes {
+                let council = node.client.council().await;
+                let membership = node.client.nodes().await;
+                ready &= council
+                    .as_ref()
+                    .is_ok_and(|c| c.members.len() == 3 && c.leader.is_some());
+                ready &= membership.as_ref().is_ok_and(|members| {
+                    members
+                        .iter()
+                        .filter(|n| n.state.eq_ignore_ascii_case("alive"))
+                        .count()
+                        == 3
+                });
+                last_views.push(format!("council={council:?}; membership={membership:?}"));
+            }
+            if ready {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(200)).await;
+        }
+    })
+    .await
+    .unwrap_or_else(|_| panic!("three enrolled voters did not converge: {last_views:?}"));
+    let mut app = durable_app("cluster-owned");
+    app.app.get_mut("cluster-owned").unwrap().placement =
+        Some(reliaburger::config::app::PlacementSpec {
+            required: vec!["fixture=rolling-0".into()],
+            preferred: vec![],
+        });
+    nodes[0].client.apply(&app).await.unwrap();
+    for node in &nodes {
+        wait_cluster_publication(&node.client).await;
+    }
+    let original = nodes[0].client.status().await.unwrap().remove(0);
+    let manifests: Vec<_> = roots.iter().map(|root| kernel_manifest(root)).collect();
+    for version in ["v0.2.0", "v0.1.0"] {
+        let leader = nodes[0].client.council().await.unwrap().leader.unwrap();
+        let mut order: Vec<_> = (0..3).collect();
+        order.sort_by_key(|i| format!("rolling-{i}") == leader);
+        for i in order {
+            if version == "v0.2.0" {
+                nodes[i]
+                    .client
+                    .upgrade_apply(&owned_upgrade_directive(&roots[i], &keys[i]))
+                    .await
+                    .unwrap();
+            } else {
+                nodes[i].client.upgrade_node_rollback(None).await.unwrap();
+            }
+            tokio::time::timeout(Duration::from_secs(60), async {
+                loop {
+                    if let Ok(status) = nodes[i].client.upgrade_status().await
+                        && status["running_version"] == version
+                        && status["in_flight"].is_null()
+                    {
+                        break;
+                    }
+                    tokio::time::sleep(Duration::from_millis(100)).await;
+                }
+            })
+            .await
+            .expect("clustered owned upgrade did not settle");
+            for node in &nodes {
+                wait_cluster_publication(&node.client).await;
+            }
+            let current = nodes[0].client.status().await.unwrap().remove(0);
+            assert_eq!(current.id, original.id);
+            assert_eq!(current.pid, original.pid);
+            assert_eq!(current.host_port, original.host_port);
+            assert_eq!(
+                std::fs::read_to_string(roots[0].join("shared/main")).unwrap(),
+                "main\n"
+            );
+            for (root, original) in roots.iter().zip(&manifests) {
+                assert_eq!(kernel_manifest(root), *original);
+            }
+        }
+    }
+    nodes[0]
+        .client
+        .stop("cluster-owned", "default")
+        .await
+        .unwrap();
+    tokio::time::timeout(Duration::from_secs(60), async {
+        loop {
+            let mut cleared = true;
+            for root in &roots {
+                let saved: serde_json::Value = serde_json::from_slice(
+                    &std::fs::read(root.join("data/discovery/discovery.json")).unwrap(),
+                )
+                .unwrap();
+                let inventory = &saved["inventory"];
+                cleared &= inventory["services"].as_array().unwrap().is_empty()
+                    && inventory["references"].as_array().unwrap().is_empty()
+                    && inventory["consumer"]["receipts"]
+                        .as_object()
+                        .unwrap()
+                        .is_empty();
+            }
+            if cleared {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+    })
+    .await
+    .expect("cluster retained withdrawal obligations after all consumers confirmed");
+    for node in &mut nodes {
+        node.crash().await;
+    }
+    for root in &roots {
+        retire_kernel(root);
+    }
 }
 
 #[cfg(feature = "ebpf")]
