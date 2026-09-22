@@ -344,7 +344,7 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
         }
     }
 
-    async fn update_discovery_inventory(
+    pub(super) async fn update_discovery_inventory(
         &mut self,
         id: &crate::onion::service_id::ServiceId,
         update: impl FnOnce(&mut crate::bun::discovery_owners::DiscoveryInventory) + Send,

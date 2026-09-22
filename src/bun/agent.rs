@@ -470,6 +470,19 @@ pub enum AgentCommand {
         ingress: Vec<crate::cluster::orchestrate::IngressAssignment>,
         response: oneshot::Sender<Result<(), BunError>>,
     },
+    /// Reconcile enrolled durable consumer views and exact withdrawal obligations.
+    SyncClusterConsumer {
+        generation: u64,
+        catalog: Box<crate::onion::catalog::EndpointCatalog>,
+        ingress: Vec<crate::cluster::orchestrate::IngressAssignment>,
+        withdrawals: Vec<crate::onion::withdrawal::EndpointWithdrawalInstruction>,
+        response: oneshot::Sender<Result<ConsumerUpdate, BunError>>,
+    },
+    /// Confirm the leader acknowledged one original, locally proven receipt.
+    ConfirmConsumerReceipt {
+        generation: u64,
+        response: oneshot::Sender<Result<(), BunError>>,
+    },
     /// List all ingress routes.
     Routes {
         response: oneshot::Sender<Vec<crate::wrapper::types::RouteInfo>>,
@@ -1521,6 +1534,8 @@ pub struct PartitionBlocklists {
 
 #[cfg(all(feature = "ebpf", target_os = "linux"))]
 use super::egress_owners::{EgressBinding, PolicyPhase};
+mod consumer;
+pub use consumer::ConsumerUpdate;
 mod discovery_ownership;
 mod discovery_recovery;
 mod egress_ownership;
@@ -2197,6 +2212,9 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
         services: &crate::onion::service_map::ServiceMap,
     ) -> Result<(), BunError> {
         self.persist_discovery_publication(id, services).await?;
+        if self.consumer_controls_views() {
+            return self.invalidate_consumer_view().await;
+        }
         self.publish_backend_kernel(id, services).await
     }
 
@@ -2239,19 +2257,25 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
         &self,
         id: &crate::onion::service_id::ServiceId,
     ) -> Result<(), BunError> {
-        let Some(handle) = self.onion_ebpf.as_ref() else {
-            return Ok(());
-        };
         // Read the VIP + port straight from the live entry: the VIP is
         // whatever the map allocated (which may have probed off the natural
         // hash on a collision), so we must not re-derive it here.
-        let Some((vip, port, destination)) = self
-            .service_map
-            .resolve(id)
-            .map(|entry| (entry.vip, entry.port, entry.app_id))
-        else {
+        let Some(entry) = self.service_map.resolve(id) else {
             return Ok(());
         };
+        self.withdraw_discovery_entry(entry).await
+    }
+
+    #[cfg(all(feature = "ebpf", target_os = "linux"))]
+    async fn withdraw_discovery_entry(
+        &self,
+        entry: &crate::onion::types::ServiceEntry,
+    ) -> Result<(), BunError> {
+        let Some(handle) = self.onion_ebpf.as_ref() else {
+            return Ok(());
+        };
+        let id = crate::onion::service_id::ServiceId::new(&entry.namespace, &entry.app_name);
+        let (vip, port, destination) = (entry.vip, entry.port, entry.app_id);
         let bpf = crate::onion::ebpf::maps::BpfServiceMap::new();
         let mut ebpf = handle.lock().await;
         bpf.remove_backends_bpf(&mut ebpf, vip, port)
@@ -2270,6 +2294,14 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
     async fn withdraw_service_ebpf(
         &self,
         _id: &crate::onion::service_id::ServiceId,
+    ) -> Result<(), BunError> {
+        Ok(())
+    }
+
+    #[cfg(not(all(feature = "ebpf", target_os = "linux")))]
+    async fn withdraw_discovery_entry(
+        &self,
+        _entry: &crate::onion::types::ServiceEntry,
     ) -> Result<(), BunError> {
         Ok(())
     }
@@ -2326,7 +2358,7 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
         }
 
         let services: Vec<crate::onion::types::ServiceEntry> = self
-            .service_map
+            .merged_service_map()
             .resolve_all()
             .into_iter()
             .cloned()
@@ -4439,6 +4471,39 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
                 let result = self
                     .publish_cluster_catalogue(generation, *catalog, ingress)
                     .await;
+                let _ = response.send(result);
+            }
+            AgentCommand::SyncClusterConsumer {
+                generation,
+                catalog,
+                ingress,
+                withdrawals,
+                response,
+            } => {
+                let result = self
+                    .synchronise_consumer(generation, *catalog, ingress, withdrawals)
+                    .await;
+                let result = match result {
+                    Err(error) => {
+                        let retry = self.consumer_update(false);
+                        if retry.receipts.is_empty() {
+                            Err(error)
+                        } else {
+                            // Capacity or candidate refusal must not starve
+                            // already-proven receipts needed to free capacity.
+                            eprintln!("bun: consumer publication awaits retry: {error}");
+                            Ok(retry)
+                        }
+                    }
+                    success => success,
+                };
+                let _ = response.send(result);
+            }
+            AgentCommand::ConfirmConsumerReceipt {
+                generation,
+                response,
+            } => {
+                let result = self.confirm_consumer_receipt(generation).await;
                 let _ = response.send(result);
             }
             AgentCommand::Routes { response } => {
@@ -8221,6 +8286,11 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
         catalog: crate::onion::catalog::EndpointCatalog,
         ingress: Vec<crate::cluster::orchestrate::IngressAssignment>,
     ) -> Result<(), BunError> {
+        if self.consumer_controls_views() {
+            return Err(BunError::ClusterPublication(
+                "durable consumer publication requires withdrawal instructions".into(),
+            ));
+        }
         if (generation == 0 && !catalog.is_empty())
             || self.cluster_catalog_generation.is_some_and(|confirmed| {
                 generation < confirmed
@@ -8273,6 +8343,9 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
     }
 
     fn merged_service_map(&self) -> crate::onion::service_map::ServiceMap {
+        if self.consumer_controls_views() {
+            return self.service_map_tx.borrow().clone();
+        }
         // Membership can lag or omit a non-voter. Local retirement must not
         // depend on the council having already learned this node's identity.
         let local_name = self
@@ -8318,6 +8391,9 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
     /// nodes. The local map alone still drives eBPF backend-map syncing —
     /// this merge only affects what DNS/ingress resolve.
     async fn rebuild_routing_table(&self) {
+        if self.consumer_controls_views() {
+            return;
+        }
         let merged = self.merged_service_map();
 
         let mut table = self.routing_table.write().await;
@@ -9463,6 +9539,16 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
             .iter()
             .any(|backend| backend.instance_id == id.0);
         entry.backends.retain(|backend| backend.instance_id != id.0);
+        if self.consumer_controls_views() {
+            self.invalidate_consumer_view().await?;
+            self.service_map
+                .remove_backend(&service, &id.0)
+                .map_err(|error| BunError::BackendRetirement {
+                    service,
+                    reason: error.to_string(),
+                })?;
+            return Ok(());
+        }
         // Keep the original userspace owner on refusal. A retry must still know
         // the exact allocated key and the backend whose removal is outstanding.
         #[cfg(all(feature = "ebpf", target_os = "linux"))]
@@ -19903,5 +19989,158 @@ host = "remote.local"
                 "{strategy} reused its predecessor's cgroup"
             );
         }
+    }
+    #[tokio::test]
+    async fn durable_consumer_waits_for_http_and_websocket_release_then_recovers_receipt_retry() {
+        use crate::bun::consumer_owners::ConsumerIdentity;
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("discovery");
+        let identity = ConsumerIdentity {
+            node_id: crate::meat::NodeId::new("test"),
+            cluster_identity: [42; 32],
+        };
+        let (mut agent, _, _) = test_cluster_fault_agent().await;
+        agent.set_records_dir(root.path().to_owned());
+        agent.supervisor.grill().set_launch_inventory(vec![]).await;
+        agent
+            .recover_consumer_ownership(&path, identity.clone())
+            .await
+            .unwrap();
+        let (catalog, ingress) = cluster_publication_fixture();
+        let result = agent
+            .synchronise_consumer(1, catalog.clone(), ingress.clone(), vec![])
+            .await
+            .unwrap();
+        assert!(result.published && result.receipts.is_empty());
+        let backend = agent.service_map_tx.borrow().resolve_all()[0].backends[0]
+            .instance_id
+            .clone();
+        let http = agent
+            .drains
+            .capture_requests(std::slice::from_ref(&backend), false)
+            .await
+            .unwrap();
+        let websocket = agent
+            .drains
+            .capture_requests(std::slice::from_ref(&backend), true)
+            .await
+            .unwrap();
+        let instruction = crate::onion::withdrawal::EndpointWithdrawalInstruction {
+            generation: 1,
+            services: catalog
+                .services
+                .iter()
+                .map(|(id, service)| {
+                    (
+                        id.clone(),
+                        crate::onion::withdrawal::ServiceWithdrawal {
+                            service: service.clone(),
+                            retire_vip: true,
+                        },
+                    )
+                })
+                .collect(),
+        };
+        let result = agent
+            .synchronise_consumer(2, Default::default(), vec![], vec![instruction.clone()])
+            .await
+            .unwrap();
+        assert!(!result.published && result.receipts.is_empty());
+        assert!(
+            http.iter()
+                .chain(&websocket)
+                .all(|token| token.is_cancelled())
+        );
+        assert!(agent.service_map_tx.borrow().resolve_all().is_empty());
+        agent.drains.decrement_connections(&backend).await;
+        let result = agent
+            .synchronise_consumer(2, Default::default(), vec![], vec![instruction.clone()])
+            .await
+            .unwrap();
+        assert!(!result.published && result.receipts.is_empty());
+        agent.drains.decrement_connections(&backend).await;
+        agent.drains.decrement_websocket(&backend).await;
+        let result = agent
+            .synchronise_consumer(2, Default::default(), vec![], vec![instruction.clone()])
+            .await
+            .unwrap();
+        assert!(result.published);
+        assert_eq!(result.receipts, vec![1]);
+        drop(agent);
+        let (mut recovered, _, _) = test_cluster_fault_agent().await;
+        recovered.set_records_dir(root.path().to_owned());
+        recovered
+            .supervisor
+            .grill()
+            .set_launch_inventory(vec![])
+            .await;
+        recovered
+            .recover_consumer_ownership(&path, identity)
+            .await
+            .unwrap();
+        assert!(recovered.service_map_tx.borrow().resolve_all().is_empty());
+        assert!(
+            recovered
+                .synchronise_consumer(1, catalog, ingress, vec![])
+                .await
+                .is_err()
+        );
+        let result = recovered
+            .synchronise_consumer(2, Default::default(), vec![], vec![instruction])
+            .await
+            .unwrap();
+        assert_eq!(result.receipts, vec![1]);
+        recovered.confirm_consumer_receipt(1).await.unwrap();
+        recovered.confirm_consumer_receipt(1).await.unwrap();
+        drop(recovered);
+        let journal = crate::bun::discovery_owners::DiscoveryJournal::open(&path).unwrap();
+        let consumer = journal.inventory().consumer.as_ref().unwrap();
+        assert!(consumer.receipts.is_empty());
+        assert_eq!(consumer.publications.len(), 1);
+        assert_eq!(consumer.publications[0].generation, 2);
+    }
+
+    #[tokio::test]
+    async fn durable_consumer_refuses_changed_enrolment_before_recovery() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("discovery");
+        let identity = crate::bun::consumer_owners::ConsumerIdentity {
+            node_id: crate::meat::NodeId::new("test"),
+            cluster_identity: [42; 32],
+        };
+        let (mut agent, _, _) = test_cluster_fault_agent().await;
+        agent.set_records_dir(root.path().to_owned());
+        agent.supervisor.grill().set_launch_inventory(vec![]).await;
+        agent
+            .recover_consumer_ownership(&path, identity.clone())
+            .await
+            .unwrap();
+        let (catalog, ingress) = cluster_publication_fixture();
+        agent
+            .synchronise_consumer(3, catalog, ingress, vec![])
+            .await
+            .unwrap();
+        drop(agent);
+        let original = std::fs::read(path.join("discovery.json")).unwrap();
+        let (mut replacement, _, _) = test_cluster_fault_agent().await;
+        replacement.set_records_dir(root.path().to_owned());
+        replacement
+            .supervisor
+            .grill()
+            .set_launch_inventory(vec![])
+            .await;
+        let mut changed = identity;
+        changed.cluster_identity = [43; 32];
+        assert!(
+            replacement
+                .recover_consumer_ownership(&path, changed)
+                .await
+                .is_err()
+        );
+        assert_eq!(
+            std::fs::read(path.join("discovery.json")).unwrap(),
+            original
+        );
+        assert!(replacement.service_map_tx.borrow().resolve_all().is_empty());
     }
 }

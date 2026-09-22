@@ -105,14 +105,40 @@ impl DiscoveryJournal {
         &self,
         launches: &[crate::grill::RuntimeLaunch],
     ) -> io::Result<DiscoveryInventory> {
-        use crate::grill::runc_intent::NetworkReferenceState;
-        if self.uncertain {
-            return Err(io::Error::other("discovery checkpoint is uncertain"));
-        }
         if self.inventory.consumer.is_some() {
             return Err(io::Error::other(
                 "consumer ownership requires cluster recovery reconciliation",
             ));
+        }
+        self.reconcile_original_runtime_inventory(launches)
+    }
+
+    /// Correlate local runtime ownership after the caller verifies consumer enrolment.
+    pub(crate) fn reconcile_consumer_runtime_inventory(
+        &self,
+        launches: &[crate::grill::RuntimeLaunch],
+        identity: &super::consumer_owners::ConsumerIdentity,
+    ) -> io::Result<DiscoveryInventory> {
+        if self
+            .inventory
+            .consumer
+            .as_ref()
+            .is_none_or(|owner| owner.identity != *identity)
+        {
+            return Err(io::Error::other(
+                "original consumer enrolment identity is missing",
+            ));
+        }
+        self.reconcile_original_runtime_inventory(launches)
+    }
+
+    fn reconcile_original_runtime_inventory(
+        &self,
+        launches: &[crate::grill::RuntimeLaunch],
+    ) -> io::Result<DiscoveryInventory> {
+        use crate::grill::runc_intent::NetworkReferenceState;
+        if self.uncertain {
+            return Err(io::Error::other("discovery checkpoint is uncertain"));
         }
         let mut by_instance = std::collections::HashMap::new();
         for launch in launches {

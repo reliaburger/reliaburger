@@ -13,10 +13,18 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
         &mut self,
         directory: &std::path::Path,
     ) -> Result<(), BunError> {
+        self.recover_discovery(directory, None).await
+    }
+
+    pub(super) async fn recover_discovery(
+        &mut self,
+        directory: &std::path::Path,
+        consumer: Option<crate::bun::consumer_owners::ConsumerIdentity>,
+    ) -> Result<(), BunError> {
         if !matches!(self.discovery_ownership, DiscoveryOwnership::Disabled)
             || !self.service_map.resolve_all().is_empty()
             || !self.supervisor.list_instances().is_empty()
-            || self.cluster.is_some()
+            || self.cluster.is_some() != consumer.is_some()
             || self.records_dir.is_none()
         {
             return Err(BunError::AdoptionState(
@@ -24,9 +32,39 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
             ));
         }
         self.discovery_ownership = DiscoveryOwnership::Uncertain;
-        let journal = DiscoveryJournal::open_async(directory)
+        let mut journal = DiscoveryJournal::open_async(directory)
             .await
             .map_err(|error| BunError::AdoptionState(error.to_string()))?;
+        if let Some(identity) = &consumer {
+            match &journal.inventory().consumer {
+                Some(original) if original.identity != *identity => {
+                    return Err(BunError::AdoptionState(
+                        "consumer enrolment identity changed".into(),
+                    ));
+                }
+                None => {
+                    if !journal.inventory().services.is_empty()
+                        || !journal.inventory().references.is_empty()
+                    {
+                        return Err(BunError::AdoptionState(
+                            "standalone ownership cannot become a cluster consumer".into(),
+                        ));
+                    }
+                    let mut next = journal.inventory().clone();
+                    next.consumer = Some(crate::bun::consumer_owners::ConsumerOwnership {
+                        identity: identity.clone(),
+                        publications: vec![],
+                        phase: crate::bun::consumer_owners::ConsumerPhase::Withdrawn,
+                        receipts: Default::default(),
+                    });
+                    journal = journal
+                        .persist(next)
+                        .await
+                        .map_err(|error| BunError::AdoptionState(error.to_string()))?;
+                }
+                Some(_) => {}
+            }
+        }
         let launches = self
             .supervisor
             .grill()
@@ -37,9 +75,11 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
                     "discovery recovery requires complete runtime inventory".into(),
                 )
             })?;
-        let inventory = journal
-            .reconcile_runtime_inventory(&launches)
-            .map_err(|error| BunError::AdoptionState(error.to_string()))?;
+        let inventory = match &consumer {
+            Some(identity) => journal.reconcile_consumer_runtime_inventory(&launches, identity),
+            None => journal.reconcile_runtime_inventory(&launches),
+        }
+        .map_err(|error| BunError::AdoptionState(error.to_string()))?;
         self.validate_discovery_kernel_inventory(&inventory).await?;
         let entries: Vec<_> = inventory
             .services
@@ -82,17 +122,16 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
         let DiscoveryOwnership::Recovered(journal) = &self.discovery_ownership else {
             return Ok(());
         };
-        if self.cluster.is_some() {
-            return Err(BunError::AdoptionState(
-                "remote discovery recovery is unconfirmed".into(),
-            ));
-        }
         let launches = launches.ok_or_else(|| {
             BunError::AdoptionState("complete runtime inventory is missing".into())
         })?;
-        let reconciled = journal
-            .reconcile_runtime_inventory(launches)
-            .map_err(|error| BunError::AdoptionState(error.to_string()))?;
+        let reconciled = match &journal.inventory().consumer {
+            Some(consumer) => {
+                journal.reconcile_consumer_runtime_inventory(launches, &consumer.identity)
+            }
+            None => journal.reconcile_runtime_inventory(launches),
+        }
+        .map_err(|error| BunError::AdoptionState(error.to_string()))?;
         if reconciled.references.len() != journal.inventory().references.len() {
             return Err(BunError::AdoptionState(
                 "runtime inventory changed during discovery recovery".into(),
@@ -162,6 +201,11 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
                 })
                 .collect();
             if instances.is_empty() {
+                if self.cluster.is_some() {
+                    // Keep the local allocation reserved until producer cleanup
+                    // and the committed cluster catalogue permit its retirement.
+                    continue;
+                }
                 self.retire_discovery_service(&service).await?;
                 self.service_map
                     .unregister(&service)
@@ -222,11 +266,17 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
             for entry in map.iter() {
                 let (key, value) =
                     entry.map_err(|error| BunError::AdoptionState(error.to_string()))?;
-                if !inventory.services.iter().any(|owner| {
-                    owner.entry.vip.to_network_byte_order() == key.vip
-                        && owner.entry.port.to_be() == key.port
-                        && owner.entry.app_id == value.app_id
-                        && owner.entry.namespace_id == value.namespace_id
+                let local = inventory.services.iter().map(|owner| &owner.entry);
+                let remote = inventory
+                    .consumer
+                    .iter()
+                    .flat_map(|owner| &owner.publications)
+                    .flat_map(|publication| &publication.effective_services);
+                if !local.chain(remote).any(|entry| {
+                    entry.vip.to_network_byte_order() == key.vip
+                        && entry.port.to_be() == key.port
+                        && entry.app_id == value.app_id
+                        && entry.namespace_id == value.namespace_id
                 }) {
                     return Err(BunError::AdoptionState(
                         "kernel backend has no original discovery owner".into(),

@@ -2397,3 +2397,25 @@ checks allowed transitions before the journal writes anything. The `BTreeMap`
 keys receipts by their original generation; deterministic ordering makes snapshots
 and tests easier to inspect. Tests first reproduce premature receipt removal and
 refusal to compact even after withdrawal, then exercise the permission boundaries.
+
+The agent now uses those permissions. It journals the proposed merged catalogue,
+local service view and ingress configuration before publishing any of them. A
+replacement first hides DNS/ingress, removes original kernel entries and destination
+grants, and cancels requests captured under the old routing-table lock. The request
+counters still have to reach zero. Only then does the agent record `Withdrawn`,
+make eligible receipts ready, compact history and publish the replacement.
+
+Local lifecycle changes cannot bypass this sequence. They invalidate the consumer
+view and retain their own runtime/discovery records; only the consumer reconciler
+may publish the merged view again. Local backends need the committed catalogue's
+allocation and matching original runtime generation. This prevents a prepared or
+retiring local instance from inventing a public endpoint outside the journal.
+
+Recovery binds the journal to both node name and enrolled cluster fingerprint.
+It inspects local and consumer kernel entries together, correlates local runtime
+holds, withdraws the old view and starts with no historical health in DNS or
+Wrapper. A ready receipt survives this process. The latest catalogue generation
+also survives, even after all but the latest publication have been compacted.
+The regression captures both an HTTP request and a WebSocket, confirms that
+cancellation alone sends no receipt, releases their guards independently, then
+reopens the journal and retries the exact original receipt.
