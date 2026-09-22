@@ -16,6 +16,10 @@ struct Node {
 
 impl Node {
     async fn start(root: &Path) -> Self {
+        Self::start_with_restarts(root, 0).await
+    }
+
+    async fn start_with_restarts(root: &Path, mut remaining: usize) -> Self {
         let log = root.join("bun.log");
         let offset = std::fs::metadata(&log).map_or(0, |m| m.len()) as usize;
         let output = std::fs::OpenOptions::new()
@@ -83,10 +87,11 @@ impl Node {
                         break client;
                     }
                 }
-                assert!(
-                    child.try_wait().unwrap().is_none(),
-                    "Bun exited: {contents}"
-                );
+                if child.try_wait().unwrap().is_some() {
+                    assert!(remaining > 0, "Bun exited: {contents}");
+                    remaining -= 1;
+                    child = command.spawn().unwrap();
+                }
                 tokio::time::sleep(Duration::from_millis(25)).await;
             }
         })
@@ -518,15 +523,17 @@ fn upgrade_fixture(root: &Path) -> Vec<u8> {
 }
 
 #[cfg(feature = "ebpf")]
-async fn upgrade_and_rollback(root: &Path, node: &Node, key: &[u8]) {
+fn owned_upgrade_directive(
+    root: &Path,
+    key: &[u8],
+) -> reliaburger::upgrade::types::UpgradeDirective {
     use reliaburger::upgrade::{
         signing,
         types::{BinarySource, UpgradeDirective},
     };
-    let original = node.client.status().await.unwrap().remove(0);
     let path = root.join("upgrade-bin/bun-v0.2.0");
     let bytes = std::fs::read(&path).unwrap();
-    let directive = UpgradeDirective {
+    UpgradeDirective {
         upgrade_id: "owned-runtime-upgrade".into(),
         target_version: "v0.2.0".parse().unwrap(),
         binary_sha256: signing::sha256_hex(&bytes),
@@ -534,7 +541,49 @@ async fn upgrade_and_rollback(root: &Path, node: &Node, key: &[u8]) {
         external_signature: None,
         source: BinarySource::LocalFile { path },
         network_provenance: false,
-    };
+    }
+}
+
+#[cfg(feature = "ebpf")]
+async fn failed_owned_upgrade_reverts(root: &Path, node: &mut Node, key: &[u8]) {
+    let original = node.client.status().await.unwrap().remove(0);
+    std::fs::write(
+        root.join("upgrade-bin/bun-v0.2.0.fail-boot"),
+        "broken candidate",
+    )
+    .unwrap();
+    let mut directive = owned_upgrade_directive(root, key);
+    directive.upgrade_id = "owned-runtime-failed-candidate".into();
+    node.client.upgrade_apply(&directive).await.unwrap();
+    tokio::time::timeout(Duration::from_secs(30), node.child.wait())
+        .await
+        .unwrap()
+        .unwrap();
+    *node = Node::start_with_restarts(root, 2).await;
+    assert_eq!(node.client.node_version().await.unwrap(), "v0.1.0");
+    let status = node.client.upgrade_status().await.unwrap();
+    assert!(status["in_flight"].is_null());
+    assert!(
+        status["history"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|item| item["outcome"] == "Reverted")
+    );
+    let adopted = node.client.status().await.unwrap().remove(0);
+    assert_eq!(adopted.id, original.id);
+    assert_eq!(adopted.pid, original.pid);
+    assert_eq!(adopted.host_port, original.host_port);
+    assert_eq!(
+        std::fs::read_to_string(root.join("shared/main")).unwrap(),
+        "main\n"
+    );
+}
+
+#[cfg(feature = "ebpf")]
+async fn upgrade_and_rollback(root: &Path, node: &Node, key: &[u8]) {
+    let original = node.client.status().await.unwrap().remove(0);
+    let directive = owned_upgrade_directive(root, key);
     for version in ["v0.2.0", "v0.1.0"] {
         if version == "v0.2.0" {
             node.client.upgrade_apply(&directive).await.unwrap();
@@ -584,6 +633,7 @@ async fn normal_owned_bun_upgrade_and_rollback_preserve_runtime_and_kernel() {
     wait_file(&root.join("shared/main")).await;
     let original = kernel_manifest(&root);
     upgrade_and_rollback(&root, &node, &key).await;
+    failed_owned_upgrade_reverts(&root, &mut node, &key).await;
     assert_eq!(kernel_manifest(&root), original);
     node.client.stop("upgrade-owned", "default").await.unwrap();
     node.crash().await;
@@ -646,6 +696,7 @@ async fn normal_rootless_bun_recovers_owned_forward_and_discovery() {
         "main\n"
     );
     upgrade_and_rollback(&root, &recovered, &key).await;
+    failed_owned_upgrade_reverts(&root, &mut recovered, &key).await;
     assert_eq!(
         reqwest::get(&url).await.unwrap().text().await.unwrap(),
         "owned"

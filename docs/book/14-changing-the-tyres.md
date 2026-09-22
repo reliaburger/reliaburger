@@ -950,3 +950,11 @@ rootless qualification requests the same forwarded HTTP endpoint after rollback.
 Finally, confirmed stop must clear discovery ownership. These checks cover actual
 runtime recovery during a successful upgrade and explicit rollback. A failed
 candidate's automatic revert and cluster rolling upgrades need their own OCI cases.
+
+The OCI matrix also poisons the candidate with the debug-only boot-failure sidecar.
+After the actual failed process exits, the fixture performs bounded supervisor
+restarts until Bun's original boot-attempt journal selects the previous binary.
+It requires a recorded `Reverted` outcome and unchanged workload identity, PID and
+host port. Both rootful and rootless paths then complete confirmed cleanup. The
+sidecar and throwaway signing key remain test-only; release binaries contain neither
+this failure trigger nor the test key override.
