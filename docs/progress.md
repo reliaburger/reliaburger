@@ -86,6 +86,10 @@ through shutdown. All 46 affected ordinary integration tests and strict Clippy
 pass on macOS/Linux; ten live Linux placement cases pass (154.71s). The two
 Buildah-absence cases execute in isolated child environments on the equipped VM.
 
+Hosted CI at `146dee9` found two missing discovery routes in the authorisation
+audit matrix. Both now declare System scope; all eight route/scope audit tests
+pass (0.210s). Handler authentication and enrolment checks are unchanged.
+
 ### Correctness and behavioural contracts
 
 - [x] **C01** Preserve every exported log generation with full content-hash object names. Five real Parquet export/query tests and ten exporter unit tests pass; the restart/name-reuse regression fails before the fix. Legacy archive objects remain untouched (migration duplicates documented in chapter 6).

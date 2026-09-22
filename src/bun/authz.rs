@@ -173,6 +173,8 @@ pub const ROUTE_MATRIX: &[Route] = &[
     route(Get, "/v1/fault", AnyToken),
     route(Delete, "/v1/fault/{id}", Deployer),
     // Discovery + routing.
+    route(Post, "/v1/discovery/retire", System),
+    route(Post, "/v1/discovery/withdrawn", System),
     route(Get, "/v1/resolve", AnyToken),
     route(Get, "/v1/resolve/{name}", AnyToken),
     route(Get, "/v1/routes", AnyToken),
