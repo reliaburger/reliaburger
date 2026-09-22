@@ -357,9 +357,10 @@ now keeps policy through actual loader SIGKILL and recovers the same maps withou
 a detach window. The agent now records original workload policy before map
 writes and restores it before adoption; cleanup retains positive retirement
 evidence until metadata is gone. Network rules, diagnostics and adoption now use
-the container’s verified original cgroup. All 39 physical kernel tests pass.
-Pre-start namespace binding, discovery cleanup, host-reboot reconciliation and
-production kernel selection remain release gates. Automatic application restarts now retire the
+the container’s verified original cgroup. All 78 physical kernel tests pass.
+Standalone rootful startup now recovers durable kernel/discovery ownership,
+including after a host reboot. Clustered/rootless activation and actual
+upgrade/rollback qualification remain release gates. Automatic application restarts now retire the
 predecessor’s adoption and policy records before creating a successor; failed
 cleanup blocks replacement while preserving the logical workload identity.
 Rolling and blue-green generations now use separate cgroups, so retiring the
@@ -373,11 +374,6 @@ Cluster-wide credential management and permission/quota declarations require
 an unscoped Admin. App and job manifests enforce the caller's scope and configured
 permissions before applying changes; see the [user guide](docs/README.md).
 
-## Licence
-
-[Apache 2.0](LICENSE)
-
-
 Standalone rootful Linux Runc nodes with `[ebpf] enabled = true` now select owned
 runtime execution, persistent kernel maps/links and durable discovery recovery
 on normal startup. This requires an eBPF-enabled binary and mounted bpffs at
@@ -385,3 +381,7 @@ on normal startup. This requires an eBPF-enabled binary and mounted bpffs at
 mode or disabling enforcement cannot bypass that ownership. Kernel or discovery
 recovery failures prevent readiness. Clustered consumer recovery and production
 activation remain release blockers.
+
+## Licence
+
+[Apache 2.0](LICENSE)
