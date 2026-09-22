@@ -31,6 +31,17 @@ pub struct EndpointWithdrawalInstruction {
     pub services: BTreeMap<String, ServiceWithdrawal>,
 }
 
+/// A node's confirmation that one original publication has been withdrawn locally.
+/// The HTTP listener supplies the consumer identity from its TLS certificate.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct EndpointWithdrawalReceipt {
+    /// Explicit protocol and durable-state compatibility for this receipt.
+    pub compatibility: crate::compatibility::Compatibility,
+    /// Original withdrawn publication, never the current catalogue generation.
+    pub generation: u64,
+}
+
 /// A publication's withdrawn exposures and the consumers still owing confirmation.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct EndpointWithdrawal {

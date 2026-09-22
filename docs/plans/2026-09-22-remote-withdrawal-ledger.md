@@ -109,3 +109,13 @@ historical obligation may return success without changing state, because generat
 identities never repeat. This must not be used as evidence that any current or
 later publication has drained. Tests must cover replay after snapshot, late
 readers, wrong identities, missing/revoked TLS credentials and unavailable leaders.
+
+### Receipt implementation checkpoint
+
+The endpoint and Raft mutation are implemented, pending qualification. Three API
+contracts fail first (0.066s), followed by two Raft snapshot/refusal contracts
+(0.092s). The body contains only compatibility and generation; the handler derives
+the consumer from a freshly validated TLS certificate. Only Applied returns 204.
+Historical retries leave all other obligations unchanged; registration is retained.
+The new durable command advances compatibility to protocol 19/state 32. Consumer
+proof production, cancellation recovery and producer release remain open.

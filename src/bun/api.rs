@@ -455,6 +455,10 @@ pub fn router_with_upgrade(
         .route("/v1/rollback/{app}/{namespace}", post(rollback_handler))
         .route("/v1/nodes/decommission", post(node_decommission_handler))
         .route("/v1/placements/{node_id}", get(placements_handler))
+        .route(
+            "/v1/discovery/withdrawn",
+            post(endpoint_withdrawal_receipt_handler),
+        )
         .route("/v1/test/leases/retired", post(test_lease_retired_handler))
         .route("/v1/images", get(images_handler))
         .route("/v1/batch", post(super::batch::batch_submit_handler))
@@ -3042,6 +3046,70 @@ async fn refuse_retired_tls_peer(
         }
     }
     next.run(request).await
+}
+
+/// Receipts must reach the leader directly, preserving the consumer's TLS identity.
+async fn endpoint_withdrawal_receipt_handler(
+    auth: Option<axum::Extension<crate::sesame::auth::AuthContext>>,
+    peer: Option<axum::Extension<crate::sesame::renewal::TlsPeerCertificate>>,
+    State(state): State<ApiState>,
+    Json(receipt): Json<crate::onion::withdrawal::EndpointWithdrawalReceipt>,
+) -> Response {
+    if let Err(response) = crate::sesame::auth::require_system(auth.as_deref()) {
+        return response;
+    }
+    if let Err(error) = receipt.compatibility.require_current() {
+        return (StatusCode::CONFLICT, error.to_string()).into_response();
+    }
+    let Some(peer) = peer else {
+        return (
+            StatusCode::FORBIDDEN,
+            "endpoint receipts require a TLS node certificate",
+        )
+            .into_response();
+    };
+    let Some(council) = &state.council else {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            "no endpoint council available",
+        )
+            .into_response();
+    };
+    let result = tokio::time::timeout(std::time::Duration::from_secs(10), async {
+        let security = council
+            .security_state_linearizable()
+            .await
+            .map_err(|error| (StatusCode::SERVICE_UNAVAILABLE, error.to_string()))?;
+        let node_id = crate::sesame::renewal::validate_peer(&peer, &security)
+            .map_err(|error| (StatusCode::FORBIDDEN, error.to_string()))?;
+        council
+            .write(crate::council::RaftRequest::AcknowledgeEndpointWithdrawal {
+                node_id,
+                generation: receipt.generation,
+            })
+            .await
+            .map_err(|error| (StatusCode::SERVICE_UNAVAILABLE, error.to_string()))
+    })
+    .await;
+    match result {
+        Ok(Ok(crate::council::CouncilResponse::Applied { .. })) => {
+            StatusCode::NO_CONTENT.into_response()
+        }
+        Ok(Ok(crate::council::CouncilResponse::Refused { reason })) => {
+            (StatusCode::CONFLICT, reason).into_response()
+        }
+        Ok(Ok(_)) => (
+            StatusCode::SERVICE_UNAVAILABLE,
+            "endpoint receipt is unconfirmed",
+        )
+            .into_response(),
+        Ok(Err(error)) => error.into_response(),
+        Err(_) => (
+            StatusCode::GATEWAY_TIMEOUT,
+            "endpoint receipt outcome unknown; repeat the same receipt",
+        )
+            .into_response(),
+    }
 }
 
 /// `GET /v1/placements/{node_id}` — the apps (and per-node replica

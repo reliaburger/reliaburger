@@ -2074,3 +2074,44 @@ withdrawal it owes. Serialisation preserves original execution fingerprints and
 repeated reads leave obligations unchanged. Durable consumer processing and
 authenticated receipts are the next pieces; receiving instructions alone cannot
 authorise the producer to reuse an address.
+
+
+### A cleanup receipt belongs to one node and one generation
+
+Worker A has withdrawn generation 12. Worker B is offline, and generation 13 has
+also left the catalogue. A's receipt mustn't erase B's work or acknowledge 13.
+Council removes A only from generation 12's consumer set. The withdrawal record
+can disappear when that set becomes empty; the durable consumer registration
+stays, so future publications still account for A.
+
+`POST /v1/discovery/withdrawn` requires system credentials and a current node TLS
+certificate. The request contains compatibility metadata and the original
+generation, but no node name. The handler derives identity from the certificate
+after a quorum-backed security read. A caller cannot nominate another consumer,
+and a follower cannot forward the request under its own certificate. Missing,
+foreign and revoked credentials refuse without modifying the ledger. Plaintext
+development registration alone cannot authorise cleanup.
+
+The handler returns success only for a committed `Applied` response. A refused
+write, unavailable leader or timeout leaves the caller uncertain. A timeout may
+still be followed by a commit, so retries must be safe: an already absent
+historical obligation is a no-op. Zero and current/future generations refuse.
+Generation numbers never repeat, so a delayed receipt cannot discharge a newer
+withdrawal. Raft also rejects unregistered and permanently retired identities.
+
+Removing a consumer first borrows its record with `get_mut`. Once the code has
+finished using that borrow, Rust allows removing the now-empty record from the
+map. The compiler tracks the last use of the borrow, rather than requiring it to
+last to the end of the enclosing block. This lets us express the transition
+without cloning the entire ledger or introducing a lock inside the state machine.
+
+Tests exercise the HTTP handler with real signed certificates and a running Raft
+node; the fixture supplies the same certificate extension as the TLS listener.
+They verify that delayed receipts, late registrations and invalid credentials
+leave unrelated obligations intact. A separate snapshot test proves that one
+consumer's recorded receipt survives restoration and replay. These tests do not
+claim that the consumer has durably withdrawn its local routes yet: wiring that
+proof to this endpoint and gating physical producer release remain separate work.
+
+The new Raft command advances compatibility to protocol 19/state 32. Pre-release
+clusters must start fresh rather than replay an unknown durable command.

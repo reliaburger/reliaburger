@@ -309,6 +309,8 @@ pub enum RaftRequest {
     ConfirmImageCopy(crate::pickle::types::ImageCopyConfirmation),
     /// Record a node before it can consume cluster discovery publications.
     RegisterEndpointConsumer { node_id: String },
+    /// Discharge one authenticated consumer's exact original withdrawal generation.
+    AcknowledgeEndpointWithdrawal { node_id: String, generation: u64 },
 }
 
 // ---------------------------------------------------------------------------

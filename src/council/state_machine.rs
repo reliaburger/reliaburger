@@ -910,6 +910,47 @@ impl StateMachineInner {
                 }
                 self.state.endpoint_consumers.insert(node_id.clone());
             }
+            RaftRequest::AcknowledgeEndpointWithdrawal {
+                node_id,
+                generation,
+            } => {
+                if let Err(reason) = crate::cluster::retirement::validate_node_id(node_id) {
+                    return Some(CouncilResponse::Refused {
+                        reason: reason.into(),
+                    });
+                }
+                if self
+                    .state
+                    .security_state
+                    .crl
+                    .retired_nodes
+                    .contains_key(node_id)
+                {
+                    return Some(CouncilResponse::Refused {
+                        reason: "node identity is retired; fresh enrolment is required".into(),
+                    });
+                }
+                if !self.state.endpoint_consumers.contains(node_id) {
+                    return Some(CouncilResponse::Refused {
+                        reason: "endpoint consumer is not registered".into(),
+                    });
+                }
+                if *generation == 0 || *generation >= self.state.endpoint_withdrawals.generation {
+                    return Some(CouncilResponse::Refused {
+                        reason: "endpoint receipt must name an original withdrawn generation"
+                            .into(),
+                    });
+                }
+                // Generations never repeat. Retried historical receipts are no-ops;
+                // they cannot discharge any current or later publication.
+                let pending = &mut self.state.endpoint_withdrawals.pending;
+                if let Some(withdrawal) = pending.get_mut(generation) {
+                    withdrawal.consumers.remove(node_id);
+                    if withdrawal.consumers.is_empty() {
+                        pending.remove(generation);
+                    }
+                }
+            }
             RaftRequest::PublishEndpoints {
                 expected_generation,
                 catalog,
@@ -2883,6 +2924,117 @@ mod tests {
             }],
         )])
         .unwrap()
+    }
+
+    fn endpoint_receipt(node_id: &str, generation: u64) -> RaftRequest {
+        serde_json::from_value(serde_json::json!({
+            "AcknowledgeEndpointWithdrawal": {"node_id": node_id, "generation": generation}
+        }))
+        .unwrap()
+    }
+
+    #[test]
+    fn endpoint_receipts_refuse_invalid_identities_and_nonhistorical_generations_atomically() {
+        let mut inner = StateMachineInner::default();
+        inner.state.endpoint_consumers.insert("reader".into());
+        let first = withdrawal_fixture_catalogue();
+        for (expected_generation, catalog) in [first, Default::default()].into_iter().enumerate() {
+            assert!(
+                inner
+                    .apply_request(&RaftRequest::PublishEndpoints {
+                        expected_generation: expected_generation as u64,
+                        catalog: Box::new(catalog),
+                    })
+                    .is_none()
+            );
+        }
+        assert!(matches!(
+            inner.apply_request(&RaftRequest::DecommissionNode {
+                node_id: "retired".into(),
+                retired_by: "operator".into(),
+                reason: "fenced".into(),
+                retired_at_unix_ms: 1,
+                membership_log_id: None,
+            }),
+            Some(CouncilResponse::NodeDecommissioned { .. })
+        ));
+        let original = serde_json::to_value(&inner.state).unwrap();
+        for (node, generation) in [
+            ("reader", 0),
+            ("reader", 2),
+            ("reader", u64::MAX),
+            ("unregistered", 1),
+            ("retired", 1),
+            ("../reader", 1),
+        ] {
+            assert!(
+                matches!(
+                    inner.apply_request(&endpoint_receipt(node, generation)),
+                    Some(CouncilResponse::Refused { .. })
+                ),
+                "{node}/{generation} must refuse"
+            );
+            assert_eq!(serde_json::to_value(&inner.state).unwrap(), original);
+        }
+    }
+
+    #[tokio::test]
+    async fn endpoint_receipts_survive_snapshot_and_replay_without_discharging_other_consumers() {
+        let mut sm = CouncilStateMachine::new();
+        let requests = [
+            RaftRequest::RegisterEndpointConsumer {
+                node_id: "reader".into(),
+            },
+            RaftRequest::RegisterEndpointConsumer {
+                node_id: "offline".into(),
+            },
+            RaftRequest::PublishEndpoints {
+                expected_generation: 0,
+                catalog: Box::new(withdrawal_fixture_catalogue()),
+            },
+            RaftRequest::PublishEndpoints {
+                expected_generation: 1,
+                catalog: Box::default(),
+            },
+            endpoint_receipt("reader", 1),
+        ];
+        for (index, request) in requests.into_iter().enumerate() {
+            let response = sm
+                .apply(vec![normal_entry(1, index as u64 + 1, request)])
+                .await
+                .unwrap();
+            assert!(matches!(response[0], CouncilResponse::Applied { .. }));
+        }
+        let before = sm.desired_state().await;
+        assert_eq!(
+            before.endpoint_withdrawals.pending[&1].consumers,
+            std::collections::BTreeSet::from(["offline".into()])
+        );
+        let mut builder = sm.get_snapshot_builder().await;
+        let snapshot = builder.build_snapshot().await.unwrap();
+        let mut restored = CouncilStateMachine::new();
+        restored
+            .install_snapshot(&snapshot.meta, snapshot.snapshot)
+            .await
+            .unwrap();
+        let response = restored
+            .apply(vec![normal_entry(2, 6, endpoint_receipt("reader", 1))])
+            .await
+            .unwrap();
+        assert!(matches!(response[0], CouncilResponse::Applied { .. }));
+        let replayed = restored.desired_state().await;
+        assert_eq!(replayed.endpoint_withdrawals, before.endpoint_withdrawals);
+        assert_eq!(replayed.endpoint_consumers, before.endpoint_consumers);
+        let response = restored
+            .apply(vec![normal_entry(2, 7, endpoint_receipt("offline", 1))])
+            .await
+            .unwrap();
+        assert!(matches!(response[0], CouncilResponse::Applied { .. }));
+        let after = restored.desired_state().await;
+        assert!(after.endpoint_withdrawals.pending.is_empty());
+        assert_eq!(after.endpoint_withdrawals.generation, 2);
+        assert_eq!(after.endpoint_consumers, before.endpoint_consumers);
+        assert!(after.endpoint_catalog.is_empty());
     }
 
     #[test]
