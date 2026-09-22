@@ -551,34 +551,71 @@ they do not establish that every upgrade failure has the same cause.
 
 ### Qualifying the parser behind an archive
 
-A dependency advisory named Thrift, which our Parquet reader uses for metadata.
-Updating that crate is only part of the repair. Parquet also has a private
-compact-protocol decoder. Its integer loop kept shifting until an input byte
-said to stop, and used a wrapping shift. Sixty-four continuation bytes could
-therefore turn malformed metadata back into a plausible value.
+A dependency advisory named Thrift, which the Parquet reader used to decode file
+metadata. The advisory is about allocation: a crafted length can make the
+decoder reserve far more memory than the file could possibly hold. Who can hand
+us a crafted Parquet file? Mostly nobody. Bun reads archives it wrote itself,
+plus whatever an operator points the remote log query at. But "mostly nobody"
+is a compensating control, not a fix.
 
-The regression writes a real one-row Parquet file, changes the metadata integer,
-updates the footer length and asks the public reader to open it. The untouched
-file must work; the malformed one must return an error. This checks the parsing
-path we actually ship, rather than merely comparing dependency version numbers.
+Our first attempt copied Parquet 54 into the repository and patched its decoder.
+It worked, and it was honest (the patch was recorded line by line), but it meant
+maintaining 90,000 lines of someone else's code. So we looked again. Parquet 59
+no longer uses the Thrift crate at all: it ships its own metadata decoder, with
+its own bounds on list sizes. DataFusion 55 depends on Parquet 59. Upgrading
+DataFusion from 45 to 55 removes Thrift from our dependency graph, and the
+unmaintained `paste` macro crate with it.
 
-We keep the query engine on DataFusion 45 and use Thrift 0.23 with a small,
-reviewable patch to Parquet 54.3.1. The upstream source, licence, archive checksum
-and exact patch live under `vendor/parquet`. Cargo's `[patch.crates-io]` section
-makes every dependent crate use that same parser. It is a temporary maintained
-dependency, with removal criteria recorded beside it.
+Ten major versions sounds like a migration project. It wasn't, and the reason
+is worth knowing. Our code never names the `parquet` crate in `Cargo.toml`; it
+reaches it through DataFusion's re-export:
 
-The decoder now visits only the bit positions that fit the wire integer. Each
-step also checks that the final byte's payload fits the remaining bits. Lengths
-and 32-bit integers get a 32-bit budget; 64-bit values get 64 bits. Unknown-field
-skipping uses these same methods, so adding an unfamiliar field cannot bypass
-the check. We also reject list counts larger than the remaining metadata before
-allocation, and replace a truncated-double indexing panic with an EOF error.
+```rust
+use datafusion::parquet::file::properties::WriterProperties;
+```
 
-The tests include a valid maximum-width integer to make sure refusal hasn't
-become indiscriminate. Normal metric, rollup and log persistence/query tests
-remain part of qualification. A dependency scan is useful evidence. A parser
-regression is different evidence, and we need both.
+A `pub use` in DataFusion makes its Parquet dependency part of its public API.
+Cargo resolves one version, and we always get the one DataFusion was built and
+tested against. Depending on `parquet` directly as well would risk two copies in
+the build, whose types don't mix: a `WriterProperties` from Parquet 58 isn't a
+`WriterProperties` from Parquet 59, as far as the compiler is concerned.
+
+The upgrade changed exactly two lines of ours. Parquet 59 marks two writer
+methods with `#[deprecated]`, an attribute that makes the compiler warn at every
+call site. We build with warnings as errors, so the old names had to go:
+
+```rust
+let mut builder = WriterProperties::builder()
+    .set_compression(Compression::ZSTD(ZstdLevel::default()))
+    .set_max_row_group_row_count(Some(LOG_ROW_GROUP_SIZE));
+```
+
+The new method takes an `Option<usize>`, where `None` means "no row limit".
+We read the deprecated implementations before renaming: both simply forward to
+their replacements, so the files we write are unchanged.
+
+The regression tests stay, because they check the parser we actually ship
+rather than a version number. Each one writes a real one-row Parquet file,
+edits a metadata field, fixes up the footer length and asks the public reader
+to open it. An impossible list count must be refused before allocation. A
+truncated `double` must return an error, not panic. An unknown field must be
+skipped with the same bounds as a known one.
+
+Two tests changed their minds. Parquet's varint decoder is lenient: extra
+continuation bytes wrap around instead of failing, and oversized `i32` values
+truncate. That can garble a metadata integer, but the loop stops when the input
+runs out, so it can't hang or run away with memory. We now assert only that
+opening such a file returns:
+
+```rust
+let _ = accepts(&bytes);
+```
+
+`let _ =` evaluates the expression and deliberately throws the result away.
+Here it says "accept or refuse, we don't mind". A panic would still fail the
+test. The metric, rollup and log restart and query suites complete the picture:
+a dependency scan and a parser regression are different evidence, and we want
+both.
 
 ### A log query owns its response bodies
 

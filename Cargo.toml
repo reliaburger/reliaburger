@@ -65,7 +65,7 @@ pem = "3"
 argon2 = "0.5"
 age = { version = "0.10", features = ["armor"] }
 base64 = "0.22"
-datafusion = "45"
+datafusion = "55"
 object_store = { version = "0.14", features = ["fs", "aws", "gcp"] }
 url = "2"
 sysinfo = "0.33"
@@ -135,8 +135,3 @@ harness = false
 [[bench]]
 name = "gossip_large"
 harness = false
-
-# Parquet's private compact decoder needs the same bounds as patched Thrift.
-# See vendor/parquet/RELIABURGER-PATCH.md for provenance and removal criteria.
-[patch.crates-io]
-parquet = { path = "vendor/parquet" }

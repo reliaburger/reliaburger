@@ -450,6 +450,8 @@ issue, and ratatui brings in an `lru::IterMut` soundness issue. The latter affec
 isn't called by ratatui's layout cache. The former can parse a crafted Parquet object when an
 operator points the remote log-query command at it, so trusted storage is a compensating
 control, not a fix. We wrote both decisions down, named an owner and gave them an expiry.
+Both expiries did their job: ratatui 0.30 later brought a fixed `lru`, and moving to
+DataFusion 55 removed Thrift from the graph altogether (Chapter 6 tells that story).
 
 A later `rkyv` advisory showed why the compiled graph matters too. Cargo locked
 `rust_decimal`'s optional `rkyv` 0.7 dependency, but `byte-unit` disables the defaults that

@@ -15,9 +15,12 @@ the rkyv assumption is now checked automatically.
 | Advisory and pinned package | Reachability and disposition | Migration work |
 | --- | --- | --- |
 | [RUSTSEC-2024-0370](https://rustsec.org/advisories/RUSTSEC-2024-0370.html), proc-macro-error 1.0.4 | Unmaintained informational advisory. Build-time macro through age 0.10.1 and i18n-embed-fl 0.7.0. Retain for this pinned build chain until the review deadline. | [Age 0.12.1](https://docs.rs/crate/age/latest) uses i18n-embed-fl 0.10, whose [dependencies](https://docs.rs/crate/i18n-embed-fl/0.10.0) include proc-macro-error2. Qualify that crypto API upgrade with persisted secret and envelope interoperability tests. |
-| [RUSTSEC-2024-0436](https://rustsec.org/advisories/RUSTSEC-2024-0436.html), paste 1.0.15 | Unmaintained informational advisory. Build-time macro through DataFusion 45 and Parquet 54, including our vendored patch. Retain until the review deadline. The current graph no longer reaches it through ratatui. | Evaluate an upstream query/storage dependency upgrade or the advisory's pastey replacement. Retain the H12 Parquet repair and qualify queries, archives and exports. |
 | [RUSTSEC-2025-0141](https://rustsec.org/advisories/RUSTSEC-2025-0141.html), bincode 1.3.3 | Unmaintained informational advisory; no patched version. Runtime-reachable in reporting and Council disk metadata/encrypted envelopes. Retain explicitly until the review deadline. | Evaluate postcard, bitcode or wincode and version the wire/disk formats. Reporting checks format headers, bounds decode to the received body and rejects trailing bytes; these controls do not replace a deliberate codec migration. |
 | [RUSTSEC-2026-0235](https://rustsec.org/advisories/RUSTSEC-2026-0235.html), rkyv 0.7.46 | Out-of-bounds archive validation vulnerability, fixed in 0.8.17. The locked 0.7 package is on an inactive optional path. Cargo reports no active graph across all root features and targets. Retain only while that remains true, and no later than the review deadline. | Upgrade or remove the parent before enabling its archive feature. `make audit` refuses an active graph or failed graph inspection before applying this exception. |
+
+[RUSTSEC-2024-0436](https://rustsec.org/advisories/RUSTSEC-2024-0436.html)
+(paste) is **removed**, not renewed. The DataFusion 45 → 55 upgrade drops paste
+from the graph, together with the Thrift crate behind GHSA-2f9f-gq7v-9h6m.
 
 [RUSTSEC-2025-0134](https://rustsec.org/advisories/RUSTSEC-2025-0134.html) is
 **removed**, not renewed. `cc7f44e` replaces rustls-pemfile with Rustls

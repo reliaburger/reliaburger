@@ -13,11 +13,12 @@
 #     lru 0.18.2, which patches both. Removed.
 #   - RUSTSEC-2026-0190 (anyhow::Error::downcast_mut): anyhow 1.0.102 -> 1.0.104.
 #     Removed.
+#   - RUSTSEC-2024-0436 (paste): DataFusion 45 -> 55 drops paste from the
+#     graph, along with the Thrift crate behind GHSA-2f9f-gq7v-9h6m. Removed.
 # Next review: 18 November 2026.
 [advisories]
 ignore = [
   "RUSTSEC-2024-0370", # proc-macro-error: unmaintained, no patched release; build-time only, reached through age
-  "RUSTSEC-2024-0436", # paste: unmaintained, no patched release; build-time proc-macro through DataFusion/Parquet
   "RUSTSEC-2025-0141", # bincode 1: unmaintained, no patched release; durable-format migration required to move off
   "RUSTSEC-2026-0235", # rkyv 0.7: patched in 0.8, but rust_decimal 1.x pins the 0.7 optional feature. `cargo tree -i rkyv` finds no active path — lock-only, never compiled
 ]
