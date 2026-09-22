@@ -74,10 +74,11 @@ Formats remain 16/30. Continue with stale-publication guards and authenticated
 receipts; no consumer receipt endpoint or physical release permission exists yet.
 
 
-Stale-publication protection is implemented and committed early: PublishEndpoints
-requires the generation from the candidate's original desired-state snapshot.
-Raft rejects mismatches before mutation, including no-op requests. Four contracts
-fail first; five focused tests, 398 native library cases and ten agent/compatibility
-cases pass. Cluster/Linux qualification is pending. The changed request and Raft
-log shape advance compatibility to protocol 17/state 31. After qualification,
-continue generation-bound consumer instructions and authenticated receipts.
+Stale-publication protection is complete (`6643aed`). PublishEndpoints requires
+the generation from the candidate's original desired-state snapshot. Raft rejects
+mismatches before mutation, including no-op requests. Four contracts fail first;
+five focused tests, 398 native/410 Linux library cases, ten agent/compatibility
+cases and three real failover/decommission cases per platform pass, with strict
+Clippy and formatting. The request/log shape advances compatibility to protocol
+17/state 31. Continue generation-bound consumer instructions and authenticated
+receipts.
