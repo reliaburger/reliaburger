@@ -2451,6 +2451,57 @@ fn persistent_policy_refuses_missing_or_malformed_boot_identity() {
 
 #[test]
 #[ignore = "requires Linux root and RELIABURGER_EBPF_TESTS=1"]
+fn persistent_policy_never_recreates_a_missing_live_claim() {
+    assert!(ebpf_tests_enabled());
+    let owned = OwnedPolicyFixture::new();
+    let loader = owned.load().unwrap();
+    let lock = owned.root.path().join("ownership/owner.lock");
+    let saved = owned.root.path().join("held.lock");
+    std::fs::rename(&lock, &saved).unwrap();
+    let second = owned.load();
+    let refused = second.is_err();
+    drop(second);
+    let recreated = lock.exists();
+    if recreated {
+        std::fs::remove_file(&lock).unwrap();
+    }
+    std::fs::rename(saved, lock).unwrap();
+    drop(loader);
+    assert!(
+        refused && !recreated,
+        "missing live claim allowed a second owner"
+    );
+}
+
+#[test]
+#[ignore = "requires Linux root and RELIABURGER_EBPF_TESTS=1"]
+fn persistent_policy_never_recreates_a_missing_manifest() {
+    assert!(ebpf_tests_enabled());
+    let owned = OwnedPolicyFixture::new();
+    let mut loader = owned.load().unwrap();
+    loader.retire_owned().unwrap();
+    drop(loader);
+    let path = owned.root.path().join("ownership/owner.json");
+    let saved = owned.root.path().join("retired.json");
+    std::fs::rename(&path, &saved).unwrap();
+    let result = owned.load();
+    let refused = result.is_err();
+    if let Ok(mut unexpected) = result {
+        unexpected.retire_owned().unwrap();
+    }
+    let recreated = path.exists();
+    if recreated {
+        std::fs::remove_file(&path).unwrap();
+    }
+    std::fs::rename(saved, path).unwrap();
+    assert!(
+        refused && !recreated,
+        "missing manifest resurrected a retired owner"
+    );
+}
+
+#[test]
+#[ignore = "requires Linux root and RELIABURGER_EBPF_TESTS=1"]
 fn persistent_policy_recovers_partial_startup_and_interrupted_retirement() {
     assert!(ebpf_tests_enabled());
     let owned = OwnedPolicyFixture::new();

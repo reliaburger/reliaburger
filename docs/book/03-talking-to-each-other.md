@@ -2361,3 +2361,19 @@ Bun's runtime polling. Its isolated network namespace also needs a fresh
 `/run/netns` mount point after boot. These are test prerequisites, not recovery
 permissions. The driver retains checksums, phase logs and original ownership
 proofs under `/var/tmp` in the guest.
+
+
+There is another way to lose exclusive ownership: recreate a missing lock file.
+The original process still holds a lock on the old inode, while the replacement
+locks a new inode at the same pathname. Both believe they are the only writer.
+Our physical regression reproduced this with a live loader. A second regression
+removed a retired owner's manifest and watched the old loader recreate it as a
+fresh active owner.
+
+Kernel ownership now creates a lock and manifest only when it created the private
+state directory itself. Existing directories require both original files. Fresh
+ownership syncs the lock, directory and parent before creating kernel objects.
+We check bpffs, cgroup and boot prerequisites before establishing that directory,
+so an unmounted bpffs doesn't leave a misleading partial claim. Losing established
+authority refuses recovery on every boot; a new boot proves old kernel absence,
+not permission to invent a replacement journal.

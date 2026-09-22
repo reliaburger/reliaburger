@@ -58,12 +58,12 @@ impl Drop for Ownership {
     }
 }
 
-fn private_directory(path: &Path) -> io::Result<()> {
-    match std::fs::DirBuilder::new().mode(0o700).create(path) {
-        Ok(()) => {}
-        Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {}
+fn private_directory(path: &Path) -> io::Result<bool> {
+    let fresh = match std::fs::DirBuilder::new().mode(0o700).create(path) {
+        Ok(()) => true,
+        Err(error) if error.kind() == io::ErrorKind::AlreadyExists => false,
         Err(error) => return Err(error),
-    }
+    };
     let metadata = std::fs::symlink_metadata(path)?;
     if !metadata.is_dir()
         || metadata.uid() != nix::unistd::geteuid().as_raw()
@@ -73,7 +73,7 @@ fn private_directory(path: &Path) -> io::Result<()> {
             "invalid private kernel ownership directory",
         ));
     }
-    Ok(())
+    Ok(fresh)
 }
 
 fn claim(
@@ -81,12 +81,26 @@ fn claim(
     state_directory: &Path,
     pin_directory: &Path,
 ) -> io::Result<Ownership> {
-    private_directory(state_directory)?;
+    // Validate volatile prerequisites before establishing durable ownership.
+    private_directory(pin_directory)?;
+    let pin_directory = std::fs::canonicalize(pin_directory)?;
+    let filesystem = nix::sys::statfs::statfs(&pin_directory).map_err(io::Error::other)?;
+    if filesystem.filesystem_type().0 != 0xcafe4a11 {
+        return Err(io::Error::other(
+            "kernel policy pins require a mounted bpffs",
+        ));
+    }
+    let cgroup_path = std::fs::canonicalize(cgroup_path)?;
+    let cgroup_id = crate::sesame::egress::cgroup_id_of_path(&cgroup_path)
+        .ok_or_else(|| io::Error::other("cannot identify ownership cgroup"))?;
+    let boot_id = crate::grill::process_owner::current_boot_id()?
+        .ok_or_else(|| io::Error::other("kernel boot identity is unavailable"))?;
+    let fresh = private_directory(state_directory)?;
     let state_directory = std::fs::canonicalize(state_directory)?;
     let lock = OpenOptions::new()
         .read(true)
         .write(true)
-        .create(true)
+        .create_new(fresh)
         .truncate(false)
         .mode(0o600)
         .custom_flags(nix::libc::O_NOFOLLOW | nix::libc::O_NONBLOCK)
@@ -100,21 +114,17 @@ fn claim(
         return Err(io::Error::other("invalid kernel ownership lock"));
     }
     lock.try_lock().map_err(io::Error::other)?;
-    private_directory(pin_directory)?;
-    let pin_directory = std::fs::canonicalize(pin_directory)?;
-    let filesystem = nix::sys::statfs::statfs(&pin_directory).map_err(io::Error::other)?;
-    if filesystem.filesystem_type().0 != 0xcafe4a11 {
-        return Err(io::Error::other(
-            "kernel policy pins require a mounted bpffs",
-        ));
+    if fresh {
+        lock.sync_all()?;
+        File::open(&state_directory)?.sync_all()?;
+        if let Some(parent) = state_directory.parent() {
+            File::open(parent)?.sync_all()?;
+        }
     }
-    let cgroup_path = std::fs::canonicalize(cgroup_path)?;
     let mut manifest = Manifest {
         version: 3,
-        boot_id: crate::grill::process_owner::current_boot_id()?
-            .ok_or_else(|| io::Error::other("kernel boot identity is unavailable"))?,
-        cgroup_id: crate::sesame::egress::cgroup_id_of_path(&cgroup_path)
-            .ok_or_else(|| io::Error::other("cannot identify ownership cgroup"))?,
+        boot_id,
+        cgroup_id,
         cgroup_path,
         state_directory,
         pin_directory,
@@ -179,6 +189,11 @@ fn claim(
             }
         }
         Err(error) if error.kind() == io::ErrorKind::NotFound => {
+            if !fresh {
+                return Err(io::Error::other(
+                    "original kernel ownership manifest is missing",
+                ));
+            }
             if std::fs::read_dir(&manifest.pin_directory)?
                 .next()
                 .transpose()?
