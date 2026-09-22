@@ -249,7 +249,14 @@ this tier now blocks the 0.1.0 candidate rather than the merge.
       drain B with a short deadline, and assert A's stream completes and B's
       drain finishes immediately.
 
-- [ ] **T1.8 Certificates have zero clock-skew tolerance.**
+- [x] **T1.8 Certificates have zero clock-skew tolerance.**
+      Done. `set_validity` backdates `not_before` by `CLOCK_SKEW_BACKDATE`
+      (5 minutes, now shared with workload identity) while the lifetime still
+      counts from the issuing instant; validation stays exact. The issuer
+      bound now checks the issuer at the real issuing instant (not the
+      backdated start) and clamps the leaf's start to the issuer's. A regression
+      checks root, intermediate, self-issued and CSR-signed node certificates
+      and an end-entity leaf at `now - 60 s`; it failed before the fix.
       `set_validity` in `src/sesame/ca.rs` now sets `not_before = now` (the old
       code effectively backdated to midnight), and `check_validity_at`
       (`src/sesame/cert.rs:123`) has no leeway. A joiner or renewing node whose

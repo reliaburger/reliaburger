@@ -13,6 +13,7 @@ use rcgen::{
 };
 use serde::{Deserialize, Serialize};
 
+use super::ca::CLOCK_SKEW_BACKDATE;
 use super::cert;
 use super::types::{SerialNumber, SpiffeUri, WorkloadIdentity};
 
@@ -24,11 +25,6 @@ pub const ROTATION_INTERVAL: Duration = Duration::from_secs(1800);
 
 /// Maximum grace period extension when council is unreachable: 4 hours.
 pub const GRACE_PERIOD_EXTENSION: Duration = Duration::from_secs(4 * 3600);
-
-/// How far a workload certificate's `not_before` is backdated, so a signer
-/// and verifier whose clocks disagree by a few minutes still accept a
-/// freshly issued certificate.
-pub const CLOCK_SKEW_BACKDATE: Duration = Duration::from_secs(300);
 
 /// Errors from workload identity operations.
 #[derive(Debug, thiserror::Error)]

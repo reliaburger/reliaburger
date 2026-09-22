@@ -823,6 +823,35 @@ metadata comes from the same parameters used to sign the certificate. The
 regression decodes a real 90-second certificate and compares both the duration
 and the root CA's encoded timestamps with its stored metadata.
 
+That fix was a little too exact, though. With `not_before` set to the issuing
+second, a joining node whose clock ran one second behind the issuer's received
+a certificate it considered "not yet valid". It refused to save it, asked for a
+new one five seconds later, and burned another Raft serial each time. Nobody's
+clocks agree to the second, so this isn't an edge case.
+
+Every issuance path now backdates `not_before` by `CLOCK_SKEW_BACKDATE` (five
+minutes), the same constant workload certificates already used in Chapter 10.
+The lifetime still counts from the issuing instant, so a 90-second certificate
+stays usable for 90 seconds. We deliberately didn't add leeway to validation:
+the verifier stays exact, and the only thing that moved is the start of the
+window the issuer signs.
+
+Backdating had one knock-on effect, caught by an existing test. The check that a
+leaf never outlives its issuer compared the leaf's `not_before` with the
+issuer's window. Once that start moved five minutes back, an ingress CA that had
+expired a second ago could still mint a (born-expired) leaf. The check now judges
+the issuer at the real issuing instant, and clamps the leaf's backdated start so
+it never predates its issuer. The regression issues a root, an intermediate, a node
+certificate (both the self-issued and CSR-signed kinds) and an ingress leaf,
+then checks each one with a clock sixty seconds in the past.
+
+The constant is declared `pub const CLOCK_SKEW_BACKDATE: Duration = ...;` in
+`ca.rs`. A Rust `const` is a compile-time value with no fixed address (closer to
+a C `#define` with a type than to a global variable), so sharing it between
+modules costs nothing. The workload identity code now imports it with
+`use super::ca::CLOCK_SKEW_BACKDATE;`, where `super` means "the parent module",
+here `sesame`.
+
 ### Bad certificate input is an error, not a panic
 
 A DNS subject alternative name must fit the certificate library's IA5 string
