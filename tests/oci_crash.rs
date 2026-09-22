@@ -703,6 +703,13 @@ async fn normal_clustered_bun_recovers_enrolled_consumer_before_adoption() {
         active,
         "normal clustered startup did not activate consumer ownership"
     );
+    node.client
+        .apply(&durable_app("cluster-owned"))
+        .await
+        .unwrap();
+    wait_file(&root.join("shared/main")).await;
+    wait_cluster_publication(&node.client).await;
+    let original = node.client.status().await.unwrap().remove(0);
     node.crash().await;
     let journal =
         reliaburger::bun::discovery_owners::DiscoveryJournal::open(&root.join("data/discovery"))
@@ -713,7 +720,45 @@ async fn normal_clustered_bun_recovers_enrolled_consumer_before_adoption() {
     );
     drop(journal);
     let mut recovered = Node::start(&root).await;
-    assert!(recovered.client.status().await.unwrap().is_empty());
+    wait_cluster_publication(&recovered.client).await;
+    let adopted = recovered.client.status().await.unwrap().remove(0);
+    assert_eq!(adopted.pid, original.pid);
+    assert_eq!(adopted.host_port, original.host_port);
+    assert_eq!(
+        std::fs::read_to_string(root.join("shared/main")).unwrap(),
+        "main\n"
+    );
+    recovered
+        .client
+        .stop("cluster-owned", "default")
+        .await
+        .unwrap();
+    tokio::time::timeout(Duration::from_secs(45), async {
+        loop {
+            let checkpoint: serde_json::Value = serde_json::from_slice(
+                &std::fs::read(root.join("data/discovery/discovery.json")).unwrap(),
+            )
+            .unwrap();
+            let inventory = &checkpoint["inventory"];
+            if inventory["services"].as_array().unwrap().is_empty()
+                && inventory["references"].as_array().unwrap().is_empty()
+                && inventory["consumer"]["receipts"]
+                    .as_object()
+                    .unwrap()
+                    .is_empty()
+            {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+    })
+    .await
+    .unwrap_or_else(|_| {
+        panic!(
+            "cluster retirement failed: {}",
+            std::fs::read_to_string(root.join("bun.log")).unwrap()
+        )
+    });
     recovered.crash().await;
     let journal =
         reliaburger::bun::discovery_owners::DiscoveryJournal::open(&root.join("data/discovery"))
@@ -724,6 +769,22 @@ async fn normal_clustered_bun_recovers_enrolled_consumer_before_adoption() {
     );
     drop(journal);
     retire_kernel(&root);
+}
+
+#[cfg(feature = "ebpf")]
+async fn wait_cluster_publication(client: &BunClient) {
+    tokio::time::timeout(Duration::from_secs(45), async {
+        loop {
+            if let Ok(service) = client.resolve("cluster-owned").await
+                && service.healthy_backends == 1
+            {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+    })
+    .await
+    .expect("cluster never confirmed its workload publication");
 }
 
 #[cfg(feature = "ebpf")]

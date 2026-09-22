@@ -2535,3 +2535,15 @@ paths. The rootless case then proves the original process and host forward survi
 Bun death and that confirmed stop clears publication. The cluster case verifies
 normal enrolled startup and restart. A complete clustered workload retirement and
 upgrade matrix is a separate qualification step.
+
+### Retry the remaining obligation
+
+The real clustered retirement test found an easy trap: the first attempt removes
+a local backend, but another consumer still holds the address. On retry, asking
+the service map to remove that same backend returns “not found”. That error would
+block cleanup forever. We now invalidate the consumer view on every attempt and
+remove the local entry only while it is present. Absence is not release permission;
+the original remote confirmations and durable runtime hold still govern release.
+The physical regression publishes an OCI workload through the council, kills Bun,
+adopts the same execution, deletes the desired app and waits until service,
+address and receipt obligations are all cleared.

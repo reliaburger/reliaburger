@@ -9564,12 +9564,16 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
         entry.backends.retain(|backend| backend.instance_id != id.0);
         if self.consumer_controls_views() {
             self.invalidate_consumer_view().await?;
-            self.service_map
-                .remove_backend(&service, &id.0)
-                .map_err(|error| BunError::BackendRetirement {
-                    service,
-                    reason: error.to_string(),
-                })?;
+            // A prior attempt may have removed the local backend before remote
+            // consumers confirmed. Retrying still fences the whole consumer view.
+            if had_backend {
+                self.service_map
+                    .remove_backend(&service, &id.0)
+                    .map_err(|error| BunError::BackendRetirement {
+                        service,
+                        reason: error.to_string(),
+                    })?;
+            }
             return Ok(());
         }
         // Keep the original userspace owner on refusal. A retry must still know
