@@ -1320,6 +1320,21 @@ times out, it deletes nothing; a later committed generation still invalidates
 older publication attempts. This is why the generation belongs in the replicated
 state as well as the network request.
 
+There was a gap on the losing side of that race, though. The publisher persists
+its local catalogue *before* proposing, and when Raft said "stale" or refused
+outright, we returned the error and left the local tag pointing at the rejected
+digest. The node then advertised an image the cluster never accepted, and since
+the council's catalogue didn't reference those layers, nothing would ever collect
+them. Now the blocking task that applies the local commit also keeps a clone of
+the catalogue as it was before, and returns both with the write guard. After the
+proposal, we sort the answer into three buckets. Acceptance keeps the change. An
+explicit refusal (a `Refused` or `RegistryPublicationStale` response, or the 409
+a forwarding follower decodes into `LeaseDenied`) restores and persists the
+earlier catalogue under the same guard. Anything else, such as a timeout or a
+503, is *uncertain*: the council may have committed after all, so local state
+stays for a retry to settle. The test drives all three answers through a fake
+leader and checks both the in-memory and the on-disk catalogue.
+
 The tests first reproduced a stale manifest being accepted and an exhausted
 counter still approving collection. They also exercise snapshot restoration,
 unchanged generations for refused deletions, ownership across caller cancellation

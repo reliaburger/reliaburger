@@ -410,10 +410,13 @@ Registry and storage:
       *Done.* `revalidate_blob` streams via a shared `sha256_file` (copy.rs uses it too) and
       returns `Result<bool>`; only NotFound is a miss. Tests: a late-byte mismatch in a
       multi-chunk blob is caught and removed; an unreadable blob path errors and survives.
-- [ ] **T2.17 An explicit council refusal doesn't roll back the local
+- [x] **T2.17 An explicit council refusal doesn't roll back the local
       catalogue.** `src/pickle/api.rs:316-378`. A push that loses the GC race
       leaves its digest tagged locally, so its layers never get collected. Roll
       back on `Refused`/`Stale`; keep local state only on timeout.
+      *Done.* `record_commit_owned` keeps the pre-commit catalogue and restores + persists it
+      on `Refused`, `RegistryPublicationStale` or a forwarded 409; other errors keep it.
+      `refused_publication_rolls_back_the_local_tag_but_uncertain_keeps_it` covers all three.
 
 - [ ] **T2.20 Export withdrawal-ledger occupancy as a Mayo metric.** T1.2
       shipped the readiness signal and log. Mayo only records host metrics
