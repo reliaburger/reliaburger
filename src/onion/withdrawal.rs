@@ -52,9 +52,23 @@ pub enum WithdrawalError {
     /// Stored history conflicts with the active publication sequence.
     #[error("endpoint withdrawal generation conflicts with publication history")]
     GenerationConflict,
+    /// The candidate contains an invalid service or conflicting virtual addresses.
+    #[error("invalid endpoint catalogue: {0}")]
+    InvalidCatalogue(#[from] super::types::OnionError),
+    /// Another publication still owns the requested virtual address remotely.
+    #[error("endpoint catalogue reuses virtual address {vip} awaiting withdrawal")]
+    RetiredVipInUse { vip: std::net::Ipv4Addr },
 }
 
 impl EndpointWithdrawals {
+    /// Virtual addresses retained until all original consumers confirm withdrawal.
+    pub fn reserved_vips(&self) -> impl Iterator<Item = super::vip::VirtualIP> + '_ {
+        self.pending
+            .values()
+            .flat_map(|withdrawal| withdrawal.services.values())
+            .filter_map(|removed| removed.retire_vip.then_some(removed.service.vip))
+    }
+
     /// Prepare an atomic publication transition without changing the original ledger.
     pub fn plan_publication(
         &self,
@@ -62,6 +76,9 @@ impl EndpointWithdrawals {
         next: &EndpointCatalog,
         consumers: &BTreeSet<String>,
     ) -> Result<Self, WithdrawalError> {
+        previous.validate_allocations()?;
+        next.validate_allocations()?;
+        self.check_reservations(next)?;
         if self
             .pending
             .keys()
@@ -90,6 +107,8 @@ impl EndpointWithdrawals {
             }
         }
         planned.check_capacity()?;
+        // Also protect allocations withdrawn by this very publication.
+        planned.check_reservations(next)?;
         planned.generation = generation;
         Ok(planned)
     }
@@ -100,6 +119,16 @@ impl EndpointWithdrawals {
             withdrawal.consumers.remove(node_id);
             !withdrawal.consumers.is_empty()
         });
+    }
+
+    fn check_reservations(&self, next: &EndpointCatalog) -> Result<(), WithdrawalError> {
+        let reserved: std::collections::HashSet<_> = self.reserved_vips().collect();
+        for service in next.services.values() {
+            if reserved.contains(&service.vip) {
+                return Err(WithdrawalError::RetiredVipInUse { vip: service.vip.0 });
+            }
+        }
+        Ok(())
     }
 
     fn check_capacity(&self) -> Result<(), WithdrawalError> {
@@ -487,5 +516,95 @@ mod tests {
             Err(WithdrawalError::CapacityReached)
         ));
         assert_eq!(full.pending.len(), 4);
+    }
+    #[test]
+    fn withdrawn_vip_requires_confirmation_before_a_later_publication_reuses_it() {
+        let first = catalogue('a');
+        let consumers = BTreeSet::from(["reader".into()]);
+        let ledger = EndpointWithdrawals::default()
+            .plan_publication(&EndpointCatalog::default(), &first, &consumers)
+            .unwrap()
+            .plan_publication(&first, &EndpointCatalog::default(), &consumers)
+            .unwrap();
+        assert_eq!(
+            ledger.reserved_vips().collect::<Vec<_>>(),
+            vec![first.services["default__api"].vip]
+        );
+        assert!(
+            ledger
+                .plan_publication(&EndpointCatalog::default(), &first, &consumers)
+                .is_err()
+        );
+        let mut retired = ledger.clone();
+        retired.retire_consumer("reader");
+        assert!(
+            retired
+                .plan_publication(&EndpointCatalog::default(), &first, &BTreeSet::new())
+                .is_ok()
+        );
+        assert_eq!(ledger.pending.len(), 1);
+    }
+
+    #[test]
+    fn withdrawn_vip_cannot_change_owners_in_the_same_publication() {
+        let first = catalogue('a');
+        let consumers = BTreeSet::from(["reader".into()]);
+        let ledger = EndpointWithdrawals::default()
+            .plan_publication(&EndpointCatalog::default(), &first, &consumers)
+            .unwrap();
+        let replacement = EndpointCatalog {
+            services: BTreeMap::from([(
+                "default__different".into(),
+                first.services["default__api"].clone(),
+            )]),
+        };
+        assert!(
+            ledger
+                .plan_publication(&first, &replacement, &consumers)
+                .is_err()
+        );
+        assert!(ledger.pending.is_empty());
+        assert_eq!(ledger.generation, 1);
+    }
+
+    #[test]
+    fn catalogue_publication_rejects_invalid_or_aliased_virtual_allocations() {
+        let first = catalogue('a');
+        let mut invalid = first.clone();
+        invalid.services.insert(
+            "default__different".into(),
+            first.services["default__api"].clone(),
+        );
+        assert!(
+            EndpointWithdrawals::default()
+                .plan_publication(&EndpointCatalog::default(), &invalid, &BTreeSet::new())
+                .is_err()
+        );
+        let mut invalid = first.clone();
+        invalid.services.get_mut("default__api").unwrap().port = 0;
+        assert!(
+            EndpointWithdrawals::default()
+                .plan_publication(&EndpointCatalog::default(), &invalid, &BTreeSet::new())
+                .is_err()
+        );
+        let mut invalid = first.clone();
+        invalid.services.get_mut("default__api").unwrap().vip =
+            super::super::vip::VirtualIP("10.0.0.1".parse().unwrap());
+        assert!(
+            EndpointWithdrawals::default()
+                .plan_publication(&EndpointCatalog::default(), &invalid, &BTreeSet::new())
+                .is_err()
+        );
+        let invalid = EndpointCatalog {
+            services: BTreeMap::from([(
+                "bad/service".into(),
+                first.services["default__api"].clone(),
+            )]),
+        };
+        assert!(
+            EndpointWithdrawals::default()
+                .plan_publication(&EndpointCatalog::default(), &invalid, &BTreeSet::new())
+                .is_err()
+        );
     }
 }

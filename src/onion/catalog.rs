@@ -100,6 +100,11 @@ impl EndpointCatalog {
         &self,
         services: impl IntoIterator<Item = (ServiceId, u16, Vec<CatalogBackend>)>,
     ) -> Result<Self, super::types::OnionError> {
+        self.reconcile_reserving(services, std::iter::empty())
+    }
+
+    /// Check qualified identities, service ports and unique in-range allocations.
+    pub(crate) fn validate_allocations(&self) -> Result<(), super::types::OnionError> {
         use super::types::OnionError;
         let mut original_vips = std::collections::HashSet::new();
         for (qualified, service) in &self.services {
@@ -118,6 +123,17 @@ impl EndpointCatalog {
                 });
             }
         }
+        Ok(())
+    }
+
+    /// Reconcile active services while retaining additional withdrawal reservations.
+    pub fn reconcile_reserving(
+        &self,
+        services: impl IntoIterator<Item = (ServiceId, u16, Vec<CatalogBackend>)>,
+        reserved: impl IntoIterator<Item = VirtualIP>,
+    ) -> Result<Self, super::types::OnionError> {
+        use super::types::OnionError;
+        self.validate_allocations()?;
         let mut inputs = BTreeMap::new();
         for (id, port, backends) in services {
             let qualified = id.qualified();
@@ -147,6 +163,7 @@ impl EndpointCatalog {
             .filter(|(qualified, _)| inputs.contains_key(*qualified))
             .map(|(_, service)| service.vip)
             .collect();
+        allocated.extend(reserved);
         let mut catalogue = Self::new();
         for (qualified, (id, port, backends)) in inputs {
             let vip = match self.services.get(&qualified) {
@@ -223,6 +240,29 @@ mod tests {
             .unwrap();
         pair.sort_by_key(ServiceId::qualified);
         (pair[0].clone(), pair[1].clone())
+    }
+
+    #[test]
+    fn reserved_vips_are_skipped_without_moving_existing_allocations() {
+        let (first, second) = colliding_ids();
+        let original = EndpointCatalog::rebuild([(first.clone(), 80, vec![])]).unwrap();
+        let reserved = original.resolve(&first).unwrap().vip;
+        let next = EndpointCatalog::default()
+            .reconcile_reserving([(second.clone(), 80, vec![])], [reserved])
+            .unwrap();
+        assert_ne!(next.resolve(&second).unwrap().vip, reserved);
+        let active = original
+            .reconcile_reserving(
+                [(first.clone(), 80, vec![]), (second.clone(), 80, vec![])],
+                [reserved],
+            )
+            .unwrap();
+        assert_eq!(active.resolve(&first).unwrap().vip, reserved);
+        assert_ne!(active.resolve(&second).unwrap().vip, reserved);
+        let released = EndpointCatalog::default()
+            .reconcile_reserving([(second.clone(), 80, vec![])], [])
+            .unwrap();
+        assert_eq!(released.resolve(&second).unwrap().vip, reserved);
     }
 
     #[test]

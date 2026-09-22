@@ -47,7 +47,10 @@ Persist consumer ownership before publishing. Withdraw original userspace/kernel
 entries, cancel captured requests, and wait for positive guard release before
 sending receipts. Recovery must reconcile original state before replay. Gate the
 common Process host-port and owned-Runc address release paths on the committed
-result. Failed or cancelled operations retain ownership for retry.
+result. Failed or cancelled operations retain ownership for retry. Final producer
+release must also prevent stale reports from republishing an already retired
+execution after its address has been reused; checking only one momentary absence
+from the catalogue is insufficient.
 
 Qualify offline consumers, delayed receipts, reuse, leader replacement, consumer
 restart and permanent decommission. Then finish actual OCI interruption/reboot

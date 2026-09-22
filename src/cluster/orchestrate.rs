@@ -752,7 +752,18 @@ fn build_endpoint_catalog(
         }
     }
 
-    desired.endpoint_catalog.reconcile(grouped.into_values())
+    // A departing service may still be present on a remote node. Reserve both
+    // existing allocations and already-recorded withdrawals before probing.
+    let reserved = desired.endpoint_withdrawals.reserved_vips().chain(
+        desired
+            .endpoint_catalog
+            .services
+            .values()
+            .map(|service| service.vip),
+    );
+    desired
+        .endpoint_catalog
+        .reconcile_reserving(grouped.into_values(), reserved)
 }
 
 /// Build the scheduler's view of the cluster from gossip membership
@@ -1958,6 +1969,56 @@ image = "busybox:latest"
             },
             uptime: Duration::from_secs(1),
             resource_usage: AppResourceUsage::default(),
+        }
+    }
+
+    #[test]
+    fn retired_vips_are_reserved_for_departing_and_previously_withdrawn_services() {
+        use crate::onion::{catalog::EndpointCatalog, service_id::ServiceId, vip::VirtualIP};
+        let mut original =
+            EndpointCatalog::rebuild([(ServiceId::new("default", "old"), 80, vec![])]).unwrap();
+        let reserved = VirtualIP::from_service_id(&ServiceId::new("default", "new"));
+        original.services.get_mut("default__old").unwrap().vip = reserved;
+        for already_withdrawn in [false, true] {
+            let mut desired = crate::council::types::DesiredState::default();
+            desired.endpoint_consumers.insert("reader".into());
+            desired.endpoint_withdrawals = desired
+                .endpoint_withdrawals
+                .plan_publication(
+                    &EndpointCatalog::default(),
+                    &original,
+                    &desired.endpoint_consumers,
+                )
+                .unwrap();
+            if already_withdrawn {
+                desired.endpoint_withdrawals = desired
+                    .endpoint_withdrawals
+                    .plan_publication(
+                        &original,
+                        &EndpointCatalog::default(),
+                        &desired.endpoint_consumers,
+                    )
+                    .unwrap();
+            } else {
+                desired.endpoint_catalog = original.clone();
+            }
+            desired.apps.insert(
+                crate::meat::types::AppId::new("new", "default"),
+                spec_from_toml("[app.new]\nimage = \"x:1\"\nport = 80\n"),
+            );
+            let candidate =
+                build_endpoint_catalog(&[], &AggregatedState::default(), &desired).unwrap();
+            assert_ne!(candidate.services["default__new"].vip, reserved);
+            assert!(
+                desired
+                    .endpoint_withdrawals
+                    .plan_publication(
+                        &desired.endpoint_catalog,
+                        &candidate,
+                        &desired.endpoint_consumers
+                    )
+                    .is_ok()
+            );
         }
     }
 

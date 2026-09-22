@@ -2989,6 +2989,21 @@ mod tests {
     }
 
     #[test]
+    fn retired_vip_publication_is_refused_without_changing_committed_state() {
+        let mut inner = StateMachineInner::default();
+        inner.state.endpoint_consumers.insert("reader".into());
+        let original = withdrawal_fixture_catalogue();
+        inner.apply_request(&RaftRequest::PublishEndpoints(Box::new(original.clone())));
+        inner.apply_request(&RaftRequest::PublishEndpoints(Box::default()));
+        let before = serde_json::to_value(&inner.state).unwrap();
+        assert!(matches!(
+            inner.apply_request(&RaftRequest::PublishEndpoints(Box::new(original))),
+            Some(CouncilResponse::Refused { .. })
+        ));
+        assert_eq!(serde_json::to_value(&inner.state).unwrap(), before);
+    }
+
+    #[test]
     fn endpoint_withdrawal_refusal_leaves_publication_and_decommission_atomic() {
         let mut inner = StateMachineInner::default();
         inner.state.endpoint_consumers.insert("reader".into());

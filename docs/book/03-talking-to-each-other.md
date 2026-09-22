@@ -1989,3 +1989,27 @@ must require the committed result before release. The next integration also
 reserves retired VIPs in the allocator. State format 30 records the new ledger;
 protocol 16 is unchanged in this checkpoint, and pre-release clusters need fresh
 state.
+
+### A withdrawal keeps its VIP reserved
+
+A durable withdrawal record is useful only if allocation honours it. The leader
+now reserves both the current catalogue's addresses and older withdrawn VIPs
+before allocating new services. This covers a service that disappears in the very
+update that introduces a colliding newcomer. Existing active services keep their
+allocations; a recreated service probes for another address while its previous
+allocation still has remote consumers.
+
+Council checks the same rule at publication. It validates service identities,
+ports and unique in-range addresses, then rejects collisions with both retained
+withdrawals and the withdrawals produced by this update. Refusal leaves the
+committed catalogue and history unchanged. A candidate prepared from an older
+view therefore cannot bypass reservations simply by proposing its own VIP.
+
+`reserved_vips()` returns `impl Iterator<Item = VirtualIP> + '_`. The caller sees
+an iterator of copied addresses, while `'_` ties its borrowed traversal to the
+ledger's lifetime. The compiler prevents retaining that traversal after its
+ledger disappears. Only withdrawn service allocations reserve VIPs; replacing a
+backend does not move an otherwise active service.
+
+These checks protect virtual address assignment. Consumer receipts and the
+producer's physical address/host-port release decision remain separate work.
