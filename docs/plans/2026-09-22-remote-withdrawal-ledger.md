@@ -255,3 +255,14 @@ contracts fail before implementation. Nine final producer library cases (0.362s)
 and six receipt/producer API cases (0.057s) pass. Broader native/Linux qualification
 follows. Completing consumer recovery, receipt production and service VIP retirement
 is still required before enabling the production profile.
+
+
+Producer API/agent integration is committed as `ac76b5c`, with qualification
+follow-ups `c609b4f` and `968bd3e`. Native/Linux functional qualification passes
+770/782 affected library cases (18.584s/32.414s), sixteen integrations each
+(5.941s/5.018s), 45 recovery/runtime cases each (26.071s/23.710s), and three real
+failover/decommission cases each (71.241s/71.081s). Final focused reruns pass nine
+cases per platform (0.384s/0.643s), and strict all-target/all-feature Clippy and
+formatting pass. All pipelines are reaped. The production binary supplies the
+client, but durable discovery remains opt-in until consumer recovery is complete;
+existing real-cluster checks do not qualify that unfinished end-to-end loop.
