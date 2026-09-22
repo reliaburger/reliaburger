@@ -1869,12 +1869,28 @@ and has no heartbeat expiry. Repeated polls don't append another registration.
 `BTreeSet<String>` stores each node name once, in deterministic order. Unlike a
 map, a set has no separate value; membership itself is the fact we need here.
 The registration limit refuses new consumers without evicting existing ones.
-Where credentials are configured, the internal service credential is required.
-The existing credential-free development profile still registers every consumer;
-this only adds an obligation and cannot discharge one. With TLS, the peer's validated node
-identity must also match the requested node; the deliberately plaintext profile
-trusts the cluster service credential. Neither an ordinary API user nor an invalid
-certificate can create consumer records.
+Where credentials are configured, the internal service credential is required,
+and the peer's validated TLS node identity must match the requested node. Neither
+an ordinary API user nor an invalid certificate can create consumer records.
+
+Only a TLS-authenticated poll registers a consumer at all. We learnt that one
+the hard way. The first version registered plaintext development consumers too,
+but a receipt must come from the same TLS identity, so a plaintext node could
+owe obligations it had no way to discharge. After about a thousand deploys the
+ledger filled up and the whole cluster stopped publishing catalogue updates.
+Plaintext clusters now skip the census, which gives them the weaker pre-ledger
+behaviour: fine for a laptop, and one more reason never to run one on a shared
+network.
+
+The same trap exists with TLS, just more slowly. A node that dies without being
+decommissioned keeps owing every later withdrawal. The leader measures the
+ledger each tick. At 75% full it degrades a non-critical readiness subsystem,
+`discovery:withdrawal-backlog`, and logs which nodes owe receipts and whether
+gossip still sees them. It also stops proposing publications the ledger would
+refuse, so a full ledger doesn't fill the Raft log with refusals. We chose a
+warning over automatic expiry on purpose: a partitioned node that's still alive
+could be serving old routes, and handing its addresses to someone else is worse
+than asking an operator to confirm the node is really gone.
 
 Operator decommission removes the fenced identity from this census and records
 that fact in the immutable retirement result. A repeat returns the same result;

@@ -119,8 +119,14 @@ this tier now blocks the 0.1.0 candidate rather than the merge.
       while health probes run for 30 s, asserting zero failures. Also a unit test
       that a repeated identical probe result causes no journal write.
 
-- [ ] **T1.2 Discovery freezes cluster-wide after about 1,024 withdrawals that a
-      dead or plaintext consumer can never acknowledge.**
+- [x] **T1.2 Discovery freezes cluster-wide after about 1,024 withdrawals that a
+      dead or plaintext consumer can never acknowledge.** Done. Only
+      TLS-authenticated placement polls register consumers (receipts need that
+      identity), so plaintext clusters owe nothing. The leader degrades the
+      non-critical `discovery:withdrawal-backlog` readiness subsystem at 75%,
+      logs which nodes owe receipts and whether gossip sees them, and stops
+      proposing publications the ledger would refuse. Runbook: manual chapter
+      02. The metric part of decision A moved to T2.20.
       Every node that polls `/v1/placements` becomes a permanent endpoint
       consumer (`src/bun/api.rs` `placements_handler`, around the
       `register` call). Each publication that removes a backend adds a pending
@@ -328,6 +334,11 @@ Registry and storage:
       catalogue.** `src/pickle/api.rs:316-378`. A push that loses the GC race
       leaves its digest tagged locally, so its layers never get collected. Roll
       back on `Refused`/`Stale`; keep local state only on timeout.
+
+- [ ] **T2.20 Export withdrawal-ledger occupancy as a Mayo metric.** T1.2
+      shipped the readiness signal and log. Mayo only records host metrics
+      today (`src/mayo/collector.rs`), so a gauge needs a small path for
+      Bun-internal metrics first.
 
 Config:
 

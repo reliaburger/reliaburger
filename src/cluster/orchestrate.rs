@@ -34,6 +34,48 @@ use crate::reporting::aggregator::AggregatedState;
 const RECONCILE_INTERVAL: Duration = Duration::from_secs(2);
 const RECONCILE_IO_TIMEOUT: Duration = Duration::from_secs(10);
 
+/// Ledger occupancy at which the leader starts warning. Publication itself
+/// only stops at 100%, so this leaves room to decommission a lost node.
+const WITHDRAWAL_BACKLOG_WARNING: f64 = 0.75;
+
+/// Readiness subsystem the leader degrades while the withdrawal ledger is
+/// close to refusing catalogue updates. It is informational: scheduling
+/// continues, but operators see which nodes owe receipts.
+pub const WITHDRAWAL_BACKLOG_SUBSYSTEM: &str = "discovery:withdrawal-backlog";
+
+/// Operator warning once the withdrawal ledger nears its bound, naming the
+/// consumers that owe receipts and whether gossip still sees them alive.
+pub(crate) fn withdrawal_backlog_warning(
+    withdrawals: &crate::onion::withdrawal::EndpointWithdrawals,
+    alive: &HashSet<&str>,
+) -> Option<String> {
+    let occupancy = withdrawals.occupancy();
+    if occupancy < WITHDRAWAL_BACKLOG_WARNING {
+        return None;
+    }
+    let mut owing: Vec<_> = withdrawals.owed_by_consumer().into_iter().collect();
+    // Most-owing first; a lost node usually owes every retained generation.
+    owing.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(b.0)));
+    let owing = owing
+        .iter()
+        .map(|(node, generations)| {
+            let state = if alive.contains(node) {
+                "alive"
+            } else {
+                "not alive"
+            };
+            format!("{node} ({generations} generations, {state})")
+        })
+        .collect::<Vec<_>>()
+        .join(", ");
+    Some(format!(
+        "endpoint withdrawal ledger is {:.0}% full; catalogue updates stop at 100%. \
+         Receipts owed by: {owing}. If a node is permanently gone, run \
+         `relish decommission-node <node> --workloads-stopped --reason <why>`",
+        occupancy * 100.0
+    ))
+}
+
 /// One app assigned to a node, as served by `/v1/placements/{node}`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct NodeAssignment {
@@ -101,6 +143,7 @@ pub fn spawn_leader_scheduler(
     aggregated_rx: watch::Receiver<AggregatedState>,
     dns_required: bool,
     reconstruction_config: crate::config::node::ReconstructionSection,
+    readiness: Option<crate::bun::readiness::ReadinessTracker>,
     shutdown: CancellationToken,
 ) -> super::capacity::CapacityAdmission {
     use crate::reconstruction::controller::ReconstructionController;
@@ -110,6 +153,13 @@ pub fn spawn_leader_scheduler(
     tokio::spawn(async move {
         let mut reconstruction = ReconstructionController::new(reconstruction_config);
         let mut was_leader = false;
+        let mut backlog_warning: Option<String> = None;
+        if let Some(readiness) = &readiness {
+            readiness
+                .register(WITHDRAWAL_BACKLOG_SUBSYSTEM, false)
+                .await;
+            readiness.ready(WITHDRAWAL_BACKLOG_SUBSYSTEM).await;
+        }
         let mut tick = tokio::time::interval(RECONCILE_INTERVAL);
         loop {
             let capacity_request = tokio::select! {
@@ -132,6 +182,12 @@ pub fn spawn_leader_scheduler(
             }
             was_leader = is_leader;
             if !is_leader {
+                // Only the leader judges the replicated ledger.
+                if backlog_warning.take().is_some()
+                    && let Some(readiness) = &readiness
+                {
+                    readiness.ready(WITHDRAWAL_BACKLOG_SUBSYSTEM).await;
+                }
                 continue;
             }
 
@@ -146,6 +202,29 @@ pub fn spawn_leader_scheduler(
             });
             let reports = aggregated_rx.borrow().clone();
 
+            let alive_names: HashSet<&str> = members
+                .iter()
+                .filter(|member| member.state == NodeState::Alive)
+                .map(|member| member.node_id.0.as_str())
+                .collect();
+            let warning = withdrawal_backlog_warning(&desired.endpoint_withdrawals, &alive_names);
+            if warning != backlog_warning {
+                if let Some(readiness) = &readiness {
+                    match &warning {
+                        Some(message) => {
+                            readiness
+                                .degraded(WITHDRAWAL_BACKLOG_SUBSYSTEM, message.clone())
+                                .await
+                        }
+                        None => readiness.ready(WITHDRAWAL_BACKLOG_SUBSYSTEM).await,
+                    }
+                }
+                if let Some(message) = &warning {
+                    eprintln!("scheduler: {message}");
+                }
+                backlog_warning = warning;
+            }
+
             // Publish the cluster endpoint catalogue every tick the backends
             // change (12b.4). This runs before the learning-period gate below:
             // cross-node resolution shouldn't wait for a fresh leader to finish
@@ -158,8 +237,18 @@ pub fn spawn_leader_scheduler(
                     None
                 }
             };
+            // The state machine plans with these exact inputs, so a full
+            // ledger would only commit another refusal every tick.
             if let Some(catalog) = catalog
                 && desired.endpoint_catalog != catalog
+                && !matches!(
+                    desired.endpoint_withdrawals.plan_publication(
+                        &desired.endpoint_catalog,
+                        &catalog,
+                        &desired.endpoint_consumers,
+                    ),
+                    Err(crate::onion::withdrawal::WithdrawalError::CapacityReached)
+                )
             {
                 match council
                     .write(RaftRequest::PublishEndpoints {
@@ -1306,6 +1395,48 @@ mod tests {
     use crate::reporting::types::{ResourceUsage, StateReport};
     use std::collections::HashMap;
     use std::time::{Instant, SystemTime};
+
+    fn withdrawals_owed_by(
+        consumers: &[&str],
+        generations: u64,
+    ) -> crate::onion::withdrawal::EndpointWithdrawals {
+        use crate::onion::withdrawal::{EndpointWithdrawal, EndpointWithdrawals};
+        EndpointWithdrawals {
+            generation: generations + 1,
+            pending: (1..=generations)
+                .map(|generation| {
+                    (
+                        generation,
+                        EndpointWithdrawal {
+                            services: Default::default(),
+                            consumers: consumers.iter().map(|c| c.to_string()).collect(),
+                        },
+                    )
+                })
+                .collect(),
+        }
+    }
+
+    #[test]
+    fn withdrawal_backlog_is_quiet_below_three_quarters() {
+        let withdrawals = withdrawals_owed_by(&["lost"], 700);
+        assert!(withdrawal_backlog_warning(&withdrawals, &HashSet::new()).is_none());
+    }
+
+    #[test]
+    fn withdrawal_backlog_names_the_node_that_owes_receipts() {
+        let mut withdrawals = withdrawals_owed_by(&["lost", "worker"], 800);
+        for withdrawal in withdrawals.pending.values_mut().skip(10) {
+            withdrawal.consumers.remove("worker");
+        }
+        let warning = withdrawal_backlog_warning(&withdrawals, &HashSet::from(["worker"])).unwrap();
+        assert!(warning.contains("78% full"), "{warning}");
+        assert!(
+            warning.contains("lost (800 generations, not alive), worker (10 generations, alive)"),
+            "{warning}"
+        );
+        assert!(warning.contains("relish decommission-node"), "{warning}");
+    }
 
     fn reconciler_for_deadline_test(
         address: std::net::SocketAddr,

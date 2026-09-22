@@ -1361,6 +1361,7 @@ async fn run_agent(cli: Cli) -> anyhow::Result<()> {
                 aggregated_rx,
                 config.dns.enabled,
                 config.reconstruction.clone(),
+                Some(readiness.clone()),
                 shutdown.clone(),
             ));
             // L3: leader-only autoscale loop, feeding on the same rollup

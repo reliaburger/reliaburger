@@ -151,10 +151,29 @@ impl EndpointWithdrawals {
         Ok(())
     }
 
-    fn check_capacity(&self) -> Result<(), WithdrawalError> {
-        if self.pending.len() > MAX_WITHDRAWAL_GENERATIONS {
-            return Err(WithdrawalError::CapacityReached);
+    /// Largest share of any ledger bound in use, from 0.0 upwards. Publication
+    /// is refused once this passes 1.0.
+    pub fn occupancy(&self) -> f64 {
+        let (exposures, confirmations) = self.usage();
+        [
+            self.pending.len() as f64 / MAX_WITHDRAWAL_GENERATIONS as f64,
+            exposures as f64 / MAX_WITHDRAWAL_EXPOSURES as f64,
+            confirmations as f64 / MAX_WITHDRAWAL_CONFIRMATIONS as f64,
+        ]
+        .into_iter()
+        .fold(0.0, f64::max)
+    }
+
+    /// How many retained generations each consumer still has to confirm.
+    pub fn owed_by_consumer(&self) -> BTreeMap<&str, usize> {
+        let mut owed = BTreeMap::new();
+        for consumer in self.pending.values().flat_map(|w| &w.consumers) {
+            *owed.entry(consumer.as_str()).or_insert(0) += 1;
         }
+        owed
+    }
+
+    fn usage(&self) -> (usize, usize) {
         let mut exposures = 0usize;
         let mut confirmations = 0usize;
         for withdrawal in self.pending.values() {
@@ -164,10 +183,17 @@ impl EndpointWithdrawals {
                     .saturating_add(1)
                     .saturating_add(removed.service.backends.len());
             }
-            if exposures > MAX_WITHDRAWAL_EXPOSURES || confirmations > MAX_WITHDRAWAL_CONFIRMATIONS
-            {
-                return Err(WithdrawalError::CapacityReached);
-            }
+        }
+        (exposures, confirmations)
+    }
+
+    fn check_capacity(&self) -> Result<(), WithdrawalError> {
+        let (exposures, confirmations) = self.usage();
+        if self.pending.len() > MAX_WITHDRAWAL_GENERATIONS
+            || exposures > MAX_WITHDRAWAL_EXPOSURES
+            || confirmations > MAX_WITHDRAWAL_CONFIRMATIONS
+        {
+            return Err(WithdrawalError::CapacityReached);
         }
         Ok(())
     }

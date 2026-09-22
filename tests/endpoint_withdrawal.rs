@@ -178,6 +178,45 @@ async fn acknowledge(app: Router, body: serde_json::Value, bearer: &str) -> Stat
     .status()
 }
 
+async fn poll_placements(app: Router, node: &str, bearer: &str) -> StatusCode {
+    app.oneshot(
+        Request::get(format!("/v1/placements/{node}"))
+            .header("authorization", format!("Bearer {bearer}"))
+            .body(Body::empty())
+            .unwrap(),
+    )
+    .await
+    .unwrap()
+    .status()
+}
+
+#[tokio::test]
+async fn only_tls_authenticated_placement_polls_register_endpoint_consumers() {
+    let hierarchy = ca::generate_ca_hierarchy("placements", &IKM).unwrap();
+    let council = council(&hierarchy, true).await;
+    // A plaintext consumer can never send a receipt, so it must never owe one.
+    assert_eq!(
+        poll_placements(router(council.clone(), None), "node", "internal-token").await,
+        StatusCode::OK
+    );
+    assert!(
+        council.desired_state().await.endpoint_consumers.is_empty(),
+        "a plaintext poll registered an obligation nobody can discharge"
+    );
+    let authenticated = router(council.clone(), Some(peer(&hierarchy, "node", 10)));
+    assert_eq!(
+        poll_placements(authenticated, "node", "internal-token").await,
+        StatusCode::OK
+    );
+    assert!(
+        council
+            .desired_state()
+            .await
+            .endpoint_consumers
+            .contains("node")
+    );
+}
+
 #[tokio::test]
 async fn endpoint_receipts_discharge_only_the_authenticated_consumer_and_original_generation() {
     let hierarchy = ca::generate_ca_hierarchy("receipts", &IKM).unwrap();

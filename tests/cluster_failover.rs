@@ -222,6 +222,7 @@ async fn start_node_for_test(
                 large_cluster_timeout_secs: 10,
                 large_cluster_node_count: 5000,
             },
+            None,
             shutdown.clone(),
         );
     }

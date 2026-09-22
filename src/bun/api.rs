@@ -3230,6 +3230,9 @@ async fn placements_handler(
             .into_response();
     }
     let mut desired = council.desired_state().await;
+    // Receipts must come from this same TLS identity. A plaintext consumer
+    // could never send one, so registering it would only freeze discovery.
+    let authenticated_consumer = peer.is_some();
     if let Some(peer) = peer {
         match crate::sesame::renewal::validate_peer(&peer, &desired.security_state) {
             Ok(identity) if identity == node_id => {}
@@ -3262,7 +3265,7 @@ async fn placements_handler(
     }
     // Registration precedes every first exposure. Once committed, an offline
     // consumer stays accountable until the operator permanently fences it.
-    if !desired.endpoint_consumers.contains(&node_id) {
+    if authenticated_consumer && !desired.endpoint_consumers.contains(&node_id) {
         let registration = tokio::time::timeout(
             std::time::Duration::from_secs(10),
             council.write(crate::council::RaftRequest::RegisterEndpointConsumer {
@@ -10003,7 +10006,7 @@ schedule = "* * * * *"
     }
 
     #[tokio::test]
-    async fn credential_free_placements_still_record_consumers_but_a_service_token_requires_authentication()
+    async fn credential_free_placements_serve_discovery_but_a_service_token_requires_authentication()
      {
         let council = seeded_council("endpoint-consumer-development").await;
         for service in [None, Some("internal".to_string())] {
@@ -10031,13 +10034,13 @@ schedule = "* * * * *"
                     StatusCode::OK
                 }
             );
-            assert_eq!(
-                council
+            // Neither poll carries a TLS identity, so neither may owe receipts.
+            assert!(
+                !council
                     .desired_state()
                     .await
                     .endpoint_consumers
-                    .contains(node),
-                !protected
+                    .contains(node)
             );
             shutdown.cancel();
         }
@@ -10061,7 +10064,14 @@ schedule = "* * * * *"
             Some(council.clone()),
         )
         .await;
+        // Only TLS-authenticated polls register consumers, so enrol directly.
         for consumer in ["worker", "other-worker"] {
+            council
+                .write(RaftRequest::RegisterEndpointConsumer {
+                    node_id: consumer.into(),
+                })
+                .await
+                .unwrap();
             assert_eq!(
                 get_authenticated(
                     app.clone(),
@@ -10104,6 +10114,12 @@ schedule = "* * * * *"
             ));
             originals.push(serde_json::to_value(&catalog.services["default__web"]).unwrap());
             if generation == 2 {
+                council
+                    .write(RaftRequest::RegisterEndpointConsumer {
+                        node_id: "late-worker".into(),
+                    })
+                    .await
+                    .unwrap();
                 let (status, bytes) =
                     get_authenticated(app.clone(), "/v1/placements/late-worker", "internal").await;
                 assert_eq!(status, StatusCode::OK);
@@ -10191,7 +10207,7 @@ schedule = "* * * * *"
     }
 
     #[tokio::test]
-    async fn placements_register_the_consumer_before_serving_discovery() {
+    async fn placements_serve_plaintext_discovery_without_registering_a_consumer() {
         let council = seeded_council("endpoint-consumer").await;
         let (token, user_key) = a_user_token(crate::sesame::types::ApiRole::Admin);
         let (app, shutdown) = setup_with_auth_leases_events_and_council(
@@ -10214,12 +10230,11 @@ schedule = "* * * * *"
             get_authenticated(app.clone(), path, "internal").await.0,
             StatusCode::OK
         );
+        // Receipts need a TLS identity; tests/endpoint_withdrawal.rs covers
+        // registration for authenticated consumers.
         assert!(
-            council
-                .desired_state()
-                .await
-                .endpoint_consumers
-                .contains("worker")
+            council.desired_state().await.endpoint_consumers.is_empty(),
+            "a plaintext poll registered an obligation nobody can discharge"
         );
         let invalid_peer =
             app.clone()

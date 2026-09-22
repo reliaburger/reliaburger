@@ -97,6 +97,7 @@ async fn scheduler_repairs_a_catalogue_replaced_after_its_last_publication() {
         reports_rx,
         false,
         Default::default(),
+        None,
         shutdown.clone(),
     );
     let service = ServiceId::new("default", "api");

@@ -199,6 +199,7 @@ async fn start_node_with_auth(
                 large_cluster_timeout_secs: 4,
                 large_cluster_node_count: 5000,
             },
+            None,
             shutdown.clone(),
         ));
         reliaburger::cluster::orchestrate::spawn_autoscaler(
