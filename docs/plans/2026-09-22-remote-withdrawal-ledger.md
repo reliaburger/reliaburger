@@ -1,0 +1,55 @@
+# Remote withdrawal ledger — 22 September 2026
+
+Continue C34 on `codex/codebase-completion-fixes`, PR167. Standalone discovery
+recovery, original runtime/report identities and durable consumer registration
+are already implemented. Do not repeat those audits.
+
+## Checkpoint 1: replicated withdrawal obligations
+
+- Add a monotonically increasing catalogue publication generation to replicated
+  state. Identical publications are no-ops; overflow refuses without mutation.
+- On catalogue replacement, retain only removed or changed backend exposures,
+  plus removed service allocations. Unchanged backends do not acquire spurious
+  drain obligations. Retain their exact original VIP, port, node and execution
+  identity, indexed by the publication generation that exposed them.
+- Capture the durable consumer census in the same Raft transition. Consumers
+  register before receiving placements; census entries never disappear through
+  gossip expiry. A later registration need not confirm an already withdrawn
+  publication it was never permitted to read.
+- Keep older withdrawals through later publications and snapshots. Bound retained
+  obligations and refuse overflow atomically; do not evict cleanup evidence.
+- Permanent operator decommission removes only that consumer's obligations.
+  If the node also produced endpoints, journal their removal for the remaining
+  consumers in the same transition. Validate the entire transition before changing
+  placements, leases or retirement records.
+- Test these transitions first, including snapshot recovery, replacement on the
+  same host port, repeated publication, late registration, capacity refusal and
+  decommission. Update compatibility, the book, progress and the session handoff.
+
+This checkpoint records obligations. It does not add a receipt endpoint or permit
+physical allocation reuse. Those depend on the next checkpoints.
+
+## Checkpoint 2: allocation reservations and authenticated receipts
+
+- Reserve withdrawn VIPs in allocation and enforce reservation checks in Raft,
+  including deletion/replacement in one publication. Prevent stale writers from
+  replacing newer publication state.
+- Expose publication and retirement identities to registered consumers. Accept
+  only authenticated, identity-bound receipts for the exact withdrawn generation;
+  future, unknown and mismatched receipts cannot discharge another obligation.
+- Keep producer retirement decisions tied to committed state, including active
+  re-publication and all outstanding generations; absence of a local entry alone
+  is not proof of global withdrawal.
+
+## Checkpoint 3: consumer and producer integration
+
+Persist consumer ownership before publishing. Withdraw original userspace/kernel
+entries, cancel captured requests, and wait for positive guard release before
+sending receipts. Recovery must reconcile original state before replay. Gate the
+common Process host-port and owned-Runc address release paths on the committed
+result. Failed or cancelled operations retain ownership for retry.
+
+Qualify offline consumers, delayed receipts, reuse, leader replacement, consumer
+restart and permanent decommission. Then finish actual OCI interruption/reboot
+qualification and production runtime selection, followed by V01–V04. Keep C34
+unchecked until all of these boundaries pass.
