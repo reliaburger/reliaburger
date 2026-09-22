@@ -762,10 +762,10 @@ async fn autoscaler_scales_up_on_high_metric() {
 
 /// W11 (L14): the quorum safety rail rejects a node-level fault that
 /// would risk Raft majority. On a 3-member council `max_allowed = 1`, so
-/// the first transport partition is accepted but a second one — which would
-/// put two council members at risk — is rejected with a 4xx. Drives the
-/// real transport-blocklist path through `/v1/chaos/partition`; a
-/// service-to-service eBPF partition does not affect Raft quorum.
+/// fully isolating one follower is accepted, but a second partition while
+/// that voter is gone from the live view is refused by the quorum rail.
+/// Drives the real transport-blocklist path through `/v1/chaos/partition`;
+/// a service-to-service eBPF partition does not affect Raft quorum.
 #[tokio::test(flavor = "multi_thread", worker_threads = 6)]
 #[ignore = "slow multi-node placement acceptance; run with make test-cluster"]
 async fn fault_injection_rejected_when_quorum_at_risk() {
@@ -823,41 +823,80 @@ async fn fault_injection_rejected_when_quorum_at_risk() {
         .find(|n| *n.thinks_leader.borrow())
         .expect("leader exists");
 
-    let peer = nodes
-        .iter()
-        .find(|node| node.name != leader.name)
-        .expect("leader has a peer")
-        .name
-        .clone();
+    let mut followers = nodes.iter().filter(|node| node.name != leader.name);
+    let isolated = followers.next().expect("leader has a first follower");
+    let other = followers.next().expect("leader has a second follower");
 
-    // First node-level fault: within the quorum budget, accepted.
-    leader
+    // First node-level fault: cut one follower off from both peers. One
+    // unavailable voter is within the quorum budget, so it's accepted.
+    isolated
         .client
-        .inject_partition(std::slice::from_ref(&peer), 60, true)
+        .inject_partition(&[leader.name.clone(), other.name.clone()], 60, true)
         .await
         .expect("first partition should be within the quorum budget");
 
-    // Second node-level fault: would put a majority of the 3-member
-    // council at risk, so the rail must reject it.
+    // The quorum rail counts voters missing from the leader's live API
+    // membership. Until SWIM drops the isolated follower, the only thing
+    // refusing a second fault is the single-reservation rule, which would
+    // let this test pass without the quorum rail.
+    assert!(
+        wait_until_api_view_drops(leader, &isolated.name, Duration::from_secs(30)).await,
+        "{} never dropped the isolated {} from its API membership",
+        leader.name,
+        isolated.name
+    );
+
+    // Second node-level fault: would take a second voter of the 3-member
+    // council out, so the quorum rail must reject it.
     let rejected = leader
         .client
-        .inject_partition(std::slice::from_ref(&peer), 60, true)
+        .inject_partition(std::slice::from_ref(&other.name), 60, true)
         .await;
-    assert!(
-        rejected.is_err(),
-        "second node fault should be rejected to protect quorum, got {rejected:?}"
-    );
-    let msg = format!("{}", rejected.unwrap_err()).to_lowercase();
-    assert!(
-        msg.contains("quorum") || msg.contains("capacity is reserved"),
-        "rejection should cite the quorum rail, got: {msg}"
-    );
+    assert_quorum_refusal(&rejected);
 
     shutdown.cancel();
     for n in nodes {
         if let Some(c) = &n.handle.council {
             c.shutdown().await.ok();
         }
+    }
+}
+
+/// Assert that a node fault was refused by the quorum rail specifically.
+///
+/// Other refusals (one node fault already holding the cluster reservation,
+/// an unknown leader) would also stop the fault, but they'd pass this test
+/// even if the quorum rail were deleted.
+fn assert_quorum_refusal<T: std::fmt::Debug>(result: &Result<T, reliaburger::relish::RelishError>) {
+    let quorum = matches!(
+        result,
+        Err(reliaburger::relish::RelishError::ApiError { status: 400, body })
+            if body.contains("quorum risk: 1 council nodes already affected, max allowed is 1")
+    );
+    assert!(
+        quorum,
+        "expected the quorum rail's 400 refusal, got {result:?}"
+    );
+}
+
+/// Wait until `observer`'s API membership table (what the fault safety
+/// rails read) no longer lists `target`.
+async fn wait_until_api_view_drops(observer: &Node, target: &str, timeout: Duration) -> bool {
+    let deadline = tokio::time::Instant::now() + timeout;
+    loop {
+        let listed = observer
+            .membership_table
+            .read()
+            .await
+            .iter()
+            .any(|member| member.node_id.0 == target);
+        if !listed {
+            return true;
+        }
+        if tokio::time::Instant::now() >= deadline {
+            return false;
+        }
+        tokio::time::sleep(Duration::from_millis(250)).await;
     }
 }
 
@@ -1088,23 +1127,16 @@ async fn authenticated_node_kill_fails_and_restores_a_real_cluster_member() {
         .find(|node| node.name != source.name && node.name != target.name)
         .copied()
         .expect("second follower exists");
+    assert!(
+        wait_until_api_view_drops(other, &target.name, Duration::from_secs(30)).await,
+        "{} never dropped the killed {} from its API membership",
+        other.name,
+        target.name
+    );
     let mut unsafe_second_kill = request.clone();
     unsafe_second_kill.target_node = Some(other.name.clone());
     let refused = other.client.inject_fault(&unsafe_second_kill).await;
-    assert!(
-        refused.as_ref().is_err_and(|error| match error {
-            reliaburger::relish::RelishError::ApiError { status: 400, body } =>
-                body.to_lowercase().contains("quorum"),
-            reliaburger::relish::RelishError::ApiError { status: 409, body } =>
-                body.contains("capacity is reserved") || body.contains("quorum"),
-            reliaburger::relish::RelishError::ApiError { status: 503, body } =>
-                body == "node fault safety cannot map the council leader to live membership"
-                    || body == "node fault safety requires a known council leader",
-            _ => false,
-        }),
-        "second voter failure must be refused after {target_name} is down: {refused:?}",
-        target_name = target.name
-    );
+    assert_quorum_refusal(&refused);
     assert!(
         other.client.list_faults().await.unwrap().is_empty(),
         "a refused second voter fault must leave no active effect"

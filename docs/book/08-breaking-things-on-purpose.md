@@ -381,7 +381,7 @@ cleanup code can no longer quietly treat them as the same fault.
 
 The safety rails from the top of this chapter only protect you if the numbers they read are real. The rail that guards Raft quorum asks "how many council members already have an active node-level fault?" — and for a while the answer was hardcoded to zero, which meant the rail could never fire in production. It passed its unit tests (which supply the context by hand) and did nothing in the wired path.
 
-The agent now builds that context from live state every time a fault arrives: council size from the Raft metrics, alive-node count from the membership table, the target service's replica count from the supervisor, and the active node-level fault count from the registry. Counting node faults conservatively — treating every active partition or node-kill as if it *could* be sitting on a council member — means the quorum rail protects the worst case rather than assuming the best. On a three-member council, `max_allowed` is `(3-1)/2 = 1`: the first partition is within budget, the second is rejected with a `QuorumRisk` violation. The `fault_injection_rejected_when_quorum_at_risk` test drives two partition faults through the real API and asserts the second one comes back 4xx.
+The agent now builds that context from live state every time a fault arrives: council size from the Raft metrics, alive-node count from the membership table, the target service's replica count from the supervisor, and the active node-level fault count from the registry. Counting node faults conservatively — treating every active partition or node-kill as if it *could* be sitting on a council member — means the quorum rail protects the worst case rather than assuming the best. On a three-member council, `max_allowed` is `(3-1)/2 = 1`: the first partition is within budget, the second is rejected with a `QuorumRisk` violation. The `fault_injection_rejected_when_quorum_at_risk` test drives two partition faults through the real API and asserts the second one comes back with the quorum rail's own refusal.
 
 The lesson repeats one from earlier chapters: a check that always passes is worse than no check, because it looks like protection. The gap between recording a fault and injecting one is the gap between chaos engineering and vandalism — and the gap between a safety rail and a comment is whether the numbers behind it are real.
 
@@ -1027,6 +1027,15 @@ transport gates reopen before cleanup is acknowledged and that an old fence
 leaves a newer fault running. The three-node acceptance case sends competing
 kills to different APIs, then fails the leader and checks that its successor
 inherits the reservation until reversal is confirmed.
+
+Adding the reservation quietly weakened two older tests. Once one node fault
+holds the slot, a second fault is refused with a 409 ("node fault capacity is
+reserved") whatever the quorum rail thinks. The quorum tests had been loosened
+to accept that refusal, so they'd have kept passing with the quorum rail deleted.
+They now wait until the first fault has actually removed a voter from the
+leader's live membership view, then insist on the rail's `400` and its
+`quorum risk` message. A test that accepts any refusal only proves that
+*something* said no.
 
 Membership changes share the admission ordering too. Before changing voters or
 learners, the leader commits a no-op and checks for an outstanding reservation.

@@ -328,10 +328,13 @@ CI and release:
       *Done.* Both fixtures now `.expect()` their directory variable; the interruption driver
       `--skip`s them and `make test-linux` excludes them by filter. Linux run of the
       panic path still pending (macOS only compiles these files).
-- [ ] **T2.3 Quorum assertions were loosened.** `tests/placement.rs:~851` and
+- [x] **T2.3 Quorum assertions were loosened.** `tests/placement.rs:~851` and
       `:1093-1103` now also accept capacity or leader-unknown refusals. Restore
       the quorum-specific assertion (set up capacity so the quorum check is the
       one that fires).
+      *Done.* Both tests wait until the first fault's voter has left the API membership
+      view, then `assert_quorum_refusal` requires 400 + "quorum risk". The first test now
+      isolates a follower fully (the old setup only ever hit the 409 reservation refusal).
 
 Execution (grill):
 
