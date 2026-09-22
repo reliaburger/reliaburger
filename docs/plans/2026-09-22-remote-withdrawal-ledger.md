@@ -63,3 +63,12 @@ Broader qualification now passes: 388 native/400 Linux library tests, ten
 agent/compatibility cases and three real failover/decommission cases per platform,
 plus strict Clippy/formatting. State format 30, protocol 16. The session handoff
 records timings and logs. Continue with checkpoint 2; C34 remains open.
+
+
+Checkpoint 2's allocation reservations are complete (`2481943`). Six contracts
+fail first; fourteen focused cases, 394 native/406 Linux library cases, ten
+agent/compatibility cases and three failover/decommission cases per platform pass
+with strict checks. Both current/departing and already-withdrawn VIPs are reserved;
+Raft independently rejects invalid, aliased and prematurely reused allocations.
+Formats remain 16/30. Continue with stale-publication guards and authenticated
+receipts; no consumer receipt endpoint or physical release permission exists yet.
