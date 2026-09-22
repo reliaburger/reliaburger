@@ -3440,24 +3440,30 @@ async fn local_statuses(state: &ApiState) -> Result<Vec<InstanceStatus>, String>
 async fn status_handler(
     State(state): State<ApiState>,
     Query(query): Query<StatusQuery>,
+    auth: Option<axum::Extension<crate::sesame::auth::AuthContext>>,
 ) -> Response {
+    let auth = auth.as_deref();
+    let visible = |app: &str, namespace: &str| {
+        crate::sesame::auth::authorize_scoped(auth, app, namespace).is_ok()
+    };
     if !query.cluster {
         return match local_statuses(&state).await {
-            Ok(statuses) => Json(statuses).into_response(),
-            Err(error) => (
-                StatusCode::SERVICE_UNAVAILABLE,
-                Json(serde_json::json!({"error": error})),
-            )
-                .into_response(),
+            Ok(mut statuses) => {
+                statuses.retain(|status| visible(&status.app_name, &status.namespace));
+                Json(statuses).into_response()
+            }
+            Err(error) => unavailable_response(error),
         };
     }
+    // Peers answer the fan-out under this node's service token, which sees
+    // everything, so the caller's scope has to be applied here.
     match cluster_statuses(&state).await {
-        Ok(statuses) => Json(statuses).into_response(),
-        Err(error) => (
-            StatusCode::SERVICE_UNAVAILABLE,
-            Json(serde_json::json!({"error": error})),
-        )
-            .into_response(),
+        Ok(mut statuses) => {
+            statuses
+                .retain(|status| visible(&status.instance.app_name, &status.instance.namespace));
+            Json(statuses).into_response()
+        }
+        Err(error) => unavailable_response(error),
     }
 }
 
@@ -12753,6 +12759,93 @@ schedule = "* * * * *"
         assert!(json["error"].as_str().unwrap().contains("unresponsive"));
         worker.await.unwrap();
         drop(listener);
+    }
+
+    /// The cluster fan-out authenticates to peers with the node's own service
+    /// token, which sees everything. What comes back must still be trimmed
+    /// to the *caller's* scope, locally and cluster-wide (T1.9).
+    #[tokio::test]
+    async fn namespace_scoped_token_sees_only_its_namespace_in_status() {
+        let status = |id: &str, namespace: &str| -> InstanceStatus {
+            serde_json::from_value(serde_json::json!({
+                "id": id, "app_name": "web", "namespace": namespace, "state": "running",
+                "restart_count": 0, "host_port": null, "pid": null
+            }))
+            .unwrap()
+        };
+        let peer_statuses = vec![status("peer-a", "team-a"), status("peer-b", "team-b")];
+        let peer = Router::new().route(
+            "/v1/status",
+            axum::routing::get(move || {
+                let statuses = peer_statuses.clone();
+                async move { Json(statuses) }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let peer_address = listener.local_addr().unwrap();
+        let peer_server = tokio::spawn(async move {
+            axum::serve(listener, peer).await.unwrap();
+        });
+
+        let (cmd_tx, mut cmd_rx) = mpsc::channel(4);
+        let local_statuses = vec![status("local-a", "team-a"), status("local-b", "team-b")];
+        let worker = tokio::spawn(async move {
+            while let Some(command) = cmd_rx.recv().await {
+                if let AgentCommand::Status { response } = command {
+                    let _ = response.send(local_statuses.clone());
+                }
+            }
+        });
+        let created = crate::sesame::token::create_token(
+            "tenant-a-reader",
+            crate::sesame::types::ApiRole::ReadOnly,
+            crate::sesame::types::TokenScope {
+                apps: None,
+                namespaces: Some(vec!["team-a".to_string()]),
+            },
+            None,
+        )
+        .unwrap();
+        let store = crate::sesame::auth::new_token_store();
+        store.write().await.push(created.token);
+        let members = Arc::new(RwLock::new(vec![NodeMembershipInfo {
+            node_id: crate::meat::NodeId::new("peer"),
+            address: peer_address,
+        }]));
+        let app = router(
+            cmd_tx,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            Some(store),
+            None,
+            None,
+            Some(members),
+            None,
+            9117,
+            None,
+        );
+
+        let (code, body) = get_authenticated(app.clone(), "/v1/status", &created.plaintext).await;
+        assert_eq!(code, StatusCode::OK);
+        let local: Vec<InstanceStatus> = serde_json::from_slice(&body).unwrap();
+        let local_ids: Vec<_> = local.iter().map(|s| s.id.as_str()).collect();
+        assert_eq!(local_ids, ["local-a"]);
+
+        let (code, body) =
+            get_authenticated(app, "/v1/status?cluster=true", &created.plaintext).await;
+        assert_eq!(code, StatusCode::OK);
+        let cluster: Vec<crate::bun::agent::ClusterInstanceStatus> =
+            serde_json::from_slice(&body).unwrap();
+        let mut cluster_ids: Vec<_> = cluster.iter().map(|s| s.instance.id.as_str()).collect();
+        cluster_ids.sort_unstable();
+        assert_eq!(cluster_ids, ["local-a", "peer-a"]);
+
+        peer_server.abort();
+        worker.abort();
     }
 
     #[test]

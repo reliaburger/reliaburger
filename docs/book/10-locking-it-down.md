@@ -500,6 +500,19 @@ This reads the crate's own source with `include_str!`, which embeds a file's con
 
 One route wouldn't fit the pattern. `/v1/logs/sql` takes operator SQL and runs it over the whole `logs` table, so there's no app or namespace to check a scope against. We could try rewriting arbitrary SQL into a tenant-filtered query. Please don't: that way lies a bespoke SQL parser and a long tail of bypasses through subqueries and CTEs you didn't think of. A scoped token is refused outright and pointed at `/v1/logs/query/{app}/{namespace}`, which *can* filter. Unscoped tokens keep the endpoint they've always had.
 
+`/v1/status` slipped past that test because its path names no app: it lists every instance on the node, and with `?cluster=true` every instance in the cluster. The handler took no `AuthContext` at all. Worse, the cluster view fans out to each peer using the node's own service token, which is unscoped, so a read-only token scoped to `team-a` got back everybody's instances from every node. Scoping the peer requests wouldn't help, because the peers see the service token, not the caller.
+
+So the handler filters the merged list before replying, the same way `/v1/diagnostics/apps` already did:
+
+```rust
+let auth = auth.as_deref();
+let visible = |app: &str, namespace: &str| authorize_scoped(auth, app, namespace).is_ok();
+// ...
+statuses.retain(|status| visible(&status.instance.app_name, &status.instance.namespace));
+```
+
+`visible` is a closure: an anonymous function written `|arguments| body`, much like a Python `lambda` or a Go function literal. It captures `auth` from the surrounding scope by reference, so both branches of the handler can share one rule. `Vec::retain` keeps only the elements for which the closure returns `true`, filtering in place without building a second vector. The regression serves one peer and one local agent, each with an instance in `team-a` and one in `team-b`, and checks that a `team-a` token sees only the two `team-a` instances.
+
 The deploy-history endpoint had a quieter version of the same bug. It filtered on the bare app name, and since instance identity gained namespaces (chapter 2), two apps called `web` can live in different namespaces quite happily. Filtering by name alone returned both. The namespace now rides in as a query parameter, and the handler filters and scope-checks on it.
 
 ### Fail closed, not open

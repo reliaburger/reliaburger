@@ -265,7 +265,12 @@ this tier now blocks the 0.1.0 candidate rather than the merge.
       *Fix:* backdate `not_before` by 5 minutes.
       *Test:* validate a freshly issued certificate at `now - 60 s`.
 
-- [ ] **T1.9 `/v1/status?cluster=true` ignores token scope.**
+- [x] **T1.9 `/v1/status?cluster=true` ignores token scope.**
+      Done. `status_handler` now takes the `AuthContext` and filters both the
+      local list and the merged cluster list through `authorize_scoped`. A
+      regression serves a local agent and one peer, each with a `team-a` and
+      a `team-b` instance; a read-only `team-a` token sees only the two
+      `team-a` instances. It failed before the fix (saw `team-b`).
       `status_handler` / `cluster_statuses` (`src/bun/api.rs`) takes no
       `AuthContext` and fans out to every member with the node's service token,
       so a namespace-scoped read-only token sees every instance on every node.
