@@ -632,3 +632,157 @@ async fn retained_addresses_survive_exit_and_recovery_until_the_original_referen
     );
     assert_eq!(successor_still_held, Some(successor));
 }
+
+#[tokio::test]
+#[ignore = "requires root, runc, static /usr/bin/busybox, ip and nft"]
+async fn previous_boot_intent_cannot_start_or_remove_conflicting_live_resources() {
+    let root = tempfile::tempdir().unwrap();
+    let id = instance(root.path());
+    let first = runtime(root.path());
+    first
+        .create(&id, &spec(root.path(), "exit 0"))
+        .await
+        .unwrap();
+    install_fixture(root.path(), &id);
+    drop(first);
+    let path = root
+        .path()
+        .join("bundles/.intents/records")
+        .join(&id.0)
+        .join("intent.json");
+    let original = std::fs::read(&path).unwrap();
+    let mut record: serde_json::Value = serde_json::from_slice(&original).unwrap();
+    let recorded_boot = record["boot_id"].as_str().is_some();
+    record["boot_id"] = "00000000-0000-4000-8000-000000000001".into();
+    std::fs::write(&path, serde_json::to_vec(&record).unwrap()).unwrap();
+    let recovered = runtime(root.path());
+    let started = recovered.start(&id).await;
+    let retired = recovered.kill(&id).await;
+    let namespace_retained = reliaburger::grill::netns::namespace_path(&id).exists();
+    drop(recovered);
+    std::fs::write(path, original).unwrap();
+    runtime(root.path()).kill(&id).await.unwrap();
+    assert!(
+        recorded_boot,
+        "OCI intent must remember its original kernel"
+    );
+    assert!(started.is_err(), "old-boot launch was admitted");
+    assert!(
+        retired.is_err(),
+        "conflicting current-boot resources were deleted"
+    );
+    assert!(namespace_retained);
+}
+
+/// Two-phase fixture: the driver must actually power-cycle the disposable VM.
+#[tokio::test]
+#[ignore = "run only through scripts/release/qualify-oci-reboot.sh in a disposable Linux VM"]
+async fn actual_host_reboot_preserves_holds_and_retires_original_execution() {
+    let Ok(directory) = std::env::var("RELIABURGER_REBOOT_DIRECTORY") else {
+        return;
+    };
+    assert!(nix::unistd::geteuid().is_root());
+    let root = Path::new(&directory);
+    let id = instance(root);
+    let prepared = InstanceId(format!("{}-prepared", id.0));
+    let runtime = runtime(root);
+    let boot = std::fs::read_to_string("/proc/sys/kernel/random/boot_id").unwrap();
+    let proof = root.join("proof.json");
+    match std::env::var("RELIABURGER_REBOOT_PHASE").unwrap().as_str() {
+        "prepare" => {
+            assert!(!proof.exists(), "never overwrite earlier reboot evidence");
+            let mut specification = spec(
+                root,
+                "printf 'run\\n' >> /work/runs; exec /bin/busybox sleep 86400",
+            );
+            specification.linux.cgroups_path = Some(format!("/{}", id.0));
+            runtime.create(&id, &specification).await.unwrap();
+            install_fixture(root, &id);
+            let reference = runtime
+                .retain_network_reference(&id)
+                .await
+                .unwrap()
+                .unwrap();
+            runtime.start(&id).await.unwrap();
+            wait_file(&root.join("shared/runs")).await;
+            runtime
+                .create(
+                    &prepared,
+                    &spec(root, "printf unexpected > /work/prepared-ran"),
+                )
+                .await
+                .unwrap();
+            assert_eq!(runtime.state(&id).await.unwrap(), ContainerState::Running);
+            std::fs::write(
+                &proof,
+                serde_json::to_vec(&serde_json::json!({"boot": boot, "reference": reference}))
+                    .unwrap(),
+            )
+            .unwrap();
+            std::fs::File::open(&proof).unwrap().sync_all().unwrap();
+            std::fs::File::open(root).unwrap().sync_all().unwrap();
+        }
+        "verify" => {
+            let evidence: serde_json::Value =
+                serde_json::from_slice(&std::fs::read(&proof).unwrap()).unwrap();
+            assert_ne!(
+                evidence["boot"].as_str().unwrap(),
+                boot,
+                "this is not an actual kernel reboot"
+            );
+            let reference: reliaburger::grill::runc_intent::NetworkReference =
+                serde_json::from_value(evidence["reference"].clone()).unwrap();
+            assert!(!reliaburger::grill::netns::namespace_path(&id).exists());
+            assert!(
+                !Path::new("/sys/class/net")
+                    .join(reliaburger::grill::netns::host_veth_name(&id))
+                    .exists()
+            );
+            assert!(!Path::new("/sys/fs/cgroup").join(&id.0).exists());
+            assert!(
+                root.join("state").join(&id.0).exists(),
+                "fixture must retain stale OCI metadata across reboot"
+            );
+            assert_eq!(runtime.state(&id).await.unwrap(), ContainerState::Stopped);
+            assert_eq!(runtime.exit_code(&id).await, None);
+            assert_eq!(
+                runtime.state(&prepared).await.unwrap(),
+                ContainerState::Stopped
+            );
+            assert_eq!(
+                runtime.network_reference(&id).await.unwrap(),
+                Some(reference.clone())
+            );
+            assert!(runtime.create(&id, &spec(root, "exit 0")).await.is_err());
+            assert_eq!(
+                std::fs::read_to_string(root.join("shared/runs")).unwrap(),
+                "run\n"
+            );
+            assert!(!root.join("shared/prepared-ran").exists());
+            runtime.release_network_reference(&reference).await.unwrap();
+            runtime.create(&id, &spec(root, "exit 7")).await.unwrap();
+            install_fixture(root, &id);
+            let successor = runtime
+                .retain_network_reference(&id)
+                .await
+                .unwrap()
+                .unwrap();
+            assert_ne!(successor.generation, reference.generation);
+            assert!(runtime.release_network_reference(&reference).await.is_err());
+            runtime.start(&id).await.unwrap();
+            tokio::time::timeout(Duration::from_secs(20), async {
+                while runtime.state(&id).await.unwrap() != ContainerState::Stopped {
+                    tokio::time::sleep(Duration::from_millis(20)).await;
+                }
+            })
+            .await
+            .unwrap();
+            assert_eq!(runtime.exit_code(&id).await, Some(7));
+            runtime.release_network_reference(&successor).await.unwrap();
+            assert_absent(root, &id);
+            assert_absent(root, &prepared);
+            std::fs::write(root.join("verified-boot"), boot).unwrap();
+        }
+        other => panic!("invalid reboot qualification phase {other}"),
+    }
+}

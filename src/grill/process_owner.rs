@@ -148,7 +148,7 @@ pub(crate) fn current_boot_id() -> io::Result<Option<String>> {
     }
 }
 
-fn valid_boot_id(value: &str) -> bool {
+pub(crate) fn valid_boot_id(value: &str) -> bool {
     value.len() == 36
         && value.bytes().enumerate().all(|(index, byte)| {
             if [8, 13, 18, 23].contains(&index) {

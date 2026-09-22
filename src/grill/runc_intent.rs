@@ -106,6 +106,8 @@ pub enum NetworkReferenceState {
 #[serde(deny_unknown_fields)]
 pub struct RuntimeIntent {
     version: u32,
+    /// Linux kernel that admitted this generation, before any resource mutation.
+    pub boot_id: Option<String>,
     /// Workload name shared with the agent's independent adoption record.
     pub instance_id: InstanceId,
     /// Generation required by any subsequent mutation.
@@ -120,6 +122,21 @@ pub struct RuntimeIntent {
     pub roles: RuntimeRoles,
     /// Discovery ownership survives runtime exit independently of its launcher.
     pub network_reference: Option<NetworkReferenceState>,
+}
+
+impl RuntimeIntent {
+    /// Prove that this execution belongs to an earlier Linux kernel.
+    pub async fn from_previous_boot(&self) -> io::Result<bool> {
+        let original = self.boot_id.clone();
+        tokio::task::spawn_blocking(move || {
+            Ok(match (original, super::process_owner::current_boot_id()?) {
+                (Some(original), Some(current)) => original != current,
+                _ => false,
+            })
+        })
+        .await
+        .map_err(io::Error::other)?
+    }
 }
 
 /// A node's persistent collection of original Runc preparation attempts.
@@ -298,7 +315,12 @@ impl IntentJournal {
             return Err(io::Error::other("runtime intent exceeds size limit"));
         }
         let record: RuntimeIntent = serde_json::from_slice(&bytes)?;
-        if record.version != 4
+        if record.version != 5
+            || record
+                .boot_id
+                .as_deref()
+                .is_some_and(|boot| !super::process_owner::valid_boot_id(boot))
+            || (cfg!(target_os = "linux") && record.boot_id.is_none())
             || record.instance_id != *instance
             || record.configuration != self.configuration
             || record.generation.0.len() != 32
@@ -352,7 +374,8 @@ impl IntentClaim {
                 .fill(&mut nonce)
                 .map_err(|_| io::Error::other("cannot generate runtime intent identity"))?;
             let record = RuntimeIntent {
-                version: 4,
+                version: 5,
+                boot_id: super::process_owner::current_boot_id()?,
                 instance_id: self.instance.clone(),
                 generation: IntentGeneration(hex::encode(nonce)),
                 spec,

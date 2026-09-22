@@ -266,6 +266,16 @@ impl IntentCommands {
             }
             self.validate_roles().await?;
             self.require_terminal_commands().await?;
+            if self
+                .record()
+                .ok_or_else(|| io::Error::other("missing runtime intent"))?
+                .from_previous_boot()
+                .await?
+            {
+                return Err(io::Error::other(
+                    "runtime role belongs to a previous kernel boot",
+                ));
+            }
             self.prepare_role_admission(role).await?;
             let id = self
                 .collection(role)
@@ -342,6 +352,16 @@ impl IntentCommands {
         environment: &BTreeMap<String, String>,
         timeout: Duration,
     ) -> io::Result<(Self, CommandOutput)> {
+        if self
+            .record()
+            .ok_or_else(|| io::Error::other("missing runtime intent"))?
+            .from_previous_boot()
+            .await?
+        {
+            return Err(io::Error::other(
+                "runtime command belongs to a previous kernel boot",
+            ));
+        }
         self.execute(program, arguments, environment, timeout, false)
             .await
     }

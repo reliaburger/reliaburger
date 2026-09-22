@@ -3473,3 +3473,18 @@ This proves process absence, not discovery withdrawal. A retained container
 address still needs its original consumer confirmations, and persisted OCI and
 kernel resources need their own recovery checks. The unit-style regressions edit
 records to exercise these decisions; they are not evidence of an actual reboot.
+
+OCI metadata needs a separate check. Runc's state directory may survive reboot,
+including a saved PID. We bind the original runtime intent to the boot too. On a
+later boot, recovery first refuses any matching namespace, veth or cgroup that
+exists in the new kernel. Under the original exclusive claim, it seals and drains
+all admitted commands, then removes the stale private OCI metadata directly.
+Passing that old PID to `runc delete --force` would give stale state too much power.
+
+The two-phase `qualify-oci-reboot.sh` test uses a disposable Lima VM. It starts a
+real container, holds its address, leaves another launch prepared, and force-stops
+the VM. After restart it requires a different kernel boot UUID and absent original
+kernel objects. It checks that the unknown outcome stays unknown, the prepared
+payload never runs, and the held address cannot be reused until explicit release.
+Finally it runs a replacement and refuses a delayed release from the old generation.
+The driver preserves both logs and the test binary's checksum across the reboot.

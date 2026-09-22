@@ -237,7 +237,7 @@ durable path now holds producer allocations until committed consumer confirmatio
 permanent execution fences prevent stale reports from reviving retired endpoints.
 
 0.1.0 requires a fresh cluster; development state is refused. Rolling upgrades
-require matching explicit formats (currently protocol 20 and state 35). See the
+require matching explicit formats (currently protocol 20 and state 36). See the
 [compatibility policy](releasing.md#cluster-compatibility).
 
 Lease-owned test volumes and generated configuration have durable provisioning

@@ -330,6 +330,11 @@ impl RuncGrill {
     pub(super) async fn owned_start(&self, instance: &InstanceId) -> Result<(), GrillError> {
         self.owned_operation(instance, |runtime, id, context| async move {
             let intent = context.intent().await?;
+            if intent.from_previous_boot().await? {
+                return Err(io::Error::other(
+                    "runtime generation belongs to a previous kernel boot",
+                ));
+            }
             if intent.phase != IntentPhase::Owned || intent.roles.launcher.is_some() {
                 return Err(io::Error::other(
                     "runtime launcher is already bound or admission is sealed",
@@ -408,6 +413,27 @@ impl RuncGrill {
         if matches!(record.phase, IntentPhase::Retired { .. }) {
             return Ok(());
         }
+        let previous_boot = record.from_previous_boot().await?;
+        if previous_boot {
+            // Old PIDs and namespace names are not authority over new kernel
+            // objects. Refuse conflicts before running any cleanup command.
+            let cgroup = record
+                .spec
+                .linux
+                .host_cgroup_path()
+                .unwrap_or_else(|| Path::new("/sys/fs/cgroup").join(&id.0));
+            for path in [
+                cgroup,
+                netns::namespace_path(id),
+                Path::new("/sys/class/net").join(netns::host_veth_name(id)),
+            ] {
+                if tokio::fs::try_exists(path).await? {
+                    return Err(io::Error::other(
+                        "prior-boot runtime has conflicting current kernel resources",
+                    ));
+                }
+            }
+        }
         let exit_code = match context.role_state(RuntimeRole::Launcher).await? {
             Some(CommandState::Retired { exit_code }) => exit_code,
             _ => None,
@@ -415,8 +441,18 @@ impl RuncGrill {
         let cleanup = context.seal(Duration::from_secs(15)).await?;
         let state = self.state_dir.join(&id.0);
         if tokio::fs::try_exists(&state).await? {
-            self.owned_runc_command(&cleanup, &["delete", "--force", &id.0])
-                .await?;
+            if previous_boot {
+                // Under the exclusive original claim, remove only stale private
+                // metadata. Never feed prior-boot PIDs to `runc delete --force`.
+                tokio::fs::remove_dir_all(&state).await?;
+                let parent = self.state_dir.clone();
+                tokio::task::spawn_blocking(move || std::fs::File::open(parent)?.sync_all())
+                    .await
+                    .map_err(io::Error::other)??;
+            } else {
+                self.owned_runc_command(&cleanup, &["delete", "--force", &id.0])
+                    .await?;
+            }
             if tokio::fs::try_exists(&state).await? {
                 return Err(io::Error::other("runc deletion left OCI state"));
             }
@@ -541,7 +577,7 @@ impl RuncGrill {
             if matches!(record.phase, IntentPhase::Retired { .. }) {
                 return Ok(ContainerState::Stopped);
             }
-            if record.phase == IntentPhase::Retiring {
+            if record.phase == IntentPhase::Retiring || record.from_previous_boot().await? {
                 runtime.owned_cleanup(&id, &context).await?;
                 return Ok(ContainerState::Stopped);
             }
