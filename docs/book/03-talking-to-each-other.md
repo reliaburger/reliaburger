@@ -2311,6 +2311,18 @@ execution. Pending, malformed, redirected and mismatched replies preserve the
 allocation. Dropping the wait cannot grant permission; a later attempt sends the
 same original execution and obtains a fresh committed result.
 
+That wait used to happen right on the agent's only loop. With the leader
+unreachable, each retirement could spend up to sixteen seconds per tick on
+inventory reads and the 10-second request timeout, one instance after another.
+Meanwhile nothing else ran: no API commands, no health checks, no reports. The
+node looked broken exactly while the cluster was degraded. Now the request runs
+as its own task, stored in a map keyed by the execution it would release. A
+fresh request waits at most a second, which is plenty for a healthy leader, and
+otherwise the caller hears "awaits leader confirmation" and retries later. The
+retry doesn't ask again; it collects the answer if one has arrived. The map
+holds `AbortOnDropHandle`s from `tokio_util`, so dropping an entry, or the whole
+agent, cancels its request instead of leaving it running in the background.
+
 The agent performs this check before deleting records or releasing an allocation,
 including the automatic-restart path. For Runc, the returned generation must also
 match the original network reference, and durable local release permission still

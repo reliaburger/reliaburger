@@ -1629,6 +1629,14 @@ pub struct BunAgent<G: Grill> {
     discovery_ownership: DiscoveryOwnership,
     /// Enrolled transport used by the opt-in durable producer retirement gate.
     producer_release_client: Option<crate::cluster::producer::ProducerReleaseClient>,
+    /// Producer release confirmations still waiting for the leader, keyed by
+    /// the execution they would release. Dropping one aborts its request.
+    producer_releases: std::collections::HashMap<
+        crate::grill::RuntimeExecution,
+        tokio_util::task::AbortOnDropHandle<
+            Result<crate::onion::producer::ProducerReleaseConfirmation, String>,
+        >,
+    >,
     /// Cluster-wide endpoint catalogue (12b.4), replicated from the leader.
     /// Overlaid onto the local `service_map` when publishing the DNS/routing
     /// snapshot so this node resolves services whose backends live elsewhere.
@@ -1808,6 +1816,7 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
             service_map: crate::onion::service_map::ServiceMap::new(),
             discovery_ownership: DiscoveryOwnership::default(),
             producer_release_client: None,
+            producer_releases: std::collections::HashMap::new(),
             cluster_catalog: crate::onion::catalog::EndpointCatalog::new(),
             cluster_catalog_generation: None,
             service_map_tx: tokio::sync::watch::channel(
@@ -1909,6 +1918,7 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
             service_map: crate::onion::service_map::ServiceMap::new(),
             discovery_ownership: DiscoveryOwnership::default(),
             producer_release_client: None,
+            producer_releases: std::collections::HashMap::new(),
             cluster_catalog: crate::onion::catalog::EndpointCatalog::new(),
             cluster_catalog_generation: None,
             service_map_tx: tokio::sync::watch::channel(
@@ -12461,6 +12471,80 @@ mod tests {
                 crate::grill::records::record_path(&root.path().join("records"), &id.0).exists()
             );
         }
+    }
+
+    #[tokio::test]
+    async fn slow_producer_release_does_not_stall_the_agent_loop() {
+        let grill = MockGrill::new();
+        grill.set_pid(std::process::id());
+        let allocator = PortAllocator::new(30000, 30001);
+        let (_, receiver) = mpsc::channel(8);
+        let mut agent = BunAgent::new(
+            grill.clone(),
+            allocator.clone(),
+            receiver,
+            CancellationToken::new(),
+        );
+        let root = tempfile::tempdir().unwrap();
+        agent.set_volumes_dir(root.path().join("volumes"));
+        agent.set_records_dir(root.path().join("records"));
+        agent
+            .enable_fresh_discovery_ownership(&root.path().join("discovery"))
+            .await
+            .unwrap();
+        let reference = original_test_network_reference();
+        grill.set_network_reference(reference.clone()).await;
+        expect_complete(&drain_deploy(&mut agent, basic_config()).await);
+        let id = reference.instance_id.clone();
+        let original = agent.supervisor.get_instance(&id).unwrap();
+        let host_port = original.host_port.unwrap();
+        let execution = crate::grill::RuntimeExecution {
+            instance_id: id.clone(),
+            generation: crate::grill::RuntimeGeneration::runc(reference.generation.as_str()),
+        };
+        grill
+            .set_launch_inventory(vec![crate::grill::RuntimeLaunch {
+                instance_id: id.clone(),
+                generation: execution.generation.clone(),
+                spec: original.oci_spec.clone().unwrap(),
+                network_reference: Some(crate::grill::runc_intent::NetworkReferenceState::Held(
+                    reference.clone(),
+                )),
+            }])
+            .await;
+        let (mut clustered, _, _) = test_cluster_fault_agent().await;
+        agent.cluster = clustered.cluster.take();
+        agent.kill_and_wait_for_exit(&id).await.unwrap();
+        let confirmation =
+            serde_json::json!({"node_id": "test", "execution": execution}).to_string();
+        // An overloaded or partitioned leader answers slowly.
+        let (client, task) = crate::cluster::producer::test_delayed_fixture(
+            axum::http::StatusCode::OK,
+            confirmation,
+            std::time::Duration::from_secs(3),
+        )
+        .await;
+        agent.set_producer_release_client(client);
+        let started = std::time::Instant::now();
+        assert!(agent.finish_retire_bookkeeping(&id).await.is_err());
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(2),
+            "one retirement held the agent loop for {:?}",
+            started.elapsed()
+        );
+        let retry = std::time::Instant::now();
+        assert!(agent.finish_retire_bookkeeping(&id).await.is_err());
+        assert!(
+            retry.elapsed() < std::time::Duration::from_millis(500),
+            "a retry waited for the leader again"
+        );
+        assert!(allocator.is_allocated(host_port).await);
+        tokio::time::sleep(std::time::Duration::from_secs(3)).await;
+        // The confirmation that arrived in the background completes retirement.
+        agent.finish_retire_bookkeeping(&id).await.unwrap();
+        assert!(!allocator.is_allocated(host_port).await);
+        task.abort();
+        let _ = task.await;
     }
 
     #[tokio::test]

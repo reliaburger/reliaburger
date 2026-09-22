@@ -219,7 +219,11 @@ this tier now blocks the 0.1.0 candidate rather than the merge.
       publication succeeds once the directory is writable, and assert readiness
       shows the degraded state meanwhile.
 
-- [ ] **T1.6 Retirement network calls stall the agent's main loop.**
+- [x] **T1.6 Retirement network calls stall the agent's main loop.** Done.
+      The leader request runs as a task keyed by execution; a fresh request
+      waits at most 1 s, retries collect the finished answer without asking
+      again, and dropping an entry aborts it. A 3 s leader delay used to hold
+      a retirement for 3 s; it now returns within 1 s and completes later.
       The 1 s tick (`src/bun/agent.rs:3375-3387`) runs
       `drive_startup_retirements` → `retire_instance_artifacts` (`:8555`) →
       `confirm_producer_release` inline: up to 5 s + 1 s inventory plus a 10 s
