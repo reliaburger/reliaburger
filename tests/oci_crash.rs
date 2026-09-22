@@ -42,6 +42,7 @@ impl Node {
                 ),
             )
             .env("OCI_CRASH_ROOT", root)
+            .env("LD_PRELOAD", root.join("admission.so"))
             .stdout(output.try_clone().unwrap())
             .stderr(output)
             .kill_on_drop(true)
@@ -95,6 +96,22 @@ fn runtime(root: &Path) -> RuncGrill {
 }
 
 fn install_wrappers(root: &Path) {
+    let compilation = std::process::Command::new("cc")
+        .args(["-shared", "-fPIC", "-Wall", "-Wextra", "-Werror"])
+        .arg(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/tests/fixtures/oci_admission_gate.c"
+        ))
+        .arg("-o")
+        .arg(root.join("admission.so"))
+        .arg("-ldl")
+        .output()
+        .unwrap();
+    assert!(
+        compilation.status.success(),
+        "{}",
+        String::from_utf8_lossy(&compilation.stderr)
+    );
     std::fs::create_dir(root.join("bin")).unwrap();
     std::fs::create_dir(root.join("shared")).unwrap();
     // OCI workloads run as the configured non-root user.
@@ -129,7 +146,7 @@ with open(path, 'w') as stream: json.dump(spec, stream)
 PY
 fi
 if [[ -f "$root/armed" && "$arguments" == *'__init-0'* ]]; then
-    if [[ "$phase" == preparation && '{program}' == ip && "$arguments" == *' netns add '* ]] ||
+    if [[ ( "$phase" == preparation || "$phase" == retry ) && '{program}' == ip && "$arguments" == *' netns add '* ]] ||
        [[ "$phase" == start && '{program}' == runc && "$arguments" == *' run '* ]] ||
        [[ "$phase" == retirement && '{program}' == ip && "$arguments" == *' netns del '* ]]; then
         touch "$root/ready"
@@ -160,7 +177,7 @@ fn manifest(running_init: bool, name: &str) -> Config {
         r#"
 [app.oci-crash]
 image = "/empty-fixture"
-command = ["/bin/busybox", "sh", "-c", "printf 'main\\n' >> /work/main; exec /bin/busybox sleep 60"]
+command = ["/bin/busybox", "sh", "-c", "printf 'main\\n' >> /work/main; trap 'exit 0' TERM; while :; do /bin/busybox sleep 1; done"]
 [[app.oci-crash.init]]
 command = ["/bin/busybox", "true"]
 [[app.oci-crash.init]]
@@ -189,7 +206,15 @@ async fn wait_file(path: &Path) {
 #[ignore = "requires isolated Linux root, real runc/ip/nft and static BusyBox"]
 async fn actual_bun_sigkill_and_cancelled_caller_preserve_oci_init_and_retry_ownership() {
     assert!(nix::unistd::geteuid().is_root());
-    for phase in ["preparation", "start", "running", "retirement", "adopted"] {
+    for phase in [
+        "admission",
+        "preparation",
+        "start",
+        "running",
+        "retirement",
+        "adopted",
+        "retry",
+    ] {
         let root = tempfile::tempdir().unwrap().keep();
         println!("qualifying {phase}: {}", root.as_path().display());
         let name = format!(
@@ -223,6 +248,15 @@ registry_port = 0
         )
         .unwrap();
         let mut node = Node::start(root.as_path()).await;
+        if phase == "retry" {
+            std::fs::remove_file(root.join("armed")).unwrap();
+            node.client.apply(&manifest(false, &name)).await.unwrap();
+            node.client.stop(&name, "default").await.unwrap();
+            for file in ["main", "second", "initialisers"] {
+                std::fs::remove_file(root.join("shared").join(file)).unwrap();
+            }
+            std::fs::write(root.join("armed"), "armed").unwrap();
+        }
         let client = node.client.clone();
         let config = manifest(phase == "running", &name);
         let mut request = tokio::spawn(async move { client.apply(&config).await });
@@ -246,6 +280,16 @@ registry_port = 0
                 request.abort();
                 let _ = request.await;
             }
+        }
+        if phase == "admission" {
+            let initialiser = format!("default__{name}-0__init-0");
+            assert!(
+                !root
+                    .join("data/instances/runc/bundles/.intents/records")
+                    .join(initialiser)
+                    .exists(),
+                "admission fixture ran after runtime intent publication"
+            );
         }
         node.crash().await;
         std::fs::remove_file(root.as_path().join("armed")).unwrap();
@@ -290,10 +334,13 @@ registry_port = 0
         } else {
             "main\n"
         };
-        assert_eq!(
-            std::fs::read_to_string(root.as_path().join("shared/main")).unwrap(),
-            expected
-        );
+        tokio::time::timeout(Duration::from_secs(10), async {
+            while std::fs::read_to_string(root.join("shared/main")).unwrap() != expected {
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .expect("explicit retry must execute the main payload exactly once");
         recovered.client.stop(&name, "default").await.unwrap();
         recovered.crash().await;
         println!(

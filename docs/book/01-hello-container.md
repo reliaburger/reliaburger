@@ -3509,3 +3509,13 @@ standalone qualification. It refuses other runtimes and cluster mode. This is
 not production activation: durable consumer discovery recovery and pinned kernel
 recovery still have to meet their own contracts before the normal startup path
 can select them.
+
+One gap is too small to hit reliably by polling. Bun can register an initialiser
+and die before Runc publishes its intent. The Linux qualification fixture compiles
+a small `LD_PRELOAD` shim that pauses the real file-open operation for that intent's
+lock. It checks that the intent directory does not yet exist, then kills Bun. The
+shim belongs to the test only; the production Rust path contains no injected wait.
+A final case starts a successful application first, then repeats the crash during
+its subsequent explicit deployment. This catches accidental reliance on fresh
+storage. The interruption driver also reruns the lower-level caller-cancellation,
+launcher, exec and network-mutation contracts in private Linux namespaces.
