@@ -1,7 +1,7 @@
 # PR #167 review fixes: plan
 
 **Status:** in progress. PR #167 merged on 22 September 2026 (`435efc2`);
-decisions A–E are made, F is open. T2.19 is done.
+all decisions (A–G) are made.
 **Reviewed at:** `9d8eb3d` on `codex/codebase-completion-fixes`.
 **Written:** 22 September 2026, from a Claude review of the Codex-built branch.
 
@@ -82,9 +82,14 @@ subsystem review agents that traced the code; confirm each one before fixing it.
       1–1.5k lines across the affected chapters, down from 8.2k.
 - [x] **E. Vendored `parquet`.** Decided 22 September 2026: drop it and
       upgrade DataFusion 45 → 55 (T2.19). See the dedicated section below.
-- [ ] **F. One Runc lifecycle (T4.2).** Recommended: yes, make owned Runc the
-      only Linux Runc path, after the Tier 1 owner-recovery fixes (T1.3/T1.4)
-      land, since those make the owned path safe to depend on everywhere.
+- [x] **F. One Runc lifecycle (T4.2).** Decided 22 September 2026: yes. Owned
+      Runc becomes the only Linux Runc path; remove all legacy Runc code and
+      docs, after the Tier 1 owner-recovery fixes (T1.3/T1.4) land.
+- [x] **G. No legacy code before the first release.** Decided 22 September
+      2026. Nothing has been released, so there is nothing to stay compatible
+      with: no second "legacy" implementation, no deprecation handling for
+      unreleased config keys, no migrations for development-only formats.
+      This turns T2.18 into a won't-do, takes T4.1 off hold and adds T4.9.
 
 ## Tier 1: merge blockers
 
@@ -342,9 +347,8 @@ Registry and storage:
 
 Config:
 
-- [ ] **T2.18 Removed config keys now fail parsing.** `[upgrades] release_url`
-      and `[dns] default_namespace` in `src/config/node.rs`. Accept them with a
-      deprecation warning so an upgraded node with an old config still starts.
+- [x] **T2.18 Removed config keys now fail parsing.** Won't do (decision G):
+      those keys were never released, so refusing them is correct.
 
 ## Tier 3: docs cleanup before merge
 
@@ -392,10 +396,9 @@ spot-checked by hand.
       `start/restore_rootless_network` and `slirp_handles`
       (`src/grill/runc.rs:74, 364-490`), the rootless arm of legacy `adopt`
       (`:~1290-1320`) and its tests (`:1879-2160`) are dead.
-      *On hold:* rootless clusters are deferred past 0.1.0 (to get early user
-      feedback first), not dropped. Before deleting, decide whether that work
-      builds purely on the owned path or wants any of the slirp4netns code.
-      Git history keeps it either way.
+      *Unblocked by decision G:* this is legacy code, so it goes. Rootless
+      clusters (deferred past 0.1.0) will build on the owned path; git history
+      keeps the slirp4netns code if it's ever wanted.
 - [ ] **T4.2 Make every Linux Runc instance owned; drop
       `--experimental-owned-runc` (~600–700 prod, ~375 test lines; medium
       risk).** Removes the legacy branch of each
@@ -434,6 +437,10 @@ spot-checked by hand.
       `router(cmd_tx, None ×11, …)` + agent spawn 12–20 times in the
       `api.rs` test module. Table-driving saves little: only 5
       near-duplicate test pairs exist.
+- [ ] **T4.9 Sweep remaining legacy code (decision G).** Search for
+      "legacy", "compat", "deprecated", "migrate", `#[serde(default)]` on
+      durable formats and version fallbacks. Delete paths that exist only for
+      unreleased formats or superseded implementations, and their docs.
 - [ ] **T4.8 Make `make loc` honest.** Count tracked files (`git ls-files`)
       so `node_modules` Markdown under `docs/talks/` stops inflating `.md`, and
       treat `#[cfg(test)] mod x;` files as tests.
