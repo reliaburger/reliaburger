@@ -20090,6 +20090,19 @@ host = "remote.local"
             .await
             .unwrap();
         assert_eq!(result.receipts, vec![1]);
+        let (response, reply) = oneshot::channel();
+        recovered
+            .handle_command(AgentCommand::SyncClusterConsumer {
+                generation: 0,
+                catalog: Box::default(),
+                ingress: vec![],
+                withdrawals: vec![],
+                response,
+            })
+            .await;
+        let retry = reply.await.unwrap().unwrap();
+        assert!(!retry.published);
+        assert_eq!(retry.receipts, vec![1]);
         recovered.confirm_consumer_receipt(1).await.unwrap();
         recovered.confirm_consumer_receipt(1).await.unwrap();
         drop(recovered);
