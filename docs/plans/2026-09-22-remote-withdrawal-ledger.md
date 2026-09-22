@@ -200,3 +200,11 @@ request guards as well as the service view. Add explicit confirmed-withdrawal an
 receipt phases before allowing bounded compaction; the current append-only store
 must refuse at capacity. Producer release still needs committed proof and stale
 execution-report fencing.
+
+Storage implementation is committed as `6b105b0`. Five contracts fail first
+(0.157s); all 24 journal/fresh-enable cases pass (0.711s). Qualification passes
+349 native/361 Linux affected library cases (18.497s/23.954s), thirteen integration
+cases per platform (5.487s/5.025s), strict all-target/all-feature Clippy and
+formatting. Both pipelines are reaped. Logs and scripts are
+`/tmp/rb-consumer-ownership-{native,linux}.{log,sh}`. Publication and recovery
+integration remain open; this checkpoint enables no new cleanup authority.
