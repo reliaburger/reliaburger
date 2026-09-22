@@ -366,7 +366,7 @@ fn read_checkpoint(directory: &Path) -> io::Result<DiscoveryInventory> {
         return Err(io::Error::other("discovery checkpoint exceeds size limit"));
     }
     let checkpoint: Checkpoint = serde_json::from_slice(&bytes)?;
-    if checkpoint.schema != 2 {
+    if checkpoint.schema != 3 {
         return Err(io::Error::other("unsupported discovery checkpoint schema"));
     }
     validate(&checkpoint.inventory)?;
@@ -375,7 +375,7 @@ fn read_checkpoint(directory: &Path) -> io::Result<DiscoveryInventory> {
 
 fn write_checkpoint(directory: &Path, inventory: &DiscoveryInventory) -> io::Result<()> {
     let bytes = serde_json::to_vec(&Checkpoint {
-        schema: 2,
+        schema: 3,
         inventory: inventory.clone(),
     })?;
     if bytes.len() as u64 > LIMIT {
@@ -607,13 +607,14 @@ mod tests {
         let effective =
             ServiceMap::new().with_cluster_catalog_excluding_node(&catalog, Some("reader"));
         serde_json::json!({"generation": generation, "catalog": catalog,
-            "effective_services": effective.resolve_all()})
+            "effective_services": effective.resolve_all(), "ingress": []})
     }
 
     fn consumer_inventory() -> serde_json::Value {
         serde_json::json!({"services": [], "references": [], "consumer": {
             "identity": {"node_id": "reader", "cluster_identity": vec![42_u8; 32]},
-            "publications": [consumer_snapshot(1, 30001), consumer_snapshot(2, 30002)]
+            "publications": [consumer_snapshot(1, 30001), consumer_snapshot(2, 30002)],
+            "phase": "Withdrawing", "receipts": {}
         }})
     }
 
@@ -636,7 +637,7 @@ mod tests {
         assert!(DiscoveryJournal::open(&path).is_err());
         let wire: serde_json::Value =
             serde_json::from_slice(&std::fs::read(path.join(CHECKPOINT)).unwrap()).unwrap();
-        assert_eq!(wire["schema"], 2);
+        assert_eq!(wire["schema"], 3);
     }
 
     #[test]
@@ -744,7 +745,7 @@ mod tests {
         let mut journal = DiscoveryJournal::open(&root.path().join("owners")).unwrap();
         let mut next = consumer_inventory();
         next["consumer"]["publications"] = serde_json::json!([{
-            "generation": 0, "catalog": {"services": {}}, "effective_services": []
+            "generation": 0, "catalog": {"services": {}}, "effective_services": [], "ingress": []
         }]);
         journal
             .save(serde_json::from_value(next.clone()).unwrap())

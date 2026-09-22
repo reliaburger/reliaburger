@@ -2377,3 +2377,23 @@ We check bpffs, cgroup and boot prerequisites before establishing that directory
 so an unmounted bpffs doesn't leave a misleading partial claim. Losing established
 authority refuses recovery on every boot; a new boot proves old kernel absence,
 not permission to invent a replacement journal.
+
+### Remembering the reader's cleanup work
+
+A node can stop publishing an endpoint while an HTTP request still holds the old
+backend. It can also send a withdrawal receipt and crash before recording the
+leader's reply. Neither case is permission to forget the original exposure.
+
+The consumer journal has four phases: `Publishing`, `Active`, `Withdrawing` and
+`Withdrawn`. Only the last permits compacting publication history. The latest
+catalogue generation survives that compaction, so an old assignment cannot become
+new just because earlier records disappeared. Each withdrawal instruction also
+has `Pending` or `Ready` receipt state. Pending means local cleanup still owes
+proof. Ready means sending is safe, but the instruction remains until the leader
+acknowledges it. A lost response causes an idempotent retry.
+
+Rust enums make these permissions explicit. A `match` over the old and new phases
+checks allowed transitions before the journal writes anything. The `BTreeMap`
+keys receipts by their original generation; deterministic ordering makes snapshots
+and tests easier to inspect. Tests first reproduce premature receipt removal and
+refusal to compact even after withdrawal, then exercise the permission boundaries.

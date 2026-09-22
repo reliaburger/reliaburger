@@ -53,7 +53,7 @@ payload. Complete durable discovery/kernel recovery and final release acceptance
 remain open; see the [remaining work](docs/plans/2026-09-22-v0.1.0-remaining-work.md).
 
 0.1.0 requires a fresh cluster; development state is refused. Rolling upgrades
-require matching explicit formats (currently protocol 20 and state 37). See the
+require matching explicit formats (currently protocol 20 and state 38). See the
 [compatibility policy](docs/releasing.md#cluster-compatibility).
 Registry uploads belong to their exact creating credential. Recovery reclaims
 abandoned partial uploads after a crash and
