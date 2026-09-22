@@ -23,7 +23,14 @@ impl Node {
             .append(true)
             .open(&log)
             .unwrap();
-        let mut command = tokio::process::Command::new(env!("CARGO_BIN_EXE_bun"));
+        let executable = if root.join("upgrade-bin/bun").exists() {
+            root.join("upgrade-bin/bun")
+        } else {
+            env!("CARGO_BIN_EXE_bun").into()
+        };
+        let listen =
+            std::fs::read_to_string(root.join("listen")).unwrap_or_else(|_| "127.0.0.1:0".into());
+        let mut command = tokio::process::Command::new(executable);
         if root.join("cluster").exists() {
             command.arg("--cluster");
         }
@@ -33,7 +40,7 @@ impl Node {
         let mut child = command
             .arg("--config")
             .arg(root.join("node.toml"))
-            .args(["--listen", "127.0.0.1:0", "--runtime", "runc"])
+            .args(["--listen", &listen, "--runtime", "runc"])
             .env(
                 "PATH",
                 format!(
@@ -481,6 +488,114 @@ async fn normal_standalone_bun_recovers_durable_kernel_and_discovery() {
 }
 
 #[cfg(feature = "ebpf")]
+fn upgrade_fixture(root: &Path) -> Vec<u8> {
+    use reliaburger::upgrade::signing;
+    let directory = root.join("upgrade-bin");
+    std::fs::create_dir(&directory).unwrap();
+    for version in ["v0.1.0", "v0.2.0"] {
+        std::fs::copy(
+            env!("CARGO_BIN_EXE_bun"),
+            directory.join(format!("bun-{version}")),
+        )
+        .unwrap();
+        std::fs::write(directory.join(format!("bun-{version}.version")), version).unwrap();
+    }
+    std::os::unix::fs::symlink("bun-v0.1.0", directory.join("bun")).unwrap();
+    let (key, public) = signing::generate_keypair().unwrap();
+    let mut config =
+        reliaburger::config::node::NodeConfig::from_file(&root.join("node.toml")).unwrap();
+    config.upgrades.binary_dir = Some(directory);
+    config.upgrades.release_keys_override = Some(vec![signing::encode_public_key(&public)]);
+    config.upgrades.boot_grace_secs = 2;
+    std::fs::write(root.join("node.toml"), toml::to_string(&config).unwrap()).unwrap();
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    std::fs::write(
+        root.join("listen"),
+        listener.local_addr().unwrap().to_string(),
+    )
+    .unwrap();
+    key
+}
+
+#[cfg(feature = "ebpf")]
+async fn upgrade_and_rollback(root: &Path, node: &Node, key: &[u8]) {
+    use reliaburger::upgrade::{
+        signing,
+        types::{BinarySource, UpgradeDirective},
+    };
+    let original = node.client.status().await.unwrap().remove(0);
+    let path = root.join("upgrade-bin/bun-v0.2.0");
+    let bytes = std::fs::read(&path).unwrap();
+    let directive = UpgradeDirective {
+        upgrade_id: "owned-runtime-upgrade".into(),
+        target_version: "v0.2.0".parse().unwrap(),
+        binary_sha256: signing::sha256_hex(&bytes),
+        embedded_signature: signing::sign(key, &bytes).unwrap(),
+        external_signature: None,
+        source: BinarySource::LocalFile { path },
+        network_provenance: false,
+    };
+    for version in ["v0.2.0", "v0.1.0"] {
+        if version == "v0.2.0" {
+            node.client.upgrade_apply(&directive).await.unwrap();
+        } else {
+            node.client.upgrade_node_rollback(None).await.unwrap();
+        }
+        tokio::time::timeout(Duration::from_secs(45), async {
+            loop {
+                if let Ok(status) = node.client.upgrade_status().await
+                    && status["running_version"] == version
+                    && status["in_flight"].is_null()
+                {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(100)).await;
+            }
+        })
+        .await
+        .unwrap_or_else(|_| panic!("owned runtime never settled on {version}"));
+        let adopted = node.client.status().await.unwrap().remove(0);
+        assert_eq!(adopted.id, original.id);
+        assert_eq!(adopted.pid, original.pid);
+        assert_eq!(adopted.host_port, original.host_port);
+        assert_eq!(
+            std::fs::read_link(root.join("upgrade-bin/bun")).unwrap(),
+            Path::new(&format!("bun-{version}"))
+        );
+        assert_eq!(
+            std::fs::read_to_string(root.join("shared/main")).unwrap(),
+            "main\n"
+        );
+    }
+}
+
+#[cfg(feature = "ebpf")]
+#[tokio::test]
+#[ignore = "requires isolated Linux root, bpffs, real runc/ip/nft and static BusyBox"]
+async fn normal_owned_bun_upgrade_and_rollback_preserve_runtime_and_kernel() {
+    let root = tempfile::tempdir().unwrap().keep();
+    durable_fixture(&root);
+    let key = upgrade_fixture(&root);
+    let mut node = Node::start(&root).await;
+    node.client
+        .apply(&durable_app("upgrade-owned"))
+        .await
+        .unwrap();
+    wait_file(&root.join("shared/main")).await;
+    let original = kernel_manifest(&root);
+    upgrade_and_rollback(&root, &node, &key).await;
+    assert_eq!(kernel_manifest(&root), original);
+    node.client.stop("upgrade-owned", "default").await.unwrap();
+    node.crash().await;
+    let journal =
+        reliaburger::bun::discovery_owners::DiscoveryJournal::open(&root.join("data/discovery"))
+            .unwrap();
+    assert!(journal.inventory().services.is_empty());
+    drop(journal);
+    retire_kernel(&root);
+}
+
+#[cfg(feature = "ebpf")]
 #[tokio::test]
 #[ignore = "requires unprivileged Linux user, rootless runc/slirp and static BusyBox"]
 async fn normal_rootless_bun_recovers_owned_forward_and_discovery() {
@@ -493,6 +608,7 @@ async fn normal_rootless_bun_recovers_owned_forward_and_discovery() {
         config.replace("enabled = true", "enabled = false"),
     )
     .unwrap();
+    let key = upgrade_fixture(&root);
     let mut node = Node::start(&root).await;
     let active = root.join("data/discovery/discovery.json").exists();
     if !active {
@@ -528,6 +644,11 @@ async fn normal_rootless_bun_recovers_owned_forward_and_discovery() {
     assert_eq!(
         std::fs::read_to_string(root.join("shared/main")).unwrap(),
         "main\n"
+    );
+    upgrade_and_rollback(&root, &recovered, &key).await;
+    assert_eq!(
+        reqwest::get(&url).await.unwrap().text().await.unwrap(),
+        "owned"
     );
     recovered
         .client

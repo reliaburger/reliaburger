@@ -938,3 +938,15 @@ Pickle uses port zero because this fixture never addresses its registry directly
 the kernel chooses an available port at the actual bind. Replacements reuse the
 fixed API and cluster addresses, preserving the test's original observation and
 rejoin deadlines. A port allocation failure is not evidence about rollback.
+
+### Carry runtime ownership through the actual swap
+
+The OCI qualification copies the compiled Bun into two versioned files, signs the
+candidate with a disposable test key, then invokes the real upgrade and rollback
+APIs. Both binaries use normal durable startup. The workload must keep its exact
+instance ID, PID and host port through both execs, and its main-command marker must
+appear only once. Rootful qualification also compares the original kernel manifest;
+rootless qualification requests the same forwarded HTTP endpoint after rollback.
+Finally, confirmed stop must clear discovery ownership. These checks cover actual
+runtime recovery during a successful upgrade and explicit rollback. A failed
+candidate's automatic revert and cluster rolling upgrades need their own OCI cases.
