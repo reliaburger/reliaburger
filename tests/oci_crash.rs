@@ -951,9 +951,9 @@ async fn three_enrolled_oci_nodes_preserve_ownership_through_upgrade_and_rollbac
     let (node, key) = enrolled_upgrade_fixture(&roots[0], "rolling-0", None).await;
     nodes.push(node);
     keys.push(key);
-    for i in 1..3 {
+    for (i, node_root) in roots.iter().enumerate().skip(1) {
         let (node, key) = enrolled_upgrade_fixture(
-            &roots[i],
+            node_root,
             &format!("rolling-{i}"),
             Some((&roots[0], &nodes[0])),
         )
@@ -1079,6 +1079,34 @@ async fn three_enrolled_oci_nodes_preserve_ownership_through_upgrade_and_rollbac
     for root in &roots {
         retire_kernel(root);
     }
+}
+
+#[cfg(feature = "ebpf")]
+#[tokio::test]
+#[ignore = "requires Linux root and private mount namespaces"]
+async fn managed_guest_startup_establishes_bpffs_before_bun() {
+    let command = reliaburger::relish::quickstart::provision::SERVICE
+        .lines()
+        .find_map(|line| line.strip_prefix("ExecStartPre="))
+        .expect("durable startup requires a BPF mount preflight");
+    let script = format!(
+        "set -eu\numount /sys/fs/bpf\n{command}\ntest \"$(stat -f -c %T /sys/fs/bpf)\" = bpf_fs\n{command}\ntest \"$(stat -f -c %T /sys/fs/bpf)\" = bpf_fs\n"
+    );
+    let output = tokio::time::timeout(
+        Duration::from_secs(10),
+        tokio::process::Command::new("unshare")
+            .args(["--mount", "--propagation", "private", "sh", "-c", &script])
+            .kill_on_drop(true)
+            .output(),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
 }
 
 #[cfg(feature = "ebpf")]

@@ -1073,3 +1073,14 @@ HTTP exception exists only in test builds; distributed CLIs require HTTPS.
 The candidate record can also be verified locally before staging, without
 creating a release tag. None of these tests claims that the first signed
 candidate has completed the cold-host matrix. They make that test possible.
+
+### Establish the kernel filesystem before starting Bun
+
+Durable kernel recovery needs bpffs mounted at `/sys/fs/bpf`. A managed guest
+cannot assume the base image mounted it. Its systemd service now runs a short
+pre-start command: retain an existing mount, otherwise mount bpffs, and let any
+failure prevent Bun from starting. The loader still verifies ownership and refuses
+invalid pins. A physical regression starts in a private mount namespace, removes
+the inherited mount, runs the actual generated preflight twice and checks the
+filesystem type after each run. This covers first boot and repeat startup without
+unmounting the host's policy inventory.

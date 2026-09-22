@@ -80,7 +80,7 @@ pub fn node_config(
 }
 
 /// Guest service supervised and restarted by systemd; logs go to its journal.
-pub const SERVICE: &str = "[Unit]\nDescription=Reliaburger node\nAfter=network-online.target\nWants=network-online.target\n\n[Service]\nType=simple\nExecStart=/usr/local/bin/bun --cluster --runtime runc --config /etc/reliaburger/node.toml --listen 0.0.0.0:9117\nRestart=on-failure\nRestartSec=2\nLimitNOFILE=1048576\nKillMode=mixed\nTimeoutStopSec=30\n\n[Install]\nWantedBy=multi-user.target\n";
+pub const SERVICE: &str = "[Unit]\nDescription=Reliaburger node\nAfter=network-online.target\nWants=network-online.target\n\n[Service]\nType=simple\nExecStartPre=/bin/sh -ec 'mountpoint -q /sys/fs/bpf || mount -t bpf bpf /sys/fs/bpf'\nExecStart=/usr/local/bin/bun --cluster --runtime runc --config /etc/reliaburger/node.toml --listen 0.0.0.0:9117\nRestart=on-failure\nRestartSec=2\nLimitNOFILE=1048576\nKillMode=mixed\nTimeoutStopSec=30\n\n[Install]\nWantedBy=multi-user.target\n";
 
 #[cfg(test)]
 mod tests {
