@@ -210,6 +210,7 @@ async fn consumer_reconciler_retries_lost_receipts_after_tls_leader_change() {
             })
             .collect(),
     };
+    let deployment_started = Arc::new(AtomicBool::new(false));
     let assignments = NodeAssignments {
         endpoint_generation: 2,
         endpoint_withdrawals: vec![instruction],
@@ -222,8 +223,22 @@ async fn consumer_reconciler_retries_lost_receipts_after_tls_leader_change() {
         let attempts = Arc::new(AtomicUsize::new(0));
         observed.push(attempts.clone());
         let assignments = assignments.clone();
+        let started = deployment_started.clone();
+        let initial_catalog = catalog.clone();
         let router = Router::new()
-            .route("/v1/placements/consumer", get(move || { let assignments = assignments.clone(); async move { axum::Json(assignments) } }))
+            .route("/v1/placements/consumer", get(move || {
+                let mut assignments = assignments.clone();
+                if !started.load(Ordering::SeqCst) {
+                    assignments.endpoint_generation = 1;
+                    assignments.endpoint_catalog = initial_catalog.clone();
+                    assignments.endpoint_withdrawals.clear();
+                }
+                assignments.apps = vec![reliaburger::cluster::orchestrate::NodeAssignment {
+                    name: "pending".into(), namespace: "default".into(), replicas: 1,
+                    spec: reliaburger::config::Config::parse("[app.pending]\nimage = \"proc-grill:image-ignored\"\ncommand = [\"sleep\", \"60\"]").unwrap().app.remove("pending").unwrap(),
+                }];
+                async move { axum::Json(assignments) }
+            }))
             .route("/v1/discovery/withdrawn", axum::routing::post(move |headers: axum::http::HeaderMap, axum::Json(receipt): axum::Json<EndpointWithdrawalReceipt>| {
                 let attempts = attempts.clone();
                 async move {
@@ -305,7 +320,14 @@ async fn consumer_reconciler_retries_lost_receipts_after_tls_leader_change() {
     let confirmations = confirms.clone();
     let forwarding = tokio::spawn(async move {
         let mut lost = false;
+        let mut pending_deployment = None;
         while let Some(command) = forwarded.recv().await {
+            if let AgentCommand::Deploy { events, .. } = command {
+                assert!(pending_deployment.is_none(), "duplicate pending deployment");
+                pending_deployment = Some(events);
+                deployment_started.store(true, Ordering::SeqCst);
+                continue;
+            }
             if let AgentCommand::ConfirmConsumerReceipt {
                 generation,
                 response,

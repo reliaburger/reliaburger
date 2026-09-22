@@ -2506,3 +2506,16 @@ Rootless recovery has a different address proof: the owned network helper must
 confirm the original host/container port pair. Only then can adoption restore a
 loopback backend without a container IP. The regression deliberately removes the
 container address; an absent or mismatched helper still refuses adoption.
+
+### A rollout must keep listening
+
+A rolling replacement can wait for the local consumer's withdrawal receipt.
+If placement polling waits for the rollout to finish, the receipt never arrives.
+The reconciler now polls discovery while waiting for the terminal deployment
+event. `tokio::pin!` keeps that same pending future in place across selections;
+we don't restart its deadline or submit a second deployment on each tick.
+Catalogue polls still require positive agent acknowledgement, and receipt retries
+still resolve the current leader and require authenticated HTTPS. A socket test
+holds the deployment open while the next consumer update arrives. The real mTLS
+fixture also holds it open through a lost receipt response, leader replacement
+and lost local confirmation before proving the durable receipt was forgotten.

@@ -890,6 +890,120 @@ async fn persist_placements(
         .map_err(std::io::Error::other)?
 }
 
+// Discovery must keep progressing while a rollout waits for its terminal event.
+#[allow(clippy::too_many_arguments)]
+async fn poll_consumer(
+    node_name: &str,
+    metrics_rx: &watch::Receiver<openraft::RaftMetrics<u64, CouncilNodeInfo>>,
+    directory_rx: &watch::Receiver<crate::mustard::directory::NodeDirectory>,
+    raft_to_api_offset: i32,
+    service_token: &Option<String>,
+    cmd_tx: &mpsc::Sender<AgentCommand>,
+    shutdown: &CancellationToken,
+    cluster_http: &crate::cluster::ClusterHttp,
+    receipt_cursor: &mut usize,
+) -> Option<(String, NodeAssignments)> {
+    let client = cluster_http.client();
+    let leader_url = {
+        let metrics = metrics_rx.borrow();
+        let directory = directory_rx.borrow();
+        crate::cluster::directory::resolve_leader(&metrics, &directory, raft_to_api_offset, 0)
+            .and_then(|view| view.api_address)
+            .map(|address| cluster_http.url(&address.to_string(), ""))
+    };
+    let leader_url = leader_url?;
+
+    let url = format!("{leader_url}/v1/placements/{node_name}");
+    let mut request = client.get(&url);
+    if let Some(token) = service_token {
+        request = request.bearer_auth(token);
+    }
+    // The deadline covers both headers and body. An incomplete body
+    // must not prevent the next placement poll or graceful shutdown.
+    let poll = async {
+        request
+            .send()
+            .await?
+            .error_for_status()?
+            .json::<NodeAssignments>()
+            .await
+    };
+    let polled = tokio::select! {
+        _ = shutdown.cancelled() => return None,
+        result = tokio::time::timeout(RECONCILE_IO_TIMEOUT, poll) => result,
+    };
+    let assignments = match polled {
+        Ok(Ok(assignments)) => assignments,
+        _ => return None,
+    };
+
+    // Queue acceptance is not publication. The deadline covers both
+    // sending the update and receiving the agent's confirmed result.
+    let sync_catalogue = async {
+        let (response, reply) = tokio::sync::oneshot::channel();
+        cmd_tx
+            .send(AgentCommand::SyncClusterConsumer {
+                generation: assignments.endpoint_generation,
+                catalog: Box::new(assignments.endpoint_catalog.clone()),
+                ingress: assignments.ingress.clone(),
+                withdrawals: assignments.endpoint_withdrawals.clone(),
+                response,
+            })
+            .await
+            .map_err(|_| crate::bun::BunError::ClusterPublication("agent channel closed".into()))?;
+        reply
+            .await
+            .map_err(|_| crate::bun::BunError::ClusterPublication("agent reply lost".into()))?
+    };
+    let synchronised = tokio::select! {
+        _ = shutdown.cancelled() => return None,
+        result = tokio::time::timeout(RECONCILE_IO_TIMEOUT, sync_catalogue) => result,
+    };
+    let update = match synchronised {
+        Ok(Ok(update)) => update,
+        Ok(Err(error)) => {
+            eprintln!("orchestrator: {error}");
+            return None;
+        }
+        Err(_) => {
+            eprintln!("orchestrator: cluster discovery publication timed out");
+            return None;
+        }
+    };
+
+    // Rotate bounded batches so a failing receipt cannot starve later generations.
+    let receipt_http = cluster_http.clone().with_bearer(service_token.clone());
+    let count = update.receipts.len();
+    if count > 0 {
+        for offset in 0..count.min(16) {
+            let generation = update.receipts[(*receipt_cursor + offset) % count];
+            let deliver = async {
+                super::consumer::acknowledge(&receipt_http, &leader_url, generation)
+                    .await
+                    .ok()?;
+                let (response, reply) = tokio::sync::oneshot::channel();
+                cmd_tx
+                    .send(AgentCommand::ConfirmConsumerReceipt {
+                        generation,
+                        response,
+                    })
+                    .await
+                    .ok()?;
+                reply.await.ok()?.ok()
+            };
+            tokio::select! {
+                _ = shutdown.cancelled() => return None,
+                _ = tokio::time::timeout(Duration::from_secs(1), deliver) => {}
+            }
+        }
+        *receipt_cursor = (*receipt_cursor + count.min(16)) % count;
+    }
+    if !update.published {
+        return None;
+    }
+    Some((leader_url, assignments))
+}
+
 /// Spawn the per-node placement reconciler.
 ///
 /// Polls the leader's `/v1/placements/{node}` endpoint and converges
@@ -971,112 +1085,21 @@ pub fn spawn_placement_reconciler(
                 checkpoint_verified = true;
             }
 
-            let leader_url = {
-                let metrics = metrics_rx.borrow();
-                let directory = directory_rx.borrow();
-                crate::cluster::directory::resolve_leader(
-                    &metrics,
-                    &directory,
-                    raft_to_api_offset,
-                    0,
-                )
-                .and_then(|view| view.api_address)
-                .map(|address| cluster_http.url(&address.to_string(), ""))
-            };
-            let Some(leader_url) = leader_url else {
+            let Some((leader_url, assignments)) = poll_consumer(
+                &node_name,
+                &metrics_rx,
+                &directory_rx,
+                raft_to_api_offset,
+                &service_token,
+                &cmd_tx,
+                &shutdown,
+                &cluster_http,
+                &mut receipt_cursor,
+            )
+            .await
+            else {
                 continue;
             };
-
-            let url = format!("{leader_url}/v1/placements/{node_name}");
-            let mut request = client.get(&url);
-            if let Some(token) = &service_token {
-                request = request.bearer_auth(token);
-            }
-            // The deadline covers both headers and body. An incomplete body
-            // must not prevent the next placement poll or graceful shutdown.
-            let poll = async {
-                request
-                    .send()
-                    .await?
-                    .error_for_status()?
-                    .json::<NodeAssignments>()
-                    .await
-            };
-            let polled = tokio::select! {
-                _ = shutdown.cancelled() => return,
-                result = tokio::time::timeout(RECONCILE_IO_TIMEOUT, poll) => result,
-            };
-            let assignments = match polled {
-                Ok(Ok(assignments)) => assignments,
-                _ => continue,
-            };
-
-            // Queue acceptance is not publication. The deadline covers both
-            // sending the update and receiving the agent's confirmed result.
-            let sync_catalogue = async {
-                let (response, reply) = tokio::sync::oneshot::channel();
-                cmd_tx
-                    .send(AgentCommand::SyncClusterConsumer {
-                        generation: assignments.endpoint_generation,
-                        catalog: Box::new(assignments.endpoint_catalog.clone()),
-                        ingress: assignments.ingress.clone(),
-                        withdrawals: assignments.endpoint_withdrawals.clone(),
-                        response,
-                    })
-                    .await
-                    .map_err(|_| {
-                        crate::bun::BunError::ClusterPublication("agent channel closed".into())
-                    })?;
-                reply.await.map_err(|_| {
-                    crate::bun::BunError::ClusterPublication("agent reply lost".into())
-                })?
-            };
-            let synchronised = tokio::select! {
-                _ = shutdown.cancelled() => return,
-                result = tokio::time::timeout(RECONCILE_IO_TIMEOUT, sync_catalogue) => result,
-            };
-            let update = match synchronised {
-                Ok(Ok(update)) => update,
-                Ok(Err(error)) => {
-                    eprintln!("orchestrator: {error}");
-                    continue;
-                }
-                Err(_) => {
-                    eprintln!("orchestrator: cluster discovery publication timed out");
-                    continue;
-                }
-            };
-
-            // Rotate bounded batches so a failing receipt cannot starve later generations.
-            let receipt_http = cluster_http.clone().with_bearer(service_token.clone());
-            let count = update.receipts.len();
-            if count > 0 {
-                for offset in 0..count.min(16) {
-                    let generation = update.receipts[(receipt_cursor + offset) % count];
-                    let deliver = async {
-                        super::consumer::acknowledge(&receipt_http, &leader_url, generation)
-                            .await
-                            .ok()?;
-                        let (response, reply) = tokio::sync::oneshot::channel();
-                        cmd_tx
-                            .send(AgentCommand::ConfirmConsumerReceipt {
-                                generation,
-                                response,
-                            })
-                            .await
-                            .ok()?;
-                        reply.await.ok()?.ok()
-                    };
-                    tokio::select! {
-                        _ = shutdown.cancelled() => return,
-                        _ = tokio::time::timeout(Duration::from_secs(1), deliver) => {}
-                    }
-                }
-                receipt_cursor = (receipt_cursor + count.min(16)) % count;
-            }
-            if !update.published {
-                continue;
-            }
 
             let mut seen: HashSet<(String, String)> = HashSet::new();
             for assignment in &assignments.apps {
@@ -1116,9 +1139,21 @@ pub fn spawn_placement_reconciler(
                 if !matches!(queued, Ok(Ok(()))) {
                     continue;
                 }
-                let succeeded = tokio::select! {
-                    _ = shutdown.cancelled() => return,
-                    result = deploy_succeeded(event_rx, DEPLOY_TERMINAL_TIMEOUT) => result,
+                let terminal = deploy_succeeded(event_rx, DEPLOY_TERMINAL_TIMEOUT);
+                tokio::pin!(terminal);
+                let succeeded = loop {
+                    tokio::select! {
+                            _ = shutdown.cancelled() => return,
+                            result = &mut terminal => break result,
+                            _ = tick.tick() => {
+                                // The producer can need our own withdrawal receipt before
+                                // it can emit the terminal deployment event.
+                                let _ = poll_consumer(
+                        &node_name, &metrics_rx, &directory_rx, raft_to_api_offset,
+                        &service_token, &cmd_tx, &shutdown, &cluster_http, &mut receipt_cursor,
+                    ).await;
+                            }
+                        }
                 };
                 if succeeded {
                     let mut next = applied.clone();
@@ -1408,6 +1443,73 @@ mod tests {
         let _ = reconciler.await;
         server.abort();
         let _ = server.await;
+    }
+
+    #[tokio::test]
+    async fn pending_deployment_does_not_block_consumer_updates() {
+        let root = tempfile::tempdir().unwrap();
+        let assignments = NodeAssignments {
+            endpoint_generation: 7,
+            apps: vec![NodeAssignment {
+                name: "web".into(),
+                namespace: "default".into(),
+                replicas: 1,
+                spec: spec_from_toml(
+                    "[app.web]\nimage = \"proc-grill:image-ignored\"\ncommand = [\"sleep\", \"60\"]",
+                ),
+            }],
+            ..Default::default()
+        };
+        let router = axum::Router::new().route(
+            "/v1/placements/worker",
+            axum::routing::get(move || {
+                let assignments = assignments.clone();
+                async move { axum::Json(assignments) }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
+        let (commands, mut received) = mpsc::channel(8);
+        let reconciler = reconciler_for_deadline_test(address, root.path(), commands);
+        let mut deployment = None;
+        let outcome = tokio::time::timeout(Duration::from_secs(6), async {
+            loop {
+                match received.recv().await.unwrap() {
+                    AgentCommand::Status { response } => {
+                        response.send(vec![]).unwrap();
+                    }
+                    AgentCommand::SyncClusterConsumer { response, .. } => {
+                        response
+                            .send(Ok(crate::bun::agent::ConsumerUpdate {
+                                published: deployment.is_none(),
+                                receipts: vec![],
+                            }))
+                            .unwrap();
+                        if deployment.is_some() {
+                            break;
+                        }
+                    }
+                    AgentCommand::Deploy { events, .. } => {
+                        assert!(
+                            deployment.is_none(),
+                            "duplicate deployment while original is pending"
+                        );
+                        deployment = Some(events);
+                    }
+                    _ => panic!("unexpected command"),
+                }
+            }
+        })
+        .await;
+        reconciler.abort();
+        let _ = reconciler.await;
+        server.abort();
+        let _ = server.await;
+        assert!(
+            outcome.is_ok(),
+            "pending deployment starved consumer updates"
+        );
     }
 
     #[test]
