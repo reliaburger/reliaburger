@@ -82,3 +82,10 @@ cases and three real failover/decommission cases per platform pass, with strict
 Clippy and formatting. The request/log shape advances compatibility to protocol
 17/state 31. Continue generation-bound consumer instructions and authenticated
 receipts.
+
+Consumer-specific instructions are implemented, pending qualification. The
+placement response carries required generation, catalogue and instruction fields;
+only the requesting consumer's obligations are included. Late enrolment doesn't
+inherit older withdrawals, and reads don't acknowledge them. Two contracts fail
+first (0.115s); platform checks follow. Protocol 18/state 31. Authenticated
+receipts and durable consumer/producer integration remain separate.

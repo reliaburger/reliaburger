@@ -3188,9 +3188,22 @@ async fn placements_handler(
                     })
             })
             .collect(),
-        // Piggyback the replicated endpoint catalogue (12b.4) so the polling
-        // node can resolve services on other nodes.
+        // All discovery fields describe the same committed state; serving them
+        // does not discharge any cleanup obligation.
+        endpoint_generation: desired.endpoint_withdrawals.generation,
         endpoint_catalog: desired.endpoint_catalog.clone(),
+        endpoint_withdrawals: desired
+            .endpoint_withdrawals
+            .pending
+            .iter()
+            .filter(|(_, withdrawal)| withdrawal.consumers.contains(&node_id))
+            .map(|(generation, withdrawal)| {
+                crate::onion::withdrawal::EndpointWithdrawalInstruction {
+                    generation: *generation,
+                    services: withdrawal.services.clone(),
+                }
+            })
+            .collect(),
         ingress: desired
             .apps
             .iter()
@@ -9885,6 +9898,152 @@ schedule = "* * * * *"
             );
             shutdown.cancel();
         }
+        council.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn placements_expose_only_the_consumers_original_withdrawal_generations() {
+        use crate::council::{CouncilResponse, RaftRequest};
+        use crate::onion::catalog::{CatalogBackend, EndpointCatalog};
+        use crate::onion::service_id::ServiceId;
+
+        let council = seeded_council("withdrawal-instructions").await;
+        let (app, shutdown) = setup_with_auth_leases_events_and_council(
+            vec![],
+            Some("internal".into()),
+            crate::bun::readiness::ReadinessTracker::new(),
+            lease_static_capabilities(),
+            None,
+            None,
+            Some(council.clone()),
+        )
+        .await;
+        for consumer in ["worker", "other-worker"] {
+            assert_eq!(
+                get_authenticated(
+                    app.clone(),
+                    &format!("/v1/placements/{consumer}"),
+                    "internal"
+                )
+                .await
+                .0,
+                StatusCode::OK
+            );
+        }
+        let mut catalog = EndpointCatalog::default();
+        let mut originals = Vec::new();
+        for generation in 1..=3_u64 {
+            catalog = catalog
+                .reconcile([(
+                    ServiceId::new("default", "web"),
+                    8080,
+                    vec![CatalogBackend {
+                        execution: Some(crate::grill::RuntimeExecution {
+                            instance_id: crate::grill::InstanceId("default__web-0".into()),
+                            generation: format!("{generation:064x}").try_into().unwrap(),
+                        }),
+                        node_id: "producer".into(),
+                        node_ip: "127.0.0.1".parse().unwrap(),
+                        host_port: 18080 + generation as u16,
+                        healthy: true,
+                    }],
+                )])
+                .unwrap();
+            assert!(matches!(
+                council
+                    .write(RaftRequest::PublishEndpoints {
+                        expected_generation: generation - 1,
+                        catalog: Box::new(catalog.clone()),
+                    })
+                    .await
+                    .unwrap(),
+                CouncilResponse::Applied { .. }
+            ));
+            originals.push(serde_json::to_value(&catalog.services["default__web"]).unwrap());
+            if generation == 2 {
+                let (status, bytes) =
+                    get_authenticated(app.clone(), "/v1/placements/late-worker", "internal").await;
+                assert_eq!(status, StatusCode::OK);
+                let body: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+                assert_eq!(body["endpoint_generation"], 2);
+                assert_eq!(body["endpoint_withdrawals"], serde_json::json!([]));
+            }
+        }
+        let before = council.desired_state().await;
+        for (consumer, expected) in [
+            ("worker", vec![1, 2]),
+            ("other-worker", vec![1, 2]),
+            ("late-worker", vec![2]),
+        ] {
+            let (status, bytes) = get_authenticated(
+                app.clone(),
+                &format!("/v1/placements/{consumer}"),
+                "internal",
+            )
+            .await;
+            assert_eq!(status, StatusCode::OK);
+            let body: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+            assert_eq!(body["endpoint_generation"], 3);
+            assert_eq!(
+                body["endpoint_catalog"],
+                serde_json::to_value(&catalog).unwrap()
+            );
+            let instructions = body["endpoint_withdrawals"].as_array().unwrap();
+            assert_eq!(instructions.len(), expected.len());
+            for (instruction, generation) in instructions.iter().zip(expected) {
+                assert_eq!(instruction["generation"], generation);
+                assert_eq!(
+                    instruction["services"]["default__web"]["service"],
+                    originals[generation as usize - 1]
+                );
+                assert_eq!(instruction["services"]["default__web"]["retire_vip"], false);
+                assert!(
+                    instruction.get("consumers").is_none(),
+                    "do not expose another consumer's obligations"
+                );
+            }
+            // The receiving worker must retain the same exact instructions when decoding.
+            let decoded: crate::cluster::orchestrate::NodeAssignments =
+                serde_json::from_slice(&bytes).unwrap();
+            assert_eq!(serde_json::to_value(decoded).unwrap(), body);
+        }
+        let after = council.desired_state().await;
+        assert_eq!(before.last_applied_log, after.last_applied_log);
+        assert_eq!(
+            before.endpoint_withdrawals, after.endpoint_withdrawals,
+            "serving instructions is not a cleanup acknowledgement"
+        );
+        assert!(matches!(
+            council
+                .write(RaftRequest::PublishEndpoints {
+                    expected_generation: 3,
+                    catalog: Box::new(EndpointCatalog::default()),
+                })
+                .await
+                .unwrap(),
+            CouncilResponse::Applied { .. }
+        ));
+        let (status, bytes) =
+            get_authenticated(app, "/v1/placements/late-worker", "internal").await;
+        assert_eq!(status, StatusCode::OK);
+        let body: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(body["endpoint_generation"], 4);
+        assert_eq!(
+            body["endpoint_catalog"],
+            serde_json::to_value(EndpointCatalog::default()).unwrap()
+        );
+        let instructions = body["endpoint_withdrawals"].as_array().unwrap();
+        assert_eq!(instructions.len(), 2);
+        assert_eq!(instructions[1]["generation"], 3);
+        assert_eq!(
+            instructions[1]["services"]["default__web"]["service"],
+            originals[2]
+        );
+        assert_eq!(
+            instructions[1]["services"]["default__web"]["retire_vip"],
+            true
+        );
+        shutdown.cancel();
         council.shutdown().await.unwrap();
     }
 

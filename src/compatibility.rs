@@ -15,9 +15,9 @@ pub struct Compatibility {
     pub state: u32,
 }
 
-/// Supported formats, including generation-checked catalogue publication requests.
+/// Supported formats, including generation-bound consumer withdrawal instructions.
 pub const CURRENT: Compatibility = Compatibility {
-    protocol: 17,
+    protocol: 18,
     state: 31,
 };
 

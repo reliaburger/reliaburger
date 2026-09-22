@@ -2042,3 +2042,35 @@ before checking that the scheduler converges without repeated unchanged writes.
 This changes both the cluster request and stored Raft log representation, so the
 compatibility boundary advances to protocol 17/state 31. Missing generations
 cannot silently default to zero. Fresh pre-release clusters are required.
+
+
+### Tell each consumer which original routes to withdraw
+
+A worker saw generation 1, disconnected, and returned after two backend changes.
+Sending only the latest catalogue loses the identities of the routes it may still
+own. Its placement response now includes the current publication generation and
+all outstanding withdrawal instructions for that worker. Each instruction retains
+the original generation, service allocation, removed backends and whether the VIP
+itself is retiring. A worker enrolled after a withdrawal doesn't inherit it.
+
+The API builds the catalogue, generation and instructions from one cloned committed
+state. It filters the ledger by the requesting node's registered identity and
+copies only that consumer's instructions, without exposing the list of other
+consumers. Registration and the existing system/TLS identity checks still precede
+this response. Reading an instruction neither acknowledges it nor modifies Raft.
+
+The Rust response uses a `Vec<EndpointWithdrawalInstruction>` for the ordered
+instructions and each instruction uses a `BTreeMap<String, ServiceWithdrawal>`
+for its original services. Both types own their values, so serialisation can't
+observe a subsequent change to committed state. We deliberately omit
+`#[serde(default)]` from the catalogue, publication generation and instruction
+list: a missing field is an incompatible response, not evidence of no cleanup.
+An explicitly empty instruction list remains valid. The HTTP contract advances
+to protocol 18; durable state remains 31 because this adds no stored field.
+
+The regression runs the real placement handler against Raft. Two original readers
+retain both old generations, while a reader registered later receives only the
+withdrawal it owes. Serialisation preserves original execution fingerprints and
+repeated reads leave obligations unchanged. Durable consumer processing and
+authenticated receipts are the next pieces; receiving instructions alone cannot
+authorise the producer to reuse an address.

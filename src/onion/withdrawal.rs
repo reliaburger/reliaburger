@@ -22,6 +22,15 @@ pub struct ServiceWithdrawal {
     pub retire_vip: bool,
 }
 
+/// Original routes a registered consumer must remove before acknowledging cleanup.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct EndpointWithdrawalInstruction {
+    /// Original publication generation whose routes may still be owned locally.
+    pub generation: u64,
+    /// Original service allocations and only their removed destinations.
+    pub services: BTreeMap<String, ServiceWithdrawal>,
+}
+
 /// A publication's withdrawn exposures and the consumers still owing confirmation.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct EndpointWithdrawal {

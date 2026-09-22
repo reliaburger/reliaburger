@@ -71,12 +71,12 @@ pub struct NodeAssignments {
     pub apps: Vec<NodeAssignment>,
     /// Confirmed-cleanup instructions, including nodes absent from current placement.
     pub retirements: Vec<LeaseRetirement>,
-    /// The cluster-wide service endpoint catalogue (12b.4), piggybacked on
-    /// the placements poll so every node — council voter or not — gets the
-    /// replicated catalogue over the one HTTP call it already makes.
-    /// `#[serde(default)]` so a node polling a pre-12b.4 leader still parses.
-    #[serde(default)]
+    /// Committed publication generation shared by this catalogue and its instructions.
+    pub endpoint_generation: u64,
+    /// Current cluster-wide catalogue, required even when explicitly empty.
     pub endpoint_catalog: crate::onion::catalog::EndpointCatalog,
+    /// This consumer's original routes awaiting confirmed local withdrawal.
+    pub endpoint_withdrawals: Vec<crate::onion::withdrawal::EndpointWithdrawalInstruction>,
     /// Cluster-wide ingress routes, independent of local placements.
     #[serde(default)]
     pub ingress: Vec<IngressAssignment>,
@@ -1240,6 +1240,22 @@ mod tests {
         )
     }
 
+    #[test]
+    fn placements_require_publication_generation_and_withdrawal_instructions() {
+        for field in [
+            "endpoint_generation",
+            "endpoint_withdrawals",
+            "endpoint_catalog",
+        ] {
+            let mut wire = serde_json::to_value(NodeAssignments::default()).unwrap();
+            wire.as_object_mut().unwrap().remove(field);
+            assert!(
+                serde_json::from_value::<NodeAssignments>(wire).is_err(),
+                "missing {field} must not be interpreted as an empty/current publication"
+            );
+        }
+    }
+
     #[tokio::test]
     async fn leased_retirement_without_a_journal_waits_for_runtime_and_persistence() {
         use std::sync::{
@@ -1263,7 +1279,10 @@ mod tests {
                 axum::routing::get(move || {
                     let retirement = retirement.clone();
                     async move {
-                        axum::Json(serde_json::json!({"apps": [], "retirements": [retirement]}))
+                        axum::Json(NodeAssignments {
+                            retirements: vec![serde_json::from_value(retirement).unwrap()],
+                            ..NodeAssignments::default()
+                        })
                     }
                 }),
             )
