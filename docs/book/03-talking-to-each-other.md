@@ -1950,3 +1950,42 @@ that temporary journal would achieve nothing. It belongs to the shared runtime
 ownership instead. The regression aborts one caller, times out a second, releases
 the original operation, and verifies that the cancelled queued read never runs.
 A separate case checks recovery after a failed read.
+
+### Removing an endpoint creates an obligation
+
+Suppose a worker disappears while another node still routes requests to its old
+host port. Replacing the leader's catalogue doesn't erase that remote node's
+copy. Reusing the port at this point could send a request to a different workload.
+
+Council now commits withdrawal obligations alongside catalogue replacement. A
+monotonic publication number identifies the outgoing catalogue. Each withdrawal
+retains the original service allocation, removed backend execution identities
+and the durable consumer identities that may still hold them. Later publications
+and Raft snapshots retain those obligations. Nodes registering after a withdrawal
+don't inherit it: registration must happen before a node can read a catalogue.
+
+We compare destination ownership separately from health. A health change or a
+reordered report doesn't create a new execution, and a partial replacement
+shouldn't drain backends that remain in use. A HashSet indexes the node, address,
+port and execution identity; deriving `Hash` for the execution newtypes lets Rust
+hash those fields together. The stored withdrawal still carries the original
+values, including the service port, for eventual kernel and routing removal.
+
+The ledger bounds retained generations, service/backend exposures and outstanding
+consumer confirmations. Hitting a limit refuses the publication without evicting
+old evidence. `plan_publication` constructs a candidate value; Council installs
+it only after all checks pass. `checked_add` returns None on sequence overflow,
+so a new publication can never wrap around and reuse an old number.
+
+Decommissioning follows the same rule. After the operator fences a node, Council
+discharges that consumer's obligations. If the node also produced endpoints,
+Council records their withdrawal for the remaining consumers before committing
+any placement, lease or retirement changes. A failed ledger transition therefore
+cannot leave a partially decommissioned node.
+
+This is the replicated record, not permission to reuse an address. Consumers
+still need durable local withdrawal and authenticated receipts, and producers
+must require the committed result before release. The next integration also
+reserves retired VIPs in the allocator. State format 30 records the new ledger;
+protocol 16 is unchanged in this checkpoint, and pre-release clusters need fresh
+state.

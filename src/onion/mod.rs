@@ -15,6 +15,7 @@ pub mod service_map;
 pub mod trace;
 pub mod types;
 pub mod vip;
+pub mod withdrawal;
 
 #[cfg(target_os = "linux")]
 pub mod ebpf;

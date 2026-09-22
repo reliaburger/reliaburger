@@ -248,7 +248,7 @@ pub enum GrillError {
 }
 
 /// Non-secret identity of one original runtime execution generation.
-#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Clone, Hash, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(try_from = "String")]
 pub struct RuntimeGeneration(String);
 
@@ -290,7 +290,7 @@ impl RuntimeGeneration {
 }
 
 /// Original execution behind a reported or published workload endpoint.
-#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Clone, Hash, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct RuntimeExecution {
     /// Exact canonical runtime instance name, including deployment generation.

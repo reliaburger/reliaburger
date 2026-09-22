@@ -435,6 +435,9 @@ pub struct DesiredState {
     /// Defaults empty so pre-12b.4 snapshots load cleanly.
     #[serde(default)]
     pub endpoint_catalog: crate::onion::catalog::EndpointCatalog,
+    /// Original discovery exposures awaiting remote withdrawal confirmation.
+    #[serde(default)]
+    pub endpoint_withdrawals: crate::onion::withdrawal::EndpointWithdrawals,
     /// Nodes that may retain discovery publications, including offline nodes.
     #[serde(default)]
     pub endpoint_consumers: std::collections::BTreeSet<String>,

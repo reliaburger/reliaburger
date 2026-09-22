@@ -41,7 +41,7 @@ Install and usage details are in the [documentation](docs/README.md), and
 implementation status in [progress.md](docs/progress.md).
 
 0.1.0 requires a fresh cluster; development state is refused. Rolling upgrades
-require matching explicit formats (currently protocol 16 and state 29). See the
+require matching explicit formats (currently protocol 16 and state 30). See the
 [compatibility policy](docs/releasing.md#cluster-compatibility).
 Registry uploads belong to their exact creating credential. Recovery reclaims
 abandoned partial uploads after a crash and
