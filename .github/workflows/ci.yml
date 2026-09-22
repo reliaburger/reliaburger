@@ -126,7 +126,7 @@ jobs:
       - name: Install runtime and kernel test dependencies
         run: |
           sudo apt-get update -qq
-          sudo apt-get install -y -qq btrfs-progs buildah busybox-static clang iproute2 libbpf-dev linux-headers-$(uname -r) llvm nftables runc slirp4netns uidmap
+          sudo apt-get install -y -qq btrfs-progs buildah busybox-static gcc clang iproute2 libbpf-dev linux-headers-$(uname -r) llvm nftables runc slirp4netns uidmap
       - name: Mount persistent BPF storage for kernel recovery tests
         run: mountpoint -q /sys/fs/bpf || sudo mount -t bpf bpf /sys/fs/bpf
       - name: Permit rootless runc on Ubuntu AppArmor hosts
@@ -136,6 +136,15 @@ jobs:
           fi
       - name: Prove rootless port adoption
         run: make test-rootless-runc
+      - name: Qualify actual Bun OCI interruptions
+        run: scripts/release/qualify-oci-interruptions.sh
+      - name: Retain OCI interruption evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: oci-interruption-evidence
+          path: /var/tmp/reliaburger-oci-interruptions.*/
+          if-no-files-found: ignore
       - name: Run only provisioned Linux tests
         run: sudo -E env PATH="$PATH" NEXTEST_PROFILE=ci make test-linux
 
