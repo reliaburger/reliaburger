@@ -38,8 +38,10 @@ Actual Linux qualification covers standalone host reboot, enrolled clustered
 publication/adoption/retirement, rootless forwarding recovery, signed upgrades,
 explicit rollback and failed-candidate automatic revert. Three enrolled OCI nodes
 also preserve the original workload and kernel ownership through six controlled
-binary swaps and final remote cleanup. Full independent-host acceptance, sustained
-qualification and the signed cold-install matrix remain release gates. Rootless
+binary swaps and final remote cleanup. C34 ownership and cleanup qualification is complete, including actual Bun death
+before automatic-restart adoption. Hosted CI and all four binary builds pass at
+`6c64fed`. Full independent-host acceptance, sustained qualification and the signed
+cold-install matrix remain release gates. Rootless
 support in 0.1.0 is standalone host-port forwarding, without eBPF policy or
 workload DNS. Bun refuses `--cluster` when Runc runs without root, including
 automatic runtime selection. Use rootful Linux Runc/eBPF for container clusters;

@@ -1,8 +1,13 @@
 # Remote withdrawal ledger — 22 September 2026
 
-Continue C34 on `codex/codebase-completion-fixes`, PR167. Standalone discovery
-recovery, original runtime/report identities and durable consumer registration
-are already implemented. Do not repeat those audits.
+All three checkpoints are complete on PR167: replicated withdrawal obligations,
+authenticated receipts, producer release fencing, durable consumer recovery and
+normal production activation. C34 is closed with hosted CI/builds passing at
+`6c64fed`; see the [closure matrix](2026-09-22-c34-closure.md). Current formats are
+protocol 20/state 39. V01–V04 remain independent release gates.
+
+The dated implementation sequence below preserves earlier intermediate states.
+Its “continue” and “remaining” notes describe those checkpoints, not current work.
 
 ## Checkpoint 1: replicated withdrawal obligations — complete
 
@@ -29,7 +34,7 @@ are already implemented. Do not repeat those audits.
 This checkpoint records obligations. It does not add a receipt endpoint or permit
 physical allocation reuse. Those depend on the next checkpoints.
 
-## Checkpoint 2: allocation reservations and authenticated receipts
+## Checkpoint 2: allocation reservations and authenticated receipts — complete
 
 - Reserve withdrawn VIPs in allocation and enforce reservation checks in Raft,
   including deletion/replacement in one publication. Prevent stale writers from
@@ -41,7 +46,7 @@ physical allocation reuse. Those depend on the next checkpoints.
   re-publication and all outstanding generations; absence of a local entry alone
   is not proof of global withdrawal.
 
-## Checkpoint 3: consumer and producer integration
+## Checkpoint 3: consumer and producer integration — complete
 
 Persist consumer ownership before publishing. Withdraw original userspace/kernel
 entries, cancel captured requests, and wait for positive guard release before

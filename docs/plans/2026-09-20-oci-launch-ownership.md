@@ -10,8 +10,8 @@ Current formats are protocol 20/state 39, command owner 3, OCI intent 5,
 kernel manifest 3 and discovery 4.
 
 The [C34 closure matrix](2026-09-22-c34-closure.md) maps implementation to physical
-qualification. Final hosted validation and V01–V04 release acceptance remain
-separate. Earlier paragraphs below preserve their original intermediate evidence;
+qualification. Final hosted CI/builds pass at `6c64fed`; V01–V04 release
+acceptance remains separate. Earlier paragraphs below preserve their original intermediate evidence;
 phrases such as “opt-in” or “production remains open” describe those checkpoints,
 not the current implementation.
 

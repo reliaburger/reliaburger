@@ -127,5 +127,5 @@ security boundary against hostile same-user processes.
 
 Production Bun now uses the durable process owner and startup reconciliation.
 The [OCI/runtime/discovery integration](2026-09-20-oci-launch-ownership.md) and
-physical boundary qualification are also implemented. Final hosted validation and
-the independent V01–V04 release gates remain separate.
+physical boundary qualification are also complete, with final hosted CI/builds
+passing at `6c64fed`. The independent V01–V04 release gates remain open.

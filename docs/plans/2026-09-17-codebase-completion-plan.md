@@ -602,7 +602,8 @@ Registry host extraction splits at the first colon and hardcodes 5050; ingress n
 **22 September closure audit:** all resource-family implementation and supported
 production integration are complete, including physical automatic-restart death
 before adoption. The [closure matrix](2026-09-22-c34-closure.md) maps evidence to
-parent checkboxes. Final hosted validation is tracked there; V01–V04 remain
+parent checkboxes. Hosted CI and Build & Release pass at `6c64fed`; C34 is
+complete. V01–V04 remain
 independent release gates. The dated entries below preserve intermediate states
 and historical format generations, not additional open implementation work.
 
