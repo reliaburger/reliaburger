@@ -3066,6 +3066,21 @@ while cleanup proceeds. Retired preserves an optional independently observed
 workload exit code. Publishing a replacement requires Retired. Merely dropping the Rust value
 that represents a claim does not retire any resources.
 
+Why store the runtime configuration at all? Because recovering a live container
+with a different Runc binary, state directory or resolver would inspect the wrong
+state, or none. So a live intent refuses to load under a changed configuration,
+and the error names the instance so the operator knows what to stop first. We
+first applied that check to *every* intent, retired ones included. Retired
+records stay on disk (a finished job's exit code lives there), so changing the
+DNS resolver once any container had ever run stopped Bun from starting. A retired
+generation owns nothing, so its old configuration no longer matters; only live
+intents are checked now.
+
+Replacing a generation also tidies up after it. Each generation keeps its command
+records and logs under `generations/<id>/`. Once the successor is durable, the
+retired generation's directory goes. Deleting after the successor is written
+means a crash can only leave an orphaned directory behind, never a missing record.
+
 A Tokio mutex can coordinate clones of one adapter. It cannot coordinate two
 adapters constructed separately after recovery. Each intent therefore has a
 stable filesystem lock. We never remove or replace its file: doing so would let

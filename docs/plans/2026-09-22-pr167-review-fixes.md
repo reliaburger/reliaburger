@@ -180,8 +180,12 @@ this tier now blocks the 0.1.0 candidate rather than the merge.
       restart Bun and assert the instance is retired or re-adopted rather than
       stuck. Snapshot test for the unit file.
 
-- [ ] **T1.4 ✔ Changing runtime config after any container has run stops Bun
-      from starting.**
+- [x] **T1.4 ✔ Changing runtime config after any container has run stops Bun
+      from starting.** Done. Only live intents must match the current
+      configuration; a live mismatch still refuses, now naming the instance
+      and what to stop. Publishing a replacement removes the retired
+      generation's `generations/<id>/` directory. Retired intents themselves
+      stay (they carry job exit codes); one small record per instance name.
       `RuntimeIntentStore::load` (`src/grill/runc_intent.rs:325`) rejects any
       record whose `configuration` differs from the current one (runc path, DNS
       nameserver, image dir, node index). Retired records are never deleted, and

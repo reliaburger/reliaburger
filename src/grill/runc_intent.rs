@@ -322,7 +322,6 @@ impl IntentJournal {
                 .is_some_and(|boot| !super::process_owner::valid_boot_id(boot))
             || (cfg!(target_os = "linux") && record.boot_id.is_none())
             || record.instance_id != *instance
-            || record.configuration != self.configuration
             || record.generation.0.len() != 32
             || !record
                 .generation
@@ -331,6 +330,19 @@ impl IntentJournal {
                 .all(|byte| byte.is_ascii_hexdigit())
         {
             return Err(io::Error::other("invalid or incompatible runtime intent"));
+        }
+        // A retired generation owns nothing, so the configuration it ran under
+        // no longer matters. A live one must be recovered with the paths and
+        // resolver it was prepared with.
+        if record.configuration != self.configuration
+            && !matches!(record.phase, IntentPhase::Retired { .. })
+        {
+            return Err(io::Error::other(format!(
+                "instance {} was started with a different runtime configuration; stop its \
+                 workloads before changing the Runc program, runtime directories, DNS \
+                 resolver or node index",
+                instance.0
+            )));
         }
         if let Some(state) = &record.network_reference {
             let reference = match state {
@@ -400,6 +412,18 @@ impl IntentClaim {
                 File::open(&records)?.sync_all()?;
             } else {
                 persist(&directory, &record)?;
+            }
+            // The previous generation retired, so its command records and logs
+            // have no remaining owner. Remove them only after the successor is
+            // durable: a crash in between leaves an orphaned directory, never
+            // a missing record.
+            if let Some(previous) = &self.record {
+                match std::fs::remove_dir_all(
+                    directory.join("generations").join(&previous.generation.0),
+                ) {
+                    Err(error) if error.kind() != io::ErrorKind::NotFound => return Err(error),
+                    _ => {}
+                }
             }
             self.record = Some(record);
             Ok(self)
