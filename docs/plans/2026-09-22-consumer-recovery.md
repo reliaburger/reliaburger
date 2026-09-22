@@ -1,7 +1,10 @@
 # Durable consumer recovery and receipt retry
 
-Continue C34 on `codex/codebase-completion-fixes`, PR167. Keep production cluster
-activation gated until this loop and its runtime integration pass qualification.
+Implemented on `codex/codebase-completion-fixes`, PR167, in `77e135f`, `82066b7`,
+`acc9b60`, `d9db398` and `ef19fb8`. The agent/reconciler loop is complete;
+production clustered startup and runtime activation remain separate gates.
+See the [handoff](2026-09-20-v0.1.0-session-handoff.md) for final qualification
+and the [remaining-work table](2026-09-22-v0.1.0-remaining-work.md) for next steps.
 
 1. Persist original catalogue, effective service entries and ingress before
    publication. A generation fence survives compaction. Bound history and receipt

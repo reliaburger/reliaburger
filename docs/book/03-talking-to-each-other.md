@@ -2441,3 +2441,13 @@ channel acceptance nor an HTTP success category proves both operations happened.
 The code checks the exact acknowledgement before requesting the second durable
 write. This is the same ownership rule we've used throughout: retain evidence
 until the next owner has positively accepted responsibility.
+
+We test this boundary in two places. The privileged Linux tests publish into an
+actual backend map, freeze that map to make deletion fail, then restart recovery.
+The pending receipt and both publication attempts must survive; recovery must
+refuse to claim success. The positive control removes the map entry and recovers
+its ready receipt without republishing the old view. A separate mTLS test runs the
+real agent and placement reconciler against two HTTPS leaders. It loses the first
+HTTP reply, changes the leader, then loses the first local confirmation. Only the
+successful retry removes the journal entry. A timeout is a reason to try again,
+not permission to forget.

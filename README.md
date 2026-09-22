@@ -40,17 +40,19 @@ The full architectural vision lives in the [whitepaper](docs/whitepaper.md).
 Install and usage details are in the [documentation](docs/README.md), and
 implementation status in [progress.md](docs/progress.md).
 
-Cluster discovery keeps its last confirmed DNS and ingress views when a routing
-update fails, and retries confirmation before continuing placement work. Consumers
-reject stale catalogue generations and conflicting merged allocations. Durable
-consumer recovery and confirmed remote cleanup remain release blockers. The opt-in
-durable path now holds producer allocations until committed consumer confirmation;
-permanent execution fences prevent stale reports from reviving retired endpoints.
+Durable cluster consumers journal catalogue and ingress exposure before publication,
+withdraw the previous view and wait for captured HTTP/WebSocket requests to finish.
+Recovery starts with empty views under the original enrolled identity. Ready cleanup
+receipts survive crashes and retry against the current authenticated leader until
+positively acknowledged. This conservative path can briefly interrupt routing during
+updates. Producer allocations remain held until committed consumer confirmation;
+permanent execution fences reject stale reports. Clustered production activation,
+service VIP retirement and final release qualification remain open.
 
 The opt-in owned Runc path passes actual Bun crash/cancellation and abrupt VM
 reboot checks. Rolling replacements now run their initialisers before the main
-payload. Complete durable discovery/kernel recovery and final release acceptance
-remain open; see the [remaining work](docs/plans/2026-09-22-v0.1.0-remaining-work.md).
+payload. Standalone durable discovery/kernel reboot recovery is qualified. Clustered
+production activation and final release acceptance remain open; see the [remaining work](docs/plans/2026-09-22-v0.1.0-remaining-work.md).
 
 0.1.0 requires a fresh cluster; development state is refused. Rolling upgrades
 require matching explicit formats (currently protocol 20 and state 38). See the
@@ -151,10 +153,10 @@ generations available for cleanup. Rollout finalisation also retains ownership
 when identity or adoption-record removal fails, so cleanup can be retried.
 Explicit Stop and per-instance rollout retirement now confirm kernel backend
 withdrawal before stopping the runtime. Refusal retains the original destination
-and its address. Natural-exit and durable discovery recovery remain release gates.
+and its address. Natural-exit address holds and standalone discovery recovery are qualified.
 Service retirement now confirms removal of grants to its exact allocated VIP before
 releasing that destination. Refusal retains the service and its cleanup owner;
-unrelated destination grants remain untouched. Durable discovery recovery remains open.
+unrelated destination grants remain untouched. Clustered production activation remains open.
 Failed final kernel backend publication now reports a deployment error and retains
 the running workload’s ownership for cleanup or retry.
 Retirement also fences automatic restarts before signalling the old runtime.
@@ -379,8 +381,9 @@ runtime execution, persistent kernel maps/links and durable discovery recovery
 on normal startup. This requires an eBPF-enabled binary and mounted bpffs at
 `/sys/fs/bpf`. State lives under the configured data directory; changing runtime
 mode or disabling enforcement cannot bypass that ownership. Kernel or discovery
-recovery failures prevent readiness. Clustered consumer recovery and production
-activation remain release blockers.
+recovery failures prevent readiness. Durable consumer recovery and receipt retry are
+implemented at the agent/reconciler boundary; clustered production activation and
+upgrade/rollback qualification remain release blockers.
 
 ## Licence
 
