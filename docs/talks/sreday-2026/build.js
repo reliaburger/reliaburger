@@ -477,6 +477,85 @@ So a big part of my job was saying no. Use the library. Do the simple thing. Del
 [MEME idea: "Galaxy brain" expanding brain meme, or the "Is this a pigeon?" meme: "Is this a new abstraction layer?"]`);
 }
 
+// ---------------------------------------------------------------- L1 Standing on shoulders
+{
+  const s = lightSlide();
+  kicker(s, "Rule 4, in practice");
+  title(s, "What I didn't have to write");
+  const libs = [
+    ["tokio", "Async runtime", "Threads, timers, the lot"],
+    ["openraft", "Raft consensus", "The hardest algorithm here"],
+    ["rustls + ring", "TLS and crypto", "Never write your own"],
+    ["rcgen + x509-parser", "The PKI", "Certificates are a swamp"],
+    ["redb", "Embedded store", "Durable Raft log on disk"],
+    ["datafusion", "SQL engine", "That's how you query metrics"],
+    ["axum + hyper", "HTTP", "API, dashboards, registry"],
+    ["ratatui", "Terminal UI", "The TUI, for free"],
+    ["aya", "eBPF loader", "Kernel plumbing from Rust"],
+    ["age", "Encryption", "Secrets at rest"],
+    ["serde + clap", "Config and CLI", "Boring. Perfect."],
+    ["oci-distribution", "Registry client", "Speaks Docker Hub"],
+  ];
+  libs.forEach((l, i) => {
+    const c = i % 4, r = Math.floor(i / 4);
+    const x = 0.7 + c * 3.05, y = 2.2 + r * 1.5;
+    s.addShape(pres.shapes.ROUNDED_RECTANGLE, { x, y, w: 2.8, h: 1.32, rectRadius: 0.12, fill: { color: TINT } });
+    text(s, l[0], { x: x + 0.22, y: y + 0.15, w: 2.4, h: 0.4, fontFace: MONO, fontSize: 14, bold: true, color: KETCHUP });
+    text(s, l[1], { x: x + 0.22, y: y + 0.55, w: 2.4, h: 0.35, fontFace: H, fontSize: 15, bold: true, color: INK });
+    text(s, l[2], { x: x + 0.22, y: y + 0.92, w: 2.4, h: 0.35, fontSize: 12, color: MUTED });
+  });
+  text(s, [
+    { text: "57 direct dependencies. 708 crates in the lockfile. ", options: { bold: true, color: INK } },
+    { text: "All of it maintained by someone else.", options: { color: MUTED } },
+  ], { x: 0.7, y: 6.6, w: 11.9, h: 0.5, fontSize: 19 });
+  s.addNotes(`[about 1 minute 30 seconds]
+
+Rule four was fighting complexity creep. Here's the other half of that: most of this system is other people's code, and that's the point.
+
+tokio does the async runtime. openraft does Raft, which is the single hardest algorithm in here. rustls and ring do TLS and crypto, and you never, ever write your own crypto. rcgen and x509-parser handle certificates, which are a swamp. redb is the embedded store that holds the Raft log durably.
+
+datafusion is my favourite. That's a whole SQL engine, and it's why you can query your metrics with SQL instead of learning another query language.
+
+axum and hyper do HTTP. ratatui gives us the terminal UI basically for free. aya loads the eBPF programs from Rust. age encrypts the secrets. serde and clap do config and the command line, and they're boring, which is exactly what you want.
+
+57 direct dependencies, 708 crates once you count everything underneath. All maintained by someone who cares more about that problem than I do.
+
+This is where the model and I disagreed most often. It would cheerfully offer to write a TLS handshake, or a little Raft, or its own metrics query language. Every single time, the answer was no. Use the library.`);
+}
+
+// ---------------------------------------------------------------- L2 What we did write
+{
+  const s = darkSlide();
+  kicker(s, "The other side", true);
+  text(s, "So what's actually ours?", { x: 0.7, y: 1.0, w: 11.9, h: 0.9, fontFace: H, fontSize: 36, bold: true, color: CREAM });
+  const ours = [
+    ["Mustard", "SWIM gossip. We needed bounded messages and our own piggyback payloads."],
+    ["Meat", "The scheduler. Placement is the one thing nobody can do for you."],
+    ["Onion", "The eBPF programs, and the glue that keeps the maps honest."],
+    ["The joins", "How all of it fits together: leases, ownership, recovery, who cleans up after whom."],
+  ];
+  ours.forEach((o, i) => {
+    const y = 2.2 + i * 1.12;
+    s.addShape(pres.shapes.OVAL, { x: 0.7, y: y + 0.12, w: 0.5, h: 0.5, fill: { color: MUSTARD } });
+    text(s, o[0], { x: 1.5, y, w: 2.3, h: 0.75, valign: "middle", fontFace: H, fontSize: 21, bold: true, color: MUSTARD });
+    text(s, o[1], { x: 3.9, y, w: 8.7, h: 0.85, valign: "middle", fontSize: 17, color: CREAM });
+  });
+  text(s, "Write the part that's yours. Borrow the rest.", { x: 0.7, y: 6.5, w: 11.9, h: 0.55, fontSize: 24, bold: true, italic: true, color: MUSTARD });
+  s.addNotes(`[about 1 minute]
+
+So what did we actually write?
+
+Mustard, the gossip layer, is ours. That was a real decision. There are good SWIM crates out there, but we wanted fixed-size messages and our own piggyback payloads, and that's the core of how it scales. So that one earned its place.
+
+Meat, the scheduler, is ours, because placement is the one thing nobody can do for you. It's your policy.
+
+Onion's eBPF programs are ours: about 390 lines of C, plus the glue that keeps the kernel maps honest.
+
+And then the biggest one, which doesn't have a name: the joins. How all of it fits together. Who owns what, what happens when a lease expires, who cleans up after a node dies halfway through something. That's where nearly all the bugs lived, and it's where I spent nearly all of my review time.
+
+Write the part that's yours. Borrow the rest. That's not an AI lesson, it's just engineering, but the machines make it much easier to forget.`);
+}
+
 // ---------------------------------------------------------------- 23 Cost
 {
   const s = lightSlide();
