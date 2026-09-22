@@ -3020,7 +3020,7 @@ evidence. Listing the current commands does not prevent a concurrent caller
 from registering another one. The adapter is a foundation; routing Runc and
 network operations through it, preserving the original OCI specification, and
 keeping their guards through cancellation are separate integration steps in the
-[OCI ownership plan](../plans/2026-09-20-oci-launch-ownership.md).
+[OCI ownership plan](../plans/archive/2026-09-20-oci-launch-ownership.md).
 
 
 ### Runtime files belong to the configured node

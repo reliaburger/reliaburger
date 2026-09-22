@@ -3,7 +3,7 @@
 Baseline: `fc11d253cf081d8eb9ef8f41389c2f98a0000545` on
 `codex/v0.1.0-release`, [PR #165](https://github.com/reliaburger/reliaburger/pull/165).
 Audit branch: `codex/codebase-completion-audit`.
-[Findings and completion tests](../plans/2026-09-17-codebase-completion-plan.md)
+[Findings and completion tests](../plans/archive/2026-09-17-codebase-completion-plan.md)
 use C/H/F/V IDs; [progress](../progress.md) owns their state.
 
 This audit changes documentation. Temporary observation tests were run against

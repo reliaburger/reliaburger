@@ -685,7 +685,7 @@ agent adoption records before reconciliation. It cancels unactivated launches,
 retires unrecorded active launches with confirmed absence, and preserves completed
 job exit codes. A launch permit with no runtime intent refuses startup. A helper
 lost after activation remains uncertain; a replacement never signals its saved
-PID. The [foreground ownership plan](../plans/2026-09-20-foreground-process-ownership.md)
+PID. The [foreground ownership plan](../plans/archive/2026-09-20-foreground-process-ownership.md)
 tracks the remaining qualification work.
 
 An application needs more than the runtime's command to resume its health,

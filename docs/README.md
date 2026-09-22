@@ -14,7 +14,7 @@ unchanged installer/assets with checksums and signatures still enabled.
 
 User guide for building and running Reliaburger. For the full architectural vision, see the [whitepaper](whitepaper.md). For current implementation status, see [progress.md](progress.md).
 
-The [17 September codebase audit and completion plan](plans/2026-09-17-codebase-completion-plan.md)
+The [17 September codebase audit and completion plan](plans/archive/2026-09-17-codebase-completion-plan.md)
 reconciles the older TODOs, records remaining correctness gaps and separates
 release acceptance from deferred capabilities. The current checklist lives in
 [progress.md](progress.md).
@@ -113,7 +113,7 @@ cannot authorise a rerun. The old runtime must still pass confirmed retirement.
 Explicit stop cancels pending retries but preserves an unknown outcome. A failed
 job checkpoint write blocks further job mutations until Bun reloads its state;
 unrelated apps can still stop. Pre-adoption runtime discovery remains a separate
-release blocker; the [recovery plan](plans/2026-09-19-job-recovery.md) records it.
+release blocker; the [recovery plan](plans/archive/2026-09-19-job-recovery.md) records it.
 
 App and job names, their namespaces and namespace declarations must be lowercase
 DNS labels: 1–63 ASCII letters/digits/hyphens, with a letter or digit at each end.

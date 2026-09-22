@@ -732,7 +732,7 @@ This follow-up repairs correctness gaps and reconciles the implementation,
 manual and book. Its historical checklist is in
 [progress.md](progress.md#phase-16-post-phase-15-audit--truthfulness--hardening),
 with current unresolved work mapped to the
-[completion plan](plans/2026-09-17-codebase-completion-plan.md).
+[completion plan](plans/archive/2026-09-17-codebase-completion-plan.md).
 Each repair updates the relevant existing book chapter. Future architecture
 families and optional refactors remain explicitly separate from release gates.
 

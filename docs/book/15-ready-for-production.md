@@ -2393,7 +2393,7 @@ already checks gossip rejoin; the replacement process's local boot-marker check
 still has a separate gap. Calling all upgrade verification either finished or
 missing hides useful information. We now keep completed milestones and explicit
 residual tasks side by side in [progress](../progress.md), with completion tests
-in the [new plan](../plans/2026-09-17-codebase-completion-plan.md).
+in the [new plan](../plans/archive/2026-09-17-codebase-completion-plan.md).
 
 Portable tests and controlled servers let us force awkward orderings quickly.
 They don't establish that three independent Linux nodes survive the complete
