@@ -565,6 +565,42 @@ once the workload exits, the generation retires on its own. A Linux regression
 reproduces the old unit's behaviour with a real cgroup kill of Bun, its owners
 and the Runc launcher, and checks the restarted Bun recovers the container.
 
+A reboot is the cleanest owner death of all: nothing from the old boot
+survives. Each record stores the boot that admitted it, and a record from
+another boot retires without asking anyone. On Linux that identity is
+`/proc/sys/kernel/random/boot_id`. On macOS we used to return `None`, so a Mac
+that rebooted left its records waiting for owners that could never answer.
+macOS has its own per-boot UUID, the `kern.bootsessionuuid` sysctl, and we read
+it through libc:
+
+```rust
+let result = unsafe {
+    nix::libc::sysctlbyname(
+        c"kern.bootsessionuuid".as_ptr(),
+        bytes.as_mut_ptr().cast(),
+        &mut length,
+        std::ptr::null_mut(),
+        0,
+    )
+};
+```
+
+`c"..."` is a C string literal: the compiler adds the trailing NUL byte and
+gives us a `&CStr`, so `.as_ptr()` is a valid `const char *` for C without any
+runtime conversion. `bytes.as_mut_ptr().cast()` turns a `*mut u8` into the
+`*mut c_void` that the C signature wants. macOS prints the UUID in upper case,
+Linux in lower case, so we lowercase both before storing or comparing. Records
+must now carry a boot identity on both systems. The tests check the identity is
+present and stable, that a record naming another boot counts as a previous
+boot, and that a prepared generation whose record we rewrite to a foreign boot
+reads as stopped and refuses to start.
+
+One macOS gap stays documented rather than fixed. Without a subreaper,
+`retire_children` on macOS proves absence only for the workload's process
+group. A descendant that calls `setsid` leaves that group, so retirement can't
+see it and it can outlive the generation. That's another reason process mode
+is for foreground workloads.
+
 Startup also needs to discover owners it has never seen in its adoption table.
 The runtime exposes a complete launch inventory from the records published
 before execution. It validates every entry before returning anything; damaged

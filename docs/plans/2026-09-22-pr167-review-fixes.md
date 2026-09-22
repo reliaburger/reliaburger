@@ -344,11 +344,14 @@ Execution (grill):
       zombies. Reap in the main loop (`:327-355`).
       Done. Each tick peeks with `waitid(WNOWAIT)` and reaps exited orphans
       by exact PID, leaving the root and exec helpers to their own waiters.
-- [ ] **T2.5 macOS has no boot identity.** `current_boot_id()`
+- [x] **T2.5 macOS has no boot identity.** `current_boot_id()`
       (`src/grill/process_owner.rs:132-149`) returns `None` off Linux, so a
       reboot leaves `Running` records failing with NotFound forever. Use the
       `kern.bootsessionuuid` sysctl. Also: macOS `retire_children` checks only
       the process group, so `setsid` descendants survive.
+      Done. macOS reads `kern.bootsessionuuid`, both systems store lowercase
+      UUIDs, and schema-3 records require one everywhere. The `setsid` gap is
+      documented in chapter 8, not fixed.
 - [ ] **T2.6 Adoption compares start times exactly.**
       `src/grill/runc/owned.rs:786`. Use the ±2 s slack the rest of the code
       uses (NTP steps move `/proc/stat` btime).

@@ -160,6 +160,34 @@ async fn recovered_preparation_can_be_cancelled_before_execution() {
 }
 
 #[tokio::test]
+async fn generation_from_a_previous_boot_never_runs() {
+    let directory = tempfile::tempdir().unwrap();
+    let marker = directory.path().join("ran");
+    let id = InstanceId("default__rebooted-0".into());
+    let grill = runtime(directory.path());
+    grill
+        .create(&id, &spec(&format!("touch '{}'", marker.display())))
+        .await
+        .unwrap();
+    // Simulate a reboot between preparation and start: the durable record
+    // names a kernel boot that is no longer running.
+    let path = directory
+        .path()
+        .join("process-owners")
+        .join(&id.0)
+        .join("owner.json");
+    let mut record: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+    assert!(record["boot_id"].is_string(), "{record}");
+    record["boot_id"] = "00000000-0000-4000-8000-000000000000".into();
+    std::fs::write(&path, serde_json::to_vec(&record).unwrap()).unwrap();
+    let recovered = runtime(directory.path());
+    assert_eq!(recovered.state(&id).await.unwrap(), ContainerState::Stopped);
+    assert!(recovered.start(&id).await.is_err());
+    assert!(!marker.exists());
+}
+
+#[tokio::test]
 async fn long_data_paths_and_repeated_generations_preserve_control() {
     let root = tempfile::tempdir().unwrap();
     let directory = root.path().join("a".repeat(100)).join("b".repeat(100));

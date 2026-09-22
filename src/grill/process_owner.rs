@@ -53,7 +53,7 @@ pub enum OwnerPhase {
 pub struct OwnerRecord {
     /// Owner record format, independent of agent adoption records.
     pub schema: u32,
-    /// Linux kernel boot that admitted this execution; never inferred from PIDs.
+    /// Kernel boot that admitted this execution; never inferred from PIDs.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub boot_id: Option<String>,
     /// Unpredictable generation capability used by the control socket.
@@ -128,24 +128,51 @@ pub(crate) fn load(directory: &Path) -> io::Result<OwnerRecord> {
     Ok(record)
 }
 
-/// Read a positive Linux kernel identity. Unsupported hosts cannot infer reboot.
+/// Read the identity of the running kernel boot, in lowercase UUID form.
+///
+/// Linux publishes a random `boot_id`; macOS publishes `kern.bootsessionuuid`.
+/// Both change on every boot, so a record naming another boot cannot have a
+/// live owner or child.
 pub(crate) fn current_boot_id() -> io::Result<Option<String>> {
     #[cfg(target_os = "linux")]
-    {
+    let boot = {
         let mut bytes = String::new();
         File::open("/proc/sys/kernel/random/boot_id")?
             .take(64)
             .read_to_string(&mut bytes)?;
-        let boot = bytes.trim();
-        if !valid_boot_id(boot) {
-            return Err(io::Error::other("invalid kernel boot identity"));
+        bytes
+    };
+    #[cfg(target_os = "macos")]
+    let boot = {
+        let mut bytes = [0u8; 64];
+        let mut length = bytes.len();
+        // SAFETY: the name is a NUL-terminated literal; the output buffer is
+        // writable for `length` bytes and the kernel writes at most that many,
+        // updating `length`. No new value is supplied, so nothing is changed.
+        let result = unsafe {
+            nix::libc::sysctlbyname(
+                c"kern.bootsessionuuid".as_ptr(),
+                bytes.as_mut_ptr().cast(),
+                &mut length,
+                std::ptr::null_mut(),
+                0,
+            )
+        };
+        if result != 0 {
+            return Err(io::Error::last_os_error());
         }
-        Ok(Some(boot.to_owned()))
+        let value = bytes
+            .get(..length)
+            .ok_or_else(|| io::Error::other("invalid kernel boot identity length"))?;
+        String::from_utf8_lossy(value)
+            .trim_end_matches('\0')
+            .to_owned()
+    };
+    let boot = boot.trim().to_ascii_lowercase();
+    if !valid_boot_id(&boot) {
+        return Err(io::Error::other("invalid kernel boot identity"));
     }
-    #[cfg(not(target_os = "linux"))]
-    {
-        Ok(None)
-    }
+    Ok(Some(boot))
 }
 
 pub(crate) fn valid_boot_id(value: &str) -> bool {
@@ -164,7 +191,7 @@ fn validate_boot(record: &OwnerRecord) -> io::Result<()> {
         .boot_id
         .as_deref()
         .is_some_and(|boot| !valid_boot_id(boot))
-        || (cfg!(target_os = "linux") && record.schema == 3 && record.boot_id.is_none())
+        || (record.schema == 3 && record.boot_id.is_none())
     {
         return Err(io::Error::other("invalid process owner boot identity"));
     }
@@ -731,5 +758,38 @@ fn retire_children(owner: &mut OwnedChild) -> io::Result<bool> {
         owner.child.wait()?;
         owner.reaped = true;
         return Ok(true);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn record(boot_id: Option<String>) -> OwnerRecord {
+        OwnerRecord {
+            schema: 1,
+            boot_id,
+            nonce: "test-generation".into(),
+            command: vec!["true".into()],
+            environment: BTreeMap::new(),
+            phase: OwnerPhase::Prepared,
+            launch: None,
+        }
+    }
+
+    #[test]
+    fn host_has_a_stable_valid_boot_identity() {
+        let first = current_boot_id().unwrap().expect("host exposes no boot id");
+        assert!(valid_boot_id(&first), "{first}");
+        assert_eq!(first, first.to_ascii_lowercase());
+        assert_eq!(current_boot_id().unwrap(), Some(first));
+    }
+
+    #[test]
+    fn record_from_another_boot_is_from_a_previous_boot() {
+        let current = current_boot_id().unwrap();
+        assert!(!from_previous_boot(&record(current)).unwrap());
+        let other = "00000000-0000-4000-8000-000000000000".to_owned();
+        assert!(from_previous_boot(&record(Some(other))).unwrap());
     }
 }
