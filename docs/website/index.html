@@ -23,14 +23,26 @@
 
     <main id="main">
       <section class="intro" aria-labelledby="title">
-        <div class="eyebrow">RUST · APACHE 2.0 · IN DEVELOPMENT</div>
-        <h1 id="title">Container orchestration.<br>One agent. One CLI.</h1>
-        <p class="lede">Reliaburger puts scheduling, service discovery, ingress, a registry,
-          secrets, logs and metrics in one node agent. Written in Rust. Driven by TOML.</p>
-        <div class="intro-links">
-          <a class="primary-link" href="https://github.com/reliaburger/reliaburger">Read the source <span aria-hidden="true">↗</span></a>
-          <a href="https://github.com/reliaburger/reliaburger/blob/main/docs/whitepaper.md">Read the whitepaper</a>
+        <div class="intro-copy">
+          <div class="eyebrow">RUST · APACHE 2.0 · IN DEVELOPMENT</div>
+          <h1 id="title">Container orchestration.<br>One agent. One CLI.</h1>
+          <p class="lede">Reliaburger puts scheduling, service discovery, ingress, a registry,
+            secrets, logs and metrics in one node agent. Written in Rust. Driven by TOML.</p>
+          <div class="intro-links">
+            <a class="primary-link" href="https://github.com/reliaburger/reliaburger">Read the source <span aria-hidden="true">↗</span></a>
+            <a href="https://github.com/reliaburger/reliaburger/blob/main/docs/whitepaper.md">Read the whitepaper</a>
+          </div>
         </div>
+        <!-- Decorative burger loop. The source has a plain white background; mix-blend-mode: multiply on .burger
+             makes that white vanish against the paper colour, so no alpha channel is needed. Muted + playsinline
+             lets it autoplay everywhere. People who prefer reduced motion get the still instead (CSS, no JS). -->
+        <figure class="intro-art" aria-hidden="true">
+          <video class="burger burger-loop" autoplay muted loop playsinline preload="metadata" disablepictureinpicture poster="./assets/burger-still.webp">
+            <source src="./assets/burger-loop.webm" type="video/webm">
+            <source src="./assets/burger-loop.mp4" type="video/mp4">
+          </video>
+          <img class="burger burger-still" src="./assets/burger-still.webp" alt="" width="720" height="892">
+        </figure>
       </section>
 
       <aside class="status" aria-label="Release status">
