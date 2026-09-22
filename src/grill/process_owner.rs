@@ -53,6 +53,9 @@ pub enum OwnerPhase {
 pub struct OwnerRecord {
     /// Owner record format, independent of agent adoption records.
     pub schema: u32,
+    /// Linux kernel boot that admitted this execution; never inferred from PIDs.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub boot_id: Option<String>,
     /// Unpredictable generation capability used by the control socket.
     pub nonce: String,
     /// Foreground executable followed by its arguments.
@@ -104,7 +107,7 @@ pub(crate) fn load(directory: &Path) -> io::Result<OwnerRecord> {
         return Err(io::Error::other("process owner record exceeds size limit"));
     }
     let record: OwnerRecord = serde_json::from_slice(&bytes)?;
-    if !matches!(record.schema, 1 | 2)
+    if !matches!(record.schema, 1..=3)
         || record.nonce.is_empty()
         || record.nonce.len() > 128
         || record
@@ -114,14 +117,66 @@ pub(crate) fn load(directory: &Path) -> io::Result<OwnerRecord> {
     {
         return Err(io::Error::other("invalid process owner record"));
     }
-    if (record.schema == 2) != record.launch.is_some()
-        || (record.schema == 2
+    if (record.schema >= 2) != record.launch.is_some()
+        || (record.schema >= 2
             && (record.nonce.len() != 32
                 || !record.nonce.bytes().all(|byte| byte.is_ascii_hexdigit())))
     {
         return Err(io::Error::other("invalid process launch generation"));
     }
+    validate_boot(&record)?;
     Ok(record)
+}
+
+/// Read a positive Linux kernel identity. Unsupported hosts cannot infer reboot.
+pub(crate) fn current_boot_id() -> io::Result<Option<String>> {
+    #[cfg(target_os = "linux")]
+    {
+        let mut bytes = String::new();
+        File::open("/proc/sys/kernel/random/boot_id")?
+            .take(64)
+            .read_to_string(&mut bytes)?;
+        let boot = bytes.trim();
+        if !valid_boot_id(boot) {
+            return Err(io::Error::other("invalid kernel boot identity"));
+        }
+        Ok(Some(boot.to_owned()))
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        Ok(None)
+    }
+}
+
+fn valid_boot_id(value: &str) -> bool {
+    value.len() == 36
+        && value.bytes().enumerate().all(|(index, byte)| {
+            if [8, 13, 18, 23].contains(&index) {
+                byte == b'-'
+            } else {
+                byte.is_ascii_hexdigit()
+            }
+        })
+}
+
+fn validate_boot(record: &OwnerRecord) -> io::Result<()> {
+    if record
+        .boot_id
+        .as_deref()
+        .is_some_and(|boot| !valid_boot_id(boot))
+        || (cfg!(target_os = "linux") && record.schema == 3 && record.boot_id.is_none())
+    {
+        return Err(io::Error::other("invalid process owner boot identity"));
+    }
+    Ok(())
+}
+
+pub(crate) fn from_previous_boot(record: &OwnerRecord) -> io::Result<bool> {
+    validate_boot(record)?;
+    match (&record.boot_id, current_boot_id()?) {
+        (Some(original), Some(current)) => Ok(*original != current),
+        _ => Ok(false),
+    }
 }
 
 pub(crate) fn persist(directory: &Path, record: &OwnerRecord) -> io::Result<()> {
@@ -177,9 +232,14 @@ pub fn run_owner_generation(directory: &Path, generation: Option<&str>) -> io::R
     let lock = lock_owner(directory)?;
     let mut record = load(directory)?;
     if generation.is_some_and(|generation| generation != record.nonce)
-        || (record.schema == 2 && generation.is_none())
+        || (record.schema >= 2 && generation.is_none())
     {
         return Err(io::Error::other("process owner generation mismatch"));
+    }
+    if from_previous_boot(&record)? {
+        return Err(io::Error::other(
+            "process generation belongs to a previous kernel boot",
+        ));
     }
     run_locked_owner(directory, &mut record, lock)
 }

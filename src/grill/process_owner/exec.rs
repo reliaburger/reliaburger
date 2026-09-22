@@ -80,7 +80,8 @@ impl Execution {
         launch.spec.process.env.clear();
         launch.spec.port_mapping = None;
         let record = OwnerRecord {
-            schema: 2,
+            schema: 3,
+            boot_id: super::current_boot_id()?,
             nonce: hex::encode(nonce),
             command,
             // Process exec has always inherited Bun's host environment.

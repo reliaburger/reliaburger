@@ -145,7 +145,8 @@ impl ProcessControl {
                 .fill(&mut nonce)
                 .map_err(|_| io::Error::other("cannot generate process capability"))?;
             let record = OwnerRecord {
-                schema: 2,
+                schema: 3,
+                boot_id: process_owner::current_boot_id()?,
                 nonce: hex::encode(nonce),
                 command: command(&spec),
                 environment: environment(&spec),
@@ -220,6 +221,11 @@ impl ProcessControl {
             // A prior preparer could have died after rename but before its
             // directory sync. Re-establish publication before any execution.
             File::open(&this.root)?.sync_all()?;
+            if process_owner::from_previous_boot(&record)? {
+                return Err(io::Error::other(
+                    "process generation belongs to a previous kernel boot",
+                ));
+            }
             if !matches!(record.phase, OwnerPhase::Prepared) {
                 return Err(io::Error::other("process generation is not prepared"));
             }
@@ -361,6 +367,30 @@ impl ProcessControl {
     fn finish_retirement(&self, id: &InstanceId) -> io::Result<OwnerRecord> {
         let directory = self.directory(id)?;
         let mut record = self.load(id)?;
+        if process_owner::from_previous_boot(&record)? {
+            // A different kernel cannot retain any old owner or child. Holding
+            // the owner lock also fences delayed helpers before updating proof.
+            let _owner = process_owner::lock_owner(&directory)?;
+            record = self.load(id)?;
+            if process_owner::from_previous_boot(&record)? {
+                match record.phase {
+                    OwnerPhase::Prepared => {
+                        record.phase = OwnerPhase::Cancelled;
+                        process_owner::persist(&directory, &record)?;
+                    }
+                    OwnerPhase::Running { .. } => {
+                        record.phase = OwnerPhase::Retiring { exit_code: None };
+                        process_owner::persist(&directory, &record)?;
+                        process_owner::complete_retirement(&directory, &mut record)?;
+                    }
+                    OwnerPhase::Retiring { .. } => {
+                        process_owner::complete_retirement(&directory, &mut record)?;
+                    }
+                    OwnerPhase::Cancelled | OwnerPhase::Retired { .. } => {}
+                }
+            }
+            return Ok(record);
+        }
         let deadline = Instant::now() + Duration::from_secs(2);
         while matches!(record.phase, OwnerPhase::Retiring { .. }) {
             match process_owner::lock_owner(&directory) {

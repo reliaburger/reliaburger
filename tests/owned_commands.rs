@@ -499,3 +499,91 @@ async fn unreachable_command_owner_expires_retirement_and_retains_original_evide
         "unreachable owner lost its original Running evidence"
     );
 }
+
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn prior_boot_commands_retire_without_signalling_reused_pids_or_restarting() {
+    let root = tempfile::tempdir().unwrap();
+    let commands = commands(root.path());
+    for running in [false, true] {
+        let id = commands
+            .prepare(Path::new("/bin/true"), &[], &BTreeMap::new())
+            .await
+            .unwrap();
+        let path = commands
+            .log_stem(&id)
+            .unwrap()
+            .parent()
+            .unwrap()
+            .join("owner.json");
+        let mut record: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        assert!(
+            record["boot_id"].as_str().is_some(),
+            "launch must record its kernel boot before execution"
+        );
+        record["boot_id"] = "00000000-0000-4000-8000-000000000001".into();
+        if running {
+            record["phase"] = serde_json::json!({"state": "running", "pid": std::process::id()});
+        }
+        std::fs::write(&path, serde_json::to_vec(&record).unwrap()).unwrap();
+        assert!(commands.start(&id).await.is_err());
+        assert_eq!(
+            commands.state(&id).await.unwrap(),
+            if running {
+                CommandState::Retired { exit_code: None }
+            } else {
+                CommandState::Cancelled
+            }
+        );
+        commands.retire(&id, Duration::from_secs(2)).await.unwrap();
+    }
+}
+
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn same_boot_missing_owner_and_malformed_boot_identity_never_prove_retirement() {
+    let root = tempfile::tempdir().unwrap();
+    let commands = commands(root.path());
+    let id = commands
+        .prepare(Path::new("/bin/true"), &[], &BTreeMap::new())
+        .await
+        .unwrap();
+    let path = commands
+        .log_stem(&id)
+        .unwrap()
+        .parent()
+        .unwrap()
+        .join("owner.json");
+    let mut record: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+    record["phase"] = serde_json::json!({"state": "running", "pid": std::process::id()});
+    std::fs::write(&path, serde_json::to_vec(&record).unwrap()).unwrap();
+    assert!(commands.state(&id).await.is_err());
+    record["boot_id"] = "corrupt".into();
+    std::fs::write(&path, serde_json::to_vec(&record).unwrap()).unwrap();
+    assert!(commands.state(&id).await.is_err());
+    record.as_object_mut().unwrap().remove("boot_id");
+    std::fs::write(&path, serde_json::to_vec(&record).unwrap()).unwrap();
+    assert!(commands.state(&id).await.is_err());
+}
+
+#[tokio::test]
+async fn boot_bound_owner_still_requires_the_exact_generation_capability() {
+    let root = tempfile::tempdir().unwrap();
+    let commands = commands(root.path());
+    let id = commands
+        .prepare(Path::new("/bin/true"), &[], &BTreeMap::new())
+        .await
+        .unwrap();
+    let stem = commands.log_stem(&id).unwrap();
+    let output = tokio::process::Command::new(env!("CARGO_BIN_EXE_bun"))
+        .args(["__process-owner", "--directory"])
+        .arg(stem.parent().unwrap())
+        .output()
+        .await
+        .unwrap();
+    assert!(!output.status.success());
+    assert_eq!(commands.state(&id).await.unwrap(), CommandState::Prepared);
+    commands.retire(&id, Duration::from_secs(2)).await.unwrap();
+}

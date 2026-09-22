@@ -3450,3 +3450,26 @@ child's environment without changing the parent's. That matters when other
 asynchronous tests run concurrently: changing the whole process environment
 would change their runtime discovery too. The child must still select
 ProcessGrill, and explicit Apple selection must explain the supported VM path.
+
+### The owner survived Bun. Did it survive the kernel?
+
+Kill Bun and a container can keep running. Reboot Linux and it cannot. Recovery
+needs to tell those situations apart before it can release anything.
+
+Each new command record now stores Linux's kernel boot UUID before the owner may
+execute it. A different, valid UUID is positive evidence that the old kernel and
+all of its processes are gone. Recovery takes the exclusive owner lock, reloads
+the same generation, then cancels unstarted work or records an interrupted
+execution with no exit code. It never signals the saved PID. That number might
+already belong to your database.
+
+`Option<String>` makes the platform boundary explicit: `Some(uuid)` carries Linux
+evidence; `None` on other hosts grants no reboot recovery authority. The `?`
+operator propagates failed reads instead of turning missing evidence into an
+empty identifier. An invalid UUID or an unreachable owner on the same boot still
+blocks cleanup. Existing confirmed exit codes survive reboot unchanged.
+
+This proves process absence, not discovery withdrawal. A retained container
+address still needs its original consumer confirmations, and persisted OCI and
+kernel resources need their own recovery checks. The unit-style regressions edit
+records to exercise these decisions; they are not evidence of an actual reboot.
