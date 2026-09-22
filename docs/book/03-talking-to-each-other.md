@@ -1572,9 +1572,45 @@ Wrapper now takes the routing read lock, chooses its candidates and records a
 request guard for all of them before releasing the lock. Bun's route withdrawal
 needs the write lock, so it cannot pass a handler that has copied an endpoint
 without recording its ownership. Normal requests create active entries; starting
-a drain adds a deadline without resetting their counts. The guard conservatively
-holds every captured failover candidate until the request finishes. WebSockets
-capture just their single target because their handshake has no failover.
+a drain adds a deadline without resetting their counts. Until a backend answers,
+the guard holds every captured failover candidate, because any of them might
+still receive the request. WebSockets capture just their single target because
+their handshake has no failover.
+
+Once a backend answers, though, the other candidates are spectators. We first
+kept them captured for the whole response, and a review spotted what that does
+to a rolling deploy. An SSE stream served by healthy instance A also held B, a
+failover candidate it never touched. When the deploy retired B, B's drain
+couldn't finish, because it counted A's stream as its own. At B's deadline, the
+cancellation meant for B tore down A's perfectly healthy stream instead.
+
+So the moment a response arrives from candidate `idx`, the proxy narrows its
+ownership:
+
+```rust
+let mut drain_guard = drain_guard;
+if let Some(guard) = &mut drain_guard {
+    guard.keep_only(idx);
+}
+let terminate: Vec<_> = terminate.into_iter().nth(idx).into_iter().collect();
+```
+
+`if let Some(guard) = &mut drain_guard` borrows the guard mutably inside the
+`Option` without taking it out, so `keep_only` can edit it in place.
+`keep_only` moves the unused instance ids into a second, throwaway
+`DrainGuard` and drops it at once. Its `Drop` releases them exactly as a
+finished request would, so there's one release path, not two. The last line
+keeps only the serving backend's cancellation token: `into_iter()` consumes the
+vector, `nth(idx)` yields an `Option` holding that one token, and a second
+`into_iter().collect()` turns the `Option` back into a zero- or one-element
+`Vec`. For that to be right, the tokens must line up with the candidates, so
+`capture_requests` now returns exactly one token per candidate, in order.
+
+The regression runs two streaming backends behind the proxy, starts a response,
+then drains whichever backend didn't serve it. That drain now completes within a
+few sweeps, and after its deadline has passed the stream still arrives intact.
+Before the fix, both halves failed: the drain waited, and the stream ended in an
+unexpected EOF.
 
 A deadline cancels work. It doesn't prove the work stopped. HTTP body reads,
 upstream connection/header waits, response streaming and WebSocket handshakes

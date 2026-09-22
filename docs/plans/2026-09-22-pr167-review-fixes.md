@@ -235,8 +235,16 @@ this tier now blocks the 0.1.0 candidate rather than the merge.
       *Test:* with a leader that never answers, assert that `/v1/health` and
       health probing keep their cadence while a retirement is pending.
 
-- [ ] **T1.7 ✔ Ingress aborts healthy long-lived streams during rolling
+- [x] **T1.7 ✔ Ingress aborts healthy long-lived streams during rolling
       deploys.**
+      Done. When a backend answers, `DrainGuard::keep_only` releases the
+      other captured candidates (through the guard's own `Drop`) and the
+      proxy keeps only that backend's cancellation token;
+      `capture_requests` now returns tokens aligned with the candidates. A
+      regression streams from one of two backends and drains the other with
+      a short deadline: that drain completes at once, and after its deadline
+      the stream still arrives whole. Before the fix, the drain waited and
+      the stream ended in an unexpected EOF.
       Non-WebSocket requests capture drain guards and cancellation tokens for
       all `MAX_UPSTREAM_ATTEMPTS` (3) candidates (`src/wrapper/proxy.rs:441`)
       and keep them for the whole response. `wait_for_termination`

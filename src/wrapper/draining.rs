@@ -46,6 +46,9 @@ impl SharedDrains {
 
     /// Capture every candidate while the caller still holds the routing read lock.
     /// A deadline that has already fired refuses the whole capture.
+    ///
+    /// Returns one termination token per candidate, in the same order as
+    /// `instance_ids`, so the caller can keep only the one it ends up using.
     pub(crate) async fn capture_requests(
         &self,
         instance_ids: &[String],
@@ -55,16 +58,20 @@ impl SharedDrains {
         if instance_ids.iter().any(|id| tracker.is_terminating(id)) {
             return None;
         }
-        let mut tokens = Vec::with_capacity(instance_ids.len());
-        for id in instance_ids {
-            tracker.increment_connections(id);
-            if websocket {
-                tracker.increment_websocket(id);
-            }
-            if let Some(token) = tracker.terminate_token(id) {
-                tokens.push(token);
-            }
-        }
+        let tokens = instance_ids
+            .iter()
+            .map(|id| {
+                let entry = tracker
+                    .draining
+                    .entry(id.clone())
+                    .or_insert_with(DrainEntry::active);
+                entry.active_connections += 1;
+                if websocket {
+                    entry.websocket_connections += 1;
+                }
+                entry.terminate.clone()
+            })
+            .collect();
         Some(tokens)
     }
 
