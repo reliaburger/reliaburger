@@ -283,10 +283,21 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
         if self.cluster.is_some() {
             // Release only this node's reservation. The council independently
             // retains the global VIP until every registered consumer confirms.
-            self.invalidate_consumer_view().await?;
-            if !self.withdraw_consumer_view().await? {
+            // Republishing drops this service's local backends from the view;
+            // the drains below prove its captured requests have released.
+            self.mark_consumer_view_stale()?;
+            self.refresh_consumer_view().await?;
+            // A failed publication leaves the kernel view uncertain until the
+            // next synchronisation withdraws it completely.
+            if !self.consumer_owner().is_some_and(|owner| {
+                matches!(
+                    owner.phase,
+                    crate::bun::consumer_owners::ConsumerPhase::Active
+                        | crate::bun::consumer_owners::ConsumerPhase::Withdrawn
+                )
+            }) {
                 return Err(refuse(
-                    "captured consumer requests still require confirmed release",
+                    "consumer view has not settled after a failed publication",
                 ));
             }
         }

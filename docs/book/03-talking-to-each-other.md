@@ -2385,7 +2385,8 @@ backend. It can also send a withdrawal receipt and crash before recording the
 leader's reply. Neither case is permission to forget the original exposure.
 
 The consumer journal has four phases: `Publishing`, `Active`, `Withdrawing` and
-`Withdrawn`. Only the last permits compacting publication history. The latest
+`Withdrawn`. History may be compacted after a full withdrawal, or from `Active`
+once the earlier views have drained (more on that below). The latest
 catalogue generation survives that compaction, so an old assignment cannot become
 new just because earlier records disappeared. Each withdrawal instruction also
 has `Pending` or `Ready` receipt state. Pending means local cleanup still owes
@@ -2398,27 +2399,59 @@ keys receipts by their original generation; deterministic ordering makes snapsho
 and tests easier to inspect. Tests first reproduce premature receipt removal and
 refusal to compact even after withdrawal, then exercise the permission boundaries.
 
-The agent now uses those permissions. It journals the proposed merged catalogue,
-local service view and ingress configuration before publishing any of them. A
-replacement first hides DNS/ingress, removes original kernel entries and destination
-grants, and cancels requests captured under the old routing-table lock. The request
-counters still have to reach zero. Only then does the agent record `Withdrawn`,
-make eligible receipts ready, compact history and publish the replacement.
+The agent journals the proposed merged catalogue, local service view and ingress
+configuration before publishing any of them. Local backends need the committed
+catalogue's allocation and matching original runtime generation, so a prepared or
+retiring local instance can't invent a public endpoint outside the journal.
 
-Local lifecycle changes cannot bypass this sequence. They invalidate the consumer
-view and retain their own runtime/discovery records; only the consumer reconciler
-may publish the merged view again. Local backends need the committed catalogue's
-allocation and matching original runtime generation. This prevents a prepared or
-retiring local instance from inventing a public endpoint outside the journal.
+### Replacing a view without dropping requests
+
+Our first version replaced a view the careful way: hide DNS and ingress, remove
+every kernel entry, cancel every captured request, wait for the counters to reach
+zero, then publish the new view. It was correct, and it was a disaster. The
+catalogue generation changes whenever anything deploys anywhere in the cluster,
+and every health probe republished too. So a single rolling deploy made every
+node drop every in-flight request it was proxying, for every service. No test
+noticed, because none kept traffic flowing while the catalogue changed.
+
+What does a receipt actually need? Proof that nothing this node still exposes
+contains the withdrawn endpoint. That's a much smaller promise than "nothing is
+exposed at all". So the journal now keeps a list of views that *may* still be
+exposed: the newest one in the kernel and userspace, and older ones through
+requests that captured their backends. A replacement appends one view, updates
+the kernel entries in place and swaps the routing table and DNS snapshot. Only
+services that left the view lose their kernel entries. Backends that left start a
+graceful 30-second drain, the same default a deploy uses. Requests to backends
+that stayed never notice.
+
+Once those drains finish, the agent forgets the older views. Rust's slices make
+the bookkeeping short. `&owner.publications[..len - 1]` borrows every view except
+the newest (a range with no start begins at zero), and the state machine checks a
+compaction with `history.ends_with(&next.publications)`: the kept views must be a
+suffix of the old list, ending with the published one. A receipt becomes `Ready`
+only when no view left in that list intersects its withdrawal.
+
+Local changes follow the same path. A health transition, restart or replacement
+journals its own record and marks the consumer view stale. The agent loop then
+republishes once, in place, from the last committed catalogue, so a burst of
+probes costs one publication and the old view serves until then. A probe whose
+result matches what's already published returns early without touching disk.
+
+Recovery keeps the old, conservative sequence. After a crash we can't know which
+requests the previous process captured, so the first publication after a restart
+still withdraws everything and waits. That costs a brief gap once per restart,
+not once per deploy.
 
 Recovery binds the journal to both node name and enrolled cluster fingerprint.
 It inspects local and consumer kernel entries together, correlates local runtime
 holds, withdraws the old view and starts with no historical health in DNS or
 Wrapper. A ready receipt survives this process. The latest catalogue generation
 also survives, even after all but the latest publication have been compacted.
-The regression captures both an HTTP request and a WebSocket, confirms that
-cancellation alone sends no receipt, releases their guards independently, then
-reopens the journal and retries the exact original receipt.
+The regression captures both an HTTP request and a WebSocket, checks that the
+withdrawal publishes at once without cancelling them and sends no receipt,
+releases their guards independently, then reopens the journal and retries the
+exact original receipt. Two more regressions keep requests and the published
+view intact across a catalogue change and a local change.
 
 ### Delivering the receipt
 

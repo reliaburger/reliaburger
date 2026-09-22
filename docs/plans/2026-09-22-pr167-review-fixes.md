@@ -34,7 +34,8 @@ editing, since earlier fixes move them.
    Linux suites need the Lima VM or hosted CI; macOS can't run them.
 5. One commit per item; within this approved plan, commit without re-asking.
    Never amend. Push the tier branch and keep its PR description current.
-6. Tick the box here, with the commit hash, in the same commit.
+6. Tick the box here in the same commit, and end the commit subject with the
+   item ID, e.g. `(T1.1)`, so `git log --grep 'T1.1'` finds it.
 
 Local tooling note: the repo pins nextest 0.9.145. With an older local nextest,
 `make test` fails immediately; update it or pass `--override-version-check`.
@@ -90,8 +91,14 @@ subsystem review agents that traced the code; confirm each one before fixing it.
 All of these were introduced or exposed by PR #167. The PR has merged, so
 this tier now blocks the 0.1.0 candidate rather than the merge.
 
-- [ ] **T1.1 ✔ Health probes blank DNS and ingress for the whole node (cluster
-      mode).**
+- [x] **T1.1 ✔ Health probes blank DNS and ingress for the whole node (cluster
+      mode).** Done. Wider than reviewed: *every* catalogue generation change
+      (any deploy anywhere) took the same withdraw-everything path, so each
+      deploy made every node abort all proxied requests. The consumer journal
+      now replaces views in place, retains earlier views until their removed
+      backends drain gracefully (30 s), and marks receipts ready only when no
+      retained view intersects them. Local changes mark the view stale and the
+      agent loop republishes once. Recovery keeps the full withdrawal.
       `publish_instance_health` (`src/bun/agent.rs:7407`, called from `:7368`
       on *every* probe) has no "nothing changed" check. It goes through
       `publish_backend_snapshot` (`:2218`) into `invalidate_consumer_view`

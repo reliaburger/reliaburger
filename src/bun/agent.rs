@@ -1653,6 +1653,8 @@ pub struct BunAgent<G: Grill> {
     ingress_configs: std::collections::HashMap<(String, String), crate::config::app::IngressSpec>,
     cluster_ingress_configs:
         std::collections::HashMap<(String, String), crate::config::app::IngressSpec>,
+    /// A local change awaits in-place republication of the consumer view.
+    consumer_view_stale: bool,
     /// Perimeter firewall config. Disabled in rootless mode.
     perimeter_config: crate::firewall::rules::PerimeterConfig,
     /// Last applied cluster-node set for firewall reconciliation. `None`
@@ -1816,6 +1818,7 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
             )),
             ingress_configs: std::collections::HashMap::new(),
             cluster_ingress_configs: std::collections::HashMap::new(),
+            consumer_view_stale: false,
             // Single-node mode: no nftables needed (no cluster ports to protect)
             perimeter_config: crate::firewall::rules::PerimeterConfig {
                 enabled: false,
@@ -1915,6 +1918,7 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
             )),
             ingress_configs: std::collections::HashMap::new(),
             cluster_ingress_configs: std::collections::HashMap::new(),
+            consumer_view_stale: false,
             #[cfg(target_os = "linux")]
             perimeter_config: {
                 let mut cfg = if crate::grill::rootless::is_rootless() {
@@ -2222,7 +2226,7 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
     ) -> Result<(), BunError> {
         self.persist_discovery_publication(id, services).await?;
         if self.consumer_controls_views() {
-            return self.invalidate_consumer_view().await;
+            return self.mark_consumer_view_stale();
         }
         self.publish_backend_kernel(id, services).await
     }
@@ -3386,6 +3390,11 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
                     self.sweep_kernel_networking().await;
                     self.check_identity_rotation().await;
                 }
+            }
+            // Local changes only mark the consumer view stale, so a burst of
+            // them costs one republication, and the old view serves meanwhile.
+            if let Err(error) = self.refresh_consumer_view().await {
+                eprintln!("bun: consumer view refresh awaits retry: {error}");
             }
         }
     }
@@ -7416,9 +7425,25 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
         }
         let service =
             crate::onion::service_id::ServiceId::new(&instance.namespace, &instance.app_name);
+        let healthy = instance.state == ContainerState::Running;
+        // `service_map` changes only after a successful publication, so a
+        // failed attempt still differs here and the next probe retries it.
+        let published = self
+            .service_map
+            .resolve(&service)
+            .and_then(|entry| {
+                entry
+                    .backends
+                    .iter()
+                    .find(|backend| backend.instance_id == id.0)
+            })
+            .is_some_and(|backend| backend.healthy == healthy);
+        if published {
+            return Ok(());
+        }
         let mut candidate = self.service_map.clone();
         candidate
-            .set_backend_health(&service, &id.0, instance.state == ContainerState::Running)
+            .set_backend_health(&service, &id.0, healthy)
             .map_err(|error| BunError::BackendPublication {
                 service: service.clone(),
                 reason: error.to_string(),
@@ -9563,9 +9588,9 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
             .any(|backend| backend.instance_id == id.0);
         entry.backends.retain(|backend| backend.instance_id != id.0);
         if self.consumer_controls_views() {
-            self.invalidate_consumer_view().await?;
+            self.mark_consumer_view_stale()?;
             // A prior attempt may have removed the local backend before remote
-            // consumers confirmed. Retrying still fences the whole consumer view.
+            // consumers confirmed. Remote receipts, not this return, prove release.
             if had_backend {
                 self.service_map
                     .remove_backend(&service, &id.0)
@@ -20106,11 +20131,13 @@ host = "remote.local"
             .synchronise_consumer(2, Default::default(), vec![], vec![instruction.clone()])
             .await
             .unwrap();
-        assert!(!result.published && result.receipts.is_empty());
+        // The new view publishes at once; the withdrawn backend drains gracefully.
+        assert!(result.published && result.receipts.is_empty());
         assert!(
             http.iter()
                 .chain(&websocket)
-                .all(|token| token.is_cancelled())
+                .all(|token| !token.is_cancelled()),
+            "withdrawal cancelled requests before their drain deadline"
         );
         assert!(agent.service_map_tx.borrow().resolve_all().is_empty());
         agent.drains.decrement_connections(&backend).await;
@@ -20118,7 +20145,7 @@ host = "remote.local"
             .synchronise_consumer(2, Default::default(), vec![], vec![instruction.clone()])
             .await
             .unwrap();
-        assert!(!result.published && result.receipts.is_empty());
+        assert!(result.published && result.receipts.is_empty());
         agent.drains.decrement_connections(&backend).await;
         agent.drains.decrement_websocket(&backend).await;
         let result = agent
@@ -20172,6 +20199,85 @@ host = "remote.local"
         assert!(consumer.receipts.is_empty());
         assert_eq!(consumer.publications.len(), 1);
         assert_eq!(consumer.publications[0].generation, 2);
+    }
+
+    #[tokio::test]
+    async fn durable_consumer_catalogue_change_keeps_captured_requests_and_view() {
+        let (mut agent, _root, catalog) = clustered_allocation_fixture().await;
+        let (_, ingress) = cluster_publication_fixture();
+        let backend = agent.service_map_tx.borrow().resolve_all()[0].backends[0]
+            .instance_id
+            .clone();
+        let captured = agent
+            .drains
+            .capture_requests(std::slice::from_ref(&backend), false)
+            .await
+            .unwrap();
+        // A deploy anywhere in the cluster commits a new generation. This
+        // node's backends are unchanged, so its requests must not notice.
+        let result = agent
+            .synchronise_consumer(2, catalog, ingress, vec![])
+            .await
+            .unwrap();
+        assert!(result.published);
+        assert!(
+            captured.iter().all(|token| !token.is_cancelled()),
+            "a catalogue change cancelled requests to an unchanged backend"
+        );
+        assert!(!agent.drains.is_draining(&backend).await);
+        assert_eq!(
+            agent.service_map_tx.borrow().resolve_all()[0].backends[0].instance_id,
+            backend
+        );
+        agent.drains.decrement_connections(&backend).await;
+    }
+
+    #[tokio::test]
+    async fn durable_consumer_local_change_keeps_the_published_view() {
+        let (mut agent, _root, _catalog) = clustered_allocation_fixture().await;
+        let service = crate::onion::service_id::ServiceId::new("default", "remote");
+        let published = agent.service_map_tx.borrow().resolve_all().len();
+        assert_eq!(published, 1);
+        // Health probes, restarts and replacements all publish through here.
+        agent
+            .publish_backend_snapshot(&service, &agent.service_map.clone())
+            .await
+            .unwrap();
+        assert_eq!(
+            agent.service_map_tx.borrow().resolve_all().len(),
+            published,
+            "a local change blanked DNS and ingress"
+        );
+        assert!(!agent.routing_table.read().await.list_routes().is_empty());
+    }
+
+    #[tokio::test]
+    async fn unchanged_health_probe_does_not_rewrite_discovery_ownership() {
+        use std::os::unix::fs::MetadataExt;
+        let (mut agent, _, _, grill) = test_agent_with_grill();
+        let root = tempfile::tempdir().unwrap();
+        agent.set_records_dir(root.path().join("records"));
+        agent.set_volumes_dir(root.path().join("volumes"));
+        agent
+            .enable_fresh_discovery_ownership(&root.path().join("discovery"))
+            .await
+            .unwrap();
+        grill.set_pid(std::process::id());
+        grill.set_container_ip("10.0.2.5".parse().unwrap());
+        grill
+            .set_network_reference(original_test_network_reference())
+            .await;
+        expect_complete(&drain_deploy(&mut agent, basic_config()).await);
+        let id = agent.supervisor.list_instances()[0].id.clone();
+        let journal = root.path().join("discovery").join("discovery.json");
+        agent.publish_instance_health(&id).await.unwrap();
+        let before = std::fs::metadata(&journal).unwrap().ino();
+        agent.publish_instance_health(&id).await.unwrap();
+        assert_eq!(
+            std::fs::metadata(&journal).unwrap().ino(),
+            before,
+            "an unchanged probe result rewrote the discovery journal"
+        );
     }
 
     #[tokio::test]
@@ -20282,7 +20388,7 @@ host = "remote.local"
     }
 
     #[tokio::test]
-    async fn clustered_local_allocation_retires_only_after_consumer_guards_release() {
+    async fn clustered_local_allocation_retires_without_cancelling_remote_replica_requests() {
         let (mut agent, root, catalog) = clustered_allocation_fixture().await;
         // Restore the exact local reservation; the public view also has a remote replica.
         let mut entry = agent.service_map_tx.borrow().resolve_all()[0].clone();
@@ -20299,12 +20405,25 @@ host = "remote.local"
             .capture_requests(std::slice::from_ref(&backend), false)
             .await
             .unwrap();
-        assert!(agent.retire_discovery_service(&service).await.is_err());
-        assert!(guards[0].is_cancelled());
-        agent.drains.decrement_connections(&backend).await;
+        // Only this node's reservation retires. The remote replica keeps
+        // serving, so a request it captured must not notice.
         agent.retire_discovery_service(&service).await.unwrap();
+        assert!(
+            !guards[0].is_cancelled(),
+            "retiring a local allocation cancelled a remote replica's request"
+        );
+        agent.drains.decrement_connections(&backend).await;
         agent.service_map.unregister(&service).unwrap();
-        assert!(agent.service_map_tx.borrow().resolve_all().is_empty());
+        assert_eq!(
+            agent
+                .service_map_tx
+                .borrow()
+                .resolve(&service)
+                .unwrap()
+                .backends[0]
+                .instance_id,
+            backend
+        );
         assert!(
             agent
                 .synchronise_consumer(1, catalog.clone(), vec![], vec![])
