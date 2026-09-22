@@ -65,6 +65,8 @@ pub struct DiscoveryInventory {
     pub services: Vec<ServiceOwner>,
     /// Held references and release permissions not yet confirmed by the runtime.
     pub references: Vec<ReferenceOwner>,
+    /// Original cluster publication attempts, bound to their enrolled consumer.
+    pub consumer: Option<super::consumer_owners::ConsumerOwnership>,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -106,6 +108,11 @@ impl DiscoveryJournal {
         use crate::grill::runc_intent::NetworkReferenceState;
         if self.uncertain {
             return Err(io::Error::other("discovery checkpoint is uncertain"));
+        }
+        if self.inventory.consumer.is_some() {
+            return Err(io::Error::other(
+                "consumer ownership requires cluster recovery reconciliation",
+            ));
         }
         let mut by_instance = std::collections::HashMap::new();
         for launch in launches {
@@ -359,7 +366,7 @@ fn read_checkpoint(directory: &Path) -> io::Result<DiscoveryInventory> {
         return Err(io::Error::other("discovery checkpoint exceeds size limit"));
     }
     let checkpoint: Checkpoint = serde_json::from_slice(&bytes)?;
-    if checkpoint.schema != 1 {
+    if checkpoint.schema != 2 {
         return Err(io::Error::other("unsupported discovery checkpoint schema"));
     }
     validate(&checkpoint.inventory)?;
@@ -368,7 +375,7 @@ fn read_checkpoint(directory: &Path) -> io::Result<DiscoveryInventory> {
 
 fn write_checkpoint(directory: &Path, inventory: &DiscoveryInventory) -> io::Result<()> {
     let bytes = serde_json::to_vec(&Checkpoint {
-        schema: 1,
+        schema: 2,
         inventory: inventory.clone(),
     })?;
     if bytes.len() as u64 > LIMIT {
@@ -378,6 +385,9 @@ fn write_checkpoint(directory: &Path, inventory: &DiscoveryInventory) -> io::Res
 }
 
 fn validate(inventory: &DiscoveryInventory) -> io::Result<()> {
+    if let Some(consumer) = &inventory.consumer {
+        consumer.validate()?;
+    }
     let entries: Vec<_> = inventory
         .services
         .iter()
@@ -449,6 +459,10 @@ fn validate(inventory: &DiscoveryInventory) -> io::Result<()> {
 }
 
 fn validate_transition(previous: &DiscoveryInventory, next: &DiscoveryInventory) -> io::Result<()> {
+    super::consumer_owners::validate_transition(
+        previous.consumer.as_ref(),
+        next.consumer.as_ref(),
+    )?;
     let services: std::collections::HashMap<_, _> = next
         .services
         .iter()
@@ -574,6 +588,295 @@ mod tests {
         );
     }
 
+    fn consumer_snapshot(generation: u64, host_port: u16) -> serde_json::Value {
+        let catalog = crate::onion::catalog::EndpointCatalog::rebuild([(
+            ServiceId::new("default", "remote"),
+            8080,
+            vec![crate::onion::catalog::CatalogBackend {
+                execution: Some(crate::grill::RuntimeExecution {
+                    instance_id: crate::grill::InstanceId("default__remote-0".into()),
+                    generation: format!("{host_port:064x}").try_into().unwrap(),
+                }),
+                node_id: "producer".into(),
+                node_ip: "192.0.2.10".parse().unwrap(),
+                host_port,
+                healthy: true,
+            }],
+        )])
+        .unwrap();
+        let effective =
+            ServiceMap::new().with_cluster_catalog_excluding_node(&catalog, Some("reader"));
+        serde_json::json!({"generation": generation, "catalog": catalog,
+            "effective_services": effective.resolve_all()})
+    }
+
+    fn consumer_inventory() -> serde_json::Value {
+        serde_json::json!({"services": [], "references": [], "consumer": {
+            "identity": {"node_id": "reader", "cluster_identity": vec![42_u8; 32]},
+            "publications": [consumer_snapshot(1, 30001), consumer_snapshot(2, 30002)]
+        }})
+    }
+
+    #[test]
+    fn consumer_publications_retain_original_generations_and_effective_views_after_reopening() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("owners");
+        let expected = consumer_inventory();
+        let mut journal = DiscoveryJournal::open(&path).unwrap();
+        journal
+            .save(serde_json::from_value(expected.clone()).unwrap())
+            .unwrap();
+        drop(journal);
+        let journal = DiscoveryJournal::open(&path).unwrap();
+        assert_eq!(serde_json::to_value(journal.inventory()).unwrap(), expected);
+        assert!(
+            journal.reconcile_runtime_inventory(&[]).is_err(),
+            "standalone recovery must not ignore remote consumer ownership"
+        );
+        assert!(DiscoveryJournal::open(&path).is_err());
+        let wire: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(path.join(CHECKPOINT)).unwrap()).unwrap();
+        assert_eq!(wire["schema"], 2);
+    }
+
+    #[test]
+    fn consumer_ownership_refuses_lost_rewritten_rebound_and_stale_history_atomically() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("owners");
+        let mut journal = DiscoveryJournal::open(&path).unwrap();
+        let original = consumer_inventory();
+        journal
+            .save(serde_json::from_value(original.clone()).unwrap())
+            .unwrap();
+        let bytes = std::fs::read(path.join(CHECKPOINT)).unwrap();
+        let mutations: &[fn(&mut serde_json::Value)] = &[
+            |v| v["consumer"] = serde_json::Value::Null,
+            |v| v["consumer"]["identity"]["node_id"] = "another-reader".into(),
+            |v| v["consumer"]["identity"]["cluster_identity"] = serde_json::json!(vec![43_u8; 32]),
+            |v| {
+                v["consumer"]["publications"]
+                    .as_array_mut()
+                    .unwrap()
+                    .remove(0);
+            },
+            |v| {
+                v["consumer"]["publications"].as_array_mut().unwrap().pop();
+            },
+            |v| v["consumer"]["publications"][0] = consumer_snapshot(1, 31001),
+            |v| {
+                v["consumer"]["publications"]
+                    .as_array_mut()
+                    .unwrap()
+                    .push(consumer_snapshot(1, 30001))
+            },
+            |v| {
+                v["consumer"]["publications"]
+                    .as_array_mut()
+                    .unwrap()
+                    .push(consumer_snapshot(2, 31002))
+            },
+        ];
+        for mutate in mutations {
+            let mut candidate = original.clone();
+            mutate(&mut candidate);
+            assert!(
+                journal
+                    .save(serde_json::from_value(candidate).unwrap())
+                    .is_err()
+            );
+            assert_eq!(std::fs::read(path.join(CHECKPOINT)).unwrap(), bytes);
+            assert_eq!(serde_json::to_value(journal.inventory()).unwrap(), original);
+        }
+        let mut next = original;
+        next["consumer"]["publications"]
+            .as_array_mut()
+            .unwrap()
+            .push(consumer_snapshot(3, 30003));
+        journal
+            .save(serde_json::from_value(next.clone()).unwrap())
+            .unwrap();
+        assert_eq!(serde_json::to_value(journal.inventory()).unwrap(), next);
+    }
+
+    #[test]
+    fn consumer_ownership_rejects_invalid_or_uncorrelated_effective_views_and_capacity_overflow() {
+        let mutations: &[fn(&mut serde_json::Value)] = &[
+            |v| v["consumer"]["identity"]["node_id"] = "".into(),
+            |v| v["consumer"]["publications"][0]["generation"] = 0.into(),
+            |v| v["consumer"]["publications"][0]["effective_services"] = serde_json::json!([]),
+            |v| v["consumer"]["publications"][0]["effective_services"][0]["port"] = 9090.into(),
+            |v| {
+                v["consumer"]["publications"][0]["effective_services"][0]["backends"] =
+                    serde_json::json!([])
+            },
+            |v| {
+                let mut alias = v["consumer"]["publications"][0]["effective_services"][0].clone();
+                alias["app_name"] = "alias".into();
+                v["consumer"]["publications"][0]["effective_services"]
+                    .as_array_mut()
+                    .unwrap()
+                    .push(alias);
+            },
+            |v| {
+                v["consumer"]["publications"] =
+                    serde_json::json!(vec![consumer_snapshot(1, 30001); 1025])
+            },
+        ];
+        for mutate in mutations {
+            let root = tempfile::tempdir().unwrap();
+            let path = root.path().join("owners");
+            let mut journal = DiscoveryJournal::open(&path).unwrap();
+            let bytes = std::fs::read(path.join(CHECKPOINT)).unwrap();
+            let mut candidate = consumer_inventory();
+            mutate(&mut candidate);
+            assert!(
+                journal
+                    .save(serde_json::from_value(candidate).unwrap())
+                    .is_err()
+            );
+            assert_eq!(std::fs::read(path.join(CHECKPOINT)).unwrap(), bytes);
+        }
+    }
+
+    #[test]
+    fn consumer_retains_local_changes_within_one_generation_and_empty_initial_catalogue() {
+        let root = tempfile::tempdir().unwrap();
+        let mut journal = DiscoveryJournal::open(&root.path().join("owners")).unwrap();
+        let mut next = consumer_inventory();
+        next["consumer"]["publications"] = serde_json::json!([{
+            "generation": 0, "catalog": {"services": {}}, "effective_services": []
+        }]);
+        journal
+            .save(serde_json::from_value(next.clone()).unwrap())
+            .unwrap();
+        let mut publication = consumer_snapshot(1, 30001);
+        next["consumer"]["publications"]
+            .as_array_mut()
+            .unwrap()
+            .push(publication.clone());
+        journal
+            .save(serde_json::from_value(next.clone()).unwrap())
+            .unwrap();
+        let mut local = ServiceMap::new();
+        local
+            .register(&ServiceId::new("default", "local"), 9000, None)
+            .unwrap();
+        publication["effective_services"]
+            .as_array_mut()
+            .unwrap()
+            .push(serde_json::to_value(local.resolve_all()[0]).unwrap());
+        next["consumer"]["publications"]
+            .as_array_mut()
+            .unwrap()
+            .push(publication);
+        journal
+            .save(serde_json::from_value(next.clone()).unwrap())
+            .unwrap();
+        assert_eq!(serde_json::to_value(journal.inventory()).unwrap(), next);
+    }
+
+    #[test]
+    fn consumer_bounds_total_exposures_even_below_publication_capacity() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("owners");
+        let mut journal = DiscoveryJournal::open(&path).unwrap();
+        let before = std::fs::read(path.join(CHECKPOINT)).unwrap();
+        let mut publication: super::super::consumer_owners::ConsumerPublication =
+            serde_json::from_value(consumer_snapshot(1, 30001)).unwrap();
+        let service = publication.catalog.services.values_mut().next().unwrap();
+        let backend = service.backends[0].clone();
+        service.backends = (0..32)
+            .map(|offset| {
+                let mut backend = backend.clone();
+                backend.host_port += offset;
+                backend
+            })
+            .collect();
+        let effective = ServiceMap::new()
+            .with_cluster_catalog_excluding_node(&publication.catalog, Some("reader"));
+        publication.effective_services = effective.resolve_all().into_iter().cloned().collect();
+        let mut next: DiscoveryInventory = serde_json::from_value(consumer_inventory()).unwrap();
+        // Each attempt retains two service records and 64 backend records.
+        next.consumer.as_mut().unwrap().publications = vec![publication; 993];
+        assert!(
+            journal
+                .save(next)
+                .unwrap_err()
+                .to_string()
+                .contains("exposure capacity")
+        );
+        assert_eq!(std::fs::read(path.join(CHECKPOINT)).unwrap(), before);
+    }
+
+    #[test]
+    fn consumer_failed_write_preserves_previous_evidence_and_fences_the_writer() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("owners");
+        let mut journal = DiscoveryJournal::open(&path).unwrap();
+        let original = consumer_inventory();
+        journal
+            .save(serde_json::from_value(original.clone()).unwrap())
+            .unwrap();
+        let mut next = original.clone();
+        next["consumer"]["publications"]
+            .as_array_mut()
+            .unwrap()
+            .push(consumer_snapshot(3, 30003));
+        std::fs::rename(path.join(CHECKPOINT), path.join("saved.json")).unwrap();
+        std::fs::create_dir(path.join(CHECKPOINT)).unwrap();
+        assert!(
+            journal
+                .save(serde_json::from_value(next.clone()).unwrap())
+                .is_err()
+        );
+        assert_eq!(serde_json::to_value(journal.inventory()).unwrap(), original);
+        std::fs::remove_dir(path.join(CHECKPOINT)).unwrap();
+        std::fs::rename(path.join("saved.json"), path.join(CHECKPOINT)).unwrap();
+        assert!(journal.save(serde_json::from_value(next).unwrap()).is_err());
+        drop(journal);
+        let recovered = DiscoveryJournal::open(&path).unwrap();
+        assert_eq!(
+            serde_json::to_value(recovered.inventory()).unwrap(),
+            original
+        );
+    }
+
+    #[tokio::test]
+    async fn consumer_cancelled_persistence_keeps_the_claim_until_original_evidence_is_written() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("owners");
+        let mut journal = DiscoveryJournal::open_async(&path).await.unwrap();
+        let original = consumer_inventory();
+        let next = serde_json::from_value(original.clone()).unwrap();
+        let (entered, waiting) = tokio::sync::oneshot::channel();
+        let (resume, paused) = tokio::sync::oneshot::channel();
+        journal.write_pause = Some((entered, paused));
+        let operation = tokio::spawn(journal.persist(next));
+        waiting.await.unwrap();
+        operation.abort();
+        assert!(operation.await.unwrap_err().is_cancelled());
+        assert!(matches!(DiscoveryJournal::open_async(&path).await,
+            Err(error) if error.kind() == io::ErrorKind::WouldBlock));
+        resume.send(()).unwrap();
+        let recovered = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            loop {
+                match DiscoveryJournal::open_async(&path).await {
+                    Ok(journal) => break journal,
+                    Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
+                        tokio::task::yield_now().await
+                    }
+                    Err(error) => panic!("recovery failed: {error}"),
+                }
+            }
+        })
+        .await
+        .unwrap();
+        assert_eq!(
+            serde_json::to_value(recovered.inventory()).unwrap(),
+            original
+        );
+    }
+
     fn inventory() -> DiscoveryInventory {
         let mut services = ServiceMap::new();
         let id = ServiceId::new("default", "api-g5");
@@ -581,6 +884,7 @@ mod tests {
             .register(&id, 8080, Some(vec!["default/client".into()]))
             .unwrap();
         DiscoveryInventory {
+            consumer: None,
             services: vec![ServiceOwner { entry: services.resolve(&id).unwrap().clone(), phase: ServicePhase::Owned }],
             references: vec![ReferenceOwner {
                 service: id.clone(),
@@ -890,7 +1194,8 @@ mod tests {
         for bytes in [
             None,
             Some(b"{".as_slice()),
-            Some(br#"{"schema":2,"inventory":{"services":[],"references":[]}}"#.as_slice()),
+            Some(br#"{"schema":1,"inventory":{"services":[],"references":[]}}"#.as_slice()),
+            Some(br#"{"schema":99,"inventory":{"services":[],"references":[]}}"#.as_slice()),
         ] {
             let root = tempfile::tempdir().unwrap();
             let path = root.path().join("owners");

@@ -9,6 +9,7 @@ pub mod authz;
 pub mod batch;
 pub mod build_runner;
 pub mod capabilities;
+pub mod consumer_owners;
 pub mod deploy_operations;
 pub mod diagnostics;
 pub mod discovery_owners;

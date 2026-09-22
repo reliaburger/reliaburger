@@ -33,7 +33,10 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
         let journal = DiscoveryJournal::open_async(directory)
             .await
             .map_err(|error| BunError::AdoptionState(error.to_string()))?;
-        if !journal.inventory().services.is_empty() || !journal.inventory().references.is_empty() {
+        if !journal.inventory().services.is_empty()
+            || !journal.inventory().references.is_empty()
+            || journal.inventory().consumer.is_some()
+        {
             return Err(BunError::AdoptionState(
                 "existing discovery ownership requires recovery reconciliation".into(),
             ));

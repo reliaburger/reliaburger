@@ -188,7 +188,7 @@ pub enum OnionError {
 /// Bun compiles this into the BPF map entries. This is the
 /// source-of-truth that the `ServiceMap` stores and that
 /// `relish resolve` displays.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ServiceEntry {
     /// App name (e.g. "redis").
     pub app_name: String,
@@ -210,7 +210,7 @@ pub struct ServiceEntry {
 }
 
 /// A single backend instance of a service.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct BackendInstance {
     /// Instance ID (e.g. "redis-0").
     pub instance_id: String,

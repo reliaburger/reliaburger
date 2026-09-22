@@ -12184,6 +12184,29 @@ mod tests {
         assert!(crate::grill::records::record_path(records.path(), "default__web-0").exists());
     }
 
+    #[tokio::test]
+    async fn fresh_discovery_enablement_refuses_existing_consumer_obligations() {
+        let (mut agent, _, _) = test_agent();
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("discovery");
+        let journal = crate::bun::discovery_owners::DiscoveryJournal::open_async(&path)
+            .await
+            .unwrap();
+        let inventory = serde_json::from_value(serde_json::json!({
+            "services": [], "references": [], "consumer": {
+                "identity": {"node_id": "reader", "cluster_identity": vec![42_u8; 32]},
+                "publications": []
+            }
+        }))
+        .unwrap();
+        drop(journal.persist(inventory).await.unwrap());
+        assert!(agent.enable_fresh_discovery_ownership(&path).await.is_err());
+        assert!(matches!(
+            agent.discovery_ownership,
+            discovery_ownership::DiscoveryOwnership::Uncertain
+        ));
+    }
+
     fn original_test_network_reference() -> crate::grill::runc_intent::NetworkReference {
         serde_json::from_value(serde_json::json!({
             "instance_id": "default__web-0", "generation": "1234567890abcdef1234567890abcdef", "container_index": 7

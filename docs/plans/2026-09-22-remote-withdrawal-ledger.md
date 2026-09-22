@@ -176,3 +176,27 @@ integrations and three real failover/decommission cases each, with strict Clippy
 and formatting. This internal channel change leaves protocol
 19/state 32 unchanged. Durable consumer ownership before publication and positive
 drain proof before receipts remain the next work.
+
+
+### Consumer ownership storage checkpoint
+
+The exclusive discovery journal now has an optional, identity-bound consumer
+inventory. It preserves original committed catalogue generations and the exact
+proposed merged service views. Updates retain the entire previous history;
+changed identity, stale or rewritten generations, missing remote backends and
+conflicting allocations refuse before writing. Limits are 1,024 attempts and
+65,536 combined service/backend records, plus the existing 16 MiB checkpoint cap.
+No history eviction or completion inference is permitted.
+
+This is storage groundwork, not publication integration. Use the existing journal
+worker and exclusive claim rather than introducing a second independently written
+store. Standalone reconciliation and fresh enablement refuse existing consumer
+ownership. The schema advances to 2 and state to 33 (protocol remains 19).
+
+Next: pass committed generations and withdrawal instructions to Bun, establish
+the stable enrolment identity, persist before attempted publication, and reconcile
+old ownership before new publication on restart. Capture ingress destinations and
+request guards as well as the service view. Add explicit confirmed-withdrawal and
+receipt phases before allowing bounded compaction; the current append-only store
+must refuse at capacity. Producer release still needs committed proof and stale
+execution-report fencing.

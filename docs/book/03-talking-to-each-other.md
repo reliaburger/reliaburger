@@ -2150,3 +2150,45 @@ This is an in-process contract, so protocol 19/state 32 remain unchanged. It is
 also only publication confirmation. A request captured before the table swap may
 still own an old backend. Durable consumer records, confirmed draining and receipt
 submission are the next steps; this reply alone cannot authorise address reuse.
+
+
+### Remembering what a consumer might have published
+
+A consumer can die after installing a route but before reporting success. On
+restart, the latest catalogue might already omit that backend. We therefore need
+the original attempted publication, including its execution fingerprint, alongside
+the exact merged local and remote service view. Saving only the latest desired
+catalogue would lose the evidence needed to withdraw the old route.
+
+The discovery journal now accepts a consumer identity and an ordered history of
+publication attempts. The identity binds the enrolled node to a fingerprint of
+its cluster trust identity; rotating leaf certificates must not change that
+binding. Each attempt keeps its committed generation and original catalogue.
+`Option<ConsumerOwnership>` lets standalone inventories express the absence of a
+cluster consumer explicitly. Generation zero is valid only for an empty catalogue.
+
+Validation reconstructs each effective service map, checks allocation uniqueness,
+and requires every remote catalogue backend to appear with its original VIP and
+port. Additional local entries remain part of the recorded exposure. Adjacent
+attempts may share a generation when only the local view changes, but they cannot
+rewrite the catalogue or move backwards. Rust's slice `starts_with` method checks
+that an update preserves the whole previous history. Derived `PartialEq` and `Eq`
+compare the nested records by value, including backend health and execution IDs.
+
+This foundation deliberately refuses history removal. It caps retained attempts
+at 1,024 and combined service/backend records at 65,536, in addition to the
+journal's 16 MiB limit. Reaching a limit refuses a write; it never evicts uncertain
+ownership. Confirmed-withdrawal phases and safe compaction still need implementing.
+
+The existing journal provides exclusive ownership and cancellation-safe blocking
+writes. If the async caller disappears, the worker retains its claim until the
+write completes. A failed write fences that writer until reopening and recovery.
+Tests interrupt both paths and compare the recovered original evidence. Other
+tests reject lost history, changed enrolment identity and conflicting effective
+views without changing the checkpoint. Standalone recovery and fresh enablement
+refuse consumer evidence they cannot reconcile.
+
+The checkpoint schema advances to 2 and durable state to 33; protocol remains 19.
+Publication does not yet call this storage path. Connecting it before publication,
+recovering original exposures, confirming drainage and sending receipts remain
+separate work. A saved attempt alone grants no permission to reuse an address.
