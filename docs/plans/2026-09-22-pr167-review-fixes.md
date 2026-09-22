@@ -338,10 +338,12 @@ CI and release:
 
 Execution (grill):
 
-- [ ] **T2.4 The subreaper owner doesn't reap orphans while the workload runs.**
+- [x] **T2.4 The subreaper owner doesn't reap orphans while the workload runs.**
       `waitpid(-1)` only runs in `retire_children`
       (`src/grill/process_owner.rs:~584`), so double-forking workloads pile up
       zombies. Reap in the main loop (`:327-355`).
+      Done. Each tick peeks with `waitid(WNOWAIT)` and reaps exited orphans
+      by exact PID, leaving the root and exec helpers to their own waiters.
 - [ ] **T2.5 macOS has no boot identity.** `current_boot_id()`
       (`src/grill/process_owner.rs:132-149`) returns `None` off Linux, so a
       reboot leaves `Running` records failing with NotFound forever. Use the

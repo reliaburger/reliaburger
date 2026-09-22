@@ -337,6 +337,7 @@ fn run_locked_owner(directory: &Path, record: &mut OwnerRecord, _lock: File) -> 
             Err(error) if error.kind() == io::ErrorKind::WouldBlock => {}
             Err(error) => return Err(error),
         }
+        reap_orphans(owned.child.id(), &executions)?;
         if exit_code.is_none() {
             exit_code = observe_exit(owned.child.id())?;
         }
@@ -593,6 +594,47 @@ fn become_subreaper() -> io::Result<()> {
 
 #[cfg(target_os = "macos")]
 fn become_subreaper() -> io::Result<()> {
+    Ok(())
+}
+
+/// Reap exited orphans that the subreaper adopted while the workload runs.
+///
+/// A double-forking workload hands its grandchildren to this owner. Without
+/// reaping, each one stays a zombie until the whole generation retires. The
+/// root child and exec helpers are left alone: `observe_exit` and each
+/// execution still need their exit statuses, and reaping would discard them.
+#[cfg(target_os = "linux")]
+fn reap_orphans(root: u32, executions: &[exec::Execution]) -> io::Result<()> {
+    use nix::sys::wait::{Id, WaitPidFlag, waitid, waitpid};
+    loop {
+        // WNOWAIT only peeks, so a tracked child's status stays in place.
+        let flags = WaitPidFlag::WEXITED | WaitPidFlag::WNOHANG | WaitPidFlag::WNOWAIT;
+        let pid = match waitid(Id::All, flags) {
+            Ok(status) => status.pid(),
+            Err(nix::errno::Errno::ECHILD) => None,
+            Err(error) => return Err(error.into()),
+        };
+        let Some(pid) = pid else {
+            return Ok(());
+        };
+        let raw = pid.as_raw() as u32;
+        if raw == root
+            || executions
+                .iter()
+                .any(|execution| execution.child_id() == Some(raw))
+        {
+            // Its own waiter collects it this tick; orphans wait for the next.
+            return Ok(());
+        }
+        // Only this single-threaded owner reaps, so the peeked PID is still
+        // that exited orphan.
+        waitpid(pid, Some(WaitPidFlag::WNOHANG))?;
+    }
+}
+
+/// macOS has no subreaper, so launchd adopts and reaps orphaned descendants.
+#[cfg(target_os = "macos")]
+fn reap_orphans(_root: u32, _executions: &[exec::Execution]) -> io::Result<()> {
     Ok(())
 }
 

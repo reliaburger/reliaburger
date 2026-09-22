@@ -118,6 +118,12 @@ impl Execution {
         Ok(())
     }
 
+    /// The helper's PID while it remains this owner's unreaped child.
+    #[cfg(target_os = "linux")]
+    pub(super) fn child_id(&self) -> Option<u32> {
+        self.child.as_ref().map(Child::id)
+    }
+
     fn cancel(&self) -> io::Result<()> {
         if let Some(child) = &self.child {
             // This unreaped child is our helper, not a PID recovered from disk.

@@ -451,6 +451,46 @@ group, including zombies. Only then may it reap the root and publish retirement.
 The completion record carries the root's exit code; a signal termination has no
 exit code. An inspection or write failure leaves uncertainty in place.
 
+Our first owner only reaped during retirement, which was fine for a workload
+that runs once and exits. What about a shell loop that runs `(cleanup &)` every
+few seconds for a week? Each subshell exits straight away, its background child
+is orphaned to the owner, and when that child finishes it becomes a zombie
+nobody collects. A review found them piling up under long-lived owners. We
+can't just call `waitpid(-1)` in the main loop, though: it would happily reap
+the root child and throw away the exit code that `observe_exit` is waiting for,
+or steal an exec helper's status from its own `Child` handle. So each tick
+peeks first. `waitid` with `WNOWAIT` reports an exited child without consuming
+its status; if it's an orphan we reap that exact PID, and if it's the root or an
+exec helper we stop and leave it for its own waiter:
+
+```rust
+let Some(pid) = pid else {
+    return Ok(());
+};
+let raw = pid.as_raw() as u32;
+if raw == root
+    || executions
+        .iter()
+        .any(|execution| execution.child_id() == Some(raw))
+{
+    return Ok(());
+}
+```
+
+You've met let-else before. `child_id` is a one-liner,
+`self.child.as_ref().map(Child::id)`, where `map(Child::id)` passes the method
+itself as the function, a shorter spelling of `map(|child| child.id())`. Nothing else reaps the owner's children,
+so the peeked PID can't be recycled before we reap it. We first read the child
+list from `/proc/self/task/<pid>/children`, then found a Linux kernel built
+without `CONFIG_PROC_CHILDREN` that simply doesn't have that file; the peek
+needs nothing but the system call. macOS has no subreaper, so launchd adopts and
+reaps the orphans there and the function does nothing.
+
+The test starts exactly that shell loop, samples the owner's zombie children
+with `ps` for two seconds, then releases the loop and checks the record still
+carries its exit code of 5. On Linux the old owner collected 89 zombies in
+those two seconds.
+
 The actual-binary tests exercise these transitions, including stale clients,
 duplicate owners and failed completion writes. One test explicitly releases the
 parent while its child still has 30 seconds to run, then requires retirement

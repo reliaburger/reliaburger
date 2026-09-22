@@ -337,3 +337,48 @@ fn failed_terminal_persistence_does_not_publish_retirement() {
     .unwrap();
     assert_eq!(last["phase"]["state"], "running");
 }
+
+/// Zombie children of `parent`, read from `ps` so the check works on Linux and
+/// macOS alike.
+fn zombie_children(parent: u32) -> usize {
+    let output = Command::new("ps")
+        .args(["-A", "-o", "ppid=,stat="])
+        .output()
+        .unwrap();
+    String::from_utf8_lossy(&output.stdout)
+        .lines()
+        .filter_map(|line| {
+            let mut fields = line.split_whitespace();
+            Some((fields.next()?.parse::<u32>().ok()?, fields.next()?))
+        })
+        .filter(|(ppid, stat)| *ppid == parent && stat.starts_with('Z'))
+        .count()
+}
+
+#[test]
+fn owner_reaps_orphaned_descendants_while_the_workload_runs() {
+    let marker = tempfile::tempdir_in("/tmp").unwrap();
+    let release = marker.path().join("exit-parent");
+    // Each subshell backgrounds a short sleep and exits at once, so the sleep
+    // is orphaned to the subreaper owner, the way a double-forking daemon is.
+    let mut owner = Owner::start(&format!(
+        "while [ ! -f '{}' ]; do (sleep 0.01 &); sleep 0.02; done; exit 5",
+        release.display()
+    ));
+    owner.wait_phase("running");
+    let deadline = Instant::now() + Duration::from_secs(2);
+    let mut worst = 0;
+    while Instant::now() < deadline {
+        worst = worst.max(zombie_children(owner.child.id()));
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    // A zombie can exist for one owner tick before it is reaped. Dozens of
+    // orphans exit in two seconds, so an owner that never reaps fails here.
+    assert!(worst <= 3, "{worst} zombies piled up under the owner");
+    std::fs::write(release, "exit").unwrap();
+    let record = owner.wait_phase("retired");
+    assert_eq!(
+        record["phase"]["exit_code"], 5,
+        "reaping orphans lost the workload's own exit status"
+    );
+}
