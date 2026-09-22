@@ -2382,6 +2382,75 @@ fn persistent_policy_refuses_obsolete_destination_identity() {
 
 #[test]
 #[ignore = "requires Linux root and RELIABURGER_EBPF_TESTS=1"]
+fn persistent_policy_rebuilds_only_proven_prior_boot_empty_inventory() {
+    assert!(ebpf_tests_enabled());
+    let owned = OwnedPolicyFixture::new();
+    drop(owned.load().unwrap());
+    let path = owned.root.path().join("ownership/owner.json");
+    let original = std::fs::read(&path).unwrap();
+    let mut manifest: serde_json::Value = serde_json::from_slice(&original).unwrap();
+    assert_eq!(
+        manifest["boot_id"],
+        std::fs::read_to_string("/proc/sys/kernel/random/boot_id")
+            .unwrap()
+            .trim()
+    );
+    manifest["boot_id"] = "00000000-0000-0000-0000-000000000001".into();
+    std::fs::write(&path, serde_json::to_vec(&manifest).unwrap()).unwrap();
+    assert!(owned.load().is_err(), "prior-boot claim accepted live pins");
+    assert_eq!(
+        serde_json::from_slice::<serde_json::Value>(&std::fs::read(&path).unwrap()).unwrap(),
+        manifest
+    );
+    // Only this fixture's pins are removed, simulating whole-kernel loss.
+    for entry in std::fs::read_dir(&owned.pin).unwrap() {
+        std::fs::remove_file(entry.unwrap().path()).unwrap();
+    }
+    std::fs::write(&path, &original).unwrap();
+    assert!(
+        owned.load().is_err(),
+        "same-boot absence authorised recreation"
+    );
+    manifest["cgroup_id"] = 0.into();
+    std::fs::write(&path, serde_json::to_vec(&manifest).unwrap()).unwrap();
+    let loader = owned.load().unwrap();
+    assert!(
+        loader.is_attached()
+            && loader.connect6_attached()
+            && loader.sendmsg4_attached()
+            && loader.sendmsg6_attached()
+    );
+    let recovered: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+    assert_eq!(
+        recovered["boot_id"],
+        std::fs::read_to_string("/proc/sys/kernel/random/boot_id")
+            .unwrap()
+            .trim()
+    );
+    assert_ne!(recovered["cgroup_id"], 0);
+    drop(loader);
+}
+
+#[test]
+#[ignore = "requires Linux root and RELIABURGER_EBPF_TESTS=1"]
+fn persistent_policy_refuses_missing_or_malformed_boot_identity() {
+    assert!(ebpf_tests_enabled());
+    let owned = OwnedPolicyFixture::new();
+    drop(owned.load().unwrap());
+    let path = owned.root.path().join("ownership/owner.json");
+    let original = std::fs::read(&path).unwrap();
+    for boot in [serde_json::Value::Null, serde_json::json!("invalid")] {
+        let mut manifest: serde_json::Value = serde_json::from_slice(&original).unwrap();
+        manifest["boot_id"] = boot;
+        std::fs::write(&path, serde_json::to_vec(&manifest).unwrap()).unwrap();
+        assert!(owned.load().is_err());
+    }
+    std::fs::write(path, original).unwrap();
+}
+
+#[test]
+#[ignore = "requires Linux root and RELIABURGER_EBPF_TESTS=1"]
 fn persistent_policy_recovers_partial_startup_and_interrupted_retirement() {
     assert!(ebpf_tests_enabled());
     let owned = OwnedPolicyFixture::new();

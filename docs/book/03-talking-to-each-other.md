@@ -2300,3 +2300,27 @@ invalid node identity, invalid execution identity, conflicting original ownershi
 and exhausted capacity. `thiserror` supplies the human-readable error from each
 variant's `#[error(...)]` attribute. The Raft boundary converts it to a refusal
 message; the library keeps the reason typed until that boundary.
+
+
+### Rebooting the kernel owner
+
+Suppose Bun dies while a container is still serving requests. Its pinned maps
+and cgroup links must stay alive until the next Bun recovers them. Now suppose
+the whole machine loses power. Those same objects disappear with the kernel.
+An empty pin directory means different things in these two cases.
+
+The kernel manifest records the Linux boot UUID before creating maps or links.
+On the same boot we require the original cgroup identity and complete active
+inventory. Missing pins are an error. On a different, positively identified
+boot we require an empty pin directory and unchanged ownership paths. Any live
+pin refuses recovery: the old manifest cannot authorise changing a new kernel's
+objects. We write the new boot and `Preparing` phase before rebuilding. A second
+crash can then resume that preparation. `Retiring` and `Retired` remain terminal
+for loading, even across a reboot.
+
+The comparison uses Rust's exhaustive `matches!` expression for the two phases
+that allow reconstruction. The manifest's `String` boot identity is required by
+Serde, so missing or malformed evidence cannot silently become permission.
+This is kernel absence evidence only. Durable discovery and remote withdrawal
+obligations live on disk and must still be reconciled before publication or
+address reuse. A reboot doesn't erase another node's open request.

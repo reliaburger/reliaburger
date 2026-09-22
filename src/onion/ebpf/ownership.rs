@@ -22,6 +22,7 @@ const ATTACH_TYPES: [u32; 4] = [10, 11, 14, 15];
 #[serde(deny_unknown_fields)]
 struct Manifest {
     version: u32,
+    boot_id: String,
     state_directory: PathBuf,
     pin_directory: PathBuf,
     cgroup_path: PathBuf,
@@ -109,7 +110,9 @@ fn claim(
     }
     let cgroup_path = std::fs::canonicalize(cgroup_path)?;
     let mut manifest = Manifest {
-        version: 2,
+        version: 3,
+        boot_id: crate::grill::process_owner::current_boot_id()?
+            .ok_or_else(|| io::Error::other("kernel boot identity is unavailable"))?,
         cgroup_id: crate::sesame::egress::cgroup_id_of_path(&cgroup_path)
             .ok_or_else(|| io::Error::other("cannot identify ownership cgroup"))?,
         cgroup_path,
@@ -139,8 +142,40 @@ fn claim(
             }
             let original: Manifest = serde_json::from_slice(&bytes)?;
             manifest.phase = original.phase;
-            if original != manifest {
+            if original.version != manifest.version
+                || !crate::grill::process_owner::valid_boot_id(&original.boot_id)
+                || original.state_directory != manifest.state_directory
+                || original.pin_directory != manifest.pin_directory
+                || original.cgroup_path != manifest.cgroup_path
+            {
                 return Err(io::Error::other("kernel ownership configuration changed"));
+            }
+            if original.boot_id == manifest.boot_id {
+                if original.cgroup_id != manifest.cgroup_id {
+                    return Err(io::Error::other("kernel ownership cgroup changed"));
+                }
+            } else {
+                // A changed, positively read boot UUID proves the old kernel is
+                // gone. It does not authorise touching objects in the new kernel.
+                if std::fs::read_dir(&manifest.pin_directory)?
+                    .next()
+                    .transpose()?
+                    .is_some()
+                {
+                    return Err(io::Error::other(
+                        "prior-boot kernel ownership has live pins",
+                    ));
+                }
+                if matches!(original.phase, Phase::Preparing | Phase::Active) {
+                    manifest.phase = Phase::Preparing;
+                }
+                // Commit the new boot before creating anything. Interrupted
+                // recreation resumes as Preparing under the same exclusive lock.
+                crate::sesame::identity::atomic_write_mode(
+                    &path,
+                    &serde_json::to_vec(&manifest)?,
+                    Some(0o600),
+                )?;
             }
         }
         Err(error) if error.kind() == io::ErrorKind::NotFound => {
