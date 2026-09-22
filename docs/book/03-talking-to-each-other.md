@@ -2478,3 +2478,15 @@ address until every registered consumer has confirmed. A remaining remote replic
 can still publish the original service after this worker removes its local copy.
 The regression holds a remote request guard across local retirement and proves
 both the refusal and the subsequent successful remote publication.
+
+### Rootless execution evidence
+
+A rootless container forwards a host port through its userspace network helper.
+It has no address lease in the rootful bridge pool. Requiring that kind of lease
+would make every rootless recovery fail; accepting an instance name alone could
+mistake a replacement for the original execution. We persist the original runtime
+generation for these published backends instead. Recovery compares the generation,
+service identity and both ports with the original runtime intent. Missing or
+replaced intent refuses recovery. The optional `BTreeMap<String, RuntimeGeneration>`
+uses sorted instance keys, keeping serialised evidence deterministic. An existing
+publication cannot replace its witness without withdrawing that backend first.

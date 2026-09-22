@@ -240,7 +240,7 @@ permanent execution fences reject stale reports. Clustered production activation
 service VIP retirement and final release qualification remain open.
 
 0.1.0 requires a fresh cluster; development state is refused. Rolling upgrades
-require matching explicit formats (currently protocol 20 and state 38). See the
+require matching explicit formats (currently protocol 20 and state 39). See the
 [compatibility policy](releasing.md#cluster-compatibility).
 
 Lease-owned test volumes and generated configuration have durable provisioning

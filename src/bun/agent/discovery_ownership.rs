@@ -54,11 +54,36 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
         services: &crate::onion::service_map::ServiceMap,
     ) -> Result<(), BunError> {
         use crate::bun::discovery_owners::{ServiceOwner, ServicePhase};
+        if matches!(self.discovery_ownership, DiscoveryOwnership::Disabled) {
+            return Ok(());
+        }
+        let launches = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            self.supervisor.grill().launch_inventory(),
+        )
+        .await
+        .map_err(|_| BunError::AdoptionState("publication runtime inventory timed out".into()))??;
         self.update_discovery_inventory(id, |next| {
             // Absence from the candidate is not withdrawal proof. Preserve
             // earlier allocations until their confirmed retirement removes them.
             for entry in services.resolve_all() {
                 let owner = ServiceOwner {
+                    executions: entry
+                        .backends
+                        .iter()
+                        .filter_map(|backend| {
+                            launches
+                                .as_ref()?
+                                .iter()
+                                .find(|launch| {
+                                    launch.instance_id.0 == backend.instance_id
+                                        && launch.network_reference.is_none()
+                                })
+                                .map(|launch| {
+                                    (backend.instance_id.clone(), launch.generation.clone())
+                                })
+                        })
+                        .collect(),
                     entry: entry.clone(),
                     phase: ServicePhase::Owned,
                 };
@@ -186,6 +211,7 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
                         .entry
                         .backends
                         .retain(|backend| backend.instance_id != reference.instance_id.0);
+                    owner.executions.remove(&reference.instance_id.0);
                 }
             }
             for owner in &mut next.references {
@@ -290,6 +316,7 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
                     && owner.entry.app_name == service.name
                 {
                     owner.entry.backends.clear();
+                    owner.executions.clear();
                     owner.phase = ServicePhase::Withdrawn;
                 }
             }

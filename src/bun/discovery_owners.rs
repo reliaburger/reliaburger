@@ -30,6 +30,9 @@ pub enum ServicePhase {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ServiceOwner {
+    /// Original executions for backends without a rootful network address hold.
+    #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    pub executions: std::collections::BTreeMap<String, crate::grill::RuntimeGeneration>,
     /// Original allocated VIP, port, destination identity and attempted backends.
     pub entry: ServiceEntry,
     /// Withdrawal evidence established by the publisher, not inferred by this store.
@@ -200,12 +203,30 @@ impl DiscoveryJournal {
         }
         for service in &next.services {
             for backend in &service.entry.backends {
-                if !next.references.iter().any(|owner| {
-                    owner.reference.instance_id.0 == backend.instance_id
-                        && owner.service.namespace == service.entry.namespace
-                        && owner.service.name == service.entry.app_name
-                        && owner.phase == ReferencePhase::Held
-                }) {
+                let execution_matches = service
+                    .executions
+                    .get(&backend.instance_id)
+                    .zip(by_instance.get(&crate::grill::InstanceId(backend.instance_id.clone())))
+                    .is_some_and(|(generation, launch)| {
+                        launch.network_reference.is_none()
+                            && launch.generation == *generation
+                            && launch.spec.port_mapping.is_some_and(|mapping| {
+                                mapping.host_port == backend.host_port
+                                    && mapping.container_port == service.entry.port
+                            })
+                            && service_for_launch(&next, launch).is_ok_and(|id| {
+                                id.namespace == service.entry.namespace
+                                    && id.name == service.entry.app_name
+                            })
+                    });
+                if !execution_matches
+                    && !next.references.iter().any(|owner| {
+                        owner.reference.instance_id.0 == backend.instance_id
+                            && owner.service.namespace == service.entry.namespace
+                            && owner.service.name == service.entry.app_name
+                            && owner.phase == ReferencePhase::Held
+                    })
+                {
                     return Err(io::Error::other(
                         "published backend has no original runtime hold",
                     ));
@@ -392,7 +413,7 @@ fn read_checkpoint(directory: &Path) -> io::Result<DiscoveryInventory> {
         return Err(io::Error::other("discovery checkpoint exceeds size limit"));
     }
     let checkpoint: Checkpoint = serde_json::from_slice(&bytes)?;
-    if checkpoint.schema != 3 {
+    if checkpoint.schema != 4 {
         return Err(io::Error::other("unsupported discovery checkpoint schema"));
     }
     validate(&checkpoint.inventory)?;
@@ -401,7 +422,7 @@ fn read_checkpoint(directory: &Path) -> io::Result<DiscoveryInventory> {
 
 fn write_checkpoint(directory: &Path, inventory: &DiscoveryInventory) -> io::Result<()> {
     let bytes = serde_json::to_vec(&Checkpoint {
-        schema: 3,
+        schema: 4,
         inventory: inventory.clone(),
     })?;
     if bytes.len() as u64 > LIMIT {
@@ -438,6 +459,19 @@ fn validate(inventory: &DiscoveryInventory) -> io::Result<()> {
         return Err(io::Error::other(
             "withdrawn service still contains backends",
         ));
+    }
+    for owner in &inventory.services {
+        if owner.executions.keys().any(|id| {
+            !owner
+                .entry
+                .backends
+                .iter()
+                .any(|backend| &backend.instance_id == id)
+        }) {
+            return Err(io::Error::other(
+                "execution witness has no published backend",
+            ));
+        }
     }
     let mut instances = std::collections::HashSet::new();
     let mut allocations = std::collections::HashSet::new();
@@ -501,6 +535,21 @@ fn validate_transition(previous: &DiscoveryInventory, next: &DiscoveryInventory)
         .collect();
     for original in &previous.services {
         let id = ServiceId::new(&original.entry.namespace, &original.entry.app_name);
+        if let Some(successor) = services.get(&id) {
+            for (instance, generation) in &original.executions {
+                if successor
+                    .entry
+                    .backends
+                    .iter()
+                    .any(|backend| &backend.instance_id == instance)
+                    && successor.executions.get(instance) != Some(generation)
+                {
+                    return Err(io::Error::other(
+                        "published execution changed without withdrawal",
+                    ));
+                }
+            }
+        }
         match services.get(&id) {
             Some(successor)
                 if successor.entry.vip == original.entry.vip
@@ -663,7 +712,7 @@ mod tests {
         assert!(DiscoveryJournal::open(&path).is_err());
         let wire: serde_json::Value =
             serde_json::from_slice(&std::fs::read(path.join(CHECKPOINT)).unwrap()).unwrap();
-        assert_eq!(wire["schema"], 3);
+        assert_eq!(wire["schema"], 4);
     }
 
     #[test]
@@ -912,7 +961,7 @@ mod tests {
             .unwrap();
         DiscoveryInventory {
             consumer: None,
-            services: vec![ServiceOwner { entry: services.resolve(&id).unwrap().clone(), phase: ServicePhase::Owned }],
+            services: vec![ServiceOwner { executions: Default::default(), entry: services.resolve(&id).unwrap().clone(), phase: ServicePhase::Owned }],
             references: vec![ReferenceOwner {
                 service: id.clone(),
                 reference: serde_json::from_value(serde_json::json!({
@@ -948,6 +997,39 @@ mod tests {
             spec,
             network_reference: Some(reference),
         }
+    }
+
+    #[test]
+    fn recovery_correlates_rootless_publications_to_original_execution_generations() {
+        let root = tempfile::tempdir().unwrap();
+        let mut journal = DiscoveryJournal::open(&root.path().join("owners")).unwrap();
+        let mut saved = inventory();
+        let reference = saved.references.remove(0).reference;
+        let mut launch = runtime_launch(crate::grill::runc_intent::NetworkReferenceState::Held(
+            reference,
+        ));
+        launch.network_reference = None;
+        let owner = &mut saved.services[0];
+        owner
+            .entry
+            .backends
+            .push(crate::onion::types::BackendInstance {
+                instance_id: launch.instance_id.0.clone(),
+                node_ip: "127.0.0.1".parse().unwrap(),
+                host_port: 20000,
+                healthy: true,
+            });
+        owner
+            .executions
+            .insert(launch.instance_id.0.clone(), launch.generation.clone());
+        journal.save(saved).unwrap();
+        journal
+            .reconcile_runtime_inventory(std::slice::from_ref(&launch))
+            .unwrap();
+        let mut changed = launch.clone();
+        changed.generation = crate::grill::RuntimeGeneration::runc("replacement");
+        assert!(journal.reconcile_runtime_inventory(&[changed]).is_err());
+        assert!(journal.reconcile_runtime_inventory(&[]).is_err());
     }
 
     #[test]
