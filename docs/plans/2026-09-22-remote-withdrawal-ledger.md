@@ -224,3 +224,9 @@ The fence is in memory; recovery must restore it from original consumer evidence
 before new publication. Ingress can change independently at the same catalogue
 generation, so its ordering and original exposure history remain separate work.
 No new withdrawal receipt or release authority is enabled by this change.
+
+The fence is committed as `edf551a`. Native/Linux qualification passes 490/502
+affected library cases (18.398s/32.257s), thirteen integration cases each
+(5.121s/5.053s), three real failover/decommission cases each (71.409s/71.044s),
+strict all-target/all-feature Clippy and formatting. Both pipelines are reaped.
+Evidence: `/tmp/rb-consumer-generation-{red,focused,native,linux}.log`.
