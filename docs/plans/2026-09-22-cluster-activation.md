@@ -19,3 +19,13 @@ Continue PR167 on the current branch, one commit per fix or feature.
    Run focused failing-first regressions, affected platform checks and relevant
    real runtime/kernel tests. Update progress, README, book and handoff as each
    piece is committed. Keep V01–V04 open until their separate acceptance evidence.
+
+## Checkpoint
+
+Steps 1–4 are implemented and physically qualified for enrolled rootful Runc/eBPF
+clusters and standalone rootless Runc. See `docs/progress.md` for individual commits
+and evidence. Three enrolled nodes preserve workload and kernel ownership through
+six controlled binary swaps and final remote cleanup. Rootless cluster scope is
+still pending; generation-bound host-port release permission is required if it is
+included. Platform validation and managed bpffs startup pass; final hosted validation
+remains separate. V01–V04 remain independent release gates.

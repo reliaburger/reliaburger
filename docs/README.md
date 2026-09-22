@@ -19,57 +19,29 @@ reconciles the older TODOs, records remaining correctness gaps and separates
 release acceptance from deferred capabilities. The current checklist lives in
 [progress.md](progress.md).
 
-The opt-in durable Runc adapter now covers rootful and rootless Linux containers.
-Its rootful service path now retains a durable, generation-bound address reference
-across natural exit. Checked discovery withdrawal permits reuse; lost original
-discovery ownership refuses cleanup. If live policy is lost and backend withdrawal
-fails, the owned path stops execution while retaining the address and cleanup
-records. Exact service snapshot restoration and a durable discovery checkpoint
-now preserve original allocations and cleanup permissions. An opt-in fresh Bun
-agent journals publication and original address holds before launch. Standalone
-Stop and automatic retry persist release permission before returning addresses;
-confirmed service retirement removes its durable owner before freeing the VIP.
-Original runtime/discovery correlation checks generations, allocations and cgroup
-identity, including a hold saved before discovery acknowledgement. Opt-in
-standalone startup recovery reserves original allocations, replays release
-permissions and publishes only positively adopted runtimes with fresh health
-checks. Remote acknowledgements, actual Bun/host crash qualification and
-production selection remain open. Journal I/O runs on blocking workers that
-retain exclusive ownership through caller cancellation.
-Rolling and blue-green cutovers now confirm kernel backend publication before
-exposing replacements in DNS and ingress; refusal preserves the original routing view.
-Fresh deployments also stop before workload creation when initial service publication fails.
-Health updates reach DNS and ingress after kernel confirmation; refused withdrawal
-blocks restart and retries on later probes. Backend-capacity failures report a
-failed deployment while retaining created workloads for cleanup.
-Rootful and rootless recovery tests cover caller death before adoption, short
-jobs, published ports and interrupted network-helper startup.
-Rootless networking is ready before the workload starts. Command waits retry
-transient owner-control failures within their original deadline; losing a status
-response never counts as confirmed retirement. Production selection
-and discovery recovery remain release blockers
-in the [OCI ownership plan](plans/2026-09-20-oci-launch-ownership.md).
+Normal Linux Runc startup selects durable ownership for rootful nodes with
+`[ebpf] enabled = true`, including enrolled clusters, and for standalone rootless
+nodes. Rootful policy recovery requires an eBPF-enabled binary and bpffs at
+`/sys/fs/bpf`. Cluster recovery binds consumers to their enrolled node ID and root
+CA and requires the cluster service key. Changing runtime or enforcement mode
+cannot bypass existing ownership; uncertain recovery prevents readiness.
 
-Workers exclude their own advertised endpoints using their configured node identity,
-even before council membership arrives. Delayed catalogues cannot restore a locally
-retired endpoint in DNS, resolve responses or ingress routing. Remote retirement
-acknowledgements and durable discovery ownership remain release work.
+Before publication, Bun records the original execution, service allocation and
+kernel policy. Retirement preserves these records until runtime exit, local
+withdrawal and required remote confirmations succeed. Receipts survive crashes
+and retry against the current authenticated leader. Repeated local withdrawal is
+idempotent; an absent local backend does not authorise address reuse. DNS and
+ingress updates wait for confirmed kernel publication, and captured requests
+must release their guards before consumer withdrawal completes.
 
-Egress cleanup now retains the stopped workload's binding and adoption record
-until the kernel confirms removal. Failed policy rewrites stop affected workloads;
-repeated cleanup failures remain retryable. An opt-in persistent kernel loader
-now keeps policy through actual loader SIGKILL and recovers the same maps without
-a detach window. The agent now records original workload policy before map
-writes and restores it before adoption; cleanup retains positive retirement
-evidence until metadata is gone. Network rules, diagnostics and adoption now use
-the container’s verified original cgroup. All 78 physical kernel tests pass.
-Standalone rootful startup now recovers durable kernel/discovery ownership,
-including after a host reboot. Clustered/rootless activation and actual
-upgrade/rollback qualification remain release gates. Automatic application restarts now retire the
-predecessor’s adoption and policy records before creating a successor; failed
-cleanup blocks replacement while preserving the logical workload identity.
-Rolling and blue-green generations now use separate cgroups, so retiring the
-predecessor preserves the running replacement.
+Actual Linux qualification covers standalone host reboot, enrolled clustered
+publication/adoption/retirement, rootless forwarding recovery, signed upgrades,
+explicit rollback and failed-candidate automatic revert. Three enrolled OCI nodes
+also preserve the original workload and kernel ownership through six controlled
+binary swaps and final remote cleanup. Full independent-host acceptance, sustained
+qualification and the signed cold-install matrix remain release gates. Rootless
+qualification currently covers standalone host-port forwarding; it does not claim
+eBPF policy, workload DNS or qualified rootless clusters.
 
 Log exports now preserve content generations, scope receipts to the destination,
 and serialise durable checkpoint updates across agent and offline exports. Source
@@ -92,7 +64,7 @@ the proposed service entry. Failed retirement does not establish that execution
 stopped. Natural-exit address holds and standalone discovery recovery are qualified.
 Service retirement now confirms removal of grants to its exact allocated VIP before
 releasing that destination. Refusal retains the service and its cleanup owner;
-unrelated destination grants remain untouched. Clustered production activation remains open.
+unrelated destination grants remain untouched. Enrolled rootful cluster retirement is qualified; final release acceptance remains open.
 Failed final kernel backend publication now reports a deployment error and retains
 the running workload’s ownership for cleanup or retry.
 Before signalling an old instance, the rollout fences the periodic restart and
@@ -236,8 +208,8 @@ Recovery starts with empty views under the original enrolled identity. Ready cle
 receipts survive crashes and retry against the current authenticated leader until
 positively acknowledged. This conservative path can briefly interrupt routing during
 updates. Producer allocations remain held until committed consumer confirmation;
-permanent execution fences reject stale reports. Clustered production activation,
-service VIP retirement and final release qualification remain open.
+permanent execution fences reject stale reports. Normal enrolled rootful startup and confirmed service VIP retirement are implemented;
+final release qualification remains open.
 
 0.1.0 requires a fresh cluster; development state is refused. Rolling upgrades
 require matching explicit formats (currently protocol 20 and state 39). See the
@@ -1431,23 +1403,8 @@ release. It does not close the remaining release gates in the
 [remaining-work table](plans/2026-09-22-v0.1.0-remaining-work.md).
 
 
-Standalone rootful Linux Runc nodes with `[ebpf] enabled = true` now select owned
-runtime execution, persistent kernel maps/links and durable discovery recovery
-on normal startup. This requires an eBPF-enabled binary and mounted bpffs at
-`/sys/fs/bpf`. State lives under the configured data directory; changing runtime
-mode or disabling enforcement cannot bypass that ownership. Kernel or discovery
-recovery failures prevent readiness. Durable consumer recovery and receipt retry are
-implemented at the agent/reconciler boundary; clustered production activation and
-upgrade/rollback qualification remain release blockers.
 
 The complete standalone path is qualified by
 `scripts/release/qualify-discovery-reboot.sh --vm DISPOSABLE_LIMA_VM`. It retains
 Bun/test executable checksums and original discovery obligations through a real
 power-cut, then verifies retirement, explicit redeployment and same-boot adoption.
-
-Normal Linux Runc startup now recovers durable discovery on rootful nodes with
-`[ebpf] enabled = true`, including enrolled clusters, and on standalone rootless
-nodes. Cluster recovery requires the enrolled identity and cluster service key.
-Rootless mode provides owned host-port forwarding; it does not provide eBPF policy
-or workload DNS. Actual rootless process/port recovery and enrolled cluster startup
-pass; full clustered lifecycle and upgrade qualification remain release work.
