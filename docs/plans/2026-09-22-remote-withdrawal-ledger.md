@@ -83,9 +83,29 @@ Clippy and formatting. The request/log shape advances compatibility to protocol
 17/state 31. Continue generation-bound consumer instructions and authenticated
 receipts.
 
-Consumer-specific instructions are implemented, pending qualification. The
+Consumer-specific instructions are complete (`8aa0163`). The
 placement response carries required generation, catalogue and instruction fields;
 only the requesting consumer's obligations are included. Late enrolment doesn't
 inherit older withdrawals, and reads don't acknowledge them. Two contracts fail
-first (0.115s); platform checks follow. Protocol 18/state 31. Authenticated
-receipts and durable consumer/producer integration remain separate.
+first (0.115s); both focused tests pass (0.057s). Native/Linux pass 402/414
+affected library cases, ten agent/compatibility cases each, real cross-node
+discovery through leader replacement and strict Clippy/formatting. Protocol
+18/state 31. Authenticated receipts and durable consumer/producer integration remain separate.
+
+### Next receipt boundary
+
+The receipt endpoint must require both system authority and the current TLS node
+identity, validated against a linearizable security read. Derive the consumer
+identity from the certificate; don't trust a caller-supplied node name or forward
+through a follower's certificate. A plaintext development registration confers no
+permission to discharge obligations. Only a confirmed Raft result can acknowledge
+completion; timeout, cancellation or write refusal retains uncertainty.
+
+Each receipt names one original withdrawal generation. Applying it removes only
+that consumer from that generation, retaining the registration and every other
+generation/consumer. Raft must reject retired or unregistered identities and
+current/future generations. Define retry behaviour explicitly: an already absent
+historical obligation may return success without changing state, because generation
+identities never repeat. This must not be used as evidence that any current or
+later publication has drained. Tests must cover replay after snapshot, late
+readers, wrong identities, missing/revoked TLS credentials and unavailable leaders.
