@@ -2344,3 +2344,20 @@ checks that lost discovery evidence and disabled enforcement refuse readiness.
 Cluster consumers need an additional recovery step: restoring their original
 remote exposures and sending durable withdrawal receipts. Standalone activation
 doesn't enable that unfinished path.
+
+
+`scripts/release/qualify-discovery-reboot.sh --vm DISPOSABLE_LIMA_VM` tests the
+whole standalone startup path across an abrupt VM stop. It leaves a real Bun and
+published container alive, records the kernel manifest and original discovery
+reference, and verifies the same Bun/test binary checksums after boot. Recovery
+must observe a different boot UUID and absent pins, preserve the on-disk
+obligations, retire the interrupted execution with unknown outcome, and clear its
+old service before readiness. An explicit redeployment runs once; the earlier
+release reference cannot free the successor's address. We then restart Bun once
+more to prove same-boot adoption still works after reboot recovery.
+
+The fixture reads the atomic discovery checkpoint rather than competing with
+Bun's runtime polling. Its isolated network namespace also needs a fresh
+`/run/netns` mount point after boot. These are test prerequisites, not recovery
+permissions. The driver retains checksums, phase logs and original ownership
+proofs under `/var/tmp` in the guest.

@@ -483,3 +483,150 @@ async fn assert_startup_refused(root: &Path, expected: &str) {
     );
     assert!(!stderr.contains("API server listening"));
 }
+
+#[cfg(feature = "ebpf")]
+#[tokio::test]
+#[ignore = "run through scripts/release/qualify-discovery-reboot.sh on a disposable VM"]
+async fn actual_bun_kernel_discovery_host_reboot() {
+    let Ok(directory) = std::env::var("RELIABURGER_DISCOVERY_REBOOT_DIRECTORY") else {
+        return;
+    };
+    let root = Path::new(&directory);
+    let name = format!(
+        "reboot-{}",
+        root.file_name()
+            .unwrap()
+            .to_str()
+            .unwrap()
+            .rsplit('.')
+            .next()
+            .unwrap()
+            .to_ascii_lowercase()
+    );
+    let name = name.as_str();
+    let boot = std::fs::read_to_string("/proc/sys/kernel/random/boot_id").unwrap();
+    match std::env::var("RELIABURGER_REBOOT_PHASE").unwrap().as_str() {
+        "prepare" => {
+            assert!(!root.join("proof.json").exists());
+            durable_fixture(root);
+            let node = Node::start(root).await;
+            node.client.apply(&durable_app(name)).await.unwrap();
+            wait_file(&root.join("shared/main")).await;
+            let discovery: serde_json::Value = serde_json::from_slice(
+                &std::fs::read(root.join("data/discovery/discovery.json")).unwrap(),
+            )
+            .unwrap();
+            let reference: reliaburger::grill::runc_intent::NetworkReference =
+                serde_json::from_value(
+                    discovery["inventory"]["references"]
+                        .as_array()
+                        .unwrap()
+                        .iter()
+                        .find(|owner| {
+                            owner["reference"]["instance_id"] == format!("default__{name}-0")
+                        })
+                        .unwrap()["reference"]
+                        .clone(),
+                )
+                .unwrap();
+            assert_eq!(
+                discovery["inventory"]["services"].as_array().unwrap().len(),
+                1
+            );
+            assert_eq!(kernel_manifest(root)["boot_id"], boot.trim());
+            std::fs::write(
+                root.join("proof.json"),
+                serde_json::to_vec(&serde_json::json!({
+                    "boot": boot, "kernel": kernel_manifest(root), "discovery": discovery,
+                    "reference": reference
+                }))
+                .unwrap(),
+            )
+            .unwrap();
+            // Keep the actual Bun and workload alive for the external power-cut.
+            // File-backed stdout survives this test process exiting.
+            std::mem::forget(node);
+        }
+        "verify" => {
+            let proof: serde_json::Value =
+                serde_json::from_slice(&std::fs::read(root.join("proof.json")).unwrap()).unwrap();
+            assert_ne!(
+                proof["boot"].as_str().unwrap(),
+                boot,
+                "kernel never rebooted"
+            );
+            let pins = Path::new(proof["kernel"]["pin_directory"].as_str().unwrap());
+            assert!(!pins.exists(), "original kernel pins survived reboot");
+            let reference: reliaburger::grill::runc_intent::NetworkReference =
+                serde_json::from_value(proof["reference"].clone()).unwrap();
+            assert!(!reliaburger::grill::netns::namespace_path(&reference.instance_id).exists());
+            assert_eq!(
+                serde_json::from_slice::<serde_json::Value>(
+                    &std::fs::read(root.join("data/discovery/discovery.json")).unwrap()
+                )
+                .unwrap(),
+                proof["discovery"],
+                "reboot erased durable discovery obligations"
+            );
+            let mut node = Node::start(root).await;
+            assert_eq!(kernel_manifest(root)["boot_id"], boot.trim());
+            assert!(
+                node.client.status().await.unwrap().is_empty(),
+                "old runtime was republished"
+            );
+            assert_eq!(
+                runtime(root).state(&reference.instance_id).await.unwrap(),
+                ContainerState::Stopped
+            );
+            assert_eq!(runtime(root).exit_code(&reference.instance_id).await, None);
+            assert_eq!(
+                std::fs::read_to_string(root.join("shared/main")).unwrap(),
+                "main\n"
+            );
+            let discovery: serde_json::Value = serde_json::from_slice(
+                &std::fs::read(root.join("data/discovery/discovery.json")).unwrap(),
+            )
+            .unwrap();
+            assert!(
+                discovery["inventory"]["services"]
+                    .as_array()
+                    .unwrap()
+                    .is_empty()
+            );
+            assert!(
+                discovery["inventory"]["references"]
+                    .as_array()
+                    .unwrap()
+                    .is_empty()
+            );
+            node.client.apply(&durable_app(name)).await.unwrap();
+            tokio::time::timeout(Duration::from_secs(10), async {
+                while std::fs::read_to_string(root.join("shared/main")).unwrap() != "main\nmain\n" {
+                    tokio::time::sleep(Duration::from_millis(20)).await;
+                }
+            })
+            .await
+            .unwrap();
+            node.crash().await;
+            assert!(
+                runtime(root)
+                    .release_network_reference(&reference)
+                    .await
+                    .is_err(),
+                "old release reached a successor"
+            );
+            let mut node = Node::start(root).await;
+            node.client.stop(name, "default").await.unwrap();
+            node.crash().await;
+            retire_kernel(root);
+            std::fs::write(root.join("verified-boot"), boot).unwrap();
+        }
+        "cleanup" => {
+            let mut node = Node::start(root).await;
+            assert!(node.client.status().await.unwrap().is_empty());
+            node.crash().await;
+            retire_kernel(root);
+        }
+        phase => panic!("unknown reboot phase {phase}"),
+    }
+}
