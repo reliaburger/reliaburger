@@ -1426,3 +1426,12 @@ kernel boot. This deliberately interrupts every process in the selected VM. The
 rootful runtime qualification passed, including address retention until explicit
 release. It does not close the remaining release gates in the
 [remaining-work table](plans/2026-09-22-v0.1.0-remaining-work.md).
+
+
+Standalone rootful Linux Runc nodes with `[ebpf] enabled = true` now select owned
+runtime execution, persistent kernel maps/links and durable discovery recovery
+on normal startup. This requires an eBPF-enabled binary and mounted bpffs at
+`/sys/fs/bpf`. State lives under the configured data directory; changing runtime
+mode or disabling enforcement cannot bypass that ownership. Kernel or discovery
+recovery failures prevent readiness. Clustered consumer recovery and production
+activation remain release blockers.

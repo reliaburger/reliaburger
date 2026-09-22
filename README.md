@@ -376,3 +376,12 @@ permissions before applying changes; see the [user guide](docs/README.md).
 ## Licence
 
 [Apache 2.0](LICENSE)
+
+
+Standalone rootful Linux Runc nodes with `[ebpf] enabled = true` now select owned
+runtime execution, persistent kernel maps/links and durable discovery recovery
+on normal startup. This requires an eBPF-enabled binary and mounted bpffs at
+`/sys/fs/bpf`. State lives under the configured data directory; changing runtime
+mode or disabling enforcement cannot bypass that ownership. Kernel or discovery
+recovery failures prevent readiness. Clustered consumer recovery and production
+activation remain release blockers.

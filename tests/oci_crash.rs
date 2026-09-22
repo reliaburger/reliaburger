@@ -23,16 +23,14 @@ impl Node {
             .append(true)
             .open(&log)
             .unwrap();
-        let mut child = tokio::process::Command::new(env!("CARGO_BIN_EXE_bun"))
+        let mut command = tokio::process::Command::new(env!("CARGO_BIN_EXE_bun"));
+        if !root.join("production").exists() {
+            command.arg("--experimental-owned-runc");
+        }
+        let mut child = command
             .arg("--config")
             .arg(root.join("node.toml"))
-            .args([
-                "--listen",
-                "127.0.0.1:0",
-                "--runtime",
-                "runc",
-                "--experimental-owned-runc",
-            ])
+            .args(["--listen", "127.0.0.1:0", "--runtime", "runc"])
             .env(
                 "PATH",
                 format!(
@@ -347,4 +345,141 @@ registry_port = 0
             "qualified {phase}: interrupted request, actual Bun death, recovery and explicit retry"
         );
     }
+}
+
+#[cfg(feature = "ebpf")]
+fn durable_fixture(root: &Path) {
+    install_wrappers(root);
+    std::fs::write(root.join("production"), "normal startup").unwrap();
+    std::fs::write(root.join("phase"), "none").unwrap();
+    std::fs::write(
+        root.join("node.toml"),
+        format!(
+            r#"
+[storage]
+data = "{root}/data"
+images = "{root}/images"
+logs = "{root}/logs"
+metrics = "{root}/metrics"
+volumes = "{root}/volumes"
+[images]
+registry_bind = "127.0.0.1"
+registry_port = 0
+[ebpf]
+enabled = true
+"#,
+            root = root.display()
+        ),
+    )
+    .unwrap();
+}
+
+#[cfg(feature = "ebpf")]
+fn durable_app(name: &str) -> Config {
+    let mut config = manifest(false, name);
+    config.app.get_mut(name).unwrap().port = Some(8080);
+    config
+}
+
+#[cfg(feature = "ebpf")]
+fn kernel_manifest(root: &Path) -> serde_json::Value {
+    serde_json::from_slice(&std::fs::read(root.join("data/kernel-policy/owner.json")).unwrap())
+        .unwrap()
+}
+
+#[cfg(feature = "ebpf")]
+fn retire_kernel(root: &Path) {
+    let owner = kernel_manifest(root);
+    reliaburger::onion::ebpf::loader::OnionEbpf::retire_owned_state(
+        Path::new(owner["cgroup_path"].as_str().unwrap()),
+        &root.join("data/kernel-policy"),
+        Path::new(owner["pin_directory"].as_str().unwrap()),
+    )
+    .unwrap();
+    std::fs::remove_dir(owner["pin_directory"].as_str().unwrap()).unwrap();
+}
+
+#[cfg(feature = "ebpf")]
+#[tokio::test]
+#[ignore = "requires isolated Linux root, bpffs, real runc/ip/nft and static BusyBox"]
+async fn normal_standalone_bun_recovers_durable_kernel_and_discovery() {
+    let root = tempfile::tempdir().unwrap().keep();
+    durable_fixture(&root);
+    let mut node = Node::start(&root).await;
+    let activated =
+        root.join("data/kernel-policy/owner.json").exists() && root.join("data/discovery").is_dir();
+    if !activated {
+        node.crash().await;
+    }
+    assert!(
+        activated,
+        "normal standalone startup did not activate durable ownership"
+    );
+    let name = format!(
+        "durable-{}",
+        root.file_name()
+            .unwrap()
+            .to_str()
+            .unwrap()
+            .trim_start_matches('.')
+            .to_ascii_lowercase()
+    );
+    node.client.apply(&durable_app(&name)).await.unwrap();
+    wait_file(&root.join("shared/main")).await;
+    let original = kernel_manifest(&root);
+    node.crash().await;
+    let mut recovered = Node::start(&root).await;
+    assert_eq!(kernel_manifest(&root), original);
+    assert_eq!(recovered.client.status().await.unwrap().len(), 1);
+    assert_eq!(
+        std::fs::read_to_string(root.join("shared/main")).unwrap(),
+        "main\n"
+    );
+    recovered.client.stop(&name, "default").await.unwrap();
+    recovered.crash().await;
+    let journal =
+        reliaburger::bun::discovery_owners::DiscoveryJournal::open(&root.join("data/discovery"))
+            .unwrap();
+    assert!(journal.inventory().services.is_empty());
+    drop(journal);
+    let config = std::fs::read_to_string(root.join("node.toml")).unwrap();
+    std::fs::write(
+        root.join("node.toml"),
+        config.replace("enabled = true", "enabled = false"),
+    )
+    .unwrap();
+    assert_startup_refused(&root, "refusing a mode change").await;
+    std::fs::write(root.join("node.toml"), config).unwrap();
+    let checkpoint = root.join("data/discovery/discovery.json");
+    let saved = root.join("saved-discovery.json");
+    std::fs::rename(&checkpoint, &saved).unwrap();
+    assert_startup_refused(&root, "cannot recover durable discovery ownership").await;
+    assert!(
+        !checkpoint.exists(),
+        "lost discovery evidence was silently recreated"
+    );
+    std::fs::rename(saved, checkpoint).unwrap();
+    retire_kernel(&root);
+}
+
+#[cfg(feature = "ebpf")]
+async fn assert_startup_refused(root: &Path, expected: &str) {
+    let output = tokio::time::timeout(
+        Duration::from_secs(20),
+        tokio::process::Command::new(env!("CARGO_BIN_EXE_bun"))
+            .arg("--config")
+            .arg(root.join("node.toml"))
+            .args(["--runtime", "runc", "--listen", "127.0.0.1:0"])
+            .kill_on_drop(true)
+            .output(),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        !output.status.success() && stderr.contains(expected),
+        "{stderr}"
+    );
+    assert!(!stderr.contains("API server listening"));
 }

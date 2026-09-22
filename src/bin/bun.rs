@@ -919,7 +919,22 @@ async fn run_agent(cli: Cli) -> anyhow::Result<()> {
 
     // Select runtime
     let runtime = select_runtime(&cli.runtime, &instances_dir, &pickle_dir).await?;
-    let runtime = if cli.experimental_owned_runc {
+    #[cfg(target_os = "linux")]
+    let durable_discovery = !cli.cluster
+        && config.ebpf.enabled
+        && !reliaburger::grill::rootless::is_rootless()
+        && matches!(&runtime, AnyGrill::Runc(_));
+    #[cfg(not(target_os = "linux"))]
+    let durable_discovery = false;
+    if !durable_discovery
+        && (data_base.join("kernel-policy").try_exists()?
+            || data_base.join("discovery").try_exists()?)
+    {
+        anyhow::bail!(
+            "durable ownership requires standalone rootful Runc with eBPF enabled; refusing a mode change"
+        );
+    }
+    let runtime = if cli.experimental_owned_runc || durable_discovery {
         if cli.cluster {
             anyhow::bail!(
                 "owned Runc qualification is standalone only; cluster recovery is not qualified"
@@ -1208,8 +1223,8 @@ async fn run_agent(cli: Cli) -> anyhow::Result<()> {
 
     // L8: load and attach the eBPF data path (Onion connect rewrite,
     // Smoker network faults, Sesame egress). Linux + `ebpf` feature only.
-    // A load failure is logged and the node continues without kernel
-    // enforcement rather than refusing to start.
+    // Durable standalone ownership requires all hooks before recovery. A load
+    // failure must not start an agent that can forget original policy owners.
     agent.set_ebpf_sweep_interval(config.ebpf.sweep_interval_secs);
     // Observed, not configured: `enabled = true` with a failed load means no
     // enforcement, and a capability report must say so.
@@ -1222,9 +1237,28 @@ async fn run_agent(cli: Cli) -> anyhow::Result<()> {
         #[cfg(all(feature = "ebpf", target_os = "linux"))]
         {
             use reliaburger::onion::ebpf::loader::OnionEbpf;
-            let loaded = match config.ebpf.resolve_program_dir() {
-                Some(program_dir) => OnionEbpf::load(&program_dir, &config.ebpf.cgroup_path),
-                None => OnionEbpf::load_embedded(&config.ebpf.cgroup_path),
+            let loaded = if durable_discovery {
+                use sha2::{Digest, Sha256};
+                let directory = std::fs::canonicalize(&data_base)?;
+                let identity = Sha256::digest(directory.as_os_str().as_encoded_bytes());
+                let pins = PathBuf::from(format!("/sys/fs/bpf/reliaburger-{identity:x}"));
+                let cgroup = config.ebpf.cgroup_path.clone();
+                let program = config.ebpf.resolve_program_dir();
+                tokio::task::spawn_blocking(move || {
+                    OnionEbpf::load_owned(
+                        program.as_deref(),
+                        &cgroup,
+                        &directory.join("kernel-policy"),
+                        &pins,
+                    )
+                })
+                .await
+                .context("kernel ownership recovery task failed")?
+            } else {
+                match config.ebpf.resolve_program_dir() {
+                    Some(program_dir) => OnionEbpf::load(&program_dir, &config.ebpf.cgroup_path),
+                    None => OnionEbpf::load_embedded(&config.ebpf.cgroup_path),
+                }
             };
             match loaded {
                 Ok(ebpf) => {
@@ -1232,10 +1266,23 @@ async fn run_agent(cli: Cli) -> anyhow::Result<()> {
                         "bun: eBPF data path loaded (attached={})",
                         ebpf.is_attached()
                     );
+                    if durable_discovery
+                        && !(ebpf.is_attached()
+                            && ebpf.connect6_attached()
+                            && ebpf.sendmsg4_attached()
+                            && ebpf.sendmsg6_attached())
+                    {
+                        anyhow::bail!("durable kernel ownership did not confirm every hook");
+                    }
                     ebpf_loaded = ebpf.is_attached();
                     agent
                         .set_onion_ebpf(Arc::new(tokio::sync::Mutex::new(ebpf)))
                         .await;
+                }
+                Err(error) if durable_discovery => {
+                    return Err(
+                        anyhow::anyhow!(error).context("cannot recover durable kernel policy")
+                    );
                 }
                 Err(error) => eprintln!(
                     "bun: failed to load eBPF data path: {error}; continuing without enforcement"
@@ -1247,6 +1294,10 @@ async fn run_agent(cli: Cli) -> anyhow::Result<()> {
             "bun: [ebpf] enabled but this binary lacks Linux eBPF support; \
              network faults and egress allowlists are NOT enforced"
         );
+    }
+
+    if durable_discovery && !ebpf_loaded {
+        anyhow::bail!("durable discovery requires a binary with working Linux eBPF support");
     }
 
     // Derive the internal service token from the shared master key, so bun's own
@@ -1477,6 +1528,12 @@ async fn run_agent(cli: Cli) -> anyhow::Result<()> {
     agent.set_readiness_tracker(readiness.clone());
     agent.set_trust_policy(config.images.trust_policy.clone());
     agent.set_records_dir(instances_dir.clone());
+    if durable_discovery {
+        agent
+            .recover_discovery_ownership(&data_base.join("discovery"))
+            .await
+            .context("cannot recover durable discovery ownership")?;
+    }
     if let Some(manager) = upgrade_manager.clone() {
         agent.set_upgrade_manager(manager);
     }

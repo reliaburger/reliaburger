@@ -2324,3 +2324,23 @@ Serde, so missing or malformed evidence cannot silently become permission.
 This is kernel absence evidence only. Durable discovery and remote withdrawal
 obligations live on disk and must still be reconciled before publication or
 address reuse. A reboot doesn't erase another node's open request.
+
+
+Normal standalone rootful Runc startup now joins these pieces when eBPF is
+enabled. Bun selects the command owner before runtime recovery, takes the kernel
+claim, verifies every hook, and opens the discovery journal before adopting any
+instance. The journal initially reserves old VIPs without publishing old health.
+Only a positively adopted runtime can regain a backend. A stopped runtime must
+complete its recorded withdrawal before its address can be released.
+
+We derive the private bpffs directory from the canonical data path using SHA-256.
+That gives restart and self-upgrade the same pin location without sharing another
+node's claim. An existing ownership directory also prevents switching off eBPF or
+changing runtime mode to bypass recovery. A failed load stops startup; it cannot
+fall back to an unprotected agent. The actual Bun regression deploys a container,
+kills Bun, adopts the same execution, then confirms service retirement. It also
+checks that lost discovery evidence and disabled enforcement refuse readiness.
+
+Cluster consumers need an additional recovery step: restoring their original
+remote exposures and sending durable withdrawal receipts. Standalone activation
+doesn't enable that unfinished path.
