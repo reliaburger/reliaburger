@@ -362,7 +362,6 @@ async fn record_commit_owned(
     let mutation = match &access.lease_id {
         Some(lease_id) => super::authority::RegistryMutation::LeasedManifest {
             lease_id: lease_id.clone(),
-            observed_at_unix_ms: crate::testkit::lease::now_unix_millis(),
             commit: Box::new(commit),
         },
         None => super::authority::RegistryMutation::Manifest(Box::new(commit)),
@@ -407,7 +406,9 @@ impl PickleState {
         };
         tokio::time::timeout(
             std::time::Duration::from_secs(10),
-            council.write(mutation.request()),
+            // A follower's council refuses with ForwardToLeader, so only a
+            // leader's own clock is ever stamped here.
+            council.write(mutation.request(crate::testkit::lease::now_unix_millis())),
         )
         .await
         .map_err(|_| {

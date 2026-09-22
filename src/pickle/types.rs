@@ -193,7 +193,8 @@ pub struct ImageCopyConfirmation {
     pub lease_id: Option<String>,
     /// Generation observed before verification, fenced again at Raft application.
     pub observed_gc_generation: u64,
-    /// Lease observation time recorded by the storage node.
+    /// Lease observation time. A standalone node uses its own clock; in a
+    /// cluster the leader overwrites it with its own before proposing.
     pub observed_at_unix_ms: u64,
 }
 

@@ -4526,7 +4526,7 @@ async fn registry_proposal_handler(
             .map_err(|error| (StatusCode::FORBIDDEN, error.to_string()))?;
         let request = proposal
             .mutation
-            .request_for_node(&node_id)
+            .request_for_node(&node_id, crate::testkit::lease::now_unix_millis())
             .map_err(|error| (StatusCode::FORBIDDEN, error.to_string()))?;
         council
             .write(request)

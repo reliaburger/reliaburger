@@ -1047,6 +1047,21 @@ entry is applied. Moving the lease to Cleaning fences a proposal admitted
 before cleanup but committed afterwards. Ordinary manifest commits cannot
 bypass the reserved `rbtest-.../` repository namespace.
 
+Whose clock decides that a lease has expired? At first, the storage node's.
+Each writer claim, publication and copy confirmation carried an
+`observed_at_unix_ms` stamped by the node that proposed it, and the state
+machine compared that with the lease's expiry. A node whose clock ran a minute
+slow could keep writing for a minute after its lease ended. The state machine
+can't simply read the clock itself: every council member replays `apply` and
+must reach the same answer, so `apply` never touches wall time. The leader
+does the next best thing. Registry mutations no longer carry a timestamp;
+`RegistryMutation::request(leader_now_unix_ms)` stamps the leader's time as it
+turns a mutation into a Raft request, either for its own proposal or for one a
+follower forwarded. Copy confirmations keep their field for standalone nodes,
+and the leader overwrites it with the struct update syntax from Chapter 1:
+`ImageCopyConfirmation { observed_at_unix_ms: leader_now_unix_ms, ..copy.clone() }`.
+Now one clock, the leader's, decides expiry for everyone.
+
 The cleanup barrier has two stages. First, desired workloads disappear and
 all former placement owners confirm runtime retirement. Only then does Raft
 record `workloads_retired`. Registry acknowledgements before that point refuse.

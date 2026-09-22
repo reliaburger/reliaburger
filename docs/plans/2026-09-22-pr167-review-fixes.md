@@ -396,10 +396,13 @@ Discovery and API:
 
 Registry and storage:
 
-- [ ] **T2.15 Lease expiry trusts the proposing node's clock.**
+- [x] **T2.15 Lease expiry trusts the proposing node's clock.**
       `src/pickle/lease.rs:155-164`, `src/pickle/api.rs:367`,
       `src/pickle/copy.rs:74`. A slow clock lets a node write after expiry. Have
       the leader stamp the time, or refuse `observed_at` beyond a skew bound.
+      *Done.* The leader stamps: `ClaimWriter`/`LeasedManifest` lost their timestamp and
+      `RegistryMutation::request(leader_now)` sets it (and overwrites copies'). Test
+      `slow_clock_lease_observations_are_refused_after_leader_expiry` proves the refusal.
 - [ ] **T2.16 `revalidate_blob` reads multi-GB blobs into memory.**
       `src/pickle/store.rs:214-226`, called on every heal tick and p2p resolve.
       Stream the hash as `copy.rs:118` already does. Treat read errors as

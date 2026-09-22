@@ -6,7 +6,7 @@ use std::time::Duration;
 use serde::{Deserialize, Serialize};
 use tokio::sync::watch;
 
-use super::types::{GcReport, ManifestCommit, PickleError};
+use super::types::{GcReport, ImageCopyConfirmation, ManifestCommit, PickleError};
 use crate::cluster::ClusterHttp;
 use crate::council::{CouncilNode, CouncilResponse, RaftRequest};
 use crate::mustard::directory::NodeDirectory;
@@ -18,6 +18,11 @@ pub const MAX_REGISTRY_PROPOSAL_BYTES: usize = 8 * 1024 * 1024;
 const PROPOSAL_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// Registry operations that a storage node may propose for its own holdings.
+///
+/// Lease expiry is judged by the leader's clock alone. A mutation carries no
+/// timestamp of its own; [`RegistryMutation::request`] stamps the leader's
+/// time when it becomes a Raft request, so a proposer whose clock runs slow
+/// can't write after its lease expired.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum RegistryMutation {
     /// Confirm the authenticated node's verified copy of a committed image.
@@ -32,12 +37,10 @@ pub enum RegistryMutation {
         repository: String,
         node_id: u64,
         owner_id: Option<String>,
-        observed_at_unix_ms: u64,
     },
     /// Publish only while the recorded lease and its writer remain active.
     LeasedManifest {
         lease_id: String,
-        observed_at_unix_ms: u64,
         commit: Box<ManifestCommit>,
     },
     /// Confirm this node's exact repository obligation after local retirement.
@@ -49,8 +52,13 @@ pub enum RegistryMutation {
 }
 
 impl RegistryMutation {
-    /// Refuse claims about another node before constructing a Raft operation.
-    pub fn request_for_node(&self, node_name: &str) -> Result<RaftRequest, PickleError> {
+    /// Refuse claims about another node before constructing a Raft operation
+    /// observed at the leader's `leader_now_unix_ms`.
+    pub fn request_for_node(
+        &self,
+        node_name: &str,
+        leader_now_unix_ms: u64,
+    ) -> Result<RaftRequest, PickleError> {
         let id = crate::cluster::identity::raft_id_from_name(node_name);
         let valid = match self {
             Self::Copy(copy) => copy.node_id == id,
@@ -68,12 +76,18 @@ impl RegistryMutation {
                 "registry proposal does not belong to the authenticated node".into(),
             ));
         }
-        Ok(self.request())
+        Ok(self.request(leader_now_unix_ms))
     }
 
-    pub(crate) fn request(&self) -> RaftRequest {
+    /// Build the Raft request, observing any lease at the leader's clock.
+    /// Only the leader may call this: `apply` must stay deterministic, so the
+    /// time is fixed here, before proposing, and never read during apply.
+    pub(crate) fn request(&self, leader_now_unix_ms: u64) -> RaftRequest {
         match self {
-            Self::Copy(copy) => RaftRequest::ConfirmImageCopy(copy.clone()),
+            Self::Copy(copy) => RaftRequest::ConfirmImageCopy(ImageCopyConfirmation {
+                observed_at_unix_ms: leader_now_unix_ms,
+                ..copy.clone()
+            }),
             Self::Manifest(commit) => RaftRequest::ManifestCommit(commit.as_ref().clone()),
             Self::GarbageCollection(report) => RaftRequest::GcReport(report.clone()),
             Self::ClaimWriter {
@@ -81,21 +95,16 @@ impl RegistryMutation {
                 repository,
                 node_id,
                 owner_id,
-                observed_at_unix_ms,
             } => RaftRequest::TestLeaseRegistryWriter {
                 lease_id: lease_id.clone(),
                 repository: repository.clone(),
                 node_id: *node_id,
                 owner_id: owner_id.clone(),
-                observed_at_unix_ms: *observed_at_unix_ms,
+                observed_at_unix_ms: leader_now_unix_ms,
             },
-            Self::LeasedManifest {
-                lease_id,
-                observed_at_unix_ms,
-                commit,
-            } => RaftRequest::TestLeaseManifestCommit {
+            Self::LeasedManifest { lease_id, commit } => RaftRequest::TestLeaseManifestCommit {
                 lease_id: lease_id.clone(),
-                observed_at_unix_ms: *observed_at_unix_ms,
+                observed_at_unix_ms: leader_now_unix_ms,
                 commit: commit.clone(),
             },
             Self::WriterRetired {
@@ -288,7 +297,10 @@ impl RegistryForwarder {
         mutation: RegistryMutation,
     ) -> Result<CouncilResponse, PickleError> {
         if let Some(council) = council {
-            match council.write(mutation.request()).await {
+            // Only a leader accepts this write, so its clock is the one
+            // that matters; a follower forwards and the leader restamps.
+            let request = mutation.request(crate::testkit::lease::now_unix_millis());
+            match council.write(request).await {
                 Ok(response) => return Ok(response),
                 Err(crate::council::CouncilError::ForwardToLeader { .. }) => {}
                 Err(error) => return Err(unavailable(error.to_string())),
@@ -606,10 +618,77 @@ mod tests {
         let _ = server.await;
     }
 
+    /// Lease expiry follows the leader's clock, not the proposer's: a
+    /// storage node whose clock runs slow can't write after expiry.
+    #[test]
+    fn slow_clock_lease_observations_are_refused_after_leader_expiry() {
+        use crate::testkit::lease::TestLease;
+        let writer = crate::cluster::identity::raft_id_from_name("writer");
+        let lease = TestLease::new(
+            "run1".into(),
+            "token:ci".into(),
+            "ci".into(),
+            "rbtest-run1".into(),
+            10,
+            1_000,
+        )
+        .unwrap();
+        // The writer's clock says 500, well inside the lease; the leader's
+        // clock says 2,000, after it expired. The claim carries no time, so
+        // the writer's clock can't enter the decision.
+        let claim = RegistryMutation::ClaimWriter {
+            lease_id: "run1".into(),
+            repository: "rbtest-run1/app".into(),
+            node_id: writer,
+            owner_id: Some("token:ci".into()),
+        };
+        assert!(
+            lease
+                .clone()
+                .attach_registry_writer("rbtest-run1/app", writer, Some("token:ci"), 500)
+                .is_ok(),
+            "the writer's own clock would admit the claim"
+        );
+        let RaftRequest::TestLeaseRegistryWriter {
+            observed_at_unix_ms,
+            ..
+        } = claim.request_for_node("writer", 2_000).unwrap()
+        else {
+            panic!("claim must become a registry-writer request");
+        };
+        assert_eq!(observed_at_unix_ms, 2_000);
+        assert!(
+            lease
+                .clone()
+                .attach_registry_writer(
+                    "rbtest-run1/app",
+                    writer,
+                    Some("token:ci"),
+                    observed_at_unix_ms
+                )
+                .is_err(),
+            "the leader's clock must refuse the expired lease"
+        );
+
+        let copy = RegistryMutation::Copy(super::super::types::ImageCopyConfirmation {
+            repository: "rbtest-run1/app".into(),
+            manifest_digest: super::super::store::compute_sha256(b"manifest"),
+            node_id: writer,
+            lease_id: Some("run1".into()),
+            observed_gc_generation: 0,
+            observed_at_unix_ms: 500,
+        });
+        let RaftRequest::ConfirmImageCopy(copy) = copy.request_for_node("writer", 2_000).unwrap()
+        else {
+            panic!("copy must stay a copy confirmation");
+        };
+        assert_eq!(copy.observed_at_unix_ms, 2_000);
+    }
+
     #[test]
     fn proposals_cannot_claim_another_nodes_blob_holdings() {
-        assert!(report().request_for_node("writer").is_ok());
-        assert!(report().request_for_node("another").is_err());
+        assert!(report().request_for_node("writer", 1).is_ok());
+        assert!(report().request_for_node("another", 1).is_err());
         let manifest = super::super::types::ImageManifest {
             repository: "ordinary".into(),
             tags: std::collections::BTreeSet::from(["latest".into()]),
@@ -634,6 +713,6 @@ mod tests {
                 crate::cluster::identity::raft_id_from_name("another"),
             ]),
         }));
-        assert!(mutation.request_for_node("writer").is_err());
+        assert!(mutation.request_for_node("writer", 1).is_err());
     }
 }

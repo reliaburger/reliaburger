@@ -192,7 +192,6 @@ async fn registry_proposals_require_service_and_current_node_authority() {
             repository: "rbtest-run/web".into(),
             node_id: 99,
             owner_id: None,
-            observed_at_unix_ms: 1,
         },
         RegistryMutation::WriterRetired {
             lease_id: "run".into(),
