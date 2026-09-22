@@ -499,10 +499,13 @@ desired.endpoint_catalog.reconcile(grouped)?  // preserve VIPs, allocate newcome
 Now, how does it reach every node? Through Raft. The leader writes the whole catalogue as one `PublishEndpoints` entry:
 
 ```rust
-RaftRequest::PublishEndpoints(Box<EndpointCatalog>)
+RaftRequest::PublishEndpoints {
+    expected_generation: desired.endpoint_withdrawals.generation,
+    catalog: Box::new(catalog),
+}
 ```
 
-Applying it just replaces `DesiredState.endpoint_catalog` — a wholesale swap, so the leader is the single source of truth and a follower never merges half a view. Because it lives in `DesiredState`, it rides the same replication and snapshot machinery as every other cluster fact, and it survives a leader change for free: the new leader inherits the last catalogue and republishes from its own reports on the next tick. The leader only writes when the catalogue actually changed, so a steady cluster isn't churning the log every couple of seconds.
+Applying it checks the observed generation, records withdrawals and replaces `DesiredState.endpoint_catalog` — a wholesale swap, so the leader is the single source of truth and a follower never merges half a view. Because it lives in `DesiredState`, it rides the same replication and snapshot machinery as every other cluster fact, and it survives a leader change for free: the new leader inherits the last catalogue and republishes from its own reports on the next tick. The leader only writes when the catalogue actually changed, so a steady cluster isn't churning the log every couple of seconds.
 
 The last hop is getting the catalogue *into* each node's resolution path. Every node's reconciler polls the leader's `/v1/placements/{node}` endpoint every couple of seconds to learn its assignments. We piggyback the catalogue on that response, after registering the consumer in Raft. Council voters also hold the replicated `DesiredState`, but use the same reconciler to install routing. Explicit protocol and state compatibility must match; a serde default is not permission to mix incompatible binaries. The reconciler hands the catalogue to its Bun agent, which overlays it onto the local service map:
 
@@ -2013,3 +2016,29 @@ backend does not move an otherwise active service.
 
 These checks protect virtual address assignment. Consumer receipts and the
 producer's physical address/host-port release decision remain separate work.
+
+
+### Refusing a catalogue prepared against an older generation
+
+The scheduler reads generation 12 and starts preparing a catalogue. Meanwhile,
+another committed operation removes a node's endpoints and advances publication
+to generation 13. The first scheduler mustn't overwrite that newer decision.
+
+`PublishEndpoints` now carries `expected_generation` alongside its candidate.
+Council compares it with committed state before checking or changing any
+publication data. A mismatch returns Refused and leaves the catalogue and
+withdrawal history untouched. This comparison and the eventual update happen
+inside one Raft state-machine transition, so another writer cannot slip between
+them. The scheduler sends the generation from the same desired-state snapshot
+used to build its candidate; after refusal, its next tick reads current state.
+
+Even an identical catalogue needs current evidence. A repeated old request may
+have lost its reply, but that doesn't make its old generation current again. A
+freshly read identical candidate is still a no-op and doesn't advance the
+publication number. Snapshot recovery and endpoint removal during decommission
+preserve this rule. The live scheduler regression also submits a stale writer
+before checking that the scheduler converges without repeated unchanged writes.
+
+This changes both the cluster request and stored Raft log representation, so the
+compatibility boundary advances to protocol 17/state 31. Missing generations
+cannot silently default to zero. Fresh pre-release clusters are required.

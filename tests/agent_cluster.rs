@@ -113,12 +113,26 @@ async fn scheduler_repairs_a_catalogue_replaced_after_its_last_publication() {
             }
             metrics.changed().await.unwrap();
         }
-        let original = council.desired_state().await.endpoint_catalog;
+        let observed = council.desired_state().await;
+        let expected_generation = observed.endpoint_withdrawals.generation;
+        let original = observed.endpoint_catalog;
         let response = council
-            .write(RaftRequest::PublishEndpoints(Box::default()))
+            .write(RaftRequest::PublishEndpoints {
+                expected_generation,
+                catalog: Box::default(),
+            })
             .await
             .unwrap();
         assert!(matches!(response, CouncilResponse::Applied { .. }));
+        let stale = council
+            .write(RaftRequest::PublishEndpoints {
+                expected_generation,
+                catalog: Box::new(original.clone()),
+            })
+            .await
+            .unwrap();
+        assert!(matches!(stale, CouncilResponse::Refused { .. }));
+
         loop {
             if council.desired_state().await.endpoint_catalog == original {
                 break;

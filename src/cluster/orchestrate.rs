@@ -162,7 +162,10 @@ pub fn spawn_leader_scheduler(
                 && desired.endpoint_catalog != catalog
             {
                 match council
-                    .write(RaftRequest::PublishEndpoints(Box::new(catalog)))
+                    .write(RaftRequest::PublishEndpoints {
+                        expected_generation: desired.endpoint_withdrawals.generation,
+                        catalog: Box::new(catalog),
+                    })
                     .await
                 {
                     // A committed request can still be refused by the state

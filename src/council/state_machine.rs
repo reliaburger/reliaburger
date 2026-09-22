@@ -910,7 +910,18 @@ impl StateMachineInner {
                 }
                 self.state.endpoint_consumers.insert(node_id.clone());
             }
-            RaftRequest::PublishEndpoints(catalog) => {
+            RaftRequest::PublishEndpoints {
+                expected_generation,
+                catalog,
+            } => {
+                if *expected_generation != self.state.endpoint_withdrawals.generation {
+                    return Some(CouncilResponse::Refused {
+                        reason: format!(
+                            "endpoint publication generation changed: expected {}, current {}; rebuild from committed state",
+                            expected_generation, self.state.endpoint_withdrawals.generation,
+                        ),
+                    });
+                }
                 if catalog.services.values().any(|service| {
                     service.backends.iter().any(|backend| {
                         self.state
@@ -2874,6 +2885,164 @@ mod tests {
         .unwrap()
     }
 
+    #[test]
+    fn endpoint_publication_generation_rejects_old_and_future_writers_atomically() {
+        let mut inner = StateMachineInner::default();
+        inner.state.endpoint_consumers.insert("reader".into());
+        let first = withdrawal_fixture_catalogue();
+        assert!(
+            inner
+                .apply_request(&RaftRequest::PublishEndpoints {
+                    expected_generation: 0,
+                    catalog: Box::new(first.clone())
+                })
+                .is_none()
+        );
+        let mut second = first.clone();
+        second.services.get_mut("default__api").unwrap().backends[0].host_port = 30002;
+        assert!(
+            inner
+                .apply_request(&RaftRequest::PublishEndpoints {
+                    expected_generation: 1,
+                    catalog: Box::new(second.clone())
+                })
+                .is_none()
+        );
+        assert_eq!(inner.state.endpoint_withdrawals.pending.len(), 1);
+        let before = serde_json::to_value(&inner.state).unwrap();
+        let mut candidate = second;
+        candidate.services.get_mut("default__api").unwrap().backends[0].host_port = 30003;
+        for expected_generation in [1, 3] {
+            assert!(matches!(
+                inner.apply_request(&RaftRequest::PublishEndpoints {
+                    expected_generation,
+                    catalog: Box::new(candidate.clone())
+                }),
+                Some(CouncilResponse::Refused { .. })
+            ));
+            assert_eq!(serde_json::to_value(&inner.state).unwrap(), before);
+        }
+    }
+
+    #[test]
+    fn endpoint_publication_generation_requires_current_evidence_even_for_noops() {
+        let mut inner = StateMachineInner::default();
+        assert!(matches!(
+            inner.apply_request(&RaftRequest::PublishEndpoints {
+                expected_generation: 1,
+                catalog: Box::default()
+            }),
+            Some(CouncilResponse::Refused { .. })
+        ));
+        let first = withdrawal_fixture_catalogue();
+        let request = RaftRequest::PublishEndpoints {
+            expected_generation: 0,
+            catalog: Box::new(first.clone()),
+        };
+        assert!(inner.apply_request(&request).is_none());
+        let before = serde_json::to_value(&inner.state).unwrap();
+        assert!(matches!(
+            inner.apply_request(&request),
+            Some(CouncilResponse::Refused { .. })
+        ));
+        assert_eq!(serde_json::to_value(&inner.state).unwrap(), before);
+        assert!(
+            inner
+                .apply_request(&RaftRequest::PublishEndpoints {
+                    expected_generation: 1,
+                    catalog: Box::new(first)
+                })
+                .is_none()
+        );
+        assert_eq!(serde_json::to_value(&inner.state).unwrap(), before);
+    }
+
+    #[tokio::test]
+    async fn endpoint_publication_generation_survives_snapshot_for_stale_noop_refusal() {
+        let mut sm = CouncilStateMachine::new();
+        let request = RaftRequest::PublishEndpoints {
+            expected_generation: 0,
+            catalog: Box::new(withdrawal_fixture_catalogue()),
+        };
+        let applied = sm
+            .apply(vec![normal_entry(1, 1, request.clone())])
+            .await
+            .unwrap();
+        assert!(matches!(applied[0], CouncilResponse::Applied { .. }));
+        let original = sm.desired_state().await;
+        let mut builder = sm.get_snapshot_builder().await;
+        let snapshot = builder.build_snapshot().await.unwrap();
+        let mut restored = CouncilStateMachine::new();
+        restored
+            .install_snapshot(&snapshot.meta, snapshot.snapshot)
+            .await
+            .unwrap();
+        let response = restored
+            .apply(vec![normal_entry(2, 2, request)])
+            .await
+            .unwrap();
+        assert!(matches!(response[0], CouncilResponse::Refused { .. }));
+        let state = restored.desired_state().await;
+        assert_eq!(state.endpoint_catalog, original.endpoint_catalog);
+        assert_eq!(state.endpoint_withdrawals, original.endpoint_withdrawals);
+    }
+
+    #[test]
+    fn endpoint_publication_generation_observes_decommission_changes() {
+        let mut inner = StateMachineInner::default();
+        inner.state.endpoint_consumers.insert("reader".into());
+        let first = withdrawal_fixture_catalogue();
+        assert!(
+            inner
+                .apply_request(&RaftRequest::PublishEndpoints {
+                    expected_generation: 0,
+                    catalog: Box::new(first.clone())
+                })
+                .is_none()
+        );
+        let request = RaftRequest::DecommissionNode {
+            node_id: "producer".into(),
+            retired_by: "operator".into(),
+            reason: "powered off".into(),
+            retired_at_unix_ms: 10,
+            membership_log_id: None,
+        };
+        assert!(matches!(
+            inner.apply_request(&request),
+            Some(CouncilResponse::NodeDecommissioned { .. })
+        ));
+        assert_eq!(inner.state.endpoint_withdrawals.generation, 2);
+        let mut candidate = first;
+        let backend = &mut candidate.services.get_mut("default__api").unwrap().backends[0];
+        backend.node_id = "replacement".into();
+        backend.node_ip = "10.0.0.2".parse().unwrap();
+        let before = serde_json::to_value(&inner.state).unwrap();
+        assert!(matches!(
+            inner.apply_request(&RaftRequest::PublishEndpoints {
+                expected_generation: 1,
+                catalog: Box::new(candidate.clone())
+            }),
+            Some(CouncilResponse::Refused { .. })
+        ));
+        assert_eq!(serde_json::to_value(&inner.state).unwrap(), before);
+        assert!(
+            inner
+                .apply_request(&RaftRequest::PublishEndpoints {
+                    expected_generation: 2,
+                    catalog: Box::new(candidate)
+                })
+                .is_none()
+        );
+        assert_eq!(inner.state.endpoint_withdrawals.generation, 3);
+        assert_eq!(
+            inner.state.endpoint_withdrawals.pending,
+            serde_json::from_value::<DesiredState>(before)
+                .unwrap()
+                .endpoint_withdrawals
+                .pending
+        );
+    }
+
     #[tokio::test]
     async fn endpoint_withdrawals_survive_raft_snapshot_and_fenced_consumer_retirement() {
         let mut sm = CouncilStateMachine::new();
@@ -2885,8 +3054,14 @@ mod tests {
             RaftRequest::RegisterEndpointConsumer {
                 node_id: "survivor".into(),
             },
-            RaftRequest::PublishEndpoints(Box::new(catalogue.clone())),
-            RaftRequest::PublishEndpoints(Box::default()),
+            RaftRequest::PublishEndpoints {
+                expected_generation: 0,
+                catalog: Box::new(catalogue.clone()),
+            },
+            RaftRequest::PublishEndpoints {
+                expected_generation: 1,
+                catalog: Box::default(),
+            },
             RaftRequest::RegisterEndpointConsumer {
                 node_id: "late-reader".into(),
             },
@@ -2959,7 +3134,10 @@ mod tests {
             });
         }
         let catalogue = withdrawal_fixture_catalogue();
-        inner.apply_request(&RaftRequest::PublishEndpoints(Box::new(catalogue.clone())));
+        inner.apply_request(&RaftRequest::PublishEndpoints {
+            expected_generation: 0,
+            catalog: Box::new(catalogue.clone()),
+        });
         let request = RaftRequest::DecommissionNode {
             node_id: "producer".into(),
             retired_by: "operator".into(),
@@ -2993,11 +3171,20 @@ mod tests {
         let mut inner = StateMachineInner::default();
         inner.state.endpoint_consumers.insert("reader".into());
         let original = withdrawal_fixture_catalogue();
-        inner.apply_request(&RaftRequest::PublishEndpoints(Box::new(original.clone())));
-        inner.apply_request(&RaftRequest::PublishEndpoints(Box::default()));
+        inner.apply_request(&RaftRequest::PublishEndpoints {
+            expected_generation: 0,
+            catalog: Box::new(original.clone()),
+        });
+        inner.apply_request(&RaftRequest::PublishEndpoints {
+            expected_generation: 1,
+            catalog: Box::default(),
+        });
         let before = serde_json::to_value(&inner.state).unwrap();
         assert!(matches!(
-            inner.apply_request(&RaftRequest::PublishEndpoints(Box::new(original))),
+            inner.apply_request(&RaftRequest::PublishEndpoints {
+                expected_generation: 2,
+                catalog: Box::new(original)
+            }),
             Some(CouncilResponse::Refused { .. })
         ));
         assert_eq!(serde_json::to_value(&inner.state).unwrap(), before);
@@ -3011,7 +3198,10 @@ mod tests {
         inner.state.endpoint_withdrawals.generation = u64::MAX;
         let before = serde_json::to_value(&inner.state).unwrap();
         for request in [
-            RaftRequest::PublishEndpoints(Box::default()),
+            RaftRequest::PublishEndpoints {
+                expected_generation: u64::MAX,
+                catalog: Box::default(),
+            },
             RaftRequest::DecommissionNode {
                 node_id: "producer".into(),
                 retired_by: "operator".into(),
@@ -3163,7 +3353,14 @@ mod tests {
             ),
         ])
         .unwrap();
-        let entry = normal_entry(1, 1, RaftRequest::PublishEndpoints(Box::new(catalog)));
+        let entry = normal_entry(
+            1,
+            1,
+            RaftRequest::PublishEndpoints {
+                expected_generation: 0,
+                catalog: Box::new(catalog),
+            },
+        );
         sm.apply(vec![entry]).await.unwrap();
 
         let state = sm.desired_state().await;
@@ -3185,7 +3382,14 @@ mod tests {
         // A later publish wholly replaces the catalogue (leader is authoritative).
         let replacement =
             EndpointCatalog::rebuild([(ServiceId::new("default", "web"), 80, vec![])]).unwrap();
-        let entry2 = normal_entry(2, 1, RaftRequest::PublishEndpoints(Box::new(replacement)));
+        let entry2 = normal_entry(
+            2,
+            1,
+            RaftRequest::PublishEndpoints {
+                expected_generation: 1,
+                catalog: Box::new(replacement),
+            },
+        );
         sm.apply(vec![entry2]).await.unwrap();
         let state = sm.desired_state().await;
         assert!(

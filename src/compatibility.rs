@@ -15,10 +15,10 @@ pub struct Compatibility {
     pub state: u32,
 }
 
-/// Supported formats, including replicated discovery withdrawal obligations.
+/// Supported formats, including generation-checked catalogue publication requests.
 pub const CURRENT: Compatibility = Compatibility {
-    protocol: 16,
-    state: 30,
+    protocol: 17,
+    state: 31,
 };
 
 /// Name of the durable format stamp at the root of a node's data directory.
