@@ -121,6 +121,11 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
         if matches!(self.discovery_ownership, DiscoveryOwnership::Disabled) {
             return Ok(());
         }
+        // The original grant was fsynced before the runtime release. Replaying
+        // that exact permission must also work while the leader is unavailable.
+        if self.require_discovery_release_permission(reference).is_ok() {
+            return Ok(());
+        }
         let refuse = |reason: &str| BunError::RetirementState {
             instance_id: reference.instance_id.clone(),
             reason: reason.into(),

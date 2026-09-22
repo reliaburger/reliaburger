@@ -2451,3 +2451,13 @@ real agent and placement reconciler against two HTTPS leaders. It loses the firs
 HTTP reply, changes the leader, then loses the first local confirmation. Only the
 successful retry removes the journal entry. A timeout is a reason to try again,
 not permission to forget.
+
+### Replaying a release grant
+
+Bun can crash after saving `ReleaseAuthorised` but before the runtime acknowledges
+release. On restart, the leader might be unavailable. We can still replay the
+exact saved permission: it already records the successful remote confirmation and
+local withdrawal. We compare the entire original reference, including execution
+generation and allocation. A different or still-held reference must obtain its
+own confirmation. The regression recovers an enrolled consumer with no leader
+transport and checks that only its already-authorised reference is released.

@@ -12952,6 +12952,45 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn clustered_recovery_replays_durable_release_without_contacting_leader() {
+        let (mut agent, grill, root, reference) = discovery_recovery_fixture().await;
+        grill.set_state(&reference.instance_id, ContainerState::Stopped);
+        let journal =
+            crate::bun::discovery_owners::DiscoveryJournal::open(&root.path().join("discovery"))
+                .unwrap();
+        let mut inventory = journal.inventory().clone();
+        inventory.references[0].phase =
+            crate::bun::discovery_owners::ReferencePhase::ReleaseAuthorised;
+        inventory.services[0].entry.backends.clear();
+        let identity = crate::bun::consumer_owners::ConsumerIdentity {
+            node_id: crate::meat::NodeId::new("test"),
+            cluster_identity: [42; 32],
+        };
+        inventory.consumer = Some(crate::bun::consumer_owners::ConsumerOwnership {
+            identity: identity.clone(),
+            publications: vec![],
+            phase: crate::bun::consumer_owners::ConsumerPhase::Withdrawn,
+            receipts: Default::default(),
+        });
+        drop(journal.persist(inventory).await.unwrap());
+        let (mut clustered, _, _) = test_cluster_fault_agent().await;
+        agent.cluster = clustered.cluster.take();
+        agent
+            .recover_consumer_ownership(&root.path().join("discovery"), identity)
+            .await
+            .unwrap();
+        agent.replay_discovery_releases().await.unwrap();
+        assert!(
+            grill
+                .network_reference(&reference.instance_id)
+                .await
+                .unwrap()
+                .is_none()
+        );
+        assert!(agent.network_references.is_empty());
+    }
+
+    #[tokio::test]
     async fn discovery_recovery_refuses_changed_runtime_before_adoption_or_cleanup() {
         let (mut agent, grill, root, reference) = discovery_recovery_fixture().await;
         let mut launches = grill.launch_inventory().await.unwrap().unwrap();
