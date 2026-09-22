@@ -362,7 +362,7 @@ Execution (grill):
 - [ ] **T2.8 An `io::Error::other` allocation runs inside `pre_exec`.**
       `src/grill/volume/owned.rs:437`. Use `io::Error::last_os_error()`, and
       make the `// SAFETY:` comment true.
-- [ ] **T2.9 Flaky `job_recovery` test (seen locally).**
+- [x] **T2.9 Flaky `job_recovery` test (seen locally).**
       `completed_job_survives_bun_death_with_or_without_adoption_record` failed
       once under full-suite load with
       `StateUnavailable { reason: "Broken pipe (os error 32)" }` at
@@ -372,6 +372,13 @@ Execution (grill):
       Also watch `bun::api::tests::app_metrics_name_injection_cannot_bypass_predicate`:
       it hit `LEAK-FAIL` once under parallel load (the PR made
       `leak-timeout` fatal), then passed 6 times in isolation.
+      Done. The single-threaded owner drops a client slower than its 100 ms
+      read timeout, and `pid()` turned that into "no PID" (so jobs also
+      skipped their adoption record). `status` and `signal` now retry a live
+      owner (the lock proves it) up to ten times on a dropped connection.
+      Under a CPU hog, 30 runs each: `completed_job_survives...` 7 to 0
+      failures, `killed_exec_caller...` 2 to 0. The api leak test wasn't
+      investigated.
 
 Discovery and API:
 

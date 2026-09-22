@@ -601,6 +601,44 @@ group. A descendant that calls `setsid` leaves that group, so retirement can't
 see it and it can outlive the generation. That's another reason process mode
 is for foreground workloads.
 
+A live owner can also hang up on you. Two recovery tests failed now and then
+under a loaded full suite, always with `Broken pipe (os error 32)` from a state
+query. The owner is single-threaded and gives each client 100 ms to send its
+request, so one stalled client can't freeze it. On a busy machine our own client
+sometimes lost the CPU between connecting and writing, the owner gave up on it,
+and the write hit a closed socket. `state` turned that into a hard error. Worse,
+`pid()` swallowed the error with `.ok()?` and reported "no PID", so Bun skipped
+writing a job's adoption record, which is where a third flaky failure came from.
+
+The fix lives in the client. After a failed request we already re-read the
+durable record through `finish_retirement`. If that still says Running, it has
+just failed to take `owner.lock`, which proves the owner is alive. A dropped
+connection from a live owner says nothing about the workload, so we ask again,
+up to ten times, 20 ms apart:
+
+```rust
+let response = match result {
+    Err(error) if dropped_connection(&error) && attempt < OWNER_REQUEST_ATTEMPTS => {
+        attempt += 1;
+        std::thread::sleep(Duration::from_millis(20));
+        continue;
+    }
+    result => result?,
+};
+```
+
+The first arm has a *match guard*, the `if` after the pattern: the arm is taken
+only when the pattern matches and the condition is true. Everything else falls
+through to `result => result?`, which unwraps success or returns the error.
+`dropped_connection` accepts broken pipes, resets, refusals, "not connected" and
+an early end of file. Signals get the same loop: an owner that hung up before
+answering never read the request, so sending it again is safe. What we still
+never do is treat a closed socket as proof of absence. Only the durable record
+or a dead owner's empty process group can say that. A fake owner in the unit
+tests hangs up on its first three clients and must be asked a fourth time; a
+fake that never answers still produces an error, not Stopped. Under a CPU hog,
+the two flaky tests went from 7 and 2 failures in 30 runs to none.
+
 Startup also needs to discover owners it has never seen in its adoption table.
 The runtime exposes a complete launch inventory from the records published
 before execution. It validates every entry before returning anything; damaged

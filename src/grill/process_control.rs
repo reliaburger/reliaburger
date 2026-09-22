@@ -294,22 +294,51 @@ impl ProcessControl {
 
     pub(crate) async fn status(&self, id: &InstanceId) -> io::Result<OwnerRecord> {
         self.run(id, |this, id| {
-            let record = this.finish_retirement(&id)?;
-            if !matches!(record.phase, OwnerPhase::Running { .. }) { return Ok(record); }
-            let result = request(&this.directory(&id)?, &record, "status");
-            // The owner may commit completion and remove its socket between
-            // reading the record and connecting. Re-read that positive proof.
-            let current = this.finish_retirement(&id)?;
-            if current.nonce != record.nonce { return Err(io::Error::other("process generation changed during inspection")); }
-            if matches!(current.phase, OwnerPhase::Retired { .. }) { return Ok(current); }
-            let response = result?;
-            let phase: OwnerPhase = serde_json::from_value(response.get("phase").cloned()
-                .ok_or_else(|| io::Error::other("owner returned no phase"))?)?;
-            if !matches!((phase, &record.phase), (OwnerPhase::Running { pid: live }, OwnerPhase::Running { pid: recorded }) if live == *recorded) {
-                return Err(io::Error::other("owner returned conflicting process identity"));
+            let mut attempt = 1;
+            loop {
+                let record = this.finish_retirement(&id)?;
+                if !matches!(record.phase, OwnerPhase::Running { .. }) {
+                    return Ok(record);
+                }
+                let result = request(&this.directory(&id)?, &record, "status");
+                // The owner may commit completion and remove its socket between
+                // reading the record and connecting. Re-read that positive proof.
+                let current = this.finish_retirement(&id)?;
+                if current.nonce != record.nonce {
+                    return Err(io::Error::other(
+                        "process generation changed during inspection",
+                    ));
+                }
+                if matches!(current.phase, OwnerPhase::Retired { .. }) {
+                    return Ok(current);
+                }
+                // finish_retirement just failed to take the owner lock, so the
+                // owner is alive. A dropped connection only means it closed
+                // this client, never that the workload is gone: ask again.
+                let response = match result {
+                    Err(error) if dropped_connection(&error) && attempt < OWNER_REQUEST_ATTEMPTS => {
+                        attempt += 1;
+                        std::thread::sleep(Duration::from_millis(20));
+                        continue;
+                    }
+                    result => result?,
+                };
+                let phase: OwnerPhase = serde_json::from_value(
+                    response
+                        .get("phase")
+                        .cloned()
+                        .ok_or_else(|| io::Error::other("owner returned no phase"))?,
+                )?;
+                if !matches!((phase, &record.phase), (OwnerPhase::Running { pid: live }, OwnerPhase::Running { pid: recorded }) if live == *recorded)
+                {
+                    return Err(io::Error::other(
+                        "owner returned conflicting process identity",
+                    ));
+                }
+                return Ok(current);
             }
-            Ok(current)
-        }).await
+        })
+        .await
     }
 
     pub(crate) async fn signal(&self, id: &InstanceId, force: bool) -> io::Result<()> {
@@ -342,24 +371,39 @@ impl ProcessControl {
             ) {
                 return Ok(());
             }
-            let result = request(
-                &directory,
-                &record,
-                if force { "kill" } else { "terminate" },
-            );
-            let current = this.finish_retirement(&id)?;
-            if current.nonce != record.nonce {
-                return Err(io::Error::other(
-                    "process generation changed during signalling",
-                ));
-            }
-            if matches!(current.phase, OwnerPhase::Retired { .. }) {
+            let mut attempt = 1;
+            loop {
+                let result = request(
+                    &directory,
+                    &record,
+                    if force { "kill" } else { "terminate" },
+                );
+                let current = this.finish_retirement(&id)?;
+                if current.nonce != record.nonce {
+                    return Err(io::Error::other(
+                        "process generation changed during signalling",
+                    ));
+                }
+                if matches!(current.phase, OwnerPhase::Retired { .. }) {
+                    return Ok(());
+                }
+                // As in status: a live owner that dropped this client has not
+                // acted on the request, so asking again is safe.
+                let response = match result {
+                    Err(error)
+                        if dropped_connection(&error) && attempt < OWNER_REQUEST_ATTEMPTS =>
+                    {
+                        attempt += 1;
+                        std::thread::sleep(Duration::from_millis(20));
+                        continue;
+                    }
+                    result => result?,
+                };
+                if response["accepted"] != true {
+                    return Err(io::Error::other("owner did not accept signal"));
+                }
                 return Ok(());
             }
-            if result?["accepted"] != true {
-                return Err(io::Error::other("owner did not accept signal"));
-            }
-            Ok(())
         })
         .await
     }
@@ -607,6 +651,25 @@ fn remove_control_socket(directory: &Path, record: &OwnerRecord) -> io::Result<(
     }
 }
 
+/// Requests made to a live owner before a dropped connection is an error.
+const OWNER_REQUEST_ATTEMPTS: u32 = 10;
+
+/// Whether the owner closed or refused this connection before answering.
+///
+/// A live single-threaded owner drops a client that is slower than its read
+/// timeout, and an exiting owner drops its queued connections. Neither says
+/// anything about the workload.
+fn dropped_connection(error: &io::Error) -> bool {
+    matches!(
+        error.kind(),
+        io::ErrorKind::BrokenPipe
+            | io::ErrorKind::ConnectionReset
+            | io::ErrorKind::ConnectionRefused
+            | io::ErrorKind::NotConnected
+            | io::ErrorKind::UnexpectedEof
+    )
+}
+
 fn request(directory: &Path, record: &OwnerRecord, action: &str) -> io::Result<serde_json::Value> {
     let path = process_owner::socket_path(directory, record);
     process_owner::validate_socket_directory(
@@ -648,4 +711,107 @@ fn request(directory: &Path, record: &OwnerRecord, action: &str) -> io::Result<s
         return Err(io::Error::other(format!("process owner refused: {error}")));
     }
     Ok(response)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::{BufRead, Write};
+    use std::os::unix::net::UnixListener;
+
+    fn spec() -> OciSpec {
+        use super::super::oci::{OciLinux, OciProcess, OciRoot, OciUser};
+        OciSpec {
+            root: OciRoot {
+                path: "/".into(),
+                readonly: false,
+            },
+            process: OciProcess {
+                args: vec!["sleep".into(), "60".into()],
+                env: vec![],
+                cwd: "/".into(),
+                user: OciUser { uid: 0, gid: 0 },
+            },
+            mounts: vec![],
+            linux: OciLinux {
+                namespaces: vec![],
+                resources: None,
+                cgroups_path: None,
+                uid_mappings: None,
+                gid_mappings: None,
+            },
+            port_mapping: None,
+        }
+    }
+
+    /// A live owner that hangs up on its first clients without answering, the
+    /// way the real one drops a client slower than its read timeout.
+    struct ImpatientOwner {
+        _lock: File,
+        socket_directory: PathBuf,
+    }
+
+    impl ImpatientOwner {
+        async fn start(control: &ProcessControl, id: &InstanceId, dropped: usize) -> Self {
+            control.prepare(id, &spec()).await.unwrap();
+            let directory = control.directory(id).unwrap();
+            let mut record = control.load(id).unwrap();
+            let pid = std::process::id();
+            record.phase = OwnerPhase::Running { pid };
+            process_owner::persist(&directory, &record).unwrap();
+            // Holding the owner lock is what makes an owner live.
+            let lock = process_owner::lock_owner(&directory).unwrap();
+            let socket = process_owner::socket_path(&directory, &record);
+            let socket_directory = socket.parent().unwrap().to_path_buf();
+            std::fs::DirBuilder::new()
+                .mode(0o700)
+                .create(&socket_directory)
+                .unwrap();
+            let listener = UnixListener::bind(&socket).unwrap();
+            std::thread::spawn(move || {
+                for (index, connection) in listener.incoming().enumerate() {
+                    let mut connection = connection.unwrap();
+                    if index < dropped {
+                        continue;
+                    }
+                    let mut line = String::new();
+                    std::io::BufReader::new(&connection)
+                        .read_line(&mut line)
+                        .unwrap();
+                    let response = serde_json::json!({"phase": {"state": "running", "pid": pid}});
+                    writeln!(connection, "{response}").unwrap();
+                }
+            });
+            Self {
+                _lock: lock,
+                socket_directory,
+            }
+        }
+    }
+
+    impl Drop for ImpatientOwner {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.socket_directory);
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn status_asks_a_live_owner_again_after_it_drops_the_connection() {
+        let root = tempfile::tempdir().unwrap();
+        let control = ProcessControl::new(root.path().join("owners"), PathBuf::from("/bin/false"));
+        let id = InstanceId("default__impatient-0".into());
+        let _owner = ImpatientOwner::start(&control, &id, 3).await;
+        let record = control.status(&id).await.unwrap();
+        assert!(matches!(record.phase, OwnerPhase::Running { .. }));
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn status_gives_up_on_an_owner_that_never_answers() {
+        let root = tempfile::tempdir().unwrap();
+        let control = ProcessControl::new(root.path().join("owners"), PathBuf::from("/bin/false"));
+        let id = InstanceId("default__silent-0".into());
+        let _owner = ImpatientOwner::start(&control, &id, usize::MAX).await;
+        // Still no proof of absence: the caller gets an error, not Stopped.
+        assert!(control.status(&id).await.is_err());
+    }
 }
