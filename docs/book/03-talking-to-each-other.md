@@ -2294,3 +2294,9 @@ The production binary supplies the enrolled client and live leader watches. The
 gate is enabled by the opt-in durable discovery profile; selecting that profile
 for production still waits for complete consumer recovery. Service VIP retirement
 also remains separate from releasing one producer execution's physical address.
+
+Producer validation returns `ProducerRetirementError`, with distinct variants for
+invalid node identity, invalid execution identity, conflicting original ownership
+and exhausted capacity. `thiserror` supplies the human-readable error from each
+variant's `#[error(...)]` attribute. The Raft boundary converts it to a refusal
+message; the library keeps the reason typed until that boundary.

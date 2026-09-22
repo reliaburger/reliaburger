@@ -8,6 +8,23 @@ use std::collections::BTreeMap;
 /// Maximum permanently retired executions; reaching this limit never evicts history.
 pub const MAX_PRODUCER_RETIREMENTS: usize = 65_536;
 
+/// A retirement that cannot preserve valid, bounded execution ownership.
+#[derive(Debug, thiserror::Error)]
+pub enum ProducerRetirementError {
+    /// The producer identity is not a valid enrolled node name.
+    #[error("{0}")]
+    InvalidNode(&'static str),
+    /// The requested instance is not a canonical workload identity.
+    #[error("invalid producer execution identity")]
+    InvalidExecution,
+    /// An original generation was already fenced for a different instance.
+    #[error("producer generation belongs to another instance")]
+    GenerationConflict,
+    /// Permanent fences reached their bound; no history may be evicted.
+    #[error("producer retirement capacity exhausted")]
+    Capacity,
+}
+
 /// Permanent node-scoped generation fences, retained after all consumers acknowledge.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -31,15 +48,16 @@ impl ProducerRetirements {
         &self,
         node_id: &str,
         execution: &RuntimeExecution,
-    ) -> Result<Self, String> {
-        crate::cluster::retirement::validate_node_id(node_id).map_err(String::from)?;
+    ) -> Result<Self, ProducerRetirementError> {
+        crate::cluster::retirement::validate_node_id(node_id)
+            .map_err(ProducerRetirementError::InvalidNode)?;
         crate::grill::InstanceIdentity::parse(&execution.instance_id.0)
             .filter(|id| {
                 id.instance_id() == execution.instance_id
                     && crate::config::valid_workload_label(&id.namespace)
                     && crate::config::valid_workload_label(&id.app)
             })
-            .ok_or_else(|| "invalid producer execution identity".to_string())?;
+            .ok_or(ProducerRetirementError::InvalidExecution)?;
         if let Some(original) = self
             .executions
             .get(node_id)
@@ -48,11 +66,11 @@ impl ProducerRetirements {
             return if original == &execution.instance_id {
                 Ok(self.clone())
             } else {
-                Err("producer generation belongs to another instance".into())
+                Err(ProducerRetirementError::GenerationConflict)
             };
         }
         if self.executions.values().map(BTreeMap::len).sum::<usize>() >= MAX_PRODUCER_RETIREMENTS {
-            return Err("producer retirement capacity exhausted".into());
+            return Err(ProducerRetirementError::Capacity);
         }
         let mut next = self.clone();
         next.executions.entry(node_id.into()).or_default().insert(

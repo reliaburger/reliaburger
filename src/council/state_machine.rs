@@ -969,7 +969,11 @@ impl StateMachineInner {
                     .plan_retirement(node_id, execution)
                 {
                     Ok(value) => value,
-                    Err(reason) => return Some(CouncilResponse::Refused { reason }),
+                    Err(error) => {
+                        return Some(CouncilResponse::Refused {
+                            reason: error.to_string(),
+                        });
+                    }
                 };
                 let catalog = retirements.withdraw(&self.state.endpoint_catalog);
                 let withdrawals = match self.state.endpoint_withdrawals.plan_publication(
