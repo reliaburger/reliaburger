@@ -1425,3 +1425,22 @@ turns a cancellation request into permission to forget an owner.
 This gate covers local request ownership at the shared cleanup boundary. It does
 not supply missing original discovery metadata or acknowledgements from remote
 nodes. Those must still be reconstructed and confirmed separately.
+
+### A replacement needs its initialisers too
+
+The OCI crash matrix caught a plain deployment bug: a fresh application ran its
+initialisers, but a rolling replacement skipped them and started the main process.
+Pausing the replacement's first initialiser therefore never reached the gate.
+The replacement was already serving. Wrong order.
+
+Fresh and rolling deployments now call the same `drive_initialisers` method.
+It registers each child before creation, observes its actual exit, confirms its
+retirement, and refreshes network policy before the next child or main workload.
+A failed initialiser prevents main startup and leaves the previous serving
+instance intact under the existing rolling-deployment cleanup rules.
+
+The method borrows the original cgroup path as `&Path`: it uses the caller's path
+without taking ownership or manufacturing a second identity. Each `await?` waits
+for positive completion and propagates an error to the deployment worker. The
+new regression checks both a successful initialiser before main startup and a
+failed initialiser that cannot start main or retire the old serving workload.

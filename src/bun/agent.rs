@@ -800,7 +800,6 @@ struct RollingInstance {
 struct PreparedInstance {
     oci_spec: crate::grill::oci::OciSpec,
     cgroup_path: PathBuf,
-    cgroup_str: String,
     has_init: bool,
 }
 
@@ -5957,7 +5956,6 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
         Ok(PreparedInstance {
             oci_spec,
             cgroup_path,
-            cgroup_str,
             has_init: !spec.init.is_empty(),
         })
     }
@@ -10480,6 +10478,73 @@ impl<G: Grill + Clone + 'static> DeployWorker<G> {
         }
     }
 
+    /// Run the same owned init chain for fresh and rolling replacements.
+    async fn drive_initialisers(
+        &self,
+        instance_id: &InstanceId,
+        app_name: &str,
+        namespace: &str,
+        spec: &AppSpec,
+        cgroup_path: &std::path::Path,
+    ) -> Result<(), BunError> {
+        if spec.init.is_empty() {
+            return Ok(());
+        }
+        self.ops
+            .transition_state(instance_id, ContainerState::Initialising)
+            .await?;
+        for (i, init_spec) in spec.init.iter().enumerate() {
+            let init_id = self.ops.register_initialiser(instance_id, i).await?;
+            let init_oci = crate::grill::oci::generate_init_oci_spec(
+                &init_spec.command,
+                namespace,
+                app_name,
+                spec.image.as_deref(),
+                &cgroup_path.to_string_lossy(),
+                None,
+            );
+            self.grill.create(&init_id, &init_oci).await?;
+            self.grill.start(&init_id).await?;
+
+            // Bounded wait: a hung init can't wedge the deploy forever (and
+            // no longer wedges the loop at all — this poll is off it).
+            let deadline =
+                std::time::Instant::now() + std::time::Duration::from_secs(INIT_TIMEOUT_SECS);
+            let failed = loop {
+                tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+                let state = self.grill.state(&init_id).await?;
+                if state == ContainerState::Stopped {
+                    let exit_code = self.grill.exit_code(&init_id).await;
+                    break exit_code != Some(0);
+                }
+                if std::time::Instant::now() >= deadline {
+                    let _ = self.grill.kill(&init_id).await;
+                    break true;
+                }
+            };
+
+            if failed {
+                let _ = self
+                    .ops
+                    .transition_state(instance_id, ContainerState::Failed)
+                    .await;
+                return Err(BunError::InitContainerFailed {
+                    instance_id: instance_id.clone(),
+                    init_index: i,
+                });
+            }
+            kill_runtime_instance(&self.grill, &init_id).await?;
+            self.ops.forget_initialiser(instance_id, &init_id).await?;
+            // Runc can remove the shared cgroup when an init exits. Its
+            // successor must receive policy for the new kernel identity
+            // before either another init or the main workload executes.
+            self.ops
+                .apply_network_pre_start(instance_id, app_name, Some(spec), cgroup_path)
+                .await?;
+        }
+        Ok(())
+    }
+
     /// Drive a fresh instance through create → egress → init → start →
     /// HealthWait. The blocking grill calls (create/init/start) run here on
     /// the task; the loop applies the state transitions and bookkeeping.
@@ -10508,63 +10573,14 @@ impl<G: Grill + Clone + 'static> DeployWorker<G> {
             .await?;
 
         if prepared.has_init {
-            self.ops
-                .transition_state(instance_id, ContainerState::Initialising)
-                .await?;
-            for (i, init_spec) in spec.init.iter().enumerate() {
-                let init_id = self.ops.register_initialiser(instance_id, i).await?;
-                let init_oci = crate::grill::oci::generate_init_oci_spec(
-                    &init_spec.command,
-                    namespace,
-                    app_name,
-                    spec.image.as_deref(),
-                    &prepared.cgroup_str,
-                    None,
-                );
-                self.grill.create(&init_id, &init_oci).await?;
-                self.grill.start(&init_id).await?;
-
-                // Bounded wait: a hung init can't wedge the deploy forever (and
-                // no longer wedges the loop at all — this poll is off it).
-                let deadline =
-                    std::time::Instant::now() + std::time::Duration::from_secs(INIT_TIMEOUT_SECS);
-                let failed = loop {
-                    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-                    let state = self.grill.state(&init_id).await?;
-                    if state == ContainerState::Stopped {
-                        let exit_code = self.grill.exit_code(&init_id).await;
-                        break exit_code != Some(0);
-                    }
-                    if std::time::Instant::now() >= deadline {
-                        let _ = self.grill.kill(&init_id).await;
-                        break true;
-                    }
-                };
-
-                if failed {
-                    let _ = self
-                        .ops
-                        .transition_state(instance_id, ContainerState::Failed)
-                        .await;
-                    return Err(BunError::InitContainerFailed {
-                        instance_id: instance_id.clone(),
-                        init_index: i,
-                    });
-                }
-                kill_runtime_instance(&self.grill, &init_id).await?;
-                self.ops.forget_initialiser(instance_id, &init_id).await?;
-                // Runc can remove the shared cgroup when an init exits. Its
-                // successor must receive policy for the new kernel identity
-                // before either another init or the main workload executes.
-                self.ops
-                    .apply_network_pre_start(
-                        instance_id,
-                        app_name,
-                        Some(spec),
-                        &prepared.cgroup_path,
-                    )
-                    .await?;
-            }
+            self.drive_initialisers(
+                instance_id,
+                app_name,
+                namespace,
+                spec,
+                &prepared.cgroup_path,
+            )
+            .await?;
         }
 
         self.ops
@@ -10901,6 +10917,23 @@ impl<G: Grill + Clone + 'static> DeployWorker<G> {
                 let _ = events
                     .send(ApplyEvent::Error {
                         message: format!("failed to program egress for {}: {e}", new_id.0),
+                    })
+                    .await;
+                new_failed = true;
+                break;
+            }
+            let initialised = async {
+                self.drive_initialisers(&new_id, app_name, namespace, spec, &cgroup_path)
+                    .await?;
+                self.ops
+                    .transition_state(&new_id, ContainerState::Starting)
+                    .await
+            }
+            .await;
+            if let Err(error) = initialised {
+                let _ = events
+                    .send(ApplyEvent::Error {
+                        message: format!("failed to initialise {}: {error}", new_id.0),
                     })
                     .await;
                 new_failed = true;
@@ -17910,6 +17943,56 @@ host = "remote.local"
             stopped,
             "initialiser still owns execution after parent retirement"
         );
+    }
+
+    #[tokio::test]
+    async fn rolling_replacement_runs_initialisers_and_refuses_main_after_init_failure() {
+        for exit_code in [0, 7] {
+            let (mut agent, tx, shutdown, grill) = test_agent_with_grill();
+            let task = tokio::spawn(async move { agent.run().await });
+            let mut fresh = config_with_init_container();
+            fresh.app.get_mut("web").unwrap().init.clear();
+            expect_complete(&send_deploy(&tx, fresh).await);
+            let main = InstanceId("default__web-g1-0".into());
+            let init = InstanceId(format!("{}__init-0", main.0));
+            grill.set_state(&init, ContainerState::Stopped);
+            grill.set_exit_code(&init, Some(exit_code));
+            let before = grill.calls().len();
+            let events = send_deploy(&tx, config_with_init_container()).await;
+            let calls = grill.calls()[before..].to_vec();
+            let init_started = calls
+                .iter()
+                .position(|(op, id)| op == "start" && id == &init);
+            let main_started = calls
+                .iter()
+                .position(|(op, id)| op == "start" && id == &main);
+            shutdown.cancel();
+            task.await.unwrap();
+            assert!(
+                init_started.is_some(),
+                "rolling replacement skipped its initialiser"
+            );
+            if exit_code == 0 {
+                expect_complete(&events);
+                assert!(main_started.is_some() && init_started < main_started);
+            } else {
+                assert!(
+                    events
+                        .iter()
+                        .any(|event| matches!(event, ApplyEvent::Error { .. }))
+                );
+                assert!(
+                    main_started.is_none(),
+                    "failed init allowed the main payload to start"
+                );
+                assert!(
+                    !calls
+                        .iter()
+                        .any(|(op, id)| (op == "stop" || op == "kill") && id.0 == "default__web-0"),
+                    "failed initialiser retired the original serving workload"
+                );
+            }
+        }
     }
 
     #[tokio::test]

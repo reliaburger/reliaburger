@@ -457,6 +457,7 @@ the later hardening sections and the dated review documents.
 - [x] TestApp standalone binary (`cargo run --bin testapp`)
 - [x] Job execution (deploy, run-to-completion, retry with backoff, failure)
 - [x] Init container execution (sequential run, failure prevents main start)
+  - [x] Run the same owned init chain for rolling replacements. The actual OCI retry matrix first exposed a replacement reaching main without its initialisers. The shared path keeps failure cleanup and per-init policy refresh; 13 native rolling/init regressions pass (1.093s), including preservation of the previous serving instance after failed init. Full physical retry qualification follows in C34.
 - [x] Restart re-drive (health check and job restarts re-start instances)
 - [x] Exit code tracking on Grill trait (ProcessGrill, MockGrill)
 - [x] Example configs (minimal-app, restarts, job-success, job-failure, init-container, volumes, multi-app, full-featured)
