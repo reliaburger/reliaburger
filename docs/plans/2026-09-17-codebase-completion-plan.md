@@ -599,6 +599,13 @@ Registry host extraction splits at the first colon and hardcodes 5050; ingress n
 
 ### C34 — Define lease ownership for the remaining test resources
 
+**22 September closure audit:** all resource-family implementation and supported
+production integration are complete, including physical automatic-restart death
+before adoption. The [closure matrix](2026-09-22-c34-closure.md) maps evidence to
+parent checkboxes. Final hosted validation is tracked there; V01–V04 remain
+independent release gates. The dated entries below preserve intermediate states
+and historical format generations, not additional open implementation work.
+
 **Priority:** P2. **Wave:** 4. **Book chapters:** 15.
 
 Evidence: `src/testkit/lease.rs:LeasedResource`; `src/testkit/bench/suites.rs`.

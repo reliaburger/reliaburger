@@ -119,10 +119,13 @@ security boundary against hostile same-user processes.
   All 42 macOS/43 Linux owner, recovery, real Bun-crash and compatibility
   cases pass with strict Clippy. Physical HTTP exec/Bun SIGKILL preserves the
   main workload PID on recovery; Linux also passes binary-unlink execution.
-- [ ] Qualify actual Bun death at the preparation/activation/adoption boundaries,
+- [x] Qualify actual Bun death at the preparation/activation/adoption boundaries,
   helper loss, short jobs, cron and complete group retirement on macOS/Linux.
-  Re-run the runtime, agent, job-recovery and upgrade suites.
+  Actual process-owner/recovery, job/exec/init Bun-death and signed upgrade
+  regressions pass on macOS/Linux. See the [C34 closure matrix](2026-09-22-c34-closure.md)
+  and dated evidence in `docs/progress.md`.
 
 Production Bun now uses the durable process owner and startup reconciliation.
-Remaining [OCI/runtime/discovery ownership](2026-09-20-oci-launch-ownership.md),
-physical boundary qualification and the 0.1.0 release gates remain open.
+The [OCI/runtime/discovery integration](2026-09-20-oci-launch-ownership.md) and
+physical boundary qualification are also implemented. Final hosted validation and
+the independent V01–V04 release gates remain separate.

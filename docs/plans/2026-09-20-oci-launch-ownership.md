@@ -1,22 +1,21 @@
 # OCI ownership before agent adoption
 
-Current qualification checkpoint (22 September): owned rootful Runc now passes
-seven actual Bun death/cancelled-caller boundaries and an abrupt VM reboot with
-positive boot identity, unknown outcomes, held addresses and stale-release refusal.
-The matrix found and fixed rolling replacements skipping initialisers. Command
-owner schema 3 and OCI intent schema 5 use durable state 36 (protocol 20).
-Rootless runtime, 74 kernel tests, affected native/Linux suites and strict checks
-also pass. Full durable consumer/kernel recovery and production selection remain
-open. The detailed evidence and next steps are in the
-[session handoff](2026-09-20-v0.1.0-session-handoff.md); older checklists below record
-the implementation sequence and do not replace the current C34 checklist.
+Current implementation checkpoint (22 September): normal enrolled rootful
+Runc/eBPF and standalone rootless Runc select durable runtime/discovery recovery.
+Actual Bun SIGKILL, caller cancellation, prior-boot recovery, real VM reboot,
+upgrade, rollback and failed-candidate revert are qualified. The final audit also
+adds automatic-restart death before replacement adoption (`62295c8`, 19.54s).
+Rootless clusters explicitly refuse; direct Apple Container remains deferred.
+Current formats are protocol 20/state 39, command owner 3, OCI intent 5,
+kernel manifest 3 and discovery 4.
 
-C34 remains open after foreground process ownership. This plan covers the
-remaining runtime work on PR #167. It does not change the agreed release
-contract: uncertain cleanup retains ownership, and operator decommission only
-clears obligations after external fencing and permanent identity retirement.
+The [C34 closure matrix](2026-09-22-c34-closure.md) maps implementation to physical
+qualification. Final hosted validation and V01–V04 release acceptance remain
+separate. Earlier paragraphs below preserve their original intermediate evidence;
+phrases such as “opt-in” or “production remains open” describe those checkpoints,
+not the current implementation.
 
-## What the code still permits
+## Original findings (20 September)
 
 `RuncGrill::start` directly spawns `runc run`. Bun can die before storing its
 child handle or application adoption record. `launcher_exited` currently treats
@@ -48,7 +47,7 @@ changes only once the corresponding recovery contract is implemented.
   recovered inventory, timeout followed by explicit retirement, preserved
   output/exit status, invalid-input refusal and bounded output after completion.
   All 42 macOS/43 Linux adapter, owner and recovery cases pass with strict Clippy.
-- [ ] Use the adapter for external runtime commands, keeping records under their
+- [x] Use the adapter for external runtime commands, keeping records under their
   owning runtime generation. Integrate complete inventory and actual retirement
   evidence before changing production selection. A timeout or missing socket
   must never become successful command retirement.
@@ -62,7 +61,7 @@ changes only once the corresponding recovery contract is implemented.
   bundles. Both rootless regressions fail first; all 304 selected Linux runtime
   tests pass with strict Clippy on Linux and macOS. Confirmed retirement permits
   replacement. Durable pre-adoption intent remains the next step.
-- [ ] Journal original Runc intent before preparation can allocate resources.
+- [x] Journal original Runc intent before preparation can allocate resources.
   Include the instance generation and runtime configuration needed for recovery.
   Publish a validated complete inventory for the agent's existing reconciliation
   path. Missing, malformed or conflicting records must refuse.
@@ -71,7 +70,7 @@ changes only once the corresponding recovery contract is implemented.
     adapters, invalid inventory, configuration conflicts and publication failure.
     All 13 selected journal/command cases and strict Clippy pass on macOS/Linux.
     Production integration and complete agent inventory remain open.
-- [ ] Keep the per-instance lifecycle guard through the completion of each owned
+- [x] Keep the per-instance lifecycle guard through the completion of each owned
   create/start/cleanup operation. A cancelled caller cannot leave a blocking
   worker or command able to mutate resources after a successor acquires that
   guard. Bind queued operations to their original generation.
@@ -79,7 +78,7 @@ changes only once the corresponding recovery contract is implemented.
     positive draining under cancelled callers and actual caller SIGKILL. All 17
     selected command/journal cases and strict Clippy pass on macOS/Linux. Real
     runtime command-path integration remains separate.
-- [ ] Move `runc run` and rootless slirp4netns behind durable owners. Reconstruct
+- [x] Move `runc run` and rootless slirp4netns behind durable owners. Reconstruct
   runtime state, exit outcomes, logs and forwarding from those records before
   relying on agent adoption metadata. Remove recovered-PID signalling from the
   production recovery path.
@@ -107,7 +106,7 @@ changes only once the corresponding recovery contract is implemented.
     All six rootful cases plus their fixture pass again (5.22s), 37 macOS/40 Linux
     selected regressions pass, and strict Clippy passes on both. CI now includes
     these rootless cases with a static BusyBox fixture. Production remains open.
-- [ ] Route namespace, link and forwarding mutations through owned commands.
+- [x] Route namespace, link and forwarding mutations through owned commands.
   Before confirming cleanup, retire every admitted command, then verify OCI
   state, helper sockets, mounts, namespaces, links and owned forwarding state.
   Keep the address reservation and original intent until every check succeeds.
@@ -115,7 +114,7 @@ changes only once the corresponding recovery contract is implemented.
     caller-SIGKILL recovery: 304 Linux runtime tests, 21 selected integration
     cases, both privileged network cases and strict Clippy pass. macOS passes
     19 selected integration cases and strict Clippy. Production wiring remains open.
-- [ ] Join runtime reconciliation to discovery and egress cleanup. Restore only
+- [x] Join runtime reconciliation to discovery and egress cleanup. Restore only
   verified source bindings; withdraw bindings before confirming retirement.
   Audit persistent kernel state created before agent adoption independently of
   the external-command changes.
@@ -125,8 +124,9 @@ changes only once the corresponding recovery contract is implemented.
     repeated failed cleanup and propagates enumeration errors. All 27 physical
     Linux eBPF cases pass (5.67s), all 202 selected agent/egress library cases pass
     on both macOS and Linux, and strict Clippy passes on both.
-  - [ ] Qualify the lifetime of unpinned cgroup links across actual Bun death,
-    and restore or fence protected workloads before adoption.
+  - [x] Replace the unpinned production lifetime with persistent owned maps/links.
+    Actual loader/Bun SIGKILL and full VM reboot prove reconstruction or refusal
+    before adoption; missing authority never becomes a fresh owner.
 - Deferred beyond 0.1.0 (operator decision): apply the same pre-adoption reasoning
   to Apple Container CLI operations before restoring direct selection. An older
   invocation may still create a container; macOS containers use managed Linux VMs.
@@ -146,10 +146,10 @@ and repeated cold installs on the advertised host matrix (V04). Passing a
 runtime unit suite does not close those release gates.
 
 
-## Remaining adapter integration
+## Adapter integration record
 
-The integrated rootful and rootless adapters remain opt-in. Production selection
-still awaits discovery recovery and full qualification. Complete these remaining steps:
+The following sequence records the earlier opt-in integration. Normal production
+selection and discovery recovery are now complete; see the closure matrix above.
 
 1. Completed: extend generation-bound whole-operation workers to rootless
    preparation, launch and cleanup. Rootless mode creates no host overlay mount
@@ -203,7 +203,7 @@ Complete this before production OCI selection:
 - [x] Keep ordinary ephemeral loaders available for isolated tests. Build an
   explicitly persistent object for the owned loader; avoid changing the default
   loader into a source of global pins.
-- [ ] Reconcile retained egress, namespace and service maps against original
+- [x] Reconcile retained egress, namespace and service maps against original
   runtime intent and adoption records before serving recovered workloads. Do not
   erase policy merely because the new Bun has not rebuilt its in-memory bindings.
   Egress ownership now precedes map programming and is restored before adoption;
@@ -217,11 +217,11 @@ Complete this before production OCI selection:
   partial preparation, missing active pins, interrupted retirement, wrong map
   layout and same-layout foreign map identity. Strict Linux/macOS Clippy passes.
   Format 1 pins are opt-in; production loading is unchanged.
-- [ ] Qualify actual Bun SIGKILL, blocked traffic during absence,
+- [x] Qualify actual Bun SIGKILL, blocked traffic during absence,
   restoration with the same maps, partial startup, conflicting identities,
   repeated restart and upgrade, plus positive per-workload cleanup. Wire production
   selection only after that evidence passes and advance the state format.
-- [ ] Distinguish host reboot from loader death. bpffs objects disappear at boot,
+- [x] Distinguish host reboot from loader death. bpffs objects disappear at boot,
   while normal-storage ownership survives. Use positive boot identity and runtime
   absence evidence before reinitialising; missing pins during the same boot must
   continue to refuse recovery.
