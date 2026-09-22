@@ -50,6 +50,7 @@ struct Cli {
 
     /// Join/form a cluster using the `[cluster]` config (gossip membership).
     /// Without this flag, bun runs as a single node, as before.
+    /// Container clusters require rootful Linux Runc; rootless Runc is standalone only.
     #[arg(long)]
     cluster: bool,
 
@@ -921,7 +922,16 @@ async fn run_agent(cli: Cli) -> anyhow::Result<()> {
     let runtime = select_runtime(&cli.runtime, &instances_dir, &pickle_dir).await?;
     #[cfg(target_os = "linux")]
     let (durable_discovery, durable_kernel) = match &runtime {
-        AnyGrill::Runc(runtime) if runtime.is_rootless() => (!cli.cluster, false),
+        AnyGrill::Runc(runtime) if runtime.is_rootless() => {
+            if cli.cluster {
+                anyhow::bail!(
+                    "rootless runc clusters are unsupported in 0.1.0; run standalone without --cluster \
+                     or use rootful Linux Runc with eBPF for a container cluster \
+                     (relish setup --quickstart provisions a managed Linux VM on macOS)"
+                );
+            }
+            (true, false)
+        }
         AnyGrill::Runc(_) => (config.ebpf.enabled, config.ebpf.enabled),
         _ => (false, false),
     };

@@ -25,7 +25,8 @@ Continue PR167 on the current branch, one commit per fix or feature.
 Steps 1–4 are implemented and physically qualified for enrolled rootful Runc/eBPF
 clusters and standalone rootless Runc. See `docs/progress.md` for individual commits
 and evidence. Three enrolled nodes preserve workload and kernel ownership through
-six controlled binary swaps and final remote cleanup. Rootless cluster scope is
-still pending; generation-bound host-port release permission is required if it is
-included. Platform validation and managed bpffs startup pass; final hosted validation
+six controlled binary swaps and final remote cleanup. The operator has deferred rootless clusters beyond 0.1.0. Bun now explicitly
+refuses them for both explicit and automatic Runc selection, including the
+experimental flag. Standalone rootless forwarding remains supported; future
+cluster support requires generation-bound host-port release permission. Platform validation and managed bpffs startup pass; final hosted validation
 remains separate. V01–V04 remain independent release gates.

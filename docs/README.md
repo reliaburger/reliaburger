@@ -40,8 +40,10 @@ explicit rollback and failed-candidate automatic revert. Three enrolled OCI node
 also preserve the original workload and kernel ownership through six controlled
 binary swaps and final remote cleanup. Full independent-host acceptance, sustained
 qualification and the signed cold-install matrix remain release gates. Rootless
-qualification currently covers standalone host-port forwarding; it does not claim
-eBPF policy, workload DNS or qualified rootless clusters.
+support in 0.1.0 is standalone host-port forwarding, without eBPF policy or
+workload DNS. Bun refuses `--cluster` when Runc runs without root, including
+automatic runtime selection. Use rootful Linux Runc/eBPF for container clusters;
+on macOS, `relish setup --quickstart` provisions the managed Linux VM.
 
 Log exports now preserve content generations, scope receipts to the destination,
 and serialise durable checkpoint updates across agent and offline exports. Source

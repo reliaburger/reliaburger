@@ -7,6 +7,56 @@ use std::time::Duration;
 use reliaburger::grill::runc::RuncGrill;
 use reliaburger::grill::{ContainerState, Grill, ImageStore, InstanceId, OciSpec};
 
+#[tokio::test]
+#[ignore = "requires an unprivileged Linux user and runc in PATH"]
+async fn rootless_cluster_refuses_before_ownership_recovery_for_every_selection() {
+    assert!(!nix::unistd::geteuid().is_root());
+    for runtime in ["runc", "auto"] {
+        for experimental in [false, true] {
+            let root = tempfile::tempdir().unwrap();
+            let config = root.path().join("node.toml");
+            std::fs::write(
+                &config,
+                format!(
+                    "[storage]\ndata = '{0}/data'\nimages = '{0}/images'\nlogs = '{0}/logs'\nmetrics = '{0}/metrics'\nvolumes = '{0}/volumes'\n",
+                    root.path().display()
+                ),
+            ).unwrap();
+            let mut command = tokio::process::Command::new(env!("CARGO_BIN_EXE_bun"));
+            command
+                .args(["--cluster", "--runtime", runtime, "--listen", "127.0.0.1:0"])
+                .arg("--config")
+                .arg(&config)
+                .kill_on_drop(true);
+            if experimental {
+                command.arg("--experimental-owned-runc");
+            }
+            let output = tokio::time::timeout(Duration::from_secs(10), command.output())
+                .await
+                .expect("unsupported rootless cluster must refuse promptly")
+                .unwrap();
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            assert!(!output.status.success());
+            assert!(
+                stderr.contains("rootless runc clusters are unsupported in 0.1.0"),
+                "runtime={runtime}, experimental={experimental}: {stderr}"
+            );
+            assert!(stderr.contains("without --cluster"));
+            assert!(stderr.contains("rootful Linux Runc"));
+            for path in [
+                "data/discovery",
+                "data/kernel-policy",
+                "data/instances/runc",
+            ] {
+                assert!(
+                    !root.path().join(path).exists(),
+                    "unexpected ownership activation: {path}"
+                );
+            }
+        }
+    }
+}
+
 fn runtime(root: &Path) -> RuncGrill {
     RuncGrill::new(
         root.join("bundles"),

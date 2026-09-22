@@ -2547,3 +2547,24 @@ the original remote confirmations and durable runtime hold still govern release.
 The physical regression publishes an OCI workload through the council, kills Bun,
 adopts the same execution, deletes the desired app and waits until service,
 address and receipt obligations are all cleared.
+
+
+### Keep rootless clusters outside the release boundary
+
+A surviving rootless execution proves who owns its local host port. It doesn't
+prove that every remote consumer has stopped sending traffic to the old address.
+Until we carry the original publication generation through remote withdrawal and
+port release, recovering that execution alone cannot make clustered reuse safe.
+
+For 0.1.0, rootless Runc supports standalone host-port forwarding. Bun rejects
+`--cluster` immediately after selecting a rootless Runc runtime, before owner
+recovery, workload adoption or networking starts. We check the selected runtime,
+so `--runtime auto` and the experimental ownership flag cannot bypass the refusal.
+Rootful Linux Runc/eBPF remains the container cluster profile; the macOS quickstart
+provides it inside the managed Linux VM.
+
+The regression launches the actual Bun binary as an unprivileged Linux user for
+both explicit and automatic selection, with and without the experimental flag.
+Every attempt must fail promptly with migration guidance and leave runtime,
+discovery and kernel ownership unopened. The existing standalone recovery test
+continues to prove that supported rootless workloads survive upgrades and rollback.
