@@ -358,6 +358,10 @@ spot-checked by hand.
       `start/restore_rootless_network` and `slirp_handles`
       (`src/grill/runc.rs:74, 364-490`), the rootless arm of legacy `adopt`
       (`:~1290-1320`) and its tests (`:1879-2160`) are dead.
+      *On hold:* rootless clusters are deferred past 0.1.0 (to get early user
+      feedback first), not dropped. Before deleting, decide whether that work
+      builds purely on the owned path or wants any of the slirp4netns code.
+      Git history keeps it either way.
 - [ ] **T4.2 Make every Linux Runc instance owned; drop
       `--experimental-owned-runc` (~600–700 prod, ~375 test lines; medium
       risk).** Removes the legacy branch of each
