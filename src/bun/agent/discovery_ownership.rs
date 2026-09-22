@@ -197,7 +197,7 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
         .await
     }
 
-    /// Retire an exact standalone allocation after kernel withdrawal and runtime cleanup.
+    /// Retire an exact local allocation after consumer withdrawal and runtime cleanup.
     pub(super) async fn retire_discovery_service(
         &mut self,
         service: &crate::onion::service_id::ServiceId,
@@ -217,9 +217,14 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
                 "discovery ownership is uncertain; recovery required",
             ));
         };
-        let original = journal.inventory().services.iter().find(|owner| {
-            owner.entry.namespace == service.namespace && owner.entry.app_name == service.name
-        });
+        let original = journal
+            .inventory()
+            .services
+            .iter()
+            .find(|owner| {
+                owner.entry.namespace == service.namespace && owner.entry.app_name == service.name
+            })
+            .cloned();
         let live = self.service_map.resolve(service);
         let Some(original) = original else {
             // Portless workloads and repeated acknowledged stops own no allocation.
@@ -229,10 +234,8 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
                 Err(refuse("original service allocation is missing"))
             };
         };
-        if self.cluster.is_some() {
-            return Err(refuse(
-                "remote withdrawal must be confirmed before service retirement",
-            ));
+        if self.cluster.is_some() && self.consumer_owner().is_none() {
+            return Err(refuse("original consumer ownership is missing"));
         }
         let Some(live) = live else {
             return Err(refuse("original service withdrawal is unproven"));
@@ -250,6 +253,16 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
             .any(|owner| owner.service == *service)
         {
             return Err(refuse("original runtime references still require release"));
+        }
+        if self.cluster.is_some() {
+            // Release only this node's reservation. The council independently
+            // retains the global VIP until every registered consumer confirms.
+            self.invalidate_consumer_view().await?;
+            if !self.withdraw_consumer_view().await? {
+                return Err(refuse(
+                    "captured consumer requests still require confirmed release",
+                ));
+            }
         }
         // Include historical candidates: private metadata loss cannot prove that
         // a request which already captured an endpoint released it.

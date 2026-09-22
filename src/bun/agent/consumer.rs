@@ -46,6 +46,49 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
         .await
     }
 
+    /// Reserve the council's exact allocation before a local clustered launch.
+    pub(super) fn register_local_service(
+        &mut self,
+        id: &ServiceId,
+        port: u16,
+        firewall_allow_from: Option<Vec<String>>,
+    ) -> Result<(), BunError> {
+        let Some(owner) = self.consumer_owner() else {
+            if self.consumer_controls_views() {
+                return Err(failure("consumer ownership is uncertain"));
+            }
+            return self
+                .service_map
+                .register(id, port, firewall_allow_from)
+                .map(|_| ())
+                .map_err(failure);
+        };
+        let allocation = owner
+            .publications
+            .last()
+            .and_then(|publication| publication.catalog.resolve(id))
+            .filter(|service| service.port == port)
+            .ok_or_else(|| failure("local service requires its committed cluster allocation"))?;
+        let mut entries: Vec<_> = self
+            .service_map
+            .resolve_all()
+            .into_iter()
+            .cloned()
+            .collect();
+        entries.push(crate::onion::types::ServiceEntry {
+            namespace: id.namespace.clone(),
+            app_name: id.name.clone(),
+            namespace_id: crate::onion::vip::name_to_id(&id.namespace),
+            app_id: u32::from(allocation.vip.0),
+            vip: allocation.vip,
+            port,
+            backends: vec![],
+            firewall_allow_from,
+        });
+        self.service_map = ServiceMap::from_snapshot(&entries).map_err(failure)?;
+        Ok(())
+    }
+
     /// Recover enrolled consumer ownership before starting any proxy, DNS or adoption.
     /// All consumers from the previous Bun process must have stopped first.
     pub async fn recover_consumer_ownership(
@@ -342,7 +385,7 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
         self.cluster_ingress_configs.clear();
     }
 
-    async fn withdraw_consumer_view(&mut self) -> Result<bool, BunError> {
+    pub(super) async fn withdraw_consumer_view(&mut self) -> Result<bool, BunError> {
         let owner = self
             .consumer_owner()
             .cloned()

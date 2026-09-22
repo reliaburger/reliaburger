@@ -6293,12 +6293,7 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
                     Some(f.allow_from.clone())
                 }
             });
-            self.service_map
-                .register(&service_id, port, firewall)
-                .map_err(|error| BunError::BackendPublication {
-                    service: service_id.clone(),
-                    reason: error.to_string(),
-                })?;
+            self.register_local_service(&service_id, port, firewall)?;
 
             for new_id in new_ids {
                 if let Some(host_port) = new_ports.get(new_id).copied().flatten() {
@@ -9821,12 +9816,7 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
             } => {
                 let service_id = crate::onion::service_id::ServiceId::new(&namespace, &app_name);
                 let result = async {
-                    self.service_map
-                        .register(&service_id, port, firewall)
-                        .map_err(|error| BunError::BackendPublication {
-                            service: service_id.clone(),
-                            reason: error.to_string(),
-                        })?;
+                    self.register_local_service(&service_id, port, firewall)?;
                     self.publish_backend_ebpf(&service_id).await?;
                     self.sync_firewall_ebpf().await;
                     Ok(())
@@ -20194,5 +20184,111 @@ host = "remote.local"
             original
         );
         assert!(replacement.service_map_tx.borrow().resolve_all().is_empty());
+    }
+    async fn clustered_allocation_fixture() -> (
+        BunAgent<MockGrill>,
+        tempfile::TempDir,
+        crate::onion::catalog::EndpointCatalog,
+    ) {
+        let (mut agent, _, _) = test_cluster_fault_agent().await;
+        let root = tempfile::tempdir().unwrap();
+        agent.set_records_dir(root.path().join("records"));
+        agent.supervisor.grill().set_launch_inventory(vec![]).await;
+        agent
+            .recover_consumer_ownership(
+                &root.path().join("discovery"),
+                crate::bun::consumer_owners::ConsumerIdentity {
+                    node_id: crate::meat::NodeId::new("test"),
+                    cluster_identity: [42; 32],
+                },
+            )
+            .await
+            .unwrap();
+        let (mut catalog, ingress) = cluster_publication_fixture();
+        catalog.services.get_mut("default__remote").unwrap().vip =
+            crate::onion::vip::VirtualIP("127.128.43.42".parse().unwrap());
+        agent
+            .synchronise_consumer(1, catalog.clone(), ingress, vec![])
+            .await
+            .unwrap();
+        (agent, root, catalog)
+    }
+
+    #[tokio::test]
+    async fn clustered_local_registration_uses_the_committed_vip() {
+        let (mut agent, _root, catalog) = clustered_allocation_fixture().await;
+        let (reply, result) = oneshot::channel();
+        agent
+            .handle_deploy_op(DeployOp::RegisterServiceApp {
+                app_name: "remote".into(),
+                namespace: "default".into(),
+                port: 8080,
+                firewall: None,
+                reply,
+            })
+            .await;
+        result.await.unwrap().unwrap();
+        let service = crate::onion::service_id::ServiceId::new("default", "remote");
+        assert_eq!(
+            agent.service_map.resolve(&service).unwrap().vip,
+            catalog.resolve(&service).unwrap().vip
+        );
+        let (reply, result) = oneshot::channel();
+        agent
+            .handle_deploy_op(DeployOp::RegisterServiceApp {
+                app_name: "uncommitted".into(),
+                namespace: "default".into(),
+                port: 8080,
+                firewall: None,
+                reply,
+            })
+            .await;
+        assert!(
+            result.await.unwrap().is_err(),
+            "invented an uncommitted cluster allocation"
+        );
+    }
+
+    #[tokio::test]
+    async fn clustered_local_allocation_retires_only_after_consumer_guards_release() {
+        let (mut agent, root, catalog) = clustered_allocation_fixture().await;
+        // Restore the exact local reservation; the public view also has a remote replica.
+        let mut entry = agent.service_map_tx.borrow().resolve_all()[0].clone();
+        let backend = entry.backends[0].instance_id.clone();
+        entry.backends.clear();
+        agent.service_map = crate::onion::service_map::ServiceMap::from_snapshot(&[entry]).unwrap();
+        let service = crate::onion::service_id::ServiceId::new("default", "remote");
+        agent
+            .persist_discovery_publication(&service, &agent.service_map.clone())
+            .await
+            .unwrap();
+        let guards = agent
+            .drains
+            .capture_requests(std::slice::from_ref(&backend), false)
+            .await
+            .unwrap();
+        assert!(agent.retire_discovery_service(&service).await.is_err());
+        assert!(guards[0].is_cancelled());
+        agent.drains.decrement_connections(&backend).await;
+        agent.retire_discovery_service(&service).await.unwrap();
+        agent.service_map.unregister(&service).unwrap();
+        assert!(agent.service_map_tx.borrow().resolve_all().is_empty());
+        assert!(
+            agent
+                .synchronise_consumer(1, catalog.clone(), vec![], vec![])
+                .await
+                .unwrap()
+                .published
+        );
+        assert_eq!(
+            agent.service_map_tx.borrow().resolve(&service).unwrap().vip,
+            catalog.resolve(&service).unwrap().vip
+        );
+        drop(agent);
+        let journal =
+            crate::bun::discovery_owners::DiscoveryJournal::open(&root.path().join("discovery"))
+                .unwrap();
+        assert!(journal.inventory().services.is_empty());
+        assert!(journal.inventory().consumer.is_some());
     }
 }

@@ -2461,3 +2461,20 @@ local withdrawal. We compare the entire original reference, including execution
 generation and allocation. A different or still-held reference must obtain its
 own confirmation. The regression recovers an enrolled consumer with no leader
 transport and checks that only its already-authorised reference is released.
+
+### Local reservations and global addresses
+
+A worker must reserve the VIP the council assigned, including collision resolution.
+Hashing the name independently can pick a different address. Clustered registration
+therefore reads the last durable catalogue, checks the declared port and restores
+that exact allocation through the same snapshot validator used during recovery.
+An uncommitted service cannot start publishing an invented address.
+
+Removing a worker's empty local reservation does not free the cluster's VIP. The
+worker first releases its original runtime references, withdraws its complete
+consumer view and waits for captured requests. It then records local withdrawal
+before forgetting that reservation. The council continues reserving the global
+address until every registered consumer has confirmed. A remaining remote replica
+can still publish the original service after this worker removes its local copy.
+The regression holds a remote request guard across local retirement and proves
+both the refusal and the subsequent successful remote publication.
