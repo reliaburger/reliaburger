@@ -152,7 +152,15 @@ this tier now blocks the 0.1.0 candidate rather than the merge.
       reaches the warning signal before the refusal; an integration test that a
       plaintext cluster survives 2,000 rolling-deploy withdrawals.
 
-- [ ] **T1.3 ✔ Owners die on every Bun restart, which wedges their instances.**
+- [x] **T1.3 ✔ Owners die on every Bun restart, which wedges their instances.**
+      Done, and worse than reviewed: after a cgroup kill Bun could not start
+      again at all. The unit now uses `KillMode=process`. A dead owner is
+      detected by its free `owner.lock`; once a null-signal probe shows the
+      workload's process group is empty, the generation retires with an
+      unknown exit code. A live orphaned workload still refuses stop/state. A
+      Linux regression kills Bun, owners and the Runc launcher through
+      `cgroup.kill`, then requires restart, cleanup and redeploy; it fails
+      without the fix (Bun exits at startup) and passes with it.
       The shipped guest unit sets `KillMode=mixed`
       (`src/relish/quickstart/provision.rs:83`), and owner processes stay in
       Bun's cgroup. On stop, or on a crash with `Restart=on-failure`, systemd

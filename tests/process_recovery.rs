@@ -209,7 +209,7 @@ async fn delayed_helper_cannot_start_a_replacement_generation() {
 }
 
 #[tokio::test]
-async fn owner_loss_preserves_uncertainty_and_never_signals_recorded_pid() {
+async fn owner_loss_retires_only_after_the_workload_process_group_is_gone() {
     let directory = tempfile::tempdir().unwrap();
     let marker = directory.path().join("owner-killed");
     let release = directory.path().join("release");
@@ -245,14 +245,14 @@ async fn owner_loss_preserves_uncertainty_and_never_signals_recorded_pid() {
     })
     .await
     .unwrap();
-    assert!(status.is_err(), "missing owner must not imply absence");
-    assert!(kill.is_err(), "cannot signal a PID recovered from disk");
     assert!(
-        recovered.state(&id).await.is_err(),
-        "natural exit is still unobserved by the owner"
+        status.is_err(),
+        "a live workload without its owner is not absent"
     );
-    // The test has positively observed its workload finish; remove only this
-    // fixture's abandoned control socket so it does not litter the host.
+    assert!(kill.is_err(), "cannot signal a PID recovered from disk");
+    // Once nothing in the workload's process group remains, the dead owner's
+    // generation retires with an unknown exit code instead of wedging.
+    stopped(&recovered, &id).await;
     let record: serde_json::Value = serde_json::from_slice(
         &std::fs::read(
             directory
@@ -264,13 +264,17 @@ async fn owner_loss_preserves_uncertainty_and_never_signals_recorded_pid() {
         .unwrap(),
     )
     .unwrap();
+    assert_eq!(record["phase"]["state"], "retired", "{record}");
+    assert!(record["phase"]["exit_code"].is_null(), "{record}");
     let socket_directory = std::path::PathBuf::from(format!(
         "/tmp/rbp-{}-{}",
         nix::unistd::geteuid(),
         record["nonce"].as_str().unwrap()
     ));
-    std::fs::remove_file(socket_directory.join("control.sock")).unwrap();
-    std::fs::remove_dir(socket_directory).unwrap();
+    assert!(
+        !socket_directory.exists(),
+        "retirement left the control socket"
+    );
     assert!(diagnostic_logs.unwrap().contains("diagnostic-output"));
 }
 

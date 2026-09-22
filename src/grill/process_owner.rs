@@ -355,6 +355,22 @@ fn run_locked_owner(directory: &Path, record: &mut OwnerRecord, _lock: File) -> 
     }
 }
 
+/// Whether no process remains in the execution gate's process group.
+///
+/// The gate leads its own group, so its PID is also the group ID. This sends
+/// the null signal, which only asks the kernel whether the group exists, so it
+/// can never disturb a process that later reuses the ID. A reused group, or a
+/// zombie awaiting its reaper, reads as present; the caller just retries.
+pub(crate) fn process_group_absent(leader: u32) -> io::Result<bool> {
+    let group =
+        i32::try_from(leader).map_err(|_| io::Error::other("invalid recorded process group"))?;
+    match nix::sys::signal::killpg(Pid::from_raw(group), None) {
+        Ok(()) | Err(nix::errno::Errno::EPERM) => Ok(false),
+        Err(nix::errno::Errno::ESRCH) => Ok(true),
+        Err(error) => Err(io::Error::from(error)),
+    }
+}
+
 pub(crate) fn complete_retirement(directory: &Path, record: &mut OwnerRecord) -> io::Result<()> {
     let OwnerPhase::Retiring { exit_code } = record.phase else {
         return Err(io::Error::other("process retirement has no absence proof"));

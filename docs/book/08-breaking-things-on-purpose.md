@@ -481,13 +481,49 @@ There is another small crash window after all children are gone: removing the
 control socket and writing the final completion record are separate operations.
 The owner first persists a retirement record with positive absence evidence.
 If it dies during socket cleanup, a fresh adapter can finish that cleanup under
-the owner lock. A record that still says Running provides no such permission.
-The adapter reports uncertainty even if the socket has disappeared.
+the owner lock.
 
-Logs remain available in that uncertain state. Reading an owned log file needs
+### When the owner itself dies
+
+A record that still says Running is harder. Our first version treated it as
+permanently uncertain: no owner, no proof, no progress. That looked safe until
+we read the systemd unit we ship. It said `KillMode=mixed`, which means "when
+the service stops, SIGKILL everything left in its cgroup". Every owner lives in
+Bun's cgroup, so every Bun restart killed every owner, and every instance they
+owned wedged until the next reboot. Tests that kill Bun alone never saw it.
+
+Two changes fix it. The unit now says `KillMode=process`: systemd signals Bun
+and leaves the owners alone, which is the whole point of having owners. And a
+dead owner is no longer a dead end. A live owner holds `owner.lock` for its
+entire life, so if a fresh adapter can take that lock while the record says
+Running, the owner is gone. That still isn't proof the *workload* is gone, since
+killing a parent doesn't kill its children. So we ask the kernel directly:
+
+```rust
+match nix::sys::signal::killpg(Pid::from_raw(group), None) {
+    Ok(()) | Err(nix::errno::Errno::EPERM) => Ok(false),
+    Err(nix::errno::Errno::ESRCH) => Ok(true),
+    Err(error) => Err(io::Error::from(error)),
+}
+```
+
+`killpg` sends a signal to every process in a process group, and the exec gate
+leads its own group. Passing `None` instead of a signal is the null signal: the
+kernel checks permissions and existence and delivers nothing. So this can't
+hurt a stranger that reused the ID. `ESRCH` ("no such process") is the proof we
+want; anything else, including a zombie waiting for init to reap it, reads as
+still present and the caller simply tries again later. Once the group is empty,
+the adapter records retirement with an unknown exit code, because nobody saw the
+exit. A workload that's still running keeps refusing stop and state, exactly as
+before: we still never signal a PID read from disk.
+
+Logs remain available in the uncertain state. Reading an owned log file needs
 validated durable identity, but doesn't need a live signalling endpoint. The
-owner-loss test checks both properties: stop and state refuse to invent authority,
-while the last diagnostic output remains readable.
+owner-loss test checks all of it: while the orphaned workload runs, stop and
+state refuse to invent authority; the last diagnostic output stays readable; and
+once the workload exits, the generation retires on its own. A Linux regression
+reproduces the old unit's behaviour with a real cgroup kill of Bun, its owners
+and the Runc launcher, and checks the restarted Bun recovers the container.
 
 Startup also needs to discover owners it has never seen in its adoption table.
 The runtime exposes a complete launch inventory from the records published

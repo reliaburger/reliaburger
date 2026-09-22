@@ -80,11 +80,19 @@ pub fn node_config(
 }
 
 /// Guest service supervised and restarted by systemd; logs go to its journal.
-pub const SERVICE: &str = "[Unit]\nDescription=Reliaburger node\nAfter=network-online.target\nWants=network-online.target\n\n[Service]\nType=simple\nExecStartPre=/bin/sh -ec 'mountpoint -q /sys/fs/bpf || mount -t bpf bpf /sys/fs/bpf'\nExecStart=/usr/local/bin/bun --cluster --runtime runc --config /etc/reliaburger/node.toml --listen 0.0.0.0:9117\nRestart=on-failure\nRestartSec=2\nLimitNOFILE=1048576\nKillMode=mixed\nTimeoutStopSec=30\n\n[Install]\nWantedBy=multi-user.target\n";
+pub const SERVICE: &str = "[Unit]\nDescription=Reliaburger node\nAfter=network-online.target\nWants=network-online.target\n\n[Service]\nType=simple\nExecStartPre=/bin/sh -ec 'mountpoint -q /sys/fs/bpf || mount -t bpf bpf /sys/fs/bpf'\nExecStart=/usr/local/bin/bun --cluster --runtime runc --config /etc/reliaburger/node.toml --listen 0.0.0.0:9117\nRestart=on-failure\nRestartSec=2\nLimitNOFILE=1048576\nKillMode=process\nTimeoutStopSec=30\n\n[Install]\nWantedBy=multi-user.target\n";
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn service_restarts_leave_durable_owners_running() {
+        // Owners outlive Bun by design; `mixed` or `control-group` would
+        // SIGKILL them on every restart and leave their records unowned.
+        assert!(SERVICE.contains("\nKillMode=process\n"), "{SERVICE}");
+        assert!(!SERVICE.contains("KillMode=mixed"));
+    }
 
     #[test]
     fn managed_vm_has_no_host_mounts_and_only_explicit_loopback_forwards() {

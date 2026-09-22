@@ -391,6 +391,26 @@ impl ProcessControl {
             }
             return Ok(record);
         }
+        if matches!(record.phase, OwnerPhase::Running { .. })
+            && let Ok(_owner) = process_owner::lock_owner(&directory)
+        {
+            // A live owner holds this lock for its whole life, so getting it
+            // proves the owner died: a crash, an OOM kill, or systemd stopping
+            // Bun's unit. Only its workload's absence permits retirement.
+            record = self.load(id)?;
+            if let OwnerPhase::Running { pid } = record.phase {
+                if !process_owner::process_group_absent(pid)? {
+                    return Err(io::Error::other(
+                        "process owner died while its workload still runs",
+                    ));
+                }
+                // Nobody observed the exit, so its code stays unknown.
+                record.phase = OwnerPhase::Retiring { exit_code: None };
+                process_owner::persist(&directory, &record)?;
+                process_owner::complete_retirement(&directory, &mut record)?;
+            }
+            return Ok(record);
+        }
         let deadline = Instant::now() + Duration::from_secs(2);
         while matches!(record.phase, OwnerPhase::Retiring { .. }) {
             match process_owner::lock_owner(&directory) {

@@ -41,6 +41,15 @@ impl Node {
         if !root.join("production").exists() {
             command.arg("--experimental-owned-runc");
         }
+        if let Ok(cgroup) = std::fs::read_to_string(root.join("service-cgroup")) {
+            let procs = std::path::PathBuf::from(cgroup.trim()).join("cgroup.procs");
+            // SAFETY: the closure runs in the forked child before exec and only
+            // performs open/write/close syscalls through std's File API on a
+            // path allocated before the fork; it takes no locks.
+            unsafe {
+                command.pre_exec(move || std::fs::write(&procs, "0"));
+            }
+        }
         let mut child = command
             .arg("--config")
             .arg(root.join("node.toml"))
@@ -491,6 +500,64 @@ async fn normal_standalone_bun_recovers_durable_kernel_and_discovery() {
         "lost discovery evidence was silently recreated"
     );
     std::fs::rename(saved, checkpoint).unwrap();
+    retire_kernel(&root);
+}
+
+/// systemd's `KillMode=mixed`/`control-group` stop: everything left in the
+/// unit's cgroup dies at once, including detached owners and Runc launchers.
+/// Containers survive because Runc gives them cgroups of their own.
+#[cfg(feature = "ebpf")]
+#[tokio::test]
+#[ignore = "requires isolated Linux root, cgroup v2, bpffs, real runc/ip/nft and static BusyBox"]
+async fn service_cgroup_kill_of_bun_and_owners_retires_the_launch_and_redeploys() {
+    let root = tempfile::tempdir().unwrap().keep();
+    durable_fixture(&root);
+    let name = format!(
+        "cgkill-{}",
+        root.file_name()
+            .unwrap()
+            .to_str()
+            .unwrap()
+            .trim_start_matches('.')
+            .to_ascii_lowercase()
+    );
+    let cgroup = Path::new("/sys/fs/cgroup").join(format!("reliaburger-{name}"));
+    std::fs::create_dir(&cgroup).unwrap();
+    std::fs::write(root.join("service-cgroup"), cgroup.to_str().unwrap()).unwrap();
+    let mut node = Node::start(&root).await;
+    node.client.apply(&durable_app(&name)).await.unwrap();
+    wait_file(&root.join("shared/main")).await;
+    std::fs::write(cgroup.join("cgroup.kill"), "1").unwrap();
+    node.child.wait().await.unwrap();
+    tokio::time::timeout(Duration::from_secs(10), async {
+        while !std::fs::read_to_string(cgroup.join("cgroup.procs"))
+            .unwrap()
+            .trim()
+            .is_empty()
+        {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .unwrap();
+    let mut recovered = Node::start(&root).await;
+    // The launcher that supervised the container died with its owner, so Bun
+    // can't adopt it. It must retire the launch and clean up rather than wedge
+    // on the dead owners' records, and the same app must deploy again.
+    assert!(recovered.client.status().await.unwrap().is_empty());
+    std::fs::remove_file(root.join("shared/main")).unwrap();
+    recovered.client.apply(&durable_app(&name)).await.unwrap();
+    wait_file(&root.join("shared/main")).await;
+    let running = recovered.client.status().await.unwrap();
+    assert!(
+        running
+            .iter()
+            .any(|instance| instance.app_name == name && instance.state == "running"),
+        "{running:?}"
+    );
+    recovered.client.stop(&name, "default").await.unwrap();
+    recovered.crash().await;
+    std::fs::remove_dir(&cgroup).unwrap();
     retire_kernel(&root);
 }
 
