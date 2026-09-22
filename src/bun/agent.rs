@@ -1655,6 +1655,9 @@ pub struct BunAgent<G: Grill> {
         std::collections::HashMap<(String, String), crate::config::app::IngressSpec>,
     /// A local change awaits in-place republication of the consumer view.
     consumer_view_stale: bool,
+    /// Journal to reopen after a discovery write whose outcome is unknown,
+    /// and whether it had been recovered from an earlier process.
+    discovery_reopen: Option<(std::path::PathBuf, bool)>,
     /// Perimeter firewall config. Disabled in rootless mode.
     perimeter_config: crate::firewall::rules::PerimeterConfig,
     /// Last applied cluster-node set for firewall reconciliation. `None`
@@ -1819,6 +1822,7 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
             ingress_configs: std::collections::HashMap::new(),
             cluster_ingress_configs: std::collections::HashMap::new(),
             consumer_view_stale: false,
+            discovery_reopen: None,
             // Single-node mode: no nftables needed (no cluster ports to protect)
             perimeter_config: crate::firewall::rules::PerimeterConfig {
                 enabled: false,
@@ -1919,6 +1923,7 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
             ingress_configs: std::collections::HashMap::new(),
             cluster_ingress_configs: std::collections::HashMap::new(),
             consumer_view_stale: false,
+            discovery_reopen: None,
             #[cfg(target_os = "linux")]
             perimeter_config: {
                 let mut cfg = if crate::grill::rootless::is_rootless() {
@@ -3377,6 +3382,7 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
                     self.handle_snapshot_request(req).await;
                 }
                 _ = health_interval.tick() => {
+                    self.reopen_uncertain_discovery().await;
                     self.drive_startup_retirements().await;
                     self.refresh_egress_readiness().await;
                     self.run_health_checks().await;
@@ -20199,6 +20205,91 @@ host = "remote.local"
         assert!(consumer.receipts.is_empty());
         assert_eq!(consumer.publications.len(), 1);
         assert_eq!(consumer.publications[0].generation, 2);
+    }
+
+    async fn fresh_discovery_agent() -> (TestAgent, tempfile::TempDir) {
+        let (mut agent, _, _, _) = test_agent_with_grill();
+        let root = tempfile::tempdir().unwrap();
+        agent.set_records_dir(root.path().join("records"));
+        agent
+            .enable_fresh_discovery_ownership(&root.path().join("discovery"))
+            .await
+            .unwrap();
+        (agent, root)
+    }
+
+    async fn discovery_journal_state(
+        readiness: &crate::bun::readiness::ReadinessTracker,
+    ) -> Option<crate::bun::readiness::SubsystemState> {
+        readiness
+            .snapshot()
+            .await
+            .subsystems
+            .into_iter()
+            .find(|subsystem| subsystem.name == "discovery:journal")
+            .map(|subsystem| subsystem.state)
+    }
+
+    #[tokio::test]
+    async fn failed_discovery_write_recovers_by_reopening_the_journal() {
+        let (mut agent, _root) = fresh_discovery_agent().await;
+        let readiness = crate::bun::readiness::ReadinessTracker::new();
+        agent.set_readiness_tracker(readiness.clone());
+        let service = crate::onion::service_id::ServiceId::new("default", "web");
+        let DiscoveryOwnership::Ready(journal) = &mut agent.discovery_ownership else {
+            panic!("fresh discovery ownership is not ready");
+        };
+        journal.fail_next_write();
+        let map = crate::onion::service_map::ServiceMap::new();
+        assert!(
+            agent
+                .persist_discovery_publication(&service, &map)
+                .await
+                .is_err()
+        );
+        assert_eq!(
+            discovery_journal_state(&readiness).await,
+            Some(crate::bun::readiness::SubsystemState::Degraded),
+            "a fenced journal must be visible"
+        );
+        // A transient ENOSPC or EIO must not fence discovery until restart.
+        agent
+            .persist_discovery_publication(&service, &map)
+            .await
+            .unwrap();
+        assert!(matches!(
+            agent.discovery_ownership,
+            DiscoveryOwnership::Ready(_)
+        ));
+        assert_eq!(
+            discovery_journal_state(&readiness).await,
+            Some(crate::bun::readiness::SubsystemState::Ready)
+        );
+    }
+
+    #[tokio::test]
+    async fn refused_discovery_update_does_not_fence_the_journal() {
+        let (mut agent, _root) = fresh_discovery_agent().await;
+        let service = crate::onion::service_id::ServiceId::new("system", "discovery");
+        // An invalid consumer identity fails validation before any disk write.
+        let refused = agent
+            .update_discovery_inventory(&service, |next| {
+                next.consumer = Some(crate::bun::consumer_owners::ConsumerOwnership {
+                    identity: crate::bun::consumer_owners::ConsumerIdentity {
+                        node_id: crate::meat::NodeId::new(""),
+                        cluster_identity: [0; 32],
+                    },
+                    publications: vec![],
+                    phase: crate::bun::consumer_owners::ConsumerPhase::Withdrawn,
+                    receipts: Default::default(),
+                })
+            })
+            .await;
+        assert!(refused.is_err());
+        assert!(
+            matches!(agent.discovery_ownership, DiscoveryOwnership::Ready(_)),
+            "a refusal that never reached disk fenced discovery"
+        );
     }
 
     #[tokio::test]

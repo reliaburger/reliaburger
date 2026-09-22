@@ -3,6 +3,10 @@
 use super::{BunAgent, BunError, Grill};
 use crate::bun::discovery_owners::DiscoveryJournal;
 
+/// Critical readiness subsystem that reports a fenced discovery journal. While
+/// it is degraded the node cannot publish, withdraw or retire services.
+pub(super) const DISCOVERY_JOURNAL_SUBSYSTEM: &str = "discovery:journal";
+
 /// Publication is either unconfigured, exclusively owned, or fenced after uncertainty.
 #[derive(Debug, Default)]
 pub(super) enum DiscoveryOwnership {
@@ -409,32 +413,85 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
             service: id.clone(),
             reason,
         };
-        let (journal, recovered) =
-            match std::mem::replace(&mut self.discovery_ownership, DiscoveryOwnership::Uncertain) {
-                DiscoveryOwnership::Disabled => {
-                    self.discovery_ownership = DiscoveryOwnership::Disabled;
-                    return Ok(());
-                }
-                DiscoveryOwnership::Ready(journal) => (journal, false),
-                DiscoveryOwnership::Recovered(journal) => (journal, true),
-                DiscoveryOwnership::Uncertain => {
-                    return Err(failure(
-                        "discovery ownership is uncertain; recovery required".into(),
-                    ));
-                }
-            };
+        self.reopen_uncertain_discovery().await;
+        let (journal, recovered) = match &self.discovery_ownership {
+            DiscoveryOwnership::Disabled => return Ok(()),
+            DiscoveryOwnership::Ready(journal) => (journal, false),
+            DiscoveryOwnership::Recovered(journal) => (journal, true),
+            DiscoveryOwnership::Uncertain => {
+                return Err(failure(
+                    "discovery ownership is uncertain; recovery required".into(),
+                ));
+            }
+        };
         let mut next = journal.inventory().clone();
         update(&mut next);
-        let journal = journal
-            .persist(next)
-            .await
+        // A refusal decided in memory never touches disk, so it can't make the
+        // durable state uncertain.
+        journal
+            .check(&next)
             .map_err(|error| failure(error.to_string()))?;
-        self.discovery_ownership = if recovered {
-            DiscoveryOwnership::Recovered(journal)
-        } else {
-            DiscoveryOwnership::Ready(journal)
+        let directory = journal.directory().to_owned();
+        let (DiscoveryOwnership::Ready(journal) | DiscoveryOwnership::Recovered(journal)) =
+            std::mem::replace(&mut self.discovery_ownership, DiscoveryOwnership::Uncertain)
+        else {
+            return Err(failure("discovery ownership changed during update".into()));
         };
-        Ok(())
+        match journal.persist(next).await {
+            Ok(journal) => {
+                self.discovery_ownership = if recovered {
+                    DiscoveryOwnership::Recovered(journal)
+                } else {
+                    DiscoveryOwnership::Ready(journal)
+                };
+                Ok(())
+            }
+            Err(error) => {
+                // The write may or may not have reached disk. Reopening later
+                // adopts whichever checkpoint is durable; the journal is written
+                // before any kernel or userspace effect, so either is safe.
+                self.discovery_reopen = Some((directory, recovered));
+                if let Some(readiness) = &self.readiness {
+                    readiness.register(DISCOVERY_JOURNAL_SUBSYSTEM, true).await;
+                    readiness
+                        .degraded(DISCOVERY_JOURNAL_SUBSYSTEM, error.to_string())
+                        .await;
+                }
+                Err(failure(error.to_string()))
+            }
+        }
+    }
+
+    /// Reopen the discovery journal after a write whose outcome is unknown.
+    /// Called before each update and on every agent tick, so any caller path
+    /// recovers once the disk (or a still-running write worker) allows it.
+    pub(super) async fn reopen_uncertain_discovery(&mut self) {
+        if !matches!(self.discovery_ownership, DiscoveryOwnership::Uncertain) {
+            return;
+        }
+        let Some((directory, recovered)) = self.discovery_reopen.clone() else {
+            return;
+        };
+        match DiscoveryJournal::open_async(&directory).await {
+            Ok(journal) => {
+                self.discovery_ownership = if recovered {
+                    DiscoveryOwnership::Recovered(journal)
+                } else {
+                    DiscoveryOwnership::Ready(journal)
+                };
+                self.discovery_reopen = None;
+                if let Some(readiness) = &self.readiness {
+                    readiness.ready(DISCOVERY_JOURNAL_SUBSYSTEM).await;
+                }
+            }
+            Err(error) => {
+                if let Some(readiness) = &self.readiness {
+                    readiness
+                        .degraded(DISCOVERY_JOURNAL_SUBSYSTEM, error.to_string())
+                        .await;
+                }
+            }
+        }
     }
 
     /// Fresh-only configuration cannot guess original allocations during adoption.

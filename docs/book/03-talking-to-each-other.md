@@ -1625,13 +1625,26 @@ The checkpoint store cannot protect a publication nobody records. Bun now has an
 opt-in fresh-agent integration: before acknowledging a backend snapshot, it
 persists the exact service allocation and attempted backends, then writes the
 kernel map. DNS and Wrapper still receive only the confirmed candidate. A storage
-failure therefore stops initial deployment before runtime creation; the agent
-refuses later publication even if somebody repairs the path underneath it.
+failure therefore stops initial deployment before runtime creation.
 
 The owner is an enum with three states: Disabled, Ready and Uncertain. Starting a
 write uses `std::mem::replace` to move the Ready journal into its blocking worker
 and leave Uncertain in the agent. Only acknowledged success returns Ready. This
 makes cancellation fail closed without losing the worker's exclusive claim.
+
+Failing closed is only half the job, though; something has to reopen the door.
+Our first version never did. One failed write (a full disk for a second, say)
+left the agent Uncertain until Bun restarted, publishing and retiring nothing,
+while its health check said everything was fine. Two changes fix that. Refusals
+decided in memory, like an invalid transition, are checked before the journal
+moves into its worker, so they can't fence anything. And after a real write
+failure the agent remembers which directory it owned. On the next update, and on
+every one-second tick, it reopens the journal from disk and adopts whichever
+checkpoint is durable. Because the journal is always written *before* the kernel
+or userspace changes it describes, either the old or the new checkpoint is a
+safe description of what might be exposed. While it's fenced, a critical
+readiness subsystem, `discovery:journal`, reports the failure, so the scheduler
+stops sending work to a node that can't publish it.
 Disappearing from a new snapshot does not prove retirement: the next checkpoint
 retains earlier service allocations until a separate confirmed cleanup can remove
 them. Tests reopen the store after agent drop, reject a broken checkpoint before

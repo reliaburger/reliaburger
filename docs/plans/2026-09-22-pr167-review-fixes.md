@@ -200,7 +200,12 @@ this tier now blocks the 0.1.0 candidate rather than the merge.
       *Test:* run a container, retire it, change `dns_nameserver`, restart Bun,
       and assert startup succeeds. Assert retired record directories are gone.
 
-- [ ] **T1.5 One journal-write failure fences discovery until Bun restarts.**
+- [x] **T1.5 One journal-write failure fences discovery until Bun restarts.**
+      Done. Validation runs before the journal moves into its worker, so
+      refusals never fence. After a write failure the agent reopens the
+      journal from disk on the next update and on every tick, adopting the
+      durable checkpoint, and the critical `discovery:journal` readiness
+      subsystem reports the fence meanwhile.
       `update_discovery_inventory` (`src/bun/discovery_ownership.rs:397-425`)
       swaps state to `Uncertain` before persisting, and `persist`
       (`src/bun/discovery_owners.rs:243-251`) takes the journal by value, so an
