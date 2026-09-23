@@ -146,7 +146,7 @@ Reporting refuses messages over 1 MiB or with more than 100 events;
 `reporting_tree.max_events_per_report` only supports 100. Admission failures
 appear in node logs. State snapshots refresh on the next tick and metrics retry
 the last five minutes; longer gaps need the retained node-local data. See
-[reporting admission](book/11-eyes-everywhere.md#reporting-has-an-admission-boundary-c21).
+[reporting admission](book/11-eyes-everywhere.md#reporting-has-an-admission-boundary).
 
 ### Configuration changes
 

@@ -478,13 +478,20 @@ Config:
 
 ## Tier 3: docs cleanup before merge
 
-- [ ] **T3.1 Condense the book.** 8.2k added lines across 14 chapters, about 300
+- [x] **T3.1 Condense the book.** 8.2k added lines across 14 chapters, about 300
       appended fix headings, one code block. Rewrite each chapter's additions as
       one or two narrative sections with real code listings. Explain or drop
       "obligation", "authority", "qualification", "fence". Remove the ~20
       development-only protocol/state version numbers (keep only the current
       compatibility policy in chapter 14). Remove the 7 links into
       `docs/plans/`. Follow the style guide in `CLAUDE.md`.
+      Done in 16 commits, one per chapter plus a chapter 8 fix. Against the
+      book before #167 the diff went from +8,072/−226 to +1,616/−351; the
+      book is 18,615 lines (was 25,196). Each chapter's fixes are now one or
+      two narrative sections with listings checked against this branch.
+      Development version numbers and `docs/plans/` links are gone, and
+      jargon is either defined once or dropped. Chapter 8 no longer
+      describes the long-deleted `tests/chaos_smoker.rs`.
 - [ ] **T3.2 Archive plans.** Move the session handoff (1,710 lines), the
       completion plan (2,338 lines), the C34 closure and the per-feature 09-19 /
       09-20 / 09-22 plans to `docs/plans/archive/`. Keep a one-page V01–V04
