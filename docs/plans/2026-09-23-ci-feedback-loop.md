@@ -262,13 +262,22 @@ VM). A fix counts only when the loop that used to fail passes.
 - [ ] **C4.2 Shared cluster test support.** One `tests/support/cluster.rs` for
   `start_node`, `local`, `wait_until` and `wait_for_leader`, used by placement,
   cluster_failover, cluster_gossip, chaos and reconstruction.
-- [ ] **C4.3 Delete overlaps.**
+- [x] **C4.3 Delete overlaps.**
   - `tests/chaos.rs`'s council-partition test, which the unit test covers
     better. Keep the rest of chaos.rs in the portable suite if it's in-memory,
     as its header says.
   - The two `reconstruction.rs` tests that mirror unit tests.
   - The small name-level duplicates in `batch`, `integration` and `onion`,
     after confirming they add nothing.
+  - Done: `tests/chaos.rs` is gone. Its 3/2 partition test repeated the
+    council unit test, and its single-member isolation test moved into
+    `council::node::tests` using the event-driven waits (20/20 passes, 0.5 s
+    instead of fixed 2 s sleeps). Kept after reading them: the two
+    `reconstruction.rs` tests feed Raft-written desired state through the
+    controller's threshold logic, which no unit test covers. The `batch`,
+    `integration` and `onion` "duplicates" check the HTTP status mapping, not
+    the pure function.
+
 - [ ] **C4.4 Split `documentation_first_run`.** Keep the two first-run paths.
   Move the registry crash, cron SIGKILL and node-job lease tests into
   `registry_authority`, `job_recovery` or a gated acceptance binary, so the

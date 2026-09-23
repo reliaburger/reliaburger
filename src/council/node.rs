@@ -1324,6 +1324,75 @@ mod tests {
         }
     }
 
+    #[tokio::test]
+    async fn isolated_member_misses_writes_until_healed() {
+        let (nodes, router) = create_cluster(3).await;
+        init_cluster(&nodes).await;
+        wait_for_leader(&nodes, Duration::from_secs(5))
+            .await
+            .expect("leader should be elected");
+
+        // Cut node 3 off from nodes 1 and 2 in both directions.
+        for majority in [1u64, 2] {
+            router.partition(3, majority).await;
+        }
+
+        // The majority keeps, or re-elects, a leader of its own.
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+        let majority_leader = loop {
+            let mut found = None;
+            for node in &nodes[..2] {
+                if let Some(leader) = node.current_leader().await
+                    && leader != 3
+                {
+                    found = Some(leader);
+                }
+            }
+            if let Some(leader) = found
+                && nodes[(leader - 1) as usize]
+                    .write(RaftRequest::ConfigSet {
+                        key: "during_isolation".to_string(),
+                        value: "committed".to_string(),
+                    })
+                    .await
+                    .is_ok()
+            {
+                break leader;
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "the majority never accepted a write"
+            );
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        };
+        assert_ne!(majority_leader, 3);
+
+        assert!(
+            wait_for_all_states(&nodes[..2], Duration::from_secs(5), |state| {
+                state.config.contains_key("during_isolation")
+            })
+            .await,
+            "the majority did not apply its own write"
+        );
+        assert!(
+            !nodes[2]
+                .desired_state()
+                .await
+                .config
+                .contains_key("during_isolation"),
+            "the isolated node received a write through the partition"
+        );
+
+        router.heal().await;
+        assert!(
+            wait_for_all_states(&nodes, Duration::from_secs(10), |state| {
+                state.config.get("during_isolation").map(String::as_str) == Some("committed")
+            })
+            .await,
+            "the isolated node did not catch up after the partition healed"
+        );
+    }
+
     // -----------------------------------------------------------------------
     // CSR signing test
     // -----------------------------------------------------------------------

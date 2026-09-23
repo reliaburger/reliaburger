@@ -980,7 +980,7 @@ The batch scheduler and build pieces add their own: the 100K-jobs-in-under-a-sec
 
 We used to keep eight in-memory scenario tests in `tests/chaos_smoker.rs`. We deleted them: they checked a mock's bookkeeping, not anything a real node did, which is exactly the false confidence the next section warns about. The rail and registry decisions are unit-tested in `src/smoker/`, and the scenarios themselves run for real through `relish test --chaos`.
 
-`tests/chaos.rs` adds cluster-recovery-from-partition tests (carried over from Chapter 2), in-memory and deterministic. They don't need eBPF, because what they're testing is the decision-making — "would this fault be allowed, and is it tracked correctly?" — not the kernel mechanism.
+The council's own unit tests cover cluster recovery from a partition: a five-node cluster split 3/2, and a single member cut off and healed, both over the in-memory Raft transport. They don't need eBPF, because what they're testing is the decision-making — "would this fault be allowed, and is it tracked correctly?" — not the kernel mechanism.
 
 ### Gated tests — the kernel actually dropping packets
 
@@ -997,7 +997,7 @@ On a Mac, `relish dev test` runs them inside Lima. Process faults (signals) run 
 ```sh
 cargo test --lib smoker meat::batch         # safety rails, registry, batch
 relish test --chaos --yes                    # the guarded catalogue (real cluster)
-cargo test --test chaos                       # partition recovery
+cargo test --lib council::node                # partition recovery
 relish dev test onion                         # eBPF fault enforcement (Lima)
 ```
 
