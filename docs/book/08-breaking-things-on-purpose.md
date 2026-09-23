@@ -330,11 +330,11 @@ The roadmap defines 8 chaos scenarios. Each tests a different failure mode and v
 
 6. **Node failure with volume app.** The node is "dead" but volumes are on disk. An alert fires. When the node recovers, data is intact.
 
-7. **Resource exhaustion.** OOM kill triggers restart + recovery. CPU stress triggers degraded performance but not failure. Disk full triggers an alert and GC.
+7. **Resource exhaustion.** A Kill fault stands in for the OOM killer and triggers restart + recovery. CPU stress triggers degraded performance but not failure. Disk full triggers an alert and GC.
 
 8. **Bun restart.** The fault registry is in-memory, so it's empty after restart. Containers keep running (they're OS processes, not Bun children). The agent reconnects and resumes any interrupted deploy.
 
-Each test in `tests/chaos_smoker.rs` exercises the safety rails and registry logic that make these scenarios safe to run. The eBPF-level tests run in the Lima dev cluster via `relish dev test`.
+The unit tests in `src/smoker/` exercise the safety rails and registry logic that make these scenarios safe to run, and `relish test --chaos` runs the guarded catalogue against a real cluster. The eBPF-level tests run in the Lima dev cluster via `relish dev test`.
 
 ## Now it actually breaks
 
@@ -978,16 +978,9 @@ The batch scheduler and build pieces add their own: the 100K-jobs-in-under-a-sec
 
 ### Integration tests — the scenarios, in memory
 
-The eight chaos scenarios live in `tests/chaos_smoker.rs`, and they're deliberately built on in-memory infrastructure so they run on a laptop with no eBPF host:
+We used to keep eight in-memory scenario tests in `tests/chaos_smoker.rs`. We deleted them: they checked a mock's bookkeeping, not anything a real node did, which is exactly the false confidence the next section warns about. The rail and registry decisions are unit-tested in `src/smoker/`, and the scenarios themselves run for real through `relish test --chaos`.
 
-```
-kill_leader_blocked_without_flag      rapid_elections_quorum_protection
-kill_leader_allowed_with_flag         oom_kill_blocked_for_all_replicas
-kill_non_leader_node_approved         cpu_stress_allowed_no_replica_check
-drain_node_tracked_in_registry        registry_cleared_on_restart
-```
-
-`tests/chaos.rs` complements them with cluster-recovery-from-partition tests (carried over from Chapter 2), also in-memory and deterministic. Neither needs eBPF, because what they're testing is the decision-making — "would this fault be allowed, and is it tracked correctly?" — not the kernel mechanism.
+`tests/chaos.rs` adds cluster-recovery-from-partition tests (carried over from Chapter 2), in-memory and deterministic. They don't need eBPF, because what they're testing is the decision-making — "would this fault be allowed, and is it tracked correctly?" — not the kernel mechanism.
 
 ### Gated tests — the kernel actually dropping packets
 
@@ -1003,9 +996,8 @@ On a Mac, `relish dev test` runs them inside Lima. Process faults (signals) run 
 
 ```sh
 cargo test --lib smoker meat::batch         # safety rails, registry, batch
-cargo test --test chaos_smoker               # the 8 scenarios (in-memory)
+relish test --chaos --yes                    # the guarded catalogue (real cluster)
 cargo test --test chaos                       # partition recovery
 relish dev test onion                         # eBPF fault enforcement (Lima)
 ```
 
-Phase 8 adds 222 tests, bringing the total to 1263.
