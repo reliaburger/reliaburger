@@ -365,6 +365,10 @@ make bench         # reproducible transport and 5-250 node measurements
 make bench-large   # reproducible 500 and 1,000 node measurements
 ```
 
+CI runs both on pushes to `main`, nightly, and on pull requests that touch
+`src/mustard/` or `benches/`. Nothing gates on the numbers yet, so other pull
+requests skip the release build.
+
 The fast benchmarks (`cargo bench --bench gossip`) are the ones to run regularly — they catch performance regressions in the gossip protocol. Results are stored in `target/criterion/` and criterion reports whether performance changed between runs.
 
 The large benchmarks (`cargo bench --bench gossip_large`) test the same convergence logic

@@ -61,8 +61,8 @@ be visible until we remove its race.
 | `make test-upgrade-node` | Real single-node binary replacement | Linux |
 | `make test-upgrade-cluster` | Real rolling cluster replacement | Linux |
 | `make test-apple` | Deferred Apple adapter | Manual Apple-silicon development check, outside 0.1.0 |
-| `make bench` | Criterion transport and 5–250-node measurements | Pull requests |
-| `make bench-large` | Criterion 500- and 1,000-node measurements | Pull requests |
+| `make bench` | Criterion transport and 5–250-node measurements | `main`, nightly, and PRs touching gossip |
+| `make bench-large` | Criterion 500- and 1,000-node measurements | `main`, nightly, and PRs touching gossip |
 | `make coverage` | The portable suite, run once under line coverage; this is the Linux test gate too | Linux |
 | `make audit` | Current RustSec database, with new vulnerabilities and maintenance warnings denied | Pull requests, release gate and weekly schedule |
 | `make examples` | Every checked-in workload config parses, validates and plans through Relish without deployment | Linux pull requests |
