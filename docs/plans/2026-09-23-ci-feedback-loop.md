@@ -140,7 +140,7 @@ Chapter 15 of the book gets a section on how and why the pipeline is laid out.
 
 ### Phase 1: stop wasting minutes (config only, about −100 runner-min/push)
 
-- [ ] **C1.1 Fix the cache.**
+- [x] **C1.1 Fix the cache.**
   - Give the jobs that build the same profile a shared key (`shared-key` in
     `Swatinem/rust-cache`), with `save-if` true only on pushes to `main`.
     Everything else restores.
@@ -148,51 +148,51 @@ Chapter 15 of the book gets a section on how and why the pipeline is laid out.
     This keeps us well under 10 GB, and every PR (stacked or not) starts from
     `main`'s cache.
   - Expected: portable Linux cold 36 min → warm about 23 min.
-- [ ] **C1.2 Stop running the no-default suite.**
+- [x] **C1.2 Stop running the no-default suite.**
   - Replace `make test-no-default` (portable Linux), the minimum-Rust
     no-default run and the second `llvm-cov` pass with one
     `cargo clippy --no-default-features --all-targets -D warnings` in the lint
     step.
   - Update the Makefile, `make ci` and the READMEs.
   - Saves about 35 runner-minutes and one of the seven suite runs per job.
-- [ ] **C1.3 Make minimum Rust a check.** Keep the locked
+- [x] **C1.3 Make minimum Rust a check.** Keep the locked
   `cargo check --all-targets` for both feature sets on 1.97. The two test runs
   (about 28 min) repeat the stable suite. They could come back as a nightly job
   if we ever see a behaviour difference between compilers.
-- [ ] **C1.4 One instrumented Linux run.**
+- [x] **C1.4 One instrumented Linux run.**
   - `portable Linux` runs the suite once, under `cargo llvm-cov nextest`, and
     enforces the 78.65% floor there.
   - The standalone `coverage` job goes.
   - JUnit then comes from the only run, which fixes the overwrite.
   - The trade-off: Linux tests run only instrumented, which is slightly slower
     per test but saves a whole job. See decision D1.
-- [ ] **C1.5 Run the 10k acceptance in debug, inside `test-slow`.** It takes
+- [x] **C1.5 Run the 10k acceptance in debug, inside `test-slow`.** It takes
   0.3 s in a debug build. Drop the `#[ignore]` reason that sends it to
   `bench-10k`, and delete the 21-minute release job.
-- [ ] **C1.6 Benchmarks on `main` and nightly only.**
+- [x] **C1.6 Benchmarks on `main` and nightly only.**
   - Merge `bench` and `bench-large` into one job (they share `target/release`)
     that runs on push to `main`, on a nightly `schedule`, and on PRs that touch
     `src/mustard/**` or `benches/**`.
   - Nothing gates on Criterion output today, so PRs lose no signal. See D2.
-- [ ] **C1.7 Remove the privileged-job duplicates.**
+- [x] **C1.7 Remove the privileged-job duplicates.**
   - Add `& not binary(owned_runc) & not binary(owned_network)` to
     `test-linux`, since the qualify script already runs them under `unshare`.
   - Raise `timeout-minutes` from 30 to 40. One green run was cancelled at the
     cap while saving its cache.
-- [ ] **C1.8 Trim `build.yml` on PRs.**
+- [x] **C1.8 Trim `build.yml` on PRs.**
   - Build only Linux x86-64 on PRs, and only when `Cargo.*`, `src/**` or
     packaging changes.
   - Build the PDF only when `docs/**` changes.
   - Keep the full four-target matrix for `main` and manual runs.
   - The macOS x86 release build (13–56 min) is the slowest job in the repo.
     See D3.
-- [ ] **C1.9 Path filters for docs-only PRs.** A PR touching only `docs/**`,
+- [x] **C1.9 Path filters for docs-only PRs.** A PR touching only `docs/**`,
   `*.md` or `website/**` runs fmt, the doc and link checks, and the two tests
   that read docs: `documentation_first_run` and the embedded manual in
   `src/relish/manual`. #175 spent 274 runner-minutes proving that Markdown
   compiles.
 
-- [ ] **C1.10 Light path for stacked PRs (D5).** PRs whose base isn't `main`
+- [x] **C1.10 Light path for stacked PRs (D5).** PRs whose base isn't `main`
   skip the acceptance suites (wall-clock, cluster, upgrade, privileged Linux)
   unless labelled `full-ci`. They still run lint, the portable suites and
   minimum Rust. PRs into `main`, pushes to `main` and the nightly run get
@@ -201,7 +201,7 @@ Chapter 15 of the book gets a section on how and why the pipeline is laid out.
 
 ### Phase 2: build once, run everywhere (about −30 runner-min, shorter critical path)
 
-- [ ] **C2.1 `cargo nextest archive`.**
+- [x] **C2.1 `cargo nextest archive`.**
   - One `build-tests` job (portable, default features) produces a nextest
     archive plus the `bun` and `relish` binaries.
   - `wall-clock acceptance`, `multi-node cluster` and both upgrade jobs
@@ -210,10 +210,10 @@ Chapter 15 of the book gets a section on how and why the pipeline is laid out.
   - Merge `wall-clock acceptance`, `single-node upgrade` and `cluster upgrade`
     into one `acceptance` job that runs the three suites in sequence.
   - The privileged job keeps its own `ebpf` build.
-- [ ] **C2.2 Examples as an integration test.** Replace `make examples` with a
+- [x] **C2.2 Examples as an integration test.** Replace `make examples` with a
   test that loops over `examples/**/*.toml` through `CARGO_BIN_EXE_relish`. That
   removes the separate dev build, and macOS runs it too.
-- [ ] **C2.3 Faster first signal.** Put fmt and clippy in their own small job,
+- [x] **C2.3 Faster first signal.** Put fmt and clippy in their own small job,
   so a lint failure reports in about 3–5 minutes instead of waiting behind the
   suite.
 
@@ -223,27 +223,27 @@ Reproduce each one before fixing: a loop of the single test under load (for
 example `nextest run --test-threads=1` beside `stress-ng`, or 20 repeats in the
 VM). A fix counts only when the loop that used to fail passes.
 
-- [ ] **C3.1 (F1)** Find why the service-map withdrawal proof never arrives after
+- [x] **C3.1 (F1)** Find why the service-map withdrawal proof never arrives after
   clustered consumer recovery. Capture the discovery journal and service map
   when the loop spins. This is a product race and it blocks a clean #174 story.
   Check whether Tier 4's `drain_all` or inventory changes are involved, or
   whether it predates them.
-- [ ] **C3.2 (F4)** Make fault clearing report success only once quorum-risk
+- [x] **C3.2 (F4)** Make fault clearing report success only once quorum-risk
   accounting sees the node healthy, or have the safety check derive from the
   same view. Product fix, plus a test that injects straight after a clear.
-- [ ] **C3.3 (F6)** Put the force-kill confirmation deadline in the agent config.
+- [x] **C3.3 (F6)** Put the force-kill confirmation deadline in the agent config.
   Under load, 2 s is too short for `runc kill` plus the exit observation. Pick
   a production default and test it with a slow fake runtime.
-- [ ] **C3.4 (F2)** Wait until every surviving member has applied the new
+- [x] **C3.4 (F2)** Wait until every surviving member has applied the new
   membership before killing the leader. Then check whether real leader
   replacement after decommission has the same gap.
-- [ ] **C3.5 (F3)** Retry the retryable 503 in the placement cleanup helper.
-- [ ] **C3.6 (F5)** Replace the fixed 20 s budget with an event-driven wait
+- [x] **C3.5 (F3)** Retry the retryable 503 in the placement cleanup helper.
+- [x] **C3.6 (F5)** Replace the fixed 20 s budget with an event-driven wait
   (poll job state with a generous overall deadline), and put `job_recovery` in
   the `process-heavy` group.
-- [ ] **C3.7 (F7)** Seed the gossip RNG in the five-node convergence test, or
+- [x] **C3.7 (F7)** Seed the gossip RNG in the five-node convergence test, or
   loop until convergence with a round cap.
-- [ ] **C3.8 Flake register.** Add a short "Known flakes" table to
+- [x] **C3.8 Flake register.** Add a short "Known flakes" table to
   `docs/progress.md` (test, first seen, cause, owner item), maintained by the
   rerun-once rule above.
 
@@ -259,7 +259,7 @@ VM). A fix counts only when the loop that used to fail passes.
   - Watch the re-exec fixtures (`runtime_selection`, `process_recovery`).
   - Expected: 1.5–3 min less per test build, and caches small enough to fit
     easily. See D4.
-- [ ] **C4.2 Shared cluster test support.** One `tests/support/cluster.rs` for
+- [x] **C4.2 Shared cluster test support.** One `tests/support/cluster.rs` for
   `start_node`, `local`, `wait_until` and `wait_for_leader`, used by placement,
   cluster_failover, cluster_gossip, chaos and reconstruction.
 - [x] **C4.3 Delete overlaps.**
@@ -278,11 +278,11 @@ VM). A fix counts only when the loop that used to fail passes.
     `integration` and `onion` "duplicates" check the HTTP status mapping, not
     the pure function.
 
-- [ ] **C4.4 Split `documentation_first_run`.** Keep the two first-run paths.
+- [x] **C4.4 Split `documentation_first_run`.** Keep the two first-run paths.
   Move the registry crash, cron SIGKILL and node-job lease tests into
   `registry_authority`, `job_recovery` or a gated acceptance binary, so the
   portable suite loses about 150 seconds of serialised work.
-- [ ] **C4.5 Stop waiting out timeouts.**
+- [x] **C4.5 Stop waiting out timeouts.**
   - For the 19 happy-path tests that sleep a full 5/10/20/30 s, prove absence
     with `tokio::time::pause` where the code allows it, or shorten the bound
     through an injectable deadline.
@@ -291,32 +291,50 @@ VM). A fix counts only when the loop that used to fail passes.
 
 ### Phase 5: every test runs somewhere
 
-- [ ] **C5.1** Fix the `test-linux` filter so
+- [x] **C5.1** Fix the `test-linux` filter so
   `snapshot_restore_recovers_corrupted_data` runs: rename it `btrfs_…`, or
   select `RELIABURGER_BTRFS_TESTS` tests by binary and module.
-- [ ] **C5.2** Make `registry_routable_push` `#[ignore]` with a reason, so it
+- [x] **C5.2** Make `registry_routable_push` `#[ignore]` with a reason, so it
   stops reporting a pass. Then either give it a target (it needs a routable
   address; the privileged job may qualify) or delete it.
-- [ ] **C5.3** Add the missing Apple test to `make test-apple`.
-- [ ] **C5.4** List the manual-only tests (GPU, S3, host reboot, Apple) and their
+  Done differently: the test needs no external tooling, so the gate went and it
+  runs in the portable suite (0.15 s).
+- [x] **C5.3** Add the missing Apple test to `make test-apple`.
+- [x] **C5.4** List the manual-only tests (GPU, S3, host reboot, Apple) and their
   targets in `docs/README.md`'s testing section, so "not in CI" is a written
   decision.
 
 ## Follow-ups found while fixing flakes
 
-- [ ] **C6.1 First Runc deploy of `cluster-owned` fails its init container.** In
+- [x] **C6.1 First Runc deploy of `cluster-owned` fails its init container.** In
   every VM run of `oci_crash::normal_clustered_bun_recovers_enrolled_consumer_before_adoption`
   the first deploy of `cluster-owned-0` failed with "init container 0 failed". The
   reconciler then rolled to `-g1-0`, which widened the window that exposed F1.
   Find whether the test's wrapper or Runc's exit-code read is wrong.
-- [ ] **C6.2 Failed `oci_crash` runs leak Runc containers.** They keep running
+- [x] **C6.2 Failed `oci_crash` runs leak Runc containers.** They keep running
   after a failure and slow or break later runs until cleaned by hand. The
   harness needs a drop guard that kills and deletes what it started.
-- [ ] **C6.3 An eBPF recovery test leaves a tmpfs identity mount** on the host
+- [x] **C6.3 An eBPF recovery test leaves a tmpfs identity mount** on the host
   (`.identity/default__address-successor-0`).
 - [ ] **C6.4 Entry-node fault pre-checks read their own gossip view.** After a
   clear, only the leader's view is guaranteed fresh, so a lagging entry node can
   refuse briefly. That errs on the safe side; decide whether it matters.
+
+- [ ] **C6.5 Mustard needs anti-entropy.** Seeding the five-node convergence
+  test (C3.7) exposed a real protocol property: with bounded re-broadcasts and
+  no full-membership resync, about 1 in 1,300 unseeded schedules strands a
+  member permanently, and more rounds don't help. Add a periodic push-pull
+  sync (SWIM's usual answer) and an unseeded property test.
+
+- [ ] **C6.6 Say why an initialiser failed.** When Runc refuses to start a
+  container in an occupied cgroup, the deploy reports only "init container 0
+  failed"; the real reason sits in the owner's captured stderr, and the
+  reconciler drops the error text. Surface both.
+- [ ] **C6.7 Unique names in the remaining crash tests.** Other `oci_crash`
+  tests still use fixed app names (`restart-crash`, `upgrade-owned`), so a test
+  binary killed with SIGKILL can still leave a cgroup that breaks the next run.
+- [ ] **C6.8 eBPF tests that write to the host's volumes directory.** Some
+  never call `set_volumes_dir` and write under `/var/lib/reliaburger/volumes`.
 
 ## Decisions
 

@@ -338,6 +338,22 @@ in repository Actions. Signed candidate qualification is still V03.
 - [ ] **V04** (gate) Measure repeated cold installs on the advertised host matrix.
 - [x] **V05** Review all dependency exceptions against the current RustSec database and [record their reachability and migration dispositions](qualification/2026-09-18-dependency-exceptions.md). `make audit` also refuses an active rkyv graph.
 
+### Known flakes
+
+CI runs with `retries = 0`. A failure that passes on one re-run is a flake, and it goes
+here the same day with its cause. Remove a row only when the fix has landed and a loop
+that used to fail passes.
+
+| Test | First seen | Cause | Status |
+|---|---|---|---|
+| `oci_crash::normal_clustered_bun_recovers_enrolled_consumer_before_adoption` | 23 Sep | Product: rollout finalisation dropped the service reservation retirement needs | Fixed (C3.1) |
+| `placement::concurrent_node_kills_and_leader_change_preserve_reserved_capacity` | 22 Sep | Product: a returning node spread stale suspicions; a clear didn't wait for re-admission | Fixed (C3.2) |
+| `cluster_failover::decommissioned_worker_releases_cleanup_and_stays_retired_after_leader_change` | 20 Sep | Harness: waited on the leader's appended, not applied, membership | Fixed (C3.4) |
+| `job_recovery::killed_bun_*` (two tests) | 19 Sep | Harness: fixed 15–20 s budgets on loaded macOS runners | Fixed (C3.6) |
+| `mustard::protocol::tests::gossip_convergence_five_nodes` | 22 Sep | Unseeded RNG; exposed missing anti-entropy (C6.5) | Test fixed (C3.7) |
+| `ebpf::standalone_discovery_recovery_preserves_original_routing_and_cleanup` | 22 Sep | Product: 2 s force-kill deadline too short under load | Fixed (C3.3) |
+| `registry_recovery::new_leader_retains_registry_cleanup_until_the_killed_writer_returns` | 23 Sep | Harness: treated the retryable lease-leader 503 as fatal | Fixed |
+
 ## Current release checklist
 
 - [x] Commit the release scope and acceptance plan.
