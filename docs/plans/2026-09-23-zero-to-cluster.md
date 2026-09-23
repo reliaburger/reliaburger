@@ -98,7 +98,7 @@ tutorial, because a tutorial over a broken path is a lie.
 - [x] **Z1.2 Resolve Kubernetes-style short names.** Add `search <ns>.internal
   internal` to the container's `resolv.conf`, keeping `ndots` low, so `redis`
   and `redis.default` resolve the way they would in a pod.
-- [ ] **Z1.3 Import what a real app needs, and say what it drops.** Keep the
+- [x] **Z1.3 Import what a real app needs, and say what it drops.** Keep the
   Service `port` → `targetPort` mapping, warn on non-HTTP readiness probes and
   extra ports instead of dropping them silently, and import `args` separately
   from `command` so Z1.1's rules apply.

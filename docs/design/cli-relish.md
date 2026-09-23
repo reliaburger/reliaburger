@@ -1455,10 +1455,13 @@ Each correlated group becomes one `[app.*]` block. Uncorrelated resources are co
 |---|---|
 | `spec.replicas` | `replicas` |
 | `spec.template.spec.containers[0].image` | `image` |
-| `spec.template.spec.containers[0].ports[0].containerPort` | `port` |
+| `containers[0].command` / `containers[0].args` | `command` / `args` (kept separate; Kubernetes rules at run time) |
+| `containers[0].workingDir` | `working_dir` |
+| `securityContext.runAsUser` / `runAsGroup` (container, else pod) | `run_as_user` / `run_as_group` |
+| Service `targetPort` (named or numeric), else `containers[0].ports[0].containerPort` | `port`; a differing Service `port`, extra Service ports and unrouted container ports are **warned** |
 | `resources.requests.cpu` / `resources.limits.cpu` | `cpu = "request-limit"` |
 | `resources.requests.memory` / `resources.limits.memory` | `memory = "request-limit"` |
-| `readinessProbe.httpGet.path` | `[app.*.health] path` |
+| `readinessProbe.httpGet` | `[app.*.health] path` (and `port` when it isn't the app's); `exec`/`tcpSocket`/`grpc` probes are **warned** |
 | `env[]` and `envFrom[]` | `[app.*.env]` |
 | `nodeSelector` | `[app.*.placement] required` |
 | `tolerations` | **Warning** (no equivalent) |

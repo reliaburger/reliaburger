@@ -564,11 +564,12 @@ A Kubernetes Deployment becomes an `AppSpec`. The mapping isn't one-to-one, but 
 
 - `spec.replicas` → `replicas`
 - `spec.template.spec.containers[0].image` → `image`
-- `containers[0].command` + `containers[0].args` → `command` (concatenated — K8s splits the argv into two fields, we keep one)
+- `containers[0].command` → `command`, `containers[0].args` → `args` (kept apart, so the runtime can apply them to the image's `Entrypoint` and `Cmd` exactly as Kubernetes does)
+- `containers[0].workingDir` → `working_dir`; `securityContext.runAsUser`/`runAsGroup` → `run_as_user`/`run_as_group`
 - `metadata.namespace` → `namespace`
-- `containers[0].ports[0].containerPort` → `port`
+- the Service's `targetPort` (named or numeric), else `containers[0].ports[0].containerPort` → `port`
 - `env[].value` → `env` (plain values)
-- `readinessProbe.httpGet.path` → `health.path`
+- `readinessProbe.httpGet` → `health` (path, and the port when it isn't the app's)
 - `strategy.rollingUpdate.maxSurge` → `deploy.max_surge`
 - `terminationGracePeriodSeconds` → `deploy.drain_timeout`
 - `nodeSelector` → `placement.required`
@@ -577,6 +578,10 @@ A Kubernetes Deployment becomes an `AppSpec`. The mapping isn't one-to-one, but 
 DaemonSets become `replicas = "*"`. StatefulSets produce a warning because Reliaburger doesn't have ordered startup or stable network IDs. Jobs and CronJobs map directly. The whole mapping above runs through one shared `pod_spec_to_app` helper, whatever the workload kind — that wasn't always true, and the section below explains what it cost while it wasn't.
 
 Three of those rows have a history: `command`, `namespace`, and env values used to be silently dropped. A Deployment running `python -m worker.main` would import as an app running the image's default entrypoint. No error, no warning — the config just did something different from the original. Silent data loss during migration is the worst kind, because you only discover it when the workload misbehaves in production.
+
+`args` has a history of its own. For a long time the importer glued `command` and `args` into one vector, which was harmless while runc ignored the image's config anyway. Once runc started honouring `Entrypoint` and `Cmd` (Chapter 1), gluing became a bug: a manifest with only `args` would have replaced the image's entrypoint with its arguments. So they're separate fields now, on both sides.
+
+Ports are the other place where a quiet mapping would lie. A Kubernetes Service can listen on port 80 and forward to container port 9898, and it can expose several ports. A Reliaburger app has one port, and `frontend:9898` reaches it on the same number. The importer follows the Service's `targetPort` (resolving names like `http` against the container's ports) to pick the app's port, and then says what it couldn't keep: the Service port that clients used to dial, any further Service ports, container ports nothing routes to, a readiness probe that runs a command or opens a TCP socket, and a Service with no workload of the same name.
 
 Env vars that use `valueFrom` (secret refs, configmap refs, field refs) still can't map automatically — there's no way to reach into another cluster's secret store. But now they land in the migration report as warnings naming each variable, instead of vanishing. The rule the importer follows: convert what you can, warn about what you can't, drop nothing silently.
 
