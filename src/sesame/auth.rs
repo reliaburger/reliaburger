@@ -605,28 +605,6 @@ pub fn bearer_get(
     }
 }
 
-/// Helper to extract the `AuthContext` from a request's extensions.
-///
-/// Returns `None` in pre-init mode (when no tokens are configured
-/// and auth was skipped).
-pub fn get_auth_context(extensions: &axum::http::Extensions) -> Option<&AuthContext> {
-    extensions.get::<AuthContext>()
-}
-
-/// Route-level role check. Returns 403 if the token doesn't have
-/// the required role.
-#[allow(clippy::result_large_err)]
-pub fn check_route_role(
-    extensions: &axum::http::Extensions,
-    required: ApiRole,
-) -> Result<(), Response> {
-    // If no auth context (pre-init mode), allow
-    let Some(ctx) = get_auth_context(extensions) else {
-        return Ok(());
-    };
-    require_role(ctx, required).map_err(|(status, msg)| (status, msg).into_response())
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;

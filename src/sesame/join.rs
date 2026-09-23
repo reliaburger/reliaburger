@@ -441,20 +441,6 @@ pub fn sign_join_csr(
     })
 }
 
-/// Generate a new join token and add it to the security state.
-///
-/// Returns the plaintext token (for the admin). The hash is stored
-/// in the security state.
-pub fn generate_new_join_token(
-    state: &mut SecurityState,
-    ttl: Duration,
-    node_id: &str,
-) -> Result<String, JoinError> {
-    let (plaintext, join_token) = create_join_token(ttl, node_id)?;
-    state.join_tokens.push(join_token);
-    Ok(plaintext)
-}
-
 /// Create a join token without storing its plaintext.
 ///
 /// The caller commits the returned [`JoinToken`] to Raft, then returns the

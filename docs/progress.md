@@ -1063,7 +1063,7 @@ whole theme lands.
   - [x] Catch-up gating: promotion compares the learner's replicated log index (openraft
     replication metrics) against the leader's last index within `max_promotion_lag` (64);
     missing metrics count as behind unless the log is empty (D2).
-  - [x] Reconciler rework (`cluster::runtime::spawn_council_reconciler[_with_config]`):
+  - [x] Reconciler rework (`cluster::runtime::spawn_council_reconciler_with_config`):
     re-plans each tick from observed state (idempotent, timeout-bounded, errors logged —
     the M15 non-wedging property), executes exactly one action, feeds the health tracker
     on followers too so a new leader starts warm. Voter eviction uses non-retaining

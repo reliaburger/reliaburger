@@ -541,19 +541,11 @@ pub async fn adopt_container_network(
     }))
 }
 
-/// Add a port mapping from a host port to a container port.
+/// Publish a host port to a container port through the caller's
+/// generation-bound command executor.
 ///
-/// In root mode, adds an nftables DNAT rule. In rootless mode, spawns
+/// In root mode, adds an nftables DNAT map element. In rootless mode, spawns
 /// a tokio TCP proxy task.
-pub async fn add_port_mapping(
-    network: &ContainerNetwork,
-    host_port: u16,
-    container_port: u16,
-) -> Result<PortMapHandle, NetnsError> {
-    add_port_mapping_with_commands(&DirectCommandExecutor, network, host_port, container_port).await
-}
-
-/// Publish a port through the caller's generation-bound command executor.
 pub async fn add_port_mapping_with_commands(
     executor: &impl RuntimeCommandExecutor,
     network: &ContainerNetwork,
@@ -1222,7 +1214,7 @@ mod tests {
             .await
             .expect("failed to set up container network");
 
-        let handle = add_port_mapping(&network, 18080, 80)
+        let handle = add_port_mapping_with_commands(&DirectCommandExecutor, &network, 18080, 80)
             .await
             .expect("failed to add port mapping");
 
@@ -1248,7 +1240,11 @@ mod tests {
             "shutdown should delete the element: {listing}"
         );
         // Simulate cancellation before the mapping handle reaches its owner.
-        drop(add_port_mapping(&network, 18081, 80).await.unwrap());
+        drop(
+            add_port_mapping_with_commands(&DirectCommandExecutor, &network, 18081, 80)
+                .await
+                .unwrap(),
+        );
         let other = portmap::PortMapEntry {
             host_port: 18082,
             container_ip: container_ip(98, 1),

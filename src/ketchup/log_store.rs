@@ -447,26 +447,6 @@ impl LogStore {
         Ok(ctx)
     }
 
-    /// Query logs using SQL and return raw JSON rows.
-    ///
-    /// Unlike `query_sql()`, this returns arbitrary columns as JSON
-    /// objects, so `SELECT timestamp, line FROM logs` works without
-    /// requiring all 5 columns.
-    pub async fn query_sql_json(&self, sql: &str) -> Result<Vec<serde_json::Value>, KetchupError> {
-        let ctx = self.session().await?;
-        let df = ctx
-            .sql(sql)
-            .await
-            .map_err(|e| KetchupError::Io(std::io::Error::other(e.to_string())))?;
-
-        let batches = df
-            .collect()
-            .await
-            .map_err(|e| KetchupError::Io(std::io::Error::other(e.to_string())))?;
-
-        Ok(batches_to_json(&batches))
-    }
-
     /// Query logs using SQL under safety bounds (OBS5).
     ///
     /// The public `/v1/logs/sql` endpoint used to hand `?q=` straight to
@@ -599,42 +579,6 @@ impl LogStore {
              WHERE {where_clause} ORDER BY timestamp{limit_clause}"
         );
         self.query_sql(&sql).await
-    }
-
-    /// List all distinct (app, namespace) pairs in the store.
-    pub async fn query_apps(&self) -> Result<Vec<(String, String)>, KetchupError> {
-        let ctx = self.session().await?;
-        let df = ctx
-            .sql("SELECT DISTINCT app, namespace FROM logs ORDER BY app, namespace")
-            .await
-            .map_err(|e| KetchupError::Io(std::io::Error::other(e.to_string())))?;
-
-        let batches = df
-            .collect()
-            .await
-            .map_err(|e| KetchupError::Io(std::io::Error::other(e.to_string())))?;
-
-        let mut results = Vec::new();
-        for batch in &batches {
-            let apps = batch
-                .column(0)
-                .as_any()
-                .downcast_ref::<StringArray>()
-                .ok_or_else(|| {
-                    KetchupError::Io(std::io::Error::other("app column type mismatch"))
-                })?;
-            let namespaces = batch
-                .column(1)
-                .as_any()
-                .downcast_ref::<StringArray>()
-                .ok_or_else(|| {
-                    KetchupError::Io(std::io::Error::other("namespace column type mismatch"))
-                })?;
-            for i in 0..batch.num_rows() {
-                results.push((apps.value(i).to_string(), namespaces.value(i).to_string()));
-            }
-        }
-        Ok(results)
     }
 }
 

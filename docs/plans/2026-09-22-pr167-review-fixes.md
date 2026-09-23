@@ -566,7 +566,7 @@ spot-checked by hand.
       manifest (mode 0600 without the link check, Linux-only), and
       directory checks demanding exactly 0700. Production code −64 lines
       (loaders −183, new module +119); +100 lines of tests for the reader.
-- [ ] **T4.5 Remove dead functions (~130–200 lines; low risk).** No callers
+- [x] **T4.5 Remove dead functions (~130–200 lines; low risk).** No callers
       at all: `query_apps` (`ketchup/log_store.rs:605`),
       `spawn_council_reconciler` (`cluster/runtime.rs:973`),
       `derive_with_evidence` (`bun/capabilities.rs:361`), `query_sql_json`,
@@ -575,6 +575,12 @@ spot-checked by hand.
       `required_role`. Orphaned by this branch (tests only):
       `pull_manifest_layers` (`pickle/pull.rs:311`), `apply_update_locations`,
       `netns::add_port_mapping`. Re-grep before deleting.
+      Done. Deleted all ten no-caller functions, plus `get_auth_context`
+      (its only caller was `check_route_role`) and the `add_port_mapping`
+      wrapper (its gated test now calls `add_port_mapping_with_commands`).
+      Kept `pull_manifest_layers` (a `tests/pickle_cluster.rs` test calls
+      it) and `apply_update_locations` (setup for ~16 GC, P2P and state
+      machine tests of live code). `src` −181 lines (+10/−191).
 - [x] **T4.6 Small helpers (~50–70 lines).** One `launch_inventory` with a
       single timeout (7 copies, 1 s/5 s/none; this also fixes the missing
       timeout in T2.14) and one drain-then-check helper (3 copies).

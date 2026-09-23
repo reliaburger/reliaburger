@@ -968,27 +968,6 @@ impl Default for CouncilReconcilerConfig {
     }
 }
 
-/// Spawn the council reconciler with production timing. See
-/// [`spawn_council_reconciler_with_config`].
-pub fn spawn_council_reconciler(
-    council: Arc<CouncilNode>,
-    membership_rx: watch::Receiver<Vec<MembershipSnapshot>>,
-    port_offset: i32,
-    self_id: u64,
-    self_info: CouncilNodeInfo,
-    shutdown: CancellationToken,
-) {
-    spawn_council_reconciler_with_config(
-        council,
-        membership_rx,
-        port_offset,
-        self_id,
-        self_info,
-        CouncilReconcilerConfig::default(),
-        shutdown,
-    );
-}
-
 /// Spawn the council reconciler: on the leader, each tick re-plans the Raft
 /// membership from observed state (gossip health, Raft metrics) and executes
 /// at most one action — add a learner, promote a caught-up learner, evict a

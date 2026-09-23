@@ -19,11 +19,9 @@
 //! so it is now a test too: see `every_per_app_route_checks_the_callers_scope`
 //! below. A route pattern naming `{app}` must call `authorize_scoped`.
 
-use crate::sesame::types::ApiRole;
-
 /// The principal class a route requires.
 ///
-/// This is coarser than `ApiRole`: it also covers routes that need *no*
+/// This is coarser than [`crate::sesame::types::ApiRole`]: it also covers routes that need *no*
 /// token (`Public`), any authenticated caller regardless of role
 /// (`AnyToken`), and the internal cluster node identity (`System`, the
 /// service-token principal that [`crate::sesame::auth::require_system`]
@@ -41,20 +39,6 @@ pub enum RoutePrincipal {
     /// The internal system principal — a cluster node presenting the
     /// service token. Node-to-node routes only.
     System,
-}
-
-impl RoutePrincipal {
-    /// The user role this principal maps to, when it maps to one.
-    ///
-    /// `Public`/`AnyToken` have no minimum role (any or none), and
-    /// `System` is not a user role at all, so those return `None`.
-    pub fn required_role(self) -> Option<ApiRole> {
-        match self {
-            RoutePrincipal::Deployer => Some(ApiRole::Deployer),
-            RoutePrincipal::Admin => Some(ApiRole::Admin),
-            RoutePrincipal::Public | RoutePrincipal::AnyToken | RoutePrincipal::System => None,
-        }
-    }
 }
 
 /// HTTP method a matrix entry applies to. Kept as a tiny enum rather

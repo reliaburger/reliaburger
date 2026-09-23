@@ -290,17 +290,6 @@ impl ImageStore {
         tag_rootfs.join(format!("gen-{}", &generation[..16]))
     }
 
-    /// Create a store using the default rootless location.
-    ///
-    /// Uses `~/.local/share/reliaburger/images/` via the `dirs` crate.
-    pub fn rootless_default() -> Self {
-        let base = dirs::data_local_dir()
-            .unwrap_or_else(|| PathBuf::from("/tmp/reliaburger-images"))
-            .join("reliaburger")
-            .join("images");
-        Self::new(base)
-    }
-
     /// Path to a cached blob by its SHA-256 digest.
     pub fn blob_path(&self, digest: &str) -> PathBuf {
         // digest is typically "sha256:abcdef..." — strip the algorithm prefix
