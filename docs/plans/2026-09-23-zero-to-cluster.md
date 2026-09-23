@@ -95,7 +95,7 @@ tutorial, because a tutorial over a broken path is a lie.
   merge its `Env` under the app's, and use its `WorkingDir`. For `User`, see D1.
   Tests: unit tests for the merge rules, and a VM test running an image that
   needs its entrypoint and env.
-- [ ] **Z1.2 Resolve Kubernetes-style short names.** Add `search <ns>.internal
+- [x] **Z1.2 Resolve Kubernetes-style short names.** Add `search <ns>.internal
   internal` to the container's `resolv.conf`, keeping `ndots` low, so `redis`
   and `redis.default` resolve the way they would in a pod.
 - [ ] **Z1.3 Import what a real app needs, and say what it drops.** Keep the

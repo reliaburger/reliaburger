@@ -918,6 +918,10 @@ workload, as published by the runtime. Unknown or ambiguous source addresses are
 refused; host tools should query `redis.<namespace>.internal`. The old
 `dns.default_namespace` setting is no longer accepted.
 
+Containers also get a Kubernetes-style search list (`search <namespace>.internal
+internal`, `options ndots:2`), so an app can reach `redis:6379` in its own
+namespace or `redis.default:6379` in another one, exactly as a pod would.
+
 Runc receives a per-instance, read-only resolver file. Bun doesn't modify the
 shared unpacked image. Both UDP and TCP must bind before the node reports DNS
 ready; a later responder-task failure stops Bun so its capability expires.

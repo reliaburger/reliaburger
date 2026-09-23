@@ -352,7 +352,10 @@ impl RuncGrill {
             let resolv_path = std::fs::canonicalize(&bundle_dir)
                 .unwrap_or_else(|_| bundle_dir.clone())
                 .join("resolv.conf");
-            tokio::fs::write(&resolv_path, resolv_conf_content(nameserver))
+            let namespace = super::InstanceIdentity::parse(&instance.0).map(|id| id.namespace);
+            let content =
+                crate::onion::dns::container_resolv_conf(nameserver, namespace.as_deref());
+            tokio::fs::write(&resolv_path, content)
                 .await
                 .map_err(|e| GrillError::StartFailed {
                     instance: instance.clone(),
@@ -568,14 +571,6 @@ impl super::Grill for RuncGrill {
     ) {
         self.owned_follow_logs(instance, lines_tx).await;
     }
-}
-
-/// Render the resolv.conf pointing containers at the node's resolver.
-///
-/// `ndots:0` keeps single-label lookups (like `redis.internal`) from
-/// being expanded through search domains first.
-fn resolv_conf_content(nameserver: std::net::Ipv4Addr) -> String {
-    format!("nameserver {nameserver}\noptions ndots:0\n")
 }
 
 impl Drop for RuncGrill {
@@ -960,7 +955,13 @@ mod tests {
                     // Keep both namespaces alive while they query. This catches
                     // duplicate-gateway routing bugs that a single-container
                     // proof cannot see.
-                    "sleep 1; cat /etc/resolv.conf; nslookup redis.internal; sleep 2".to_string(),
+                    // `getent` resolves through musl's getaddrinfo, which
+                    // walks the search list the way applications do (Z1.2).
+                    "sleep 1; cat /etc/resolv.conf; nslookup redis.internal; \
+                     echo short=$(getent hosts redis | cut -d' ' -f1); \
+                     echo qualified=$(getent hosts redis.default | cut -d' ' -f1); \
+                     sleep 2"
+                        .to_string(),
                 ],
                 env: vec!["PATH=/usr/sbin:/usr/bin:/sbin:/bin".to_string()],
                 cwd: "/".to_string(),
@@ -1011,6 +1012,16 @@ mod tests {
             assert!(
                 logs.contains(&expected_vip.0.to_string()),
                 "{id} did not resolve redis.internal to {expected_vip:?}: {logs}"
+            );
+            // Kubernetes-style names: `redis` stays in the caller's own
+            // namespace, `redis.default` names the default one explicitly.
+            assert!(
+                logs.contains(&format!("short={}", expected_vip.0)),
+                "{id} did not resolve the short name redis to {expected_vip:?}: {logs}"
+            );
+            assert!(
+                logs.contains(&format!("qualified={}", vip.0)),
+                "{id} did not resolve redis.default to {vip:?}: {logs}"
             );
             assert_eq!(grill.exit_code(id).await, Some(0), "{id} logs: {logs}");
         }

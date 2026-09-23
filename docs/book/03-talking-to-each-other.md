@@ -596,6 +596,16 @@ The Rust-flavoured part is how the responder reads the service map. The agent *o
 
 Containers find the responder through an old-fashioned mechanism: `/etc/resolv.conf`. Runc writes a per-instance file in the OCI bundle and bind-mounts it read-only at `/etc/resolv.conf`; it never edits the shared unpacked image rootfs. The file names the node-side veth gateway, not host loopback. `resolv.conf` has no port syntax, so only port 53 is valid.
 
+Kubernetes manifests don't say `redis.internal`, though. They say `redis:6379`, or `redis.default` to cross a namespace, because a pod's `resolv.conf` carries a search list. Ours does too now, for a container in `payments`:
+
+```text
+nameserver 10.0.2.1
+search payments.internal internal
+options ndots:2
+```
+
+A resolver appends each search suffix in turn to any name with fewer than `ndots` dots, before trying it as written. So `redis` becomes `redis.payments.internal` (the caller's own namespace), and `redis.default` becomes `redis.default.payments.internal` and then `redis.default.internal`. That first attempt can't exist, and the responder has to say so with NXDOMAIN. It used to answer REFUSED, and glibc and musl both treat REFUSED as "stop searching", so `redis.default` quietly failed. Why `ndots:2` rather than Kubernetes' 5? With 1, `redis.default` would go upstream as written before the search list, leaking an internal name to the public resolver. With 5, `api.stripe.com` would pay three local misses before its real lookup. Two covers both short forms and costs a two-label external name like `example.com` two node-local NXDOMAINs.
+
 Rootful runc is the supported transparent DNS path today. Rootless runc now has supervised slirp networking and published ports, but it still has no route to the node's port-53 responder or resolver injection. ProcessGrill doesn't install a resolver into the host, and Apple Container has no DNS injection in its adapter. Enabling `[dns]` with any of those runtimes fails before adoption or workload creation. The live node capability records readiness, IPv4/IPv6 support and workload reachability; a DNS-enabled scheduling pass excludes nodes that can't prove all three.
 
 ### Testing service discovery
