@@ -321,7 +321,8 @@ impl InterruptedControl {
 impl Drop for InterruptedControl {
     fn drop(&mut self) {
         self.listener.take();
-        let _ = std::fs::remove_file(&self.socket);
+        // Rename over the fake socket in one step. Removing it first left a
+        // window where a retrying client saw no socket at all (NotFound).
         let _ = std::fs::rename(&self.parked, &self.socket);
     }
 }
