@@ -105,9 +105,8 @@ pub async fn run(options: Options) -> Result<()> {
             );
             // Straight after install.sh, `relish` may not be on PATH yet.
             let relish = crate::relish::install::invocation();
-            println!(
-                "  next: {relish} nodes; {relish} status; {relish} logs hello; {relish} dashboard"
-            );
+            println!("  next: {relish} manual tour   (the five-minute tour of this cluster)");
+            println!("  or: {relish} status; {relish} logs hello; {relish} dashboard");
             println!(
                 "  lifecycle: {relish} local status|stop|start|destroy --name {}",
                 operation.state.spec.name

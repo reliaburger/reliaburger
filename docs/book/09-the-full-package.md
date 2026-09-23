@@ -995,3 +995,11 @@ Order matters too. While `clusters/` has a saved cluster, or the Lima home has a
 Two small Rust details. `std::fs::remove_dir_all` doesn't follow a symbolic link at the top level, so if someone made `cache` a link to a directory they care about, we remove the link and not their files; a test proves it. And the binary deletes itself. On Unix that's fine: unlinking removes the name from the directory, and the kernel keeps the file's contents alive until the running process closes it.
 
 The shape of the errors follows the rest of the crate: a `thiserror` enum, `UninstallError`, whose messages say what to do next, and a `#[from]` conversion into `RelishError` so the binary's `?` just works. `#[from]` generates the `From` impl that the `?` operator calls to convert one error type into another.
+
+### The tour, twice
+
+The homepage has a "Try it in five minutes" section, and the CLI has the same tour as a manual chapter, `docs/manual/08_five-minute-tour.md`. Why both? Because the quickstart ends in a terminal, and "now go back to the website" is exactly the kind of context switch that loses people. Setup's last lines now say `relish manual tour`, with the full path to `relish` if your shell can't find it yet.
+
+`relish manual` had no way to open one chapter, so it gained an optional positional argument. Clap already had a subcommand in that position (`relish manual examples`); it tries subcommand names first, so `examples` still means the subcommand and anything else becomes the chapter. A parser test pins that down, because it's the sort of precedence rule that changes quietly in a refactor.
+
+`find_chapter` takes what you typed and tries, in order: an exact short name (`chaos`), a part of exactly one short name (`tour`), and a part of exactly one title. Ambiguity is an error that lists every short name rather than a guess. The short name comes from the file name, with `split_once('_')` dropping the number: `split_once` returns an `Option` of the two halves around the first match, and `map_or(stem, |(_, rest)| rest)` means "the part after the underscore, or the whole stem if there isn't one". The reader gained `open_document`, which selects the chapter and gives the content pane the keyboard, so the arrow keys scroll the tour straight away.

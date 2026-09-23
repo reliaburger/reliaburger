@@ -363,6 +363,9 @@ enum Command {
         /// Port for --web (0 picks an ephemeral port).
         #[arg(long, default_value_t = 8642)]
         port: u16,
+        /// Open this chapter, e.g. `tour` or `chaos`.
+        #[arg(conflicts_with = "web")]
+        chapter: Option<String>,
         #[command(subcommand)]
         action: Option<ManualAction>,
     },
@@ -1553,11 +1556,12 @@ async fn main() -> ExitCode {
         Command::Manual {
             web,
             port,
+            ref chapter,
             ref action,
         } => match action {
             Some(ManualAction::Examples { dir }) => reliaburger::relish::manual::examples(dir),
             None if web => reliaburger::relish::manual::web::serve(port).await,
-            None => reliaburger::relish::manual::run().await,
+            None => reliaburger::relish::manual::run(chapter.as_deref()).await,
         },
         Command::Source { query } => reliaburger::relish::source::run(query).await,
         Command::Uninstall { yes } => reliaburger::relish::uninstall::run(yes).map_err(Into::into),
@@ -2985,10 +2989,12 @@ mod tests {
             Command::Manual {
                 web,
                 port,
+                ref chapter,
                 ref action,
             } => {
                 assert!(!web);
                 assert_eq!(port, 8642);
+                assert!(chapter.is_none());
                 assert!(action.is_none());
             }
             _ => panic!("expected Manual command"),
@@ -3003,7 +3009,26 @@ mod tests {
             Command::Manual {
                 web: true,
                 port: 0,
+                chapter: None,
                 action: None,
+            }
+        ));
+    }
+
+    #[test]
+    fn parse_manual_chapter_and_keep_examples_a_subcommand() {
+        let cli = parse(&["relish", "manual", "tour"]).unwrap();
+        assert!(matches!(
+            cli.command,
+            Command::Manual { chapter: Some(ref chapter), action: None, .. } if chapter == "tour"
+        ));
+        let cli = parse(&["relish", "manual", "examples"]).unwrap();
+        assert!(matches!(
+            cli.command,
+            Command::Manual {
+                chapter: None,
+                action: Some(ManualAction::Examples { .. }),
+                ..
             }
         ));
     }

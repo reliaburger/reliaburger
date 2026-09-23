@@ -173,4 +173,8 @@ pub enum RelishError {
     /// `relish uninstall` refused or could not remove something.
     #[error("{0}")]
     Uninstall(#[from] uninstall::UninstallError),
+
+    /// `relish manual CHAPTER` named no single chapter.
+    #[error("{0}")]
+    Manual(#[from] manual::ManualError),
 }
