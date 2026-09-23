@@ -598,7 +598,7 @@ The fix: don't spawn concurrent tasks. Drive the protocol manually from the test
 async fn gossip_convergence_five_nodes() {
     // ...setup 5 nodes in a ring...
 
-    for _ in 0..50 {
+    for _ in 0..100 {
         // Phase 1: each node sends a PING to a random peer
         for node in &mut nodes {
             if let Some((_, target_addr)) = node.pick_probe_target() {
@@ -626,7 +626,33 @@ async fn gossip_convergence_five_nodes() {
 
 Each round, every node sends one PING, then we drain all inboxes twice: first to process PINGs (which generate ACKs), then to process ACKs (which apply piggybacked updates). No timers, no spawned tasks, no flakiness. The `try_recv()` method returns immediately if the channel is empty, so no clock manipulation is needed at all.
 
-Why 50 rounds? Because gossip propagation depends on random target selection, and with a ring topology each node initially knows only one peer. Information has to hop through intermediaries. The minimum broadcast count of 3 ensures updates survive long enough during early cluster formation when the cluster is small, but random target selection means some rounds are "wasted" pinging a node that already knows the update. 50 rounds gives enough margin for even the unluckiest random sequences.
+Why a round cap at all? Because gossip propagation depends on random target selection, and with a ring topology each node initially knows only one peer. Information has to hop through intermediaries, and random target selection means some rounds are "wasted" pinging a node that already knows the update. We started with 50 rounds, later raised it to 100, and believed that was enough margin for even the unluckiest sequence.
+
+It wasn't. In one full-suite run the test finished with one node seeing four members instead of five. More rounds would not have helped, and that's the interesting part. We ran twenty thousand unseeded schedules and about one in 1,300 got stuck for good: every update about some member spent its bounded re-broadcasts before reaching one particular node, every dissemination queue drained, and from then on the PINGs carried nothing new. Nothing in Mustard resynchronises full membership (the push-pull sync that production SWIM implementations such as HashiCorp's memberlist add on top), so a stranded node stays stranded until something changes. That's a property of the protocol, not of the test, and the fix belongs in Mustard rather than in a longer test.
+
+So the test now replays fixed schedules. Each `MustardNode` owns its random number generator instead of reaching for `rand::thread_rng()` on every probe:
+
+```rust
+use rand::SeedableRng;
+use rand::rngs::StdRng;
+
+pub struct MustardNode<T: MustardTransport> {
+    // ...
+    rng: StdRng,
+}
+
+// in MustardNode::new
+rng: StdRng::from_entropy(),
+
+#[cfg(test)]
+fn seed_rng(&mut self, seed: u64) {
+    self.rng = StdRng::seed_from_u64(seed);
+}
+```
+
+`StdRng::from_entropy()` seeds from the operating system, so production behaves exactly as before. `seed_from_u64` comes from the `SeedableRng` trait, and here's a Rust rule that surprises Go and Python programmers: a trait's methods are only callable when the trait is in scope. Without `use rand::SeedableRng;` the compiler reports that `StdRng` has no function called `seed_from_u64`, even though the type implements it. The `#[cfg(test)]` attribute compiles `seed_rng` only into test builds, so the seam doesn't leak into the public API.
+
+A seed alone wasn't enough. The membership table is a `HashMap`, and Rust's `HashMap` randomises its hashing per instance to resist denial-of-service attacks, so the candidate list came out in a different order every run. The same random index then picked a different peer. `pick_probe_target()` now sorts candidates by node ID before choosing. The choice is still uniform; it just depends only on the generator. The test drives sixteen seeds and asserts that every one converges, typically within two to four rounds.
 
 The test passes because of the dissemination mechanism. When n0 pings n1, n1 learns about n0 and enqueues a dissemination update. When n1 later pings n2, that update piggybacks on the PING. n2 receives it, re-enqueues it for further dissemination, and the ripple continues. The `MembershipUpdate` struct carries the node's address alongside its state, so nodes discovered via gossip (not direct contact) know how to reach each other.
 
