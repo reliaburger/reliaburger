@@ -52,7 +52,6 @@ async fn one_node_handles_10k_member_protocol_state() {
             address: address(index),
             state: NodeState::Alive,
             incarnation: 1,
-            lamport: index as u64,
         })
         .collect();
 

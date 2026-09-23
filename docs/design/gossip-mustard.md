@@ -263,8 +263,6 @@ struct MembershipUpdate {
     state: NodeState,
     /// Incarnation number of the node (for crdt-like conflict resolution).
     incarnation: u64,
-    /// Reserved legacy wire slot; current senders write zero, receivers ignore it.
-    lamport: u64,
 }
 
 #[derive(Serialize, Deserialize, Clone, PartialEq, Eq)]

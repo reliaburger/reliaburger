@@ -236,7 +236,8 @@ impl MustardTransport for UdpMustardTransport {
         // the `hmac` field, so it doesn't change the on-wire size. The
         // directory extension gets its own tag (over the message's canonical
         // bytes plus the extension), because the message HMAC deliberately
-        // excludes the extension — old peers must still verify new datagrams.
+        // excludes the extension, so dropping a bad extension never costs the
+        // membership payload.
         let bytes = match &self.hmac_key {
             Some(key) => {
                 let mut signed = message

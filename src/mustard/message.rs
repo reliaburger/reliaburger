@@ -132,9 +132,7 @@ pub enum GossipPayload {
         /// `sender` (an indirect-probe rescue), rather than sent directly by
         /// the sender itself. On a relayed ACK the transport socket is the
         /// relay's, not the sender's, so the receiver must NOT record the
-        /// sender's address from it (M13). `#[serde(default)]` so an ACK from a
-        /// peer predating this field decodes as a direct ACK.
-        #[serde(default)]
+        /// sender's address from it (M13).
         relayed: bool,
     },
 }
@@ -152,9 +150,8 @@ impl GossipPayload {
 
 /// A single membership update piggybacked on gossip messages.
 ///
-/// Carries the node's identity, its new state, the incarnation number
-/// for conflict resolution, and a reserved legacy timestamp field.
-/// The address is included so that nodes learning about a peer through
+/// Carries the node's identity, its new state and the incarnation number
+/// for conflict resolution. The address is included so that nodes learning about a peer through
 /// gossip (not direct contact) can reach it.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct MembershipUpdate {
@@ -166,10 +163,6 @@ pub struct MembershipUpdate {
     pub state: NodeState,
     /// Incarnation number for CRDT-like conflict resolution.
     pub incarnation: u64,
-    /// Reserved legacy timestamp, retained in its original wire position.
-    /// Receivers ignore it; current senders write zero. Membership ordering
-    /// uses incarnation and node state, not this value.
-    pub lamport: u64,
 }
 
 // ---------------------------------------------------------------------------
@@ -199,8 +192,9 @@ pub struct LeaderHint {
 ///
 /// Carries the sending node's advertised control-plane endpoints and its
 /// best leader hint. Appended after the bincode-encoded [`GossipMessage`]
-/// rather than inside it, so older peers (which stop reading at the end of
-/// the message) still parse the datagram — see [`encode_datagram`].
+/// rather than inside it, with its own HMAC, so a missing or bad extension
+/// costs directory data but never the membership payload — see
+/// [`encode_datagram`].
 ///
 /// `node_id` names the node the endpoints belong to. It is always the node
 /// that physically stamped the datagram — which is NOT always
@@ -220,26 +214,13 @@ pub struct DirectoryExtension {
     /// Bounded on the way out by [`bounded_labels`] so gossip datagrams
     /// stay under the UDP budget. `BTreeMap` for a deterministic wire
     /// order (a `HashMap` would break the HMAC across nodes).
-    ///
-    /// `#[serde(default)]` is deliberately NOT used here: the extension
-    /// rides as trailing bytes (see [`encode_datagram`]), so the whole
-    /// struct is versioned by its trailing position, not per-field. A
-    /// pre-labels peer sends an extension one field shorter, which a
-    /// newer decoder rejects and drops (the endpoints/leader hint still
-    /// come through the message body's own relayed copies). New peers
-    /// always emit the field, so a mixed cluster converges on labels as
-    /// the old nodes roll.
     pub labels: BTreeMap<String, String>,
     /// Whether the stamping node's disk has been under sustained pressure long
     /// enough that it should resign its council seat (12b.2 T3). A voter only
     /// knows its OWN disk locally; advertising this bit is how the leader (who
     /// runs the reconciler) learns which OTHER voters are pressured and must be
-    /// replaced. It rides the same trailing, position-versioned extension as
-    /// `labels`: a pre-field peer sends a shorter extension a newer decoder
-    /// drops, and new peers always emit the field, so a mixed cluster converges
-    /// as the old nodes roll. It sits before `hmac` for the same reason `labels`
-    /// does — the extension HMAC covers everything up to (and excluding) the
-    /// zeroed `hmac`, so a flipped `disk_pressured` bit fails verification.
+    /// replaced. The extension HMAC covers it, so a flipped `disk_pressured`
+    /// bit fails verification.
     pub disk_pressured: bool,
     /// HMAC-SHA256 over the carrying message's canonical bytes plus this
     /// extension with `hmac` zeroed. Zeroed when gossip runs unkeyed.
@@ -351,8 +332,8 @@ pub fn decode_datagram(bytes: &[u8]) -> Result<GossipMessage, bincode::Error> {
     //
     // The encoding must stay byte-identical to `bincode::serialize`, which
     // `encode_datagram` uses and every peer in this generation speaks. `bincode`'s
-    // builder API defaults to *varint* encoding, so the legacy shape has to be
-    // asked for explicitly — `with_fixint_encoding().with_little_endian()`.
+    // builder API defaults to *varint* encoding, so the fixed-width shape has to
+    // be asked for explicitly — `with_fixint_encoding().with_little_endian()`.
     // Getting this wrong wouldn't fail to compile, it would fail to talk to
     // the rest of the cluster, so `fixed_width_wire_bytes_decode_unchanged` pins it.
     use bincode::Options;
@@ -373,7 +354,7 @@ pub fn decode_datagram(bytes: &[u8]) -> Result<GossipMessage, bincode::Error> {
     Ok(message)
 }
 
-/// The datagram decoder: the legacy bincode wire encoding, with reads bounded
+/// The datagram decoder: the fixed-width bincode wire encoding, with reads bounded
 /// to `limit` bytes (O20).
 fn datagram_codec(limit: usize) -> impl bincode::Options {
     use bincode::Options;
@@ -390,31 +371,6 @@ fn datagram_codec(limit: usize) -> impl bincode::Options {
 
 #[cfg(test)]
 mod tests {
-    #[test]
-    fn membership_update_preserves_legacy_timestamp_wire_slot() {
-        let update = super::MembershipUpdate {
-            node_id: crate::meat::types::NodeId::new("legacy-peer"),
-            address: "127.0.0.1:9443".parse().unwrap(),
-            state: super::NodeState::Alive,
-            incarnation: 7,
-            lamport: u64::MAX,
-        };
-        // The legacy sequence fixes field order and retains the final u64.
-        let bytes = bincode::serialize(&(
-            &update.node_id,
-            &update.address,
-            update.state,
-            update.incarnation,
-            update.lamport,
-        ))
-        .unwrap();
-        assert_eq!(bincode::serialize(&update).unwrap(), bytes);
-        assert_eq!(
-            bincode::deserialize::<super::MembershipUpdate>(&bytes).unwrap(),
-            update
-        );
-    }
-
     use super::*;
 
     #[test]
@@ -456,7 +412,6 @@ mod tests {
                     address: test_addr(),
                     state: NodeState::Alive,
                     incarnation: 3,
-                    lamport: 10,
                 }],
             },
         )
@@ -506,7 +461,6 @@ mod tests {
             address: test_addr(),
             state: NodeState::Alive,
             incarnation: 1,
-            lamport: 1,
         }];
         let payload = GossipPayload::Ping {
             updates: updates.clone(),
@@ -521,7 +475,6 @@ mod tests {
             address: test_addr(),
             state: NodeState::Suspect,
             incarnation: 2,
-            lamport: 5,
         }];
         let payload = GossipPayload::PingReq {
             target: NodeId::new("node-2"),
@@ -547,7 +500,6 @@ mod tests {
             address: test_addr(),
             state: NodeState::Suspect,
             incarnation: 42,
-            lamport: 100,
         };
         let json = serde_json::to_string(&update).unwrap();
         let decoded: MembershipUpdate = serde_json::from_str(&json).unwrap();
@@ -571,48 +523,6 @@ mod tests {
             disk_pressured: false,
             hmac: [0u8; 32],
         }
-    }
-
-    /// The exact wire shape a pre-12b.2 peer serialises and parses.
-    /// Current-generation message without a directory extension.
-    #[derive(Debug, Serialize, Deserialize)]
-    struct BareGossipMessage {
-        version: u8,
-        state_format: u32,
-        sender: NodeId,
-        incarnation: u64,
-        hmac: [u8; 32],
-        payload: GossipPayload,
-    }
-
-    #[test]
-    fn current_generation_decoder_can_ignore_the_extension() {
-        let mut msg = a_message();
-        msg.extension = Some(an_extension());
-        let datagram = encode_datagram(&msg).unwrap();
-
-        // The fixed-shape decoder can ignore the optional directory extension.
-        let legacy: BareGossipMessage = bincode::deserialize(&datagram).unwrap();
-        assert_eq!(legacy.sender, NodeId::new("sender"));
-        assert_eq!(legacy.payload.updates().len(), 1);
-    }
-
-    #[test]
-    fn current_generation_allows_an_extension_free_datagram() {
-        // A supported peer may omit the directory extension.
-        let legacy = BareGossipMessage {
-            version: GossipMessage::VERSION,
-            state_format: crate::compatibility::CURRENT.state,
-            sender: NodeId::new("old-node"),
-            incarnation: 3,
-            hmac: [0u8; 32],
-            payload: GossipPayload::Ping { updates: vec![] },
-        };
-        let datagram = bincode::serialize(&legacy).unwrap();
-
-        let decoded = decode_datagram(&datagram).unwrap();
-        assert_eq!(decoded.sender, NodeId::new("old-node"));
-        assert!(decoded.extension.is_none());
     }
 
     #[test]
@@ -644,7 +554,7 @@ mod tests {
         with.extension = Some(an_extension());
         let without = a_message();
         // The message HMAC must not change when an extension is attached,
-        // or old peers could no longer verify new datagrams.
+        // so a datagram whose extension is dropped still verifies.
         assert_eq!(
             with.canonical_bytes().unwrap(),
             without.canonical_bytes().unwrap()
@@ -687,17 +597,6 @@ mod tests {
         );
     }
 
-    /// The exact wire shape a pre-labels (post-12b.2-directory) peer
-    /// serialises for the extension: no `labels` field.
-    #[derive(Debug, Serialize, Deserialize)]
-    struct LegacyDirectoryExtension {
-        node_id: NodeId,
-        api_address: SocketAddr,
-        reporting_address: SocketAddr,
-        leader: Option<LeaderHint>,
-        hmac: [u8; 32],
-    }
-
     #[test]
     fn extension_carries_labels_round_trip() {
         let mut msg = a_message();
@@ -709,43 +608,6 @@ mod tests {
     }
 
     #[test]
-    fn new_peer_drops_a_pre_labels_extension_but_keeps_the_message() {
-        // A pre-labels peer's datagram is the message body followed by the
-        // shorter extension. bincode is positional, so the trailing bytes
-        // don't decode as the current `DirectoryExtension` — the extension
-        // is dropped, the message body still parses (both-direction
-        // tolerance, exactly as for a pre-directory peer).
-        let msg = a_message();
-        let legacy_ext = LegacyDirectoryExtension {
-            node_id: NodeId::new("old"),
-            api_address: SocketAddr::from(([127, 0, 0, 1], 9117)),
-            reporting_address: SocketAddr::from(([127, 0, 0, 1], 9445)),
-            leader: None,
-            hmac: [0u8; 32],
-        };
-        let mut datagram = bincode::serialize(&msg).unwrap();
-        datagram.extend(bincode::serialize(&legacy_ext).unwrap());
-
-        let decoded = decode_datagram(&datagram).unwrap();
-        assert_eq!(decoded.sender, msg.sender);
-        // The shorter legacy extension hits EOF partway through the labels
-        // map; the modern decoder rejects it rather than mis-reading.
-        assert!(decoded.extension.is_none());
-    }
-
-    /// The exact wire shape a pre-`disk_pressured` (but post-labels) peer
-    /// serialises for the extension: labels, but no `disk_pressured` field.
-    #[derive(Debug, Serialize, Deserialize)]
-    struct LegacyLabelledDirectoryExtension {
-        node_id: NodeId,
-        api_address: SocketAddr,
-        reporting_address: SocketAddr,
-        leader: Option<LeaderHint>,
-        labels: BTreeMap<String, String>,
-        hmac: [u8; 32],
-    }
-
-    #[test]
     fn extension_carries_disk_pressured_round_trip() {
         let mut ext = an_extension();
         ext.disk_pressured = true;
@@ -754,51 +616,6 @@ mod tests {
         let datagram = encode_datagram(&msg).unwrap();
         let decoded = decode_datagram(&datagram).unwrap();
         assert!(decoded.extension.unwrap().disk_pressured);
-    }
-
-    #[test]
-    fn new_peer_drops_a_pre_disk_pressured_extension_but_keeps_the_message() {
-        // A pre-`disk_pressured` peer's extension is one bool shorter. bincode
-        // is positional, so the modern decoder hits EOF where it expects the
-        // bool and drops the extension; the message body still parses. This is
-        // the same both-direction tolerance labels already relied on.
-        let msg = a_message();
-        let legacy_ext = LegacyLabelledDirectoryExtension {
-            node_id: NodeId::new("old"),
-            api_address: SocketAddr::from(([127, 0, 0, 1], 9117)),
-            reporting_address: SocketAddr::from(([127, 0, 0, 1], 9445)),
-            leader: None,
-            labels: BTreeMap::from([("zone".to_string(), "us-east".to_string())]),
-            hmac: [0u8; 32],
-        };
-        let mut datagram = bincode::serialize(&msg).unwrap();
-        datagram.extend(bincode::serialize(&legacy_ext).unwrap());
-
-        let decoded = decode_datagram(&datagram).unwrap();
-        assert_eq!(decoded.sender, msg.sender);
-        assert!(decoded.extension.is_none());
-    }
-
-    #[test]
-    fn old_labelled_peer_parses_a_datagram_carrying_disk_pressured() {
-        // The reverse direction: a new peer's datagram (with `disk_pressured`)
-        // must still parse as the shorter pre-`disk_pressured` extension shape,
-        // ignoring the trailing bool. bincode's legacy `deserialize` ignores
-        // what it doesn't read, so labels come through and the extra byte is
-        // dropped.
-        let mut ext = an_extension();
-        ext.disk_pressured = true;
-        let mut msg = a_message();
-        msg.extension = Some(ext);
-        let datagram = encode_datagram(&msg).unwrap();
-
-        let body = bincode::serialize(&msg).unwrap();
-        let legacy: LegacyLabelledDirectoryExtension =
-            bincode::deserialize(&datagram[body.len()..]).unwrap();
-        assert_eq!(
-            legacy.labels.get("zone").map(String::as_str),
-            Some("us-east")
-        );
     }
 
     #[test]
@@ -864,7 +681,6 @@ mod tests {
                     address: test_addr(),
                     state: NodeState::Dead,
                     incarnation: 3,
-                    lamport: 10,
                 }],
             },
         );
@@ -875,15 +691,15 @@ mod tests {
         assert_eq!(decoded.incarnation, msg.incarnation);
     }
 
-    /// The decoder switched from bincode's deprecated `config()` builder to
-    /// the `Options` builder, whose default is *varint* encoding — a silent
-    /// wire-format change that compiles perfectly and simply stops talking to
-    /// every deployed peer. Pin the legacy shape against bytes produced by
-    /// `bincode::serialize` directly, which is what peers send.
+    /// The decoder uses bincode's `Options` builder, whose default is
+    /// *varint* encoding — a silent wire-format change that compiles
+    /// perfectly and simply stops talking to every peer. Pin the fixed-width
+    /// shape against bytes produced by `bincode::serialize` directly, which
+    /// is what peers send.
     #[test]
     fn fixed_width_wire_bytes_decode_unchanged() {
         let msg = GossipMessage::new(
-            NodeId::new("legacy-peer"),
+            NodeId::new("peer"),
             42,
             GossipPayload::Ack {
                 updates: vec![MembershipUpdate {
@@ -891,14 +707,13 @@ mod tests {
                     address: test_addr(),
                     state: NodeState::Suspect,
                     incarnation: 7,
-                    lamport: 9,
                 }],
                 relayed: false,
             },
         );
-        // Exactly what an older peer puts on the wire: plain `bincode::serialize`.
-        let legacy = bincode::serialize(&msg).expect("legacy encode");
-        let decoded = decode_datagram(&legacy).expect("legacy bytes must still decode");
+        // Exactly what a peer puts on the wire: plain `bincode::serialize`.
+        let bytes = bincode::serialize(&msg).expect("encode");
+        let decoded = decode_datagram(&bytes).expect("peer bytes must decode");
 
         assert_eq!(decoded.version, msg.version);
         assert_eq!(decoded.sender, msg.sender);
@@ -907,7 +722,7 @@ mod tests {
         assert_eq!(decoded.payload.updates()[0].incarnation, 7);
         assert!(
             decoded.extension.is_none(),
-            "a legacy datagram carries no directory extension"
+            "a bare datagram carries no directory extension"
         );
     }
 
@@ -932,7 +747,6 @@ mod tests {
                     address: test_addr(),
                     state: NodeState::Alive,
                     incarnation: 1,
-                    lamport: 1,
                 }],
             },
         );
@@ -966,7 +780,6 @@ mod tests {
                 address: test_addr(),
                 state: NodeState::Suspect,
                 incarnation: u64::MAX,
-                lamport: u64::MAX,
             })
             .collect();
         let msg = GossipMessage::new(

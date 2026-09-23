@@ -155,7 +155,6 @@ fn bench_dissemination_queue(c: &mut Criterion) {
                             NodeState::Alive
                         },
                         incarnation: 1,
-                        lamport: i as u64,
                     },
                     100,
                 );

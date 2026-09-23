@@ -216,7 +216,7 @@ permanent execution fences reject stale reports. Normal enrolled rootful startup
 final release qualification remains open.
 
 0.1.0 requires a fresh cluster; development state is refused. Rolling upgrades
-require matching explicit formats (currently protocol 21 and state 39). See the
+require matching explicit formats (currently protocol 22 and state 39). See the
 [compatibility policy](releasing.md#cluster-compatibility).
 
 Lease-owned test volumes and generated configuration have durable provisioning

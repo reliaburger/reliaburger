@@ -1503,11 +1503,11 @@ The leader hint is the interesting part. Only the actual leader *originates* a h
 
 On the receiving side, every node folds extensions into a `NodeDirectory` — a map of node to endpoints plus the best hint — and publishes it on a `watch` channel. The reporting worker's leader-target maintainer and the placement reconciler now resolve the leader through one shared function: Raft metrics stay authoritative when they know a leader (voters, same term or newer), and the gossip directory answers for everyone else. A worker outside the council learns the leader from its very first gossip exchange with anyone who knows.
 
-### Old peers must keep gossiping
+### Keeping the extension out of the message body
 
-Now, the wire problem. Gossip messages are bincode, and bincode is positional — no field names, no tags, just bytes in struct order. Add a field to `GossipMessage` and an old binary misparses every datagram a new binary sends. `#[serde(default)]`, the usual "tolerate missing fields" tool, is useless here: it only helps formats that know which fields are present. During a rolling upgrade (Phase 14 makes this routine), old and new binaries *will* share a cluster, and the membership protocol is the one thing that must not fracture.
+Gossip messages are bincode, and bincode is positional — no field names, no tags, just bytes in struct order. Old and new binaries never share a wire format: the first byte is the protocol generation, and a mismatch is refused before anything else is read. The directory is still worth keeping apart from the membership payload, though. It's optional per datagram, and a bad one should cost us directory data, never membership.
 
-The trick is to not put the extension in the message at all:
+So we don't put the extension in the message at all:
 
 ```rust
 pub struct GossipMessage {
@@ -1517,9 +1517,9 @@ pub struct GossipMessage {
 }
 ```
 
-`#[serde(skip)]` is new syntax for us: it tells serde the field doesn't exist for serialisation purposes — it's never written, and on deserialisation it's filled with its `Default` value (`None`). So the message body's bytes are *identical* to the old wire format. The UDP transport then appends the encoded extension after the message bytes in the same datagram. Old peers deserialise the message and never look at the trailing bytes (bincode's legacy `deserialize` ignores them — a behaviour we pin with a test that decodes a new datagram using a copy of the old struct). New peers read the message, notice the cursor hasn't consumed the whole datagram, and decode the extension from the remainder. Tolerant in both directions. Compatibility tests pin the old bytes, while the 10,000-member scale acceptance feeds the new messages through the same production handler.
+`#[serde(skip)]` is new syntax for us: it tells serde the field doesn't exist for serialisation purposes — it's never written, and on deserialisation it's filled with its `Default` value (`None`). The UDP transport appends the encoded extension after the message bytes in the same datagram. The receiver reads the message, notices the cursor hasn't consumed the whole datagram, and decodes the extension from the remainder. Trailing bytes that don't decode as an extension are dropped; the message still counts. The 10,000-member scale acceptance feeds these datagrams through the same production handler.
 
-Authentication needed one extra step. The message HMAC (Phase 4) deliberately still covers only the message — otherwise old peers couldn't verify new datagrams. The extension carries its own HMAC, computed over the message's canonical bytes plus the extension, under the same cluster key. A keyed receiver that gets an extension with a bad or missing tag drops the extension and keeps the message: worst case you lose directory data, never membership.
+Authentication needed one extra step. The message HMAC (Phase 4) covers only the message, so a datagram whose extension is dropped still verifies. The extension carries its own HMAC, computed over the message's canonical bytes plus the extension, under the same cluster key. A keyed receiver that gets an extension with a bad or missing tag drops the extension and keeps the message: worst case you lose directory data, never membership.
 
 ### Proving it: eight-plus nodes through failover
 
@@ -2146,8 +2146,6 @@ It rides gossip. Every datagram already carries a small authenticated directory 
 
 Why gossip and not a new dedicated message? Because the directory extension is already there, already signed, already flowing to everyone on every datagram. Adding a bool to it is nearly free, and it inherits the extension's HMAC for free: the tag covers every field up to (but not including) the zeroed `hmac`, so a flipped `disk_pressured` bit fails verification exactly the way a tampered endpoint would. A test pins that — flip the bit on a signed extension, watch the check reject it.
 
-The wire-compatibility trick is the same one the `labels` field uses. The extension isn't inside the bincode message; it's appended after it as trailing bytes, versioned by position rather than by a per-field default. An old node that doesn't know about `disk_pressured` sends a shorter extension, and our newer decoder — reaching for a bool that isn't there — hits the end of the buffer and simply drops the whole extension, keeping the message body. A new node always emits the field. So a mixed cluster mid-upgrade converges the moment the old binaries roll, with no flag day. Two tests, one in each direction, pin exactly this: a new decoder dropping an old peer's shorter extension, and an old decoder ignoring the extra trailing byte a new peer sends.
-
 Until this wiring existed, the production path fed the reconciler a permanently empty set — the resignation *machinery* was complete and tested, but nothing in a live cluster ever put a name into it. This is the piece that makes it engage.
 
 ### Testing the whole thing
@@ -2369,17 +2367,11 @@ while testing node-fault expiry:
 the transport gates reopened correctly, but discovery had forgotten its way home.
 
 
-### Keep the wire slot, remove the imaginary clock
+### Remove the imaginary clock
 
-Membership updates still carry a field named `lamport`. Earlier code incremented
+Membership updates used to carry a field named `lamport`. Earlier code incremented
 it locally but never merged a received timestamp or used it to resolve an update.
 That wasn't a Lamport clock. The actual conflict rules use incarnation and node
-state. For 0.1.0 we remove the unused local counter and send zero in the old slot.
-Receivers ignore that slot, including values from older senders.
-
-Why keep the field? Bincode serialises struct fields in order. Removing the last
-`u64` would change the message layout. The compatibility test compares an update's
-bytes with the legacy field sequence, then decodes them back. A second test sends
-a stale incarnation with the largest possible timestamp and checks that it cannot
-overrule current membership. This preserves the wire representation without
-claiming a causal-ordering feature we don't implement.
+state, so for 0.1.0 the field is gone. Removing a positional bincode field changes
+the message layout, which is exactly what the protocol generation is for: the
+change bumps it, and peers of the old generation are refused before decoding.

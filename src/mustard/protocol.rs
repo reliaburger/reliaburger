@@ -340,7 +340,6 @@ impl<T: MustardTransport> MustardNode<T> {
                     address: member.address,
                     state: member.state,
                     incarnation: member.incarnation,
-                    lamport: 0,
                 },
             );
             updates.truncate(super::message::MAX_PIGGYBACK_UPDATES);
@@ -414,7 +413,6 @@ impl<T: MustardTransport> MustardNode<T> {
                 address: self.address,
                 state: NodeState::Left,
                 incarnation: self.incarnation,
-                lamport: 0,
             },
             self.membership.len(),
         );
@@ -558,7 +556,6 @@ impl<T: MustardTransport> MustardNode<T> {
                     // peers (detection stops propagating) or wrongly overrides
                     // fresher Alive state.
                     incarnation: self.membership_incarnation_of(&target_id),
-                    lamport: 0,
                 },
                 self.membership.len(),
             );
@@ -627,7 +624,6 @@ impl<T: MustardTransport> MustardNode<T> {
                     address: from,
                     state: NodeState::Alive,
                     incarnation: message.incarnation,
-                    lamport: 0,
                 },
                 self.membership.len(),
             );
@@ -763,7 +759,6 @@ impl<T: MustardTransport> MustardNode<T> {
             address: self.address,
             state: NodeState::Alive,
             incarnation: self.incarnation,
-            lamport: 0,
         };
         // Apply the refutation to our own record too, not just the outbound
         // queue (O9). The claim we're refuting was applied a moment ago, so
@@ -802,7 +797,6 @@ impl<T: MustardTransport> MustardNode<T> {
                         address: node_addr,
                         state: NodeState::Dead,
                         incarnation: inc,
-                        lamport: 0,
                     },
                     self.membership.len(),
                 );
@@ -989,7 +983,6 @@ mod tests {
                 address: member.address,
                 state: NodeState::Left,
                 incarnation: member.incarnation,
-                lamport: 1,
             })
             .collect::<Vec<_>>()
         {
@@ -1312,7 +1305,6 @@ mod tests {
                     address: addr(2),
                     state: NodeState::Suspect,
                     incarnation: 1,
-                    lamport: 1,
                 }],
             },
         );
@@ -1349,7 +1341,6 @@ mod tests {
                     address: addr(2),
                     state: NodeState::Dead,
                     incarnation: 1,
-                    lamport: 1,
                 }],
             },
         );
@@ -1385,7 +1376,6 @@ mod tests {
                 address: addr(3),
                 state: NodeState::Alive,
                 incarnation: 1,
-                lamport: 1,
             },
             3,
         );
@@ -2070,7 +2060,6 @@ mod tests {
                     address: addr(1),
                     state: NodeState::Dead,
                     incarnation: 50,
-                    lamport: 1,
                 }],
             },
         );
@@ -2108,7 +2097,6 @@ mod tests {
                     address: addr(1),
                     state: NodeState::Suspect,
                     incarnation: 4,
-                    lamport: 1,
                 }],
             },
         );
@@ -2146,7 +2134,6 @@ mod tests {
                     address: addr(1),
                     state: NodeState::Left,
                     incarnation: 1,
-                    lamport: 1,
                 }],
             },
         );
@@ -2188,7 +2175,6 @@ mod tests {
                     address: addr(1),
                     state: NodeState::Left,
                     incarnation: node.incarnation,
-                    lamport: 9,
                 }],
             },
         );
