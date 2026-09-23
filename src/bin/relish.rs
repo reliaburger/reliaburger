@@ -111,7 +111,7 @@ enum Command {
         /// SQL query against the `logs` table.
         sql: String,
     },
-    /// Show the status (state, PID, restarts) of all running workloads.
+    /// Show every workload on every node, with its latest CPU and memory.
     Top,
     /// Execute a command inside a running container.
     Exec {

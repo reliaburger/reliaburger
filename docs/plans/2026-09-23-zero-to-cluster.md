@@ -117,7 +117,7 @@ tutorial, because a tutorial over a broken path is a lie.
   `[testing]` policy of `safety_class = "development"` with workload faults
   allowed (see D3). Workload faults are forwarded to the node that owns the
   target instance, like node faults already are.
-- [ ] **Z2.2 Cluster-wide follow and top.** `relish logs -f` streams from every
+- [x] **Z2.2 Cluster-wide follow and top.** `relish logs -f` streams from every
   node that runs the app (fan-out over the existing SSE endpoint), and
   `relish top` shows every node, with CPU and memory.
 - [ ] **Z2.3 `wtf` and `trace` from the host.** Route the per-node calls through

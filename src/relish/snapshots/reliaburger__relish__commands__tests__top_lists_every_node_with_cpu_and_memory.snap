@@ -1,0 +1,8 @@
+---
+source: src/relish/commands.rs
+expression: "render_top(&[top_row(\"rb-0123456789ab-1\", \"default__podinfo-0\", Some(2311),\nSome(3.4), Some(24_117_248)),\ntop_row(\"rb-2\", \"default__podinfo-0\", Some(2290), Some(0.0), Some(900)),\ntop_row(\"rb-3\", \"default__podinfo-0\", None, None, None),])"
+---
+NODE               APP                  NAMESPACE    STATE      PID      RESTARTS      CPU     MEMORY
+rb-0123456789ab-1  podinfo              default      running    2311     0            3.4%   23.0 MiB
+rb-2               podinfo              default      running    2290     0            0.0%      900 B
+rb-3               podinfo              default      running    -        1               -          -

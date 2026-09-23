@@ -1359,48 +1359,86 @@ pub fn export_k8s(file: &Path) -> Result<(), RelishError> {
     Ok(())
 }
 
-/// Show the status of all running workloads — state, PID, restart count.
-///
-/// Named `top` by analogy, but it does not (yet) report live CPU/memory usage;
-/// the title and help say what it actually shows rather than promising resource
-/// figures it doesn't print (O19).
+/// Show every workload in the cluster with its node, state and latest CPU and
+/// memory. The figures are the last samples the node's metrics collector took
+/// (every few seconds), not a live meter; `-` means no sample yet.
 pub async fn top(output: OutputFormat) -> Result<(), RelishError> {
     let client = BunClient::default_local();
-    let statuses = client.status().await?;
+    let top = client.cluster_top().await?;
+    for warning in &top.warnings {
+        eprintln!("warning: {warning}");
+    }
 
     match output {
-        OutputFormat::Human => {
-            if statuses.is_empty() {
-                println!("no workloads running");
-                return Ok(());
-            }
-            println!(
-                "{:<20} {:<12} {:<10} {:<10} {:<10}",
-                "APP", "NAMESPACE", "STATE", "PID", "RESTARTS"
-            );
-            for s in &statuses {
-                let pid = s
-                    .pid
-                    .map(|p| p.to_string())
-                    .unwrap_or_else(|| "-".to_string());
-                println!(
-                    "{:<20} {:<12} {:<10} {:<10} {:<10}",
-                    s.app_name, s.namespace, s.state, pid, s.restart_count
-                );
-            }
-        }
+        OutputFormat::Human => print!("{}", render_top(&top.rows)),
         OutputFormat::Json => {
             let json =
-                serde_json::to_string_pretty(&statuses).map_err(RelishError::SerialiseJson)?;
+                serde_json::to_string_pretty(&top.rows).map_err(RelishError::SerialiseJson)?;
             println!("{json}");
         }
         OutputFormat::Yaml => {
-            let yaml = serde_yaml::to_string(&statuses).map_err(RelishError::SerialiseYaml)?;
+            let yaml = serde_yaml::to_string(&top.rows).map_err(RelishError::SerialiseYaml)?;
             print!("{yaml}");
         }
     }
 
     Ok(())
+}
+
+/// The `relish top` table.
+fn render_top(rows: &[crate::bun::top::TopRow]) -> String {
+    use std::fmt::Write as _;
+
+    if rows.is_empty() {
+        return "no workloads running\n".to_string();
+    }
+    let mut output = format!(
+        "{:<18} {:<20} {:<12} {:<10} {:<8} {:<9} {:>7} {:>10}\n",
+        "NODE", "APP", "NAMESPACE", "STATE", "PID", "RESTARTS", "CPU", "MEMORY"
+    );
+    for row in rows {
+        let pid = row
+            .instance
+            .pid
+            .map(|pid| pid.to_string())
+            .unwrap_or_else(|| "-".to_string());
+        let cpu = row
+            .cpu_percent
+            .map(|cpu| format!("{cpu:.1}%"))
+            .unwrap_or_else(|| "-".to_string());
+        let memory = row
+            .memory_bytes
+            .map(format_memory)
+            .unwrap_or_else(|| "-".to_string());
+        let _ = writeln!(
+            output,
+            "{:<18} {:<20} {:<12} {:<10} {:<8} {:<9} {:>7} {:>10}",
+            row.node,
+            row.instance.app_name,
+            row.instance.namespace,
+            row.instance.state,
+            pid,
+            row.instance.restart_count,
+            cpu,
+            memory
+        );
+    }
+    output
+}
+
+/// Bytes in binary units, one decimal place above a KiB.
+fn format_memory(bytes: u64) -> String {
+    const UNITS: [&str; 4] = ["KiB", "MiB", "GiB", "TiB"];
+    if bytes < 1024 {
+        return format!("{bytes} B");
+    }
+    let mut value = bytes as f64 / 1024.0;
+    let mut unit = 0;
+    while value >= 1024.0 && unit < UNITS.len() - 1 {
+        value /= 1024.0;
+        unit += 1;
+    }
+    format!("{value:.1} {}", UNITS[unit])
 }
 
 /// List images in the local Pickle registry.
@@ -2004,6 +2042,64 @@ pub async fn snapshot_delete(app: &str, namespace: &str, name: &str) -> Result<(
 mod tests {
     use super::*;
     use std::io::Write as _;
+
+    fn top_row(
+        node: &str,
+        id: &str,
+        pid: Option<u32>,
+        cpu: Option<f64>,
+        memory: Option<u64>,
+    ) -> crate::bun::top::TopRow {
+        crate::bun::top::TopRow {
+            node: node.to_string(),
+            instance: crate::bun::agent::InstanceStatus {
+                id: id.to_string(),
+                app_name: "podinfo".to_string(),
+                namespace: "default".to_string(),
+                state: "running".to_string(),
+                restart_count: u32::from(node == "rb-3"),
+                host_port: None,
+                exit_code: None,
+                pid,
+            },
+            cpu_percent: cpu,
+            memory_bytes: memory,
+        }
+    }
+
+    #[test]
+    fn top_lists_every_node_with_cpu_and_memory() {
+        insta::assert_snapshot!(render_top(&[
+            top_row(
+                "rb-0123456789ab-1",
+                "default__podinfo-0",
+                Some(2311),
+                Some(3.4),
+                Some(24_117_248)
+            ),
+            top_row(
+                "rb-2",
+                "default__podinfo-0",
+                Some(2290),
+                Some(0.0),
+                Some(900)
+            ),
+            top_row("rb-3", "default__podinfo-0", None, None, None),
+        ]));
+    }
+
+    #[test]
+    fn top_says_so_when_nothing_runs() {
+        assert_eq!(render_top(&[]), "no workloads running\n");
+    }
+
+    #[test]
+    fn memory_uses_binary_units() {
+        assert_eq!(format_memory(512), "512 B");
+        assert_eq!(format_memory(1536), "1.5 KiB");
+        assert_eq!(format_memory(24_117_248), "23.0 MiB");
+        assert_eq!(format_memory(3 * 1024 * 1024 * 1024), "3.0 GiB");
+    }
 
     #[tokio::test]
     async fn join_token_file_rejects_exposed_empty_and_oversized_credentials() {

@@ -391,6 +391,9 @@ pub enum AgentCommand {
         app_name: String,
         namespace: String,
         tail: Option<usize>,
+        /// `Some(node)` prefixes every line with `[node instance]`, so lines
+        /// from several nodes stay attributable once they're merged.
+        label: Option<String>,
         lines: mpsc::Sender<String>,
     },
     /// Execute a command inside a running instance.
@@ -4108,9 +4111,10 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
                 app_name,
                 namespace,
                 tail,
+                label,
                 lines,
             } => {
-                self.follow_app_logs(&app_name, &namespace, tail, lines)
+                self.follow_app_logs(&app_name, &namespace, tail, label.as_deref(), lines)
                     .await;
             }
             AgentCommand::Exec {
@@ -9016,6 +9020,7 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
         app_name: &str,
         namespace: &str,
         tail: Option<usize>,
+        label: Option<&str>,
         lines: mpsc::Sender<String>,
     ) {
         let instance_ids: Vec<InstanceId> = self
@@ -9030,13 +9035,16 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
             return;
         }
 
+        let prefix = |id: &InstanceId| label.map(|node| format!("[{node} {}] ", id.0));
+
         // Send initial tail lines if requested
         if let Some(n) = tail {
             for id in &instance_ids {
                 let logs = self.supervisor.grill().logs(id).await.unwrap_or_default();
                 let tailed = tail_lines(&logs, n);
+                let prefix = prefix(id).unwrap_or_default();
                 for line in tailed.lines() {
-                    if lines.send(line.to_string()).await.is_err() {
+                    if lines.send(format!("{prefix}{line}")).await.is_err() {
                         return;
                     }
                 }
@@ -9048,9 +9056,26 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
         // loop is never blocked waiting for a client to disconnect.
         for id in instance_ids {
             let grill = self.supervisor.grill().clone();
+            let Some(prefix) = prefix(&id) else {
+                let tx = lines.clone();
+                tokio::spawn(async move {
+                    grill.follow_logs(&id, tx).await;
+                });
+                continue;
+            };
+            // A labelled follow reads the instance through its own channel
+            // and stamps each line on the way through.
+            let (instance_tx, mut instance_rx) = mpsc::channel::<String>(64);
+            tokio::spawn(async move {
+                grill.follow_logs(&id, instance_tx).await;
+            });
             let tx = lines.clone();
             tokio::spawn(async move {
-                grill.follow_logs(&id, tx).await;
+                while let Some(line) = instance_rx.recv().await {
+                    if tx.send(format!("{prefix}{line}")).await.is_err() {
+                        return;
+                    }
+                }
             });
         }
     }
@@ -16138,6 +16163,7 @@ host = "remote.local"
             app_name: "sleeper".into(),
             namespace: "default".into(),
             tail: None,
+            label: None,
             lines: line_tx,
         })
         .await

@@ -348,6 +348,7 @@ pub fn router_with_upgrade(
         .route("/v1/ws/events", get(ws_events_handler))
         .route("/v1/ws/logs/{app}/{namespace}", get(ws_logs_handler))
         .route("/v1/status/{app}/{namespace}", get(status_app_handler))
+        .route("/v1/top", get(top_handler))
         .route("/v1/stop/{app}/{namespace}", post(stop_handler))
         .route("/v1/logs/{app}/{namespace}", get(logs_handler))
         .route(
@@ -3588,6 +3589,123 @@ async fn collect_cluster_statuses(
     Ok((statuses, failures))
 }
 
+/// `GET /v1/top[?cluster=true]`: workloads with their latest CPU and memory.
+///
+/// Without `cluster` a node answers for itself. With it, the node merges its
+/// own rows with every peer's; a peer that doesn't answer becomes a warning
+/// rather than failing the whole view, so `relish top` still works while a
+/// node is down.
+async fn top_handler(
+    State(state): State<ApiState>,
+    Query(query): Query<StatusQuery>,
+    auth: Option<axum::Extension<crate::sesame::auth::AuthContext>>,
+) -> Response {
+    let auth = auth.as_deref();
+    let visible = |row: &crate::bun::top::TopRow| {
+        crate::sesame::auth::authorize_scoped(auth, &row.instance.app_name, &row.instance.namespace)
+            .is_ok()
+    };
+    let mut rows = match local_top_rows(&state).await {
+        Ok(rows) => rows,
+        Err(error) => return unavailable_response(error),
+    };
+    if !query.cluster {
+        rows.retain(visible);
+        return Json(rows).into_response();
+    }
+    let mut warnings = Vec::new();
+    let local_name = local_node_name(&state);
+    let members = match &state.membership {
+        Some(membership) => membership.read().await.clone(),
+        None => Vec::new(),
+    };
+    let requests = futures_util::stream::iter(
+        members
+            .into_iter()
+            .filter(|member| member.node_id.0 != local_name)
+            .map(|member| {
+                let state = &state;
+                async move {
+                    let name = member.node_id.0;
+                    let result = tokio::time::timeout(CLUSTER_STATUS_TIMEOUT, async {
+                        let url = state
+                            .cluster_http
+                            .url(&member.address.to_string(), "/v1/top");
+                        let mut request = state.cluster_http.client().get(url);
+                        if let Some(token) = &state.service_token {
+                            request = request.bearer_auth(token);
+                        }
+                        request
+                            .send()
+                            .await?
+                            .error_for_status()?
+                            .json::<Vec<crate::bun::top::TopRow>>()
+                            .await
+                    })
+                    .await;
+                    match result {
+                        Ok(Ok(rows)) => Ok(rows),
+                        Ok(Err(error)) => Err(format!("node {name}: {error}")),
+                        Err(_) => Err(format!("node {name} timed out")),
+                    }
+                }
+            }),
+    )
+    .buffer_unordered(8);
+    tokio::pin!(requests);
+    while let Some(result) = requests.next().await {
+        match result {
+            Ok(peer_rows) => rows.extend(peer_rows),
+            Err(warning) => warnings.push(warning),
+        }
+    }
+    // Peers answered with the node's service token, which sees everything,
+    // so the caller's scope applies here.
+    rows.retain(visible);
+    rows.sort_by(|left, right| {
+        (&left.node, &left.instance.namespace, &left.instance.id).cmp(&(
+            &right.node,
+            &right.instance.namespace,
+            &right.instance.id,
+        ))
+    });
+    warnings.sort();
+    Json(crate::bun::top::ClusterTop { rows, warnings }).into_response()
+}
+
+/// This node's workloads joined to their latest samples in its own store.
+async fn local_top_rows(state: &ApiState) -> Result<Vec<crate::bun::top::TopRow>, String> {
+    use crate::bun::top::{CPU_METRIC, MEMORY_METRIC, USAGE_WINDOW_SECS};
+
+    let statuses = local_statuses(state).await?;
+    let usage = match &state.mayo {
+        Some(mayo) => {
+            let since = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_secs()
+                .saturating_sub(USAGE_WINDOW_SECS);
+            let sql = format!(
+                "SELECT timestamp, metric_name, labels, value FROM metrics \
+                 WHERE metric_name IN ('{CPU_METRIC}', '{MEMORY_METRIC}') \
+                 AND timestamp >= {since} ORDER BY timestamp"
+            );
+            // Missing samples leave the columns empty; they don't hide the
+            // workloads themselves.
+            match mayo.read().await.query_sql(&sql).await {
+                Ok(samples) => crate::bun::top::latest_usage(&samples),
+                Err(_) => std::collections::HashMap::new(),
+            }
+        }
+        None => std::collections::HashMap::new(),
+    };
+    Ok(crate::bun::top::node_rows(
+        &local_node_name(state),
+        statuses,
+        &usage,
+    ))
+}
+
 /// List all run-to-completion workload instances.
 async fn jobs_handler(State(state): State<ApiState>) -> Response {
     match ask_agent(&state.cmd_tx, |response| AgentCommand::JobStatus {
@@ -3844,6 +3962,11 @@ struct LogsQuery {
     start: Option<u64>,
     end: Option<u64>,
     grep: Option<String>,
+    /// Follow only this node's instances. Set on the internal per-node
+    /// streams of a cluster-wide follow, so a peer never fans out again.
+    local: Option<bool>,
+    /// Prefix each followed line with `[node instance]`.
+    label: Option<bool>,
 }
 
 /// Get logs for an app.
@@ -3862,25 +3985,37 @@ async fn logs_handler(
     let follow = query.follow.unwrap_or(false);
 
     if follow {
-        let (lines_tx, lines_rx) = mpsc::channel::<String>(64);
-        if state
-            .cmd_tx
-            .send(AgentCommand::FollowLogs {
-                app_name: app,
-                namespace,
-                tail: query.tail,
-                lines: lines_tx,
-            })
-            .await
-            .is_err()
+        // A cluster member follows every node that runs the app; the
+        // per-node streams it opens come back here with `local=true`.
+        if !query.local.unwrap_or(false)
+            && let (Some(council), Some(membership), Some(self_name)) =
+                (&state.council, &state.membership, &state.node_name)
         {
-            return (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(serde_json::json!({ "error": "agent unavailable" })),
-            )
+            let (events_tx, events_rx) = mpsc::channel::<Event>(256);
+            tokio::spawn(follow_cluster_logs(
+                state.clone(),
+                Arc::clone(council),
+                Arc::clone(membership),
+                self_name.clone(),
+                app,
+                namespace,
+                query.tail,
+                events_tx,
+            ));
+            let stream = ReceiverStream::new(events_rx).map(Ok::<_, std::convert::Infallible>);
+            return Sse::new(stream)
+                .keep_alive(axum::response::sse::KeepAlive::default())
                 .into_response();
         }
-
+        let label = query
+            .label
+            .unwrap_or(false)
+            .then(|| state.node_name.clone())
+            .flatten();
+        let lines_rx = match follow_local_logs(&state, app, namespace, query.tail, label).await {
+            Ok(lines_rx) => lines_rx,
+            Err(response) => return response,
+        };
         let stream = ReceiverStream::new(lines_rx)
             .map(|line| Ok::<_, std::convert::Infallible>(Event::default().data(line)));
         return Sse::new(stream).into_response();
@@ -3902,6 +4037,275 @@ async fn logs_handler(
             .into_response(),
         Err(response) => response,
     }
+}
+
+/// Start following this node's instances of an app.
+// `Response` is large but it IS the HTTP reply to send on failure;
+// boxing it would tax every call site for a value that lives one frame.
+#[allow(clippy::result_large_err)]
+async fn follow_local_logs(
+    state: &ApiState,
+    app: String,
+    namespace: String,
+    tail: Option<usize>,
+    label: Option<String>,
+) -> Result<mpsc::Receiver<String>, Response> {
+    let (lines_tx, lines_rx) = mpsc::channel::<String>(64);
+    state
+        .cmd_tx
+        .send(AgentCommand::FollowLogs {
+            app_name: app,
+            namespace,
+            tail,
+            label,
+            lines: lines_tx,
+        })
+        .await
+        .map_err(|_| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({ "error": "agent unavailable" })),
+            )
+                .into_response()
+        })?;
+    Ok(lines_rx)
+}
+
+/// How often a cluster-wide follow re-reads placements, to pick up replicas
+/// scheduled onto new nodes and to notice nodes that left.
+const LOG_FOLLOW_REFRESH: std::time::Duration = std::time::Duration::from_secs(2);
+
+/// Why one node's part of a cluster-wide follow stopped.
+struct LogSourceEnded {
+    node: String,
+    /// `None` when the stream ended cleanly, say because its replica
+    /// restarted; the next refresh reconnects without a warning.
+    error: Option<String>,
+}
+
+/// Merge the log streams of every node that runs an app into `events`.
+///
+/// Every [`LOG_FOLLOW_REFRESH`] it re-reads the app's placements and the live
+/// membership: it opens a stream to each placed node it isn't following yet
+/// and drops the streams of nodes that left. A node that goes away produces a
+/// `warning` event and the follow carries on with the rest. It returns when
+/// the client disconnects.
+#[allow(clippy::too_many_arguments)]
+async fn follow_cluster_logs(
+    state: ApiState,
+    council: Arc<crate::council::CouncilNode>,
+    membership: Arc<RwLock<Vec<NodeMembershipInfo>>>,
+    self_name: String,
+    app: String,
+    namespace: String,
+    tail: Option<usize>,
+    events: mpsc::Sender<Event>,
+) {
+    let app_id = crate::meat::types::AppId::new(&app, &namespace);
+    let mut sources: std::collections::HashMap<String, tokio::task::AbortHandle> =
+        std::collections::HashMap::new();
+    let mut connected_before: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let mut departed: std::collections::HashSet<String> = std::collections::HashSet::new();
+    // When each node's last stream ended, so a node with nothing to stream
+    // yet is retried once per refresh rather than in a tight loop.
+    let mut ended_at: std::collections::HashMap<String, tokio::time::Instant> =
+        std::collections::HashMap::new();
+    let (ended_tx, mut ended_rx) = mpsc::channel::<LogSourceEnded>(16);
+    loop {
+        let placed: std::collections::BTreeSet<crate::meat::NodeId> = council
+            .desired_state()
+            .await
+            .scheduling
+            .get(&app_id)
+            .map(|placements| placements.iter().map(|p| p.node_id.clone()).collect())
+            .unwrap_or_default();
+        let members = membership.read().await.clone();
+
+        // A node we followed that dropped out of the live membership gets
+        // one warning, whether its stream broke, ended cleanly (a graceful
+        // shutdown) or is still hanging on a dead connection.
+        let alive = |node: &str| members.iter().any(|member| member.node_id.0 == node);
+        departed.retain(|node| !alive(node));
+        let newly_departed: Vec<String> = connected_before
+            .iter()
+            .filter(|node| **node != self_name && !alive(node) && !departed.contains(*node))
+            .cloned()
+            .collect();
+        for node in newly_departed {
+            if let Some(source) = sources.remove(&node) {
+                source.abort();
+            }
+            let warning = format!("node {node} left the cluster; no longer following its logs");
+            if !send_log_warning(&events, warning).await {
+                return;
+            }
+            departed.insert(node);
+        }
+
+        for node in placed {
+            let cooling = ended_at
+                .get(&node.0)
+                .is_some_and(|at| at.elapsed() < LOG_FOLLOW_REFRESH);
+            if sources.contains_key(&node.0) || cooling {
+                continue;
+            }
+            // Only the first connection replays the tail; a reconnect after
+            // a replica restart carries on from new lines.
+            let tail = if connected_before.insert(node.0.clone()) {
+                tail
+            } else {
+                None
+            };
+            let source = if node.0 == self_name {
+                spawn_local_log_source(
+                    &state,
+                    &app,
+                    &namespace,
+                    tail,
+                    &self_name,
+                    events.clone(),
+                    ended_tx.clone(),
+                )
+                .await
+            } else {
+                let Some(member) = members.iter().find(|member| member.node_id == node) else {
+                    continue;
+                };
+                let url = state.cluster_http.url(
+                    &member.address.to_string(),
+                    &format!("/v1/logs/{app}/{namespace}"),
+                );
+                Some(spawn_peer_log_source(
+                    &state,
+                    node.0.clone(),
+                    url,
+                    tail,
+                    events.clone(),
+                    ended_tx.clone(),
+                ))
+            };
+            if let Some(source) = source {
+                sources.insert(node.0, source);
+            }
+        }
+
+        tokio::select! {
+            () = events.closed() => break,
+            Some(ended) = ended_rx.recv() => {
+                sources.remove(&ended.node);
+                ended_at.insert(ended.node.clone(), tokio::time::Instant::now());
+                if let Some(error) = ended.error
+                    && !send_log_warning(&events, format!("node {}: {error}", ended.node)).await
+                {
+                    break;
+                }
+            }
+            () = tokio::time::sleep(LOG_FOLLOW_REFRESH) => {}
+        }
+    }
+    for source in sources.into_values() {
+        source.abort();
+    }
+}
+
+async fn send_log_warning(events: &mpsc::Sender<Event>, warning: String) -> bool {
+    events
+        .send(
+            Event::default()
+                .event(crate::ketchup::sse::WARNING_EVENT)
+                .data(warning),
+        )
+        .await
+        .is_ok()
+}
+
+/// Follow this node's own instances as one source of a cluster-wide follow.
+async fn spawn_local_log_source(
+    state: &ApiState,
+    app: &str,
+    namespace: &str,
+    tail: Option<usize>,
+    self_name: &str,
+    events: mpsc::Sender<Event>,
+    ended: mpsc::Sender<LogSourceEnded>,
+) -> Option<tokio::task::AbortHandle> {
+    let mut lines = follow_local_logs(
+        state,
+        app.to_string(),
+        namespace.to_string(),
+        tail,
+        Some(self_name.to_string()),
+    )
+    .await
+    .ok()?;
+    let node = self_name.to_string();
+    Some(
+        tokio::spawn(async move {
+            while let Some(line) = lines.recv().await {
+                if events.send(Event::default().data(line)).await.is_err() {
+                    return;
+                }
+            }
+            let _ = ended.send(LogSourceEnded { node, error: None }).await;
+        })
+        .abort_handle(),
+    )
+}
+
+/// Stream one peer's labelled log lines into `events`, and report how the
+/// stream ended.
+fn spawn_peer_log_source(
+    state: &ApiState,
+    node: String,
+    url: String,
+    tail: Option<usize>,
+    events: mpsc::Sender<Event>,
+    ended: mpsc::Sender<LogSourceEnded>,
+) -> tokio::task::AbortHandle {
+    let mut request = state.cluster_http.client().get(url).query(&[
+        ("follow", "true"),
+        ("local", "true"),
+        ("label", "true"),
+    ]);
+    if let Some(tail) = tail {
+        request = request.query(&[("tail", tail)]);
+    }
+    if let Some(token) = &state.service_token {
+        request = request.bearer_auth(token);
+    }
+    tokio::spawn(async move {
+        let error = relay_peer_log_stream(request, &events).await.err();
+        let _ = ended.send(LogSourceEnded { node, error }).await;
+    })
+    .abort_handle()
+}
+
+async fn relay_peer_log_stream(
+    request: reqwest::RequestBuilder,
+    events: &mpsc::Sender<Event>,
+) -> Result<(), String> {
+    let response = tokio::time::timeout(std::time::Duration::from_secs(5), request.send())
+        .await
+        .map_err(|_| "log stream did not start within 5s".to_string())?
+        .map_err(|error| format!("log stream failed: {error}"))?;
+    if !response.status().is_success() {
+        return Err(format!("log stream refused: {}", response.status()));
+    }
+    let mut decoder = crate::ketchup::sse::SseDecoder::default();
+    let mut body = response.bytes_stream();
+    while let Some(chunk) = body.next().await {
+        let chunk = chunk.map_err(|error| format!("log stream broke: {error}"))?;
+        for event in decoder.push(&chunk) {
+            let mut forwarded = Event::default().data(event.data);
+            if let Some(kind) = event.event {
+                forwarded = forwarded.event(kind);
+            }
+            if events.send(forwarded).await.is_err() {
+                return Ok(());
+            }
+        }
+    }
+    Ok(())
 }
 
 /// Upgrade an authenticated request to a live log stream.
@@ -3935,6 +4339,7 @@ async fn ws_logs_session(
             app_name: app,
             namespace,
             tail,
+            label: None,
             lines: lines_tx,
         })
         .await
@@ -13759,8 +14164,37 @@ mod cluster_routing_tests {
 
     struct FakeCluster {
         nodes: Vec<FakeNode>,
+        membership: Arc<RwLock<Vec<NodeMembershipInfo>>>,
         operator: String,
         stop: CancellationToken,
+    }
+
+    impl FakeCluster {
+        /// List a member whose address has nothing listening, like a node
+        /// that died before gossip noticed.
+        async fn add_unreachable_member(&self, name: &str) {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let address = listener.local_addr().unwrap();
+            drop(listener);
+            self.membership.write().await.push(NodeMembershipInfo {
+                node_id: crate::meat::NodeId::new(name),
+                address,
+            });
+        }
+
+        async fn get_json<T: serde::de::DeserializeOwned>(&self, entry: usize, path: &str) -> T {
+            reqwest::Client::new()
+                .get(format!("{}{path}", self.nodes[entry].url))
+                .bearer_auth(&self.operator)
+                .send()
+                .await
+                .unwrap()
+                .error_for_status()
+                .unwrap()
+                .json()
+                .await
+                .unwrap()
+        }
     }
 
     impl Drop for FakeCluster {
@@ -13936,6 +14370,7 @@ mod cluster_routing_tests {
         }
         FakeCluster {
             nodes,
+            membership,
             operator: created.plaintext,
             stop,
         }
@@ -14112,5 +14547,43 @@ mod cluster_routing_tests {
         let message = response.text().await.unwrap();
         assert!(message.contains("node-2: node-2 cleared 1"), "{message}");
         assert!(cluster.nodes[1].injected.lock().await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn top_merges_every_node_and_warns_about_the_missing_one() {
+        let cluster = start_cluster(vec![
+            ("node-1", vec![instance("default/web-0", "web", "running")]),
+            (
+                "node-2",
+                vec![
+                    instance("default/web-0", "web", "running"),
+                    instance("default/api-0", "api", "running"),
+                ],
+            ),
+        ])
+        .await;
+        cluster.add_unreachable_member("node-3").await;
+
+        let top: crate::bun::top::ClusterTop = cluster.get_json(0, "/v1/top?cluster=true").await;
+        let rows: Vec<_> = top
+            .rows
+            .iter()
+            .map(|row| (row.node.as_str(), row.instance.app_name.as_str()))
+            .collect();
+        assert_eq!(
+            rows,
+            vec![("node-1", "web"), ("node-2", "api"), ("node-2", "web")]
+        );
+        assert_eq!(top.warnings.len(), 1, "{:?}", top.warnings);
+        assert!(
+            top.warnings[0].starts_with("node node-3"),
+            "{:?}",
+            top.warnings
+        );
+
+        // Without `cluster`, a node answers for itself only.
+        let local: Vec<crate::bun::top::TopRow> = cluster.get_json(1, "/v1/top").await;
+        assert!(local.iter().all(|row| row.node == "node-2"));
+        assert_eq!(local.len(), 2);
     }
 }

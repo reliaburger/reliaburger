@@ -920,6 +920,7 @@ async fn authenticated_node_kill_fails_and_restores_a_real_cluster_member() {
 
 /// Start three authenticated nodes and wait until a 3-replica `web` runs one
 /// replica on each. Used by the tests that act on a replica somewhere else.
+/// Each node gets a child of `shutdown`, so a test can stop one node alone.
 async fn start_spread_web_cluster(
     prefix: &str,
     first_port: u16,
@@ -930,7 +931,7 @@ async fn start_spread_web_cluster(
         &format!("{prefix}1"),
         first_port,
         vec![],
-        shutdown,
+        &shutdown.child_token(),
         Some(auth.clone()),
     )
     .await;
@@ -938,7 +939,7 @@ async fn start_spread_web_cluster(
         &format!("{prefix}2"),
         first_port + 4,
         vec![local(first_port)],
-        shutdown,
+        &shutdown.child_token(),
         Some(auth.clone()),
     )
     .await;
@@ -946,7 +947,7 @@ async fn start_spread_web_cluster(
         &format!("{prefix}3"),
         first_port + 8,
         vec![local(first_port)],
-        shutdown,
+        &shutdown.child_token(),
         Some(auth),
     )
     .await;
@@ -1080,6 +1081,149 @@ async fn a_kill_sent_to_one_node_kills_a_replica_on_another() {
             .all(|fault| fault.node.as_deref() == Some(target.name.as_str())),
         "{:?}",
         listing.faults
+    );
+
+    shutdown.cancel();
+    for node in &nodes {
+        if let Some(council) = &node.handle.council {
+            council.shutdown().await.ok();
+        }
+    }
+}
+
+/// Read a followed log stream until `done` says so or `timeout` passes,
+/// returning every event seen so far.
+async fn read_follow_events<B: AsRef<[u8]>>(
+    body: &mut (impl futures_util::Stream<Item = reqwest::Result<B>> + Unpin),
+    decoder: &mut reliaburger::ketchup::sse::SseDecoder,
+    events: &mut Vec<reliaburger::ketchup::sse::SseEvent>,
+    timeout: Duration,
+    mut done: impl FnMut(&[reliaburger::ketchup::sse::SseEvent]) -> bool,
+) {
+    use futures_util::StreamExt;
+
+    let deadline = tokio::time::Instant::now() + timeout;
+    while !done(events) {
+        match tokio::time::timeout_at(deadline, body.next()).await {
+            Ok(Some(Ok(chunk))) => events.extend(decoder.push(chunk.as_ref())),
+            Ok(Some(Err(_)) | None) | Err(_) => return,
+        }
+    }
+}
+
+/// The nodes that produced followed lines, from their `[node instance]` prefix.
+fn followed_nodes(events: &[reliaburger::ketchup::sse::SseEvent]) -> Vec<String> {
+    let mut nodes: Vec<String> = events
+        .iter()
+        .filter(|event| event.event.is_none())
+        .filter_map(|event| {
+            let rest = event.data.strip_prefix('[')?;
+            Some(rest.split_once(' ')?.0.to_string())
+        })
+        .collect();
+    nodes.sort();
+    nodes.dedup();
+    nodes
+}
+
+/// Z2.2: `relish logs -f` and `relish top` from one node see every node.
+/// The follow merges each node's lines under a `[node instance]` prefix, and
+/// when a node dies mid-stream it warns and keeps streaming the others.
+#[tokio::test(flavor = "multi_thread", worker_threads = 6)]
+#[ignore = "slow multi-node placement acceptance; run with make test-cluster"]
+async fn follow_and_top_cover_every_node_and_survive_one_leaving() {
+    let shutdown = CancellationToken::new();
+    let nodes = start_spread_web_cluster("lf", 19641, &shutdown).await;
+    let entry = &nodes[0];
+    // Lose a follower rather than the leader, so the test watches the
+    // follow's reaction rather than an election.
+    let doomed = nodes[1..]
+        .iter()
+        .find(|node| !*node.thinks_leader.borrow())
+        .expect("a follower other than the entry node");
+    let names: Vec<String> = nodes.iter().map(|node| node.name.clone()).collect();
+
+    let top = entry.client.cluster_top().await.unwrap();
+    assert!(top.warnings.is_empty(), "{:?}", top.warnings);
+    let mut top_nodes: Vec<_> = top
+        .rows
+        .iter()
+        .filter(|row| row.instance.app_name == "web")
+        .map(|row| row.node.clone())
+        .collect();
+    top_nodes.sort();
+    assert_eq!(top_nodes, names);
+
+    let response = entry
+        .client
+        .http()
+        .unwrap()
+        .get(format!("{}/v1/logs/web/default", entry.client.base_url()))
+        .query(&[("follow", "true")])
+        .send()
+        .await
+        .unwrap();
+    assert!(response.status().is_success());
+    let mut body = response.bytes_stream();
+    let mut decoder = reliaburger::ketchup::sse::SseDecoder::default();
+    let mut events = Vec::new();
+
+    read_follow_events(
+        &mut body,
+        &mut decoder,
+        &mut events,
+        Duration::from_secs(20),
+        |events| followed_nodes(events).len() == 3,
+    )
+    .await;
+    assert_eq!(followed_nodes(&events), names, "lines from every node");
+    let line = events
+        .iter()
+        .find(|event| event.data.starts_with(&format!("[{} ", doomed.name)))
+        .unwrap();
+    assert!(line.data.contains("tick from"), "{}", line.data);
+
+    // Take a node away mid-stream: the follow warns about it and carries on.
+    doomed._wired.shutdown.cancel();
+    let before = events.len();
+    read_follow_events(
+        &mut body,
+        &mut decoder,
+        &mut events,
+        Duration::from_secs(45),
+        |events| {
+            events[before..].iter().any(|event| {
+                event.event.as_deref() == Some(reliaburger::ketchup::sse::WARNING_EVENT)
+                    && event.data.contains(&doomed.name)
+            })
+        },
+    )
+    .await;
+    let warned = events[before..].iter().any(|event| {
+        event.event.as_deref() == Some(reliaburger::ketchup::sse::WARNING_EVENT)
+            && event.data.contains(&doomed.name)
+    });
+    assert!(
+        warned,
+        "no warning about {}: {:?}",
+        doomed.name,
+        &events[before..]
+    );
+    let after_warning = events.len();
+    read_follow_events(
+        &mut body,
+        &mut decoder,
+        &mut events,
+        Duration::from_secs(10),
+        |events| events.len() >= after_warning + 5,
+    )
+    .await;
+    // The survivors keep streaming. Which of them runs the rescheduled
+    // replicas is the scheduler's business, not this test's.
+    let survivors = followed_nodes(&events[after_warning..]);
+    assert!(
+        !survivors.is_empty() && !survivors.contains(&doomed.name),
+        "the follow should keep streaming the survivors, got {survivors:?}"
     );
 
     shutdown.cancel();

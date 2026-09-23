@@ -298,6 +298,64 @@ A rejected query is a `400`, not a `500` — the client asked for something the 
 
 One more, quieter fix rode along: a clean shutdown used to drop whatever the flush loops had buffered since their last tick. The stop path now forces a final flush of both the metrics and log buffers after the workers have joined, so the last minute survives a restart. And we deleted the dead `KetchupStore` — a second, older log store that Bun constructed and never used, whose calendar/index code and `logs.max_file_size_mb` setting drove nothing. `LogStore` is the live path; the dead one is gone.
 
+## Following the whole cluster
+
+`relish logs web` has asked every node for years. `relish logs web -f` didn't:
+it followed the node you happened to be talking to. On a laptop cluster that's
+node 1, and the scheduler had just put two of your three replicas on nodes 2
+and 3. You'd watch one replica and wonder why the others were so quiet.
+
+We had two places to fix it. The CLI could open one stream per node, or the
+node could do it and hand the CLI one merged stream. The laptop settled it:
+behind Lima's user-mode network, the host can reach node 1's forwarded port and
+nothing else. So the node does the fan-out. When a follow arrives without
+`local=true`, the node starts a background task that reads the app's
+placements from the council every two seconds, opens a stream to each placed
+node (with `local=true&label=true`, so the peer doesn't fan out again and
+stamps each line `[node instance]`), and pushes everything into one channel
+that feeds the client's server-sent-event response.
+
+The task keeps a map from node name to the `AbortHandle` of that node's
+stream. `tokio::spawn` gives you a `JoinHandle`; calling `.abort_handle()` on
+it gives you something smaller that can cancel the task but can't wait for
+it, which is all a supervisor needs. The loop itself waits on three things at
+once:
+
+```rust
+tokio::select! {
+    () = events.closed() => break,
+    Some(ended) = ended_rx.recv() => { /* forget it, warn if it failed */ }
+    () = tokio::time::sleep(LOG_FOLLOW_REFRESH) => {}
+}
+```
+
+`select!` polls every branch and runs whichever finishes first, dropping the
+others. Go programmers will recognise `select` on channels; the difference is
+that Rust's version works on any future, including a timer and "the client
+went away" (`Sender::closed`), not just channel operations. When the client
+disconnects, the first branch wins and the whole fan-out winds down.
+
+A node that goes away gets exactly one `warning` event, whichever way it
+went: a broken connection, a clean end during a graceful shutdown, or a
+stream still hanging on a dead TCP connection that only the membership table
+knows is gone. The CLI prints warnings to stderr and lines to stdout, so
+`relish logs web -f | grep ERROR` still works while a node dies.
+
+Both ends of that pipe parse SSE, so the parsing lives in one small type,
+`ketchup::sse::SseDecoder`. It's incremental on purpose: a network read can
+end anywhere, including halfway through a multi-byte UTF-8 character, so the
+decoder buffers bytes and only decodes a block once it has seen the blank line
+that ends it.
+
+`relish top` had the same blind spot and a subtler trap. The dashboard already
+charted `process_cpu_percent` and `process_memory_bytes`, labelled by app and
+PID. Why not have the CLI query those metrics and match them to instances by
+PID? Because a PID only means something on the node that issued it, and three
+VMs booted from the same image hand out very similar PIDs. So each node joins
+its own statuses to its own samples (`bun::top::node_rows`), and the node you
+ask merges finished rows. A PID never crosses a machine boundary without the
+node it belongs to.
+
 ## When nothing looks like success
 
 Both hardening passes share a pattern, and later reviews kept finding more of it: a failure that comes back dressed as an empty, successful answer. A directory called `blocked.parquet` made the exporter and both retention loops report success. A peer that sent `200 OK` and then went quiet hung a log query. A node that answered `{}` convinced the diagnostic collector there were no alerts. None of these crash. They lie quietly, which is worse.

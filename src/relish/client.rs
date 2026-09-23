@@ -45,6 +45,16 @@ pub struct LogsExportOutcome {
     pub checkpoint_saved: bool,
 }
 
+/// Print one event of a followed log stream: lines to stdout (after the
+/// client-side filters), warnings to stderr.
+fn print_followed_event(event: &crate::ketchup::sse::SseEvent, options: &LogOptions) {
+    if event.event.as_deref() == Some(crate::ketchup::sse::WARNING_EVENT) {
+        eprintln!("warning: {}", event.data);
+    } else if options.matches(&event.data) {
+        println!("{}", event.data);
+    }
+}
+
 #[derive(Debug, Clone, Default)]
 pub struct LogOptions {
     pub tail: Option<usize>,
@@ -1321,8 +1331,8 @@ impl BunClient {
         options: &LogOptions,
     ) -> Result<String, RelishError> {
         if options.follow {
-            // Follow mode uses the SSE endpoint (local only). The SSE
-            // path does not filter server-side, so filters apply here.
+            // Follow mode uses the SSE endpoint, which fans out across the
+            // cluster but does not filter server-side, so filters apply here.
             return self.logs_follow(app, namespace, options).await;
         }
 
@@ -1412,7 +1422,10 @@ impl BunClient {
         Ok(filtered.join("\n"))
     }
 
-    /// Follow logs via SSE stream (local node only).
+    /// Follow logs via the SSE stream. On a cluster the node follows every
+    /// node that runs the app and prefixes each line with `[node instance]`;
+    /// a node dropping out arrives as a warning on stderr and the stream
+    /// carries on.
     async fn logs_follow(
         &self,
         app: &str,
@@ -1438,34 +1451,15 @@ impl BunClient {
         }
 
         let mut stream = response.bytes_stream();
-        let mut buffer = Vec::new();
-
+        let mut decoder = crate::ketchup::sse::SseDecoder::default();
         while let Some(chunk) = stream.next().await {
             let bytes = chunk.map_err(classify_error)?;
-            buffer.extend_from_slice(&bytes);
-
-            while let Some(event_end) = buffer.windows(2).position(|pair| pair == b"\n\n") {
-                let event_text = String::from_utf8_lossy(&buffer[..event_end]).into_owned();
-                buffer.drain(..event_end + 2);
-
-                for line in event_text.lines() {
-                    if let Some(data) = line.strip_prefix("data:") {
-                        let data = data.trim();
-                        if options.matches(data) {
-                            println!("{data}");
-                        }
-                    }
-                }
+            for event in decoder.push(&bytes) {
+                print_followed_event(&event, options);
             }
         }
-
-        for line in String::from_utf8_lossy(&buffer).lines() {
-            if let Some(data) = line.strip_prefix("data:") {
-                let data = data.trim();
-                if options.matches(data) {
-                    println!("{data}");
-                }
-            }
+        if let Some(event) = decoder.finish() {
+            print_followed_event(&event, options);
         }
 
         Ok(String::new())
@@ -1714,6 +1708,11 @@ impl BunClient {
             status: 0,
             body: format!("failed to parse response: {e}"),
         })
+    }
+
+    /// Every node's workloads with their latest CPU and memory samples.
+    pub async fn cluster_top(&self) -> Result<crate::bun::top::ClusterTop, RelishError> {
+        self.get_typed_json("/v1/top?cluster=true").await
     }
 
     /// List every node's active faults, each tagged with its node.
