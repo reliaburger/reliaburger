@@ -298,6 +298,12 @@ this tier now blocks the 0.1.0 candidate rather than the merge.
       crates to `reliaburger/arrow-rs@34ac186` (59.3.0 + that one commit).
       Remove it when DataFusion depends on a Parquet release with #10979; the
       safety tests must pass on Linux.
+- [x] **T1.11 The cgroup-kill regression ran in the host-network `test-linux`
+      stage.** Done. Its name matched the `cgroup_` filter, so it ran beside
+      the serialised owned-Runc tests and they collided on container
+      addresses. `test-linux` now excludes `oci_crash`, whose driver runs it
+      serially in private namespaces.
+
 ## Tier 2: fix before release
 
 Smaller, mostly one commit each.
