@@ -387,7 +387,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn legacy_or_malformed_rollup_responses_remain_unknown() {
+    async fn unowned_or_malformed_rollup_responses_remain_unknown() {
         use axum::{Json, Router, routing::get};
         for owned_endpoint in [false, true] {
             let app = Router::new().route(

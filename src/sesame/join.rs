@@ -362,8 +362,7 @@ pub fn check_join_token(
         return Err(JoinError::TokenExpired);
     }
     // The token is bound to one node id: the request must ask for exactly that
-    // id (M4). A legacy token loads with an empty id and so matches no real
-    // node id — it is refused here, failing closed.
+    // id (M4).
     if join_token.node_id != requested_node_id {
         return Err(JoinError::NodeIdMismatch);
     }

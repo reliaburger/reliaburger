@@ -24,8 +24,7 @@ pub struct LocalContext {
     pub token: String,
     /// Absolute path to the cluster's public CA certificate.
     pub ca_cert: PathBuf,
-    /// Explicit host forwards; absent legacy metadata never implies guest reachability.
-    #[serde(default)]
+    /// Explicit host forwards; an absent origin never implies guest reachability.
     pub service_endpoints: crate::bun::capabilities::ServiceEndpoints,
 }
 

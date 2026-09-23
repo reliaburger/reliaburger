@@ -202,11 +202,8 @@ allows concurrent readers while serialising a transition. We copy a snapshot out
 returning it, so a slow HTTP client never holds the lock.
 
 Readiness also travels to the leader in its own reporting message. Why another message?
-Reliaburger uses positional bincode frames between nodes. Adding a field to an existing
-frame would make an older binary run out of bytes while decoding it. Appending a new enum
-variant preserves every existing discriminant. An old node may reject the new extension,
-but it still decodes the ordinary report. The leader treats a missing or expired readiness
-extension as unready. Rolling compatibility doesn't mean optimistic guessing.
+It gets its own lease, so a fresh state report can't keep a dead subsystem looking alive.
+The leader treats a missing or expired readiness report as unready. No optimistic guessing.
 
 There is one more trap here: “supervise” doesn't automatically mean “restart”. A gossip
 task owns a UDP socket. A report worker owns the receiving end of a channel. Starting a

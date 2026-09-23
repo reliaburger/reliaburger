@@ -21,7 +21,7 @@ async fn managed_status_fails_for_missing_stopped_and_unreachable_nodes() {
                 version: "v0.1.0".parse().unwrap(),
                 api_port: port,
                 ingress_port: if port == 18080 { 18081 } else { 18080 },
-                registry_port: None,
+                registry_port: if port == 15050 { 15051 } else { 15050 },
             },
         )
         .unwrap();

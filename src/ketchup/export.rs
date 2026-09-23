@@ -43,10 +43,8 @@ pub const CHECKPOINT_FILENAME: &str = "_export_checkpoint.json";
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct ExportCheckpoint {
     /// Durable ids (`{filename}@{hash}`) that have already been exported.
-    #[serde(default)]
     pub exported_files: HashSet<String>,
     /// Hash of the destination URL and node prefix these acknowledgements cover.
-    #[serde(default)]
     pub scope: Option<String>,
 }
 
@@ -240,7 +238,7 @@ async fn export_logs_locked(
     let node_prefix = prefix.join(node_id);
     let scope = export_scope(destination, node_id)?;
     if checkpoint.scope.as_ref() != Some(&scope) {
-        // Legacy or differently scoped acknowledgements cannot justify skipping
+        // Unscoped or differently scoped acknowledgements cannot justify skipping
         // an upload or pruning its source. Immutable object names make retries safe.
         checkpoint.exported_files.clear();
         checkpoint.scope = Some(scope);

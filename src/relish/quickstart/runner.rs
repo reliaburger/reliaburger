@@ -55,7 +55,7 @@ pub async fn run(options: Options) -> Result<()> {
         version,
         api_port: options.api_port,
         ingress_port: options.ingress_port,
-        registry_port: Some(options.registry_port),
+        registry_port: options.registry_port,
     };
     let operation_root = root.clone();
     let (mut operation, bootstrap, _setup_lock) =
@@ -183,13 +183,13 @@ async fn provision_cluster(
             std::env::consts::ARCH,
             spec.api_port + index as u16,
             (index == 0).then_some(spec.ingress_port),
-            (index == 0).then_some(spec.registry_port).flatten(),
+            (index == 0).then_some(spec.registry_port),
         )?;
         tokio::fs::write(&config_path, yaml).await?;
         let status = statuses[index].clone();
         let api_port = spec.api_port + index as u16;
         let ingress_port = (index == 0).then_some(spec.ingress_port);
-        let registry_port = (index == 0).then_some(spec.registry_port).flatten();
+        let registry_port = (index == 0).then_some(spec.registry_port);
         let boot = async move {
             if status.as_deref() != Some("Running") {
                 let mut ports = vec![api_port];
@@ -432,9 +432,7 @@ async fn provision_cluster(
         token: tokio::fs::read_to_string(bootstrap.directory.join("admin.token")).await?,
         ca_cert: bootstrap.directory.join("identity/root-ca.crt"),
         service_endpoints: crate::bun::capabilities::ServiceEndpoints {
-            registry: spec
-                .registry_port
-                .map(|port| format!("https://127.0.0.1:{port}")),
+            registry: Some(format!("https://127.0.0.1:{}", spec.registry_port)),
             ingress_http: Some(format!("http://127.0.0.1:{}", spec.ingress_port)),
             ingress_https: None,
         },

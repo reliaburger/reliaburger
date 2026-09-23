@@ -2269,8 +2269,8 @@ work, not by `M1`.
     production callers, and described an "agent executes this plan" design that CHAOS1
     explicitly rejected in favour of refusing node-level faults honestly
   - [x] **Already fine:** the Raft-id djb2 collision risk is thoroughly documented at
-    `cluster::identity::raft_id_from_name` (12b.2/CP10), including why changing it needs a
-    flag day. No action
+    `cluster::identity::raft_id_from_name` (12b.2/CP10), including why changing it is a
+    protocol and state generation change. No action
 
 The review flagged `O6`/`O7`/`O9` as the security-adjacent ones to prioritise within this list.
 

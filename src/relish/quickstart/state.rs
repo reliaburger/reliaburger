@@ -23,9 +23,8 @@ pub struct ClusterSpec {
     pub api_port: u16,
     /// Host port forwarded to the first node's HTTP ingress.
     pub ingress_port: u16,
-    /// Optional Pickle host forward. Older managed clusters did not expose it.
-    #[serde(default)]
-    pub registry_port: Option<u16>,
+    /// Host port forwarded to the first node's Pickle registry.
+    pub registry_port: u16,
 }
 
 impl ClusterSpec {
@@ -41,9 +40,9 @@ impl ClusterSpec {
         if self.api_port < 1024
             || self.ingress_port < 1024
             || (self.api_port..=last).contains(&self.ingress_port)
-            || self.registry_port.is_some_and(|port| {
-                port < 1024 || (self.api_port..=last).contains(&port) || port == self.ingress_port
-            })
+            || self.registry_port < 1024
+            || (self.api_port..=last).contains(&self.registry_port)
+            || self.registry_port == self.ingress_port
         {
             return Err(failed("managed ports must be unprivileged and distinct"));
         }
@@ -104,8 +103,7 @@ impl ClusterState {
             return Err(failed("invalid managed cluster state"));
         }
         for (index, node) in self.nodes.iter().enumerate() {
-            let legacy_name = format!("rb-{}-{}-{}", self.spec.name, &self.id[..12], index + 1);
-            if node.name != vm_name(&self.id, index) && node.name != legacy_name {
+            if node.name != vm_name(&self.id, index) {
                 return Err(failed(
                     "managed state contains a VM not owned by this operation",
                 ));
@@ -307,7 +305,7 @@ mod tests {
             version: "v0.1.0".parse().unwrap(),
             api_port: 19117,
             ingress_port: 18080,
-            registry_port: Some(15050),
+            registry_port: 15050,
         }
     }
 
@@ -392,36 +390,19 @@ mod tests {
                 ..spec()
             },
             ClusterSpec {
-                registry_port: Some(1023),
+                registry_port: 1023,
                 ..spec()
             },
             ClusterSpec {
-                registry_port: Some(19118),
+                registry_port: 19118,
                 ..spec()
             },
             ClusterSpec {
-                registry_port: Some(18080),
+                registry_port: 18080,
                 ..spec()
             },
         ] {
             assert!(Operation::open(root.path(), &invalid).is_err());
         }
-    }
-
-    #[test]
-    fn legacy_managed_state_does_not_invent_a_registry_forward() {
-        let mut encoded = serde_json::to_value(spec()).unwrap();
-        encoded.as_object_mut().unwrap().remove("registry_port");
-        let legacy: ClusterSpec = serde_json::from_value(encoded).unwrap();
-        assert_eq!(legacy.registry_port, None);
-        legacy.validate().unwrap();
-        let root = tempfile::tempdir().unwrap();
-        let operation = Operation::open(root.path(), &legacy).unwrap();
-        drop(operation);
-        assert!(Operation::load(root.path(), &legacy.name).is_ok());
-        assert!(
-            Operation::open(root.path(), &spec()).is_err(),
-            "resume must not claim an uncreated forward"
-        );
     }
 }
