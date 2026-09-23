@@ -17,11 +17,45 @@ permissions:
   contents: read
 
 jobs:
+  changes:
+    # Pushes and manual runs build everything. A pull request builds the PDF
+    # only when the docs change, and only the Linux x86-64 binaries when Rust
+    # or packaging inputs change; main builds the whole matrix.
+    name: select builds
+    runs-on: ubuntu-latest
+    outputs:
+      pdf: ${{ steps.select.outputs.pdf }}
+      binaries: ${{ steps.select.outputs.binaries }}
+      matrix: ${{ steps.select.outputs.matrix }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - id: select
+        env:
+          EVENT: ${{ github.event_name }}
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+        run: |
+          all='[{"target":"aarch64-unknown-linux-gnu","suffix":"linux-aarch64","runner":"ubuntu-22.04-arm","arguments":"--features ebpf --bin bun --bin relish"},{"target":"x86_64-unknown-linux-gnu","suffix":"linux-x86_64","runner":"ubuntu-22.04","arguments":"--features ebpf --bin bun --bin relish"},{"target":"aarch64-apple-darwin","suffix":"macos-aarch64","runner":"macos-15","arguments":"--bin relish"},{"target":"x86_64-apple-darwin","suffix":"macos-x86_64","runner":"macos-15-intel","arguments":"--bin relish"}]'
+          if [ "$EVENT" != pull_request ]; then
+            pdf=true binaries=true matrix="$all"
+          else
+            changed=$(git diff --name-only "$BASE_SHA...HEAD")
+            pdf=false binaries=false
+            grep -qE '^docs/|^Makefile$|^\.github/workflows/build\.yml$' <<<"$changed" && pdf=true
+            grep -qE '^(src|ebpf|brioche|assets|docs/manual|scripts/release)/|^(build\.rs|Cargo\.(toml|lock)|rust-toolchain.*|\.github/workflows/build\.yml)$' <<<"$changed" && binaries=true
+            matrix=$(jq -c '[.[] | select(.suffix == "linux-x86_64")]' <<<"$all")
+          fi
+          { echo "pdf=$pdf"; echo "binaries=$binaries"; echo "matrix=$matrix"; } >>"$GITHUB_OUTPUT"
+          echo "pdf=$pdf binaries=$binaries"
+
   validate-release:
     if: github.event_name == 'workflow_dispatch'
     uses: ./.github/workflows/ci.yml
 
   build-pdf:
+    needs: changes
+    if: needs.changes.outputs.pdf == 'true'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -58,26 +92,12 @@ jobs:
         run: test "$CANDIDATE_REF" = refs/heads/main
 
   build-binaries:
+    needs: changes
+    if: needs.changes.outputs.binaries == 'true'
     strategy:
       fail-fast: false
       matrix:
-        include:
-          - target: aarch64-unknown-linux-gnu
-            suffix: linux-aarch64
-            runner: ubuntu-22.04-arm
-            arguments: --features ebpf --bin bun --bin relish
-          - target: x86_64-unknown-linux-gnu
-            suffix: linux-x86_64
-            runner: ubuntu-22.04
-            arguments: --features ebpf --bin bun --bin relish
-          - target: aarch64-apple-darwin
-            suffix: macos-aarch64
-            runner: macos-15
-            arguments: --bin relish
-          - target: x86_64-apple-darwin
-            suffix: macos-x86_64
-            runner: macos-15-intel
-            arguments: --bin relish
+        include: ${{ fromJSON(needs.changes.outputs.matrix) }}
     runs-on: ${{ matrix.runner }}
     env:
       RELIABURGER_GIT_SHA: ${{ github.sha }}
