@@ -363,7 +363,6 @@ Gossip protocol benchmarks use [criterion](https://docs.rs/criterion) for statis
 ```sh
 make bench         # reproducible transport and 5-250 node measurements
 make bench-large   # reproducible 500 and 1,000 node measurements
-make bench-10k     # deterministic 10,000-member per-node scale acceptance
 ```
 
 The fast benchmarks (`cargo bench --bench gossip`) are the ones to run regularly — they catch performance regressions in the gossip protocol. Results are stored in `target/criterion/` and criterion reports whether performance changed between runs.

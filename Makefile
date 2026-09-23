@@ -1,4 +1,4 @@
-.PHONY: build test test-cargo test-doc test-slow test-linux test-rootless-runc test-cluster test-upgrade test-upgrade-node test-upgrade-cluster test-apple coverage check fmt lint audit clean pdf loc help examples bench bench-large bench-10k pickle-test-macos ci ci-full observability-demo kubernetes-demo toml-demo
+.PHONY: build test test-cargo test-doc test-slow test-linux test-rootless-runc test-cluster test-upgrade test-upgrade-node test-upgrade-cluster test-apple coverage check fmt lint audit clean pdf loc help examples bench bench-large pickle-test-macos ci ci-full observability-demo kubernetes-demo toml-demo
 
 CARGO = cargo
 NEXTEST_PROFILE ?= default
@@ -100,9 +100,6 @@ bench: ## Run reproducible transport and 5-250 node gossip benchmarks
 
 bench-large: ## Run reproducible 500 and 1000 node gossip benchmarks
 	$(CARGO) bench --bench gossip_large
-
-bench-10k: ## Run the deterministic 10k-member per-node scale acceptance
-	$(CARGO) test --release --test gossip_10k -- --ignored --nocapture
 
 coverage: ## Run the portable suite once under line coverage and enforce the floor
 	$(CARGO) llvm-cov clean --workspace

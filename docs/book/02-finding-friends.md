@@ -270,7 +270,7 @@ The threshold that remains isn't a ceiling on what we keep, only a trigger for *
 
 Two things worth taking from this. First: when you bound a queue, ask what the data's own structure says the bound should be before reaching for a number. Constants encode an assumption about scale, and assumptions about scale are wrong at the edges — which is where scale problems live.
 
-Second, and more uncomfortable: the unit tests passed. Of course they did, we wrote them to check the cap held, and it held beautifully. The test that caught this drives ten thousand real members through a real protocol state machine, and it's `#[ignore]`d because it takes minutes — so `make test` skips it and `make bench-10k` runs it in CI. A local run that skips the expensive tests is a *fast* signal, not a complete one, and it's worth knowing which of your gates you've actually passed before you push.
+Second, and more uncomfortable: the unit tests passed. Of course they did, we wrote them to check the cap held, and it held beautifully. The test that caught this drives ten thousand real members through a real protocol state machine, and for a long time we `#[ignore]`d it on the assumption that it took minutes, then paid for a 21-minute release build in CI to run it. When we finally timed it, it took about a second in a debug build. It's now an ordinary test in `make test`. Measure before you assume a test is expensive. A local run that skips the expensive tests is a *fast* signal, not a complete one, and it's worth knowing which of your gates you've actually passed before you push.
 
 ### Message types
 
@@ -687,7 +687,7 @@ the protocol rather than rebuilding and sorting every membership snapshot on eve
 What about 10,000 nodes? A real cluster distributes one 10,000-entry table to each machine.
 Putting all 10,000 tables in one test process creates 100 million membership records and
 asks one hosted runner to impersonate a datacentre. We tried it. It couldn't finish inside
-90 minutes. `make bench-10k` therefore checks the real per-node contract: one Mustard node
+90 minutes. `tests/gossip_10k.rs` therefore checks the real per-node contract: one Mustard node
 learns 10,000 members through fixed-size messages, selects a probe target and makes every
 update available in bounded dissemination batches. Full multi-node convergence remains
 covered at 1,000 nodes. Different tests, different claims. Much less hand-waving.

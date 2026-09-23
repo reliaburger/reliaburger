@@ -276,17 +276,3 @@ jobs:
           name: criterion-large
           path: target/criterion
           if-no-files-found: error
-
-  scale-10k:
-    name: 10k-member scale acceptance
-    runs-on: ubuntu-latest
-    timeout-minutes: 30
-    steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@1.98.0
-      - uses: Swatinem/rust-cache@v2
-        with:
-          shared-key: scale-10k
-          save-if: ${{ github.ref == 'refs/heads/main' }}
-          cache-on-failure: true
-      - run: make bench-10k

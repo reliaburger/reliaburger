@@ -1,8 +1,8 @@
 //! Deterministic large-cluster gossip convergence benchmarks.
 //!
 //! These are deliberately separate from the fast benchmark target. Run with
-//! `make bench-large`; the 10,000-member per-node scale acceptance lives
-//! in `make bench-10k`.
+//! `make bench-large`; the 10,000-member per-node scale acceptance is an
+//! ordinary test in `tests/gossip_10k.rs`.
 
 use criterion::{BenchmarkId, Criterion, criterion_group, criterion_main};
 
