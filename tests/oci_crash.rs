@@ -372,7 +372,6 @@ async fn wait_file(path: &Path) {
 /// and ordinal. A fixed name shares that path with every earlier run, so one
 /// leaked workload makes Runc refuse the next run's first container ("cgroup
 /// is not empty") and the deploy rolls to a new generation instead.
-#[cfg(feature = "ebpf")]
 fn root_app_name(prefix: &str, root: &Path) -> String {
     let suffix = root
         .file_name()
@@ -400,15 +399,7 @@ async fn actual_bun_sigkill_and_cancelled_caller_preserve_oci_init_and_retry_own
         let root = tempfile::tempdir().unwrap().keep();
         let _cleanup = RootCleanup(root.clone());
         println!("qualifying {phase}: {}", root.as_path().display());
-        let name = format!(
-            "oci-crash-{}",
-            root.file_name()
-                .unwrap()
-                .to_str()
-                .unwrap()
-                .trim_start_matches('.')
-                .to_ascii_lowercase()
-        );
+        let name = root_app_name("oci-crash", &root);
         install_wrappers(root.as_path());
         std::fs::write(root.as_path().join("phase"), phase).unwrap();
         std::fs::write(root.as_path().join("armed"), "armed").unwrap();
@@ -601,15 +592,7 @@ async fn normal_standalone_bun_recovers_durable_kernel_and_discovery() {
         activated,
         "normal standalone startup did not activate durable ownership"
     );
-    let name = format!(
-        "durable-{}",
-        root.file_name()
-            .unwrap()
-            .to_str()
-            .unwrap()
-            .trim_start_matches('.')
-            .to_ascii_lowercase()
-    );
+    let name = root_app_name("durable", &root);
     node.client.apply(&durable_app(&name)).await.unwrap();
     wait_file(&root.join("shared/main")).await;
     let original = kernel_manifest(&root);
@@ -658,15 +641,7 @@ async fn service_cgroup_kill_of_bun_and_owners_retires_the_launch_and_redeploys(
     let root = tempfile::tempdir().unwrap().keep();
     let _cleanup = RootCleanup(root.clone());
     durable_fixture(&root);
-    let name = format!(
-        "cgkill-{}",
-        root.file_name()
-            .unwrap()
-            .to_str()
-            .unwrap()
-            .trim_start_matches('.')
-            .to_ascii_lowercase()
-    );
+    let name = root_app_name("cgkill", &root);
     let cgroup = Path::new("/sys/fs/cgroup").join(format!("reliaburger-{name}"));
     std::fs::create_dir(&cgroup).unwrap();
     std::fs::write(root.join("service-cgroup"), cgroup.to_str().unwrap()).unwrap();
@@ -715,7 +690,8 @@ async fn automatic_restart_bun_death_before_adoption_retires_the_unrecorded_succ
     let _cleanup = RootCleanup(root.clone());
     println!("qualifying automatic restart: {}", root.display());
     durable_fixture(&root);
-    let name = "restart-crash";
+    let name = root_app_name("restart-crash", &root);
+    let name = name.as_str();
     let mut config = durable_app(name);
     config.app.get_mut(name).unwrap().command = vec![
         "/bin/busybox".into(), "sh".into(), "-c".into(),
@@ -724,11 +700,11 @@ async fn automatic_restart_bun_death_before_adoption_retires_the_unrecorded_succ
     let mut node = Node::start(&root).await;
     node.client.apply(&config).await.unwrap();
     wait_file(&root.join("shared/main")).await;
-    let record = root.join("data/instances/default__restart-crash-0.json");
+    let id = reliaburger::grill::InstanceId(format!("default__{name}-0"));
+    let record = root.join(format!("data/instances/{}.json", id.0));
     assert!(record.exists());
     let original_kernel = kernel_manifest(&root);
     let original = runtime(&root).launch_inventory().await.unwrap().unwrap();
-    let id = reliaburger::grill::InstanceId("default__restart-crash-0".into());
     let original = original
         .iter()
         .find(|launch| launch.instance_id == id)
@@ -921,17 +897,15 @@ async fn normal_owned_bun_upgrade_and_rollback_preserve_runtime_and_kernel() {
     let _cleanup = RootCleanup(root.clone());
     durable_fixture(&root);
     let key = upgrade_fixture(&root);
+    let name = root_app_name("upgrade-owned", &root);
     let mut node = Node::start(&root).await;
-    node.client
-        .apply(&durable_app("upgrade-owned"))
-        .await
-        .unwrap();
+    node.client.apply(&durable_app(&name)).await.unwrap();
     wait_file(&root.join("shared/main")).await;
     let original = kernel_manifest(&root);
     upgrade_and_rollback(&root, &node, &key).await;
     failed_owned_upgrade_reverts(&root, &mut node, &key).await;
     assert_eq!(kernel_manifest(&root), original);
-    node.client.stop("upgrade-owned", "default").await.unwrap();
+    node.client.stop(&name, "default").await.unwrap();
     node.crash().await;
     let journal =
         reliaburger::bun::discovery_owners::DiscoveryJournal::open(&root.join("data/discovery"))
@@ -966,8 +940,9 @@ async fn normal_rootless_bun_recovers_owned_forward_and_discovery() {
         "normal rootless startup did not activate durable discovery"
     );
     assert!(!root.join("data/kernel-policy").exists());
-    let mut app = durable_app("rootless-owned");
-    app.app.get_mut("rootless-owned").unwrap().command = vec![
+    let name = root_app_name("rootless-owned", &root);
+    let mut app = durable_app(&name);
+    app.app.get_mut(&name).unwrap().command = vec![
         "/bin/busybox".into(), "sh".into(), "-c".into(),
         "printf 'main\n' >> /work/main; printf owned > /work/index.html; exec /bin/busybox httpd -f -p 8080 -h /work".into(),
     ];
@@ -998,11 +973,7 @@ async fn normal_rootless_bun_recovers_owned_forward_and_discovery() {
         reqwest::get(&url).await.unwrap().text().await.unwrap(),
         "owned"
     );
-    recovered
-        .client
-        .stop("rootless-owned", "default")
-        .await
-        .unwrap();
+    recovered.client.stop(&name, "default").await.unwrap();
     recovered.crash().await;
     let journal =
         reliaburger::bun::discovery_owners::DiscoveryJournal::open(&root.join("data/discovery"))

@@ -66,7 +66,8 @@ int fsync(int fd) {
             length = pread(fd, contents, sizeof(contents)-1, 0);
             if (length > 0) {
                 contents[length] = 0;
-                if (strstr(contents, "\"instance_id\": \"default__restart-crash-0\""))
+                /* The test names its app restart-crash-<temporary root>. */
+                if (strstr(contents, "\"instance_id\": \"default__restart-crash-"))
                     admission_gate("restart-adoption");
             }
         }
