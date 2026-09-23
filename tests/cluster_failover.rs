@@ -18,61 +18,26 @@
 
 use std::collections::BTreeSet;
 use std::net::SocketAddr;
-use std::sync::Arc;
 use std::time::Duration;
 
-use tokio::sync::{RwLock, mpsc, watch};
 use tokio_util::sync::CancellationToken;
 
-use reliaburger::bun::agent::BunAgent;
-use reliaburger::bun::api;
-use reliaburger::cluster::orchestrate::{spawn_leader_scheduler, spawn_placement_reconciler};
-use reliaburger::cluster::runtime::{self, ClusterParams};
-use reliaburger::config::node::ReportingTreeSection;
+use reliaburger::cluster::orchestrate::spawn_placement_reconciler;
 use reliaburger::council::types::RaftRequest;
-use reliaburger::grill::port::PortAllocator;
-use reliaburger::grill::process::ProcessGrill;
 use reliaburger::meat::{AppId, NodeId};
 use reliaburger::reporting::aggregator::AggregatedState;
 
-#[path = "support/task_harness.rs"]
-mod task_harness;
-use task_harness::TestTasks;
-
-/// Whether the heavy cluster suite is enabled.
-fn cluster_tests_enabled() -> bool {
-    std::env::var("RELIABURGER_CLUSTER_TESTS").is_ok()
-}
+#[path = "support/cluster.rs"]
+mod cluster_support;
+use cluster_support::{
+    MembershipSource, WiredNode, WiredNodeOptions, cluster_tests_enabled, local, start_wired_node,
+};
 
 const RETIREMENT_SERVICE_TOKEN: &str = "cluster-test-retirement-service";
 const NODE_COUNT: usize = 9;
 const BASE_PORT: u16 = 19510;
 
-fn local(port: u16) -> SocketAddr {
-    SocketAddr::from(([127, 0, 0, 1], port))
-}
-
-/// Everything the test needs to observe (and kill) one node.
-struct NodeHarness {
-    name: String,
-    raft_id: u64,
-    council: Arc<reliaburger::council::CouncilNode>,
-    metrics_rx:
-        watch::Receiver<openraft::RaftMetrics<u64, reliaburger::council::types::CouncilNodeInfo>>,
-    aggregated_rx: watch::Receiver<AggregatedState>,
-    /// This node's agent command channel, so a test can resolve services
-    /// against the node's own (cluster-merged) service view.
-    cmd_tx: mpsc::Sender<reliaburger::bun::agent::AgentCommand>,
-    /// Cancelling this token kills THIS node only.
-    shutdown: CancellationToken,
-    reconciler: tokio::task::JoinHandle<()>,
-    directory_rx: watch::Receiver<reliaburger::mustard::directory::NodeDirectory>,
-    api_port: u16,
-    _runtime: runtime::ClusterRuntime,
-    _tasks: TestTasks,
-}
-
-impl NodeHarness {
+impl WiredNode {
     /// Resolve a service by name against this node's agent — the merged
     /// local + cluster-catalogue view (12b.4).
     async fn resolve(&self, app: &str) -> Option<reliaburger::onion::types::ResolveResponse> {
@@ -86,9 +51,7 @@ impl NodeHarness {
             .ok()?;
         rx.await.ok().flatten()
     }
-}
 
-impl NodeHarness {
     async fn is_leader(&self) -> bool {
         self.council.is_leader().await
     }
@@ -121,7 +84,7 @@ impl NodeHarness {
 /// survivors on a joint configuration whose old half needs the dead leader,
 /// and no election can succeed. Only a uniform configuration which every
 /// survivor has applied (so it is committed) makes a leader kill safe.
-fn settled_voters(nodes: &[&NodeHarness]) -> Option<BTreeSet<u64>> {
+fn settled_voters(nodes: &[&WiredNode]) -> Option<BTreeSet<u64>> {
     let mut agreed: Option<(openraft::LogId<u64>, BTreeSet<u64>)> = None;
     for node in nodes {
         let metrics = node.metrics_rx.borrow();
@@ -145,7 +108,7 @@ fn settled_voters(nodes: &[&NodeHarness]) -> Option<BTreeSet<u64>> {
 }
 
 /// Start one fully wired node: the same subsystems `bun --cluster` runs.
-async fn start_node(index: usize, seeds: Vec<SocketAddr>, root: &CancellationToken) -> NodeHarness {
+async fn start_node(index: usize, seeds: Vec<SocketAddr>, root: &CancellationToken) -> WiredNode {
     start_node_with_scheduler(index, seeds, root, true).await
 }
 
@@ -154,7 +117,7 @@ async fn start_node_with_scheduler(
     seeds: Vec<SocketAddr>,
     root: &CancellationToken,
     schedule: bool,
-) -> NodeHarness {
+) -> WiredNode {
     start_node_for_test(index, seeds, root, schedule, None).await
 }
 
@@ -164,187 +127,31 @@ async fn start_node_for_test(
     root: &CancellationToken,
     schedule: bool,
     operator: Option<reliaburger::sesame::types::ApiToken>,
-) -> NodeHarness {
-    let name = format!("fo{index}");
-    let gossip_port = BASE_PORT + (index as u16) * 10;
-    let raft_port = gossip_port + 1;
-    let reporting_port = gossip_port + 2;
-    let api_port = gossip_port + 3;
-    let shutdown = root.child_token();
-
-    let data_dir = std::env::temp_dir().join(format!("rb-failover-{name}-{gossip_port}"));
-    let _ = std::fs::remove_dir_all(&data_dir);
-    let reconciler_state_dir = data_dir.clone();
-    let readiness = reliaburger::bun::readiness::ReadinessTracker::new();
-    readiness.register("agent", true).await;
-
-    let (handle, cluster_runtime) = runtime::start(
-        ClusterParams {
-            node_name: name.clone(),
-            gossip_addr: local(gossip_port),
-            raft_port,
-            reporting_port,
-            api_port,
-            reporting_config: ReportingTreeSection {
-                report_interval_secs: 1,
-                max_events_per_report: 100,
-                stale_report_timeout_secs: 10,
-            },
-            seeds,
-            wrapping_ikm: None,
-            bootstrap_security_state: None,
-            data_dir,
-            mayo: None,
-            rollup_interval: Duration::from_secs(60),
-            identity: None,
-            backup: Default::default(),
-            labels: std::collections::BTreeMap::new(),
-            self_disk_pressured_rx: None,
-            readiness: Some(readiness.clone()),
-        },
-        shutdown.clone(),
-    )
+) -> WiredNode {
+    start_wired_node(WiredNodeOptions {
+        name: format!("fo{index}"),
+        gossip_port: BASE_PORT + (index as u16) * 10,
+        seeds,
+        // Cancelling a node's own token kills that node only.
+        shutdown: root.child_token(),
+        data_dir_prefix: "rb-failover",
+        stale_report_timeout_secs: 10,
+        metrics_rollup: None,
+        scheduler: schedule.then_some(reliaburger::config::node::ReconstructionSection {
+            report_threshold_percent: 80,
+            learning_period_timeout_secs: 5,
+            large_cluster_timeout_secs: 10,
+            large_cluster_node_count: 5000,
+        }),
+        lease_reaper: false,
+        // The two worker nodes have no Raft view, so peers come from the
+        // gossip directory.
+        membership: MembershipSource::Directory,
+        service_identity: Some(RETIREMENT_SERVICE_TOKEN.into()),
+        operator_token: operator,
+        fault_injection: false,
+    })
     .await
-    .unwrap();
-
-    let council = handle.council.clone().expect("cluster mode has a council");
-    let membership_rx = handle.membership_rx.clone();
-    let metrics_rx = handle
-        .raft_metrics_rx
-        .clone()
-        .expect("cluster mode has raft metrics");
-    let aggregated_rx = cluster_runtime.aggregated_rx.clone();
-    let directory_rx = cluster_runtime.directory_rx.clone();
-    // Real agent answering reporting snapshots with real capacity.
-    let (cmd_tx, cmd_rx) = mpsc::channel(256);
-    // Kept for the harness so a test can resolve against this node's agent.
-    let resolve_cmd_tx = cmd_tx.clone();
-    let mut agent = BunAgent::with_cluster(
-        ProcessGrill::new(),
-        PortAllocator::new(gossip_port + 100, gossip_port + 400),
-        cmd_rx,
-        shutdown.clone(),
-        handle,
-        "default".to_string(),
-    );
-    agent.set_volumes_dir(reconciler_state_dir.join("volumes"));
-    agent.set_node_capacity(8000, 16384);
-    agent.set_readiness_tracker(readiness.clone());
-    // Co-located test agents must not touch the shared host firewall.
-    agent.set_perimeter_enabled(false);
-    let agent_task = reliaburger::bun::readiness::spawn_owned(
-        "agent",
-        true,
-        readiness,
-        shutdown.clone(),
-        move |ready| async move { agent.run_with_readiness(ready).await },
-    );
-
-    // Leader scheduler with a fast learning period, so a fresh leader
-    // starts scheduling within seconds of gaining coverage.
-    if schedule {
-        spawn_leader_scheduler(
-            Arc::clone(&council),
-            membership_rx.clone(),
-            aggregated_rx.clone(),
-            false,
-            reliaburger::config::node::ReconstructionSection {
-                report_threshold_percent: 80,
-                learning_period_timeout_secs: 5,
-                large_cluster_timeout_secs: 10,
-                large_cluster_node_count: 5000,
-            },
-            None,
-            shutdown.clone(),
-        );
-    }
-
-    // Placement reconciler: resolves the leader through Raft metrics OR the
-    // gossip directory — on the two worker nodes only the latter exists.
-    let reconciler = spawn_placement_reconciler(
-        name.clone(),
-        metrics_rx.clone(),
-        directory_rx.clone(),
-        2, // api = raft + 2 in this port block
-        Some(RETIREMENT_SERVICE_TOKEN.into()),
-        cmd_tx.clone(),
-        shutdown.clone(),
-        reliaburger::cluster::ClusterHttp::plaintext(),
-        Some(reconciler_state_dir.clone()),
-    );
-
-    // HTTP API (serves /v1/placements for the reconcilers).
-    let listener = tokio::net::TcpListener::bind(local(api_port))
-        .await
-        .unwrap();
-    let membership_table = Arc::new(RwLock::new(Vec::new()));
-    let table = membership_table.clone();
-    let mut table_directory = directory_rx.clone();
-    let table_shutdown = shutdown.clone();
-    let table_task = tokio::spawn(async move {
-        loop {
-            let snapshot = table_directory
-                .borrow()
-                .endpoints
-                .iter()
-                .map(|(node_id, endpoints)| api::NodeMembershipInfo {
-                    node_id: node_id.clone(),
-                    address: endpoints.api_address,
-                })
-                .collect();
-            *table.write().await = snapshot;
-            tokio::select! {
-                _ = table_shutdown.cancelled() => break,
-                result = table_directory.changed() => if result.is_err() { break; },
-            }
-        }
-    });
-    let token_store = match operator {
-        Some(operator) => {
-            let store = reliaburger::sesame::auth::new_token_store();
-            store.write().await.push(operator);
-            Some(store)
-        }
-        None => None,
-    };
-    let router = api::router(
-        cmd_tx,
-        None,
-        None,
-        None,
-        None,
-        None,
-        Some(Arc::clone(&council)),
-        token_store,
-        Some(RETIREMENT_SERVICE_TOKEN.into()),
-        None,
-        Some(membership_table),
-        None,
-        api_port,
-        None,
-    );
-    let api_shutdown = shutdown.clone();
-    let api_task = tokio::spawn(async move {
-        axum::serve(listener, router)
-            .with_graceful_shutdown(async move { api_shutdown.cancelled().await })
-            .await
-            .ok();
-    });
-
-    NodeHarness {
-        raft_id: reliaburger::cluster::identity::raft_id_from_name(&name),
-        name,
-        council,
-        metrics_rx,
-        aggregated_rx,
-        cmd_tx: resolve_cmd_tx,
-        shutdown: shutdown.clone(),
-        reconciler,
-        directory_rx,
-        api_port,
-        _runtime: cluster_runtime,
-        _tasks: TestTasks::new(shutdown, vec![agent_task, api_task, table_task]),
-    }
 }
 
 async fn wait_until(what: &str, timeout: Duration, mut cond: impl AsyncFnMut() -> bool) {
@@ -493,8 +300,8 @@ async fn service_on_one_node_resolves_and_survives_leader_change_from_another() 
     nodes[0].shutdown.cancel();
     nodes[0].council.shutdown().await.ok();
 
-    let survivors: Vec<&NodeHarness> = nodes.iter().filter(|n| n.name != old_leader).collect();
-    let mut new_leader: Option<&NodeHarness> = None;
+    let survivors: Vec<&WiredNode> = nodes.iter().filter(|n| n.name != old_leader).collect();
+    let mut new_leader: Option<&WiredNode> = None;
     let deadline = tokio::time::Instant::now() + Duration::from_secs(90);
     while new_leader.is_none() {
         assert!(
@@ -565,7 +372,7 @@ async fn eight_plus_node_cluster_reconciles_and_reports_through_leader_failover(
     // metrics watches can trail that commit briefly, so counting each node's
     // local opinion here produced a false third "worker" in CI.
     let voter_ids = nodes[0].voter_ids();
-    let workers: Vec<&NodeHarness> = nodes
+    let workers: Vec<&WiredNode> = nodes
         .iter()
         .filter(|node| !voter_ids.contains(&node.raft_id))
         .collect();
@@ -612,9 +419,9 @@ async fn eight_plus_node_cluster_reconciles_and_reports_through_leader_failover(
     // explicit shutdown — a real `kill -9` takes both out at once.
     nodes[0].council.shutdown().await.ok();
 
-    let survivors: Vec<&NodeHarness> = nodes.iter().filter(|n| n.name != old_leader_name).collect();
+    let survivors: Vec<&WiredNode> = nodes.iter().filter(|n| n.name != old_leader_name).collect();
 
-    let mut new_leader: Option<&NodeHarness> = None;
+    let mut new_leader: Option<&WiredNode> = None;
     let deadline = tokio::time::Instant::now() + Duration::from_secs(60);
     while new_leader.is_none() {
         assert!(

@@ -10,148 +10,38 @@
 //! `RELIABURGER_CLUSTER_TESTS=1 cargo test --test council_disaster_recovery`
 
 use std::collections::{BTreeMap, BTreeSet};
-use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use tokio::sync::watch;
 use tokio_util::sync::CancellationToken;
 
-use reliaburger::cluster::identity::raft_id_from_name;
 use reliaburger::cluster::runtime::{
-    CouncilReconcilerConfig, spawn_council_reconciler_with_config,
-    spawn_council_reconciler_with_pressure, spawn_disk_pressure_consumer,
+    spawn_council_reconciler_with_config, spawn_council_reconciler_with_pressure,
+    spawn_disk_pressure_consumer,
 };
 use reliaburger::council::log_store::MemLogStore;
-use reliaburger::council::network::{InMemoryRaftNetworkFactory, InMemoryRaftRouter};
-use reliaburger::council::node::CouncilNode;
-use reliaburger::council::selection::CouncilSelectionConfig;
-use reliaburger::council::state_machine::CouncilStateMachine;
-use reliaburger::council::types::{CouncilConfig, CouncilNodeInfo, RaftRequest};
+use reliaburger::council::network::InMemoryRaftNetworkFactory;
+use reliaburger::council::types::RaftRequest;
 use reliaburger::meat::NodeId;
 use reliaburger::mustard::GossipConfig;
 use reliaburger::mustard::directory::NodeDirectory;
 use reliaburger::mustard::membership::MembershipSnapshot;
 use reliaburger::mustard::protocol::MustardNode;
-use reliaburger::mustard::state::NodeState;
 use reliaburger::mustard::transport::InMemoryNetwork;
 
-fn cluster_tests_enabled() -> bool {
-    std::env::var("RELIABURGER_CLUSTER_TESTS").is_ok()
-}
+#[path = "support/cluster.rs"]
+mod cluster_support;
+use cluster_support::{
+    NAMES, build_council, cluster_tests_enabled, fast_council_config, gossip_addr,
+    heal_reconciler_config, initial_voter_leader_index, member, node_info, rid,
+};
 
-const NAMES: [&str; 5] = ["node-1", "node-2", "node-3", "node-4", "node-5"];
+/// How often `wait_until` re-checks its condition in this binary.
+const POLL_INTERVAL: Duration = Duration::from_millis(50);
 
-fn rid(index: usize) -> u64 {
-    raft_id_from_name(NAMES[index])
-}
-
-fn gossip_addr(index: usize) -> SocketAddr {
-    SocketAddr::from(([127, 0, 0, 1], 9443 + 2 * index as u16))
-}
-
-fn node_info(index: usize) -> CouncilNodeInfo {
-    CouncilNodeInfo::new(
-        SocketAddr::from(([127, 0, 0, 1], 9444 + 2 * index as u16)),
-        NAMES[index].to_string(),
-    )
-}
-
-fn member(index: usize, now: Instant) -> MembershipSnapshot {
-    MembershipSnapshot {
-        node_id: NodeId::new(NAMES[index]),
-        address: gossip_addr(index),
-        state: NodeState::Alive,
-        incarnation: 1,
-        is_council: false,
-        is_leader: false,
-        labels: BTreeMap::new(),
-        first_seen: now - Duration::from_secs(700 - index as u64 * 10),
-        resources: None,
-    }
-}
-
-fn fast_council_config() -> CouncilConfig {
-    CouncilConfig {
-        heartbeat_interval_ms: 50,
-        election_timeout_min_ms: 200,
-        election_timeout_max_ms: 400,
-        snapshot_threshold: 1000,
-        max_in_snapshot_log_to_keep: 500,
-    }
-}
-
-fn heal_reconciler_config() -> CouncilReconcilerConfig {
-    CouncilReconcilerConfig {
-        selection: CouncilSelectionConfig {
-            min_node_age: Duration::from_secs(0),
-            min_council_size: 3,
-            max_council_size: 3,
-            dead_window: Duration::from_millis(600),
-            candidate_alive_window: Duration::from_millis(200),
-            max_promotion_lag: 16,
-            ..CouncilSelectionConfig::default()
-        },
-        tick_interval: Duration::from_millis(100),
-        op_timeout: Duration::from_secs(1),
-    }
-}
-
-async fn wait_until(timeout: Duration, mut cond: impl FnMut() -> bool) -> bool {
-    let deadline = tokio::time::Instant::now() + timeout;
-    while tokio::time::Instant::now() < deadline {
-        if cond() {
-            return true;
-        }
-        tokio::time::sleep(Duration::from_millis(50)).await;
-    }
-    cond()
-}
-
-/// Build a fresh five-node router with the first three initialised as voters.
-async fn build_cluster() -> (Vec<Arc<CouncilNode>>, InMemoryRaftRouter) {
-    let router = InMemoryRaftRouter::new();
-    let mut nodes = Vec::new();
-    for index in 0..NAMES.len() {
-        let network = InMemoryRaftNetworkFactory::new(rid(index), router.clone());
-        let node = CouncilNode::new(
-            rid(index),
-            fast_council_config(),
-            network,
-            MemLogStore::new(),
-            CouncilStateMachine::new(),
-            None,
-        )
-        .await
-        .unwrap();
-        router.register(rid(index), node.raft().clone()).await;
-        nodes.push(Arc::new(node));
-    }
-
-    let mut members = BTreeMap::new();
-    for index in 0..3 {
-        members.insert(rid(index), node_info(index));
-    }
-    nodes[0].initialize(members).await.unwrap();
-    (nodes, router)
-}
-
-async fn current_leader_index(nodes: &[Arc<CouncilNode>]) -> Option<usize> {
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
-    loop {
-        #[allow(clippy::needless_range_loop)]
-        for index in 0..3 {
-            if let Some(leader) = nodes[index].current_leader().await
-                && let Some(pos) = (0..3).find(|i| rid(*i) == leader)
-            {
-                return Some(pos);
-            }
-        }
-        if tokio::time::Instant::now() >= deadline {
-            return None;
-        }
-        tokio::time::sleep(Duration::from_millis(50)).await;
-    }
+async fn wait_until(timeout: Duration, cond: impl FnMut() -> bool) -> bool {
+    cluster_support::wait_until(timeout, POLL_INTERVAL, cond).await
 }
 
 // ---------------------------------------------------------------------------
@@ -173,8 +63,8 @@ async fn trigger_elect_advances_term_and_can_move_leadership() {
         "set RELIABURGER_CLUSTER_TESTS=1 on a provisioned multi-core host"
     );
 
-    let (nodes, _router) = build_cluster().await;
-    let leader = current_leader_index(&nodes)
+    let (nodes, _router) = build_council().await;
+    let leader = initial_voter_leader_index(&nodes)
         .await
         .expect("no leader elected");
     let leader_id = rid(leader);
@@ -234,8 +124,8 @@ async fn pressured_leader_resigns_and_leadership_moves() {
         "set RELIABURGER_CLUSTER_TESTS=1 on a provisioned multi-core host"
     );
 
-    let (nodes, _router) = build_cluster().await;
-    let leader = current_leader_index(&nodes)
+    let (nodes, _router) = build_council().await;
+    let leader = initial_voter_leader_index(&nodes)
         .await
         .expect("no leader elected");
     let leader_id = rid(leader);
@@ -324,8 +214,8 @@ async fn disk_pressure_advertised_over_gossip_drives_resignation() {
         "set RELIABURGER_CLUSTER_TESTS=1 on a provisioned multi-core host"
     );
 
-    let (nodes, _router) = build_cluster().await;
-    let leader = current_leader_index(&nodes)
+    let (nodes, _router) = build_council().await;
+    let leader = initial_voter_leader_index(&nodes)
         .await
         .expect("no leader elected");
     let leader_id = rid(leader);
@@ -464,8 +354,8 @@ async fn full_council_loss_recovers_from_backup() {
     let master_key = [7u8; 32];
 
     // 1. A three-voter council; register an app so there is state to lose.
-    let (nodes, router) = build_cluster().await;
-    let leader = current_leader_index(&nodes)
+    let (nodes, router) = build_council().await;
+    let leader = initial_voter_leader_index(&nodes)
         .await
         .expect("no leader elected");
     nodes[leader]

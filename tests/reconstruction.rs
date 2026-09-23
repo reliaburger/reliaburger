@@ -20,6 +20,10 @@ use reliaburger::reporting::types::{
     AppResourceUsage, ReportHealthStatus, ResourceUsage, RunningApp, StateReport,
 };
 
+#[path = "support/cluster.rs"]
+mod cluster_support;
+use cluster_support::wait_for_leader;
+
 fn fast_council_config() -> CouncilConfig {
     CouncilConfig {
         heartbeat_interval_ms: 50,
@@ -74,21 +78,6 @@ async fn init_cluster(nodes: &[CouncilNode]) {
         members.insert(id, node_info(id));
     }
     nodes[0].initialize(members).await.unwrap();
-}
-
-async fn wait_for_leader(nodes: &[CouncilNode], timeout: Duration) -> Option<u64> {
-    let start = tokio::time::Instant::now();
-    loop {
-        for node in nodes {
-            if let Some(leader) = node.current_leader().await {
-                return Some(leader);
-            }
-        }
-        if start.elapsed() > timeout {
-            return None;
-        }
-        tokio::time::sleep(Duration::from_millis(50)).await;
-    }
 }
 
 fn build_aggregated(entries: Vec<(NodeId, Vec<(&str, &str)>)>) -> AggregatedState {

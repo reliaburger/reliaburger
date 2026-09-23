@@ -9,23 +9,21 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
 
-use reliaburger::bun::agent::{BunAgent, ClusterHandle};
-use reliaburger::bun::api::{self, NodeMembershipInfo};
-use reliaburger::cluster::orchestrate::{spawn_leader_scheduler, spawn_placement_reconciler};
-use reliaburger::cluster::runtime::{self, ClusterParams};
-use reliaburger::config::node::ReportingTreeSection;
-use reliaburger::grill::port::PortAllocator;
-use reliaburger::grill::process::ProcessGrill;
+use reliaburger::bun::agent::ClusterHandle;
+use reliaburger::bun::api::NodeMembershipInfo;
 use reliaburger::relish::client::BunClient;
-use tokio::sync::{RwLock, mpsc};
+use tokio::sync::{RwLock, mpsc, watch};
 use tokio_util::sync::CancellationToken;
 
-#[path = "support/task_harness.rs"]
-mod task_harness;
-use task_harness::TestTasks;
+#[path = "support/cluster.rs"]
+mod cluster_support;
+use cluster_support::{MembershipSource, WiredNode, WiredNodeOptions, local, start_wired_node};
 
-fn local(port: u16) -> SocketAddr {
-    SocketAddr::from(([127, 0, 0, 1], port))
+/// How often `wait_until` re-checks its condition in this binary.
+const POLL_INTERVAL: Duration = Duration::from_millis(250);
+
+async fn wait_until(timeout: Duration, cond: impl FnMut() -> bool) -> bool {
+    cluster_support::wait_until(timeout, POLL_INTERVAL, cond).await
 }
 
 /// A fully wired node: everything `bun --cluster` starts, on one host
@@ -38,8 +36,7 @@ struct Node {
     membership_table: Arc<RwLock<Vec<NodeMembershipInfo>>>,
     token_store: Option<reliaburger::sesame::auth::TokenStore>,
     rollup_store: Arc<RwLock<reliaburger::mayo::rollup_store::RollupStore>>,
-    _runtime: runtime::ClusterRuntime,
-    _tasks: TestTasks,
+    _wired: WiredNode,
 }
 
 #[derive(Clone)]
@@ -89,8 +86,6 @@ async fn partition(
         .await
 }
 
-use tokio::sync::watch;
-
 async fn start_node(
     name: &str,
     gossip_port: u16,
@@ -107,269 +102,33 @@ async fn start_node_with_auth(
     shutdown: &CancellationToken,
     auth: Option<NodeFaultAuth>,
 ) -> Node {
-    let raft_port = gossip_port + 1;
-    let reporting_port = gossip_port + 2;
-    let api_port = gossip_port + 3;
-
-    let data_dir = std::env::temp_dir().join(format!("rb-placement-{name}-{gossip_port}"));
-    let _ = std::fs::remove_dir_all(&data_dir);
-    let reconciler_state_dir = data_dir.clone();
-
-    let mayo = Arc::new(RwLock::new(reliaburger::mayo::store::MayoStore::new(
-        data_dir.join("metrics"),
-    )));
-    let readiness = reliaburger::bun::readiness::ReadinessTracker::new();
-    readiness.register("agent", true).await;
-
-    let (handle, cluster_runtime) = runtime::start(
-        ClusterParams {
-            node_name: name.into(),
-            gossip_addr: local(gossip_port),
-            raft_port,
-            reporting_port,
-            api_port,
-            reporting_config: ReportingTreeSection {
-                report_interval_secs: 1,
-                max_events_per_report: 100,
-                stale_report_timeout_secs: 30,
-            },
-            seeds,
-            wrapping_ikm: None,
-            bootstrap_security_state: None,
-            data_dir,
-            mayo: Some(mayo),
-            rollup_interval: Duration::from_millis(500),
-            identity: None,
-            backup: Default::default(),
-            labels: std::collections::BTreeMap::new(),
-            self_disk_pressured_rx: None,
-            readiness: Some(readiness.clone()),
-        },
-        shutdown.clone(),
-    )
-    .await
-    .unwrap();
-
-    let partition_blocklists = handle.partition_blocklists.clone();
-    let council = handle.council.clone();
-    let membership_rx = handle.membership_rx.clone();
-    let metrics_rx = handle.raft_metrics_rx.clone();
-    let aggregated_rx = cluster_runtime.aggregated_rx.clone();
-    let rollup_store = Arc::clone(&cluster_runtime.rollup_store);
-    let directory_rx = cluster_runtime.directory_rx.clone();
-
-    // Real agent with a ProcessGrill, built with the cluster handle so
-    // it answers reporting snapshots with real capacity.
-    let (cmd_tx, cmd_rx) = mpsc::channel(256);
-    let mut agent = BunAgent::with_cluster(
-        ProcessGrill::new(),
-        PortAllocator::new(gossip_port + 100, gossip_port + 400),
-        cmd_rx,
-        shutdown.clone(),
-        // The agent needs its OWN handle clone; ClusterHandle isn't
-        // Clone (it owns snapshot_rx), so build a second runtime handle
-        // by re-taking the pieces. Instead we move `handle` into the
-        // agent and keep clones of the watch receivers above.
-        handle,
-        "default".to_string(),
-    );
-    agent.set_volumes_dir(reconciler_state_dir.join("volumes"));
-    agent.set_node_capacity(8000, 16384);
-    agent.set_readiness_tracker(readiness.clone());
-    // Several agents share this host; don't spawn nft against the real
-    // host firewall (`with_cluster` enables it by default on Linux).
-    agent.set_perimeter_enabled(false);
-    let agent_task = reliaburger::bun::readiness::spawn_owned(
-        "agent",
-        true,
-        readiness.clone(),
-        shutdown.clone(),
-        move |ready| async move { agent.run_with_readiness(ready).await },
-    );
-    let mut tasks = vec![agent_task];
-
-    // DELETE starts cleanup; the leader's reaper finishes it once workers
-    // acknowledge retirement. Match Bun's lifecycle rather than leaving the
-    // fixture permanently at HTTP 202 after the final acknowledgement.
-    if let Some(council) = &council {
-        tasks.push(reliaburger::testkit::lease::spawn_cluster_lease_reaper(
-            Arc::clone(council),
-            shutdown.clone(),
-        ));
-    }
-
-    // Membership table (peer API addresses = gossip IP + offset 3).
-    let membership_table: Arc<RwLock<Vec<NodeMembershipInfo>>> = Arc::new(RwLock::new(Vec::new()));
-    {
-        let mut rx = membership_rx.clone();
-        let table = Arc::clone(&membership_table);
-        let sd = shutdown.clone();
-        let membership_task = tokio::spawn(async move {
-            loop {
-                let snapshot: Vec<NodeMembershipInfo> = rx
-                    .borrow()
-                    .iter()
-                    .filter(|m| m.state == reliaburger::mustard::state::NodeState::Alive)
-                    .map(|m| NodeMembershipInfo {
-                        node_id: m.node_id.clone(),
-                        address: SocketAddr::new(m.address.ip(), m.address.port() + 3),
-                    })
-                    .collect();
-                *table.write().await = snapshot;
-                tokio::select! {
-                    _ = sd.cancelled() => break,
-                    changed = rx.changed() => if changed.is_err() { break },
-                }
-            }
-        });
-        tasks.push(membership_task);
-    }
-
-    // Leader scheduler + autoscaler (fast interval for the test).
-    let mut capacity_admission = None;
-    if let Some(council) = &council {
-        capacity_admission = Some(spawn_leader_scheduler(
-            Arc::clone(council),
-            membership_rx.clone(),
-            aggregated_rx,
-            false,
-            // Fast learning period so the test doesn't wait long.
-            reliaburger::config::node::ReconstructionSection {
-                report_threshold_percent: 95,
-                learning_period_timeout_secs: 2,
-                large_cluster_timeout_secs: 4,
-                large_cluster_node_count: 5000,
-            },
-            None,
-            shutdown.clone(),
-        ));
-        reliaburger::cluster::orchestrate::spawn_autoscaler(
-            Arc::clone(council),
-            Arc::clone(&rollup_store),
-            Duration::from_millis(500),
-            shutdown.clone(),
-        );
-    }
-
-    // Placement reconciler (API is raft_port + 2 = gossip + 3).
-    if let Some(metrics_rx) = metrics_rx.clone() {
-        spawn_placement_reconciler(
-            name.to_string(),
-            metrics_rx,
-            directory_rx,
-            2, // api_port - raft_port
-            auth.as_ref()
-                .map(|_| "placement-test-internal-service-identity".to_string()),
-            cmd_tx.clone(),
-            shutdown.clone(),
-            reliaburger::cluster::ClusterHttp::plaintext(),
-            Some(reconciler_state_dir),
-        );
-    }
-
-    // API server.
-    let listener = tokio::net::TcpListener::bind(local(api_port))
-        .await
-        .unwrap();
-    let token_store = auth
-        .as_ref()
-        .map(|auth| Arc::new(RwLock::new(vec![auth.token.clone()])));
-    let app = if auth.is_some() {
-        let static_capabilities = reliaburger::bun::capabilities::StaticCapabilities {
-            cluster_mode: true,
-            test_policy: reliaburger::testkit::safety::ClusterTestPolicy {
-                safety_class: reliaburger::testkit::safety::ClusterSafetyClass::Development,
-                allowed_operations: std::collections::BTreeSet::from([
-                    reliaburger::testkit::safety::OperationPermission::AlterNodeState,
-                    reliaburger::testkit::safety::OperationPermission::ProvisionIsolatedWorkloads,
-                    reliaburger::testkit::safety::OperationPermission::SaturateCapacity,
-                ]),
-                ..reliaburger::testkit::safety::ClusterTestPolicy::default()
-            },
-            ..reliaburger::bun::capabilities::StaticCapabilities::default()
-        };
-        api::router_with_upgrade(
-            cmd_tx,
-            None,
-            None,
-            None,
-            None,
-            None,
-            council.clone(),
-            token_store.clone(),
-            Some("placement-test-internal-service-identity".into()),
-            None,
-            Some(Arc::clone(&membership_table)),
-            None,
-            None,
-            api_port,
-            None,
-            None,
-            None,
-            "default".to_string(),
-            Some(name.to_string()),
-            900,
-            reliaburger::cluster::ClusterHttp::plaintext(),
-            5050,
-            "http",
-            256 * 1024 * 1024,
-            false,
-            static_capabilities,
-            readiness,
-            None,
-            None,
-        )
-    } else {
-        api::router(
-            cmd_tx,
-            None,
-            None,
-            None,
-            None,
-            None,
-            council.clone(),
-            None,
-            None,
-            None,
-            Some(Arc::clone(&membership_table)),
-            None,
-            api_port,
-            None,
-        )
-    };
-    let app = match capacity_admission {
-        Some(admission) => app.layer(axum::Extension(admission)),
-        None => app,
-    };
-    let sd = shutdown.clone();
-    let api_task = tokio::spawn(async move {
-        axum::serve(listener, app)
-            .with_graceful_shutdown(async move { sd.cancelled().await })
-            .await
-            .ok();
-    });
-    tasks.push(api_task);
-
-    // Derive a leadership watch from the raft metrics.
-    let (leader_tx, leader_rx) = watch::channel(false);
-    if let Some(mut metrics_rx) = metrics_rx {
-        let leadership_task = tokio::spawn(async move {
-            loop {
-                let is_leader = {
-                    let m = metrics_rx.borrow();
-                    m.current_leader == Some(m.id)
-                };
-                let _ = leader_tx.send(is_leader);
-                if metrics_rx.changed().await.is_err() {
-                    break;
-                }
-            }
-        });
-        tasks.push(leadership_task);
-    }
+    let wired = start_wired_node(WiredNodeOptions {
+        name: name.to_string(),
+        gossip_port,
+        seeds,
+        shutdown: shutdown.clone(),
+        data_dir_prefix: "rb-placement",
+        stale_report_timeout_secs: 30,
+        metrics_rollup: Some(Duration::from_millis(500)),
+        // Fast learning period so the test doesn't wait long.
+        scheduler: Some(reliaburger::config::node::ReconstructionSection {
+            report_threshold_percent: 95,
+            learning_period_timeout_secs: 2,
+            large_cluster_timeout_secs: 4,
+            large_cluster_node_count: 5000,
+        }),
+        lease_reaper: true,
+        membership: MembershipSource::Gossip,
+        service_identity: auth
+            .as_ref()
+            .map(|_| "placement-test-internal-service-identity".to_string()),
+        operator_token: auth.as_ref().map(|auth| auth.token.clone()),
+        fault_injection: auth.is_some(),
+    })
+    .await;
 
     let client = BunClient::new_with_token(
-        &format!("http://127.0.0.1:{api_port}"),
+        &format!("http://127.0.0.1:{}", wired.api_port),
         auth.as_ref().map(|auth| auth.plaintext.as_str()),
     );
     for _ in 0..40 {
@@ -379,40 +138,26 @@ async fn start_node_with_auth(
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
 
-    // We moved `handle` into the agent; rebuild a thin stand-in for the
-    // test's own leadership checks from the metrics watch above.
+    // The agent owns the real `ClusterHandle`; rebuild a thin stand-in for
+    // the test's own council and partition checks.
     Node {
         name: name.to_string(),
         client,
         handle: ClusterHandle {
             local_node_id: reliaburger::meat::NodeId::new(name),
-            membership_rx,
+            membership_rx: wired.membership_rx.clone(),
             raft_metrics_rx: None,
-            council,
+            council: Some(Arc::clone(&wired.council)),
             snapshot_rx: mpsc::channel(1).1,
             wrapping_ikm: None,
-            partition_blocklists,
+            partition_blocklists: wired.partition_blocklists.clone(),
             crl_handle: Default::default(),
         },
-        thinks_leader: leader_rx,
-        membership_table,
-        token_store,
-        rollup_store,
-        _runtime: cluster_runtime,
-        _tasks: TestTasks::new(shutdown.clone(), tasks),
-    }
-}
-
-async fn wait_until(timeout: Duration, mut cond: impl FnMut() -> bool) -> bool {
-    let deadline = tokio::time::Instant::now() + timeout;
-    loop {
-        if cond() {
-            return true;
-        }
-        if tokio::time::Instant::now() >= deadline {
-            return false;
-        }
-        tokio::time::sleep(Duration::from_millis(250)).await;
+        thinks_leader: wired.thinks_leader.clone(),
+        membership_table: Arc::clone(&wired.membership_table),
+        token_store: wired.token_store.clone(),
+        rollup_store: Arc::clone(&wired.rollup_store),
+        _wired: wired,
     }
 }
 

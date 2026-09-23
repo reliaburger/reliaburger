@@ -171,3 +171,7 @@ observation, and choose exactly one suite. Prefer a black-box test when the prom
 to `bun` or `relish`. Use snapshots for structured rendering, properties for large algorithm
 spaces and Criterion for measurements. A test that can pass without executing its promised
 behaviour is worse than no test: it gives us confidence we didn't earn.
+
+Multi-node tests start their clusters through `tests/support/cluster.rs`: the fully wired
+`bun --cluster` node, the in-memory five-node council, `local`, `wait_until` and the leader
+waits all live there, so include it rather than copying another start-up helper.
