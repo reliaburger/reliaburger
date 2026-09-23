@@ -425,22 +425,29 @@ fn run(program: &str, arguments: &[&std::ffi::OsStr]) -> Result<(), VolumeError>
     {
         use std::os::unix::process::CommandExt;
         let parent = std::process::id();
-        // SAFETY: only async-signal-safe Linux syscalls run between fork and exec.
-        // The synchronous spawning thread remains alive until this child exits;
-        // rechecking the parent closes death before PR_SET_PDEATHSIG was armed.
+        // SAFETY: only async-signal-safe Linux syscalls run between fork and exec,
+        // and neither error path allocates (`last_os_error` and
+        // `from_raw_os_error` build the error inline). The synchronous spawning
+        // thread remains alive until this child exits; rechecking the parent
+        // closes death before PR_SET_PDEATHSIG was armed.
         unsafe {
             command.pre_exec(move || {
                 if nix::libc::prctl(nix::libc::PR_SET_PDEATHSIG, nix::libc::SIGKILL) != 0 {
                     return Err(std::io::Error::last_os_error());
                 }
                 if nix::libc::getppid() as u32 != parent {
-                    return Err(std::io::Error::other("storage command owner exited"));
+                    return Err(std::io::Error::from_raw_os_error(nix::libc::ESRCH));
                 }
                 Ok(())
             });
         }
     }
-    let mut child = command.spawn()?;
+    let mut child = match command.spawn() {
+        Err(error) if error.raw_os_error() == Some(nix::libc::ESRCH) => {
+            return Err(refuse("storage command owner exited"));
+        }
+        spawned => spawned?,
+    };
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
     let status = loop {
         if let Some(status) = child.try_wait()? {

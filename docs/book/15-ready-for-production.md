@@ -1710,6 +1710,18 @@ After installing the signal, the helper requires `/proc/PID/task/TID` to exist
 inside that same parent process. Missing or unreadable evidence stops startup
 before the helper joins a pressure cgroup.
 
+The storage helpers use the same trick through `Command::pre_exec`, a closure
+that runs in the child after `fork` and before `exec`. In a multi-threaded
+program, that window is hostile: another thread may have held the allocator's
+lock at the moment of the fork, and the child inherits the locked lock with no
+thread left to release it. So the closure may only make async-signal-safe
+calls, and allocating memory isn't one. Our closure broke that rule on its
+error path: `std::io::Error::other("…")` boxes a string. It now returns
+`std::io::Error::from_raw_os_error(ESRCH)`, which stores the error code inline,
+and the parent turns that code back into a readable message after `spawn`
+returns. The `// SAFETY:` comment now says so, because the comment is the part
+a reviewer actually checks.
+
 The privileged acceptance fixture launches the real Bun helper from a Python
 thread, waits for readiness and then lets that thread finish while its process
 stays alive. The helper must exit through SIGKILL. A second case kills the

@@ -364,7 +364,9 @@ Execution (grill):
       `src/bun/agent.rs:~7942` `let _ = …stop(&id).await`, then `Failed` with
       no retry, leaking the container and its network reference. Keep the
       instance owned and retry the stop.
-- [ ] **T2.8 An `io::Error::other` allocation runs inside `pre_exec`.**
+- [x] **T2.8 An `io::Error::other` allocation runs inside `pre_exec`.** Done:
+      the child returns `ESRCH` without allocating and the parent maps it back
+      to the message; privileged storage tests pass (4/4).
       `src/grill/volume/owned.rs:437`. Use `io::Error::last_os_error()`, and
       make the `// SAFETY:` comment true.
 - [x] **T2.9 Flaky `job_recovery` test (seen locally).**
