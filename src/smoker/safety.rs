@@ -101,7 +101,7 @@ fn check_replica_minimum(
 ) -> Option<SafetyViolation> {
     let kills_instances = matches!(
         request.fault_type,
-        FaultType::Kill { .. } | FaultType::Pause | FaultType::MemoryPressure { oom: true, .. }
+        FaultType::Kill { .. } | FaultType::Pause
     );
     if !kills_instances {
         return None;
@@ -410,29 +410,6 @@ mod tests {
             acknowledged: false,
         };
         // Pause affects all replicas → 0 survive
-        let check = evaluate_safety(&req, &ctx);
-        assert!(!check.approved);
-    }
-
-    #[test]
-    fn replica_minimum_applies_to_oom() {
-        let ctx = default_context();
-        let req = FaultRequest {
-            fault_type: FaultType::MemoryPressure {
-                percentage: 0,
-                oom: true,
-            },
-            target_service: "web".into(),
-            namespace: None,
-            target_instance: None,
-            target_node: None,
-            duration: Duration::from_secs(30),
-            injected_by: "test".into(),
-            reason: None,
-            include_leader: false,
-            override_safety: false,
-            acknowledged: false,
-        };
         let check = evaluate_safety(&req, &ctx);
         assert!(!check.approved);
     }

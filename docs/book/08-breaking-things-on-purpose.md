@@ -121,7 +121,7 @@ pub fn cpu_stress_quota(percentage: u8) -> String {
 
 The `.max(1)` is a deliberate floor: 100% would wedge the process entirely, and a process that can't run at all is a Kill, not a stress. Before we write the cap we *read* the current `cpu.max` and save it. That saved string is the reversal — clear or expire the fault and the original quota goes straight back.
 
-**Memory pressure** squeezes `memory.high`, the soft limit. The kernel forces a workload into reclaim (and, past its working set, allocation stalls) as it approaches `memory.high`, without the outright OOM kill a lowered `memory.max` would cause. We set it to a percentage of the hard `memory.max`, so 90% pressure leaves a 10% headroom band, and we save the previous soft limit to restore later. A cgroup with no hard limit can't be squeezed this way, so the fault is refused rather than pretending. And an `--oom` request? That one genuinely isn't reversible — it kills — so we reject it and point you at a Kill fault, which is the honest way to test the OOM/restart path.
+**Memory pressure** squeezes `memory.high`, the soft limit. The kernel forces a workload into reclaim (and, past its working set, allocation stalls) as it approaches `memory.high`, without the outright OOM kill a lowered `memory.max` would cause. We set it to a percentage of the hard `memory.max`, so 90% pressure leaves a 10% headroom band, and we save the previous soft limit to restore later. A cgroup with no hard limit can't be squeezed this way, so the fault is refused rather than pretending. There's no OOM variant: a kill genuinely isn't reversible, and a Kill fault is the honest way to test the OOM/restart path.
 
 **Disk I/O throttle** writes cgroupv2's `io.max`, the kernel's native per-device throttle:
 

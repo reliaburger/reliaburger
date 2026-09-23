@@ -1267,9 +1267,9 @@ return an error even on an eBPF-capable node. They need a TC packet hook,
 lifecycle ownership and effect tests before they can claim success. Parsing a
 future contract is fine. Pretending it ran isn't.
 
-The memory `oom` form follows the same rule from the other direction. It
-doesn't pretend to be reversible: Bun refuses it and points the experiment at a
-Kill fault when the goal is to test restart after abrupt termination.
+Memory pressure follows the same rule from the other direction. An OOM kill
+can't be reversed, so there's no `oom` form at all. A Kill fault is the honest
+way to test restart after abrupt termination.
 
 ## Every fault must expire
 

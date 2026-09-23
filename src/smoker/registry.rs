@@ -367,7 +367,7 @@ mod tests {
         let survivor = reg.iter().next().unwrap();
         assert_eq!(survivor.namespace.as_deref(), Some("team-b"));
 
-        // A namespace-less clear still reaches every namespace (legacy/admin).
+        // A namespace-less clear (unscoped tokens only) reaches every namespace.
         let removed = reg.clear_by_service("web", None);
         assert_eq!(removed.len(), 1);
         assert_eq!(reg.len(), 0);

@@ -285,11 +285,8 @@ pub enum FaultType {
     },
 
     /// Squeeze the workload's memory.high toward memory.max.
-    /// `oom` is a compatibility flag which Bun rejects because an OOM kill is
-    /// not reversible; use Kill to exercise restart after abrupt termination.
     MemoryPressure {
         percentage: u8,
-        oom: bool,
     },
 
     /// Throttle disk I/O via blkio cgroup.
@@ -382,7 +379,7 @@ pub struct ScenarioStep {
     /// Target service name.
     pub target: String,
 
-    /// Fault value (e.g. "200ms", "10%", "90%", "oom", "nxdomain").
+    /// Fault value (e.g. "200ms", "10%", "90%", "nxdomain").
     pub value: String,
 
     /// Optional jitter (e.g. "50ms").
@@ -952,10 +949,9 @@ kernel forces reclaim and allocation stalls as the workload crosses that soft
 boundary. Clear and expiry restore the exact saved value. A cgroup with no hard
 limit is refused because there is no meaningful percentage to calculate.
 
-The `oom` spelling remains in the compatibility wire type, but Bun rejects it.
-Lowering `memory.max` or allocating past it kills a process and can't be
-reversed. Use a Kill fault when the hypothesis concerns restart after an abrupt
-termination.
+There's no OOM form. Lowering `memory.max` or allocating past it kills a process
+and can't be reversed. Use a Kill fault when the hypothesis concerns restart
+after an abrupt termination.
 
 #### 5.2.3 Disk I/O Throttle via blkio cgroup
 
@@ -1458,11 +1454,11 @@ relish fault dns redis nxdomain --acknowledge
 Reversal is de-escalating. It still requires the role and operation which owns
 that class of fault, but it deliberately doesn't require destructive
 acknowledgement or `allow_protected_mutation`. Removing an active fault must
-remain possible after policy is tightened. The deprecated `/v1/chaos` council
-route applies the same Admin/operation boundary and cannot bypass this model.
+remain possible after policy is tightened. Council partitions are node faults
+on the same route, so they share this model.
 
-`FaultSummary.injected_by` is a human-readable authenticated token name for
-compatibility. It is not the audit key. The event's `principal` is the stable
+`FaultSummary.injected_by` is the human-readable authenticated token name. It
+is not the audit key. The event's `principal` is the stable
 authenticated credential id, and Bun never accepts either value from `$USER`
 or a client-supplied JSON field.
 

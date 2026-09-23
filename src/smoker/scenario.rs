@@ -105,20 +105,9 @@ pub fn step_to_fault_request(
                 cores: None,
             }
         }
-        "memory" => {
-            if step.value.trim().eq_ignore_ascii_case("oom") {
-                FaultType::MemoryPressure {
-                    percentage: 0,
-                    oom: true,
-                }
-            } else {
-                let percentage = crate::relish::fault::parse_percentage(&step.value)?;
-                FaultType::MemoryPressure {
-                    percentage,
-                    oom: false,
-                }
-            }
-        }
+        "memory" => FaultType::MemoryPressure {
+            percentage: crate::relish::fault::parse_percentage(&step.value)?,
+        },
         "disk-io" => {
             let bytes_per_sec = crate::relish::fault::parse_bandwidth(&step.value)?;
             FaultType::DiskIoThrottle {
@@ -317,24 +306,6 @@ mod tests {
         assert!(matches!(
             req.fault_type,
             FaultType::Drop { probability: 25 }
-        ));
-    }
-
-    #[test]
-    fn step_to_fault_request_memory_oom() {
-        let step = ScenarioStep {
-            description: "OOM".into(),
-            fault: "memory".into(),
-            target: "payment".into(),
-            value: "oom".into(),
-            jitter: None,
-            duration: None,
-            start_after: None,
-        };
-        let req = step_to_fault_request(&step, 1.0).unwrap();
-        assert!(matches!(
-            req.fault_type,
-            FaultType::MemoryPressure { oom: true, .. }
         ));
     }
 

@@ -505,7 +505,7 @@ pub enum AgentCommand {
     },
     /// Clear every active fault targeting a given service. `namespace`
     /// confines the clear to one tenant (`None` clears the service in every
-    /// namespace, for legacy/admin callers).
+    /// namespace, which the API allows only for unscoped tokens).
     ClearFaultsByService {
         service: String,
         namespace: Option<String>,
@@ -4974,20 +4974,11 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
                 "bandwidth faults need a TC packet hook; no bandwidth program is attached"
                     .to_string(),
             ),
-            FaultType::MemoryPressure { percentage, oom } => {
+            FaultType::MemoryPressure { percentage } => {
                 // Squeeze the TARGET instance's `memory.high` toward its hard
                 // limit so the kernel forces reclaim/allocation stalls on the
                 // workload (CHAOS1 — this used to be a genuine no-op that
-                // reported success). `oom` isn't a reversible cgroup edit —
-                // it would lower `memory.max` to trigger the kill — so we
-                // reject it here rather than pretend; the supervisor's normal
-                // OOM/restart path is the honest way to test that.
-                if *oom {
-                    return Err(
-                        "memory oom is not a reversible fault; use a Kill fault to crash an instance"
-                            .to_string(),
-                    );
-                }
+                // reported success).
                 self.apply_cgroup_fault(
                     rule,
                     |cgroup| {
@@ -5641,51 +5632,35 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
         }
     }
 
-    /// Delete the eBPF map entry for a cleared or expired fault (P2).
+    /// Delete the eBPF map entries for a cleared or expired fault (P2).
     ///
-    /// Best-effort: VIP is deterministic from the app name, but the port
-    /// comes from the service entry — if the service is already gone we
-    /// skip, since the kernel ignores the entry past its `expires_ns`.
+    /// Removes exactly the keys the fault recorded when it was installed, so
+    /// clearing one fault never touches another's entries.
     #[cfg(all(feature = "ebpf", target_os = "linux"))]
     async fn delete_fault_bpf_entry(&self, rule: &crate::smoker::types::FaultRule) {
         use crate::smoker::bpf_maps;
         use crate::smoker::bpf_types::*;
-        use crate::smoker::types::FaultType;
 
         if !rule.fault_type.requires_ebpf() {
             return;
         }
+        let crate::smoker::types::FaultReversal::BpfConnectKeys(keys) = &rule.reversal else {
+            return;
+        };
         let Some(handle) = self.onion_ebpf.as_ref() else {
             return;
         };
         let mut ebpf = handle.lock().await;
-
-        if let crate::smoker::types::FaultReversal::BpfConnectKeys(keys) = &rule.reversal {
-            for (vip, port, source_cgroup_id) in keys {
-                if let Err(error) = bpf_maps::delete_connect_fault(
-                    &mut ebpf.bpf,
-                    &partition_fault_key(*vip, *port, *source_cgroup_id),
-                ) {
-                    eprintln!(
-                        "smoker: delete connect fault key for {} failed: {error}",
-                        rule.id
-                    );
-                }
+        for (vip, port, source_cgroup_id) in keys {
+            if let Err(error) = bpf_maps::delete_connect_fault(
+                &mut ebpf.bpf,
+                &partition_fault_key(*vip, *port, *source_cgroup_id),
+            ) {
+                eprintln!(
+                    "smoker: delete connect fault key for {} failed: {error}",
+                    rule.id
+                );
             }
-            return;
-        }
-
-        // Compatibility fallback for a rule created before exact key
-        // ownership was recorded.
-        if let Some((vip, port)) = self.fault_vip_port(rule)
-            && matches!(rule.fault_type, FaultType::Drop { .. })
-            && let Err(error) =
-                bpf_maps::delete_connect_fault(&mut ebpf.bpf, &connect_fault_key(vip, port))
-        {
-            eprintln!(
-                "smoker: delete legacy connect fault key for {} failed: {error}",
-                rule.id
-            );
         }
     }
 
@@ -19806,22 +19781,6 @@ host = "remote.local"
         assert!(result.await.unwrap().is_ok());
         assert!(agent.fault_registry.get(rule.id).is_none());
         assert!(!gate.is_quiesced());
-    }
-
-    #[tokio::test]
-    async fn memory_oom_is_rejected_as_irreversible() {
-        // An OOM squeeze isn't a reversible cgroup edit, so we refuse it and
-        // point the operator at a Kill fault instead of pretending.
-        let (mut agent, _tx, _shutdown) = test_agent();
-        let rule = fault_rule(crate::smoker::types::FaultType::MemoryPressure {
-            percentage: 100,
-            oom: true,
-        });
-        let err = agent
-            .apply_fault(&rule)
-            .await
-            .expect_err("memory oom must be rejected");
-        assert!(err.contains("reversible"), "unexpected reason: {err}");
     }
 
     #[tokio::test]

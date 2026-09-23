@@ -905,7 +905,7 @@ enum FaultAction {
     Memory {
         /// Target service name.
         target: String,
-        /// Memory fill percentage or "oom" (e.g. "90%", "oom").
+        /// Memory fill percentage (e.g. "90%").
         value: String,
         /// Fault duration (default: 10m).
         #[arg(long)]

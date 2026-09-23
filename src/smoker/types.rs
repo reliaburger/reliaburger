@@ -95,9 +95,6 @@ pub enum FaultType {
     MemoryPressure {
         /// How full to push memory (0-100).
         percentage: u8,
-        /// If true, trigger an immediate OOM kill instead.
-        #[serde(default)]
-        oom: bool,
     },
 
     /// Throttle disk I/O via blkio cgroup.
@@ -221,13 +218,7 @@ impl fmt::Display for FaultType {
                     write!(f, "cpu {percentage}%")
                 }
             }
-            Self::MemoryPressure { percentage, oom } => {
-                if *oom {
-                    write!(f, "memory oom")
-                } else {
-                    write!(f, "memory {percentage}%")
-                }
-            }
+            Self::MemoryPressure { percentage } => write!(f, "memory {percentage}%"),
             Self::DiskIoThrottle {
                 bytes_per_sec,
                 write_only,
@@ -636,7 +627,7 @@ pub struct ScenarioStep {
     pub fault: String,
     /// Target service name.
     pub target: String,
-    /// Fault value (e.g. "200ms", "10%", "90%", "oom", "nxdomain").
+    /// Fault value (e.g. "200ms", "10%", "90%", "nxdomain").
     pub value: String,
     /// Optional jitter (e.g. "50ms").
     pub jitter: Option<String>,
@@ -662,7 +653,6 @@ pub struct FaultSummary {
     /// Target instance, if scoped.
     pub target_instance: Option<String>,
     /// Target node, for routed node faults.
-    #[serde(default)]
     pub target_node: Option<String>,
     /// Seconds remaining before auto-expiry.
     pub remaining_secs: u64,
@@ -800,13 +790,7 @@ mod tests {
             }
             .requires_cgroups()
         );
-        assert!(
-            FaultType::MemoryPressure {
-                percentage: 90,
-                oom: false
-            }
-            .requires_cgroups()
-        );
+        assert!(FaultType::MemoryPressure { percentage: 90 }.requires_cgroups());
         assert!(
             FaultType::DiskIoThrottle {
                 bytes_per_sec: 1024,
@@ -863,10 +847,7 @@ mod tests {
                 percentage: 50,
                 cores: Some(2),
             },
-            FaultType::MemoryPressure {
-                percentage: 90,
-                oom: false,
-            },
+            FaultType::MemoryPressure { percentage: 90 },
             FaultType::DiskIoThrottle {
                 bytes_per_sec: 10_000_000,
                 write_only: true,

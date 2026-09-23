@@ -748,7 +748,7 @@ Commands:
 | `fault partition <target> [--from <app>] --acknowledge` | Block connect() from one source app (or all callers) to a service; requires Linux eBPF |
 | `fault bandwidth <target> <rate>` | Reserved contract; currently refused until the TC packet path ships |
 | `fault cpu <target> <pct> --acknowledge` | Consume CPU in a service's cgroup |
-| `fault memory <target> <pct\|oom> --acknowledge` | Push memory toward the limit (`oom` is refused) |
+| `fault memory <target> <pct> --acknowledge` | Push memory toward the limit |
 | `fault disk-io <target> <rate> [--write-only] --acknowledge` | Throttle disk I/O for a service |
 | `fault kill <target> --acknowledge` | Kill instances of a service (SIGKILL) |
 | `fault pause <target> --acknowledge` | Freeze instances of a service (SIGSTOP) |

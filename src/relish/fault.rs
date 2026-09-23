@@ -167,8 +167,8 @@ fn make_request(
         target_instance: targeting.instance.clone(),
         target_node: targeting.node.clone(),
         duration,
-        // Compatibility wire field only. Bun replaces it with the
-        // authenticated token name before recording the fault.
+        // Bun replaces this with the authenticated token name before
+        // recording the fault.
         injected_by: String::new(),
         reason: targeting.reason.clone(),
         include_leader: false,
@@ -302,13 +302,10 @@ pub async fn memory(
     duration: &Option<String>,
     targeting: &FaultTargeting,
 ) -> Result<(), RelishError> {
-    let (percentage, oom) = if value.trim().eq_ignore_ascii_case("oom") {
-        (0, true)
-    } else {
-        (parse_percentage(value)?, false)
-    };
     let request = make_request(
-        FaultType::MemoryPressure { percentage, oom },
+        FaultType::MemoryPressure {
+            percentage: parse_percentage(value)?,
+        },
         target.into(),
         get_duration(duration)?,
         targeting,
