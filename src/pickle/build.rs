@@ -1199,14 +1199,16 @@ mod tests {
         let mut archive = Vec::new();
         {
             let mut builder = tar::Builder::new(&mut archive);
-            for i in 0..=MAX_CONTEXT_ENTRIES {
+            // Every entry counts towards the cap, whatever it creates. The
+            // same directory repeated keeps the real cap without creating
+            // 65,537 files, which took over half a minute on APFS.
+            for _ in 0..=MAX_CONTEXT_ENTRIES {
                 let mut header = tar::Header::new_gnu();
+                header.set_entry_type(tar::EntryType::Directory);
                 header.set_size(0);
-                header.set_mode(0o644);
+                header.set_mode(0o755);
                 header.set_cksum();
-                builder
-                    .append_data(&mut header, format!("f{i}"), &b""[..])
-                    .unwrap();
+                builder.append_data(&mut header, "d", &b""[..]).unwrap();
             }
             builder.finish().unwrap();
         }
