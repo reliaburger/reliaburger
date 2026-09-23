@@ -1092,6 +1092,63 @@ async fn a_kill_sent_to_one_node_kills_a_replica_on_another() {
     }
 }
 
+/// Z6.1: a network fault acts where a connection starts, so a DNS fault on
+/// `web` sent to one node is installed on every node (any of them may run a
+/// caller), listed with each holder, and cleared everywhere by service name.
+#[tokio::test(flavor = "multi_thread", worker_threads = 6)]
+#[ignore = "slow multi-node placement acceptance; run with make test-cluster"]
+async fn a_network_fault_sent_to_one_node_is_installed_where_every_caller_runs() {
+    use reliaburger::smoker::types::{FaultRequest, FaultType};
+
+    let shutdown = CancellationToken::new();
+    let nodes = start_spread_web_cluster("nf", 19841, &shutdown).await;
+    let entry = &nodes[0];
+
+    let summary = entry
+        .client
+        .inject_fault(&FaultRequest {
+            fault_type: FaultType::DnsNxdomain,
+            target_service: "web".to_string(),
+            namespace: None,
+            target_instance: None,
+            target_node: None,
+            duration: Duration::from_secs(120),
+            injected_by: String::new(),
+            reason: Some("callers everywhere".to_string()),
+            include_leader: false,
+            override_safety: false,
+            acknowledged: true,
+        })
+        .await
+        .expect("a destination-wide network fault should be routed to every node");
+    let mut holders: Vec<String> = std::iter::once(&summary)
+        .chain(&summary.routed)
+        .filter_map(|fault| fault.node.clone())
+        .collect();
+    holders.sort();
+    let mut names: Vec<String> = nodes.iter().map(|node| node.name.clone()).collect();
+    names.sort();
+    assert_eq!(holders, names);
+
+    let listing = entry.client.list_cluster_faults().await.unwrap();
+    assert_eq!(listing.faults.len(), 3, "{:?}", listing.faults);
+
+    entry
+        .client
+        .clear_faults_by_service("web", Some("default"))
+        .await
+        .expect("clear by service reaches every node");
+    let listing = entry.client.list_cluster_faults().await.unwrap();
+    assert!(listing.faults.is_empty(), "{:?}", listing.faults);
+
+    shutdown.cancel();
+    for node in &nodes {
+        if let Some(council) = &node.handle.council {
+            council.shutdown().await.ok();
+        }
+    }
+}
+
 /// Read a followed log stream until `done` says so or `timeout` passes,
 /// returning every event seen so far.
 async fn read_follow_events<B: AsRef<[u8]>>(

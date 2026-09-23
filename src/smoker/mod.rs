@@ -16,9 +16,12 @@
 /// - **process** — SIGKILL/SIGSTOP/SIGCONT signal injection.
 /// - **resource** — CPU stress, memory pressure, disk I/O throttle (Linux).
 /// - **node** — Node drain and node kill simulation.
+/// - **routing** — Which nodes a fault request is sent to.
+/// - **network** — What a network fault should install on a caller's node.
 pub mod bpf_maps;
 pub mod bpf_types;
 pub mod config;
+pub mod network;
 pub mod node_fault;
 pub mod node_pressure;
 pub mod process;

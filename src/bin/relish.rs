@@ -881,6 +881,9 @@ enum FaultAction {
         /// Jitter (e.g. "50ms").
         #[arg(long)]
         jitter: Option<String>,
+        /// Only delay traffic from this app (in the target's namespace).
+        #[arg(long)]
+        from: Option<String>,
         /// Fault duration (default: 10m).
         #[arg(long)]
         duration: Option<String>,
@@ -1297,6 +1300,7 @@ async fn main() -> ExitCode {
                 target,
                 delay,
                 jitter,
+                from,
                 duration,
                 targeting,
             } => {
@@ -1304,6 +1308,7 @@ async fn main() -> ExitCode {
                     target,
                     delay,
                     jitter.as_deref(),
+                    from.as_deref(),
                     duration,
                     targeting,
                 )
@@ -2766,6 +2771,20 @@ mod tests {
                 assert_eq!(target, "redis");
                 assert_eq!(delay, "200ms");
             }
+            _ => panic!("expected Fault Delay"),
+        }
+    }
+
+    #[test]
+    fn parse_fault_delay_from_one_source() {
+        let cli = parse(&[
+            "relish", "fault", "delay", "redis", "300ms", "--from", "frontend",
+        ])
+        .unwrap();
+        match cli.command {
+            Command::Fault {
+                action: FaultAction::Delay { from, .. },
+            } => assert_eq!(from.as_deref(), Some("frontend")),
             _ => panic!("expected Fault Delay"),
         }
     }

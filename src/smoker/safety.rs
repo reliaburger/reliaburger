@@ -421,6 +421,7 @@ mod tests {
             fault_type: FaultType::Delay {
                 delay_ns: 200_000_000,
                 jitter_ns: 0,
+                source_app: None,
             },
             target_service: "web".into(),
             namespace: None,
@@ -567,6 +568,7 @@ mod tests {
             fault_type: FaultType::Delay {
                 delay_ns: 200_000_000,
                 jitter_ns: 0,
+                source_app: None,
             },
             target_service: "redis".into(),
             namespace: None,

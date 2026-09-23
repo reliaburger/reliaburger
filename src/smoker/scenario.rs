@@ -86,6 +86,7 @@ pub fn step_to_fault_request(
             FaultType::Delay {
                 delay_ns,
                 jitter_ns,
+                source_app: None,
             }
         }
         "drop" => {
@@ -284,7 +285,8 @@ mod tests {
             req.fault_type,
             FaultType::Delay {
                 delay_ns: 200_000_000,
-                jitter_ns: 50_000_000
+                jitter_ns: 50_000_000,
+                source_app: None
             }
         ));
         assert_eq!(req.target_service, "redis");

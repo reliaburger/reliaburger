@@ -63,6 +63,16 @@ command prints each one. `relish fault list` shows every node's faults with a
 id (pass `--node` if two nodes happen to use the same number). `relish fault
 clear` with no id, or with a service name, clears on every node.
 
+Network faults (`delay`, `drop`, `dns`, `partition`) are the other way round.
+They change what happens when something *calls* the target, and that happens
+on the caller's node: the eBPF connect hook and the DNS responder run there. So
+`relish fault drop redis 20%` lands on every node, because any of them may run
+something that calls redis, and `relish fault partition redis --from frontend`
+lands only on the nodes that run `frontend` in redis's namespace. A frontend
+replica that starts, restarts or moves while the fault is active picks it up
+within a second, and when the fault expires or is cleared every node removes
+it. `relish fault clear redis` clears all of them at once.
+
 ## Recovery catalogue
 
 `relish test --chaos` runs five destructive recovery checks, one at a time:

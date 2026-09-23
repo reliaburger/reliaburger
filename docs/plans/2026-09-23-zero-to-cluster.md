@@ -205,7 +205,7 @@ beat needs product work first:
   there's no `relish metrics`, and the dashboard's app charts are always empty
   (brioche.js expects an array and gets `{data, warnings}`).
 
-- [ ] **Z6.1 Install network faults where the callers are.** Destination-wide
+- [x] **Z6.1 Install network faults where the callers are.** Destination-wide
   faults go to every node; source-scoped ones (`--from`) to the nodes running
   the source. Filter sources by namespace, and apply a running fault to source
   instances that start while it's active.

@@ -7,6 +7,11 @@
 //! one request per owning node, and it counts replicas cluster-wide so the
 //! replica-minimum rail judges the whole service rather than one node's
 //! slice of it. The API layer gathers the evidence and does the sending.
+//!
+//! Network faults are the exception. They act where a connection *starts*
+//! (the eBPF connect hook, the traffic-control qdisc and the DNS responder
+//! all run on the caller's node), so [`plan_network_fault`] sends them to the
+//! nodes that run the callers rather than the target.
 
 use std::collections::BTreeMap;
 
@@ -37,6 +42,10 @@ pub struct RoutedFault {
 pub enum RoutingError {
     #[error("no running instances of {namespace}/{service} match the fault's target")]
     NoRunningInstances { namespace: String, service: String },
+    #[error("no running instances of source app {namespace}/{app} to fault the calls from")]
+    NoRunningSources { namespace: String, app: String },
+    #[error("node {node} is not a live cluster member that could host a caller")]
+    NoSuchCallerNode { node: String },
 }
 
 /// Split a workload fault into one request per node that owns a target.
@@ -113,20 +122,88 @@ pub fn plan_workload_fault(
         .collect())
 }
 
+/// Split a network fault into one request per node that runs a caller.
+///
+/// A fault limited to one source app (`--from`) goes to every node running
+/// that app; `sources` must already be restricted to that app and the fault's
+/// namespace. A fault on every caller goes to every live node in `nodes`,
+/// because any of them may run, now or later, something that calls the
+/// target. The request's `target_node` narrows either set to one node.
+pub fn plan_network_fault(
+    request: &FaultRequest,
+    nodes: &[String],
+    sources: &[WorkloadInstance],
+) -> Result<Vec<RoutedFault>, RoutingError> {
+    let namespace = request
+        .namespace
+        .clone()
+        .unwrap_or_else(|| "default".to_string());
+    let mut callers: Vec<&str> = match request.fault_type.source_app() {
+        Some(source) => {
+            let running: Vec<&str> = sources
+                .iter()
+                .filter(|instance| instance.running)
+                .map(|instance| instance.node.as_str())
+                .collect();
+            if running.is_empty() {
+                return Err(RoutingError::NoRunningSources {
+                    namespace,
+                    app: source.to_string(),
+                });
+            }
+            running
+        }
+        None => nodes.iter().map(String::as_str).collect(),
+    };
+    callers.sort_unstable();
+    callers.dedup();
+    if let Some(node) = request.target_node.as_deref() {
+        if !callers.contains(&node) {
+            return Err(match request.fault_type.source_app() {
+                Some(source) => RoutingError::NoRunningSources {
+                    namespace,
+                    app: format!("{source} on {node}"),
+                },
+                None => RoutingError::NoSuchCallerNode {
+                    node: node.to_string(),
+                },
+            });
+        }
+        callers.retain(|caller| *caller == node);
+    }
+    Ok(callers
+        .into_iter()
+        .map(|node| {
+            let mut routed = request.clone();
+            routed.target_node = Some(node.to_string());
+            RoutedFault {
+                node: node.to_string(),
+                request: routed,
+            }
+        })
+        .collect())
+}
+
 /// Count the target service's replicas and already-faulted replicas across
 /// the whole cluster, for the replica-minimum rail.
 ///
 /// `instances` is the same service-restricted list the planner takes;
-/// `faults` is every node's active fault list.
+/// `faults` is every node's active fault list. Only pauses count: a paused
+/// replica is out of service for the fault's lifetime, while a kill is
+/// instantaneous and a network or resource fault leaves the replica running.
+/// A network fault is also installed on every caller's node, so counting it
+/// would count one fault several times.
 pub fn replica_evidence(
     request: &FaultRequest,
     instances: &[WorkloadInstance],
     faults: &[FaultSummary],
 ) -> ReplicaEvidence {
     let replicas = instances.iter().filter(|instance| instance.running).count() as u32;
+    let paused = FaultType::Pause.to_string();
     let faulted_replicas = faults
         .iter()
         .filter(|fault| fault.target_service == request.target_service)
+        .filter(|fault| fault.fault_type == paused)
         .count() as u32;
     ReplicaEvidence {
         replicas,
@@ -245,6 +322,98 @@ mod tests {
                 service: "web".to_string(),
             })
         );
+    }
+
+    fn nodes() -> Vec<String> {
+        ["node-1", "node-2", "node-3"].map(str::to_string).to_vec()
+    }
+
+    #[test]
+    fn a_fault_on_every_caller_goes_to_every_live_node() {
+        let plan = plan_network_fault(&request(FaultType::DnsNxdomain), &nodes(), &[]).unwrap();
+        let routed: Vec<_> = plan
+            .iter()
+            .map(|routed| (routed.node.as_str(), routed.request.target_node.as_deref()))
+            .collect();
+        assert_eq!(
+            routed,
+            vec![
+                ("node-1", Some("node-1")),
+                ("node-2", Some("node-2")),
+                ("node-3", Some("node-3")),
+            ]
+        );
+    }
+
+    #[test]
+    fn a_fault_from_one_source_goes_only_where_the_source_runs() {
+        let partition = request(FaultType::Partition {
+            source_app: Some("frontend".to_string()),
+        });
+        let mut stopped = instance("node-1", "default/frontend-1");
+        stopped.running = false;
+        let sources = vec![
+            instance("node-3", "default/frontend-0"),
+            instance("node-3", "default/frontend-2"),
+            stopped,
+        ];
+        let plan = plan_network_fault(&partition, &nodes(), &sources).unwrap();
+        let routed: Vec<_> = plan.iter().map(|routed| routed.node.as_str()).collect();
+        assert_eq!(routed, vec!["node-3"]);
+    }
+
+    #[test]
+    fn a_source_that_runs_nowhere_is_an_error() {
+        let delay = request(FaultType::Delay {
+            delay_ns: 1,
+            jitter_ns: 0,
+            source_app: Some("frontend".to_string()),
+        });
+        assert_eq!(
+            plan_network_fault(&delay, &nodes(), &[]),
+            Err(RoutingError::NoRunningSources {
+                namespace: "default".to_string(),
+                app: "frontend".to_string(),
+            })
+        );
+    }
+
+    #[test]
+    fn a_named_node_narrows_a_network_fault_to_that_node() {
+        let mut drop = request(FaultType::Drop { probability: 50 });
+        drop.target_node = Some("node-2".to_string());
+        let plan = plan_network_fault(&drop, &nodes(), &[]).unwrap();
+        assert_eq!(plan.len(), 1);
+        assert_eq!(plan[0].node, "node-2");
+
+        drop.target_node = Some("node-9".to_string());
+        assert_eq!(
+            plan_network_fault(&drop, &nodes(), &[]),
+            Err(RoutingError::NoSuchCallerNode {
+                node: "node-9".to_string()
+            })
+        );
+    }
+
+    #[test]
+    fn network_faults_do_not_count_as_unavailable_replicas() {
+        let fault = |kind: &str| FaultSummary {
+            id: 1,
+            fault_type: kind.to_string(),
+            target_service: "web".to_string(),
+            target_instance: None,
+            target_node: None,
+            remaining_secs: 30,
+            injected_by: "ops".to_string(),
+            node: None,
+            routed: Vec::new(),
+        };
+        let evidence = replica_evidence(
+            &request(FaultType::Kill { count: 1 }),
+            &spread(),
+            &[fault("delay 300ms"), fault("dns nxdomain"), fault("pause")],
+        );
+        assert_eq!(evidence.faulted_replicas, 1);
     }
 
     #[test]

@@ -43,12 +43,16 @@ impl fmt::Display for FaultId {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(tag = "type")]
 pub enum FaultType {
-    /// Add latency to connections to the target service.
+    /// Add latency to traffic towards the target service.
     Delay {
         /// Delay in nanoseconds.
         delay_ns: u64,
         /// Jitter range in nanoseconds (+/- random).
         jitter_ns: u64,
+        /// Source app whose traffic is delayed (in the fault's namespace);
+        /// `None` delays every caller.
+        #[serde(default)]
+        source_app: Option<String>,
     },
 
     /// Fail a percentage of connections with EPERM.
@@ -165,6 +169,35 @@ impl FaultType {
         self.is_node_operation() || matches!(self, Self::NodePressure { .. })
     }
 
+    /// Whether the fault acts on the *callers* of its target rather than on
+    /// the target's own processes.
+    ///
+    /// Network faults take effect where a connection starts: the eBPF connect
+    /// hook, the traffic-control qdisc and the DNS responder all run on the
+    /// caller's node. So these faults are installed on the nodes that run the
+    /// callers, not on the nodes that run the target.
+    pub fn acts_on_callers(&self) -> bool {
+        matches!(
+            self,
+            Self::Delay { .. }
+                | Self::Drop { .. }
+                | Self::DnsNxdomain
+                | Self::Partition { .. }
+                | Self::Bandwidth { .. }
+        )
+    }
+
+    /// The one caller app a network fault is limited to, if any. `None`
+    /// means every caller of the target.
+    pub fn source_app(&self) -> Option<&str> {
+        match self {
+            Self::Delay { source_app, .. } | Self::Partition { source_app } => {
+                source_app.as_deref()
+            }
+            _ => None,
+        }
+    }
+
     /// Whether the fault must be routed to a named node.
     pub fn is_node_targeted(&self) -> bool {
         matches!(
@@ -183,13 +216,17 @@ impl fmt::Display for FaultType {
             Self::Delay {
                 delay_ns,
                 jitter_ns,
+                source_app,
             } => {
                 let delay_ms = *delay_ns / 1_000_000;
+                write!(f, "delay {delay_ms}ms")?;
                 if *jitter_ns > 0 {
                     let jitter_ms = *jitter_ns / 1_000_000;
-                    write!(f, "delay {delay_ms}ms +/-{jitter_ms}ms")
-                } else {
-                    write!(f, "delay {delay_ms}ms")
+                    write!(f, " +/-{jitter_ms}ms")?;
+                }
+                match source_app {
+                    Some(source) => write!(f, " from {source}"),
+                    None => Ok(()),
                 }
             }
             Self::Drop { probability } => write!(f, "drop {probability}%"),
@@ -296,7 +333,8 @@ impl FaultType {
 /// State captured when a persistent fault is applied, so clearing or expiring
 /// it can put the target back exactly as it was.
 ///
-/// eBPF service faults record their exact map keys. Process Kill has nothing
+/// Network faults record nothing here: the agent converges their kernel state
+/// on the active fault set (see `smoker::network`). Process Kill has nothing
 /// to undo, so it carries `None`. Resource faults and Pause, which leave a
 /// durable change on the target instance's cgroup or process, record what to
 /// restore here. The field is runtime-only: it never crosses the wire
@@ -322,10 +360,6 @@ pub enum FaultReversal {
     /// Stored as peer node ids (resolved to addresses at reversal time so a
     /// peer that changed address is still cleared correctly).
     Partition { peers: Vec<String> },
-    /// Exact eBPF connect-map keys installed for a service network fault.
-    ///
-    /// Tuple fields are `(virtual IP, network-order port, source cgroup id)`.
-    BpfConnectKeys(Vec<(u32, u16, u64)>),
     /// A scheduler drain: restore readiness when the final drain owner clears.
     NodeDrain,
     /// A simulated node failure: reopen gossip, Raft and reporting transports.
@@ -733,6 +767,7 @@ mod tests {
         let ft = FaultType::Delay {
             delay_ns: 200_000_000,
             jitter_ns: 0,
+            source_app: None,
         };
         assert_eq!(ft.to_string(), "delay 200ms");
     }
@@ -742,6 +777,7 @@ mod tests {
         let ft = FaultType::Delay {
             delay_ns: 200_000_000,
             jitter_ns: 50_000_000,
+            source_app: None,
         };
         assert_eq!(ft.to_string(), "delay 200ms +/-50ms");
     }
@@ -793,7 +829,8 @@ mod tests {
         assert!(
             FaultType::Delay {
                 delay_ns: 1,
-                jitter_ns: 0
+                jitter_ns: 0,
+                source_app: None
             }
             .requires_ebpf()
         );
@@ -826,7 +863,8 @@ mod tests {
         assert!(
             !FaultType::Delay {
                 delay_ns: 1,
-                jitter_ns: 0
+                jitter_ns: 0,
+                source_app: None
             }
             .requires_cgroups()
         );
@@ -855,6 +893,7 @@ mod tests {
             FaultType::Delay {
                 delay_ns: 200_000_000,
                 jitter_ns: 50_000_000,
+                source_app: None,
             },
             FaultType::Drop { probability: 10 },
             FaultType::DnsNxdomain,
@@ -1042,6 +1081,7 @@ mod tests {
             fault_type: FaultType::Delay {
                 delay_ns: 200_000_000,
                 jitter_ns: 0,
+                source_app: None,
             },
             target_service: "redis".into(),
             namespace: None,

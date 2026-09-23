@@ -942,6 +942,7 @@ async fn network_fault_without_ebpf_is_rejected_not_faked() {
         fault_type: FaultType::Delay {
             delay_ns: 100_000_000,
             jitter_ns: 0,
+            source_app: None,
         },
         target_service: "svc".into(),
         namespace: None,

@@ -121,6 +121,23 @@ All fault injection requests flow through the cluster API on the leader node:
   fault spread over several owners becomes one node-local fault per owner,
   returned together; `GET /v1/fault?cluster=true` lists every node's faults
   and a clear without an id reaches every node.
+  Network faults (`delay`, `drop`, `dns`, `partition`, `bandwidth`) are routed
+  to the *callers*, not the target, because the connect hook, the netem qdisc
+  and the DNS responder all act on the node where a connection starts. A
+  destination-wide fault goes to every live node; a `--from APP` fault goes to
+  the nodes that run APP in the fault's namespace (`smoker::routing::
+  plan_network_fault`). No replica rail applies to them, and the replica rail
+  counts only pauses, so a network fault held by five nodes doesn't look like
+  five unavailable replicas.
+- **Convergence on the caller's node.** Bun doesn't write a network fault's
+  kernel state once. It recomputes what the active faults want from the
+  instances running now (`smoker::network::desired_connect_faults`) and applies
+  only the difference, after an inject, clear or expiry, when a local instance
+  starts, and on every one-second health tick. A source replica that restarts
+  with a new cgroup, or is scheduled onto the node mid-fault, is covered within
+  a tick; two faults that want the same `fault_connect_map` key resolve to the
+  stronger one (partition over drop, likelier drop over gentler), and clearing
+  one rewrites the key for the other rather than deleting it.
 - **Audit logging.** Every successful injection and reversal is logged as a
   structured cluster event with the authenticated credential principal,
   action, target, type and duration. Source address is not yet an event field.

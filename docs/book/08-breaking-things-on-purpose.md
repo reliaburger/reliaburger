@@ -194,8 +194,9 @@ The application sees `EPERM` — exactly what a real connection failure looks li
 A partition between service A and service B uses the `source_cgroup_id` field
 in the key. The eBPF program checks `bpf_get_current_cgroup_id()` against the
 key. Clients don't get to assert that id: Bun resolves every running instance
-of the named source app, records every exact key it writes, and removes those
-keys on clear or expiry. If the calling process is in a blocked cgroup and the
+of the named source app in the fault's namespace, and keeps one key per
+instance for as long as the fault lives (including instances that start
+later, as "The caller's side of the wire" explains). If the calling process is in a blocked cgroup and the
 destination matches, Linux refuses `connect()` with `EPERM` before sending a
 packet.
 
@@ -459,6 +460,78 @@ The quickstart turns all of this on. A laptop cluster writes
 `alter_node_state` into every node's `[testing]` section. It's a throwaway
 cluster, and breaking it on purpose is half the fun. A server install still
 writes nothing, which still means "unknown", which still refuses everything.
+
+### The caller's side of the wire
+
+The router above had one blind spot, and the podinfo demo walked straight
+into it. Three `frontend` replicas call `redis`, which runs on node 2. You ask
+node 1 for `relish fault partition redis --from frontend`. The router looks up
+who runs `redis`, finds node 2, and installs the partition there. And nothing
+happens, because nothing on node 2 calls redis.
+
+A kill acts on the target's processes, so it belongs where the target runs. A
+network fault acts on a *connection*, and every piece of machinery that can
+spoil one runs where the connection starts: the eBPF connect hook fires in the
+caller's cgroup, the DNS responder answers the caller's query, and (as we'll
+see shortly) a traffic-control qdisc sits on the caller's interface. So network
+faults get their own planner. A fault on every caller goes to every live node,
+because any of them may run something that calls redis. A `--from frontend`
+fault goes to the nodes that run `frontend`, in redis's namespace, so a
+same-named app in another tenant stays out of it.
+
+Routing to the right nodes isn't enough, though, because callers move. A
+frontend replica crashes and restarts in a fresh cgroup, whose id the old
+partition key doesn't match. The scheduler places a new replica on node 3
+halfway through the experiment. The old code wrote the eBPF keys once, at
+injection, and recorded them for clean-up. Anything that started later sailed
+straight past the fault.
+
+So the agent stopped *writing* network faults and started *converging* on
+them, the way it already converges on desired apps. On every relevant event
+(an inject, a clear, an expiry, a local instance starting) and on every
+one-second health tick while a network fault is active, it asks a pure
+function what the connect map should hold right now:
+
+```rust
+pub fn desired_connect_faults<'a>(
+    rules: impl IntoIterator<Item = &'a FaultRule>,
+    resolve: impl Fn(&FaultRule) -> Option<(u32, u16)>,
+    callers: &[LocalCaller],
+) -> BTreeMap<ConnectFaultKey, ConnectFaultEntry> {
+```
+
+`impl IntoIterator<Item = &'a FaultRule>` accepts anything you can loop over
+that yields borrowed rules (the registry's iterator in production, a two-item
+array in a test) without a trait object or an allocation. The `'a` names how
+long those borrows live; the function only reads them while it runs, and the
+map it returns owns plain numbers, so nothing it hands back is tied to `'a`.
+`resolve` is a closure that turns a rule into its service's virtual IP and
+port, which keeps the service map out of the function and out of its tests.
+
+Then the agent diffs that map against the keys it has installed and writes or
+deletes only the difference. Two faults can want the same key (a 10% drop and
+a partition on every caller of redis). The match that fills the map settles it:
+
+```rust
+match desired.get(&key) {
+    Some(existing) if !entry.outranks(existing) => {}
+    _ => {
+        desired.insert(key, entry);
+    }
+}
+```
+
+The `if` after the pattern is a match guard: the first arm matches only when
+there's an existing entry *and* the new one doesn't outrank it. A partition
+beats a drop, a likelier drop beats a gentler one. The old per-fault clean-up
+got this case wrong: clearing the drop deleted the key both faults shared, and
+silently lifted the partition too. With convergence, clearing one fault just
+rewrites the key for whatever is still active.
+
+Looking up a container's cgroup id isn't free (runc proves the workload is
+really running first), so the agent caches the id per instance and restart
+count. A restart bumps the count, the next tick looks the cgroup up again, and
+the new cgroup gets its key.
 
 ## One experiment at a time
 
@@ -1100,6 +1173,7 @@ The 91 tests in `src/smoker/` cover the parts that must never be wrong:
 - **Safety rails** — one test per `SafetyViolation` variant, plus the evaluation-order test (quorum reported before leader when both trip). These are the tests that let us promise quorum protection can't be bypassed.
 - **The registry** — expiry via the min-heap, and the property that a `bun` restart leaves it empty.
 - **`#[repr(C)]` size assertions** — `connect_fault_key_size` and friends, which run on *every* platform and catch a padding mistake before any BPF code loads.
+- **Routing and convergence** — `smoker::routing` proves a fault on every caller reaches every node and a `--from` fault only the nodes running its source; `smoker::network` proves a new source instance adds its key, a gone one removes it, and clearing the stronger of two faults on one key rewrites it for the weaker. The API's fake-cluster tests then drive the same routing over real HTTP between three routers.
 
 The batch scheduler and build pieces add their own: the 100K-jobs-in-under-a-second benchmark runs *as a unit test* (a regression that slows scheduling fails the build), and the build tests cover `pickle://` enforcement, namespace-scope rejection, and buildah argument construction.
 

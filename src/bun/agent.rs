@@ -1565,6 +1565,23 @@ struct PreparedTrace<G> {
     onion_ebpf: Option<std::sync::Arc<tokio::sync::Mutex<crate::onion::ebpf::loader::OnionEbpf>>>,
 }
 
+/// What this node has installed for its active network faults.
+///
+/// Network faults are reconciled rather than written once: every change to the
+/// fault set or the local instances recomputes the desired state and applies
+/// only the difference against what is recorded here.
+#[derive(Debug, Default)]
+struct InstalledNetworkFaults {
+    /// `fault_connect_map` entries this node wrote.
+    connect: std::collections::BTreeMap<
+        crate::smoker::network::ConnectFaultKey,
+        crate::smoker::network::ConnectFaultEntry,
+    >,
+    /// Proven workload cgroup per caller instance, with the restart count it
+    /// was read at, so a restarted container is looked up again.
+    caller_cgroups: std::collections::HashMap<InstanceId, (u32, u64)>,
+}
+
 /// The Bun agent. Generic over `G: Grill` so tests can inject mocks.
 pub struct BunAgent<G: Grill> {
     supervisor: WorkloadSupervisor<G>,
@@ -1582,6 +1599,8 @@ pub struct BunAgent<G: Grill> {
     trust_domain: String,
     /// Smoker fault registry — active faults on this node.
     fault_registry: crate::smoker::registry::FaultRegistry,
+    /// Kernel state this node has installed for its active network faults.
+    network_faults: InstalledNetworkFaults,
     /// Smoker duration limits (`[smoker]`): default + maximum fault lifetime.
     smoker_config: crate::smoker::config::SmokerConfig,
     /// Reference-counted node drains, independent from binary-upgrade drains.
@@ -1802,6 +1821,7 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
             cluster: None,
             trust_domain: "default".to_string(),
             fault_registry: crate::smoker::registry::FaultRegistry::new(),
+            network_faults: InstalledNetworkFaults::default(),
             smoker_config: crate::smoker::config::SmokerConfig::default(),
             stop_confirmation_timeout: crate::config::node::RuntimeSection::default()
                 .stop_confirmation_timeout(),
@@ -1908,6 +1928,7 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
             cluster: Some(cluster),
             trust_domain,
             fault_registry: crate::smoker::registry::FaultRegistry::new(),
+            network_faults: InstalledNetworkFaults::default(),
             smoker_config: crate::smoker::config::SmokerConfig::default(),
             stop_confirmation_timeout: crate::config::node::RuntimeSection::default()
                 .stop_confirmation_timeout(),
@@ -4388,6 +4409,8 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
                     }
                     Err(reason) => {
                         self.fault_registry.remove(rule.id);
+                        // Take back anything a partial network install wrote.
+                        self.reconcile_network_faults().await;
                         let _ = response.send(Err(BunError::FaultRejected { reason }));
                     }
                 }
@@ -4432,7 +4455,6 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
                 }
                 let msg = match self.fault_registry.get(fault_id).cloned() {
                     Some(rule) => {
-                        self.delete_fault_bpf_entry(&rule).await;
                         let node_pressure = matches!(
                             &rule.fault_type,
                             crate::smoker::types::FaultType::NodePressure { .. }
@@ -4446,9 +4468,12 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
                             self.reverse_fault(&rule).await;
                         }
                         self.fault_registry.remove(fault_id);
-                        // A DnsNxdomain fault lives in the published set, not a
-                        // BPF map, so republish so the responder stops faulting
-                        // the target.
+                        // Network faults are converged from the registry, so
+                        // reconciling without the rule takes its kernel state
+                        // back. A DnsNxdomain fault lives in the published set,
+                        // so republish so the responder stops faulting the
+                        // target.
+                        self.reconcile_network_faults().await;
                         self.publish_dns_faults();
                         format!("cleared fault {} ({})", rule.id, rule.fault_type)
                     }
@@ -4462,9 +4487,9 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
             AgentCommand::ClearAllFaults { response } => {
                 let removed = self.fault_registry.clear_workload_faults();
                 for rule in &removed {
-                    self.delete_fault_bpf_entry(rule).await;
                     self.reverse_fault(rule).await;
                 }
+                self.reconcile_network_faults().await;
                 // Republish the (now empty) DnsNxdomain set for the responder.
                 self.publish_dns_faults();
                 let msg = format!("cleared {} fault(s)", removed.len());
@@ -4479,9 +4504,9 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
                     .fault_registry
                     .clear_by_service(&service, namespace.as_deref());
                 for rule in &removed {
-                    self.delete_fault_bpf_entry(rule).await;
                     self.reverse_fault(rule).await;
                 }
+                self.reconcile_network_faults().await;
                 self.publish_dns_faults();
                 let msg = format!("cleared {} fault(s) for {service}", removed.len());
                 let _ = response.send(Ok(msg));
@@ -5075,14 +5100,15 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
             }
             FaultType::Drop { .. } | FaultType::Partition { .. } => {
                 // Connect-time drop and partition faults have a real cgroup
-                // eBPF implementation. Record the exact keys only after every
-                // requested map write succeeds.
+                // eBPF implementation. The rule is already in the registry,
+                // so reconciling installs it; a failure here makes the caller
+                // remove the rule and reconcile again, which takes back any
+                // key this attempt wrote.
                 #[cfg(all(feature = "ebpf", target_os = "linux"))]
                 {
                     if self.onion_ebpf.is_some() {
-                        let reversal = self.write_fault_bpf_entry(rule).await?;
-                        self.record_reversal(rule.id, reversal);
-                        return Ok(());
+                        self.check_connect_fault(rule).await?;
+                        return self.reconcile_connect_faults().await;
                     }
                 }
                 Err(format!(
@@ -5461,7 +5487,7 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
 
     /// Reverse a cleared or expired fault's persistent effect.
     ///
-    /// eBPF network faults are undone by `delete_fault_bpf_entry`; this handles
+    /// Network faults are undone by `reconcile_network_faults`; this handles
     /// everything else that leaves a durable change — a paused process (SIGCONT
     /// it), a capped `cpu.max`, a squeezed `memory.high` or an `io.max`
     /// throttle (restore the saved value). Best-effort: an instance that has
@@ -5511,10 +5537,6 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
             }
             FaultReversal::Partition { peers } => {
                 self.remove_partition(peers).await;
-            }
-            FaultReversal::BpfConnectKeys(_) => {
-                // `delete_fault_bpf_entry` owns map cleanup before this
-                // generic non-eBPF reversal path runs.
             }
             FaultReversal::NodeDrain => {
                 if self.node_drain_gate.finish()
@@ -5591,7 +5613,6 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
                     rule.id, rule.fault_type
                 );
             }
-            self.delete_fault_bpf_entry(rule).await;
             // Undo persistent non-eBPF effects too: SIGCONT a paused
             // workload, lift a cgroup cap. Without this an expired Pause left
             // the process frozen and an expired resource fault left its cap in
@@ -5608,189 +5629,211 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
         if expired_dns {
             self.publish_dns_faults();
         }
+        // Converge network faults every tick, not only on expiry: a source
+        // instance that started or restarted since the last tick needs the
+        // faults already active against its targets.
+        self.reconcile_network_faults().await;
         // Retry any node-pressure cgroup whose directory lingered after its
         // helper was killed, so a transient removal failure doesn't leave the
         // controller permanently refusing new pressure faults.
         self.node_pressure.retry_pending_cleanup().await;
     }
 
-    /// The network-byte-order VIP + port for a fault's target service, if
-    /// it is registered. VIP is deterministic from the app name; the port
-    /// comes from the service entry. Connect/bandwidth fault keys need both.
-    #[cfg(all(feature = "ebpf", target_os = "linux"))]
-    fn fault_vip_port(&self, rule: &crate::smoker::types::FaultRule) -> Option<(u32, u16)> {
-        // Resolve the exact service identity, so a network fault on `web` in
-        // `team-a` never picks up `team-b`'s `web` VIP.
-        let entry = self
-            .service_map
-            .resolve(&crate::onion::service_id::ServiceId::new(
-                rule.namespace.as_deref()?,
-                rule.target_service.as_str(),
-            ))?;
-        Some((entry.vip.to_network_byte_order(), entry.port.to_be()))
-    }
+    /// Local instances that may call a faulted service.
+    ///
+    /// Only instances of an app some active fault names as its source need a
+    /// cgroup id (the connect hook keys source-scoped faults by cgroup), and
+    /// those are cached per restart, so the reconcile that runs on every
+    /// health tick doesn't ask the runtime again for an unchanged container.
+    #[cfg_attr(not(all(feature = "ebpf", target_os = "linux")), allow(dead_code))]
+    async fn local_callers(&mut self) -> Vec<crate::smoker::network::LocalCaller> {
+        use crate::smoker::network::{LocalCaller, applies_to_caller};
 
-    /// Resolve every running instance of a partition's source app to the
-    /// cgroup id observed by `bpf_get_current_cgroup_id()`.
-    #[cfg(all(feature = "ebpf", target_os = "linux"))]
-    async fn partition_source_cgroup_ids(
-        &self,
-        source_app: Option<&str>,
-    ) -> Result<Vec<u64>, String> {
-        let Some(source_app) = source_app else {
-            return Ok(vec![0]);
-        };
-        let instances: Vec<_> = self
+        let live: Vec<(InstanceId, String, String, u32)> = self
             .supervisor
             .list_instances()
-            .iter()
-            .filter(|instance| instance.app_name == source_app)
-            .map(|instance| instance.id.clone())
+            .into_iter()
+            .filter(|instance| {
+                matches!(
+                    instance.state,
+                    ContainerState::Starting
+                        | ContainerState::HealthWait
+                        | ContainerState::Running
+                        | ContainerState::Unhealthy
+                )
+            })
+            .map(|instance| {
+                (
+                    instance.id.clone(),
+                    instance.app_name.clone(),
+                    instance.namespace.clone(),
+                    instance.restart_count,
+                )
+            })
             .collect();
-        if instances.is_empty() {
-            return Err(format!("no running instances of source app {source_app}"));
-        }
+        self.network_faults
+            .caller_cgroups
+            .retain(|id, _| live.iter().any(|(live_id, ..)| live_id == id));
 
-        let mut cgroup_ids = Vec::with_capacity(instances.len());
-        for instance in instances {
-            let cgroup_id = self
-                .supervisor
-                .grill()
-                .workload_cgroup(&instance)
-                .await
-                .map_err(|error| format!("source instance {}: {error}", instance.0))?
-                .ok_or_else(|| {
-                    format!(
-                        "source instance {} has no verified workload cgroup",
-                        instance.0
-                    )
-                })?;
-            cgroup_ids.push(cgroup_id);
-        }
-        cgroup_ids.sort_unstable();
-        cgroup_ids.dedup();
-        Ok(cgroup_ids)
-    }
-
-    /// Write the eBPF map entry for a newly injected network fault (P2).
-    ///
-    /// Only reachable with the `ebpf` feature: without it, `apply_fault`
-    /// rejects network faults before we get here. `expires_ns` comes from
-    /// the rule, which now uses CLOCK_MONOTONIC (P0) to match the kernel's
-    /// `bpf_ktime_get_ns()`.
-    #[cfg(all(feature = "ebpf", target_os = "linux"))]
-    async fn write_fault_bpf_entry(
-        &self,
-        rule: &crate::smoker::types::FaultRule,
-    ) -> Result<crate::smoker::types::FaultReversal, String> {
-        use crate::smoker::bpf_maps;
-        use crate::smoker::bpf_types::*;
-        use crate::smoker::types::{FaultReversal, FaultType};
-
-        let source_cgroup_ids = match &rule.fault_type {
-            FaultType::Partition { source_app } => {
-                self.partition_source_cgroup_ids(source_app.as_deref())
-                    .await?
-            }
-            _ => vec![0],
-        };
-        let (vip, port) = self
-            .fault_vip_port(rule)
-            .ok_or_else(|| format!("no service VIP exists for {}", rule.target_service))?;
-        let Some(handle) = self.onion_ebpf.as_ref() else {
-            return Err("the eBPF data path is not loaded on this node".to_string());
-        };
-        let expires = rule.expires_at_ns;
-        let mut ebpf = handle.lock().await;
-
-        match &rule.fault_type {
-            FaultType::Drop { probability } => {
-                let key = connect_fault_key(vip, port);
-                let value = BpfConnectFaultValue {
-                    action: FAULT_ACTION_DROP,
-                    probability: *probability,
-                    _pad: [0; 6],
-                    delay_ns: 0,
-                    jitter_ns: 0,
-                    expires_ns: expires,
-                };
-                bpf_maps::write_connect_fault(&mut ebpf.bpf, key, value)
-                    .map_err(|error| format!("failed to install drop fault: {error}"))?;
-                Ok(FaultReversal::BpfConnectKeys(vec![(
-                    key.virtual_ip,
-                    key.port,
-                    key.source_cgroup_id,
-                )]))
-            }
-            FaultType::Partition { .. } => {
-                let value = BpfConnectFaultValue {
-                    action: FAULT_ACTION_PARTITION,
-                    probability: 100,
-                    _pad: [0; 6],
-                    delay_ns: 0,
-                    jitter_ns: 0,
-                    expires_ns: expires,
-                };
-                let mut installed = Vec::with_capacity(source_cgroup_ids.len());
-                for source_cgroup_id in source_cgroup_ids {
-                    let key = partition_fault_key(vip, port, source_cgroup_id);
-                    if let Err(error) = bpf_maps::write_connect_fault(&mut ebpf.bpf, key, value) {
-                        for installed_key in installed.iter().rev() {
-                            let _ = bpf_maps::delete_connect_fault(&mut ebpf.bpf, installed_key);
-                        }
-                        return Err(format!("failed to install partition fault: {error}"));
+        let mut callers = Vec::with_capacity(live.len());
+        for (id, app, namespace, restarts) in live {
+            let named_as_source = self.fault_registry.iter().any(|rule| {
+                rule.fault_type.source_app().is_some() && applies_to_caller(rule, &app, &namespace)
+            });
+            let cgroup_id = match self.network_faults.caller_cgroups.get(&id) {
+                _ if !named_as_source => None,
+                Some((seen_at, cgroup)) if *seen_at == restarts => Some(*cgroup),
+                _ => match self.supervisor.grill().workload_cgroup(&id).await {
+                    Ok(Some(cgroup)) => {
+                        self.network_faults
+                            .caller_cgroups
+                            .insert(id.clone(), (restarts, cgroup));
+                        Some(cgroup)
                     }
-                    installed.push(key);
-                }
-                Ok(FaultReversal::BpfConnectKeys(
-                    installed
-                        .iter()
-                        .map(|key| (key.virtual_ip, key.port, key.source_cgroup_id))
-                        .collect(),
-                ))
-            }
-            _ => Err(format!(
-                "{} has no connect-map implementation",
-                rule.fault_type
-            )),
+                    Ok(None) => None,
+                    Err(error) => {
+                        eprintln!("smoker: caller {id} has no provable cgroup: {error}");
+                        None
+                    }
+                },
+            };
+            callers.push(LocalCaller {
+                instance_id: id.0,
+                app,
+                namespace,
+                cgroup_id,
+            });
         }
+        callers
     }
 
-    /// Delete the eBPF map entries for a cleared or expired fault (P2).
+    /// Bring every network fault's kernel state on this node in line with
+    /// the active faults and the instances running now.
     ///
-    /// Removes exactly the keys the fault recorded when it was installed, so
-    /// clearing one fault never touches another's entries.
-    #[cfg(all(feature = "ebpf", target_os = "linux"))]
-    async fn delete_fault_bpf_entry(&self, rule: &crate::smoker::types::FaultRule) {
-        use crate::smoker::bpf_maps;
-        use crate::smoker::bpf_types::*;
-
-        if !rule.fault_type.requires_ebpf() {
+    /// Called after a fault is injected, cleared or expires, when a local
+    /// instance starts, and on every health tick while a network fault is
+    /// active, so a source replica that restarts or is scheduled here picks
+    /// the fault up. Failures are logged; the next tick retries.
+    async fn reconcile_network_faults(&mut self) {
+        let active = self
+            .fault_registry
+            .iter()
+            .any(|rule| rule.fault_type.acts_on_callers());
+        if !active && self.network_faults.connect.is_empty() {
             return;
         }
-        let crate::smoker::types::FaultReversal::BpfConnectKeys(keys) = &rule.reversal else {
-            return;
-        };
-        let Some(handle) = self.onion_ebpf.as_ref() else {
-            return;
-        };
-        let mut ebpf = handle.lock().await;
-        for (vip, port, source_cgroup_id) in keys {
-            if let Err(error) = bpf_maps::delete_connect_fault(
-                &mut ebpf.bpf,
-                &partition_fault_key(*vip, *port, *source_cgroup_id),
-            ) {
-                eprintln!(
-                    "smoker: delete connect fault key for {} failed: {error}",
-                    rule.id
-                );
-            }
+        if let Err(error) = self.reconcile_connect_faults().await {
+            eprintln!("smoker: network fault reconcile: {error}");
         }
     }
 
-    /// Delete is a no-op without the eBPF data path (nothing was written).
+    /// Check that a drop or partition can take effect here before reporting
+    /// it installed: the target's VIP is known, and a source-scoped fault has
+    /// at least one local source instance with a provable cgroup.
+    #[cfg(all(feature = "ebpf", target_os = "linux"))]
+    async fn check_connect_fault(
+        &mut self,
+        rule: &crate::smoker::types::FaultRule,
+    ) -> Result<(), String> {
+        let services = self.merged_service_map();
+        if fault_vip_port(&services, rule).is_none() {
+            return Err(format!(
+                "no service VIP exists for {}/{}",
+                rule.namespace.as_deref().unwrap_or("default"),
+                rule.target_service
+            ));
+        }
+        let Some(source) = rule.fault_type.source_app() else {
+            return Ok(());
+        };
+        let callers = self.local_callers().await;
+        let proven = callers.iter().any(|caller| {
+            caller.cgroup_id.is_some()
+                && crate::smoker::network::applies_to_caller(rule, &caller.app, &caller.namespace)
+        });
+        if proven {
+            Ok(())
+        } else {
+            Err(format!(
+                "no running instance of source app {source} on this node has a verified workload cgroup"
+            ))
+        }
+    }
+
+    /// Converge the eBPF `fault_connect_map` on what the active drop and
+    /// partition faults ask for (see `smoker::network`).
+    #[cfg(all(feature = "ebpf", target_os = "linux"))]
+    async fn reconcile_connect_faults(&mut self) -> Result<(), String> {
+        use crate::smoker::bpf_maps;
+        use crate::smoker::bpf_types::{
+            BpfConnectFaultValue, FAULT_ACTION_DROP, FAULT_ACTION_PARTITION, partition_fault_key,
+        };
+        use crate::smoker::network::{
+            ConnectFaultAction, connect_fault_changes, desired_connect_faults,
+        };
+
+        let Some(handle) = self.onion_ebpf.clone() else {
+            return Ok(());
+        };
+        let callers = self.local_callers().await;
+        let services = self.merged_service_map();
+        let desired = desired_connect_faults(
+            self.fault_registry.iter(),
+            |rule| fault_vip_port(&services, rule),
+            &callers,
+        );
+        let changes = connect_fault_changes(&self.network_faults.connect, &desired);
+        if changes.write.is_empty() && changes.delete.is_empty() {
+            return Ok(());
+        }
+
+        let mut failures = Vec::new();
+        let mut ebpf = handle.lock().await;
+        for key in changes.delete {
+            let bpf_key = partition_fault_key(key.virtual_ip, key.port, key.source_cgroup_id);
+            match bpf_maps::delete_connect_fault(&mut ebpf.bpf, &bpf_key) {
+                Ok(()) => {
+                    self.network_faults.connect.remove(&key);
+                }
+                Err(error) => failures.push(format!("delete {key:?}: {error}")),
+            }
+        }
+        for (key, entry) in changes.write {
+            let (action, probability) = match entry.action {
+                ConnectFaultAction::Drop { probability } => (FAULT_ACTION_DROP, probability),
+                ConnectFaultAction::Partition => (FAULT_ACTION_PARTITION, 100),
+            };
+            let value = BpfConnectFaultValue {
+                action,
+                probability,
+                _pad: [0; 6],
+                delay_ns: 0,
+                jitter_ns: 0,
+                expires_ns: entry.expires_ns,
+            };
+            let bpf_key = partition_fault_key(key.virtual_ip, key.port, key.source_cgroup_id);
+            match bpf_maps::write_connect_fault(&mut ebpf.bpf, bpf_key, value) {
+                Ok(()) => {
+                    self.network_faults.connect.insert(key, entry);
+                }
+                Err(error) => failures.push(format!("write {key:?}: {error}")),
+            }
+        }
+        if failures.is_empty() {
+            Ok(())
+        } else {
+            Err(format!(
+                "failed to program fault_connect_map: {}",
+                failures.join("; ")
+            ))
+        }
+    }
+
+    /// Without the eBPF data path there is no connect map to converge.
     #[cfg(not(all(feature = "ebpf", target_os = "linux")))]
-    async fn delete_fault_bpf_entry(&self, _rule: &crate::smoker::types::FaultRule) {}
+    async fn reconcile_connect_faults(&mut self) -> Result<(), String> {
+        Ok(())
+    }
 
     /// Enforce the image trust policy for a workload before deploying it.
     ///
@@ -5942,6 +5985,9 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
         let service_id = crate::onion::service_id::ServiceId::new(namespace, app_name);
         self.publish_backend_ebpf(&service_id).await?;
         self.sync_firewall_ebpf().await;
+        // A new caller must meet the network faults already active against
+        // the services it calls.
+        self.reconcile_network_faults().await;
         Ok(())
     }
 
@@ -9720,9 +9766,9 @@ impl<G: Grill + Clone + 'static> BunAgent<G> {
         // cgroup behind in the first place.
         let faults = self.fault_registry.clear();
         for rule in &faults {
-            self.delete_fault_bpf_entry(rule).await;
             self.reverse_fault(rule).await;
         }
+        self.reconcile_network_faults().await;
         self.publish_dns_faults();
 
         let mut ids: Vec<InstanceId> = self
@@ -11806,6 +11852,21 @@ impl<G: Grill + Clone + 'static> DeployWorker<G> {
 
         std::ops::ControlFlow::Continue(())
     }
+}
+
+/// The network-byte-order VIP and port of a fault's target service, if this
+/// node knows it. Resolved against the exact namespace-qualified identity, so
+/// a fault on `web` in `team-a` never picks up `team-b`'s `web` VIP.
+#[cfg(all(feature = "ebpf", target_os = "linux"))]
+fn fault_vip_port(
+    services: &crate::onion::service_map::ServiceMap,
+    rule: &crate::smoker::types::FaultRule,
+) -> Option<(u32, u16)> {
+    let entry = services.resolve(&crate::onion::service_id::ServiceId::new(
+        rule.namespace.as_deref()?,
+        rule.target_service.as_str(),
+    ))?;
+    Some((entry.vip.to_network_byte_order(), entry.port.to_be()))
 }
 
 const DNS_TRACE_SCRIPT: &str = r#"
@@ -20269,6 +20330,7 @@ host = "remote.local"
         let delay = fault_rule(crate::smoker::types::FaultType::Delay {
             delay_ns: 10_000_000,
             jitter_ns: 0,
+            source_app: None,
         });
         let error = agent.apply_fault(&delay).await.unwrap_err();
         assert!(error.contains("TC packet hook"), "{error}");

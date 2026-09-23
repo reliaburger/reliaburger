@@ -5967,6 +5967,9 @@ async fn route_workload_fault(
 ) -> Response {
     use crate::smoker::routing::{WorkloadInstance, plan_workload_fault, replica_evidence};
 
+    if request.fault_type.acts_on_callers() {
+        return route_network_fault(state, auth, headers, request, self_name).await;
+    }
     let namespace = request.namespace.clone().unwrap_or_default();
     let (statuses, faults) = tokio::join!(
         collect_cluster_statuses(state, FAULT_EVIDENCE_TIMEOUT),
@@ -6027,10 +6030,79 @@ async fn route_workload_fault(
         }
     };
 
+    send_routed_faults(state, auth, headers, plan, self_name, Some(evidence)).await
+}
+
+/// Route a network fault to the nodes that run its callers.
+///
+/// Network faults act where a connection starts, so a destination-wide fault
+/// goes to every live node and a `--from` fault to the nodes that run the
+/// source app in the fault's namespace. No replica rail applies: nothing is
+/// stopped, only traffic towards the target changes.
+async fn route_network_fault(
+    state: &ApiState,
+    auth: Option<&crate::sesame::auth::AuthContext>,
+    headers: &HeaderMap,
+    request: crate::smoker::types::FaultRequest,
+    self_name: &str,
+) -> Response {
+    use crate::smoker::routing::{WorkloadInstance, plan_network_fault};
+
+    let namespace = request.namespace.clone().unwrap_or_default();
+    let mut nodes: Vec<String> = match &state.membership {
+        Some(membership) => membership
+            .read()
+            .await
+            .iter()
+            .map(|member| member.node_id.0.clone())
+            .collect(),
+        None => Vec::new(),
+    };
+    nodes.push(self_name.to_string());
+    let sources: Vec<WorkloadInstance> = match request.fault_type.source_app() {
+        Some(source) => match collect_cluster_statuses(state, FAULT_EVIDENCE_TIMEOUT).await {
+            Ok((statuses, _unreachable)) => statuses
+                .into_iter()
+                .filter(|status| {
+                    status.instance.app_name == source && status.instance.namespace == namespace
+                })
+                .map(|status| WorkloadInstance {
+                    running: status.instance.state == "running",
+                    node: status.node,
+                    instance_id: status.instance.id,
+                })
+                .collect(),
+            Err(error) => return unavailable_response(error),
+        },
+        None => Vec::new(),
+    };
+    let plan = match plan_network_fault(&request, &nodes, &sources) {
+        Ok(plan) => plan,
+        Err(error) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({ "error": error.to_string() })),
+            )
+                .into_response();
+        }
+    };
+    send_routed_faults(state, auth, headers, plan, self_name, None).await
+}
+
+/// Apply this node's share of a routed fault and forward every other share,
+/// returning one summary whose `routed` lists the rest.
+async fn send_routed_faults(
+    state: &ApiState,
+    auth: Option<&crate::sesame::auth::AuthContext>,
+    headers: &HeaderMap,
+    plan: Vec<crate::smoker::routing::RoutedFault>,
+    self_name: &str,
+    evidence: Option<crate::smoker::types::ReplicaEvidence>,
+) -> Response {
     let mut applied: Vec<crate::smoker::types::FaultSummary> = Vec::new();
     for routed in plan {
         let result = if routed.node == self_name {
-            apply_fault_locally(state, auth, routed.request, None, Some(evidence)).await
+            apply_fault_locally(state, auth, routed.request, None, evidence).await
         } else {
             forward_workload_fault(state, &routed.node, headers, &routed.request).await
         };
@@ -14933,6 +15005,87 @@ mod cluster_routing_tests {
         assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
         assert!(body.to_string().contains("no running instances"), "{body}");
         assert_eq!(injected_count(&cluster).await, 0);
+    }
+
+    fn network(fault_type: FaultType) -> FaultRequest {
+        FaultRequest {
+            fault_type,
+            duration: std::time::Duration::from_secs(60),
+            ..kill(0)
+        }
+    }
+
+    async fn nodes_that_got_a_fault(cluster: &FakeCluster) -> Vec<usize> {
+        let mut nodes = Vec::new();
+        for (index, node) in cluster.nodes.iter().enumerate() {
+            if !node.injected.lock().await.is_empty() {
+                nodes.push(index);
+            }
+        }
+        nodes
+    }
+
+    #[tokio::test]
+    async fn a_network_fault_on_every_caller_lands_on_every_node() {
+        // The target runs on node-2 only, but its callers could be anywhere:
+        // the connect hook and the DNS responder act on the caller's node.
+        let cluster = start_cluster(vec![
+            ("node-1", vec![]),
+            ("node-2", vec![instance("default/web-0", "web", "running")]),
+            ("node-3", vec![]),
+        ])
+        .await;
+
+        let (status, body) = inject(&cluster, 0, &network(FaultType::DnsNxdomain)).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let summary: FaultSummary = serde_json::from_value(body).unwrap();
+        let mut holders: Vec<_> = std::iter::once(&summary)
+            .chain(&summary.routed)
+            .map(|fault| fault.node.clone().unwrap())
+            .collect();
+        holders.sort();
+        assert_eq!(holders, vec!["node-1", "node-2", "node-3"]);
+        assert_eq!(nodes_that_got_a_fault(&cluster).await, vec![0, 1, 2]);
+        for node in &cluster.nodes {
+            let injected = node.injected.lock().await;
+            // Each node's share names that node, and the owner re-plans it
+            // as a network fault rather than a target-owner fault.
+            assert_eq!(injected[0].0.fault_type, FaultType::DnsNxdomain);
+            assert_eq!(injected[0].1, None, "no replica evidence for traffic");
+        }
+    }
+
+    #[tokio::test]
+    async fn a_network_fault_from_one_source_lands_only_where_that_source_runs() {
+        let mut other_tenant = instance("team-b/frontend-0", "frontend", "running");
+        other_tenant.namespace = "team-b".to_string();
+        let cluster = start_cluster(vec![
+            ("node-1", vec![instance("default/web-0", "web", "running")]),
+            ("node-2", vec![other_tenant]),
+            (
+                "node-3",
+                vec![instance("default/frontend-0", "frontend", "running")],
+            ),
+        ])
+        .await;
+
+        let partition = network(FaultType::Partition {
+            source_app: Some("frontend".to_string()),
+        });
+        let (status, body) = inject(&cluster, 0, &partition).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(nodes_that_got_a_fault(&cluster).await, vec![2]);
+
+        // A source with no running instance anywhere is refused up front.
+        let nowhere = network(FaultType::Delay {
+            delay_ns: 300_000_000,
+            jitter_ns: 0,
+            source_app: Some("worker".to_string()),
+        });
+        let (status, body) = inject(&cluster, 0, &nowhere).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+        assert!(body.to_string().contains("worker"), "{body}");
+        assert_eq!(injected_count(&cluster).await, 1);
     }
 
     #[tokio::test]

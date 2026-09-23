@@ -182,6 +182,7 @@ pub async fn delay(
     target: &str,
     delay_str: &str,
     jitter: Option<&str>,
+    from: Option<&str>,
     duration: &Option<String>,
     targeting: &FaultTargeting,
 ) -> Result<(), RelishError> {
@@ -194,6 +195,7 @@ pub async fn delay(
         FaultType::Delay {
             delay_ns,
             jitter_ns,
+            source_app: from.map(str::to_string),
         },
         target.into(),
         get_duration(duration)?,
