@@ -125,34 +125,47 @@ impl Node {
 /// Bun dies with its `Child`, but the owners it launched lead process groups
 /// of their own and the containers they supervise outlive both. Leaked, they
 /// hold host-wide cgroups and addresses that break every later run, and their
-/// pinned eBPF programs make every connect() on the host fail. Drop can't
-/// wait or report, so the teardown is synchronous and best-effort: nothing in
-/// it may panic, since a second panic during unwinding aborts the test binary
-/// and hides the first.
+/// pinned eBPF programs make every connect() on the host fail. Deleting the
+/// containers doesn't free their networks either: each namespace's bind mount
+/// keeps its veth pair and /32 host route, and the next test's first
+/// container gets the same address and fails with "File exists". Drop can't
+/// await or return errors, so the teardown is synchronous and best-effort:
+/// nothing in it may panic, since a second panic during unwinding aborts the
+/// test binary and hides the first.
 struct RootCleanup(PathBuf);
 
 impl Drop for RootCleanup {
     fn drop(&mut self) {
-        kill_root_processes(&self.0);
+        // The kernel ownership lock is released only once Bun has exited, and
+        // SIGKILL doesn't wait for that.
+        wait_for_exit(&kill_root_processes(&self.0));
         for node in node_roots(&self.0) {
             delete_runc_containers(&node.join("data/instances/runc/state"));
             #[cfg(feature = "ebpf")]
             retire_leaked_kernel(&node);
         }
+        let suffix = root_suffix(&self.0);
+        if suffix.is_empty() {
+            return;
+        }
+        remove_leaked_cgroups(&suffix);
+        remove_leaked_networks(&suffix);
     }
 }
 
 /// SIGKILL every process whose command line names a path under the root:
 /// Bun, its detached owners and the Runc commands they were running.
-fn kill_root_processes(root: &Path) {
+/// Returns the processes it signalled.
+fn kill_root_processes(root: &Path) -> Vec<nix::unistd::Pid> {
     use nix::sys::signal::{Signal, kill, killpg};
     use nix::unistd::{Pid, getpgid, getpgrp};
     use std::os::unix::ffi::OsStrExt;
     // The trailing separator stops one root matching another it prefixes.
     let mut needle = root.as_os_str().as_bytes().to_vec();
     needle.push(b'/');
+    let mut killed = Vec::new();
     let Ok(entries) = std::fs::read_dir("/proc") else {
-        return;
+        return killed;
     };
     for entry in entries.flatten() {
         let Some(pid) = entry
@@ -180,6 +193,164 @@ fn kill_root_processes(root: &Path) {
                 let _ = kill(pid, Signal::SIGKILL);
             }
         }
+        killed.push(pid);
+    }
+    killed
+}
+
+/// Wait up to ten seconds for every process to exit. A zombie counts: it
+/// has already closed its files and released its locks, and Bun stays one
+/// until the test's runtime reaps it.
+fn wait_for_exit(processes: &[nix::unistd::Pid]) {
+    let exited = |pid: &nix::unistd::Pid| {
+        let Ok(stat) = std::fs::read_to_string(format!("/proc/{pid}/stat")) else {
+            return true;
+        };
+        // The state follows the command name, which may itself hold ") ".
+        stat.rsplit_once(") ")
+            .is_none_or(|(_, rest)| rest.starts_with('Z'))
+    };
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    while !processes.iter().all(exited) {
+        if std::time::Instant::now() >= deadline {
+            eprintln!("test cleanup: processes still running after SIGKILL");
+            return;
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+}
+
+/// Kill and remove the cgroups of this root's apps: their instance cgroups
+/// under /sys/fs/cgroup/reliaburger/<namespace>/, and the service cgroup the
+/// cgroup-kill test makes at /sys/fs/cgroup/reliaburger-<app>. Every test
+/// names its apps through `root_app_name`, so the root's suffix finds them.
+fn remove_leaked_cgroups(suffix: &str) {
+    let ours = |path: &Path| {
+        path.file_name()
+            .and_then(|name| name.to_str())
+            .is_some_and(|name| name.ends_with(&format!("-{suffix}")))
+    };
+    let namespaces = std::fs::read_dir("/sys/fs/cgroup/reliaburger")
+        .into_iter()
+        .flatten()
+        .flatten();
+    for namespace in namespaces {
+        for app in std::fs::read_dir(namespace.path())
+            .into_iter()
+            .flatten()
+            .flatten()
+        {
+            if ours(&app.path()) {
+                remove_cgroup(&app.path());
+            }
+        }
+    }
+    for service in std::fs::read_dir("/sys/fs/cgroup")
+        .into_iter()
+        .flatten()
+        .flatten()
+    {
+        let path = service.path();
+        let is_service = path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .is_some_and(|name| name.starts_with("reliaburger-"));
+        if is_service && ours(&path) {
+            remove_cgroup(&path);
+        }
+    }
+}
+
+/// Kill every process in a cgroup subtree, then remove it bottom-up. A
+/// cgroup refuses removal (EBUSY) until its killed processes have exited.
+fn remove_cgroup(path: &Path) {
+    if !path.join("cgroup.procs").exists() {
+        return;
+    }
+    let _ = std::fs::write(path.join("cgroup.kill"), "1");
+    for child in std::fs::read_dir(path).into_iter().flatten().flatten() {
+        if child.file_type().is_ok_and(|kind| kind.is_dir()) {
+            remove_cgroup(&child.path());
+        }
+    }
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    loop {
+        match std::fs::remove_dir(path) {
+            Ok(()) => return,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return,
+            Err(error)
+                if error.raw_os_error() == Some(nix::libc::EBUSY)
+                    && std::time::Instant::now() < deadline =>
+            {
+                std::thread::sleep(Duration::from_millis(20));
+            }
+            Err(error) => {
+                eprintln!("test cleanup: cannot remove {}: {error}", path.display());
+                return;
+            }
+        }
+    }
+}
+
+/// Delete the network namespace, host veth and port forwards of each of this
+/// root's instances. Deleting the host end of a veth pair deletes both ends
+/// and the /32 route to the container address with them.
+fn remove_leaked_networks(suffix: &str) {
+    use reliaburger::grill::{InstanceId, netns};
+    let marker = format!("-{suffix}-");
+    let placeholder = netns::namespace_path(&InstanceId(String::new()));
+    let Some(directory) = placeholder.parent() else {
+        return;
+    };
+    for entry in std::fs::read_dir(directory).into_iter().flatten().flatten() {
+        let namespace = entry.file_name().to_string_lossy().into_owned();
+        let Some(instance) = namespace.strip_prefix("rb-") else {
+            continue;
+        };
+        if !instance.contains(&marker) {
+            continue;
+        }
+        let veth = netns::host_veth_name(&InstanceId(instance.to_owned()));
+        for address in routed_addresses(&veth) {
+            remove_port_forwards(address);
+        }
+        let _ = std::process::Command::new("ip")
+            .args(["link", "del", &veth])
+            .output();
+        let _ = std::process::Command::new("ip")
+            .args(["netns", "del", &namespace])
+            .output();
+    }
+}
+
+/// The container addresses the host routes through a veth.
+fn routed_addresses(veth: &str) -> Vec<std::net::Ipv4Addr> {
+    let Ok(output) = std::process::Command::new("ip")
+        .args(["-o", "-4", "route", "show", "dev", veth])
+        .output()
+    else {
+        return Vec::new();
+    };
+    String::from_utf8_lossy(&output.stdout)
+        .lines()
+        .filter_map(|line| line.split_whitespace().next())
+        .filter_map(|destination| destination.split('/').next()?.parse().ok())
+        .collect()
+}
+
+/// Delete the nftables port-map elements that forward to an address.
+fn remove_port_forwards(address: std::net::Ipv4Addr) {
+    use reliaburger::grill::portmap;
+    let Ok(listing) = std::process::Command::new("nft")
+        .args(["-j", "list", "ruleset"])
+        .output()
+    else {
+        return;
+    };
+    for port in portmap::ports_for_address(&listing.stdout, address).unwrap_or_default() {
+        let _ = std::process::Command::new("nft")
+            .args(portmap::element_delete(port))
+            .output();
     }
 }
 
@@ -239,11 +410,13 @@ fn retire_leaked_kernel(node: &Path) {
     if !Path::new(pins).exists() {
         return;
     }
-    let _ = reliaburger::onion::ebpf::loader::OnionEbpf::retire_owned_state(
+    if let Err(error) = reliaburger::onion::ebpf::loader::OnionEbpf::retire_owned_state(
         Path::new(cgroup),
         &policy,
         Path::new(pins),
-    );
+    ) {
+        eprintln!("test cleanup: cannot retire {}: {error}", node.display());
+    }
     let _ = std::fs::remove_dir(pins);
 }
 
@@ -373,14 +546,17 @@ async fn wait_file(path: &Path) {
 /// leaked workload makes Runc refuse the next run's first container ("cgroup
 /// is not empty") and the deploy rolls to a new generation instead.
 fn root_app_name(prefix: &str, root: &Path) -> String {
-    let suffix = root
-        .file_name()
-        .unwrap()
-        .to_str()
-        .unwrap()
+    format!("{prefix}-{}", root_suffix(root))
+}
+
+/// The part of an app name `root_app_name` takes from the root, which
+/// `RootCleanup` uses to find what the root's apps left on the host.
+fn root_suffix(root: &Path) -> String {
+    root.file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or_default()
         .trim_start_matches('.')
-        .to_ascii_lowercase();
-    format!("{prefix}-{suffix}")
+        .to_ascii_lowercase()
 }
 
 #[tokio::test]
