@@ -15,6 +15,7 @@
     <header class="masthead">
       <a class="wordmark" href="./" aria-label="Reliaburger home"><span class="mark" aria-hidden="true">r/</span>reliaburger</a>
       <nav aria-label="Main navigation">
+        <a href="#tour">Try it</a>
         <a href="#start">Run it</a>
         <a href="#docs">Read the docs</a>
         <a href="https://github.com/reliaburger/reliaburger">GitHub <span aria-hidden="true">↗</span></a>
@@ -53,9 +54,88 @@
         <a href="https://github.com/reliaburger/reliaburger/blob/main/docs/plans/2026-09-16-v0.1.0-release-plan.md">Release plan <span aria-hidden="true">↗</span></a>
       </aside>
 
+      <section id="tour" class="section" aria-labelledby="tour-title">
+        <!-- The tour's commands carry data-tour. tests/suite/website.rs parses every one
+             with the real relish CLI, so the page can't drift from the product. -->
+        <details class="tour">
+          <summary>
+            <span class="section-number" aria-hidden="true">01 /</span>
+            <h2 id="tour-title">Try it in five minutes</h2>
+            <span class="pending">Arrives with 0.1.0</span>
+          </summary>
+          <div class="tour-body">
+            <p class="tour-note">This is the tour 0.1.0 has to pass before we publish it. Until the
+              signed release is out, the install line stops with a release-not-published message.
+              You’ll need macOS, or Linux with QEMU and KVM, plus about 8 GiB of free memory and
+              15 GiB of disk.</p>
+            <ol class="tour-steps">
+              <li>
+                <pre><code data-tour>curl -fsSL https://reliaburger.com/install.sh | sh</code></pre>
+                <p>Installs <code>relish</code>, then builds a three-node cluster in Linux VMs on your
+                  laptop. It checks every download against a pinned digest, and it’s the only step
+                  that takes minutes.</p>
+              </li>
+              <li>
+                <pre><code data-tour>relish apply -f https://reliaburger.com/demo/podinfo.yaml</code></pre>
+                <p>A real Kubernetes app: podinfo’s frontend, backend and Redis cache. Relish converts
+                  the YAML as it applies it and prints a report of anything it had to change.</p>
+              </li>
+              <li>
+                <pre><code data-tour>relish status</code></pre>
+                <p>Three replicas, spread over three nodes. The scheduler did that, not you.</p>
+              </li>
+              <li>
+                <pre><code>open http://podinfo.localhost:18080</code></pre>
+                <p>Or paste the address into a browser. The request comes in through the built-in
+                  ingress, and the page shows which replica answered.</p>
+              </li>
+              <li>
+                <pre><code data-tour>relish logs podinfo --since 1m</code></pre>
+                <p>Logs from every replica on every node, in one stream. No log shipper to install.</p>
+              </li>
+              <li>
+                <pre><code data-tour>relish dashboard</code></pre>
+                <p>Live CPU and memory charts in your browser, over the CLI’s own authenticated
+                  connection. Ctrl-C closes it; the cluster keeps running.</p>
+              </li>
+              <li>
+                <pre><code data-tour>relish fault kill podinfo --count 1 --acknowledge</code></pre>
+                <p>Break it on purpose. Fault injection is built in, and on a laptop cluster it’s
+                  switched on.</p>
+              </li>
+              <li>
+                <pre><code data-tour>relish status</code></pre>
+                <p>Run it again. The killed replica is back, because the node agent restarts what
+                  should be running.</p>
+              </li>
+              <li>
+                <pre><code data-tour>relish local stop <var>NODE</var></code></pre>
+                <p>Now lose a whole machine. Use the name of the third node from <code>relish status</code>.</p>
+              </li>
+              <li>
+                <pre><code data-tour>relish status</code></pre>
+                <p>The replicas that lived there come back on the two survivors.</p>
+              </li>
+              <li>
+                <pre><code data-tour>relish wtf</code></pre>
+                <p>One screen on what just happened and what still needs attention. It’s what you’d
+                  run first in a real incident.</p>
+              </li>
+            </ol>
+            <p>Finished? Remove the cluster, then Relish itself:</p>
+            <pre class="tour-cleanup"><code data-tour>relish local destroy --yes</code>
+<code data-tour>relish uninstall</code></pre>
+            <p class="tour-links">Also in the CLI: <code data-tour>relish manual tour</code>
+              · <a href="https://github.com/reliaburger/reliaburger/blob/main/docs/manual/08_five-minute-tour.md">Read it on GitHub</a>
+              · <a href="https://github.com/reliaburger/reliaburger/blob/main/docs/quickstart.md">Prerequisites, retries and cleanup</a>
+              · <a href="install.sh">Read the bootstrap script</a></p>
+          </div>
+        </details>
+      </section>
+
       <section id="start" class="section start" aria-labelledby="start-title">
         <div class="section-heading">
-          <span class="section-number" aria-hidden="true">01 /</span>
+          <span class="section-number" aria-hidden="true">02 /</span>
           <h2 id="start-title">Run it from source</h2>
         </div>
         <div class="start-grid">
@@ -86,28 +166,9 @@ target/debug/relish</code></pre>
         </div>
       </section>
 
-      <section class="section" aria-labelledby="install-title">
-        <div class="section-heading">
-          <h2 id="install-title">The 0.1.0 install path</h2>
-        </div>
-        <p>Pending the signed release. Three Linux VMs, runc, authenticated cluster
-          traffic and a sample app. No source build. No host-directory mounts.</p>
-        <pre><code>curl -fsSL https://reliaburger.com/install.sh | sh
-relish nodes
-relish status
-relish logs hello
-relish dashboard             # Ctrl-C stops the browser connection
-<span class="comment"># Sample app: http://localhost:18080/</span>
-relish local stop
-relish local start
-relish local destroy --yes</code></pre>
-        <p><a href="https://github.com/reliaburger/reliaburger/blob/main/docs/quickstart.md">Prerequisites, retries and cleanup</a>
-          · <a href="install.sh">Read the bootstrap script</a></p>
-      </section>
-
       <section id="docs" class="section" aria-labelledby="docs-title">
         <div class="section-heading">
-          <span class="section-number" aria-hidden="true">02 /</span>
+          <span class="section-number" aria-hidden="true">03 /</span>
           <h2 id="docs-title">Read before you deploy</h2>
           <span class="section-note">Documentation lives with the code.</span>
         </div>
@@ -151,7 +212,7 @@ relish local destroy --yes</code></pre>
 
       <section class="section" aria-labelledby="internals-title">
         <div class="section-heading">
-          <span class="section-number" aria-hidden="true">03 /</span>
+          <span class="section-number" aria-hidden="true">04 /</span>
           <h2 id="internals-title">Follow a subsystem</h2>
         </div>
         <p class="section-intro"><code>bun</code> runs on each node. <code>relish</code> talks to its API.
@@ -185,7 +246,7 @@ relish local destroy --yes</code></pre>
     <footer>
       <span>Reliaburger · by Miko Pawlikowski</span>
       <a href="https://github.com/reliaburger/reliaburger/blob/main/LICENSE">Apache 2.0</a>
-      <span class="footer-note">Plain HTML + CSS. No JavaScript.</span>
+      <span class="footer-note">Plain HTML and CSS. No tracking, no third-party requests.</span>
     </footer>
   </div>
 </body>

@@ -31,3 +31,6 @@ _book/
 
 # Python release-tool bytecode
 __pycache__/
+
+# Copied from examples/kubernetes/ by the Pages workflow; never committed
+docs/website/demo/

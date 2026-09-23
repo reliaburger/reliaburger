@@ -49,6 +49,25 @@ h1 { font-size: clamp(2.4rem, 5.1vw, 3.7rem); line-height: 1.12; letter-spacing:
 .section-number { color: var(--accent); }
 h2 { margin: 0; font-size: 1.5rem; line-height: 1.3; font-weight: 650; letter-spacing: -.03em; }
 .section-note { color: var(--muted); margin-left: auto; font-size: .875rem; }
+/* The tour reuses the release-status aside's accent rule: both describe what isn't published yet. */
+.tour { border-top: 1px solid var(--line); border-bottom: 1px solid var(--line); border-left: 3px solid var(--accent); }
+.tour summary { display: flex; align-items: baseline; flex-wrap: wrap; gap: 12px; padding: 20px; cursor: pointer; list-style: none; }
+.tour summary::-webkit-details-marker { display: none; }
+.tour summary::after { content: "+"; margin-left: auto; font: 1.5rem/1 var(--mono); color: var(--accent); }
+.tour[open] summary::after { content: "−"; }
+.tour summary:hover h2 { color: var(--accent); }
+.tour summary:focus-visible { outline: 3px solid var(--accent); outline-offset: 2px; }
+.pending { font: 500 .75rem var(--mono); letter-spacing: .07em; text-transform: uppercase; color: var(--accent); border: 1px solid var(--accent); border-radius: 2px; padding: 1px 8px; }
+.tour-body { padding: 0 20px 24px; }
+.tour-note { max-width: 760px; color: var(--muted); }
+.tour-steps { list-style: none; counter-reset: step; margin: 22px 0; padding: 0; }
+.tour-steps li { counter-increment: step; display: grid; grid-template-columns: 2.5rem minmax(0, 1.2fr) minmax(0, 1fr); gap: 8px 24px; align-items: start; border-top: 1px solid var(--line); padding: 14px 0; }
+.tour-steps li::before { content: counter(step, decimal-leading-zero); font: .75rem/2.9 var(--mono); color: var(--accent); }
+.tour-steps pre, .tour-cleanup { background: var(--ink); color: #e4e9e3; border-radius: 4px; padding: 10px 16px; line-height: 1.7; }
+.tour-steps p { margin: 0; color: var(--muted); font-size: .9375rem; }
+.tour-cleanup { margin-bottom: 1rem; }
+.tour var { font-style: normal; color: #f49463; }
+.tour-links { font-size: .875rem; color: var(--muted); margin: 0; }
 .start-grid { display: grid; grid-template-columns: .8fr 1.4fr; gap: 44px; }
 .start-copy p:not(:first-child) { color: var(--muted); }
 .start-copy > a { font-size: .875rem; }
@@ -89,6 +108,8 @@ footer { display: flex; flex-wrap: wrap; gap: 12px 24px; margin-top: 20px; paddi
   .start-grid { grid-template-columns: 1fr; gap: 24px; }
   .start-copy { max-width: 700px; }
   .subsystems > div { grid-template-columns: 1fr; gap: 2px; }
+  .tour-steps li { grid-template-columns: 2rem minmax(0, 1fr); }
+  .tour-steps li p { grid-column: 2; }
 }
 @media (max-width: 900px) {
   .intro { grid-template-columns: 1fr; gap: 28px; }
@@ -110,6 +131,11 @@ footer { display: flex; flex-wrap: wrap; gap: 12px 24px; margin-top: 20px; paddi
   .subsystems > div { grid-template-columns: minmax(125px, .8fr) 1fr; gap: 14px; }
   .contributing { flex-direction: column; align-items: start; gap: 22px; }
   .footer-note { margin-left: 0; width: 100%; }
+  .tour summary { padding: 16px 14px; }
+  .tour-body { padding: 0 14px 20px; }
+  .tour-steps li { grid-template-columns: 1fr; gap: 6px; }
+  .tour-steps li p { grid-column: 1; }
+  .tour-steps li::before { line-height: 1.4; }
 }
 @media print {
   .page { max-width: none; padding: 0; }

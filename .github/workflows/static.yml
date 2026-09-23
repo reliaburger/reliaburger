@@ -33,6 +33,13 @@ jobs:
         uses: actions/checkout@v4
       - name: Setup Pages
         uses: actions/configure-pages@v5
+      - name: Publish the tutorial's demo manifest
+        # The homepage tour applies https://reliaburger.com/demo/podinfo.yaml.
+        # Copying the tested example at deploy time means the site can never
+        # serve a different manifest from the one CI imports.
+        run: |
+          mkdir -p docs/website/demo
+          cp examples/kubernetes/podinfo.yaml docs/website/demo/podinfo.yaml
       - name: Upload artifact
         uses: actions/upload-pages-artifact@v3
         with:
